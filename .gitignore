@@ -1,0 +1,76 @@
+# Rust
+/target/
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/logs/
+
+# Test artifacts
+/tmp/
+/test_output/
+bench_results/
+# Mining artifacts
+/mining_cache/
+/mining_workspace*/
+/.mining_cache/
+/.mining_workspace*/
+/.mining_results*/
+/.mining_iter*/
+/mining_iter*/
+/.henos_dsl_debug/
+/diagnose_guard
+/test_translate_direct
+/docs/property_examples/
+# Cache directories (fetched repositories)
+/cache_*/
+/test_mining_cache/
+# Workspace directories (mining workflow outputs)
+/workspace_*/
+
+# Preprocessing artifacts (sv2v)
+*sv2v_converted.v
+*sv2v_manifest.json
+sv2v.log
+sv2v_*.log
+preprocessed_manifest.json
+preprocessed/
+deprecated/
+
+# Documentation
+/doc/
+
+# LaTeX build artifacts (sci/)
+sci/*.aux
+sci/*.log
+sci/*.out
+sci/*.toc
+sci/*.synctex.gz
+sci/*.pdf.venv/
+.venv-uhdm/
+
+# integration scripts output
+bpmn_examples_output.md
+
+# Local helper scripts (not checked in)
+scripts/run_henos_api_local.sh
+CLAUDE.md
+CLAUDE.md

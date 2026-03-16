@@ -1,0 +1,55 @@
+// Dual-condition start example: an industrial workcell where the assembly machine may enter
+// the Running state only when both the safety gate is closed and the operator panel is marked
+// ready. The machine transition uses a label set containing both `gate_closed` and
+// `operator_ready`, illustrating multi-element labels in the CLTS representation.
+context dual_condition_start {
+    alphabet {
+        label gate_closed;
+        label gate_open;
+        label operator_ready;
+        label operator_reset;
+        label stop;
+    }
+
+    automata {
+        automaton SafetyGate {
+            states {
+                state Open initial;
+                state Closed;
+            }
+            transitions {
+                transition Open -> Closed on label gate_closed;
+                transition Closed -> Open on label gate_open;
+            }
+        }
+
+        automaton OperatorPanel {
+            states {
+                state Idle initial;
+                state Ready;
+            }
+            transitions {
+                transition Idle -> Ready on label operator_ready;
+                transition Ready -> Idle on label operator_reset;
+            }
+        }
+
+        automaton AssemblyMachine {
+            states {
+                state Idle initial;
+                state Running;
+            }
+            transitions {
+                // In the Rust CLTS example this transition label is the set {gate_closed, operator_ready}.
+                transition Idle -> Running on label gate_closed;
+                transition Running -> Idle on label stop;
+            }
+        }
+    }
+
+    composition {
+        synchronous workcell {
+            members [SafetyGate, OperatorPanel, AssemblyMachine];
+        }
+    }
+}

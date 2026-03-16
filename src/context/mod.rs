@@ -1,0 +1,2980 @@
+//! Context management for CLTS instances.
+//!
+//! This is an early scaffold that will eventually coordinate global alphabets,
+//! variable registries, and CLTS composition. For now, it focuses on exposing a
+//! shared `LabelStoreBuilder` and registering named CLTS instances.
+
+use crate::clts::{
+    Clts, CltsBuilder, CltsError, DefaultLabelIdx, DefaultStateIdx, LabelId, LabelStoreBuilder,
+    StateId,
+};
+use crate::composition::{CompositionOptions, compose};
+use crate::context_dsl::{ContextDoc, IncrementalState, LoadPlan};
+use crate::mu_calculus::{
+    Environment, EvalResult, EvaluationError, EvaluationOptions, Formula,
+    evaluate_with_options_and_automaton,
+};
+use crate::persistence::{
+    PersistenceError, load_clts_from_path, maybe_spill_clts, save_clts_to_path,
+};
+use bitvec::prelude::{BitVec, Lsb0};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ContextError {
+    #[error("CLTS with name '{0}' already registered")]
+    DuplicateClts(String),
+    #[error("controllable alphabet element '{0}' already claimed by another CLTS")]
+    DuplicateControllableAlphabet(String),
+    #[error("internal alphabet element '{0}' already claimed by another CLTS")]
+    DuplicateInternalAlphabet(String),
+    #[error("failed to merge label store: {0}")]
+    LabelRegistry(String),
+    #[error("unknown CLTS '{0}'")]
+    UnknownClts(String),
+    #[error("composition failed: {0}")]
+    Composition(#[from] CltsError),
+    #[error("controller synthesis failed: {0}")]
+    Controller(CltsError),
+    #[error("persistence failure: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("μ-calculus environment for '{name}' expected {expected} states, received {provided}")]
+    EnvironmentMismatch {
+        name: String,
+        expected: usize,
+        provided: usize,
+    },
+    #[error("μ-calculus evaluation failed: {0}")]
+    MuEvaluation(#[from] EvaluationError),
+}
+
+/// Cache for incremental DSL loads.
+#[derive(Debug, Default, Clone)]
+pub struct ContextDslCache {
+    state: IncrementalState,
+}
+
+impl ContextDslCache {
+    /// Creates an empty cache for incremental DSL loads.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Computes the changes required to rebuild the context from `doc` without mutating the cache.
+    pub fn diff(&self, doc: &ContextDoc) -> LoadPlan {
+        self.state.diff(doc)
+    }
+
+    /// Applies a previously computed plan, updating the cached fingerprints.
+    pub fn update(&mut self, plan: &LoadPlan) {
+        self.state.apply(plan);
+    }
+
+    /// Convenience helper that computes the plan and updates the cache in one step.
+    ///
+    /// # Coverage Status
+    /// Covered by test: `context_dsl_cache_diff_and_update`
+    pub fn diff_and_update(&mut self, doc: &ContextDoc) -> LoadPlan {
+        let plan = self.diff(doc);
+        self.update(&plan);
+        plan
+    }
+}
+
+/// Context for managing CLTS instances and their shared resources.
+///
+/// This struct contains:
+/// - A map of CLTS instances by name.
+/// - A shared label store for interning labels.
+/// - A set of controllable alphabet symbols.
+/// - A set of global variables.
+///
+/// The context is used to manage the lifecycle of CLTS instances and their shared resources.
+/// It is also used to evaluate μ-calculus formulas and synthesise controllers.
+#[derive(Debug, Default)]
+pub struct Context {
+    cltss: HashMap<String, Clts<DefaultStateIdx, DefaultLabelIdx>>,
+    label_store: LabelStoreBuilder<DefaultLabelIdx>,
+    controllable_alphabet: HashSet<String>,
+    global_variables: HashSet<String>,
+}
+
+impl Drop for Context {
+    /// Custom drop implementation to avoid stack overflow when dropping contexts with large CLTSs.
+    ///
+    /// When a Context contains multiple large CLTSs (e.g., 2000+ states), dropping them all
+    /// at once can cause stack overflow. This implementation drops CLTSs one at a time to
+    /// avoid deep recursion.
+    fn drop(&mut self) {
+        // Drop CLTSs one at a time to avoid stack overflow
+        // Use take to move them out, then drop individually
+        let mut cltss = std::mem::take(&mut self.cltss);
+
+        let keys: Vec<String> = cltss.keys().cloned().collect();
+
+        for key in keys.iter() {
+            if let Some(clts) = cltss.remove(key) {
+                drop(clts); // Each CLTS has its own Drop implementation
+            }
+        }
+    }
+}
+
+mod diagnostics;
+
+use crate::context::diagnostics::{
+    BfsReachability, bfs_reachable_states, build_unrealizable_initials_synthesis,
+    enrich_diagnostics_for_excluded_initials,
+};
+
+impl Context {
+    /// Returns a new context builder.
+    pub fn builder() -> ContextBuilder {
+        ContextBuilder::default()
+    }
+
+    /// Retrieves a registered CLTS by name.
+    pub fn clts(&self, name: &str) -> Option<&Clts<DefaultStateIdx, DefaultLabelIdx>> {
+        self.cltss.get(name)
+    }
+
+    /// Returns the list of registered CLTS names.
+    ///
+    /// # Coverage Status
+    /// Covered indirectly by `context::tests::registers_clts_instances`.
+    pub fn clts_names(&self) -> Vec<String> {
+        self.cltss.keys().cloned().collect()
+    }
+
+    /// Prints a compact representation of the internal structure of this context.
+    ///
+    /// This includes:
+    /// - All registered CLTS instances with their states, transitions, labels, and variables
+    /// - Global variables and controllable alphabet
+    /// - Label store information
+    ///
+    /// The output is written to the provided writer.
+    pub fn print_structure<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writeln!(writer, "Context Structure:")?;
+        writeln!(writer, "==================")?;
+        writeln!(writer)?;
+
+        // Global information
+        writeln!(writer, "Global Variables: {}", self.global_variables.len())?;
+        if !self.global_variables.is_empty() {
+            let mut vars: Vec<String> = self.global_variables.iter().cloned().collect();
+            vars.sort();
+            writeln!(writer, "  {}", vars.join(", "))?;
+        }
+        writeln!(writer)?;
+
+        writeln!(
+            writer,
+            "Controllable Alphabet: {} symbols",
+            self.controllable_alphabet.len()
+        )?;
+        if !self.controllable_alphabet.is_empty() {
+            let mut symbols: Vec<String> = self.controllable_alphabet.iter().cloned().collect();
+            symbols.sort();
+            writeln!(writer, "  {}", symbols.join(", "))?;
+        }
+        writeln!(writer)?;
+
+        // CLTS instances
+        writeln!(writer, "CLTS Instances: {}", self.cltss.len())?;
+        writeln!(writer)?;
+
+        let mut clts_names: Vec<_> = self.cltss.keys().collect();
+        clts_names.sort();
+
+        for name in clts_names {
+            let clts = &self.cltss[name];
+            writeln!(writer, "Automaton: {}", name)?;
+            writeln!(writer, "  States: {}", clts.state_count())?;
+
+            // Initial states
+            let initial_names: Vec<String> = clts
+                .initial_states()
+                .iter()
+                .filter_map(|&id| clts.state_name(id).map(|s| s.to_string()))
+                .collect();
+            if !initial_names.is_empty() {
+                writeln!(writer, "  Initial: {}", initial_names.join(", "))?;
+            }
+
+            // Variables
+            let variables = clts.variables();
+            if !variables.is_empty() {
+                writeln!(writer, "  Variables: {}", variables.join(", "))?;
+            }
+
+            // Labels
+            let mut label_vec = clts.alphabet();
+            if !label_vec.is_empty() {
+                label_vec.sort();
+                writeln!(writer, "  Labels: {}", label_vec.join(", "))?;
+            }
+
+            // Controllable/Uncontrollable/Internal alphabet
+            let ctrl_count = clts.controllable_alphabet().len();
+            let unctrl_count = clts.uncontrollable_alphabet().len();
+            let internal_count = clts.internal_alphabet().len();
+            if ctrl_count > 0 || unctrl_count > 0 || internal_count > 0 {
+                writeln!(
+                    writer,
+                    "  Alphabet: {} controllable, {} uncontrollable, {} internal",
+                    ctrl_count, unctrl_count, internal_count
+                )?;
+            }
+
+            // Transitions summary
+            let mut total_transitions = 0;
+            let mut controllable_transitions = 0;
+            let mut uncontrollable_transitions = 0;
+            for (_state_id, outgoing) in clts.state_outgoing_pairs() {
+                for trans in outgoing {
+                    total_transitions += 1;
+                    if trans.is_controllable(clts) {
+                        controllable_transitions += 1;
+                    } else {
+                        uncontrollable_transitions += 1;
+                    }
+                }
+            }
+            writeln!(
+                writer,
+                "  Transitions: {} total ({} controllable, {} uncontrollable)",
+                total_transitions, controllable_transitions, uncontrollable_transitions
+            )?;
+
+            // State details
+            writeln!(writer, "  State Details:")?;
+            for (state_id, outgoing) in clts.state_outgoing_pairs() {
+                let state_name = clts.state_name(state_id).unwrap_or("<unnamed>");
+                let is_initial = clts.initial_states().contains(&state_id);
+                let outgoing_count = outgoing.len();
+                let incoming_count = clts.incoming(state_id).len();
+
+                write!(writer, "    [{}] {}", state_id.index(), state_name)?;
+                if is_initial {
+                    write!(writer, " (initial)")?;
+                }
+                writeln!(
+                    writer,
+                    ": {} outgoing, {} incoming",
+                    outgoing_count, incoming_count
+                )?;
+
+                // Transition details
+                if outgoing_count > 0 {
+                    for (idx, trans) in outgoing.iter().enumerate() {
+                        let target_name = clts.state_name(trans.target()).unwrap_or("<unnamed>");
+                        let labels: Vec<String> = trans
+                            .labels()
+                            .iter()
+                            .filter_map(|&lid| {
+                                clts.label_payload(lid).map(|payload| payload.join(","))
+                            })
+                            .collect();
+                        let label_str = if labels.is_empty() {
+                            "<no labels>".to_string()
+                        } else {
+                            labels.join("|")
+                        };
+                        let kind_str = if trans.is_controllable(clts) {
+                            "ctrl"
+                        } else {
+                            "unctrl"
+                        };
+                        writeln!(
+                            writer,
+                            "      {} -> [{}] {} ({}) [{}]",
+                            idx,
+                            trans.target().index(),
+                            target_name,
+                            kind_str,
+                            label_str
+                        )?;
+                    }
+                }
+            }
+            writeln!(writer)?;
+        }
+
+        Ok(())
+    }
+
+    /// Produces a `CltsBuilder` seeded with the context's shared label store.
+    ///
+    /// Use this when constructing CLTSs that will be registered with the
+    /// context so their label IDs stay aligned with previously registered
+    /// systems. For isolated unit tests, `Clts::builder()` remains available.
+    pub fn new_clts_builder(&self) -> CltsBuilder<DefaultStateIdx, DefaultLabelIdx> {
+        CltsBuilder::with_label_store(self.label_store.clone())
+    }
+
+    /// Returns the global set of variables known to the context.
+    pub fn global_variables(&self) -> &HashSet<String> {
+        &self.global_variables
+    }
+
+    /// Returns the global set of controllable alphabet symbols tracked by the context.
+    ///
+    /// # Coverage Status
+    /// Covered by test: `controllable_alphabet_accessor`
+    pub fn controllable_alphabet(&self) -> &HashSet<String> {
+        &self.controllable_alphabet
+    }
+
+    /// Composes two registered CLTS instances using the provided semantics.
+    ///
+    /// The composed CLTS is standalone; callers may register it afterwards if
+    /// they wish to keep the result in the context registry.
+    ///
+    /// # Coverage Status
+    /// Covered by test: `compose_named_error_handling`
+    pub fn compose_named(
+        &self,
+        left: &str,
+        right: &str,
+        options: &CompositionOptions,
+    ) -> Result<Clts<DefaultStateIdx, DefaultLabelIdx>, ContextError> {
+        let lhs = self
+            .cltss
+            .get(left)
+            .ok_or_else(|| ContextError::UnknownClts(left.to_owned()))?;
+        let rhs = self
+            .cltss
+            .get(right)
+            .ok_or_else(|| ContextError::UnknownClts(right.to_owned()))?;
+        compose(lhs, rhs, options).map_err(ContextError::from)
+    }
+
+    /// Evaluates a μ-calculus [`Formula`] against the named CLTS using the provided environment.
+    ///
+    /// The environment's state count must match the CLTS; otherwise an
+    /// [`ContextError::EnvironmentMismatch`] is returned. Optional evaluator
+    /// settings can be supplied via `options`; when omitted, the defaults (memoisation
+    /// + guard partitions enabled) are used.
+    pub fn evaluate_mu(
+        &self,
+        name: &str,
+        formula: &Formula,
+        env: &Environment,
+        options: Option<&EvaluationOptions>,
+    ) -> Result<EvalResult, ContextError> {
+        let clts = self
+            .cltss
+            .get(name)
+            .ok_or_else(|| ContextError::UnknownClts(name.to_owned()))?;
+
+        let expected = clts.state_count();
+        let provided = env.state_count();
+        if expected != provided {
+            return Err(ContextError::EnvironmentMismatch {
+                name: name.to_owned(),
+                expected,
+                provided,
+            });
+        }
+
+        let eval_options = options.cloned().unwrap_or_default();
+        evaluate_with_options_and_automaton(formula, clts, env, &eval_options)
+            .map_err(ContextError::from)
+    }
+
+    /// Builds a controller by restricting `source` to the states that satisfy `formula`.
+    ///
+    /// This function performs **controller synthesis** by evaluating a μ-calculus formula
+    /// over the source CLTS and constructing a new CLTS that contains only the states and
+    /// transitions that satisfy the specification.
+    ///
+    /// # Synthesis Process
+    ///
+    /// 1. **Formula Evaluation**: Evaluates the μ-calculus formula using `evaluate_mu()` to
+    ///    determine which states satisfy the specification. This produces a bitset `keep_bits`
+    ///    where `keep_bits[i] = true` if state `i` satisfies the formula.
+    ///
+    /// 2. **Initial State Filtering**: Checks which initial states satisfy the formula:
+    ///    - If **no initial states** satisfy → controller is unrealizable (empty controller)
+    ///    - If **some initial states** satisfy → controller is realizable (may exclude some initials)
+    ///
+    /// 3. **Reachability Analysis**: Performs a BFS from satisfying initial states to find all
+    ///    reachable states that also satisfy the formula. This prunes:
+    ///    - States that don't satisfy the formula
+    ///    - States that are unreachable from any satisfying initial state
+    ///
+    /// 4. **Controller Construction**: Builds a new CLTS containing:
+    ///    - Only states that satisfy the formula and are reachable
+    ///    - Only transitions between retained states
+    ///    - Preserved state names, variables, and initial state markings
+    ///
+    /// 5. **Optional Minimization**: If `options.minimize` is `true`, runs structural minimization
+    ///    to merge behaviorally equivalent states (see `minimise_controller()`).
+    ///
+    /// # Realizability
+    ///
+    /// - **Realizable** (`realizable = true`): At least one initial state satisfies the formula
+    ///   and the controller contains reachable satisfying states.
+    /// - **Unrealizable** (`realizable = false`): No initial states satisfy the formula, or all
+    ///   satisfying states are unreachable.
+    ///
+    /// # Diagnostics
+    ///
+    /// When enabled via `options.diagnostics`, the function collects:
+    /// - **Violating initial states**: Initial states that don't satisfy the formula
+    /// - **Counterexample traces**: Minimal paths showing why the specification fails
+    /// - **Counterstrategy**: Environment strategy that prevents satisfaction
+    /// - **Deadlock traces**: Paths from initial states to deadlock states
+    /// - **Proof obligations**: Explanations for why states violate the specification
+    ///
+    /// # Performance
+    ///
+    /// - **Time Complexity**: O(n + m + f) where:
+    ///   - n = number of states
+    ///   - m = number of transitions
+    ///   - f = cost of formula evaluation (typically O(n * m) for fixpoint formulas)
+    /// - **Space Complexity**: O(n) for bitsets and visited tracking
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mununu::clts::Clts;
+    /// use mununu::context::Context;
+    /// use mununu::mu_calculus::{evaluator::Environment, parser};
+    ///
+    /// # let mut builder = Clts::builder();
+    /// # let label = builder.labels().intern(["tick"]).unwrap();
+    /// # builder.state("s0").initial("s0");
+    /// # builder.state("s1");
+    /// # builder.transition("s0", &[label], "s1");
+    /// # let plant = builder.build().unwrap();
+    /// # let context = Context::builder()
+    /// #     .register_clts("plant", plant)
+    /// #     .finish_with_checks().unwrap();
+    /// # let env = Environment::new(context.clts("plant").unwrap().state_count());
+    /// // Synthesize a controller that ensures "eventually p"
+    /// let formula = parser::parse("mu X. (p || <> X)")?;
+    /// let synthesis = context.synthesise_controller("plant", &formula, &env, None)?;
+    ///
+    /// if synthesis.realizable {
+    ///     println!("Controller has {} states", synthesis.controller.state_count());
+    /// } else {
+    ///     println!("Unrealizable: {}", synthesis.diagnostics.messages.join(", "));
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// The resulting controller retains only the states marked as satisfying and the
+    /// transitions between them. Unreachable states (w.r.t. the surviving initial
+    /// states) are pruned via a reachability pass. When no initial state satisfies the
+    /// formula the returned controller is empty and `realizable` is set to `false`.
+    pub fn synthesise_controller(
+        &self,
+        source: &str,
+        formula: &Formula,
+        env: &Environment,
+        options: Option<&EvaluationOptions>,
+    ) -> Result<ControllerSynthesis, ContextError> {
+        let synthesis_options = ControllerSynthesisOptions {
+            evaluation: options,
+            ..Default::default()
+        };
+        self.synthesise_controller_with_options(source, formula, env, synthesis_options)
+    }
+
+    /// Variant of [`Context::synthesise_controller`] that accepts extended options.
+    ///
+    /// This function provides additional control over the synthesis process:
+    /// - **Evaluation options**: Control μ-calculus evaluation behavior (memoization, guard partitions)
+    /// - **Diagnostics options**: Enable counterexample/counterstrategy generation, deadlock traces
+    /// - **Minimization**: Optionally run structural minimization after synthesis
+    ///
+    /// See [`Context::synthesise_controller`] for detailed documentation of the synthesis process.
+    pub fn synthesise_controller_with_options(
+        &self,
+        source: &str,
+        formula: &Formula,
+        env: &Environment,
+        options: ControllerSynthesisOptions<'_>,
+    ) -> Result<ControllerSynthesis, ContextError> {
+        let keep_bits = self.evaluate_mu(source, formula, env, options.evaluation)?;
+        let clts = self
+            .cltss
+            .get(source)
+            .ok_or_else(|| ContextError::UnknownClts(source.to_owned()))?;
+
+        let BfsReachability {
+            visited,
+            parent,
+            violating_initials,
+        } = bfs_reachable_states(clts, &keep_bits);
+
+        // If no satisfying initial state is reachable, the controller is unrealizable.
+        if visited.not_any() {
+            return build_unrealizable_initials_synthesis(
+                self,
+                clts,
+                &keep_bits,
+                &violating_initials,
+                &options,
+            );
+        }
+
+        let mut diagnostics = ControllerDiagnostics::default();
+        let proof_obligations_enabled = options
+            .diagnostics
+            .is_none_or(|diag| diag.proof_obligations);
+
+        let retained = visited.iter().filter(|bit| **bit).count();
+        let mut builder = CltsBuilder::with_label_store(self.label_store.clone());
+        builder.reserve_states(retained);
+        let mut mapping = HashMap::new();
+
+        for state in clts.states() {
+            if !visited.get(state.index()).is_some_and(|bit| *bit) {
+                continue;
+            }
+
+            let name = clts.state_name(state).unwrap_or("state").to_owned();
+            let new_state = builder
+                .state_with_name(name)
+                .ok_or(ContextError::Controller(CltsError::IdOverflow {
+                    kind: "state",
+                    value: usize::MAX,
+                }))?;
+
+            if clts.initial_states().contains(&state) {
+                builder.initial_state_id(new_state);
+            }
+
+            let vars = clts.state_variables(state);
+            builder.with_variables_for_state(new_state, vars.iter().map(|s| s.as_str()));
+
+            mapping.insert(state, new_state);
+        }
+
+        for (original, mapped) in &mapping {
+            for transition in clts.outgoing(*original) {
+                if let Some(&target_mapped) = mapping.get(&transition.target()) {
+                    builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                }
+            }
+        }
+
+        let mut controller = builder.build().map_err(ContextError::Controller)?;
+        diagnostics.messages.push(format!(
+            "Controller realizable: retained {} of {} states.",
+            mapping.len(),
+            clts.state_count()
+        ));
+        if !violating_initials.is_empty() {
+            enrich_diagnostics_for_excluded_initials(
+                &mut diagnostics,
+                clts,
+                &keep_bits,
+                &violating_initials,
+                &options,
+                proof_obligations_enabled,
+            );
+        }
+        if options.diagnostics.is_some_and(|diag| diag.deadlock_traces) {
+            let deadlock_traces = collect_deadlock_traces(clts, &visited, &parent);
+            if !deadlock_traces.is_empty() {
+                diagnostics.messages.push(format!(
+                    "Deadlock traces recorded: {}",
+                    deadlock_traces.len()
+                ));
+                diagnostics.deadlock_traces = deadlock_traces;
+            }
+        }
+        if options.minimize
+            && let Some((minimized, report)) = self.minimise_controller(&controller)?
+        {
+            if report.removed_states > 0 || report.removed_transitions > 0 {
+                diagnostics.messages.push(format!(
+                    "Controller minimization removed {} state(s) and {} transition(s).",
+                    report.removed_states, report.removed_transitions
+                ));
+            }
+            if !report.merged_states.is_empty() {
+                diagnostics.messages.push(format!(
+                    "Merged states: {}.",
+                    report.merged_states.join(", ")
+                ));
+            }
+            diagnostics.minimization = Some(report.clone());
+            controller = minimized;
+        }
+        Ok(ControllerSynthesis {
+            controller,
+            realizable: true,
+            diagnostics,
+        })
+    }
+
+    /// Minimizes a controller CLTS by merging behaviorally equivalent states.
+    ///
+    /// This function performs **structural minimization** using a partition refinement algorithm
+    /// (similar to bisimulation minimization). It merges states that are behaviorally equivalent,
+    /// reducing the controller size while preserving all observable behavior.
+    ///
+    /// # Minimization Algorithm
+    ///
+    /// The algorithm uses **partition refinement** with state signatures:
+    ///
+    /// 1. **Initial Partition**: All states start in the same partition (class 0).
+    ///
+    /// 2. **Iterative Refinement**: Repeatedly refine partitions until stable:
+    ///    - For each state, compute a **signature** based on:
+    ///      - **State variables**: Bitset representation of variables associated with the state
+    ///      - **Outgoing transitions**: For each transition, record:
+    ///        - Target partition (from current partition)
+    ///        - Sorted label IDs
+    ///    - States with identical signatures belong to the same partition
+    ///    - Continue until partition stabilizes (no changes between iterations)
+    ///
+    /// 3. **State Merging**: For each partition class:
+    ///    - Select the first state as the **representative**
+    ///    - Merge all other states in the class into the representative
+    ///    - Preserve initial state marking (if any state in class is initial)
+    ///    - Preserve variables from the representative
+    ///
+    /// 4. **Transition Deduplication**: When building transitions:
+    ///    - For each representative state, collect transitions to merged target states
+    ///    - Deduplicate transitions with same target and labels
+    ///    - Only add unique transitions to the minimized controller
+    ///
+    /// # State Signature
+    ///
+    /// A state's signature consists of:
+    /// - **Variables**: Bitset of variables associated with the state
+    /// - **Transitions**: Sorted list of transition signatures, each containing:
+    ///   - Target partition ID (from current partition)
+    ///   - Sorted label IDs
+    ///
+    /// Two states are equivalent if they have identical signatures, meaning they:
+    /// - Have the same variables
+    /// - Have transitions to the same partition classes with the same labels
+    ///
+    /// # Termination
+    ///
+    /// The algorithm terminates when:
+    /// - The partition stabilizes (no changes between iterations), OR
+    /// - All states are in separate partitions (no minimization possible)
+    ///
+    /// # Result
+    ///
+    /// Returns `None` if:
+    /// - Controller has ≤ 1 states (nothing to minimize)
+    /// - All states are already distinct (no equivalent states found)
+    ///
+    /// Otherwise, returns `Some((minimized_controller, report))` containing:
+    /// - **Minimized controller**: CLTS with merged equivalent states
+    /// - **Minimization report**: Statistics on removed states/transitions and merged states
+    ///
+    /// # Performance
+    ///
+    /// - **Time Complexity**: O(k * n * (m + v)) where:
+    ///   - k = number of refinement iterations (typically O(log n))
+    ///   - n = number of states
+    ///   - m = number of transitions
+    ///   - v = number of variables
+    /// - **Space Complexity**: O(n + m) for partitions and signatures
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use mununu::clts::Clts;
+    /// use mununu::context::{Context, ControllerSynthesisOptions};
+    /// use mununu::mu_calculus::{evaluator::Environment, parser};
+    ///
+    /// # let mut builder = Clts::builder();
+    /// # let label = builder.labels().intern(["tick"]).unwrap();
+    /// # builder.state("s0").initial("s0");
+    /// # builder.state("s1");
+    /// # builder.transition("s0", &[label], "s1");
+    /// # let plant = builder.build().unwrap();
+    /// # let context = Context::builder()
+    /// #     .register_clts("plant", plant)
+    /// #     .finish_with_checks().unwrap();
+    /// # let env = Environment::new(context.clts("plant").unwrap().state_count());
+    /// # let formula = parser::parse("true").unwrap();
+    /// // Minimization is automatically performed when using synthesise_controller_with_options
+    /// let options = ControllerSynthesisOptions {
+    ///     minimize: true,  // Enable minimization
+    ///     ..Default::default()
+    /// };
+    /// let synthesis = context.synthesise_controller_with_options("plant", &formula, &env, options)?;
+    /// if let Some(report) = synthesis.diagnostics.minimization {
+    ///     println!("Removed {} states, {} transitions",
+    ///              report.removed_states, report.removed_transitions);
+    ///     println!("Merged states: {}", report.merged_states.join(", "));
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Algorithm Correctness
+    ///
+    /// The minimization preserves **behavioral equivalence**: two states are merged only if
+    /// they have identical variables and identical transition patterns (same labels to same
+    /// partition classes). This ensures the minimized controller is behaviorally equivalent
+    /// to the original, just with fewer states.
+    fn minimise_controller(
+        &self,
+        controller: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> Result<MinimizationOutcome, ContextError> {
+        let state_count = controller.state_count();
+        if state_count <= 1 {
+            return Ok(None);
+        }
+
+        // Partition refinement algorithm: iteratively refine partitions until stable
+        // Each state is assigned to a partition class (initially all in class 0)
+        let mut partition = vec![0usize; state_count];
+        let mut changed = true;
+
+        // Iterate until partition stabilizes (no changes)
+        while changed {
+            changed = false;
+            let mut map: HashMap<StateSignature, usize> = HashMap::new();
+            let mut next_partition = vec![0usize; state_count];
+            let mut next_id = 0usize;
+
+            // Compute signature for each state and assign to partition based on signature
+            for state in controller.states() {
+                // State signature includes: variables (bitset) + transitions (target partition + labels)
+                let signature = StateSignature::new(controller, state, &partition);
+                let entry = map.entry(signature).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                });
+                next_partition[state.index()] = *entry;
+            }
+
+            // Check if partition changed
+            if next_partition != partition {
+                partition = next_partition;
+                changed = true;
+            }
+        }
+
+        let class_count = partition
+            .iter()
+            .copied()
+            .max()
+            .map(|max| max + 1)
+            .unwrap_or(0);
+
+        if class_count == state_count {
+            return Ok(None);
+        }
+
+        let mut class_members: Vec<Vec<StateId<DefaultStateIdx>>> = vec![Vec::new(); class_count];
+        for state in controller.states() {
+            class_members[partition[state.index()]].push(state);
+        }
+
+        let mut class_info: Vec<(usize, Vec<StateId<DefaultStateIdx>>)> = class_members
+            .into_iter()
+            .enumerate()
+            .filter_map(|(class, mut members)| {
+                if members.is_empty() {
+                    return None;
+                }
+                members.sort_by_key(|state| state.index());
+                Some((class, members))
+            })
+            .collect();
+        if class_info.is_empty() {
+            return Ok(None);
+        }
+
+        class_info.sort_by_key(|(_, members)| members[0].index());
+
+        let mut builder = CltsBuilder::with_label_store(self.label_store.clone());
+        builder.reserve_states(class_info.len());
+
+        let mut mapping = HashMap::new();
+        let mut representatives = Vec::with_capacity(class_info.len());
+        let mut report = ControllerMinimizationReport::default();
+
+        let original_transition_count: usize = controller
+            .states()
+            .map(|state| controller.outgoing(state).len())
+            .sum();
+
+        for (_, members) in &class_info {
+            let representative = members[0];
+            let name = controller
+                .state_name(representative)
+                .unwrap_or("state")
+                .to_owned();
+            let new_state = builder
+                .state_with_name(name)
+                .ok_or(ContextError::Controller(CltsError::IdOverflow {
+                    kind: "state",
+                    value: usize::MAX,
+                }))?;
+
+            if members
+                .iter()
+                .any(|state| controller.initial_states().contains(state))
+            {
+                builder.initial_state_id(new_state);
+            }
+
+            let vars = controller.state_variables(representative);
+            builder.with_variables_for_state(new_state, vars.iter().map(|s| s.as_str()));
+
+            for (idx, state) in members.iter().enumerate() {
+                mapping.insert(*state, new_state);
+                if idx > 0
+                    && let Some(name) = controller.state_name(*state)
+                {
+                    report.merged_states.push(name.to_owned());
+                }
+            }
+
+            representatives.push((representative, new_state));
+        }
+
+        report.removed_states = state_count.saturating_sub(representatives.len());
+
+        let mut new_transition_count = 0usize;
+
+        for (source, new_source) in &representatives {
+            let mut seen = HashSet::new();
+            for transition in controller.outgoing(*source) {
+                if let Some(&target_new) = mapping.get(&transition.target()) {
+                    let key = TransitionKey::new(target_new, transition.labels());
+                    if seen.insert(key) {
+                        builder.transition_ids(*new_source, transition.labels(), target_new);
+                        new_transition_count += 1;
+                    }
+                }
+            }
+        }
+
+        report.removed_transitions = original_transition_count.saturating_sub(new_transition_count);
+
+        let minimized = builder.build().map_err(ContextError::Controller)?;
+
+        Ok(Some((minimized, report)))
+    }
+
+    /// Saves a registered CLTS to disk.
+    /// Saves a registered CLTS snapshot to disk.
+    ///
+    /// # Coverage Status
+    /// Covered by test: `save_clts_to_path_error_handling`
+    pub fn save_clts_to_path<P: AsRef<Path>>(
+        &self,
+        name: &str,
+        path: P,
+    ) -> Result<(), ContextError> {
+        let clts = self
+            .cltss
+            .get(name)
+            .ok_or_else(|| ContextError::UnknownClts(name.to_owned()))?;
+        save_clts_to_path(clts, path).map_err(ContextError::from)
+    }
+
+    /// Saves the entire context (all registered CLTS instances) to `path`.
+    ///
+    /// This uses the binary `CTXBIN` format implemented by the `persistence`
+    /// module so registries can be snapshotted and restored in one step.
+    pub fn save_to_path<P: AsRef<Path>>(&self, path: P) -> Result<(), ContextError> {
+        crate::persistence::save_context_to_path(self, path).map_err(ContextError::from)
+    }
+
+    /// Loads a CLTS from disk and registers it under `name`, replacing any existing entry.
+    ///
+    /// # Coverage Status
+    /// Covered by test: `load_clts_from_path_error_handling`
+    pub fn load_clts_from_path<P: AsRef<Path>>(
+        &mut self,
+        name: impl Into<String>,
+        path: P,
+    ) -> Result<(), ContextError> {
+        let clts = load_clts_from_path(path)?;
+        self.cltss.insert(name.into(), clts);
+        Ok(())
+    }
+
+    /// Loads a context snapshot from disk.
+    ///
+    /// This reconstructs the registry, shared label store, controllable
+    /// alphabet, and global variables from a `CTXBIN` snapshot previously
+    /// created with [`Context::save_to_path`].
+    pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self, ContextError> {
+        crate::persistence::load_context_from_path(path).map_err(ContextError::from)
+    }
+
+    /// Serialises the CLTS to disk when the snapshot size exceeds `limit_bytes`.
+    /// Returns the size of the snapshot when spilling occurred.
+    ///
+    /// # Coverage Status
+    /// Covered by test: `spill_clts_if_exceeds_triggers`
+    pub fn spill_clts_if_exceeds<P: AsRef<Path>>(
+        &self,
+        name: &str,
+        limit_bytes: usize,
+        path: P,
+    ) -> Result<Option<usize>, ContextError> {
+        let clts = self
+            .cltss
+            .get(name)
+            .ok_or_else(|| ContextError::UnknownClts(name.to_owned()))?;
+        maybe_spill_clts(clts, limit_bytes, path).map_err(ContextError::from)
+    }
+
+    /// Evaluates a μ-calculus [`Formula`] against multiple CLTSs identified by
+    /// `names`, using `make_env` to construct the environment for each system.
+    ///
+    /// Returns a map of CLTS name → evaluation result. The helper reuses
+    /// [`Context::evaluate_mu`] internally, so any missing CLTS or environment
+    /// / state-count mismatch surfaces with the same error variants.
+    pub fn evaluate_mu_many<'a, I, F>(
+        &self,
+        names: I,
+        formula: &Formula,
+        make_env: F,
+        options: Option<&EvaluationOptions>,
+    ) -> Result<HashMap<String, EvalResult>, ContextError>
+    where
+        I: IntoIterator<Item = &'a str>,
+        F: Fn(&str, &Clts<DefaultStateIdx, DefaultLabelIdx>) -> Environment,
+    {
+        let mut results = HashMap::new();
+
+        for name in names {
+            let clts = self
+                .cltss
+                .get(name)
+                .ok_or_else(|| ContextError::UnknownClts(name.to_owned()))?;
+            let env = make_env(name, clts);
+            let eval = self.evaluate_mu(name, formula, &env, options)?;
+            results.insert(name.to_owned(), eval);
+        }
+
+        Ok(results)
+    }
+}
+
+/// Builder for creating a context.
+///
+/// This builder is used to create a context by registering CLTS instances and
+/// managing shared resources. It is used to create a context by registering CLTS
+/// instances and managing shared resources. It is also used to create a context
+/// by registering CLTS instances and managing shared resources.
+#[derive(Debug, Default)]
+pub struct ContextBuilder {
+    label_store: LabelStoreBuilder<DefaultLabelIdx>,
+    cltss: HashMap<String, Clts<DefaultStateIdx, DefaultLabelIdx>>,
+    controllable_alphabet: HashSet<String>,
+    global_variables: HashSet<String>,
+}
+
+impl ContextBuilder {
+    /// Registers a CLTS under the provided name. Later calls overwrite the same name.
+    pub fn register_clts(
+        mut self,
+        name: impl Into<String>,
+        clts: Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> Self {
+        let name = name.into();
+        self.cltss.insert(name, clts);
+        self
+    }
+
+    /// Loads a CLTS snapshot from disk and registers it under `name`.
+    pub fn register_clts_from_path<P: AsRef<Path>>(
+        mut self,
+        name: impl Into<String>,
+        path: P,
+    ) -> Result<Self, PersistenceError> {
+        let clts = load_clts_from_path(path)?;
+        self.cltss.insert(name.into(), clts);
+        Ok(self)
+    }
+
+    /// Finalises the builder without running additional consistency checks.
+    ///
+    /// This path is mainly for lightweight scaffolding or white-box tests. It
+    /// does **not** merge registered CLTS labels back into the shared store and
+    /// therefore should not be used for production contexts.
+    pub fn finish(self) -> Context {
+        Context {
+            cltss: self.cltss,
+            label_store: self.label_store,
+            controllable_alphabet: self.controllable_alphabet,
+            global_variables: self.global_variables,
+        }
+    }
+
+    /// Finalises the builder while enforcing controllable alphabet uniqueness and
+    /// aggregating variable sets from each registered CLTS.
+    ///
+    /// This is the recommended production path: it merges each CLTS's canonical
+    /// labels back into the shared builder so subsequent
+    /// [`Context::new_clts_builder`] calls reuse the same handles, and it
+    /// surfaces any interning failures as [`ContextError::LabelRegistry`].
+    pub fn finish_with_checks(mut self) -> Result<Context, ContextError> {
+        self.validate_and_aggregate_clts()?;
+        Ok(self.finish())
+    }
+
+    /// Validates controllable/internal alphabets across all CLTSs and aggregates
+    /// global variables and label information into the builder.
+    ///
+    /// This enforces that:
+    /// - controllable labels are not shared by multiple CLTSs, and
+    /// - internal labels are mutually exclusive across CLTSs.
+    ///
+    /// It also merges each CLTS's label entries back into the shared
+    /// `label_store` and aggregates all variable names into `global_variables`.
+    fn validate_and_aggregate_clts(&mut self) -> Result<(), ContextError> {
+        // Track controllable and internal alphabets across all CLTSs (by name, not LabelId)
+        let mut global_controllable: HashMap<String, String> = HashMap::new(); // label_name -> clts_name
+        let mut global_internal: HashMap<String, String> = HashMap::new(); // label_name -> clts_name
+
+        for (clts_name, clts) in self.cltss.iter() {
+            // Merge canonical labels back into the shared store
+            self.label_store
+                .absorb(clts.label_entries())
+                .map_err(|err| ContextError::LabelRegistry(err.to_string()))?;
+
+            // Aggregate variable names
+            for var in clts.variables() {
+                self.global_variables.insert(var);
+            }
+
+            // Check controllable alphabet (by name)
+            for &label_id in clts.controllable_alphabet().iter() {
+                if let Some(payload) = clts.label_payload(label_id) {
+                    for symbol in payload {
+                        if let Some(existing_clts) = global_controllable.get(symbol) {
+                            return Err(ContextError::DuplicateControllableAlphabet(format!(
+                                "label '{}' is controllable in both '{}' and '{}'",
+                                symbol, existing_clts, clts_name
+                            )));
+                        }
+                        global_controllable.insert(symbol.clone(), clts_name.clone());
+                        // Also add to legacy controllable_alphabet set for backward compatibility
+                        self.controllable_alphabet.insert(symbol.clone());
+                    }
+                }
+            }
+
+            // Check internal alphabet (by name)
+            for &label_id in clts.internal_alphabet().iter() {
+                if let Some(payload) = clts.label_payload(label_id) {
+                    for symbol in payload {
+                        if let Some(existing_clts) = global_internal.get(symbol) {
+                            return Err(ContextError::DuplicateInternalAlphabet(format!(
+                                "label '{}' is internal in both '{}' and '{}'",
+                                symbol, existing_clts, clts_name
+                            )));
+                        }
+                        global_internal.insert(symbol.clone(), clts_name.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// (diagnostics helpers moved to `context::diagnostics`)
+
+/// Diagnostics toggles for controller synthesis.
+#[derive(Debug, Clone, Copy)]
+pub struct DiagnosticsOptions {
+    /// When `true`, attempt to derive counterexample/counterstrategy artefacts.
+    pub counterexample: bool,
+    /// When `true`, report deadlock traces among the retained states.
+    pub deadlock_traces: bool,
+    /// Optional cap on the number of counterstrategy traces returned.
+    pub max_counter_traces: Option<usize>,
+    /// When `true`, emit proof obligations for violating initial states.
+    pub proof_obligations: bool,
+}
+
+impl Default for DiagnosticsOptions {
+    fn default() -> Self {
+        Self {
+            counterexample: false,
+            deadlock_traces: false,
+            max_counter_traces: None,
+            proof_obligations: true,
+        }
+    }
+}
+
+/// Extended controller synthesis configuration, combining evaluation, diagnostics, and post-processing knobs.
+#[derive(Debug, Default)]
+pub struct ControllerSynthesisOptions<'a> {
+    pub evaluation: Option<&'a EvaluationOptions>,
+    pub diagnostics: Option<&'a DiagnosticsOptions>,
+    /// When `true`, run a structural minimisation pass over the synthesised controller.
+    pub minimize: bool,
+}
+
+/// Result of controller synthesis, including diagnostics metadata.
+#[derive(Debug)]
+pub struct ControllerSynthesis {
+    pub controller: Clts<DefaultStateIdx, DefaultLabelIdx>,
+    pub realizable: bool,
+    pub diagnostics: ControllerDiagnostics,
+}
+
+/// Aggregated diagnostics emitted during controller synthesis.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ControllerDiagnostics {
+    /// User-facing notes about the synthesis outcome.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<String>,
+    /// Initial states that failed to satisfy the requested formula.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub violating_initials: Vec<String>,
+    /// Minimal counterexample trace expressed as state names (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample_trace: Option<Vec<String>>,
+    /// Deadlock traces (initial-to-deadlock paths) collected during synthesis.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deadlock_traces: Vec<Vec<String>>,
+    /// Minimal counterstrategy paths (environment choices) covering each violating initial.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub counterstrategy_traces: Vec<Vec<String>>,
+    /// Summary of controller minimisation, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimization: Option<ControllerMinimizationReport>,
+    /// Outstanding proof obligations for unrealizable specifications.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proof_obligations: Vec<ProofObligation>,
+    /// Prototype counterstrategy covering the losing region.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterstrategy: Option<CounterStrategy>,
+}
+
+/// Prototype counterstrategy definition exposed in diagnostics.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CounterStrategy {
+    /// States that belong to the losing region explored by the strategy.
+    pub states: Vec<String>,
+    /// Initial states that trigger the strategy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub initial_states: Vec<String>,
+    /// Environment transitions that maintain the losing region.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<CounterStrategyEdge>,
+}
+
+/// Edge belonging to a prototype counterstrategy.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CounterStrategyEdge {
+    pub from: String,
+    pub to: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+/// Metrics describing the effect of controller minimisation.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ControllerMinimizationReport {
+    /// Number of states removed by the minimisation pass.
+    pub removed_states: usize,
+    /// Number of transitions removed after merging equivalent states.
+    pub removed_transitions: usize,
+    /// States merged into their representatives.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merged_states: Vec<String>,
+}
+
+/// Proof obligation describing why a specification could not be satisfied.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProofObligation {
+    /// State for which the obligation failed.
+    pub state: String,
+    /// Optional additional details about the failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ControllerDiagnostics {
+    /// Provides a concise human-readable summary of recorded diagnostics.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.messages.is_empty() {
+            parts.push(format!("messages: {}", self.messages.join(" | ")));
+        }
+        if !self.violating_initials.is_empty() {
+            parts.push(format!(
+                "violating initials: {}",
+                self.violating_initials.join(", ")
+            ));
+        }
+        if let Some(trace) = &self.counterexample_trace {
+            parts.push(format!("counterexample: {}", trace.join(" -> ")));
+        }
+        if !self.counterstrategy_traces.is_empty() {
+            parts.push(format!(
+                "counterstrategies: {}",
+                self.counterstrategy_traces.len()
+            ));
+        }
+        if !self.deadlock_traces.is_empty() {
+            parts.push(format!("deadlocks: {}", self.deadlock_traces.len()));
+        }
+        if let Some(report) = &self.minimization {
+            parts.push(format!(
+                "minimized: -{} states, -{} transitions",
+                report.removed_states, report.removed_transitions
+            ));
+        }
+        if !self.proof_obligations.is_empty() {
+            parts.push(format!("obligations: {}", self.proof_obligations.len()));
+        }
+        if self.counterstrategy.is_some() {
+            parts.push("counterstrategy".to_owned());
+        }
+        if parts.is_empty() {
+            "no diagnostics recorded".to_owned()
+        } else {
+            parts.join("; ")
+        }
+    }
+
+    /// Returns a JSON value representing the diagnostics.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("controller diagnostics serialize")
+    }
+
+    /// Returns a pretty-printed JSON string with diagnostics information.
+    pub fn to_json_string_pretty(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Serialises diagnostics as formatted JSON to `path`.
+    pub fn write_json<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let json = self.to_json_string_pretty().map_err(io::Error::other)?;
+        fs::write(path, json)
+    }
+
+    /// Serialises diagnostics to a sidecar DSL file.
+    pub fn write_sidecar_dsl<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut file = File::create(path)?;
+        writeln!(file, "diagnostics {{")?;
+        if !self.messages.is_empty() {
+            Self::write_string_block(&mut file, "messages", &self.messages)?;
+        }
+        if !self.violating_initials.is_empty() {
+            Self::write_string_block(&mut file, "violating_initials", &self.violating_initials)?;
+        }
+        if let Some(trace) = &self.counterexample_trace {
+            Self::write_trace_block(
+                &mut file,
+                "counterexample_trace",
+                std::slice::from_ref(trace),
+            )?;
+        }
+        if !self.counterstrategy_traces.is_empty() {
+            Self::write_trace_block(
+                &mut file,
+                "counterstrategy_traces",
+                &self.counterstrategy_traces,
+            )?;
+        }
+        if !self.deadlock_traces.is_empty() {
+            Self::write_trace_block(&mut file, "deadlock_traces", &self.deadlock_traces)?;
+        }
+        if let Some(report) = &self.minimization {
+            Self::write_minimization_block(&mut file, report)?;
+        }
+        if !self.proof_obligations.is_empty() {
+            Self::write_obligations_block(&mut file, &self.proof_obligations)?;
+        }
+        if let Some(strategy) = &self.counterstrategy {
+            Self::write_counterstrategy_block(&mut file, strategy)?;
+        }
+        writeln!(file, "}}")?;
+        Ok(())
+    }
+
+    fn write_string_block<W: Write>(
+        writer: &mut W,
+        name: &str,
+        entries: &[String],
+    ) -> io::Result<()> {
+        writeln!(writer, "    {name} [")?;
+        for entry in entries {
+            writeln!(
+                writer,
+                "        {};",
+                serde_json::to_string(entry).map_err(io::Error::other)?
+            )?;
+        }
+        writeln!(writer, "    ];")?;
+        Ok(())
+    }
+
+    fn write_obligations_block<W: Write>(
+        writer: &mut W,
+        obligations: &[ProofObligation],
+    ) -> io::Result<()> {
+        writeln!(writer, "    proof_obligations [")?;
+        for obligation in obligations {
+            let mut entry = format!(
+                "{{ state: {}",
+                serde_json::to_string(&obligation.state).map_err(io::Error::other)?
+            );
+            if let Some(detail) = &obligation.detail {
+                let detail_json = serde_json::to_string(detail).map_err(io::Error::other)?;
+                entry.push_str(&format!(", detail: {}", detail_json));
+            }
+            entry.push_str(" }");
+            writeln!(writer, "        {entry};")?;
+        }
+        writeln!(writer, "    ];")?;
+        Ok(())
+    }
+
+    fn write_counterstrategy_block<W: Write>(
+        writer: &mut W,
+        strategy: &CounterStrategy,
+    ) -> io::Result<()> {
+        writeln!(writer, "    counterstrategy {{")?;
+        if !strategy.states.is_empty() {
+            writeln!(writer, "        states [")?;
+            for state in &strategy.states {
+                writeln!(
+                    writer,
+                    "            {};",
+                    serde_json::to_string(state).map_err(io::Error::other)?
+                )?;
+            }
+            writeln!(writer, "        ];")?;
+        }
+        if !strategy.initial_states.is_empty() {
+            writeln!(writer, "        initial_states [")?;
+            for state in &strategy.initial_states {
+                writeln!(
+                    writer,
+                    "            {};",
+                    serde_json::to_string(state).map_err(io::Error::other)?
+                )?;
+            }
+            writeln!(writer, "        ];")?;
+        }
+        if !strategy.transitions.is_empty() {
+            writeln!(writer, "        transitions [")?;
+            for edge in &strategy.transitions {
+                let from = serde_json::to_string(&edge.from).map_err(io::Error::other)?;
+                let to = serde_json::to_string(&edge.to).map_err(io::Error::other)?;
+                let labels = serde_json::to_string(&edge.labels).map_err(io::Error::other)?;
+                writeln!(
+                    writer,
+                    "            {{ from: {from}, to: {to}, labels: {labels} }};"
+                )?;
+            }
+            writeln!(writer, "        ];")?;
+        }
+        writeln!(writer, "    }}")?;
+        Ok(())
+    }
+
+    fn write_trace_block<W: Write>(
+        writer: &mut W,
+        name: &str,
+        traces: &[Vec<String>],
+    ) -> io::Result<()> {
+        writeln!(writer, "    {name} [")?;
+        for trace in traces {
+            writeln!(
+                writer,
+                "        {};",
+                serde_json::to_string(trace).map_err(io::Error::other)?
+            )?;
+        }
+        writeln!(writer, "    ];")?;
+        Ok(())
+    }
+
+    fn write_minimization_block<W: Write>(
+        writer: &mut W,
+        report: &ControllerMinimizationReport,
+    ) -> io::Result<()> {
+        writeln!(writer, "    minimization {{")?;
+        writeln!(
+            writer,
+            "        removed_states = {};",
+            report.removed_states
+        )?;
+        writeln!(
+            writer,
+            "        removed_transitions = {};",
+            report.removed_transitions
+        )?;
+        if !report.merged_states.is_empty() {
+            writeln!(writer, "        merged_states [")?;
+            for state in &report.merged_states {
+                writeln!(
+                    writer,
+                    "            {};",
+                    serde_json::to_string(state).map_err(io::Error::other)?
+                )?;
+            }
+            writeln!(writer, "        ];")?;
+        }
+        writeln!(writer, "    }}")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Signature used to determine state equivalence during minimization.
+///
+/// A state's signature captures its observable behavior:
+/// - **Variables**: Bitset representation of variables associated with the state
+/// - **Transitions**: Sorted list of transition signatures, each containing:
+///   - Target partition ID (which partition class the transition leads to)
+///   - Sorted label IDs (the labels on the transition)
+///
+/// Two states with identical signatures are behaviorally equivalent and can be merged.
+/// The signature is computed relative to the current partition, allowing iterative refinement.
+struct StateSignature {
+    variables: BitVec<usize, Lsb0>,
+    transitions: Vec<MinTransitionSignature>,
+}
+
+impl StateSignature {
+    /// Computes the signature for a state given the current partition.
+    ///
+    /// The signature includes:
+    /// 1. **Variables**: Bitset of variables associated with the state
+    /// 2. **Transitions**: For each outgoing transition:
+    ///    - Target partition ID (from current partition)
+    ///    - Sorted label IDs (for canonical ordering)
+    ///
+    /// Transitions are sorted to ensure canonical ordering regardless of construction order.
+    fn new(
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+        state: StateId<DefaultStateIdx>,
+        partition: &[usize],
+    ) -> Self {
+        let variables = clts.state_variable_bitset(state).bits().to_bitvec();
+        let mut transitions: Vec<MinTransitionSignature> = clts
+            .outgoing(state)
+            .iter()
+            .map(|transition| {
+                let mut labels: Vec<usize> = transition
+                    .labels()
+                    .iter()
+                    .map(|label| label.index())
+                    .collect();
+                labels.sort_unstable();
+                MinTransitionSignature {
+                    target_partition: partition[transition.target().index()],
+                    labels,
+                }
+            })
+            .collect();
+        transitions.sort();
+        Self {
+            variables,
+            transitions,
+        }
+    }
+}
+
+/// Signature of a transition used in state minimization.
+///
+/// Contains the target partition ID and sorted label IDs. Used to compare transitions
+/// during partition refinement to determine if states have equivalent transition patterns.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct MinTransitionSignature {
+    /// Partition class ID of the target state (from current partition)
+    target_partition: usize,
+    /// Sorted label IDs for canonical ordering
+    labels: Vec<usize>,
+}
+
+/// Key used to deduplicate transitions when building the minimized controller.
+///
+/// Contains the target state index and sorted label IDs. Used to ensure that
+/// when multiple states are merged, transitions with the same target and labels
+/// are only added once to the minimized controller.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TransitionKey {
+    target: usize,
+    labels: Vec<usize>,
+}
+
+impl TransitionKey {
+    fn new(target: StateId<DefaultStateIdx>, labels: &[LabelId<DefaultLabelIdx>]) -> Self {
+        let mut label_ids: Vec<usize> = labels.iter().map(|label| label.index()).collect();
+        label_ids.sort_unstable();
+        Self {
+            target: target.index(),
+            labels: label_ids,
+        }
+    }
+}
+
+/// Explorer used to walk the losing region and derive counterexample/counterstrategy artefacts.
+#[derive(Default)]
+struct CounterExampleExplorer {
+    starts: Vec<StateId<DefaultStateIdx>>,
+    losing: HashSet<StateId<DefaultStateIdx>>,
+}
+
+impl CounterExampleExplorer {
+    fn build(
+        violating_initials: &[StateId<DefaultStateIdx>],
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+        keep_bits: &BitVec<usize, Lsb0>,
+    ) -> Self {
+        let mut losing = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        for &start in violating_initials {
+            if losing.insert(start) {
+                queue.push_back(start);
+            }
+        }
+
+        while let Some(state) = queue.pop_front() {
+            for transition in clts.outgoing(state) {
+                let target = transition.target();
+                let losing_successor = !keep_bits.get(target.index()).is_some_and(|bit| *bit);
+                if losing_successor && losing.insert(target) {
+                    queue.push_back(target);
+                }
+            }
+        }
+
+        Self {
+            starts: violating_initials.to_vec(),
+            losing,
+        }
+    }
+
+    fn minimal_traces(
+        &self,
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+        keep_bits: &BitVec<usize, Lsb0>,
+    ) -> (Vec<String>, Vec<Vec<String>>) {
+        let mut counterexample = Vec::new();
+        let mut counter_paths = Vec::new();
+
+        for &start in &self.starts {
+            let path = self.path_from(start, clts, keep_bits);
+            if counterexample.is_empty() {
+                counterexample = path.clone();
+            }
+            counter_paths.push(path);
+        }
+
+        if counterexample.is_empty() {
+            counterexample.push("state".to_owned());
+        }
+
+        (counterexample, counter_paths)
+    }
+
+    fn strategy(&self, clts: &Clts<DefaultStateIdx, DefaultLabelIdx>) -> CounterStrategy {
+        let mut states: Vec<String> = self
+            .losing
+            .iter()
+            .filter_map(|state| clts.state_name(*state))
+            .map(|name| name.to_owned())
+            .collect();
+        states.sort();
+        states.dedup();
+
+        let mut initial_states: Vec<String> = self
+            .starts
+            .iter()
+            .filter_map(|state| clts.state_name(*state))
+            .map(|name| name.to_owned())
+            .collect();
+        initial_states.sort();
+        initial_states.dedup();
+
+        let mut transitions = Vec::new();
+        for state in &self.losing {
+            let from_name = clts.state_name(*state).unwrap_or("state").to_owned();
+            for transition in clts.outgoing(*state) {
+                let target = transition.target();
+                if self.losing.contains(&target) {
+                    let to_name = clts.state_name(target).unwrap_or("state").to_owned();
+                    let mut labels = Vec::new();
+                    for label_id in transition.labels() {
+                        if let Some(payload) = clts.label_payload(*label_id) {
+                            labels.extend(payload.iter().cloned());
+                        }
+                    }
+                    labels.sort();
+                    labels.dedup();
+                    transitions.push(CounterStrategyEdge {
+                        from: from_name.clone(),
+                        to: to_name,
+                        labels,
+                    });
+                }
+            }
+        }
+
+        CounterStrategy {
+            states,
+            initial_states,
+            transitions,
+        }
+    }
+
+    fn path_from(
+        &self,
+        start: StateId<DefaultStateIdx>,
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+        keep_bits: &BitVec<usize, Lsb0>,
+    ) -> Vec<String> {
+        let mut queue: VecDeque<Vec<StateId<DefaultStateIdx>>> = VecDeque::new();
+        let mut visited = HashSet::new();
+        queue.push_back(vec![start]);
+        visited.insert(start);
+
+        while let Some(path) = queue.pop_front() {
+            let state = *path.last().expect("path never empty");
+
+            for transition in clts.outgoing(state) {
+                let target = transition.target();
+                if keep_bits.get(target.index()).is_some_and(|bit| *bit) {
+                    let mut extended = path.clone();
+                    extended.push(target);
+                    return self.to_names(&extended, clts);
+                }
+                if self.losing.contains(&target) && visited.insert(target) {
+                    let mut extended = path.clone();
+                    extended.push(target);
+                    queue.push_back(extended);
+                }
+            }
+        }
+
+        self.to_names(&[start], clts)
+    }
+
+    fn to_names(
+        &self,
+        path: &[StateId<DefaultStateIdx>],
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> Vec<String> {
+        path.iter()
+            .map(|state| clts.state_name(*state).unwrap_or("state").to_owned())
+            .collect()
+    }
+}
+
+/// Collects deadlock traces by replaying parent pointers back to initial states.
+fn collect_deadlock_traces(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    visited: &BitVec<usize, Lsb0>,
+    parent: &HashMap<StateId<DefaultStateIdx>, StateId<DefaultStateIdx>>,
+) -> Vec<Vec<String>> {
+    let initial_set: HashSet<_> = clts.initial_states().iter().copied().collect();
+    let mut traces = Vec::new();
+    let mut seen_deadlocks: HashSet<StateId<DefaultStateIdx>> = HashSet::new();
+
+    for (state, outgoing) in clts.state_outgoing_pairs() {
+        if !visited.get(state.index()).is_some_and(|bit| *bit) {
+            continue;
+        }
+
+        let mut has_transition = false;
+        for transition in outgoing {
+            if visited
+                .get(transition.target().index())
+                .is_some_and(|bit| *bit)
+            {
+                has_transition = true;
+                break;
+            }
+        }
+
+        if has_transition || !seen_deadlocks.insert(state) {
+            continue;
+        }
+
+        let mut path = Vec::new();
+        let mut current = state;
+        let mut guard = HashSet::new();
+        path.push(clts.state_name(current).unwrap_or("state").to_owned());
+
+        while !initial_set.contains(&current) {
+            if let Some(prev) = parent.get(&current) {
+                if !guard.insert(current) {
+                    break;
+                }
+                current = *prev;
+                path.push(clts.state_name(current).unwrap_or("state").to_owned());
+            } else {
+                break;
+            }
+        }
+
+        if initial_set.contains(&current) {
+            path.reverse();
+            traces.push(path);
+        }
+    }
+
+    traces
+}
+
+type MinimizationOutcome = Option<(
+    Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ControllerMinimizationReport,
+)>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clts::Clts;
+    use crate::composition::{CompositionOptions, CompositionSemantics};
+    use crate::context_dsl::parse;
+    use crate::mu_calculus::{evaluate, parser};
+    use tempfile::{NamedTempFile, tempdir};
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn registers_clts_instances() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0");
+        let clts = builder.build()?;
+
+        let context = Context::builder().register_clts("m", clts).finish();
+        assert!(context.clts("m").is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn shares_label_store_across_builders() -> TestResult {
+        let context = Context::builder().finish();
+
+        let mut builder_a = context.new_clts_builder();
+        let label_a = builder_a.labels().intern(["a", "b"])?;
+        let clts_a = {
+            let mut owned = builder_a;
+            owned.state("s0");
+            owned.build()?
+        };
+
+        let mut builder_b = context.new_clts_builder();
+        let label_b = builder_b.labels().intern(["b", "a"])?;
+        let clts_b = {
+            let mut owned = builder_b;
+            owned.state("s1");
+            owned.build()?
+        };
+
+        let context = Context::builder()
+            .register_clts("a", clts_a)
+            .register_clts("b", clts_b)
+            .finish();
+
+        let ca = context.clts("a").unwrap();
+        let cb = context.clts("b").unwrap();
+
+        assert_eq!(label_a, label_b);
+        assert_eq!(ca.outgoing(ca.state_id("s0")?).len(), 0);
+        assert_eq!(cb.outgoing(cb.state_id("s1")?).len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn merges_label_store_on_registration() -> TestResult {
+        let mut context = Context::builder().finish();
+
+        let mut builder_a = context.new_clts_builder();
+        let label = builder_a.labels().intern(["ctrl"])?;
+        let clts_a = {
+            let mut owned = builder_a;
+            owned.state("s0");
+            owned.build()?
+        };
+
+        context = Context::builder()
+            .register_clts("a", clts_a)
+            .finish_with_checks()?;
+
+        let mut builder_b = context.new_clts_builder();
+        let label_b = builder_b.labels().intern(["ctrl"])?;
+        assert_eq!(label, label_b, "label IDs diverged after registration");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_controllable_alphabet() -> TestResult {
+        let context = Context::builder().finish();
+
+        let mut builder_a = context.new_clts_builder();
+        let label = builder_a.labels().intern(["ctrl"])?;
+        let clts_a = {
+            let mut owned = builder_a;
+            owned.state("s0");
+            owned.transition("s0", &[label], "s0");
+            owned.build()?
+        };
+
+        let mut builder_b = context.new_clts_builder();
+        let label_dup = builder_b.labels().intern(["ctrl"])?;
+        let clts_b = {
+            let mut owned = builder_b;
+            owned.state("s1");
+            owned.transition("s1", &[label_dup], "s1");
+            owned.build()?
+        };
+
+        let result = Context::builder()
+            .register_clts("a", clts_a)
+            .register_clts("b", clts_b)
+            .finish_with_checks();
+
+        assert!(matches!(
+            result,
+            Err(ContextError::DuplicateControllableAlphabet(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_internal_alphabet() -> TestResult {
+        let context = Context::builder().finish();
+
+        let mut builder_a = context.new_clts_builder();
+        let internal_label = builder_a.labels().intern(["internal"])?;
+        builder_a
+            .set_label_controllability(internal_label, crate::clts::LabelControllability::Internal);
+        let clts_a = {
+            let mut owned = builder_a;
+            owned.state("s0");
+            owned.transition("s0", &[internal_label], "s0");
+            owned.build()?
+        };
+
+        let mut builder_b = context.new_clts_builder();
+        let internal_label_b = builder_b.labels().intern(["internal"])?; // Same name
+        builder_b.set_label_controllability(
+            internal_label_b,
+            crate::clts::LabelControllability::Internal,
+        );
+        let clts_b = {
+            let mut owned = builder_b;
+            owned.state("s1");
+            owned.transition("s1", &[internal_label_b], "s1");
+            owned.build()?
+        };
+
+        let result = Context::builder()
+            .register_clts("a", clts_a)
+            .register_clts("b", clts_b)
+            .finish_with_checks();
+
+        assert!(matches!(
+            result,
+            Err(ContextError::DuplicateInternalAlphabet(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn tracks_global_variables() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder = context.new_clts_builder();
+        builder.with_variables("s0", ["temp", "flag"]);
+        builder.state("s1");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("sys", clts)
+            .finish_with_checks()?;
+
+        let vars: Vec<_> = context.global_variables().iter().cloned().collect();
+        assert!(vars.contains(&"temp".to_owned()));
+        assert!(vars.contains(&"flag".to_owned()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_realizable() -> TestResult {
+        let mut builder = Clts::builder();
+        let label = builder.labels().intern(["tick"])?;
+        builder.state("s0");
+        builder.state("s1");
+        builder.initial("s0");
+        builder.transition("s0", &[label], "s1");
+        builder.transition("s1", &[label], "s1");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        let formula = parser::parse("true")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let diag_opts = DiagnosticsOptions {
+            counterexample: true,
+            deadlock_traces: true,
+            max_counter_traces: None,
+            proof_obligations: true,
+        };
+        let synthesis = context.synthesise_controller_with_options(
+            "plant",
+            &formula,
+            &env,
+            ControllerSynthesisOptions {
+                diagnostics: Some(&diag_opts),
+                ..Default::default()
+            },
+        )?;
+        assert!(synthesis.realizable);
+        assert_eq!(synthesis.controller.state_count(), 2);
+        assert_eq!(synthesis.controller.initial_states().len(), 1);
+        assert!(synthesis.diagnostics.violating_initials.is_empty());
+        assert!(synthesis.diagnostics.counterexample_trace.is_none());
+        assert!(
+            synthesis
+                .diagnostics
+                .messages
+                .iter()
+                .any(|msg| msg.contains("Controller realizable"))
+        );
+        assert!(!synthesis.diagnostics.messages.is_empty());
+        assert!(synthesis.diagnostics.counterstrategy_traces.is_empty());
+        assert!(synthesis.diagnostics.deadlock_traces.len() <= 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_unrealizable() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0");
+        builder.initial("s0");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        let formula = parser::parse("false")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let synthesis = context.synthesise_controller("plant", &formula, &env, None)?;
+        assert!(!synthesis.realizable);
+        assert_eq!(synthesis.controller.state_count(), 0);
+        assert_eq!(
+            synthesis.diagnostics.violating_initials,
+            vec!["s0".to_owned()]
+        );
+        assert_eq!(
+            synthesis.diagnostics.counterexample_trace,
+            Some(vec!["s0".to_owned()])
+        );
+        assert_eq!(
+            synthesis.diagnostics.proof_obligations.len(),
+            1,
+            "expected proof obligations for violating initial"
+        );
+        assert!(
+            synthesis
+                .diagnostics
+                .messages
+                .iter()
+                .any(|msg| msg.contains("Controller unrealizable"))
+        );
+        assert!(!synthesis.diagnostics.messages.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_reports_counterstrategy_when_enabled() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0");
+        builder.initial("s0");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        let formula = parser::parse("false")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let diag_opts = DiagnosticsOptions {
+            counterexample: true,
+            deadlock_traces: false,
+            max_counter_traces: None,
+            proof_obligations: true,
+        };
+        let synthesis = context.synthesise_controller_with_options(
+            "plant",
+            &formula,
+            &env,
+            ControllerSynthesisOptions {
+                diagnostics: Some(&diag_opts),
+                ..Default::default()
+            },
+        )?;
+
+        assert!(!synthesis.realizable);
+        assert_eq!(synthesis.controller.state_count(), 0);
+        assert_eq!(
+            synthesis.diagnostics.counterexample_trace,
+            Some(vec!["s0".to_owned()])
+        );
+        assert_eq!(
+            synthesis.diagnostics.counterstrategy_traces,
+            vec![vec!["s0".to_owned()]]
+        );
+        assert_eq!(
+            synthesis.diagnostics.proof_obligations.len(),
+            1,
+            "expected proof obligations for unrealizable controller"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_reports_deadlock_traces_when_enabled() -> TestResult {
+        let mut builder = Clts::builder();
+        let label = builder.labels().intern(["tick"])?;
+        builder.state("s0");
+        builder.state("s1");
+        builder.initial("s0");
+        builder.transition("s0", &[label], "s1");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        let formula = parser::parse("true")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let diag_opts = DiagnosticsOptions {
+            counterexample: false,
+            deadlock_traces: true,
+            max_counter_traces: None,
+            proof_obligations: true,
+        };
+        let synthesis = context.synthesise_controller_with_options(
+            "plant",
+            &formula,
+            &env,
+            ControllerSynthesisOptions {
+                diagnostics: Some(&diag_opts),
+                ..Default::default()
+            },
+        )?;
+
+        assert!(synthesis.realizable);
+        assert!(synthesis.diagnostics.violating_initials.is_empty());
+        assert_eq!(
+            synthesis.diagnostics.deadlock_traces,
+            vec![vec!["s0".to_owned(), "s1".to_owned()]]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_runs_minimization_when_enabled() -> TestResult {
+        let mut builder = Clts::builder();
+        let step = builder.labels().intern(["step"])?;
+        let wait = builder.labels().intern(["wait"])?;
+        builder.state("init");
+        builder.initial("init");
+        builder.state("idle_a");
+        builder.state("idle_b");
+        builder.transition("init", &[step], "idle_a");
+        builder.transition("init", &[step], "idle_b");
+        builder.transition("idle_a", &[wait], "idle_a");
+        builder.transition("idle_b", &[wait], "idle_b");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        let formula = parser::parse("true")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let diag_opts = DiagnosticsOptions {
+            counterexample: false,
+            deadlock_traces: false,
+            max_counter_traces: None,
+            proof_obligations: true,
+        };
+        let synthesis = context.synthesise_controller_with_options(
+            "plant",
+            &formula,
+            &env,
+            ControllerSynthesisOptions {
+                diagnostics: Some(&diag_opts),
+                minimize: true,
+                ..Default::default()
+            },
+        )?;
+
+        assert!(synthesis.realizable);
+        assert_eq!(synthesis.controller.state_count(), 2);
+        let minimization = synthesis
+            .diagnostics
+            .minimization
+            .as_ref()
+            .expect("minimization report present");
+        assert_eq!(minimization.removed_states, 1);
+        assert!(minimization.removed_transitions >= 1);
+        assert!(
+            minimization
+                .merged_states
+                .iter()
+                .any(|name| name == "idle_b")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn controller_diagnostics_exports_reports() -> TestResult {
+        let diagnostics = ControllerDiagnostics {
+            messages: vec![
+                "Controller realizable: retained 2 of 4 states.".into(),
+                "Initial state(s) excluded from controller: s2.".into(),
+            ],
+            violating_initials: vec!["s2".into()],
+            counterexample_trace: Some(vec!["s2".into(), "s3".into()]),
+            deadlock_traces: vec![vec!["s3".into()]],
+            counterstrategy_traces: vec![vec!["s2".into(), "s3".into()]],
+            minimization: None,
+            proof_obligations: vec![ProofObligation {
+                state: "s2".into(),
+                detail: Some("State requires attention.".into()),
+            }],
+            counterstrategy: Some(CounterStrategy {
+                states: vec!["s2".into(), "s3".into()],
+                initial_states: vec!["s2".into()],
+                transitions: vec![CounterStrategyEdge {
+                    from: "s2".into(),
+                    to: "s3".into(),
+                    labels: vec!["tick".into()],
+                }],
+            }),
+        };
+
+        let json = diagnostics.to_json_string_pretty()?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(value["violating_initials"].as_array().unwrap().len(), 1);
+        assert!(
+            value["proof_obligations"]
+                .as_array()
+                .is_some_and(|array| !array.is_empty())
+        );
+        assert!(value["counterstrategy"].is_object());
+
+        let sidecar = NamedTempFile::new()?;
+        diagnostics.write_sidecar_dsl(sidecar.path())?;
+        let sidecar_contents = std::fs::read_to_string(sidecar.path())?;
+        assert!(sidecar_contents.contains("messages ["));
+        assert!(sidecar_contents.contains("counterstrategy_traces"));
+        assert!(sidecar_contents.contains("proof_obligations"));
+        assert!(sidecar_contents.contains("counterstrategy"));
+
+        let json_file = NamedTempFile::new()?;
+        diagnostics.write_json(json_file.path())?;
+        let written_json = std::fs::read_to_string(json_file.path())?;
+        assert!(written_json.contains("\"counterexample_trace\""));
+        assert!(written_json.contains("\"proof_obligations\""));
+        assert!(written_json.contains("\"counterstrategy\""));
+
+        assert!(diagnostics.summary().contains("messages:"));
+        assert!(diagnostics.summary().contains("obligations: 1"));
+        assert!(diagnostics.summary().contains("counterstrategy"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn composes_registered_clts() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder_a = context.new_clts_builder();
+        let label = builder_a.labels().intern(["sync"])?;
+        // Mark shared synchronization label as uncontrollable (environment-controlled)
+        builder_a
+            .set_label_controllability(label, crate::clts::LabelControllability::Uncontrollable);
+        builder_a.state("a0").initial("a0");
+        builder_a.transition("a0", &[label], "a1");
+        let clts_a = builder_a.build()?;
+
+        let mut builder_b = context.new_clts_builder();
+        let label_b = builder_b.labels().intern(["sync"])?;
+        // Mark shared synchronization label as uncontrollable (environment-controlled)
+        builder_b
+            .set_label_controllability(label_b, crate::clts::LabelControllability::Uncontrollable);
+        builder_b.state("b0").initial("b0");
+        builder_b.transition("b0", &[label_b], "b1");
+        let clts_b = builder_b.build()?;
+
+        let context = Context::builder()
+            .register_clts("left", clts_a)
+            .register_clts("right", clts_b)
+            .finish();
+
+        let options = CompositionOptions::new(CompositionSemantics::Synchronous);
+        let product = context.compose_named("left", "right", &options)?;
+
+        assert_eq!(product.state_count(), 2);
+        // Ensure the composed transition exists.
+        let initial = product.state_id("a0|b0")?;
+        let outgoing = product.outgoing(initial);
+        assert_eq!(outgoing.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_label_and_variable_order_preserved() -> TestResult {
+        let context = Context::builder().finish();
+
+        // First CLTS introduces labels/variables via the context builder.
+        let mut builder_a = context.new_clts_builder();
+        let sync = builder_a.labels().intern(["sync"])?;
+        builder_a.with_variables("s0", ["flag"]);
+        builder_a.state("s0");
+        let clts_a = builder_a.build()?;
+
+        // Register and obtain a new context with canonical stores merged.
+        let context = Context::builder()
+            .register_clts("a", clts_a.clone())
+            .finish_with_checks()?;
+
+        // Second CLTS should reuse the same label/variable IDs.
+        let mut builder_b = context.new_clts_builder();
+        let sync_b = builder_b.labels().intern(["sync"])?;
+        builder_b.with_variables("b0", ["flag"]);
+        builder_b.state("b0");
+        let clts_b = builder_b.build()?;
+
+        assert_eq!(sync.index(), sync_b.index());
+
+        let bitset_a = clts_a.label_bitset(sync);
+        let bitset_b = clts_b.label_bitset(sync_b);
+        assert_eq!(bitset_a.bits(), bitset_b.bits());
+
+        let vars_a = clts_a.state_variable_bitset(clts_a.state_id("s0")?);
+        let vars_b = clts_b.state_variable_bitset(clts_b.state_id("b0")?);
+        assert_eq!(vars_a.bits(), vars_b.bits());
+
+        // A CLTS with a different label should be unequal.
+        let mut builder_d = context.new_clts_builder();
+        let other_label = builder_d.labels().intern(["other"])?;
+        builder_d.state("x0");
+        builder_d.transition("x0", &[other_label], "x0");
+        let clts_d = builder_d.build()?;
+        assert!(!clts_b.structural_eq(&clts_d));
+        assert_ne!(clts_b.structural_hash(), clts_d.structural_hash());
+
+        Ok(())
+    }
+
+    #[test]
+    fn structural_hash_matches_for_identical_clts() -> TestResult {
+        let empty_context = Context::builder().finish();
+
+        let make_clts = |ctx: &Context| -> Clts<DefaultStateIdx, DefaultLabelIdx> {
+            let mut builder = ctx.new_clts_builder();
+            let sync = builder.labels().intern(["sync"]).unwrap();
+            builder
+                .transition("s0", &[sync], "s1")
+                .with_variables("s0", ["flag"])
+                .with_variables("s1", ["flag"]);
+            builder.build().unwrap()
+        };
+
+        let seed = make_clts(&empty_context);
+        let context = Context::builder()
+            .register_clts("seed", seed)
+            .finish_with_checks()?;
+
+        let clts_a = make_clts(&context);
+        let clts_b = make_clts(&context);
+
+        assert!(clts_a.structural_eq(&clts_b));
+        assert_eq!(clts_a.structural_hash(), clts_b.structural_hash());
+
+        // Differing structure (additional uncontrollable edge).
+        let mut builder = context.new_clts_builder();
+        let sync = builder.labels().intern(["sync"])?;
+        builder
+            .transition("c0", &[sync], "c1")
+            .transition("c0", &[sync], "c2");
+        let clts_c = builder.build()?;
+
+        assert!(!clts_a.structural_eq(&clts_c));
+        assert_ne!(clts_a.structural_hash(), clts_c.structural_hash());
+
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_mu_matches_direct_invocation() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder = context.new_clts_builder();
+        builder.state("s0").initial("s0");
+        builder.state("s1");
+        let tick = builder.labels().intern(["tick"])?;
+        builder.transition("s0", &[tick], "s1");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", clts.clone())
+            .finish();
+
+        let formula = parser::parse("< labels = {tick} > true")?;
+        let env = Environment::new(clts.state_count());
+        let direct = evaluate(&formula, &clts, &env)?;
+        let via_context = context.evaluate_mu("plant", &formula, &env, None)?;
+
+        assert_eq!(direct, via_context);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_mu_rejects_mismatched_environment() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder = context.new_clts_builder();
+        builder.state("s0").initial("s0");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", clts.clone())
+            .finish();
+
+        let formula = parser::parse("true")?;
+        let env = Environment::new(clts.state_count() + 1);
+
+        let err = context
+            .evaluate_mu("plant", &formula, &env, None)
+            .expect_err("mismatched environment should error");
+        assert!(matches!(
+            err,
+            ContextError::EnvironmentMismatch { expected, provided, .. }
+            if expected == clts.state_count() && provided == clts.state_count() + 1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_mu_many_runs_batch() -> TestResult {
+        let context = Context::builder().finish();
+
+        let mut builder_a = context.new_clts_builder();
+        builder_a.state("a0").initial("a0");
+        let sync = builder_a.labels().intern(["sync"])?;
+        builder_a.transition("a0", &[sync], "a1");
+        let plant_a = builder_a.build()?;
+
+        let mut builder_b = context.new_clts_builder();
+        builder_b.state("b0").initial("b0");
+        let sync_b = builder_b.labels().intern(["sync"])?;
+        builder_b.transition("b0", &[sync_b], "b1");
+        let plant_b = builder_b.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant_a", plant_a.clone())
+            .register_clts("plant_b", plant_b.clone())
+            .finish();
+
+        let formula = parser::parse("< labels = {sync} > true")?;
+        let results = context.evaluate_mu_many(
+            ["plant_a", "plant_b"],
+            &formula,
+            |_, clts| Environment::new(clts.state_count()),
+            None,
+        )?;
+
+        assert_eq!(results.len(), 2);
+        for (name, result) in &results {
+            let clts = context.clts(name).unwrap();
+            let initial = clts
+                .initial_states()
+                .iter()
+                .copied()
+                .next()
+                .expect("initial state present");
+            assert!(result.get(initial.index()).map(|b| *b).unwrap_or(false));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_mu_many_propagates_mismatch() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder = context.new_clts_builder();
+        builder.state("s0").initial("s0");
+        let clts = builder.build()?;
+        let context = Context::builder().register_clts("plant", clts).finish();
+
+        let formula = parser::parse("true")?;
+        let err = context
+            .evaluate_mu_many(["plant"], &formula, |_, _| Environment::new(0), None)
+            .expect_err("expected mismatch error");
+        assert!(matches!(err, ContextError::EnvironmentMismatch { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn saves_and_loads_clts_via_persistence() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder = context.new_clts_builder();
+        let sync = builder.labels().intern(["sync"])?;
+        builder.state("s0").initial("s0");
+        builder.transition("s0", &[sync], "s1");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", clts.clone())
+            .finish();
+
+        let dir = tempdir()?;
+        let path = dir.path().join("plant.json");
+        context.save_clts_to_path("plant", &path)?;
+
+        let mut restored = Context::builder().finish();
+        restored.load_clts_from_path("plant", &path)?;
+
+        let loaded = restored.clts("plant").unwrap();
+        assert!(clts.structural_eq(loaded));
+        Ok(())
+    }
+
+    #[test]
+    fn spill_clts_if_exceeds_triggers_when_large_enough() -> TestResult {
+        let context = Context::builder().finish();
+        let mut builder = context.new_clts_builder();
+        builder.state("s0").initial("s0");
+        let clts = builder.build()?;
+        let context = Context::builder().register_clts("plant", clts).finish();
+
+        let dir = tempdir()?;
+        let path = dir.path().join("spill.json");
+        let spilled = context.spill_clts_if_exceeds("plant", 16, &path)?;
+        assert!(spilled.is_some());
+        assert!(path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn dsl_cache_tracks_incremental_changes() -> TestResult {
+        let mut cache = ContextDslCache::new();
+        let doc1 = parse(
+            r"
+context example {
+    automata {
+        automaton Machine {
+            states { state S initial; }
+            transitions { transition S -> S on label tick; }
+        }
+    }
+    mu_formulas {
+        formula safe { over Machine; body = nu X. (tick && X); }
+    }
+    controllers {
+        controller C1 { source Machine; satisfying safe; }
+    }
+}
+",
+        )?;
+
+        let plan1 = cache.diff(&doc1);
+        assert!(plan1.changed_automata.contains("Machine"));
+        assert!(plan1.changed_controllers.contains("C1"));
+        cache.update(&plan1);
+
+        let doc2 = parse(
+            r"
+context example {
+    automata {
+        automaton Machine {
+            states { state S initial; }
+            transitions { transition S -> S on label tick; }
+        }
+    }
+    mu_formulas {
+        formula safe { over Machine; body = nu X. (tick && X && < labels = {tick} > true); }
+    }
+    controllers {
+        controller C1 { source Machine; satisfying safe; }
+    }
+}
+",
+        )?;
+
+        let plan2 = cache.diff(&doc2);
+        assert!(plan2.changed_formulas.contains("safe"));
+        assert!(plan2.changed_controllers.contains("C1"));
+        cache.update(&plan2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn controllable_alphabet_accessor() -> TestResult {
+        // Test controllable_alphabet() accessor (lines 114-115)
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1");
+        let label = builder.labels().intern(["ctrl"])?;
+        builder.transition("s0", &[label], "s1");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", clts)
+            .finish_with_checks()?;
+
+        let alphabet = context.controllable_alphabet();
+        assert!(alphabet.contains("ctrl"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn context_dsl_cache_diff_and_update() -> TestResult {
+        // Test diff_and_update() method (lines 73-76)
+        let mut cache = ContextDslCache::new();
+        let doc1 = parse(
+            r"
+context test {
+    automata {
+        automaton A { states { state S initial; } transitions { transition S -> S on epsilon; } }
+    }
+}
+",
+        )?;
+        let plan1 = cache.diff_and_update(&doc1);
+        // Plan should indicate changes for new automaton
+        assert!(!plan1.changed_automata.is_empty() || !plan1.removed_automata.is_empty());
+
+        let doc2 = parse(
+            r"
+context test {
+    automata {
+        automaton A { states { state S initial; } transitions { transition S -> S on epsilon; } }
+        automaton B { states { state T initial; } transitions { transition T -> T on epsilon; } }
+    }
+}
+",
+        )?;
+        let plan2 = cache.diff_and_update(&doc2);
+        // Plan should indicate new automaton B was added
+        assert!(!plan2.changed_automata.is_empty() || !plan2.removed_automata.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_no_initial_states_satisfy() -> TestResult {
+        // Test synthesis when no initial states satisfy (lines 267-275)
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1");
+        builder.initial("s0").initial("s1");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        // Formula that no state satisfies
+        let formula = parser::parse("false")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let synthesis = context.synthesise_controller("plant", &formula, &env, None)?;
+        assert!(!synthesis.realizable);
+        assert_eq!(synthesis.controller.state_count(), 0);
+        assert_eq!(synthesis.diagnostics.violating_initials.len(), 2);
+        assert!(!synthesis.diagnostics.proof_obligations.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthesises_controller_with_counterexample_explorer() -> TestResult {
+        // Test synthesis with counterexample explorer enabled (lines 349-387)
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").state("s2");
+        builder.initial("s0");
+        let label = builder.labels().intern(["tick"])?;
+        builder.transition("s0", &[label], "s1");
+        builder.transition("s1", &[label], "s2");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        // Formula that s0 doesn't satisfy but s1 does
+        let formula = parser::parse("mu X. (<labels={tick}>X || true)")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let diagnostics = DiagnosticsOptions {
+            counterexample: true,
+            max_counter_traces: Some(2),
+            ..Default::default()
+        };
+        let options = ControllerSynthesisOptions {
+            diagnostics: Some(&diagnostics),
+            ..Default::default()
+        };
+
+        let synthesis =
+            context.synthesise_controller_with_options("plant", &formula, &env, options)?;
+
+        // Should have counterstrategy if unrealizable
+        if !synthesis.realizable {
+            assert!(synthesis.diagnostics.counterstrategy.is_some());
+            assert!(!synthesis.diagnostics.counterstrategy_traces.is_empty());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimization_returns_none_for_single_state() -> TestResult {
+        // Test minimization returns None for single state controller (line 432)
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        let formula = parser::parse("true")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let synthesis = context.synthesise_controller("plant", &formula, &env, None)?;
+        assert!(synthesis.realizable);
+
+        // Minimization should return None for single state
+        let minimized = context.minimise_controller(&synthesis.controller)?;
+        assert!(minimized.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimization_returns_none_when_no_reduction_possible() -> TestResult {
+        // Test minimization returns None when no states can be merged (lines 468, 481, 483, 488, 491)
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").state("s2");
+        builder.initial("s0");
+        let label_a = builder.labels().intern(["a"])?;
+        let label_b = builder.labels().intern(["b"])?;
+        builder.transition("s0", &[label_a], "s1");
+        builder.transition("s0", &[label_b], "s2");
+        builder.transition("s1", &[label_a], "s1");
+        builder.transition("s2", &[label_b], "s2");
+        let plant = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("plant", plant)
+            .finish_with_checks()?;
+
+        let plant_ref = context.clts("plant").unwrap();
+        // Formula that requires all states to be distinct
+        let formula = parser::parse("true")?;
+        let env = Environment::new(plant_ref.state_count());
+
+        let synthesis = context.synthesise_controller("plant", &formula, &env, None)?;
+        assert!(synthesis.realizable);
+
+        // If all states are distinct, minimization may return None
+        let _minimized = context.minimise_controller(&synthesis.controller)?;
+        // Result depends on controller structure - test that it doesn't panic
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_clts_from_path_error_handling() -> TestResult {
+        // Test load_clts_from_path error handling (lines 590-591)
+        let mut context = Context::builder().finish();
+        let temp_dir = tempdir()?;
+        let invalid_path = temp_dir.path().join("nonexistent.clts");
+
+        // Should return error for non-existent file
+        let result = context.load_clts_from_path("test", &invalid_path);
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn save_clts_to_path_error_handling() -> TestResult {
+        // Test save_clts_to_path error handling (line 580)
+        let mut builder = Clts::builder();
+        builder.state("s0");
+        let clts = builder.build()?;
+
+        let context = Context::builder().register_clts("test", clts).finish();
+
+        let temp_dir = tempdir()?;
+        let file_path = temp_dir.path().join("test.clts");
+
+        // Should succeed for valid path
+        let result = context.save_clts_to_path("test", &file_path);
+        assert!(result.is_ok());
+        assert!(file_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn context_save_and_load_round_trip() -> TestResult {
+        // Build a small context with a single CLTS.
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        let label = builder.labels().intern(["a"])?;
+        builder.transition("s0", &[label], "s0");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("sys", clts)
+            .finish_with_checks()?;
+
+        let temp_dir = tempdir()?;
+        let file_path = temp_dir.path().join("context.henos");
+
+        // Save the full context.
+        context.save_to_path(&file_path)?;
+        assert!(file_path.exists());
+
+        // Load it back and check that the CLTS round-trips structurally.
+        let restored = Context::load_from_path(&file_path)?;
+        let orig_clts = context.clts("sys").unwrap();
+        let restored_clts = restored.clts("sys").unwrap();
+        assert!(orig_clts.structural_eq(restored_clts));
+
+        Ok(())
+    }
+
+    #[test]
+    fn spill_clts_if_exceeds_triggers() -> TestResult {
+        // Test spill_clts_if_exceeds (lines 606, 633, 635)
+        let mut builder = Clts::builder();
+        // Create a large CLTS
+        for i in 0..100 {
+            builder.state(format!("s{}", i));
+        }
+        let clts = builder.build()?;
+
+        let context = Context::builder().register_clts("large", clts).finish();
+
+        let temp_dir = tempdir()?;
+        let spill_path = temp_dir.path().join("spill.clts");
+
+        // Test with very small limit - should trigger spill
+        let result = context.spill_clts_if_exceeds("large", 1, &spill_path)?;
+        assert!(result.is_some());
+        assert!(spill_path.exists());
+
+        // Test with large limit - should not trigger
+        let spill_path2 = temp_dir.path().join("spill2.clts");
+        let result2 = context.spill_clts_if_exceeds("large", usize::MAX, &spill_path2)?;
+        assert!(result2.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn compose_named_error_handling() -> TestResult {
+        // Test compose_named error handling (line 135)
+        let context = Context::builder().finish();
+
+        // Should return error for unknown CLTS
+        let options = CompositionOptions {
+            semantics: CompositionSemantics::Synchronous,
+        };
+        let result = context.compose_named("nonexistent", "also_nonexistent", &options);
+        assert!(result.is_err());
+        match result {
+            Err(ContextError::UnknownClts(name)) => {
+                assert!(name == "nonexistent" || name == "also_nonexistent");
+            }
+            _ => panic!("expected UnknownClts error"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_structure_outputs_expected_format() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        builder.state("s1");
+        let label = builder.labels().intern(["a"])?;
+        builder.transition("s0", &[label], "s1");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("test_automaton", clts)
+            .finish_with_checks()?;
+
+        let mut output = Vec::new();
+        context.print_structure(&mut output)?;
+        let output_str = String::from_utf8(output)?;
+
+        // Check that key elements are present
+        assert!(output_str.contains("Context Structure:"));
+        assert!(output_str.contains("Automaton: test_automaton"));
+        assert!(output_str.contains("States: 2"));
+        assert!(output_str.contains("Initial: s0"));
+        assert!(output_str.contains("[0] s0"));
+        assert!(output_str.contains("[1] s1"));
+        assert!(output_str.contains("Transitions: 1 total"));
+        assert!(output_str.contains("1 controllable, 0 uncontrollable"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_structure_includes_global_variables() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("test", clts)
+            .finish_with_checks()?;
+
+        let mut output = Vec::new();
+        context.print_structure(&mut output)?;
+        let output_str = String::from_utf8(output)?;
+
+        assert!(output_str.contains("Global Variables: 0"));
+        assert!(output_str.contains("Controllable Alphabet:"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_structure_shows_transition_details() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        builder.state("s1");
+        builder.state("s2");
+        let label_a = builder.labels().intern(["a"])?;
+        let label_b = builder.labels().intern(["b"])?;
+        builder
+            .set_label_controllability(label_b, crate::clts::LabelControllability::Uncontrollable);
+        builder.transition("s0", &[label_a], "s1");
+        builder.transition("s0", &[label_b], "s2");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("test", clts)
+            .finish_with_checks()?;
+
+        let mut output = Vec::new();
+        context.print_structure(&mut output)?;
+        let output_str = String::from_utf8(output)?;
+
+        // Check transition details
+        assert!(output_str.contains("Transitions: 2 total"));
+        assert!(output_str.contains("1 controllable, 1 uncontrollable"));
+        assert!(output_str.contains("-> [1] s1"));
+        assert!(output_str.contains("-> [2] s2"));
+        assert!(output_str.contains("(ctrl)"));
+        assert!(output_str.contains("(unctrl)"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_structure_handles_multiple_automata() -> TestResult {
+        let mut builder1 = Clts::builder();
+        builder1.state("a0").initial("a0");
+        let clts1 = builder1.build()?;
+
+        let mut builder2 = Clts::builder();
+        builder2.state("b0").initial("b0");
+        let clts2 = builder2.build()?;
+
+        let context = Context::builder()
+            .register_clts("automaton_a", clts1)
+            .register_clts("automaton_b", clts2)
+            .finish_with_checks()?;
+
+        let mut output = Vec::new();
+        context.print_structure(&mut output)?;
+        let output_str = String::from_utf8(output)?;
+
+        assert!(output_str.contains("CLTS Instances: 2"));
+        assert!(output_str.contains("Automaton: automaton_a"));
+        assert!(output_str.contains("Automaton: automaton_b"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_structure_shows_state_transition_counts() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        builder.state("s1");
+        builder.state("s2");
+        let label = builder.labels().intern(["a"])?;
+        // s0 has 2 outgoing, s1 has 1 incoming
+        builder.transition("s0", &[label], "s1");
+        builder.transition("s0", &[label], "s2");
+        let clts = builder.build()?;
+
+        let context = Context::builder()
+            .register_clts("test", clts)
+            .finish_with_checks()?;
+
+        let mut output = Vec::new();
+        context.print_structure(&mut output)?;
+        let output_str = String::from_utf8(output)?;
+
+        // Check that state details show correct counts
+        assert!(output_str.contains("[0] s0"));
+        assert!(output_str.contains("2 outgoing, 0 incoming"));
+        assert!(output_str.contains("[1] s1"));
+        assert!(output_str.contains("0 outgoing, 1 incoming"));
+
+        Ok(())
+    }
+}

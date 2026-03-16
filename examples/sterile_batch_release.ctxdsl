@@ -1,0 +1,112 @@
+// Industrial BPM Example: Sterile Pharmaceutical Batch Release
+//
+// Regulated fill-and-finish plants (Pfizer, Roche, ...), operating under FDA 21 CFR Part 11 and
+// EU GMP Annex 1, orchestrate batch release via BPM platforms. The canonical pipeline is:
+//
+//   Production → Quality Control → Qualified Person Release → Logistics.
+//
+// Compliance requires that no shipment leaves the cold-chain warehouse before QC passes and a
+// QP signs off; conversely every batch marked "ready" must eventually be released or quarantined.
+// This context models the workflow as CLTS components so the Henos verifier can evaluate the
+// relevant μ-calculus properties and synthesise controllers enforcing the policy.
+context sterile_batch_release {
+    alphabet {
+        label produce;
+        label qc_start;
+        label qc_pass;
+        label qc_fail;
+        label qp_sign;
+        label quarantine;
+        label ship;
+        label cancel;
+    }
+
+    automata {
+        automaton Production {
+            meta { id = "sterile.production"; }
+            states {
+                state Idle initial;
+                state Filling;
+                state Complete;
+                state Cancelled;
+            }
+            transitions {
+                transition Idle -> Filling on label produce;
+                transition Filling -> Complete on label qc_start;
+                transition Filling -> Cancelled on label cancel;
+            }
+        }
+
+        automaton QualityControl {
+            meta { id = "sterile.qc"; }
+            states {
+                state Waiting initial;
+                state Testing;
+                state Approved;
+                state Rejected;
+            }
+            transitions {
+                transition Waiting -> Testing on label qc_start;
+                transition Testing -> Approved on label qc_pass;
+                transition Testing -> Rejected on label qc_fail;
+                transition Approved -> Waiting on label qp_sign;
+                transition Rejected -> Waiting on label quarantine;
+            }
+        }
+
+        automaton ReleaseGateway {
+            meta { id = "sterile.gateway"; }
+            states {
+                state Hold initial;
+                state Released;
+                state Quarantined;
+            }
+            transitions {
+                transition Hold -> Released on label qp_sign;
+                transition Hold -> Quarantined on label quarantine;
+            }
+        }
+
+        automaton Logistics {
+            meta { id = "sterile.logistics"; }
+            states {
+                state Staging initial;
+                state Packed;
+                state Shipped;
+            }
+            transitions {
+                transition Staging -> Packed on label qp_sign;
+                transition Packed -> Shipped on label ship;
+                transition Shipped -> Staging on label cancel;
+            }
+        }
+    }
+
+    composition {
+        synchronous pipeline {
+            meta { id = "sterile.pipeline"; }
+            members [Production, QualityControl, ReleaseGateway, Logistics];
+        }
+    }
+
+    mu_formulas {
+        formula ship_requires_release {
+            over pipeline;
+            body = nu Safe. ((! < ( labels = {ship} ) > true) || < ( labels = {qp_sign} ) > true) && Safe;
+        }
+
+        formula completion_leads_to_disposition {
+            over pipeline;
+            body = nu Progress. ( [ ( labels = {qc_start} ) ] mu Resolve. ( < ( labels = {qp_sign} ) > true || < ( labels = {quarantine} ) > true || < ( labels = {cancel} ) > true ) && Resolve ) && Progress;
+        }
+    }
+
+    controllers {
+        controller SafePipeline {
+            meta { id = "sterile.safe"; }
+            source pipeline;
+            satisfying ship_requires_release;
+            export "controllers/sterile_release.ctxdsl";
+        }
+    }
+}

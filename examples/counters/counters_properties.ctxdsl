@@ -1,0 +1,21 @@
+context counters_properties {
+    mu_formulas {
+        formula reachability {
+            over Counter;
+            body = mu X. ( < labels = { tick } > X || < labels = { tick } > true );
+        }
+
+        formula safety_idle {
+            over Counter;
+            body = true;
+        }
+    }
+
+    controllers {
+        controller reachability_controller {
+            source Counter;
+            satisfying reachability;
+        }
+    }
+}
+

@@ -1,0 +1,199 @@
+{
+  "version": "1.0",
+  "description": "LTL to μ-Calculus translation patterns for AI-assisted property discovery",
+  "note": "All modalities ([] and <>) operate on the NEXT state only. Use fixpoints for temporal properties.",
+  "patterns": [
+    {
+      "id": "next",
+      "ltl": "X φ",
+      "description": "In the next step, φ holds",
+      "mu_calculus": "[] φ",
+      "example": {
+        "ltl": "X alarm",
+        "mu_calculus": "[] alarm",
+        "description": "Alarm is active in the next state"
+      }
+    },
+    {
+      "id": "always",
+      "ltl": "G φ",
+      "description": "Always φ (globally)",
+      "mu_calculus": "ν X. (φ ∧ [] X)",
+      "example": {
+        "ltl": "G safe",
+        "mu_calculus": "ν X. (safe ∧ [] X)",
+        "description": "Safe condition always holds"
+      }
+    },
+    {
+      "id": "eventually",
+      "ltl": "F φ",
+      "description": "Eventually φ (finally)",
+      "mu_calculus": "μ X. (φ ∨ [] X)",
+      "example": {
+        "ltl": "F completed",
+        "mu_calculus": "μ X. (completed ∨ [] X)",
+        "description": "Completion state is eventually reached"
+      }
+    },
+    {
+      "id": "until",
+      "ltl": "φ U ψ",
+      "description": "φ holds until ψ happens (and ψ eventually happens)",
+      "mu_calculus": "μ X. (ψ ∨ (φ ∧ [] X))",
+      "example": {
+        "ltl": "request U grant",
+        "mu_calculus": "μ X. (grant ∨ (request ∧ [] X))",
+        "description": "Request holds until grant is received"
+      }
+    },
+    {
+      "id": "infinitely_often",
+      "ltl": "G F φ",
+      "description": "Infinitely often φ (always eventually)",
+      "mu_calculus": "ν Y. (μ X. (φ ∨ [] X) ∧ [] Y)",
+      "example": {
+        "ltl": "G F heartbeat",
+        "mu_calculus": "ν Y. (μ X. (heartbeat ∨ [] X) ∧ [] Y)",
+        "description": "Heartbeat occurs infinitely often"
+      }
+    },
+    {
+      "id": "stabilization",
+      "ltl": "F G φ",
+      "description": "Eventually forever φ (stabilization)",
+      "mu_calculus": "μ Y. (ν X. (φ ∧ [] X) ∨ [] Y)",
+      "example": {
+        "ltl": "F G idle",
+        "mu_calculus": "μ Y. (ν X. (idle ∧ [] X) ∨ [] Y)",
+        "description": "System eventually stabilizes to idle state"
+      }
+    },
+    {
+      "id": "safety",
+      "ltl": "G ¬bad",
+      "description": "Nothing bad ever happens (safety property)",
+      "mu_calculus": "ν X. (¬bad ∧ [] X)",
+      "example": {
+        "ltl": "G ¬deadlock",
+        "mu_calculus": "ν X. (¬deadlock ∧ [] X)",
+        "description": "Deadlock never occurs"
+      }
+    },
+    {
+      "id": "liveness",
+      "ltl": "F good",
+      "description": "Something good eventually happens (liveness property)",
+      "mu_calculus": "μ X. (good ∨ [] X)",
+      "example": {
+        "ltl": "F completion",
+        "mu_calculus": "μ X. (completion ∨ [] X)",
+        "description": "Completion is eventually reached"
+      }
+    },
+    {
+      "id": "responsiveness",
+      "ltl": "G (req → F grant)",
+      "description": "Every request is eventually granted (responsiveness)",
+      "mu_calculus": "ν X. ((¬req ∨ μ Y. (grant ∨ [] Y)) ∧ [] X)",
+      "example": {
+        "ltl": "G (request → F approval)",
+        "mu_calculus": "ν X. ((¬request ∨ μ Y. (approval ∨ [] Y)) ∧ [] X)",
+        "description": "Every request eventually receives approval"
+      }
+    },
+    {
+      "id": "bounded_eventually",
+      "ltl": "F[0..N] φ",
+      "description": "φ happens within N steps (bounded eventually)",
+      "mu_calculus": "< steps = N > φ",
+      "example": {
+        "ltl": "F[0..10] response",
+        "mu_calculus": "< steps = 10 > response",
+        "description": "Response occurs within 10 steps"
+      },
+      "note": "This uses the bounded modality syntax supported by the evaluator"
+    },
+    {
+      "id": "gr1_safety",
+      "ltl": "G Bi",
+      "description": "GR(1) safety clause: assumption/guarantee Bi always holds",
+      "mu_calculus": "ν Xi. (Bi ∧ [] Xi)",
+      "example": {
+        "ltl": "G env_releases_resource",
+        "mu_calculus": "ν X. (env_releases_resource ∧ [] X)",
+        "description": "Environment always releases resources"
+      }
+    },
+    {
+      "id": "gr1_liveness",
+      "ltl": "G F Lj",
+      "description": "GR(1) liveness clause: Lj happens infinitely often",
+      "mu_calculus": "ν Yj. (μ Zj. (Lj ∨ [] Zj) ∧ [] Yj)",
+      "example": {
+        "ltl": "G F progress",
+        "mu_calculus": "ν Y. (μ Z. (progress ∨ [] Z) ∧ [] Y)",
+        "description": "Progress occurs infinitely often"
+      }
+    }
+  ],
+  "domain_specific_patterns": {
+    "bpmn": [
+      {
+        "pattern": "compensation_completes",
+        "description": "If compensation is triggered, it eventually completes",
+        "mu_calculus": "ν X. (!compensation_triggered || (μ Y. compensation_completed || <> Y)) && [] X",
+        "placeholders": ["compensation_triggered", "compensation_completed"]
+      },
+      {
+        "pattern": "boundary_event_handled",
+        "description": "Boundary events are always handled",
+        "mu_calculus": "ν X. (!boundary_event_sig || (μ Y. handled_sig || <> Y)) && [] X",
+        "placeholders": ["boundary_event_sig", "handled_sig"]
+      },
+      {
+        "pattern": "response_within_deadline",
+        "description": "Every request receives a response within a deadline",
+        "mu_calculus": "ν X. (!request_sig || < steps = N > response_sig) && [] X",
+        "placeholders": ["request_sig", "response_sig", "N"]
+      },
+      {
+        "pattern": "no_dead_tasks",
+        "description": "No task remains permanently blocked",
+        "mu_calculus": "nu X. (has_enabled_transition && (mu Reach_task. task_signal || <> Reach_task)) && [] X",
+        "placeholders": ["has_enabled_transition", "task_signal"]
+      }
+    ],
+    "rtl": [
+      {
+        "pattern": "signal_stability",
+        "description": "Signal stabilizes after reset",
+        "mu_calculus": "μ Y. (ν X. (stable ∧ [] X) ∨ [] Y)",
+        "placeholders": ["stable"]
+      }
+    ]
+  },
+  "usage_guidelines": [
+    "Always use fixpoints (μ or ν) for temporal properties - [] and <> only look one step ahead",
+    "Use ν (greatest fixpoint) for 'always' properties",
+    "Use μ (least fixpoint) for 'eventually' properties",
+    "For bounded 'eventually', use < steps = N > syntax when available",
+    "Combine patterns: responsiveness = always (request → eventually grant)",
+    "Consider controllability: [] accounts for uncontrollable moves in CLTS"
+  ],
+  "common_mistakes": [
+    {
+      "mistake": "Using [] for 'always' without fixpoint",
+      "wrong": "[] safe",
+      "correct": "ν X. (safe ∧ [] X)",
+      "explanation": "[] only checks next state, need ν for always"
+    },
+    {
+      "mistake": "Using <> for 'eventually' without fixpoint",
+      "wrong": "<> goal",
+      "correct": "μ X. (goal ∨ [] X)",
+      "explanation": "<> only checks next state, need μ for eventually"
+    }
+  ]
+}
+

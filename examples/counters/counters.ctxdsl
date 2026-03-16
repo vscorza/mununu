@@ -1,0 +1,20 @@
+context counters {
+    alphabet {
+        label tick;
+    }
+
+    automata {
+        automaton Counter {
+            states {
+                state Idle initial;
+                state Active;
+            }
+
+            transitions {
+                transition Idle -> Active on label tick;
+                transition Active -> Active on label tick;
+            }
+        }
+    }
+}
+

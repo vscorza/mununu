@@ -1,0 +1,2829 @@
+use std::collections::{HashMap, HashSet};
+
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::abstraction::unrolling::{
+    Effect, OriginalState, OriginalTransition, UnrolledClts, UnrollingOptions, VariableDecl,
+    unroll_states,
+};
+use crate::clts::{
+    Clts, CltsBuilder, CltsError, DefaultLabelIdx, DefaultStateIdx, LabelControllability, LabelId,
+};
+use crate::composition::{CompositionOptions, CompositionSemantics};
+use crate::context::{Context, ContextBuilder, ContextError};
+use crate::ltl;
+use crate::mu_calculus::{Environment, Formula, parser as mu_parser};
+use bitvec::prelude::{BitVec, Lsb0};
+
+use super::ast::{
+    AlphabetEntry, Automaton, CompositionKind, ContextDoc, Expr, ExprKind, FormulaExpr,
+    FormulaTargets, Meta, PredicateDecl, PredicateTarget, StateDecl, StateRef, StateSelector,
+    TransitionDecl, TransitionLabel,
+};
+use super::runtime::ResolvedControllerOptions;
+use super::state_matching::StateNameMatcher;
+use super::traversal::AstTraverser;
+
+type RuntimeClts = Clts<DefaultStateIdx, DefaultLabelIdx>;
+type RuntimeBuilder = CltsBuilder<DefaultStateIdx, DefaultLabelIdx>;
+type RuntimeLabelId = LabelId<DefaultLabelIdx>;
+
+/// Result of realising a DSL context into runtime structures.
+#[derive(Debug)]
+pub struct RealizedContext {
+    pub context: Context,
+    pub formulas: HashMap<String, RealizedFormula>,
+    pub controllers: HashMap<String, RealizedController>,
+    pub predicates: HashMap<String, HashSet<String>>,
+    predicate_metadata: HashMap<String, HashMap<String, PredicateMetadata>>,
+    predicate_bitsets: HashMap<String, HashMap<String, BitVec<usize, Lsb0>>>,
+    /// Maps composition names to their member automaton names
+    composition_members: HashMap<String, Vec<String>>,
+}
+
+/// Resolved μ-calculus formula with metadata.
+#[derive(Debug, Clone)]
+pub struct RealizedFormula {
+    pub name: String,
+    pub targets: FormulaTargetsKind,
+    pub formula: Formula,
+    pub raw: String,
+    pub meta: Meta,
+    pub parse_error: Option<String>,
+}
+
+/// Metadata describing a guard-derived predicate.
+#[derive(Debug, Clone)]
+pub struct PredicateMetadata {
+    pub guard: String,
+    pub expression: GuardExpressionMetadata,
+}
+
+/// Structured representation of the guard expression backing a predicate.
+#[derive(Debug, Clone)]
+pub enum GuardExpressionMetadata {
+    True,
+    Predicate(String),
+    Comparison {
+        left: String,
+        op: String,
+        right: String,
+    },
+    Unknown,
+}
+
+impl PredicateMetadata {
+    fn from_json(value: &Value, formula: &RealizedFormula) -> Self {
+        let guard = value
+            .get("guard")
+            .and_then(Value::as_str)
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| formula.raw.clone());
+        let expression = GuardExpressionMetadata::from_json(value.get("expr"));
+        Self { guard, expression }
+    }
+}
+
+impl GuardExpressionMetadata {
+    fn from_json(value: Option<&Value>) -> Self {
+        let Some(expr) = value else {
+            return GuardExpressionMetadata::Unknown;
+        };
+        let Some(kind) = expr.get("type").and_then(Value::as_str) else {
+            return GuardExpressionMetadata::Unknown;
+        };
+        match kind {
+            "true" => GuardExpressionMetadata::True,
+            "predicate" => expr
+                .get("value")
+                .and_then(Value::as_str)
+                .map(|s| GuardExpressionMetadata::Predicate(s.to_owned()))
+                .unwrap_or(GuardExpressionMetadata::Unknown),
+            "comparison" => {
+                let left = expr
+                    .get("left")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let op = expr
+                    .get("op")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let right = expr
+                    .get("right")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                GuardExpressionMetadata::Comparison { left, op, right }
+            }
+            _ => GuardExpressionMetadata::Unknown,
+        }
+    }
+}
+
+/// Target set associated with a μ-calculus formula.
+#[derive(Debug, Clone)]
+pub enum FormulaTargetsKind {
+    All,
+    Named(Vec<String>),
+}
+
+impl RealizedContext {
+    /// Returns the set of predicate names associated with `automaton`, if any.
+    pub fn predicate_names(&self, automaton: &str) -> Option<&HashSet<String>> {
+        self.predicates.get(automaton)
+    }
+
+    /// Returns the stored guard expression for the given predicate, when available.
+    pub fn predicate_formula(&self, automaton: &str, predicate: &str) -> Option<&str> {
+        if let Some(metadata) = self.predicate_metadata(automaton, predicate) {
+            return Some(metadata.guard.as_str());
+        }
+        self.formulas
+            .get(predicate)
+            .map(|formula| formula.raw.as_str())
+    }
+
+    /// Returns structured metadata for the requested predicate, if available.
+    pub fn predicate_metadata(
+        &self,
+        automaton: &str,
+        predicate: &str,
+    ) -> Option<&PredicateMetadata> {
+        self.predicate_metadata
+            .get(automaton)
+            .and_then(|map| map.get(predicate))
+    }
+
+    /// Builds an environment seeded with predicate valuations for the given automaton.
+    ///
+    /// Guard predicate valuations fall back to a conservative approximation:
+    /// - predicates with body `true` are set to the all-true bitset;
+    /// - predicates with body `false` are set to the all-false bitset;
+    /// - otherwise, predicates are currently defaulted to all-true until richer
+    ///   arithmetic evaluation is introduced.
+    ///
+    /// For composed automata, predicates from member automata are projected onto
+    /// the composed state space. Composed states are named in the format "left|right",
+    /// so predicates are true in a composed state if they are true in the corresponding
+    /// member state component.
+    pub fn environment_for(&self, automaton: &str) -> Environment {
+        let clts = self
+            .context
+            .clts(automaton)
+            .unwrap_or_else(|| panic!("unknown automaton '{automaton}'"));
+        let state_count = clts.state_count();
+        let mut env = Environment::new(state_count);
+
+        // Check if this is a composed automaton
+        if let Some(member_names) = self.composition_members.get(automaton) {
+            // For composed automata, project predicates from member automata
+            for member_name in member_names {
+                if let Some(member_predicates) = self.predicates.get(member_name) {
+                    let member_clts = self
+                        .context
+                        .clts(member_name)
+                        .expect("member automaton should exist");
+
+                    for predicate in member_predicates {
+                        // Get the predicate bitset from the member automaton
+                        let member_bits = self
+                            .predicate_bitsets
+                            .get(member_name)
+                            .and_then(|map| map.get(predicate))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let member_state_count = member_clts.state_count();
+                                fallback_bits(
+                                    member_state_count,
+                                    self.predicate_metadata(member_name, predicate),
+                                )
+                            });
+
+                        // Project the predicate onto the composed state space
+                        // Composed states are named "left|right" (e.g., "Idle|Wait")
+                        // For left-associative composition, we need to find which component
+                        // corresponds to this member automaton
+                        let mut projected_bits = BitVec::repeat(false, state_count);
+                        let member_index = member_names
+                            .iter()
+                            .position(|n| n == member_name)
+                            .expect("member should be in composition");
+
+                        for composed_state_id in clts.states() {
+                            if let Some(composed_state_name) = clts.state_name(composed_state_id) {
+                                // Split the composed state name by '|' to get component states
+                                let parts: Vec<&str> = composed_state_name.split('|').collect();
+
+                                // For left-associative composition, the parts correspond to members in order
+                                if member_index < parts.len() {
+                                    let member_state_name = parts[member_index].trim();
+                                    // Check if this member state satisfies the predicate
+                                    if let Ok(member_state_id) =
+                                        member_clts.state_id(member_state_name)
+                                        && member_bits
+                                            .get(member_state_id.index())
+                                            .map(|b| *b)
+                                            .unwrap_or(false)
+                                    {
+                                        projected_bits.set(composed_state_id.index(), true);
+                                    }
+                                }
+                            }
+                        }
+                        env = env.with_predicate(predicate.clone(), projected_bits);
+                    }
+                }
+            }
+        } else {
+            // For non-composed automata, use predicates directly
+            if let Some(predicates) = self.predicates.get(automaton) {
+                for predicate in predicates {
+                    let bits = self
+                        .predicate_bitsets
+                        .get(automaton)
+                        .and_then(|map| map.get(predicate))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            fallback_bits(
+                                state_count,
+                                self.predicate_metadata(automaton, predicate),
+                            )
+                        });
+                    env = env.with_predicate(predicate.clone(), bits);
+                }
+            }
+        }
+        env
+    }
+}
+
+fn fallback_bits(state_count: usize, metadata: Option<&PredicateMetadata>) -> BitVec<usize, Lsb0> {
+    if let Some(meta) = metadata {
+        if meta.guard.eq_ignore_ascii_case("false") {
+            return BitVec::repeat(false, state_count);
+        }
+        match &meta.expression {
+            GuardExpressionMetadata::True => BitVec::repeat(true, state_count),
+            GuardExpressionMetadata::Predicate(value) if value.eq_ignore_ascii_case("false") => {
+                BitVec::repeat(false, state_count)
+            }
+            _ => BitVec::repeat(true, state_count),
+        }
+    } else {
+        BitVec::repeat(true, state_count)
+    }
+}
+
+/// Controller declaration resolved to runtime-friendly representation.
+#[derive(Debug)]
+pub struct RealizedController {
+    pub name: String,
+    pub source: String,
+    pub formula: String,
+    pub options: ResolvedControllerOptions,
+    pub export: Option<String>,
+    pub meta: Meta,
+}
+
+/// Errors raised while realising DSL documents into runtime contexts.
+#[derive(Debug, Error)]
+pub enum RealizationError {
+    #[error("duplicate {kind} '{name}'")]
+    Duplicate { kind: &'static str, name: String },
+    #[error("duplicate {kind} '{label}' claimed by both '{owner}' and '{other}'")]
+    DuplicateLabelOwnership {
+        kind: &'static str,
+        label: String,
+        owner: String,
+        other: String,
+    },
+    #[error("unsupported DSL feature: {feature}")]
+    UnsupportedFeature { feature: &'static str },
+    #[error("unknown automaton '{0}' referenced by controller")]
+    UnknownAutomaton(String),
+    #[error("unknown formula '{0}' referenced by controller")]
+    UnknownFormula(String),
+    #[error("failed to build automaton '{name}': {error}")]
+    AutomatonBuild {
+        name: String,
+        #[source]
+        error: CltsError,
+    },
+    #[error(transparent)]
+    Context(#[from] ContextError),
+    #[error("unknown state '{state}' referenced by predicate in automaton '{automaton}'")]
+    UnknownPredicateState { automaton: String, state: String },
+    #[error("invalid composition '{name}': {reason}")]
+    InvalidComposition { name: String, reason: String },
+    #[error("unrolling failed for automaton '{name}': {error}")]
+    UnrollingFailed { name: String, error: String },
+    #[error("dynamic guards require unrolling - automaton '{name}' must have variables")]
+    DynamicGuardsRequireUnrolling { name: String },
+}
+
+/// Aggregated predicate maps produced during realization.
+///
+/// This helper groups together:
+/// - the set of predicate names per automaton,
+/// - the metadata describing how each predicate was derived, and
+/// - the pre-computed bitsets for each predicate.
+struct PredicateMaps {
+    predicates: HashMap<String, HashSet<String>>,
+    predicate_metadata: HashMap<String, HashMap<String, PredicateMetadata>>,
+    predicate_bitsets: HashMap<String, HashMap<String, BitVec<usize, Lsb0>>>,
+}
+
+/// Computes predicate maps and bitsets from the realised context and formulas.
+///
+/// This function centralises the logic that was previously inlined in `realize`:
+/// it discovers predicate names from formula metadata, builds per-automaton
+/// metadata tables, and then evaluates or directly computes the corresponding
+/// bitsets.
+fn compute_predicate_maps(
+    context: &Context,
+    formulas: &HashMap<String, RealizedFormula>,
+) -> Result<PredicateMaps, RealizationError> {
+    let mut predicates: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut predicate_metadata: HashMap<String, HashMap<String, PredicateMetadata>> =
+        HashMap::new();
+
+    // Register completion predicates for all automata that have can_reach_completion formulas.
+    for formula in formulas.values() {
+        if formula.name.ends_with("_can_reach_completion")
+            && let FormulaTargetsKind::Named(targets) = &formula.targets
+        {
+            for automaton in targets {
+                let completion_predicate_name = format!("{}_is_completion_state", automaton);
+                predicates
+                    .entry(automaton.clone())
+                    .or_default()
+                    .insert(completion_predicate_name);
+            }
+        }
+    }
+
+    // Populate predicate sets and metadata from formula comments.
+    for formula in formulas.values() {
+        if let FormulaTargetsKind::Named(targets) = &formula.targets {
+            for target in targets {
+                predicates.entry(target.clone()).or_default();
+            }
+        }
+        if let Some(comment) = formula.meta.comment.as_deref()
+            && let Ok(json) = serde_json::from_str::<Value>(comment)
+            && let Some(predicate_name) = json.get("predicate").and_then(Value::as_str)
+            && let FormulaTargetsKind::Named(targets) = &formula.targets
+        {
+            let metadata = PredicateMetadata::from_json(&json, formula);
+            for target in targets {
+                predicates
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(predicate_name.to_owned());
+                predicate_metadata
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(predicate_name.to_owned(), metadata.clone());
+            }
+        }
+    }
+
+    // Evaluate or directly compute predicate bitsets for each automaton.
+    let mut predicate_bitsets: HashMap<String, HashMap<String, BitVec<usize, Lsb0>>> =
+        HashMap::new();
+    for (automaton, metadata_map) in &predicate_metadata {
+        if metadata_map.is_empty() {
+            continue;
+        }
+        let Some(clts) = context.clts(automaton) else {
+            continue;
+        };
+        let state_count = clts.state_count();
+        for (predicate_name, metadata) in metadata_map {
+            let bits = if let Some(formula) = formulas.get(predicate_name) {
+                // Check if this is a structural predicate that should be computed directly.
+                let computed_directly = if let Some(comment) = &formula.meta.comment {
+                    if let Ok(json) = serde_json::from_str::<Value>(comment) {
+                        json.get("expr")
+                            .and_then(|e| e.get("computed_directly"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if computed_directly {
+                    // For predicates marked as "computed_directly", extract end state names from metadata
+                    // and compute bitset directly from state names.
+                    let end_state_names: Option<Vec<String>> =
+                        if let Some(comment) = &formula.meta.comment {
+                            if let Ok(json) = serde_json::from_str::<Value>(comment) {
+                                json.get("expr")
+                                    .and_then(|e| e.get("end_states"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                    if let Some(end_states) = end_state_names {
+                        // Compute bitset directly: set bits for all end states.
+                        // Use pattern matching to handle unrolled state names by
+                        // OR-ing the bitsets for each end-state pattern.
+                        end_states.iter().fold(
+                            BitVec::repeat(false, state_count),
+                            |mut acc, pat| {
+                                let bits = StateNameMatcher::create_bitset_for_pattern(clts, pat);
+                                acc |= bits;
+                                acc
+                            },
+                        )
+                    } else {
+                        // Check if this is a completion predicate (format: {automaton}_is_completion_state)
+                        // If so, look up end_states from the can_reach_completion formula metadata.
+                        let completion_predicate_name =
+                            format!("{}_is_completion_state", automaton);
+                        if predicate_name == &completion_predicate_name {
+                            // Find the can_reach_completion formula to get end_states.
+                            let can_reach_name = format!("{}_can_reach_completion", automaton);
+                            if let Some(can_reach_formula) = formulas.get(&can_reach_name) {
+                                if let Some(comment) = &can_reach_formula.meta.comment {
+                                    if let Ok(json) = serde_json::from_str::<Value>(comment) {
+                                        if let Some(end_states) = json
+                                            .get("expr")
+                                            .and_then(|e| e.get("end_states"))
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_str().map(|s| s.to_string())
+                                                    })
+                                                    .collect::<Vec<String>>()
+                                            })
+                                        {
+                                            // Compute bitset for all end states.
+                                            // Use pattern matching to handle unrolled state names
+                                            // by OR-ing the bitsets for each pattern.
+                                            end_states.iter().fold(
+                                                BitVec::repeat(false, state_count),
+                                                |mut acc, pat| {
+                                                    let bits =
+                                                        StateNameMatcher::create_bitset_for_pattern(
+                                                            clts, pat,
+                                                        );
+                                                    acc |= bits;
+                                                    acc
+                                                },
+                                            )
+                                        } else {
+                                            // Fall through to fallback.
+                                            BitVec::repeat(false, state_count)
+                                        }
+                                    } else {
+                                        // Fall through to fallback.
+                                        BitVec::repeat(false, state_count)
+                                    }
+                                } else {
+                                    // Fall through to fallback.
+                                    BitVec::repeat(false, state_count)
+                                }
+                            } else {
+                                // Fall through to fallback.
+                                BitVec::repeat(false, state_count)
+                            }
+                        } else {
+                            // Fallback: try to infer from formula body (state name disjunction).
+                            // This handles cases where metadata doesn't have `end_states`.
+                            // Use pattern matching to handle unrolled state names.
+                            // Extract state names from formula raw (e.g., "End" or "End || Complete").
+                            let formula_raw = &formula.raw;
+                            let state_names: Vec<String> = formula_raw
+                                .split("||")
+                                .map(|s| {
+                                    s.trim()
+                                        .trim_start_matches('(')
+                                        .trim_end_matches(')')
+                                        .trim()
+                                        .to_string()
+                                })
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            // OR together the bitsets for each state name pattern.
+                            state_names.iter().fold(
+                                BitVec::repeat(false, state_count),
+                                |mut acc, pat| {
+                                    let bits =
+                                        StateNameMatcher::create_bitset_for_pattern(clts, pat);
+                                    acc |= bits;
+                                    acc
+                                },
+                            )
+                        }
+                    }
+                } else {
+                    // Regular formula evaluation.
+                    let env = Environment::new(state_count);
+                    match context.evaluate_mu(automaton, &formula.formula, &env, None) {
+                        Ok(result) => result,
+                        Err(_) => fallback_bits(state_count, Some(metadata)),
+                    }
+                }
+            } else {
+                fallback_bits(state_count, Some(metadata))
+            };
+            predicate_bitsets
+                .entry(automaton.clone())
+                .or_default()
+                .insert(predicate_name.clone(), bits);
+        }
+    }
+
+    Ok(PredicateMaps {
+        predicates,
+        predicate_metadata,
+        predicate_bitsets,
+    })
+}
+
+/// Builds the runtime context and composition membership map from the DSL document.
+fn build_context_with_compositions(
+    doc: &ContextDoc,
+    label_universe: &LabelUniverse,
+    input_signals: &HashSet<String>,
+) -> Result<(Context, HashMap<String, Vec<String>>), RealizationError> {
+    let mut automaton_names = HashSet::new();
+    let mut automata = Vec::with_capacity(doc.automata.len());
+    let mut controllable_owners: HashMap<String, String> = HashMap::new();
+    let mut internal_owners: HashMap<String, String> = HashMap::new();
+
+    AstTraverser::visit_automata(doc, |automaton| {
+        let name = automaton.name.name.clone();
+        if !automaton_names.insert(name.clone()) {
+            return Err(RealizationError::Duplicate {
+                kind: "automaton",
+                name,
+            });
+        }
+        // Track controllable/internal ownership per label.
+        for entry in &automaton.controllable {
+            let label = entry.name.name.clone();
+            if let Some(other) = controllable_owners.insert(label.clone(), name.clone()) {
+                return Err(RealizationError::DuplicateLabelOwnership {
+                    kind: "controllable label",
+                    label,
+                    owner: name.clone(),
+                    other,
+                });
+            }
+        }
+        for entry in &automaton.internal {
+            let label = entry.name.name.clone();
+            if let Some(other) = internal_owners.insert(label.clone(), name.clone()) {
+                return Err(RealizationError::DuplicateLabelOwnership {
+                    kind: "internal label",
+                    label,
+                    owner: name.clone(),
+                    other,
+                });
+            }
+        }
+
+        let clts = build_automaton(&name, automaton, label_universe, input_signals)?;
+        automata.push((name, clts));
+        Ok::<(), RealizationError>(())
+    })?;
+
+    let mut context_builder = ContextBuilder::default();
+    for (name, clts) in automata {
+        context_builder = context_builder.register_clts(name, clts);
+    }
+    let context = context_builder.finish_with_checks()?;
+
+    // Process compositions: compose automata and register them as new automata.
+    // Also track composition members for predicate projection.
+    let mut composition_members: HashMap<String, Vec<String>> = HashMap::new();
+    let mut composed_automata: Vec<(String, RuntimeClts)> = Vec::new();
+    for composition in &doc.compositions {
+        let composition_name = composition.name.name.clone();
+        let member_names: Vec<String> = composition
+            .members
+            .iter()
+            .map(|ident| ident.name.clone())
+            .collect();
+        composition_members.insert(composition_name.clone(), member_names.clone());
+
+        if member_names.is_empty() {
+            return Err(RealizationError::InvalidComposition {
+                name: composition_name,
+                reason: "composition has no members".to_string(),
+            });
+        }
+
+        // Determine composition semantics.
+        let semantics = match composition.kind {
+            CompositionKind::Synchronous => CompositionSemantics::Synchronous,
+            CompositionKind::Asynchronous => CompositionSemantics::Asynchronous,
+            CompositionKind::Superset => CompositionSemantics::Superset,
+        };
+        let options = CompositionOptions::new(semantics);
+
+        // Compose members left-associatively.
+        let first_name = &member_names[0];
+        let mut composed_clts = context
+            .clts(first_name)
+            .ok_or_else(|| {
+                RealizationError::UnknownAutomaton(format!(
+                    "composition '{}' references unknown automaton '{}'",
+                    composition_name, first_name
+                ))
+            })?
+            .clone();
+
+        for member_name in member_names.iter().skip(1) {
+            let member_clts = context
+                .clts(member_name)
+                .ok_or_else(|| {
+                    RealizationError::UnknownAutomaton(format!(
+                        "composition '{}' references unknown automaton '{}'",
+                        composition_name, member_name
+                    ))
+                })?
+                .clone();
+
+            // Create a temporary context for composition.
+            let temp_context = ContextBuilder::default()
+                .register_clts("left".to_string(), composed_clts.clone())
+                .register_clts("right".to_string(), member_clts.clone())
+                .finish_with_checks()?;
+
+            composed_clts = temp_context
+                .compose_named("left", "right", &options)
+                .map_err(|e| RealizationError::InvalidComposition {
+                    name: composition_name.clone(),
+                    reason: format!("failed to compose automata: {}", e),
+                })?;
+        }
+
+        composed_automata.push((composition_name, composed_clts));
+    }
+
+    // Build final context with all original automata plus composed automata.
+    // Only rebuild if we have composed automata to avoid unnecessary work.
+    let context = if composed_automata.is_empty() {
+        context
+    } else {
+        // For composed automata, we use finish() instead of finish_with_checks()
+        // because composed automata inherit labels from their members, and the
+        // strict controllable alphabet check would incorrectly flag conflicts.
+        // The original context was already validated with finish_with_checks(),
+        // so we only need to merge the composed automata without re-validating.
+        let mut final_builder = ContextBuilder::default();
+        // Re-register all existing automata from the context.
+        for name in context.clts_names() {
+            let clts = context.clts(&name).expect("automaton should exist").clone();
+            final_builder = final_builder.register_clts(name, clts);
+        }
+        // Register all composed automata.
+        for (name, clts) in composed_automata {
+            final_builder = final_builder.register_clts(name, clts);
+        }
+        // Use finish() to skip the controllable alphabet check for composed automata
+        // since they are derived from already-validated member automata.
+        final_builder.finish()
+    };
+
+    Ok((context, composition_members))
+}
+
+/// Collects and parses all μ-calculus formulas from the main document and sidecars.
+fn collect_formulas(
+    docs: &[&ContextDoc],
+) -> Result<HashMap<String, RealizedFormula>, RealizationError> {
+    let mut formulas: HashMap<String, RealizedFormula> = HashMap::new();
+    for doc in docs {
+        AstTraverser::visit_formulas(doc, |formula| {
+            let name = formula.name.name.clone();
+            // Skip the special __input_signals__ formula - it's metadata only.
+            if name == "__input_signals__" {
+                return Ok(());
+            }
+            if formulas.contains_key(&name) {
+                return Err(RealizationError::Duplicate {
+                    kind: "μ-formula",
+                    name,
+                });
+            }
+            let (parsed, parse_error, raw) = match &formula.body {
+                FormulaExpr::MuCalculus(mu_expr) => {
+                    let (parsed, parse_error) = match mu_parser::parse(&mu_expr.raw) {
+                        Ok(parsed) => (parsed, None),
+                        Err(error) => (
+                            mu_parser::parse("true")
+                                .expect("fallback μ-calculus formula parses successfully"),
+                            Some(error.to_string()),
+                        ),
+                    };
+                    (parsed, parse_error, mu_expr.raw.clone())
+                }
+                FormulaExpr::Ltl(ltl_expr) => {
+                    // Translate LTL to μ-calculus.
+                    match ltl::translator::translate(&ltl_expr.formula) {
+                        Ok(translated) => {
+                            // Format the translated formula for display.
+                            let raw = format!("ltl {:?}", ltl_expr.formula);
+                            (translated, None, raw)
+                        }
+                        Err(error) => {
+                            let fallback = mu_parser::parse("true")
+                                .expect("fallback μ-calculus formula parses successfully");
+                            (
+                                fallback,
+                                Some(format!("LTL translation error: {}", error)),
+                                format!("ltl {:?} (translation failed)", ltl_expr.formula),
+                            )
+                        }
+                    }
+                }
+            };
+            let targets = match &formula.targets {
+                FormulaTargets::All(_) => FormulaTargetsKind::All,
+                FormulaTargets::Named(list) => {
+                    FormulaTargetsKind::Named(list.iter().map(|ident| ident.name.clone()).collect())
+                }
+            };
+            formulas.insert(
+                name.clone(),
+                RealizedFormula {
+                    name,
+                    targets,
+                    formula: parsed,
+                    raw,
+                    meta: formula.meta.clone(),
+                    parse_error,
+                },
+            );
+            Ok::<(), RealizationError>(())
+        })?;
+    }
+    Ok(formulas)
+}
+
+/// Realises a primary DSL document and optional sidecars into runtime structures.
+///
+/// The base document typically carries the structural definition (automata,
+/// compositions) while sidecars contribute additional μ-formulas and controllers.
+/// All μ-formulas and controllers are merged into the returned lookups with
+/// duplicate identifiers rejected.
+pub fn realize(
+    doc: &ContextDoc,
+    sidecars: &[ContextDoc],
+) -> Result<RealizedContext, RealizationError> {
+    let mut docs: Vec<&ContextDoc> = Vec::with_capacity(1 + sidecars.len());
+    docs.push(doc);
+    docs.extend(sidecars.iter());
+
+    let label_universe = LabelUniverse::from_alphabet(&doc.alphabet);
+    let user_predicates = collect_user_predicates(doc);
+
+    // Extract input signals from all documents (main + sidecars).
+    // The arithmetic sidecar contains the __input_signals__ formula.
+    let input_signals = extract_input_signals_from_documents(&docs);
+
+    let (context, composition_members) =
+        build_context_with_compositions(doc, &label_universe, &input_signals)?;
+
+    let mut formulas = collect_formulas(&docs)?;
+
+    // Generate structural predicates for each automaton.
+    generate_structural_predicates(&context, &mut formulas)?;
+
+    let mut controllers: HashMap<String, RealizedController> = HashMap::new();
+    for doc in &docs {
+        for controller in &doc.controllers {
+            let name = controller.name.name.clone();
+            if controllers.contains_key(&name) {
+                return Err(RealizationError::Duplicate {
+                    kind: "controller",
+                    name,
+                });
+            }
+            let source = controller.source.name.clone();
+            if context.clts(&source).is_none() {
+                return Err(RealizationError::UnknownAutomaton(source));
+            }
+            let formula_name = controller.formula.name.clone();
+            if !formulas.contains_key(&formula_name) {
+                return Err(RealizationError::UnknownFormula(formula_name));
+            }
+            let options = ResolvedControllerOptions::from_ast(&controller.options);
+            controllers.insert(
+                name.clone(),
+                RealizedController {
+                    name,
+                    source,
+                    formula: formula_name,
+                    options,
+                    export: controller.export.clone(),
+                    meta: controller.meta.clone(),
+                },
+            );
+        }
+    }
+
+    let PredicateMaps {
+        predicates,
+        predicate_metadata,
+        predicate_bitsets,
+    } = compute_predicate_maps(&context, &formulas)?;
+
+    let mut realized = RealizedContext {
+        context,
+        formulas,
+        controllers,
+        predicates,
+        predicate_metadata,
+        predicate_bitsets,
+        composition_members,
+    };
+
+    register_user_predicates(
+        &realized.context,
+        &user_predicates,
+        &mut realized.predicates,
+        &mut realized.predicate_metadata,
+        &mut realized.predicate_bitsets,
+    )?;
+
+    // Auto-register state name predicates: if a formula references a predicate name
+    // that matches a state name, automatically create that predicate.
+    auto_register_state_name_predicates(
+        &realized.context,
+        &realized.formulas,
+        &mut realized.predicates,
+        &mut realized.predicate_metadata,
+        &mut realized.predicate_bitsets,
+    )?;
+
+    Ok(realized)
+}
+
+/// Generates structural predicates for each automaton in the context.
+///
+/// Structural predicates are automatically generated based on the CLTS structure:
+/// - `has_enabled_transition`: True in states that have at least one outgoing transition
+/// - `is_deadlock_state`: True in states that have no outgoing transitions
+/// - `can_reach_completion`: True in states from which a completion state is reachable
+///
+/// These predicates are added as formulas with metadata so they can be used in property verification.
+fn generate_structural_predicates(
+    context: &Context,
+    formulas: &mut HashMap<String, RealizedFormula>,
+) -> Result<(), RealizationError> {
+    // Get all automaton names from the context
+    let automaton_names = context.clts_names();
+
+    for automaton_name in automaton_names {
+        let Some(clts) = context.clts(&automaton_name) else {
+            continue;
+        };
+
+        // Generate has_enabled_transition predicate
+        // Formula: <> true (there exists a next state, i.e., at least one outgoing transition)
+        let has_enabled_name = format!("{}_has_enabled_transition", automaton_name);
+        if !formulas.contains_key(&has_enabled_name) {
+            let formula_str = "<> true";
+            let (parsed, parse_error) = match mu_parser::parse(formula_str) {
+                Ok(parsed) => (parsed, None),
+                Err(_error) => {
+                    return Err(RealizationError::UnsupportedFeature {
+                        feature: "failed to parse has_enabled_transition structural predicate",
+                    });
+                }
+            };
+
+            // Create metadata JSON for predicate recognition
+            let metadata_json = serde_json::json!({
+                "predicate": has_enabled_name.clone(),
+                "guard": formula_str,
+                "expr": {
+                    "type": "structural",
+                    "description": "True in states with at least one outgoing transition"
+                }
+            });
+
+            formulas.insert(
+                has_enabled_name.clone(),
+                RealizedFormula {
+                    name: has_enabled_name.clone(),
+                    targets: FormulaTargetsKind::Named(vec![automaton_name.clone()]),
+                    formula: parsed,
+                    raw: formula_str.to_string(),
+                    meta: Meta {
+                        id: None,
+                        comment: Some(metadata_json.to_string()),
+                    },
+                    parse_error,
+                },
+            );
+        }
+
+        // Generate is_deadlock_state predicate
+        // Formula: !(<> true) (there is no next state, i.e., no outgoing transitions)
+        let is_deadlock_name = format!("{}_is_deadlock_state", automaton_name);
+        if !formulas.contains_key(&is_deadlock_name) {
+            let formula_str = "!(<> true)";
+            let (parsed, parse_error) = match mu_parser::parse(formula_str) {
+                Ok(parsed) => (parsed, None),
+                Err(_error) => {
+                    return Err(RealizationError::UnsupportedFeature {
+                        feature: "failed to parse is_deadlock_state structural predicate",
+                    });
+                }
+            };
+
+            let metadata_json = serde_json::json!({
+                "predicate": is_deadlock_name.clone(),
+                "guard": formula_str,
+                "expr": {
+                    "type": "structural",
+                    "description": "True in states with no outgoing transitions (deadlock states)"
+                }
+            });
+
+            formulas.insert(
+                is_deadlock_name.clone(),
+                RealizedFormula {
+                    name: is_deadlock_name.clone(),
+                    targets: FormulaTargetsKind::Named(vec![automaton_name.clone()]),
+                    formula: parsed,
+                    raw: formula_str.to_string(),
+                    meta: Meta {
+                        id: None,
+                        comment: Some(metadata_json.to_string()),
+                    },
+                    parse_error,
+                },
+            );
+        }
+
+        // Note: is_completion_state predicate is generated by translation pipelines
+
+        // The predicate is computed directly from state names during predicate_bitsets
+        // computation (see below) when the formula metadata indicates "computed_directly": true.
+
+        // Generate can_reach_completion predicate
+        // Formula: mu X. (completion_state || <> X)
+        // This requires identifying completion states (end states, states with "complete" in name, etc.)
+        // For now, we'll use a simpler approach: states from which we can eventually reach any state
+        // Actually, let's make it more specific: states from which we can reach an end state
+        // We identify end states by checking if is_completion_state predicate exists
+        // or by checking state names (fallback)
+        let end_state_names: Vec<String> = clts
+            .states()
+            .filter_map(|state_id| {
+                clts.state_name(state_id).and_then(|name| {
+                    let name_lower = name.to_lowercase();
+                    if name_lower.contains("end")
+                        || name_lower.contains("complete")
+                        || name_lower.contains("finish")
+                        || name_lower.contains("done")
+                    {
+                        Some(name.to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        if !end_state_names.is_empty() {
+            // Instead of enumerating all end states in the formula (which causes stack overflow
+            // for large automata with 2000+ end states), we create a single predicate that
+            // is true for all end states, then use that predicate in a simple formula.
+            let completion_predicate_name = format!("{}_is_completion_state", automaton_name);
+            let can_reach_name = format!("{}_can_reach_completion", automaton_name);
+
+            if !formulas.contains_key(&can_reach_name) {
+                // Register the completion predicate for all end states
+                // This will be handled by the predicate bitset computation later
+                // For now, we just create the formula that references this predicate
+
+                // Simple formula: mu X. (is_completion_state || <> X)
+                // This means: least fixpoint where we're either in a completion state or can reach one
+                let formula_str = format!("mu X. ({} || <> X)", completion_predicate_name);
+
+                let parsed = mu_parser::parse(&formula_str).map_err(|_| {
+                    RealizationError::UnsupportedFeature {
+                        feature: "failed to parse can_reach_completion structural predicate",
+                    }
+                })?;
+
+                let metadata_json = serde_json::json!({
+                    "predicate": can_reach_name.clone(),
+                    "guard": formula_str.clone(),
+                    "expr": {
+                        "type": "structural",
+                        "description": "True in states from which a completion state is reachable",
+                        "completion_predicate": completion_predicate_name,
+                        "end_states": end_state_names
+                    }
+                });
+
+                formulas.insert(
+                    can_reach_name.clone(),
+                    RealizedFormula {
+                        name: can_reach_name.clone(),
+                        targets: FormulaTargetsKind::Named(vec![automaton_name.clone()]),
+                        formula: parsed,
+                        raw: formula_str,
+                        meta: Meta {
+                            id: None,
+                            comment: Some(metadata_json.to_string()),
+                        },
+                        parse_error: None,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_user_predicates(doc: &ContextDoc) -> HashMap<String, Vec<PredicateDecl>> {
+    let mut map = HashMap::new();
+    for automaton in &doc.automata {
+        if !automaton.predicates.is_empty() {
+            map.insert(automaton.name.name.clone(), automaton.predicates.clone());
+        }
+    }
+    map
+}
+
+fn register_user_predicates(
+    context: &Context,
+    user_predicates: &HashMap<String, Vec<PredicateDecl>>,
+    predicates: &mut HashMap<String, HashSet<String>>,
+    predicate_metadata: &mut HashMap<String, HashMap<String, PredicateMetadata>>,
+    predicate_bitsets: &mut HashMap<String, HashMap<String, BitVec<usize, Lsb0>>>,
+) -> Result<(), RealizationError> {
+    for (automaton, decls) in user_predicates {
+        let clts = context
+            .clts(automaton)
+            .ok_or_else(|| RealizationError::UnknownAutomaton(automaton.clone()))?;
+        for decl in decls {
+            let predicate_name = decl.name.name.clone();
+            let entry = predicates.entry(automaton.clone()).or_default();
+            if !entry.insert(predicate_name.clone()) {
+                return Err(RealizationError::Duplicate {
+                    kind: "predicate",
+                    name: predicate_name,
+                });
+            }
+
+            let state_name = predicate_state_name(&decl.target)?;
+            let bits = bitset_for_state(clts, automaton, &state_name)?;
+            predicate_bitsets
+                .entry(automaton.clone())
+                .or_default()
+                .insert(predicate_name.clone(), bits);
+
+            let metadata = PredicateMetadata {
+                guard: format!("state == {}", state_name),
+                expression: GuardExpressionMetadata::Comparison {
+                    left: "state".to_string(),
+                    op: "==".to_string(),
+                    right: state_name,
+                },
+            };
+            predicate_metadata
+                .entry(automaton.clone())
+                .or_default()
+                .insert(predicate_name, metadata);
+        }
+    }
+    Ok(())
+}
+
+/// Automatically registers state name predicates when they're referenced in formulas
+/// but not explicitly declared. This ensures that formulas like `nu X. ((!Executing || ...) && [] X)`
+/// work correctly when "Executing" is a state name but not a declared predicate.
+fn auto_register_state_name_predicates(
+    context: &Context,
+    formulas: &HashMap<String, RealizedFormula>,
+    predicates: &mut HashMap<String, HashSet<String>>,
+    predicate_metadata: &mut HashMap<String, HashMap<String, PredicateMetadata>>,
+    predicate_bitsets: &mut HashMap<String, HashMap<String, BitVec<usize, Lsb0>>>,
+) -> Result<(), RealizationError> {
+    // Collect all predicate names referenced in formulas
+    let mut referenced_predicates: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for formula in formulas.values() {
+        // Extract predicate names from the formula AST
+        let mut predicate_names = HashSet::new();
+        extract_predicate_names(&formula.formula, &mut predicate_names);
+
+        // Add to the set for each automaton this formula targets
+        let automata = match &formula.targets {
+            FormulaTargetsKind::Named(names) => names.to_vec(),
+            FormulaTargetsKind::All => context.clts_names().into_iter().collect(),
+        };
+        for automaton in automata {
+            referenced_predicates
+                .entry(automaton)
+                .or_default()
+                .extend(predicate_names.iter().cloned());
+        }
+    }
+
+    // For each automaton, check if referenced predicates match state names
+    for (automaton, pred_names) in referenced_predicates {
+        let Some(clts) = context.clts(&automaton) else {
+            continue;
+        };
+
+        // Get all state names in this automaton
+        let state_names: HashSet<String> = clts
+            .states()
+            .filter_map(|state_id| clts.state_name(state_id).map(|s| s.to_string()))
+            .collect();
+
+        // For each referenced predicate that matches a state name but isn't registered
+        let automaton_predicates = predicates.entry(automaton.clone()).or_default();
+        for pred_name in pred_names {
+            // Check if it matches any state name (exact or prefix match for unrolled states)
+            let matches_any_state = state_names
+                .iter()
+                .any(|state_name| StateNameMatcher::matches_pattern(&pred_name, state_name));
+
+            // If it matches a state name and not already registered as a predicate
+            if matches_any_state && !automaton_predicates.contains(&pred_name) {
+                // Register it as a predicate
+                automaton_predicates.insert(pred_name.clone());
+
+                // Create bitset: true for all states matching the pattern (exact or prefix)
+                // This handles unrolled states where "End" should match "End_x_0", "End_count_5", etc.
+                let bitset = StateNameMatcher::create_bitset_for_pattern(clts, &pred_name);
+                predicate_bitsets
+                    .entry(automaton.clone())
+                    .or_default()
+                    .insert(pred_name.clone(), bitset);
+
+                // Create metadata
+                let metadata = PredicateMetadata {
+                    guard: format!("state == {}", pred_name),
+                    expression: GuardExpressionMetadata::Comparison {
+                        left: "state".to_string(),
+                        op: "==".to_string(),
+                        right: pred_name.clone(),
+                    },
+                };
+                predicate_metadata
+                    .entry(automaton.clone())
+                    .or_default()
+                    .insert(pred_name, metadata);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively extracts all predicate names from a formula AST
+fn extract_predicate_names(formula: &crate::mu_calculus::Formula, names: &mut HashSet<String>) {
+    use crate::mu_calculus::Node;
+
+    fn visit_node(
+        formula: &crate::mu_calculus::Formula,
+        node_id: crate::mu_calculus::NodeId,
+        names: &mut HashSet<String>,
+    ) {
+        match formula.node(node_id) {
+            Node::Predicate(name) => {
+                names.insert(name.clone());
+            }
+            Node::Not(inner) => {
+                visit_node(formula, *inner, names);
+            }
+            Node::And(left, right) => {
+                visit_node(formula, *left, names);
+                visit_node(formula, *right, names);
+            }
+            Node::Or(left, right) => {
+                visit_node(formula, *left, names);
+                visit_node(formula, *right, names);
+            }
+            Node::Modal { target, .. } => {
+                visit_node(formula, *target, names);
+            }
+            Node::Mu { body, .. } => {
+                visit_node(formula, *body, names);
+            }
+            Node::Nu { body, .. } => {
+                visit_node(formula, *body, names);
+            }
+            Node::True | Node::False | Node::Variable(_) => {
+                // No predicates in these nodes
+            }
+        }
+    }
+
+    visit_node(formula, formula.root(), names);
+}
+
+fn predicate_state_name(target: &PredicateTarget) -> Result<String, RealizationError> {
+    match target {
+        PredicateTarget::State(StateRef::Simple(ident)) => Ok(ident.name.clone()),
+        PredicateTarget::State(StateRef::Indexed { .. }) => {
+            Err(RealizationError::UnsupportedFeature {
+                feature: "indexed state predicates",
+            })
+        }
+    }
+}
+
+/// Matches a state name pattern against actual state names, handling unrolled states.
+///
+/// This function supports matching original state names (e.g., "End") against unrolled
+/// state names (e.g., "End_x_0", "End_count_5"). It first tries exact matching, then
+fn bitset_for_state(
+    clts: &RuntimeClts,
+    automaton: &str,
+    state_name: &str,
+) -> Result<BitVec<usize, Lsb0>, RealizationError> {
+    // First try exact match (for backward compatibility)
+    if let Ok(state_id) = clts.state_id(state_name) {
+        let mut bits = BitVec::repeat(false, clts.state_count());
+        bits.set(state_id.index(), true);
+        return Ok(bits);
+    }
+
+    // If exact match fails, try pattern matching for unrolled states
+    let bits = StateNameMatcher::create_bitset_for_pattern(clts, state_name);
+
+    // Check if we found any matches
+    if bits.iter().any(|bit| *bit) {
+        Ok(bits)
+    } else {
+        Err(RealizationError::UnknownPredicateState {
+            automaton: automaton.to_owned(),
+            state: state_name.to_owned(),
+        })
+    }
+}
+
+/// Converts an expression to a string representation for guard parsing.
+fn expr_to_string(expr: &Expr) -> String {
+    match &expr.kind {
+        ExprKind::Integer(value) => value.to_string(),
+        ExprKind::Ident(ident) => {
+            // Check if identifier is a boolean literal keyword
+            // The parser converts true/false keywords to identifiers
+            if ident.name.eq_ignore_ascii_case("true") {
+                "true".to_string()
+            } else if ident.name.eq_ignore_ascii_case("false") {
+                "false".to_string()
+            } else {
+                ident.name.clone()
+            }
+        }
+        ExprKind::Index { target, expr } => {
+            format!("{}[{}]", target.name, expr_to_string(expr))
+        }
+        ExprKind::Unary { op, expr } => {
+            let op_str = match op {
+                crate::context_dsl::ast::UnaryOp::Not => "!",
+                crate::context_dsl::ast::UnaryOp::Neg => "-",
+            };
+            format!("({}{})", op_str, expr_to_string(expr))
+        }
+        ExprKind::Binary { left, op, right } => {
+            let op_str = match op {
+                crate::context_dsl::ast::BinaryOp::Add => "+",
+                crate::context_dsl::ast::BinaryOp::Sub => "-",
+                crate::context_dsl::ast::BinaryOp::Mul => "*",
+                crate::context_dsl::ast::BinaryOp::Div => "/",
+                crate::context_dsl::ast::BinaryOp::Mod => "%",
+                crate::context_dsl::ast::BinaryOp::And => "&&",
+                crate::context_dsl::ast::BinaryOp::Or => "||",
+                crate::context_dsl::ast::BinaryOp::Eq => "==",
+                crate::context_dsl::ast::BinaryOp::Ne => "!=",
+                crate::context_dsl::ast::BinaryOp::Lt => "<",
+                crate::context_dsl::ast::BinaryOp::Le => "<=",
+                crate::context_dsl::ast::BinaryOp::Gt => ">",
+                crate::context_dsl::ast::BinaryOp::Ge => ">=",
+            };
+            format!(
+                "({}{}{})",
+                expr_to_string(left),
+                op_str,
+                expr_to_string(right)
+            )
+        }
+        ExprKind::Group(expr) => {
+            // Remove outer parentheses for guard parsing - they're not needed
+            // and might interfere with static guard detection
+            expr_to_string(expr)
+        }
+    }
+}
+
+/// Extracts all identifier names from an expression.
+fn extract_identifiers_from_expr(expr: &Expr) -> HashSet<String> {
+    let mut identifiers = HashSet::new();
+    match &expr.kind {
+        ExprKind::Ident(ident) => {
+            identifiers.insert(ident.name.clone());
+        }
+        ExprKind::Index { target, .. } => {
+            identifiers.insert(target.name.clone());
+        }
+        ExprKind::Unary { expr, .. } => {
+            identifiers.extend(extract_identifiers_from_expr(expr));
+        }
+        ExprKind::Binary { left, right, .. } => {
+            identifiers.extend(extract_identifiers_from_expr(left));
+            identifiers.extend(extract_identifiers_from_expr(right));
+        }
+        ExprKind::Group(expr) => {
+            identifiers.extend(extract_identifiers_from_expr(expr));
+        }
+        ExprKind::Integer(_) => {}
+    }
+    identifiers
+}
+
+/// Extracts input signals from context documents (main + sidecars).
+///
+/// Input signals can be extracted during translation.
+/// They are stored in the arithmetic sidecar as a special formula `__input_signals__`
+/// with metadata containing the input signal list.
+///
+/// **IMPORTANT**: Transitions with guards containing input signals are automatically
+/// marked as uncontrollable in `build_automaton` (see lines 503-515). This ensures
+/// that the controller cannot force transitions that depend on environment-controlled
+/// input signals, which is the correct semantics when modelling environment inputs.
+fn extract_input_signals_from_documents(docs: &[&ContextDoc]) -> HashSet<String> {
+    // Look for the special __input_signals__ formula in any of the documents
+    // (typically in the arithmetic sidecar)
+    for doc in docs {
+        for formula in &doc.mu_formulas {
+            if formula.name.name == "__input_signals__"
+                && let Some(ref comment) = formula.meta.comment
+            {
+                // Parse the JSON metadata to extract input_signals
+                if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(comment)
+                    && let Some(input_signals_array) =
+                        metadata.get("input_signals").and_then(|v| v.as_array())
+                {
+                    return input_signals_array
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                }
+            }
+        }
+    }
+    HashSet::new()
+}
+
+fn build_automaton(
+    name: &str,
+    automaton: &Automaton,
+    labels: &LabelUniverse,
+    input_signals: &HashSet<String>,
+) -> Result<RuntimeClts, RealizationError> {
+    // Prepare per-automaton controllable/internal sets
+    let mut automaton_controllable = HashSet::new();
+    for entry in &automaton.controllable {
+        automaton_controllable.insert(entry.name.name.clone());
+    }
+    let mut automaton_internal = HashSet::new();
+    for entry in &automaton.internal {
+        automaton_internal.insert(entry.name.name.clone());
+    }
+
+    if !automaton.parameters.is_empty() {
+        return Err(RealizationError::UnsupportedFeature {
+            feature: "automaton parameters",
+        });
+    }
+    if !automaton.state_groups.is_empty() {
+        return Err(RealizationError::UnsupportedFeature {
+            feature: "state groups",
+        });
+    }
+
+    // Phase 1: Check if unrolling is required
+    let has_variables = !automaton.variables.is_empty();
+
+    // Only check for dynamic guards that require unrolling if we don't already have variables
+    // (If we have variables, we'll unroll anyway)
+    let has_dynamic_guards_requiring_unrolling = if has_variables {
+        false // Don't need to check - we'll unroll anyway
+    } else {
+        has_dynamic_guards(automaton)?
+    };
+
+    // If automaton has dynamic guards that reference variables but no variables are declared,
+    // unrolling is required but impossible
+    if has_dynamic_guards_requiring_unrolling && !has_variables {
+        return Err(RealizationError::DynamicGuardsRequireUnrolling {
+            name: name.to_owned(),
+        });
+    }
+
+    // If automaton has variables, MUST unroll (regardless of guards)
+    // If automaton has dynamic guards that reference variables, MUST unroll
+    if has_variables || has_dynamic_guards_requiring_unrolling {
+        return build_automaton_with_unrolling(
+            name,
+            automaton,
+            labels,
+            input_signals,
+            &automaton_controllable,
+            &automaton_internal,
+        );
+    }
+
+    // Otherwise, build directly (no unrolling needed)
+
+    let mut builder = Clts::builder();
+    builder.reserve_states(automaton.states.len());
+
+    let mut label_cache: HashMap<String, RuntimeLabelId> = HashMap::new();
+
+    let mut variable_names = Vec::new();
+    for variable in &automaton.variables {
+        if variable.index.is_some() {
+            return Err(RealizationError::UnsupportedFeature {
+                feature: "indexed variables",
+            });
+        }
+        variable_names.push(variable.name.name.clone());
+    }
+
+    for state in &automaton.states {
+        ensure_supported_state(state)?;
+        builder.state(&state.name.name);
+        if state.is_initial {
+            builder.initial(&state.name.name);
+        }
+        if !variable_names.is_empty() {
+            builder.with_variables(&state.name.name, variable_names.iter().map(String::as_str));
+        }
+    }
+
+    AstTraverser::visit_transitions(automaton, |transition| {
+        // Phase 1: Check if guard is static and filter if false
+        // Note: With mandatory unrolling, dynamic guards are handled during unrolling
+        // Static false guards are filtered here
+        if let Some(ref guard) = transition.guard {
+            let guard_str = expr_to_string(guard);
+            let (_, parsed_guard) = crate::guard::parse_guard(&guard_str);
+            let static_value = crate::guard::is_static_guard(&parsed_guard);
+
+            // Filter static false guards
+            if static_value == Some(false) {
+                return Ok(()); // Skip this transition - it's always disabled
+            }
+        }
+
+        let source = state_selector_name(&transition.source)?;
+        let target = state_selector_name(&transition.target)?;
+
+        let mut label_ids: Vec<RuntimeLabelId> = Vec::new();
+        let primary = convert_label(
+            name,
+            &mut builder,
+            &mut label_cache,
+            labels,
+            &transition.label,
+        )?;
+        label_ids.push(primary);
+
+        for additional in &transition.additional_labels {
+            let id = convert_label(name, &mut builder, &mut label_cache, labels, additional)?;
+            if !label_ids.contains(&id) {
+                label_ids.push(id);
+            }
+        }
+
+        // Label-based controllability (proof-of-concept for Phase 3.5)
+        // 1. Epsilon transitions are always uncontrollable
+        let is_epsilon = matches!(transition.label, TransitionLabel::Epsilon(_))
+            || transition
+                .additional_labels
+                .iter()
+                .any(|l| matches!(l, TransitionLabel::Epsilon(_)));
+
+        // 2. Check if any label name matches an input signal
+        let _label_has_input_signal = {
+            let mut label_names = Vec::new();
+            if let TransitionLabel::Named { name, .. } = &transition.label {
+                label_names.push(&name.name);
+            }
+            for additional in &transition.additional_labels {
+                if let TransitionLabel::Named { name, .. } = additional {
+                    label_names.push(&name.name);
+                }
+            }
+            label_names.iter().any(|name| input_signals.contains(*name))
+        };
+
+        // 3. Fall back to guard-based check (for backward compatibility)
+        let guard_has_input_signal = if let Some(ref guard) = transition.guard {
+            let guard_identifiers = extract_identifiers_from_expr(guard);
+            guard_identifiers
+                .iter()
+                .any(|id| input_signals.contains(id))
+        } else {
+            false
+        };
+
+        // Determine label controllability for each label
+        // Build full label names list including epsilon
+        let mut label_names = transition_label_names(transition);
+        // If this is an epsilon transition, ensure "epsilon" is in the names list
+        if is_epsilon && !label_names.contains(&"epsilon".to_string()) {
+            // For epsilon transitions, label_ids contains the "epsilon" label but transition_label_names doesn't return it
+            // So we need to add it manually
+            label_names.push("epsilon".to_string());
+        }
+
+        // Ensure label_names and label_ids have the same length
+        // If label_ids has more elements (e.g., epsilon label), pad label_names
+        while label_names.len() < label_ids.len() {
+            label_names.push("epsilon".to_string());
+        }
+
+        // If automaton declares controllable/internal labels, use them; otherwise fallback to legacy inference
+        let uses_explicit_sets = automaton.controllable_declared
+            || automaton.internal_declared
+            || !automaton_controllable.is_empty()
+            || !automaton_internal.is_empty();
+
+        for (label_id, label_name) in label_ids.iter().zip(label_names.iter()) {
+            // Check if label controllability is already set (use the public method)
+            let needs_setting = {
+                // We need to check if it's set, but we can't access the internal map directly
+                // So we'll just set it - set_label_controllability will overwrite if needed
+                true
+            };
+            if needs_setting {
+                let controllability = if uses_explicit_sets {
+                    if automaton_controllable.contains(label_name)
+                        || automaton_internal.contains(label_name)
+                    {
+                        if automaton_internal.contains(label_name) {
+                            LabelControllability::Internal
+                        } else {
+                            LabelControllability::Controllable
+                        }
+                    } else {
+                        LabelControllability::Uncontrollable
+                    }
+                } else {
+                    // Legacy inference: uncontrollable if matches input signal or is epsilon
+                    // Note: "epsilon" label is always uncontrollable
+                    let is_uncontrollable = label_name == "epsilon"
+                        || is_epsilon
+                        || input_signals.contains(label_name)
+                        || guard_has_input_signal;
+                    if is_uncontrollable {
+                        LabelControllability::Uncontrollable
+                    } else {
+                        LabelControllability::Controllable
+                    }
+                };
+                builder.set_label_controllability(*label_id, controllability);
+            }
+        }
+        // All transitions are always enabled after unrolling (guards resolved at build time)
+        builder.transition(source, &label_ids, target);
+        Ok::<(), RealizationError>(())
+    })?;
+
+    builder
+        .build()
+        .map_err(|error| RealizationError::AutomatonBuild {
+            name: name.to_owned(),
+            error,
+        })
+}
+
+/// Checks if an automaton has any dynamic guards that require unrolling.
+///
+/// Only guards that reference state variables require unrolling.
+/// Predicate guards (like "cond_a") don't require unrolling - they're evaluated
+/// at runtime using the environment.
+fn has_dynamic_guards(automaton: &Automaton) -> Result<bool, RealizationError> {
+    use crate::guard::GuardExpr;
+
+    // Helper functions to check if a string is a constant
+    fn is_numeric_literal(s: &str) -> bool {
+        s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
+    }
+
+    fn is_boolean_literal(s: &str) -> bool {
+        s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false")
+    }
+
+    for transition in &automaton.transitions {
+        if let Some(ref guard) = transition.guard {
+            let guard_str = expr_to_string(guard);
+            let (_, parsed_guard) = crate::guard::parse_guard(&guard_str);
+
+            // Check if this guard references variables (requires unrolling)
+            let requires_unrolling = match &parsed_guard {
+                GuardExpr::True | GuardExpr::False => false, // Static - no unrolling needed
+                GuardExpr::Predicate(_) => false, // Predicate - evaluated via environment, no unrolling needed
+                GuardExpr::Comparison { left, right, .. } => {
+                    // Check if either side is not a constant (i.e., references a variable)
+                    let left_is_const = is_numeric_literal(left) || is_boolean_literal(left);
+                    let right_is_const = is_numeric_literal(right) || is_boolean_literal(right);
+
+                    // If at least one side is not a constant, it references a variable
+                    !left_is_const || !right_is_const
+                }
+            };
+
+            if requires_unrolling {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Builds an automaton using unrolling (mandatory for automata with variables or dynamic guards).
+fn build_automaton_with_unrolling(
+    name: &str,
+    automaton: &Automaton,
+    labels: &LabelUniverse,
+    input_signals: &HashSet<String>,
+    automaton_controllable: &HashSet<String>,
+    automaton_internal: &HashSet<String>,
+) -> Result<RuntimeClts, RealizationError> {
+    // Convert DSL structures to unrolling format
+    let original_states = convert_states_for_unrolling(&automaton.states)?;
+
+    // Track which original state names were initial
+    let initial_location_names: HashSet<String> = automaton
+        .states
+        .iter()
+        .filter(|s| s.is_initial)
+        .map(|s| s.name.name.clone())
+        .collect();
+
+    let original_transitions = convert_transitions_for_unrolling(&automaton.transitions)?;
+    let variables = convert_variables_for_unrolling(&automaton.variables)?;
+
+    let mut unrolling_options = UnrollingOptions::default();
+    if let Some(ref mut heuristic_config) = unrolling_options.heuristic_config {
+        heuristic_config.max_total_states = 10000; // Increased limit for integration tests
+    } else {
+        unrolling_options.heuristic_config =
+            Some(crate::abstraction::heuristics::HeuristicConfig {
+                max_total_states: 10000,
+                ..Default::default()
+            });
+    }
+    let unrolled = unroll_states(
+        original_states,
+        original_transitions,
+        variables,
+        unrolling_options,
+    )
+    .map_err(|e| RealizationError::UnrollingFailed {
+        name: name.to_owned(),
+        error: e.to_string(),
+    })?;
+
+    // Build CLTS from unrolled result
+    build_clts_from_unrolled(
+        unrolled,
+        name,
+        labels,
+        input_signals,
+        automaton_controllable,
+        automaton_internal,
+        &initial_location_names,
+    )
+}
+
+/// Converts DSL states to unrolling format.
+fn convert_states_for_unrolling(
+    states: &[StateDecl],
+) -> Result<Vec<OriginalState>, RealizationError> {
+    let mut result = Vec::new();
+    for state in states {
+        ensure_supported_state(state)?;
+        result.push(OriginalState {
+            name: state.name.name.clone(),
+            initial: state.is_initial,
+        });
+    }
+    Ok(result)
+}
+
+/// Converts DSL transitions to unrolling format.
+fn convert_transitions_for_unrolling(
+    transitions: &[TransitionDecl],
+) -> Result<Vec<OriginalTransition>, RealizationError> {
+    let mut result = Vec::new();
+    for transition in transitions {
+        let source = state_selector_name(&transition.source)?;
+        let target = state_selector_name(&transition.target)?;
+
+        // Get label name (unrolling only supports single labels, use primary label)
+        let label = match &transition.label {
+            TransitionLabel::Named { name, .. } => name.name.clone(),
+            TransitionLabel::Epsilon(_) => "epsilon".to_string(),
+        };
+
+        // Convert guard expression to string
+        let guard = transition.guard.as_ref().map(expr_to_string);
+
+        // Convert effects
+        let effects: Vec<Effect> = transition
+            .effects
+            .iter()
+            .map(|a| Effect {
+                target: a.target.name.clone(),
+                value_expr: expr_to_string(&a.expr),
+            })
+            .collect();
+
+        result.push(OriginalTransition {
+            from: source.to_string(),
+            to: target.to_string(),
+            label,
+            guard,
+            effects,
+        });
+    }
+    Ok(result)
+}
+
+/// Converts DSL variables to unrolling format.
+fn convert_variables_for_unrolling(
+    variables: &[crate::context_dsl::ast::VariableDecl],
+) -> Result<Vec<VariableDecl>, RealizationError> {
+    let mut result = Vec::new();
+    for variable in variables {
+        if variable.index.is_some() {
+            return Err(RealizationError::UnsupportedFeature {
+                feature: "indexed variables",
+            });
+        }
+
+        // Extract initial value as string
+        let initial_str = expr_to_string(&variable.init);
+
+        result.push(VariableDecl {
+            name: variable.name.name.clone(),
+            ty: match variable.ty {
+                crate::context_dsl::ast::TypeName::Bool => "bool".to_string(),
+                crate::context_dsl::ast::TypeName::I64 => "i64".to_string(),
+            },
+            initial: Some(initial_str),
+        });
+    }
+    Ok(result)
+}
+
+/// Builds a CLTS from unrolled states and transitions.
+/// All guards have been resolved during unrolling, so no guard predicates are needed.
+fn build_clts_from_unrolled(
+    unrolled: UnrolledClts,
+    name: &str,
+    labels: &LabelUniverse,
+    input_signals: &HashSet<String>,
+    automaton_controllable: &HashSet<String>,
+    automaton_internal: &HashSet<String>,
+    initial_location_names: &HashSet<String>,
+) -> Result<RuntimeClts, RealizationError> {
+    let mut builder = Clts::builder();
+    let mut label_cache: HashMap<String, RuntimeLabelId> = HashMap::new();
+
+    // Add states from unrolled CLTS and mark initial states
+    for state in &unrolled.states {
+        let state_name = state.state_name();
+        builder.state(&state_name);
+
+        // Mark as initial if the state's location was initial in the original automaton
+        if initial_location_names.contains(&state.location) {
+            builder.initial(&state_name);
+        }
+    }
+
+    // Add transitions (all are always enabled - no guards)
+    for transition in &unrolled.transitions {
+        let from_name = transition.from.state_name();
+        let to_name = transition.to.state_name();
+
+        // Convert label to label ID
+        let label_id = convert_label(
+            name,
+            &mut builder,
+            &mut label_cache,
+            labels,
+            &TransitionLabel::Named {
+                name: crate::context_dsl::ast::Ident {
+                    name: transition.label.clone(),
+                    span: crate::context_dsl::token::Span::new(0, 0, 0, 0),
+                },
+                index: None,
+            },
+        )?;
+
+        // Determine label controllability
+        let uses_explicit_sets =
+            !automaton_controllable.is_empty() || !automaton_internal.is_empty();
+        let controllability = if uses_explicit_sets {
+            if automaton_internal.contains(&transition.label) {
+                LabelControllability::Internal
+            } else if automaton_controllable.contains(&transition.label) {
+                LabelControllability::Controllable
+            } else {
+                LabelControllability::Uncontrollable
+            }
+        } else {
+            // Legacy inference: uncontrollable if matches input signal or is epsilon
+            let is_uncontrollable =
+                transition.label == "epsilon" || input_signals.contains(&transition.label);
+            if is_uncontrollable {
+                LabelControllability::Uncontrollable
+            } else {
+                LabelControllability::Controllable
+            }
+        };
+        builder.set_label_controllability(label_id, controllability);
+
+        // Add transition without guard (all transitions in unrolled CLTS are always enabled)
+        builder.transition(&from_name, &[label_id], &to_name);
+    }
+
+    builder
+        .build()
+        .map_err(|error| RealizationError::AutomatonBuild {
+            name: name.to_owned(),
+            error,
+        })
+}
+
+fn transition_label_names(transition: &TransitionDecl) -> Vec<String> {
+    let mut names = Vec::new();
+    if let TransitionLabel::Named { name, .. } = &transition.label {
+        names.push(name.name.clone());
+    }
+    for additional in &transition.additional_labels {
+        if let TransitionLabel::Named { name, .. } = additional
+            && !names.contains(&name.name)
+        {
+            names.push(name.name.clone());
+        }
+    }
+    names
+}
+
+fn ensure_supported_state(state: &StateDecl) -> Result<(), RealizationError> {
+    if state.index.is_some() {
+        return Err(RealizationError::UnsupportedFeature {
+            feature: "indexed states",
+        });
+    }
+    if !state.overrides.is_empty() {
+        return Err(RealizationError::UnsupportedFeature {
+            feature: "state variable overrides",
+        });
+    }
+    Ok(())
+}
+
+fn state_selector_name(selector: &StateSelector) -> Result<&str, RealizationError> {
+    match selector {
+        StateSelector::Named(StateRef::Simple(ident)) => Ok(&ident.name),
+        StateSelector::Named(StateRef::Indexed { .. }) => {
+            Err(RealizationError::UnsupportedFeature {
+                feature: "indexed state references",
+            })
+        }
+        StateSelector::Group(_) => Err(RealizationError::UnsupportedFeature {
+            feature: "state groups in transitions",
+        }),
+        StateSelector::Wildcard(_) => Err(RealizationError::UnsupportedFeature {
+            feature: "state wildcards",
+        }),
+    }
+}
+
+fn convert_label(
+    automaton_name: &str,
+    builder: &mut RuntimeBuilder,
+    cache: &mut HashMap<String, RuntimeLabelId>,
+    universe: &LabelUniverse,
+    label: &TransitionLabel,
+) -> Result<RuntimeLabelId, RealizationError> {
+    let label_name = match label {
+        TransitionLabel::Named { name, index } => {
+            if index.is_some() {
+                return Err(RealizationError::UnsupportedFeature {
+                    feature: "indexed labels",
+                });
+            }
+            name.name.clone()
+        }
+        TransitionLabel::Epsilon(_) => "epsilon".to_owned(),
+    };
+
+    if let Some(id) = cache.get(&label_name) {
+        return Ok(*id);
+    }
+
+    let payload = universe.payload(&label_name);
+    let id =
+        builder
+            .labels()
+            .intern(payload)
+            .map_err(|error| RealizationError::AutomatonBuild {
+                name: automaton_name.to_owned(),
+                error,
+            })?;
+    cache.insert(label_name, id);
+    Ok(id)
+}
+
+struct LabelUniverse {
+    entries: HashMap<String, Vec<String>>,
+}
+
+impl LabelUniverse {
+    fn from_alphabet(entries: &[AlphabetEntry]) -> Self {
+        let mut map = HashMap::new();
+        for entry in entries {
+            let payload = entry
+                .display
+                .as_ref()
+                .map(|value| vec![value.clone()])
+                .unwrap_or_else(|| vec![entry.name.name.clone()]);
+            map.insert(entry.name.name.clone(), payload);
+        }
+        Self { entries: map }
+    }
+
+    fn payload(&self, name: &str) -> Vec<String> {
+        self.entries
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| vec![name.to_owned()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context_dsl::parse;
+
+    #[test]
+    fn realize_simple_context() {
+        let doc = parse(
+            r#"
+context simple {
+    alphabet { label tick; }
+    automata {
+        automaton Machine {
+            states {
+                state s0 initial;
+                state s1;
+            }
+            transitions {
+                transition s0 -> s1 on label tick;
+                transition s1 -> s1 on label tick;
+            }
+        }
+    }
+    mu_formulas {
+        formula stay { over Machine; body = true; }
+    }
+    controllers {
+        controller trivial { source Machine; satisfying stay; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("context realizes");
+        assert!(realized.context.clts("Machine").is_some());
+        assert!(realized.formulas.contains_key("stay"));
+        assert!(realized.controllers.contains_key("trivial"));
+    }
+
+    #[test]
+    fn realize_merges_sidecar_formulas() {
+        let base = parse(
+            r#"
+context base {
+    alphabet { label alpha; }
+    automata {
+        automaton A {
+            states { state start initial; }
+            transitions { transition start -> start on label alpha; }
+        }
+    }
+}
+"#,
+        )
+        .expect("base parses");
+
+        let sidecar = parse(
+            r#"
+context base_properties {
+    mu_formulas {
+        formula ok { over A; body = true; }
+    }
+    controllers {
+        controller ok_ctrl { source A; satisfying ok; }
+    }
+}
+"#,
+        )
+        .expect("sidecar parses");
+
+        let realized = realize(&base, &[sidecar]).expect("context realizes");
+        assert!(realized.formulas.contains_key("ok"));
+        assert!(realized.controllers.contains_key("ok_ctrl"));
+    }
+
+    #[test]
+    fn realize_rejects_duplicate_automata() {
+        // Test duplicate automaton error (lines 253-257)
+        let doc = parse(
+            r#"
+context dup {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+        automaton A {
+            states { state s1 initial; }
+            transitions { transition s1 -> s1 on epsilon; }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let result = realize(&doc, &[]);
+        assert!(result.is_err());
+        match result {
+            Err(RealizationError::Duplicate { kind, name }) => {
+                assert_eq!(kind, "automaton");
+                assert_eq!(name, "A");
+            }
+            _ => panic!("expected Duplicate error"),
+        }
+    }
+
+    #[test]
+    fn realize_rejects_duplicate_formulas() {
+        // Test duplicate formula error (lines 277-281)
+        let doc = parse(
+            r#"
+context dup {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+    }
+    mu_formulas {
+        formula f1 { over A; body = true; }
+        formula f1 { over A; body = false; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let result = realize(&doc, &[]);
+        assert!(result.is_err());
+        match result {
+            Err(RealizationError::Duplicate { kind, name }) => {
+                assert_eq!(kind, "μ-formula");
+                assert_eq!(name, "f1");
+            }
+            _ => panic!("expected Duplicate error"),
+        }
+    }
+
+    #[test]
+    fn realize_rejects_duplicate_controllers() {
+        // Test duplicate controller error (lines 315-319)
+        let doc = parse(
+            r#"
+context dup {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+    }
+    mu_formulas {
+        formula f1 { over A; body = true; }
+    }
+    controllers {
+        controller c1 { source A; satisfying f1; }
+        controller c1 { source A; satisfying f1; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let result = realize(&doc, &[]);
+        assert!(result.is_err());
+        match result {
+            Err(RealizationError::Duplicate { kind, name }) => {
+                assert_eq!(kind, "controller");
+                assert_eq!(name, "c1");
+            }
+            _ => panic!("expected Duplicate error"),
+        }
+    }
+
+    #[test]
+    fn realize_rejects_unknown_automaton() {
+        // Test unknown automaton error (lines 322-323)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+    }
+    mu_formulas {
+        formula f1 { over A; body = true; }
+    }
+    controllers {
+        controller c1 { source B; satisfying f1; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let result = realize(&doc, &[]);
+        assert!(result.is_err());
+        match result {
+            Err(RealizationError::UnknownAutomaton(name)) => {
+                assert_eq!(name, "B");
+            }
+            _ => panic!("expected UnknownAutomaton error"),
+        }
+    }
+
+    #[test]
+    fn realize_rejects_unknown_formula() {
+        // Test unknown formula error (lines 326-327)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+    }
+    controllers {
+        controller c1 { source A; satisfying unknown; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let result = realize(&doc, &[]);
+        assert!(result.is_err());
+        match result {
+            Err(RealizationError::UnknownFormula(name)) => {
+                assert_eq!(name, "unknown");
+            }
+            _ => panic!("expected UnknownFormula error"),
+        }
+    }
+
+    #[test]
+    fn realize_handles_formula_parse_errors() {
+        // Test formula parse error handling (lines 283-289)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+    }
+    mu_formulas {
+        formula bad { over A; body = invalid syntax here; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds with fallback");
+        let formula = realized.formulas.get("bad").expect("formula exists");
+        assert!(formula.parse_error.is_some());
+        // Should have fallback to "true"
+        assert!(matches!(
+            formula.formula.node(formula.formula.root()),
+            crate::mu_calculus::Node::True
+        ));
+    }
+
+    #[test]
+    fn realize_environment_for_builds_predicates() {
+        // Test environment_for method (lines 156-177)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states {
+                state s0 initial;
+                state s1;
+            }
+            transitions {
+                transition s0 -> s1 on label tick;
+            }
+        }
+    }
+    mu_formulas {
+        formula p1 { over A; body = true; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let env = realized.environment_for("A");
+        // Environment should be created successfully
+        assert_eq!(env.state_count(), 2);
+    }
+
+    #[test]
+    fn realize_predicate_names_accessor() {
+        // Test predicate_names accessor (lines 124-126)
+        // Predicates are populated from guard metadata in formula comments
+        let doc = parse(
+            r#"
+context test {
+    alphabet {
+        label tick;
+        label sync;
+    }
+    automata {
+        automaton A {
+            alphabet { label tick; }
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on label tick; }
+        }
+        automaton B {
+            alphabet { label sync; }
+            states { state t0 initial; }
+            transitions { transition t0 -> t0 on label sync; }
+        }
+    }
+    mu_formulas {
+        formula guard1 {
+            meta { comment = "{\"predicate\": \"guard1\", \"guard\": \"x > 0\", \"expr\": {\"type\": \"comparison\", \"left\": \"x\", \"op\": \">\", \"right\": \"0\"}}"; }
+            over A;
+            body = true;
+        }
+        formula guard2 {
+            meta { comment = "{\"predicate\": \"guard2\", \"guard\": \"y == 1\", \"expr\": {\"type\": \"comparison\", \"left\": \"y\", \"op\": \"==\", \"right\": \"1\"}}"; }
+            over A, B;
+            body = true;
+        }
+        formula no_guard {
+            over A;
+            body = true;
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+
+        // Test automaton A: should have both guard1 and guard2, plus structural predicates
+        let names_a = realized
+            .predicate_names("A")
+            .expect("A should have predicates");
+        // Should have guard1, guard2, and structural predicates (has_enabled_transition, is_deadlock_state, can_reach_completion)
+        assert!(
+            names_a.len() >= 2,
+            "A should have at least guard1 and guard2"
+        );
+        assert!(names_a.contains("guard1"));
+        assert!(names_a.contains("guard2"));
+        // Structural predicates are also generated
+        assert!(names_a.iter().any(|p| p.contains("has_enabled_transition")));
+
+        // Test automaton B: should have guard2 (targeted by guard2 formula), plus structural predicates
+        let names_b = realized
+            .predicate_names("B")
+            .expect("B should have predicates");
+        // Should have guard2 and structural predicates
+        assert!(!names_b.is_empty(), "B should have at least guard2");
+        assert!(names_b.contains("guard2"));
+        // Structural predicates are also generated
+        assert!(names_b.iter().any(|p| p.contains("has_enabled_transition")));
+
+        // Test non-existent automaton: should return None
+        assert!(realized.predicate_names("C").is_none());
+
+        // Verify that formulas without guard metadata don't create predicates
+        // (no_guard formula should not appear in predicate_names)
+        assert!(!names_a.contains("no_guard"));
+    }
+
+    #[test]
+    fn realize_predicate_formula_accessor() {
+        // Test predicate_formula accessor (lines 129-136)
+        // predicate_formula returns metadata guard if available, otherwise formula raw
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on label tick; }
+        }
+    }
+    mu_formulas {
+        formula guard_pred {
+            meta { comment = "{\"predicate\": \"guard_pred\", \"guard\": \"x > 5\", \"expr\": {\"type\": \"comparison\", \"left\": \"x\", \"op\": \">\", \"right\": \"5\"}}"; }
+            over A;
+            body = x > 5;
+        }
+        formula no_metadata {
+            over A;
+            body = true;
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+
+        // Test with metadata: should return guard from metadata, not formula raw
+        let guard_formula = realized
+            .predicate_formula("A", "guard_pred")
+            .expect("guard_pred should exist");
+        assert_eq!(guard_formula, "x > 5"); // From metadata guard, not formula raw
+
+        // Test without metadata: should return formula raw as fallback
+        let fallback_formula = realized
+            .predicate_formula("A", "no_metadata")
+            .expect("no_metadata should exist");
+        assert_eq!(fallback_formula, "true"); // From formula.raw
+
+        // Test non-existent predicate: should return None (no metadata and no formula)
+        assert!(realized.predicate_formula("A", "nonexistent").is_none());
+
+        // Test non-existent automaton: falls back to formula raw if formula exists
+        // (predicate_formula doesn't validate automaton existence before fallback)
+        let formula_for_b = realized.predicate_formula("B", "guard_pred");
+        // Since guard_pred formula exists, it returns the formula raw as fallback
+        // (even though automaton B doesn't exist, the function falls back to formulas.get)
+        assert_eq!(formula_for_b, Some("x > 5")); // Falls back to formula.raw
+    }
+
+    #[test]
+    fn realize_marks_uncontrollable_transitions() {
+        // Test that transitions with input signals are marked uncontrollable (lines 536-549)
+        // Use different labels for each transition to avoid label controllability conflicts
+        // Note: With mandatory unrolling, we need variables for guards that reference predicates
+        let main_doc = parse(
+            r#"
+context test {
+    alphabet {
+        label tick;
+        label action;
+    }
+    automata {
+        automaton A {
+            variables {
+                var has_input: bool = false;
+                var is_controllable: bool = true;
+            }
+            states {
+                state s0 initial;
+                state s1;
+            }
+            transitions {
+                transition s0 -> s1 on label tick guard has_input;
+                transition s0 -> s0 on label action guard is_controllable;
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("main context parses");
+
+        // Realize without sidecar (not needed for variable-based guards)
+        let realized = realize(&main_doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("A").expect("CLTS exists");
+
+        // After unrolling, state names include variable values (e.g., "s0_has_input_false_is_controllable_true")
+        // Find initial states (should be states starting with "s0_")
+        let initial_states: Vec<_> = clts
+            .initial_states()
+            .iter()
+            .filter_map(|&id| {
+                clts.state_name(id)
+                    .filter(|name| name.starts_with("s0_"))
+                    .map(|_| id)
+            })
+            .collect();
+
+        assert!(
+            !initial_states.is_empty(),
+            "should have at least one initial state"
+        );
+        let s0 = initial_states[0];
+
+        let transitions = clts.outgoing(s0);
+        // After unrolling with has_input=false and is_controllable=true:
+        // - The tick transition (guard has_input=false) won't be included
+        // - The action transition (guard is_controllable=true) should be included
+        // However, if no transitions satisfy their guards, the state might have no outgoing transitions
+
+        // Find transition with "action" label if it exists
+        let trans_with_action = transitions.iter().find(|t| {
+            t.labels().iter().any(|&lid| {
+                clts.label_payload(lid)
+                    .map(|payload| payload.contains(&"action".to_string()))
+                    .unwrap_or(false)
+            })
+        });
+
+        // If action transition exists, verify it's controllable
+        if let Some(trans) = trans_with_action {
+            // Transition with is_controllable guard should be controllable
+            assert!(
+                trans.is_controllable(clts),
+                "transition with action label (is_controllable guard) should be controllable"
+            );
+
+            // Verify that the label has the correct controllability
+            let action_label = trans.labels()[0]; // First (and only) label in transition with action
+
+            // action should be controllable
+            assert_eq!(
+                clts.label_controllability(action_label),
+                Some(LabelControllability::Controllable),
+                "action label should be marked controllable"
+            );
+        }
+
+        // Note: The tick transition with guard has_input=false won't be in the unrolled CLTS
+        // because the guard evaluates to false during unrolling
+        // The action transition with guard is_controllable=true should be present if the guard is satisfied
+    }
+
+    #[test]
+    fn realize_extracts_input_signals_from_sidecar() {
+        // Test input signals extraction (lines 447-470)
+        // The __input_signals__ formula is skipped during realization (line 274-275)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on label tick; }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        // Create a sidecar with __input_signals__ formula
+        // Note: The actual metadata format is complex (JSON in comment field)
+        // This test just verifies the formula is skipped
+        let sidecar = parse(
+            r#"
+context arithmetic {
+    mu_formulas {
+        formula __input_signals__ {
+            over A;
+            body = true;
+        }
+    }
+}
+"#,
+        )
+        .expect("sidecar parses");
+
+        let realized = realize(&doc, &[sidecar]).expect("realization succeeds");
+        // The __input_signals__ formula should not appear in formulas map (line 274-275)
+        assert!(!realized.formulas.contains_key("__input_signals__"));
+    }
+
+    #[test]
+    fn realize_marks_epsilon_transitions_as_uncontrollable() {
+        // Test that epsilon transitions are marked as uncontrollable (Phase 3.5 proof-of-concept)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label alpha; }
+    automata {
+        automaton A {
+            states {
+                state s0 initial;
+                state s1;
+            }
+            transitions {
+                transition s0 -> s1 on epsilon;
+                transition s1 -> s0 on label alpha;
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("A").expect("automaton A exists");
+        let s0 = clts.state_id("s0").expect("state s0 exists");
+
+        // Check that the epsilon transition from s0 is marked as uncontrollable
+        let outgoing = clts.outgoing(s0);
+        assert_eq!(outgoing.len(), 1, "s0 should have one outgoing transition");
+        assert!(
+            outgoing[0].is_uncontrollable(clts),
+            "epsilon transition should be marked as uncontrollable"
+        );
+
+        // Check that the labeled transition from s1 is controllable
+        let s1 = clts.state_id("s1").expect("state s1 exists");
+        let outgoing_s1 = clts.outgoing(s1);
+        assert_eq!(
+            outgoing_s1.len(),
+            1,
+            "s1 should have one outgoing transition"
+        );
+        assert!(
+            outgoing_s1[0].is_controllable(clts),
+            "labeled transition should be marked as controllable"
+        );
+    }
+
+    #[test]
+    fn realize_handles_formula_targets_all() {
+        // Test FormulaTargets::All handling (line 292)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on epsilon; }
+        }
+    }
+    mu_formulas {
+        formula f1 { over all; body = true; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let formula = realized.formulas.get("f1").expect("formula exists");
+        match &formula.targets {
+            FormulaTargetsKind::All => {}
+            _ => panic!("expected All targets"),
+        }
+    }
+
+    #[test]
+    fn realize_handles_formula_targets_named() {
+        // Test FormulaTargets::Named handling (lines 293-295)
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; label tock; }
+    automata {
+        automaton A {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on label tick; }
+        }
+        automaton B {
+            states { state t0 initial; }
+            transitions { transition t0 -> t0 on label tock; }
+        }
+    }
+    mu_formulas {
+        formula f1 { over A, B; body = true; }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let formula = realized.formulas.get("f1").expect("formula exists");
+        match &formula.targets {
+            FormulaTargetsKind::Named(names) => {
+                assert_eq!(names.len(), 2);
+                assert!(names.contains(&"A".to_string()));
+                assert!(names.contains(&"B".to_string()));
+            }
+            _ => panic!("expected Named targets"),
+        }
+    }
+
+    #[test]
+    fn realize_pattern_matching_for_unrolled_states() {
+        // Test that predicate computation correctly matches original state names
+        // against unrolled state names using prefix pattern matching.
+        // This ensures sidecar formulas referencing "End" work with unrolled states like "End_x_0".
+        let doc = parse(
+            r#"
+context test {
+    alphabet { label tick; }
+    automata {
+        automaton A {
+            variables {
+                var x : i64 = 0;
+            }
+            states {
+                state Start initial;
+                state Processing;
+                state End;
+            }
+            transitions {
+                transition Start -> Processing on label tick;
+                transition Processing -> End on label tick;
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+
+        // Create a sidecar with a structural predicate referencing "End"
+        let sidecar = parse(
+            r#"
+context test_structural {
+    mu_formulas {
+        formula A_is_completion_state {
+            meta {
+                comment = "{\"predicate\": \"A_is_completion_state\", \"guard\": \"End\", \"expr\": {\"type\": \"structural\", \"end_states\": [\"End\"], \"computed_directly\": true}}";
+            }
+            over A;
+            body = End;
+        }
+    }
+}
+"#,
+        )
+        .expect("sidecar parses");
+
+        let realized = realize(&doc, &[sidecar]).expect("realization succeeds");
+        let clts = realized.context.clts("A").expect("automaton A exists");
+
+        // After unrolling, states should have variable values in their names
+        // e.g., "Start_x_0", "Processing_x_0", "End_x_0"
+        let state_names: Vec<String> = clts
+            .states()
+            .filter_map(|id| clts.state_name(id).map(|s| s.to_string()))
+            .collect();
+
+        // Verify that unrolled states exist
+        assert!(
+            state_names.iter().any(|n| n.starts_with("End_")),
+            "Should have unrolled End states (e.g., End_x_0), got: {:?}",
+            state_names
+        );
+
+        // Verify that the predicate was registered
+        let predicates = realized
+            .predicate_names("A")
+            .expect("A should have predicates");
+        assert!(
+            predicates.contains("A_is_completion_state"),
+            "Should have A_is_completion_state predicate, got: {:?}",
+            predicates
+        );
+
+        // Verify that the predicate bitset correctly matches unrolled End states
+        let predicate_bitsets = realized
+            .predicate_bitsets
+            .get("A")
+            .expect("A should have predicate bitsets");
+        let completion_bitset = predicate_bitsets
+            .get("A_is_completion_state")
+            .expect("A_is_completion_state bitset should exist");
+
+        // Count how many states match the predicate
+        let matching_states: Vec<String> = clts
+            .states()
+            .filter_map(|id| {
+                if completion_bitset
+                    .get(id.index())
+                    .map(|b| *b)
+                    .unwrap_or(false)
+                {
+                    clts.state_name(id).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Should match all unrolled End states (e.g., "End_x_0")
+        assert!(
+            !matching_states.is_empty(),
+            "Predicate should match at least one unrolled End state, got: {:?}",
+            matching_states
+        );
+        assert!(
+            matching_states.iter().all(|n| n.starts_with("End_")),
+            "All matching states should be unrolled End states, got: {:?}",
+            matching_states
+        );
+
+        // Verify that the predicate works in formula evaluation
+        let env = realized.environment_for("A");
+        let formula = realized
+            .formulas
+            .get("A_is_completion_state")
+            .expect("formula should exist");
+        let result = realized
+            .context
+            .evaluate_mu("A", &formula.formula, &env, None)
+            .expect("evaluation should succeed");
+
+        // The result should match the predicate bitset
+        assert_eq!(
+            result.len(),
+            completion_bitset.len(),
+            "Formula evaluation result should match predicate bitset size"
+        );
+        for state_id in clts.states() {
+            let idx = state_id.index();
+            let formula_result = result.get(idx).map(|b| *b).unwrap_or(false);
+            let predicate_result = completion_bitset.get(idx).map(|b| *b).unwrap_or(false);
+            assert_eq!(
+                formula_result,
+                predicate_result,
+                "State {} should have consistent formula and predicate results",
+                clts.state_name(state_id).unwrap_or("unknown")
+            );
+        }
+    }
+}

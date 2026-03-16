@@ -1,0 +1,621 @@
+//! Integration tests for LTL temporal logic patterns.
+//!
+//! These tests verify that common LTL patterns from `docs/ltl_templates/temporal_logic_patterns.md`
+//! can be parsed, translated to μ-calculus, and realized correctly in the Context DSL.
+
+use mununu::context_dsl;
+use mununu::context_dsl::realize_context;
+use mununu::ltl::{self, LtlFormula};
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// Helper to parse a context with LTL formulas
+fn parse_context_with_ltl(
+    source: &str,
+) -> Result<context_dsl::ast::ContextDoc, context_dsl::ParseError> {
+    context_dsl::parse(source)
+}
+
+/// Helper to realize a context and check for errors
+fn realize_test_context(source: &str) -> TestResult<mununu::context_dsl::RealizedContext> {
+    let doc = parse_context_with_ltl(source)?;
+    let realized = realize_context(&doc, &[] as &[mununu::context_dsl::ast::ContextDoc])?;
+    Ok(realized)
+}
+
+// ============================================================================
+// Safety Properties
+// ============================================================================
+
+#[test]
+fn test_safety_mutual_exclusion() -> TestResult {
+    // Pattern: G(!(in_critical_section_1 && in_critical_section_2))
+    let source = r#"
+    context test {
+        automata {
+            automaton System {
+                states {
+                    state idle initial;
+                    state critical_1;
+                    state critical_2;
+                }
+                transitions {
+                    transition idle -> critical_1 on epsilon;
+                    transition idle -> critical_2 on epsilon;
+                    transition critical_1 -> idle on epsilon;
+                    transition critical_2 -> idle on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula mutual_exclusion {
+                over System;
+                body = ltl G !(in_critical_section_1 && in_critical_section_2);
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "mutual_exclusion")
+        .unwrap();
+
+    let ltl_expr = match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => {
+            // Verify it's an Always with Not and And inside
+            match &ltl_expr.formula {
+                LtlFormula::Always(inner) => match &**inner {
+                    LtlFormula::Not(not_inner) => match &**not_inner {
+                        LtlFormula::And(_, _) => {}
+                        _ => panic!("Expected And inside Not"),
+                    },
+                    _ => panic!("Expected Not inside Always"),
+                },
+                _ => panic!("Expected Always at top level"),
+            }
+            ltl_expr
+        }
+        _ => panic!("Expected LTL formula"),
+    };
+
+    // Verify it can be translated
+    let translated = ltl::translator::translate(&ltl_expr.formula)?;
+    assert!(matches!(
+        translated.node(translated.root()),
+        mununu::mu_calculus::Node::Nu { .. }
+    ));
+
+    // Verify it can be realized
+    realize_test_context(source)?;
+    Ok(())
+}
+
+#[test]
+fn test_safety_bounded_buffer() -> TestResult {
+    // Pattern: G(buffer_count <= N)
+    // Note: This is a simplified test - actual bounded buffer would need predicates
+    let source = r#"
+    context test {
+        automata {
+            automaton Buffer {
+                states {
+                    state empty initial;
+                    state partial;
+                    state full;
+                }
+                transitions {
+                    transition empty -> partial on epsilon;
+                    transition partial -> full on epsilon;
+                    transition full -> partial on epsilon;
+                    transition partial -> empty on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula bounded {
+                over Buffer;
+                body = ltl G !overflow;
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "bounded")
+        .unwrap();
+
+    match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => match &ltl_expr.formula {
+            LtlFormula::Always(inner) => match &**inner {
+                LtlFormula::Not(_) => {}
+                _ => panic!("Expected Not inside Always"),
+            },
+            _ => panic!("Expected Always at top level"),
+        },
+        _ => panic!("Expected LTL formula"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+// ============================================================================
+// Liveness Properties
+// ============================================================================
+
+#[test]
+fn test_liveness_request_response() -> TestResult {
+    // Pattern: G(request -> F(response))
+    let source = r#"
+    context test {
+        automata {
+            automaton Protocol {
+                states {
+                    state idle initial;
+                    state waiting;
+                    state responding;
+                }
+                transitions {
+                    transition idle -> waiting on epsilon;
+                    transition waiting -> responding on epsilon;
+                    transition responding -> idle on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula responsiveness {
+                over Protocol;
+                body = ltl G (request -> F response);
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "responsiveness")
+        .unwrap();
+
+    let ltl_expr = match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => {
+            // Verify structure: Always(Implies(request, Eventually(response)))
+            match &ltl_expr.formula {
+                LtlFormula::Always(inner) => match &**inner {
+                    LtlFormula::Implies(_trigger, response) => match &**response {
+                        LtlFormula::Eventually(_) => {}
+                        _ => panic!("Expected Eventually in response"),
+                    },
+                    _ => panic!("Expected Implies inside Always"),
+                },
+                _ => panic!("Expected Always at top level"),
+            }
+            ltl_expr
+        }
+        _ => panic!("Expected LTL formula"),
+    };
+
+    // Verify translation produces Nu (for G) with Mu inside (for F)
+    let translated = ltl::translator::translate(&ltl_expr.formula)?;
+    match translated.node(translated.root()) {
+        mununu::mu_calculus::Node::Nu { .. } => {}
+        _ => panic!("Expected Nu (Always) at root"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+#[test]
+fn test_liveness_termination() -> TestResult {
+    // Pattern: F(terminated)
+    let source = r#"
+    context test {
+        automata {
+            automaton Algorithm {
+                states {
+                    state running initial;
+                    state terminated;
+                }
+                transitions {
+                    transition running -> terminated on epsilon;
+                    transition terminated -> terminated on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula termination {
+                over Algorithm;
+                body = ltl F terminated;
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "termination")
+        .unwrap();
+
+    match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => match &ltl_expr.formula {
+            LtlFormula::Eventually(_) => {}
+            _ => panic!("Expected Eventually at top level"),
+        },
+        _ => panic!("Expected LTL formula"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+#[test]
+fn test_liveness_recurrence() -> TestResult {
+    // Pattern: GF(heartbeat)
+    let source = r#"
+    context test {
+        automata {
+            automaton System {
+                states {
+                    state active initial;
+                }
+                transitions {
+                    transition active -> active on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula heartbeat {
+                over System;
+                body = ltl G F heartbeat;
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "heartbeat")
+        .unwrap();
+
+    let ltl_expr = match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => {
+            // GF = G(F(...)) = Always(Eventually(...))
+            match &ltl_expr.formula {
+                LtlFormula::Always(inner) => match &**inner {
+                    LtlFormula::Eventually(_) => {}
+                    _ => panic!("Expected Eventually inside Always"),
+                },
+                _ => panic!("Expected Always at top level"),
+            }
+            ltl_expr
+        }
+        _ => panic!("Expected LTL formula"),
+    };
+
+    // Verify translation: GF should produce Nu with Mu inside
+    let translated = ltl::translator::translate(&ltl_expr.formula)?;
+    match translated.node(translated.root()) {
+        mununu::mu_calculus::Node::Nu { .. } => {}
+        _ => panic!("Expected Nu (G) at root for GF"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+// ============================================================================
+// Reactiveness Properties
+// ============================================================================
+
+#[test]
+fn test_reactiveness_conditional_response() -> TestResult {
+    // Pattern: G((req1 -> F(grant1)) && (req2 -> F(grant2)))
+    let source = r#"
+    context test {
+        automata {
+            automaton Controller {
+                states {
+                    state idle initial;
+                }
+                transitions {
+                    transition idle -> idle on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula conditional_response {
+                over Controller;
+                body = ltl G ((req1 -> F grant1) && (req2 -> F grant2));
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "conditional_response")
+        .unwrap();
+
+    match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => {
+            // Verify structure: Always(And(Implies(...), Implies(...)))
+            match &ltl_expr.formula {
+                LtlFormula::Always(inner) => match &**inner {
+                    LtlFormula::And(_, _) => {}
+                    _ => panic!("Expected And inside Always"),
+                },
+                _ => panic!("Expected Always at top level"),
+            }
+        }
+        _ => panic!("Expected LTL formula"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+// ============================================================================
+// GR(1) Patterns
+// ============================================================================
+
+#[test]
+fn test_gr1_basic_pattern() -> TestResult {
+    // Pattern: (G(env_assume) && GF(env_justice)) -> (G(sys_guarantee) && GF(sys_justice))
+    // Simplified: G(env_assume) && GF(env_justice)
+    let source = r#"
+    context test {
+        automata {
+            automaton System {
+                states {
+                    state s0 initial;
+                }
+                transitions {
+                    transition s0 -> s0 on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula env_safety {
+                over System;
+                body = ltl G env_assume;
+            }
+            formula env_justice {
+                over System;
+                body = ltl G F env_justice;
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+
+    // Verify both formulas are parsed correctly
+    assert_eq!(doc.mu_formulas.len(), 2);
+
+    let safety = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "env_safety")
+        .unwrap();
+    match &safety.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => match &ltl_expr.formula {
+            LtlFormula::Always(_) => {}
+            _ => panic!("Expected Always for safety"),
+        },
+        _ => panic!("Expected LTL formula"),
+    }
+
+    let justice = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "env_justice")
+        .unwrap();
+    match &justice.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => match &ltl_expr.formula {
+            LtlFormula::Always(inner) => match &**inner {
+                LtlFormula::Eventually(_) => {}
+                _ => panic!("Expected Eventually inside Always for justice"),
+            },
+            _ => panic!("Expected Always for justice"),
+        },
+        _ => panic!("Expected LTL formula"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+// ============================================================================
+// Until Patterns
+// ============================================================================
+
+#[test]
+fn test_until_phase_transition() -> TestResult {
+    // Pattern: initialization U operational
+    let source = r#"
+    context test {
+        automata {
+            automaton StateMachine {
+                states {
+                    state init initial;
+                    state operational;
+                }
+                transitions {
+                    transition init -> operational on epsilon;
+                    transition operational -> operational on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula phase_transition {
+                over StateMachine;
+                body = ltl initialization U operational;
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    let formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "phase_transition")
+        .unwrap();
+
+    let ltl_expr = match &formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(ltl_expr) => {
+            match &ltl_expr.formula {
+                LtlFormula::Until { left: _, right: _ } => {}
+                _ => panic!("Expected Until at top level"),
+            }
+            ltl_expr
+        }
+        _ => panic!("Expected LTL formula"),
+    };
+
+    // Verify translation produces Mu (for Until)
+    let translated = ltl::translator::translate(&ltl_expr.formula)?;
+    match translated.node(translated.root()) {
+        mununu::mu_calculus::Node::Mu { .. } => {}
+        _ => panic!("Expected Mu (Until) at root"),
+    }
+
+    realize_test_context(source)?;
+    Ok(())
+}
+
+// ============================================================================
+// End-to-End Realization Tests
+// ============================================================================
+
+#[test]
+fn test_realize_ltl_safety_formula() -> TestResult {
+    // Test that LTL formulas can be fully realized and used
+    let source = r#"
+    context test {
+        automata {
+            automaton A {
+                states {
+                    state s initial;
+                }
+                transitions {
+                    transition s -> s on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula safety {
+                over A;
+                body = ltl G safe;
+            }
+        }
+    }
+    "#;
+
+    let realized = realize_test_context(source)?;
+
+    // Verify formula exists in realized context
+    assert!(realized.formulas.contains_key("safety"));
+
+    Ok(())
+}
+
+#[test]
+fn test_realize_ltl_liveness_formula() -> TestResult {
+    let source = r#"
+    context test {
+        automata {
+            automaton A {
+                states {
+                    state s initial;
+                }
+                transitions {
+                    transition s -> s on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula liveness {
+                over A;
+                body = ltl F completed;
+            }
+        }
+    }
+    "#;
+
+    let realized = realize_test_context(source)?;
+    assert!(realized.formulas.contains_key("liveness"));
+    Ok(())
+}
+
+#[test]
+fn test_realize_mixed_ltl_and_mu_formulas() -> TestResult {
+    // Test that both LTL and μ-calculus formulas can coexist
+    let source = r#"
+    context test {
+        automata {
+            automaton A {
+                states {
+                    state s initial;
+                }
+                transitions {
+                    transition s -> s on epsilon;
+                }
+            }
+        }
+        mu_formulas {
+            formula ltl_formula {
+                over A;
+                body = ltl G safe;
+            }
+            formula mu_formula {
+                over A;
+                body = nu X. (safe && [] X);
+            }
+        }
+    }
+    "#;
+
+    let doc = parse_context_with_ltl(source)?;
+    assert_eq!(doc.mu_formulas.len(), 2);
+
+    let ltl_formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "ltl_formula")
+        .unwrap();
+    match &ltl_formula.body {
+        context_dsl::ast::FormulaExpr::Ltl(_) => {}
+        _ => panic!("Expected LTL formula"),
+    }
+
+    let mu_formula = doc
+        .mu_formulas
+        .iter()
+        .find(|f| f.name.name == "mu_formula")
+        .unwrap();
+    match &mu_formula.body {
+        context_dsl::ast::FormulaExpr::MuCalculus(_) => {}
+        _ => panic!("Expected μ-calculus formula"),
+    }
+
+    let realized = realize_test_context(source)?;
+    assert!(realized.formulas.contains_key("ltl_formula"));
+    assert!(realized.formulas.contains_key("mu_formula"));
+
+    Ok(())
+}
