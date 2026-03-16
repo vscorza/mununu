@@ -449,11 +449,9 @@ impl<'a> Lexer<'a> {
 
         let mut check_chars = self.source[start_pos..].chars();
         // Skip the first character (which we already checked via peek_char)
-        if self.peeked.is_some() {
+        if let Some(peeked_char) = self.peeked {
             // The peeked char is the first one, so skip it in the iterator
             // by creating iterator from a position that accounts for it
-            // Actually, we need to get the UTF-8 length of the peeked char
-            let peeked_char = self.peeked.unwrap();
             let peeked_len = peeked_char.len_utf8();
             check_chars = self.source[start_pos + peeked_len..].chars();
         } else {
