@@ -1,0 +1,26 @@
+context BoundaryEventHandlingExample {
+    alphabet {
+        label start_wait_for_payment;
+        label payment_received;
+        label boundary_event_sig;
+        label handled_sig;
+    }
+
+    automata {
+        automaton Process {
+            states {
+                state Invoice_Sent initial;
+                state Waiting_For_Payment;
+                state Escalated;
+                state Completed;
+            }
+
+            transitions {
+                transition Invoice_Sent -> Waiting_For_Payment on label start_wait_for_payment;
+                transition Waiting_For_Payment -> Completed on label payment_received;
+                transition Waiting_For_Payment -> Escalated on label boundary_event_sig;
+                transition Escalated -> Completed on label handled_sig;
+            }
+        }
+    }
+}

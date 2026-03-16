@@ -2776,7 +2776,7 @@ context test {
             .finish_with_checks()?;
 
         let temp_dir = tempdir()?;
-        let file_path = temp_dir.path().join("context.henos");
+        let file_path = temp_dir.path().join("context.mununu");
 
         // Save the full context.
         context.save_to_path(&file_path)?;

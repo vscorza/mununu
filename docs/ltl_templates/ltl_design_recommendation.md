@@ -468,7 +468,7 @@ Consider adding full LTL parser only if:
 
 ## Conclusion
 
-**Template-based approach with flexible composition is the optimal choice** for Henos because:
+**Template-based approach with flexible composition is the optimal choice** for Mununu because:
 
 1. ✅ It answers "yes" to both questions:
    - Variable number of terms: Supported via propositional operators

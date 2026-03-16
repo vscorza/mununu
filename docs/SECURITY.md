@@ -1,10 +1,10 @@
 # Security and Dependency Management
 
-This document describes the security practices and dependency management for the Henos project.
+This document describes the security practices and dependency management for the Mununu project.
 
 ## Dependency Auditing
 
-Henos uses automated tools to check for security vulnerabilities and keep dependencies up to date.
+Mununu uses automated tools to check for security vulnerabilities and keep dependencies up to date.
 
 ### Security Vulnerabilities
 
@@ -59,7 +59,7 @@ This script:
 
 ## Reporting Security Issues
 
-If you discover a security vulnerability in Henos, please report it responsibly:
+If you discover a security vulnerability in Mununu, please report it responsibly:
 
 1. **Do not** open a public GitHub issue
 2. Email the maintainer: vscorza@gmail.com

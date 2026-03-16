@@ -1,5 +1,5 @@
 #!/bin/bash
-# Dependency auditing script for Henos
+# Dependency auditing script for Mununu
 # Checks for security vulnerabilities and outdated dependencies
 
 set -e

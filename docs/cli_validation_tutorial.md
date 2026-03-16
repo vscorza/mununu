@@ -1,21 +1,21 @@
 # CLI Validation Tutorial
 
-Hands-on walkthrough for validating HENOS via the CLI and a text editor (e.g., `nano`, `vim`, VS Code). It assumes you have cloned the official GitHub repository and can run `henos` from its root directory (with Cargo installed). Each section builds on files stored in a temporary working directory—feel free to adapt paths to your environment.
+Hands-on walkthrough for validating MUNUNU via the CLI and a text editor (e.g., `nano`, `vim`, VS Code). It assumes you have cloned the official GitHub repository and can run `mununu` from its root directory (with Cargo installed). Each section builds on files stored in a temporary working directory—feel free to adapt paths to your environment.
 
 ---
 
 ## 1. Prerequisites
 
 - Rust toolchain installed (`cargo` on PATH)
-- GitHub access: `git clone https://github.com/vscorza/henos-rust.git`
-- The `henos` CLI available (run from repo root with `cargo run --bin henos -- …`)
+- GitHub access: `git clone https://github.com/vscorza/mununu.git`
+- The `mununu` CLI available (run from repo root with `cargo run --bin mununu -- …`)
 - A text editor for editing `.ctxdsl` files
 
-Throughout the tutorial we use `WORKDIR=/tmp/henos_tutorial`. Create it up front:
+Throughout the tutorial we use `WORKDIR=/tmp/mununu_tutorial`. Create it up front:
 
 ```bash
-mkdir -p /tmp/henos_tutorial
-cd henos-rust
+mkdir -p /tmp/mununu_tutorial
+cd mununu
 ```
 
 ---
@@ -24,7 +24,7 @@ cd henos-rust
 
 ### 2.1 Create a minimal context
 
-Open your editor and create `/tmp/henos_tutorial/traffic_light.ctxdsl` with the following content:
+Open your editor and create `/tmp/mununu_tutorial/traffic_light.ctxdsl` with the following content:
 
 ```ctxdsl
 context traffic_light {
@@ -57,7 +57,7 @@ The `predicates` block names state predicates (`is_green`, `is_yellow`) that bec
 ### 2.2 Sanity-check via CLI
 
 ```bash
-cargo run --bin henos -- context summarize /tmp/henos_tutorial/traffic_light.ctxdsl
+cargo run --bin mununu -- context summarize /tmp/mununu_tutorial/traffic_light.ctxdsl
 ```
 
 You should see state/transition counts for automaton `Light`.
@@ -67,7 +67,7 @@ You should see state/transition counts for automaton `Light`.
 To see a detailed view of the materialized CLTS structure (states, transitions, labels, controllability), use `--print-structure`:
 
 ```bash
-cargo run --bin henos -- context summarize /tmp/henos_tutorial/traffic_light.ctxdsl --print-structure
+cargo run --bin mununu -- context summarize /tmp/mununu_tutorial/traffic_light.ctxdsl --print-structure
 ```
 
 This prints the JSON summary followed by a compact representation showing:
@@ -80,22 +80,22 @@ This prints the JSON summary followed by a compact representation showing:
 To write the structure to a file instead of stdout:
 
 ```bash
-cargo run --bin henos -- context summarize /tmp/henos_tutorial/traffic_light.ctxdsl --print-structure /tmp/henos_tutorial/traffic_light_structure.txt
+cargo run --bin mununu -- context summarize /tmp/mununu_tutorial/traffic_light.ctxdsl --print-structure /tmp/mununu_tutorial/traffic_light_structure.txt
 ```
 
 ### 2.3 Graph Visualization with Cytoscape
 
-HENOS can generate interactive graph visualizations of automata using Cytoscape.js. This is useful for understanding the structure of your automata, especially when working with complex models or unrolled representations.
+MUNUNU can generate interactive graph visualizations of automata using Cytoscape.js. This is useful for understanding the structure of your automata, especially when working with complex models or unrolled representations.
 
 #### 2.3.1 Basic DSL Graph Visualization
 
 Generate a graph visualization of the DSL automata (the original Context DSL representation):
 
 ```bash
-cargo run --bin henos -- context graph \
-  /tmp/henos_tutorial/traffic_light.ctxdsl \
+cargo run --bin mununu -- context graph \
+  /tmp/mununu_tutorial/traffic_light.ctxdsl \
   --type dsl \
-  --output /tmp/henos_tutorial/traffic_light_dsl.html
+  --output /tmp/mununu_tutorial/traffic_light_dsl.html
 ```
 
 Open the generated HTML file in your browser to see an interactive visualization showing:
@@ -112,7 +112,7 @@ For automata with variables, you can visualize the unrolled representation where
 Create a simple DSL file with variables:
 
 ```bash
-cat <<'CTXDSL' > /tmp/henos_tutorial/counter_with_vars.ctxdsl
+cat <<'CTXDSL' > /tmp/mununu_tutorial/counter_with_vars.ctxdsl
 context Counter {
     alphabet {
         label begin;
@@ -142,10 +142,10 @@ context Counter {
 CTXDSL
 
 # Generate unrolled graph
-cargo run --bin henos -- context graph \
-  /tmp/henos_tutorial/counter_with_vars.ctxdsl \
+cargo run --bin mununu -- context graph \
+  /tmp/mununu_tutorial/counter_with_vars.ctxdsl \
   --type unrolled \
-  --output /tmp/henos_tutorial/counter_unrolled.html
+  --output /tmp/mununu_tutorial/counter_unrolled.html
 ```
 
 The unrolled visualization shows:
@@ -160,10 +160,10 @@ The unrolled visualization shows:
 To see both the original DSL representation and the unrolled representation side-by-side:
 
 ```bash
-cargo run --bin henos -- context graph \
-  /tmp/henos_tutorial/counter_out/Counter.ctxdsl \
+cargo run --bin mununu -- context graph \
+  /tmp/mununu_tutorial/counter_out/Counter.ctxdsl \
   --type both \
-  --output /tmp/henos_tutorial/counter_both.html
+  --output /tmp/mununu_tutorial/counter_both.html
 ```
 
 This generates a single HTML file with both automata visualizations, making it easy to compare the original model with its unrolled expansion.
@@ -173,11 +173,11 @@ This generates a single HTML file with both automata visualizations, making it e
 To visualize only a specific automaton from a context with multiple automata:
 
 ```bash
-cargo run --bin henos -- context graph \
-  /tmp/henos_tutorial/traffic_light.ctxdsl \
+cargo run --bin mununu -- context graph \
+  /tmp/mununu_tutorial/traffic_light.ctxdsl \
   --type dsl \
   --automaton Light \
-  --output /tmp/henos_tutorial/traffic_light_light_only.html
+  --output /tmp/mununu_tutorial/traffic_light_light_only.html
 ```
 
 #### 2.3.5 Graph Visualization with Sidecars
@@ -185,12 +185,12 @@ cargo run --bin henos -- context graph \
 When working with contexts that have sidecars (e.g., guard predicates, properties), include them for complete visualization:
 
 ```bash
-cargo run --bin henos -- context graph \
-  /tmp/henos_tutorial/counter_out/Counter.ctxdsl \
-  --sidecar /tmp/henos_tutorial/counter_out/Counter_guards.ctxdsl \
-  --sidecar /tmp/henos_tutorial/counter_out/Counter_properties.ctxdsl \
+cargo run --bin mununu -- context graph \
+  /tmp/mununu_tutorial/counter_out/Counter.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/counter_out/Counter_guards.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/counter_out/Counter_properties.ctxdsl \
   --type dsl \
-  --output /tmp/henos_tutorial/counter_with_sidecars.html
+  --output /tmp/mununu_tutorial/counter_with_sidecars.html
 ```
 
 **Key Features of Graph Visualization:**
@@ -238,7 +238,7 @@ If `controllable`/`internal` blocks are omitted, controllability falls back to l
 Try it: summarize the provided example
 
 ```bash
-cargo run --bin henos -- context summarize examples/manual/controllability_demo.ctxdsl
+cargo run --bin mununu -- context summarize examples/manual/controllability_demo.ctxdsl
 ```
 
 You should see `Producer` and `Consumer` automata (2 states, 2 transitions each) with no controllability conflicts, reflecting the explicit ownership in the file.
@@ -247,7 +247,7 @@ You should see `Producer` and `Consumer` automata (2 states, 2 transitions each)
 
 ## 4. Property Verification
 
-Add a sidecar with simple safety/liveness formulas. Create `/tmp/henos_tutorial/traffic_light_props.ctxdsl`:
+Add a sidecar with simple safety/liveness formulas. Create `/tmp/mununu_tutorial/traffic_light_props.ctxdsl`:
 
 ```ctxdsl
 context traffic_light_props {
@@ -270,15 +270,15 @@ context traffic_light_props {
 Evaluate each formula:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/traffic_light.ctxdsl \
-  --sidecar /tmp/henos_tutorial/traffic_light_props.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/traffic_light.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/traffic_light_props.ctxdsl \
   --formula green_then_yellow \
   --automaton Light
 
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/traffic_light.ctxdsl \
-  --sidecar /tmp/henos_tutorial/traffic_light_props.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/traffic_light.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/traffic_light_props.ctxdsl \
   --formula eventually_green \
   --automaton Light
 ```
@@ -288,9 +288,9 @@ cargo run --bin henos -- context eval \
 You can also print the internal CLTS structure when evaluating formulas:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/traffic_light.ctxdsl \
-  --sidecar /tmp/henos_tutorial/traffic_light_props.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/traffic_light.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/traffic_light_props.ctxdsl \
   --formula eventually_green \
   --automaton Light \
   --print-structure
@@ -326,7 +326,7 @@ i.e. *if `req1` holds infinitely often, then both `grant1` and `grant2` must als
 Run controller synthesis with diagnostics enabled:
 
 ```bash
-cargo run --bin henos -- context synth \
+cargo run --bin mununu -- context synth \
   examples/manual/core/req_grant_unfair.ctxdsl \
   --formula fairness_req1_grants \
   --automaton Service \
@@ -355,7 +355,7 @@ The `counterexample trace` and `counterstrategy` entries give you a concrete wit
 
 ### 3.1 Predicates under composition
 
-Predicates remain available even when automata participate in synchronous/asynchronous compositions. For example, create `/tmp/henos_tutorial/composed.ctxdsl`:
+Predicates remain available even when automata participate in synchronous/asynchronous compositions. For example, create `/tmp/mununu_tutorial/composed.ctxdsl`:
 
 ```ctxdsl
 context composed_demo {
@@ -398,8 +398,8 @@ context composed_demo {
 Then evaluate:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/composed.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/composed.ctxdsl \
   --formula master_idle_check \
   --automaton Master
 ```
@@ -411,8 +411,8 @@ The command reports the `Idle` state as satisfying the formula, proving that use
 You can also evaluate formulas directly over the composed automaton. The `duo_initial_check` formula verifies that both Master and Worker are in their initial states simultaneously:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/composed.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/composed.ctxdsl \
   --formula duo_initial_check \
   --automaton Duo
 ```
@@ -422,8 +422,8 @@ cargo run --bin henos -- context eval \
 To see the detailed internal structure of the composed Duo automaton (states, transitions, labels, controllability), use `--print-structure`:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/composed.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/composed.ctxdsl \
   --formula duo_initial_check \
   --automaton Duo \
   --print-structure
@@ -439,11 +439,11 @@ This prints the evaluation results followed by a compact representation showing:
 To write the structure to a file instead of stdout:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/composed.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/composed.ctxdsl \
   --formula duo_initial_check \
   --automaton Duo \
-  --print-structure /tmp/henos_tutorial/duo_structure.txt
+  --print-structure /tmp/mununu_tutorial/duo_structure.txt
 ```
 
 This is particularly useful for understanding how the synchronous composition materializes the product states and transitions.
@@ -452,7 +452,7 @@ This is particularly useful for understanding how the synchronous composition ma
 
 Asynchronous composition allows automata to interleave their transitions independently. However, when automata share labels and need to coordinate, blocking can occur if one automaton moves past the point where it can participate in a shared action that another automaton still needs.
 
-Create `/tmp/henos_tutorial/blocking_example.ctxdsl`:
+Create `/tmp/mununu_tutorial/blocking_example.ctxdsl`:
 
 ```ctxdsl
 context blocking_demo {
@@ -516,12 +516,12 @@ context blocking_demo {
 Summarize and inspect the structure:
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/blocking_example.ctxdsl \
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/blocking_example.ctxdsl \
   --print-structure
 ```
 
-You can verify the blocking by checking reachability. First, create `/tmp/henos_tutorial/blocking_properties.ctxdsl`:
+You can verify the blocking by checking reachability. First, create `/tmp/mununu_tutorial/blocking_properties.ctxdsl`:
 
 ```ctxdsl
 context blocking_properties {
@@ -542,9 +542,9 @@ context blocking_properties {
 Then evaluate:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/blocking_example.ctxdsl \
-  --sidecar /tmp/henos_tutorial/blocking_properties.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/blocking_example.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/blocking_properties.ctxdsl \
   --formula can_reach_end_a \
   --automaton Composed \
   --print-structure
@@ -585,7 +585,7 @@ nu X. ((!open_door) || (Floor1_Open || Floor2_Open || Floor3_Open)) && [] X
 Evaluate using the shipped example:
 
 ```bash
-cargo run --bin henos -- context eval \
+cargo run --bin mununu -- context eval \
   examples/manual/gr1/elevator/elevator.ctxdsl \
   --sidecar examples/manual/gr1/elevator/elevator_properties.ctxdsl \
   --formula door_safety \
@@ -595,7 +595,7 @@ cargo run --bin henos -- context eval \
 Liveness (`G (call ⇒ F arrive)`):
 
 ```bash
-cargo run --bin henos -- context eval \
+cargo run --bin mununu -- context eval \
   examples/manual/gr1/elevator/elevator.ctxdsl \
   --sidecar examples/manual/gr1/elevator/elevator_properties.ctxdsl \
   --formula serve_floor1 \
@@ -607,16 +607,16 @@ cargo run --bin henos -- context eval \
 Translate and review:
 
 ```bash
-cargo run --bin henos -- translate bpm \
+cargo run --bin mununu -- translate bpm \
   --input tests/data/bpm/realizable/order_approval.json \
-  --output /tmp/henos_tutorial/order_approval \
+  --output /tmp/mununu_tutorial/order_approval \
   --name OrderApproval \
   --force
 
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/order_approval/OrderApproval.ctxdsl \
-  --sidecar /tmp/henos_tutorial/order_approval/OrderApproval_properties.ctxdsl \
-  --sidecar /tmp/henos_tutorial/order_approval/OrderApproval_bpmn_structural.ctxdsl
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/order_approval/OrderApproval.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/order_approval/OrderApproval_properties.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/order_approval/OrderApproval_bpmn_structural.ctxdsl
 ```
 
 Look for formulas like `no_deadlocks`, `response_within_deadline`, etc., that correspond to classical LTL patterns.
@@ -628,15 +628,15 @@ Look for formulas like `no_deadlocks`, `response_within_deadline`, etc., that co
 Use the elevator GR(1) spec to demonstrate counterexamples:
 
 ```bash
-cargo run --bin henos -- context synth \
+cargo run --bin mununu -- context synth \
   examples/manual/gr1/elevator/elevator.ctxdsl \
   --sidecar examples/manual/gr1/elevator/elevator_properties.ctxdsl \
   --formula gr1_spec \
   --automaton lift \
   --counterexample \
   --deadlock-traces \
-  --dump-json /tmp/henos_tutorial/elevator_cex.json \
-  --dump-diagnostics /tmp/henos_tutorial/elevator_diag.ctxdsl
+  --dump-json /tmp/mununu_tutorial/elevator_cex.json \
+  --dump-diagnostics /tmp/mununu_tutorial/elevator_diag.ctxdsl
 ```
 
 **Inspecting structure during synthesis:**
@@ -644,17 +644,17 @@ cargo run --bin henos -- context synth \
 To see the internal CLTS structure when synthesizing controllers:
 
 ```bash
-cargo run --bin henos -- context synth \
+cargo run --bin mununu -- context synth \
   examples/manual/gr1/elevator/elevator.ctxdsl \
   --sidecar examples/manual/gr1/elevator/elevator_properties.ctxdsl \
   --formula gr1_spec \
   --automaton lift \
-  --print-structure /tmp/henos_tutorial/elevator_structure.txt
+  --print-structure /tmp/mununu_tutorial/elevator_structure.txt
 ```
 
 This helps understand the controller structure and diagnose synthesis issues.
 
-If the spec is unrealizable, HENOS prints “Realizable: no” and writes diagnostics describing the failing obligation. Inspect `/tmp/henos_tutorial/elevator_diag.ctxdsl` in your editor to drill into traces and offending states.
+If the spec is unrealizable, MUNUNU prints “Realizable: no” and writes diagnostics describing the failing obligation. Inspect `/tmp/mununu_tutorial/elevator_diag.ctxdsl` in your editor to drill into traces and offending states.
 
 To experiment with an unrealizable variant, edit `elevator_properties.ctxdsl` to tighten a liveness clause (e.g., require serving a floor without allowing movement) and rerun the command to observe the new counterexample.
 
@@ -667,8 +667,8 @@ To experiment with an unrealizable variant, edit `elevator_properties.ctxdsl` to
 1. **Author BPMN JSON** with a text editor. The following self-contained example is enough to exercise translation, structural predicates, and response templates:
 
     ```bash
-    mkdir -p /tmp/henos_tutorial
-    cat <<'JSON' > /tmp/henos_tutorial/custom_process.json
+    mkdir -p /tmp/mununu_tutorial
+    cat <<'JSON' > /tmp/mununu_tutorial/custom_process.json
     {
       "name": "custom_process",
       "states": [
@@ -708,9 +708,9 @@ To experiment with an unrealizable variant, edit `elevator_properties.ctxdsl` to
 2. **Translate**:
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/custom_process.json \
-  --output /tmp/henos_tutorial/custom_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/custom_process.json \
+  --output /tmp/mununu_tutorial/custom_out \
   --name CustomProcess \
   --force
 ```
@@ -720,9 +720,9 @@ cargo run --bin henos -- translate bpm \
 To see the internal CLTS structure immediately after translation:
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/custom_process.json \
-  --output /tmp/henos_tutorial/custom_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/custom_process.json \
+  --output /tmp/mununu_tutorial/custom_out \
   --name CustomProcess \
   --force \
   --print-structure
@@ -731,12 +731,12 @@ cargo run --bin henos -- translate bpm \
 Or write it to a file:
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/custom_process.json \
-  --output /tmp/henos_tutorial/custom_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/custom_process.json \
+  --output /tmp/mununu_tutorial/custom_out \
   --name CustomProcess \
   --force \
-  --print-structure /tmp/henos_tutorial/custom_structure.txt
+  --print-structure /tmp/mununu_tutorial/custom_structure.txt
 ```
 
 This helps verify that the translation produced the expected states and transitions, especially when unrolling is applied for models with variables.
@@ -749,19 +749,19 @@ This helps verify that the translation produced the expected states and transiti
 4. **Summarize**:
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/custom_out/CustomProcess.ctxdsl \
-  --sidecar /tmp/henos_tutorial/custom_out/CustomProcess_properties.ctxdsl \
-  --sidecar /tmp/henos_tutorial/custom_out/CustomProcess_bpmn_structural.ctxdsl
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/custom_out/CustomProcess.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/custom_out/CustomProcess_properties.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/custom_out/CustomProcess_bpmn_structural.ctxdsl
 ```
 
 **With structure inspection:**
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/custom_out/CustomProcess.ctxdsl \
-  --sidecar /tmp/henos_tutorial/custom_out/CustomProcess_properties.ctxdsl \
-  --sidecar /tmp/henos_tutorial/custom_out/CustomProcess_bpmn_structural.ctxdsl \
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/custom_out/CustomProcess.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/custom_out/CustomProcess_properties.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/custom_out/CustomProcess_bpmn_structural.ctxdsl \
   --print-structure
 ```
 
@@ -770,30 +770,30 @@ This shows both the JSON summary and the detailed internal structure, which is p
 5. **Verify with property library** (optional):
 
 ```bash
-cargo run --bin henos -- mining verify \
-  --cache-dir /tmp/henos_tutorial/cache \
-  --output-dir /tmp/henos_tutorial/results \
+cargo run --bin mununu -- mining verify \
+  --cache-dir /tmp/mununu_tutorial/cache \
+  --output-dir /tmp/mununu_tutorial/results \
   --workers 1
 ```
 
-*(Populate the cache via `henos mining fetch` or by copying BPMN files beforehand.)*
+*(Populate the cache via `mununu mining fetch` or by copying BPMN files beforehand.)*
 
 ### 6.2 Industrial Composition + Verification
 
 1. **Copy the industrial fixture** (ships with the repo) into the tutorial workspace:
 
     ```bash
-    mkdir -p /tmp/henos_tutorial
+    mkdir -p /tmp/mununu_tutorial
     cp tests/data/bpm/industrial/sterile_batch_release.json \
-       /tmp/henos_tutorial/
+       /tmp/mununu_tutorial/
     ```
 
 2. **Translate the full process** (do this from the repo root so relative paths resolve):
 
     ```bash
-    cargo run --bin henos -- translate bpm \
-      --input /tmp/henos_tutorial/sterile_batch_release.json \
-      --output /tmp/henos_tutorial/sterile_out \
+    cargo run --bin mununu -- translate bpm \
+      --input /tmp/mununu_tutorial/sterile_batch_release.json \
+      --output /tmp/mununu_tutorial/sterile_out \
       --name SterileBatchRelease \
       --force
     ```
@@ -803,22 +803,22 @@ cargo run --bin henos -- mining verify \
 3. **Start a composition session** directly from the source BPMN (the compose CLI replays the translation pipeline and tracks artefacts/scopes for you):
 
     ```bash
-    cargo run --bin henos -- compose start \
-      --artifact /tmp/henos_tutorial/sterile_batch_release.json \
+    cargo run --bin mununu -- compose start \
+      --artifact /tmp/mununu_tutorial/sterile_batch_release.json \
       --name sterile_session
     ```
 
 4. **Preview and materialise composed outputs**:
 
     ```bash
-    # Inspect contexts/sidecars (writes them under /tmp/henos_tutorial/sterile_preview)
-    cargo run --bin henos -- compose preview \
+    # Inspect contexts/sidecars (writes them under /tmp/mununu_tutorial/sterile_preview)
+    cargo run --bin mununu -- compose preview \
       --session sterile_session.compose-session.json \
-      --output /tmp/henos_tutorial/sterile_preview
+      --output /tmp/mununu_tutorial/sterile_preview
 
     # Emit final artefacts + manifest for downstream tools
-    cargo run --bin henos -- compose write \
-      --output /tmp/henos_tutorial/sterile_composed \
+    cargo run --bin mununu -- compose write \
+      --output /tmp/mununu_tutorial/sterile_composed \
       --force \
       --manifest
     ```
@@ -832,25 +832,25 @@ cargo run --bin henos -- mining verify \
 5. **Summarize and verify**:
 
     ```bash
-    cargo run --bin henos -- context summarize \
-      /tmp/henos_tutorial/sterile_composed/contexts/01_sterile_batch_release.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_guards.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_properties.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_bpmn_structural.ctxdsl
+    cargo run --bin mununu -- context summarize \
+      /tmp/mununu_tutorial/sterile_composed/contexts/01_sterile_batch_release.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_guards.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_properties.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_bpmn_structural.ctxdsl
 
-    cargo run --bin henos -- context eval \
-      /tmp/henos_tutorial/sterile_composed/contexts/01_sterile_batch_release.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_guards.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_properties.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_bpmn_structural.ctxdsl \
+    cargo run --bin mununu -- context eval \
+      /tmp/mununu_tutorial/sterile_composed/contexts/01_sterile_batch_release.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_guards.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_properties.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_bpmn_structural.ctxdsl \
       --formula guard_valid \
       --automaton Process
 
-    cargo run --bin henos -- context eval \
-      /tmp/henos_tutorial/sterile_composed/contexts/01_sterile_batch_release.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_guards.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_properties.ctxdsl \
-      --sidecar /tmp/henos_tutorial/sterile_composed/sidecars/01_sterile_batch_release_bpmn_structural.ctxdsl \
+    cargo run --bin mununu -- context eval \
+      /tmp/mununu_tutorial/sterile_composed/contexts/01_sterile_batch_release.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_guards.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_properties.ctxdsl \
+      --sidecar /tmp/mununu_tutorial/sterile_composed/sidecars/01_sterile_batch_release_bpmn_structural.ctxdsl \
       --formula quality_review_leads_to_decision \
       --automaton Process
     ```
@@ -906,16 +906,16 @@ To validate basic multi-process collaboration support (Issue 8 in the BPMN spec)
 1. **Translate to CLTS context**:
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  /tmp/henos_tutorial/collab.json \
-  --out /tmp/henos_tutorial/collab.ctxdsl
+cargo run --bin mununu -- translate bpm \
+  /tmp/mununu_tutorial/collab.json \
+  --out /tmp/mununu_tutorial/collab.ctxdsl
 ```
 
 2. **Inspect composition and message labels**:
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/collab.ctxdsl
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/collab.ctxdsl
 ```
 
 - You should see automata `P1` and `P2`.
@@ -928,11 +928,11 @@ This mirrors the automated check in `tests/multi_process_collaboration.rs` and p
 
 ## 8. Gateway Examples
 
-BPMN gateways control the flow of execution through conditional branching and parallel execution. HENOS supports XOR (exclusive), AND (parallel), and OR (inclusive) gateways.
+BPMN gateways control the flow of execution through conditional branching and parallel execution. MUNUNU supports XOR (exclusive), AND (parallel), and OR (inclusive) gateways.
 
 ### 8.1 XOR Gateway (Exclusive Gateway)
 
-XOR gateways select exactly one path based on guard conditions. Create `/tmp/henos_tutorial/xor_gateway.json`:
+XOR gateways select exactly one path based on guard conditions. Create `/tmp/mununu_tutorial/xor_gateway.json`:
 
 ```json
 {
@@ -970,9 +970,9 @@ XOR gateways select exactly one path based on guard conditions. Create `/tmp/hen
 **Translate and inspect:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/xor_gateway.json \
-  --output /tmp/henos_tutorial/xor_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/xor_gateway.json \
+  --output /tmp/mununu_tutorial/xor_out \
   --name PriorityRouting \
   --force \
   --print-structure
@@ -981,8 +981,8 @@ cargo run --bin henos -- translate bpm \
 **Verify gateway behavior:**
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/xor_out/PriorityRouting.ctxdsl \
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/xor_out/PriorityRouting.ctxdsl \
   --print-structure
 ```
 
@@ -998,7 +998,7 @@ You should see:
 
 ### 8.2 AND Gateway (Parallel Gateway)
 
-AND gateways execute all branches concurrently. Create `/tmp/henos_tutorial/parallel_gateway.json`:
+AND gateways execute all branches concurrently. Create `/tmp/mununu_tutorial/parallel_gateway.json`:
 
 ```json
 {
@@ -1045,9 +1045,9 @@ AND gateways execute all branches concurrently. Create `/tmp/henos_tutorial/para
 **Translate and verify:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/parallel_gateway.json \
-  --output /tmp/henos_tutorial/parallel_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/parallel_gateway.json \
+  --output /tmp/mununu_tutorial/parallel_out \
   --name ParallelProcessing \
   --force \
   --print-structure
@@ -1061,7 +1061,7 @@ cargo run --bin henos -- translate bpm \
 
 ### 8.3 OR Gateway (Inclusive Gateway)
 
-OR gateways execute one or more branches based on conditions. Create `/tmp/henos_tutorial/or_gateway.json`:
+OR gateways execute one or more branches based on conditions. Create `/tmp/mununu_tutorial/or_gateway.json`:
 
 ```json
 {
@@ -1120,11 +1120,11 @@ OR gateways execute one or more branches based on conditions. Create `/tmp/henos
 
 ## 9. State Unrolling (Abstraction) Examples
 
-When a BPMN model contains variables, HENOS automatically applies state unrolling to expand the state space by incorporating variable values into state names. This eliminates explicit variables in the generated CLTS and enables precise guard evaluation.
+When a BPMN model contains variables, MUNUNU automatically applies state unrolling to expand the state space by incorporating variable values into state names. This eliminates explicit variables in the generated CLTS and enables precise guard evaluation.
 
 ### 9.1 Simple Unrolling Example
 
-Create `/tmp/henos_tutorial/simple_unroll.json`:
+Create `/tmp/mununu_tutorial/simple_unroll.json`:
 
 ```json
 {
@@ -1158,9 +1158,9 @@ Create `/tmp/henos_tutorial/simple_unroll.json`:
 **Translate with structure inspection:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/simple_unroll.json \
-  --output /tmp/henos_tutorial/unroll_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/simple_unroll.json \
+  --output /tmp/mununu_tutorial/unroll_out \
   --name CounterProcess \
   --force \
   --print-structure
@@ -1186,9 +1186,9 @@ To see the difference, temporarily remove the `variables` field and translate ag
 Use the provided example `tests/data/bpm/realizable/loan_processing.json`:
 
 ```bash
-cargo run --bin henos -- translate bpm \
+cargo run --bin mununu -- translate bpm \
   --input tests/data/bpm/realizable/loan_processing.json \
-  --output /tmp/henos_tutorial/loan_out \
+  --output /tmp/mununu_tutorial/loan_out \
   --name LoanProcessing \
   --force \
   --print-structure
@@ -1197,9 +1197,9 @@ cargo run --bin henos -- translate bpm \
 **Inspect the unrolled structure:**
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/loan_out/LoanProcessing.ctxdsl \
-  --sidecar /tmp/henos_tutorial/loan_out/LoanProcessing_properties.ctxdsl \
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/loan_out/LoanProcessing.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/loan_out/LoanProcessing_properties.ctxdsl \
   --print-structure
 ```
 
@@ -1211,7 +1211,7 @@ cargo run --bin henos -- context summarize \
 
 ### 9.3 Unrolling with Unreachable States
 
-Some models produce empty transition sets when unrolling, indicating that no transitions are reachable from the initial state. Create `/tmp/henos_tutorial/unreachable_unroll.json`:
+Some models produce empty transition sets when unrolling, indicating that no transitions are reachable from the initial state. Create `/tmp/mununu_tutorial/unreachable_unroll.json`:
 
 ```json
 {
@@ -1237,9 +1237,9 @@ Some models produce empty transition sets when unrolling, indicating that no tra
 **Translate and observe fallback:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/unreachable_unroll.json \
-  --output /tmp/henos_tutorial/unreachable_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/unreachable_unroll.json \
+  --output /tmp/mununu_tutorial/unreachable_out \
   --name UnreachableEscalation \
   --force \
   --print-structure
@@ -1261,7 +1261,7 @@ cargo run --bin henos -- translate bpm \
 
 ## 10. Guard Handling Examples
 
-HENOS uses a two-phase approach for guard handling:
+MUNUNU uses a two-phase approach for guard handling:
 - **Phase 1 (Build-time)**: Static guards (`guard: true`, `guard: false`) are filtered
 - **Phase 2 (Runtime)**: Dynamic guards are evaluated using guard predicates
 
@@ -1269,7 +1269,7 @@ HENOS uses a two-phase approach for guard handling:
 
 **Static `guard: false` (always disabled):**
 
-Create `/tmp/henos_tutorial/static_false_guard.json`:
+Create `/tmp/mununu_tutorial/static_false_guard.json`:
 
 ```json
 {
@@ -1299,9 +1299,9 @@ Create `/tmp/henos_tutorial/static_false_guard.json`:
 **Translate and verify filtering:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/static_false_guard.json \
-  --output /tmp/henos_tutorial/static_false_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/static_false_guard.json \
+  --output /tmp/mununu_tutorial/static_false_out \
   --name DisabledPath \
   --force \
   --print-structure
@@ -1320,7 +1320,7 @@ The transition with `guard: true` is included in the CLTS without a guard predic
 
 **Dynamic guards (state-dependent):**
 
-Create `/tmp/henos_tutorial/dynamic_guard.json`:
+Create `/tmp/mununu_tutorial/dynamic_guard.json`:
 
 ```json
 {
@@ -1355,9 +1355,9 @@ Create `/tmp/henos_tutorial/dynamic_guard.json`:
 **Translate and inspect:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/dynamic_guard.json \
-  --output /tmp/henos_tutorial/dynamic_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/dynamic_guard.json \
+  --output /tmp/mununu_tutorial/dynamic_out \
   --name ConditionalRouting \
   --force \
   --print-structure
@@ -1371,9 +1371,9 @@ cargo run --bin henos -- translate bpm \
 **Evaluate guard predicates:**
 
 ```bash
-cargo run --bin henos -- context summarize \
-  /tmp/henos_tutorial/dynamic_out/ConditionalRouting.ctxdsl \
-  --sidecar /tmp/henos_tutorial/dynamic_out/ConditionalRouting_guards.ctxdsl \
+cargo run --bin mununu -- context summarize \
+  /tmp/mununu_tutorial/dynamic_out/ConditionalRouting.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/dynamic_out/ConditionalRouting_guards.ctxdsl \
   --print-structure
 ```
 
@@ -1381,7 +1381,7 @@ The summary shows guard predicates like `Process_Check_route_a_guard_0` that tra
 
 ### 10.3 Mixed Static and Dynamic Guards
 
-Create `/tmp/henos_tutorial/mixed_guards.json`:
+Create `/tmp/mununu_tutorial/mixed_guards.json`:
 
 ```json
 {
@@ -1423,9 +1423,9 @@ Create `/tmp/henos_tutorial/mixed_guards.json`:
 **Translate and analyze:**
 
 ```bash
-cargo run --bin henos -- translate bpm \
-  --input /tmp/henos_tutorial/mixed_guards.json \
-  --output /tmp/henos_tutorial/mixed_out \
+cargo run --bin mununu -- translate bpm \
+  --input /tmp/mununu_tutorial/mixed_guards.json \
+  --output /tmp/mununu_tutorial/mixed_out \
   --name MixedGuards \
   --force \
   --print-structure
@@ -1439,9 +1439,9 @@ cargo run --bin henos -- translate bpm \
 **Test guard evaluation:**
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/mixed_out/MixedGuards.ctxdsl \
-  --sidecar /tmp/henos_tutorial/mixed_out/MixedGuards_guards.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/mixed_out/MixedGuards.ctxdsl \
+  --sidecar /tmp/mununu_tutorial/mixed_out/MixedGuards_guards.ctxdsl \
   --formula reachability \
   --automaton Process \
   --print-structure
@@ -1461,7 +1461,7 @@ The `[]` operator requires that **all** transitions (grouped by uncontrollable l
 
 #### 11.1.1 Box with All Uncontrollable Actions (Validating)
 
-Create `/tmp/henos_tutorial/box_all_unctrl_valid.ctxdsl`:
+Create `/tmp/mununu_tutorial/box_all_unctrl_valid.ctxdsl`:
 
 ```ctxdsl
 context box_all_unctrl_valid {
@@ -1510,8 +1510,8 @@ context box_all_unctrl_valid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/box_all_unctrl_valid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/box_all_unctrl_valid.ctxdsl \
   --formula all_paths_good \
   --automaton System \
   --print-structure
@@ -1521,7 +1521,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.1.2 Box with All Uncontrollable Actions (Invalidating)
 
-Create `/tmp/henos_tutorial/box_all_unctrl_invalid.ctxdsl`:
+Create `/tmp/mununu_tutorial/box_all_unctrl_invalid.ctxdsl`:
 
 ```ctxdsl
 context box_all_unctrl_invalid {
@@ -1569,8 +1569,8 @@ context box_all_unctrl_invalid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/box_all_unctrl_invalid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/box_all_unctrl_invalid.ctxdsl \
   --formula all_paths_good \
   --automaton System
 ```
@@ -1579,7 +1579,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.1.3 Box with All Controllable Actions (Validating)
 
-Create `/tmp/henos_tutorial/box_all_ctrl_valid.ctxdsl`:
+Create `/tmp/mununu_tutorial/box_all_ctrl_valid.ctxdsl`:
 
 ```ctxdsl
 context box_all_ctrl_valid {
@@ -1628,8 +1628,8 @@ context box_all_ctrl_valid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/box_all_ctrl_valid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/box_all_ctrl_valid.ctxdsl \
   --formula all_paths_good \
   --automaton System
 ```
@@ -1638,7 +1638,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.1.4 Box with All Controllable Actions (Invalidating)
 
-Create `/tmp/henos_tutorial/box_all_ctrl_invalid.ctxdsl`:
+Create `/tmp/mununu_tutorial/box_all_ctrl_invalid.ctxdsl`:
 
 ```ctxdsl
 context box_all_ctrl_invalid {
@@ -1686,8 +1686,8 @@ context box_all_ctrl_invalid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/box_all_ctrl_invalid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/box_all_ctrl_invalid.ctxdsl \
   --formula all_paths_good \
   --automaton System
 ```
@@ -1696,7 +1696,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.1.5 Box with Mixed Controllable/Uncontrollable (Validating - Skolem Test)
 
-Create `/tmp/henos_tutorial/box_mixed_valid.ctxdsl`:
+Create `/tmp/mununu_tutorial/box_mixed_valid.ctxdsl`:
 
 ```ctxdsl
 context box_mixed_valid {
@@ -1747,8 +1747,8 @@ context box_mixed_valid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/box_mixed_valid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/box_mixed_valid.ctxdsl \
   --formula all_paths_good \
   --automaton System \
   --print-structure
@@ -1763,7 +1763,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.1.6 Box with Mixed Controllable/Uncontrollable (Invalidating - Skolem Test)
 
-Create `/tmp/henos_tutorial/box_mixed_invalid.ctxdsl`:
+Create `/tmp/mununu_tutorial/box_mixed_invalid.ctxdsl`:
 
 ```ctxdsl
 context box_mixed_invalid {
@@ -1813,8 +1813,8 @@ context box_mixed_invalid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/box_mixed_invalid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/box_mixed_invalid.ctxdsl \
   --formula all_paths_good \
   --automaton System
 ```
@@ -1827,7 +1827,7 @@ The `<>` operator requires that **at least one** transition (in each group of tr
 
 #### 11.2.1 Diamond with All Uncontrollable Actions (Validating)
 
-Create `/tmp/henos_tutorial/diamond_all_unctrl_valid.ctxdsl`:
+Create `/tmp/mununu_tutorial/diamond_all_unctrl_valid.ctxdsl`:
 
 ```ctxdsl
 context diamond_all_unctrl_valid {
@@ -1873,8 +1873,8 @@ context diamond_all_unctrl_valid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/diamond_all_unctrl_valid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/diamond_all_unctrl_valid.ctxdsl \
   --formula some_path_good \
   --automaton System
 ```
@@ -1883,7 +1883,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.2.2 Diamond with All Uncontrollable Actions (Invalidating)
 
-Create `/tmp/henos_tutorial/diamond_all_unctrl_invalid.ctxdsl`:
+Create `/tmp/mununu_tutorial/diamond_all_unctrl_invalid.ctxdsl`:
 
 ```ctxdsl
 context diamond_all_unctrl_invalid {
@@ -1930,8 +1930,8 @@ context diamond_all_unctrl_invalid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/diamond_all_unctrl_invalid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/diamond_all_unctrl_invalid.ctxdsl \
   --formula some_path_good \
   --automaton System
 ```
@@ -1940,7 +1940,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.2.3 Diamond with All Controllable Actions (Validating)
 
-Create `/tmp/henos_tutorial/diamond_all_ctrl_valid.ctxdsl`:
+Create `/tmp/mununu_tutorial/diamond_all_ctrl_valid.ctxdsl`:
 
 ```ctxdsl
 context diamond_all_ctrl_valid {
@@ -1986,8 +1986,8 @@ context diamond_all_ctrl_valid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/diamond_all_ctrl_valid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/diamond_all_ctrl_valid.ctxdsl \
   --formula some_path_good \
   --automaton System
 ```
@@ -1996,7 +1996,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.2.4 Diamond with All Controllable Actions (Invalidating)
 
-Create `/tmp/henos_tutorial/diamond_all_ctrl_invalid.ctxdsl`:
+Create `/tmp/mununu_tutorial/diamond_all_ctrl_invalid.ctxdsl`:
 
 ```ctxdsl
 context diamond_all_ctrl_invalid {
@@ -2043,8 +2043,8 @@ context diamond_all_ctrl_invalid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/diamond_all_ctrl_invalid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/diamond_all_ctrl_invalid.ctxdsl \
   --formula some_path_good \
   --automaton System
 ```
@@ -2053,7 +2053,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.2.5 Diamond with Mixed Controllable/Uncontrollable (Validating - Skolem Test)
 
-Create `/tmp/henos_tutorial/diamond_mixed_valid.ctxdsl`:
+Create `/tmp/mununu_tutorial/diamond_mixed_valid.ctxdsl`:
 
 ```ctxdsl
 context diamond_mixed_valid {
@@ -2105,8 +2105,8 @@ context diamond_mixed_valid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/diamond_mixed_valid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/diamond_mixed_valid.ctxdsl \
   --formula some_path_good \
   --automaton System \
   --print-structure
@@ -2124,7 +2124,7 @@ cargo run --bin henos -- context eval \
 
 #### 11.2.6 Diamond with Mixed Controllable/Uncontrollable (Invalidating - Skolem Test)
 
-Create `/tmp/henos_tutorial/diamond_mixed_invalid.ctxdsl`:
+Create `/tmp/mununu_tutorial/diamond_mixed_invalid.ctxdsl`:
 
 ```ctxdsl
 context diamond_mixed_invalid {
@@ -2172,8 +2172,8 @@ context diamond_mixed_invalid {
 **Evaluate**:
 
 ```bash
-cargo run --bin henos -- context eval \
-  /tmp/henos_tutorial/diamond_mixed_invalid.ctxdsl \
+cargo run --bin mununu -- context eval \
+  /tmp/mununu_tutorial/diamond_mixed_invalid.ctxdsl \
   --formula some_path_good \
   --automaton System
 ```
@@ -2207,10 +2207,10 @@ cargo run --bin henos -- context eval \
 ## 12. Summary
 
 - **Modeling**: author `.ctxdsl` contexts + sidecars with your editor.
-- **Verification**: `henos context eval` for formula checks; `context synth` for GR(1) realizability + diagnostics.
+- **Verification**: `mununu context eval` for formula checks; `context synth` for GR(1) realizability + diagnostics.
 - **LTL → μ-calculus**: reuse the cheatsheet patterns; synchronous examples (elevator) and asynchronous BPMN translations demonstrate both safety/liveness cases.
 - **Diagnosis**: enable `--counterexample` / `--deadlock-traces` to capture artifacts for unrealizable specs.
-- **BPM translation**: `henos translate bpm` + `context summarize` gives end-to-end visibility from BPMN to CLTS.
+- **BPM translation**: `mununu translate bpm` + `context summarize` gives end-to-end visibility from BPMN to CLTS.
 - **Gateways**: XOR (exclusive), AND (parallel), and OR (inclusive) gateways control flow through conditional branching and parallel execution.
 - **State unrolling**: Automatic abstraction when variables are present, expanding state space by encoding variable values in state names.
 - **Guard handling**: Two-phase approach with static guard filtering at build time and dynamic guard evaluation at runtime.

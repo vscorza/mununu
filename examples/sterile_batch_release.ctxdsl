@@ -7,7 +7,7 @@
 //
 // Compliance requires that no shipment leaves the cold-chain warehouse before QC passes and a
 // QP signs off; conversely every batch marked "ready" must eventually be released or quarantined.
-// This context models the workflow as CLTS components so the Henos verifier can evaluate the
+// This context models the workflow as CLTS components so the Mununu verifier can evaluate the
 // relevant μ-calculus properties and synthesise controllers enforcing the policy.
 context sterile_batch_release {
     alphabet {

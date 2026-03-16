@@ -1,6 +1,6 @@
 ## Abstraction and State Unrolling
 
-This document describes the abstraction layer used by Henos to handle state
+This document describes the abstraction layer used by Mununu to handle state
 variables, dynamic guards, and effects during unrolling. It is intended for
 contributors who want to understand or extend the implementation in
 `src/abstraction/*`.
@@ -220,8 +220,8 @@ Sidecar DSL files and predicates interact with unrolled states via pattern
 matching (see `context_dsl::state_matching::StateNameMatcher`), so structural
 predicates remain stable under unrolling.
 
-On the CLI side, nothing special is required: the `henos context ...` and
-`henos translate ...` commands simply operate on the realized CLTS, which may
+On the CLI side, nothing special is required: the `mununu context ...` and
+`mununu translate ...` commands simply operate on the realized CLTS, which may
 have been produced via unrolling.
 
 ---

@@ -1,0 +1,33 @@
+context CompensationCompletesExample {
+    alphabet {
+        label start_capture_payment;
+        label capture_success;
+        label start_ship_goods;
+        label ship_completed;
+        label compensation_triggered_sig;
+        label compensation_completed_sig;
+    }
+
+    automata {
+        automaton Process {
+            states {
+                state Order_Ready initial;
+                state Capturing;
+                state Ready_to_Ship;
+                state Shipping;
+                state Compensation_In_Progress;
+                state Completed;
+            }
+
+            transitions {
+                transition Order_Ready -> Capturing on label start_capture_payment;
+                transition Capturing -> Ready_to_Ship on label capture_success;
+                transition Ready_to_Ship -> Shipping on label start_ship_goods;
+                transition Shipping -> Completed on label ship_completed;
+
+                transition Capturing -> Compensation_In_Progress on label compensation_triggered_sig;
+                transition Compensation_In_Progress -> Completed on label compensation_completed_sig;
+            }
+        }
+    }
+}

@@ -1,0 +1,27 @@
+context NoDeadTasksExample {
+    alphabet {
+        label start_review_application;
+        label complete_review_application;
+        label start_background_check;
+        label complete_background_check;
+    }
+
+    automata {
+        automaton Process {
+            states {
+                state Submission initial;
+                state Review_In_Progress;
+                state Review_Done;
+                state Background_Check_In_Progress;
+                state Completed;
+            }
+
+            transitions {
+                transition Submission -> Review_In_Progress on label start_review_application;
+                transition Review_In_Progress -> Review_Done on label complete_review_application;
+                transition Review_Done -> Background_Check_In_Progress on label start_background_check;
+                transition Background_Check_In_Progress -> Completed on label complete_background_check;
+            }
+        }
+    }
+}
