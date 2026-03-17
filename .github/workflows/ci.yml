@@ -25,6 +25,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --lib --bins --tests --examples -- --nocapture
+      - name: Test API module
+        run: cargo test --lib api --features api
 
   security-audit:
     runs-on: ubuntu-latest

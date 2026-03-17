@@ -1,0 +1,57 @@
+// Req/Ack Handshake Protocol (from hw-verification-uba lab01)
+//
+// 4-state FSM modeling a request/acknowledge handshake with latency.
+// The environment controls the `req` signal; the controller manages
+// ack assertion and state transitions.
+//
+// Protocol:
+//   1. Environment asserts req (IDLE -> WAIT_ACK)
+//   2. Controller counts latency cycles (WAIT_ACK ticks)
+//   3. Controller asserts ack (WAIT_ACK -> ACTIVE)
+//   4. Environment deasserts req (ACTIVE -> DONE)
+//   5. Controller deasserts ack, returns to IDLE (DONE -> IDLE)
+
+context handshake {
+    alphabet {
+        label req_assert;
+        label req_deassert;
+        label latency_tick;
+        label ack_assert;
+        label ack_deassert;
+    }
+
+    automata {
+        automaton Handshake {
+            controllable {
+                label ack_assert;
+                label ack_deassert;
+                label latency_tick;
+            }
+
+            states {
+                state Idle initial;
+                state WaitAck;
+                state Active;
+                state Done;
+            }
+
+            transitions {
+                // Environment raises request
+                transition Idle -> WaitAck on label req_assert;
+                // Idle self-loop: no request yet
+                transition Idle -> Idle on label latency_tick;
+
+                // Controller counts latency cycles
+                transition WaitAck -> WaitAck on label latency_tick;
+                // Controller asserts ack after latency
+                transition WaitAck -> Active on label ack_assert;
+
+                // Active: ack held high, waiting for req deassert
+                transition Active -> Done on label req_deassert;
+
+                // Done: controller deasserts ack, return to idle
+                transition Done -> Idle on label ack_deassert;
+            }
+        }
+    }
+}

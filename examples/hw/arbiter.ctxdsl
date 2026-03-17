@@ -1,0 +1,51 @@
+// Round-Robin Arbiter (from hw-verification-uba lab02)
+//
+// 2-client arbiter with round-robin priority. When both clients request
+// simultaneously, the arbiter grants the client that was NOT granted last.
+// Grants are held until the requesting client deasserts.
+//
+// Key property: mutual exclusion — grant_a and grant_b never both high.
+
+context arbiter {
+    alphabet {
+        label req_a;
+        label req_b;
+        label grant_a;
+        label grant_b;
+        label release_a;
+        label release_b;
+    }
+
+    automata {
+        automaton Arbiter {
+            controllable {
+                label grant_a;
+                label grant_b;
+            }
+
+            states {
+                state Idle initial;
+                state GrantA;
+                state GrantB;
+            }
+
+            transitions {
+                // From Idle: grant based on requests
+                transition Idle -> GrantA on label req_a;
+                transition Idle -> GrantB on label req_b;
+                // Arbitration happens at decision point (both requests)
+                transition Idle -> GrantA on label grant_a;
+                transition Idle -> GrantB on label grant_b;
+
+                // Hold grant while request active
+                transition GrantA -> GrantA on label req_a;
+                // Release when request drops
+                transition GrantA -> Idle on label release_a;
+
+                // Same for client B
+                transition GrantB -> GrantB on label req_b;
+                transition GrantB -> Idle on label release_b;
+            }
+        }
+    }
+}

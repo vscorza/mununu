@@ -1,0 +1,44 @@
+// Properties for Ready/Valid Adapter
+//
+// Protocol correctness properties derived from lab09 props.sv assertions.
+
+context rv_adapter_properties {
+    mu_formulas {
+        // Safety invariant: the adapter is always in a valid state.
+        formula safety_invariant {
+            over RvAdapter;
+            body = nu X. ([] X);
+        }
+
+        // Reachability: the Full state is reachable (buffer can be used).
+        formula buffer_reachable {
+            over RvAdapter;
+            body = mu X. (Full || <> X);
+        }
+
+        // Full cycle: the adapter can always return to Empty from any state.
+        formula cycle_completes {
+            over RvAdapter;
+            body = mu X. (Empty || <> X);
+        }
+
+        // Drain: from Full, Empty is reachable (buffer can be drained).
+        formula drain_possible {
+            over RvAdapter;
+            body = (! Full) || (mu Y. (Empty || <> Y));
+        }
+
+        // Push: from Empty, Full is reachable (buffer can capture data).
+        formula push_possible {
+            over RvAdapter;
+            body = (! Empty) || (mu Y. (Full || <> Y));
+        }
+    }
+
+    controllers {
+        controller safe_adapter {
+            source RvAdapter;
+            satisfying safety_invariant;
+        }
+    }
+}

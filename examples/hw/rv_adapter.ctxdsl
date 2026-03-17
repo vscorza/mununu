@@ -1,0 +1,50 @@
+// Ready/Valid Adapter with Skid Buffer (from hw-verification-uba lab09)
+//
+// 2-state FSM that converts a simple valid-only producer to a
+// ready/valid (backpressured) consumer interface using a skid buffer.
+//
+// When the consumer deasserts ready while data is valid, the adapter
+// captures the data in a buffer (EMPTY -> FULL). When ready reasserts,
+// the buffered data is sent (FULL -> EMPTY).
+//
+// The environment controls in_valid and out_ready signals.
+
+context rv_adapter {
+    alphabet {
+        label push;
+        label drain;
+        label passthrough;
+        label idle;
+    }
+
+    automata {
+        automaton RvAdapter {
+            controllable {
+                label push;
+                label drain;
+                label passthrough;
+            }
+
+            states {
+                state Empty initial;
+                state Full;
+            }
+
+            transitions {
+                // EMPTY state: buffer is empty
+                // Passthrough: data flows directly (valid && ready)
+                transition Empty -> Empty on label passthrough;
+                // Push: data captured in buffer (valid && !ready)
+                transition Empty -> Full on label push;
+                // Idle: no data (no valid)
+                transition Empty -> Empty on label idle;
+
+                // FULL state: buffer holds data
+                // Drain: consumer accepts buffered data (ready asserted)
+                transition Full -> Empty on label drain;
+                // Stay full if consumer not ready
+                transition Full -> Full on label idle;
+            }
+        }
+    }
+}

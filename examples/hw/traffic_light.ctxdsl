@@ -1,0 +1,50 @@
+// Traffic Light Controller (from hw-verification-uba lab05)
+//
+// 4-state FSM with timer-driven transitions. The light cycles through
+// GREEN -> YELLOW -> RED -> RED_WAIT, then waits for a sensor signal
+// before returning to GREEN.
+//
+// The environment controls the sensor; the controller manages the
+// light state and timer. Timer expiration is modeled as a label.
+
+context traffic_light {
+    alphabet {
+        label timer_tick;
+        label timer_expire;
+        label sensor_trigger;
+    }
+
+    automata {
+        automaton TrafficLight {
+            controllable {
+                label timer_expire;
+            }
+
+            states {
+                state Green initial;
+                state Yellow;
+                state Red;
+                state RedWait;
+            }
+
+            transitions {
+                // GREEN phase: timer counts down
+                transition Green -> Green on label timer_tick;
+                transition Green -> Yellow on label timer_expire;
+
+                // YELLOW phase: timer counts down
+                transition Yellow -> Yellow on label timer_tick;
+                transition Yellow -> Red on label timer_expire;
+
+                // RED phase: timer counts down
+                transition Red -> Red on label timer_tick;
+                transition Red -> RedWait on label timer_expire;
+
+                // RED_WAIT: waiting for sensor (environment input)
+                transition RedWait -> Green on label sensor_trigger;
+                // Stay in RedWait if no sensor
+                transition RedWait -> RedWait on label timer_tick;
+            }
+        }
+    }
+}

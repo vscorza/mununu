@@ -15,6 +15,9 @@ pub mod ltl;
 pub mod mu_calculus;
 pub mod persistence;
 
+#[cfg(feature = "api")]
+pub mod api;
+
 /// Temporary placeholder to ensure the crate builds.
 pub fn init() {}
 

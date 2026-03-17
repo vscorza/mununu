@@ -40,6 +40,13 @@ enum Commands {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    #[cfg(feature = "api")]
+    /// Start HTTP API server
+    Server {
+        /// Server address (default: 127.0.0.1:8080)
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -255,6 +262,20 @@ fn init_tracing() {
 fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(command),
+        #[cfg(feature = "api")]
+        Commands::Server { addr } => {
+            use std::net::SocketAddr;
+            let addr: SocketAddr = addr
+                .parse()
+                .map_err(|e| format!("Invalid address: {}", e))?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Failed to create runtime: {}", e))?;
+            rt.block_on(mununu::api::start_server(addr))
+                .map_err(|e| format!("Server error: {}", e))?;
+            Ok(())
+        }
     }
 }
 
