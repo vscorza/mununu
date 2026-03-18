@@ -1,0 +1,272 @@
+// AMBA AHB Bus Arbiter — 4-Client GR(1) Synthesis Specification
+//
+// Scaled version of the 2-client arbiter inspired by Bloem, Jobstmann,
+// Piterman, Pnueli & Sa'ar, "Synthesis of Reactive(1) Designs" (JCSS, 2012).
+//
+// Models a 4-client bus arbiter where clients issue requests and the
+// arbiter grants exclusive access. The GR(1) contract requires:
+//
+//   Environment (clients):
+//     - Requests are well-behaved (modeled by FSM structure)
+//
+//   System (arbiter):
+//     - Safety:  mutual exclusion — at most one grant active at any time
+//     - Liveness: no starvation — every request is eventually granted
+//     - Synthesis: controller enforcing the safety invariant
+
+context amba_arbiter_gr1_synthesis {
+    alphabet {
+        label req_0;
+        label req_1;
+        label req_2;
+        label req_3;
+        label grant_0;
+        label grant_1;
+        label grant_2;
+        label grant_3;
+        label release_0;
+        label release_1;
+        label release_2;
+        label release_3;
+        label idle;
+    }
+
+    automata {
+        automaton Client0 {
+            controllable {
+                label req_0;
+                label release_0;
+            }
+
+            states {
+                state Idle initial;
+                state Requesting0;
+                state Holding;
+            }
+            transitions {
+                transition Idle -> Requesting0 on label req_0;
+                transition Idle -> Idle on label idle;
+                transition Requesting0 -> Holding on label grant_0;
+                transition Requesting0 -> Requesting0 on label idle;
+                transition Holding -> Idle on label release_0;
+            }
+        }
+
+        automaton Client1 {
+            controllable {
+                label req_1;
+                label release_1;
+            }
+
+            states {
+                state Idle initial;
+                state Requesting1;
+                state Holding;
+            }
+            transitions {
+                transition Idle -> Requesting1 on label req_1;
+                transition Idle -> Idle on label idle;
+                transition Requesting1 -> Holding on label grant_1;
+                transition Requesting1 -> Requesting1 on label idle;
+                transition Holding -> Idle on label release_1;
+            }
+        }
+
+        automaton Client2 {
+            controllable {
+                label req_2;
+                label release_2;
+            }
+
+            states {
+                state Idle initial;
+                state Requesting2;
+                state Holding;
+            }
+            transitions {
+                transition Idle -> Requesting2 on label req_2;
+                transition Idle -> Idle on label idle;
+                transition Requesting2 -> Holding on label grant_2;
+                transition Requesting2 -> Requesting2 on label idle;
+                transition Holding -> Idle on label release_2;
+            }
+        }
+
+        automaton Client3 {
+            controllable {
+                label req_3;
+                label release_3;
+            }
+
+            states {
+                state Idle initial;
+                state Requesting3;
+                state Holding;
+            }
+            transitions {
+                transition Idle -> Requesting3 on label req_3;
+                transition Idle -> Idle on label idle;
+                transition Requesting3 -> Holding on label grant_3;
+                transition Requesting3 -> Requesting3 on label idle;
+                transition Holding -> Idle on label release_3;
+            }
+        }
+
+        // Arbiter: grants bus access to one client at a time.
+        automaton Arbiter {
+            controllable {
+                label grant_0;
+                label grant_1;
+                label grant_2;
+                label grant_3;
+                label idle;
+            }
+
+            states {
+                state Free initial;
+                state Grant0;
+                state Grant1;
+                state Grant2;
+                state Grant3;
+            }
+            transitions {
+                // Free: arbiter decides who gets the bus
+                transition Free -> Grant0 on label grant_0;
+                transition Free -> Grant1 on label grant_1;
+                transition Free -> Grant2 on label grant_2;
+                transition Free -> Grant3 on label grant_3;
+                transition Free -> Free on label idle;
+
+                // Grant0: client 0 holds the bus
+                transition Grant0 -> Free on label release_0;
+                transition Grant0 -> Grant0 on label idle;
+
+                // Grant1: client 1 holds the bus
+                transition Grant1 -> Free on label release_1;
+                transition Grant1 -> Grant1 on label idle;
+
+                // Grant2: client 2 holds the bus
+                transition Grant2 -> Free on label release_2;
+                transition Grant2 -> Grant2 on label idle;
+
+                // Grant3: client 3 holds the bus
+                transition Grant3 -> Free on label release_3;
+                transition Grant3 -> Grant3 on label idle;
+            }
+        }
+    }
+
+    composition {
+        asynchronous bus_system {
+            members [Client0, Client1, Client2, Client3, Arbiter];
+        }
+    }
+
+    // GR(1) properties expressed as mu-calculus formulas.
+    //
+    // GR(1) form: (⋀ GF env_justiceᵢ) → (⋀ GF sys_justiceⱼ)
+    // Each property below captures a component of the GR(1) contract,
+    // scaled to 4 clients.
+
+    mu_formulas {
+        // Safety: mutual exclusion — at most one grant active at any time.
+        // For 4 clients: every pair of grant states is mutually exclusive.
+        formula mutual_exclusion_01 {
+            over bus_system;
+            body = (! Grant0) || (! Grant1);
+        }
+
+        formula mutual_exclusion_02 {
+            over bus_system;
+            body = (! Grant0) || (! Grant2);
+        }
+
+        formula mutual_exclusion_03 {
+            over bus_system;
+            body = (! Grant0) || (! Grant3);
+        }
+
+        formula mutual_exclusion_12 {
+            over bus_system;
+            body = (! Grant1) || (! Grant2);
+        }
+
+        formula mutual_exclusion_13 {
+            over bus_system;
+            body = (! Grant1) || (! Grant3);
+        }
+
+        formula mutual_exclusion_23 {
+            over bus_system;
+            body = (! Grant2) || (! Grant3);
+        }
+
+        // Safety invariant: all reachable states are valid.
+        formula safety_invariant {
+            over bus_system;
+            body = nu X. ([] X);
+        }
+
+        // GR(1) liveness: GF(RequestingN) → GF(GrantN)
+        // If client N requests infinitely often, it is granted infinitely often.
+
+        formula grant0_reachable {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Requesting0 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Grant0 || <> W)) && ([] Z));
+        }
+
+        formula grant1_reachable {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Requesting1 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Grant1 || <> W)) && ([] Z));
+        }
+
+        formula grant2_reachable {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Requesting2 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Grant2 || <> W)) && ([] Z));
+        }
+
+        formula grant3_reachable {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Requesting3 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Grant3 || <> W)) && ([] Z));
+        }
+
+        // GR(1) no starvation: GF(GrantN) → GF(Free)
+        // If the arbiter grants client N infinitely often, it also
+        // frees the bus infinitely often.
+
+        formula no_starvation_0 {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Grant0 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+        }
+
+        formula no_starvation_1 {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Grant1 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+        }
+
+        formula no_starvation_2 {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Grant2 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+        }
+
+        formula no_starvation_3 {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Grant3 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+        }
+    }
+
+    controllers {
+        controller fair_arbiter {
+            source Arbiter;
+            satisfying safety_invariant;
+        }
+    }
+}

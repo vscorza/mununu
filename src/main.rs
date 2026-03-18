@@ -945,13 +945,15 @@ fn context_graph(args: ContextGraphArgs) -> Result<(), String> {
                 &automata_to_visualize,
             )?;
             all_elements.extend(dsl_elements);
-            let unrolled_elements = unrolled_automata_to_cytoscape(
+            // Skip unrolled graph if automata have no variables to unroll
+            if let Ok(unrolled_elements) = unrolled_automata_to_cytoscape(
                 &context_doc,
                 &sidecar_docs,
                 &realized,
                 &automata_to_visualize,
-            )?;
-            all_elements.extend(unrolled_elements);
+            ) {
+                all_elements.extend(unrolled_elements);
+            }
         }
     }
 

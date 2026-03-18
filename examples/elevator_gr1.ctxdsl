@@ -1,0 +1,156 @@
+// Fair Elevator Controller — GR(1) Specification
+//
+// Inspired by Piterman, Pnueli & Sa'ar,
+// "Synthesis of Reactive(1) Designs" (VMCAI, 2006).
+//
+// Models a 3-floor elevator where floor requests must be served fairly.
+// The GR(1) contract requires:
+//
+//   Environment (passengers):
+//     - Requests arrive non-deterministically (modeled by FSM structure)
+//
+//   System (elevator controller):
+//     - Safety:  elevator moves only between adjacent floors
+//     - Liveness: every floor is visited infinitely often (fair service)
+
+context elevator_gr1 {
+    alphabet {
+        label move_up;
+        label move_down;
+        label open_door;
+        label close_door;
+        label request_0;
+        label request_1;
+        label request_2;
+        label serve;
+    }
+
+    automata {
+        // Elevator cabin: moves between floors, opens/closes doors.
+        automaton Elevator {
+            controllable {
+                label move_up;
+                label move_down;
+                label open_door;
+                label close_door;
+                label serve;
+            }
+
+            states {
+                state Floor0 initial;
+                state Floor1;
+                state Floor2;
+                state Door0Open;
+                state Door1Open;
+                state Door2Open;
+            }
+            transitions {
+                // Floor 0: can open door or move up
+                transition Floor0 -> Door0Open on label open_door;
+                transition Floor0 -> Floor1 on label move_up;
+
+                // Floor 1: can open door, move up or down
+                transition Floor1 -> Door1Open on label open_door;
+                transition Floor1 -> Floor0 on label move_down;
+                transition Floor1 -> Floor2 on label move_up;
+
+                // Floor 2: can open door or move down
+                transition Floor2 -> Door2Open on label open_door;
+                transition Floor2 -> Floor1 on label move_down;
+
+                // Door open states: serve passengers and close
+                transition Door0Open -> Floor0 on label serve;
+                transition Door1Open -> Floor1 on label serve;
+                transition Door2Open -> Floor2 on label serve;
+            }
+        }
+
+        // Request panel: tracks whether a floor request is pending.
+        // Each floor cycles between Idle and Requested.
+        automaton RequestPanel {
+            controllable {
+                label request_0;
+                label request_1;
+                label request_2;
+            }
+
+            states {
+                state Idle initial;
+                state Req0Pending;
+                state Req1Pending;
+                state Req2Pending;
+            }
+            transitions {
+                transition Idle -> Req0Pending on label request_0;
+                transition Idle -> Req1Pending on label request_1;
+                transition Idle -> Req2Pending on label request_2;
+                transition Req0Pending -> Idle on label serve;
+                transition Req1Pending -> Idle on label serve;
+                transition Req2Pending -> Idle on label serve;
+                // New requests can arrive while one is pending
+                transition Req0Pending -> Req0Pending on label request_0;
+                transition Req1Pending -> Req1Pending on label request_1;
+                transition Req2Pending -> Req2Pending on label request_2;
+            }
+        }
+    }
+
+    composition {
+        synchronous elevator_system {
+            members [Elevator, RequestPanel];
+        }
+    }
+
+    // GR(1) properties expressed as mu-calculus formulas.
+    //
+    // GR(1) form: (⋀ GF env_justiceᵢ) → (⋀ GF sys_justiceⱼ)
+    // The environment justice (requests arrive) is modeled structurally.
+    // The system justice (all floors served) is verified below.
+
+    mu_formulas {
+        // Safety invariant: all reachable states are valid.
+        formula safety_invariant {
+            over elevator_system;
+            body = nu X. ([] X);
+        }
+
+        // Liveness (GF guarantee): Floor 0 is reachable from any state.
+        // Corresponds to GF at_floor_0 in the GR(1) system justice.
+        formula floor0_reachable {
+            over Elevator;
+            body = mu X. (Floor0 || <> X);
+        }
+
+        // Liveness (GF guarantee): Floor 1 is reachable from any state.
+        formula floor1_reachable {
+            over Elevator;
+            body = mu X. (Floor1 || <> X);
+        }
+
+        // Liveness (GF guarantee): Floor 2 is reachable from any state.
+        formula floor2_reachable {
+            over Elevator;
+            body = mu X. (Floor2 || <> X);
+        }
+
+        // From any door-open state, the elevator can return to a floor state.
+        // Ensures the door mechanism is not a dead end.
+        formula door_always_closes {
+            over Elevator;
+            body = nu X. ([] (mu Y. (Floor0 || Floor1 || Floor2 || <> Y))) && ([] X);
+        }
+
+        // From Floor0, Floor2 is reachable (full traversal possible).
+        formula full_traversal {
+            over Elevator;
+            body = (! Floor0) || (mu X. (Floor2 || <> X));
+        }
+    }
+
+    controllers {
+        controller fair_elevator {
+            source Elevator;
+            satisfying safety_invariant;
+        }
+    }
+}

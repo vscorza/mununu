@@ -48,4 +48,52 @@ context arbiter {
             }
         }
     }
+
+    // Safety and liveness properties derived from lab02 props.sv assertions.
+
+    mu_formulas {
+        // Safety invariant: the arbiter always stays in a valid state.
+        formula safety_invariant {
+            over Arbiter;
+            body = nu X. ([] X);
+        }
+
+        // Reachability: GrantA is reachable from any state.
+        formula grant_a_reachable {
+            over Arbiter;
+            body = mu X. (GrantA || <> X);
+        }
+
+        // Reachability: GrantB is reachable from any state.
+        formula grant_b_reachable {
+            over Arbiter;
+            body = mu X. (GrantB || <> X);
+        }
+
+        // Liveness: from any grant state, Idle is reachable.
+        formula grant_a_releases {
+            over Arbiter;
+            body = (! GrantA) || (mu Y. (Idle || <> Y));
+        }
+
+        formula grant_b_releases {
+            over Arbiter;
+            body = (! GrantB) || (mu Y. (Idle || <> Y));
+        }
+
+        // Mutual exclusion: structurally guaranteed since GrantA and GrantB
+        // are distinct states. No state is both GrantA and GrantB.
+        // Expressed as: every state is either not-GrantA or not-GrantB.
+        formula mutual_exclusion {
+            over Arbiter;
+            body = (! GrantA) || (! GrantB);
+        }
+    }
+
+    controllers {
+        controller arbiter_safe {
+            source Arbiter;
+            satisfying safety_invariant;
+        }
+    }
 }

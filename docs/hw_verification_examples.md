@@ -76,24 +76,20 @@ A 2-state FSM for backpressure handling:
 cd /path/to/mununu
 
 # Summarize a context
-cargo run -- context summarize examples/hw/handshake.ctxdsl \
-  --sidecar examples/hw/handshake_properties.ctxdsl
+cargo run -- context summarize examples/hw/handshake.ctxdsl
 
 # Evaluate a formula
 cargo run -- context eval examples/hw/handshake.ctxdsl \
-  --sidecar examples/hw/handshake_properties.ctxdsl \
   --formula ack_reachable \
   --automaton Handshake
 
 # Synthesize a controller
 cargo run -- context synth examples/hw/handshake.ctxdsl \
-  --sidecar examples/hw/handshake_properties.ctxdsl \
   --formula safety_invariant \
   --automaton Handshake
 
 # Generate graph visualization
 cargo run -- context graph examples/hw/handshake.ctxdsl \
-  --sidecar examples/hw/handshake_properties.ctxdsl \
   --output handshake_graph.html
 ```
 

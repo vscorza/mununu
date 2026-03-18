@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use crate::abstraction::unrolling::{
     Effect, OriginalState, OriginalTransition, UnrollingOptions, VariableDecl, unroll_states,
 };
+use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx};
 use crate::context_dsl::ast::{
     BinaryOp, Expr, ExprKind, StateRef, StateSelector, TransitionLabel, TypeName, UnaryOp,
 };
@@ -29,15 +30,34 @@ pub fn generate_graphs(
     automaton: Option<&str>,
     graph_types: &[GraphType],
 ) -> Result<(Vec<GraphData>, ContextSummary), String> {
-    // Determine which automata to visualize
+    // Determine which automata to visualize (including compositions)
+    let all_docs = std::iter::once(context_doc).chain(sidecar_docs.iter());
+
+    // Collect direct automata names
+    let direct_automata: HashSet<String> = all_docs
+        .clone()
+        .flat_map(|doc| doc.automata.iter().map(|a| a.name.name.clone()))
+        .collect();
+
+    // Collect composition names
+    let composition_names: HashSet<String> = all_docs
+        .flat_map(|doc| doc.compositions.iter().map(|c| c.name.name.clone()))
+        .collect();
+
     let automata_to_visualize: Vec<String> = if let Some(automaton_name) = automaton {
         vec![automaton_name.to_string()]
     } else {
-        context_doc
+        let mut names: Vec<String> = context_doc
             .automata
             .iter()
             .map(|a| a.name.name.clone())
-            .collect()
+            .collect();
+        for doc in std::iter::once(context_doc).chain(sidecar_docs.iter()) {
+            for comp in &doc.compositions {
+                names.push(comp.name.name.clone());
+            }
+        }
+        names
     };
 
     if automata_to_visualize.is_empty() {
@@ -47,30 +67,40 @@ pub fn generate_graphs(
     let mut graphs = Vec::new();
 
     for automaton_name in &automata_to_visualize {
+        let is_composition =
+            composition_names.contains(automaton_name) && !direct_automata.contains(automaton_name);
+
         for &graph_type in graph_types {
-            let (elements, metadata) = match graph_type {
-                GraphType::Dsl => {
-                    let elements = dsl_automata_to_graph_elements(
-                        context_doc,
-                        sidecar_docs,
-                        realized,
-                        std::slice::from_ref(automaton_name),
-                    )?;
-                    let metadata = calculate_graph_metadata(&elements, automaton_name);
-                    (elements, metadata)
-                }
-                GraphType::Unrolled => {
-                    match unrolled_automata_to_graph_elements(
-                        context_doc,
-                        sidecar_docs,
-                        realized,
-                        std::slice::from_ref(automaton_name),
-                    ) {
-                        Ok(elements) => {
-                            let metadata = calculate_graph_metadata(&elements, automaton_name);
-                            (elements, metadata)
+            let (elements, metadata) = if is_composition {
+                // Compositions: generate graph from realized CLTS directly
+                let elements = realized_clts_to_graph_elements(realized, automaton_name)?;
+                let metadata = calculate_graph_metadata(&elements, automaton_name);
+                (elements, metadata)
+            } else {
+                match graph_type {
+                    GraphType::Dsl => {
+                        let elements = dsl_automata_to_graph_elements(
+                            context_doc,
+                            sidecar_docs,
+                            realized,
+                            std::slice::from_ref(automaton_name),
+                        )?;
+                        let metadata = calculate_graph_metadata(&elements, automaton_name);
+                        (elements, metadata)
+                    }
+                    GraphType::Unrolled => {
+                        match unrolled_automata_to_graph_elements(
+                            context_doc,
+                            sidecar_docs,
+                            realized,
+                            std::slice::from_ref(automaton_name),
+                        ) {
+                            Ok(elements) => {
+                                let metadata = calculate_graph_metadata(&elements, automaton_name);
+                                (elements, metadata)
+                            }
+                            Err(_) => continue,
                         }
-                        Err(_) => continue, // skip if automaton has no variables to unroll
                     }
                 }
             };
@@ -81,6 +111,11 @@ pub fn generate_graphs(
                 elements,
                 metadata,
             });
+
+            // Compositions only get one graph (from realized CLTS), not DSL + unrolled
+            if is_composition {
+                break;
+            }
         }
     }
 
@@ -112,7 +147,16 @@ fn calculate_context_summary(
         automata,
         formulas_count: realized.formulas.len(),
         controllers_count: realized.controllers.len(),
+        controllers: Vec::new(),
     }
+}
+
+/// Public wrapper for calculating graph metadata.
+pub fn calculate_graph_metadata_pub(
+    elements: &[GraphElement],
+    automaton_name: &str,
+) -> GraphMetadata {
+    calculate_graph_metadata(elements, automaton_name)
 }
 
 /// Calculate metadata for a specific graph
@@ -150,6 +194,198 @@ fn calculate_graph_metadata(elements: &[GraphElement], automaton_name: &str) -> 
         transitions_count,
         initial_states,
     }
+}
+
+/// Generate graph elements from a realized CLTS (used for compositions)
+fn realized_clts_to_graph_elements(
+    realized: &RealizedContext,
+    automaton_name: &str,
+) -> Result<Vec<GraphElement>, String> {
+    let clts = realized.context.clts(automaton_name).ok_or_else(|| {
+        format!(
+            "composed automaton '{}' not found in realized context",
+            automaton_name
+        )
+    })?;
+    clts_to_graph_elements(clts, automaton_name)
+}
+
+/// Convert a CLTS to graph elements for visualization.
+pub fn clts_to_graph_elements(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+) -> Result<Vec<GraphElement>, String> {
+    clts_to_graph_elements_with_labels(clts, automaton_name, None)
+}
+
+/// Convert a synthesized controller CLTS to graph elements, resolving label names
+/// from the source CLTS (since the controller's label IDs originate from it).
+pub fn controller_to_graph_elements(
+    controller: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    source_clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+) -> Result<Vec<GraphElement>, String> {
+    clts_to_graph_elements_with_labels(controller, automaton_name, Some(source_clts))
+}
+
+fn clts_to_graph_elements_with_labels(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+    label_source: Option<&Clts<DefaultStateIdx, DefaultLabelIdx>>,
+) -> Result<Vec<GraphElement>, String> {
+    let label_clts = label_source.unwrap_or(clts);
+    let mut elements = Vec::new();
+    let state_spacing = 250.0;
+    let mut x_pos = 100.0;
+    let y_offset = 0.0;
+
+    // Create compound node
+    let automaton_id = automaton_name.to_string();
+    elements.push(GraphElement {
+        data: GraphElementData::Node {
+            id: automaton_id.clone(),
+            label: String::new(),
+            parent: None,
+            vars: Vec::new(),
+            actions: Vec::new(),
+        },
+        position: None,
+        classes: None,
+    });
+
+    // Add state nodes
+    for state_id in clts.states() {
+        let state_name = clts.state_name(state_id).unwrap_or("?").to_string();
+        let node_id = format!("{}_{}", automaton_name, state_name);
+        let is_initial = clts.initial_states().contains(&state_id);
+
+        let mut classes = Vec::new();
+        if is_initial {
+            classes.push("start");
+        }
+        // Check if dead (no outgoing transitions)
+        if clts.outgoing(state_id).is_empty() {
+            classes.push("dead");
+        }
+
+        elements.push(GraphElement {
+            data: GraphElementData::Node {
+                id: node_id.clone(),
+                label: state_name.clone(),
+                parent: Some(automaton_id.clone()),
+                vars: Vec::new(),
+                actions: Vec::new(),
+            },
+            position: Some(GraphPosition {
+                x: x_pos,
+                y: y_offset + 100.0,
+            }),
+            classes: Some(classes.join(" ")),
+        });
+
+        // Add entry arrow for initial states
+        if is_initial {
+            let entry_id = format!("{}_entry_{}", automaton_name, state_name);
+            elements.push(GraphElement {
+                data: GraphElementData::Node {
+                    id: entry_id.clone(),
+                    label: String::new(),
+                    parent: Some(automaton_id.clone()),
+                    vars: Vec::new(),
+                    actions: Vec::new(),
+                },
+                position: Some(GraphPosition {
+                    x: 40.0,
+                    y: y_offset + 100.0,
+                }),
+                classes: Some("entry".to_string()),
+            });
+
+            elements.push(GraphElement {
+                data: GraphElementData::Edge {
+                    id: format!("{}_entry_edge_{}", automaton_name, state_name),
+                    source: entry_id,
+                    target: node_id,
+                    label: None,
+                    action: None,
+                    action_type: Some("start-arrow".to_string()),
+                    guard: None,
+                    effect: None,
+                },
+                position: None,
+                classes: None,
+            });
+        }
+
+        x_pos += state_spacing;
+    }
+
+    // Add transition edges
+    let mut edge_idx = 0;
+    for state_id in clts.states() {
+        let source_name = clts.state_name(state_id).unwrap_or("?").to_string();
+        let source_id = format!("{}_{}", automaton_name, source_name);
+
+        for transition in clts.outgoing(state_id) {
+            let target_name = clts
+                .state_name(transition.target())
+                .unwrap_or("?")
+                .to_string();
+            let target_id = format!("{}_{}", automaton_name, target_name);
+
+            // Build label from label payloads
+            let label_parts: Vec<String> = transition
+                .labels()
+                .iter()
+                .map(|lid| {
+                    let payload = label_clts.label_payload(*lid);
+                    match payload {
+                        Some(values)
+                            if !values.is_empty() && !values.iter().all(|v| v.is_empty()) =>
+                        {
+                            values
+                                .iter()
+                                .filter(|v| !v.is_empty())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                        _ => format!("label_{}", lid.index()),
+                    }
+                })
+                .collect();
+            let label_text = if label_parts.is_empty() {
+                None
+            } else {
+                Some(label_parts.join(" | "))
+            };
+
+            let is_controllable = transition.is_controllable(clts);
+            let action_type = if is_controllable {
+                "controllable"
+            } else {
+                "uncontrollable"
+            };
+
+            elements.push(GraphElement {
+                data: GraphElementData::Edge {
+                    id: format!("{}_t{}", automaton_name, edge_idx),
+                    source: source_id.clone(),
+                    target: target_id,
+                    label: label_text.clone(),
+                    action: label_text,
+                    action_type: Some(action_type.to_string()),
+                    guard: None,
+                    effect: None,
+                },
+                position: None,
+                classes: None,
+            });
+            edge_idx += 1;
+        }
+    }
+
+    Ok(elements)
 }
 
 /// Convert DSL automata to graph elements

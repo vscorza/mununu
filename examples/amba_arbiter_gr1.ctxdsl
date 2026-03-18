@@ -1,0 +1,164 @@
+// AMBA AHB Bus Arbiter — GR(1) Specification
+//
+// Inspired by Bloem, Jobstmann, Piterman, Pnueli & Sa'ar,
+// "Synthesis of Reactive(1) Designs" (JCSS, 2012).
+//
+// Models a 2-client bus arbiter where clients issue requests and the
+// arbiter grants exclusive access. The GR(1) contract requires:
+//
+//   Environment (clients):
+//     - Requests are well-behaved (modeled by FSM structure)
+//
+//   System (arbiter):
+//     - Safety:  mutual exclusion — never grant both clients simultaneously
+//     - Liveness: no starvation — every request is eventually granted
+
+context amba_arbiter_gr1 {
+    alphabet {
+        label req_0;
+        label req_1;
+        label grant_0;
+        label grant_1;
+        label release_0;
+        label release_1;
+        label idle;
+    }
+
+    automata {
+        // Client 0: issues requests and holds the bus until release.
+        automaton Client0 {
+            controllable {
+                label req_0;
+                label release_0;
+            }
+
+            states {
+                state Idle initial;
+                state Requesting0;
+                state Holding;
+            }
+            transitions {
+                transition Idle -> Requesting0 on label req_0;
+                transition Idle -> Idle on label idle;
+                transition Requesting0 -> Holding on label grant_0;
+                transition Requesting0 -> Requesting0 on label idle;
+                transition Holding -> Idle on label release_0;
+            }
+        }
+
+        // Client 1: same protocol as Client 0.
+        automaton Client1 {
+            controllable {
+                label req_1;
+                label release_1;
+            }
+
+            states {
+                state Idle initial;
+                state Requesting1;
+                state Holding;
+            }
+            transitions {
+                transition Idle -> Requesting1 on label req_1;
+                transition Idle -> Idle on label idle;
+                transition Requesting1 -> Holding on label grant_1;
+                transition Requesting1 -> Requesting1 on label idle;
+                transition Holding -> Idle on label release_1;
+            }
+        }
+
+        // Arbiter: grants bus access to one client at a time.
+        automaton Arbiter {
+            controllable {
+                label grant_0;
+                label grant_1;
+                label idle;
+            }
+
+            states {
+                state Free initial;
+                state Grant0;
+                state Grant1;
+            }
+            transitions {
+                // Free: arbiter decides who gets the bus
+                transition Free -> Grant0 on label grant_0;
+                transition Free -> Grant1 on label grant_1;
+                transition Free -> Free on label idle;
+
+                // Grant0: client 0 holds the bus
+                transition Grant0 -> Free on label release_0;
+                transition Grant0 -> Grant0 on label idle;
+
+                // Grant1: client 1 holds the bus
+                transition Grant1 -> Free on label release_1;
+                transition Grant1 -> Grant1 on label idle;
+            }
+        }
+    }
+
+    composition {
+        asynchronous bus_system {
+            members [Client0, Client1, Arbiter];
+        }
+    }
+
+    // GR(1) properties expressed as mu-calculus formulas.
+    //
+    // GR(1) form: (⋀ GF env_justiceᵢ) → (⋀ GF sys_justiceⱼ)
+    // Each property below captures a component of the GR(1) contract.
+
+    mu_formulas {
+        // Safety: mutual exclusion — the arbiter is never in both Grant0 and Grant1.
+        // Structurally guaranteed since they are distinct states.
+        formula mutual_exclusion {
+            over bus_system;
+            body = (! Grant0) || (! Grant1);
+        }
+
+        // Safety invariant: all reachable states are valid.
+        formula safety_invariant {
+            over bus_system;
+            body = nu X. ([] X);
+        }
+
+        // Liveness (GF guarantee): Grant0 is reachable — client 0 can be served.
+        // Corresponds to GF grant_0 in the GR(1) system justice.
+        formula grant0_reachable {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Requesting0 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Grant0 || <> W)) && ([] Z));
+        }
+
+        // Liveness (GF guarantee): Grant1 is reachable — client 1 can be served.
+        formula grant1_reachable {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Requesting1 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Grant1 || <> W)) && ([] Z));
+        }
+
+        // GR(1) no starvation for client 0: GF(Grant0) → GF(Free).
+        // If the arbiter grants client 0 infinitely often, it also frees the
+        // bus infinitely often.
+        // GF(p) = nu X. (mu Y. (p || <> Y)) && ([] X)
+        formula no_starvation_0 {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Grant0 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+        }
+
+        // GR(1) no starvation for client 1: GF(Grant1) → GF(Free).
+        formula no_starvation_1 {
+            over bus_system;
+            body = (! (nu X. (mu Y. (Grant1 || <> Y)) && ([] X)))
+                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+        }
+    }
+
+    controllers {
+        controller fair_arbiter {
+            source Arbiter;
+            satisfying safety_invariant;
+        }
+    }
+}

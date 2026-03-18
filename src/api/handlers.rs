@@ -54,27 +54,86 @@ pub async fn context_summarize_handler(
             source: None,
         })?;
 
-    // Build summary
-    let automata: Vec<AutomatonSummary> = context_doc
+    // Build summary — include both direct automata and compositions
+    let mut automata_names: Vec<String> = context_doc
         .automata
         .iter()
-        .filter_map(|a| {
-            realized
-                .context
-                .clts(&a.name.name)
-                .map(|clts| AutomatonSummary {
-                    name: a.name.name.clone(),
-                    states_count: clts.states().count(),
-                    transitions_count: clts.states().map(|sid| clts.outgoing(sid).len()).sum(),
-                })
+        .map(|a| a.name.name.clone())
+        .collect();
+    for doc in std::iter::once(&context_doc).chain(sidecar_docs.iter()) {
+        for comp in &doc.compositions {
+            automata_names.push(comp.name.name.clone());
+        }
+    }
+
+    let automata: Vec<AutomatonSummary> = automata_names
+        .iter()
+        .filter_map(|name| {
+            realized.context.clts(name).map(|clts| AutomatonSummary {
+                name: name.clone(),
+                states_count: clts.states().count(),
+                transitions_count: clts.states().map(|sid| clts.outgoing(sid).len()).sum(),
+            })
         })
         .collect();
+
+    // Synthesize declared controllers and collect summaries
+    let eval_options = EvaluationOptions::default();
+    let mut controllers = Vec::new();
+    for rc in realized.controllers.values() {
+        let Some(rf) = realized.formulas.get(&rc.formula) else {
+            continue;
+        };
+        if realized.context.clts(&rc.source).is_none() {
+            continue;
+        }
+        let env = realized.environment_for(&rc.source);
+        let (realizable, states_count, transitions_count) =
+            match realized.context.synthesise_controller_with_options(
+                &rc.source,
+                &rf.formula,
+                &env,
+                ControllerSynthesisOptions {
+                    evaluation: Some(&eval_options),
+                    diagnostics: None,
+                    minimize: rc.options.minimize(),
+                },
+            ) {
+                Ok(syn) => (
+                    syn.realizable,
+                    if syn.realizable {
+                        syn.controller.state_count()
+                    } else {
+                        0
+                    },
+                    if syn.realizable {
+                        syn.controller
+                            .states()
+                            .map(|sid| syn.controller.outgoing(sid).len())
+                            .sum()
+                    } else {
+                        0
+                    },
+                ),
+                Err(_) => (false, 0, 0),
+            };
+
+        controllers.push(ControllerSummary {
+            name: rc.name.clone(),
+            source: rc.source.clone(),
+            formula: rc.formula.clone(),
+            realizable,
+            states_count,
+            transitions_count,
+        });
+    }
 
     let summary = ContextSummary {
         context_name: context_doc.name.name.clone(),
         automata,
         formulas_count: realized.formulas.len(),
         controllers_count: realized.controllers.len(),
+        controllers,
     };
 
     Ok(Json(ContextSummarizeResponse {
@@ -223,7 +282,7 @@ pub async fn context_graphs_handler(
         })?;
 
     // Generate graphs
-    let (graphs, context_summary) = generate_graphs(
+    let (mut graphs, context_summary) = generate_graphs(
         &context_doc,
         &sidecar_docs,
         &realized,
@@ -234,6 +293,51 @@ pub async fn context_graphs_handler(
         message: format!("Failed to generate graphs: {}", e),
         source: None,
     })?;
+
+    // Synthesize declared controllers and add their graphs
+    if request.include_controllers {
+        let eval_options = EvaluationOptions::default();
+        for rc in realized.controllers.values() {
+            let Some(rf) = realized.formulas.get(&rc.formula) else {
+                continue;
+            };
+            if realized.context.clts(&rc.source).is_none() {
+                continue;
+            }
+            let env = realized.environment_for(&rc.source);
+            let Ok(syn) = realized.context.synthesise_controller_with_options(
+                &rc.source,
+                &rf.formula,
+                &env,
+                ControllerSynthesisOptions {
+                    evaluation: Some(&eval_options),
+                    diagnostics: None,
+                    minimize: rc.options.minimize(),
+                },
+            ) else {
+                continue;
+            };
+            if !syn.realizable {
+                continue;
+            }
+            let controller_name = format!("{}_controller", rc.name);
+            let source_clts = realized.context.clts(&rc.source).unwrap();
+            if let Ok(elements) = crate::api::graph::controller_to_graph_elements(
+                &syn.controller,
+                source_clts,
+                &controller_name,
+            ) {
+                let metadata =
+                    crate::api::graph::calculate_graph_metadata_pub(&elements, &controller_name);
+                graphs.push(GraphData {
+                    automaton: controller_name,
+                    graph_type: GraphTypeResponse::Controller,
+                    elements,
+                    metadata,
+                });
+            }
+        }
+    }
 
     Ok(Json(ContextGraphsResponse {
         success: true,

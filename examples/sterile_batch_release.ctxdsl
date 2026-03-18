@@ -24,6 +24,11 @@ context sterile_batch_release {
     automata {
         automaton Production {
             meta { id = "sterile.production"; }
+            controllable {
+                label produce;
+                label cancel;
+            }
+
             states {
                 state Idle initial;
                 state Filling;
@@ -39,6 +44,13 @@ context sterile_batch_release {
 
         automaton QualityControl {
             meta { id = "sterile.qc"; }
+            controllable {
+                label qc_start;
+                label qc_pass;
+                label qc_fail;
+                label quarantine;
+            }
+
             states {
                 state Waiting initial;
                 state Testing;
@@ -56,6 +68,10 @@ context sterile_batch_release {
 
         automaton ReleaseGateway {
             meta { id = "sterile.gateway"; }
+            controllable {
+                label qp_sign;
+            }
+
             states {
                 state Hold initial;
                 state Released;
@@ -69,6 +85,10 @@ context sterile_batch_release {
 
         automaton Logistics {
             meta { id = "sterile.logistics"; }
+            controllable {
+                label ship;
+            }
+
             states {
                 state Staging initial;
                 state Packed;

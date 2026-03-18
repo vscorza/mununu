@@ -13,6 +13,11 @@ context dual_condition_start {
 
     automata {
         automaton SafetyGate {
+            controllable {
+                label gate_closed;
+                label gate_open;
+            }
+
             states {
                 state Open initial;
                 state Closed;
@@ -24,6 +29,11 @@ context dual_condition_start {
         }
 
         automaton OperatorPanel {
+            controllable {
+                label operator_ready;
+                label operator_reset;
+            }
+
             states {
                 state Idle initial;
                 state Ready;
@@ -35,6 +45,10 @@ context dual_condition_start {
         }
 
         automaton AssemblyMachine {
+            controllable {
+                label stop;
+            }
+
             states {
                 state Idle initial;
                 state Running;
@@ -50,6 +64,26 @@ context dual_condition_start {
     composition {
         synchronous workcell {
             members [SafetyGate, OperatorPanel, AssemblyMachine];
+        }
+    }
+
+    mu_formulas {
+        // Safety: the composed system always remains in a valid state.
+        formula safety_invariant {
+            over workcell;
+            body = nu X. ([] X);
+        }
+
+        // Reachability: the Running state is reachable in the composition.
+        formula running_reachable {
+            over AssemblyMachine;
+            body = mu X. (Running || <> X);
+        }
+
+        // Reachability: the system can always return to Idle.
+        formula idle_reachable {
+            over AssemblyMachine;
+            body = mu X. (Idle || <> X);
         }
     }
 }

@@ -58,12 +58,25 @@ pub struct ContextSummary {
     pub automata: Vec<AutomatonSummary>,
     pub formulas_count: usize,
     pub controllers_count: usize,
+    #[serde(default)]
+    pub controllers: Vec<ControllerSummary>,
 }
 
 /// Automaton summary information
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AutomatonSummary {
     pub name: String,
+    pub states_count: usize,
+    pub transitions_count: usize,
+}
+
+/// Controller summary information
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ControllerSummary {
+    pub name: String,
+    pub source: String,
+    pub formula: String,
+    pub realizable: bool,
     pub states_count: usize,
     pub transitions_count: usize,
 }
@@ -160,6 +173,8 @@ pub struct ContextGraphsRequest {
     pub automaton: Option<String>,
     #[serde(default = "default_graph_types")]
     pub graph_types: Vec<GraphType>,
+    #[serde(default)]
+    pub include_controllers: bool,
 }
 
 fn default_graph_types() -> Vec<GraphType> {
@@ -197,6 +212,7 @@ pub struct GraphData {
 pub enum GraphTypeResponse {
     Dsl,
     Unrolled,
+    Controller,
 }
 
 impl From<GraphType> for GraphTypeResponse {
