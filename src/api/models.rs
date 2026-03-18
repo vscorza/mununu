@@ -265,6 +265,44 @@ pub struct GraphPosition {
     pub y: f64,
 }
 
+// ============================================================================
+// Context Verify Endpoints
+// ============================================================================
+
+/// Request for context verification (formula evaluation)
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ContextVerifyRequest {
+    pub context: FileContent,
+    #[serde(default)]
+    pub sidecars: Vec<SidecarFile>,
+    /// If omitted, evaluate ALL formulas defined in the context.
+    pub formula: Option<String>,
+    /// If omitted, use the formula's target automaton(s).
+    pub automaton: Option<String>,
+}
+
+/// Response from context verification
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ContextVerifyResponse {
+    pub success: bool,
+    pub all_satisfied: bool,
+    pub results: Vec<FormulaVerificationResult>,
+}
+
+/// Verification result for a single formula–automaton pair
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FormulaVerificationResult {
+    pub formula_name: String,
+    pub automaton: String,
+    pub satisfied: bool,
+    pub total_states: usize,
+    pub satisfying_states: usize,
+    pub initial_states: Vec<String>,
+    pub initial_satisfying: Vec<String>,
+    pub initial_violating: Vec<String>,
+    pub satisfying_state_names: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

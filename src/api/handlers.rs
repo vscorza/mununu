@@ -242,6 +242,177 @@ pub async fn context_graphs_handler(
     }))
 }
 
+/// Verify context by evaluating μ-calculus formulas over automata
+pub async fn context_verify_handler(
+    Json(request): Json<ContextVerifyRequest>,
+) -> ApiResult<Json<ContextVerifyResponse>> {
+    // Parse context document
+    let context_doc =
+        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
+            message: format!("Failed to parse context: {}", e),
+            details: Some(e.to_string()),
+        })?;
+
+    // Parse sidecar documents
+    let sidecar_docs: Result<Vec<_>, _> = request
+        .sidecars
+        .iter()
+        .map(|s| parse_context_doc(&s.content))
+        .collect();
+
+    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
+        message: format!("Failed to parse sidecar: {}", e),
+        details: Some(e.to_string()),
+    })?;
+
+    // Realize context
+    let realized =
+        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
+            message: format!("Failed to realize context: {}", e),
+            source: None,
+        })?;
+
+    // Collect formula–automaton pairs to evaluate
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    if let Some(ref formula_name) = request.formula {
+        // Specific formula requested
+        if !realized.formulas.contains_key(formula_name) {
+            return Err(ApiError::BadRequest {
+                message: format!("Unknown formula '{}'", formula_name),
+                details: None,
+            });
+        }
+        if let Some(ref automaton_name) = request.automaton {
+            pairs.push((formula_name.clone(), automaton_name.clone()));
+        } else {
+            // Use the formula's target automata
+            let rf = &realized.formulas[formula_name];
+            let automata = resolve_targets(&rf.targets, &realized);
+            for a in automata {
+                pairs.push((formula_name.clone(), a));
+            }
+        }
+    } else {
+        // Evaluate ALL explicit user-defined formulas (skip auto-generated structural predicates)
+        for (name, rf) in &realized.formulas {
+            if rf
+                .meta
+                .comment
+                .as_ref()
+                .is_some_and(|c| c.contains("\"type\":\"structural\""))
+            {
+                continue;
+            }
+            if let Some(ref automaton_name) = request.automaton {
+                pairs.push((name.clone(), automaton_name.clone()));
+            } else {
+                let automata = resolve_targets(&rf.targets, &realized);
+                for a in automata {
+                    pairs.push((name.clone(), a));
+                }
+            }
+        }
+    }
+
+    // Sort for deterministic output
+    pairs.sort();
+
+    let eval_options = EvaluationOptions::default();
+    let mut results = Vec::new();
+
+    for (formula_name, automaton_name) in &pairs {
+        let rf = &realized.formulas[formula_name];
+        let clts = realized
+            .context
+            .clts(automaton_name)
+            .ok_or_else(|| ApiError::BadRequest {
+                message: format!("Unknown automaton '{}'", automaton_name),
+                details: None,
+            })?;
+        let env = realized.environment_for(automaton_name);
+
+        let bitvec = realized
+            .context
+            .evaluate_mu(automaton_name, &rf.formula, &env, Some(&eval_options))
+            .map_err(|e| ApiError::Internal {
+                message: format!(
+                    "μ-calculus evaluation failed for formula '{}' on '{}': {}",
+                    formula_name, automaton_name, e
+                ),
+                source: None,
+            })?;
+
+        let mut satisfying_state_names = Vec::new();
+        for state_id in clts.states() {
+            if bitvec
+                .get(state_id.index())
+                .map(|bit| *bit)
+                .unwrap_or(false)
+            {
+                if let Some(name) = clts.state_name(state_id) {
+                    satisfying_state_names.push(name.to_string());
+                }
+            }
+        }
+        satisfying_state_names.sort();
+
+        let initial_states: Vec<String> = clts
+            .initial_states()
+            .iter()
+            .filter_map(|sid| clts.state_name(*sid).map(|n| n.to_string()))
+            .collect();
+
+        let mut initial_satisfying = Vec::new();
+        let mut initial_violating = Vec::new();
+        for sid in clts.initial_states() {
+            if let Some(name) = clts.state_name(*sid) {
+                if bitvec.get(sid.index()).map(|bit| *bit).unwrap_or(false) {
+                    initial_satisfying.push(name.to_string());
+                } else {
+                    initial_violating.push(name.to_string());
+                }
+            }
+        }
+        initial_satisfying.sort();
+        initial_violating.sort();
+
+        let satisfied = initial_violating.is_empty() && !initial_states.is_empty();
+
+        results.push(FormulaVerificationResult {
+            formula_name: formula_name.clone(),
+            automaton: automaton_name.clone(),
+            satisfied,
+            total_states: clts.state_count(),
+            satisfying_states: satisfying_state_names.len(),
+            initial_states,
+            initial_satisfying,
+            initial_violating,
+            satisfying_state_names,
+        });
+    }
+
+    let all_satisfied = results.iter().all(|r| r.satisfied);
+
+    Ok(Json(ContextVerifyResponse {
+        success: true,
+        all_satisfied,
+        results,
+    }))
+}
+
+/// Resolve formula targets to a list of automaton names
+fn resolve_targets(
+    targets: &crate::context_dsl::FormulaTargetsKind,
+    realized: &crate::context_dsl::RealizedContext,
+) -> Vec<String> {
+    use crate::context_dsl::FormulaTargetsKind;
+    match targets {
+        FormulaTargetsKind::All => realized.context.clts_names(),
+        FormulaTargetsKind::Named(names) => names.clone(),
+    }
+}
+
 /// Convert controller diagnostics to API format
 fn convert_diagnostics(
     diagnostics: &crate::context::ControllerDiagnostics,

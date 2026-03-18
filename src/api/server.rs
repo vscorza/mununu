@@ -57,6 +57,10 @@ fn create_router() -> Router {
             "/api/v1/context/graphs",
             post(handlers::context_graphs_handler),
         )
+        .route(
+            "/api/v1/context/verify",
+            post(handlers::context_verify_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

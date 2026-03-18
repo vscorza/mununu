@@ -392,10 +392,9 @@ fn normalize_helper_calls(expr: &str) -> String {
                 }
             })
             .collect();
-        matches!(
-            key.as_str(),
-            "bpmn_getdataobject" | "bpmn_getdatainput" | "bpmn_getdataoutput"
-        )
+        // No known helper functions; kept as extension point.
+        let _ = key;
+        false
     }
 
     let mut result = String::new();

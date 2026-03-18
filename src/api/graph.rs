@@ -60,14 +60,18 @@ pub fn generate_graphs(
                     (elements, metadata)
                 }
                 GraphType::Unrolled => {
-                    let elements = unrolled_automata_to_graph_elements(
+                    match unrolled_automata_to_graph_elements(
                         context_doc,
                         sidecar_docs,
                         realized,
                         std::slice::from_ref(automaton_name),
-                    )?;
-                    let metadata = calculate_graph_metadata(&elements, automaton_name);
-                    (elements, metadata)
+                    ) {
+                        Ok(elements) => {
+                            let metadata = calculate_graph_metadata(&elements, automaton_name);
+                            (elements, metadata)
+                        }
+                        Err(_) => continue, // skip if automaton has no variables to unroll
+                    }
                 }
             };
 
@@ -209,7 +213,7 @@ fn dsl_automata_to_graph_elements(
         elements.push(GraphElement {
             data: GraphElementData::Node {
                 id: automaton_id.clone(),
-                label: format!("Automaton {}", automaton_name),
+                label: String::new(),
                 parent: None,
                 vars: var_names.clone(),
                 actions: action_info.clone(),
@@ -258,7 +262,7 @@ fn dsl_automata_to_graph_elements(
             elements.push(GraphElement {
                 data: GraphElementData::Node {
                     id: state_id.clone(),
-                    label: format!("{}_{}", automaton_name, state_name),
+                    label: state_name.to_string(),
                     parent: Some(automaton_id.clone()),
                     vars: state_vars,
                     actions: Vec::new(),
@@ -568,7 +572,7 @@ fn unrolled_automata_to_graph_elements(
         elements.push(GraphElement {
             data: GraphElementData::Node {
                 id: automaton_id.clone(),
-                label: format!("Automaton {} (Unrolled)", automaton_name),
+                label: String::new(),
                 parent: None,
                 vars: var_names.clone(),
                 actions: action_info.clone(),
