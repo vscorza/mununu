@@ -1,0 +1,114 @@
+// Tutorial 06 — Controllability and Controller Synthesis
+//
+// System: Robot arm pick-and-place controller
+//
+// The robot arm has controllable actuators (extend, retract, grip,
+// release) and uncontrollable sensor inputs (object_detected,
+// obstacle_detected). The controller must ensure safe operation
+// despite unpredictable sensor events.
+//
+// Key concept: controllable labels are actions the controller can
+// choose to take or not. Uncontrollable labels are environment
+// actions that can happen at any time.
+//
+// Introduces: controllable vs uncontrollable semantics, synthesis.
+
+context robot_arm {
+    alphabet {
+        label extend;
+        label retract;
+        label grip;
+        label release;
+        label object_detected;
+        label obstacle_detected;
+        label idle;
+    }
+
+    automata {
+        automaton RobotArm {
+            // Only actuator commands are controllable.
+            // Sensor inputs (object_detected, obstacle_detected) are
+            // uncontrollable — the environment triggers them.
+            controllable {
+                label extend;
+                label retract;
+                label grip;
+                label release;
+            }
+
+            states {
+                state Home initial;
+                state Extended;
+                state Gripping;
+                state Retracting;
+                state Blocked;
+            }
+
+            transitions {
+                // Normal operation cycle
+                transition Home -> Extended on label extend;
+                transition Extended -> Gripping on label grip;
+                transition Gripping -> Retracting on label retract;
+                transition Retracting -> Home on label release;
+
+                // Object detection triggers grip (environment event)
+                transition Extended -> Gripping on label object_detected;
+
+                // Obstacle can appear while extended (environment event)
+                transition Extended -> Blocked on label obstacle_detected;
+                // Must retract when blocked
+                transition Blocked -> Home on label retract;
+
+                // Idle self-loops
+                transition Home -> Home on label idle;
+                transition Extended -> Extended on label idle;
+            }
+        }
+    }
+
+    mu_formulas {
+        // Safety: the robot always stays in a valid state
+        formula safety_invariant {
+            over RobotArm;
+            body = nu X. ([] X);
+        }
+
+        // The robot can always return home from any state
+        formula can_return_home {
+            over RobotArm;
+            body = mu X. (Home || <> X);
+        }
+
+        // From Blocked, Home is reachable (recovery possible)
+        formula blocked_recovery {
+            over RobotArm;
+            body = (! Blocked) || (mu Y. (Home || <> Y));
+        }
+
+        // Gripping is reachable (the arm can pick up objects)
+        formula grip_reachable {
+            over RobotArm;
+            body = mu X. (Gripping || <> X);
+        }
+
+        // Game-theoretic: can the controller force returning Home
+        // despite uncontrollable obstacle_detected/object_detected events?
+        // [ (ctrl = controllable) ] X ensures:
+        //   - all uncontrollable transitions stay in the winning region
+        //   - at least one controllable transition progresses toward Home
+        formula ctrl_return_home {
+            over RobotArm;
+            body = mu X. (Home || [ (ctrl = controllable) ] X);
+        }
+    }
+
+    controllers {
+        // Synthesize a controller that enforces safety.
+        // The controller can only restrict controllable actions;
+        // uncontrollable environment events always pass through.
+        controller safe_robot {
+            source RobotArm;
+            satisfying safety_invariant;
+        }
+    }
+}

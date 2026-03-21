@@ -1,0 +1,161 @@
+\input{common/preamble}
+
+\title{05 --- LTL Properties}
+\subtitle{Safety, Liveness, and Response Patterns}
+
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------
+\begin{frame}{LTL Operators}
+
+\begin{center}
+\begin{tabular}{@{}clp{6.5cm}@{}}
+  \toprule
+  \textbf{Syntax} & \textbf{Operator} & \textbf{Meaning} \\
+  \midrule
+  \texttt{G}  & $\Globally$  (Globally)  & $\varphi$ holds in \emph{every} future state \\
+  \texttt{F}  & $\Finally$   (Finally)   & $\varphi$ holds in \emph{some} future state \\
+  \texttt{X}  & $\Next$      (Next)      & $\varphi$ holds in the \emph{next} state \\
+  \texttt{U}  & $\Until$     (Until)     & $\psi$ holds eventually; $\varphi$ holds until then \\
+  \texttt{W}  & Weak Until  & Like $\Until$, but $\psi$ need not occur \\
+  \texttt{R}  & Release     & Dual of $\Until$: $\psi$ holds until $\varphi \wedge \psi$ \\
+  \texttt{->} & Implies     & Standard logical implication \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+In Mununu, LTL formulas are written with \ctxdsl{body = ltl ...;} and
+automatically translated to mu-calculus for evaluation.
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{The Water Tank Automaton}
+
+\begin{columns}[c]
+\begin{column}{0.45\textwidth}
+\lstinputlisting[style=ctxdsl, firstline=29, lastline=47]{../examples/05_ltl_properties.ctxdsl}
+\end{column}
+\begin{column}{0.5\textwidth}
+\begin{center}
+\begin{tikzpicture}[
+    ->, >=Stealth, node distance=2.2cm,
+    every state/.style={thick, fill=ubaBlue!10, minimum size=1cm},
+  ]
+  \node[state, initial] (e) {Empty};
+  \node[state, right of=e] (f) {Filling};
+  \node[state, below of=f] (fu) {Full};
+  \node[state, below of=e] (d) {Draining};
+
+  \path (e)  edge node[above, font=\footnotesize]{fill} (f)
+        (f)  edge node[right, font=\footnotesize]{fill} (fu)
+        (fu) edge node[below, font=\footnotesize]{drain} (d)
+        (d)  edge node[left,  font=\footnotesize]{drain} (e)
+        (e)  edge[loop left] node[left, font=\footnotesize]{idle} (e);
+\end{tikzpicture}
+\end{center}
+\end{column}
+\end{columns}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Three Property Types}
+
+\lstinputlisting[style=ctxdsl, firstline=51, lastline=74]{../examples/05_ltl_properties.ctxdsl}
+
+\begin{description}
+  \item[Safety] $\Globally\varphi$ --- ``nothing bad ever happens.''
+  \item[Liveness] $\Globally(\varphi \to \Finally\psi)$ --- ``every request gets a response.''
+  \item[Response] $\Globally(\text{Full} \to \Finally\text{Empty})$ --- ``the system cycles.''
+\end{description}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{LTL $\leftrightarrow$ Mu-Calculus Equivalence}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{Pattern} & \textbf{LTL} & \textbf{Mu-calculus} \\
+  \midrule
+  Safety (invariant)     & $\Globally\mathit{safe}$
+    & $\gfp X.\; \Boxx\, X$ \\[4pt]
+  Reachability           & $\Finally\mathit{target}$
+    & $\lfp X.\; \mathit{target} \lor \Dia\, X$ \\[4pt]
+  Infinitely often       & $\Globally\Finally p$
+    & $\gfp X.\; (\lfp Y.\; p \lor \Dia\, Y) \land \Boxx\, X$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+Equivalent mu-calculus formulas from the same file:
+
+\lstinputlisting[style=ctxdsl, firstline=76, lastline=95]{../examples/05_ltl_properties.ctxdsl}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Game-Theoretic Reachability}
+
+Can the controller \emph{force} the system to reach \textbf{Full},
+despite the environment choosing \ctxdsl{idle}?
+
+\lstinputlisting[style=ctxdsl, firstline=98, lastline=113]{../examples/05_ltl_properties.ctxdsl}
+
+\medskip
+\begin{itemize}
+  \item \ctxdsl{[ (ctrl = controllable) ] X} = \textbf{controllable attractor step}:
+    \begin{itemize}
+      \item ALL uncontrollable transitions must stay in $X$.
+      \item At least ONE controllable transition must go to $X$.
+    \end{itemize}
+  \item \textbf{Result:} 2/4 states satisfy (Filling, Full) ---
+        \ctxdsl{idle} is uncontrollable, so the environment can loop at Empty forever.
+  \item If \ctxdsl{idle} were controllable, the result would be 4/4.
+\end{itemize}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Syntax: LTL vs.\ Mu-Calculus}
+
+Both formula styles use the same \ctxdsl{formula} block:
+
+\begin{columns}[t]
+\begin{column}{0.48\textwidth}
+\textbf{LTL syntax:}
+\begin{ctxdslcode}
+formula ltl_safety {
+    over Tank;
+    body = ltl G (Empty || Filling
+                || Full || Draining);
+}
+\end{ctxdslcode}
+\end{column}
+\begin{column}{0.48\textwidth}
+\textbf{Mu-calculus syntax:}
+\begin{ctxdslcode}
+formula mu_safety {
+    over Tank;
+    body = nu X. ([] X);
+}
+\end{ctxdslcode}
+\end{column}
+\end{columns}
+
+\vspace{1em}
+\begin{itemize}
+  \item Use \ctxdsl{body = ltl ...;} for temporal logic patterns.
+  \item Use \ctxdsl{body = ...;} (no \texttt{ltl} keyword) for mu-calculus.
+  \item Mununu translates LTL to mu-calculus internally before evaluation.
+\end{itemize}
+
+\end{frame}
+
+\end{document}

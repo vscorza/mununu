@@ -1,0 +1,150 @@
+% 08_mu_calculus.tex — Tutorial 08: Mu-Calculus Elements
+\input{common/preamble}
+
+\title{08 --- Mu-Calculus}
+\subtitle{Fixpoints, Modalities, and Common Patterns}
+
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------
+\begin{frame}{The Token Ring}
+  A token circulates among three nodes; each can \textbf{process} locally before passing it on.
+
+  \bigskip
+  \begin{center}
+  \begin{tikzpicture}[
+    ->,>=Stealth,
+    node distance=2.8cm,
+    every state/.style={fill=ubaBlue!10, draw=ubaBlue, thick, minimum size=1cm},
+    every edge/.style={draw, thick},
+  ]
+    % Ring nodes in a triangle
+    \node[state, initial]  (N0)                    {Node0};
+    \node[state]           (N1) [right=of N0]      {Node1};
+    \node[state]           (N2) [below right=1.8cm and 1.4cm of N0] {Node2};
+
+    % Processing states
+    \node[state, fill=ubaLightBlue!15] (P0) [above=1.2cm of N0] {Proc0};
+    \node[state, fill=ubaLightBlue!15] (P1) [above=1.2cm of N1] {Proc1};
+    \node[state, fill=ubaLightBlue!15] (P2) [below=1.2cm of N2] {Proc2};
+
+    % Token passing
+    \path (N0) edge              node[above]      {\footnotesize pass\_01} (N1)
+          (N1) edge              node[right]       {\footnotesize pass\_12} (N2)
+          (N2) edge              node[below left]  {\footnotesize pass\_20} (N0);
+
+    % Local processing (bidirectional)
+    \path (N0) edge[bend left=15]  node[left]  {\footnotesize process} (P0)
+          (P0) edge[bend left=15]  node[right] {\footnotesize process} (N0)
+          (N1) edge[bend left=15]  node[left]  {\footnotesize process} (P1)
+          (P1) edge[bend left=15]  node[right] {\footnotesize process} (N1)
+          (N2) edge[bend left=15]  node[left]  {\footnotesize process} (P2)
+          (P2) edge[bend left=15]  node[right] {\footnotesize process} (N2);
+  \end{tikzpicture}
+  \end{center}
+
+  \medskip
+  6 states, 4 labels: \texttt{pass\_01}, \texttt{pass\_12}, \texttt{pass\_20}, \texttt{process}.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Operator Reference}
+  \begin{center}
+  \begin{tabularx}{0.92\textwidth}{llX}
+    \toprule
+    \textbf{Syntax} & \textbf{Name} & \textbf{Meaning} \\
+    \midrule
+    \texttt{nu X. $\varphi$}  & Greatest fixpoint & Safety / invariance \\
+    \texttt{mu X. $\varphi$}  & Least fixpoint    & Reachability / liveness \\
+    \midrule
+    \texttt{[] $\varphi$}     & Box               & \emph{All} successors satisfy $\varphi$ \\
+    \texttt{<> $\varphi$}     & Diamond           & \emph{Some} successor satisfies $\varphi$ \\
+    \texttt{[ labels=\{a\} ] $\varphi$} & Labeled box    & All $a$-successors satisfy $\varphi$ \\
+    \texttt{< labels=\{a\} > $\varphi$} & Labeled diamond & Some $a$-successor satisfies $\varphi$ \\
+    \midrule
+    \texttt{$\varphi$ \&\& $\psi$} & Conjunction & Both hold \\
+    \texttt{$\varphi$ || $\psi$}   & Disjunction & At least one holds \\
+    \texttt{! $\varphi$}            & Negation    & Does not hold \\
+    \texttt{true} / \texttt{false}  & Constants   & Trivially satisfied / unsatisfied \\
+    \bottomrule
+  \end{tabularx}
+  \end{center}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Safety and Reachability}
+  \lstinputlisting[style=ctxdsl, firstline=66, lastline=82]{../examples/08_mu_calculus.ctxdsl}
+
+  \bigskip
+  \begin{description}
+    \item[{$\gfp X.\;[\;] X$}] \textbf{Safety} --- ``all reachable states are valid.'' Satisfied by all 6 states.
+    \item[{$\lfp X.\;(\text{Node2} \lor \Dia X)$}] \textbf{Reachability} --- ``Node2 is reachable from here.'' Also satisfied by all 6 states (ring is connected).
+  \end{description}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Labeled Modalities}
+  \lstinputlisting[style=ctxdsl, firstline=84, lastline=102]{../examples/08_mu_calculus.ctxdsl}
+
+  \bigskip
+  \begin{itemize}
+    \item \textbf{Labeled box:} $[\text{labels} = \{ \texttt{pass\_01} \}]\; \text{Node1}$ --- ``every \texttt{pass\_01} leads to Node1.''
+
+    True for \emph{all} 6 states (only Node0 has a \texttt{pass\_01} transition, and it goes to Node1; states without that label satisfy box vacuously).
+
+    \item \textbf{Labeled diamond:} $\langle \text{labels} = \{ \texttt{pass\_12} \} \rangle\; \text{Node2}$ --- ``some \texttt{pass\_12} leads to Node2.''
+
+    True \emph{only} for Node1 (the only state with a \texttt{pass\_12} transition).
+  \end{itemize}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Nested Fixpoints --- GF Pattern}
+  \lstinputlisting[style=ctxdsl, firstline=104, lastline=112]{../examples/08_mu_calculus.ctxdsl}
+
+  \bigskip
+  $\gfp X.\; (\lfp Y.\; (\text{Node0} \lor \Dia Y)) \;\land\; [\;] X$
+
+  \begin{itemize}
+    \item \textbf{Outer} $\gfp$ (safety): the property holds at every reachable state.
+    \item \textbf{Inner} $\lfp$ (reachability): Node0 can be reached from the current state.
+    \item \textbf{Combined}: ``from every reachable state, Node0 can always be reached again'' --- the \alert{GF (infinitely often)} pattern.
+  \end{itemize}
+
+  \medskip
+  Satisfied by all 6 states because the ring always returns to Node0.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Common Patterns Summary}
+  \begin{center}
+  \begin{tabularx}{0.95\textwidth}{lX}
+    \toprule
+    \textbf{Pattern} & \textbf{Formula} \\
+    \midrule
+    Safety invariant
+      & $\gfp X.\; [\;] X$ \\
+    Reachability
+      & $\lfp X.\; (p \lor \Dia X)$ \\
+    Labeled transition check
+      & $[\text{labels} = \{a\}]\; q$ ~or~ $\langle \text{labels} = \{a\} \rangle\; q$ \\
+    GF (infinitely often)
+      & $\gfp X.\; (\lfp Y.\; (p \lor \Dia Y)) \land [\;] X$ \\
+    No deadlock
+      & $\gfp X.\; \Dia \texttt{true} \;\land\; [\;] X$ \\
+    \bottomrule
+  \end{tabularx}
+  \end{center}
+
+  \bigskip
+  \textbf{Key insight:}
+  \begin{itemize}
+    \item $\gfp$ (nu) starts from ``everything satisfies'' and removes violations --- \textbf{safety}.
+    \item $\lfp$ (mu) starts from ``nothing satisfies'' and adds witnesses --- \textbf{reachability}.
+    \item Nesting them yields \textbf{liveness} properties (e.g., infinitely often).
+  \end{itemize}
+\end{frame}
+
+\end{document}

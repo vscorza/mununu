@@ -199,8 +199,8 @@ fn propagate_dependencies(
             continue;
         }
         for (composition, members) in &dependencies.composition_members {
-            if members.contains(&automaton) && changed_compositions.insert(composition.clone()) {
-                // compositions might depend on automata but we do not propagate further here.
+            if members.contains(&automaton) {
+                changed_compositions.insert(composition.clone());
             }
         }
         for (formula, targets) in &dependencies.formula_targets {
@@ -211,6 +211,21 @@ fn propagate_dependencies(
         for (controller, source) in &dependencies.controller_source {
             if source == &automaton {
                 changed_controllers.insert(controller.clone());
+            }
+        }
+    }
+
+    // Propagate composition-to-composition dependencies: if an inner composition
+    // changed, outer compositions that reference it must also be reprocessed.
+    let mut comp_queue: VecDeque<String> = changed_compositions.iter().cloned().collect();
+    let mut comp_visited = BTreeSet::new();
+    while let Some(comp) = comp_queue.pop_front() {
+        if !comp_visited.insert(comp.clone()) {
+            continue;
+        }
+        for (outer_comp, members) in &dependencies.composition_members {
+            if members.contains(&comp) && changed_compositions.insert(outer_comp.clone()) {
+                comp_queue.push_back(outer_comp.clone());
             }
         }
     }

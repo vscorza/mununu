@@ -1,0 +1,175 @@
+% preamble.tex — Shared article-class preamble for Mununu cheatsheet
+% Usage: \input{common/preamble} at the top of cheatsheet.tex
+
+\documentclass[10pt,a4paper,landscape]{article}
+
+% --- Page geometry ---
+\usepackage[landscape, left=8mm, right=8mm, top=8mm, bottom=8mm]{geometry}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1pt plus 0.5pt}
+
+% --- Multi-column layout ---
+\usepackage{multicol}
+\setlength{\columnsep}{6mm}
+\setlength{\columnseprule}{0.2pt}
+
+% --- Language ---
+\usepackage[english]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+% --- Math and symbols ---
+\usepackage{amsmath, amssymb}
+\usepackage{stmaryrd}
+
+% --- Colors ---
+\usepackage{xcolor}
+\definecolor{ubaBlue}{RGB}{0, 51, 102}
+\definecolor{ubaLightBlue}{RGB}{0, 102, 153}
+\definecolor{ubaGray}{RGB}{100, 100, 100}
+\definecolor{ubaRed}{RGB}{180, 40, 40}
+
+% --- Code listings ---
+\usepackage{listings}
+
+% --- UTF-8 support for listings (em-dash and other non-ASCII in comments) ---
+\lstset{
+  extendedchars=true,
+  inputencoding=utf8,
+  literate={—}{{---}}3 {→}{{$\to$}}1 {ε}{{$\varepsilon$}}1
+           {≥}{{$\geq$}}1 {≤}{{$\leq$}}1 {≠}{{$\neq$}}1,
+}
+
+\lstdefinelanguage{CTXDSL}{
+  morekeywords=[1]{
+    context, alphabet, label, constants, const, ranges, range,
+    automata, automaton, meta, controllable, internal,
+    states, state, initial, transitions, transition, on, epsilon,
+    guard, effects, variables, var, predicates, predicate,
+    parameters, param, in,
+    composition, synchronous, asynchronous, superset, members,
+    mu_formulas, formula, over, all, body,
+    controllers, controller, source, satisfying, export,
+    minimize, diagnostics, counterexample,
+    deadlock_traces, max_counter_traces, proof_obligations,
+  },
+  morekeywords=[2]{nu, mu, ltl, true, false, i64, bool},
+  morecomment=[l]{//},
+  morestring=[b]",
+  sensitive=true,
+}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{ubaBlue}\bfseries,
+  commentstyle=\color{ubaGray}\itshape,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+}
+
+\lstdefinestyle{ctxdsl}{
+  language=CTXDSL,
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=[1]{\color{ubaBlue}\bfseries},
+  keywordstyle=[2]{\color{ubaLightBlue}\bfseries},
+  commentstyle=\color{ubaGray}\itshape,
+  frame=l,
+  framerule=1.5pt,
+  rulecolor=\color{ubaBlue},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  tabsize=4,
+  xleftmargin=1em,
+}
+
+\lstdefinestyle{shell}{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=l,
+  framerule=1.5pt,
+  rulecolor=\color{ubaGray},
+  showstringspaces=false,
+  xleftmargin=1em,
+}
+
+% --- TikZ ---
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc}
+
+% --- Compact section headers ---
+\usepackage{titlesec}
+\titleformat{\section}
+  {\normalfont\bfseries\color{ubaBlue}\normalsize}
+  {}{0pt}{}
+\titlespacing*{\section}{0pt}{3pt}{1pt}
+
+\titleformat{\subsection}
+  {\normalfont\bfseries\color{ubaLightBlue}\footnotesize}
+  {}{0pt}{}
+\titlespacing*{\subsection}{0pt}{2pt}{0.5pt}
+
+% --- tcolorbox environments ---
+\usepackage[most]{tcolorbox}
+
+\newtcolorbox{cheatbox}[1]{%
+  colback=ubaBlue!5,
+  colframe=ubaBlue,
+  coltitle=white,
+  fonttitle=\bfseries\scriptsize,
+  title={#1},
+  left=2pt, right=2pt, top=1pt, bottom=1pt,
+  boxrule=0pt, leftrule=2pt,
+  arc=1pt,
+  fontupper=\scriptsize,
+}
+
+\newtcolorbox{tipbox}[1]{%
+  colback=ubaLightBlue!5,
+  colframe=ubaLightBlue,
+  coltitle=white,
+  fonttitle=\bfseries\scriptsize,
+  title={#1},
+  left=2pt, right=2pt, top=1pt, bottom=1pt,
+  boxrule=0pt, leftrule=2pt,
+  arc=1pt,
+  fontupper=\scriptsize,
+}
+
+\newtcolorbox{warnbox}[1]{%
+  colback=ubaRed!5,
+  colframe=ubaRed,
+  coltitle=white,
+  fonttitle=\bfseries\scriptsize,
+  title={#1},
+  left=2pt, right=2pt, top=1pt, bottom=1pt,
+  boxrule=0pt, leftrule=2pt,
+  arc=1pt,
+  fontupper=\scriptsize,
+}
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{tabularx}
+
+% --- Compact lists ---
+\usepackage{enumitem}
+\setlist{nosep, leftmargin=*, font=\scriptsize}
+\setlist[itemize]{label=\textcolor{ubaBlue}{\textbullet}}
+
+% --- Header banner ---
+\newcommand{\cheatheader}[2]{%
+  \begin{center}
+    {\Large\bfseries\color{ubaBlue} #1}\\[1pt]
+    {\footnotesize\color{ubaGray} #2 \hfill Mununu Tutorial / Mariano Cerrutti}
+  \end{center}
+  \vspace{-4pt}
+  {\color{ubaBlue}\hrule height 0.6pt}
+  \vspace{3pt}
+}
+
+% --- Inline code ---
+\newcommand{\code}[1]{{\ttfamily\color{ubaBlue}\scriptsize #1}}

@@ -1,0 +1,104 @@
+% 09_unrealizable.tex — Tutorial 09: Unrealizable Specification Diagnosis
+\input{common/preamble}
+
+\title{09 --- Unrealizable Specifications}
+\subtitle{Diagnosis and Counterexamples}
+
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------
+\begin{frame}{The Valve Controller}
+  A simple valve with two states and four events:
+
+  \bigskip
+  \begin{center}
+  \begin{tikzpicture}[
+    ->,>=Stealth,
+    node distance=3.5cm,
+    every state/.style={fill=ubaBlue!10, draw=ubaBlue, thick, minimum size=1.2cm},
+    every edge/.style={draw, thick},
+  ]
+    \node[state, initial]  (C)  {Closed};
+    \node[state]           (O)  [right=of C] {Open};
+
+    \path (C) edge [bend left=20]  node[above] {\footnotesize open\_valve}     (O)
+          (O) edge [bend left=20]  node[below] {\footnotesize close\_valve}    (C)
+          (C) edge [loop below]    node[below] {\footnotesize pressure\_drop}  ()
+          (O) edge [loop above]    node[above] {\footnotesize pressure\_rise}  ();
+  \end{tikzpicture}
+  \end{center}
+
+  \bigskip
+  \begin{itemize}
+    \item \textbf{Controllable:} \texttt{open\_valve}, \texttt{close\_valve} (controller chooses).
+    \item \textbf{Uncontrollable:} \texttt{pressure\_rise}, \texttt{pressure\_drop} (environment).
+  \end{itemize}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{The Automaton in CTXDSL}
+  \lstinputlisting[style=ctxdsl, firstline=26, lastline=44]{../examples/09_unrealizable.ctxdsl}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{An Impossible Specification}
+  \lstinputlisting[style=ctxdsl, firstline=47, lastline=59]{../examples/09_unrealizable.ctxdsl}
+
+  \bigskip
+  \begin{description}
+    \item[\ctxdsl{impossible_spec}:] \texttt{Open \&\& Closed} --- no state is simultaneously Open \emph{and} Closed. \alert{Unsatisfiable} (0/2 states).
+    \item[\ctxdsl{open_reachable}:] $\lfp X.\;(\text{Open} \lor \Dia X)$ --- the valve \emph{can} reach Open. \textbf{Satisfiable} (2/2 states).
+  \end{description}
+
+  \medskip
+  The impossible spec is not a syntactic error --- it is \emph{logically} vacuous.
+  Mununu detects this during synthesis.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Controller with Diagnostics}
+  \lstinputlisting[style=ctxdsl, firstline=68, lastline=78]{../examples/09_unrealizable.ctxdsl}
+
+  \bigskip
+  Running synthesis with diagnostics enabled:
+
+  \begin{shellcode}
+$ mununu context synth 09_unrealizable.ctxdsl \
+    --controller impossible_valve
+Controller impossible_valve: UNREALIZABLE
+  Violating initials: {Closed}
+  Counterexample: no state satisfies (Open && Closed)
+  Deadlock trace: Closed -[open_valve]-> Open (spec violated)
+  \end{shellcode}
+
+  \medskip
+  The \ctxdsl{diagnostics} block enables \ctxdsl{counterexample} and \ctxdsl{deadlock_traces} --- they reveal \emph{why} no controller exists.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Takeaway}
+  \begin{center}
+  \begin{tabularx}{0.92\textwidth}{lX}
+    \toprule
+    \textbf{Concept} & \textbf{Meaning} \\
+    \midrule
+    Unrealizable & No controller can enforce the specification --- the property is too strong or contradictory. \\
+    \ctxdsl{diagnostics}   & Enables detailed output explaining failure. \\
+    \ctxdsl{counterexample} & Shows a concrete witness of why synthesis fails. \\
+    \ctxdsl{deadlock_traces} & Shows traces leading to states where the controller gets stuck. \\
+    \bottomrule
+  \end{tabularx}
+  \end{center}
+
+  \bigskip
+  \textbf{Best practices:}
+  \begin{itemize}
+    \item Always include a \textbf{realizable} formula for contrast (e.g., safety invariant).
+    \item Enable diagnostics early --- they are your debugger for specifications.
+    \item An unrealizable result is not a tool failure; it means the spec needs revision.
+  \end{itemize}
+\end{frame}
+
+\end{document}

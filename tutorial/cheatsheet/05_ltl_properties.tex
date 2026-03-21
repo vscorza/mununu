@@ -1,0 +1,138 @@
+\input{common/preamble}
+
+\begin{document}
+\cheatheader{05 --- LTL Properties}{Safety, Liveness, and Response Patterns}
+
+\begin{multicols}{3}
+\footnotesize
+
+% ── Column 1 ──────────────────────────────────────
+
+\begin{cheatbox}{LTL Operators}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}c l X@{}}
+\toprule
+\scriptsize\textbf{Op} & \scriptsize\textbf{Name} & \scriptsize\textbf{Meaning} \\
+\midrule
+\code{G}   & Globally    & Holds in every future state \\
+\code{F}   & Eventually  & Holds in some future state \\
+\code{X}   & Next        & Holds in the next state \\
+\code{U}   & Until       & $p$ holds until $q$ becomes true \\
+\code{W}   & Weak until  & Like \code{U} but $q$ may never come \\
+\code{R}   & Release     & Dual of \code{U}: $q$ until $p \land q$ \\
+\code{->}  & Implies     & Material implication \\
+\code{\&\&}& And         & Conjunction \\
+\code{||}  & Or          & Disjunction \\
+\code{!}   & Not         & Negation \\
+\bottomrule
+\end{tabularx}
+\end{cheatbox}
+
+\begin{cheatbox}{Syntax}
+\begin{lstlisting}[style=ctxdsl]
+formula response {
+    over System;
+    body = ltl G(request -> F(grant));
+}
+\end{lstlisting}
+The \code{ltl} keyword triggers automatic translation to
+mu-calculus before evaluation.
+\end{cheatbox}
+
+\columnbreak
+
+% ── Column 2 ──────────────────────────────────────
+
+\begin{cheatbox}{Property Patterns}
+\textbf{Safety} --- nothing bad ever happens:
+\begin{lstlisting}[style=ctxdsl]
+body = ltl G safe;
+\end{lstlisting}
+
+\textbf{Liveness} --- every stimulus gets a response:
+\begin{lstlisting}[style=ctxdsl]
+body = ltl G (request -> F grant);
+\end{lstlisting}
+
+\textbf{Response (GR1)} --- repeated stimulus, repeated
+response:
+\begin{lstlisting}[style=ctxdsl]
+body = ltl G (trigger -> F ack);
+\end{lstlisting}
+
+\textbf{Persistence} --- eventually always stable:
+\begin{lstlisting}[style=ctxdsl]
+body = ltl F G stable;
+\end{lstlisting}
+
+\textbf{Recurrence} --- event happens infinitely often:
+\begin{lstlisting}[style=ctxdsl]
+body = ltl G F heartbeat;
+\end{lstlisting}
+
+\textbf{Precedence} --- $q$ does not occur before $p$:
+\begin{lstlisting}[style=ctxdsl]
+body = ltl (!q) W p;
+\end{lstlisting}
+\end{cheatbox}
+
+\columnbreak
+
+% ── Column 3 ──────────────────────────────────────
+
+\begin{cheatbox}{LTL to Mu-Calculus Translation}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\scriptsize\textbf{LTL} & \scriptsize\textbf{Mu-Calculus} \\
+\midrule
+\code{G(safe)}
+  & $\nu X.\; \textit{safe} \wedge [\,] X$ \\
+\code{F(target)}
+  & $\mu X.\; \textit{target} \vee \langle\rangle X$ \\
+\code{G F(p)}
+  & $\nu X.\; (\mu Y.\; p \vee \langle\rangle Y) \wedge [\,] X$ \\
+\code{p U q}
+  & $\mu X.\; q \vee (p \wedge \langle\rangle X)$ \\
+\code{X(p)}
+  & $\langle\rangle p$ \\
+\bottomrule
+\end{tabularx}
+
+\medskip
+Key: $\nu$ = greatest fixpoint (safety/invariance), \\
+$\mu$ = least fixpoint (liveness/reachability), \\
+$[\,]$ = box (all successors), $\langle\rangle$ = diamond (some successor).
+\end{cheatbox}
+
+\begin{tipbox}{Controllable Attractor}
+Controllable reachability (game-theoretic):
+\begin{lstlisting}[style=ctxdsl]
+mu X. (p || [ (ctrl = controllable) ] X)
+\end{lstlisting}
+\code{[ (ctrl = controllable) ] X} means:
+\begin{itemize}
+  \item ALL uncontrollable transitions $\rightarrow$ X
+  \item At least ONE controllable $\rightarrow$ X
+\end{itemize}
+\end{tipbox}
+
+\begin{tipbox}{When to Use LTL vs Mu-Calculus}
+\begin{itemize}
+  \item \textbf{Use LTL} for standard temporal patterns
+        (safety, liveness, response) --- simpler and less
+        error-prone.
+  \item \textbf{Use mu-calculus} when you need:
+    \begin{itemize}[leftmargin=*]
+      \item Label-specific modalities: $[a]$, $\langle b \rangle$.
+      \item Deeply nested or alternating fixpoints.
+      \item Properties that mix box/diamond on different
+            labels.
+    \end{itemize}
+  \item LTL formulas are translated automatically; no
+        performance penalty.
+\end{itemize}
+\end{tipbox}
+
+\end{multicols}
+\end{document}

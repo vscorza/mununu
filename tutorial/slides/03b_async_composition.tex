@@ -1,0 +1,111 @@
+\input{common/preamble}
+
+\title{03b --- Asynchronous Composition}
+\subtitle{Interleaved Execution}
+
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------
+\begin{frame}{System Overview: Two Sensors + Monitor}
+
+Three independent components communicating via shared labels:
+
+\begin{itemize}
+  \item \textbf{SensorA} --- cycles between \ctxdsl{IdleA} and \ctxdsl{SampledA}
+  \item \textbf{SensorB} --- cycles between \ctxdsl{IdleB} and \ctxdsl{SampledB}
+  \item \textbf{Monitor} --- receives reports: \ctxdsl{Ready}, \ctxdsl{ReceivedA}, \ctxdsl{ReceivedB}
+\end{itemize}
+
+\vspace{1em}
+\begin{center}
+\begin{tikzpicture}[
+    ->, >=Stealth, node distance=2.8cm, every state/.style={thick, fill=ubaBlue!10},
+  ]
+  \node[state, initial]  (ia)  {IdleA};
+  \node[state, right of=ia]  (sa)  {SampledA};
+  \node[state, initial, below=1.5cm of ia]  (ib)  {IdleB};
+  \node[state, right of=ib]  (sb)  {SampledB};
+  \node[state, initial, right=4cm of sa]  (r)   {Ready};
+  \node[state, above right=0.4cm and 1.8cm of r]  (ra)  {ReceivedA};
+  \node[state, below right=0.4cm and 1.8cm of r]  (rb)  {ReceivedB};
+
+  \path (ia) edge[bend left] node[above]{\footnotesize sample} (sa)
+        (sa) edge[bend left] node[below]{\footnotesize report} (ia)
+        (ib) edge[bend left] node[above]{\footnotesize sample} (sb)
+        (sb) edge[bend left] node[below]{\footnotesize report} (ib)
+        (r)  edge node[above left]{\footnotesize a\_report} (ra)
+        (r)  edge node[below left]{\footnotesize b\_report} (rb)
+        (ra) edge[bend left] node[right]{\footnotesize process} (r)
+        (rb) edge[bend right] node[right]{\footnotesize process} (r);
+\end{tikzpicture}
+\end{center}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Automata Definitions}
+
+\textbf{SensorA} and \textbf{SensorB} --- simple two-state cycles:
+
+\lstinputlisting[style=ctxdsl, firstline=24, lastline=39]{../examples/03b_async_composition.ctxdsl}
+
+\textbf{Monitor} --- three states, receives from either sensor:
+
+\lstinputlisting[style=ctxdsl, firstline=58, lastline=75]{../examples/03b_async_composition.ctxdsl}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Asynchronous Composition}
+
+\lstinputlisting[style=ctxdsl, firstline=78, lastline=82]{../examples/03b_async_composition.ctxdsl}
+
+\vspace{0.5em}
+\textbf{Key difference from synchronous:}
+\begin{itemize}
+  \item Any component can step \emph{independently} --- no lock-step.
+  \item No \ctxdsl{skip} labels needed.
+  \item Shared labels (e.g.\ \ctxdsl{sensor_a_report}) still synchronize the components that use them.
+  \item Non-shared labels execute as \emph{interleaved} steps.
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{State space:} $2 \times 2 \times 3 = 12$ composed states.
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Properties over the Composition}
+
+\lstinputlisting[style=ctxdsl, firstline=84, lastline=117]{../examples/03b_async_composition.ctxdsl}
+
+Formulas can target the composition (\ctxdsl{over sensor_network}) or individual automata (\ctxdsl{over SensorA}).
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Synchronous vs.\ Asynchronous Comparison}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{Aspect} & \textbf{Synchronous} & \textbf{Asynchronous} \\
+  \midrule
+  Execution model  & Lock-step (all move together) & Interleaved (any can move) \\
+  Skip labels      & Required for ``no-op'' steps  & Not needed \\
+  Shared labels    & All participate on every step  & Only involved parties sync \\
+  State space      & Product of states              & Product of states \\
+  Typical use      & Tightly coupled components     & Independent components \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{1em}
+\textbf{Rule of thumb:} use \alert{synchronous} when components must coordinate on every step;
+use \alert{asynchronous} when components act independently and synchronize only on shared events.
+
+\end{frame}
+
+\end{document}

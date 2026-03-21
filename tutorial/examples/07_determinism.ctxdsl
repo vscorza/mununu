@@ -1,0 +1,124 @@
+// Tutorial 07 — Determinism vs Non-Determinism
+//
+// System: Two versions of a request-acknowledge protocol
+//
+// DeterministicProtocol: each (state, label) pair has exactly one target.
+// The system is fully predictable.
+//
+// NondeterministicProtocol: from NdPending, the label `nd_ack` can lead to
+// either NdDone or NdRetry. The system's behavior is not fully determined
+// by the current state and input alone.
+//
+// Non-determinism affects verification: box modality (ALL successors)
+// vs diamond modality (SOME successor) yield different results.
+//
+// Introduces: non-determinism (same label, same source, multiple targets).
+
+context determinism_demo {
+    automata {
+        // Deterministic version: fully predictable
+        automaton DeterministicProtocol {
+            controllable {
+                label det_req;
+                label det_ack;
+                label det_reset;
+            }
+
+            states {
+                state DetIdle initial;
+                state DetPending;
+                state DetDone;
+            }
+
+            transitions {
+                transition DetIdle -> DetPending on label det_req;
+                transition DetPending -> DetDone on label det_ack;
+                transition DetDone -> DetIdle on label det_reset;
+            }
+        }
+
+        // Non-deterministic version: nd_ack from NdPending has TWO targets
+        automaton NondeterministicProtocol {
+            controllable {
+                label nd_req;
+                label nd_ack;
+                label nd_reset;
+                label nd_retry;
+            }
+
+            states {
+                state NdIdle initial;
+                state NdPending;
+                state NdDone;
+                state NdRetry;
+            }
+
+            transitions {
+                transition NdIdle -> NdPending on label nd_req;
+                // Non-deterministic choice: nd_ack leads to Done OR Retry
+                transition NdPending -> NdDone on label nd_ack;
+                transition NdPending -> NdRetry on label nd_ack;
+                // Retry loops back to try again
+                transition NdRetry -> NdPending on label nd_retry;
+                transition NdDone -> NdIdle on label nd_reset;
+            }
+        }
+    }
+
+    mu_formulas {
+        // === Deterministic protocol ===
+
+        // Safety (trivially holds)
+        formula det_safety {
+            over DeterministicProtocol;
+            body = nu X. ([] X);
+        }
+
+        // Reachability: DetDone is reachable
+        formula det_done_reachable {
+            over DeterministicProtocol;
+            body = mu X. (DetDone || <> X);
+        }
+
+        // After det_req, det_ack always leads to DetDone (deterministic)
+        // From DetPending, all det_ack transitions go to DetDone
+        formula det_ack_deterministic {
+            over DeterministicProtocol;
+            body = (! DetPending) || [ labels = { det_ack } ] DetDone;
+        }
+
+        // === Non-deterministic protocol ===
+
+        // Safety (trivially holds)
+        formula nd_safety {
+            over NondeterministicProtocol;
+            body = nu X. ([] X);
+        }
+
+        // Reachability: NdDone is reachable (exists a path)
+        formula nd_done_reachable {
+            over NondeterministicProtocol;
+            body = mu X. (NdDone || <> X);
+        }
+
+        // Box modality: from NdPending, ALL nd_ack transitions lead to NdDone?
+        // This will be FALSE because nd_ack also leads to NdRetry
+        formula nd_ack_always_done {
+            over NondeterministicProtocol;
+            body = (! NdPending) || [ labels = { nd_ack } ] NdDone;
+        }
+
+        // Diamond modality: from NdPending, SOME nd_ack transition leads to NdDone?
+        // This will be TRUE (one branch does lead to NdDone)
+        formula nd_ack_some_done {
+            over NondeterministicProtocol;
+            body = (! NdPending) || < labels = { nd_ack } > NdDone;
+        }
+
+        // Non-determinism impact: NdRetry is also reachable
+        formula nd_retry_reachable {
+            over NondeterministicProtocol;
+            body = mu X. (NdRetry || <> X);
+        }
+    }
+}

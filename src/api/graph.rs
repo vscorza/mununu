@@ -562,17 +562,25 @@ fn dsl_automata_to_graph_elements(
                 _ => continue,
             };
 
-            let label_name = match &transition.label {
+            let primary_label = match &transition.label {
                 TransitionLabel::Named { name, .. } => name.name.clone(),
                 TransitionLabel::Epsilon(_) => "\u{03B5}".to_string(),
             };
+            let mut all_label_names = vec![primary_label.clone()];
+            for additional in &transition.additional_labels {
+                if let TransitionLabel::Named { name, .. } = additional {
+                    all_label_names.push(name.name.clone());
+                }
+            }
+            let label_name = all_label_names.join(", ");
 
             // Determine action type
-            let is_controllable = automaton
-                .controllable
+            let is_controllable = all_label_names
                 .iter()
-                .any(|c| c.name.name == label_name);
-            let is_internal = automaton.internal.iter().any(|i| i.name.name == label_name);
+                .any(|l| automaton.controllable.iter().any(|c| c.name.name == *l));
+            let is_internal = all_label_names
+                .iter()
+                .any(|l| automaton.internal.iter().any(|i| i.name.name == *l));
             let action_type = if is_internal {
                 "internal"
             } else if is_controllable {
@@ -702,10 +710,17 @@ fn unrolled_automata_to_graph_elements(
                     _ => return None,
                 };
 
-                let label_name = match &t.label {
+                let primary_label = match &t.label {
                     TransitionLabel::Named { name, .. } => name.name.clone(),
                     TransitionLabel::Epsilon(_) => "\u{03B5}".to_string(),
                 };
+                let mut all_label_names = vec![primary_label];
+                for additional in &t.additional_labels {
+                    if let TransitionLabel::Named { name, .. } = additional {
+                        all_label_names.push(name.name.clone());
+                    }
+                }
+                let label_name = all_label_names.join(", ");
 
                 let guard_str = t
                     .guard

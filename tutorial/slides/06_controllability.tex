@@ -1,0 +1,150 @@
+\input{common/preamble}
+
+\title{06 --- Controllability}
+\subtitle{Controllable vs.\ Uncontrollable Actions}
+
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------
+\begin{frame}{The Concept}
+
+\begin{columns}[c]
+\begin{column}{0.45\textwidth}
+\begin{itemize}
+  \item \textbf{\color{ubaBlue}Controllable} --- actions the controller \emph{decides}:
+    extend, retract, grip, release.
+  \item \textbf{\color{red!70!black}Uncontrollable} --- environment events that
+    \emph{cannot be blocked}: object\_detected, obstacle\_detected.
+\end{itemize}
+\end{column}
+\begin{column}{0.52\textwidth}
+\begin{center}
+\begin{tikzpicture}[
+    ->, >=Stealth, node distance=2cm,
+    every state/.style={thick, fill=ubaBlue!10, minimum size=0.9cm, font=\footnotesize},
+    ctrl/.style={ubaBlue, thick},
+    unctrl/.style={red!70!black, thick, dashed},
+  ]
+  \node[state, initial] (h) {Home};
+  \node[state, right=2.5cm of h] (e) {Extended};
+  \node[state, below of=e] (g) {Gripping};
+  \node[state, below of=h] (r) {Retracting};
+  \node[state, right=2.5cm of g] (b) {Blocked};
+
+  \path[ctrl]   (h) edge node[above, font=\scriptsize]{extend} (e);
+  \path[ctrl]   (e) edge node[right, font=\scriptsize]{grip} (g);
+  \path[unctrl] (e) edge[bend left=15] node[above right, font=\scriptsize]{object\_det.} (g);
+  \path[ctrl]   (g) edge node[above, font=\scriptsize]{retract} (r);
+  \path[ctrl]   (r) edge node[left, font=\scriptsize]{release} (h);
+  \path[unctrl] (e) edge node[above, font=\scriptsize]{obstacle\_det.} (b);
+  \path[ctrl]   (b) edge[bend left=25] node[below, font=\scriptsize]{retract} (h);
+\end{tikzpicture}
+
+\vspace{0.3em}
+{\footnotesize \textcolor{ubaBlue}{\rule{0.8cm}{2pt}} controllable \quad
+ \textcolor{red!70!black}{\rule[0.3ex]{0.4cm}{1pt}\rule[0.3ex]{0.15cm}{0pt}\rule[0.3ex]{0.4cm}{1pt}} uncontrollable}
+\end{center}
+\end{column}
+\end{columns}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Declaring Controllable Labels}
+
+\lstinputlisting[style=ctxdsl, firstline=28, lastline=45]{../examples/06_controllability.ctxdsl}
+
+Labels \textbf{not} listed in \ctxdsl{controllable} are uncontrollable by default:
+\begin{itemize}
+  \item \ctxdsl{object_detected} --- sensor event, cannot be suppressed.
+  \item \ctxdsl{obstacle_detected} --- sensor event, cannot be suppressed.
+  \item \ctxdsl{idle} --- environment can always idle.
+\end{itemize}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Robot Arm Transitions}
+
+\lstinputlisting[style=ctxdsl, firstline=47, lastline=65]{../examples/06_controllability.ctxdsl}
+
+The controller can choose whether to \ctxdsl{extend} or \ctxdsl{grip},
+but it \emph{cannot prevent} \ctxdsl{obstacle_detected} from occurring.
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Controllable Reachability: Return Home}
+
+Can the controller \emph{force} returning to \textbf{Home} from every state?
+
+\lstinputlisting[style=ctxdsl, firstline=95, lastline=102]{../examples/06_controllability.ctxdsl}
+
+\medskip
+\begin{itemize}
+  \item \ctxdsl{[ (ctrl = controllable) ] X} ensures:
+    \begin{itemize}
+      \item All uncontrollable transitions stay in the winning region.
+      \item At least one controllable transition progresses toward Home.
+    \end{itemize}
+  \item \textbf{Result:} 4/5 states satisfy --- \textbf{Extended} is excluded
+        because \ctxdsl{idle} is uncontrollable there, letting the
+        environment stall indefinitely.
+  \item The controller cannot force progress from Extended when the
+        environment can choose to idle forever.
+\end{itemize}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Controller Synthesis}
+
+\lstinputlisting[style=ctxdsl, firstline=105, lastline=113]{../examples/06_controllability.ctxdsl}
+
+\vspace{0.5em}
+CLI invocation:
+
+\begin{shellcode}
+$ mununu context synth 06_controllability.ctxdsl \
+    --formula safety_invariant --automaton RobotArm
+\end{shellcode}
+
+\vspace{0.5em}
+\begin{itemize}
+  \item \ctxdsl{source} --- the automaton to restrict.
+  \item \ctxdsl{satisfying} --- the property the controller must enforce.
+  \item The synthesizer removes \emph{controllable} transitions that would
+        violate the property, while preserving all uncontrollable transitions.
+\end{itemize}
+
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Synthesis Result and Key Rules}
+
+\textbf{Result:} the controller retains all 5 states --- the property is
+\alert{realizable} without removing any state.
+
+\vspace{1em}
+\textbf{How synthesis works:}
+\begin{enumerate}
+  \item Compute the \emph{winning region} --- states from which the property
+        can be enforced despite the environment.
+  \item \emph{Restrict} controllable transitions that leave the winning region.
+  \item \emph{Preserve} all uncontrollable transitions (environment cannot be blocked).
+\end{enumerate}
+
+\vspace{1em}
+\textbf{Key rule for composition:}
+\begin{center}
+\fbox{\parbox{0.75\textwidth}{%
+  Controllable labels must \textbf{not} be shared between automata
+  in a composition --- each controller owns its own actions.
+}}
+\end{center}
+
+\end{frame}
+
+\end{document}

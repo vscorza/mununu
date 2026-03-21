@@ -1,0 +1,127 @@
+% 03a_sync_composition.tex — Tutorial 03a: Synchronous Composition
+\input{common/preamble}
+
+\title{03a --- Synchronous Composition}
+\subtitle{Lock-Step Parallel Execution}
+
+\begin{document}
+
+\maketitle
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Producer Automaton}
+  \lstinputlisting[style=ctxdsl, firstline=17, lastline=35]{../examples/03a_sync_composition.ctxdsl}
+
+  \medskip
+  The Producer generates data and hands it off via \ctxdsl{transfer}.
+  The \ctxdsl{p_skip} label lets it idle while the Consumer acts.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Consumer Automaton}
+  \lstinputlisting[style=ctxdsl, firstline=38, lastline=57]{../examples/03a_sync_composition.ctxdsl}
+
+  \medskip
+  The Consumer receives data via \ctxdsl{transfer} (shared with Producer) and processes it.
+  Its own skip label \ctxdsl{c_skip} allows it to idle independently.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Composition Block}
+  \lstinputlisting[style=ctxdsl, firstline=60, lastline=64]{../examples/03a_sync_composition.ctxdsl}
+
+  \bigskip
+  \begin{itemize}
+    \item \ctxdsl{synchronous} --- both automata step \textbf{simultaneously} every cycle.
+    \item \ctxdsl{members [Producer, Consumer]} --- lists the participating automata.
+    \item \ctxdsl{pipeline} --- the name of the composed system (used in \ctxdsl{over}).
+  \end{itemize}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Lock-Step Semantics}
+  \begin{center}
+  \begin{tabularx}{0.88\textwidth}{lX}
+    \toprule
+    \textbf{Rule} & \textbf{Description} \\
+    \midrule
+    Shared labels &
+      A label present in \emph{both} alphabets (e.g.\ \texttt{transfer})
+      must fire in both automata simultaneously. \\
+    \addlinespace
+    Non-shared labels &
+      Labels unique to one automaton (e.g.\ \texttt{produce}, \texttt{consume})
+      combine freely with any transition of the other side. \\
+    \addlinespace
+    Skip labels &
+      Each automaton needs its own skip (\texttt{p\_skip}, \texttt{c\_skip})
+      so it can ``do nothing'' while the other acts.
+      A shared \texttt{idle} would force both to idle together. \\
+    \bottomrule
+  \end{tabularx}
+  \end{center}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Product State Space}
+  The composed system \texttt{pipeline} has $2 \times 2 = 4$ states:
+
+  \begin{center}
+  \begin{tikzpicture}[
+    ->,>=Stealth,
+    node distance=3.5cm and 3.5cm,
+    every state/.style={fill=ubaBlue!10, draw=ubaBlue, thick,
+                        minimum size=1.2cm, font=\scriptsize, align=center},
+    every edge/.style={draw, thick},
+  ]
+    \node[state, initial]  (EW)  {Empty\\Waiting};
+    \node[state]           (DW)  [right=of EW]   {DataReady\\Waiting};
+    \node[state]           (EP)  [below=2.5cm of EW]   {Empty\\Processing};
+    \node[state]           (DP)  [right=of EP]   {DataReady\\Processing};
+
+    \path
+      (EW) edge              node[above] {\tiny produce + c\_skip} (DW)
+      (DW) edge              node[right] {\tiny transfer}          (EP)
+      (EP) edge              node[below] {\tiny produce + consume} (DW)
+      (EP) edge [loop left]  node[left]  {\tiny p\_skip + consume} ()
+      (EW) edge [loop left]  node[left]  {\tiny p\_skip + c\_skip} ()
+      (DW) edge [loop right] node[right] {\tiny p\_skip + c\_skip} ()
+      (EP) edge              node[left]  {\tiny p\_skip + consume} (EW)
+      (DP) edge              node[right] {\tiny transfer}          (EP)
+      (DW) edge              node[above, sloped] {\tiny produce + c\_skip} (DP)
+      (DP) edge [loop right] node[right] {\tiny p\_skip + c\_skip} ()
+      ;
+  \end{tikzpicture}
+  \end{center}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Formulas Over Compositions}
+  \lstinputlisting[style=ctxdsl, firstline=66, lastline=94]{../examples/03a_sync_composition.ctxdsl}
+
+  \medskip
+  \begin{itemize}
+    \item \textbf{Structural} formulas (\ctxdsl{over pipeline}) use no state names --- they work on the product.
+    \item \textbf{Component} formulas (\ctxdsl{over Producer}) can reference individual state names.
+  \end{itemize}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{New Syntax Summary}
+  \begin{center}
+  \begin{tabularx}{0.85\textwidth}{lX}
+    \toprule
+    \textbf{Keyword}       & \textbf{Purpose} \\
+    \midrule
+    \ctxdsl{composition}    & Block declaring composed systems \\
+    \ctxdsl{synchronous}    & Lock-step composition mode \\
+    \ctxdsl{members}        & Lists the automata to compose \\
+    \bottomrule
+  \end{tabularx}
+  \end{center}
+
+  \bigskip
+  \textbf{Key takeaway:} Synchronous composition models systems where every component takes a step on every clock cycle. Shared labels enforce coordination; private skip labels allow independent idling.
+\end{frame}
+
+\end{document}

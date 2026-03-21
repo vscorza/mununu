@@ -1,0 +1,115 @@
+// Tutorial 05 — LTL Property Verification
+//
+// System: Water tank level controller
+//
+// A simple controller manages a water tank: it fills when empty,
+// drains when full. This system demonstrates three types of LTL
+// properties that map to real verification concerns:
+//
+//   Safety:   "nothing bad ever happens"  — G(safe_condition)
+//   Liveness: "something good eventually happens" — G(p -> F(q))
+//   GR(1):    "repeated stimulus yields repeated response" — GF(p) -> GF(q)
+//
+// Introduces: body = ltl ..., G (globally), F (eventually), -> (implies).
+
+context water_tank {
+    alphabet {
+        label fill;
+        label drain;
+        label idle;
+    }
+
+    automata {
+        automaton Tank {
+            controllable {
+                label fill;
+                label drain;
+            }
+
+            states {
+                state Empty initial;
+                state Filling;
+                state Full;
+                state Draining;
+            }
+
+            transitions {
+                // Start filling when empty
+                transition Empty -> Filling on label fill;
+                // Tank is now full
+                transition Filling -> Full on label fill;
+                // Start draining when full
+                transition Full -> Draining on label drain;
+                // Tank is now empty
+                transition Draining -> Empty on label drain;
+                // Stay empty (waiting for fill command)
+                transition Empty -> Empty on label idle;
+            }
+        }
+    }
+
+    mu_formulas {
+        // === LTL Properties ===
+
+        // Safety: the tank is always in a valid state.
+        // G(phi) means phi holds in every reachable state.
+        formula ltl_safety {
+            over Tank;
+            body = ltl G (Empty || Filling || Full || Draining);
+        }
+
+        // Liveness: if the tank starts filling, it eventually becomes full.
+        // G(p -> F(q)) is the "response" pattern.
+        formula ltl_liveness {
+            over Tank;
+            body = ltl G (Filling -> F Full);
+        }
+
+        // GR(1) response: if the tank is full infinitely often,
+        // it is also empty infinitely often (the system cycles).
+        // This is expressed as G(Full -> F Empty) — a response pattern.
+        formula ltl_response {
+            over Tank;
+            body = ltl G (Full -> F Empty);
+        }
+
+        // === Equivalent mu-calculus formulas (for comparison) ===
+
+        // Safety in mu-calculus: nu X. ([] X) — greatest fixpoint invariant
+        formula mu_safety {
+            over Tank;
+            body = nu X. ([] X);
+        }
+
+        // Reachability in mu-calculus: mu X. (Full || <> X)
+        formula mu_full_reachable {
+            over Tank;
+            body = mu X. (Full || <> X);
+        }
+
+        // GF pattern in mu-calculus: nu X. (mu Y. (Empty || <> Y)) && ([] X)
+        // "infinitely often Empty" — the system repeatedly returns to Empty
+        formula mu_gf_empty {
+            over Tank;
+            body = nu X. ((mu Y. (Empty || <> Y)) && ([] X));
+        }
+
+        // === Game-theoretic reachability (controllable attractor) ===
+
+        // Controllable reachability: can the controller force reaching Full
+        // despite the environment's ability to choose `idle`?
+        //
+        // [ (ctrl = controllable) ] X means:
+        //   - ALL uncontrollable transitions must lead to X (environment can't escape)
+        //   - At least ONE controllable transition must lead to X (controller has a strategy)
+        //
+        // With `idle` uncontrollable: FAILS for Empty and Draining (2/4)
+        //   because the environment can loop idle forever at Empty.
+        // If idle were controllable: SUCCEEDS for all states (4/4)
+        //   because the controller would simply choose fill instead of idle.
+        formula ctrl_reachable_full {
+            over Tank;
+            body = mu X. (Full || [ (ctrl = controllable) ] X);
+        }
+    }
+}

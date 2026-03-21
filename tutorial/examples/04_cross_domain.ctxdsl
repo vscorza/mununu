@@ -1,0 +1,176 @@
+// Tutorial 04 — Cross-Domain Composition
+//
+// System: Fast ADC sampling domain + slow processing domain
+//
+// Two conceptually separate clock domains communicate via a shared FIFO.
+// Within each domain, components would move in lock-step (synchronous).
+// Between domains, they interleave (asynchronous).
+//
+// Architecture (conceptual):
+//   fast_domain = sync(ADC, SampleBuffer)  — shares fifo_push
+//   slow_domain = sync(Processor, ResultStore) — shares store_result
+//   system = async(fast_domain, slow_domain) — shares fifo_pop
+//
+// Hierarchical composition is used: each domain is composed synchronously
+// first, then the two domains are composed asynchronously. This mirrors
+// the real hardware architecture where components within a clock domain
+// move in lock-step, but domains interleave independently.
+
+context cross_domain_adc {
+    alphabet {
+        label adc_start;
+        label adc_done;
+        label fifo_push;
+        label fifo_pop;
+        label proc_compute;
+        label proc_done;
+        label store_result;
+        label store_clear;
+    }
+
+    automata {
+        // === Fast Clock Domain ===
+
+        automaton ADC {
+            controllable {
+                label adc_start;
+                label adc_done;
+                label adc_skip;
+            }
+
+            states {
+                state AdcIdle initial;
+                state Converting;
+                state AdcDone;
+            }
+
+            transitions {
+                // Start conversion
+                transition AdcIdle -> Converting on label adc_start;
+                // Conversion complete
+                transition Converting -> AdcDone on label adc_done;
+                // Push result to FIFO (synchronizes with SampleBuffer)
+                transition AdcDone -> AdcIdle on label fifo_push;
+                // Skip: ADC idles this cycle (needed for sync composition)
+                transition AdcIdle -> AdcIdle on label adc_skip;
+                transition Converting -> Converting on label adc_skip;
+                transition AdcDone -> AdcDone on label adc_skip;
+            }
+        }
+
+        automaton SampleBuffer {
+            controllable {
+                label buf_skip;
+            }
+
+            states {
+                state BufEmpty initial;
+                state BufHolding;
+            }
+
+            transitions {
+                // Receive from ADC (synchronizes with ADC)
+                transition BufEmpty -> BufHolding on label fifo_push;
+                // Deliver to Processor (synchronizes with Processor)
+                transition BufHolding -> BufEmpty on label fifo_pop;
+                // Skip: buffer idles this cycle
+                transition BufEmpty -> BufEmpty on label buf_skip;
+                transition BufHolding -> BufHolding on label buf_skip;
+            }
+        }
+
+        // === Slow Clock Domain ===
+
+        automaton Processor {
+            controllable {
+                label proc_compute;
+                label proc_done;
+                label proc_skip;
+            }
+
+            states {
+                state ProcWaiting initial;
+                state Computing;
+                state ProcFinished;
+            }
+
+            transitions {
+                // Read from FIFO (synchronizes with SampleBuffer)
+                transition ProcWaiting -> Computing on label fifo_pop;
+                // Computation done
+                transition Computing -> ProcFinished on label proc_done;
+                // Store result (synchronizes with ResultStore)
+                transition ProcFinished -> ProcWaiting on label store_result;
+                // Skip: processor idles this cycle
+                transition ProcWaiting -> ProcWaiting on label proc_skip;
+                transition Computing -> Computing on label proc_skip;
+                transition ProcFinished -> ProcFinished on label proc_skip;
+            }
+        }
+
+        automaton ResultStore {
+            controllable {
+                label store_skip;
+            }
+
+            states {
+                state StoreEmpty initial;
+                state StoreHolding;
+            }
+
+            transitions {
+                // Receive from Processor (synchronizes with Processor)
+                transition StoreEmpty -> StoreHolding on label store_result;
+                // Clear result (external read)
+                transition StoreHolding -> StoreEmpty on label store_clear;
+                // Skip: store idles this cycle
+                transition StoreEmpty -> StoreEmpty on label store_skip;
+                transition StoreHolding -> StoreHolding on label store_skip;
+            }
+        }
+    }
+
+    composition {
+        // Step 1: Compose each clock domain synchronously
+        synchronous fast_domain {
+            members [ADC, SampleBuffer];
+        }
+        synchronous slow_domain {
+            members [Processor, ResultStore];
+        }
+        // Step 2: Compose the two domains asynchronously
+        asynchronous system {
+            members [fast_domain, slow_domain];
+        }
+    }
+
+    mu_formulas {
+        // Safety over the full system
+        formula safety {
+            over system;
+            body = nu X. ([] X);
+        }
+
+        // Individual component reachability
+        formula adc_can_convert {
+            over ADC;
+            body = mu X. (AdcDone || <> X);
+        }
+
+        formula processor_can_finish {
+            over Processor;
+            body = mu X. (ProcFinished || <> X);
+        }
+
+        formula store_can_hold {
+            over ResultStore;
+            body = mu X. (StoreHolding || <> X);
+        }
+
+        // End-to-end: from any ADC state, conversion is reachable
+        formula adc_cycles {
+            over ADC;
+            body = mu X. (AdcIdle || <> X);
+        }
+    }
+}

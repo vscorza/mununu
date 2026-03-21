@@ -1,0 +1,128 @@
+\input{common/preamble}
+
+\begin{document}
+\cheatheader{04 --- Cross-Domain Composition}{Multiple Clock Domains}
+
+\begin{multicols}{3}
+\footnotesize
+
+% ── Column 1 ──────────────────────────────────────
+
+\begin{cheatbox}{Architecture}
+A typical cross-domain system has components running at
+different speeds, connected through buffering:
+
+\medskip
+\renewcommand{\arraystretch}{1.1}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\scriptsize\textbf{Domain} & \scriptsize\textbf{Components} \\
+\midrule
+Fast  & ADC, SampleBuffer \\
+Slow  & Processor, ResultStore \\
+Bridge & FIFO (shared labels) \\
+\bottomrule
+\end{tabularx}
+
+\medskip
+Data flows: ADC $\xrightarrow{\text{sample}}$ Buffer
+$\xrightarrow{\text{fifo\_push}}$ FIFO
+$\xrightarrow{\text{fifo\_pop}}$ Processor
+$\xrightarrow{\text{store\_result}}$ Store.
+\end{cheatbox}
+
+\begin{cheatbox}{Shared Labels as Sync Points}
+Cross-domain boundaries are enforced by shared labels that
+act as handshake signals:
+
+\begin{itemize}
+  \item \code{fifo\_push} --- Buffer $\leftrightarrow$ FIFO
+  \item \code{fifo\_pop} --- FIFO $\leftrightarrow$ Processor
+  \item \code{store\_result} --- Processor $\leftrightarrow$ Store
+\end{itemize}
+
+Each pair synchronizes only on its shared labels; other
+components step independently.
+\end{cheatbox}
+
+\columnbreak
+
+% ── Column 2 ──────────────────────────────────────
+
+\begin{cheatbox}{Flat Async Workaround}
+Since hierarchical composition is not yet supported, model
+cross-domain systems as a single flat async composition:
+
+\begin{lstlisting}[style=ctxdsl]
+asynchronous system {
+    members [
+        ADC,
+        SampleBuffer,
+        Processor,
+        ResultStore
+    ];
+}
+\end{lstlisting}
+
+All components are listed as direct members. Domain
+boundaries emerge from the shared-label topology, not from
+nesting.
+\end{cheatbox}
+
+\begin{tipbox}{Design Pattern: Pairwise Sync}
+Use \textbf{unique shared labels} between each pair of
+communicating components to create sync barriers:
+
+\begin{itemize}
+  \item Name labels by the pair: \code{adc\_buf\_sample},
+        \code{buf\_fifo\_push}, etc.
+  \item Avoid giving the same label to unrelated pairs ---
+        it forces unwanted synchronization.
+  \item This creates a chain of local handshakes that
+        preserves domain isolation.
+\end{itemize}
+\end{tipbox}
+
+\columnbreak
+
+% ── Column 3 ──────────────────────────────────────
+
+\begin{cheatbox}{Verify Components Individually}
+Evaluating properties over \textbf{individual automata}
+(or small sub-compositions) gives more precise results:
+
+\begin{lstlisting}[style=ctxdsl]
+formula buf_safe {
+    over SampleBuffer;
+    body = nu X. safe && ([] X);
+}
+\end{lstlisting}
+
+\begin{itemize}
+  \item Smaller state space $\Rightarrow$ faster fixpoint
+        computation.
+  \item Easier to pinpoint which component violates a
+        property.
+  \item Compose and re-verify only when component-level
+        properties pass.
+\end{itemize}
+\end{cheatbox}
+
+\begin{warnbox}{Hierarchical Composition}
+Mununu does \textbf{not yet support} referencing a
+composition as a member of another composition:
+
+\begin{lstlisting}[style=ctxdsl]
+// NOT supported:
+asynchronous outer {
+    members [fast_domain, slow_domain];
+}
+\end{lstlisting}
+
+\textbf{Workaround:} flatten all components into a single
+\code{asynchronous} block and rely on shared-label topology
+to enforce domain boundaries.
+\end{warnbox}
+
+\end{multicols}
+\end{document}

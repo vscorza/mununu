@@ -1,0 +1,117 @@
+// Tutorial 03b — Asynchronous Composition
+//
+// System: Two independent vibration sensors reporting to a central monitor
+//
+// Each sensor operates independently (sampling and reporting). The monitor
+// receives reports. Asynchronous composition models interleaved execution:
+// any component can step independently (no lock-step requirement).
+//
+// Compare with synchronous (03a): here, one automaton can move while
+// others stay still. No "skip" labels needed.
+//
+// Introduces: asynchronous composition.
+
+context async_sensors {
+    alphabet {
+        label sensor_a_sample;
+        label sensor_a_report;
+        label sensor_b_sample;
+        label sensor_b_report;
+        label monitor_process;
+    }
+
+    automata {
+        automaton SensorA {
+            // Sensor controls sampling; reporting is environment-triggered
+            controllable {
+                label sensor_a_sample;
+            }
+
+            states {
+                state IdleA initial;
+                state SampledA;
+            }
+
+            transitions {
+                transition IdleA -> SampledA on label sensor_a_sample;
+                transition SampledA -> IdleA on label sensor_a_report;
+            }
+        }
+
+        automaton SensorB {
+            controllable {
+                label sensor_b_sample;
+            }
+
+            states {
+                state IdleB initial;
+                state SampledB;
+            }
+
+            transitions {
+                transition IdleB -> SampledB on label sensor_b_sample;
+                transition SampledB -> IdleB on label sensor_b_report;
+            }
+        }
+
+        automaton Monitor {
+            controllable {
+                label monitor_process;
+            }
+
+            states {
+                state Ready initial;
+                state ReceivedA;
+                state ReceivedB;
+            }
+
+            transitions {
+                transition Ready -> ReceivedA on label sensor_a_report;
+                transition Ready -> ReceivedB on label sensor_b_report;
+                transition ReceivedA -> Ready on label monitor_process;
+                transition ReceivedB -> Ready on label monitor_process;
+            }
+        }
+    }
+
+    composition {
+        asynchronous sensor_network {
+            members [SensorA, SensorB, Monitor];
+        }
+    }
+
+    mu_formulas {
+        // Safety: the sensor network always stays in valid states
+        formula safety {
+            over sensor_network;
+            body = nu X. ([] X);
+        }
+
+        // No deadlocks in the composed system
+        formula no_deadlock {
+            over sensor_network;
+            body = nu X. ((<> true) && ([] X));
+        }
+
+        // Properties over individual automata
+        formula sensor_a_can_sample {
+            over SensorA;
+            body = mu X. (SampledA || <> X);
+        }
+
+        formula sensor_b_can_sample {
+            over SensorB;
+            body = mu X. (SampledB || <> X);
+        }
+
+        formula monitor_receives {
+            over Monitor;
+            body = mu X. (ReceivedA || <> X);
+        }
+
+        formula monitor_resets {
+            over Monitor;
+            body = mu X. (Ready || <> X);
+        }
+    }
+}

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -616,9 +616,81 @@ fn build_context_with_compositions(
     // Process compositions: compose automata and register them as new automata.
     // Also track composition members for predicate projection.
     let mut composition_members: HashMap<String, Vec<String>> = HashMap::new();
-    let mut composed_automata: Vec<(String, RuntimeClts)> = Vec::new();
-    for composition in &doc.compositions {
-        let composition_name = composition.name.name.clone();
+    // Topologically sort compositions to support hierarchical composition
+    // (compositions referencing other compositions as members).
+    let composition_name_set: HashSet<String> = doc
+        .compositions
+        .iter()
+        .map(|c| c.name.name.clone())
+        .collect();
+
+    // Build dependency graph: for each composition, which other compositions it depends on
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    for comp in &doc.compositions {
+        let name = comp.name.name.clone();
+        let dep_count = comp
+            .members
+            .iter()
+            .filter(|m| composition_name_set.contains(&m.name))
+            .count();
+        in_degree.insert(name.clone(), dep_count);
+        for member in &comp.members {
+            if composition_name_set.contains(&member.name) {
+                dependents
+                    .entry(member.name.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
+
+    // Kahn's algorithm for topological sort
+    let mut queue: VecDeque<String> = in_degree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut sorted_names: Vec<String> = Vec::new();
+    while let Some(node) = queue.pop_front() {
+        sorted_names.push(node.clone());
+        if let Some(deps) = dependents.get(&node) {
+            for dep in deps {
+                if let Some(deg) = in_degree.get_mut(dep) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+    if sorted_names.len() != composition_name_set.len() {
+        let sorted_set: HashSet<String> = sorted_names.into_iter().collect();
+        let remaining: Vec<String> = composition_name_set
+            .difference(&sorted_set)
+            .cloned()
+            .collect();
+        return Err(RealizationError::InvalidComposition {
+            name: remaining.join(", "),
+            reason: "circular dependency detected among compositions".to_string(),
+        });
+    }
+
+    // Index compositions by name for lookup during ordered processing
+    let comp_by_name: HashMap<String, &super::ast::Composition> = doc
+        .compositions
+        .iter()
+        .map(|c| (c.name.name.clone(), c))
+        .collect();
+
+    // Process compositions in topological order. Already-realized compositions
+    // are stored in `realized` so later compositions can reference them.
+    let mut realized: HashMap<String, Clts<DefaultStateIdx, DefaultLabelIdx>> = HashMap::new();
+
+    for comp_name in &sorted_names {
+        let composition = comp_by_name[comp_name.as_str()];
+        let composition_name = comp_name.clone();
         let member_names: Vec<String> = composition
             .members
             .iter()
@@ -642,12 +714,14 @@ fn build_context_with_compositions(
         let options = CompositionOptions::new(semantics);
 
         // Compose members left-associatively.
+        // Members can be base automata (from context) or previously realized compositions.
         let first_name = &member_names[0];
         let mut composed_clts = context
             .clts(first_name)
+            .or_else(|| realized.get(first_name.as_str()))
             .ok_or_else(|| {
                 RealizationError::UnknownAutomaton(format!(
-                    "composition '{}' references unknown automaton '{}'",
+                    "composition '{}' references unknown member '{}'",
                     composition_name, first_name
                 ))
             })?
@@ -656,19 +730,23 @@ fn build_context_with_compositions(
         for member_name in member_names.iter().skip(1) {
             let member_clts = context
                 .clts(member_name)
+                .or_else(|| realized.get(member_name.as_str()))
                 .ok_or_else(|| {
                     RealizationError::UnknownAutomaton(format!(
-                        "composition '{}' references unknown automaton '{}'",
+                        "composition '{}' references unknown member '{}'",
                         composition_name, member_name
                     ))
                 })?
                 .clone();
 
             // Create a temporary context for composition.
+            // Use finish() (no controllability re-validation) because members
+            // may themselves be composed CLTS that carry inherited labels.
+            // The original automata were already validated at registration time.
             let temp_context = ContextBuilder::default()
                 .register_clts("left".to_string(), composed_clts.clone())
                 .register_clts("right".to_string(), member_clts.clone())
-                .finish_with_checks()?;
+                .finish();
 
             composed_clts = temp_context
                 .compose_named("left", "right", &options)
@@ -678,8 +756,31 @@ fn build_context_with_compositions(
                 })?;
         }
 
-        composed_automata.push((composition_name, composed_clts));
+        realized.insert(composition_name, composed_clts);
     }
+
+    // Expand composition_members transitively: if a member is itself a composition,
+    // replace it with that composition's expanded members. Since we process in
+    // topological order, inner compositions are already expanded.
+    for comp_name in &sorted_names {
+        let direct_members = composition_members[comp_name].clone();
+        let mut expanded = Vec::new();
+        for member in &direct_members {
+            if let Some(sub_members) = composition_members.get(member) {
+                if composition_name_set.contains(member) {
+                    expanded.extend(sub_members.clone());
+                } else {
+                    expanded.push(member.clone());
+                }
+            } else {
+                expanded.push(member.clone());
+            }
+        }
+        composition_members.insert(comp_name.clone(), expanded);
+    }
+
+    let composed_automata: Vec<(String, Clts<DefaultStateIdx, DefaultLabelIdx>)> =
+        realized.into_iter().collect();
 
     // Build final context with all original automata plus composed automata.
     // Only rebuild if we have composed automata to avoid unnecessary work.

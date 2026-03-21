@@ -1,0 +1,71 @@
+% preamble.tex — Shared Beamer configuration for Mununu tutorial
+% Usage: \input{common/preamble} at the top of slides.tex
+
+\documentclass[aspectratio=169]{beamer}
+
+% --- Theme ---
+\usetheme{metropolis}
+
+% Color accents
+\definecolor{ubaBlue}{RGB}{0, 51, 102}
+\definecolor{ubaLightBlue}{RGB}{0, 102, 153}
+\definecolor{ubaGray}{RGB}{100, 100, 100}
+
+\setbeamercolor{palette primary}{bg=ubaBlue}
+\setbeamercolor{frametitle}{bg=ubaBlue}
+\setbeamercolor{alerted text}{fg=ubaLightBlue}
+\setbeamercolor{example text}{fg=ubaGray}
+
+% --- Language ---
+\usepackage[english]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+% --- Math and symbols ---
+\usepackage{amsmath, amssymb}
+\usepackage{stmaryrd}       % \llbracket, \rrbracket
+
+% --- Code listings ---
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{ubaBlue}\bfseries,
+  commentstyle=\color{ubaGray}\itshape,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+}
+
+% --- TikZ for diagrams ---
+\usepackage{tikz}
+\usetikzlibrary{automata, positioning, arrows.meta, calc, fit}
+
+% --- Common macros: LTL operators ---
+\newcommand{\Globally}{\mathbf{G}\,}
+\newcommand{\Finally}{\mathbf{F}\,}
+\newcommand{\Next}{\mathbf{X}\,}
+\newcommand{\Until}{\,\mathbf{U}\,}
+
+% --- Common macros: Fixpoints ---
+\newcommand{\lfp}{\mu}
+\newcommand{\gfp}{\nu}
+
+% --- Common macros: Modalities ---
+\newcommand{\Boxx}{\square}
+\newcommand{\Dia}{\lozenge}
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{tabularx}
+
+% --- Title info ---
+\author{Mariano Cerrutti}
+\institute{Mununu Tutorial}
+\date{}
+
+% --- Navigation / footline ---
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+% --- Code styles ---
+\input{common/code}
