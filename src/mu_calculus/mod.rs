@@ -5,6 +5,7 @@
 //! reference CLTS labels, controllability metadata, and variable valuations.
 
 pub mod evaluator;
+pub mod invert;
 mod memo;
 pub mod parser;
 pub mod simplify;
@@ -129,11 +130,16 @@ pub enum ModalKind {
 }
 
 /// Controllability guard applied to modalities.
+///
+/// - `All`: no controllability distinction (all transitions treated equally)
+/// - `Controllable`: system perspective — all uncontrollable must satisfy, some controllable must
+/// - `Environment`: environment perspective (dual of Controllable) — some uncontrollable satisfies OR all controllable satisfy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Control {
     #[default]
     All,
     Controllable,
+    Environment,
 }
 
 /// Variable guard describing required/forbidden symbols.

@@ -4,8 +4,10 @@
 //! and convert file-based operations to in-memory content processing.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 use axum::Json;
+use tracing::info;
 
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::graph::generate_graphs;
@@ -28,7 +30,10 @@ pub async fn health_check() -> Json<serde_json::Value> {
 pub async fn context_summarize_handler(
     Json(request): Json<ContextSummarizeRequest>,
 ) -> ApiResult<Json<ContextSummarizeResponse>> {
+    let handler_start = Instant::now();
+
     // Parse context document
+    let t0 = Instant::now();
     let context_doc =
         parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
             message: format!("Failed to parse context: {}", e),
@@ -46,13 +51,17 @@ pub async fn context_summarize_handler(
         message: format!("Failed to parse sidecar: {}", e),
         details: Some(e.to_string()),
     })?;
+    let parse_ms = t0.elapsed().as_millis();
 
     // Realize context
+    let t1 = Instant::now();
     let realized =
         realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
             message: format!("Failed to realize context: {}", e),
             source: None,
         })?;
+    let realize_ms = t1.elapsed().as_millis();
+    info!(parse_ms, realize_ms, "summarize: parse+realize complete");
 
     // Build summary — include both direct automata and compositions
     let mut automata_names: Vec<String> = context_doc
@@ -128,6 +137,7 @@ pub async fn context_summarize_handler(
         });
     }
 
+    let controllers_count = controllers.len();
     let summary = ContextSummary {
         context_name: context_doc.name.name.clone(),
         automata,
@@ -135,6 +145,14 @@ pub async fn context_summarize_handler(
         controllers_count: realized.controllers.len(),
         controllers,
     };
+    let total_ms = handler_start.elapsed().as_millis();
+    info!(
+        parse_ms,
+        realize_ms,
+        total_ms,
+        controllers = controllers_count,
+        "summarize: complete"
+    );
 
     Ok(Json(ContextSummarizeResponse {
         success: true,
@@ -312,7 +330,9 @@ pub async fn context_graphs_handler(
                 ControllerSynthesisOptions {
                     evaluation: Some(&eval_options),
                     diagnostics: None,
-                    minimize: rc.options.minimize(),
+                    minimize: request
+                        .minimize_controllers
+                        .unwrap_or(rc.options.minimize()),
                 },
             ) else {
                 continue;
@@ -350,7 +370,11 @@ pub async fn context_graphs_handler(
 pub async fn context_verify_handler(
     Json(request): Json<ContextVerifyRequest>,
 ) -> ApiResult<Json<ContextVerifyResponse>> {
+    let handler_start = Instant::now();
+    let counterstrategy_requested = request.counterstrategy;
+
     // Parse context document
+    let t0 = Instant::now();
     let context_doc =
         parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
             message: format!("Failed to parse context: {}", e),
@@ -368,13 +392,22 @@ pub async fn context_verify_handler(
         message: format!("Failed to parse sidecar: {}", e),
         details: Some(e.to_string()),
     })?;
+    let parse_ms = t0.elapsed().as_millis();
 
     // Realize context
+    let t1 = Instant::now();
     let realized =
         realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
             message: format!("Failed to realize context: {}", e),
             source: None,
         })?;
+    let realize_ms = t1.elapsed().as_millis();
+    info!(
+        parse_ms,
+        realize_ms,
+        counterstrategy = counterstrategy_requested,
+        "verify: parse+realize complete"
+    );
 
     // Collect formula–automaton pairs to evaluate
     let mut pairs: Vec<(String, String)> = Vec::new();
@@ -424,6 +457,7 @@ pub async fn context_verify_handler(
 
     let eval_options = EvaluationOptions::default();
     let mut results = Vec::new();
+    let t2 = Instant::now();
 
     for (formula_name, automaton_name) in &pairs {
         let rf = &realized.formulas[formula_name];
@@ -483,6 +517,50 @@ pub async fn context_verify_handler(
 
         let satisfied = initial_violating.is_empty() && !initial_states.is_empty();
 
+        // Compute counterstrategy for failed formulas when requested
+        let counterstrategy = if request.counterstrategy && !satisfied {
+            use crate::mu_calculus::invert;
+
+            let inverted = invert::invert(&rf.formula);
+            let inverted_bitvec = realized
+                .context
+                .evaluate_mu(automaton_name, &inverted, &env, Some(&eval_options))
+                .ok();
+
+            inverted_bitvec.map(|inv_bv| {
+                // Collect environment winning states
+                let winning_set: HashSet<usize> = clts
+                    .states()
+                    .filter(|sid| inv_bv.get(sid.index()).map(|bit| *bit).unwrap_or(false))
+                    .map(|sid| sid.index())
+                    .collect();
+
+                let mut env_winning: Vec<String> = clts
+                    .states()
+                    .filter(|sid| winning_set.contains(&sid.index()))
+                    .filter_map(|sid| clts.state_name(sid).map(|n| n.to_string()))
+                    .collect();
+                env_winning.sort();
+
+                // Build graph elements directly from original CLTS, filtered
+                let cs_name = format!("{}_counterstrategy", automaton_name);
+                let graph_elements = crate::api::graph::counterstrategy_to_graph_elements(
+                    clts,
+                    &cs_name,
+                    &winning_set,
+                );
+
+                CounterstrategyResult {
+                    environment_winning_states: env_winning,
+                    graph_elements,
+                    inverted_formula: format!("{:?}", inverted),
+                    minimized: false,
+                }
+            })
+        } else {
+            None
+        };
+
         results.push(FormulaVerificationResult {
             formula_name: formula_name.clone(),
             automaton: automaton_name.clone(),
@@ -493,8 +571,21 @@ pub async fn context_verify_handler(
             initial_satisfying,
             initial_violating,
             satisfying_state_names,
+            counterstrategy,
         });
     }
+
+    let eval_ms = t2.elapsed().as_millis();
+    let total_ms = handler_start.elapsed().as_millis();
+    info!(
+        parse_ms,
+        realize_ms,
+        eval_ms,
+        total_ms,
+        formulas = pairs.len(),
+        counterstrategy = counterstrategy_requested,
+        "verify: complete"
+    );
 
     let all_satisfied = results.iter().all(|r| r.satisfied);
 

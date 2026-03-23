@@ -228,6 +228,173 @@ pub fn controller_to_graph_elements(
     clts_to_graph_elements_with_labels(controller, automaton_name, Some(source_clts))
 }
 
+/// Build graph elements for a counterstrategy: only states in the winning set
+/// and transitions between them.
+pub fn counterstrategy_to_graph_elements(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+    winning_set: &std::collections::HashSet<usize>,
+) -> Vec<GraphElement> {
+    let mut elements = Vec::new();
+    let state_spacing = 250.0;
+    let mut x_pos = 100.0;
+    let y_offset = 0.0;
+
+    // Compound node
+    let automaton_id = automaton_name.to_string();
+    elements.push(GraphElement {
+        data: GraphElementData::Node {
+            id: automaton_id.clone(),
+            label: format!(
+                "Counterstrategy: {}",
+                automaton_name.replace("_counterstrategy", "")
+            ),
+            parent: None,
+            vars: Vec::new(),
+            actions: Vec::new(),
+        },
+        position: None,
+        classes: None,
+    });
+
+    // State nodes (only winning states)
+    for state_id in clts.states() {
+        if !winning_set.contains(&state_id.index()) {
+            continue;
+        }
+        let state_name = clts.state_name(state_id).unwrap_or("?").to_string();
+        let node_id = format!("{}_{}", automaton_name, state_name);
+        let is_initial = clts.initial_states().contains(&state_id);
+
+        let mut classes = vec!["env-winning"];
+        if is_initial {
+            classes.push("start");
+        }
+
+        elements.push(GraphElement {
+            data: GraphElementData::Node {
+                id: node_id.clone(),
+                label: state_name.clone(),
+                parent: Some(automaton_id.clone()),
+                vars: Vec::new(),
+                actions: Vec::new(),
+            },
+            position: Some(GraphPosition {
+                x: x_pos,
+                y: y_offset + 100.0,
+            }),
+            classes: Some(classes.join(" ")),
+        });
+
+        if is_initial {
+            let entry_id = format!("{}_entry_{}", automaton_name, state_name);
+            elements.push(GraphElement {
+                data: GraphElementData::Node {
+                    id: entry_id.clone(),
+                    label: String::new(),
+                    parent: Some(automaton_id.clone()),
+                    vars: Vec::new(),
+                    actions: Vec::new(),
+                },
+                position: Some(GraphPosition {
+                    x: 40.0,
+                    y: y_offset + 100.0,
+                }),
+                classes: Some("entry".to_string()),
+            });
+            elements.push(GraphElement {
+                data: GraphElementData::Edge {
+                    id: format!("{}_entry_edge_{}", automaton_name, state_name),
+                    source: entry_id,
+                    target: node_id,
+                    label: None,
+                    action: None,
+                    action_type: Some("start-arrow".to_string()),
+                    guard: None,
+                    effect: None,
+                },
+                position: None,
+                classes: None,
+            });
+        }
+
+        x_pos += state_spacing;
+    }
+
+    // Transitions (only between winning states)
+    for state_id in clts.states() {
+        if !winning_set.contains(&state_id.index()) {
+            continue;
+        }
+        let source_name = clts.state_name(state_id).unwrap_or("?").to_string();
+        let source_id = format!("{}_{}", automaton_name, source_name);
+
+        for transition in clts.outgoing(state_id) {
+            if !winning_set.contains(&transition.target().index()) {
+                continue;
+            }
+            let target_name = clts
+                .state_name(transition.target())
+                .unwrap_or("?")
+                .to_string();
+            let target_id = format!("{}_{}", automaton_name, target_name);
+
+            let label_parts: Vec<String> = transition
+                .labels()
+                .iter()
+                .map(|lid| {
+                    clts.label_payload(*lid)
+                        .and_then(|vals| {
+                            let joined = vals
+                                .iter()
+                                .filter(|v| !v.is_empty())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if joined.is_empty() {
+                                None
+                            } else {
+                                Some(joined)
+                            }
+                        })
+                        .unwrap_or_else(|| format!("label_{}", lid.index()))
+                })
+                .collect();
+            let label_text = if label_parts.is_empty() {
+                None
+            } else {
+                Some(label_parts.join(" | "))
+            };
+
+            let is_uncontrollable = transition.is_uncontrollable(clts);
+            let action_type = if is_uncontrollable {
+                "uncontrollable"
+            } else {
+                "controllable"
+            };
+
+            let transition_id = format!("{}_{}_t{}", automaton_name, source_name, elements.len());
+
+            elements.push(GraphElement {
+                data: GraphElementData::Edge {
+                    id: transition_id,
+                    source: source_id.clone(),
+                    target: target_id,
+                    label: label_text,
+                    action: None,
+                    action_type: Some(action_type.to_string()),
+                    guard: None,
+                    effect: None,
+                },
+                position: None,
+                classes: None,
+            });
+        }
+    }
+
+    elements
+}
+
 fn clts_to_graph_elements_with_labels(
     clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
     automaton_name: &str,

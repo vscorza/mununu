@@ -650,10 +650,71 @@ where
             return true;
         }
 
+        // Environment diamond: <ctrl=environment> Φ
+        // TRUE if (∃ uncontrollable → Φ) OR (∀ controllable → Φ)
+        // "The environment has an uncontrollable escape, or the system is trapped"
+        if guard.control == Control::Environment {
+            // Check: ∃ uncontrollable transition → targets
+            for transition in outgoing.iter() {
+                if !transition.is_uncontrollable(self.clts) {
+                    continue;
+                }
+                if !self.guard_matches(state, transition, guard) {
+                    continue;
+                }
+                if let Some(parts) = guard_parts
+                    && !parts.matches_next(transition.target().index())
+                {
+                    continue;
+                }
+                if targets
+                    .get(transition.target().index())
+                    .map(|bit| *bit)
+                    .unwrap_or(false)
+                {
+                    return true; // Environment has an uncontrollable escape
+                }
+            }
+
+            // Check: ∀ controllable transitions → targets (system is trapped)
+            let mut ctrl_seen = false;
+            let mut all_ctrl_satisfy = true;
+            for transition in outgoing.iter() {
+                if !transition.is_controllable(self.clts) {
+                    continue;
+                }
+                if !self.guard_matches(state, transition, guard) {
+                    continue;
+                }
+                if let Some(parts) = guard_parts
+                    && !parts.matches_next(transition.target().index())
+                {
+                    continue;
+                }
+                ctrl_seen = true;
+                if !targets
+                    .get(transition.target().index())
+                    .map(|bit| *bit)
+                    .unwrap_or(false)
+                {
+                    all_ctrl_satisfy = false;
+                    break;
+                }
+            }
+            if ctrl_seen && all_ctrl_satisfy {
+                return true; // System is trapped: all controllable moves lead to targets
+            }
+            // No controllable transitions and no uncontrollable escape: vacuously true
+            if !ctrl_seen {
+                return true;
+            }
+        }
+
         // All transitions should have been checked above through:
         // 1. Uncontrollable groups (with sub-grouping by full label set)
         // 2. Controllable transitions grouped by full label set
         // 3. Global label set grouping for nondeterminism
+        // 4. Environment diamond (Control::Environment)
         // If we reach here, no group/sub-group satisfied the formula
         false
     }
@@ -806,6 +867,33 @@ where
                     // Uncontrollable transitions already handled in uncontrollable_groups above
                 }
                 if ctrl_seen { ctrl_satisfied } else { true }
+            }
+            Control::Environment => {
+                // Box with environment perspective: dual of diamond with controllable.
+                // [ctrl=environment] Φ = (∀ uncontrollable → Φ) ∧ (¬(∃ controllable → ¬Φ))
+                // = all uncontrollable satisfy AND no controllable escapes.
+                // Simplified: all uncontrollable → Φ AND (∃ controllable → Φ fails → false)
+                // Practically: all matching transitions must satisfy (like Control::All).
+                // This case is rare — inversion primarily produces <ctrl=environment>.
+                let outgoing = self.clts.outgoing(state);
+                for transition in outgoing {
+                    if !self.guard_matches(state, transition, guard) {
+                        continue;
+                    }
+                    if let Some(parts) = guard_parts
+                        && !parts.matches_next(transition.target().index())
+                    {
+                        continue;
+                    }
+                    if !targets
+                        .get(transition.target().index())
+                        .map(|bit| *bit)
+                        .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                }
+                true
             }
         }
     }

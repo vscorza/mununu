@@ -1,0 +1,146 @@
+// Tutorial 11 — Unrealizable Asynchronous Reactiveness
+//
+// System: Message delivery over an unreliable network
+//
+// A Sender produces messages and a Receiver consumes them.
+// The network (environment) can non-deterministically drop messages.
+// The system is composed asynchronously.
+//
+// The reactiveness specification "controller can force Delivered"
+// is UNREALIZABLE because the environment can always choose `drop`
+// (uncontrollable) at the Sender, preventing any message from
+// reaching the Receiver.
+//
+// Adding a controllable `retry` action that bypasses the network
+// makes the spec realizable: the controller retries until delivery.
+
+context unrealizable_async_response {
+    alphabet {
+        label send;
+        label drop;
+        label deliver;
+        label consume;
+        label retry;
+        label ack;
+    }
+
+    automata {
+        automaton Sender {
+            // Controller controls sending and retrying.
+            // drop is uncontrollable (network failure).
+            controllable {
+                label send;
+                label retry;
+            }
+
+            states {
+                state Idle initial;
+                state Sending;
+                state Dropped;
+                state Sent;
+            }
+
+            transitions {
+                // Controller initiates send
+                transition Idle -> Sending on label send;
+                // Network drops the message (uncontrollable)
+                transition Sending -> Dropped on label drop;
+                // Message successfully enters network
+                transition Sending -> Sent on label deliver;
+                // After drop, controller can retry (controllable)
+                transition Dropped -> Sending on label retry;
+                // After successful send, return to idle
+                transition Sent -> Idle on label ack;
+            }
+        }
+
+        automaton Receiver {
+            // Consumer controls when to consume.
+            // deliver is uncontrollable from receiver's perspective.
+            controllable {
+                label consume;
+                label ack;
+            }
+
+            states {
+                state Waiting initial;
+                state Received;
+                state Delivered;
+            }
+
+            transitions {
+                // Message arrives (triggered by Sender's deliver)
+                transition Waiting -> Received on label deliver;
+                // Consumer processes the message
+                transition Received -> Delivered on label consume;
+                // Acknowledge and reset
+                transition Delivered -> Waiting on label ack;
+            }
+        }
+    }
+
+    composition {
+        asynchronous message_system {
+            members [Sender, Receiver];
+        }
+    }
+
+    mu_formulas {
+        // === UNREALIZABLE (without retry): Sender can force Sent state ===
+        //
+        // From Sending, the environment can ALWAYS choose `drop`
+        // (uncontrollable), sending us to Dropped. Without retry
+        // being available from Dropped, the controller would be stuck.
+        //
+        // BUT: retry IS controllable in this model, so the controller
+        // can keep retrying. However, from Sending the environment
+        // can ALWAYS drop again. The question is: can the controller
+        // force reaching Sent despite infinite drops?
+        //
+        // With [ (ctrl = controllable) ]:
+        //   From Sending: uncontrollable `drop` → Dropped (must be in X)
+        //   From Dropped: controllable `retry` → Sending (must be in X)
+        //   From Sending: uncontrollable `drop` → Dropped (circular!)
+        //   The fixpoint never grows past {Sent} because Sending requires
+        //   Dropped ∈ X, but Dropped requires Sending ∈ X.
+        //
+        // This demonstrates that even with retry, the controller cannot
+        // GUARANTEE delivery because the environment can drop forever.
+        formula ctrl_force_sent {
+            over Sender;
+            body = mu X. (Sent || [ (ctrl = controllable) ] X);
+        }
+
+        // === Environment counterstrategy ===
+        //
+        // The environment wins from {Idle, Sending, Dropped}: it can
+        // always choose `drop` to keep the system cycling Sending↔Dropped.
+        formula env_prevents_sent {
+            over Sender;
+            body = nu X. ((!Sent) && < (ctrl = environment) > X);
+        }
+
+        // === REALIZABLE: Existential reachability ===
+        //
+        // Sent IS reachable — the environment MIGHT let deliver happen.
+        // But it's not guaranteed.
+        formula sent_existentially_reachable {
+            over Sender;
+            body = mu X. (Sent || <> X);
+        }
+
+        // === Receiver properties ===
+
+        // Receiver can always process a received message (controllable)
+        formula receiver_can_deliver {
+            over Receiver;
+            body = mu X. (Delivered || [ (ctrl = controllable) ] X);
+        }
+
+        // Safety over the composed system
+        formula system_safety {
+            over message_system;
+            body = nu X. ([] X);
+        }
+    }
+}

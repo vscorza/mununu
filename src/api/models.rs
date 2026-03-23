@@ -175,6 +175,8 @@ pub struct ContextGraphsRequest {
     pub graph_types: Vec<GraphType>,
     #[serde(default)]
     pub include_controllers: bool,
+    /// Override the minimize setting for controller graphs.
+    pub minimize_controllers: Option<bool>,
 }
 
 fn default_graph_types() -> Vec<GraphType> {
@@ -295,10 +297,16 @@ pub struct ContextVerifyRequest {
     pub formula: Option<String>,
     /// If omitted, use the formula's target automaton(s).
     pub automaton: Option<String>,
+    /// When true, compute counterstrategy for failed formulas via formula inversion.
+    #[serde(default)]
+    pub counterstrategy: bool,
+    /// When true and counterstrategy is enabled, minimize the counterstrategy automaton.
+    #[serde(default)]
+    pub minimize_counterstrategy: bool,
 }
 
 /// Response from context verification
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct ContextVerifyResponse {
     pub success: bool,
     pub all_satisfied: bool,
@@ -306,7 +314,7 @@ pub struct ContextVerifyResponse {
 }
 
 /// Verification result for a single formula–automaton pair
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FormulaVerificationResult {
     pub formula_name: String,
     pub automaton: String,
@@ -317,6 +325,22 @@ pub struct FormulaVerificationResult {
     pub initial_satisfying: Vec<String>,
     pub initial_violating: Vec<String>,
     pub satisfying_state_names: Vec<String>,
+    /// Present when counterstrategy was requested and formula is not satisfied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterstrategy: Option<CounterstrategyResult>,
+}
+
+/// Counterstrategy result: the environment's winning region and strategy as a graph.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CounterstrategyResult {
+    /// States where the environment can force the property to be violated.
+    pub environment_winning_states: Vec<String>,
+    /// Cytoscape graph elements for the counterstrategy automaton.
+    pub graph_elements: Vec<GraphElement>,
+    /// The inverted formula (for transparency/debugging).
+    pub inverted_formula: String,
+    /// Whether bisimulation minimization was applied.
+    pub minimized: bool,
 }
 
 #[cfg(test)]

@@ -1,0 +1,153 @@
+// Tutorial 10 — Unrealizable Synchronous Liveness
+//
+// System: Traffic light with pedestrian button (synchronous composition)
+//
+// The light controller manages Red/Green phases. A pedestrian button
+// (uncontrollable) can interrupt, sending the system to PedWaiting.
+// While in PedWaiting, the environment can keep pressing the button
+// (ped_request is uncontrollable), preventing the controller from
+// ever reaching Green.
+//
+// The liveness specification "controller can force Green" is
+// UNREALIZABLE because the environment has a winning strategy:
+// keep pressing ped_request indefinitely from PedWaiting.
+//
+// If ped_timeout is made controllable, the spec becomes realizable
+// because the controller can choose to timeout and proceed to Green.
+
+context unrealizable_sync_liveness {
+    automata {
+        automaton TrafficLight {
+            // Controller controls the light phases and its own skip.
+            controllable {
+                label go_green;
+                label go_red;
+                label light_skip;
+            }
+
+            states {
+                state Red initial;
+                state Green;
+                state PedWaiting;
+            }
+
+            transitions {
+                // Controller decides to go green
+                transition Red -> Green on label go_green;
+                // Controller decides to go red
+                transition Green -> Red on label go_red;
+                // Pedestrian presses button (uncontrollable)
+                transition Red -> PedWaiting on label ped_request;
+                // Pedestrian keeps pressing (uncontrollable, env can loop here)
+                transition PedWaiting -> PedWaiting on label ped_request;
+                // Pedestrian phase times out (uncontrollable — env decides when)
+                transition PedWaiting -> Red on label ped_timeout;
+                // Skip for sync composition
+                transition Red -> Red on label light_skip;
+                transition Green -> Green on label light_skip;
+                transition PedWaiting -> PedWaiting on label light_skip;
+            }
+        }
+
+        automaton PedestrianButton {
+            // Button has its own skip; ped_request and ped_timeout are uncontrollable.
+            controllable {
+                label btn_skip;
+            }
+
+            states {
+                state BtnIdle initial;
+                state BtnPressed;
+            }
+
+            transitions {
+                // Pedestrian presses (uncontrollable)
+                transition BtnIdle -> BtnPressed on label ped_request;
+                // Button resets after timeout (uncontrollable)
+                transition BtnPressed -> BtnIdle on label ped_timeout;
+                // Pedestrian presses again while pressed (uncontrollable)
+                transition BtnPressed -> BtnPressed on label ped_request;
+                // Skip
+                transition BtnIdle -> BtnIdle on label btn_skip;
+                transition BtnPressed -> BtnPressed on label btn_skip;
+            }
+        }
+    }
+
+    composition {
+        synchronous traffic_system {
+            members [TrafficLight, PedestrianButton];
+        }
+    }
+
+    mu_formulas {
+        // === UNREALIZABLE: Controller can force reaching Green ===
+        //
+        // [ (ctrl = controllable) ] X means:
+        //   ALL uncontrollable transitions must stay in X
+        //   At least ONE controllable transition goes to X
+        //
+        // This FAILS for PedWaiting because the environment can loop
+        // ped_request (uncontrollable) forever, keeping the system in
+        // PedWaiting and never allowing ped_timeout to fire.
+        formula ctrl_force_green {
+            over TrafficLight;
+            body = mu X. (Green || [ (ctrl = controllable) ] X);
+        }
+
+        // === Environment counterstrategy (inverted formula) ===
+        //
+        // nu X. (! Green && < (ctrl = environment) > X)
+        // "Not Green AND environment has an escape or system is trapped"
+        // Satisfies: {Red, PedWaiting} — the environment's winning region.
+        formula env_prevents_green {
+            over TrafficLight;
+            body = nu X. ((!Green) && < (ctrl = environment) > X);
+        }
+
+        // === REALIZABLE: Existential reachability (ignores controllability) ===
+        //
+        // Green IS reachable via some path (PedWaiting → ped_timeout → Red → go_green → Green)
+        // But the controller cannot FORCE this path because ped_timeout is uncontrollable.
+        formula green_existentially_reachable {
+            over TrafficLight;
+            body = mu X. (Green || <> X);
+        }
+
+        // === REALIZABLE: GR(1) response with environment fairness ===
+        //
+        // The fix: ASSUME the environment is fair — ped_timeout fires
+        // infinitely often (the pedestrian phase always eventually ends).
+        // Under this assumption, the controller can guarantee Green
+        // infinitely often by choosing go_green whenever Red is reached.
+        //
+        // GR(1) pattern: GF(Red) → GF(Green)
+        // "If Red is visited infinitely often (env fairness), then
+        //  Green is visited infinitely often (system guarantee)."
+        //
+        // In mu-calculus:
+        //   ¬GF(Red) ∨ GF(Green)
+        //   where GF(p) = nu X. (mu Y. (p || <> Y)) && ([] X)
+        formula fair_green_liveness {
+            over TrafficLight;
+            body = (! (nu X. ((mu Y. (Red || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Green || <> W)) && ([] Z)));
+        }
+
+        // Safety: the system always stays in a valid state
+        formula safety {
+            over traffic_system;
+            body = nu X. ([] X);
+        }
+    }
+
+    controllers {
+        // Controller enforcing fair green liveness.
+        // Realizable because under the fairness assumption (GF Red),
+        // the controller can always choose go_green from Red.
+        controller fair_traffic {
+            source TrafficLight;
+            satisfying fair_green_liveness;
+        }
+    }
+}

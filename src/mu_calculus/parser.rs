@@ -718,6 +718,7 @@ fn parse_control(raw: &str, pos: usize) -> Result<Control, ParseError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "all" => Ok(Control::All),
         "controllable" | "controller" => Ok(Control::Controllable),
+        "environment" | "env" => Ok(Control::Environment),
         other => Err(ParseError::Unexpected {
             pos,
             message: format!("unknown controllability `{other}`"),
