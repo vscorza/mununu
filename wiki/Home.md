@@ -1,0 +1,44 @@
+# Mununu
+
+> **Alpha Software** — Mununu is under active development. APIs, syntax, and behavior may change. We welcome feedback and bug reports via [GitHub Issues](https://github.com/vscorza/mununu/issues).
+
+Mununu is a formal verification tool for reactive systems modeled as **Compositional Labeled Transition Systems (CLTS)**. It helps hardware verification engineers and system designers verify protocols, synthesize controllers, and check temporal properties -- all from a single, readable DSL.
+
+Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain pipeline, or a sensor network, Mununu lets you model the system, compose its parts, state the properties you care about, and get a definitive answer: does the property hold, and if so, can a controller enforce it?
+
+## Key Capabilities
+
+- **CTXDSL** -- a purpose-built DSL for defining automata, alphabets, compositions, formulas, and controllers in one file.
+- **Mu-calculus and LTL** -- express safety, liveness, reachability, and fairness properties using mu-calculus directly or via LTL sugar.
+- **Synchronous and asynchronous composition** -- combine automata lock-step (shared clock) or interleaved (independent clocks), with hierarchical nesting for cross-domain designs.
+- **Controller synthesis** -- automatically derive a maximally permissive controller that enforces a given property, respecting the controllable/uncontrollable label split.
+- **Counterstrategy generation** -- when a property is unrealizable, Mununu produces diagnostic traces showing how the environment can force a violation.
+- **Web UI** -- the companion `mununu-ui` frontend connects to the built-in API server for interactive graph visualization, formula evaluation, and synthesis.
+
+## Table of Contents
+
+| Page | What you will find |
+|------|--------------------|
+| [Getting Started](Getting-Started) | Installation, first example, API server |
+| [CTXDSL Language Reference](CTXDSL-Language-Reference) | Complete DSL syntax: alphabets, automata, transitions, variables, guards, effects |
+| [Composition](Composition) | Synchronous, asynchronous, and hierarchical composition with examples |
+| [Mu-Calculus Reference](Mu-Calculus-Reference) | Fixpoints, modalities, controllability-aware operators, common patterns |
+
+## Video Tutorials
+
+A playlist walking through Mununu from first principles:
+
+[Watch on YouTube](https://www.youtube.com/watch?v=PovNx1rWOy8&list=PL8lIyan4cdjWOUZy32IKu4Yc3Ivi1_YLZ)
+
+## GitHub Repositories
+
+| Repository | Description |
+|------------|-------------|
+| [mununu](https://github.com/vscorza/mununu) | Backend -- CLI, verification engine, API server |
+| [mununu-ui](https://github.com/vscorza/mununu-ui) | Frontend -- web UI for graph visualization, evaluation, and synthesis |
+
+## We'd Love Your Feedback
+
+Mununu is in its early stages and we are actively shaping the tool based on real-world use cases. If you run into a bug, have a feature request, or just want to share how you are using Mununu, please open an issue:
+
+[GitHub Issues](https://github.com/vscorza/mununu/issues)
