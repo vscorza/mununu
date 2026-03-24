@@ -11,8 +11,8 @@ pub mod parser;
 pub mod simplify;
 
 pub use evaluator::{
-    Environment, EvalResult, EvaluationError, EvaluationOptions, evaluate, evaluate_with_options,
-    evaluate_with_options_and_automaton,
+    Environment, EvalResult, EvaluationError, EvaluationOptions, WitnessMap, evaluate,
+    evaluate_with_options, evaluate_with_options_and_automaton, evaluate_with_witnesses,
 };
 pub use simplify::simplify;
 

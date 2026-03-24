@@ -11,8 +11,8 @@ use crate::clts::{
 use crate::composition::{CompositionOptions, compose};
 use crate::context_dsl::{ContextDoc, IncrementalState, LoadPlan};
 use crate::mu_calculus::{
-    Environment, EvalResult, EvaluationError, EvaluationOptions, Formula,
-    evaluate_with_options_and_automaton,
+    Environment, EvalResult, EvaluationError, EvaluationOptions, Formula, WitnessMap,
+    evaluate_with_options_and_automaton, evaluate_with_witnesses,
 };
 use crate::persistence::{
     PersistenceError, load_clts_from_path, maybe_spill_clts, save_clts_to_path,
@@ -384,6 +384,34 @@ impl Context {
         let eval_options = options.cloned().unwrap_or_default();
         evaluate_with_options_and_automaton(formula, clts, env, &eval_options)
             .map_err(ContextError::from)
+    }
+
+    /// Evaluates a mu-calculus formula and additionally records a witness map
+    /// for strategy extraction. See [`evaluate_with_witnesses`].
+    pub fn evaluate_mu_with_witnesses(
+        &self,
+        name: &str,
+        formula: &Formula,
+        env: &Environment,
+        options: Option<&EvaluationOptions>,
+    ) -> Result<(EvalResult, WitnessMap), ContextError> {
+        let clts = self
+            .cltss
+            .get(name)
+            .ok_or_else(|| ContextError::UnknownClts(name.to_owned()))?;
+
+        let expected = clts.state_count();
+        let provided = env.state_count();
+        if expected != provided {
+            return Err(ContextError::EnvironmentMismatch {
+                name: name.to_owned(),
+                expected,
+                provided,
+            });
+        }
+
+        let eval_options = options.cloned().unwrap_or_default();
+        evaluate_with_witnesses(formula, clts, env, &eval_options).map_err(ContextError::from)
     }
 
     /// Builds a controller by restricting `source` to the states that satisfy `formula`.

@@ -36,6 +36,24 @@ impl Default for EvaluationOptions {
 /// Bitset result representing the states that satisfy the evaluated formula.
 pub type EvalResult = BitVec<usize, Lsb0>;
 
+/// Records which transition was chosen at each (state, modality) pair
+/// during fixpoint evaluation. This constitutes a positional winning
+/// strategy on the model-checking game.
+///
+/// Reference: Bruse, Friedmann & Lange, "Certification for Mu-Calculus
+/// with Winning Strategies" (SPIN 2016, arXiv:1401.1693)
+#[derive(Debug, Clone, Default)]
+pub struct WitnessMap {
+    /// `(state_index, diamond_node_id)` → transition index in outgoing list.
+    /// For each state where a diamond/existential modality was satisfied, records
+    /// which outgoing transition was the witness (the controller's chosen move).
+    pub witnesses: HashMap<(usize, NodeId), usize>,
+
+    /// `(state_index, fixpoint_var_id)` → iteration number when the state
+    /// entered the fixpoint set. Used for obligation ranking in GR(1).
+    pub iteration_ranks: HashMap<(usize, super::FormulaVarId), usize>,
+}
+
 /// Environment that supplies atomic predicate valuations for evaluation.
 ///
 /// Supports both pre-computed predicate bitsets and on-demand evaluation
@@ -170,11 +188,48 @@ where
         memo: MemoizationCache::default(),
         guard_cache: HashMap::new(),
         expression_eval_cache: HashMap::new(),
+        witness_map: None,
     };
     let bindings = HashMap::new();
     let result = ctx.eval_node(formula.root(), &bindings)?;
-    // Clone the final result to ensure it's not modified after return
     Ok(result)
+}
+
+/// Evaluates `formula` and additionally records a witness map for strategy extraction.
+///
+/// For each diamond (existential) modality, records which outgoing transition
+/// was the witness. This constitutes a positional winning strategy on the
+/// model-checking game (Bruse, Friedmann & Lange, SPIN 2016).
+pub fn evaluate_with_witnesses<S, L>(
+    formula: &Formula,
+    clts: &Clts<S, L>,
+    env: &Environment,
+    options: &EvaluationOptions,
+) -> Result<(EvalResult, WitnessMap), EvaluationError>
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    assert_eq!(
+        clts.state_count(),
+        env.state_count(),
+        "environment state count does not match CLTS"
+    );
+
+    let mut ctx = EvalContext {
+        formula,
+        clts,
+        env,
+        options: options.clone(),
+        memo: MemoizationCache::default(),
+        guard_cache: HashMap::new(),
+        expression_eval_cache: HashMap::new(),
+        witness_map: Some(WitnessMap::default()),
+    };
+    let bindings = HashMap::new();
+    let result = ctx.eval_node(formula.root(), &bindings)?;
+    let witnesses = ctx.witness_map.unwrap_or_default();
+    Ok((result, witnesses))
 }
 
 fn bit_is_set(bits: &BitVec<usize, Lsb0>, idx: usize) -> bool {
@@ -201,6 +256,9 @@ where
     /// Cache for on-demand expression evaluation results.
     /// This is separate from env.expression_cache to allow per-evaluation caching.
     expression_eval_cache: HashMap<String, BitVec<usize, Lsb0>>,
+    /// When Some, records transition witnesses for strategy extraction.
+    /// None = no overhead; Some = recording witnesses during modal evaluation.
+    witness_map: Option<WitnessMap>,
 }
 
 impl<'a, S, L> EvalContext<'a, S, L>
@@ -235,7 +293,7 @@ where
                 kind,
                 guard,
                 target,
-            } => self.eval_modal(*kind, guard, *target, bindings)?,
+            } => self.eval_modal(*kind, guard, *target, bindings, node_id)?,
             Node::Mu { var, body } => {
                 self.eval_fixpoint(*var, *body, FixpointKind::Least, bindings)?
             }
@@ -297,6 +355,7 @@ where
         guard: &Guard,
         target: NodeId,
         bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
+        modal_node_id: NodeId,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
         let target_set = self.eval_node(target, bindings)?;
         if let Some(bound) = guard.max_steps {
@@ -312,15 +371,40 @@ where
 
         for state in self.clts.states() {
             let satisfies = match kind {
-                ModalKind::Diamond => {
-                    self.modal_exists(state, guard, &target_set, guard_parts.as_deref())
-                }
-                ModalKind::Box => {
-                    self.modal_forall(state, guard, &target_set, guard_parts.as_deref())
-                }
+                ModalKind::Diamond => self.modal_exists(
+                    state,
+                    guard,
+                    &target_set,
+                    guard_parts.as_deref(),
+                    modal_node_id,
+                ),
+                ModalKind::Box => self.modal_forall(
+                    state,
+                    guard,
+                    &target_set,
+                    guard_parts.as_deref(),
+                    modal_node_id,
+                ),
             };
             if satisfies {
                 result.set(state.index(), true);
+                // Record witness: which transition satisfies the modality
+                if self.witness_map.is_some() && kind == ModalKind::Diamond {
+                    // Find the first outgoing transition whose target is in target_set
+                    for (idx, transition) in self.clts.outgoing(state).iter().enumerate() {
+                        if self.guard_matches(state, transition, guard)
+                            && target_set
+                                .get(transition.target().index())
+                                .map(|bit| *bit)
+                                .unwrap_or(false)
+                        {
+                            if let Some(ref mut wm) = self.witness_map {
+                                wm.witnesses.insert((state.index(), modal_node_id), idx);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -448,11 +532,12 @@ where
     }
 
     fn modal_exists(
-        &self,
+        &mut self,
         state: StateId<S>,
         guard: &Guard,
         targets: &BitVec<usize, Lsb0>,
         guard_parts: Option<&GuardPartitions>,
+        _modal_node_id: NodeId,
     ) -> bool {
         if let Some(parts) = guard_parts
             && !parts.matches_current(state.index())
@@ -725,6 +810,7 @@ where
         guard: &Guard,
         targets: &BitVec<usize, Lsb0>,
         guard_parts: Option<&GuardPartitions>,
+        _modal_node_id: NodeId,
     ) -> bool {
         if let Some(parts) = guard_parts
             && !parts.matches_current(state.index())
@@ -1393,28 +1479,34 @@ where
             FixpointKind::Least => self.alloc_bitvec(false)?, // ∅
             FixpointKind::Greatest => self.alloc_bitvec(true)?, // States
         };
+        let mut iteration: usize = 0;
 
         loop {
+            iteration += 1;
             let mut next_bindings = bindings.clone();
             next_bindings.insert(var, self.clone_bitvec(&current_set)?);
             let next_set = self.eval_node(body, &next_bindings)?;
 
-            // Debug: Print iteration details (only in test mode)
+            // Record iteration ranks for newly entering states (strategy witness data)
+            if self.witness_map.is_some() {
+                let state_count = next_set.len();
+                for state_idx in 0..state_count {
+                    let was_in = current_set.get(state_idx).map(|b| *b).unwrap_or(false);
+                    let now_in = next_set.get(state_idx).map(|b| *b).unwrap_or(false);
+                    if now_in
+                        && !was_in
+                        && let Some(ref mut wm) = self.witness_map
+                    {
+                        wm.iteration_ranks.insert((state_idx, var), iteration);
+                    }
+                }
+            }
+
             if next_set == current_set {
-                // Clone the result to ensure we're returning a fresh copy
                 return self.clone_bitvec(&next_set);
             }
 
-            match kind {
-                FixpointKind::Least => {
-                    // Clone to avoid reusing the same bitset reference
-                    current_set = self.clone_bitvec(&next_set)?;
-                }
-                FixpointKind::Greatest => {
-                    // Clone to avoid reusing the same bitset reference
-                    current_set = self.clone_bitvec(&next_set)?;
-                }
-            }
+            current_set = self.clone_bitvec(&next_set)?;
         }
     }
 
