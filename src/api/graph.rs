@@ -336,7 +336,7 @@ pub fn counterstrategy_to_graph_elements(
         let state_witnesses: Option<std::collections::HashSet<usize>> = witness_map.map(|wm| {
             wm.witnesses
                 .iter()
-                .filter(|(&(si, _), _)| si == state_id.index())
+                .filter(|((si, _), _)| *si == state_id.index())
                 .map(|(_, &ti)| ti)
                 .collect()
         });
