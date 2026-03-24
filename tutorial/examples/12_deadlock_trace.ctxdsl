@@ -1,0 +1,84 @@
+// Tutorial 12 — Deadlock Trace Diagnostics
+//
+// System: Conveyor belt with jam sensor
+//
+// The controller can start and stop the belt. A jam event
+// (uncontrollable) puts the system in a Jammed state with
+// no controllable transitions out — a deadlock in the controller.
+//
+// The safety invariant is satisfied (all states are valid),
+// but synthesizing a controller reveals a deadlock: the
+// controller cannot escape the Jammed state.
+//
+// Demonstrates: --deadlock-traces flag in synthesis output.
+
+context conveyor_deadlock {
+    alphabet {
+        label start;
+        label stop;
+        label jam;
+    }
+
+    automata {
+        automaton Conveyor {
+            controllable {
+                label start;
+                label stop;
+            }
+
+            states {
+                state Idle initial;
+                state Running;
+                state Jammed;
+            }
+
+            transitions {
+                // Controller starts the belt
+                transition Idle -> Running on label start;
+                // Controller stops the belt
+                transition Running -> Idle on label stop;
+                // Environment jams the belt (uncontrollable)
+                transition Running -> Jammed on label jam;
+                // Jammed is a DEADLOCK: no outgoing transitions at all.
+                // The belt is stuck and requires physical intervention
+                // (not modeled in this automaton).
+                // Idle self-loop
+                transition Idle -> Idle on label stop;
+            }
+        }
+    }
+
+    mu_formulas {
+        // Safety: all states are valid (trivially true)
+        formula safety {
+            over Conveyor;
+            body = nu X. ([] X);
+        }
+
+        // Controllable reachability: can the controller force Idle?
+        // Fails for Jammed because unjam is uncontrollable.
+        formula ctrl_force_idle {
+            over Conveyor;
+            body = mu X. (Idle || [ (ctrl = controllable) ] X);
+        }
+
+        // Existential: Idle IS reachable from Jammed (via unjam)
+        formula idle_reachable {
+            over Conveyor;
+            body = mu X. (Idle || <> X);
+        }
+    }
+
+    controllers {
+        // Controller for safety — retains all states including Jammed.
+        // Use --deadlock-traces to see the path to Jammed:
+        //   Idle -> Running -> Jammed
+        controller safe_conveyor {
+            source Conveyor;
+            satisfying safety;
+            diagnostics {
+                deadlock_traces = true;
+            }
+        }
+    }
+}

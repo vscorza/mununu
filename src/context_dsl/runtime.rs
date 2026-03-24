@@ -41,6 +41,7 @@ impl ResolvedControllerOptions {
             evaluation: None,
             diagnostics: self.diagnostics.as_ref(),
             minimize: self.minimize,
+            extract_strategy: false,
         }
     }
 }

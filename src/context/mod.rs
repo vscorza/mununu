@@ -558,9 +558,19 @@ impl Context {
         }
 
         for (original, mapped) in &mapping {
+            let mut controllable_added = false;
             for transition in clts.outgoing(*original) {
                 if let Some(&target_mapped) = mapping.get(&transition.target()) {
-                    builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                    if options.extract_strategy && transition.is_controllable(clts) {
+                        // Strategy mode: keep only ONE controllable transition per state
+                        if !controllable_added {
+                            builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                            controllable_added = true;
+                        }
+                    } else {
+                        // Keep all uncontrollable transitions, or all transitions in projection mode
+                        builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                    }
                 }
             }
         }
@@ -1124,6 +1134,10 @@ pub struct ControllerSynthesisOptions<'a> {
     pub diagnostics: Option<&'a DiagnosticsOptions>,
     /// When `true`, run a structural minimisation pass over the synthesised controller.
     pub minimize: bool,
+    /// When `true`, extract a positional strategy: keep only ONE controllable transition
+    /// per state (the controller's chosen action) plus ALL uncontrollable transitions.
+    /// This produces a deterministic controller rather than a full projection.
+    pub extract_strategy: bool,
 }
 
 /// Result of controller synthesis, including diagnostics metadata.
@@ -1158,9 +1172,21 @@ pub struct ControllerDiagnostics {
     /// Outstanding proof obligations for unrealizable specifications.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proof_obligations: Vec<ProofObligation>,
+    /// Lasso traces for liveness counterexamples: `(prefix, cycle)` where the
+    /// infinite counterexample is `prefix ++ cycle^ω`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lasso_traces: Vec<LassoTrace>,
     /// Prototype counterstrategy covering the losing region.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterstrategy: Option<CounterStrategy>,
+}
+
+/// A lasso trace: finite prefix followed by an infinitely repeating cycle.
+/// Represents an infinite counterexample path: `prefix ++ cycle^ω`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LassoTrace {
+    pub prefix: Vec<String>,
+    pub cycle: Vec<String>,
 }
 
 /// Prototype counterstrategy definition exposed in diagnostics.
@@ -1529,9 +1555,9 @@ impl TransitionKey {
 
 /// Explorer used to walk the losing region and derive counterexample/counterstrategy artefacts.
 #[derive(Default)]
-struct CounterExampleExplorer {
-    starts: Vec<StateId<DefaultStateIdx>>,
-    losing: HashSet<StateId<DefaultStateIdx>>,
+pub(crate) struct CounterExampleExplorer {
+    pub(crate) starts: Vec<StateId<DefaultStateIdx>>,
+    pub(crate) losing: HashSet<StateId<DefaultStateIdx>>,
 }
 
 impl CounterExampleExplorer {
@@ -1668,6 +1694,60 @@ impl CounterExampleExplorer {
         }
 
         self.to_names(&[start], clts)
+    }
+
+    /// Find a lasso trace (prefix + cycle) in the losing region.
+    /// Returns `(prefix, cycle)` where the infinite counterexample is `prefix ++ cycle^ω`.
+    /// If no cycle is found, returns the linear prefix with an empty cycle.
+    pub fn lasso_from(
+        &self,
+        start: StateId<DefaultStateIdx>,
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> (Vec<String>, Vec<String>) {
+        // DFS to find a cycle in the losing region
+        let mut path: Vec<StateId<DefaultStateIdx>> = vec![start];
+        let mut on_path: HashSet<StateId<DefaultStateIdx>> = HashSet::new();
+        on_path.insert(start);
+        let mut visited: HashSet<StateId<DefaultStateIdx>> = HashSet::new();
+
+        loop {
+            let state = *path.last().expect("path never empty");
+            visited.insert(state);
+
+            // Find a successor in the losing region
+            let mut found_next = false;
+            for transition in clts.outgoing(state) {
+                let target = transition.target();
+                if !self.losing.contains(&target) {
+                    continue;
+                }
+                // Cycle detected: target is already on the current path
+                if on_path.contains(&target) {
+                    let cycle_start_idx = path.iter().position(|s| *s == target).unwrap();
+                    let prefix = self.to_names(&path[..cycle_start_idx], clts);
+                    let cycle = self.to_names(&path[cycle_start_idx..], clts);
+                    return (prefix, cycle);
+                }
+                // Unvisited successor: extend the path
+                if !visited.contains(&target) {
+                    path.push(target);
+                    on_path.insert(target);
+                    found_next = true;
+                    break;
+                }
+            }
+
+            if !found_next {
+                // Backtrack: no unvisited successor in losing region
+                on_path.remove(&state);
+                path.pop();
+                if path.is_empty() {
+                    // No cycle found — return just the start state
+                    let name = clts.state_name(start).unwrap_or("state").to_owned();
+                    return (vec![name], Vec::new());
+                }
+            }
+        }
     }
 
     fn to_names(
@@ -2144,6 +2224,7 @@ mod tests {
             ControllerSynthesisOptions {
                 diagnostics: Some(&diag_opts),
                 minimize: true,
+                extract_strategy: false,
                 ..Default::default()
             },
         )?;
@@ -2183,6 +2264,7 @@ mod tests {
                 state: "s2".into(),
                 detail: Some("State requires attention.".into()),
             }],
+            lasso_traces: Vec::new(),
             counterstrategy: Some(CounterStrategy {
                 states: vec!["s2".into(), "s3".into()],
                 initial_states: vec!["s2".into()],

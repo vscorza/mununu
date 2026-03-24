@@ -120,6 +120,12 @@ When synthesis reports unrealizable, follow this diagnostic workflow:
 3. **Trace the counterstrategy**: identify which uncontrollable actions the environment uses to escape the controller's winning region
 4. **Fix the specification**: either strengthen the plant (add transitions), weaken the property, or add fairness assumptions (GR(1)) to rule out pathological environment behaviors
 
+## Strategy Extraction
+
+When `minimize_counterstrategy` is enabled in the verify request, the counterstrategy graph shows a **positional environment strategy**: only ONE uncontrollable transition per state (the environment's chosen escape) plus ALL controllable transitions (showing the controller is trapped).
+
+This produces a minimal deterministic environment strategy.
+
 ## See Also
 
 - [Controller Synthesis](Controller-Synthesis.md) -- synthesis workflow and realizability

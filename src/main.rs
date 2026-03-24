@@ -146,6 +146,9 @@ struct ContextSynthesizeArgs {
     /// Run a structural minimisation pass on the synthesised controller.
     #[arg(long)]
     minimize: bool,
+    /// Extract a positional strategy: keep only one controllable transition per state.
+    #[arg(long = "extract-strategy")]
+    extract_strategy: bool,
     /// Emit counterexample/counterstrategy diagnostics when unrealizable.
     #[arg(long)]
     counterexample: bool,
@@ -755,6 +758,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                 evaluation: Some(&eval_options),
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: args.minimize,
+                extract_strategy: args.extract_strategy,
             },
         )
         .map_err(|err| format!("controller synthesis failed: {err}"))?;
@@ -862,6 +866,19 @@ fn render_controller_diagnostics(diagnostics: &ControllerDiagnostics) {
     if !diagnostics.counterstrategy_traces.is_empty() {
         for (idx, trace) in diagnostics.counterstrategy_traces.iter().enumerate() {
             println!("    counterstrategy trace #{idx}: {}", trace.join(" -> "));
+        }
+    }
+    if !diagnostics.lasso_traces.is_empty() {
+        for (idx, lasso) in diagnostics.lasso_traces.iter().enumerate() {
+            if lasso.cycle.is_empty() {
+                println!("    lasso trace #{idx}: {}", lasso.prefix.join(" -> "));
+            } else {
+                println!(
+                    "    lasso trace #{idx}: {} -> ({})^ω",
+                    lasso.prefix.join(" -> "),
+                    lasso.cycle.join(" -> ")
+                );
+            }
         }
     }
     if let Some(report) = &diagnostics.minimization {

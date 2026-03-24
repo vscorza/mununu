@@ -126,6 +126,16 @@ pub(crate) fn build_unrealizable_initials_synthesis(
                 .map(|name| vec![name.clone()])
                 .collect();
             let explorer = CounterExampleExplorer::build(violating_initials, clts, keep_bits);
+
+            // Generate lasso traces (prefix + cycle) for liveness counterexamples
+            use crate::context::LassoTrace;
+            for &start in &explorer.starts {
+                let (prefix, cycle) = explorer.lasso_from(start, clts);
+                if !cycle.is_empty() {
+                    diagnostics.lasso_traces.push(LassoTrace { prefix, cycle });
+                }
+            }
+
             diagnostics.counterstrategy = Some(explorer.strategy(clts));
         } else if let Some(first) = violating_names.first() {
             diagnostics.counterexample_trace = Some(vec![first.clone()]);
@@ -199,6 +209,16 @@ pub(crate) fn enrich_diagnostics_for_excluded_initials(
         }
         diagnostics.counterexample_trace = Some(trace);
         diagnostics.counterstrategy_traces = counter_paths;
+
+        // Generate lasso traces (prefix + cycle) for liveness counterexamples
+        use crate::context::LassoTrace;
+        for &start in &explorer.starts {
+            let (prefix, cycle) = explorer.lasso_from(start, clts);
+            if !cycle.is_empty() {
+                diagnostics.lasso_traces.push(LassoTrace { prefix, cycle });
+            }
+        }
+
         diagnostics.counterstrategy = Some(explorer.strategy(clts));
     } else if let Some(first) = names.first() {
         diagnostics

@@ -255,6 +255,38 @@ mununu context synth spec.ctxdsl \
     --counterexample --deadlock-traces
 ```
 
+## Known Limitations
+
+### Strategy vs Projection
+
+Current controllers are **projections** of the winning region — they retain all transitions between winning states. For safety properties, this IS a valid strategy (any move within the region preserves the invariant). For liveness/GR(1), the controller may include transitions that don't guarantee progress.
+
+Use `--extract-strategy` to produce a **positional strategy** that keeps only ONE controllable transition per state:
+
+```bash
+mununu context synth example.ctxdsl --formula F --automaton A --extract-strategy
+```
+
+### GR(1) Obligation Tracking
+
+Mununu evaluates GR(1) formulas as nested mu-calculus fixpoints, which correctly computes the winning region. However, it does **not** implement the Piterman-Pnueli-Sa'ar rank-based algorithm that tracks which obligation is being pursued. This means:
+
+- The winning region is correct
+- But the synthesized controller does not cycle through obligations (g₁ → g₂ → ... → gₘ → repeat)
+- For `[]<> g₁ && []<> g₂`, the controller knows WHICH states are winning but not HOW to schedule visits
+
+This is planned for a future release via instrumented fixpoint evaluation (Bruse, Friedmann & Lange, 2016).
+
+### Lasso Traces
+
+Counterexample traces for liveness properties now include **lasso format**:
+
+```
+lasso trace #0: Red -> (PedWaiting)^ω
+```
+
+The prefix shows the path to the cycle entry, and the cycle repeats infinitely. Use `--counterexample` with synthesis to see lasso traces.
+
 ## See Also
 
 - [LTL Properties](LTL-Properties.md) -- writing temporal specifications

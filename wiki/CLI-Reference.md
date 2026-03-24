@@ -85,6 +85,7 @@ mununu context synth <CONTEXT> [options]
 | `--counterexample` | Generate counterstrategy traces when unrealizable |
 | `--deadlock-traces` | Capture traces leading to deadlock states |
 | `--max-counter-traces <N>` | Cap the number of counterstrategy traces collected |
+| `--extract-strategy` | Produce a positional strategy (one controllable transition per state) instead of the full winning-region projection |
 | `--no-proof-obligations` | Skip proof obligation emission for violating initial states |
 | `--dump-json <FILE>` | Write a JSON summary of the synthesis result to a file |
 | `--emit-dsl <FILE>` | Write the synthesized controller as a CTXDSL file |
@@ -116,7 +117,14 @@ mununu context synth tutorial/examples/09_unrealizable.ctxdsl \
 mununu context synth examples/hw/handshake.ctxdsl \
     --formula safety_invariant --automaton Handshake \
     --emit-dsl controller_output.ctxdsl
+
+# Extract a positional strategy (one controllable transition per state)
+mununu context synth examples/hw/arbiter.ctxdsl \
+    --formula liveness_grant --automaton Arbiter \
+    --extract-strategy
 ```
+
+**Output format notes**: When `--counterexample` is used with liveness or GR(1) formulas, counterexample traces are reported in **lasso format** (e.g., `lasso trace #0: Red -> (PedWaiting)^ω`), showing a finite prefix followed by an infinitely repeating cycle.
 
 ---
 

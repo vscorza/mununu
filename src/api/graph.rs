@@ -229,11 +229,14 @@ pub fn controller_to_graph_elements(
 }
 
 /// Build graph elements for a counterstrategy: only states in the winning set
-/// and transitions between them.
+/// and transitions between them. When `extract_strategy` is true, keep only
+/// ONE uncontrollable transition per state (environment's chosen escape)
+/// plus ALL controllable transitions (to show the controller is trapped).
 pub fn counterstrategy_to_graph_elements(
     clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
     automaton_name: &str,
     winning_set: &std::collections::HashSet<usize>,
+    extract_strategy: bool,
 ) -> Vec<GraphElement> {
     let mut elements = Vec::new();
     let state_spacing = 250.0;
@@ -328,9 +331,15 @@ pub fn counterstrategy_to_graph_elements(
         }
         let source_name = clts.state_name(state_id).unwrap_or("?").to_string();
         let source_id = format!("{}_{}", automaton_name, source_name);
+        let mut uncontrollable_added = false;
 
         for transition in clts.outgoing(state_id) {
             if !winning_set.contains(&transition.target().index()) {
+                continue;
+            }
+            // Strategy extraction for counterstrategy: keep ONE uncontrollable
+            // (environment's chosen escape) + ALL controllable (controller is trapped)
+            if extract_strategy && transition.is_uncontrollable(clts) && uncontrollable_added {
                 continue;
             }
             let target_name = clts
@@ -367,6 +376,9 @@ pub fn counterstrategy_to_graph_elements(
             };
 
             let is_uncontrollable = transition.is_uncontrollable(clts);
+            if is_uncontrollable {
+                uncontrollable_added = true;
+            }
             let action_type = if is_uncontrollable {
                 "uncontrollable"
             } else {

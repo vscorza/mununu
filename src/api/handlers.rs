@@ -106,6 +106,7 @@ pub async fn context_summarize_handler(
                     evaluation: Some(&eval_options),
                     diagnostics: None,
                     minimize: rc.options.minimize(),
+                    extract_strategy: false,
                 },
             ) {
                 Ok(syn) => (
@@ -234,6 +235,7 @@ pub async fn context_synthesize_handler(
                 evaluation: Some(&eval_options),
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: request.options.minimize,
+                extract_strategy: false,
             },
         )
         .map_err(|e| ApiError::Internal {
@@ -333,6 +335,7 @@ pub async fn context_graphs_handler(
                     minimize: request
                         .minimize_controllers
                         .unwrap_or(rc.options.minimize()),
+                    extract_strategy: false,
                 },
             ) else {
                 continue;
@@ -548,6 +551,7 @@ pub async fn context_verify_handler(
                     clts,
                     &cs_name,
                     &winning_set,
+                    request.minimize_counterstrategy,
                 );
 
                 CounterstrategyResult {
