@@ -3,13 +3,16 @@ set -e
 
 echo "Running pre-commit checks..."
 
-echo "  [1/3] Checking formatting..."
+echo "  [1/4] Checking formatting..."
 cargo fmt --all -- --check
 
-echo "  [2/3] Running clippy..."
+echo "  [2/4] Running clippy..."
 cargo clippy --all-targets -- -D warnings
 
-echo "  [3/3] Running tests..."
+echo "  [3/4] Running tests..."
 cargo test --lib --bins --tests --examples
+
+echo "  [4/4] Testing API module..."
+cargo test --lib api --features api
 
 echo "All pre-commit checks passed."
