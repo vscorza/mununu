@@ -529,7 +529,15 @@ impl Context {
         env: &Environment,
         options: ControllerSynthesisOptions<'_>,
     ) -> Result<ControllerSynthesis, ContextError> {
-        let keep_bits = self.evaluate_mu(source, formula, env, options.evaluation)?;
+        // When strategy extraction is requested, use witness-guided evaluation
+        let (keep_bits, witness_map) = if options.extract_strategy {
+            let (bits, wm) =
+                self.evaluate_mu_with_witnesses(source, formula, env, options.evaluation)?;
+            (bits, Some(wm))
+        } else {
+            let bits = self.evaluate_mu(source, formula, env, options.evaluation)?;
+            (bits, None)
+        };
         let clts = self
             .cltss
             .get(source)
@@ -585,18 +593,51 @@ impl Context {
             mapping.insert(state, new_state);
         }
 
+        // Build set of witnessed transition indices per state (from all diamond nodes)
+        let witnessed_transitions: HashMap<usize, HashSet<usize>> =
+            if let Some(ref wm) = witness_map {
+                let mut per_state: HashMap<usize, HashSet<usize>> = HashMap::new();
+                for (&(state_idx, _node_id), &trans_idx) in &wm.witnesses {
+                    per_state.entry(state_idx).or_default().insert(trans_idx);
+                }
+                per_state
+            } else {
+                HashMap::new()
+            };
+
         for (original, mapped) in &mapping {
-            let mut controllable_added = false;
-            for transition in clts.outgoing(*original) {
-                if let Some(&target_mapped) = mapping.get(&transition.target()) {
-                    if options.extract_strategy && transition.is_controllable(clts) {
-                        // Strategy mode: keep only ONE controllable transition per state
-                        if !controllable_added {
+            if options.extract_strategy {
+                // Strategy mode: use witness data to select transitions
+                let state_witnesses = witnessed_transitions.get(&original.index());
+                let mut controllable_added = false;
+
+                for (idx, transition) in clts.outgoing(*original).iter().enumerate() {
+                    if let Some(&target_mapped) = mapping.get(&transition.target()) {
+                        if transition.is_controllable(clts) {
+                            // Add controllable transition only if witnessed (or first if no witnesses)
+                            if let Some(witnesses) = state_witnesses {
+                                if witnesses.contains(&idx) {
+                                    builder.transition_ids(
+                                        *mapped,
+                                        transition.labels(),
+                                        target_mapped,
+                                    );
+                                }
+                            } else if !controllable_added {
+                                // No witness data for this state → fall back to first controllable
+                                builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                                controllable_added = true;
+                            }
+                        } else {
+                            // Always keep uncontrollable transitions
                             builder.transition_ids(*mapped, transition.labels(), target_mapped);
-                            controllable_added = true;
                         }
-                    } else {
-                        // Keep all uncontrollable transitions, or all transitions in projection mode
+                    }
+                }
+            } else {
+                // Projection mode: keep all transitions between winning states
+                for transition in clts.outgoing(*original) {
+                    if let Some(&target_mapped) = mapping.get(&transition.target()) {
                         builder.transition_ids(*mapped, transition.labels(), target_mapped);
                     }
                 }

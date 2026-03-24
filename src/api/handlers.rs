@@ -525,12 +525,26 @@ pub async fn context_verify_handler(
             use crate::mu_calculus::invert;
 
             let inverted = invert::invert(&rf.formula);
-            let inverted_bitvec = realized
-                .context
-                .evaluate_mu(automaton_name, &inverted, &env, Some(&eval_options))
-                .ok();
+            let inverted_result = if request.minimize_counterstrategy {
+                realized
+                    .context
+                    .evaluate_mu_with_witnesses(
+                        automaton_name,
+                        &inverted,
+                        &env,
+                        Some(&eval_options),
+                    )
+                    .ok()
+                    .map(|(bv, wm)| (bv, Some(wm)))
+            } else {
+                realized
+                    .context
+                    .evaluate_mu(automaton_name, &inverted, &env, Some(&eval_options))
+                    .ok()
+                    .map(|bv| (bv, None))
+            };
 
-            inverted_bitvec.map(|inv_bv| {
+            inverted_result.map(|(inv_bv, witness_map)| {
                 // Collect environment winning states
                 let winning_set: HashSet<usize> = clts
                     .states()
@@ -552,6 +566,7 @@ pub async fn context_verify_handler(
                     &cs_name,
                     &winning_set,
                     request.minimize_counterstrategy,
+                    witness_map.as_ref(),
                 );
 
                 CounterstrategyResult {

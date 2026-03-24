@@ -237,6 +237,7 @@ pub fn counterstrategy_to_graph_elements(
     automaton_name: &str,
     winning_set: &std::collections::HashSet<usize>,
     extract_strategy: bool,
+    witness_map: Option<&crate::mu_calculus::WitnessMap>,
 ) -> Vec<GraphElement> {
     let mut elements = Vec::new();
     let state_spacing = 250.0;
@@ -331,16 +332,32 @@ pub fn counterstrategy_to_graph_elements(
         }
         let source_name = clts.state_name(state_id).unwrap_or("?").to_string();
         let source_id = format!("{}_{}", automaton_name, source_name);
+        // Build per-state witness set from the witness map
+        let state_witnesses: Option<std::collections::HashSet<usize>> = witness_map.map(|wm| {
+            wm.witnesses
+                .iter()
+                .filter(|(&(si, _), _)| si == state_id.index())
+                .map(|(_, &ti)| ti)
+                .collect()
+        });
         let mut uncontrollable_added = false;
 
-        for transition in clts.outgoing(state_id) {
+        for (idx, transition) in clts.outgoing(state_id).iter().enumerate() {
             if !winning_set.contains(&transition.target().index()) {
                 continue;
             }
-            // Strategy extraction for counterstrategy: keep ONE uncontrollable
-            // (environment's chosen escape) + ALL controllable (controller is trapped)
-            if extract_strategy && transition.is_uncontrollable(clts) && uncontrollable_added {
-                continue;
+            // Strategy extraction for counterstrategy:
+            // With witnesses: keep only WITNESSED uncontrollable transitions
+            // Without witnesses: keep ONE uncontrollable (first found)
+            // Always keep ALL controllable (controller is trapped)
+            if extract_strategy && transition.is_uncontrollable(clts) {
+                if let Some(ref witnesses) = state_witnesses {
+                    if !witnesses.contains(&idx) {
+                        continue; // Skip non-witnessed uncontrollable
+                    }
+                } else if uncontrollable_added {
+                    continue; // No witness data: first-found heuristic
+                }
             }
             let target_name = clts
                 .state_name(transition.target())
