@@ -104,6 +104,9 @@ pub struct SynthesisOptions {
     pub minimize: bool,
     #[serde(default)]
     pub diagnostics: DiagnosticsOptions,
+    /// Extract a positional strategy (one controllable transition per state).
+    #[serde(default)]
+    pub extract_strategy: bool,
 }
 
 /// Diagnostics options
@@ -142,6 +145,16 @@ pub struct SynthesisDiagnostics {
     pub minimization: Option<MinimizationReport>,
     #[serde(default)]
     pub proof_obligations: Vec<ProofObligation>,
+    /// Lasso traces for liveness counterexamples: prefix + repeating cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lasso_traces: Vec<LassoTraceApi>,
+}
+
+/// Lasso trace: finite prefix followed by infinitely repeating cycle.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LassoTraceApi {
+    pub prefix: Vec<String>,
+    pub cycle: Vec<String>,
 }
 
 /// Minimization report

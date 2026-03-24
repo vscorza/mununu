@@ -235,7 +235,7 @@ pub async fn context_synthesize_handler(
                 evaluation: Some(&eval_options),
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: request.options.minimize,
-                extract_strategy: false,
+                extract_strategy: request.options.extract_strategy,
             },
         )
         .map_err(|e| ApiError::Internal {
@@ -651,6 +651,14 @@ fn convert_diagnostics(
             .map(|po| ProofObligation {
                 state: po.state.clone(),
                 detail: po.detail.clone(),
+            })
+            .collect(),
+        lasso_traces: diagnostics
+            .lasso_traces
+            .iter()
+            .map(|lt| LassoTraceApi {
+                prefix: lt.prefix.clone(),
+                cycle: lt.cycle.clone(),
             })
             .collect(),
     }
