@@ -192,6 +192,12 @@ struct ContextGraphArgs {
     /// Restrict output to a single automaton.
     #[arg(long = "automaton", value_name = "NAME")]
     automaton: Option<String>,
+    /// Generate a counterstrategy graph for a failed formula (requires --formula and --automaton).
+    #[arg(long)]
+    counterstrategy: bool,
+    /// Formula to evaluate for counterstrategy generation.
+    #[arg(long = "formula", value_name = "NAME")]
+    formula: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -974,6 +980,58 @@ fn context_graph(args: ContextGraphArgs) -> Result<(), String> {
         }
     }
 
+    // Generate counterstrategy graph if requested
+    if args.counterstrategy {
+        let formula_name = args
+            .formula
+            .as_ref()
+            .ok_or("--counterstrategy requires --formula")?;
+        let automaton_name = args
+            .automaton
+            .as_ref()
+            .ok_or("--counterstrategy requires --automaton")?;
+
+        let rf = realized
+            .formulas
+            .get(formula_name)
+            .ok_or_else(|| format!("unknown formula '{formula_name}'"))?;
+        let clts = realized
+            .context
+            .clts(automaton_name)
+            .ok_or_else(|| format!("unknown automaton '{automaton_name}'"))?;
+        let env = realized.environment_for(automaton_name);
+        let eval_options = mununu::mu_calculus::EvaluationOptions::default();
+
+        // Invert formula and evaluate to get environment winning region
+        let inverted = mununu::mu_calculus::invert::invert(&rf.formula);
+        let inv_bv = realized
+            .context
+            .evaluate_mu(automaton_name, &inverted, &env, Some(&eval_options))
+            .map_err(|e| format!("counterstrategy evaluation failed: {e}"))?;
+
+        let winning_set: std::collections::HashSet<usize> = clts
+            .states()
+            .filter(|sid| inv_bv.get(sid.index()).map(|bit| *bit).unwrap_or(false))
+            .map(|sid| sid.index())
+            .collect();
+
+        let cs_name = format!("{automaton_name}_counterstrategy");
+        let cs_cytoscape = counterstrategy_to_cytoscape(clts, &cs_name, &winning_set);
+
+        all_elements.extend(cs_cytoscape);
+
+        let winning_names: Vec<String> = clts
+            .states()
+            .filter(|sid| winning_set.contains(&sid.index()))
+            .filter_map(|sid| clts.state_name(sid).map(|n| n.to_string()))
+            .collect();
+        println!(
+            "Counterstrategy: environment wins from {} states: {}",
+            winning_names.len(),
+            winning_names.join(", ")
+        );
+    }
+
     // Generate HTML
     let html = generate_cytoscape_html(&all_elements)?;
 
@@ -1054,6 +1112,130 @@ enum CytoscapeData {
 struct CytoscapePosition {
     x: f64,
     y: f64,
+}
+
+fn counterstrategy_to_cytoscape(
+    clts: &mununu::clts::Clts<mununu::clts::DefaultStateIdx, mununu::clts::DefaultLabelIdx>,
+    automaton_name: &str,
+    winning_set: &std::collections::HashSet<usize>,
+) -> Vec<CytoscapeElement> {
+    let mut elements = Vec::new();
+    let mut x_pos = 100.0;
+
+    // Compound node
+    elements.push(CytoscapeElement {
+        data: CytoscapeData::Node {
+            id: automaton_name.to_string(),
+            label: Some(format!(
+                "Counterstrategy: {}",
+                automaton_name.replace("_counterstrategy", "")
+            )),
+            parent: None,
+            vars: None,
+            actions: None,
+            note: None,
+            isStart: None,
+            isDead: None,
+        },
+        position: None,
+        classes: None,
+    });
+
+    // State nodes
+    for state_id in clts.states() {
+        if !winning_set.contains(&state_id.index()) {
+            continue;
+        }
+        let name = clts.state_name(state_id).unwrap_or("?").to_string();
+        let node_id = format!("{}_{}", automaton_name, name);
+        let is_initial = clts.initial_states().contains(&state_id);
+
+        let mut classes = vec!["env-winning"];
+        if is_initial {
+            classes.push("start");
+        }
+
+        elements.push(CytoscapeElement {
+            data: CytoscapeData::Node {
+                id: node_id,
+                label: Some(name),
+                parent: Some(automaton_name.to_string()),
+                vars: None,
+                actions: None,
+                note: None,
+                isStart: Some(is_initial),
+                isDead: Some(false),
+            },
+            position: Some(CytoscapePosition { x: x_pos, y: 100.0 }),
+            classes: Some(classes.join(" ")),
+        });
+        x_pos += 250.0;
+    }
+
+    // Transitions between winning states
+    for state_id in clts.states() {
+        if !winning_set.contains(&state_id.index()) {
+            continue;
+        }
+        let source = clts.state_name(state_id).unwrap_or("?").to_string();
+        let source_id = format!("{}_{}", automaton_name, source);
+
+        for transition in clts.outgoing(state_id) {
+            if !winning_set.contains(&transition.target().index()) {
+                continue;
+            }
+            let target = clts
+                .state_name(transition.target())
+                .unwrap_or("?")
+                .to_string();
+            let target_id = format!("{}_{}", automaton_name, target);
+
+            let label: Vec<String> = transition
+                .labels()
+                .iter()
+                .filter_map(|lid| {
+                    clts.label_payload(*lid).and_then(|vals| {
+                        let joined = vals
+                            .iter()
+                            .filter(|v| !v.is_empty())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if joined.is_empty() {
+                            None
+                        } else {
+                            Some(joined)
+                        }
+                    })
+                })
+                .collect();
+
+            elements.push(CytoscapeElement {
+                data: CytoscapeData::Edge {
+                    id: format!("{}_t{}", source_id, elements.len()),
+                    source: source_id.clone(),
+                    target: target_id,
+                    label: if label.is_empty() {
+                        None
+                    } else {
+                        Some(label.join(" | "))
+                    },
+                    action: None,
+                    actionType: if transition.is_uncontrollable(clts) {
+                        Some("uncontrollable".to_string())
+                    } else {
+                        Some("controllable".to_string())
+                    },
+                    guard: None,
+                    effect: None,
+                },
+                position: None,
+                classes: None,
+            });
+        }
+    }
+
+    elements
 }
 
 fn dsl_automata_to_cytoscape(
