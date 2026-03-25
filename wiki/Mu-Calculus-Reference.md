@@ -122,6 +122,26 @@ If there are no controllable transitions, the operator degenerates to requiring 
 
 There exists an uncontrollable transition leading to a state satisfying `phi`. This models the environment's ability to force a particular outcome.
 
+## Nondeterminism and Controllability (Skolem Paradigm)
+
+Mununu's evaluator uses the **Skolem paradigm** for handling nondeterministic transitions. The key semantics:
+
+- The **controller chooses a LABEL** (action), not a specific transition
+- **Nondeterministic outcomes** (multiple transitions with the same label to different targets) are always **adversarial** — ALL outcomes must satisfy the formula
+- This holds regardless of whether the label is controllable or uncontrollable
+
+**Controllability determines WHO triggers the label:**
+- **Controllable**: the controller can choose to trigger this label or not
+- **Uncontrollable**: the environment forces it — the controller can't prevent it
+
+**Nondeterminism determines WHAT happens after triggering:**
+- **Deterministic** (one target per label): outcome is predictable
+- **Nondeterministic** (multiple targets per label): outcome is adversarial for BOTH players
+
+Example: state S0 with transitions `risky → Good` and `risky → Bad` (both controllable, same label):
+- `mu X. (Good || <> X)` → S0 does NOT satisfy (controller can't guarantee Good — Bad might happen)
+- `mu X. (Good || Bad || <> X)` → S0 DOES satisfy (both outcomes are acceptable)
+
 ## Common Patterns
 
 These patterns come up repeatedly in hardware and protocol verification. Copy and adapt them freely.
