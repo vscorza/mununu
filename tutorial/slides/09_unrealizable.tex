@@ -78,6 +78,84 @@ Controller impossible_valve: UNREALIZABLE
 \end{frame}
 
 % ------------------------------------------------------------------
+\begin{frame}{Formula Inversion}
+  Inverting a formula computes the \textbf{environment's winning region} --- the set of states from which the environment can violate the specification.
+
+  \bigskip
+  \begin{center}
+  \begin{tabular}{lll}
+    \toprule
+    \textbf{Original} & \textbf{Inverted} & \textbf{Effect} \\
+    \midrule
+    $\lfp$ (mu)  & $\gfp$ (nu)  & Reachability $\leftrightarrow$ Safety \\
+    $\gfp$ (nu)  & $\lfp$ (mu)  & Safety $\leftrightarrow$ Reachability \\
+    $[\;]$ (box) & $\langle\;\rangle$ (diamond) & Universal $\leftrightarrow$ Existential \\
+    $\langle\;\rangle$ (diamond) & $[\;]$ (box) & Existential $\leftrightarrow$ Universal \\
+    \texttt{ctrl=controllable} & \texttt{ctrl=environment} & Controller $\leftrightarrow$ Environment \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \bigskip
+  The inverted formula's satisfying states are exactly those where the \alert{environment wins}.
+
+  \medskip
+  {\scriptsize\color{ubaGray} Reference: Zielonka, W. (1998). ``Infinite Games on Finitely Coloured Graphs with Applications to Automata on Infinite Trees''. \emph{Theoretical Computer Science}.}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Lasso Traces}
+  A \textbf{lasso trace} is a counterexample for liveness properties. It has the form:
+
+  \bigskip
+  \begin{center}
+    \texttt{prefix} $\;\to\;$ \texttt{(cycle)}$^\omega$
+  \end{center}
+
+  \bigskip
+  \textbf{Example} (traffic light that never reaches Green):
+
+  \medskip
+  \begin{center}
+    \texttt{Red} $\;\to\;$ \texttt{(PedWaiting)}$^\omega$
+  \end{center}
+
+  \bigskip
+  \begin{itemize}
+    \item The \textbf{prefix} is a finite path from an initial state to the cycle entry.
+    \item The \textbf{cycle} repeats forever, demonstrating that the goal is never reached.
+    \item A counterexample for a liveness property ($\Globally\Finally\; p$) is an infinite path that \alert{avoids $p$ from some point onward}.
+  \end{itemize}
+
+  \medskip
+  Mununu reports lasso traces when \ctxdsl{deadlock_traces} is enabled in diagnostics.
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{Counterstrategy Graph}
+  When synthesis is unrealizable, Mununu can generate a \textbf{counterstrategy graph} --- a subgraph showing how the environment wins.
+
+  \bigskip
+  \textbf{CLI:}
+  \begin{shellcode}
+$ mununu context graph file.ctxdsl \
+    --counterstrategy \
+    --formula F --automaton A \
+    --output cs.html
+  \end{shellcode}
+
+  \bigskip
+  \textbf{UI:} Click the \textbf{``Counterstrategy''} button in the Verification tab.
+
+  \bigskip
+  \begin{itemize}
+    \item The counterstrategy graph shows the \textbf{environment's winning region} --- states where the environment can force a violation.
+    \item Edges represent the environment's optimal moves.
+    \item Use it to understand \emph{which environment behaviors} make the spec unrealizable.
+  \end{itemize}
+\end{frame}
+
+% ------------------------------------------------------------------
 \begin{frame}{Takeaway}
   \begin{center}
   \begin{tabularx}{0.92\textwidth}{lX}

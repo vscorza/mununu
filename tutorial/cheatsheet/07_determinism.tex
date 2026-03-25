@@ -97,5 +97,19 @@ Non-determinism affects formal verification in several ways:
 Confusing \textbf{box} (all paths) with \textbf{diamond} (some path) when the system is non-deterministic.  A property verified with diamond does \emph{not} guarantee it holds on every execution --- use box for universal guarantees.
 \end{warnbox}
 
+\begin{warnbox}{Skolem Paradigm}
+The controller chooses a \textbf{label} (action), not a specific transition.
+Nondeterministic outcomes (same label, multiple targets) are always
+\textbf{adversarial} --- ALL outcomes must satisfy, regardless of
+controllability.
+
+\code{mu X. (Good || <> X)} at a state with \code{risky -> Good} and
+\code{risky -> Bad}: \textbf{fails} (Bad might happen).
+
+\code{mu X. (Good || Bad || <> X)}: \textbf{succeeds} (both outcomes OK).
+
+{\scriptsize Ref: Milner (1989) \textit{Communication and Concurrency}.}
+\end{warnbox}
+
 \end{multicols}
 \end{document}

@@ -64,6 +64,10 @@
     \texttt{[ labels=\{a\} ] $\varphi$} & Labeled box    & All $a$-successors satisfy $\varphi$ \\
     \texttt{< labels=\{a\} > $\varphi$} & Labeled diamond & Some $a$-successor satisfies $\varphi$ \\
     \midrule
+    \midrule
+    \texttt{[ (ctrl=controllable) ] $\varphi$} & Ctrl box & All uncontrollable successors \emph{and} some controllable successor satisfy $\varphi$ \\
+    \texttt{< (ctrl=environment) > $\varphi$} & Env diamond & Some uncontrollable successor satisfies $\varphi$ \\
+    \midrule
     \texttt{$\varphi$ \&\& $\psi$} & Conjunction & Both hold \\
     \texttt{$\varphi$ || $\psi$}   & Disjunction & At least one holds \\
     \texttt{! $\varphi$}            & Negation    & Does not hold \\
@@ -145,6 +149,9 @@
     \item $\lfp$ (mu) starts from ``nothing satisfies'' and adds witnesses --- \textbf{reachability}.
     \item Nesting them yields \textbf{liveness} properties (e.g., infinitely often).
   \end{itemize}
+
+  \medskip
+  {\scriptsize\color{ubaGray} References: Kozen (1983) ``Results on the Propositional Mu-Calculus''; Emerson \& Jutla (1991) ``Tree Automata, Mu-Calculus and Determinacy''.}
 \end{frame}
 
 \end{document}

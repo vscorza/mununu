@@ -113,5 +113,19 @@ When synthesis fails, diagnostics report:
 \end{itemize}
 \end{warnbox}
 
+\begin{tipbox}{Lasso Traces}
+Liveness counterexamples use lasso format:
+\code{prefix -> (cycle)\^{}$\omega$}
+
+Example: \code{Red -> (PedWaiting)\^{}$\omega$}
+
+Use \code{-{}-counterexample} with synthesis to see lasso traces.
+\end{tipbox}
+
+\begin{cheatbox}{Advanced CLI Flags}
+\code{-{}-extract-strategy} --- positional strategy (one ctrl transition per state)
+\code{-{}-counterstrategy} --- graph env winning region (with \code{context graph})
+\end{cheatbox}
+
 \end{multicols}
 \end{document}

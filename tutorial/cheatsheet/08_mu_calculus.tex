@@ -97,7 +97,8 @@ No deadlock & \code{nu X. (<> true) \&\& ([] X)} \\[2pt]
 Labeled check & \code{(! src) || [ labels = \{a\} ] dst} \\[2pt]
 Mutual exclusion & \code{(! A) || (! B)} \\[2pt]
 Recovery & \code{(! bad) || (mu Y. (good || <> Y))} \\[2pt]
-Ctrl reachability & \code{mu X. (p || [ (ctrl = controllable) ] X)} \\
+Ctrl reachability & \code{mu X. (p || [ (ctrl = controllable) ] X)} \\[2pt]
+Env diamond & \code{< (ctrl = environment) > phi} --- some uncontrollable satisfies OR all controllable satisfy \\
 \bottomrule
 \end{tabularx}
 \end{cheatbox}
@@ -118,6 +119,12 @@ Ctrl reachability & \code{mu X. (p || [ (ctrl = controllable) ] X)} \\
   \item Forgetting that \code{[] false} holds vacuously in deadlock states (no successors).
 \end{itemize}
 \end{warnbox}
+
+\begin{tipbox}{Further Reading}
+Kozen (1983) ``Results on the Propositional Mu-Calculus'' --- fixpoint semantics.
+Emerson \& Jutla (1991) --- positional determinacy of parity games.
+Bruse, Friedmann \& Lange (2016) --- strategy extraction from fixpoint iteration.
+\end{tipbox}
 
 \end{multicols}
 \end{document}

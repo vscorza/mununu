@@ -1,0 +1,106 @@
+\input{common/preamble}
+
+\begin{document}
+\cheatheader{10 --- Counterstrategy}{Formula Inversion and Environment Strategies}
+
+\begin{multicols}{3}
+\footnotesize
+
+%% ---- COLUMN 1 ----
+
+\begin{cheatbox}{Formula Inversion}
+Duality table --- swap operators to invert a formula:
+
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}l c l@{}}
+\toprule
+\textbf{Controller} & $\longleftrightarrow$ & \textbf{Environment} \\
+\midrule
+\code{mu} & $\leftrightarrow$ & \code{nu} \\
+\code{nu} & $\leftrightarrow$ & \code{mu} \\
+\code{[]} (box) & $\leftrightarrow$ & \code{<>} (diamond) \\
+\code{<>} (diamond) & $\leftrightarrow$ & \code{[]} (box) \\
+\code{\&\&} & $\leftrightarrow$ & \code{||} \\
+\code{||} & $\leftrightarrow$ & \code{\&\&} \\
+\code{ctrl = controllable} & $\leftrightarrow$ & \code{ctrl = environment} \\
+\bottomrule
+\end{tabularx}
+
+\smallskip
+Inverting a formula swaps the roles of controller and environment: the environment becomes the ``player'' trying to satisfy the inverted property.
+\end{cheatbox}
+
+\begin{cheatbox}{Syntax}
+A counterstrategy formula targets the \emph{complement} of the controller's goal:
+\begin{lstlisting}[style=ctxdsl]
+body = nu X. ((!target) &&
+    < (ctrl = environment) > X);
+\end{lstlisting}
+
+This computes the set of states from which the environment can \textbf{avoid} \code{target} forever.
+\end{cheatbox}
+
+\columnbreak
+
+%% ---- COLUMN 2 ----
+
+\begin{cheatbox}{Environment Diamond}
+\code{< (ctrl = environment) > phi} means:
+\begin{itemize}
+  \item There \textbf{exists} an uncontrollable transition leading to $\varphi$, OR
+  \item \textbf{All} controllable transitions lead to $\varphi$.
+\end{itemize}
+
+\smallskip
+The environment ``wins'' a step if it can force $\varphi$ via an uncontrollable move, or if every controllable option the controller might pick also leads to $\varphi$.
+\end{cheatbox}
+
+\begin{tipbox}{Skolem Paradigm}
+Nondeterminism is adversarial for \textbf{both} players.  The controller chooses a label, not a transition; similarly, the environment chooses a label.  Multiple targets under the same label are resolved adversarially against the choosing player.
+\end{tipbox}
+
+\begin{cheatbox}{Common Patterns}
+\textbf{Env prevents target:}
+\begin{lstlisting}[style=ctxdsl]
+nu X. ((!target) &&
+    < (ctrl = environment) > X)
+\end{lstlisting}
+
+\textbf{Env counterstrategy (liveness):}
+\begin{lstlisting}[style=ctxdsl]
+mu X. (bad || < (ctrl = environment) > X)
+\end{lstlisting}
+Environment can force the system into \code{bad}.
+\end{cheatbox}
+
+\columnbreak
+
+%% ---- COLUMN 3 ----
+
+\begin{cheatbox}{CLI}
+Generate a counterstrategy graph:
+\begin{lstlisting}[style=shell]
+mununu context graph file.ctxdsl \
+    --counterstrategy \
+    --formula F \
+    --automaton A \
+    --output cs.html
+\end{lstlisting}
+The output highlights the environment's winning region and the transitions it uses to defeat the controller.
+\end{cheatbox}
+
+\begin{cheatbox}{Web UI}
+\begin{itemize}
+  \item \textbf{Verification tab} --- click the \emph{Counterstrategy} button to visualize the environment winning region.
+  \item \textbf{Synthesis tab} --- full diagnostics including counterexample traces and counterstrategy graphs.
+\end{itemize}
+\end{cheatbox}
+
+\begin{tipbox}{References}
+Zielonka (1998) ``Infinite Games on Finitely Coloured Graphs with Applications to Automata on Infinite Trees'' --- parity game solving.
+Bruse, Friedmann \& Lange (2016) --- strategy extraction from fixpoint iteration.
+Emerson \& Jutla (1991) --- positional determinacy of parity games.
+\end{tipbox}
+
+\end{multicols}
+\end{document}
