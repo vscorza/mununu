@@ -38,23 +38,51 @@ fn build_line_plant(state_count: usize) -> Clts<DefaultStateIdx, DefaultLabelIdx
     builder.build().expect("controller benchmark plant builds")
 }
 
+/// Build a GR(1)-style formula: `¬GF(Req) ∨ GF(Grant)` — the controller must
+/// grant infinitely often whenever requested.  This exercises the full
+/// alternating fixpoint evaluation instead of the trivial `true` formula.
+fn gr1_formula() -> mununu::mu_calculus::Formula {
+    parser::parse(
+        "((! (nu NuA. (mu MuA. (Req || <> MuA)) && ([] NuA))) \
+          || (nu NuG. (mu MuG. (Grant || <> MuG)) && ([] NuG)))",
+    )
+    .expect("GR(1) formula parses")
+}
+
 fn build_context(
     state_count: usize,
 ) -> Result<(Context, Environment, mununu::mu_calculus::Formula), ContextError> {
     let plant = build_line_plant(state_count);
+    let n = plant.state_count();
+
+    // Mark even-indexed states as Req, odd-indexed as Grant so both predicates
+    // are non-trivial and the fixpoint computation does real work.
+    let mut req_bits = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    let mut grant_bits = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    for i in 0..n {
+        if i % 2 == 0 {
+            req_bits.set(i, true);
+        } else {
+            grant_bits.set(i, true);
+        }
+    }
+
     let context = Context::builder()
         .register_clts("plant", plant)
         .finish_with_checks()?;
 
-    let formula = parser::parse("true").expect("formula parses");
-    let env = Environment::new(state_count);
+    let env = Environment::new(n)
+        .with_predicate("Req", req_bits)
+        .with_predicate("Grant", grant_bits);
+
+    let formula = gr1_formula();
     Ok((context, env, formula))
 }
 
 fn controller_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("controller_synthesis");
 
-    for &(label, states) in &[("small", 64usize), ("large", 4096usize)] {
+    for &(label, states) in &[("small", 1_000usize), ("large", 64_000usize)] {
         let (context, env, formula) = build_context(states).expect("context builds");
         group.throughput(Throughput::Elements(states as u64));
         group.bench_function(BenchmarkId::new(label, states), |b| {

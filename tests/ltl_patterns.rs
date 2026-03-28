@@ -3,9 +3,12 @@
 //! These tests verify that common LTL patterns from `docs/ltl_templates/temporal_logic_patterns.md`
 //! can be parsed, translated to μ-calculus, and realized correctly in the Context DSL.
 
+use mununu::clts::Clts;
+use mununu::context::Context;
 use mununu::context_dsl;
 use mununu::context_dsl::realize_context;
 use mununu::ltl::{self, LtlFormula};
+use mununu::mu_calculus::Environment;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -617,5 +620,142 @@ fn test_realize_mixed_ltl_and_mu_formulas() -> TestResult {
     assert!(realized.formulas.contains_key("ltl_formula"));
     assert!(realized.formulas.contains_key("mu_formula"));
 
+    Ok(())
+}
+
+// ============================================================================
+// End-to-End Evaluation Tests (translate → evaluate over a known CLTS)
+// ============================================================================
+
+/// Build a small linear CLTS: s0 →a→ s1 →b→ s2 (s2 has a self-loop on b).
+/// Predicates: Target = {s2}, Safe = {s0, s1}.
+fn three_state_clts() -> (Context, Environment) {
+    use mununu::clts::DefaultLabelIdx;
+    use mununu::clts::DefaultStateIdx;
+    let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+    builder.state("s0");
+    builder.state("s1");
+    builder.state("s2");
+    let s0 = builder.state_id_or_insert("s0").unwrap();
+    builder.initial_state_id(s0);
+    let s1 = builder.state_id_or_insert("s1").unwrap();
+    let s2 = builder.state_id_or_insert("s2").unwrap();
+    let a = builder.labels().intern(["a"]).unwrap();
+    let b = builder.labels().intern(["b"]).unwrap();
+    builder.transition_ids(s0, &[a], s1);
+    builder.transition_ids(s1, &[b], s2);
+    builder.transition_ids(s2, &[b], s2); // self-loop
+
+    let clts = builder.build().unwrap();
+    let n = clts.state_count();
+
+    let ctx = Context::builder()
+        .register_clts("m", clts)
+        .finish_with_checks()
+        .unwrap();
+
+    let mut target = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    target.set(s2.index(), true);
+    let mut safe = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    safe.set(s0.index(), true);
+    safe.set(s1.index(), true);
+    let env = Environment::new(n)
+        .with_predicate("Target", target)
+        .with_predicate("Safe", safe);
+    (ctx, env)
+}
+
+/// `G(!Target)` — `ν X. (!Target ∧ [] X)`.
+/// No state satisfies: all paths from s0 and s1 eventually force a visit to
+/// s2 (Target) via the s2 self-loop, so even s0 and s1 cannot guarantee
+/// always staying outside Target.
+#[test]
+fn ltl_g_evaluated_over_clts() -> TestResult {
+    let (ctx, env) = three_state_clts();
+    let ltl = ltl::parse("G (!Target)")?;
+    let mu = ltl::translator::translate(&ltl)?;
+    let result = ctx.evaluate_mu("m", &mu, &env, None)?;
+    // s2 does not satisfy (it IS Target); s1 only successor is s2 so fails too;
+    // s0 only successor is s1 which fails, so s0 also fails.
+    assert_eq!(result.count_ones(), 0, "no state satisfies G(!Target) in this clts");
+    Ok(())
+}
+
+/// `F(Target)` — `μ X. (Target ∨ <> X)`.
+/// All states satisfy because Target (s2) is reachable from everywhere.
+#[test]
+fn ltl_f_evaluated_over_clts() -> TestResult {
+    let (ctx, env) = three_state_clts();
+    let ltl = ltl::parse("F Target")?;
+    let mu = ltl::translator::translate(&ltl)?;
+    let result = ctx.evaluate_mu("m", &mu, &env, None)?;
+    assert_eq!(result.count_ones(), 3, "all states can reach Target");
+    Ok(())
+}
+
+/// `Safe U Target` — `μ X. (Target ∨ (Safe ∧ <> X))`.
+/// s0 and s1 are Safe and lead to Target, s2 is Target: all satisfy.
+#[test]
+fn ltl_until_evaluated_over_clts() -> TestResult {
+    let (ctx, env) = three_state_clts();
+    let ltl = ltl::parse("Safe U Target")?;
+    let mu = ltl::translator::translate(&ltl)?;
+    let result = ctx.evaluate_mu("m", &mu, &env, None)?;
+    assert_eq!(result.count_ones(), 3, "Safe U Target holds for all states");
+    Ok(())
+}
+
+/// `GF(Target)` — `ν NuX. (μ MuX. (Target ∨ <> MuX)) ∧ [] NuX`.
+/// All states satisfy: from every state, the only path eventually reaches s2
+/// (Target) via s2's self-loop. Since all successors also satisfy, the nu
+/// fixpoint closes over all three states.
+#[test]
+fn ltl_gf_evaluated_over_clts() -> TestResult {
+    let (ctx, env) = three_state_clts();
+    let ltl = ltl::parse("G F Target")?;
+    let mu = ltl::translator::translate(&ltl)?;
+    let result = ctx.evaluate_mu("m", &mu, &env, None)?;
+    // All states: the only infinite path through this CLTS visits s2 (Target)
+    // infinitely often (s2 self-loops), so GF(Target) holds everywhere.
+    assert_eq!(result.count_ones(), 3, "all states satisfy GF(Target)");
+    Ok(())
+}
+
+/// Response: `G(Safe -> F Target)` applied to a 2-state machine where
+/// Safe=initial and Target=final with a direct transition.
+/// Both states should satisfy because Target is immediately reachable.
+#[test]
+fn ltl_response_evaluated_over_two_state_clts() -> TestResult {
+    use mununu::clts::DefaultLabelIdx;
+    use mununu::clts::DefaultStateIdx;
+    let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+    builder.state("req");
+    builder.state("done");
+    let req = builder.state_id_or_insert("req").unwrap();
+    builder.initial_state_id(req);
+    let done = builder.state_id_or_insert("done").unwrap();
+    let go = builder.labels().intern(["go"]).unwrap();
+    builder.transition_ids(req, &[go], done);
+    builder.transition_ids(done, &[go], done); // done loops
+
+    let clts = builder.build().unwrap();
+    let n = clts.state_count();
+    let ctx = Context::builder()
+        .register_clts("r", clts)
+        .finish_with_checks()
+        .unwrap();
+
+    let mut req_set = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    req_set.set(req.index(), true);
+    let mut done_set = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    done_set.set(done.index(), true);
+    let env = Environment::new(n)
+        .with_predicate("Safe", req_set)
+        .with_predicate("Target", done_set);
+
+    let ltl = ltl::parse("G (Safe -> F Target)")?;
+    let mu = ltl::translator::translate(&ltl)?;
+    let result = ctx.evaluate_mu("r", &mu, &env, None)?;
+    assert_eq!(result.count_ones(), 2, "both states satisfy G(Safe->F Target)");
     Ok(())
 }

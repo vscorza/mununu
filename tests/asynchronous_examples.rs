@@ -1,5 +1,7 @@
 use mununu::clts::{Clts, DefaultLabelIdx, DefaultStateIdx};
+use mununu::context::{Context, ContextError};
 use mununu::examples::asynchronous;
+use mununu::mu_calculus::{Environment, parser};
 
 fn skip_in_ci(test_name: &str) -> bool {
     if std::env::var("CI").is_ok() {
@@ -86,6 +88,63 @@ fn token_ring_passes_token() {
     assert_eq!(node0, vec![vec!["pass_0_1".to_string()]]);
     let node2 = single_transition_labels(&clts, "node2");
     assert_eq!(node2, vec![vec!["pass_2_0".to_string()]]);
+}
+
+// ── Formula evaluation ────────────────────────────────────────────────────
+
+fn make_context(name: &str, clts: Clts<DefaultStateIdx, DefaultLabelIdx>) -> Result<Context, ContextError> {
+    Context::builder()
+        .register_clts(name, clts)
+        .finish_with_checks()
+}
+
+/// In the producer/consumer buffer there are two reachable states: empty and full.
+/// The formula `ν X. (Empty ∨ <> X)` holds everywhere because all states can
+/// reach empty (full →consume→ empty, and empty is itself).
+#[test]
+fn producer_consumer_can_always_reach_empty() {
+    if skip_in_ci("producer_consumer_can_always_reach_empty") {
+        return;
+    }
+    let clts = asynchronous::producer_consumer_buffer();
+    let empty = clts.state_id("empty").unwrap();
+    let n = clts.state_count();
+    let ctx = make_context("pc", clts).expect("context builds");
+
+    let mut empty_set = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    empty_set.set(empty.index(), true);
+    let env = Environment::new(n).with_predicate("Empty", empty_set);
+
+    let formula = parser::parse("nu X. (Empty || <> X)").expect("parses");
+    let result = ctx.evaluate_mu("pc", &formula, &env, None).expect("eval");
+    assert_eq!(result.count_ones(), n, "every state can reach empty");
+}
+
+/// In Peterson's mutex, the `critical` state is reachable from all states:
+/// idle → p0_wait/p1_wait → critical.  The formula `μ X. (Critical ∨ <> X)`
+/// (eventually reach Critical) should hold for all 4 states.
+#[test]
+fn peterson_critical_reachable_from_all_states() {
+    if skip_in_ci("peterson_critical_reachable_from_all_states") {
+        return;
+    }
+    let clts = asynchronous::peterson_mutual_exclusion();
+    let critical = clts.state_id("critical").unwrap();
+    let n = clts.state_count();
+    let ctx = make_context("pm", clts).expect("context builds");
+
+    let mut crit_set = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    crit_set.set(critical.index(), true);
+    let env = Environment::new(n).with_predicate("Critical", crit_set);
+
+    // μ X. (Critical ∨ <> X) — eventually reach critical section
+    let formula = parser::parse("mu X. (Critical || <> X)").expect("parses");
+    let result = ctx.evaluate_mu("pm", &formula, &env, None).expect("eval");
+    assert_eq!(
+        result.count_ones(),
+        n,
+        "all {n} states can eventually reach critical"
+    );
 }
 
 #[test]

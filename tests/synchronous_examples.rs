@@ -1,5 +1,7 @@
 use mununu::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, LabelId};
+use mununu::context::{Context, ContextError};
 use mununu::examples::synchronous;
+use mununu::mu_calculus::{Environment, parser};
 
 fn skip_in_ci(test_name: &str) -> bool {
     if std::env::var("CI").is_ok() {
@@ -108,4 +110,60 @@ fn synchronous_pipeline_uses_union_label() {
     let fill = &clts.outgoing(empty)[0];
     let labels = label_set(&clts, fill.labels());
     assert_eq!(labels, vec!["consume".to_string(), "produce".to_string()]);
+}
+
+// ── Formula evaluation ────────────────────────────────────────────────────
+
+fn make_context(name: &str, clts: Clts<DefaultStateIdx, DefaultLabelIdx>) -> Result<Context, ContextError> {
+    Context::builder()
+        .register_clts(name, clts)
+        .finish_with_checks()
+}
+
+/// The traffic light cycles through red→green→yellow→red forever.
+/// The formula `ν X. (red ∨ <> X)` should hold at the initial `red` state
+/// because it IS red, and it trivially holds everywhere (all states can reach red).
+#[test]
+fn traffic_light_red_state_satisfies_reachability() {
+    if skip_in_ci("traffic_light_red_state_satisfies_reachability") {
+        return;
+    }
+    let clts = synchronous::traffic_light_controller();
+    let red = clts.state_id("red").unwrap();
+    let n = clts.state_count();
+    let ctx = make_context("tl", clts).expect("context builds");
+
+    // Predicate: only red satisfies Red
+    let mut red_set = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    red_set.set(red.index(), true);
+    let env = Environment::new(n).with_predicate("Red", red_set);
+
+    // ν X. (Red ∨ <> X) — every state can eventually reach red (true for all 3)
+    let formula = parser::parse("nu X. (Red || <> X)").expect("formula parses");
+    let result = ctx.evaluate_mu("tl", &formula, &env, None).expect("eval succeeds");
+
+    // All three states satisfy (cycle: red→green→yellow→red)
+    assert_eq!(result.count_ones(), 3, "all 3 states should satisfy reachability to Red");
+    assert!(result[red.index()], "red itself must satisfy");
+}
+
+/// The clocked toggle only has two states. `ν X. (Off ∨ <> X)` holds everywhere
+/// because `off` is reachable from `on` via tick→off.
+#[test]
+fn clocked_toggle_liveness_holds_from_both_states() {
+    if skip_in_ci("clocked_toggle_liveness_holds_from_both_states") {
+        return;
+    }
+    let clts = synchronous::clocked_toggle();
+    let off = clts.state_id("off").unwrap();
+    let n = clts.state_count();
+    let ctx = make_context("ct", clts).expect("context builds");
+
+    let mut off_set = bitvec::bitvec![usize, bitvec::order::Lsb0; 0; n];
+    off_set.set(off.index(), true);
+    let env = Environment::new(n).with_predicate("Off", off_set);
+
+    let formula = parser::parse("nu X. (Off || <> X)").expect("parses");
+    let result = ctx.evaluate_mu("ct", &formula, &env, None).expect("eval succeeds");
+    assert_eq!(result.count_ones(), 2, "both states satisfy eventual-off");
 }

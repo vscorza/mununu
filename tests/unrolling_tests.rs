@@ -87,18 +87,15 @@ fn test_unrolling_with_integer_variable() {
         ..Default::default()
     };
 
-    let result = unroll_states(states, transitions, variables, options);
-    // Should succeed and have multiple states with different count values
-    // (or hit limit, which is also valid)
-    match result {
-        Ok(unrolled) => {
-            assert!(unrolled.states.len() >= 2);
-            assert!(!unrolled.transitions.is_empty());
-        }
-        Err(_) => {
-            // Hitting limit is acceptable for this test
-        }
-    }
+    // A self-looping incrementing automaton will always exhaust any per-location
+    // limit. The unroller must return StateSpaceExplosion, not silently succeed.
+    use mununu::abstraction::unrolling::UnrollingError;
+    let err = unroll_states(states, transitions, variables, options)
+        .expect_err("infinite self-loop must trigger the state-limit error");
+    assert!(
+        matches!(err, UnrollingError::StateSpaceExplosion { .. }),
+        "expected StateSpaceExplosion, got: {err:?}"
+    );
 }
 
 #[test]
@@ -130,9 +127,36 @@ fn test_unrolling_with_guard() {
         ..Default::default()
     };
 
-    let result = unroll_states(states, transitions, variables, options);
-    // Should succeed (even if guard refinement is not fully implemented)
-    assert!(result.is_ok());
+    let result = unroll_states(states, transitions, variables, options)
+        .expect("guard-gated unrolling should succeed");
+    // The guard `count >= 5` prevents the Processing→Complete transition until
+    // count is high enough.  With limit=10 we should see unrolled states.
+    assert!(
+        !result.states.is_empty(),
+        "expected at least one unrolled state"
+    );
+    // Verify that any transition to Complete only originates from a state
+    // where count >= 5 (guard was evaluated, not unconditionally added).
+    let complete_transitions: Vec<_> = result
+        .transitions
+        .iter()
+        .filter(|t| t.to.location == "Complete")
+        .collect();
+    for t in &complete_transitions {
+        // The AbstractState display is "Processing_count_<N>"; extract N.
+        let count_val: i64 = t
+            .from
+            .to_string()
+            .rsplit('_')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        assert!(
+            count_val >= 5,
+            "transition to Complete from '{}' violates guard count >= 5",
+            t.from
+        );
+    }
 }
 
 #[test]
