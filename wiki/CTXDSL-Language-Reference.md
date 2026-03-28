@@ -11,6 +11,9 @@ Every `.ctxdsl` file has one top-level `context` block:
 ```
 context my_system {
     alphabet { ... }
+    constants { ... }
+    ranges { ... }
+    enums { ... }
     automata { ... }
     composition { ... }
     mu_formulas { ... }
@@ -54,6 +57,33 @@ range counter = 0 ..= MAX_RETRY;
 
 Constants are `i64` values. Ranges define inclusive integer intervals and can reference constants in their bounds.
 
+## Enums
+
+Enum types define named finite value sets. Variants are mapped to integers (0, 1, 2, ...) at realization time.
+
+```
+enums {
+    enum Status { idle, active, error };
+    enum MsgType { req, ack, nack };
+}
+```
+
+Enum types can be used as variable types in automata. Guards and effects reference variants by name:
+
+```
+variables {
+    var mode: Status = idle;
+}
+
+transitions {
+    transition S0 -> S1 on label activate
+        guard mode == idle
+        effects { mode = active; };
+}
+```
+
+Under the hood, enum variables are desugared to `i64` and unrolled like any other integer variable.
+
 ## Automaton
 
 An automaton is a labeled transition system with states, transitions, and optional controllability and variable declarations.
@@ -96,9 +126,57 @@ controllable {
 
 This distinction is central to controller synthesis. See the [Mu-Calculus Reference](Mu-Calculus-Reference) for controllability-aware modalities.
 
+### Parameters (Process Templates)
+
+An automaton can be parameterized over a range. The tool expands it into multiple concrete instances at realization time.
+
+```
+ranges {
+    range Clients = 0 ..= 1;
+}
+
+automata {
+    automaton Client {
+        parameters {
+            param i in Clients;
+        }
+        controllable { label req[i]; }
+        states { state Idle initial; state Waiting; }
+        transitions {
+            transition Idle -> Waiting on label req[i];
+            transition Waiting -> Idle on label grant[i];
+        }
+    }
+}
+```
+
+This expands into `Client_0` and `Client_1`, each with their own labels (`req_0`/`grant_0` and `req_1`/`grant_1`). Composition members reference instances with index syntax: `members [Client[0], Client[1], Arbiter];`.
+
+Currently only a single parameter per automaton is supported.
+
+### State Groups & Wildcards
+
+State groups name a set of states for use in bulk transition declarations. Wildcards match all declared states.
+
+```
+state_groups {
+    group error_states = { ErrorMinor, ErrorMajor };
+}
+
+transitions {
+    // Reset from any error state
+    transition group error_states -> Init on label reset;
+
+    // Emergency from any state at all
+    transition wildcard "*" -> Shutdown on label emergency;
+}
+```
+
+Groups and wildcards are expanded into individual transitions at realization time. `wildcard "*"` matches all states; `wildcard "Err*"` matches states whose names start with `Err`.
+
 ### Variables
 
-Automata can declare typed state variables. Supported types are `i64` and `bool`.
+Automata can declare typed state variables. Supported types are `i64`, `bool`, and enum types (see [Enums](#enums)).
 
 ```
 variables {
@@ -168,6 +246,18 @@ composition {
     }
 }
 ```
+
+When using parameterized automata, member references can include an index to select a specific instance:
+
+```
+composition {
+    asynchronous system {
+        members [Client[0], Client[1], Arbiter];
+    }
+}
+```
+
+This resolves `Client[0]` to `Client_0`, `Client[1]` to `Client_1`, etc.
 
 ## Mu-Calculus Formulas
 

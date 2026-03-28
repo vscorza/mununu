@@ -490,10 +490,9 @@ pub async fn context_verify_handler(
                 .get(state_id.index())
                 .map(|bit| *bit)
                 .unwrap_or(false)
+                && let Some(name) = clts.state_name(state_id)
             {
-                if let Some(name) = clts.state_name(state_id) {
-                    satisfying_state_names.push(name.to_string());
-                }
+                satisfying_state_names.push(name.to_string());
             }
         }
         satisfying_state_names.sort();

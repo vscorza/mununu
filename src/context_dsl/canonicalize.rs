@@ -9,6 +9,7 @@ pub fn canonicalize(doc: &mut ContextDoc) {
     doc.alphabet.sort_by(|a, b| a.name.name.cmp(&b.name.name));
     doc.constants.sort_by(|a, b| a.name.name.cmp(&b.name.name));
     doc.ranges.sort_by(|a, b| a.name.name.cmp(&b.name.name));
+    doc.enums.sort_by(|a, b| a.name.name.cmp(&b.name.name));
 
     for automaton in &mut doc.automata {
         canonicalize_automaton(automaton);
@@ -19,7 +20,9 @@ pub fn canonicalize(doc: &mut ContextDoc) {
     });
 
     for composition in &mut doc.compositions {
-        composition.members.sort_by(|a, b| a.name.cmp(&b.name));
+        composition
+            .members
+            .sort_by(|a, b| a.name.name.cmp(&b.name.name));
     }
 
     doc.compositions.sort_by(|a, b| {
@@ -195,6 +198,13 @@ mod tests {
         Ident::new(name.to_owned(), Span::new(0, 0, 0, 0))
     }
 
+    fn member(name: &str) -> MemberRef {
+        MemberRef {
+            name: ident(name),
+            index: None,
+        }
+    }
+
     fn alphabet_entry(name: &str) -> AlphabetEntry {
         AlphabetEntry {
             name: ident(name),
@@ -357,6 +367,7 @@ mod tests {
             alphabet: vec![alphabet_entry("tau"), alphabet_entry("alpha")],
             constants: vec![constant_entry("N", 5), constant_entry("A", 1)],
             ranges: vec![range_entry("high", 10, 20), range_entry("low", 0, 5)],
+            enums: Vec::new(),
             automata: vec![
                 dummy_automaton("Beta", Some("Z")),
                 dummy_automaton("Alpha", None),
@@ -369,7 +380,7 @@ mod tests {
                         comment: None,
                     },
                     kind: CompositionKind::Asynchronous,
-                    members: vec![ident("C"), ident("A"), ident("B")],
+                    members: vec![member("C"), member("A"), member("B")],
                     span: Span::new(0, 0, 0, 0),
                 },
                 Composition {
@@ -379,7 +390,7 @@ mod tests {
                         comment: None,
                     },
                     kind: CompositionKind::Synchronous,
-                    members: vec![ident("Y"), ident("X")],
+                    members: vec![member("Y"), member("X")],
                     span: Span::new(0, 0, 0, 0),
                 },
             ],
@@ -476,7 +487,7 @@ mod tests {
                     canonical_id(&comp.meta, &comp.name.name),
                     comp.members
                         .iter()
-                        .map(|ident| ident.name.as_str())
+                        .map(|m| m.name.name.as_str())
                         .collect::<Vec<_>>(),
                 )
             })
@@ -1206,6 +1217,7 @@ mod tests {
             alphabet: Vec::new(),
             constants: Vec::new(),
             ranges: Vec::new(),
+            enums: Vec::new(),
             automata: Vec::new(),
             compositions: vec![
                 Composition {
@@ -1215,7 +1227,7 @@ mod tests {
                         comment: None,
                     },
                     kind: CompositionKind::Superset,
-                    members: vec![ident("A")],
+                    members: vec![member("A")],
                     span: Span::new(0, 0, 0, 0),
                 },
                 Composition {
@@ -1225,7 +1237,7 @@ mod tests {
                         comment: None,
                     },
                     kind: CompositionKind::Asynchronous,
-                    members: vec![ident("A")],
+                    members: vec![member("A")],
                     span: Span::new(0, 0, 0, 0),
                 },
                 Composition {
@@ -1235,7 +1247,7 @@ mod tests {
                         comment: None,
                     },
                     kind: CompositionKind::Synchronous,
-                    members: vec![ident("A")],
+                    members: vec![member("A")],
                     span: Span::new(0, 0, 0, 0),
                 },
             ],
@@ -1261,6 +1273,7 @@ mod tests {
             alphabet: Vec::new(),
             constants: Vec::new(),
             ranges: Vec::new(),
+            enums: Vec::new(),
             automata: Vec::new(),
             compositions: Vec::new(),
             controllers: Vec::new(),

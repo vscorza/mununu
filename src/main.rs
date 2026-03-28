@@ -1639,9 +1639,10 @@ fn unrolled_automata_to_cytoscape(
 
                 VariableDecl {
                     name: v.name.name.clone(),
-                    ty: match v.ty {
+                    ty: match &v.ty {
                         mununu::context_dsl::ast::TypeName::Bool => "bool".to_string(),
                         mununu::context_dsl::ast::TypeName::I64 => "i64".to_string(),
+                        mununu::context_dsl::ast::TypeName::Enum(_) => "i64".to_string(),
                     },
                     initial: Some(initial_str),
                 }

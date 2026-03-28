@@ -4,17 +4,6 @@ use crate::context_dsl::ast::{Automaton, ContextDoc, MuFormula, TransitionDecl};
 pub(crate) struct AstTraverser;
 
 impl AstTraverser {
-    /// Invokes `visitor` for each automaton in `doc`.
-    pub fn visit_automata<F, E>(doc: &ContextDoc, mut visitor: F) -> Result<(), E>
-    where
-        F: FnMut(&Automaton) -> Result<(), E>,
-    {
-        for automaton in &doc.automata {
-            visitor(automaton)?;
-        }
-        Ok(())
-    }
-
     /// Invokes `visitor` for each μ-calculus formula in `doc`.
     pub fn visit_formulas<F, E>(doc: &ContextDoc, mut visitor: F) -> Result<(), E>
     where

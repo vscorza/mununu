@@ -43,6 +43,7 @@ impl<'a> Parser<'a> {
         let mut alphabet = Vec::new();
         let mut constants = Vec::new();
         let mut ranges = Vec::new();
+        let mut enums = Vec::new();
         let mut automata = Vec::new();
         let mut compositions = Vec::new();
         let mut controllers = Vec::new();
@@ -58,6 +59,9 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Keyword(Keyword::Ranges) => {
                     ranges.extend(self.parse_ranges_section()?);
+                }
+                TokenKind::Keyword(Keyword::Enums) => {
+                    enums.extend(self.parse_enums_section()?);
                 }
                 TokenKind::Keyword(Keyword::Automata) => {
                     automata.extend(self.parse_automata_section()?);
@@ -91,6 +95,7 @@ impl<'a> Parser<'a> {
             alphabet,
             constants,
             ranges,
+            enums,
             automata,
             compositions,
             controllers,
@@ -165,6 +170,36 @@ impl<'a> Parser<'a> {
         Ok(entries)
     }
 
+    fn parse_enums_section(&mut self) -> Result<Vec<EnumDecl>, ParseError> {
+        self.expect_keyword(Keyword::Enums)?;
+        self.expect_symbol(Symbol::LBrace)?;
+        let mut entries = Vec::new();
+        while !self.check_symbol(Symbol::RBrace) {
+            entries.push(self.parse_enum_entry()?);
+        }
+        self.expect_symbol(Symbol::RBrace)?;
+        Ok(entries)
+    }
+
+    fn parse_enum_entry(&mut self) -> Result<EnumDecl, ParseError> {
+        self.expect_keyword(Keyword::Enum)?;
+        let name = self.expect_ident()?;
+        self.expect_symbol(Symbol::LBrace)?;
+        let mut variants = Vec::new();
+        if !self.check_symbol(Symbol::RBrace) {
+            variants.push(self.expect_ident()?);
+            while self.match_symbol(Symbol::Comma) {
+                if self.check_symbol(Symbol::RBrace) {
+                    break; // trailing comma
+                }
+                variants.push(self.expect_ident()?);
+            }
+        }
+        self.expect_symbol(Symbol::RBrace)?;
+        self.expect_symbol(Symbol::Semicolon)?;
+        Ok(EnumDecl { name, variants })
+    }
+
     fn parse_automata_section(&mut self) -> Result<Vec<Automaton>, ParseError> {
         self.expect_keyword(Keyword::Automata)?;
         self.expect_symbol(Symbol::LBrace)?;
@@ -229,18 +264,30 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_members_clause(&mut self) -> Result<Vec<Ident>, ParseError> {
+    fn parse_members_clause(&mut self) -> Result<Vec<MemberRef>, ParseError> {
         self.expect_symbol(Symbol::LBracket)?;
         let mut members = Vec::new();
         if !self.check_symbol(Symbol::RBracket) {
-            members.push(self.expect_ident()?);
+            members.push(self.parse_member_ref()?);
             while self.match_symbol(Symbol::Comma) {
-                members.push(self.expect_ident()?);
+                members.push(self.parse_member_ref()?);
             }
         }
         self.expect_symbol(Symbol::RBracket)?;
         self.expect_symbol(Symbol::Semicolon)?;
         Ok(members)
+    }
+
+    fn parse_member_ref(&mut self) -> Result<MemberRef, ParseError> {
+        let name = self.expect_ident()?;
+        let index = if self.match_symbol(Symbol::LBracket) {
+            let expr = self.parse_expr()?;
+            self.expect_symbol(Symbol::RBracket)?;
+            Some(expr)
+        } else {
+            None
+        };
+        Ok(MemberRef { name, index })
     }
 
     fn parse_controllers_section(&mut self) -> Result<Vec<Controller>, ParseError> {
@@ -550,9 +597,10 @@ impl<'a> Parser<'a> {
         match self.advance().kind.clone() {
             TokenKind::Keyword(Keyword::Bool) => Ok(TypeName::Bool),
             TokenKind::Keyword(Keyword::I64) => Ok(TypeName::I64),
+            TokenKind::Identifier(name) => Ok(TypeName::Enum(name)),
             kind => Err(ParseError::UnexpectedToken {
                 found: kind,
-                expected: "type name",
+                expected: "type name (bool, i64, or enum name)",
                 span: self.previous_span(),
             }),
         }
@@ -1882,14 +1930,15 @@ context test {
     }
 
     #[test]
-    fn rejects_invalid_type_name() {
-        // Test error path for invalid type name (lines 498-502)
+    fn identifier_parses_as_enum_type() {
+        // Identifiers are now accepted as enum type references.
+        // Validation that the enum exists happens during realization, not parsing.
         let source = r"
 context test {
     automata {
         automaton A {
             variables {
-                var x: invalid = 0;
+                var x: MyEnum = 0;
             }
             states { state S initial; }
             transitions { transition S -> S on epsilon; }
@@ -1897,10 +1946,31 @@ context test {
     }
 }
 ";
-        let err = parse(source).expect_err("should reject invalid type");
+        let doc = parse_ok(source);
+        let var = &doc.automata[0].variables[0];
+        assert_eq!(var.ty, TypeName::Enum("MyEnum".to_string()));
+    }
+
+    #[test]
+    fn rejects_non_identifier_type_name() {
+        // Non-identifier tokens (numbers, symbols) should still be rejected.
+        let source = r#"
+context test {
+    automata {
+        automaton A {
+            variables {
+                var x: 42 = 0;
+            }
+            states { state S initial; }
+            transitions { transition S -> S on epsilon; }
+        }
+    }
+}
+"#;
+        let err = parse(source).expect_err("should reject numeric type");
         match err {
             ParseError::UnexpectedToken { expected, .. } => {
-                assert_eq!(expected, "type name");
+                assert!(expected.contains("type name"));
             }
             other => panic!("unexpected error: {:?}", other),
         }
@@ -1926,11 +1996,7 @@ context comp_order {
         let doc = parse_ok(source);
         let comp = &doc.compositions[0];
         assert_eq!(comp.kind, CompositionKind::Asynchronous);
-        let member_names: Vec<&str> = comp
-            .members
-            .iter()
-            .map(|ident| ident.name.as_str())
-            .collect();
+        let member_names: Vec<&str> = comp.members.iter().map(|m| m.name.name.as_str()).collect();
         assert_eq!(
             member_names,
             vec!["A", "B", "C"],

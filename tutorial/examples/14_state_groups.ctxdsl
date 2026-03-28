@@ -1,0 +1,77 @@
+// Tutorial 14 — State Groups & Wildcards
+//
+// System: Fault-tolerant process controller with emergency shutdown
+//
+// This example demonstrates two features that reduce transition boilerplate:
+//   1. state_groups — name a set of states for bulk transitions
+//   2. wildcard — match all states at once
+//
+// The process controller has normal operating states and error states.
+// A reset transition from ALL error states to Init is declared once using
+// a state group. An emergency shutdown from ANY state is declared using
+// a wildcard.
+
+context fault_tolerant {
+    alphabet {
+        label start;
+        label step;
+        label fault;
+        label reset;
+        label emergency;
+    }
+
+    automata {
+        automaton Process {
+            states {
+                state Init initial;
+                state Running;
+                state Complete;
+                state ErrorMinor;
+                state ErrorMajor;
+                state Shutdown;
+            }
+
+            state_groups {
+                group error_states = { ErrorMinor, ErrorMajor };
+            }
+
+            transitions {
+                // Normal flow
+                transition Init -> Running on label start;
+                transition Running -> Complete on label step;
+                transition Complete -> Init on label start;
+
+                // Faults lead to error states
+                transition Running -> ErrorMinor on label fault;
+                transition ErrorMinor -> ErrorMajor on label fault;
+
+                // Reset from ANY error state back to Init (uses state group)
+                transition group error_states -> Init on label reset;
+
+                // Emergency shutdown from ANY state (uses wildcard)
+                transition wildcard "*" -> Shutdown on label emergency;
+            }
+        }
+    }
+
+    mu_formulas {
+        // Safety: shutdown is always reachable via emergency
+        formula shutdown_reachable {
+            over Process;
+            body = nu X. ((mu Y. (Shutdown || <> Y)) && ([] X));
+        }
+
+        // Every error state can be recovered from
+        formula error_recoverable {
+            over Process;
+            body = mu X. (Init || <> X);
+        }
+    }
+
+    controllers {
+        controller safe_process {
+            source Process;
+            satisfying shutdown_reachable;
+        }
+    }
+}

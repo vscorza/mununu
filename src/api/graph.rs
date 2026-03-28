@@ -964,9 +964,10 @@ fn unrolled_automata_to_graph_elements(
 
                 VariableDecl {
                     name: v.name.name.clone(),
-                    ty: match v.ty {
+                    ty: match &v.ty {
                         TypeName::Bool => "bool".to_string(),
                         TypeName::I64 => "i64".to_string(),
+                        TypeName::Enum(_) => "i64".to_string(),
                     },
                     initial: Some(initial_str),
                 }

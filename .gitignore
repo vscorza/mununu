@@ -28,3 +28,8 @@ bench_results/
 
 # Claude
 CLAUDE.md
+.claude/
+
+# Private / unpublished material (lives in mununu-private/)
+/paper/
+/artifact/

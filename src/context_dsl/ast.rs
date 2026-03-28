@@ -7,11 +7,18 @@ pub struct ContextDoc {
     pub alphabet: Vec<AlphabetEntry>,
     pub constants: Vec<ConstantEntry>,
     pub ranges: Vec<RangeEntry>,
+    pub enums: Vec<EnumDecl>,
     pub automata: Vec<Automaton>,
     pub compositions: Vec<Composition>,
     pub controllers: Vec<Controller>,
     pub mu_formulas: Vec<MuFormula>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: Ident,
+    pub variants: Vec<Ident>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,10 +115,11 @@ pub struct VariableDecl {
     pub init: Expr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeName {
     Bool,
     I64,
+    Enum(String),
 }
 
 #[derive(Debug, Clone)]
@@ -188,11 +196,17 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemberRef {
+    pub name: Ident,
+    pub index: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Composition {
     pub name: Ident,
     pub meta: Meta,
     pub kind: CompositionKind,
-    pub members: Vec<Ident>,
+    pub members: Vec<MemberRef>,
     pub span: Span,
 }
 

@@ -1,0 +1,87 @@
+// Tutorial 16 — Enum Types
+//
+// System: Traffic light controller with mode tracking
+//
+// This example demonstrates enum types: named finite value sets that
+// can be used as variable types. Instead of encoding modes as raw
+// integers (0 = normal, 1 = flashing, 2 = off), you declare:
+//
+//   enums { enum Mode { normal, flashing, off }; }
+//
+// Variables of enum type are used in guards and effects with
+// readable variant names:
+//
+//   guard mode == normal
+//   effects { mode = flashing; }
+//
+// Under the hood, enum variants are mapped to integers (0, 1, 2)
+// and the variable is unrolled just like an i64 variable.
+
+context traffic_light {
+    alphabet {
+        label tick;
+        label toggle;
+        label power_off;
+        label power_on;
+    }
+
+    enums {
+        enum Mode { normal, flashing, off };
+    }
+
+    automata {
+        automaton Light {
+            variables {
+                var mode: Mode = normal;
+            }
+
+            states {
+                state Red initial;
+                state Green;
+                state Yellow;
+            }
+
+            // Normal cycle: Red -> Green -> Yellow -> Red
+            transitions {
+                transition Red -> Green on label tick
+                    guard mode == normal;
+                transition Green -> Yellow on label tick
+                    guard mode == normal;
+                transition Yellow -> Red on label tick
+                    guard mode == normal;
+
+                // Toggle to flashing mode
+                transition Red -> Red on label toggle
+                    guard mode == normal
+                    effects { mode = flashing; };
+
+                // In flashing mode, stays at Red (flashing red)
+                transition Red -> Red on label tick
+                    guard mode == flashing;
+
+                // Toggle back to normal
+                transition Red -> Red on label toggle
+                    guard mode == flashing
+                    effects { mode = normal; };
+
+                // Power off from any normal state
+                transition Red -> Red on label power_off
+                    guard mode == normal
+                    effects { mode = off; };
+
+                // Power on resumes normal
+                transition Red -> Red on label power_on
+                    guard mode == off
+                    effects { mode = normal; };
+            }
+        }
+    }
+
+    mu_formulas {
+        // In normal mode, Green is always reachable
+        formula green_reachable {
+            over Light;
+            body = mu X. (Green || <> X);
+        }
+    }
+}

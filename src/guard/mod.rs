@@ -290,6 +290,9 @@ pub enum GuardExpr {
 }
 
 fn split_comparison(expr: &str) -> Option<(String, ComparisonOp, String)> {
+    // Strip balanced outer parentheses before splitting, e.g. "(mode==0)" → "mode==0"
+    let expr = strip_outer_parens(expr);
+
     let candidates = [
         ("<=", ComparisonOp::Le),
         (">=", ComparisonOp::Ge),
@@ -310,6 +313,28 @@ fn split_comparison(expr: &str) -> Option<(String, ComparisonOp, String)> {
         }
     }
     None
+}
+
+/// Strips balanced outer parentheses from a string.
+fn strip_outer_parens(s: &str) -> &str {
+    let s = s.trim();
+    if s.starts_with('(') && s.ends_with(')') {
+        // Verify the parens are balanced (the closing paren matches the opening one)
+        let inner = &s[1..s.len() - 1];
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth >= 0
+        });
+        if balanced && depth == 0 {
+            return inner;
+        }
+    }
+    s
 }
 
 /// Checks if a string is a numeric literal (integer or decimal).

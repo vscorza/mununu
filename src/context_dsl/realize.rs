@@ -322,6 +322,10 @@ pub enum RealizationError {
     UnrollingFailed { name: String, error: String },
     #[error("dynamic guards require unrolling - automaton '{name}' must have variables")]
     DynamicGuardsRequireUnrolling { name: String },
+    #[error("unknown constant or parameter '{0}'")]
+    UnknownConstant(String),
+    #[error("cannot evaluate expression as constant: {0}")]
+    NonConstantExpression(String),
 }
 
 /// Aggregated predicate maps produced during realization.
@@ -559,18 +563,470 @@ fn compute_predicate_maps(
     })
 }
 
+/// Registry mapping enum names to their ordered variant lists.
+/// Used to resolve variant names to integer indices during realization.
+struct EnumRegistry {
+    /// enum_name → [variant0, variant1, ...]
+    enums: HashMap<String, Vec<String>>,
+    /// variant_name → integer index (flattened across all enums)
+    /// If variant names are unique across enums, this allows resolving without
+    /// knowing which enum a variable belongs to.
+    global_variants: HashMap<String, i64>,
+}
+
+impl EnumRegistry {
+    fn from_doc(doc: &ContextDoc) -> Self {
+        let mut enums = HashMap::new();
+        let mut global_variants = HashMap::new();
+        for enum_decl in &doc.enums {
+            let variants: Vec<String> = enum_decl.variants.iter().map(|v| v.name.clone()).collect();
+            for (i, variant) in variants.iter().enumerate() {
+                global_variants.insert(variant.clone(), i as i64);
+            }
+            enums.insert(enum_decl.name.name.clone(), variants);
+        }
+        Self {
+            enums,
+            global_variants,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enums.is_empty()
+    }
+
+    /// Returns the integer domain size for an enum type, or None if not found.
+    #[allow(dead_code)]
+    fn variant_count(&self, enum_name: &str) -> Option<usize> {
+        self.enums.get(enum_name).map(Vec::len)
+    }
+}
+
+/// Resolves enum variant names in an automaton's expressions to integer literals.
+/// This transforms `guard mode == idle` → `guard mode == 0` when `idle` is a known variant.
+fn resolve_enum_variants(automaton: &Automaton, registry: &EnumRegistry) -> Automaton {
+    use super::ast::*;
+
+    fn resolve_expr(expr: &Expr, registry: &EnumRegistry) -> Expr {
+        let kind = match &expr.kind {
+            ExprKind::Ident(id) => {
+                if let Some(&idx) = registry.global_variants.get(&id.name) {
+                    ExprKind::Integer(idx)
+                } else {
+                    ExprKind::Ident(id.clone())
+                }
+            }
+            ExprKind::Binary { left, op, right } => ExprKind::Binary {
+                left: Box::new(resolve_expr(left, registry)),
+                op: *op,
+                right: Box::new(resolve_expr(right, registry)),
+            },
+            ExprKind::Unary { op, expr: e } => ExprKind::Unary {
+                op: *op,
+                expr: Box::new(resolve_expr(e, registry)),
+            },
+            ExprKind::Group(e) => ExprKind::Group(Box::new(resolve_expr(e, registry))),
+            ExprKind::Index { target, expr: e } => ExprKind::Index {
+                target: target.clone(),
+                expr: Box::new(resolve_expr(e, registry)),
+            },
+            ExprKind::Integer(n) => ExprKind::Integer(*n),
+        };
+        Expr {
+            kind,
+            span: expr.span,
+        }
+    }
+
+    let variables: Vec<VariableDecl> = automaton
+        .variables
+        .iter()
+        .map(|v| VariableDecl {
+            name: v.name.clone(),
+            index: v.index.clone(),
+            ty: match &v.ty {
+                TypeName::Enum(_) => TypeName::I64, // Desugar enum type to i64
+                other => other.clone(),
+            },
+            init: resolve_expr(&v.init, registry),
+        })
+        .collect();
+
+    let transitions: Vec<TransitionDecl> = automaton
+        .transitions
+        .iter()
+        .map(|t| TransitionDecl {
+            source: t.source.clone(),
+            target: t.target.clone(),
+            label: t.label.clone(),
+            additional_labels: t.additional_labels.clone(),
+            guard: t.guard.as_ref().map(|g| resolve_expr(g, registry)),
+            effects: t
+                .effects
+                .iter()
+                .map(|a| Assignment {
+                    target: a.target.clone(),
+                    expr: resolve_expr(&a.expr, registry),
+                })
+                .collect(),
+        })
+        .collect();
+
+    Automaton {
+        name: automaton.name.clone(),
+        meta: automaton.meta.clone(),
+        parameters: automaton.parameters.clone(),
+        alphabet: automaton.alphabet.clone(),
+        controllable: automaton.controllable.clone(),
+        internal: automaton.internal.clone(),
+        controllable_declared: automaton.controllable_declared,
+        internal_declared: automaton.internal_declared,
+        variables,
+        state_groups: automaton.state_groups.clone(),
+        states: automaton.states.clone(),
+        transitions,
+        predicates: automaton.predicates.clone(),
+    }
+}
+
+/// Expands parameterized automata into concrete instances.
+/// For example, `automaton Client { parameters { param i in 0..=1; } ... }`
+/// produces `Client_0` and `Client_1`. Non-parameterized automata pass through unchanged.
+fn expand_parameterized_automata(
+    automata: &[Automaton],
+    constants: &HashMap<String, i64>,
+    ranges: &HashMap<String, (i64, i64)>,
+) -> Result<Vec<Automaton>, RealizationError> {
+    let mut result = Vec::new();
+    for automaton in automata {
+        if automaton.parameters.is_empty() {
+            result.push(automaton.clone());
+        } else {
+            // Support single parameter for now.
+            if automaton.parameters.len() > 1 {
+                return Err(RealizationError::UnsupportedFeature {
+                    feature: "multiple automaton parameters",
+                });
+            }
+            let param = &automaton.parameters[0];
+            let (lo, hi) = resolve_param_range(&param.spec, constants, ranges)?;
+            for val in lo..=hi {
+                let mut concrete = substitute_param(automaton, &param.name.name, val);
+                concrete.name = super::ast::Ident::new(
+                    format!("{}_{}", automaton.name.name, val),
+                    automaton.name.span,
+                );
+                concrete.parameters.clear();
+                result.push(concrete);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Resolves a parameter range spec to concrete (lo, hi) bounds.
+fn resolve_param_range(
+    spec: &super::ast::RangeSpec,
+    constants: &HashMap<String, i64>,
+    ranges: &HashMap<String, (i64, i64)>,
+) -> Result<(i64, i64), RealizationError> {
+    match spec {
+        super::ast::RangeSpec::Named(ident) => ranges
+            .get(&ident.name)
+            .copied()
+            .ok_or_else(|| RealizationError::UnknownConstant(format!("range '{}'", ident.name))),
+        super::ast::RangeSpec::Bounds { lower, upper } => {
+            let empty = HashMap::new();
+            let lo = eval_const_expr(lower, constants, &empty)?;
+            let hi = eval_const_expr(upper, constants, &empty)?;
+            Ok((lo, hi))
+        }
+    }
+}
+
+/// Deep-clones an automaton, replacing every occurrence of `param_name` in expressions
+/// with `value`. Also resolves indexed labels (`req[i]` → `req_0`), indexed states,
+/// and indexed state references.
+fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Automaton {
+    use super::ast::*;
+
+    fn subst_expr(expr: &Expr, param_name: &str, value: i64) -> Expr {
+        let kind = match &expr.kind {
+            ExprKind::Integer(n) => ExprKind::Integer(*n),
+            ExprKind::Ident(id) => {
+                if id.name == param_name {
+                    ExprKind::Integer(value)
+                } else {
+                    ExprKind::Ident(id.clone())
+                }
+            }
+            ExprKind::Index { target, expr: ie } => {
+                if target.name == param_name {
+                    // param itself is used as an indexed target — unusual, treat as integer
+                    ExprKind::Integer(value)
+                } else {
+                    ExprKind::Index {
+                        target: target.clone(),
+                        expr: Box::new(subst_expr(ie, param_name, value)),
+                    }
+                }
+            }
+            ExprKind::Unary { op, expr: e } => ExprKind::Unary {
+                op: *op,
+                expr: Box::new(subst_expr(e, param_name, value)),
+            },
+            ExprKind::Binary { left, op, right } => ExprKind::Binary {
+                left: Box::new(subst_expr(left, param_name, value)),
+                op: *op,
+                right: Box::new(subst_expr(right, param_name, value)),
+            },
+            ExprKind::Group(e) => ExprKind::Group(Box::new(subst_expr(e, param_name, value))),
+        };
+        Expr {
+            kind,
+            span: expr.span,
+        }
+    }
+
+    fn subst_alphabet_ref(ar: &AlphabetRef, param_name: &str, value: i64) -> AlphabetRef {
+        match &ar.index {
+            Some(idx) => {
+                // Resolve the index and fold it into the label name: req[i] → req_0
+                let resolved = subst_expr(idx, param_name, value);
+                if let ExprKind::Integer(n) = &resolved.kind {
+                    AlphabetRef {
+                        name: Ident::new(format!("{}_{}", ar.name.name, n), ar.name.span),
+                        index: None, // Resolved — no longer indexed
+                    }
+                } else {
+                    AlphabetRef {
+                        name: ar.name.clone(),
+                        index: Some(resolved),
+                    }
+                }
+            }
+            None => ar.clone(),
+        }
+    }
+
+    fn subst_state_ref(sr: &StateRef, param_name: &str, value: i64) -> StateRef {
+        match sr {
+            StateRef::Simple(id) => StateRef::Simple(id.clone()),
+            StateRef::Indexed { name, indices } => {
+                let resolved: Vec<Expr> = indices
+                    .iter()
+                    .map(|e| subst_expr(e, param_name, value))
+                    .collect();
+                // If all indices resolve to integers, fold into the name
+                let all_int: Option<Vec<i64>> = resolved
+                    .iter()
+                    .map(|e| {
+                        if let ExprKind::Integer(n) = &e.kind {
+                            Some(*n)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if let Some(ints) = all_int {
+                    let suffix = ints
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("_");
+                    StateRef::Simple(Ident::new(format!("{}_{}", name.name, suffix), name.span))
+                } else {
+                    StateRef::Indexed {
+                        name: name.clone(),
+                        indices: resolved,
+                    }
+                }
+            }
+        }
+    }
+
+    fn subst_selector(sel: &StateSelector, param_name: &str, value: i64) -> StateSelector {
+        match sel {
+            StateSelector::Named(sr) => {
+                StateSelector::Named(subst_state_ref(sr, param_name, value))
+            }
+            other => other.clone(),
+        }
+    }
+
+    fn subst_label(label: &TransitionLabel, param_name: &str, value: i64) -> TransitionLabel {
+        match label {
+            TransitionLabel::Named { name, index } => match index {
+                Some(idx) => {
+                    let resolved = subst_expr(idx, param_name, value);
+                    if let ExprKind::Integer(n) = &resolved.kind {
+                        TransitionLabel::Named {
+                            name: Ident::new(format!("{}_{}", name.name, n), name.span),
+                            index: None,
+                        }
+                    } else {
+                        TransitionLabel::Named {
+                            name: name.clone(),
+                            index: Some(resolved),
+                        }
+                    }
+                }
+                None => label.clone(),
+            },
+            TransitionLabel::Epsilon(_) => label.clone(),
+        }
+    }
+
+    let alphabet: Vec<AlphabetRef> = automaton
+        .alphabet
+        .iter()
+        .map(|ar| subst_alphabet_ref(ar, param_name, value))
+        .collect();
+    let controllable: Vec<AlphabetRef> = automaton
+        .controllable
+        .iter()
+        .map(|ar| subst_alphabet_ref(ar, param_name, value))
+        .collect();
+    let internal: Vec<AlphabetRef> = automaton
+        .internal
+        .iter()
+        .map(|ar| subst_alphabet_ref(ar, param_name, value))
+        .collect();
+
+    // Expand indexed states (state S[i in Range] → S_0, S_1, ...)
+    let mut states: Vec<StateDecl> = Vec::new();
+    for state in &automaton.states {
+        match &state.index {
+            Some(StateIndexSpec::Range { symbol, range: _ }) => {
+                // The parameter is substituted with a single value, so if the
+                // state iteration variable matches our parameter, emit one state.
+                if symbol.name == param_name {
+                    states.push(StateDecl {
+                        name: Ident::new(format!("{}_{}", state.name.name, value), state.name.span),
+                        index: None,
+                        is_initial: state.is_initial,
+                        overrides: state.overrides.clone(),
+                    });
+                } else {
+                    // Different iteration variable — keep as-is for now
+                    states.push(state.clone());
+                }
+            }
+            Some(StateIndexSpec::Expr(e)) => {
+                let resolved = subst_expr(e, param_name, value);
+                if let ExprKind::Integer(n) = &resolved.kind {
+                    states.push(StateDecl {
+                        name: Ident::new(format!("{}_{}", state.name.name, n), state.name.span),
+                        index: None,
+                        is_initial: state.is_initial,
+                        overrides: state.overrides.clone(),
+                    });
+                } else {
+                    states.push(state.clone());
+                }
+            }
+            None => states.push(state.clone()),
+        }
+    }
+
+    let transitions: Vec<TransitionDecl> = automaton
+        .transitions
+        .iter()
+        .map(|t| TransitionDecl {
+            source: subst_selector(&t.source, param_name, value),
+            target: subst_selector(&t.target, param_name, value),
+            label: subst_label(&t.label, param_name, value),
+            additional_labels: t
+                .additional_labels
+                .iter()
+                .map(|l| subst_label(l, param_name, value))
+                .collect(),
+            guard: t.guard.as_ref().map(|g| subst_expr(g, param_name, value)),
+            effects: t
+                .effects
+                .iter()
+                .map(|a| Assignment {
+                    target: a.target.clone(),
+                    expr: subst_expr(&a.expr, param_name, value),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let variables: Vec<VariableDecl> = automaton
+        .variables
+        .iter()
+        .map(|v| VariableDecl {
+            name: v.name.clone(),
+            index: v.index.as_ref().map(|e| subst_expr(e, param_name, value)),
+            ty: v.ty.clone(),
+            init: subst_expr(&v.init, param_name, value),
+        })
+        .collect();
+
+    Automaton {
+        name: automaton.name.clone(), // Will be renamed by caller
+        meta: automaton.meta.clone(),
+        parameters: automaton.parameters.clone(),
+        alphabet,
+        controllable,
+        internal,
+        controllable_declared: automaton.controllable_declared,
+        internal_declared: automaton.internal_declared,
+        variables,
+        state_groups: automaton.state_groups.clone(),
+        states,
+        transitions,
+        predicates: automaton.predicates.clone(),
+    }
+}
+
 /// Builds the runtime context and composition membership map from the DSL document.
 fn build_context_with_compositions(
     doc: &ContextDoc,
     label_universe: &LabelUniverse,
     input_signals: &HashSet<String>,
 ) -> Result<(Context, HashMap<String, Vec<String>>), RealizationError> {
+    // Build a constants map for evaluating indexed member references.
+    let constants: HashMap<String, i64> = doc
+        .constants
+        .iter()
+        .map(|c| (c.name.name.clone(), c.value))
+        .collect();
+
+    // Build ranges map for resolving parameter ranges.
+    let ranges: HashMap<String, (i64, i64)> = {
+        let empty = HashMap::new();
+        doc.ranges
+            .iter()
+            .filter_map(|r| {
+                let lo = eval_const_expr(&r.lower, &constants, &empty).ok()?;
+                let hi = eval_const_expr(&r.upper, &constants, &empty).ok()?;
+                Some((r.name.name.clone(), (lo, hi)))
+            })
+            .collect()
+    };
+
+    // Expand parameterized automata into concrete instances.
+    let expanded_automata = expand_parameterized_automata(&doc.automata, &constants, &ranges)?;
+
+    // Resolve enum variant names to integer indices.
+    let enum_registry = EnumRegistry::from_doc(doc);
+    let expanded_automata: Vec<Automaton> = if enum_registry.is_empty() {
+        expanded_automata
+    } else {
+        expanded_automata
+            .iter()
+            .map(|a| resolve_enum_variants(a, &enum_registry))
+            .collect()
+    };
+
     let mut automaton_names = HashSet::new();
-    let mut automata = Vec::with_capacity(doc.automata.len());
+    let mut automata = Vec::with_capacity(expanded_automata.len());
     let mut controllable_owners: HashMap<String, String> = HashMap::new();
     let mut internal_owners: HashMap<String, String> = HashMap::new();
 
-    AstTraverser::visit_automata(doc, |automaton| {
+    for automaton in &expanded_automata {
         let name = automaton.name.name.clone();
         if !automaton_names.insert(name.clone()) {
             return Err(RealizationError::Duplicate {
@@ -604,8 +1060,7 @@ fn build_context_with_compositions(
 
         let clts = build_automaton(&name, automaton, label_universe, input_signals)?;
         automata.push((name, clts));
-        Ok::<(), RealizationError>(())
-    })?;
+    }
 
     let mut context_builder = ContextBuilder::default();
     for (name, clts) in automata {
@@ -632,15 +1087,16 @@ fn build_context_with_compositions(
         let dep_count = comp
             .members
             .iter()
-            .filter(|m| composition_name_set.contains(&m.name))
+            .filter(|m| {
+                let resolved = resolve_member_name(m, &constants);
+                composition_name_set.contains(&resolved)
+            })
             .count();
         in_degree.insert(name.clone(), dep_count);
         for member in &comp.members {
-            if composition_name_set.contains(&member.name) {
-                dependents
-                    .entry(member.name.clone())
-                    .or_default()
-                    .push(name.clone());
+            let resolved = resolve_member_name(member, &constants);
+            if composition_name_set.contains(&resolved) {
+                dependents.entry(resolved).or_default().push(name.clone());
             }
         }
     }
@@ -694,7 +1150,7 @@ fn build_context_with_compositions(
         let member_names: Vec<String> = composition
             .members
             .iter()
-            .map(|ident| ident.name.clone())
+            .map(|m| resolve_member_name(m, &constants))
             .collect();
         composition_members.insert(composition_name.clone(), member_names.clone());
 
@@ -730,7 +1186,7 @@ fn build_context_with_compositions(
         for member_name in member_names.iter().skip(1) {
             let member_clts = context
                 .clts(member_name)
-                .or_else(|| realized.get(member_name.as_str()))
+                .or_else(|| realized.get(member_name as &str))
                 .ok_or_else(|| {
                     RealizationError::UnknownAutomaton(format!(
                         "composition '{}' references unknown member '{}'",
@@ -1502,12 +1958,136 @@ fn extract_input_signals_from_documents(docs: &[&ContextDoc]) -> HashSet<String>
     HashSet::new()
 }
 
+/// Expands state group and wildcard selectors in transitions into concrete
+/// per-state transitions. Returns a new `Automaton` with all selectors
+/// resolved to `Named(Simple(...))` and `state_groups` cleared.
+fn expand_state_selectors(automaton: &Automaton) -> Result<Automaton, RealizationError> {
+    // If there are no groups and no group/wildcard selectors, return as-is.
+    let has_selectors = automaton.transitions.iter().any(|t| {
+        matches!(
+            t.source,
+            StateSelector::Group(_) | StateSelector::Wildcard(_)
+        ) || matches!(
+            t.target,
+            StateSelector::Group(_) | StateSelector::Wildcard(_)
+        )
+    });
+    if automaton.state_groups.is_empty() && !has_selectors {
+        return Ok(automaton.clone());
+    }
+
+    // Build group membership map from state_groups declarations.
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for group in &automaton.state_groups {
+        let mut members = Vec::new();
+        for member in &group.members {
+            match member {
+                StateSelector::Named(StateRef::Simple(ident)) => {
+                    members.push(ident.name.clone());
+                }
+                _ => {
+                    return Err(RealizationError::UnsupportedFeature {
+                        feature: "nested groups or wildcards in state group members",
+                    });
+                }
+            }
+        }
+        groups.insert(group.name.name.clone(), members);
+    }
+
+    // Collect all declared state names for wildcard expansion.
+    let all_states: Vec<String> = automaton
+        .states
+        .iter()
+        .map(|s| s.name.name.clone())
+        .collect();
+
+    let resolve = |selector: &StateSelector| -> Result<Vec<String>, RealizationError> {
+        match selector {
+            StateSelector::Named(StateRef::Simple(ident)) => Ok(vec![ident.name.clone()]),
+            StateSelector::Named(StateRef::Indexed { .. }) => Ok(vec![]), // handled later
+            StateSelector::Group(ident) => {
+                groups
+                    .get(&ident.name)
+                    .cloned()
+                    .ok_or(RealizationError::UnsupportedFeature {
+                        feature: "unknown state group reference",
+                    })
+            }
+            StateSelector::Wildcard(wp) => {
+                if wp.pattern == "*" {
+                    Ok(all_states.clone())
+                } else {
+                    // Simple prefix match: "Err*" matches "Error", "ErrState", etc.
+                    let prefix = wp.pattern.trim_end_matches('*');
+                    Ok(all_states
+                        .iter()
+                        .filter(|s| s.starts_with(prefix))
+                        .cloned()
+                        .collect())
+                }
+            }
+        }
+    };
+
+    let mut expanded_transitions = Vec::new();
+    for transition in &automaton.transitions {
+        let sources = resolve(&transition.source)?;
+        let targets = resolve(&transition.target)?;
+        // If either resolution returned an empty vec because of an Indexed ref,
+        // keep the original transition for downstream handling.
+        if sources.is_empty() || targets.is_empty() {
+            expanded_transitions.push(transition.clone());
+            continue;
+        }
+        for src in &sources {
+            for tgt in &targets {
+                let src_span = match &transition.source {
+                    StateSelector::Named(StateRef::Simple(id)) => id.span,
+                    StateSelector::Group(id) => id.span,
+                    StateSelector::Wildcard(wp) => wp.span,
+                    StateSelector::Named(StateRef::Indexed { name, .. }) => name.span,
+                };
+                let tgt_span = match &transition.target {
+                    StateSelector::Named(StateRef::Simple(id)) => id.span,
+                    StateSelector::Group(id) => id.span,
+                    StateSelector::Wildcard(wp) => wp.span,
+                    StateSelector::Named(StateRef::Indexed { name, .. }) => name.span,
+                };
+                expanded_transitions.push(TransitionDecl {
+                    source: StateSelector::Named(StateRef::Simple(super::ast::Ident::new(
+                        src.clone(),
+                        src_span,
+                    ))),
+                    target: StateSelector::Named(StateRef::Simple(super::ast::Ident::new(
+                        tgt.clone(),
+                        tgt_span,
+                    ))),
+                    label: transition.label.clone(),
+                    additional_labels: transition.additional_labels.clone(),
+                    guard: transition.guard.clone(),
+                    effects: transition.effects.clone(),
+                });
+            }
+        }
+    }
+
+    let mut result = automaton.clone();
+    result.transitions = expanded_transitions;
+    result.state_groups.clear();
+    Ok(result)
+}
+
 fn build_automaton(
     name: &str,
     automaton: &Automaton,
     labels: &LabelUniverse,
     input_signals: &HashSet<String>,
 ) -> Result<RuntimeClts, RealizationError> {
+    // Desugar state groups and wildcards into concrete transitions.
+    let automaton = expand_state_selectors(automaton)?;
+    let automaton = &automaton;
+
     // Prepare per-automaton controllable/internal sets
     let mut automaton_controllable = HashSet::new();
     for entry in &automaton.controllable {
@@ -1521,11 +2101,6 @@ fn build_automaton(
     if !automaton.parameters.is_empty() {
         return Err(RealizationError::UnsupportedFeature {
             feature: "automaton parameters",
-        });
-    }
-    if !automaton.state_groups.is_empty() {
-        return Err(RealizationError::UnsupportedFeature {
-            feature: "state groups",
         });
     }
 
@@ -1898,9 +2473,10 @@ fn convert_variables_for_unrolling(
 
         result.push(VariableDecl {
             name: variable.name.name.clone(),
-            ty: match variable.ty {
+            ty: match &variable.ty {
                 crate::context_dsl::ast::TypeName::Bool => "bool".to_string(),
                 crate::context_dsl::ast::TypeName::I64 => "i64".to_string(),
+                crate::context_dsl::ast::TypeName::Enum(_) => "i64".to_string(),
             },
             initial: Some(initial_str),
         });
@@ -2031,6 +2607,84 @@ fn state_selector_name(selector: &StateSelector) -> Result<&str, RealizationErro
         StateSelector::Wildcard(_) => Err(RealizationError::UnsupportedFeature {
             feature: "state wildcards",
         }),
+    }
+}
+
+/// Evaluates a constant expression at expansion time.
+/// Resolves identifiers from `constants` (global) and `params` (template parameters).
+fn eval_const_expr(
+    expr: &Expr,
+    constants: &HashMap<String, i64>,
+    params: &HashMap<String, i64>,
+) -> Result<i64, RealizationError> {
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(*n),
+        ExprKind::Ident(id) => params
+            .get(&id.name)
+            .or_else(|| constants.get(&id.name))
+            .copied()
+            .ok_or_else(|| RealizationError::UnknownConstant(id.name.clone())),
+        ExprKind::Binary { left, op, right } => {
+            use super::ast::BinaryOp;
+            let l = eval_const_expr(left, constants, params)?;
+            let r = eval_const_expr(right, constants, params)?;
+            match op {
+                BinaryOp::Add => Ok(l + r),
+                BinaryOp::Sub => Ok(l - r),
+                BinaryOp::Mul => Ok(l * r),
+                BinaryOp::Div => {
+                    if r == 0 {
+                        Err(RealizationError::NonConstantExpression(
+                            "division by zero".to_owned(),
+                        ))
+                    } else {
+                        Ok(l / r)
+                    }
+                }
+                BinaryOp::Mod => {
+                    if r == 0 {
+                        Err(RealizationError::NonConstantExpression(
+                            "modulo by zero".to_owned(),
+                        ))
+                    } else {
+                        Ok(l % r)
+                    }
+                }
+                _ => Err(RealizationError::NonConstantExpression(format!(
+                    "operator {:?} not supported in constant expressions",
+                    op
+                ))),
+            }
+        }
+        ExprKind::Unary { op, expr } => {
+            use super::ast::UnaryOp;
+            let v = eval_const_expr(expr, constants, params)?;
+            match op {
+                UnaryOp::Neg => Ok(-v),
+                UnaryOp::Not => Err(RealizationError::NonConstantExpression(
+                    "boolean not in integer expression".to_owned(),
+                )),
+            }
+        }
+        ExprKind::Group(e) => eval_const_expr(e, constants, params),
+        ExprKind::Index { .. } => Err(RealizationError::NonConstantExpression(
+            "index expressions not supported in constant context".to_owned(),
+        )),
+    }
+}
+
+/// Resolves a `MemberRef` into a concrete automaton name.
+/// For `Client[0]` → `"Client_0"`, for plain `Arbiter` → `"Arbiter"`.
+fn resolve_member_name(member: &super::ast::MemberRef, constants: &HashMap<String, i64>) -> String {
+    match &member.index {
+        Some(index_expr) => {
+            let empty = HashMap::new();
+            match eval_const_expr(index_expr, constants, &empty) {
+                Ok(idx) => format!("{}_{}", member.name.name, idx),
+                Err(_) => member.name.name.clone(), // fallback to bare name
+            }
+        }
+        None => member.name.name.clone(),
     }
 }
 

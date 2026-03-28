@@ -285,7 +285,7 @@ context elevator_sync {
     let formula = &doc.mu_formulas[0];
     match &formula.targets {
         FormulaTargets::Named(names) => {
-            let ordered: Vec<&str> = names.iter().map(|ident| ident.name.as_str()).collect();
+            let ordered: Vec<&str> = names.iter().map(|n| n.name.as_str()).collect();
             assert_eq!(ordered, vec!["Cabin", "Controller"]);
         }
         FormulaTargets::All(_) => panic!("expected named targets, got FormulaTargets::All"),
@@ -516,23 +516,17 @@ context composition_demo {
     }
 
     let sync_members = sync_members.expect("synchronous composition present");
-    let sync_member_names: Vec<&str> = sync_members
-        .iter()
-        .map(|ident| ident.name.as_str())
-        .collect();
+    let sync_member_names: Vec<&str> = sync_members.iter().map(|m| m.name.name.as_str()).collect();
     assert_eq!(sync_member_names, vec!["Controller", "Plant", "Queue"]);
 
     let async_members = async_members.expect("asynchronous composition present");
-    let async_names: Vec<&str> = async_members
-        .iter()
-        .map(|ident| ident.name.as_str())
-        .collect();
+    let async_names: Vec<&str> = async_members.iter().map(|m| m.name.name.as_str()).collect();
     assert_eq!(async_names, vec!["Producer", "Queue"]);
 
     let superset_members = superset_members.expect("superset composition present");
     let superset_names: Vec<&str> = superset_members
         .iter()
-        .map(|ident| ident.name.as_str())
+        .map(|m| m.name.name.as_str())
         .collect();
     assert_eq!(superset_names, vec!["Base", "Extension"]);
 }

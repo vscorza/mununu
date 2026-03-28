@@ -1,0 +1,89 @@
+// Tutorial 15 — Process Templates (Parameterized Automata)
+//
+// System: Multi-client resource arbiter
+//
+// This example demonstrates parameterized automata: define a process
+// once and instantiate it multiple times with different indices.
+//
+// Instead of writing Client0, Client1, Client2 manually (with near-
+// identical transitions), we write a single `Client` automaton with
+// `parameters { param i in Clients; }`. The tool expands it into
+// Client_0, Client_1, etc. at realization time.
+//
+// Labels are indexed too: `label req[i]` expands to `req_0`, `req_1`.
+//
+// Composition uses indexed member references: `Client[0], Client[1]`.
+
+context multi_client_arbiter {
+    constants {
+        const N = 1;
+    }
+
+    ranges {
+        range Clients = 0 ..= N;
+    }
+
+    alphabet {
+        label req_0;
+        label req_1;
+        label grant_0;
+        label grant_1;
+        label release_0;
+        label release_1;
+    }
+
+    automata {
+        // Parameterized client: expanded into Client_0 and Client_1
+        automaton Client {
+            parameters {
+                param i in Clients;
+            }
+
+            states {
+                state Idle initial;
+                state Waiting;
+                state Holding;
+            }
+
+            controllable {
+                label req[i];
+            }
+
+            transitions {
+                transition Idle -> Waiting on label req[i];
+                transition Waiting -> Holding on label grant[i];
+                transition Holding -> Idle on label release[i];
+            }
+        }
+
+        // The arbiter grants one client at a time
+        automaton Arbiter {
+            states {
+                state Free initial;
+                state Granted0;
+                state Granted1;
+            }
+
+            transitions {
+                transition Free -> Granted0 on label grant_0;
+                transition Free -> Granted1 on label grant_1;
+                transition Granted0 -> Free on label release_0;
+                transition Granted1 -> Free on label release_1;
+            }
+        }
+    }
+
+    composition {
+        asynchronous System {
+            members [Client[0], Client[1], Arbiter];
+        }
+    }
+
+    mu_formulas {
+        // Safety: the system never deadlocks
+        formula safety {
+            over System;
+            body = nu X. ([] X);
+        }
+    }
+}

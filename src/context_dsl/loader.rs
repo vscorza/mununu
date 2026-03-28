@@ -280,7 +280,7 @@ fn compute_dependencies(doc: &ContextDoc) -> Dependencies {
         let members = composition
             .members
             .iter()
-            .map(|ident| ident.name.clone())
+            .map(|m| m.name.name.clone())
             .collect();
         deps.composition_members.insert(id, members);
     }
@@ -420,7 +420,10 @@ fn hash_composition(composition: &Composition) -> u64 {
     );
     hash_string(&mut hasher, &format!("{:?}", composition.kind));
     for member in &composition.members {
-        hash_string(&mut hasher, &member.name);
+        hash_string(&mut hasher, &member.name.name);
+        if let Some(ref index) = member.index {
+            hash_string(&mut hasher, &format!("{:?}", index.kind));
+        }
     }
     hasher.finish()
 }

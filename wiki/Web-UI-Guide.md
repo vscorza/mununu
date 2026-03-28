@@ -85,7 +85,7 @@ The editor is built on [Monaco Editor](https://microsoft.github.io/monaco-editor
 
 The editor recognizes CTXDSL keywords and structures:
 
-- **Keywords**: `context`, `automata`, `automaton`, `states`, `state`, `initial`, `transitions`, `transition`, `on`, `alphabet`, `label`, `mu_formulas`, `formula`, `over`, `body`, `composition`, `controller`, `synthesize`, `minimize`
+- **Keywords**: `context`, `automata`, `automaton`, `states`, `state`, `initial`, `transitions`, `transition`, `on`, `alphabet`, `label`, `mu_formulas`, `formula`, `over`, `body`, `composition`, `controller`, `synthesize`, `minimize`, `enums`, `enum`, `constants`, `const`, `ranges`, `range`, `parameters`, `param`, `in`, `state_groups`, `group`, `wildcard`, `variables`, `var`, `guard`, `effects`, `controllable`, `internal`
 - **Operators**: `->`, `mu`, `nu`, `<>`, `[]`, `&&`, `||`, `!`
 - **Comments**: `//` line comments
 

@@ -14,7 +14,7 @@ Mununu is a verification tool for analyzing and synthesizing controllers for rea
 
 ## Features
 
-- **CTXDSL** &mdash; A domain-specific language for defining automata, compositions, properties, and controllers
+- **CTXDSL** &mdash; A domain-specific language for defining automata, compositions, properties, and controllers with enum types, parameterized automata (process templates), and state groups/wildcards
 - **Mu-calculus evaluation** &mdash; Fixpoint-based property verification with bitvec-backed state sets
 - **LTL support** &mdash; Linear temporal logic formulas automatically translated to mu-calculus
 - **GR(1) specifications** &mdash; Generalized Reactivity(1) properties for reactive synthesis

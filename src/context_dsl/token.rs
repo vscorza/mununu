@@ -80,6 +80,9 @@ pub enum Keyword {
     ProofObligations,
     True,
     False,
+    // Enum types
+    Enums, // "enums" section keyword
+    Enum,  // "enum" declaration keyword
     // Formula syntax markers
     Ltl, // Explicit LTL syntax marker
     Mu,  // Explicit μ-calculus syntax marker (optional, for clarity)
@@ -151,6 +154,8 @@ impl Keyword {
             "proof_obligations" => ProofObligations,
             "true" => True,
             "false" => False,
+            "enums" => Enums,
+            "enum" => Enum,
             "ltl" => Ltl,
             "mu" => Mu,
             // Note: LTL operators are not keywords - they're recognized by the LTL parser
