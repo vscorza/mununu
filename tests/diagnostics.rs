@@ -5,9 +5,7 @@
 //! deadlock trace collection, proof obligation generation) through the public
 //! synthesis API.
 
-use mununu::context::{
-    Context, ControllerSynthesisOptions, DiagnosticsOptions,
-};
+use mununu::context::{Context, ControllerSynthesisOptions, DiagnosticsOptions};
 use mununu::mu_calculus::{Environment, parser};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -116,9 +114,7 @@ fn lasso_trace_produced_for_liveness_violation() -> TestResult {
     // With goal = ∅ (empty predicate), no state satisfies goal, so the formula
     // evaluates to ∅. The synthesis with counterexample enabled should produce
     // a lasso trace showing the infinite path that avoids goal.
-    let formula = parser::parse(
-        "nu NuX. ((mu MuX. (goal || <> MuX)) && ([] NuX))",
-    )?;
+    let formula = parser::parse("nu NuX. ((mu MuX. (goal || <> MuX)) && ([] NuX))")?;
 
     let diag_opts = DiagnosticsOptions {
         counterexample: true,
@@ -167,9 +163,7 @@ fn lasso_trace_produced_for_liveness_violation() -> TestResult {
 #[test]
 fn lasso_cycle_has_no_duplicate_states() -> TestResult {
     let (ctx, env) = cyclic_clts_no_goal();
-    let formula = parser::parse(
-        "nu NuX. ((mu MuX. (goal || <> MuX)) && ([] NuX))",
-    )?;
+    let formula = parser::parse("nu NuX. ((mu MuX. (goal || <> MuX)) && ([] NuX))")?;
     let diag_opts = DiagnosticsOptions {
         counterexample: true,
         deadlock_traces: false,
@@ -278,8 +272,7 @@ fn deadlock_trace_not_produced_when_disabled() -> TestResult {
 fn proof_obligation_names_violating_initial() -> TestResult {
     let (ctx, env) = gr1_unrealizable_clts();
     // GF(Grant): infinitely often grant
-    let formula =
-        parser::parse("nu NuX. ((mu MuX. (Grant || <> MuX)) && ([] NuX))")?;
+    let formula = parser::parse("nu NuX. ((mu MuX. (Grant || <> MuX)) && ([] NuX))")?;
 
     let diag_opts = DiagnosticsOptions {
         counterexample: true,

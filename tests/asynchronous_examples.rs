@@ -92,7 +92,10 @@ fn token_ring_passes_token() {
 
 // ── Formula evaluation ────────────────────────────────────────────────────
 
-fn make_context(name: &str, clts: Clts<DefaultStateIdx, DefaultLabelIdx>) -> Result<Context, ContextError> {
+fn make_context(
+    name: &str,
+    clts: Clts<DefaultStateIdx, DefaultLabelIdx>,
+) -> Result<Context, ContextError> {
     Context::builder()
         .register_clts(name, clts)
         .finish_with_checks()

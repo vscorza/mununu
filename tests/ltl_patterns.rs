@@ -677,7 +677,11 @@ fn ltl_g_evaluated_over_clts() -> TestResult {
     let result = ctx.evaluate_mu("m", &mu, &env, None)?;
     // s2 does not satisfy (it IS Target); s1 only successor is s2 so fails too;
     // s0 only successor is s1 which fails, so s0 also fails.
-    assert_eq!(result.count_ones(), 0, "no state satisfies G(!Target) in this clts");
+    assert_eq!(
+        result.count_ones(),
+        0,
+        "no state satisfies G(!Target) in this clts"
+    );
     Ok(())
 }
 
@@ -756,6 +760,10 @@ fn ltl_response_evaluated_over_two_state_clts() -> TestResult {
     let ltl = ltl::parse("G (Safe -> F Target)")?;
     let mu = ltl::translator::translate(&ltl)?;
     let result = ctx.evaluate_mu("r", &mu, &env, None)?;
-    assert_eq!(result.count_ones(), 2, "both states satisfy G(Safe->F Target)");
+    assert_eq!(
+        result.count_ones(),
+        2,
+        "both states satisfy G(Safe->F Target)"
+    );
     Ok(())
 }

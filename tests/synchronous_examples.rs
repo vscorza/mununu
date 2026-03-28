@@ -114,7 +114,10 @@ fn synchronous_pipeline_uses_union_label() {
 
 // ── Formula evaluation ────────────────────────────────────────────────────
 
-fn make_context(name: &str, clts: Clts<DefaultStateIdx, DefaultLabelIdx>) -> Result<Context, ContextError> {
+fn make_context(
+    name: &str,
+    clts: Clts<DefaultStateIdx, DefaultLabelIdx>,
+) -> Result<Context, ContextError> {
     Context::builder()
         .register_clts(name, clts)
         .finish_with_checks()
@@ -140,10 +143,16 @@ fn traffic_light_red_state_satisfies_reachability() {
 
     // ν X. (Red ∨ <> X) — every state can eventually reach red (true for all 3)
     let formula = parser::parse("nu X. (Red || <> X)").expect("formula parses");
-    let result = ctx.evaluate_mu("tl", &formula, &env, None).expect("eval succeeds");
+    let result = ctx
+        .evaluate_mu("tl", &formula, &env, None)
+        .expect("eval succeeds");
 
     // All three states satisfy (cycle: red→green→yellow→red)
-    assert_eq!(result.count_ones(), 3, "all 3 states should satisfy reachability to Red");
+    assert_eq!(
+        result.count_ones(),
+        3,
+        "all 3 states should satisfy reachability to Red"
+    );
     assert!(result[red.index()], "red itself must satisfy");
 }
 
@@ -164,6 +173,8 @@ fn clocked_toggle_liveness_holds_from_both_states() {
     let env = Environment::new(n).with_predicate("Off", off_set);
 
     let formula = parser::parse("nu X. (Off || <> X)").expect("parses");
-    let result = ctx.evaluate_mu("ct", &formula, &env, None).expect("eval succeeds");
+    let result = ctx
+        .evaluate_mu("ct", &formula, &env, None)
+        .expect("eval succeeds");
     assert_eq!(result.count_ones(), 2, "both states satisfy eventual-off");
 }
