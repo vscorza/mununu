@@ -33,3 +33,6 @@ CLAUDE.md
 # Private / unpublished material (lives in mununu-private/)
 /paper/
 /artifact/
+/examples/syntcomp/
+/examples/scalable/
+/tutorial/

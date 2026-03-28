@@ -425,7 +425,7 @@ context enum_parse_test {
 
 #[test]
 fn state_group_graph_has_all_transitions() -> TestResult {
-    let source = std::fs::read_to_string("tutorial/examples/14_state_groups.ctxdsl")?;
+    let source = std::fs::read_to_string("tests/fixtures/14_state_groups.ctxdsl")?;
     let doc = context_dsl::parser::parse(&source)?;
     let realized = context_dsl::realize::realize(&doc, &[])?;
 
@@ -493,7 +493,7 @@ fn state_group_graph_has_all_transitions() -> TestResult {
 
 #[test]
 fn template_graph_has_correct_automata_and_labels() -> TestResult {
-    let source = std::fs::read_to_string("tutorial/examples/15_process_templates.ctxdsl")?;
+    let source = std::fs::read_to_string("tests/fixtures/15_process_templates.ctxdsl")?;
     let doc = context_dsl::parser::parse(&source)?;
     let realized = context_dsl::realize::realize(&doc, &[])?;
 
@@ -582,7 +582,7 @@ fn template_graph_has_correct_automata_and_labels() -> TestResult {
 
 #[test]
 fn enum_graph_has_unrolled_transitions() -> TestResult {
-    let source = std::fs::read_to_string("tutorial/examples/16_enums.ctxdsl")?;
+    let source = std::fs::read_to_string("tests/fixtures/16_enums.ctxdsl")?;
     let doc = context_dsl::parser::parse(&source)?;
     let realized = context_dsl::realize::realize(&doc, &[])?;
 
