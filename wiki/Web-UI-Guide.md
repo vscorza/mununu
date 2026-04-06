@@ -159,18 +159,20 @@ Toggle between graph types using the dropdown above the graph canvas.
 
 | Style | Meaning |
 |-------|---------|
-| Bold border | Initial state |
-| Gray fill | Normal state |
-| Green fill | Satisfying state (when verification overlay is active) |
-| Red fill | Violating state |
+| Green diamond border | Initial state (class `start` from the backend) |
+| Gray border | Normal state |
+| Invisible (zero-size) | Entry helper node for initial state arrows |
 
 ### Edge Styling
 
 | Style | Meaning |
 |-------|---------|
-| Solid line | Standard transition |
-| Dashed line | Uncontrollable transition |
+| Blue solid line | Controllable transition |
+| Red dashed line | Uncontrollable transition |
+| Thin gray line (no label) | Start arrow pointing to initial state |
 | Label text | Action name, guard, effect |
+
+These styles are shared between the Graphs tab and the Counterstrategy graph in the Verification tab (via a common `graphStyles.ts` module).
 
 ### Controller Graphs
 
@@ -186,12 +188,12 @@ Use the **Minimize Controllers** toggle to apply bisimulation minimization to co
 
 ## Verification Tab
 
-The Verification tab evaluates mu-calculus formulas against their target automata and presents results in a structured table. It calls the `/api/v1/context/verify` endpoint.
+The Verification tab is the unified analysis view. It evaluates mu-calculus formulas, reports realizability, and provides on-demand counterstrategy graphs and counterexample traces -- combining what was previously split across separate verification and synthesis tabs. It calls the `/api/v1/context/verify` endpoint for formula evaluation and the `/api/v1/context/synthesize` endpoint for countertraces.
 
 ### Running Verification
 
-1. Click **Verify All** to evaluate every user-defined formula, or select a specific formula from the dropdown and click **Verify**.
-2. Results appear in the results table within seconds for typical specifications.
+1. Optionally enter a formula name and/or automaton name to filter (leave empty to evaluate all formulas).
+2. Click **Verify**. Results appear in the results table within seconds for typical specifications.
 
 ### Results Table
 
@@ -202,26 +204,36 @@ Each row represents one formula-automaton pair:
 | **Formula** | Formula name. |
 | **Automaton** | Target automaton name. |
 | **Status** | "Satisfied" (green) or "Not Satisfied" (red). |
-| **States** | `satisfying / total` state counts. |
+| **Satisfying** | `satisfying / total` state counts. |
 | **Initial** | `satisfying / total` initial state counts. |
-| **Violating Initials** | List of initial states that fail the property. |
+| **Actions** | Counterstrategy and Countertraces buttons (for unsatisfied formulas). |
 
 ### Counterstrategy
 
 For formulas that are **not satisfied**, a **Counterstrategy** button appears in the row. Clicking it:
 
-1. Requests a counterstrategy from the API (formula inversion + synthesis).
-2. Opens a graph view showing the **environment winning region** -- the set of states from which the environment can force a property violation regardless of the controller's choices.
-3. Winning states are highlighted in the counterstrategy graph.
-4. The inverted formula is displayed for transparency.
+1. Fetches a minimized counterstrategy from the API (formula inversion + evaluation).
+2. Expands an inline graph view showing the **environment winning region** -- the set of states from which the environment can force a property violation regardless of the controller's choices.
+3. The counterstrategy graph only includes states **reachable from initial states** via the kept transitions (unreachable states are filtered out).
+4. Controllable transitions are shown in blue, uncontrollable in red dashed lines, and initial states as green diamonds.
 
-This is useful for understanding *why* a property fails: the counterstrategy shows the adversarial environment behavior that prevents satisfaction.
+Click the button again to collapse the graph.
+
+### Countertraces
+
+A **Countertraces** button appears next to the Counterstrategy button for unsatisfied formulas. Clicking it runs synthesis internally to compute diagnostic traces:
+
+- **Lasso traces** (shown when available): infinite counterexample paths in `prefix -> (cycle)^ω` format. Each arrow shows the transition label taken between states.
+- **Deadlock traces** (shown when no lasso traces exist): finite paths leading to deadlock states.
+- **Violating initial states**: listed at the top of the expanded section.
+
+The Countertraces button is hidden if synthesis returns no traces.
 
 ### Interpreting Results
 
 - **All Satisfied**: The system meets all specified properties from every initial state. No controller synthesis is needed for these properties.
 - **Not Satisfied, Realizable**: The property does not hold on the open system, but a controller can be synthesized to enforce it. Go to the Editor tab and add a `controller` declaration.
-- **Not Satisfied, Unrealizable**: The environment can force a violation regardless of any controller strategy. Review the counterstrategy to understand the adversarial scenario, then consider relaxing the property or restricting the environment model.
+- **Not Satisfied, Unrealizable**: The environment can force a violation regardless of any controller strategy. Review the counterstrategy graph and countertraces to understand the adversarial scenario, then consider relaxing the property or restricting the environment model.
 
 ---
 

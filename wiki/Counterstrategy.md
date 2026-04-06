@@ -99,26 +99,37 @@ The counterstrategy shows: from RedWait, the environment can simply never trigge
 
 The counterstrategy can be visualized as an automaton in **mununu-ui**. The graph shows:
 
-- **States in the environment's winning region** highlighted
-- **Transition edges** showing the environment's winning moves
-- **Controllable transitions** that the controller might attempt (all leading back into the environment's winning region)
+- **States in the environment's winning region** reachable from initial states, highlighted in amber
+- **Initial states** as green diamonds with entry arrows
+- **Uncontrollable transitions** (red dashed lines) -- the environment's winning moves
+- **Controllable transitions** (blue solid lines) -- showing the controller is trapped (all lead back into the environment's winning region)
 
-Use the `graph` command to generate visualizations:
+The graph is available from two places:
+
+1. **Verification tab**: Click **Counterstrategy** next to any unsatisfied formula to expand the graph inline.
+2. **Synthesis API**: The `/api/v1/context/synthesize` response includes a `counterstrategy` field with Cytoscape-compatible graph elements when the result is unrealizable.
+
+### Reachability Filtering
+
+When minimization is enabled, the counterstrategy graph applies **reachability filtering**: after strategy extraction prunes transitions (keeping only witnessed uncontrollable + all controllable), a BFS from initial winning states removes any states that become unreachable. This ensures the graph only shows states the environment can actually reach from the start of the game.
+
+Use the `graph` command to generate standalone HTML visualizations:
 
 ```bash
 mununu context graph spec.ctxdsl --output graph.html
 ```
 
-The HTML output uses Cytoscape.js for interactive exploration. States are colored by their membership in the winning region, and transitions are labeled with their controllability status.
-
 ## Practical Use
 
-When synthesis reports unrealizable, follow this diagnostic workflow:
+When verification reports a formula as unsatisfied, follow this diagnostic workflow:
 
-1. **Enable diagnostics**: add `--counterexample --deadlock-traces` to the `synth` command
-2. **Examine the winning regions**: the controller's winning region (from `eval`) and the environment's winning region (from the inverted formula) should partition the state space
-3. **Trace the counterstrategy**: identify which uncontrollable actions the environment uses to escape the controller's winning region
-4. **Fix the specification**: either strengthen the plant (add transitions), weaken the property, or add fairness assumptions (GR(1)) to rule out pathological environment behaviors
+1. **Click Counterstrategy** in the Verification tab to see the environment's winning strategy graph
+2. **Click Countertraces** to see lasso traces (for liveness violations) or deadlock traces (for safety violations) with transition labels
+3. **Examine the winning regions**: the controller's winning region (from `eval`) and the environment's winning region (from the inverted formula) should partition the state space
+4. **Trace the counterstrategy**: identify which uncontrollable actions the environment uses to escape the controller's winning region
+5. **Fix the specification**: either strengthen the plant (add transitions), weaken the property, or add fairness assumptions (GR(1)) to rule out pathological environment behaviors
+
+For CLI usage, add `--counterexample --deadlock-traces` to the `synth` command.
 
 ## Strategy Extraction
 

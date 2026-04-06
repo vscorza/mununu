@@ -168,8 +168,8 @@ cargo build --release --features api
 The companion [mununu-ui](https://github.com/vscorza/mununu-ui) project provides:
 
 - Monaco-based CTXDSL editor with syntax highlighting
-- Interactive graph visualization (Cytoscape/Dagre)
-- One-click verification and controller synthesis
+- Interactive graph visualization (Cytoscape/Dagre) with controllable/uncontrollable edge styling
+- Unified verification tab with counterstrategy graphs and counterexample traces
 - Internationalization (English, Spanish, Portuguese)
 
 ```bash

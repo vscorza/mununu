@@ -242,11 +242,13 @@ controllers {
 
 ## Diagnostics
 
-When synthesis fails (unrealizable), diagnostics help you understand why:
+When synthesis fails (unrealizable), the API response automatically includes a **counterstrategy graph** showing the environment's winning strategy as Cytoscape-compatible elements. The graph only includes states reachable from initial states via the transitions kept by strategy extraction, filtering out orphaned states.
+
+Additional diagnostics can be enabled:
 
 | Option | CLI Flag | Purpose |
 |--------|----------|---------|
-| `counterexample = true` | `--counterexample` | Generate counterstrategy traces showing how the environment forces violation |
+| `counterexample = true` | `--counterexample` | Generate counterexample and lasso traces showing how the environment forces violation |
 | `deadlock_traces = true` | `--deadlock-traces` | Capture traces that lead to deadlock states (no outgoing transitions in the controller) |
 
 ```bash
@@ -279,13 +281,15 @@ This is planned for a future release via instrumented fixpoint evaluation (Bruse
 
 ### Lasso Traces
 
-Counterexample traces for liveness properties now include **lasso format**:
+Counterexample traces for liveness properties include **lasso format** with transition labels:
 
 ```
-lasso trace #0: Red -> (PedWaiting)^ω
+lasso trace #0: Red -[timer_tick]-> PedWaiting -[ped_wait]-> (PedWaiting)^ω
 ```
 
-The prefix shows the path to the cycle entry, and the cycle repeats infinitely. Use `--counterexample` with synthesis to see lasso traces.
+The prefix shows the path to the cycle entry, each arrow is annotated with the transition label taken, and the cycle repeats infinitely. The last label in the cycle is the transition from the last cycle state back to the first (the closing edge of the omega loop).
+
+Use `--counterexample` with synthesis to see lasso traces. In the API, the `LassoTrace` object includes `prefix_labels` and `cycle_labels` arrays parallel to the `prefix` and `cycle` state arrays.
 
 ## See Also
 

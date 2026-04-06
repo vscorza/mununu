@@ -171,6 +171,7 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 | `realizable` | `boolean` | Whether a winning controller exists. |
 | `controller` | `FileContent \| null` | Synthesized controller as CTXDSL. `null` when unrealizable. |
 | `diagnostics` | `SynthesisDiagnostics` | Diagnostic information. |
+| `counterstrategy` | `CounterstrategyResult \| null` | Environment counterstrategy graph for unrealizable cases. Automatically computed when synthesis fails. See [CounterstrategyResult](#counterstrategyresult) below. |
 
 **SynthesisDiagnostics**
 
@@ -181,8 +182,18 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 | `counterexample_trace` | `string[] \| null` | A trace witnessing a violation (if requested). |
 | `counterstrategy_traces` | `string[][]` | Environment counterstrategy traces. |
 | `deadlock_traces` | `string[][]` | Traces leading to deadlock states. |
+| `lasso_traces` | `LassoTrace[]` | Lasso-format infinite counterexample traces (prefix + cycle). Present for liveness violations. |
 | `minimization` | `MinimizationReport \| null` | Minimization statistics (if `minimize` was `true`). |
 | `proof_obligations` | `ProofObligation[]` | Per-state proof obligations. |
+
+**LassoTrace**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prefix` | `string[]` | State names forming the finite prefix. |
+| `cycle` | `string[]` | State names forming the infinitely repeating cycle. |
+| `prefix_labels` | `string[]` | Transition labels between consecutive prefix states. `prefix_labels[i]` is the label from `prefix[i]` to `prefix[i+1]` (or `cycle[0]` for the last). |
+| `cycle_labels` | `string[]` | Transition labels between consecutive cycle states. The last element is the label from the last cycle state back to `cycle[0]`. |
 
 **MinimizationReport**
 
@@ -261,8 +272,18 @@ curl -X POST http://localhost:3000/api/v1/context/synthesize \
     "counterexample_trace": ["idle", "req1", "grant1", "req2"],
     "counterstrategy_traces": [],
     "deadlock_traces": [],
+    "lasso_traces": [],
     "minimization": null,
     "proof_obligations": []
+  },
+  "counterstrategy": {
+    "environment_winning_states": ["idle", "req1"],
+    "graph_elements": [
+      { "data": { "type": "node", "id": "cs_idle", "label": "idle", "vars": [], "actions": [] }, "classes": "env-winning start" },
+      { "data": { "type": "edge", "id": "cs_e0", "source": "cs_idle", "target": "cs_req1", "label": "request", "action_type": "uncontrollable" } }
+    ],
+    "inverted_formula": "nu X. (!goal && <ctrl=environment> X)",
+    "minimized": true
   }
 }
 ```
