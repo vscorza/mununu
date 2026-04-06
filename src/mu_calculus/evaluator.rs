@@ -1403,7 +1403,9 @@ where
             for label in &guard.labels {
                 let mut label_found = false;
                 for label_id in transition.labels() {
-                    let bitset = self.clts.label_bitset(*label_id);
+                    let Some(bitset) = self.clts.label_bitset(*label_id) else {
+                        continue;
+                    };
                     if bitset.test(label.as_str()) {
                         label_found = true;
                         break;

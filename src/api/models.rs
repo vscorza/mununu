@@ -122,12 +122,15 @@ pub struct DiagnosticsOptions {
 }
 
 /// Response from controller synthesis
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct ContextSynthesizeResponse {
     pub success: bool,
     pub realizable: bool,
     pub controller: Option<FileContent>,
     pub diagnostics: SynthesisDiagnostics,
+    /// Counterstrategy graph for unrealizable cases (environment's winning strategy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterstrategy: Option<CounterstrategyResult>,
 }
 
 /// Synthesis diagnostics (matches ControllerDiagnostics structure)
@@ -155,6 +158,14 @@ pub struct SynthesisDiagnostics {
 pub struct LassoTraceApi {
     pub prefix: Vec<String>,
     pub cycle: Vec<String>,
+    /// Transition labels between consecutive prefix states.
+    /// `prefix_labels[i]` is the label from `prefix[i]` to `prefix[i+1]` (or `cycle[0]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefix_labels: Vec<String>,
+    /// Transition labels between consecutive cycle states.
+    /// The last element is the label from the last cycle state back to `cycle[0]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycle_labels: Vec<String>,
 }
 
 /// Minimization report

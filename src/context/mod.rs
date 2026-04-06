@@ -1256,6 +1256,17 @@ pub struct ControllerDiagnostics {
 pub struct LassoTrace {
     pub prefix: Vec<String>,
     pub cycle: Vec<String>,
+    /// Transition labels between consecutive prefix states.
+    /// `prefix_labels[i]` is the label on the edge from `prefix[i]` to `prefix[i+1]`
+    /// (or to `cycle[0]` for the last element). Length = `prefix.len()` when a
+    /// successor exists, otherwise empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefix_labels: Vec<String>,
+    /// Transition labels between consecutive cycle states.
+    /// `cycle_labels[i]` is the label on the edge from `cycle[i]` to `cycle[i+1]`.
+    /// The last element is the label from the last cycle state back to `cycle[0]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycle_labels: Vec<String>,
 }
 
 /// Prototype counterstrategy definition exposed in diagnostics.
@@ -1766,15 +1777,17 @@ impl CounterExampleExplorer {
     }
 
     /// Find a lasso trace (prefix + cycle) in the losing region.
-    /// Returns `(prefix, cycle)` where the infinite counterexample is `prefix ++ cycle^ω`.
-    /// If no cycle is found, returns the linear prefix with an empty cycle.
+    /// Returns a `LassoTrace` where the infinite counterexample is `prefix ++ cycle^ω`.
+    /// If no cycle is found, returns just the start state with an empty cycle.
     pub fn lasso_from(
         &self,
         start: StateId<DefaultStateIdx>,
         clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
-    ) -> (Vec<String>, Vec<String>) {
-        // DFS to find a cycle in the losing region
+    ) -> LassoTrace {
+        // DFS to find a cycle in the losing region.
+        // Track both states and the label of the transition taken to reach each state.
         let mut path: Vec<StateId<DefaultStateIdx>> = vec![start];
+        let mut edge_labels: Vec<String> = Vec::new(); // edge_labels[i] = label from path[i] to path[i+1]
         let mut on_path: HashSet<StateId<DefaultStateIdx>> = HashSet::new();
         on_path.insert(start);
         let mut visited: HashSet<StateId<DefaultStateIdx>> = HashSet::new();
@@ -1792,13 +1805,26 @@ impl CounterExampleExplorer {
                 }
                 // Cycle detected: target is already on the current path
                 if on_path.contains(&target) {
+                    let closing_label = Self::transition_label(transition, clts);
                     let cycle_start_idx = path.iter().position(|s| *s == target).unwrap();
+
                     let prefix = self.to_names(&path[..cycle_start_idx], clts);
+                    let prefix_labels = edge_labels[..cycle_start_idx].to_vec();
                     let cycle = self.to_names(&path[cycle_start_idx..], clts);
-                    return (prefix, cycle);
+                    let mut cycle_labels = edge_labels[cycle_start_idx..].to_vec();
+                    // The closing label goes from the last cycle state back to cycle[0]
+                    cycle_labels.push(closing_label);
+
+                    return LassoTrace {
+                        prefix,
+                        cycle,
+                        prefix_labels,
+                        cycle_labels,
+                    };
                 }
                 // Unvisited successor: extend the path
                 if !visited.contains(&target) {
+                    edge_labels.push(Self::transition_label(transition, clts));
                     path.push(target);
                     on_path.insert(target);
                     found_next = true;
@@ -1810,12 +1836,49 @@ impl CounterExampleExplorer {
                 // Backtrack: no unvisited successor in losing region
                 on_path.remove(&state);
                 path.pop();
+                edge_labels.pop();
                 if path.is_empty() {
                     // No cycle found — return just the start state
                     let name = clts.state_name(start).unwrap_or("state").to_owned();
-                    return (vec![name], Vec::new());
+                    return LassoTrace {
+                        prefix: vec![name],
+                        cycle: Vec::new(),
+                        prefix_labels: Vec::new(),
+                        cycle_labels: Vec::new(),
+                    };
                 }
             }
+        }
+    }
+
+    /// Extract a human-readable label string from a transition.
+    fn transition_label(
+        transition: &crate::clts::Transition<DefaultStateIdx, DefaultLabelIdx>,
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> String {
+        let parts: Vec<String> = transition
+            .labels()
+            .iter()
+            .filter_map(|lid| {
+                clts.label_payload(*lid).and_then(|vals| {
+                    let joined = vals
+                        .iter()
+                        .filter(|v| !v.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if joined.is_empty() {
+                        None
+                    } else {
+                        Some(joined)
+                    }
+                })
+            })
+            .collect();
+        if parts.is_empty() {
+            "τ".to_string()
+        } else {
+            parts.join(" | ")
         }
     }
 
@@ -2439,8 +2502,12 @@ mod tests {
 
         assert_eq!(sync.index(), sync_b.index());
 
-        let bitset_a = clts_a.label_bitset(sync);
-        let bitset_b = clts_b.label_bitset(sync_b);
+        let bitset_a = clts_a
+            .label_bitset(sync)
+            .expect("label bitset should exist");
+        let bitset_b = clts_b
+            .label_bitset(sync_b)
+            .expect("label bitset should exist");
         assert_eq!(bitset_a.bits(), bitset_b.bits());
 
         let vars_a = clts_a.state_variable_bitset(clts_a.state_id("s0")?);

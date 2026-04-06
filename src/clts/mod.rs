@@ -660,11 +660,11 @@ impl<L: IdStorage> LabelStore<L> {
         self.entries.iter().map(|labels| labels.as_ref())
     }
 
-    fn bitset(&self, id: LabelId<L>) -> LabelBitSet<'_> {
-        LabelBitSet {
-            bits: &self.bitsets[id.index()],
+    fn bitset(&self, id: LabelId<L>) -> Option<LabelBitSet<'_>> {
+        self.bitsets.get(id.index()).map(|bits| LabelBitSet {
+            bits,
             index: &self.symbol_index,
-        }
+        })
     }
 }
 
@@ -1053,7 +1053,7 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
     ///
     /// This allows inclusion/intersection checks without converting back to
     /// string payloads.
-    pub fn label_bitset(&self, label: LabelId<L>) -> LabelBitSet<'_> {
+    pub fn label_bitset(&self, label: LabelId<L>) -> Option<LabelBitSet<'_>> {
         self.labels.bitset(label)
     }
 
@@ -1371,7 +1371,9 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
                 let mut labels: Vec<BitVec<usize, Lsb0>> = transition
                     .labels()
                     .iter()
-                    .map(|label_id| self.label_bitset(*label_id).bits().to_bitvec())
+                    .filter_map(|label_id| {
+                        self.label_bitset(*label_id).map(|bs| bs.bits().to_bitvec())
+                    })
                     .collect();
                 labels.sort();
                 TransitionFingerprint {
@@ -2716,7 +2718,7 @@ mod tests {
         builder.transition("s0", &[label], "s0");
         let clts = builder.build()?;
 
-        let bitset = clts.label_bitset(label);
+        let bitset = clts.label_bitset(label).expect("label bitset should exist");
         assert!(bitset.test("alpha"));
         assert!(bitset.test("beta"));
         assert!(!bitset.test("gamma"));

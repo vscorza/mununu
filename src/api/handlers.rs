@@ -14,9 +14,9 @@ use crate::api::graph::generate_graphs;
 use crate::api::models::*;
 use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, LabelId};
 use crate::context::{ControllerSynthesisOptions, DiagnosticsOptions as ContextDiagnosticsOptions};
-use crate::context_dsl::{parse as parse_context_doc, realize_context};
+use crate::context_dsl::{RealizedContext, parse as parse_context_doc, realize_context};
 use crate::guard::sanitize_identifier;
-use crate::mu_calculus::EvaluationOptions;
+use crate::mu_calculus::{Environment, EvaluationOptions, Formula};
 
 /// Health check endpoint
 pub async fn health_check() -> Json<serde_json::Value> {
@@ -260,6 +260,20 @@ pub async fn context_synthesize_handler(
         None
     };
 
+    // Compute counterstrategy graph for unrealizable cases
+    let counterstrategy = if !synthesis.realizable {
+        compute_counterstrategy_result(
+            &realized,
+            &request.automaton,
+            &realized_formula.formula,
+            &env,
+            &eval_options,
+            request.options.minimize,
+        )
+    } else {
+        None
+    };
+
     // Convert diagnostics
     let diagnostics = convert_diagnostics(&synthesis.diagnostics);
 
@@ -268,6 +282,7 @@ pub async fn context_synthesize_handler(
         realizable: synthesis.realizable,
         controller: controller_content,
         diagnostics,
+        counterstrategy,
     }))
 }
 
@@ -521,60 +536,14 @@ pub async fn context_verify_handler(
 
         // Compute counterstrategy for failed formulas when requested
         let counterstrategy = if request.counterstrategy && !satisfied {
-            use crate::mu_calculus::invert;
-
-            let inverted = invert::invert(&rf.formula);
-            let inverted_result = if request.minimize_counterstrategy {
-                realized
-                    .context
-                    .evaluate_mu_with_witnesses(
-                        automaton_name,
-                        &inverted,
-                        &env,
-                        Some(&eval_options),
-                    )
-                    .ok()
-                    .map(|(bv, wm)| (bv, Some(wm)))
-            } else {
-                realized
-                    .context
-                    .evaluate_mu(automaton_name, &inverted, &env, Some(&eval_options))
-                    .ok()
-                    .map(|bv| (bv, None))
-            };
-
-            inverted_result.map(|(inv_bv, witness_map)| {
-                // Collect environment winning states
-                let winning_set: HashSet<usize> = clts
-                    .states()
-                    .filter(|sid| inv_bv.get(sid.index()).map(|bit| *bit).unwrap_or(false))
-                    .map(|sid| sid.index())
-                    .collect();
-
-                let mut env_winning: Vec<String> = clts
-                    .states()
-                    .filter(|sid| winning_set.contains(&sid.index()))
-                    .filter_map(|sid| clts.state_name(sid).map(|n| n.to_string()))
-                    .collect();
-                env_winning.sort();
-
-                // Build graph elements directly from original CLTS, filtered
-                let cs_name = format!("{}_counterstrategy", automaton_name);
-                let graph_elements = crate::api::graph::counterstrategy_to_graph_elements(
-                    clts,
-                    &cs_name,
-                    &winning_set,
-                    request.minimize_counterstrategy,
-                    witness_map.as_ref(),
-                );
-
-                CounterstrategyResult {
-                    environment_winning_states: env_winning,
-                    graph_elements,
-                    inverted_formula: format!("{:?}", inverted),
-                    minimized: false,
-                }
-            })
+            compute_counterstrategy_result(
+                &realized,
+                automaton_name,
+                &rf.formula,
+                &env,
+                &eval_options,
+                request.minimize_counterstrategy,
+            )
         } else {
             None
         };
@@ -626,6 +595,72 @@ fn resolve_targets(
     }
 }
 
+/// Compute counterstrategy graph elements for an unsatisfied formula.
+///
+/// Inverts the formula, evaluates the inverted formula to find the environment's
+/// winning region, and builds Cytoscape graph elements for visualization.
+fn compute_counterstrategy_result(
+    realized: &RealizedContext,
+    automaton_name: &str,
+    formula: &Formula,
+    env: &Environment,
+    eval_options: &EvaluationOptions,
+    minimize: bool,
+) -> Option<CounterstrategyResult> {
+    use crate::mu_calculus::invert;
+
+    let clts = realized.context.clts(automaton_name)?;
+    let inverted = invert::invert(formula);
+
+    let inverted_result = if minimize {
+        realized
+            .context
+            .evaluate_mu_with_witnesses(automaton_name, &inverted, env, Some(eval_options))
+            .ok()
+            .map(|(bv, wm)| (bv, Some(wm)))
+    } else {
+        realized
+            .context
+            .evaluate_mu(automaton_name, &inverted, env, Some(eval_options))
+            .ok()
+            .map(|bv| (bv, None))
+    };
+
+    inverted_result.map(|(inv_bv, witness_map)| {
+        let winning_set: HashSet<usize> = clts
+            .states()
+            .filter(|sid| inv_bv.get(sid.index()).map(|bit| *bit).unwrap_or(false))
+            .map(|sid| sid.index())
+            .collect();
+
+        let cs_name = format!("{}_counterstrategy", automaton_name);
+        // Graph generation applies strategy extraction and then filters to
+        // states reachable from initials via the kept transitions.
+        let (graph_elements, reachable) = crate::api::graph::counterstrategy_to_graph_elements(
+            clts,
+            &cs_name,
+            &winning_set,
+            minimize,
+            witness_map.as_ref(),
+        );
+
+        // Report only reachable states in the winning list
+        let mut env_winning: Vec<String> = clts
+            .states()
+            .filter(|sid| reachable.contains(&sid.index()))
+            .filter_map(|sid| clts.state_name(sid).map(|n| n.to_string()))
+            .collect();
+        env_winning.sort();
+
+        CounterstrategyResult {
+            environment_winning_states: env_winning,
+            graph_elements,
+            inverted_formula: format!("{:?}", inverted),
+            minimized: minimize,
+        }
+    })
+}
+
 /// Convert controller diagnostics to API format
 fn convert_diagnostics(
     diagnostics: &crate::context::ControllerDiagnostics,
@@ -658,6 +693,8 @@ fn convert_diagnostics(
             .map(|lt| LassoTraceApi {
                 prefix: lt.prefix.clone(),
                 cycle: lt.cycle.clone(),
+                prefix_labels: lt.prefix_labels.clone(),
+                cycle_labels: lt.cycle_labels.clone(),
             })
             .collect(),
     }

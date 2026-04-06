@@ -238,13 +238,130 @@ pub fn counterstrategy_to_graph_elements(
     winning_set: &std::collections::HashSet<usize>,
     extract_strategy: bool,
     witness_map: Option<&crate::mu_calculus::WitnessMap>,
-) -> Vec<GraphElement> {
+) -> (Vec<GraphElement>, std::collections::HashSet<usize>) {
+    use std::collections::{HashSet, VecDeque};
+
+    // --- Pass 1: Collect kept transitions after strategy extraction ---
+    struct KeptEdge {
+        source_idx: usize,
+        target_idx: usize,
+        source_name: String,
+        target_name: String,
+        label_text: Option<String>,
+        action_type: &'static str,
+    }
+    let mut kept_edges: Vec<KeptEdge> = Vec::new();
+
+    for state_id in clts.states() {
+        if !winning_set.contains(&state_id.index()) {
+            continue;
+        }
+        let state_witnesses: Option<HashSet<usize>> = witness_map.map(|wm| {
+            wm.witnesses
+                .iter()
+                .filter(|((si, _), _)| *si == state_id.index())
+                .map(|(_, &ti)| ti)
+                .collect()
+        });
+        let mut uncontrollable_added = false;
+
+        for (idx, transition) in clts.outgoing(state_id).iter().enumerate() {
+            if !winning_set.contains(&transition.target().index()) {
+                continue;
+            }
+            if extract_strategy && transition.is_uncontrollable(clts) {
+                if let Some(ref witnesses) = state_witnesses {
+                    if !witnesses.contains(&idx) {
+                        continue;
+                    }
+                } else if uncontrollable_added {
+                    continue;
+                }
+            }
+            let is_uncontrollable = transition.is_uncontrollable(clts);
+            if is_uncontrollable {
+                uncontrollable_added = true;
+            }
+
+            let label_parts: Vec<String> = transition
+                .labels()
+                .iter()
+                .map(|lid| {
+                    clts.label_payload(*lid)
+                        .and_then(|vals| {
+                            let joined = vals
+                                .iter()
+                                .filter(|v| !v.is_empty())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if joined.is_empty() {
+                                None
+                            } else {
+                                Some(joined)
+                            }
+                        })
+                        .unwrap_or_else(|| format!("label_{}", lid.index()))
+                })
+                .collect();
+
+            kept_edges.push(KeptEdge {
+                source_idx: state_id.index(),
+                target_idx: transition.target().index(),
+                source_name: clts.state_name(state_id).unwrap_or("?").to_string(),
+                target_name: clts
+                    .state_name(transition.target())
+                    .unwrap_or("?")
+                    .to_string(),
+                label_text: if label_parts.is_empty() {
+                    None
+                } else {
+                    Some(label_parts.join(" | "))
+                },
+                action_type: if is_uncontrollable {
+                    "uncontrollable"
+                } else {
+                    "controllable"
+                },
+            });
+        }
+    }
+
+    // --- Pass 2: BFS from initial winning states using only kept transitions ---
+    // Build adjacency from kept edges
+    let mut adjacency: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for edge in &kept_edges {
+        adjacency
+            .entry(edge.source_idx)
+            .or_default()
+            .push(edge.target_idx);
+    }
+
+    let mut reachable: HashSet<usize> = HashSet::new();
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for initial in clts.initial_states() {
+        if winning_set.contains(&initial.index()) {
+            reachable.insert(initial.index());
+            queue.push_back(initial.index());
+        }
+    }
+    while let Some(idx) = queue.pop_front() {
+        if let Some(targets) = adjacency.get(&idx) {
+            for &target in targets {
+                if reachable.insert(target) {
+                    queue.push_back(target);
+                }
+            }
+        }
+    }
+
+    // --- Pass 3: Emit graph elements for reachable states only ---
     let mut elements = Vec::new();
     let state_spacing = 250.0;
     let mut x_pos = 100.0;
     let y_offset = 0.0;
 
-    // Compound node
     let automaton_id = automaton_name.to_string();
     elements.push(GraphElement {
         data: GraphElementData::Node {
@@ -261,9 +378,8 @@ pub fn counterstrategy_to_graph_elements(
         classes: None,
     });
 
-    // State nodes (only winning states)
     for state_id in clts.states() {
-        if !winning_set.contains(&state_id.index()) {
+        if !reachable.contains(&state_id.index()) {
             continue;
         }
         let state_name = clts.state_name(state_id).unwrap_or("?").to_string();
@@ -325,103 +441,30 @@ pub fn counterstrategy_to_graph_elements(
         x_pos += state_spacing;
     }
 
-    // Transitions (only between winning states)
-    for state_id in clts.states() {
-        if !winning_set.contains(&state_id.index()) {
+    // Emit kept edges between reachable states
+    let mut edge_counter = 0usize;
+    for edge in &kept_edges {
+        if !reachable.contains(&edge.source_idx) || !reachable.contains(&edge.target_idx) {
             continue;
         }
-        let source_name = clts.state_name(state_id).unwrap_or("?").to_string();
-        let source_id = format!("{}_{}", automaton_name, source_name);
-        // Build per-state witness set from the witness map
-        let state_witnesses: Option<std::collections::HashSet<usize>> = witness_map.map(|wm| {
-            wm.witnesses
-                .iter()
-                .filter(|((si, _), _)| *si == state_id.index())
-                .map(|(_, &ti)| ti)
-                .collect()
+        edge_counter += 1;
+        elements.push(GraphElement {
+            data: GraphElementData::Edge {
+                id: format!("{}_{}_t{}", automaton_name, edge.source_name, edge_counter),
+                source: format!("{}_{}", automaton_name, edge.source_name),
+                target: format!("{}_{}", automaton_name, edge.target_name),
+                label: edge.label_text.clone(),
+                action: None,
+                action_type: Some(edge.action_type.to_string()),
+                guard: None,
+                effect: None,
+            },
+            position: None,
+            classes: None,
         });
-        let mut uncontrollable_added = false;
-
-        for (idx, transition) in clts.outgoing(state_id).iter().enumerate() {
-            if !winning_set.contains(&transition.target().index()) {
-                continue;
-            }
-            // Strategy extraction for counterstrategy:
-            // With witnesses: keep only WITNESSED uncontrollable transitions
-            // Without witnesses: keep ONE uncontrollable (first found)
-            // Always keep ALL controllable (controller is trapped)
-            if extract_strategy && transition.is_uncontrollable(clts) {
-                if let Some(ref witnesses) = state_witnesses {
-                    if !witnesses.contains(&idx) {
-                        continue; // Skip non-witnessed uncontrollable
-                    }
-                } else if uncontrollable_added {
-                    continue; // No witness data: first-found heuristic
-                }
-            }
-            let target_name = clts
-                .state_name(transition.target())
-                .unwrap_or("?")
-                .to_string();
-            let target_id = format!("{}_{}", automaton_name, target_name);
-
-            let label_parts: Vec<String> = transition
-                .labels()
-                .iter()
-                .map(|lid| {
-                    clts.label_payload(*lid)
-                        .and_then(|vals| {
-                            let joined = vals
-                                .iter()
-                                .filter(|v| !v.is_empty())
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            if joined.is_empty() {
-                                None
-                            } else {
-                                Some(joined)
-                            }
-                        })
-                        .unwrap_or_else(|| format!("label_{}", lid.index()))
-                })
-                .collect();
-            let label_text = if label_parts.is_empty() {
-                None
-            } else {
-                Some(label_parts.join(" | "))
-            };
-
-            let is_uncontrollable = transition.is_uncontrollable(clts);
-            if is_uncontrollable {
-                uncontrollable_added = true;
-            }
-            let action_type = if is_uncontrollable {
-                "uncontrollable"
-            } else {
-                "controllable"
-            };
-
-            let transition_id = format!("{}_{}_t{}", automaton_name, source_name, elements.len());
-
-            elements.push(GraphElement {
-                data: GraphElementData::Edge {
-                    id: transition_id,
-                    source: source_id.clone(),
-                    target: target_id,
-                    label: label_text,
-                    action: None,
-                    action_type: Some(action_type.to_string()),
-                    guard: None,
-                    effect: None,
-                },
-                position: None,
-                classes: None,
-            });
-        }
     }
 
-    elements
+    (elements, reachable)
 }
 
 fn clts_to_graph_elements_with_labels(
