@@ -179,7 +179,9 @@
     "Use μ (least fixpoint) for 'eventually' properties",
     "For bounded 'eventually', use < steps = N > syntax when available",
     "Combine patterns: responsiveness = always (request → eventually grant)",
-    "Consider controllability: [] accounts for uncontrollable moves in CLTS"
+    "Consider controllability: [(ctrl=Controllable)] for game-aware formulas (∀ env, ∃ ctrl)",
+    "TLSF/AIGER adapter uses turn-based encoding: G φ → ν X. ((turn || φ) ∧ [(ctrl=Controllable)] X), F φ → μ X. ((!turn ∧ φ) ∨ [(ctrl=Controllable)] X)",
+    "The standard LTL translator uses [ctrl=All] modals — correct for hand-written CTXDSL but too strong for synthesis with separate env/ctrl transitions"
   ],
   "common_mistakes": [
     {

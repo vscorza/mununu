@@ -257,6 +257,17 @@ mununu context synth spec.ctxdsl \
     --counterexample --deadlock-traces
 ```
 
+## TLSF/AIGER Turn-Based Encoding
+
+When synthesizing from TLSF or AIGER specifications, the adapter produces a **turn-based compound-label encoding** that correctly models Mealy game semantics:
+
+- **Compound labels**: `env_{bits}` (uncontrollable) and `ctrl_{bits}` (controllable) replace per-signal `set_`/`clr_` labels. Each label atomically commits all signals for one player.
+- **Turn bit**: States include a turn bit. At `turn=0` (env's turn), only uncontrollable `env_*` transitions exist. At `turn=1` (ctrl's turn), only controllable `ctrl_*` transitions exist.
+- **Skolem alternation**: `[(ctrl=Controllable)]` at `turn=0` states is universal (∀ env transitions). At `turn=1` states it is existential (∃ ctrl transition). This correctly implements Mealy games: for every environment move, the controller can find a response.
+- **Formulas**: Emitted as mu-calculus (not LTL) with `(turn || φ)` guards that skip propositional evaluation at intermediate (`turn=1`) states. This prevents false unrealizable verdicts from formulas being checked before the controller has responded.
+
+This encoding doubles the state space (2^(N+1) vs 2^N) but produces semantically correct synthesis verdicts for all SYNTCOMP Lily benchmarks.
+
 ## Known Limitations
 
 ### Strategy vs Projection

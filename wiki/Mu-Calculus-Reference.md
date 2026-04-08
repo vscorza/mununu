@@ -142,6 +142,30 @@ Example: state S0 with transitions `risky → Good` and `risky → Bad` (both co
 - `mu X. (Good || <> X)` → S0 does NOT satisfy (controller can't guarantee Good — Bad might happen)
 - `mu X. (Good || Bad || <> X)` → S0 DOES satisfy (both outcomes are acceptable)
 
+## Turn-Based Game Encoding (TLSF/AIGER Adapter)
+
+The TLSF and AIGER adapters generate CTXDSL with a **turn-based encoding** that models Mealy game semantics:
+
+- States include a **turn bit** (LSB): `turn=0` = env's turn (round boundary), `turn=1` = ctrl's turn (intermediate)
+- From `turn=0` states: only `env_*` labels (uncontrollable) → `turn=1` states
+- From `turn=1` states: only `ctrl_*` labels (controllable) → `turn=0` states
+
+This ensures `[(ctrl=Controllable)]` naturally alternates ∀ env / ∃ ctrl:
+- At `turn=0`: all transitions are uncontrollable → **universal** (∀ env moves)
+- At `turn=1`: all transitions are controllable → **existential** (∃ ctrl response)
+
+**Turn-guarded formulas**: Propositional checks use `(turn || φ)` to skip evaluation at intermediate states (where the controller hasn't responded yet). Key patterns:
+
+| LTL | Turn-aware mu-calculus |
+|-----|----------------------|
+| `G φ` | `ν X. ((turn \|\| φ) ∧ [(c)] X)` |
+| `F φ` | `μ X. ((!turn ∧ φ) ��� [(c)] X)` |
+| `X φ` | `[(c)] [(c)] φ` |
+| `φ U ψ` | `μ X. ((!turn ∧ ψ) ∨ ((turn \|\| φ) ∧ [(c)] X))` |
+| `GF φ` | `ν Y. (μ X. ((!turn ∧ φ) ∨ [(c)] X) ∧ [(c)] Y)` |
+
+Where `[(c)]` = `[(ctrl=Controllable)]` and `turn` is a state group for all `turn=1` states.
+
 ## Common Patterns
 
 These patterns come up repeatedly in hardware and protocol verification. Copy and adapt them freely.
