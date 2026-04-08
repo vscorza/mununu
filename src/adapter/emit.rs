@@ -1,10 +1,13 @@
 //! CTXDSL text emitter — converts [`AdapterIR`] into CTXDSL source text.
 //!
 //! Two encoding modes:
-//! - **Signal-state**: for TLSF/AIGER (no explicit automata in IR). Enumerates
-//!   2^N states from N Boolean signals and generates compound atomic transitions
-//!   (one label per complete env/ctrl move) with game-aware mu-calculus formulas.
-//! - **Explicit automaton**: for Promela (automata in IR). Emits them directly.
+//! - **Signal-state (turn-based)**: for TLSF and AIGER (no explicit automata in
+//!   the IR). Enumerates 2^N states from N Boolean signals and generates compound
+//!   atomic transitions where each label represents a complete environment/controller
+//!   move pair, producing a turn-based game encoding with game-aware mu-calculus
+//!   formulas.
+//! - **Explicit automaton**: for Promela (automata already present in the IR).
+//!   Emits automata, compositions, and properties directly from the IR specs.
 
 use super::ir::*;
 use super::{AdapterError, AdapterErrorKind};

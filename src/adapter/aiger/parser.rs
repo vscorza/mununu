@@ -11,14 +11,28 @@ pub fn parse(content: &str) -> Result<Circuit, AdapterError> {
     let mut lines = content.lines().enumerate();
 
     // Parse header: aag M I L O A [B [C [J [F]]]]
-    let (line_num, header_line) = lines.next().ok_or_else(|| err(0, "empty file"))?;
+    let (line_num, header_line) = lines
+        .next()
+        .ok_or_else(|| err(0, "empty file (expected 'aag' header line)"))?;
 
     let parts: Vec<&str> = header_line.split_whitespace().collect();
     if parts.is_empty() || parts[0] != "aag" {
-        return Err(err(line_num, "expected 'aag' header"));
+        return Err(err(
+            line_num,
+            &format!(
+                "expected 'aag' header but found '{}' (binary .aig format is not supported)",
+                parts[0]
+            ),
+        ));
     }
     if parts.len() < 6 {
-        return Err(err(line_num, "header requires at least: aag M I L O A"));
+        return Err(err(
+            line_num,
+            &format!(
+                "incomplete header: expected 'aag M I L O A [B [C [J [F]]]]' but found {} field(s)",
+                parts.len()
+            ),
+        ));
     }
 
     let max_var = parse_usize(parts[1], line_num, "M")?;
@@ -37,12 +51,12 @@ pub fn parse(content: &str) -> Result<Circuit, AdapterError> {
         0
     };
     let num_justice = if parts.len() > 8 {
-        parse_usize(parts[8], line_num, "J")?
+        parse_usize(parts[8], line_num, "justice count (J)")?
     } else {
         0
     };
-    let _num_fairness = if parts.len() > 9 {
-        parse_usize(parts[9], line_num, "F")?
+    let num_fairness = if parts.len() > 9 {
+        parse_usize(parts[9], line_num, "fairness count (F)")?
     } else {
         0
     };
@@ -61,7 +75,13 @@ pub fn parse(content: &str) -> Result<Circuit, AdapterError> {
         let (ln, line) = next_content_line(&mut lines)?;
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 2 {
-            return Err(err(ln, "latch requires: current next [init]"));
+            return Err(err(
+                ln,
+                &format!(
+                    "latch definition requires at least 2 fields (current next [init]) but found {}",
+                    parts.len()
+                ),
+            ));
         }
         let current = parse_usize(parts[0], ln, "latch current")?;
         let next = parse_usize(parts[1], ln, "latch next")?;
@@ -115,13 +135,27 @@ pub fn parse(content: &str) -> Result<Circuit, AdapterError> {
         justice_sets.push(set);
     }
 
+    // Parse fairness constraints (one literal per line)
+    let mut fairness = Vec::with_capacity(num_fairness);
+    for _ in 0..num_fairness {
+        let (ln, line) = next_content_line(&mut lines)?;
+        let lit = parse_usize(line.trim(), ln, "fairness literal")?;
+        fairness.push(lit);
+    }
+
     // Parse AND gates (lhs rhs0 rhs1)
     let mut gates = Vec::with_capacity(num_gates);
     for _ in 0..num_gates {
         let (ln, line) = next_content_line(&mut lines)?;
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 3 {
-            return Err(err(ln, "AND gate requires: lhs rhs0 rhs1"));
+            return Err(err(
+                ln,
+                &format!(
+                    "AND gate requires 3 fields (lhs rhs0 rhs1) but found {}",
+                    parts.len()
+                ),
+            ));
         }
         let lhs = parse_usize(parts[0], ln, "gate lhs")?;
         let rhs0 = parse_usize(parts[1], ln, "gate rhs0")?;
@@ -173,6 +207,7 @@ pub fn parse(content: &str) -> Result<Circuit, AdapterError> {
         bad_outputs,
         constraints,
         justice_sets,
+        fairness,
         symbols,
     })
 }
@@ -180,14 +215,27 @@ pub fn parse(content: &str) -> Result<Circuit, AdapterError> {
 fn next_content_line<'a>(
     lines: &mut impl Iterator<Item = (usize, &'a str)>,
 ) -> Result<(usize, &'a str), AdapterError> {
-    lines.next().ok_or_else(|| err(0, "unexpected end of file"))
+    lines.next().ok_or_else(|| {
+        err(
+            0,
+            "unexpected end of file (more lines expected per header counts)",
+        )
+    })
 }
 
 fn parse_usize(s: &str, line: usize, context: &str) -> Result<usize, AdapterError> {
-    s.parse()
-        .map_err(|_| err(line, &format!("invalid {context}: '{s}'")))
+    s.parse().map_err(|_| {
+        err(
+            line,
+            &format!("invalid {context} '{s}' (expected unsigned integer)"),
+        )
+    })
 }
 
+/// Create a parse error at the given line.
+///
+/// Column is always 1 because the AIGER format is line-oriented;
+/// each line contains a single declaration or definition.
 fn err(line: usize, msg: &str) -> AdapterError {
     AdapterError {
         kind: AdapterErrorKind::ParseError,

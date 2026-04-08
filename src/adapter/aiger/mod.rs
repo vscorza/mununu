@@ -1,7 +1,18 @@
 //! AIGER (And-Inverter Graph) adapter.
 //!
 //! Translates AIGER ASCII (.aag) circuits into CTXDSL via the shared IR.
-//! Supports safety properties (bad outputs) with optional controllability annotation.
+//! The circuit's latches are enumerated into explicit states and AND gates
+//! are evaluated to compute transitions.
+//!
+//! Supported property types:
+//! - **Safety** (bad outputs): states where a bad literal is true are forbidden.
+//! - **Justice** (liveness): each justice set generates a `G F` fairness property
+//!   requiring the set's literals to be satisfied infinitely often.
+//! - **Fairness** (single-literal liveness): each fairness constraint generates
+//!   a `G F` property for the corresponding literal.
+//!
+//! Controllability is determined by the `--controllable-inputs` option; inputs
+//! not listed are treated as uncontrollable (environment).
 
 pub mod ast;
 mod parser;
@@ -258,6 +269,85 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                 name: format!("safety_{}", super::emit::sanitize(&bad_name)),
                 kind: PropertyKind::Safety,
                 formula: PropertyFormula::MuCalculus(format!("nu X. ((!({bad_pred})) && ([] X))")),
+                role: PropertyRole::Standalone,
+            });
+        }
+    }
+
+    // Justice properties: for each justice set, find states where ALL literals are true
+    for (i, justice_set) in circuit.justice_sets.iter().enumerate() {
+        let mut justice_states = Vec::new();
+        for (state_idx, state_name) in state_names.iter().enumerate() {
+            // A state satisfies a justice set if there exists an input combo
+            // under which ALL literals in the set are true
+            for input_idx in 0..input_combos {
+                let mut values = vec![false; circuit.max_var + 1];
+                for (j, &input_lit) in circuit.inputs.iter().enumerate() {
+                    let var_idx = input_lit / 2;
+                    values[var_idx] = (input_idx & (1 << (num_inputs - 1 - j))) != 0;
+                }
+                for (j, latch) in circuit.latches.iter().enumerate() {
+                    let var_idx = latch.current / 2;
+                    values[var_idx] = (state_idx & (1 << (num_latches - 1 - j))) != 0;
+                }
+                circuit.eval_gates(&mut values);
+
+                let all_satisfied = justice_set
+                    .iter()
+                    .all(|&lit| circuit.eval_literal(lit, &values));
+                if all_satisfied {
+                    justice_states.push(state_name.clone());
+                    break;
+                }
+            }
+        }
+
+        if !justice_states.is_empty() {
+            let justice_pred = justice_states.join(" || ");
+            // G F (justice_states) encoded as nu Y. (mu X. ((pred) || <> X) && [] Y)
+            properties.push(PropertySpec {
+                name: format!("justice_{i}"),
+                kind: PropertyKind::Fairness,
+                formula: PropertyFormula::MuCalculus(format!(
+                    "nu Y. ((mu X. (({justice_pred}) || (<> X))) && ([] Y))"
+                )),
+                role: PropertyRole::Standalone,
+            });
+        }
+    }
+
+    // Fairness constraints: each is a single literal that must be true infinitely often
+    for (i, &fair_lit) in circuit.fairness.iter().enumerate() {
+        let mut fair_states = Vec::new();
+        for (state_idx, state_name) in state_names.iter().enumerate() {
+            for input_idx in 0..input_combos {
+                let mut values = vec![false; circuit.max_var + 1];
+                for (j, &input_lit) in circuit.inputs.iter().enumerate() {
+                    let var_idx = input_lit / 2;
+                    values[var_idx] = (input_idx & (1 << (num_inputs - 1 - j))) != 0;
+                }
+                for (j, latch) in circuit.latches.iter().enumerate() {
+                    let var_idx = latch.current / 2;
+                    values[var_idx] = (state_idx & (1 << (num_latches - 1 - j))) != 0;
+                }
+                circuit.eval_gates(&mut values);
+
+                if circuit.eval_literal(fair_lit, &values) {
+                    fair_states.push(state_name.clone());
+                    break;
+                }
+            }
+        }
+
+        if !fair_states.is_empty() {
+            let fair_pred = fair_states.join(" || ");
+            // G F (fairness_states) encoded as nu Y. (mu X. ((pred) || <> X) && [] Y)
+            properties.push(PropertySpec {
+                name: format!("fairness_{i}"),
+                kind: PropertyKind::Fairness,
+                formula: PropertyFormula::MuCalculus(format!(
+                    "nu Y. ((mu X. (({fair_pred}) || (<> X))) && ([] Y))"
+                )),
                 role: PropertyRole::Standalone,
             });
         }

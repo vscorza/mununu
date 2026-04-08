@@ -2,7 +2,13 @@
 //!
 //! Translates bounded Promela programs into CTXDSL via compositional encoding:
 //! each process becomes a CFG automaton, each variable becomes a variable automaton,
-//! and they are composed synchronously/asynchronously.
+//! each channel becomes a channel automaton (occupancy-based for buffered channels,
+//! rendezvous for synchronous channels), and they are composed asynchronously
+//! to model process interleaving.
+//!
+//! Promoted constructs: `inline` definitions are parsed (but expansion is not
+//! yet supported), `trace`/`notrace` assertions are recognized, and LTL
+//! properties are converted to mununu's LTL representation.
 
 pub mod ast;
 pub mod cfg;

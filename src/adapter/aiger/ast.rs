@@ -21,6 +21,8 @@ pub struct Circuit {
     pub constraints: Vec<Literal>,
     /// Justice properties (liveness: sets of literals that must be true infinitely often).
     pub justice_sets: Vec<Vec<Literal>>,
+    /// Fairness constraints (single literals that must be true infinitely often).
+    pub fairness: Vec<Literal>,
     /// Symbol table: maps literals to names.
     pub symbols: SymbolTable,
 }
