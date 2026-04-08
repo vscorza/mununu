@@ -42,6 +42,7 @@ predicates = "3.1"
 default = ["cli"]
 cli = ["dep:clap", "dep:tracing", "dep:tracing-subscriber"]
 api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+syntcomp = []  # enables SYNTCOMP benchmark tests (requires mununu-private sibling repo)
 
 [[bin]]
 name = "mununu"

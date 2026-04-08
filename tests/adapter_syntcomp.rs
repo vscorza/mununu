@@ -3,6 +3,9 @@
 //! Tests each lilydemo TLSF file through the full adapter pipeline:
 //! TLSF → parse → IR → emit CTXDSL → parse CTXDSL → realize → eval → synth.
 //!
+//! Requires the `syntcomp` feature and access to the mununu-private repo.
+//! Run with: `cargo test --features syntcomp --test adapter_syntcomp`
+#![cfg(feature = "syntcomp")]
 //! Verifies:
 //! 1. Syntactic soundness: generated CTXDSL parses and realizes
 //! 2. State count matches expected (2^(inputs+outputs+1) with turn bit)
