@@ -1,4 +1,7 @@
 //! Debug test: writes adapter output CTXDSL to /tmp for CLI comparison.
+//!
+//! Requires the `syntcomp` feature and access to the mununu-private repo.
+#![cfg(feature = "syntcomp")]
 
 use mununu::adapter::tlsf::TlsfAdapter;
 use mununu::adapter::{AdapterOptions, FormatAdapter};
