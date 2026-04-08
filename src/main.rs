@@ -112,6 +112,9 @@ struct ContextEvalArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
+    /// Translate from an external format before processing (tlsf, aiger, promela, auto).
+    #[arg(long = "adapter", value_name = "FORMAT")]
+    adapter: Option<String>,
     /// μ-calculus formula to evaluate.
     #[arg(long = "formula", value_name = "NAME")]
     formula: String,
@@ -134,6 +137,9 @@ struct ContextSynthesizeArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
+    /// Translate from an external format before processing (tlsf, aiger, promela, auto).
+    #[arg(long = "adapter", value_name = "FORMAT")]
+    adapter: Option<String>,
     /// μ-calculus formula to synthesise.
     #[arg(long = "formula", value_name = "NAME")]
     formula: String,
@@ -360,11 +366,101 @@ fn parse_context_file(path: &Path) -> Result<ContextDoc, String> {
     parse_context_doc(&source).map_err(|err| format!("failed to parse '{}': {err}", path.display()))
 }
 
+/// Read a source file, optionally translating it from an external format first.
+fn load_with_adapter(path: &Path, adapter: Option<&str>) -> Result<ContextDoc, String> {
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
+
+    let ctxdsl_source = match adapter {
+        Some("tlsf") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::tlsf::TlsfAdapter::translate(&source, &options)
+                .map_err(|e| format!("TLSF adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated TLSF: {} signals, {} states, {} properties",
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("aiger") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::aiger::AigerAdapter::translate(&source, &options)
+                .map_err(|e| format!("AIGER adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated AIGER: {} signals, {} states, {} properties",
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("promela") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::promela::PromelaAdapter::translate(&source, &options)
+                .map_err(|e| format!("Promela adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated Promela: {} signals, {} states, {} properties",
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("auto") => {
+            let options = mununu::adapter::AdapterOptions::default();
+            let output = mununu::adapter::auto_translate(&source, &options)
+                .map_err(|e| format!("adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated {}: {} signals, {} states, {} properties",
+                output.source_info.format,
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some(fmt) => {
+            return Err(format!(
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, auto"
+            ));
+        }
+        None => {
+            // Auto-detect by file extension if no adapter specified
+            if let Some(fmt) = mununu::adapter::detect_format_by_extension(path) {
+                eprintln!("Auto-detected format '{}' from extension", fmt);
+                return load_with_adapter(path, Some(fmt));
+            }
+            source
+        }
+    };
+
+    parse_context_doc(&ctxdsl_source)
+        .map_err(|err| format!("failed to parse '{}': {err}", path.display()))
+}
+
 fn load_context_documents(
     context_path: &Path,
     sidecar_paths: &[PathBuf],
+    adapter: Option<&str>,
 ) -> Result<(ContextDoc, Vec<ContextDoc>), String> {
-    let context_doc = parse_context_file(context_path)?;
+    let context_doc = load_with_adapter(context_path, adapter)?;
     let mut sidecar_docs = Vec::with_capacity(sidecar_paths.len());
     for path in sidecar_paths {
         sidecar_docs.push(parse_context_file(path)?);
@@ -465,7 +561,7 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
 
     let context_path = args.files[0].clone();
     let sidecar_paths: Vec<PathBuf> = args.files.iter().skip(1).cloned().collect();
-    let (context_doc, sidecar_docs) = load_context_documents(&context_path, &sidecar_paths)?;
+    let (context_doc, sidecar_docs) = load_context_documents(&context_path, &sidecar_paths, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let summary = build_context_summary(&context_doc, &sidecar_docs, &realized);
 
@@ -533,7 +629,7 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
 }
 
 fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars)?;
+    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let summary = build_context_summary(&context_doc, &sidecar_docs, &realized);
     let json = serde_json::to_string_pretty(&summary)
@@ -549,7 +645,7 @@ fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
 }
 
 fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars)?;
+    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let mut automata: Vec<String> = realized.predicates.keys().cloned().collect();
     automata.sort();
@@ -608,7 +704,8 @@ fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
 }
 
 fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars)?;
+    let (context_doc, sidecar_docs) =
+        load_context_documents(&args.context, &args.sidecars, args.adapter.as_deref())?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let formula = realized
         .formulas
@@ -708,7 +805,8 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 }
 
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars)?;
+    let (context_doc, sidecar_docs) =
+        load_context_documents(&args.context, &args.sidecars, args.adapter.as_deref())?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let realized_formula = realized
         .formulas
@@ -908,7 +1006,7 @@ fn render_controller_diagnostics(diagnostics: &ControllerDiagnostics) {
 }
 
 fn context_graph(args: ContextGraphArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars)?;
+    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
 
     // Collect all automata to visualize

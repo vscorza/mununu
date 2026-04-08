@@ -142,7 +142,22 @@ impl fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// Detect the source format from a file extension.
+///
+/// Returns the adapter name ("tlsf", "aiger", "promela") or `None` if
+/// the extension is not recognized.
+pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("tlsf") => Some("tlsf"),
+        Some("aag") | Some("aig") => Some("aiger"),
+        Some("pml") | Some("promela") => Some("promela"),
+        _ => None,
+    }
+}
+
 /// Auto-detect the format of the given content and translate it.
+///
+/// Tries content-based detection in order: TLSF, AIGER, Promela.
 pub fn auto_translate(
     content: &str,
     options: &AdapterOptions,
@@ -159,7 +174,7 @@ pub fn auto_translate(
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF, AIGER, Promela".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml)".into(),
         location: None,
     })
 }
