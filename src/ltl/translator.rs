@@ -103,7 +103,7 @@ impl Translator {
 
             // Derived patterns
             LtlFormula::Recurrence(inner) => {
-                // GF φ = G F φ = ν Y. (μ X. (φ ∨ [] X) ∧ [] Y)
+                // GF φ = G F φ = ν Y. (μ X. (φ ∨ <> X) ∧ [] Y)
                 let eventually_id = self.translate_eventually(inner)?;
                 let var_id = self.new_fixpoint_var("Y");
                 let var_node = self.builder.push_node(Node::Variable(var_id));
@@ -116,12 +116,12 @@ impl Translator {
             }
 
             LtlFormula::Stabilization(inner) => {
-                // FG φ = F G φ = μ Y. (ν X. (φ ∧ [] X) ∨ [] Y)
+                // FG φ = F G φ = μ Y. (ν X. (φ ∧ [] X) ∨ <> Y)
                 let always_id = self.translate_always(inner)?;
                 let var_id = self.new_fixpoint_var("Y");
                 let var_node = self.builder.push_node(Node::Variable(var_id));
-                let box_var = self.box_modal(var_node);
-                let or_node = self.builder.push_node(Node::Or(always_id, box_var));
+                let dia_var = self.diamond_modal(var_node);
+                let or_node = self.builder.push_node(Node::Or(always_id, dia_var));
                 Ok(self.builder.push_node(Node::Mu {
                     var: var_id,
                     body: or_node,
@@ -129,7 +129,7 @@ impl Translator {
             }
 
             LtlFormula::Response { trigger, response } => {
-                // G(φ -> F(ψ)) = ν X. ((!φ ∨ μ Y. (ψ ∨ [] Y)) ∧ [] X)
+                // G(φ -> F(ψ)) = ν X. ((!φ ∨ μ Y. (ψ ∨ <> Y)) ∧ [] X)
                 let trigger_id = self.translate_formula(trigger)?;
                 let response_id = self.translate_formula(response)?;
                 let not_trigger = self.builder.push_node(Node::Not(trigger_id));
@@ -164,6 +164,14 @@ impl Translator {
         })
     }
 
+    fn diamond_modal(&mut self, target: NodeId) -> NodeId {
+        self.builder.push_node(Node::Modal {
+            kind: ModalKind::Diamond,
+            guard: Guard::default(),
+            target,
+        })
+    }
+
     fn translate_always(&mut self, inner: &LtlFormula) -> Result<NodeId, TranslationError> {
         // G φ = ν X. (φ ∧ [] X)
         let inner_id = self.translate_formula(inner)?;
@@ -187,11 +195,13 @@ impl Translator {
         &mut self,
         inner_id: NodeId,
     ) -> Result<NodeId, TranslationError> {
-        // F φ = μ X. (φ ∨ [] X)
+        // F φ = μ X. (φ ∨ <> X)
+        // Uses diamond (existential successor) — under the Skolem paradigm,
+        // "eventually" means the controller can find a path to φ.
         let var_id = self.new_fixpoint_var("X");
         let var_node = self.builder.push_node(Node::Variable(var_id));
-        let box_var = self.box_modal(var_node);
-        let or_node = self.builder.push_node(Node::Or(inner_id, box_var));
+        let dia_var = self.diamond_modal(var_node);
+        let or_node = self.builder.push_node(Node::Or(inner_id, dia_var));
         Ok(self.builder.push_node(Node::Mu {
             var: var_id,
             body: or_node,
@@ -214,11 +224,13 @@ impl Translator {
         left_id: NodeId,
         right_id: NodeId,
     ) -> Result<NodeId, TranslationError> {
-        // φ U ψ = μ X. (ψ ∨ (φ ∧ [] X))
+        // φ U ψ = μ X. (ψ ∨ (φ ∧ <> X))
+        // Uses diamond (existential successor) — the controller must find a
+        // path where ψ eventually holds while φ holds along the way.
         let var_id = self.new_fixpoint_var("X");
         let var_node = self.builder.push_node(Node::Variable(var_id));
-        let box_var = self.box_modal(var_node);
-        let and_left = self.builder.push_node(Node::And(left_id, box_var));
+        let dia_var = self.diamond_modal(var_node);
+        let and_left = self.builder.push_node(Node::And(left_id, dia_var));
         let or_node = self.builder.push_node(Node::Or(right_id, and_left));
         Ok(self.builder.push_node(Node::Mu {
             var: var_id,
@@ -370,8 +382,8 @@ mod tests {
     #[test]
     fn test_translate_eventually() {
         let translated = translate_ltl("F completed");
-        // F φ = μ X. (φ ∨ [] X)
-        let expected = parse_mu_str("mu X. (completed || [] X)");
+        // F φ = μ X. (φ ∨ <> X)
+        let expected = parse_mu_str("mu X. (completed || <> X)");
         match (
             translated.node(translated.root()),
             expected.node(expected.root()),
@@ -384,8 +396,8 @@ mod tests {
     #[test]
     fn test_translate_until() {
         let translated = translate_ltl("request U grant");
-        // φ U ψ = μ X. (ψ ∨ (φ ∧ [] X))
-        let expected = parse_mu_str("mu X. (grant || (request && [] X))");
+        // φ U ψ = μ X. (ψ ∨ (φ ∧ <> X))
+        let expected = parse_mu_str("mu X. (grant || (request && <> X))");
         match (
             translated.node(translated.root()),
             expected.node(expected.root()),

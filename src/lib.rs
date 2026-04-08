@@ -4,6 +4,7 @@
 //! modeled as Compositional Labeled Transition Systems (CLTS).
 
 pub mod abstraction;
+pub mod adapter;
 pub mod clts;
 pub mod composition;
 pub mod context;
