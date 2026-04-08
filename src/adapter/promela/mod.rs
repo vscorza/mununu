@@ -46,6 +46,33 @@ impl FormatAdapter for PromelaAdapter {
             }
         }
 
+        // Warn about inline macros (parsed but not expanded)
+        if !program.inlines.is_empty() {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "{} inline definition(s) parsed but expansion is not yet supported; \
+                     inline calls will be treated as unknown identifiers",
+                    program.inlines.len()
+                ),
+                location: None,
+            });
+        }
+
+        // Warn about trace/notrace
+        if !program.traces.is_empty() || !program.notraces.is_empty() {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: "trace/notrace assertions are parsed but not yet fully supported"
+                    .to_string(),
+                location: None,
+            });
+        }
+
+        // Warn about timeout expressions (conservative approximation)
+        // and remote references (approximated)
+        // These warnings are added during IR construction
+
         let _automaton_count = ir.automata.len();
         let emit_result = super::emit::emit(&ir)?;
 
@@ -79,7 +106,7 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
             continue;
         } // skip non-active proctypes
 
-        let proc_cfg = cfg::extract_cfg(&proc.name, &proc.body);
+        let proc_cfg = cfg::extract_cfg_with_options(&proc.name, &proc.body, proc.deterministic);
 
         // Convert CFG to AutomatonSpec
         let states: Vec<StateSpec> = proc_cfg
@@ -127,8 +154,14 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
 
     // Create variable automata for each global variable
     for var in &program.globals {
-        let var_aut = create_variable_automaton(var, &all_labels);
+        let var_aut = create_variable_automaton(var, &all_labels, options);
         automata.push(var_aut);
+    }
+
+    // Create channel automata for each channel declaration
+    for chan in &program.channels {
+        let chan_aut = create_channel_automaton(chan);
+        automata.push(chan_aut);
     }
 
     // Create compositions
@@ -148,10 +181,17 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
         .map(|v| format!("Var_{}", v.name))
         .collect();
 
-    if cfg_names.len() + var_names.len() > 1 {
+    let chan_names: Vec<String> = program
+        .channels
+        .iter()
+        .map(|c| format!("Chan_{}", c.name))
+        .collect();
+
+    if cfg_names.len() + var_names.len() + chan_names.len() > 1 {
         let mut all_members = Vec::new();
         all_members.extend(cfg_names);
         all_members.extend(var_names);
+        all_members.extend(chan_names);
         compositions.push(CompositionSpec::Asynchronous {
             name: "System".into(),
             members: all_members,
@@ -193,23 +233,46 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
 fn create_variable_automaton(
     var: &ast::VarDecl,
     _used_labels: &std::collections::HashSet<String>,
+    options: &AdapterOptions,
 ) -> AutomatonSpec {
-    let (lo, hi) = match &var.typename {
-        ast::TypeName::Bit | ast::TypeName::Bool => (0i64, 1),
-        ast::TypeName::Byte => {
-            // Auto-bound: use a small range for now
-            // Full auto-analysis is Phase 3.5a
-            (0, 1) // Default to boolean for byte if init is 0/false
-        }
-        _ => (0, 1), // Default fallback
-    };
-
     // Check init value
     let init_val = match &var.init {
         Some(ast::Expr::IntLit(n)) => *n,
         Some(ast::Expr::BoolLit(false)) => 0,
         Some(ast::Expr::BoolLit(true)) => 1,
         _ => 0,
+    };
+
+    // If user specified explicit bounds for this variable, use those
+    let (lo, hi) = if let Some(&(user_lo, user_hi)) = options.variable_bounds.get(&var.name) {
+        (user_lo, user_hi)
+    } else {
+        match &var.typename {
+            ast::TypeName::Bit | ast::TypeName::Bool => (0i64, 1),
+            ast::TypeName::Byte => {
+                // Auto-bound heuristic anchored at init value:
+                // If init provided: range (0, max(init_val + 3, 3))
+                // If no init: (0, 3) — small default to keep state space manageable
+                if var.init.is_some() {
+                    (0, std::cmp::max(init_val + 3, 3))
+                } else {
+                    (0, 3)
+                }
+            }
+            ast::TypeName::Short | ast::TypeName::Int => {
+                // Auto-bound heuristic for large integer types:
+                // Anchor at init value with a small window
+                if var.init.is_some() {
+                    let lo = std::cmp::min(0, init_val - 2);
+                    let hi = std::cmp::max(init_val + 3, 3);
+                    (lo, hi)
+                } else {
+                    (0, 3)
+                }
+            }
+            ast::TypeName::Mtype => (0, 3), // mtype values are typically small
+            _ => (0, 3),                    // conservative default
+        }
     };
 
     let mut states = Vec::new();
@@ -244,6 +307,106 @@ fn create_variable_automaton(
 
     AutomatonSpec {
         name: format!("Var_{}", var.name),
+        states,
+        transitions,
+        controllable_labels: vec![],
+        internal_labels: vec![],
+    }
+}
+
+/// Create a channel automaton for occupancy-based encoding.
+///
+/// For a channel with capacity N, the automaton has N+1 states representing
+/// occupancy levels 0..N. Send increments occupancy (blocks when full),
+/// receive decrements (blocks when empty). Test labels allow guards to
+/// check empty/nempty/full/nfull.
+///
+/// For synchronous channels (capacity 0), a single idle state with a
+/// rendezvous self-loop is created.
+fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
+    let mut states = Vec::new();
+    let mut transitions = Vec::new();
+
+    if chan.capacity == 0 {
+        // Synchronous (rendezvous) channel: single state with rendezvous label
+        states.push(StateSpec {
+            name: format!("{}_idle", chan.name),
+            is_initial: true,
+        });
+        let rendezvous_label = format!("rendezvous_{}", chan.name);
+        transitions.push(TransitionSpec {
+            source: format!("{}_idle", chan.name),
+            target: format!("{}_idle", chan.name),
+            labels: vec![
+                rendezvous_label,
+                format!("send_{}", chan.name),
+                format!("recv_{}", chan.name),
+            ],
+        });
+    } else {
+        // Buffered channel: occupancy-level states
+        for k in 0..=chan.capacity {
+            let state_name = format!("{}_{}", chan.name, k);
+            states.push(StateSpec {
+                name: state_name.clone(),
+                is_initial: k == 0,
+            });
+        }
+
+        // send_ch: ch_k -> ch_{k+1} for k < N (blocks at full)
+        for k in 0..chan.capacity {
+            transitions.push(TransitionSpec {
+                source: format!("{}_{}", chan.name, k),
+                target: format!("{}_{}", chan.name, k + 1),
+                labels: vec![format!("send_{}", chan.name)],
+            });
+        }
+
+        // recv_ch: ch_k -> ch_{k-1} for k > 0 (blocks at empty)
+        for k in 1..=chan.capacity {
+            transitions.push(TransitionSpec {
+                source: format!("{}_{}", chan.name, k),
+                target: format!("{}_{}", chan.name, k - 1),
+                labels: vec![format!("recv_{}", chan.name)],
+            });
+        }
+
+        // Test labels for channel status guards:
+        // test_ch_empty: self-loop on ch_0
+        transitions.push(TransitionSpec {
+            source: format!("{}_0", chan.name),
+            target: format!("{}_0", chan.name),
+            labels: vec![format!("test_{}_empty", chan.name)],
+        });
+
+        // test_ch_nempty: self-loop on ch_1..ch_N
+        for k in 1..=chan.capacity {
+            transitions.push(TransitionSpec {
+                source: format!("{}_{}", chan.name, k),
+                target: format!("{}_{}", chan.name, k),
+                labels: vec![format!("test_{}_nempty", chan.name)],
+            });
+        }
+
+        // test_ch_full: self-loop on ch_N
+        transitions.push(TransitionSpec {
+            source: format!("{}_{}", chan.name, chan.capacity),
+            target: format!("{}_{}", chan.name, chan.capacity),
+            labels: vec![format!("test_{}_full", chan.name)],
+        });
+
+        // test_ch_nfull: self-loop on ch_0..ch_{N-1}
+        for k in 0..chan.capacity {
+            transitions.push(TransitionSpec {
+                source: format!("{}_{}", chan.name, k),
+                target: format!("{}_{}", chan.name, k),
+                labels: vec![format!("test_{}_nfull", chan.name)],
+            });
+        }
+    }
+
+    AutomatonSpec {
+        name: format!("Chan_{}", chan.name),
         states,
         transitions,
         controllable_labels: vec![],

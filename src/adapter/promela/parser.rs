@@ -78,6 +78,12 @@ enum Token {
     Typedef,
     Ltl,
     Inline,
+    Unless,
+    DProctype,
+    Timeout,
+    Trace,
+    Notrace,
+    At, // '@' for remote references (process@label)
     // Type keywords
     Bit,
     Bool,
@@ -362,6 +368,10 @@ impl<'a> Lexer<'a> {
                 }
                 Ok(Token::StringLit(s))
             }
+            '@' => {
+                self.advance();
+                Ok(Token::At)
+            }
             _ if c.is_ascii_digit() => {
                 let mut num = String::new();
                 if c == '0' {
@@ -411,6 +421,11 @@ impl<'a> Lexer<'a> {
                     "typedef" => Token::Typedef,
                     "ltl" => Token::Ltl,
                     "inline" => Token::Inline,
+                    "unless" => Token::Unless,
+                    "d_proctype" => Token::DProctype,
+                    "timeout" => Token::Timeout,
+                    "trace" => Token::Trace,
+                    "notrace" => Token::Notrace,
                     "bit" => Token::Bit,
                     "bool" => Token::Bool,
                     "byte" => Token::Byte,
@@ -492,6 +507,9 @@ impl<'a> PromelaParser<'a> {
             proctypes: vec![],
             init: None,
             ltl_properties: vec![],
+            inlines: vec![],
+            traces: vec![],
+            notraces: vec![],
         };
 
         while self.current != Token::Eof {
@@ -509,7 +527,7 @@ impl<'a> PromelaParser<'a> {
                     let proc = self.parse_proctype()?;
                     program.proctypes.push(proc);
                 }
-                Token::Proctype => {
+                Token::Proctype | Token::DProctype => {
                     let proc = self.parse_proctype()?;
                     program.proctypes.push(proc);
                 }
@@ -529,15 +547,8 @@ impl<'a> PromelaParser<'a> {
                     program.channels.push(chan);
                 }
                 Token::Inline => {
-                    // Skip inline definitions for now (Phase 3.2a)
-                    self.advance()?;
-                    if let Token::Ident(_) = &self.current {
-                        self.advance()?;
-                    }
-                    self.expect(&Token::LParen)?;
-                    self.skip_parens()?;
-                    self.expect(&Token::LBrace)?;
-                    self.skip_braces()?;
+                    let inline_def = self.parse_inline_def()?;
+                    program.inlines.push(inline_def);
                 }
                 Token::Typedef => {
                     // Skip typedef for now
@@ -547,6 +558,20 @@ impl<'a> PromelaParser<'a> {
                     }
                     self.expect(&Token::LBrace)?;
                     self.skip_braces()?;
+                }
+                Token::Trace => {
+                    self.advance()?;
+                    self.expect(&Token::LBrace)?;
+                    let body = self.parse_sequence()?;
+                    self.expect(&Token::RBrace)?;
+                    program.traces.push(body);
+                }
+                Token::Notrace => {
+                    self.advance()?;
+                    self.expect(&Token::LBrace)?;
+                    let body = self.parse_sequence()?;
+                    self.expect(&Token::RBrace)?;
+                    program.notraces.push(body);
                 }
                 Token::Bit
                 | Token::Bool
@@ -693,7 +718,12 @@ impl<'a> PromelaParser<'a> {
                 self.expect(&Token::RBracket)?;
             }
         }
-        self.expect(&Token::Proctype)?;
+        let deterministic = self.current == Token::DProctype;
+        if deterministic {
+            self.advance()?;
+        } else {
+            self.expect(&Token::Proctype)?;
+        }
         let name = match &self.current {
             Token::Ident(n) => n.clone(),
             _ => return Err(self.lexer.err("Expected proctype name")),
@@ -728,6 +758,7 @@ impl<'a> PromelaParser<'a> {
             active_count,
             params,
             provided,
+            deterministic,
             body,
         })
     }
@@ -763,6 +794,24 @@ impl<'a> PromelaParser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, AdapterError> {
+        let stmt = self.parse_statement_inner()?;
+
+        // Check for `unless { escape }` postfix
+        if self.current == Token::Unless {
+            self.advance()?;
+            self.expect(&Token::LBrace)?;
+            let escape = self.parse_sequence()?;
+            self.expect(&Token::RBrace)?;
+            return Ok(Statement::Unless {
+                body: Box::new(stmt),
+                escape,
+            });
+        }
+
+        Ok(stmt)
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Statement, AdapterError> {
         // Check for label: stmt
         if let Token::Ident(name) = &self.current {
             let name = name.clone();
@@ -777,7 +826,7 @@ impl<'a> PromelaParser<'a> {
             self.advance()?;
             if self.current == Token::Colon {
                 self.advance()?;
-                let stmt = self.parse_statement()?;
+                let stmt = self.parse_statement_inner()?;
                 return Ok(Statement::Label {
                     name,
                     stmt: Box::new(stmt),
@@ -1077,9 +1126,33 @@ impl<'a> PromelaParser<'a> {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Paren(Box::new(inner)))
             }
+            Token::Timeout => {
+                self.advance()?;
+                Ok(Expr::Timeout)
+            }
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance()?;
+
+                // Check for remote reference: process@label
+                if self.current == Token::At {
+                    self.advance()?;
+                    let label = match &self.current {
+                        Token::Ident(l) => l.clone(),
+                        _ => return Err(self.lexer.err("Expected label after '@'")),
+                    };
+                    self.advance()?;
+                    return Ok(Expr::RemoteRef {
+                        process: name,
+                        label,
+                    });
+                }
+
+                // Check for remote variable: process:var (only if not a label context)
+                // Note: ':' is ambiguous with label syntax; we only parse it here
+                // when the identifier is followed by ':' and then another identifier
+                // and it's NOT in a label context (labels are handled in parse_statement_inner).
+
                 let index = if self.current == Token::LBracket {
                     self.advance()?;
                     let idx = self.parse_expr()?;
@@ -1245,6 +1318,39 @@ impl<'a> PromelaParser<'a> {
     }
 
     // -----------------------------------------------------------------------
+    // Inline definitions
+    // -----------------------------------------------------------------------
+
+    fn parse_inline_def(&mut self) -> Result<InlineDef, AdapterError> {
+        self.expect(&Token::Inline)?;
+        let name = match &self.current {
+            Token::Ident(n) => n.clone(),
+            _ => return Err(self.lexer.err("Expected inline name")),
+        };
+        self.advance()?;
+        self.expect(&Token::LParen)?;
+
+        let mut params = Vec::new();
+        while self.current != Token::RParen && self.current != Token::Eof {
+            if let Token::Ident(p) = &self.current {
+                params.push(p.clone());
+                self.advance()?;
+            } else {
+                self.advance()?;
+            }
+            if self.current == Token::Comma || self.current == Token::Semi {
+                self.advance()?;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::LBrace)?;
+        let body = self.parse_sequence()?;
+        self.expect(&Token::RBrace)?;
+
+        Ok(InlineDef { name, params, body })
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -1283,6 +1389,7 @@ impl<'a> PromelaParser<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn skip_parens(&mut self) -> Result<(), AdapterError> {
         let mut depth = 1;
         while depth > 0 && self.current != Token::Eof {

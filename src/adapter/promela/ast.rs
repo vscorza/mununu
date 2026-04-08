@@ -19,6 +19,12 @@ pub struct Program {
     pub init: Option<Sequence>,
     /// LTL property declarations.
     pub ltl_properties: Vec<LtlProperty>,
+    /// Inline macro definitions (parsed but expansion is partial).
+    pub inlines: Vec<InlineDef>,
+    /// Trace assertions (parsed but not yet fully supported).
+    pub traces: Vec<Sequence>,
+    /// Notrace assertions (parsed but not yet fully supported).
+    pub notraces: Vec<Sequence>,
 }
 
 /// mtype { name1, name2, ... }
@@ -54,7 +60,17 @@ pub struct Proctype {
     pub params: Vec<VarDecl>,
     /// Provided clause (schedulability guard).
     pub provided: Option<Expr>,
+    /// Whether this is a `d_proctype` (deterministic process).
+    pub deterministic: bool,
     /// Process body.
+    pub body: Sequence,
+}
+
+/// Inline macro definition: `inline name(params) { body }`.
+#[derive(Debug, Clone)]
+pub struct InlineDef {
+    pub name: String,
+    pub params: Vec<String>,
     pub body: Sequence,
 }
 
@@ -108,6 +124,11 @@ pub enum Statement {
     ExprStmt { expr: Expr },
     /// printf("...", args) — ignored but parsed.
     Printf { format: String, args: Vec<Expr> },
+    /// stmt unless { escape } — preemption construct.
+    Unless {
+        body: Box<Statement>,
+        escape: Sequence,
+    },
 }
 
 /// Receive argument.
@@ -194,6 +215,15 @@ pub enum Expr {
     MtypeName(String),
     /// Parenthesized expression.
     Paren(Box<Expr>),
+    /// `timeout` — fires when no other transition is enabled.
+    /// Conservative approximation: treated as always-enabled guard.
+    Timeout,
+    /// Remote reference: `process@label` — tests if process is at label.
+    /// Approximated: emits a test label for synchronization.
+    RemoteRef { process: String, label: String },
+    /// Remote variable: `process:var` — reads a variable from another process.
+    /// Approximated: emits a test label for synchronization.
+    RemoteVar { process: String, var: String },
 }
 
 /// Binary operators.
