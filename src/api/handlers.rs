@@ -277,12 +277,84 @@ pub async fn context_synthesize_handler(
     // Convert diagnostics
     let diagnostics = convert_diagnostics(&synthesis.diagnostics);
 
+    // Emit controller in native format if requested
+    let controller_native = if synthesis.realizable {
+        match request.options.output_format.as_deref() {
+            Some("xstate") => {
+                use crate::adapter::xstate::emit_controller::controller_to_xstate_json;
+                let json =
+                    controller_to_xstate_json(&synthesis.controller, &request.automaton, true);
+                Some(FileContent {
+                    name: format!("{}_controller.json", request.automaton),
+                    content: json,
+                })
+            }
+            Some("systemverilog") | Some("sv") => {
+                use crate::adapter::systemverilog::emit_controller::controller_to_systemverilog;
+                let sv =
+                    controller_to_systemverilog(&synthesis.controller, &request.automaton, true);
+                Some(FileContent {
+                    name: format!("{}_controller.sv", request.automaton),
+                    content: sv,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     Ok(Json(ContextSynthesizeResponse {
         success: true,
         realizable: synthesis.realizable,
         controller: controller_content,
+        controller_native,
         diagnostics,
         counterstrategy,
+    }))
+}
+
+/// Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela) into CTXDSL.
+pub async fn context_import_handler(
+    Json(request): Json<ContextImportRequest>,
+) -> ApiResult<Json<ContextImportResponse>> {
+    use crate::adapter::{AdapterOptions, FormatAdapter};
+
+    let options = AdapterOptions::default();
+
+    let result = match request.format.as_str() {
+        "tlsf" => crate::adapter::tlsf::TlsfAdapter::translate(&request.content, &options),
+        "aiger" => crate::adapter::aiger::AigerAdapter::translate(&request.content, &options),
+        "promela" => crate::adapter::promela::PromelaAdapter::translate(&request.content, &options),
+        "xstate" => crate::adapter::xstate::XStateAdapter::translate(&request.content, &options),
+        "systemverilog" | "sv" => crate::adapter::systemverilog::SystemVerilogAdapter::translate(
+            &request.content,
+            &options,
+        ),
+        "auto" | "" => crate::adapter::auto_translate(&request.content, &options),
+        other => {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, promela, xstate, systemverilog"
+                ),
+                details: None,
+            });
+        }
+    };
+
+    let output = result.map_err(|e| ApiError::BadRequest {
+        message: format!("Adapter translation failed: {e}"),
+        details: None,
+    })?;
+
+    Ok(Json(ContextImportResponse {
+        success: true,
+        ctxdsl: output.ctxdsl,
+        source_format: output.source_info.format.to_string(),
+        warnings: output.warnings.iter().map(|w| w.message.clone()).collect(),
+        signal_count: output.source_info.signal_count,
+        state_count: output.source_info.state_count,
+        property_count: output.source_info.property_count,
     }))
 }
 

@@ -107,6 +107,8 @@ pub struct SynthesisOptions {
     /// Extract a positional strategy (one controllable transition per state).
     #[serde(default)]
     pub extract_strategy: bool,
+    /// Output format for the controller: "ctxdsl" (default), "xstate", "systemverilog".
+    pub output_format: Option<String>,
 }
 
 /// Diagnostics options
@@ -127,6 +129,9 @@ pub struct ContextSynthesizeResponse {
     pub success: bool,
     pub realizable: bool,
     pub controller: Option<FileContent>,
+    /// Controller in the requested native format (xstate, systemverilog).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_native: Option<FileContent>,
     pub diagnostics: SynthesisDiagnostics,
     /// Counterstrategy graph for unrealizable cases (environment's winning strategy).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +187,43 @@ pub struct MinimizationReport {
 pub struct ProofObligation {
     pub state: String,
     pub detail: Option<String>,
+}
+
+// ============================================================================
+// Context Import Endpoint
+// ============================================================================
+
+/// Request for importing an external format into CTXDSL.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ContextImportRequest {
+    /// Raw file content in the source format.
+    pub content: String,
+    /// Source format hint: "auto", "tlsf", "aiger", "promela", "xstate", "systemverilog".
+    #[serde(default = "default_import_format")]
+    pub format: String,
+    /// Original filename (used for extension-based detection if format is "auto").
+    pub filename: Option<String>,
+}
+
+fn default_import_format() -> String {
+    "auto".to_string()
+}
+
+/// Response from importing an external format.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ContextImportResponse {
+    pub success: bool,
+    /// Translated CTXDSL content.
+    pub ctxdsl: String,
+    /// Detected source format.
+    pub source_format: String,
+    /// Translation warnings.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Metadata about the translated source.
+    pub signal_count: usize,
+    pub state_count: usize,
+    pub property_count: usize,
 }
 
 // ============================================================================

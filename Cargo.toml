@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "controller"
 harness = false
+
+[[bench]]
+name = "xstate"
+harness = false

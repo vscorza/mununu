@@ -179,6 +179,12 @@ struct ContextSynthesizeArgs {
     /// Print the internal structure of the context to stdout or a file.
     #[arg(long = "print-structure", value_name = "FILE")]
     print_structure: Option<Option<PathBuf>>,
+    /// Output format for the synthesized controller: ctxdsl (default), xstate, systemverilog.
+    #[arg(long = "output-format", value_name = "FORMAT")]
+    output_format: Option<String>,
+    /// Path where the native-format controller should be written (requires --output-format).
+    #[arg(long = "emit-native", value_name = "FILE")]
+    emit_native: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -420,6 +426,39 @@ fn load_with_adapter(path: &Path, adapter: Option<&str>) -> Result<ContextDoc, S
             );
             output.ctxdsl
         }
+        Some("systemverilog") | Some("sv") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output =
+                mununu::adapter::systemverilog::SystemVerilogAdapter::translate(&source, &options)
+                    .map_err(|e| format!("SystemVerilog adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated SystemVerilog: {} signals, {} states, {} properties",
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("xstate") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::xstate::XStateAdapter::translate(&source, &options)
+                .map_err(|e| format!("XState adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated XState: {} events, {} states, {} properties",
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
         Some("auto") => {
             let options = mununu::adapter::AdapterOptions::default();
             let output = mununu::adapter::auto_translate(&source, &options)
@@ -438,7 +477,7 @@ fn load_with_adapter(path: &Path, adapter: Option<&str>) -> Result<ContextDoc, S
         }
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, auto"
             ));
         }
         None => {
@@ -924,6 +963,42 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
             .write_sidecar_dsl(path)
             .map_err(|err| format!("failed to write diagnostics sidecar: {err}"))?;
         println!("  Diagnostics sidecar written to {}", path.display());
+    }
+
+    // Emit controller in native format if requested
+    if let Some(format) = args.output_format.as_deref() {
+        if synthesis.realizable {
+            let native_content = match format {
+                "xstate" => {
+                    use mununu::adapter::xstate::emit_controller::controller_to_xstate_json;
+                    controller_to_xstate_json(controller, &args.automaton, true)
+                }
+                "systemverilog" | "sv" => {
+                    use mununu::adapter::systemverilog::emit_controller::controller_to_systemverilog;
+                    controller_to_systemverilog(controller, &args.automaton, true)
+                }
+                "ctxdsl" => String::new(), // already handled by --emit-dsl
+                other => {
+                    return Err(format!(
+                        "unknown output format '{other}'. Supported: ctxdsl, xstate, systemverilog"
+                    ));
+                }
+            };
+
+            if !native_content.is_empty() {
+                if let Some(path) = args.emit_native.as_ref() {
+                    ensure_parent_dir(path)
+                        .map_err(|err| format!("failed to prepare native output path: {err}"))?;
+                    std::fs::write(path, &native_content)
+                        .map_err(|err| format!("failed to write native controller: {err}"))?;
+                    println!("  Controller ({format}) written to {}", path.display());
+                } else {
+                    println!("\n--- Controller ({format}) ---\n{native_content}");
+                }
+            }
+        } else {
+            eprintln!("  Note: --output-format ignored (specification is unrealizable)");
+        }
     }
 
     // Print structure if requested
