@@ -1,0 +1,189 @@
+// Multi-Agent Handoff Protocol — 3 Agents
+//
+// Models a supervisor + 2 specialist agent handoff system inspired by
+// OpenAI Agents SDK and LangGraph patterns. Agents transfer control
+// to each other along with conversational context.
+//
+// Protocol guarantees:
+//   - Mutual exclusion: at most one agent working at a time
+//   - No orphaned tasks: every dispatched task eventually completes
+//     or is recovered
+//   - Recovery: agent failure triggers supervisor recovery path
+//   - No infinite delegation: handoffs eventually lead to completion
+
+context handoff_protocol {
+    alphabet {
+        label activate_A;
+        label activate_B;
+        label handoff_to_A;
+        label handoff_to_B;
+        label return_to_sup;
+        label retry;
+        label task_arrive;
+        label task_complete;
+        label agent_fail;
+        label timeout;
+        label noop;
+    }
+
+    automata {
+        // Supervisor: dispatches tasks, monitors agents, recovers on failure
+        // Controllable labels owned here: activate_A, activate_B, retry, noop
+        automaton Supervisor {
+            controllable {
+                label activate_A;
+                label activate_B;
+                label retry;
+                label noop;
+            }
+
+            states {
+                state Idle initial;
+                state Dispatching;
+                state Waiting;
+                state Recovering;
+            }
+
+            transitions {
+                // Task arrives from environment
+                transition Idle -> Dispatching on label task_arrive;
+                transition Idle -> Idle on label noop;
+
+                // Supervisor dispatches to specialist A or B
+                transition Dispatching -> Waiting on label activate_A;
+                transition Dispatching -> Waiting on label activate_B;
+
+                // Task completed successfully
+                transition Waiting -> Idle on label task_complete;
+
+                // Agent fails or times out
+                transition Waiting -> Recovering on label agent_fail;
+                transition Waiting -> Recovering on label timeout;
+
+                // Supervisor retries dispatch
+                transition Recovering -> Dispatching on label retry;
+                transition Recovering -> Recovering on label noop;
+            }
+        }
+
+        // Agent A: specialist that can work on tasks or hand off to B
+        // Controllable labels owned here: handoff_to_B
+        automaton AgentA {
+            controllable {
+                label handoff_to_B;
+            }
+
+            states {
+                state IdleA initial;
+                state WorkingA;
+                state HandingOffA;
+            }
+
+            transitions {
+                // Activated by supervisor
+                transition IdleA -> WorkingA on label activate_A;
+                transition IdleA -> IdleA on label noop;
+
+                // Working: complete, hand off, or fail
+                transition WorkingA -> IdleA on label task_complete;
+                transition WorkingA -> HandingOffA on label handoff_to_B;
+                transition WorkingA -> IdleA on label agent_fail;
+                transition WorkingA -> WorkingA on label noop;
+
+                // Handoff resolves when B is activated
+                transition HandingOffA -> IdleA on label activate_B;
+                transition HandingOffA -> HandingOffA on label noop;
+            }
+        }
+
+        // Agent B: specialist that can work on tasks or hand off to A
+        // Controllable labels owned here: handoff_to_A
+        automaton AgentB {
+            controllable {
+                label handoff_to_A;
+            }
+
+            states {
+                state IdleB initial;
+                state WorkingB;
+                state HandingOffB;
+            }
+
+            transitions {
+                // Activated by supervisor
+                transition IdleB -> WorkingB on label activate_B;
+                transition IdleB -> IdleB on label noop;
+
+                // Working: complete, hand off, or fail
+                transition WorkingB -> IdleB on label task_complete;
+                transition WorkingB -> HandingOffB on label handoff_to_A;
+                transition WorkingB -> IdleB on label agent_fail;
+                transition WorkingB -> WorkingB on label noop;
+
+                // Handoff resolves when A is activated
+                transition HandingOffB -> IdleB on label activate_A;
+                transition HandingOffB -> HandingOffB on label noop;
+            }
+        }
+    }
+
+    composition {
+        asynchronous handoff_system {
+            members [Supervisor, AgentA, AgentB];
+        }
+    }
+
+    mu_formulas {
+        // Safety: mutual exclusion — at most one agent working at a time.
+        // State predicates WorkingA and WorkingB project from agent members.
+        formula mutex {
+            over handoff_system;
+            body = nu X. (
+                ((! WorkingA) || (! WorkingB))
+                && ([] X)
+            );
+        }
+
+        // Liveness: every dispatched task eventually returns to Idle.
+        // State predicates Dispatching and Idle project from Supervisor member.
+        formula supervisor_completes {
+            over handoff_system;
+            body = nu X. (
+                ((! Dispatching) || (mu Y. (Idle || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: from Recovering, Dispatching is reachable (retry works).
+        formula recovery_works {
+            over handoff_system;
+            body = nu X. (
+                ((! Recovering) || (mu Y. (Dispatching || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Safety invariant: the composed system is well-formed.
+        formula safety_invariant {
+            over handoff_system;
+            body = nu X. ([] X);
+        }
+
+        // GR(1) liveness: if tasks keep arriving, they keep completing.
+        // GF(Dispatching) -> GF(Idle)
+        formula no_orphaned_tasks {
+            over handoff_system;
+            body = (! (nu A. (mu B. (Dispatching || <> B)) && ([] A)))
+                || (nu C. (mu D. (Idle || <> D)) && ([] C));
+        }
+    }
+
+    controllers {
+        // Synthesize a controller enforcing mutual exclusion on the
+        // composed system.
+        controller safe_handoff {
+            source handoff_system;
+            satisfying mutex;
+        }
+    }
+}

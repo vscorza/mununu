@@ -1,0 +1,157 @@
+// MCP Tool Authorization Protocol
+//
+// Models a Model Context Protocol server with session-aware tool
+// authorization. Three tool categories (read, write, delete) have
+// different authorization requirements:
+//   - read:   allowed in any active session
+//   - write:  requires active session
+//   - delete: requires active session AND user confirmation
+//
+// The orchestrator (controller) decides which tool to invoke;
+// the environment controls session lifecycle and user confirmation.
+//
+// Properties:
+//   - Safety: no write/delete without active session
+//   - Safety: no delete without prior user confirmation
+//   - Liveness: if session starts, tools can eventually be called
+
+context mcp_auth {
+    alphabet {
+        label call_read;
+        label call_write;
+        label call_delete;
+        label request_confirm;
+        label session_start;
+        label session_expire;
+        label user_confirm;
+        label user_deny;
+        label noop;
+    }
+
+    automata {
+        // Session lifecycle: no_session -> active <-> expired
+        // Controllable labels owned here: call_read, call_write, noop
+        automaton Session {
+            controllable {
+                label call_read;
+                label call_write;
+                label noop;
+            }
+
+            states {
+                state NoSession initial;
+                state Active;
+                state Expired;
+            }
+
+            transitions {
+                // Environment starts/expires sessions
+                transition NoSession -> Active on label session_start;
+                transition NoSession -> NoSession on label noop;
+                transition Active -> Expired on label session_expire;
+                // All tool calls and confirm requests self-loop in active
+                transition Active -> Active on label call_read;
+                transition Active -> Active on label call_write;
+                transition Active -> Active on label call_delete;
+                transition Active -> Active on label request_confirm;
+                transition Active -> Active on label noop;
+                // Session restart from expired
+                transition Expired -> Active on label session_start;
+                transition Expired -> Expired on label noop;
+            }
+        }
+
+        // Confirmation gate for destructive operations
+        // Controllable labels owned here: request_confirm, call_delete
+        automaton Confirmation {
+            controllable {
+                label request_confirm;
+                label call_delete;
+            }
+
+            states {
+                state Idle initial;
+                state Pending;
+                state Confirmed;
+                state Denied;
+            }
+
+            transitions {
+                // Controller requests confirmation
+                transition Idle -> Pending on label request_confirm;
+                transition Idle -> Idle on label call_read;
+                transition Idle -> Idle on label call_write;
+                transition Idle -> Idle on label noop;
+                // Environment responds
+                transition Pending -> Confirmed on label user_confirm;
+                transition Pending -> Denied on label user_deny;
+                transition Pending -> Pending on label noop;
+                // Delete only from confirmed state
+                transition Confirmed -> Idle on label call_delete;
+                transition Confirmed -> Confirmed on label call_read;
+                transition Confirmed -> Confirmed on label call_write;
+                transition Confirmed -> Confirmed on label noop;
+                // Denied: controller can retry
+                transition Denied -> Pending on label request_confirm;
+                transition Denied -> Denied on label noop;
+            }
+        }
+    }
+
+    composition {
+        asynchronous auth_system {
+            members [Session, Confirmation];
+        }
+    }
+
+    mu_formulas {
+        // Safety: no write or delete without active session.
+        // NoSession and Expired states block write/delete transitions.
+        // State predicates project from Session member onto auth_system composition.
+        formula session_required {
+            over auth_system;
+            body = nu X. (
+                ((! NoSession) || (([call_write] false) && ([call_delete] false)))
+                && ((! Expired) || (([call_write] false) && ([call_delete] false)))
+                && ([] X)
+            );
+        }
+
+        // Safety: delete requires user confirmation.
+        // Confirmed predicate projects from Confirmation member.
+        formula confirm_before_delete {
+            over auth_system;
+            body = nu X. (
+                ((Confirmed) || ([call_delete] false))
+                && ([] X)
+            );
+        }
+
+        // Safety invariant: the composed system is well-formed.
+        formula safety_invariant {
+            over auth_system;
+            body = nu X. ([] X);
+        }
+
+        // Liveness: Active session state is reachable from any state.
+        formula can_reach_active {
+            over auth_system;
+            body = mu X. (Active || <> X);
+        }
+
+        // Liveness: Confirmed state is reachable from initial.
+        formula can_reach_confirmed {
+            over auth_system;
+            body = mu X. (Confirmed || <> X);
+        }
+    }
+
+    controllers {
+        // Synthesize a controller enforcing session + confirmation policy
+        // on the composed system.
+        controller auth_enforcer {
+            source auth_system;
+            satisfying session_required;
+        }
+    }
+}

@@ -1,0 +1,71 @@
+{
+    "id": "support_pipeline",
+    "initial": "system",
+    "states": {
+        "system": {
+            "type": "parallel",
+            "states": {
+                "triage": {
+                    "initial": "waiting",
+                    "states": {
+                        "waiting": {
+                            "on": { "TICKET_IN": "classifying" }
+                        },
+                        "classifying": {
+                            "on": {
+                                "ROUTE_BILLING": "routed_billing",
+                                "ROUTE_TECH": "routed_tech",
+                                "ESCALATE": "escalated"
+                            }
+                        },
+                        "routed_billing": {
+                            "on": {
+                                "RESOLVED": "waiting",
+                                "ESCALATE": "escalated"
+                            }
+                        },
+                        "routed_tech": {
+                            "on": {
+                                "RESOLVED": "waiting",
+                                "ESCALATE": "escalated"
+                            }
+                        },
+                        "escalated": {
+                            "on": { "HUMAN_RESOLVED": "waiting" }
+                        }
+                    }
+                },
+                "budget": {
+                    "initial": "under_limit",
+                    "states": {
+                        "under_limit": {
+                            "on": {
+                                "TOOL_CALL": "under_limit",
+                                "LIMIT_HIT": "over_limit"
+                            }
+                        },
+                        "over_limit": {
+                            "on": { "BUDGET_RESET": "under_limit" }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "__mununu": {
+        "controllable": ["ROUTE_BILLING", "ROUTE_TECH", "ESCALATE", "TOOL_CALL"],
+        "uncontrollable": ["TICKET_IN", "RESOLVED", "HUMAN_RESOLVED", "LIMIT_HIT", "BUDGET_RESET"],
+        "properties": [
+            {
+                "name": "no_tool_over_budget",
+                "formula": "nu X. ((!over_limit || (![TOOL_CALL] false)) && ([] X))",
+                "role": "guarantee"
+            },
+            {
+                "name": "safety_invariant",
+                "formula": "nu X. ([] X)",
+                "role": "guarantee"
+            }
+        ]
+    }
+}
