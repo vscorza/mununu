@@ -21,6 +21,7 @@ All request and response bodies use `application/json`. CORS is open by default 
 - [POST /api/v1/context/synthesize](#post-apiv1contextsynthesize)
 - [POST /api/v1/context/graphs](#post-apiv1contextgraphs)
 - [POST /api/v1/context/verify](#post-apiv1contextverify)
+- [POST /api/v1/context/import](#post-apiv1contextimport)
 - [Common Types](#common-types)
 - [Error Responses](#error-responses)
 
@@ -540,6 +541,45 @@ curl -X POST http://localhost:3000/api/v1/context/verify \
   ]
 }
 ```
+
+---
+
+## POST /api/v1/context/import
+
+Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela) and translate it to CTXDSL.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `content` | string | Yes | Raw file content in the source format |
+| `format` | string | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"promela"`, `"xstate"`, `"systemverilog"` |
+| `filename` | string | No | Original filename (used for extension-based detection if format is `"auto"`) |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | boolean | Whether the import succeeded |
+| `ctxdsl` | string | Translated CTXDSL content |
+| `source_format` | string | Detected source format name |
+| `warnings` | string[] | Translation warnings (unsupported constructs, neutral controllability, etc.) |
+| `signal_count` | number | Number of signals/events in the source |
+| `state_count` | number | Number of states (for signal-state encoding) |
+| `property_count` | number | Number of properties translated |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/context/import \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "{\"id\":\"light\",\"initial\":\"green\",\"states\":{\"green\":{\"on\":{\"TIMER\":\"yellow\"}},\"yellow\":{\"on\":{\"TIMER\":\"red\"}},\"red\":{\"on\":{\"TIMER\":\"green\"}}}}",
+    "format": "xstate"
+  }'
+```
+
+See [Adapter Formats](Adapter-Formats.md) for details on each supported format.
 
 ---
 

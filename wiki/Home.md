@@ -4,7 +4,7 @@
 
 Mununu is a formal verification tool for reactive systems modeled as **Compositional Labeled Transition Systems (CLTS)**. It helps hardware verification engineers and system designers verify protocols, synthesize controllers, and check temporal properties -- all from a single, readable DSL.
 
-Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain pipeline, or a sensor network, Mununu lets you model the system, compose its parts, state the properties you care about, and get a definitive answer: does the property hold, and if so, can a controller enforce it?
+Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain pipeline, a sensor network, or an **agentic AI orchestration workflow**, Mununu lets you model the system, compose its parts, state the properties you care about, and get a definitive answer: does the property hold, and if so, can a controller enforce it?
 
 ## Key Capabilities
 
@@ -13,7 +13,8 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 - **Synchronous and asynchronous composition** -- combine automata lock-step (shared clock) or interleaved (independent clocks), with hierarchical nesting for cross-domain designs.
 - **Controller synthesis** -- automatically derive a maximally permissive controller that enforces a given property, respecting the controllable/uncontrollable label split.
 - **Counterstrategy generation** -- when a property is unrealizable, Mununu produces diagnostic traces showing how the environment can force a violation.
-- **Web UI** -- the companion `mununu-ui` frontend connects to the built-in API server for interactive graph visualization, formula evaluation, and synthesis.
+- **Format adapters** -- import specifications from XState/Statecharts, SystemVerilog RTL, TLSF, AIGER, and Promela. Export synthesized controllers back to XState JSON or SystemVerilog modules.
+- **Web UI** -- the companion `mununu-ui` frontend connects to the built-in API server for interactive graph visualization, formula evaluation, and synthesis. Supports importing adapter formats directly from the file picker.
 
 ## Table of Contents
 
@@ -23,6 +24,10 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 | [CTXDSL Language Reference](CTXDSL-Language-Reference) | Complete DSL syntax: alphabets, automata, transitions, variables, guards, effects |
 | [Composition](Composition) | Synchronous, asynchronous, and hierarchical composition with examples |
 | [Mu-Calculus Reference](Mu-Calculus-Reference) | Fixpoints, modalities, controllability-aware operators, common patterns |
+| [Adapter Formats](Adapter-Formats) | Import from XState, SystemVerilog, TLSF, AIGER, Promela; export controllers |
+| [Agentic Orchestration](Agentic-Orchestration) | Verify multi-agent workflows, MCP tool authorization, and handoff protocols |
+| [CLI Reference](CLI-Reference) | Full command reference with adapter import/export examples |
+| [API Reference](API-Reference) | REST API documentation including the import endpoint |
 
 ## Video Tutorials
 

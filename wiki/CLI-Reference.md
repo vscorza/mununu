@@ -38,6 +38,7 @@ mununu context eval <CONTEXT> [options]
 | Flag | Description |
 |------|-------------|
 | `--sidecar <FILE>` | Additional CTXDSL sidecar files to merge (repeatable) |
+| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `auto` |
 | `--no-partitions` | Disable guard partitioning during evaluation |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
 
@@ -54,6 +55,16 @@ mununu context eval examples/hw/handshake.ctxdsl \
 mununu context eval examples/counters/counters.ctxdsl \
     --sidecar examples/counters/counters_properties.ctxdsl \
     --formula safety_invariant --automaton Counter
+```
+
+```bash
+# Evaluate a SystemVerilog design
+mununu context eval design.sv --adapter sv \
+    --formula safety --automaton handshake
+
+# Evaluate an XState machine
+mununu context eval machine.xstate --adapter xstate \
+    --formula safety --automaton light
 ```
 
 ---
@@ -87,8 +98,11 @@ mununu context synth <CONTEXT> [options]
 | `--max-counter-traces <N>` | Cap the number of counterstrategy traces collected |
 | `--extract-strategy` | Produce a positional strategy (one controllable transition per state) instead of the full winning-region projection |
 | `--no-proof-obligations` | Skip proof obligation emission for violating initial states |
+| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `auto` |
 | `--dump-json <FILE>` | Write a JSON summary of the synthesis result to a file |
 | `--emit-dsl <FILE>` | Write the synthesized controller as a CTXDSL file |
+| `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog` |
+| `--emit-native <FILE>` | Write the controller in the native format specified by `--output-format` |
 | `--dump-diagnostics <FILE>` | Export diagnostics as a DSL sidecar file |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
 
@@ -311,8 +325,28 @@ mununu context eval model.ctxdsl --sidecar properties.ctxdsl \
 mununu context merge model.ctxdsl properties.ctxdsl --output deploy/
 ```
 
+### Import from external formats and export controllers
+
+```bash
+# Import XState JSON, synthesize, export controller as XState JSON
+mununu context synth machine.xstate --adapter xstate \
+    --formula safety --automaton light \
+    --output-format xstate --emit-native controller.json
+
+# Import SystemVerilog RTL, synthesize, export as SV module
+mununu context synth design.sv --adapter sv \
+    --formula safety --automaton FSM \
+    --output-format systemverilog --emit-native controller.sv
+
+# Auto-detect format from extension
+mununu context eval design.sv --formula safety --automaton FSM
+```
+
+See [Adapter Formats](Adapter-Formats.md) for supported formats and limitations.
+
 ## See Also
 
+- [Adapter Formats](Adapter-Formats.md) -- supported external formats
 - [LTL Properties](LTL-Properties.md) -- writing temporal specifications
 - [Controller Synthesis](Controller-Synthesis.md) -- synthesis concepts and examples
 - [Hardware Verification Patterns](Hardware-Verification-Patterns.md) -- example models and properties
