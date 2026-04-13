@@ -1,0 +1,84 @@
+{
+    "id": "elevator",
+    "initial": "system",
+    "states": {
+        "system": {
+            "type": "parallel",
+            "states": {
+                "cabin": {
+                    "initial": "floor0",
+                    "states": {
+                        "floor0": {
+                            "on": {
+                                "open_door": "door0_open",
+                                "move_up": "floor1"
+                            }
+                        },
+                        "floor1": {
+                            "on": {
+                                "open_door": "door1_open",
+                                "move_down": "floor0",
+                                "move_up": "floor2"
+                            }
+                        },
+                        "floor2": {
+                            "on": {
+                                "open_door": "door2_open",
+                                "move_down": "floor1"
+                            }
+                        },
+                        "door0_open": {
+                            "on": { "serve": "floor0" }
+                        },
+                        "door1_open": {
+                            "on": { "serve": "floor1" }
+                        },
+                        "door2_open": {
+                            "on": { "serve": "floor2" }
+                        }
+                    }
+                },
+                "requests": {
+                    "initial": "idle",
+                    "states": {
+                        "idle": {
+                            "on": {
+                                "request_0": "req0_pending",
+                                "request_1": "req1_pending",
+                                "request_2": "req2_pending"
+                            }
+                        },
+                        "req0_pending": {
+                            "on": {
+                                "serve": "idle",
+                                "request_0": "req0_pending"
+                            }
+                        },
+                        "req1_pending": {
+                            "on": {
+                                "serve": "idle",
+                                "request_1": "req1_pending"
+                            }
+                        },
+                        "req2_pending": {
+                            "on": {
+                                "serve": "idle",
+                                "request_2": "req2_pending"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "__mununu": {
+        "controllable": ["move_up", "move_down", "open_door", "serve", "request_0", "request_1", "request_2"],
+        "properties": [
+            {
+                "name": "safety_invariant",
+                "formula": "nu X. ([] X)",
+                "role": "guarantee"
+            }
+        ]
+    }
+}

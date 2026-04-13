@@ -1,0 +1,68 @@
+{
+    "id": "auth_flow",
+    "initial": "main",
+    "states": {
+        "main": {
+            "type": "parallel",
+            "states": {
+                "auth": {
+                    "initial": "idle",
+                    "states": {
+                        "idle": {
+                            "on": { "LOGIN": "logging_in" }
+                        },
+                        "logging_in": {
+                            "on": {
+                                "MFA_REQUIRED": "mfa_pending",
+                                "DENY_ACCESS": "failed"
+                            }
+                        },
+                        "mfa_pending": {
+                            "on": { "MFA_CODE": "mfa_verifying" }
+                        },
+                        "mfa_verifying": {
+                            "on": {
+                                "VERIFY": "authenticated",
+                                "DENY_ACCESS": "failed"
+                            }
+                        },
+                        "authenticated": {
+                            "on": { "LOGOUT": "idle" }
+                        },
+                        "failed": {
+                            "on": { "RETRY": "idle" }
+                        }
+                    }
+                },
+                "session": {
+                    "initial": "no_session",
+                    "states": {
+                        "no_session": {
+                            "on": { "SESSION_START": "active_session" }
+                        },
+                        "active_session": {
+                            "on": {
+                                "SESSION_EXPIRE": "expired",
+                                "LOGOUT": "no_session"
+                            }
+                        },
+                        "expired": {
+                            "on": { "SESSION_START": "active_session" }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "__mununu": {
+        "controllable": ["VERIFY", "DENY_ACCESS", "SESSION_START", "MFA_REQUIRED", "RETRY"],
+        "uncontrollable": ["LOGIN", "MFA_CODE", "SESSION_EXPIRE", "LOGOUT"],
+        "properties": [
+            {
+                "name": "safety",
+                "formula": "nu X. ([] X)",
+                "role": "guarantee"
+            }
+        ]
+    }
+}

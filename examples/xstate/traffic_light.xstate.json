@@ -1,0 +1,41 @@
+{
+    "id": "traffic_light",
+    "initial": "green_ns",
+    "states": {
+        "green_ns": {
+            "on": {
+                "TIMER": "yellow_ns",
+                "PED_REQUEST": "green_ns_ped_waiting"
+            }
+        },
+        "green_ns_ped_waiting": {
+            "on": { "TIMER": "yellow_ns" }
+        },
+        "yellow_ns": {
+            "on": { "TIMER": "red_ns" }
+        },
+        "red_ns": {
+            "on": { "TIMER": "green_ew" }
+        },
+        "green_ew": {
+            "on": { "TIMER": "yellow_ew" }
+        },
+        "yellow_ew": {
+            "on": { "TIMER": "red_ew" }
+        },
+        "red_ew": {
+            "on": { "TIMER": "green_ns" }
+        }
+    },
+    "__mununu": {
+        "controllable": ["TIMER"],
+        "uncontrollable": ["PED_REQUEST"],
+        "properties": [
+            {
+                "name": "safety_invariant",
+                "formula": "nu X. ([] X)",
+                "role": "guarantee"
+            }
+        ]
+    }
+}

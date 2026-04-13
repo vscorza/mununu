@@ -179,13 +179,22 @@ impl RealizedContext {
 
         // Check if this is a composed automaton
         if let Some(member_names) = self.composition_members.get(automaton) {
-            // For composed automata, project predicates from member automata
+            // For composed automata, project predicates from member automata.
+            // Collect projected bitsets per predicate name, OR-ing across members
+            // when multiple members share a state name (e.g., both have "Idle").
+            let mut projected: HashMap<String, BitVec<usize, Lsb0>> = HashMap::new();
+
             for member_name in member_names {
                 if let Some(member_predicates) = self.predicates.get(member_name) {
                     let member_clts = self
                         .context
                         .clts(member_name)
                         .expect("member automaton should exist");
+
+                    let member_index = member_names
+                        .iter()
+                        .position(|n| n == member_name)
+                        .expect("member should be in composition");
 
                     for predicate in member_predicates {
                         // Get the predicate bitset from the member automaton
@@ -204,23 +213,14 @@ impl RealizedContext {
 
                         // Project the predicate onto the composed state space
                         // Composed states are named "left|right" (e.g., "Idle|Wait")
-                        // For left-associative composition, we need to find which component
-                        // corresponds to this member automaton
-                        let mut projected_bits = BitVec::repeat(false, state_count);
-                        let member_index = member_names
-                            .iter()
-                            .position(|n| n == member_name)
-                            .expect("member should be in composition");
+                        let mut bits_from_member = BitVec::repeat(false, state_count);
 
                         for composed_state_id in clts.states() {
                             if let Some(composed_state_name) = clts.state_name(composed_state_id) {
-                                // Split the composed state name by '|' to get component states
                                 let parts: Vec<&str> = composed_state_name.split('|').collect();
 
-                                // For left-associative composition, the parts correspond to members in order
                                 if member_index < parts.len() {
                                     let member_state_name = parts[member_index].trim();
-                                    // Check if this member state satisfies the predicate
                                     if let Ok(member_state_id) =
                                         member_clts.state_id(member_state_name)
                                         && member_bits
@@ -228,14 +228,24 @@ impl RealizedContext {
                                             .map(|b| *b)
                                             .unwrap_or(false)
                                     {
-                                        projected_bits.set(composed_state_id.index(), true);
+                                        bits_from_member.set(composed_state_id.index(), true);
                                     }
                                 }
                             }
                         }
-                        env = env.with_predicate(predicate.clone(), projected_bits);
+
+                        // OR with existing projection for this predicate name
+                        projected
+                            .entry(predicate.clone())
+                            .and_modify(|existing| *existing |= &bits_from_member)
+                            .or_insert(bits_from_member);
                     }
                 }
+            }
+
+            // Insert all projected predicates into the environment
+            for (predicate, bits) in projected {
+                env = env.with_predicate(predicate, bits);
             }
         } else {
             // For non-composed automata, use predicates directly
@@ -1430,6 +1440,7 @@ pub fn realize(
     auto_register_state_name_predicates(
         &realized.context,
         &realized.formulas,
+        &realized.composition_members,
         &mut realized.predicates,
         &mut realized.predicate_metadata,
         &mut realized.predicate_bitsets,
@@ -1682,6 +1693,7 @@ fn register_user_predicates(
 fn auto_register_state_name_predicates(
     context: &Context,
     formulas: &HashMap<String, RealizedFormula>,
+    composition_members: &HashMap<String, Vec<String>>,
     predicates: &mut HashMap<String, HashSet<String>>,
     predicate_metadata: &mut HashMap<String, HashMap<String, PredicateMetadata>>,
     predicate_bitsets: &mut HashMap<String, HashMap<String, BitVec<usize, Lsb0>>>,
@@ -1707,7 +1719,9 @@ fn auto_register_state_name_predicates(
         }
     }
 
-    // For each automaton, check if referenced predicates match state names
+    // For each automaton, check if referenced predicates match state names.
+    // For compositions, also check member automata — predicates registered on
+    // members are projected onto the composition by environment_for().
     for (automaton, pred_names) in referenced_predicates {
         let Some(clts) = context.clts(&automaton) else {
             continue;
@@ -1719,28 +1733,22 @@ fn auto_register_state_name_predicates(
             .filter_map(|state_id| clts.state_name(state_id).map(|s| s.to_string()))
             .collect();
 
-        // For each referenced predicate that matches a state name but isn't registered
+        // Try direct matching on this automaton's own states
         let automaton_predicates = predicates.entry(automaton.clone()).or_default();
-        for pred_name in pred_names {
-            // Check if it matches any state name (exact or prefix match for unrolled states)
+        for pred_name in &pred_names {
             let matches_any_state = state_names
                 .iter()
-                .any(|state_name| StateNameMatcher::matches_pattern(&pred_name, state_name));
+                .any(|state_name| StateNameMatcher::matches_pattern(pred_name, state_name));
 
-            // If it matches a state name and not already registered as a predicate
-            if matches_any_state && !automaton_predicates.contains(&pred_name) {
-                // Register it as a predicate
+            if matches_any_state && !automaton_predicates.contains(pred_name) {
                 automaton_predicates.insert(pred_name.clone());
 
-                // Create bitset: true for all states matching the pattern (exact or prefix)
-                // This handles unrolled states where "End" should match "End_x_0", "End_count_5", etc.
-                let bitset = StateNameMatcher::create_bitset_for_pattern(clts, &pred_name);
+                let bitset = StateNameMatcher::create_bitset_for_pattern(clts, pred_name);
                 predicate_bitsets
                     .entry(automaton.clone())
                     .or_default()
                     .insert(pred_name.clone(), bitset);
 
-                // Create metadata
                 let metadata = PredicateMetadata {
                     guard: format!("state == {}", pred_name),
                     expression: GuardExpressionMetadata::Comparison {
@@ -1752,7 +1760,54 @@ fn auto_register_state_name_predicates(
                 predicate_metadata
                     .entry(automaton.clone())
                     .or_default()
-                    .insert(pred_name, metadata);
+                    .insert(pred_name.clone(), metadata);
+            }
+        }
+
+        // If this is a composition, also register unresolved predicates on
+        // member automata. environment_for() will project them onto the
+        // composed state space via |‑separated state name splitting.
+        if let Some(members) = composition_members.get(&automaton) {
+            for member_name in members {
+                let Some(member_clts) = context.clts(member_name) else {
+                    continue;
+                };
+
+                let member_state_names: HashSet<String> = member_clts
+                    .states()
+                    .filter_map(|sid| member_clts.state_name(sid).map(|s| s.to_string()))
+                    .collect();
+
+                let member_predicates = predicates.entry(member_name.clone()).or_default();
+                for pred_name in &pred_names {
+                    let matches_member = member_state_names
+                        .iter()
+                        .any(|sn| StateNameMatcher::matches_pattern(pred_name, sn));
+
+                    if matches_member && !member_predicates.contains(pred_name) {
+                        member_predicates.insert(pred_name.clone());
+
+                        let bitset =
+                            StateNameMatcher::create_bitset_for_pattern(member_clts, pred_name);
+                        predicate_bitsets
+                            .entry(member_name.clone())
+                            .or_default()
+                            .insert(pred_name.clone(), bitset);
+
+                        let metadata = PredicateMetadata {
+                            guard: format!("state == {}", pred_name),
+                            expression: GuardExpressionMetadata::Comparison {
+                                left: "state".to_string(),
+                                op: "==".to_string(),
+                                right: pred_name.clone(),
+                            },
+                        };
+                        predicate_metadata
+                            .entry(member_name.clone())
+                            .or_default()
+                            .insert(pred_name.clone(), metadata);
+                    }
+                }
             }
         }
     }
