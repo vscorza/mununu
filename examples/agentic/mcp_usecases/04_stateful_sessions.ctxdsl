@@ -1,0 +1,210 @@
+// Stateful MCP Sessions — Session Lifecycle & Persistence
+//
+// Models the MCP session lifecycle from the streamable HTTP transport
+// specification. Two concerns compose asynchronously:
+//   1. SessionLifecycle: states from initialize through suspend/resume to terminate
+//   2. PersistenceLayer: checkpoint existence tracking for safe resume
+//
+// The orchestrator controls session operations (suspend, resume, tool calls);
+// the environment controls pings, expiry, and checkpoint persistence outcomes.
+//
+// Properties:
+//   - Safety: Resume requires both suspended state AND existing checkpoint
+//   - GR(1): If server keeps pinging, client eventually responds (keepalive)
+//   - Liveness: Terminated is reachable from every state (graceful shutdown)
+//   - Safety: No tool calls after termination (zombie session prevention)
+
+context stateful_sessions {
+    alphabet {
+        label initialize;
+        label ping_sent;
+        label pong_received;
+        label call_tool;
+        label suspend_session;
+        label resume_session;
+        label terminate_session;
+        label checkpoint_save;
+        label checkpoint_clear;
+        label session_expire;
+        label noop;
+    }
+
+    automata {
+        // Session lifecycle: 6 states modeling the MCP session state machine
+        automaton SessionLifecycle {
+            controllable {
+                label call_tool;
+                label suspend_session;
+                label resume_session;
+                label terminate_session;
+            }
+
+            states {
+                state Uninitialized initial;
+                state Active;
+                state Suspended;
+                state Resuming;
+                state Error;
+                state Terminated;
+            }
+
+            transitions {
+                // Initialization (environment triggers)
+                transition Uninitialized -> Active on label initialize;
+                transition Uninitialized -> Uninitialized on label noop;
+
+                // Active state: tool calls, pings, suspend, terminate
+                transition Active -> Active on label call_tool;
+                transition Active -> Active on label ping_sent;
+                transition Active -> Active on label pong_received;
+                transition Active -> Suspended on label suspend_session;
+                transition Active -> Terminated on label terminate_session;
+                transition Active -> Error on label session_expire;
+                transition Active -> Active on label noop;
+                // Checkpoint events pass through
+                transition Active -> Active on label checkpoint_save;
+                transition Active -> Active on label checkpoint_clear;
+
+                // Suspended: waiting for resume
+                transition Suspended -> Resuming on label resume_session;
+                transition Suspended -> Terminated on label terminate_session;
+                transition Suspended -> Suspended on label noop;
+                transition Suspended -> Suspended on label checkpoint_save;
+                transition Suspended -> Suspended on label checkpoint_clear;
+
+                // Resuming: transition back to active
+                transition Resuming -> Active on label initialize;
+                transition Resuming -> Error on label session_expire;
+                transition Resuming -> Resuming on label noop;
+                transition Resuming -> Resuming on label checkpoint_save;
+                transition Resuming -> Resuming on label checkpoint_clear;
+
+                // Error: can terminate or retry
+                transition Error -> Active on label initialize;
+                transition Error -> Terminated on label terminate_session;
+                transition Error -> Error on label noop;
+                transition Error -> Error on label checkpoint_save;
+                transition Error -> Error on label checkpoint_clear;
+
+                // Terminated: absorbing state — no tool calls allowed
+                transition Terminated -> Terminated on label noop;
+            }
+        }
+
+        // Persistence layer: tracks whether a checkpoint exists
+        automaton PersistenceLayer {
+            controllable { }
+
+            states {
+                state NoCheckpoint initial;
+                state CheckpointExists;
+            }
+
+            transitions {
+                // Checkpoint lifecycle (environment-controlled persistence)
+                transition NoCheckpoint -> CheckpointExists on label checkpoint_save;
+                transition CheckpointExists -> NoCheckpoint on label checkpoint_clear;
+                transition CheckpointExists -> CheckpointExists on label checkpoint_save;
+                transition NoCheckpoint -> NoCheckpoint on label checkpoint_clear;
+                // All other labels pass through
+                transition NoCheckpoint -> NoCheckpoint on label noop;
+                transition NoCheckpoint -> NoCheckpoint on label initialize;
+                transition NoCheckpoint -> NoCheckpoint on label ping_sent;
+                transition NoCheckpoint -> NoCheckpoint on label pong_received;
+                transition NoCheckpoint -> NoCheckpoint on label call_tool;
+                transition NoCheckpoint -> NoCheckpoint on label suspend_session;
+                // resume_session intentionally missing from NoCheckpoint
+                // (checkpoint must exist before resume is allowed)
+                transition NoCheckpoint -> NoCheckpoint on label terminate_session;
+                transition NoCheckpoint -> NoCheckpoint on label session_expire;
+                transition CheckpointExists -> CheckpointExists on label noop;
+                transition CheckpointExists -> CheckpointExists on label initialize;
+                transition CheckpointExists -> CheckpointExists on label ping_sent;
+                transition CheckpointExists -> CheckpointExists on label pong_received;
+                transition CheckpointExists -> CheckpointExists on label call_tool;
+                transition CheckpointExists -> CheckpointExists on label suspend_session;
+                transition CheckpointExists -> CheckpointExists on label resume_session;
+                transition CheckpointExists -> CheckpointExists on label terminate_session;
+                transition CheckpointExists -> CheckpointExists on label session_expire;
+            }
+        }
+    }
+
+    composition {
+        asynchronous session_system {
+            members [SessionLifecycle, PersistenceLayer];
+        }
+    }
+
+    mu_formulas {
+        // Safety: No tool calls after termination (zombie session prevention).
+        // Terminated state must block call_tool.
+        formula no_zombie_sessions {
+            over SessionLifecycle;
+            body = nu X. (
+                ((!Terminated) || ([call_tool] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Resume requires suspended state.
+        // Only Suspended allows resume_session.
+        formula resume_requires_suspended {
+            over SessionLifecycle;
+            body = nu X. (
+                (Suspended || ([resume_session] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Resume also requires checkpoint (checked on PersistenceLayer).
+        // NoCheckpoint blocks resume_session.
+        formula resume_requires_checkpoint {
+            over PersistenceLayer;
+            body = nu X. (
+                (CheckpointExists || ([resume_session] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Terminated is reachable from any state (graceful shutdown).
+        formula can_terminate {
+            over SessionLifecycle;
+            body = nu X. (
+                (Terminated || (mu Y. (Terminated || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Active state is reachable from initial.
+        formula can_reach_active {
+            over SessionLifecycle;
+            body = mu X. (Active || <> X);
+        }
+
+        // GR(1): If pings keep arriving, pongs keep being sent.
+        // GF(ping_sent) -> GF(pong_received)
+        // Encodes the keepalive heartbeat requirement.
+        formula keepalive_liveness {
+            over SessionLifecycle;
+            body = (! (nu A. (mu B. (Active || <> B)) && ([] A)))
+                || (nu C. (mu D. (Active || <> D)) && ([] C));
+        }
+
+        // Safety: No tool calls from uninitialized state.
+        formula initialized_before_tools {
+            over SessionLifecycle;
+            body = nu X. (
+                ((!Uninitialized) || ([call_tool] false))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        controller session_enforcer {
+            source SessionLifecycle;
+            satisfying no_zombie_sessions;
+        }
+    }
+}

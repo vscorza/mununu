@@ -1,0 +1,221 @@
+// PostgreSQL Multi-DB MCP — Cross-Database Isolation & Connection Pool
+//
+// Models a PostgreSQL MCP server routing queries to multiple databases
+// (production, staging, analytics). Two concerns compose:
+//   1. DatabaseRouter: which DB is connected, with read/write semantics
+//   2. ConnectionPool: bounded connection counter (0-3) with release
+//
+// Key insight: analytics DB is permanently read-only — no write queries
+// regardless of session context. Cross-DB isolation prevents a query
+// intended for production from executing on staging.
+//
+// Properties:
+//   - Safety: Cross-DB isolation (query matches connected DB)
+//   - Safety: Analytics permanently read-only
+//   - Safety: Connection pool exhaustion blocks new queries
+//   - Liveness: Active connections eventually return to idle
+
+context postgres_multidb {
+    alphabet {
+        label connect_prod;
+        label connect_staging;
+        label connect_analytics;
+        label disconnect;
+        label read_query;
+        label write_query;
+        label query_complete;
+        label query_error;
+        label conn_acquire;
+        label conn_release;
+        label noop;
+    }
+
+    automata {
+        // Database router: tracks which DB is connected
+        // Analytics is read-only (no write_query transition)
+        automaton DatabaseRouter {
+            controllable {
+                label connect_prod;
+                label connect_staging;
+                label connect_analytics;
+                label disconnect;
+                label read_query;
+                label write_query;
+            }
+
+            states {
+                state Disconnected initial;
+                state OnProd;
+                state OnStaging;
+                state OnAnalytics;
+            }
+
+            transitions {
+                // Connection selection
+                transition Disconnected -> OnProd on label connect_prod;
+                transition Disconnected -> OnStaging on label connect_staging;
+                transition Disconnected -> OnAnalytics on label connect_analytics;
+                transition Disconnected -> Disconnected on label noop;
+                // Pass-through for pool events
+                transition Disconnected -> Disconnected on label conn_acquire;
+                transition Disconnected -> Disconnected on label conn_release;
+                transition Disconnected -> Disconnected on label query_complete;
+                transition Disconnected -> Disconnected on label query_error;
+
+                // Production: read + write
+                transition OnProd -> OnProd on label read_query;
+                transition OnProd -> OnProd on label write_query;
+                transition OnProd -> OnProd on label query_complete;
+                transition OnProd -> OnProd on label query_error;
+                transition OnProd -> Disconnected on label disconnect;
+                transition OnProd -> OnProd on label noop;
+                transition OnProd -> OnProd on label conn_acquire;
+                transition OnProd -> OnProd on label conn_release;
+
+                // Staging: read + write
+                transition OnStaging -> OnStaging on label read_query;
+                transition OnStaging -> OnStaging on label write_query;
+                transition OnStaging -> OnStaging on label query_complete;
+                transition OnStaging -> OnStaging on label query_error;
+                transition OnStaging -> Disconnected on label disconnect;
+                transition OnStaging -> OnStaging on label noop;
+                transition OnStaging -> OnStaging on label conn_acquire;
+                transition OnStaging -> OnStaging on label conn_release;
+
+                // Analytics: READ ONLY — no write_query transition
+                transition OnAnalytics -> OnAnalytics on label read_query;
+                // write_query is intentionally missing (read-only enforcement)
+                transition OnAnalytics -> OnAnalytics on label query_complete;
+                transition OnAnalytics -> OnAnalytics on label query_error;
+                transition OnAnalytics -> Disconnected on label disconnect;
+                transition OnAnalytics -> OnAnalytics on label noop;
+                transition OnAnalytics -> OnAnalytics on label conn_acquire;
+                transition OnAnalytics -> OnAnalytics on label conn_release;
+            }
+        }
+
+        // Connection pool: bounded counter (0-3)
+        // When at max (3), no new connections can be acquired
+        automaton ConnectionPool {
+            controllable { }
+
+            states {
+                state pool_0 initial;
+                state pool_1;
+                state pool_2;
+                state pool_3;
+            }
+
+            transitions {
+                // Acquire increments
+                transition pool_0 -> pool_1 on label conn_acquire;
+                transition pool_1 -> pool_2 on label conn_acquire;
+                transition pool_2 -> pool_3 on label conn_acquire;
+                // pool_3: no acquire (exhausted)
+
+                // Release decrements
+                transition pool_1 -> pool_0 on label conn_release;
+                transition pool_2 -> pool_1 on label conn_release;
+                transition pool_3 -> pool_2 on label conn_release;
+                transition pool_0 -> pool_0 on label conn_release;
+
+                // All other labels pass through
+                transition pool_0 -> pool_0 on label noop;
+                transition pool_1 -> pool_1 on label noop;
+                transition pool_2 -> pool_2 on label noop;
+                transition pool_3 -> pool_3 on label noop;
+                transition pool_0 -> pool_0 on label connect_prod;
+                transition pool_0 -> pool_0 on label connect_staging;
+                transition pool_0 -> pool_0 on label connect_analytics;
+                transition pool_0 -> pool_0 on label disconnect;
+                transition pool_0 -> pool_0 on label read_query;
+                transition pool_0 -> pool_0 on label write_query;
+                transition pool_0 -> pool_0 on label query_complete;
+                transition pool_0 -> pool_0 on label query_error;
+                transition pool_1 -> pool_1 on label connect_prod;
+                transition pool_1 -> pool_1 on label connect_staging;
+                transition pool_1 -> pool_1 on label connect_analytics;
+                transition pool_1 -> pool_1 on label disconnect;
+                transition pool_1 -> pool_1 on label read_query;
+                transition pool_1 -> pool_1 on label write_query;
+                transition pool_1 -> pool_1 on label query_complete;
+                transition pool_1 -> pool_1 on label query_error;
+                transition pool_2 -> pool_2 on label connect_prod;
+                transition pool_2 -> pool_2 on label connect_staging;
+                transition pool_2 -> pool_2 on label connect_analytics;
+                transition pool_2 -> pool_2 on label disconnect;
+                transition pool_2 -> pool_2 on label read_query;
+                transition pool_2 -> pool_2 on label write_query;
+                transition pool_2 -> pool_2 on label query_complete;
+                transition pool_2 -> pool_2 on label query_error;
+                transition pool_3 -> pool_3 on label connect_prod;
+                transition pool_3 -> pool_3 on label connect_staging;
+                transition pool_3 -> pool_3 on label connect_analytics;
+                transition pool_3 -> pool_3 on label disconnect;
+                transition pool_3 -> pool_3 on label read_query;
+                transition pool_3 -> pool_3 on label write_query;
+                transition pool_3 -> pool_3 on label query_complete;
+                transition pool_3 -> pool_3 on label query_error;
+            }
+        }
+    }
+
+    composition {
+        asynchronous db_system {
+            members [DatabaseRouter, ConnectionPool];
+        }
+    }
+
+    mu_formulas {
+        // Safety: Analytics is permanently read-only.
+        // OnAnalytics has no write_query transition (structural).
+        formula analytics_read_only {
+            over DatabaseRouter;
+            body = nu X. (
+                ((!OnAnalytics) || ([write_query] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No queries when disconnected.
+        formula connected_before_query {
+            over DatabaseRouter;
+            body = nu X. (
+                ((!Disconnected) || (([read_query] false) && ([write_query] false)))
+                && ([] X)
+            );
+        }
+
+        // Safety: Connection pool exhaustion blocks new acquisitions.
+        formula pool_exhaustion_blocks {
+            over ConnectionPool;
+            body = nu X. (
+                ((!pool_3) || ([conn_acquire] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: pool_0 is always reachable from any pool state
+        // (connections can always be released).
+        formula pool_recoverable {
+            over ConnectionPool;
+            body = nu X. (
+                (pool_0 || (mu Y. (pool_0 || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: OnProd is reachable from initial.
+        formula can_connect_prod {
+            over DatabaseRouter;
+            body = mu X. (OnProd || <> X);
+        }
+    }
+
+    controllers {
+        controller analytics_enforcer {
+            source DatabaseRouter;
+            satisfying analytics_read_only;
+        }
+    }
+}

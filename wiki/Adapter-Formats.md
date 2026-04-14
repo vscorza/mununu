@@ -14,8 +14,11 @@ Mununu can import specifications from external formats and export synthesized co
 | **Promela** | `.pml`, `.promela` | Yes | No | Explicit automaton |
 | **XState** | `.xstate`, `.json` | Yes | Yes | Explicit automaton |
 | **SystemVerilog** | `.sv`, `.v` | Yes | Yes | Explicit automaton |
+| **CrewAI** | `.crew.json` | Yes | No | Explicit automaton (via XState) |
+| **LangGraph** | `.langgraph.json` | Yes | No | Explicit automaton (via XState) |
+| **A2A** | `.a2a.json` | Yes | No | Explicit automaton (via XState) |
 
-> **New:** XState import enables [Agentic AI Orchestration](Agentic-Orchestration) — verify and synthesize safe controllers for multi-agent workflows, MCP tool authorization, and handoff protocols.
+> The agentic adapters (CrewAI, LangGraph, A2A) are native Rust adapters that translate directly from framework JSON into CTXDSL. They build XState-compatible state machines internally and delegate to the XState adapter pipeline. See [Agentic AI Orchestration](Agentic-Orchestration) for use cases, property templates, and examples.
 
 ## Pipeline
 
@@ -187,6 +190,144 @@ endmodule
 
 ---
 
+## CrewAI
+
+Imports CrewAI workflow definitions from JSON. Supports sequential and hierarchical process types.
+
+### Input Format
+
+```json
+{
+  "agents": [
+    {"role": "researcher", "allow_delegation": false, "tools": ["web_search"]},
+    {"role": "writer", "allow_delegation": false, "tools": []}
+  ],
+  "tasks": [
+    {"name": "research", "agent_role": "researcher"},
+    {"name": "write_report", "agent_role": "writer"}
+  ],
+  "process": "sequential"
+}
+```
+
+### Process Types
+
+- **Sequential** (`"process": "sequential"`): Linear task chain. Each task has `COMPLETE_*` / `FAIL_*` (uncontrollable) and `RETRY_*` (controllable) events. Auto-generates a `can_finish` liveness property.
+- **Hierarchical** (`"process": "hierarchical"`): Supervisor + parallel worker regions. Supervisor dispatches via `ACTIVATE_*` events (controllable). Agents with `allow_delegation: true` get `DELEGATE_*_TO_*` events.
+
+### Usage
+
+```bash
+# Auto-detect from extension
+mununu context eval crew.crew.json --formula can_finish --automaton crewai_workflow
+
+# Explicit adapter
+mununu context eval crew.json --adapter crewai --formula safety_invariant --automaton crewai_workflow
+```
+
+### Live Python Object Introspection
+
+For users who want to introspect live `crewai.Crew` instances, the Python convenience script `tools/crewai_to_xstate.py` remains available. It exports XState JSON that can then be used with either `--adapter xstate` or `--adapter crewai`.
+
+---
+
+## LangGraph
+
+Imports LangGraph workflow definitions from JSON. Supports nodes, unconditional edges, and conditional routing.
+
+### Input Format
+
+```json
+{
+  "nodes": ["router", "billing", "tech"],
+  "edges": [["__start__", "router"], ["billing", "__end__"], ["tech", "__end__"]],
+  "conditional_edges": {"router": {"billing": "billing", "tech": "tech"}}
+}
+```
+
+### Controllability Heuristics
+
+Events are classified automatically:
+- `ROUTE_*` events (from conditional edges) → **controllable** (orchestrator decides routing)
+- Events matching environment patterns (`human`, `user`, `tool_result`, `sensor`, `timeout`, `error`, `fail`) → **uncontrollable**
+- Fallback: if no events match environment patterns, all `ROUTE_*` events are controllable, rest uncontrollable
+
+### Usage
+
+```bash
+# Auto-detect from extension
+mununu context eval workflow.langgraph.json --formula safety_invariant --automaton langgraph_workflow
+
+# Explicit adapter
+mununu context eval graph.json --adapter langgraph --formula safety_invariant --automaton langgraph_workflow
+```
+
+---
+
+## A2A (Agent-to-Agent)
+
+Imports A2A Agent Card JSON. Models the task lifecycle for each agent and composes them in parallel.
+
+### Input Format
+
+Single agent card or JSON array of cards:
+
+```json
+[
+  {"name": "researcher", "skills": [{"id": "web_search", "name": "Web Search"}]},
+  {"name": "writer", "skills": [{"id": "draft", "name": "Draft Report"}]}
+]
+```
+
+### Task Lifecycle
+
+Each agent gets a 5-state lifecycle FSM:
+
+```
+idle → queued → in_progress → completed → idle
+                             → failed    → idle
+```
+
+- **Skills** → `INVOKE_{AGENT}_{SKILL}` events (controllable)
+- **Cancel/Reset** → `CANCEL_*`, `RESET_*` (controllable)
+- **Task progress** → `START_*`, `COMPLETED_*`, `FAILED_*`, `TIMEOUT_*` (uncontrollable)
+
+For multi-agent cards, agents are composed in **parallel** with auto-generated **mutual exclusion** properties preventing concurrent `in_progress` states.
+
+### Usage
+
+```bash
+# Auto-detect from extension
+mununu context eval protocol.a2a.json --formula mutex_researcher_writer --automaton a2a_protocol_system
+
+# Explicit adapter
+mununu context eval cards.json --adapter a2a --formula safety_invariant --automaton a2a_protocol
+```
+
+---
+
+## Adapter Architecture
+
+All adapters follow the same three-stage pipeline via the `FormatAdapter` trait:
+
+```
+Source file → Format Parser → AdapterIR → CTXDSL Emitter → CLTS
+```
+
+The agentic adapters (CrewAI, LangGraph, A2A) use a **delegation pattern**: they parse their native JSON format, construct an XState-compatible state machine internally, and delegate to the XState adapter's `translate()` pipeline. This reuses the XState adapter's hierarchy flattening, parallel state handling, property parsing, and controllability logic without duplication.
+
+```
+CrewAI/LangGraph/A2A JSON → Build XState JSON → XState translate() → AdapterIR → CTXDSL
+```
+
+Each adapter implements:
+- `detect(content)` — content-based format detection heuristic
+- `translate(content, options)` — full parsing and translation pipeline
+
+Auto-detection works by file extension (`.crew.json`, `.langgraph.json`, `.a2a.json`) and by content inspection (presence of format-specific JSON keys like `"agents"+"tasks"+"process"` for CrewAI).
+
+---
+
 ## CLI Usage
 
 ### Import
@@ -194,9 +335,13 @@ endmodule
 ```bash
 # Auto-detect format from extension
 mununu context eval design.sv --formula safety --automaton FSM
+mununu context eval workflow.langgraph.json --formula safety_invariant --automaton langgraph_workflow
 
 # Explicit adapter selection
 mununu context eval machine.json --adapter xstate --formula safety --automaton light
+mununu context eval crew.json --adapter crewai --formula can_finish --automaton crewai_workflow
+mununu context eval graph.json --adapter langgraph --formula safety_invariant --automaton langgraph_workflow
+mununu context eval cards.json --adapter a2a --formula safety_invariant --automaton a2a_protocol
 ```
 
 ### Export

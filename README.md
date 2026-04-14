@@ -21,6 +21,7 @@ Mununu is a verification tool for analyzing and synthesizing controllers for rea
 - **Composition** &mdash; Synchronous, asynchronous, and superset composition of CLTS components
 - **Controller synthesis** &mdash; Automatic synthesis of controllers satisfying safety and liveness properties
 - **State abstraction** &mdash; Multi-level variable abstraction (Boolean, integer intervals, symbol sets)
+- **Format adapters** &mdash; Import from TLSF, AIGER, Promela, XState, SystemVerilog, CrewAI, LangGraph, and A2A; export controllers to XState JSON or SystemVerilog
 - **REST API** &mdash; Built-in HTTP server for integration with web frontends
 - **Web UI** &mdash; Interactive editor, graph visualization, and verification via [mununu-ui](https://github.com/vscorza/mununu-ui)
 
@@ -125,6 +126,7 @@ context handshake {
 
 ```
 src/
+├── adapter/        # Format adapters (TLSF, AIGER, Promela, XState, SystemVerilog, CrewAI, LangGraph, A2A)
 ├── clts/           # Core CLTS data structure (builder, label store, state management)
 ├── composition/    # Synchronous, asynchronous, and superset composition
 ├── context/        # CLTS registry, synthesis, mu-calculus evaluation engine

@@ -1,0 +1,113 @@
+// Auto-generated from extraction spec: packages/server/src/server/streamableHttp.ts
+// Commit: 9ed62fe7d8be
+// CVE: CVE-2026-25536 (GHSA-345p-7cg4-v4c7)
+// Issue: Issue 1: Transport reuse — requestId collision causes cross-client response misrouting
+// Mode: fixed
+// Generator: tools/spec_to_ctxdsl.py
+//
+// Attack chain:
+//   Step 1 (line 788): Client A sends POST with {id:0, method:'tools/call'}
+//   Step 2 (line 788): Client B sends POST with {id:0, method:'tools/call'}
+//   Step 3 (line 981): Server processes Client A's request, calls send(response, {relatedRequestId:0})
+//   Step 4 (line 996): Server writes response to B_streamId
+// FIXED: single-use transport — second client request rejected
+//
+// Abstraction: requestId domain = {0} (both clients start at 0)
+//   Over-approximation: model allows all interleavings.
+//   Map.set() overwrite is deterministic regardless of scheduling.
+
+context cve_2026_25536_transport {
+    alphabet {
+        label ev_A_post;
+        label ev_B_post;
+        label ev_respond_correct;
+        label ev_respond_misrouted;
+        label noop;
+    }
+
+    automata {
+        // Client A: sends request with requestId=0
+        automaton ClientA {
+            controllable { }
+            states { state A_Idle initial; state A_Sent; }
+            transitions {
+                transition A_Idle -> A_Sent on label ev_A_post;
+                transition A_Idle -> A_Idle on label noop;
+                transition A_Idle -> A_Idle on label ev_B_post;
+                transition A_Idle -> A_Idle on label ev_respond_correct;
+                transition A_Idle -> A_Idle on label ev_respond_misrouted;
+                transition A_Sent -> A_Sent on label noop;
+                transition A_Sent -> A_Sent on label ev_B_post;
+                transition A_Sent -> A_Sent on label ev_respond_correct;
+                transition A_Sent -> A_Sent on label ev_respond_misrouted;
+            }
+        }
+
+        // Client B: sends request with requestId=0 (collides)
+        automaton ClientB {
+            controllable { }
+            states { state B_Idle initial; state B_Sent; }
+            transitions {
+                // FIXED: second client rejected — no ev_B_post allowed
+                transition B_Idle -> B_Idle on label noop;
+                transition B_Idle -> B_Idle on label ev_A_post;
+                transition B_Idle -> B_Idle on label ev_respond_correct;
+                transition B_Idle -> B_Idle on label ev_respond_misrouted;
+            }
+        }
+
+        // MappingAndRouter: merged mapping slot + response delivery tracking
+        // Mapping: line 788 set(), line 981 get(), line 996 writeSSEEvent()
+        // States encode: who owns requestId=0 slot × has response been delivered
+        automaton MappingAndRouter {
+            controllable { }
+            // FIXED: single-use transport eliminates second-client path
+            // OwnedByB and Misrouted states do not exist
+            states {
+                state Empty initial;
+                state OwnedByA;
+                state DeliveredCorrectly;
+            }
+            transitions {
+                transition Empty -> OwnedByA on label ev_A_post;
+                // Only correct delivery possible
+                transition OwnedByA -> DeliveredCorrectly on label ev_respond_correct;
+                transition DeliveredCorrectly -> DeliveredCorrectly on label noop;
+                transition Empty -> Empty on label noop;
+                transition OwnedByA -> OwnedByA on label noop;
+            }
+        }
+    }
+
+    composition {
+        asynchronous transport_system {
+            members [ClientA, ClientB, MappingAndRouter];
+        }
+    }
+
+    mu_formulas {
+        // Response isolation: Misrouted must be unreachable
+        // Expected: HOLDS
+        formula response_isolation {
+            over MappingAndRouter;
+            body = nu X. ((!Misrouted) && ([] X));
+        }
+
+        // No overwrite: OwnedByA blocks ev_B_post
+        // Expected: HOLDS
+        formula no_overwrite {
+            over MappingAndRouter;
+            body = nu X. ((!OwnedByA || ([ev_B_post] false)) && ([] X));
+        }
+
+        // Reachability: can Misrouted be reached?
+        // Expected: UNREACHABLE
+        formula misrouted_reachable {
+            over MappingAndRouter;
+            body = mu X. (Misrouted || <> X);
+        }
+    }
+
+    // No controllers: all labels are uncontrollable (server has no choice
+    // over response routing — send() follows the mapping)
+}

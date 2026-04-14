@@ -219,6 +219,63 @@ Composed state: Waiting|WorkingA|IdleB
   → (!true || !false) = (false || true) = true ✓
 ```
 
+## Framework Integration
+
+Mununu includes **native Rust adapters** for three agentic AI orchestration frameworks. Each adapter parses the framework's JSON format directly — no Python or external tools required.
+
+### LangGraph
+
+```bash
+# Direct import via native adapter (auto-detected from extension)
+mununu context synth workflow.langgraph.json \
+    --formula safety_invariant --automaton langgraph_workflow
+
+# Or with explicit adapter flag
+mununu context synth graph.json --adapter langgraph \
+    --formula safety_invariant --automaton langgraph_workflow
+```
+
+**Input:** JSON with `nodes`, `edges`, and `conditional_edges` keys. Nodes become states, edges become events, conditional edges produce routing events. Routing decisions (`ROUTE_*`) are controllable by default; environment-like events (human, tool_result, timeout) are uncontrollable.
+
+### CrewAI
+
+```bash
+mununu context synth crew.crew.json \
+    --formula can_finish --automaton crewai_workflow
+
+# Or explicit
+mununu context synth crew.json --adapter crewai \
+    --formula safety_invariant --automaton crewai_workflow
+```
+
+**Input:** JSON with `agents`, `tasks`, and `process` keys. Sequential process → linear state chain with completion/failure/retry per task. Hierarchical process → supervisor + parallel worker regions with delegation support.
+
+### A2A Protocol
+
+```bash
+mununu context synth protocol.a2a.json \
+    --formula mutex_researcher_writer --automaton a2a_protocol_system
+
+# Or explicit
+mununu context synth cards.json --adapter a2a \
+    --formula safety_invariant --automaton a2a_protocol
+```
+
+**Input:** Single agent card or JSON array of cards with `name` and `skills`. Each agent's skills become controllable invocation events. Task lifecycle (idle → queued → in_progress → completed/failed) modeled as state machine. Multi-agent cards produce parallel regions with auto-generated mutual exclusion properties.
+
+### Python Convenience Scripts (Optional)
+
+For users who want to introspect **live Python objects** (e.g., a `crewai.Crew` instance or a compiled `langgraph.graph.CompiledStateGraph`), the Python scripts in `tools/` remain available. They export XState JSON that can then be processed by either the XState or the native adapter:
+
+```bash
+# Live object introspection (requires framework install)
+python3 tools/langgraph_to_xstate.py --input graph.json --output workflow.xstate.json
+python3 tools/crewai_to_xstate.py --input crew.json --output crew.xstate.json
+python3 tools/a2a_to_xstate.py --input card1.json card2.json --output protocol.xstate.json
+```
+
+For JSON dict input, the native Rust adapters (`--adapter langgraph|crewai|a2a`) are preferred — they are faster, have no Python dependency, and integrate with auto-detection and the web UI.
+
 ## Web UI
 
 The `mununu-ui` web client supports agentic workflows:

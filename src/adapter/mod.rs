@@ -10,9 +10,12 @@
 //! Each adapter implements the [`FormatAdapter`] trait. The shared IR types
 //! live in [`ir`], and the CTXDSL emitter in [`emit`].
 
+pub mod a2a;
 pub mod aiger;
+pub mod crewai;
 pub mod emit;
 pub mod ir;
+pub mod langgraph;
 pub mod promela;
 pub mod systemverilog;
 pub mod tlsf;
@@ -100,6 +103,9 @@ pub enum SourceFormat {
     Promela,
     XState,
     SystemVerilog,
+    CrewAi,
+    LangGraph,
+    A2a,
 }
 
 impl fmt::Display for SourceFormat {
@@ -110,6 +116,9 @@ impl fmt::Display for SourceFormat {
             SourceFormat::Promela => write!(f, "Promela"),
             SourceFormat::XState => write!(f, "XState"),
             SourceFormat::SystemVerilog => write!(f, "SystemVerilog"),
+            SourceFormat::CrewAi => write!(f, "CrewAI"),
+            SourceFormat::LangGraph => write!(f, "LangGraph"),
+            SourceFormat::A2a => write!(f, "A2A"),
         }
     }
 }
@@ -153,6 +162,18 @@ impl std::error::Error for AdapterError {}
 /// Returns the adapter name ("tlsf", "aiger", "promela") or `None` if
 /// the extension is not recognized.
 pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str> {
+    // Check for compound extensions like .crew.json, .langgraph.json, .a2a.json
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem.ends_with(".crew") {
+        return Some("crewai");
+    }
+    if stem.ends_with(".langgraph") {
+        return Some("langgraph");
+    }
+    if stem.ends_with(".a2a") {
+        return Some("a2a");
+    }
+
     match path.extension().and_then(|e| e.to_str()) {
         Some("tlsf") => Some("tlsf"),
         Some("aag") | Some("aig") => Some("aiger"),
@@ -185,10 +206,19 @@ pub fn auto_translate(
     if systemverilog::SystemVerilogAdapter::detect(content) {
         return systemverilog::SystemVerilogAdapter::translate(content, options);
     }
+    if crewai::CrewAiAdapter::detect(content) {
+        return crewai::CrewAiAdapter::translate(content, options);
+    }
+    if langgraph::LangGraphAdapter::detect(content) {
+        return langgraph::LangGraphAdapter::translate(content, options);
+    }
+    if a2a::A2aAdapter::detect(content) {
+        return a2a::A2aAdapter::translate(content, options);
+    }
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate), SystemVerilog (.sv/.v)".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate), SystemVerilog (.sv/.v), CrewAI (.crew.json), LangGraph (.langgraph.json), A2A (.a2a.json)".into(),
         location: None,
     })
 }

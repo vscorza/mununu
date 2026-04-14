@@ -13,7 +13,7 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 - **Synchronous and asynchronous composition** -- combine automata lock-step (shared clock) or interleaved (independent clocks), with hierarchical nesting for cross-domain designs.
 - **Controller synthesis** -- automatically derive a maximally permissive controller that enforces a given property, respecting the controllable/uncontrollable label split.
 - **Counterstrategy generation** -- when a property is unrealizable, Mununu produces diagnostic traces showing how the environment can force a violation.
-- **Format adapters** -- import specifications from XState/Statecharts, SystemVerilog RTL, TLSF, AIGER, and Promela. Export synthesized controllers back to XState JSON or SystemVerilog modules.
+- **Format adapters** -- import specifications from XState/Statecharts, SystemVerilog RTL, TLSF, AIGER, Promela, CrewAI, LangGraph, and A2A. Export synthesized controllers back to XState JSON or SystemVerilog modules.
 - **Web UI** -- the companion `mununu-ui` frontend connects to the built-in API server for interactive graph visualization, formula evaluation, and synthesis. Supports importing adapter formats directly from the file picker.
 
 ## Table of Contents

@@ -1,0 +1,237 @@
+// OAuth 2.1 for MCP — Dynamic Registration & Scope Management
+//
+// Extends the OIDC PKCE pattern with MCP-specific additions:
+//   1. OAuthFlow: registration → authorization → token lifecycle
+//   2. ScopeTracker: tracks granted scopes as bit-flags (read, write, admin)
+//
+// Key insight: scope downscoping on token refresh — after refresh, new
+// scopes must be a subset of original grant (monotonicity on refresh).
+//
+// The orchestrator controls tool invocations and token management;
+// the environment controls auth server responses and token expiry.
+//
+// Properties:
+//   - Safety: No tool calls before registration AND token
+//   - Safety: Per-tool scope check (write_tool requires write scope)
+//   - Safety: Scope downscoping on refresh (monotonicity)
+//   - GR(1): If token keeps expiring, client keeps refreshing
+
+context oauth21_mcp {
+    alphabet {
+        label register_client;
+        label request_auth;
+        label auth_granted;
+        label auth_denied;
+        label exchange_token;
+        label token_received;
+        label token_expired;
+        label refresh_token;
+        label token_refreshed;
+        label call_read_tool;
+        label call_write_tool;
+        label call_admin_tool;
+        label revoke_write_scope;
+        label revoke_admin_scope;
+        label noop;
+    }
+
+    automata {
+        // OAuth flow: registration -> auth -> token lifecycle
+        automaton OAuthFlow {
+            controllable {
+                label register_client;
+                label request_auth;
+                label exchange_token;
+                label refresh_token;
+                label call_read_tool;
+                label call_write_tool;
+                label call_admin_tool;
+            }
+
+            states {
+                state Unregistered initial;
+                state Registered;
+                state AuthPending;
+                state Authorized;
+                state TokenActive;
+                state TokenExpired;
+            }
+
+            transitions {
+                // Registration
+                transition Unregistered -> Registered on label register_client;
+                transition Unregistered -> Unregistered on label noop;
+
+                // Authorization request
+                transition Registered -> AuthPending on label request_auth;
+                transition Registered -> Registered on label noop;
+
+                // Auth outcome (environment)
+                transition AuthPending -> Authorized on label auth_granted;
+                transition AuthPending -> Registered on label auth_denied;
+                transition AuthPending -> AuthPending on label noop;
+
+                // Token exchange
+                transition Authorized -> TokenActive on label exchange_token;
+                transition Authorized -> Authorized on label noop;
+
+                // Active token: tools work, token can expire
+                transition TokenActive -> TokenActive on label call_read_tool;
+                transition TokenActive -> TokenActive on label call_write_tool;
+                transition TokenActive -> TokenActive on label call_admin_tool;
+                transition TokenActive -> TokenExpired on label token_expired;
+                transition TokenActive -> TokenActive on label noop;
+                // Scope revocation passes through
+                transition TokenActive -> TokenActive on label revoke_write_scope;
+                transition TokenActive -> TokenActive on label revoke_admin_scope;
+                // Token received events
+                transition TokenActive -> TokenActive on label token_refreshed;
+
+                // Expired: must refresh
+                transition TokenExpired -> TokenActive on label token_refreshed;
+                transition TokenExpired -> TokenExpired on label refresh_token;
+                transition TokenExpired -> TokenExpired on label noop;
+                transition TokenExpired -> TokenExpired on label revoke_write_scope;
+                transition TokenExpired -> TokenExpired on label revoke_admin_scope;
+            }
+        }
+
+        // Scope tracker: bit-flag encoding for granted scopes
+        // read is always granted; write and admin can be revoked
+        automaton ScopeTracker {
+            controllable { }
+
+            states {
+                state RWA initial;  // read + write + admin (full scope)
+                state RW;           // read + write (admin revoked)
+                state R;            // read only (write + admin revoked)
+            }
+
+            transitions {
+                // Scope revocation: monotonic narrowing (never widens)
+                transition RWA -> RW on label revoke_admin_scope;
+                transition RWA -> R on label revoke_write_scope;
+                transition RW -> R on label revoke_write_scope;
+                // RW cannot regain admin; R cannot regain write or admin
+                // (SCOPE MONOTONICITY: no widening after revocation)
+
+                // Tool calls: pass through (scope check is in the property)
+                transition RWA -> RWA on label call_read_tool;
+                transition RWA -> RWA on label call_write_tool;
+                transition RWA -> RWA on label call_admin_tool;
+                transition RW -> RW on label call_read_tool;
+                transition RW -> RW on label call_write_tool;
+                // RW blocks call_admin_tool (no transition)
+                transition R -> R on label call_read_tool;
+                // R blocks call_write_tool and call_admin_tool (no transitions)
+
+                // All other labels pass through
+                transition RWA -> RWA on label noop;
+                transition RWA -> RWA on label register_client;
+                transition RWA -> RWA on label request_auth;
+                transition RWA -> RWA on label auth_granted;
+                transition RWA -> RWA on label auth_denied;
+                transition RWA -> RWA on label exchange_token;
+                transition RWA -> RWA on label token_received;
+                transition RWA -> RWA on label token_expired;
+                transition RWA -> RWA on label refresh_token;
+                transition RWA -> RWA on label token_refreshed;
+                transition RW -> RW on label noop;
+                transition RW -> RW on label register_client;
+                transition RW -> RW on label request_auth;
+                transition RW -> RW on label auth_granted;
+                transition RW -> RW on label auth_denied;
+                transition RW -> RW on label exchange_token;
+                transition RW -> RW on label token_received;
+                transition RW -> RW on label token_expired;
+                transition RW -> RW on label refresh_token;
+                transition RW -> RW on label token_refreshed;
+                transition RW -> RW on label revoke_admin_scope;
+                transition R -> R on label noop;
+                transition R -> R on label register_client;
+                transition R -> R on label request_auth;
+                transition R -> R on label auth_granted;
+                transition R -> R on label auth_denied;
+                transition R -> R on label exchange_token;
+                transition R -> R on label token_received;
+                transition R -> R on label token_expired;
+                transition R -> R on label refresh_token;
+                transition R -> R on label token_refreshed;
+                transition R -> R on label revoke_admin_scope;
+                transition R -> R on label revoke_write_scope;
+            }
+        }
+    }
+
+    composition {
+        asynchronous oauth_system {
+            members [OAuthFlow, ScopeTracker];
+        }
+    }
+
+    mu_formulas {
+        // Safety: No tool calls before registration + token.
+        // Unregistered, Registered, AuthPending, Authorized block all tools.
+        formula registration_before_tools {
+            over OAuthFlow;
+            body = nu X. (
+                (TokenActive
+                    || (([call_read_tool] false)
+                        && ([call_write_tool] false)
+                        && ([call_admin_tool] false)))
+                && ([] X)
+            );
+        }
+
+        // Safety: Per-tool scope check — admin tool requires admin scope.
+        // In state R (read-only) or RW (no admin), admin tool is blocked.
+        formula admin_requires_admin_scope {
+            over ScopeTracker;
+            body = nu X. (
+                (RWA || ([call_admin_tool] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Write tool requires write scope.
+        // In state R (read-only), write tool is blocked.
+        formula write_requires_write_scope {
+            over ScopeTracker;
+            body = nu X. (
+                ((!R) || ([call_write_tool] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Scope monotonicity — once in R, cannot regain write or admin.
+        // R has no transitions on any scope-widening events (structural).
+        formula scope_monotonic {
+            over ScopeTracker;
+            body = nu X. (
+                ((!R) || (([call_write_tool] false) && ([call_admin_tool] false)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: TokenActive is reachable from initial.
+        formula can_get_token {
+            over OAuthFlow;
+            body = mu X. (TokenActive || <> X);
+        }
+
+        // GR(1): If token keeps expiring, client keeps refreshing.
+        // GF(TokenExpired) -> GF(TokenActive)
+        formula token_refresh_liveness {
+            over OAuthFlow;
+            body = (! (nu A. (mu B. (TokenExpired || <> B)) && ([] A)))
+                || (nu C. (mu D. (TokenActive || <> D)) && ([] C));
+        }
+    }
+
+    controllers {
+        controller scope_enforcer {
+            source ScopeTracker;
+            satisfying admin_requires_admin_scope;
+        }
+    }
+}

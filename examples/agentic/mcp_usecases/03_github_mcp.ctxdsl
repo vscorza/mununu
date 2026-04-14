@@ -1,0 +1,288 @@
+// GitHub MCP Server — Toolset-Based RBAC & Scope Narrowing
+//
+// Models GitHub's official MCP server where tools are grouped into
+// "toolsets" (repos, issues, pull_requests, code_search) that can be
+// enabled or disabled. The model captures:
+//   1. ToolsetSelector: bit-flag tracking for 3 toolsets (repos, issues, PRs)
+//   2. SessionManager: session lifecycle (inactive/active/expired)
+//
+// Key insight: toolsets can be NARROWED (disabled) during a session
+// but never widened — a monotonicity property on configuration changes.
+//
+// The orchestrator controls tool invocations and toolset selection;
+// the environment controls session lifecycle.
+//
+// Properties:
+//   - Safety: Disabled toolset blocks all its tools
+//   - Safety: Scope monotonicity — toolsets only narrow within a session
+//   - Liveness: Active session + enabled toolset → tool eventually callable
+
+context github_mcp {
+    alphabet {
+        label session_start;
+        label session_expire;
+        label enable_repos;
+        label disable_repos;
+        label enable_issues;
+        label disable_issues;
+        label enable_prs;
+        label disable_prs;
+        label call_list_repos;
+        label call_create_repo;
+        label call_list_issues;
+        label call_create_issue;
+        label call_list_prs;
+        label call_create_pr;
+        label noop;
+    }
+
+    automata {
+        // Session manager: inactive -> active <-> expired
+        // Session lifecycle is environment-controlled (no controllable labels)
+        automaton SessionManager {
+            controllable { }
+
+            states {
+                state Inactive initial;
+                state Active;
+                state Expired;
+            }
+
+            transitions {
+                transition Inactive -> Active on label session_start;
+                transition Inactive -> Inactive on label noop;
+                transition Active -> Expired on label session_expire;
+                transition Active -> Active on label noop;
+                // All tool and toolset ops pass through when active
+                transition Active -> Active on label enable_repos;
+                transition Active -> Active on label disable_repos;
+                transition Active -> Active on label enable_issues;
+                transition Active -> Active on label disable_issues;
+                transition Active -> Active on label enable_prs;
+                transition Active -> Active on label disable_prs;
+                transition Active -> Active on label call_list_repos;
+                transition Active -> Active on label call_create_repo;
+                transition Active -> Active on label call_list_issues;
+                transition Active -> Active on label call_create_issue;
+                transition Active -> Active on label call_list_prs;
+                transition Active -> Active on label call_create_pr;
+                // Session restart
+                transition Expired -> Active on label session_start;
+                transition Expired -> Expired on label noop;
+            }
+        }
+
+        // Repos toolset: enabled/disabled flag
+        // When disabled, repo tools are blocked (no transitions on them)
+        automaton ReposToolset {
+            controllable {
+                label call_list_repos;
+                label call_create_repo;
+                label disable_repos;
+            }
+
+            states {
+                state Repos_on initial;
+                state Repos_off;
+            }
+
+            transitions {
+                // Enabled state: tools work, can be disabled
+                transition Repos_on -> Repos_on on label call_list_repos;
+                transition Repos_on -> Repos_on on label call_create_repo;
+                transition Repos_on -> Repos_off on label disable_repos;
+                transition Repos_on -> Repos_on on label noop;
+                // Pass-through for other toolset and session labels
+                transition Repos_on -> Repos_on on label session_start;
+                transition Repos_on -> Repos_on on label session_expire;
+                transition Repos_on -> Repos_on on label enable_issues;
+                transition Repos_on -> Repos_on on label disable_issues;
+                transition Repos_on -> Repos_on on label enable_prs;
+                transition Repos_on -> Repos_on on label disable_prs;
+                transition Repos_on -> Repos_on on label call_list_issues;
+                transition Repos_on -> Repos_on on label call_create_issue;
+                transition Repos_on -> Repos_on on label call_list_prs;
+                transition Repos_on -> Repos_on on label call_create_pr;
+                // Disabled state: NO transitions on repo tools (blocked)
+                transition Repos_off -> Repos_off on label noop;
+                transition Repos_off -> Repos_off on label session_start;
+                transition Repos_off -> Repos_off on label session_expire;
+                transition Repos_off -> Repos_off on label enable_issues;
+                transition Repos_off -> Repos_off on label disable_issues;
+                transition Repos_off -> Repos_off on label enable_prs;
+                transition Repos_off -> Repos_off on label disable_prs;
+                transition Repos_off -> Repos_off on label call_list_issues;
+                transition Repos_off -> Repos_off on label call_create_issue;
+                transition Repos_off -> Repos_off on label call_list_prs;
+                transition Repos_off -> Repos_off on label call_create_pr;
+                // SCOPE MONOTONICITY: no enable_repos from Repos_off
+                // (toolsets only narrow, never widen)
+            }
+        }
+
+        // Issues toolset: enabled/disabled flag
+        automaton IssuesToolset {
+            controllable {
+                label call_list_issues;
+                label call_create_issue;
+                label disable_issues;
+            }
+
+            states {
+                state Issues_on initial;
+                state Issues_off;
+            }
+
+            transitions {
+                transition Issues_on -> Issues_on on label call_list_issues;
+                transition Issues_on -> Issues_on on label call_create_issue;
+                transition Issues_on -> Issues_off on label disable_issues;
+                transition Issues_on -> Issues_on on label noop;
+                transition Issues_on -> Issues_on on label session_start;
+                transition Issues_on -> Issues_on on label session_expire;
+                transition Issues_on -> Issues_on on label enable_repos;
+                transition Issues_on -> Issues_on on label disable_repos;
+                transition Issues_on -> Issues_on on label enable_prs;
+                transition Issues_on -> Issues_on on label disable_prs;
+                transition Issues_on -> Issues_on on label call_list_repos;
+                transition Issues_on -> Issues_on on label call_create_repo;
+                transition Issues_on -> Issues_on on label call_list_prs;
+                transition Issues_on -> Issues_on on label call_create_pr;
+                // Disabled: issue tools blocked, no re-enable
+                transition Issues_off -> Issues_off on label noop;
+                transition Issues_off -> Issues_off on label session_start;
+                transition Issues_off -> Issues_off on label session_expire;
+                transition Issues_off -> Issues_off on label enable_repos;
+                transition Issues_off -> Issues_off on label disable_repos;
+                transition Issues_off -> Issues_off on label enable_prs;
+                transition Issues_off -> Issues_off on label disable_prs;
+                transition Issues_off -> Issues_off on label call_list_repos;
+                transition Issues_off -> Issues_off on label call_create_repo;
+                transition Issues_off -> Issues_off on label call_list_prs;
+                transition Issues_off -> Issues_off on label call_create_pr;
+            }
+        }
+
+        // PRs toolset: enabled/disabled flag
+        automaton PRsToolset {
+            controllable {
+                label call_list_prs;
+                label call_create_pr;
+                label disable_prs;
+            }
+
+            states {
+                state PRs_on initial;
+                state PRs_off;
+            }
+
+            transitions {
+                transition PRs_on -> PRs_on on label call_list_prs;
+                transition PRs_on -> PRs_on on label call_create_pr;
+                transition PRs_on -> PRs_off on label disable_prs;
+                transition PRs_on -> PRs_on on label noop;
+                transition PRs_on -> PRs_on on label session_start;
+                transition PRs_on -> PRs_on on label session_expire;
+                transition PRs_on -> PRs_on on label enable_repos;
+                transition PRs_on -> PRs_on on label disable_repos;
+                transition PRs_on -> PRs_on on label enable_issues;
+                transition PRs_on -> PRs_on on label disable_issues;
+                transition PRs_on -> PRs_on on label call_list_repos;
+                transition PRs_on -> PRs_on on label call_create_repo;
+                transition PRs_on -> PRs_on on label call_list_issues;
+                transition PRs_on -> PRs_on on label call_create_issue;
+                // Disabled: PR tools blocked, no re-enable
+                transition PRs_off -> PRs_off on label noop;
+                transition PRs_off -> PRs_off on label session_start;
+                transition PRs_off -> PRs_off on label session_expire;
+                transition PRs_off -> PRs_off on label enable_repos;
+                transition PRs_off -> PRs_off on label disable_repos;
+                transition PRs_off -> PRs_off on label enable_issues;
+                transition PRs_off -> PRs_off on label disable_issues;
+                transition PRs_off -> PRs_off on label call_list_repos;
+                transition PRs_off -> PRs_off on label call_create_repo;
+                transition PRs_off -> PRs_off on label call_list_issues;
+                transition PRs_off -> PRs_off on label call_create_issue;
+            }
+        }
+    }
+
+    composition {
+        asynchronous github_system {
+            members [SessionManager, ReposToolset, IssuesToolset, PRsToolset];
+        }
+    }
+
+    mu_formulas {
+        // Safety: Disabled repos toolset blocks all repo tools.
+        // Structural: Repos_off has no transitions on call_list_repos or
+        // call_create_repo, so this holds by construction.
+        formula repos_disabled_blocks_tools {
+            over ReposToolset;
+            body = nu X. (
+                (Repos_on || (([call_list_repos] false) && ([call_create_repo] false)))
+                && ([] X)
+            );
+        }
+
+        // Safety: Scope monotonicity — once Repos_off, no enable_repos.
+        // Encodes that toolsets only narrow within a session.
+        formula repos_scope_monotonic {
+            over ReposToolset;
+            body = nu X. (
+                ((!Repos_off) || ([enable_repos] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Scope monotonicity for issues.
+        formula issues_scope_monotonic {
+            over IssuesToolset;
+            body = nu X. (
+                ((!Issues_off) || ([enable_issues] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Scope monotonicity for PRs.
+        formula prs_scope_monotonic {
+            over PRsToolset;
+            body = nu X. (
+                ((!PRs_off) || ([enable_prs] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No tool calls when session is inactive or expired.
+        formula session_required_for_tools {
+            over SessionManager;
+            body = nu X. (
+                (Active ||
+                    (([call_list_repos] false) && ([call_create_repo] false)
+                    && ([call_list_issues] false) && ([call_create_issue] false)
+                    && ([call_list_prs] false) && ([call_create_pr] false)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Active session is reachable.
+        formula can_reach_active {
+            over SessionManager;
+            body = mu X. (Active || <> X);
+        }
+
+        // Liveness: Repos_off is reachable (narrowing is possible).
+        formula can_narrow_repos {
+            over ReposToolset;
+            body = mu X. (Repos_off || <> X);
+        }
+    }
+
+    controllers {
+        // Synthesize controller enforcing scope monotonicity on repos
+        controller repos_scope_enforcer {
+            source ReposToolset;
+            satisfying repos_scope_monotonic;
+        }
+    }
+}

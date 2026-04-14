@@ -1,0 +1,323 @@
+// AWS Bedrock AgentCore — Multi-Server Gateway with IAM & Session Affinity
+//
+// Models Amazon's Bedrock AgentCore gateway pattern:
+//   1. IAMAuth: authentication lifecycle (unauthenticated → user → admin → expired)
+//   2. GatewayRouter: routes requests to backend MCP servers (A or B)
+//   3. SessionManager: tracks session affinity (which backend owns the session)
+//   4. BackendA/B: backend server availability (up/down)
+//
+// Key insights:
+//   - IAM-gated routing: no backend access without authentication
+//   - Session affinity: once routed to A, stay on A for the session
+//   - Fallback routing: if A goes down, can route to B
+//
+// Properties:
+//   - Safety: IAM-gated routing (no dispatch without auth)
+//   - Safety: Session affinity (same-session calls stick to same backend)
+//   - GR(1): Gateway availability (requests eventually dispatched)
+//   - Liveness: Fallback routing (backend failure → alternative)
+//   - GR(1): IAM token refresh responsiveness
+
+context bedrock_agentcore {
+    alphabet {
+        label iam_authenticate;
+        label iam_token_expire;
+        label iam_refresh;
+        label iam_token_refreshed;
+        label route_to_A;
+        label route_to_B;
+        label dispatch_request;
+        label request_complete;
+        label backend_A_down;
+        label backend_A_up;
+        label backend_B_down;
+        label backend_B_up;
+        label end_session;
+        label noop;
+    }
+
+    automata {
+        // IAM authentication lifecycle
+        automaton IAMAuth {
+            controllable {
+                label iam_authenticate;
+                label iam_refresh;
+                label dispatch_request;
+            }
+
+            states {
+                state Unauthenticated initial;
+                state Authenticated;
+                state TokenExpired;
+            }
+
+            transitions {
+                // Login
+                transition Unauthenticated -> Authenticated on label iam_authenticate;
+                transition Unauthenticated -> Unauthenticated on label noop;
+                // Pass-through for routing and backend events
+                transition Unauthenticated -> Unauthenticated on label route_to_A;
+                transition Unauthenticated -> Unauthenticated on label route_to_B;
+                transition Unauthenticated -> Unauthenticated on label request_complete;
+                transition Unauthenticated -> Unauthenticated on label backend_A_down;
+                transition Unauthenticated -> Unauthenticated on label backend_A_up;
+                transition Unauthenticated -> Unauthenticated on label backend_B_down;
+                transition Unauthenticated -> Unauthenticated on label backend_B_up;
+                transition Unauthenticated -> Unauthenticated on label end_session;
+
+                // Authenticated: can dispatch, token can expire
+                transition Authenticated -> Authenticated on label dispatch_request;
+                transition Authenticated -> TokenExpired on label iam_token_expire;
+                transition Authenticated -> Authenticated on label noop;
+                transition Authenticated -> Authenticated on label route_to_A;
+                transition Authenticated -> Authenticated on label route_to_B;
+                transition Authenticated -> Authenticated on label request_complete;
+                transition Authenticated -> Authenticated on label backend_A_down;
+                transition Authenticated -> Authenticated on label backend_A_up;
+                transition Authenticated -> Authenticated on label backend_B_down;
+                transition Authenticated -> Authenticated on label backend_B_up;
+                transition Authenticated -> Authenticated on label end_session;
+                transition Authenticated -> Authenticated on label iam_token_refreshed;
+
+                // Token expired: must refresh
+                transition TokenExpired -> TokenExpired on label iam_refresh;
+                transition TokenExpired -> Authenticated on label iam_token_refreshed;
+                transition TokenExpired -> TokenExpired on label noop;
+                transition TokenExpired -> TokenExpired on label route_to_A;
+                transition TokenExpired -> TokenExpired on label route_to_B;
+                transition TokenExpired -> TokenExpired on label request_complete;
+                transition TokenExpired -> TokenExpired on label backend_A_down;
+                transition TokenExpired -> TokenExpired on label backend_A_up;
+                transition TokenExpired -> TokenExpired on label backend_B_down;
+                transition TokenExpired -> TokenExpired on label backend_B_up;
+                transition TokenExpired -> TokenExpired on label end_session;
+                // No dispatch_request from TokenExpired
+            }
+        }
+
+        // Gateway router: session affinity enforcement
+        // Once bound to a backend, stays there until session ends
+        automaton GatewayRouter {
+            controllable {
+                label route_to_A;
+                label route_to_B;
+                label end_session;
+            }
+
+            states {
+                state Unbound initial;
+                state BoundToA;
+                state BoundToB;
+            }
+
+            transitions {
+                // Initial routing decision
+                transition Unbound -> BoundToA on label route_to_A;
+                transition Unbound -> BoundToB on label route_to_B;
+                transition Unbound -> Unbound on label noop;
+                transition Unbound -> Unbound on label iam_authenticate;
+                transition Unbound -> Unbound on label iam_token_expire;
+                transition Unbound -> Unbound on label iam_refresh;
+                transition Unbound -> Unbound on label iam_token_refreshed;
+                transition Unbound -> Unbound on label dispatch_request;
+                transition Unbound -> Unbound on label request_complete;
+                transition Unbound -> Unbound on label backend_A_down;
+                transition Unbound -> Unbound on label backend_A_up;
+                transition Unbound -> Unbound on label backend_B_down;
+                transition Unbound -> Unbound on label backend_B_up;
+
+                // BoundToA: session affinity — no route_to_B
+                // (route_to_B intentionally missing)
+                transition BoundToA -> BoundToA on label dispatch_request;
+                transition BoundToA -> BoundToA on label request_complete;
+                transition BoundToA -> Unbound on label end_session;
+                transition BoundToA -> BoundToA on label noop;
+                transition BoundToA -> BoundToA on label iam_authenticate;
+                transition BoundToA -> BoundToA on label iam_token_expire;
+                transition BoundToA -> BoundToA on label iam_refresh;
+                transition BoundToA -> BoundToA on label iam_token_refreshed;
+                transition BoundToA -> BoundToA on label backend_A_down;
+                transition BoundToA -> BoundToA on label backend_A_up;
+                transition BoundToA -> BoundToA on label backend_B_down;
+                transition BoundToA -> BoundToA on label backend_B_up;
+
+                // BoundToB: session affinity — no route_to_A
+                transition BoundToB -> BoundToB on label dispatch_request;
+                transition BoundToB -> BoundToB on label request_complete;
+                transition BoundToB -> Unbound on label end_session;
+                transition BoundToB -> BoundToB on label noop;
+                transition BoundToB -> BoundToB on label iam_authenticate;
+                transition BoundToB -> BoundToB on label iam_token_expire;
+                transition BoundToB -> BoundToB on label iam_refresh;
+                transition BoundToB -> BoundToB on label iam_token_refreshed;
+                transition BoundToB -> BoundToB on label backend_A_down;
+                transition BoundToB -> BoundToB on label backend_A_up;
+                transition BoundToB -> BoundToB on label backend_B_down;
+                transition BoundToB -> BoundToB on label backend_B_up;
+            }
+        }
+
+        // Backend A availability
+        automaton BackendA {
+            controllable { }
+
+            states {
+                state A_up initial;
+                state A_down;
+            }
+
+            transitions {
+                transition A_up -> A_down on label backend_A_down;
+                transition A_down -> A_up on label backend_A_up;
+                transition A_up -> A_up on label noop;
+                transition A_down -> A_down on label noop;
+                // All other labels pass through
+                transition A_up -> A_up on label iam_authenticate;
+                transition A_up -> A_up on label iam_token_expire;
+                transition A_up -> A_up on label iam_refresh;
+                transition A_up -> A_up on label iam_token_refreshed;
+                transition A_up -> A_up on label route_to_A;
+                transition A_up -> A_up on label route_to_B;
+                transition A_up -> A_up on label dispatch_request;
+                transition A_up -> A_up on label request_complete;
+                transition A_up -> A_up on label backend_B_down;
+                transition A_up -> A_up on label backend_B_up;
+                transition A_up -> A_up on label end_session;
+                transition A_down -> A_down on label iam_authenticate;
+                transition A_down -> A_down on label iam_token_expire;
+                transition A_down -> A_down on label iam_refresh;
+                transition A_down -> A_down on label iam_token_refreshed;
+                transition A_down -> A_down on label route_to_A;
+                transition A_down -> A_down on label route_to_B;
+                transition A_down -> A_down on label dispatch_request;
+                transition A_down -> A_down on label request_complete;
+                transition A_down -> A_down on label backend_B_down;
+                transition A_down -> A_down on label backend_B_up;
+                transition A_down -> A_down on label end_session;
+            }
+        }
+
+        // Backend B availability
+        automaton BackendB {
+            controllable { }
+
+            states {
+                state B_up initial;
+                state B_down;
+            }
+
+            transitions {
+                transition B_up -> B_down on label backend_B_down;
+                transition B_down -> B_up on label backend_B_up;
+                transition B_up -> B_up on label noop;
+                transition B_down -> B_down on label noop;
+                transition B_up -> B_up on label iam_authenticate;
+                transition B_up -> B_up on label iam_token_expire;
+                transition B_up -> B_up on label iam_refresh;
+                transition B_up -> B_up on label iam_token_refreshed;
+                transition B_up -> B_up on label route_to_A;
+                transition B_up -> B_up on label route_to_B;
+                transition B_up -> B_up on label dispatch_request;
+                transition B_up -> B_up on label request_complete;
+                transition B_up -> B_up on label backend_A_down;
+                transition B_up -> B_up on label backend_A_up;
+                transition B_up -> B_up on label end_session;
+                transition B_down -> B_down on label iam_authenticate;
+                transition B_down -> B_down on label iam_token_expire;
+                transition B_down -> B_down on label iam_refresh;
+                transition B_down -> B_down on label iam_token_refreshed;
+                transition B_down -> B_down on label route_to_A;
+                transition B_down -> B_down on label route_to_B;
+                transition B_down -> B_down on label dispatch_request;
+                transition B_down -> B_down on label request_complete;
+                transition B_down -> B_down on label backend_A_down;
+                transition B_down -> B_down on label backend_A_up;
+                transition B_down -> B_down on label end_session;
+            }
+        }
+    }
+
+    composition {
+        asynchronous agentcore_system {
+            members [IAMAuth, GatewayRouter, BackendA, BackendB];
+        }
+    }
+
+    mu_formulas {
+        // Safety: IAM-gated routing — no dispatch without authentication.
+        // Unauthenticated and TokenExpired block dispatch_request.
+        formula iam_gated_dispatch {
+            over IAMAuth;
+            body = nu X. (
+                (Authenticated || ([dispatch_request] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Session affinity — BoundToA blocks route_to_B.
+        formula session_affinity_A {
+            over GatewayRouter;
+            body = nu X. (
+                ((!BoundToA) || ([route_to_B] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Session affinity — BoundToB blocks route_to_A.
+        formula session_affinity_B {
+            over GatewayRouter;
+            body = nu X. (
+                ((!BoundToB) || ([route_to_A] false))
+                && ([] X)
+            );
+        }
+
+        // GR(1): Gateway availability — if requests keep arriving,
+        // they eventually get dispatched.
+        // GF(Unbound) -> GF(BoundToA || BoundToB)
+        formula gateway_availability {
+            over GatewayRouter;
+            body = (! (nu A. (mu B. (Unbound || <> B)) && ([] A)))
+                || (nu C. (mu D. (BoundToA || BoundToB || <> D)) && ([] C));
+        }
+
+        // GR(1): IAM token refresh responsiveness.
+        // GF(TokenExpired) -> GF(Authenticated)
+        formula iam_refresh_liveness {
+            over IAMAuth;
+            body = (! (nu A. (mu B. (TokenExpired || <> B)) && ([] A)))
+                || (nu C. (mu D. (Authenticated || <> D)) && ([] C));
+        }
+
+        // Liveness: Authenticated state is reachable.
+        formula can_authenticate {
+            over IAMAuth;
+            body = mu X. (Authenticated || <> X);
+        }
+
+        // Liveness: Backend A availability is recoverable.
+        formula backend_A_recoverable {
+            over BackendA;
+            body = nu X. (
+                (A_up || (mu Y. (A_up || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Session can be ended and rebound.
+        formula session_rebindable {
+            over GatewayRouter;
+            body = nu X. (
+                (Unbound || (mu Y. (Unbound || <> Y)))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        controller iam_enforcer {
+            source IAMAuth;
+            satisfying iam_gated_dispatch;
+        }
+    }
+}

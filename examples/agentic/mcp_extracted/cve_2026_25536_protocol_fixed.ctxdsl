@@ -1,0 +1,102 @@
+// Auto-generated from extraction spec: packages/core/src/shared/protocol.ts
+// Commit: 9ed62fe7d8be
+// CVE: CVE-2026-25536 (GHSA-345p-7cg4-v4c7)
+// Issue: Issue 2: Protocol/Server reuse — connect() overwrites _transport, notifications sent to wrong client
+// Mode: fixed
+// Generator: tools/spec_to_ctxdsl.py
+//
+// Attack chain:
+//   Step 1 (line 456): Client A connects: connect(transportA)
+//   Step 2 (line 546): Client A sends tools/call request
+//   Step 3 (line 456): Client B connects: connect(transportB)
+//   Step 4 (line 552): Client A's handler sends progress notification via ctx.mcpReq.notify()
+//   Step 5 (line 1000): notification() sends via this._transport
+//   Step 6 (line 634): Client A's handler returns final response
+//
+// Key distinction:
+//   Final responses use capturedTransport (line 634) → CORRECT
+//   Notifications use this._transport (line 1000) → VULNERABLE
+
+context cve_2026_25536_protocol {
+    alphabet {
+        label ev_connect_A;
+        label ev_connect_B;
+        label ev_A_request;
+        label ev_A_notify;
+        label ev_A_respond;
+        label noop;
+    }
+
+    automata {
+        // HandlerA: Client A's request handler execution
+        automaton HandlerA {
+            controllable { }
+            states { state Idle initial; state Handling; state Done; }
+            transitions {
+                // Client A sends request → handler starts
+                transition Idle -> Handling on label ev_A_request;
+                transition Idle -> Idle on label noop;
+                transition Idle -> Idle on label ev_connect_A;
+                transition Idle -> Idle on label ev_connect_B;
+                // During handling: can notify or respond
+                transition Handling -> Handling on label ev_A_notify;
+                transition Handling -> Done on label ev_A_respond;
+                transition Handling -> Handling on label noop;
+                transition Handling -> Handling on label ev_connect_B;
+                // Done
+                transition Done -> Done on label noop;
+            }
+        }
+
+        // ProtocolRef: this._transport reference + notification outcome
+        // line 456: connect() sets ref, line 1000: notification() reads ref
+        automaton ProtocolRef {
+            controllable { }
+            // FIXED: connect(B) blocked when already connected to A
+            states {
+                state None initial;
+                state PointsToA;
+                state NotifyCorrect;
+            }
+            transitions {
+                transition None -> PointsToA on label ev_connect_A;
+                // connect(B) NOT possible (throws)
+                transition PointsToA -> PointsToA on label ev_A_request;
+                transition PointsToA -> NotifyCorrect on label ev_A_notify;
+                transition PointsToA -> PointsToA on label ev_A_respond;
+                transition None -> None on label noop;
+                transition PointsToA -> PointsToA on label noop;
+                transition NotifyCorrect -> NotifyCorrect on label noop;
+            }
+        }
+    }
+
+    composition {
+        asynchronous protocol_system {
+            members [HandlerA, ProtocolRef];
+        }
+    }
+
+    mu_formulas {
+        // Notification isolation: NotifyLeaked must be unreachable
+        // Expected: HOLDS
+        formula notification_isolation {
+            over ProtocolRef;
+            body = nu X. ((!NotifyLeaked) && ([] X));
+        }
+
+        // No overwrite: PointsToA blocks ev_connect_B
+        // Expected: HOLDS
+        formula no_connect_overwrite {
+            over ProtocolRef;
+            body = nu X. ((!PointsToA || ([ev_connect_B] false)) && ([] X));
+        }
+
+        // Can leaked state be reached?
+        // Expected: UNREACHABLE
+        formula leaked_reachable {
+            over ProtocolRef;
+            body = mu X. (NotifyLeaked || <> X);
+        }
+    }
+}

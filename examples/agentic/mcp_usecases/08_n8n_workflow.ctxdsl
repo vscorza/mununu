@@ -1,0 +1,271 @@
+// n8n Workflow MCP — Template Validation & Resource Quotas
+//
+// Models the n8n MCP integration where agents build workflows from
+// templates. Four concerns compose:
+//   1. TemplateValidator: validates template parameters before instantiation
+//   2. WorkflowBuilder: tracks workflow lifecycle (draft → validated → running → done)
+//   3. ResourceQuota: bounded counter of active workflows (max 3)
+//
+// Key insight: template validation is a precondition for instantiation.
+// An agent must not create a workflow without passing validation first.
+//
+// Properties:
+//   - Safety: Validation before instantiation
+//   - Safety: Resource quota enforcement
+//   - Liveness: Every running workflow eventually completes or fails
+//   - Safety: No modification of running workflows
+
+context n8n_workflow {
+    alphabet {
+        label submit_template;
+        label validate_ok;
+        label validate_fail;
+        label instantiate_workflow;
+        label start_workflow;
+        label workflow_complete;
+        label workflow_fail;
+        label destroy_workflow;
+        label quota_release;
+        label noop;
+    }
+
+    automata {
+        // Template validator: checks template params before instantiation
+        automaton TemplateValidator {
+            controllable {
+                label submit_template;
+                label instantiate_workflow;
+            }
+
+            states {
+                state NoTemplate initial;
+                state Validating;
+                state Valid;
+                state Invalid;
+            }
+
+            transitions {
+                // Submit template for validation
+                transition NoTemplate -> Validating on label submit_template;
+                transition NoTemplate -> NoTemplate on label noop;
+                // Pass-through for workflow events
+                transition NoTemplate -> NoTemplate on label start_workflow;
+                transition NoTemplate -> NoTemplate on label workflow_complete;
+                transition NoTemplate -> NoTemplate on label workflow_fail;
+                transition NoTemplate -> NoTemplate on label destroy_workflow;
+                transition NoTemplate -> NoTemplate on label quota_release;
+
+                // Environment validates
+                transition Validating -> Valid on label validate_ok;
+                transition Validating -> Invalid on label validate_fail;
+                transition Validating -> Validating on label noop;
+
+                // Valid: can instantiate, then reset to NoTemplate
+                transition Valid -> NoTemplate on label instantiate_workflow;
+                transition Valid -> Valid on label noop;
+                transition Valid -> Valid on label start_workflow;
+                transition Valid -> Valid on label workflow_complete;
+                transition Valid -> Valid on label workflow_fail;
+                transition Valid -> Valid on label destroy_workflow;
+                transition Valid -> Valid on label quota_release;
+
+                // Invalid: must resubmit
+                transition Invalid -> Validating on label submit_template;
+                transition Invalid -> Invalid on label noop;
+                transition Invalid -> Invalid on label start_workflow;
+                transition Invalid -> Invalid on label workflow_complete;
+                transition Invalid -> Invalid on label workflow_fail;
+                transition Invalid -> Invalid on label destroy_workflow;
+                transition Invalid -> Invalid on label quota_release;
+            }
+        }
+
+        // Workflow builder: lifecycle of a single workflow
+        automaton WorkflowBuilder {
+            controllable {
+                label start_workflow;
+                label destroy_workflow;
+            }
+
+            states {
+                state WF_idle initial;
+                state WF_instantiated;
+                state WF_running;
+                state WF_completed;
+                state WF_failed;
+            }
+
+            transitions {
+                // Instantiation creates workflow
+                transition WF_idle -> WF_instantiated on label instantiate_workflow;
+                transition WF_idle -> WF_idle on label noop;
+                transition WF_idle -> WF_idle on label submit_template;
+                transition WF_idle -> WF_idle on label validate_ok;
+                transition WF_idle -> WF_idle on label validate_fail;
+                transition WF_idle -> WF_idle on label quota_release;
+
+                // Start running
+                transition WF_instantiated -> WF_running on label start_workflow;
+                transition WF_instantiated -> WF_idle on label destroy_workflow;
+                transition WF_instantiated -> WF_instantiated on label noop;
+                transition WF_instantiated -> WF_instantiated on label submit_template;
+                transition WF_instantiated -> WF_instantiated on label validate_ok;
+                transition WF_instantiated -> WF_instantiated on label validate_fail;
+                transition WF_instantiated -> WF_instantiated on label quota_release;
+
+                // Running: environment determines outcome
+                transition WF_running -> WF_completed on label workflow_complete;
+                transition WF_running -> WF_failed on label workflow_fail;
+                transition WF_running -> WF_running on label noop;
+                transition WF_running -> WF_running on label submit_template;
+                transition WF_running -> WF_running on label validate_ok;
+                transition WF_running -> WF_running on label validate_fail;
+                transition WF_running -> WF_running on label quota_release;
+                // No destroy while running (safety property below)
+
+                // Terminal states: can be destroyed to reclaim quota
+                transition WF_completed -> WF_idle on label destroy_workflow;
+                transition WF_completed -> WF_completed on label noop;
+                transition WF_completed -> WF_completed on label quota_release;
+                transition WF_completed -> WF_completed on label submit_template;
+                transition WF_completed -> WF_completed on label validate_ok;
+                transition WF_completed -> WF_completed on label validate_fail;
+                transition WF_failed -> WF_idle on label destroy_workflow;
+                transition WF_failed -> WF_failed on label noop;
+                transition WF_failed -> WF_failed on label quota_release;
+                transition WF_failed -> WF_failed on label submit_template;
+                transition WF_failed -> WF_failed on label validate_ok;
+                transition WF_failed -> WF_failed on label validate_fail;
+            }
+        }
+
+        // Resource quota: bounded counter of active workflows (max 3)
+        automaton ResourceQuota {
+            controllable { }
+
+            states {
+                state quota_0 initial;
+                state quota_1;
+                state quota_2;
+                state quota_3;
+            }
+
+            transitions {
+                // instantiate_workflow increments
+                transition quota_0 -> quota_1 on label instantiate_workflow;
+                transition quota_1 -> quota_2 on label instantiate_workflow;
+                transition quota_2 -> quota_3 on label instantiate_workflow;
+                // quota_3: no more instantiations (blocked)
+
+                // destroy_workflow decrements
+                transition quota_1 -> quota_0 on label destroy_workflow;
+                transition quota_2 -> quota_1 on label destroy_workflow;
+                transition quota_3 -> quota_2 on label destroy_workflow;
+                transition quota_0 -> quota_0 on label destroy_workflow;
+
+                // All other labels pass through
+                transition quota_0 -> quota_0 on label noop;
+                transition quota_1 -> quota_1 on label noop;
+                transition quota_2 -> quota_2 on label noop;
+                transition quota_3 -> quota_3 on label noop;
+                transition quota_0 -> quota_0 on label submit_template;
+                transition quota_0 -> quota_0 on label validate_ok;
+                transition quota_0 -> quota_0 on label validate_fail;
+                transition quota_0 -> quota_0 on label start_workflow;
+                transition quota_0 -> quota_0 on label workflow_complete;
+                transition quota_0 -> quota_0 on label workflow_fail;
+                transition quota_0 -> quota_0 on label quota_release;
+                transition quota_1 -> quota_1 on label submit_template;
+                transition quota_1 -> quota_1 on label validate_ok;
+                transition quota_1 -> quota_1 on label validate_fail;
+                transition quota_1 -> quota_1 on label start_workflow;
+                transition quota_1 -> quota_1 on label workflow_complete;
+                transition quota_1 -> quota_1 on label workflow_fail;
+                transition quota_1 -> quota_1 on label quota_release;
+                transition quota_2 -> quota_2 on label submit_template;
+                transition quota_2 -> quota_2 on label validate_ok;
+                transition quota_2 -> quota_2 on label validate_fail;
+                transition quota_2 -> quota_2 on label start_workflow;
+                transition quota_2 -> quota_2 on label workflow_complete;
+                transition quota_2 -> quota_2 on label workflow_fail;
+                transition quota_2 -> quota_2 on label quota_release;
+                transition quota_3 -> quota_3 on label submit_template;
+                transition quota_3 -> quota_3 on label validate_ok;
+                transition quota_3 -> quota_3 on label validate_fail;
+                transition quota_3 -> quota_3 on label start_workflow;
+                transition quota_3 -> quota_3 on label workflow_complete;
+                transition quota_3 -> quota_3 on label workflow_fail;
+                transition quota_3 -> quota_3 on label quota_release;
+            }
+        }
+    }
+
+    composition {
+        asynchronous n8n_system {
+            members [TemplateValidator, WorkflowBuilder, ResourceQuota];
+        }
+    }
+
+    mu_formulas {
+        // Safety: Validation before instantiation.
+        // Only Valid state allows instantiate_workflow.
+        formula validation_before_instantiation {
+            over TemplateValidator;
+            body = nu X. (
+                (Valid || ([instantiate_workflow] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Resource quota enforcement.
+        // quota_3 blocks instantiate_workflow.
+        formula quota_enforced {
+            over ResourceQuota;
+            body = nu X. (
+                ((!quota_3) || ([instantiate_workflow] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No destruction of running workflows.
+        // WF_running blocks destroy_workflow.
+        formula no_destroy_running {
+            over WorkflowBuilder;
+            body = nu X. (
+                ((!WF_running) || ([destroy_workflow] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Running workflow eventually completes or fails.
+        formula workflow_terminates {
+            over WorkflowBuilder;
+            body = nu X. (
+                ((!WF_running) || (mu Y. (WF_completed || WF_failed || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: WF_completed is reachable from initial.
+        formula can_complete_workflow {
+            over WorkflowBuilder;
+            body = mu X. (WF_completed || <> X);
+        }
+
+        // Liveness: Quota can be reclaimed (quota_0 reachable).
+        formula quota_recoverable {
+            over ResourceQuota;
+            body = nu X. (
+                (quota_0 || (mu Y. (quota_0 || <> Y)))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        controller validation_enforcer {
+            source TemplateValidator;
+            satisfying validation_before_instantiation;
+        }
+    }
+}

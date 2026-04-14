@@ -1,0 +1,179 @@
+// Figma MCP Server — Read-Write Conflict & Design Consistency
+//
+// Models Figma's bi-directional MCP server where agents can both read
+// design tokens and write style updates. Two concerns compose:
+//   1. DesignAccess: read-write state machine with lock semantics
+//   2. CacheState: tracks whether local cache is valid after writes
+//
+// Key insight: concurrent reads and writes conflict. After a write,
+// reads must go through cache invalidation before returning stale data.
+//
+// The orchestrator controls read/write requests;
+// the environment controls write completion outcomes and cache invalidation.
+//
+// Properties:
+//   - Safety: No write during active read (mutual exclusion)
+//   - Safety: Cache must be invalidated after write before read
+//   - GR(1): Write fairness — if writes keep being requested, they complete
+//   - Liveness: Conflict state eventually resolves
+
+context figma_mcp {
+    alphabet {
+        label begin_read;
+        label end_read;
+        label begin_write;
+        label write_complete;
+        label write_conflict;
+        label conflict_resolved;
+        label invalidate_cache;
+        label noop;
+    }
+
+    automata {
+        // Design access: read-write lock state machine
+        automaton DesignAccess {
+            controllable {
+                label begin_read;
+                label begin_write;
+            }
+
+            states {
+                state Idle initial;
+                state Reading;
+                state Writing;
+                state Conflict;
+            }
+
+            transitions {
+                // Idle: can start read or write
+                transition Idle -> Reading on label begin_read;
+                transition Idle -> Writing on label begin_write;
+                transition Idle -> Idle on label noop;
+                transition Idle -> Idle on label invalidate_cache;
+
+                // Reading: no write allowed (mutual exclusion)
+                // begin_write intentionally missing from Reading
+                transition Reading -> Idle on label end_read;
+                transition Reading -> Reading on label noop;
+                transition Reading -> Reading on label invalidate_cache;
+
+                // Writing: environment determines outcome
+                transition Writing -> Idle on label write_complete;
+                transition Writing -> Conflict on label write_conflict;
+                transition Writing -> Writing on label noop;
+                transition Writing -> Writing on label invalidate_cache;
+
+                // Conflict: must resolve before continuing
+                transition Conflict -> Idle on label conflict_resolved;
+                transition Conflict -> Conflict on label noop;
+                transition Conflict -> Conflict on label invalidate_cache;
+            }
+        }
+
+        // Cache state: tracks invalidation requirement
+        automaton CacheState {
+            controllable { }
+
+            states {
+                state CacheValid initial;
+                state CacheStale;
+            }
+
+            transitions {
+                // Write makes cache stale
+                transition CacheValid -> CacheStale on label write_complete;
+                transition CacheStale -> CacheStale on label write_complete;
+
+                // Invalidation restores validity
+                transition CacheStale -> CacheValid on label invalidate_cache;
+                transition CacheValid -> CacheValid on label invalidate_cache;
+
+                // Read only from valid cache (stale reads blocked)
+                transition CacheValid -> CacheValid on label begin_read;
+                // CacheStale: begin_read intentionally absent (must invalidate first)
+
+                // All other labels pass through
+                transition CacheValid -> CacheValid on label noop;
+                transition CacheValid -> CacheValid on label end_read;
+                transition CacheValid -> CacheValid on label begin_write;
+                transition CacheValid -> CacheValid on label write_conflict;
+                transition CacheValid -> CacheValid on label conflict_resolved;
+                transition CacheStale -> CacheStale on label noop;
+                transition CacheStale -> CacheStale on label end_read;
+                transition CacheStale -> CacheStale on label begin_write;
+                transition CacheStale -> CacheStale on label write_conflict;
+                transition CacheStale -> CacheStale on label conflict_resolved;
+            }
+        }
+    }
+
+    composition {
+        asynchronous figma_system {
+            members [DesignAccess, CacheState];
+        }
+    }
+
+    mu_formulas {
+        // Safety: No write during active read (mutual exclusion).
+        // Reading state blocks begin_write.
+        formula read_write_mutex {
+            over DesignAccess;
+            body = nu X. (
+                ((!Reading) || ([begin_write] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No read from stale cache.
+        // CacheStale should block begin_read.
+        formula no_stale_read {
+            over CacheState;
+            body = nu X. (
+                ((!CacheStale) || ([begin_read] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Conflict state eventually resolves.
+        formula conflict_resolves {
+            over DesignAccess;
+            body = nu X. (
+                ((!Conflict) || (mu Y. (Idle || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Idle is always reachable (no permanent lock).
+        formula can_return_idle {
+            over DesignAccess;
+            body = nu X. (
+                (Idle || (mu Y. (Idle || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // GR(1): If writes keep being requested, they eventually complete.
+        // GF(Writing) -> GF(Idle)
+        formula write_fairness {
+            over DesignAccess;
+            body = (! (nu A. (mu B. (Writing || <> B)) && ([] A)))
+                || (nu C. (mu D. (Idle || <> D)) && ([] C));
+        }
+
+        // Liveness: CacheValid is reachable from CacheStale.
+        formula cache_recoverable {
+            over CacheState;
+            body = nu X. (
+                ((!CacheStale) || (mu Y. (CacheValid || <> Y)))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        controller mutex_enforcer {
+            source DesignAccess;
+            satisfying read_write_mutex;
+        }
+    }
+}

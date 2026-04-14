@@ -1,0 +1,139 @@
+// Auto-generated from extraction spec: packages/server/src/server/streamableHttp.ts
+// Commit: 9ed62fe7d8be
+// Mode: vulnerable
+// Generator: tools/spec_to_ctxdsl.py
+//
+// BUG MODELED: close_not_checked_in_handlers
+//   _closed is not checked in handlePostRequest, handleGetRequest, or handleDeleteRequest. Requests arriving after close() begins but before async cleanup completes can still pass validateSession().
+
+context mcp_streamable_http_vulnerable {
+    alphabet {
+        label ev_start;
+        label ev_close;
+        label ev_send;
+        label ev_post_init;
+        label ev_post_msg;
+        label ev_get_sse;
+        label ev_delete;
+        label ev_session_header_ok;
+        label ev_session_header_bad;
+        label noop;
+    }
+
+    automata {
+        // TransportLifecycle: models _started, _initialized, _closed
+        // Source: packages/server/src/server/streamableHttp.ts @ 9ed62fe7d8be
+        // State fields: lines 227, 228, 232
+        // MODE: vulnerable — _closed NOT checked in request handlers (bug: close_not_checked_in_handlers)
+        automaton TransportLifecycle {
+            controllable {
+                label ev_start;
+                label ev_close;
+                label ev_send;
+            }
+
+            states {
+                state NotStarted initial;
+                state Started;
+                state Initialized;
+                state Closed;
+            }
+
+            transitions {
+                // start() — line 267: guard _started==false, line 270: _started=true
+                transition NotStarted -> Started on label ev_start;
+                transition NotStarted -> NotStarted on label noop;
+                // handlePostRequest init path — line 670: guard _initialized==false, line 679: _initialized=true
+                transition Started -> Initialized on label ev_post_init;
+                transition Started -> Closed on label ev_close;
+                transition Started -> Started on label noop;
+                // validateSession() — lines 847-874: guards _initialized, sessionId
+                transition Initialized -> Initialized on label ev_post_msg;
+                transition Initialized -> Initialized on label ev_get_sse;
+                transition Initialized -> Initialized on label ev_send;
+                // handleDeleteRequest — line 828: calls close()
+                transition Initialized -> Closed on label ev_delete;
+                transition Initialized -> Closed on label ev_close;
+                // Re-init blocked — line 670
+                transition Initialized -> Initialized on label noop;
+                // close() — line 901: guard _closed==false, line 904: _closed=true
+                // BUG: handlers do not check _closed — requests still processed
+                transition Closed -> Closed on label ev_post_msg;
+                transition Closed -> Closed on label ev_get_sse;
+                transition Closed -> Closed on label ev_delete;
+                transition Closed -> Closed on label noop;
+            }
+        }
+
+        // SessionGate: models sessionId lifecycle + validateSession()
+        // Source: validateSession() lines 847-874
+        automaton SessionGate {
+            controllable { }
+
+            states {
+                state NoSession initial;
+                state HasSession;
+            }
+
+            transitions {
+                // Init sets sessionId — line 678
+                transition NoSession -> HasSession on label ev_post_init;
+                transition NoSession -> NoSession on label noop;
+                transition NoSession -> NoSession on label ev_start;
+                transition NoSession -> NoSession on label ev_close;
+                // validateSession passes when header matches sessionId
+                transition HasSession -> HasSession on label ev_post_msg;
+                transition HasSession -> HasSession on label ev_get_sse;
+                transition HasSession -> HasSession on label ev_delete;
+                transition HasSession -> HasSession on label ev_send;
+                transition HasSession -> HasSession on label ev_close;
+                transition HasSession -> HasSession on label noop;
+                transition HasSession -> HasSession on label ev_start;
+            }
+        }
+    }
+
+    composition {
+        asynchronous transport_system {
+            members [TransportLifecycle, SessionGate];
+        }
+    }
+
+    mu_formulas {
+        // No client requests processed after close()
+        // Expected in vulnerable mode: FAILS
+        formula no_requests_after_close {
+            over TransportLifecycle;
+            body = nu X. ((!Closed || ([ev_post_msg] false) && ([ev_get_sse] false) && ([ev_delete] false)) && ([] X));
+        }
+
+        // Non-init requests require prior initialization
+        // Expected in vulnerable mode: HOLDS
+        formula init_before_messages {
+            over TransportLifecycle;
+            body = nu X. ((!NotStarted && !Started || ([ev_post_msg] false) && ([ev_get_sse] false)) && ([] X));
+        }
+
+        // Initialization requires prior start()
+        // Expected in vulnerable mode: HOLDS
+        formula start_before_init {
+            over TransportLifecycle;
+            body = nu X. ((!NotStarted || ([ev_post_init] false)) && ([] X));
+        }
+
+        // Re-initialization blocked once initialized
+        // Expected in vulnerable mode: HOLDS
+        formula no_double_init {
+            over TransportLifecycle;
+            body = nu X. ((!Initialized || ([ev_post_init] false)) && ([] X));
+        }
+
+    }
+
+    controllers {
+        controller lifecycle_enforcer {
+            source TransportLifecycle;
+            satisfying no_requests_after_close;
+        }
+    }
+}

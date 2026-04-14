@@ -1,0 +1,298 @@
+// Slack MCP Server — Channel Permissions & Rate Limiting
+//
+// Models a Slack MCP server mediating between an AI agent and Slack's API.
+// Two concerns compose asynchronously:
+//   1. ChannelRoleGate: cross-product of channel type × permission level
+//      Encodes which (role, channel) pairs allow posting.
+//   2. RateLimiter: bounded message counter with environment-controlled reset
+//
+// The orchestrator controls channel selection and message posting;
+// the environment controls role assignment and rate limit window resets.
+//
+// Properties:
+//   - Safety: Guest cannot post to private channels (role × channel gate)
+//   - Safety: Rate limit enforcement (max 3 messages per window)
+//   - Liveness: Rate-limited state is recoverable (window_reset reachable)
+//   - Safety: No posting without selecting a channel first
+
+context slack_mcp {
+    alphabet {
+        label select_public;
+        label select_private;
+        label select_dm;
+        label post_message;
+        label assign_guest;
+        label assign_member;
+        label assign_admin;
+        label window_reset;
+        label noop;
+    }
+
+    automata {
+        // Channel × Role gate: 12 states (4 channel × 3 role)
+        // Permission policy: Guest can only post to public channels.
+        // Member and Admin can post to any channel type.
+        automaton ChannelRoleGate {
+            controllable {
+                label select_public;
+                label select_private;
+                label select_dm;
+                label post_message;
+            }
+
+            states {
+                // No channel selected
+                state NoChannel_Guest initial;
+                state NoChannel_Member;
+                state NoChannel_Admin;
+                // Public channel
+                state Public_Guest;
+                state Public_Member;
+                state Public_Admin;
+                // Private channel
+                state Private_Guest;
+                state Private_Member;
+                state Private_Admin;
+                // DM channel
+                state DM_Guest;
+                state DM_Member;
+                state DM_Admin;
+            }
+
+            transitions {
+                // === NoChannel states ===
+                // Role transitions (environment)
+                transition NoChannel_Guest -> NoChannel_Member on label assign_member;
+                transition NoChannel_Guest -> NoChannel_Admin on label assign_admin;
+                transition NoChannel_Member -> NoChannel_Guest on label assign_guest;
+                transition NoChannel_Member -> NoChannel_Admin on label assign_admin;
+                transition NoChannel_Admin -> NoChannel_Guest on label assign_guest;
+                transition NoChannel_Admin -> NoChannel_Member on label assign_member;
+                // Channel selection (orchestrator)
+                transition NoChannel_Guest -> Public_Guest on label select_public;
+                transition NoChannel_Guest -> Private_Guest on label select_private;
+                transition NoChannel_Guest -> DM_Guest on label select_dm;
+                transition NoChannel_Member -> Public_Member on label select_public;
+                transition NoChannel_Member -> Private_Member on label select_private;
+                transition NoChannel_Member -> DM_Member on label select_dm;
+                transition NoChannel_Admin -> Public_Admin on label select_public;
+                transition NoChannel_Admin -> Private_Admin on label select_private;
+                transition NoChannel_Admin -> DM_Admin on label select_dm;
+                transition NoChannel_Guest -> NoChannel_Guest on label noop;
+                transition NoChannel_Member -> NoChannel_Member on label noop;
+                transition NoChannel_Admin -> NoChannel_Admin on label noop;
+                // Window reset passes through
+                transition NoChannel_Guest -> NoChannel_Guest on label window_reset;
+                transition NoChannel_Member -> NoChannel_Member on label window_reset;
+                transition NoChannel_Admin -> NoChannel_Admin on label window_reset;
+
+                // === Public channel ===
+                // All roles can post on public
+                transition Public_Guest -> Public_Guest on label post_message;
+                transition Public_Member -> Public_Member on label post_message;
+                transition Public_Admin -> Public_Admin on label post_message;
+                // Role transitions
+                transition Public_Guest -> Public_Member on label assign_member;
+                transition Public_Guest -> Public_Admin on label assign_admin;
+                transition Public_Member -> Public_Guest on label assign_guest;
+                transition Public_Member -> Public_Admin on label assign_admin;
+                transition Public_Admin -> Public_Guest on label assign_guest;
+                transition Public_Admin -> Public_Member on label assign_member;
+                // Channel switching
+                transition Public_Guest -> Private_Guest on label select_private;
+                transition Public_Guest -> DM_Guest on label select_dm;
+                transition Public_Member -> Private_Member on label select_private;
+                transition Public_Member -> DM_Member on label select_dm;
+                transition Public_Admin -> Private_Admin on label select_private;
+                transition Public_Admin -> DM_Admin on label select_dm;
+                transition Public_Guest -> Public_Guest on label noop;
+                transition Public_Member -> Public_Member on label noop;
+                transition Public_Admin -> Public_Admin on label noop;
+                transition Public_Guest -> Public_Guest on label window_reset;
+                transition Public_Member -> Public_Member on label window_reset;
+                transition Public_Admin -> Public_Admin on label window_reset;
+
+                // === Private channel ===
+                // PERMISSION POLICY: Guest CANNOT post on private
+                // (no post_message transition from Private_Guest)
+                transition Private_Member -> Private_Member on label post_message;
+                transition Private_Admin -> Private_Admin on label post_message;
+                // Role transitions
+                transition Private_Guest -> Private_Member on label assign_member;
+                transition Private_Guest -> Private_Admin on label assign_admin;
+                transition Private_Member -> Private_Guest on label assign_guest;
+                transition Private_Member -> Private_Admin on label assign_admin;
+                transition Private_Admin -> Private_Guest on label assign_guest;
+                transition Private_Admin -> Private_Member on label assign_member;
+                // Channel switching
+                transition Private_Guest -> Public_Guest on label select_public;
+                transition Private_Guest -> DM_Guest on label select_dm;
+                transition Private_Member -> Public_Member on label select_public;
+                transition Private_Member -> DM_Member on label select_dm;
+                transition Private_Admin -> Public_Admin on label select_public;
+                transition Private_Admin -> DM_Admin on label select_dm;
+                transition Private_Guest -> Private_Guest on label noop;
+                transition Private_Member -> Private_Member on label noop;
+                transition Private_Admin -> Private_Admin on label noop;
+                transition Private_Guest -> Private_Guest on label window_reset;
+                transition Private_Member -> Private_Member on label window_reset;
+                transition Private_Admin -> Private_Admin on label window_reset;
+
+                // === DM channel ===
+                // PERMISSION POLICY: Guest CANNOT send DMs
+                // (no post_message transition from DM_Guest)
+                transition DM_Member -> DM_Member on label post_message;
+                transition DM_Admin -> DM_Admin on label post_message;
+                // Role transitions
+                transition DM_Guest -> DM_Member on label assign_member;
+                transition DM_Guest -> DM_Admin on label assign_admin;
+                transition DM_Member -> DM_Guest on label assign_guest;
+                transition DM_Member -> DM_Admin on label assign_admin;
+                transition DM_Admin -> DM_Guest on label assign_guest;
+                transition DM_Admin -> DM_Member on label assign_member;
+                // Channel switching
+                transition DM_Guest -> Public_Guest on label select_public;
+                transition DM_Guest -> Private_Guest on label select_private;
+                transition DM_Member -> Public_Member on label select_public;
+                transition DM_Member -> Private_Member on label select_private;
+                transition DM_Admin -> Public_Admin on label select_public;
+                transition DM_Admin -> Private_Admin on label select_private;
+                transition DM_Guest -> DM_Guest on label noop;
+                transition DM_Member -> DM_Member on label noop;
+                transition DM_Admin -> DM_Admin on label noop;
+                transition DM_Guest -> DM_Guest on label window_reset;
+                transition DM_Member -> DM_Member on label window_reset;
+                transition DM_Admin -> DM_Admin on label window_reset;
+            }
+        }
+
+        // Rate limiter: bounded counter (0-3) with window reset
+        // Counter is passive — no controllable labels here
+        automaton RateLimiter {
+            controllable { }
+
+            states {
+                state count_0 initial;
+                state count_1;
+                state count_2;
+                state count_3;
+            }
+
+            transitions {
+                // post_message increments counter
+                transition count_0 -> count_1 on label post_message;
+                transition count_1 -> count_2 on label post_message;
+                transition count_2 -> count_3 on label post_message;
+                // count_3: no post_message transition (blocked at capacity)
+                // Environment resets window
+                transition count_0 -> count_0 on label window_reset;
+                transition count_1 -> count_0 on label window_reset;
+                transition count_2 -> count_0 on label window_reset;
+                transition count_3 -> count_0 on label window_reset;
+                // Pass-through for all other labels
+                transition count_0 -> count_0 on label noop;
+                transition count_1 -> count_1 on label noop;
+                transition count_2 -> count_2 on label noop;
+                transition count_3 -> count_3 on label noop;
+                transition count_0 -> count_0 on label select_public;
+                transition count_0 -> count_0 on label select_private;
+                transition count_0 -> count_0 on label select_dm;
+                transition count_0 -> count_0 on label assign_guest;
+                transition count_0 -> count_0 on label assign_member;
+                transition count_0 -> count_0 on label assign_admin;
+                transition count_1 -> count_1 on label select_public;
+                transition count_1 -> count_1 on label select_private;
+                transition count_1 -> count_1 on label select_dm;
+                transition count_1 -> count_1 on label assign_guest;
+                transition count_1 -> count_1 on label assign_member;
+                transition count_1 -> count_1 on label assign_admin;
+                transition count_2 -> count_2 on label select_public;
+                transition count_2 -> count_2 on label select_private;
+                transition count_2 -> count_2 on label select_dm;
+                transition count_2 -> count_2 on label assign_guest;
+                transition count_2 -> count_2 on label assign_member;
+                transition count_2 -> count_2 on label assign_admin;
+                transition count_3 -> count_3 on label select_public;
+                transition count_3 -> count_3 on label select_private;
+                transition count_3 -> count_3 on label select_dm;
+                transition count_3 -> count_3 on label assign_guest;
+                transition count_3 -> count_3 on label assign_member;
+                transition count_3 -> count_3 on label assign_admin;
+            }
+        }
+    }
+
+    composition {
+        asynchronous slack_system {
+            members [ChannelRoleGate, RateLimiter];
+        }
+    }
+
+    mu_formulas {
+        // Safety: Guest cannot post to private channels.
+        // Private_Guest has NO post_message transition, so structurally
+        // this holds. The formula confirms it:
+        // "In Private_Guest state, post_message is impossible."
+        formula guest_no_private_post {
+            over ChannelRoleGate;
+            body = nu X. (
+                ((!Private_Guest) || ([post_message] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Guest cannot send DMs.
+        formula guest_no_dm_post {
+            over ChannelRoleGate;
+            body = nu X. (
+                ((!DM_Guest) || ([post_message] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No posting without selecting a channel first.
+        // NoChannel_* states must block post_message.
+        formula channel_required {
+            over ChannelRoleGate;
+            body = nu X. (
+                ((!NoChannel_Guest) || ([post_message] false))
+                && ((!NoChannel_Member) || ([post_message] false))
+                && ((!NoChannel_Admin) || ([post_message] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Rate limit — no posting when counter is at max (3).
+        formula rate_limit_enforced {
+            over RateLimiter;
+            body = nu X. (
+                ((!count_3) || ([post_message] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: From count_3 (rate-limited), count_0 is reachable
+        // via window_reset (environment-controlled).
+        formula rate_limit_recoverable {
+            over RateLimiter;
+            body = nu X. (
+                ((!count_3) || (mu Y. (count_0 || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Member role is reachable from initial (Guest).
+        formula can_become_member {
+            over ChannelRoleGate;
+            body = mu X. (Public_Member || Private_Member || DM_Member || NoChannel_Member || <> X);
+        }
+    }
+
+    controllers {
+        // Synthesize controller that enforces rate limiting
+        controller rate_enforcer {
+            source RateLimiter;
+            satisfying rate_limit_enforced;
+        }
+    }
+}

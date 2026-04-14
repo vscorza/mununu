@@ -1,0 +1,259 @@
+// MCP Tool Chainer — Sequential & Parallel Tool Execution
+//
+// Models an MCP tool chaining server where tools execute in a DAG:
+//   Tool A (fetch data) -> Tool B (transform) -> Tool C (store)
+//   with Tool D (validate) running in parallel to B, both feeding
+//   into a join point before C can start.
+//
+// The orchestrator controls tool invocations; the environment controls
+// tool completion/failure outcomes.
+//
+// Properties:
+//   - Safety: DAG ordering — B cannot start while A is idle
+//   - Safety: Fan-in completeness — C blocked until B AND D complete
+//   - Liveness: Chain always reaches a terminal state
+//   - Safety: No tool invocation after chain failure
+
+context tool_chainer {
+    alphabet {
+        label start_A;
+        label complete_A;
+        label fail_A;
+        label start_B;
+        label complete_B;
+        label fail_B;
+        label start_C;
+        label complete_C;
+        label fail_C;
+        label start_D;
+        label complete_D;
+        label fail_D;
+        label noop;
+    }
+
+    automata {
+        // Tool A: fetch data (first in chain)
+        automaton ToolA {
+            controllable {
+                label start_A;
+            }
+
+            states {
+                state A_idle initial;
+                state A_running;
+                state A_done;
+                state A_failed;
+            }
+
+            transitions {
+                // Orchestrator starts A
+                transition A_idle -> A_running on label start_A;
+                transition A_idle -> A_idle on label noop;
+                // Environment determines outcome
+                transition A_running -> A_done on label complete_A;
+                transition A_running -> A_failed on label fail_A;
+                // Terminal states self-loop on noop
+                transition A_done -> A_done on label noop;
+                transition A_done -> A_done on label start_B;
+                transition A_done -> A_done on label start_D;
+                transition A_done -> A_done on label complete_B;
+                transition A_done -> A_done on label complete_D;
+                transition A_done -> A_done on label fail_B;
+                transition A_done -> A_done on label fail_D;
+                transition A_done -> A_done on label start_C;
+                transition A_done -> A_done on label complete_C;
+                transition A_done -> A_done on label fail_C;
+                transition A_failed -> A_failed on label noop;
+            }
+        }
+
+        // Tool B: transform (depends on A)
+        automaton ToolB {
+            controllable {
+                label start_B;
+            }
+
+            states {
+                state B_idle initial;
+                state B_running;
+                state B_done;
+                state B_failed;
+            }
+
+            transitions {
+                // Orchestrator starts B (only after A completes)
+                transition B_idle -> B_running on label start_B;
+                transition B_idle -> B_idle on label noop;
+                transition B_idle -> B_idle on label start_A;
+                transition B_idle -> B_idle on label complete_A;
+                transition B_idle -> B_idle on label fail_A;
+                transition B_idle -> B_idle on label start_D;
+                transition B_idle -> B_idle on label complete_D;
+                transition B_idle -> B_idle on label fail_D;
+                // Environment determines outcome
+                transition B_running -> B_done on label complete_B;
+                transition B_running -> B_failed on label fail_B;
+                transition B_running -> B_running on label noop;
+                // Terminal states
+                transition B_done -> B_done on label noop;
+                transition B_done -> B_done on label start_C;
+                transition B_done -> B_done on label complete_C;
+                transition B_done -> B_done on label fail_C;
+                transition B_done -> B_done on label complete_D;
+                transition B_done -> B_done on label fail_D;
+                transition B_failed -> B_failed on label noop;
+            }
+        }
+
+        // Tool D: validate (parallel to B, also depends on A)
+        automaton ToolD {
+            controllable {
+                label start_D;
+            }
+
+            states {
+                state D_idle initial;
+                state D_running;
+                state D_done;
+                state D_failed;
+            }
+
+            transitions {
+                transition D_idle -> D_running on label start_D;
+                transition D_idle -> D_idle on label noop;
+                transition D_idle -> D_idle on label start_A;
+                transition D_idle -> D_idle on label complete_A;
+                transition D_idle -> D_idle on label fail_A;
+                transition D_idle -> D_idle on label start_B;
+                transition D_idle -> D_idle on label complete_B;
+                transition D_idle -> D_idle on label fail_B;
+                // Environment determines outcome
+                transition D_running -> D_done on label complete_D;
+                transition D_running -> D_failed on label fail_D;
+                transition D_running -> D_running on label noop;
+                // Terminal states
+                transition D_done -> D_done on label noop;
+                transition D_done -> D_done on label start_C;
+                transition D_done -> D_done on label complete_C;
+                transition D_done -> D_done on label fail_C;
+                transition D_done -> D_done on label complete_B;
+                transition D_done -> D_done on label fail_B;
+                transition D_failed -> D_failed on label noop;
+            }
+        }
+
+        // Tool C: store (depends on both B AND D — the join point)
+        automaton ToolC {
+            controllable {
+                label start_C;
+            }
+
+            states {
+                state C_idle initial;
+                state C_running;
+                state C_done;
+                state C_failed;
+            }
+
+            transitions {
+                transition C_idle -> C_running on label start_C;
+                transition C_idle -> C_idle on label noop;
+                transition C_idle -> C_idle on label start_A;
+                transition C_idle -> C_idle on label complete_A;
+                transition C_idle -> C_idle on label fail_A;
+                transition C_idle -> C_idle on label start_B;
+                transition C_idle -> C_idle on label complete_B;
+                transition C_idle -> C_idle on label fail_B;
+                transition C_idle -> C_idle on label start_D;
+                transition C_idle -> C_idle on label complete_D;
+                transition C_idle -> C_idle on label fail_D;
+                // Environment determines outcome
+                transition C_running -> C_done on label complete_C;
+                transition C_running -> C_failed on label fail_C;
+                transition C_running -> C_running on label noop;
+                // Terminal states
+                transition C_done -> C_done on label noop;
+                transition C_failed -> C_failed on label noop;
+            }
+        }
+    }
+
+    composition {
+        asynchronous chain_system {
+            members [ToolA, ToolB, ToolD, ToolC];
+        }
+    }
+
+    mu_formulas {
+        // Safety: DAG ordering — B must not start while A is still idle.
+        // Uses label-modal encoding for composition safety.
+        // If start_A has not fired yet (A_idle), then start_B must be blocked.
+        formula dag_order_A_before_B {
+            over ToolA;
+            body = nu X. (
+                ((!A_idle) || ([start_B] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: DAG ordering — D must not start while A is still idle.
+        formula dag_order_A_before_D {
+            over ToolA;
+            body = nu X. (
+                ((!A_idle) || ([start_D] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Fan-in completeness — C must not start unless B is done.
+        // Checked over ToolB: if B is not done, start_C is blocked.
+        formula fanin_B_before_C {
+            over ToolB;
+            body = nu X. (
+                (B_done || ([start_C] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Fan-in completeness — C must not start unless D is done.
+        formula fanin_D_before_C {
+            over ToolD;
+            body = nu X. (
+                (D_done || ([start_C] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: From any running tool, completion or failure is reachable.
+        formula chain_A_terminates {
+            over ToolA;
+            body = nu X. (
+                ((!A_running) || (mu Y. (A_done || A_failed || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Liveness: Tool C (final) completion is reachable from initial.
+        formula chain_can_complete {
+            over ToolC;
+            body = mu X. (C_done || <> X);
+        }
+
+        // Safety: No tool invocation after chain-level failure.
+        // If A has failed, no downstream tools should start.
+        formula no_start_after_A_failure {
+            over ToolA;
+            body = nu X. (
+                ((!A_failed) || ([start_B] false) && ([start_D] false) && ([start_C] false))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        controller chain_enforcer {
+            source ToolA;
+            satisfying dag_order_A_before_B;
+        }
+    }
+}

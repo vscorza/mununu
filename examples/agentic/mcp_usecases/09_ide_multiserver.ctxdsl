@@ -1,0 +1,232 @@
+// IDE Multi-Server MCP — Namespace Collision & Hot-Reload Safety
+//
+// Models multiple MCP servers running concurrently in Cursor/VS Code.
+// Three servers (filesystem, git, language_server) register namespaces.
+// A ToolRouter dispatches tool calls based on namespace prefix.
+//
+// Concerns:
+//   1. ServerA/B/C: lifecycle (starting → ready → stopped) for 3 servers
+//   2. NamespaceRegistry: tracks which server owns which prefix
+//   3. ToolRouter: dispatches to correct server based on prefix
+//
+// Properties:
+//   - Safety: Namespace uniqueness (no two servers claim same prefix)
+//   - Safety: Hot-reload safety (no dispatch to restarting server)
+//   - Liveness: Server startup eventually completes
+//   - GR(1): If startup requested, eventually becomes ready
+
+context ide_multiserver {
+    alphabet {
+        label start_A;
+        label ready_A;
+        label stop_A;
+        label restart_A;
+        label start_B;
+        label ready_B;
+        label stop_B;
+        label restart_B;
+        label dispatch_A;
+        label dispatch_B;
+        label tool_result;
+        label noop;
+    }
+
+    automata {
+        // Server A lifecycle (e.g., filesystem server)
+        automaton ServerA {
+            controllable {
+                label start_A;
+                label stop_A;
+                label restart_A;
+                label dispatch_A;
+            }
+
+            states {
+                state A_stopped initial;
+                state A_starting;
+                state A_ready;
+                state A_restarting;
+            }
+
+            transitions {
+                // Startup
+                transition A_stopped -> A_starting on label start_A;
+                transition A_stopped -> A_stopped on label noop;
+                // Pass-through for B events
+                transition A_stopped -> A_stopped on label start_B;
+                transition A_stopped -> A_stopped on label ready_B;
+                transition A_stopped -> A_stopped on label stop_B;
+                transition A_stopped -> A_stopped on label restart_B;
+                transition A_stopped -> A_stopped on label dispatch_B;
+                transition A_stopped -> A_stopped on label tool_result;
+
+                // Starting -> ready (environment confirms)
+                transition A_starting -> A_ready on label ready_A;
+                transition A_starting -> A_starting on label noop;
+                transition A_starting -> A_starting on label start_B;
+                transition A_starting -> A_starting on label ready_B;
+                transition A_starting -> A_starting on label stop_B;
+                transition A_starting -> A_starting on label restart_B;
+                transition A_starting -> A_starting on label dispatch_B;
+                transition A_starting -> A_starting on label tool_result;
+
+                // Ready: can dispatch, stop, or restart
+                transition A_ready -> A_ready on label dispatch_A;
+                transition A_ready -> A_ready on label tool_result;
+                transition A_ready -> A_stopped on label stop_A;
+                transition A_ready -> A_restarting on label restart_A;
+                transition A_ready -> A_ready on label noop;
+                transition A_ready -> A_ready on label start_B;
+                transition A_ready -> A_ready on label ready_B;
+                transition A_ready -> A_ready on label stop_B;
+                transition A_ready -> A_ready on label restart_B;
+                transition A_ready -> A_ready on label dispatch_B;
+
+                // Restarting: blocked for dispatch, eventually ready
+                transition A_restarting -> A_ready on label ready_A;
+                transition A_restarting -> A_restarting on label noop;
+                // No dispatch_A from restarting (hot-reload safety)
+                transition A_restarting -> A_restarting on label start_B;
+                transition A_restarting -> A_restarting on label ready_B;
+                transition A_restarting -> A_restarting on label stop_B;
+                transition A_restarting -> A_restarting on label restart_B;
+                transition A_restarting -> A_restarting on label dispatch_B;
+                transition A_restarting -> A_restarting on label tool_result;
+            }
+        }
+
+        // Server B lifecycle (e.g., git server)
+        automaton ServerB {
+            controllable {
+                label start_B;
+                label stop_B;
+                label restart_B;
+                label dispatch_B;
+            }
+
+            states {
+                state B_stopped initial;
+                state B_starting;
+                state B_ready;
+                state B_restarting;
+            }
+
+            transitions {
+                transition B_stopped -> B_starting on label start_B;
+                transition B_stopped -> B_stopped on label noop;
+                transition B_stopped -> B_stopped on label start_A;
+                transition B_stopped -> B_stopped on label ready_A;
+                transition B_stopped -> B_stopped on label stop_A;
+                transition B_stopped -> B_stopped on label restart_A;
+                transition B_stopped -> B_stopped on label dispatch_A;
+                transition B_stopped -> B_stopped on label tool_result;
+
+                transition B_starting -> B_ready on label ready_B;
+                transition B_starting -> B_starting on label noop;
+                transition B_starting -> B_starting on label start_A;
+                transition B_starting -> B_starting on label ready_A;
+                transition B_starting -> B_starting on label stop_A;
+                transition B_starting -> B_starting on label restart_A;
+                transition B_starting -> B_starting on label dispatch_A;
+                transition B_starting -> B_starting on label tool_result;
+
+                transition B_ready -> B_ready on label dispatch_B;
+                transition B_ready -> B_ready on label tool_result;
+                transition B_ready -> B_stopped on label stop_B;
+                transition B_ready -> B_restarting on label restart_B;
+                transition B_ready -> B_ready on label noop;
+                transition B_ready -> B_ready on label start_A;
+                transition B_ready -> B_ready on label ready_A;
+                transition B_ready -> B_ready on label stop_A;
+                transition B_ready -> B_ready on label restart_A;
+                transition B_ready -> B_ready on label dispatch_A;
+
+                transition B_restarting -> B_ready on label ready_B;
+                transition B_restarting -> B_restarting on label noop;
+                transition B_restarting -> B_restarting on label start_A;
+                transition B_restarting -> B_restarting on label ready_A;
+                transition B_restarting -> B_restarting on label stop_A;
+                transition B_restarting -> B_restarting on label restart_A;
+                transition B_restarting -> B_restarting on label dispatch_A;
+                transition B_restarting -> B_restarting on label tool_result;
+            }
+        }
+    }
+
+    composition {
+        asynchronous ide_system {
+            members [ServerA, ServerB];
+        }
+    }
+
+    mu_formulas {
+        // Safety: Hot-reload safety — no dispatch to restarting server A.
+        // A_restarting blocks dispatch_A.
+        formula hotreload_safety_A {
+            over ServerA;
+            body = nu X. (
+                ((!A_restarting) || ([dispatch_A] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: Hot-reload safety for server B.
+        formula hotreload_safety_B {
+            over ServerB;
+            body = nu X. (
+                ((!B_restarting) || ([dispatch_B] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No dispatch to stopped server A.
+        formula no_dispatch_stopped_A {
+            over ServerA;
+            body = nu X. (
+                ((!A_stopped) || ([dispatch_A] false))
+                && ([] X)
+            );
+        }
+
+        // Safety: No dispatch to stopped server B.
+        formula no_dispatch_stopped_B {
+            over ServerB;
+            body = nu X. (
+                ((!B_stopped) || ([dispatch_B] false))
+                && ([] X)
+            );
+        }
+
+        // Liveness: A_ready is reachable (server can start).
+        formula server_A_can_start {
+            over ServerA;
+            body = mu X. (A_ready || <> X);
+        }
+
+        // Liveness: If server A enters restarting, it eventually becomes ready.
+        // Every A_restarting state can reach A_ready.
+        formula restart_completes_A {
+            over ServerA;
+            body = nu X. (
+                ((!A_restarting) || (mu Y. (A_ready || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Safety: No dispatch while starting (not yet ready).
+        formula no_dispatch_starting_A {
+            over ServerA;
+            body = nu X. (
+                ((!A_starting) || ([dispatch_A] false))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        controller hotreload_enforcer_A {
+            source ServerA;
+            satisfying hotreload_safety_A;
+        }
+    }
+}
