@@ -761,6 +761,7 @@ dependencies = [
  "clap",
  "criterion",
  "itoa",
+ "mununu-core",
  "predicates",
  "proptest",
  "regex",
@@ -779,6 +780,44 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
 ]
+
+[[package]]
+name = "mununu-cli"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "mununu-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mununu-core"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bitvec",
+ "criterion",
+ "itoa",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "mununu-extract"
+version = "0.2.0"
 
 [[package]]
 name = "normalize-line-endings"

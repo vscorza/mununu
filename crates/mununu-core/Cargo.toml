@@ -1,0 +1,52 @@
+[package]
+name = "mununu-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["Mariano Cerrutti <vscorza@gmail.com>"]
+description = "Mununu core library — verification engine, adapters, composition, evaluation"
+repository = "https://github.com/vscorza/mununu"
+license-file = "../../LICENSE"
+
+[dependencies]
+# Core
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bitvec = "1.0"
+smallvec = "1.15"
+regex = "1.12"
+
+# API (optional)
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", optional = true, features = ["cors", "trace"] }
+tokio = { version = "1", optional = true, features = ["full"] }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+criterion = "0.8"
+proptest = "1.9"
+tempfile = "3.24"
+itoa = "1.0"
+
+[features]
+default = []
+api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tracing"]
+syntcomp = []
+
+[[bench]]
+name = "clts_composition"
+harness = false
+
+[[bench]]
+name = "mu_calculus"
+harness = false
+
+[[bench]]
+name = "controller"
+harness = false
+
+[[bench]]
+name = "xstate"
+harness = false

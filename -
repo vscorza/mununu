@@ -1,0 +1,174 @@
+Context Structure:
+==================
+
+Global Variables: 0
+
+Controllable Alphabet: 0 symbols
+
+CLTS Instances: 4
+
+Automaton: BatchLifecycle
+  States: 5
+  Initial: NoBatch
+  Labels: ev_batch_post, ev_close, ev_fast_responds, ev_legit_batch, ev_legit_response, ev_legit_served, ev_slow_hangs, ev_slow_responds, noop
+  Alphabet: 0 controllable, 9 uncontrollable, 0 internal
+  Transitions: 20 total (0 controllable, 20 uncontrollable)
+  State Details:
+    [0] AllResponded: 4 outgoing, 4 incoming
+      0 -> [0] AllResponded (unctrl) [ev_legit_batch]
+      1 -> [0] AllResponded (unctrl) [ev_legit_response]
+      2 -> [0] AllResponded (unctrl) [ev_legit_served]
+      3 -> [3] NoBatch (unctrl) [noop]
+    [1] BatchStuck: 6 outgoing, 6 incoming
+      0 -> [1] BatchStuck (unctrl) [ev_batch_post]
+      1 -> [1] BatchStuck (unctrl) [ev_fast_responds]
+      2 -> [1] BatchStuck (unctrl) [ev_legit_batch]
+      3 -> [1] BatchStuck (unctrl) [ev_legit_response]
+      4 -> [1] BatchStuck (unctrl) [noop]
+      5 -> [3] NoBatch (unctrl) [ev_close]
+    [2] BatchSubmitted: 2 outgoing, 2 incoming
+      0 -> [2] BatchSubmitted (unctrl) [noop]
+      1 -> [4] OneResponsed (unctrl) [ev_fast_responds]
+    [3] NoBatch (initial): 5 outgoing, 6 incoming
+      0 -> [2] BatchSubmitted (unctrl) [ev_batch_post]
+      1 -> [3] NoBatch (unctrl) [ev_legit_batch]
+      2 -> [3] NoBatch (unctrl) [ev_legit_response]
+      3 -> [3] NoBatch (unctrl) [ev_legit_served]
+      4 -> [3] NoBatch (unctrl) [noop]
+    [4] OneResponsed: 3 outgoing, 2 incoming
+      0 -> [0] AllResponded (unctrl) [ev_slow_responds]
+      1 -> [1] BatchStuck (unctrl) [ev_slow_hangs]
+      2 -> [4] OneResponsed (unctrl) [noop]
+
+Automaton: LegitimateClient
+  States: 2
+  Initial: Waiting
+  Labels: ev_batch_post, ev_close, ev_fast_responds, ev_legit_batch, ev_legit_response, ev_legit_served, ev_slow_hangs, ev_slow_responds, noop
+  Alphabet: 0 controllable, 9 uncontrollable, 0 internal
+  Transitions: 18 total (0 controllable, 18 uncontrollable)
+  State Details:
+    [0] Served: 9 outgoing, 9 incoming
+      0 -> [0] Served (unctrl) [ev_batch_post]
+      1 -> [0] Served (unctrl) [ev_close]
+      2 -> [0] Served (unctrl) [ev_fast_responds]
+      3 -> [0] Served (unctrl) [ev_legit_response]
+      4 -> [0] Served (unctrl) [ev_legit_served]
+      5 -> [0] Served (unctrl) [ev_slow_hangs]
+      6 -> [0] Served (unctrl) [ev_slow_responds]
+      7 -> [0] Served (unctrl) [noop]
+      8 -> [1] Waiting (unctrl) [ev_legit_batch]
+    [1] Waiting (initial): 9 outgoing, 9 incoming
+      0 -> [0] Served (unctrl) [ev_legit_served]
+      1 -> [1] Waiting (unctrl) [ev_batch_post]
+      2 -> [1] Waiting (unctrl) [ev_close]
+      3 -> [1] Waiting (unctrl) [ev_fast_responds]
+      4 -> [1] Waiting (unctrl) [ev_legit_batch]
+      5 -> [1] Waiting (unctrl) [ev_legit_response]
+      6 -> [1] Waiting (unctrl) [ev_slow_hangs]
+      7 -> [1] Waiting (unctrl) [ev_slow_responds]
+      8 -> [1] Waiting (unctrl) [noop]
+
+Automaton: ResourcePool
+  States: 4
+  Initial: R0
+  Labels: ev_batch_post, ev_close, ev_fast_responds, ev_legit_batch, ev_legit_response, ev_legit_served, ev_slow_hangs, ev_slow_responds, noop
+  Alphabet: 0 controllable, 9 uncontrollable, 0 internal
+  Transitions: 34 total (0 controllable, 34 uncontrollable)
+  State Details:
+    [0] Exhausted: 7 outgoing, 7 incoming
+      0 -> [0] Exhausted (unctrl) [ev_batch_post]
+      1 -> [0] Exhausted (unctrl) [ev_fast_responds]
+      2 -> [0] Exhausted (unctrl) [ev_legit_batch]
+      3 -> [0] Exhausted (unctrl) [ev_legit_response]
+      4 -> [0] Exhausted (unctrl) [ev_slow_hangs]
+      5 -> [0] Exhausted (unctrl) [noop]
+      6 -> [1] R0 (unctrl) [ev_close]
+    [1] R0 (initial): 9 outgoing, 11 incoming
+      0 -> [1] R0 (unctrl) [ev_batch_post]
+      1 -> [1] R0 (unctrl) [ev_close]
+      2 -> [1] R0 (unctrl) [ev_fast_responds]
+      3 -> [1] R0 (unctrl) [ev_legit_batch]
+      4 -> [1] R0 (unctrl) [ev_legit_response]
+      5 -> [1] R0 (unctrl) [ev_legit_served]
+      6 -> [1] R0 (unctrl) [ev_slow_responds]
+      7 -> [1] R0 (unctrl) [noop]
+      8 -> [2] R1 (unctrl) [ev_slow_hangs]
+    [2] R1: 9 outgoing, 8 incoming
+      0 -> [1] R0 (unctrl) [ev_close]
+      1 -> [2] R1 (unctrl) [ev_batch_post]
+      2 -> [2] R1 (unctrl) [ev_fast_responds]
+      3 -> [2] R1 (unctrl) [ev_legit_batch]
+      4 -> [2] R1 (unctrl) [ev_legit_response]
+      5 -> [2] R1 (unctrl) [ev_legit_served]
+      6 -> [2] R1 (unctrl) [ev_slow_responds]
+      7 -> [2] R1 (unctrl) [noop]
+      8 -> [3] R2 (unctrl) [ev_slow_hangs]
+    [3] R2: 9 outgoing, 8 incoming
+      0 -> [0] Exhausted (unctrl) [ev_slow_hangs]
+      1 -> [1] R0 (unctrl) [ev_close]
+      2 -> [3] R2 (unctrl) [ev_batch_post]
+      3 -> [3] R2 (unctrl) [ev_fast_responds]
+      4 -> [3] R2 (unctrl) [ev_legit_batch]
+      5 -> [3] R2 (unctrl) [ev_legit_response]
+      6 -> [3] R2 (unctrl) [ev_legit_served]
+      7 -> [3] R2 (unctrl) [ev_slow_responds]
+      8 -> [3] R2 (unctrl) [noop]
+
+Automaton: batch_system
+  States: 10
+  Initial: NoBatch|Waiting|R0
+  Labels: ev_batch_post, ev_close, ev_fast_responds, ev_legit_batch, ev_legit_response, ev_legit_served, ev_slow_hangs, ev_slow_responds, noop
+  Alphabet: 0 controllable, 9 uncontrollable, 0 internal
+  Transitions: 40 total (0 controllable, 40 uncontrollable)
+  State Details:
+    [0] NoBatch|Waiting|R0 (initial): 5 outgoing, 6 incoming
+      0 -> [0] NoBatch|Waiting|R0 (unctrl) [ev_legit_batch]
+      1 -> [0] NoBatch|Waiting|R0 (unctrl) [ev_legit_response]
+      2 -> [0] NoBatch|Waiting|R0 (unctrl) [noop]
+      3 -> [1] BatchSubmitted|Waiting|R0 (unctrl) [ev_batch_post]
+      4 -> [2] NoBatch|Served|R0 (unctrl) [ev_legit_served]
+    [1] BatchSubmitted|Waiting|R0: 2 outgoing, 2 incoming
+      0 -> [1] BatchSubmitted|Waiting|R0 (unctrl) [noop]
+      1 -> [3] OneResponsed|Waiting|R0 (unctrl) [ev_fast_responds]
+    [2] NoBatch|Served|R0: 5 outgoing, 6 incoming
+      0 -> [0] NoBatch|Waiting|R0 (unctrl) [ev_legit_batch]
+      1 -> [2] NoBatch|Served|R0 (unctrl) [ev_legit_response]
+      2 -> [2] NoBatch|Served|R0 (unctrl) [ev_legit_served]
+      3 -> [2] NoBatch|Served|R0 (unctrl) [noop]
+      4 -> [4] BatchSubmitted|Served|R0 (unctrl) [ev_batch_post]
+    [3] OneResponsed|Waiting|R0: 3 outgoing, 2 incoming
+      0 -> [3] OneResponsed|Waiting|R0 (unctrl) [noop]
+      1 -> [5] AllResponded|Waiting|R0 (unctrl) [ev_slow_responds]
+      2 -> [6] BatchStuck|Waiting|R1 (unctrl) [ev_slow_hangs]
+    [4] BatchSubmitted|Served|R0: 2 outgoing, 2 incoming
+      0 -> [4] BatchSubmitted|Served|R0 (unctrl) [noop]
+      1 -> [7] OneResponsed|Served|R0 (unctrl) [ev_fast_responds]
+    [5] AllResponded|Waiting|R0: 4 outgoing, 4 incoming
+      0 -> [0] NoBatch|Waiting|R0 (unctrl) [noop]
+      1 -> [5] AllResponded|Waiting|R0 (unctrl) [ev_legit_batch]
+      2 -> [5] AllResponded|Waiting|R0 (unctrl) [ev_legit_response]
+      3 -> [8] AllResponded|Served|R0 (unctrl) [ev_legit_served]
+    [6] BatchStuck|Waiting|R1: 6 outgoing, 7 incoming
+      0 -> [0] NoBatch|Waiting|R0 (unctrl) [ev_close]
+      1 -> [6] BatchStuck|Waiting|R1 (unctrl) [ev_batch_post]
+      2 -> [6] BatchStuck|Waiting|R1 (unctrl) [ev_fast_responds]
+      3 -> [6] BatchStuck|Waiting|R1 (unctrl) [ev_legit_batch]
+      4 -> [6] BatchStuck|Waiting|R1 (unctrl) [ev_legit_response]
+      5 -> [6] BatchStuck|Waiting|R1 (unctrl) [noop]
+    [7] OneResponsed|Served|R0: 3 outgoing, 2 incoming
+      0 -> [7] OneResponsed|Served|R0 (unctrl) [noop]
+      1 -> [8] AllResponded|Served|R0 (unctrl) [ev_slow_responds]
+      2 -> [9] BatchStuck|Served|R1 (unctrl) [ev_slow_hangs]
+    [8] AllResponded|Served|R0: 4 outgoing, 4 incoming
+      0 -> [2] NoBatch|Served|R0 (unctrl) [noop]
+      1 -> [5] AllResponded|Waiting|R0 (unctrl) [ev_legit_batch]
+      2 -> [8] AllResponded|Served|R0 (unctrl) [ev_legit_response]
+      3 -> [8] AllResponded|Served|R0 (unctrl) [ev_legit_served]
+    [9] BatchStuck|Served|R1: 6 outgoing, 5 incoming
+      0 -> [2] NoBatch|Served|R0 (unctrl) [ev_close]
+      1 -> [6] BatchStuck|Waiting|R1 (unctrl) [ev_legit_batch]
+      2 -> [9] BatchStuck|Served|R1 (unctrl) [ev_batch_post]
+      3 -> [9] BatchStuck|Served|R1 (unctrl) [ev_fast_responds]
+      4 -> [9] BatchStuck|Served|R1 (unctrl) [ev_legit_response]
+      5 -> [9] BatchStuck|Served|R1 (unctrl) [noop]
+

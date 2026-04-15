@@ -1,0 +1,24 @@
+[package]
+name = "mununu-cli"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["Mariano Cerrutti <vscorza@gmail.com>"]
+description = "Mununu CLI — command-line interface for verification and synthesis"
+repository = "https://github.com/vscorza/mununu"
+license-file = "../../LICENSE"
+
+[[bin]]
+name = "mununu"
+path = "src/main.rs"
+
+[dependencies]
+mununu-core = { path = "../mununu-core", features = ["api"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
