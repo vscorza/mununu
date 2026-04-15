@@ -4,7 +4,6 @@
 //! source files into tree-sitter syntax trees. Language is detected from
 //! file extension or explicit config.
 
-#[cfg(feature = "ast-extract")]
 use tree_sitter::{Language, Parser, Tree};
 
 /// Supported source languages for AST extraction.
@@ -39,7 +38,6 @@ impl SourceLanguage {
 }
 
 /// Parsed source file with tree-sitter AST.
-#[cfg(feature = "ast-extract")]
 pub struct ParsedSource {
     /// The source code text.
     pub source: String,
@@ -49,7 +47,6 @@ pub struct ParsedSource {
     pub language: SourceLanguage,
 }
 
-#[cfg(feature = "ast-extract")]
 impl ParsedSource {
     /// Get the source text for a tree-sitter node.
     pub fn node_text(&self, node: &tree_sitter::Node) -> &str {
@@ -68,17 +65,15 @@ impl ParsedSource {
 }
 
 /// Get the tree-sitter Language for a source language.
-#[cfg(feature = "ast-extract")]
 fn get_ts_language(lang: SourceLanguage) -> Language {
     match lang {
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        SourceLanguage::Python => tree_sitter_python::LANGUAGE_PYTHON.into(),
-        SourceLanguage::Rust => tree_sitter_rust::LANGUAGE_RUST.into(),
+        SourceLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+        SourceLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
     }
 }
 
 /// Parse a source file into a tree-sitter syntax tree.
-#[cfg(feature = "ast-extract")]
 pub fn parse_source(source: &str, language: SourceLanguage) -> Result<ParsedSource, String> {
     let ts_language = get_ts_language(language);
     let mut parser = Parser::new();
@@ -103,7 +98,6 @@ pub fn parse_source(source: &str, language: SourceLanguage) -> Result<ParsedSour
 }
 
 /// Parse a source file from a path, detecting language from extension.
-#[cfg(feature = "ast-extract")]
 pub fn parse_file(
     path: &std::path::Path,
     language_override: Option<SourceLanguage>,
@@ -112,10 +106,7 @@ pub fn parse_file(
         .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
 
     let language = language_override
-        .or_else(|| {
-            path.to_str()
-                .and_then(SourceLanguage::from_extension)
-        })
+        .or_else(|| path.to_str().and_then(SourceLanguage::from_extension))
         .ok_or_else(|| {
             format!(
                 "Cannot detect language for '{}'. Use --language or a recognized extension.",
@@ -127,7 +118,6 @@ pub fn parse_file(
 }
 
 #[cfg(test)]
-#[cfg(feature = "ast-extract")]
 mod tests {
     use super::*;
 
