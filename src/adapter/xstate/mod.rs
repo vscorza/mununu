@@ -420,6 +420,7 @@ fn build_properties(annotations: Option<&MununuAnnotations>) -> Vec<PropertySpec
                 kind: PropertyKind::Safety, // Will be refined based on formula content
                 formula: PropertyFormula::MuCalculus(p.formula.clone()),
                 role,
+                over: None,
             }
         })
         .collect()

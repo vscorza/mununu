@@ -14,6 +14,7 @@ pub mod a2a;
 pub mod aiger;
 pub mod crewai;
 pub mod emit;
+pub mod extraction;
 pub mod ir;
 pub mod langgraph;
 pub mod promela;
@@ -42,6 +43,8 @@ pub struct AdapterOptions {
     pub variable_bounds: HashMap<String, (i64, i64)>,
     /// Context name for the output CTXDSL document.
     pub context_name: Option<String>,
+    /// Mode for extraction adapter: "fixed" or "vulnerable".
+    pub mode: Option<String>,
 }
 
 /// Output from a successful adapter translation.
@@ -106,6 +109,7 @@ pub enum SourceFormat {
     CrewAi,
     LangGraph,
     A2a,
+    Extraction,
 }
 
 impl fmt::Display for SourceFormat {
@@ -119,6 +123,7 @@ impl fmt::Display for SourceFormat {
             SourceFormat::CrewAi => write!(f, "CrewAI"),
             SourceFormat::LangGraph => write!(f, "LangGraph"),
             SourceFormat::A2a => write!(f, "A2A"),
+            SourceFormat::Extraction => write!(f, "Extraction"),
         }
     }
 }
@@ -162,8 +167,11 @@ impl std::error::Error for AdapterError {}
 /// Returns the adapter name ("tlsf", "aiger", "promela") or `None` if
 /// the extension is not recognized.
 pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str> {
-    // Check for compound extensions like .crew.json, .langgraph.json, .a2a.json
+    // Check for compound extensions like .espec.json, .crew.json, .langgraph.json, .a2a.json
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem.ends_with(".espec") {
+        return Some("extraction");
+    }
     if stem.ends_with(".crew") {
         return Some("crewai");
     }
@@ -215,10 +223,13 @@ pub fn auto_translate(
     if a2a::A2aAdapter::detect(content) {
         return a2a::A2aAdapter::translate(content, options);
     }
+    if extraction::ExtractionAdapter::detect(content) {
+        return extraction::ExtractionAdapter::translate(content, options);
+    }
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate), SystemVerilog (.sv/.v), CrewAI (.crew.json), LangGraph (.langgraph.json), A2A (.a2a.json)".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate), SystemVerilog (.sv/.v), CrewAI (.crew.json), LangGraph (.langgraph.json), A2A (.a2a.json), Extraction (.espec.json)".into(),
         location: None,
     })
 }

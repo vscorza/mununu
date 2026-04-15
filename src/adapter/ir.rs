@@ -170,6 +170,9 @@ pub struct PropertySpec {
     pub formula: PropertyFormula,
     /// Role in the assume-guarantee framework.
     pub role: PropertyRole,
+    /// Explicit "over" target automaton or composition name.
+    /// If `None`, the emitter uses the first automaton as default.
+    pub over: Option<String>,
 }
 
 /// Classification of a temporal property.

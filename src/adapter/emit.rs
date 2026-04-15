@@ -866,8 +866,8 @@ fn emit_properties_explicit(
         return;
     }
 
-    // Determine the "over" target: first automaton name
-    let over_target = automata
+    // Default "over" target: first automaton name
+    let default_over = automata
         .first()
         .map(|a| sanitize(&a.name))
         .unwrap_or_else(|| "System".to_string());
@@ -876,6 +876,11 @@ fn emit_properties_explicit(
     w.indent();
 
     for prop in properties {
+        let over_target = prop
+            .over
+            .as_ref()
+            .map(|s| sanitize(s))
+            .unwrap_or_else(|| default_over.clone());
         w.write_line(&format!("formula {} {{", sanitize(&prop.name)));
         w.indent();
         w.write_line(&format!("over {};", over_target));

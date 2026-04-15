@@ -215,6 +215,7 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
                 kind: PropertyKind::Safety,
                 formula: PropertyFormula::Ltl(convert_ltl(&ltl.formula)),
                 role: PropertyRole::Standalone,
+                over: None,
             }
         })
         .collect();

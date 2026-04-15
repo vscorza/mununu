@@ -182,6 +182,7 @@ fn to_ir(
                 kind: PropertyKind::Safety,
                 formula: PropertyFormula::MuCalculus(p.formula.clone()),
                 role,
+                over: None,
             }
         })
         .collect();

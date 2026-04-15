@@ -38,7 +38,12 @@ enum Commands {
     /// Inspect or manipulate Context DSL artefacts.
     Context {
         #[command(subcommand)]
-        command: ContextCommand,
+        command: Box<ContextCommand>,
+    },
+    /// Extraction spec tools (validate, check provenance).
+    Extraction {
+        #[command(subcommand)]
+        command: Box<ExtractionCommand>,
     },
     #[cfg(feature = "api")]
     /// Start HTTP API server
@@ -47,6 +52,43 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ExtractionCommand {
+    /// Validate an extraction spec's line anchors against the actual source file.
+    Validate(ExtractionValidateArgs),
+    /// Check provenance headers in CTXDSL files.
+    Check(ExtractionCheckArgs),
+}
+
+#[derive(Args, Debug)]
+struct ExtractionValidateArgs {
+    /// Path to extraction spec JSON (.json or .espec.json).
+    #[arg(value_name = "SPEC")]
+    spec: PathBuf,
+    /// Path to the source file referenced by the spec.
+    #[arg(value_name = "SOURCE")]
+    source: PathBuf,
+    /// Output as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+    /// Number of lines to search around expected position for drifted anchors.
+    #[arg(long, default_value = "5")]
+    drift_window: usize,
+}
+
+#[derive(Args, Debug)]
+struct ExtractionCheckArgs {
+    /// CTXDSL files to check for provenance headers.
+    #[arg(value_name = "FILE", num_args = 1..)]
+    files: Vec<PathBuf>,
+    /// Require @generated-from header (fail if missing).
+    #[arg(long)]
+    require_generated: bool,
+    /// Require @model-source header (fail if missing).
+    #[arg(long)]
+    require_model_source: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,9 +154,12 @@ struct ContextEvalArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
-    /// Translate from an external format before processing (tlsf, aiger, promela, auto).
+    /// Translate from an external format before processing (tlsf, aiger, promela, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
+    /// Mode for extraction adapter: "fixed" or "vulnerable".
+    #[arg(long = "mode", value_name = "MODE")]
+    mode: Option<String>,
     /// μ-calculus formula to evaluate.
     #[arg(long = "formula", value_name = "NAME")]
     formula: String,
@@ -137,9 +182,12 @@ struct ContextSynthesizeArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
-    /// Translate from an external format before processing (tlsf, aiger, promela, auto).
+    /// Translate from an external format before processing (tlsf, aiger, promela, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
+    /// Mode for extraction adapter: "fixed" or "vulnerable".
+    #[arg(long = "mode", value_name = "MODE")]
+    mode: Option<String>,
     /// μ-calculus formula to synthesise.
     #[arg(long = "formula", value_name = "NAME")]
     formula: String,
@@ -282,7 +330,8 @@ fn init_tracing() {
 
 fn dispatch(command: Commands) -> Result<(), String> {
     match command {
-        Commands::Context { command } => handle_context(command),
+        Commands::Context { command } => handle_context(*command),
+        Commands::Extraction { command } => handle_extraction(*command),
         #[cfg(feature = "api")]
         Commands::Server { addr } => {
             use std::net::SocketAddr;
@@ -308,6 +357,199 @@ fn handle_context(command: ContextCommand) -> Result<(), String> {
         ContextCommand::Eval(args) => context_eval(args),
         ContextCommand::Synth(args) => context_synthesize(args),
         ContextCommand::Graph(args) => context_graph(args),
+    }
+}
+
+fn handle_extraction(command: ExtractionCommand) -> Result<(), String> {
+    match command {
+        ExtractionCommand::Validate(args) => extraction_validate(args),
+        ExtractionCommand::Check(args) => extraction_check(args),
+    }
+}
+
+fn extraction_validate(args: ExtractionValidateArgs) -> Result<(), String> {
+    let spec_content = fs::read_to_string(&args.spec)
+        .map_err(|e| format!("Failed to read spec '{}': {e}", args.spec.display()))?;
+
+    let report = mununu::adapter::extraction::validate::validate_spec(
+        &spec_content,
+        &args.source,
+        args.drift_window,
+    )?;
+
+    if args.json {
+        // JSON output
+        let anchors: Vec<serde_json::Value> = report
+            .anchors
+            .iter()
+            .map(|a| {
+                use mununu::adapter::extraction::validate::AnchorResult;
+                match a {
+                    AnchorResult::Exact {
+                        spec_id,
+                        section,
+                        line,
+                    } => serde_json::json!({
+                        "status": "exact", "spec_id": spec_id, "section": section, "line": line
+                    }),
+                    AnchorResult::Drifted {
+                        spec_id,
+                        section,
+                        expected_line,
+                        found_line,
+                        drift,
+                    } => serde_json::json!({
+                        "status": "drifted", "spec_id": spec_id, "section": section,
+                        "expected_line": expected_line, "found_line": found_line, "drift": drift
+                    }),
+                    AnchorResult::Mismatch {
+                        spec_id,
+                        section,
+                        expected_line,
+                        expected_pattern,
+                        actual_at_line,
+                    } => serde_json::json!({
+                        "status": "mismatch", "spec_id": spec_id, "section": section,
+                        "expected_line": expected_line, "expected_pattern": expected_pattern,
+                        "actual_at_line": actual_at_line
+                    }),
+                    AnchorResult::Error {
+                        spec_id,
+                        section,
+                        message,
+                    } => serde_json::json!({
+                        "status": "error", "spec_id": spec_id, "section": section,
+                        "message": message
+                    }),
+                }
+            })
+            .collect();
+
+        let output = serde_json::json!({
+            "summary": {
+                "total": report.summary.total,
+                "exact": report.summary.exact,
+                "drifted": report.summary.drifted,
+                "mismatch": report.summary.mismatch,
+                "error": report.summary.error,
+                "uncovered_accesses": report.summary.uncovered_accesses,
+            },
+            "commit_match": report.commit_match,
+            "anchors": anchors,
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    } else {
+        // Human-readable output
+        if let Some(matches) = report.commit_match {
+            println!("Commit: {}", if matches { "MATCH" } else { "MISMATCH" });
+            println!();
+        }
+
+        println!(
+            "Anchor checks: {} total, {} exact, {} drifted, {} MISMATCH, {} ERROR",
+            report.summary.total,
+            report.summary.exact,
+            report.summary.drifted,
+            report.summary.mismatch,
+            report.summary.error,
+        );
+        println!();
+
+        for a in &report.anchors {
+            use mununu::adapter::extraction::validate::AnchorResult;
+            match a {
+                AnchorResult::Exact { spec_id, .. } => {
+                    println!("  OK    {spec_id}");
+                }
+                AnchorResult::Drifted {
+                    spec_id,
+                    expected_line,
+                    found_line,
+                    drift,
+                    ..
+                } => {
+                    println!(
+                        "  DRIFT {spec_id} (expected line {expected_line}, found at {found_line}, drift={drift:+})"
+                    );
+                }
+                AnchorResult::Mismatch {
+                    spec_id,
+                    expected_line,
+                    expected_pattern,
+                    actual_at_line,
+                    ..
+                } => {
+                    println!("  FAIL  {spec_id} (line {expected_line})");
+                    println!("         expected: {expected_pattern}");
+                    println!("         actual:   {actual_at_line}");
+                }
+                AnchorResult::Error {
+                    spec_id, message, ..
+                } => {
+                    println!("  ERR   {spec_id}: {message}");
+                }
+            }
+        }
+
+        if !report.uncovered.is_empty() {
+            println!(
+                "\nUncovered state field accesses: {}",
+                report.uncovered.len()
+            );
+            for u in report.uncovered.iter().take(20) {
+                println!("  line {:4}: {:20}  {}", u.line, u.field, u.content);
+            }
+            if report.uncovered.len() > 20 {
+                println!("  ... and {} more", report.uncovered.len() - 20);
+            }
+        }
+    }
+
+    if report.summary.mismatch > 0 || report.summary.error > 0 {
+        Err(format!(
+            "{} mismatch(es) and {} error(s) found",
+            report.summary.mismatch, report.summary.error
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn extraction_check(args: ExtractionCheckArgs) -> Result<(), String> {
+    let mut failures = 0;
+
+    for path in &args.files {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
+
+        let info = mununu::adapter::extraction::validate::check_provenance(&content);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+        if args.require_generated && !info.is_generated() {
+            println!("FAIL: {name} — missing @generated-from header");
+            failures += 1;
+        } else if args.require_model_source && !info.is_specification_model() {
+            println!("FAIL: {name} — missing @model-source header");
+            failures += 1;
+        } else if info.is_generated() {
+            println!(
+                "OK:   {name} — @generated-from: {}",
+                info.generated_from.as_deref().unwrap_or("?")
+            );
+        } else if info.is_specification_model() {
+            println!(
+                "OK:   {name} — @model-source: {}",
+                info.model_source.as_deref().unwrap_or("?")
+            );
+        } else {
+            println!("WARN: {name} — no provenance header");
+        }
+    }
+
+    if failures > 0 {
+        Err(format!("{failures} file(s) missing required headers"))
+    } else {
+        Ok(())
     }
 }
 
@@ -373,7 +615,11 @@ fn parse_context_file(path: &Path) -> Result<ContextDoc, String> {
 }
 
 /// Read a source file, optionally translating it from an external format first.
-fn load_with_adapter(path: &Path, adapter: Option<&str>) -> Result<ContextDoc, String> {
+fn load_with_adapter_mode(
+    path: &Path,
+    adapter: Option<&str>,
+    mode: Option<&str>,
+) -> Result<ContextDoc, String> {
     let source = fs::read_to_string(path)
         .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
 
@@ -507,8 +753,32 @@ fn load_with_adapter(path: &Path, adapter: Option<&str>) -> Result<ContextDoc, S
             );
             output.ctxdsl
         }
+        Some("extraction") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions {
+                mode: mode.map(|s| s.to_string()),
+                ..Default::default()
+            };
+            let output =
+                mununu::adapter::extraction::ExtractionAdapter::translate(&source, &options)
+                    .map_err(|e| format!("Extraction adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated Extraction (mode: {}): {} labels, {} states, {} properties",
+                mode.unwrap_or("vulnerable"),
+                output.source_info.signal_count,
+                output.source_info.state_count,
+                output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
         Some("auto") => {
-            let options = mununu::adapter::AdapterOptions::default();
+            let options = mununu::adapter::AdapterOptions {
+                mode: mode.map(|s| s.to_string()),
+                ..Default::default()
+            };
             let output = mununu::adapter::auto_translate(&source, &options)
                 .map_err(|e| format!("adapter error: {e}"))?;
             for w in &output.warnings {
@@ -525,14 +795,14 @@ fn load_with_adapter(path: &Path, adapter: Option<&str>) -> Result<ContextDoc, S
         }
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, crewai, langgraph, a2a, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, crewai, langgraph, a2a, extraction, auto"
             ));
         }
         None => {
             // Auto-detect by file extension if no adapter specified
             if let Some(fmt) = mununu::adapter::detect_format_by_extension(path) {
                 eprintln!("Auto-detected format '{}' from extension", fmt);
-                return load_with_adapter(path, Some(fmt));
+                return load_with_adapter_mode(path, Some(fmt), mode);
             }
             source
         }
@@ -547,7 +817,16 @@ fn load_context_documents(
     sidecar_paths: &[PathBuf],
     adapter: Option<&str>,
 ) -> Result<(ContextDoc, Vec<ContextDoc>), String> {
-    let context_doc = load_with_adapter(context_path, adapter)?;
+    load_context_documents_mode(context_path, sidecar_paths, adapter, None)
+}
+
+fn load_context_documents_mode(
+    context_path: &Path,
+    sidecar_paths: &[PathBuf],
+    adapter: Option<&str>,
+    mode: Option<&str>,
+) -> Result<(ContextDoc, Vec<ContextDoc>), String> {
+    let context_doc = load_with_adapter_mode(context_path, adapter, mode)?;
     let mut sidecar_docs = Vec::with_capacity(sidecar_paths.len());
     for path in sidecar_paths {
         sidecar_docs.push(parse_context_file(path)?);
@@ -791,8 +1070,12 @@ fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
 }
 
 fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) =
-        load_context_documents(&args.context, &args.sidecars, args.adapter.as_deref())?;
+    let (context_doc, sidecar_docs) = load_context_documents_mode(
+        &args.context,
+        &args.sidecars,
+        args.adapter.as_deref(),
+        args.mode.as_deref(),
+    )?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let formula = realized
         .formulas
@@ -892,8 +1175,12 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 }
 
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) =
-        load_context_documents(&args.context, &args.sidecars, args.adapter.as_deref())?;
+    let (context_doc, sidecar_docs) = load_context_documents_mode(
+        &args.context,
+        &args.sidecars,
+        args.adapter.as_deref(),
+        args.mode.as_deref(),
+    )?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let realized_formula = realized
         .formulas

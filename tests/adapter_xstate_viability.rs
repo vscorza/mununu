@@ -79,6 +79,7 @@ fn viability_simple_automaton_eval_synth() {
             kind: PropertyKind::Safety,
             formula: PropertyFormula::MuCalculus("nu X. ([] X)".to_string()),
             role: PropertyRole::Guarantee,
+            over: None,
         }],
         controller: Some(ControllerSpec {
             name: "safe_light".to_string(),
@@ -224,6 +225,7 @@ fn viability_synchronous_composition() {
             kind: PropertyKind::Safety,
             formula: PropertyFormula::MuCalculus("nu X. ([] X)".to_string()),
             role: PropertyRole::Guarantee,
+            over: None,
         }],
         controller: None,
     };
@@ -463,6 +465,7 @@ fn viability_variable_automaton_guard_sync() {
                 kind: PropertyKind::Safety,
                 formula: PropertyFormula::MuCalculus("nu X. ([] X)".to_string()),
                 role: PropertyRole::Guarantee,
+                over: None,
             },
             // Done is reachable: the counter mechanism works
             PropertySpec {
@@ -470,6 +473,7 @@ fn viability_variable_automaton_guard_sync() {
                 kind: PropertyKind::Liveness,
                 formula: PropertyFormula::MuCalculus("mu X. (Done || <> X)".to_string()),
                 role: PropertyRole::Guarantee,
+                over: None,
             },
         ],
         controller: None,

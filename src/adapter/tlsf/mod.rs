@@ -98,6 +98,7 @@ fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR,
             kind: PropertyKind::Liveness,
             formula: PropertyFormula::Ltl(assume.clone()),
             role: PropertyRole::Assumption,
+            over: None,
         });
     }
 
@@ -107,6 +108,7 @@ fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR,
             kind: PropertyKind::Safety,
             formula: PropertyFormula::Ltl(inv.clone()),
             role: PropertyRole::Invariant,
+            over: None,
         });
     }
 
@@ -116,6 +118,7 @@ fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR,
             kind: PropertyKind::Liveness,
             formula: PropertyFormula::Ltl(guar.clone()),
             role: PropertyRole::Guarantee,
+            over: None,
         });
     }
 

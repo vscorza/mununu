@@ -270,6 +270,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                 kind: PropertyKind::Safety,
                 formula: PropertyFormula::MuCalculus(format!("nu X. ((!({bad_pred})) && ([] X))")),
                 role: PropertyRole::Standalone,
+                over: None,
             });
         }
     }
@@ -312,6 +313,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                     "nu Y. ((mu X. (({justice_pred}) || (<> X))) && ([] Y))"
                 )),
                 role: PropertyRole::Standalone,
+                over: None,
             });
         }
     }
@@ -349,6 +351,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                     "nu Y. ((mu X. (({fair_pred}) || (<> X))) && ([] Y))"
                 )),
                 role: PropertyRole::Standalone,
+                over: None,
             });
         }
     }

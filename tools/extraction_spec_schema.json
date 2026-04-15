@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "extraction_spec_v1",
+  "title": "Extraction Spec v1",
+  "description": "Schema for extraction spec JSON files (.espec.json) that drive the mununu extraction adapter pipeline.",
+  "type": "object",
+  "required": ["source", "model_config"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "extraction_spec_v1"
+    },
+    "source": {
+      "type": "object",
+      "description": "Source code location pinned to a specific commit.",
+      "properties": {
+        "repo": { "type": "string", "description": "Repository identifier (e.g., owner/repo)" },
+        "commit": { "type": "string", "description": "Full commit SHA" },
+        "file": { "type": "string", "description": "File path within the repository" },
+        "class": { "type": "string", "description": "Class or module name" },
+        "cve": { "type": "string", "pattern": "^CVE-\\d{4}-\\d+$" },
+        "ghsa": { "type": "string", "pattern": "^GHSA-" },
+        "issue": { "type": "string", "description": "Human-readable issue description" }
+      }
+    },
+    "state_fields": {
+      "type": "array",
+      "description": "State fields extracted from source code, with line-anchored evidence.",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "field": { "type": "string" },
+          "type": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "pattern": { "type": "string", "description": "Exact code pattern expected at this line" },
+          "initial": {},
+          "note": { "type": "string" },
+          "abstraction": {
+            "type": "object",
+            "description": "Abstraction documentation for non-literal state fields.",
+            "properties": {
+              "source_type": { "type": "string" },
+              "model_type": { "type": "string" },
+              "soundness": { "type": "string" },
+              "validated": { "type": "boolean" },
+              "validation_scenario": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "methods": {
+      "type": "array",
+      "description": "Methods extracted from source code with guards and effects.",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "line_start": { "type": "integer", "minimum": 1 },
+          "line_end": { "type": "integer", "minimum": 1 },
+          "controllable": { "type": "boolean" },
+          "guards": { "type": "array" },
+          "effects": { "type": "array" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "bugs": {
+      "type": "array",
+      "description": "Documented bugs with attack chains.",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" },
+          "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+          "missing_guard": { "type": "object" },
+          "attack_chain": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "step": { "type": "integer" },
+                "action": { "type": "string" },
+                "line": { "type": "integer" },
+                "effect": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "model_config": {
+      "type": "object",
+      "required": ["context_name"],
+      "description": "Declarative model configuration for CTXDSL generation.",
+      "properties": {
+        "context_name": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "description": "Context name (snake_case) for the CTXDSL document."
+        },
+        "controllable_labels": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "uncontrollable_labels": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "automata": {
+          "type": "array",
+          "description": "Declarative automaton definitions.",
+          "items": {
+            "type": "object",
+            "required": ["id", "states", "transitions"],
+            "properties": {
+              "id": { "type": "string", "description": "Automaton identifier" },
+              "states": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "oneOf": [
+                    { "type": "string" },
+                    {
+                      "type": "object",
+                      "required": ["name"],
+                      "properties": {
+                        "name": { "type": "string" },
+                        "initial": { "type": "boolean", "default": false }
+                      }
+                    }
+                  ]
+                }
+              },
+              "controllable_labels": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "transitions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["from", "to", "label"],
+                  "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                    "label": { "type": "string" },
+                    "mode": {
+                      "type": "string",
+                      "enum": ["both", "vulnerable", "fixed"],
+                      "default": "both",
+                      "description": "Mode filter: 'both' (default), 'vulnerable' only, or 'fixed' only."
+                    },
+                    "derived_from": {
+                      "description": "Traceability to extraction spec methods/guards."
+                    },
+                    "comment": { "type": "string" }
+                  }
+                }
+              },
+              "fields": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "State field references for traceability."
+              },
+              "note": { "type": "string" },
+              "role": { "type": "string" }
+            }
+          }
+        },
+        "composition": {
+          "type": "object",
+          "required": ["type", "name", "members"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["synchronous", "asynchronous"]
+            },
+            "name": { "type": "string" },
+            "members": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 2
+            }
+          }
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string" },
+              "description": { "type": "string" },
+              "formula": { "type": "string", "description": "Mu-calculus formula body" },
+              "formula_template": { "type": "string", "description": "Alias for formula (backward compat)" },
+              "over": { "type": "string", "description": "Target automaton or composition" },
+              "holds_in_fixed": { "type": "boolean" },
+              "holds_in_vulnerable": { "type": "boolean" }
+            }
+          }
+        },
+        "controllers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "source", "satisfying"],
+            "properties": {
+              "name": { "type": "string" },
+              "source": { "type": "string" },
+              "satisfying": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
