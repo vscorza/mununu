@@ -480,9 +480,15 @@ fn extract_guards_and_effects(
             "if_statement" => {
                 // Check if condition references a state field
                 if let Some(condition) = node.child_by_field_name("condition") {
-                    if let Some(guard) =
+                    if let Some(mut guard) =
                         extract_guard_from_condition(parsed, &condition, field_names)
                     {
+                        // Early-return pattern: if the if-body contains a throw/return,
+                        // the guard means "reject when condition is true" → invert.
+                        // This is the most common guard pattern in TypeScript/JavaScript.
+                        if is_early_exit_body(parsed, &node) {
+                            guard.condition = invert_guard(guard.condition);
+                        }
                         guards.push(guard);
                     }
                 }
@@ -517,6 +523,47 @@ fn extract_guards_and_effects(
     }
 
     (guards, effects)
+}
+
+/// Check if an if-statement's body is an early-exit (throw, return, break, continue).
+/// If so, the guard condition should be INVERTED — the method proceeds when the
+/// condition is FALSE, not when it's true.
+fn is_early_exit_body(parsed: &ParsedSource, if_node: &Node) -> bool {
+    if let Some(consequence) = if_node.child_by_field_name("consequence") {
+        let mut cursor = consequence.walk();
+        for child in consequence.children(&mut cursor) {
+            match child.kind() {
+                "throw_statement" | "return_statement" | "break_statement"
+                | "continue_statement" => return true,
+                // Block containing a throw/return
+                "statement_block" | "block" => {
+                    let mut inner = child.walk();
+                    for stmt in child.children(&mut inner) {
+                        match stmt.kind() {
+                            "throw_statement" | "return_statement" | "break_statement"
+                            | "continue_statement" => return true,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Invert a guard condition (for early-return pattern detection).
+fn invert_guard(guard: CallGuard) -> CallGuard {
+    match guard {
+        CallGuard::MustBeTrue => CallGuard::MustBeFalse,
+        CallGuard::MustBeFalse => CallGuard::MustBeTrue,
+        CallGuard::CounterGtZero => CallGuard::CounterEqZero,
+        CallGuard::CounterEqZero => CallGuard::CounterGtZero,
+        CallGuard::MustBePresent => CallGuard::MustBeAbsent,
+        CallGuard::MustBeAbsent => CallGuard::MustBePresent,
+        CallGuard::None => CallGuard::None,
+    }
 }
 
 /// Try to extract a guard from an if-statement condition.

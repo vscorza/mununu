@@ -8,10 +8,10 @@
 //! - Bug documentation with attack chains
 //! - Declarative model configuration (automata, transitions, compositions, properties)
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level extraction spec.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionSpec {
     /// Schema version identifier.
     #[serde(rename = "$schema")]
@@ -37,7 +37,7 @@ pub struct ExtractionSpec {
 }
 
 /// Reference to source code location.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRef {
     pub repo: Option<String>,
     pub commit: Option<String>,
@@ -49,7 +49,7 @@ pub struct SourceRef {
 }
 
 /// A state field extracted from source.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateField {
     pub id: String,
     pub field: Option<String>,
@@ -63,7 +63,7 @@ pub struct StateField {
 }
 
 /// A method extracted from source.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Method {
     pub id: String,
     pub name: Option<String>,
@@ -78,7 +78,7 @@ pub struct Method {
 }
 
 /// A documented bug with attack chain.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bug {
     pub id: String,
     pub description: Option<String>,
@@ -89,7 +89,7 @@ pub struct Bug {
 }
 
 /// A step in an attack chain.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttackStep {
     pub step: Option<u32>,
     pub action: Option<String>,
@@ -105,7 +105,7 @@ pub struct AttackStep {
 ///
 /// Contains everything needed to deterministically generate CTXDSL:
 /// automata with states and transitions, compositions, properties, and controllers.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Context name for the CTXDSL document.
     pub context_name: String,
@@ -135,7 +135,7 @@ pub struct ModelConfig {
 }
 
 /// A declarative automaton definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomatonDef {
     /// Automaton identifier.
     pub id: String,
@@ -164,7 +164,7 @@ pub struct AutomatonDef {
 }
 
 /// A state definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StateDef {
     /// Simple: just a name string.
@@ -174,7 +174,7 @@ pub enum StateDef {
 }
 
 /// Structured state definition with optional initial flag.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateDefStructured {
     pub name: String,
     #[serde(default)]
@@ -198,7 +198,7 @@ impl StateDef {
 }
 
 /// A transition definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionDef {
     /// Source state.
     pub from: String,
@@ -220,7 +220,7 @@ fn default_mode_both() -> String {
 }
 
 /// Composition directive.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositionDef {
     /// Composition type: "synchronous" or "asynchronous".
     #[serde(rename = "type")]
@@ -232,7 +232,7 @@ pub struct CompositionDef {
 }
 
 /// A property definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyDef {
     /// Property identifier.
     pub id: String,
@@ -258,7 +258,7 @@ impl PropertyDef {
 }
 
 /// Controller synthesis target.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerDef {
     /// Controller name.
     pub name: String,
