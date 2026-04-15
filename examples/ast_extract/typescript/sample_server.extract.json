@@ -1,0 +1,22 @@
+{
+    "$schema": "extraction_config_v1",
+    "domain": "mcp_server",
+    "language": "typescript",
+    "source": {
+        "file": "examples/ast_extract/typescript/sample_server.ts"
+    },
+    "targets": [{
+        "class": "Server",
+        "automaton_id": "ServerLifecycle",
+        "state_fields": ["_started", "_closed", "_initialized"],
+        "methods": {
+            "include": ["start", "initialize", "handleRequest", "close"]
+        }
+    }],
+    "properties": [{
+        "id": "no_requests_after_close",
+        "formula": "nu X. (((!_started_F__closed_T__initialized_F && !_started_F__closed_T__initialized_T && !_started_T__closed_T__initialized_F && !_started_T__closed_T__initialized_T) || ([ev_handleRequest] false)) && ([] X))",
+        "over": "ServerLifecycle",
+        "description": "handleRequest must not fire when _closed=true"
+    }]
+}

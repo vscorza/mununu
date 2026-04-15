@@ -1,0 +1,22 @@
+{
+    "$schema": "extraction_config_v1",
+    "domain": "protocol_implementation",
+    "language": "rust",
+    "source": {
+        "file": "examples/ast_extract/rust/sample_protocol.rs"
+    },
+    "targets": [{
+        "class": "Connection",
+        "automaton_id": "ConnectionFSM",
+        "state_fields": ["started", "closed"],
+        "methods": {
+            "include": ["start", "close", "send"]
+        }
+    }],
+    "properties": [{
+        "id": "no_send_after_close",
+        "formula": "nu X. (((!started_T__closed_T && !started_F__closed_T) || ([ev_send] false)) && ([] X))",
+        "over": "ConnectionFSM",
+        "description": "send must not fire when closed"
+    }]
+}

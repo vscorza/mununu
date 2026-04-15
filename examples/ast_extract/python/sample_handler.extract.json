@@ -1,0 +1,22 @@
+{
+    "$schema": "extraction_config_v1",
+    "domain": "python_server",
+    "language": "python",
+    "source": {
+        "file": "examples/ast_extract/python/sample_handler.py"
+    },
+    "targets": [{
+        "class": "Handler",
+        "automaton_id": "HandlerFSM",
+        "state_fields": ["_active", "_rate_limited"],
+        "methods": {
+            "include": ["activate", "deactivate", "handle_request", "set_rate_limit", "clear_rate_limit"]
+        }
+    }],
+    "properties": [{
+        "id": "no_requests_when_rate_limited",
+        "formula": "nu X. (((!_active_T__rate_limited_T && !_active_F__rate_limited_T) || ([ev_handle_request] false)) && ([] X))",
+        "over": "HandlerFSM",
+        "description": "handle_request must not fire when rate limited"
+    }]
+}
