@@ -204,4 +204,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions and guidelines.
 
 - N. Piterman, A. Pnueli, and Y. Sa'ar. "Synthesis of Reactive(1) Designs." *VMCAI*, 2006.
 - R. Bloem, B. Jobstmann, N. Piterman, A. Pnueli, and Y. Sa'ar. "Synthesis of Reactive(1) Designs." *JCSS*, 78(3), 2012.
-- [hw-verification-uba](https://github.com/vscorza/hw-verification-uba) &mdash; SystemVerilog labs from which hardware examples are derived.

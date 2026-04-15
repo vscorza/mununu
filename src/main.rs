@@ -705,54 +705,6 @@ fn load_with_adapter_mode(
             );
             output.ctxdsl
         }
-        Some("crewai") => {
-            use mununu::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output = mununu::adapter::crewai::CrewAiAdapter::translate(&source, &options)
-                .map_err(|e| format!("CrewAI adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated CrewAI: {} events, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("langgraph") => {
-            use mununu::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output = mununu::adapter::langgraph::LangGraphAdapter::translate(&source, &options)
-                .map_err(|e| format!("LangGraph adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated LangGraph: {} events, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("a2a") => {
-            use mununu::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output = mununu::adapter::a2a::A2aAdapter::translate(&source, &options)
-                .map_err(|e| format!("A2A adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated A2A: {} events, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
         Some("extraction") => {
             use mununu::adapter::{AdapterOptions, FormatAdapter};
             let options = AdapterOptions {
@@ -795,7 +747,7 @@ fn load_with_adapter_mode(
         }
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, crewai, langgraph, a2a, extraction, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, auto"
             ));
         }
         None => {

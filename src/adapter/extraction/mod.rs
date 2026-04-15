@@ -13,6 +13,7 @@
 //! variants from a single spec file.
 
 pub mod ast;
+pub mod ast_extract;
 pub mod validate;
 
 use super::ir::*;
