@@ -45,8 +45,10 @@ pub fn extract_target(
 
     let mut warnings = Vec::new();
 
-    // Find the target class/struct node in the AST
-    let class_node = find_class_node(parsed, &target.class)?;
+    // Find the target class/struct/impl nodes in the AST.
+    // For Rust, fields are in struct_item and methods are in impl_item — separate nodes.
+    // For TypeScript/Python, both are in the same class node.
+    let (field_node, method_node) = find_class_nodes(parsed, &target.class)?;
 
     // Extract fields
     let field_names: HashSet<&str> = target
@@ -58,7 +60,7 @@ pub fn extract_target(
 
     let (fields, field_lines) = extract_fields(
         parsed,
-        &class_node,
+        &field_node,
         &field_names,
         target,
         profile,
@@ -72,7 +74,7 @@ pub fn extract_target(
 
     let (methods, method_lines) = extract_methods(
         parsed,
-        &class_node,
+        &method_node,
         &field_names,
         &include_set,
         &exclude_set,
@@ -91,45 +93,62 @@ pub fn extract_target(
     })
 }
 
-/// Find the class/struct declaration node by name.
-fn find_class_node<'a>(parsed: &'a ParsedSource, class_name: &str) -> Result<Node<'a>, String> {
+/// Find the class/struct/impl nodes for a target.
+/// Returns `(field_node, method_node)` — for TypeScript/Python these are the same node.
+/// For Rust, `field_node` is the struct_item and `method_node` is the impl_item.
+fn find_class_nodes<'a>(
+    parsed: &'a ParsedSource,
+    class_name: &str,
+) -> Result<(Node<'a>, Node<'a>), String> {
     let root = parsed.tree.root_node();
     let mut cursor = root.walk();
 
-    // Walk all top-level declarations
-    for child in root.children(&mut cursor) {
-        match parsed.language {
-            SourceLanguage::TypeScript => {
-                // class_declaration or export_statement containing class_declaration
+    match parsed.language {
+        SourceLanguage::TypeScript => {
+            for child in root.children(&mut cursor) {
                 if let Some(node) = find_ts_class(&child, parsed, class_name) {
-                    return Ok(node);
+                    return Ok((node, node));
                 }
             }
-            SourceLanguage::Python => {
+        }
+        SourceLanguage::Python => {
+            for child in root.children(&mut cursor) {
                 if child.kind() == "class_definition" {
                     if let Some(name_node) = child.child_by_field_name("name") {
                         if parsed.node_text(&name_node) == class_name {
-                            return Ok(child);
+                            return Ok((child, child));
                         }
                     }
                 }
             }
-            SourceLanguage::Rust => {
-                // struct or impl block
+        }
+        SourceLanguage::Rust => {
+            // For Rust, find struct (fields) and impl (methods) separately
+            let mut struct_node = None;
+            let mut impl_node = None;
+
+            for child in root.children(&mut cursor) {
                 if child.kind() == "struct_item" {
                     if let Some(name_node) = child.child_by_field_name("name") {
                         if parsed.node_text(&name_node) == class_name {
-                            return Ok(child);
+                            struct_node = Some(child);
                         }
                     }
                 }
                 if child.kind() == "impl_item" {
                     if let Some(type_node) = child.child_by_field_name("type") {
                         if parsed.node_text(&type_node) == class_name {
-                            return Ok(child);
+                            impl_node = Some(child);
                         }
                     }
                 }
+            }
+
+            match (struct_node, impl_node) {
+                (Some(s), Some(i)) => return Ok((s, i)),
+                (Some(s), None) => return Ok((s, s)), // struct only, no impl
+                (None, Some(i)) => return Ok((i, i)), // impl only, no struct visible
+                (None, None) => {}                    // fall through to error
             }
         }
     }
@@ -435,7 +454,10 @@ fn find_method_nodes<'a>(
     let body_node = match parsed.language {
         SourceLanguage::TypeScript => class_node.child_by_field_name("body"),
         SourceLanguage::Python => class_node.child_by_field_name("body"),
-        SourceLanguage::Rust => Some(*class_node), // impl block
+        SourceLanguage::Rust => {
+            // impl_item has a body field (declaration_list) containing function_items
+            class_node.child_by_field_name("body").or(Some(*class_node))
+        }
     };
 
     let body = match body_node {
@@ -468,7 +490,7 @@ fn extract_guards_and_effects(
     parsed: &ParsedSource,
     body_node: &Node,
     field_names: &HashSet<&str>,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> (Vec<Guard>, Vec<Effect>) {
     let mut guards = Vec::new();
     let mut effects = Vec::new();
@@ -749,13 +771,10 @@ impl Connection {
 
         let result = extract_target(&parsed, &target, profile).unwrap();
 
-        // TODO: Rust extraction needs to find BOTH struct (fields) AND impl (methods)
-        // Currently find_class_node returns only the struct, which has no methods.
-        // Fix: walk both struct_item and impl_item for the same type name.
-        assert_eq!(result.methods.len(), 0); // Known limitation: impl methods not found from struct node
-        // TODO: once impl block extraction works, verify:
-        // let start = result.methods.iter().find(|m| m.name == "start").unwrap();
-        // assert!(start.controllable); // pub fn → controllable in protocol_implementation profile
+        // Rust extraction: fields from struct_item, methods from impl_item
+        assert_eq!(result.methods.len(), 2);
+        let start = result.methods.iter().find(|m| m.name == "start").unwrap();
+        assert!(start.controllable); // pub fn → controllable in protocol_implementation profile
     }
 
     #[test]

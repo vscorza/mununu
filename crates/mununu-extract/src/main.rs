@@ -4,8 +4,9 @@
 //! tree-sitter, derives automata from field domains and method behaviors,
 //! and outputs a `.espec.json` extraction spec.
 
-// Extractor module has WIP code — suppress until guard/effect extraction is complete.
-// Tracked in Phase 2d of the restructure plan.
+// Guard/effect extraction has known limitations (collapsible-if from Python
+// extractor patterns, unused variables in partial implementations).
+// These will be resolved as extraction accuracy improves.
 #![allow(unused_variables, clippy::collapsible_if, clippy::ptr_arg)]
 
 pub mod extractor;
