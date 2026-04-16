@@ -96,6 +96,15 @@ run_test "TypeScript (compound guard)" \
     "WorkerFSM" \
     "1"
 
+# TypeScript: indirect_guard.ts — variable binding: const x = this.field; if (x)
+# Property should HOLD — doAction blocked when _locked via indirect variable
+run_test "TypeScript (indirect guard)" \
+    "examples/ast_extract/typescript/indirect_guard.extract.json" \
+    "examples/ast_extract/typescript/indirect_guard.ts" \
+    "no_action_when_locked" \
+    "ResourceFSM" \
+    "1"
+
 # SystemVerilog: handshake.sv via adapter (not extraction) — property should HOLD
 echo -n "  SystemVerilog (handshake via adapter) ... "
 OUTPUT=$("$MUNUNU" context eval examples/systemverilog/handshake.sv \

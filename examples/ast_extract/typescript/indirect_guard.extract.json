@@ -1,0 +1,22 @@
+{
+    "$schema": "extraction_config_v1",
+    "domain": "mcp_server",
+    "language": "typescript",
+    "source": {
+        "file": "examples/ast_extract/typescript/indirect_guard.ts"
+    },
+    "targets": [{
+        "class": "Resource",
+        "automaton_id": "ResourceFSM",
+        "state_fields": ["_locked", "_ready"],
+        "methods": {
+            "include": ["lock", "prepare", "doAction"]
+        }
+    }],
+    "properties": [{
+        "id": "no_action_when_locked",
+        "formula": "nu X. ((_locked_F__ready_F || _locked_F__ready_T || ([ev_doAction] false)) && ([] X))",
+        "over": "ResourceFSM",
+        "description": "doAction should only fire when _locked is false"
+    }]
+}

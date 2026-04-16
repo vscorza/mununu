@@ -309,6 +309,32 @@ fn build_provenance_header(spec: &ExtractionSpec, mode: &str) -> String {
         }
     }
 
+    // Compositional minimization hints (L16): when multiple automata exist,
+    // identify labels that are private to each automaton (candidates for hiding).
+    if spec.model_config.automata.len() > 1 {
+        let mut label_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for aut in &spec.model_config.automata {
+            let mut aut_labels = std::collections::HashSet::new();
+            for t in &aut.transitions {
+                aut_labels.insert(t.label.as_str());
+            }
+            for l in &aut_labels {
+                *label_counts.entry(l).or_insert(0) += 1;
+            }
+        }
+        let private: Vec<&str> = label_counts
+            .iter()
+            .filter(|(_, count)| **count == 1)
+            .map(|(label, _)| *label)
+            .collect();
+        if !private.is_empty() {
+            let mut sorted = private;
+            sorted.sort();
+            lines.push(format!("// @minimize-candidates: {}", sorted.join(", ")));
+        }
+    }
+
     lines.push("//".to_string());
     lines.push(String::new());
     lines.join("\n")

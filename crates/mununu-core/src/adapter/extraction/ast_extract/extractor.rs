@@ -13,7 +13,7 @@ use crate::adapter::extraction::ast_extract::domain::{self, DomainProfile};
 use crate::adapter::extraction::ast_extract::state_space::{
     AbstractValue, Effect, FieldDomain, Guard, MethodBehavior,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Result of extracting from a single class/struct target.
 #[derive(Debug)]
@@ -651,6 +651,12 @@ fn extract_guards_and_effects(
     let mut guards = Vec::new();
     let mut effects = Vec::new();
 
+    // Pre-pass: collect variable-to-field bindings for indirect guard detection (L2).
+    // Patterns: `const x = this.field;` / `let x = this.field;` (TS)
+    //           `x = self.field` (Python)
+    //           `let x = self.field;` (Rust)
+    let var_field_map = collect_variable_field_bindings(parsed, body_node, field_names);
+
     // Walk all descendant nodes looking for if-statements and assignments
     let mut stack = vec![*body_node];
     while let Some(node) = stack.pop() {
@@ -664,8 +670,13 @@ fn extract_guards_and_effects(
                     // Pass `negate=true` to the extraction so it inverts at each leaf
                     // and swaps || <-> && (De Morgan).
                     let negate = is_early_exit_body(parsed, &node);
-                    let extracted =
-                        extract_guards_from_condition(parsed, &condition, field_names, negate);
+                    let extracted = extract_guards_from_condition(
+                        parsed,
+                        &condition,
+                        field_names,
+                        negate,
+                        &var_field_map,
+                    );
                     guards.extend(extracted);
                 }
             }
@@ -757,6 +768,7 @@ fn extract_guards_from_condition(
     condition: &Node,
     field_names: &HashSet<&str>,
     negate: bool,
+    var_field_map: &HashMap<String, String>,
 ) -> Vec<Guard> {
     let kind = condition.kind();
 
@@ -772,7 +784,6 @@ fn extract_guards_from_condition(
                 let effective_and = if negate { is_or } else { is_and };
 
                 if effective_and {
-                    // Conjunction: recurse into both sides, collect all guards
                     let mut result = Vec::new();
                     if let Some(left) = condition.child_by_field_name("left") {
                         result.extend(extract_guards_from_condition(
@@ -780,6 +791,7 @@ fn extract_guards_from_condition(
                             &left,
                             field_names,
                             negate,
+                            var_field_map,
                         ));
                     }
                     if let Some(right) = condition.child_by_field_name("right") {
@@ -788,18 +800,18 @@ fn extract_guards_from_condition(
                             &right,
                             field_names,
                             negate,
+                            var_field_map,
                         ));
                     }
                     return result;
                 } else {
-                    // Disjunction: over-approximate — don't emit guards
                     return vec![];
                 }
             }
         }
     }
 
-    // Handle ! / not (unary negation): toggle the negate flag (double negation = cancel)
+    // Handle ! / not (unary negation): toggle the negate flag
     if kind == "unary_expression" || kind == "not_operator" {
         if let Some(operand) = condition
             .child_by_field_name("argument")
@@ -807,7 +819,13 @@ fn extract_guards_from_condition(
         {
             let text = parsed.node_text(condition);
             if text.starts_with('!') || text.starts_with("not ") {
-                return extract_guards_from_condition(parsed, &operand, field_names, !negate);
+                return extract_guards_from_condition(
+                    parsed,
+                    &operand,
+                    field_names,
+                    !negate,
+                    var_field_map,
+                );
             }
         }
     }
@@ -817,13 +835,19 @@ fn extract_guards_from_condition(
         let mut cursor = condition.walk();
         for child in condition.children(&mut cursor) {
             if child.kind() != "(" && child.kind() != ")" {
-                return extract_guards_from_condition(parsed, &child, field_names, negate);
+                return extract_guards_from_condition(
+                    parsed,
+                    &child,
+                    field_names,
+                    negate,
+                    var_field_map,
+                );
             }
         }
     }
 
-    // Base case: look for direct field references
-    if let Some(mut guard) = extract_single_guard(parsed, condition, field_names) {
+    // Base case: look for direct field references or indirect via variable binding
+    if let Some(mut guard) = extract_single_guard(parsed, condition, field_names, var_field_map) {
         if negate {
             guard.condition = invert_guard(guard.condition);
         }
@@ -833,14 +857,18 @@ fn extract_guards_from_condition(
     }
 }
 
-/// Extract a single guard from a leaf condition referencing a state field.
+/// Extract a single guard from a leaf condition referencing a state field,
+/// either directly (`this.field` / `self.field`) or indirectly via a local
+/// variable binding (`const x = this.field; if (x)`).
 fn extract_single_guard(
     parsed: &ParsedSource,
     condition: &Node,
     field_names: &HashSet<&str>,
+    var_field_map: &HashMap<String, String>,
 ) -> Option<Guard> {
     let text = parsed.node_text(condition);
 
+    // Check direct field references
     for &field in field_names {
         let this_field = format!("this.{field}");
         let self_field = format!("self.{field}");
@@ -865,7 +893,93 @@ fn extract_single_guard(
         }
     }
 
+    // Check indirect references via variable bindings (L2)
+    // e.g., `const x = this.field; if (x)` → guard on field
+    let trimmed = text.trim().trim_start_matches('!');
+    if let Some(field_name) = var_field_map.get(trimmed) {
+        let negated = text.trim().starts_with('!') || text.trim().starts_with("not ");
+        let condition = if negated {
+            CallGuard::MustBeFalse
+        } else {
+            CallGuard::MustBeTrue
+        };
+        return Some(Guard {
+            field: field_name.clone(),
+            condition,
+        });
+    }
+
     None
+}
+
+/// Collect variable-to-field bindings from a method body.
+///
+/// Matches patterns like:
+/// - TypeScript: `const x = this.field;` / `let x = this.field;`
+/// - Python: `x = self.field`
+/// - Rust: `let x = self.field;`
+///
+/// Returns a map from variable name to field name.
+fn collect_variable_field_bindings(
+    parsed: &ParsedSource,
+    body_node: &Node,
+    field_names: &HashSet<&str>,
+) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    let mut stack = vec![*body_node];
+
+    while let Some(node) = stack.pop() {
+        // TypeScript/Rust: lexical_declaration or let_declaration
+        // containing `const x = this.field` or `let x = self.field`
+        if node.kind() == "lexical_declaration" || node.kind() == "let_declaration" {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    if let (Some(name_node), Some(value_node)) = (
+                        child.child_by_field_name("name"),
+                        child.child_by_field_name("value"),
+                    ) {
+                        let var_name = parsed.node_text(&name_node).to_string();
+                        let val_text = parsed.node_text(&value_node);
+                        for &field in field_names.iter() {
+                            let this_field = format!("this.{field}");
+                            let self_field = format!("self.{field}");
+                            if val_text == this_field || val_text == self_field {
+                                bindings.insert(var_name.clone(), field.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Python: assignment `x = self.field` (at statement level)
+        if node.kind() == "assignment" {
+            if let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) {
+                if left.kind() == "identifier" {
+                    let var_name = parsed.node_text(&left).to_string();
+                    let val_text = parsed.node_text(&right);
+                    for &field in field_names.iter() {
+                        let self_field = format!("self.{field}");
+                        if val_text == self_field {
+                            bindings.insert(var_name.clone(), field.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    bindings
 }
 
 /// Try to extract an effect from an assignment to a state field.
