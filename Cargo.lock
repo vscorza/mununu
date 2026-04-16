@@ -781,6 +781,7 @@ dependencies = [
 name = "mununu-cli"
 version = "0.2.0"
 dependencies = [
+ "bitvec",
  "clap",
  "mununu-core",
  "serde",

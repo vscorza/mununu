@@ -1045,89 +1045,115 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         .ok_or_else(|| format!("unknown automaton '{}' in realised context", args.automaton))?;
 
     // Apply adaptation: hiding + minimization (before evaluation)
-    if !args.hide.is_empty() {
-        let hide_set: std::collections::HashSet<String> = args.hide.iter().cloned().collect();
-        let (hidden_clts, stats) =
-            mununu_core::composition::hide::hide_labels_with_stats(clts, &hide_set)
-                .map_err(|e| format!("label hiding failed: {e}"))?;
-        eprintln!(
-            "Hidden {} label(s) out of {} total",
-            stats.labels_hidden, stats.total_labels
-        );
-
-        if args.minimize {
-            if let Some((_minimized, report)) =
-                mununu_core::composition::minimize::minimize_bisimulation(&hidden_clts, None)
-                    .map_err(|e| format!("minimization failed: {e}"))?
-            {
+    // If adaptation is applied, evaluate on the adapted CLTS directly.
+    let adapted_clts: Option<
+        mununu_core::clts::Clts<
+            mununu_core::clts::DefaultStateIdx,
+            mununu_core::clts::DefaultLabelIdx,
+        >,
+    > = {
+        let need_adaptation = !args.hide.is_empty() || args.minimize;
+        if need_adaptation {
+            let mut working = if !args.hide.is_empty() {
+                let hide_set: std::collections::HashSet<String> =
+                    args.hide.iter().cloned().collect();
+                let (hidden, stats) =
+                    mununu_core::composition::hide::hide_labels_with_stats(clts, &hide_set)
+                        .map_err(|e| format!("label hiding failed: {e}"))?;
                 eprintln!(
-                    "Minimized: {} → {} states ({} removed), {} → {} transitions",
-                    report.states_before,
-                    report.states_after,
-                    report.states_before - report.states_after,
-                    report.transitions_before,
-                    report.transitions_after,
+                    "Hidden {} label(s) out of {} total",
+                    stats.labels_hidden, stats.total_labels
                 );
+                hidden
             } else {
-                eprintln!("Minimization: already minimal (no reduction)");
+                // Clone the original CLTS for minimization
+                // (minimization needs ownership; we can't modify the realized context)
+                // Use hide with empty set as identity clone
+                mununu_core::composition::hide::hide_labels(clts, &std::collections::HashSet::new())
+                    .map_err(|e| format!("CLTS copy failed: {e}"))?
+            };
+
+            if args.minimize {
+                match mununu_core::composition::minimize::minimize_bisimulation(&working, None)
+                    .map_err(|e| format!("minimization failed: {e}"))?
+                {
+                    Some((minimized, report)) => {
+                        eprintln!(
+                            "Minimized: {} → {} states ({} removed), {} → {} transitions",
+                            report.states_before,
+                            report.states_after,
+                            report.states_before - report.states_after,
+                            report.transitions_before,
+                            report.transitions_after,
+                        );
+                        working = minimized;
+                    }
+                    None => {
+                        eprintln!("Minimization: already minimal (no reduction)");
+                    }
+                }
+            }
+
+            Some(working)
+        } else {
+            None
+        }
+    };
+
+    // Choose which CLTS to evaluate on
+    let eval_clts = adapted_clts.as_ref().unwrap_or(clts);
+
+    // Build environment matching the CLTS state count.
+    // For adapted CLTSs, register state-name predicates so formulas
+    // referencing state names (e.g., `!Closed`) resolve correctly.
+    let env = if adapted_clts.is_some() {
+        let sc = eval_clts.state_count();
+        let mut env = mununu_core::mu_calculus::Environment::new(sc);
+        for state_id in eval_clts.states() {
+            if let Some(name) = eval_clts.state_name(state_id) {
+                let mut bits = bitvec::vec::BitVec::<usize, bitvec::order::Lsb0>::repeat(false, sc);
+                bits.set(state_id.index(), true);
+                env = env.with_predicate(name.to_string(), bits);
             }
         }
-        // Note: evaluation still runs on the original context because
-        // the adapted CLTS is not registered in the realized context.
-        // Full integration requires registering the adapted CLTS.
-        // For now, hiding and minimization report statistics only.
-        eprintln!("(Adaptation applied — evaluation runs on original context)");
-    } else if args.minimize {
-        if let Some((_minimized, report)) =
-            mununu_core::composition::minimize::minimize_bisimulation(clts, None)
-                .map_err(|e| format!("minimization failed: {e}"))?
-        {
-            eprintln!(
-                "Minimized: {} → {} states ({} removed), {} → {} transitions",
-                report.states_before,
-                report.states_after,
-                report.states_before - report.states_after,
-                report.transitions_before,
-                report.transitions_after,
-            );
-        } else {
-            eprintln!("Minimization: already minimal (no reduction)");
-        }
-        eprintln!("(Adaptation applied — evaluation runs on original context)");
-    }
-
-    let env = realized.environment_for(&args.automaton);
+        env
+    } else {
+        realized.environment_for(&args.automaton)
+    };
 
     let mut options = EvaluationOptions::default();
     if args.no_partitions {
         options.use_partitions = false;
     }
 
-    let result = realized
-        .context
-        .evaluate_mu(&args.automaton, &formula.formula, &env, Some(&options))
-        .map_err(|err| format!("μ-calculus evaluation failed: {err}"))?;
+    let result = mununu_core::mu_calculus::evaluate_with_options(
+        &formula.formula,
+        eval_clts,
+        &env,
+        &options,
+    )
+    .map_err(|err| format!("μ-calculus evaluation failed: {err}"))?;
 
     let mut satisfying = Vec::new();
-    for state_id in clts.states() {
+    for state_id in eval_clts.states() {
         if result
             .get(state_id.index())
             .map(|bit| *bit)
             .unwrap_or(false)
-            && let Some(name) = clts.state_name(state_id)
+            && let Some(name) = eval_clts.state_name(state_id)
         {
             satisfying.push(name.to_string());
         }
     }
     satisfying.sort();
 
-    let initial_states: Vec<String> = clts
+    let initial_states: Vec<String> = eval_clts
         .initial_states()
         .iter()
-        .filter_map(|state_id| clts.state_name(*state_id).map(|name| name.to_string()))
+        .filter_map(|state_id| eval_clts.state_name(*state_id).map(|name| name.to_string()))
         .collect();
 
-    let mut initial_satisfying: Vec<String> = clts
+    let mut initial_satisfying: Vec<String> = eval_clts
         .initial_states()
         .iter()
         .filter_map(|state_id| {
@@ -1136,7 +1162,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
                 .map(|bit| *bit)
                 .unwrap_or(false)
             {
-                clts.state_name(*state_id).map(|name| name.to_string())
+                eval_clts.state_name(*state_id).map(|name| name.to_string())
             } else {
                 None
             }
@@ -1151,7 +1177,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
     println!(
         "  States satisfying: {}/{}",
         satisfying.len(),
-        clts.state_count()
+        eval_clts.state_count()
     );
     if satisfying.is_empty() {
         println!("    (none)");
