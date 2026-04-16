@@ -62,6 +62,10 @@ fn create_router() -> Router {
             "/api/v1/extraction/domains",
             get(handlers::extraction_domains_handler),
         )
+        .route(
+            "/api/v1/extraction/extract",
+            post(handlers::extraction_extract_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

@@ -560,3 +560,34 @@ pub struct DomainProfileInfo {
     pub language: String,
     pub description: String,
 }
+
+/// Request for AST-based extraction from source code.
+#[derive(Debug, Deserialize)]
+pub struct ExtractionExtractRequest {
+    /// Extraction config content (.extract.json).
+    pub config: String,
+    /// Source code content.
+    pub source: String,
+    /// Source language (typescript, python, rust). Auto-detected if omitted.
+    pub language: Option<String>,
+}
+
+/// Response from AST-based extraction.
+#[derive(Debug, Serialize)]
+pub struct ExtractionExtractResponse {
+    pub success: bool,
+    /// Generated .espec.json content.
+    pub espec: String,
+    /// Extraction warnings.
+    pub warnings: Vec<String>,
+    /// Automata extracted.
+    pub automata: Vec<ExtractionAutomatonInfo>,
+}
+
+/// Summary of an extracted automaton.
+#[derive(Debug, Serialize)]
+pub struct ExtractionAutomatonInfo {
+    pub id: String,
+    pub state_count: usize,
+    pub transition_count: usize,
+}

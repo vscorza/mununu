@@ -1067,3 +1067,57 @@ pub async fn extraction_domains_handler()
 
     Ok(Json(super::models::ExtractionDomainsResponse { profiles }))
 }
+
+/// Extract a model from source code using the AST-based extraction pipeline.
+///
+/// Requires the `ast-extract` feature flag.
+#[cfg(feature = "ast-extract")]
+pub async fn extraction_extract_handler(
+    Json(request): Json<super::models::ExtractionExtractRequest>,
+) -> ApiResult<Json<super::models::ExtractionExtractResponse>> {
+    let language = request.language.as_deref().unwrap_or("typescript");
+
+    let spec = crate::adapter::extraction::ast_extract::extract_from_source(
+        &request.config,
+        &request.source,
+        language,
+    )
+    .map_err(|e| ApiError::BadRequest {
+        message: format!("Extraction failed: {e}"),
+        details: None,
+    })?;
+
+    let automata: Vec<super::models::ExtractionAutomatonInfo> = spec
+        .model_config
+        .automata
+        .iter()
+        .map(|a| super::models::ExtractionAutomatonInfo {
+            id: a.id.clone(),
+            state_count: a.states.len(),
+            transition_count: a.transitions.len(),
+        })
+        .collect();
+
+    let espec_json = serde_json::to_string_pretty(&spec).map_err(|e| ApiError::Internal {
+        message: format!("Failed to serialize extraction result: {e}"),
+        source: None,
+    })?;
+
+    Ok(Json(super::models::ExtractionExtractResponse {
+        success: true,
+        espec: espec_json,
+        warnings: vec![],
+        automata,
+    }))
+}
+
+/// Stub handler when ast-extract feature is not enabled.
+#[cfg(not(feature = "ast-extract"))]
+pub async fn extraction_extract_handler(
+    Json(_request): Json<super::models::ExtractionExtractRequest>,
+) -> ApiResult<Json<super::models::ExtractionExtractResponse>> {
+    Err(ApiError::BadRequest {
+        message: "AST extraction not available. Build with --features ast-extract".to_string(),
+        details: None,
+    })
+}
