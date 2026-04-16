@@ -41,7 +41,7 @@ echo ""
 
 # Test 1: Compile Rust to LLVM IR
 echo -n "  Compile sample_protocol.rs → LLVM IR ... "
-if rustc --edition 2021 --crate-type=lib --emit=llvm-ir \
+if rustc --edition 2021 --crate-type=lib -C opt-level=0 --emit=llvm-ir \
     examples/ast_extract/rust/sample_protocol.rs -o "$TMPDIR/sample.ll" 2>/dev/null; then
     LINES=$(wc -l < "$TMPDIR/sample.ll")
     echo -e "${GREEN}PASS${NC} ($LINES lines)"

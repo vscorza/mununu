@@ -204,18 +204,19 @@ pub fn derive_automaton(
 
         for state in &all_states {
             if guards_satisfied(state, &method.guards) {
-                let target = apply_effects(state, &method.effects, fields);
-                if let Some(target_name) = state_names.get(&target) {
-                    let source_name = &state_names[state];
-                    transitions.push(DerivedTransition {
-                        from: source_name.clone(),
-                        to: target_name.clone(),
-                        label: label.clone(),
-                    });
+                let targets = apply_effects_havoc(state, &method.effects, fields);
+                let source_name = &state_names[state];
+                for target in &targets {
+                    if let Some(target_name) = state_names.get(target) {
+                        transitions.push(DerivedTransition {
+                            from: source_name.clone(),
+                            to: target_name.clone(),
+                            label: label.clone(),
+                        });
+                    }
+                    // If target is outside the domain (e.g., counter overflow),
+                    // the transition is dropped.
                 }
-                // If target is outside the domain (e.g., counter overflow),
-                // the transition is dropped — over-approximation is handled
-                // by the bounded domain.
             }
         }
     }
@@ -306,56 +307,102 @@ fn guards_satisfied(state: &AbstractState, guards: &[Guard]) -> bool {
     })
 }
 
-/// Apply effects to a state, producing a new state.
-fn apply_effects(
+/// Apply effects to a state, returning all possible target states.
+///
+/// For deterministic effects (SetTrue, IncrementCounter, etc.) this returns
+/// exactly one target state. For `Unknown` effects (L6 havoc semantics),
+/// it returns one target per possible value of the affected field —
+/// a sound over-approximation covering all behaviors the unknown call might have.
+fn apply_effects_havoc(
     state: &AbstractState,
     effects: &[Effect],
     fields: &[FieldDomain],
-) -> AbstractState {
-    let mut new_state = state.clone();
+) -> Vec<AbstractState> {
+    let mut current_states = vec![state.clone()];
+
     for effect in effects {
-        if let Some(val) = new_state.get_mut(&effect.field) {
-            match &effect.effect {
-                CallEffect::SetTrue => *val = AbstractValue::Bool(true),
-                CallEffect::SetFalse => *val = AbstractValue::Bool(false),
-                CallEffect::SetPresent => *val = AbstractValue::Present(true),
-                CallEffect::SetAbsent => *val = AbstractValue::Present(false),
-                CallEffect::IncrementCounter => {
-                    if let AbstractValue::Counter(n) = val {
-                        let bound = fields
-                            .iter()
-                            .find(|f| f.name == effect.field)
-                            .and_then(|f| f.bound)
-                            .unwrap_or(3);
-                        *val = AbstractValue::Counter((*n + 1).min(bound));
-                    }
-                }
-                CallEffect::DecrementCounter => {
-                    if let AbstractValue::Counter(n) = val {
-                        *val = AbstractValue::Counter((*n - 1).max(0));
-                    }
-                }
-                CallEffect::ResetToZero => {
-                    if let AbstractValue::Counter(_) = val {
-                        *val = AbstractValue::Counter(0);
-                    }
-                }
-                CallEffect::ReadOnly | CallEffect::None => {}
-                CallEffect::Unknown => {
-                    // KNOWN LIMITATION (L6): keeps current value, which is an
-                    // under-approximation. Sound for safety properties if the
-                    // unknown call is idempotent, but unsound for liveness.
-                    // TODO: when `unknown_effect_policy = "havoc"` is configured,
-                    // the caller should expand this into one transition per
-                    // possible field value (nondeterministic over-approximation).
+        // Apply explicit value override first
+        if let Some(explicit) = &effect.value {
+            for s in &mut current_states {
+                if let Some(val) = s.get_mut(&effect.field) {
+                    *val = explicit.clone();
                 }
             }
-            if let Some(explicit) = &effect.value {
-                *val = explicit.clone();
+            continue;
+        }
+
+        match &effect.effect {
+            CallEffect::Unknown => {
+                // Havoc: branch into all possible values for this field
+                let field_domain = fields.iter().find(|f| f.name == effect.field);
+                if let Some(fd) = field_domain {
+                    let possible_values = fd.values();
+                    if possible_values.len() > 1 {
+                        let mut new_states = Vec::new();
+                        for s in &current_states {
+                            for val in &possible_values {
+                                let mut branched = s.clone();
+                                if let Some(v) = branched.get_mut(&effect.field) {
+                                    *v = val.clone();
+                                }
+                                new_states.push(branched);
+                            }
+                        }
+                        current_states = new_states;
+                        continue;
+                    }
+                }
+                // Field not found or single-valued → keep current
+            }
+            _ => {
+                // Deterministic effect: apply in-place to all branches
+                for s in &mut current_states {
+                    apply_single_effect(s, effect, fields);
+                }
             }
         }
     }
-    new_state
+
+    // Deduplicate
+    current_states.sort();
+    current_states.dedup();
+    current_states
+}
+
+/// Apply a single deterministic effect to a state in-place.
+fn apply_single_effect(state: &mut AbstractState, effect: &Effect, fields: &[FieldDomain]) {
+    if let Some(val) = state.get_mut(&effect.field) {
+        match &effect.effect {
+            CallEffect::SetTrue => *val = AbstractValue::Bool(true),
+            CallEffect::SetFalse => *val = AbstractValue::Bool(false),
+            CallEffect::SetPresent => *val = AbstractValue::Present(true),
+            CallEffect::SetAbsent => *val = AbstractValue::Present(false),
+            CallEffect::IncrementCounter => {
+                if let AbstractValue::Counter(n) = val {
+                    let bound = fields
+                        .iter()
+                        .find(|f| f.name == effect.field)
+                        .and_then(|f| f.bound)
+                        .unwrap_or(3);
+                    *val = AbstractValue::Counter((*n + 1).min(bound));
+                }
+            }
+            CallEffect::DecrementCounter => {
+                if let AbstractValue::Counter(n) = val {
+                    *val = AbstractValue::Counter((*n - 1).max(0));
+                }
+            }
+            CallEffect::ResetToZero => {
+                if let AbstractValue::Counter(_) = val {
+                    *val = AbstractValue::Counter(0);
+                }
+            }
+            CallEffect::ReadOnly | CallEffect::None | CallEffect::Unknown => {}
+        }
+        if let Some(explicit) = &effect.value {
+            *val = explicit.clone();
+        }
+    }
 }
 
 /// Prune unreachable states via BFS from initial state.

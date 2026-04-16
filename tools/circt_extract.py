@@ -1,40 +1,32 @@
 #!/usr/bin/env python3
-"""circt_extract.py — Extract .espec.json from CIRCT MLIR output.
+"""circt_extract.py — Extract .espec.json reactive system from CIRCT MLIR.
 
-Parses the hw/comb/seq dialect MLIR produced by circt-verilog and
-reconstructs the FSM as a mununu .espec.json extraction spec.
-
-The extraction heuristic:
-1. Find seq.firreg operations (state registers)
-2. Identify comb.icmp operations comparing the register to constants (state tests)
-3. Trace comb.mux chains to determine next-state logic (transitions)
-4. Map constants to enum names using the module's input/output structure
+Builds a reactive transition system from hw/comb/seq dialect MLIR:
+- Every seq.firreg register is a state dimension
+- Each clock step evaluates the combinational cone (mux/icmp/and/or/xor)
+  to compute the next-state function
+- Input ports are uncontrollable labels
+- State space is the cross-product of all register values
 
 Usage:
     circt-verilog design.sv | python3 tools/circt_extract.py --output spec.espec.json
-
-Or:
-    circt-verilog design.sv -o design.mlir
-    python3 tools/circt_extract.py design.mlir --output spec.espec.json
 """
 
 import argparse
+import itertools
 import json
 import re
 import sys
 
 
 def parse_mlir(mlir_text: str) -> dict:
-    """Parse CIRCT MLIR output into a simplified representation."""
+    """Parse CIRCT MLIR output into a simplified SSA representation."""
     module = {
         "name": None,
         "inputs": [],
         "outputs": [],
-        "constants": {},
+        "ops": {},       # SSA name -> (op_type, operands_dict)
         "registers": [],
-        "comparisons": [],
-        "muxes": [],
-        "assigns": [],
     }
 
     lines = mlir_text.strip().split("\n")
@@ -48,154 +40,321 @@ def parse_mlir(mlir_text: str) -> dict:
             ports = m.group(2)
             for port in re.findall(r'(in|out)\s+%(\w+)\s*:\s*(\w+)', ports):
                 direction, name, typ = port
+                entry = {"name": name, "type": typ}
                 if direction == "in":
-                    module["inputs"].append({"name": name, "type": typ})
+                    module["inputs"].append(entry)
                 else:
-                    module["outputs"].append({"name": name, "type": typ})
+                    module["outputs"].append(entry)
 
-        # Constants
-        m = re.match(r'%(\S+)\s*=\s*hw\.constant\s+(.+?)\s*:\s*(.+)', line)
+        # Constants: %name = hw.constant value [: type]
+        m = re.match(r'%(\S+)\s*=\s*hw\.constant\s+(.+?)(?:\s*:\s*(.+))?$', line)
         if m:
-            name, value, typ = m.group(1), m.group(2), m.group(3)
-            module["constants"][name] = {"value": value, "type": typ}
+            name, value = m.group(1), m.group(2).strip()
+            typ = m.group(3) or ("i1" if value in ("true", "false") else "unknown")
+            module["ops"][name] = ("constant", {"value": value, "type": typ})
 
-        # State register (seq.firreg)
-        m = re.match(r'%(\w+)\s*=\s*seq\.firreg\s+%(\w+)\s+clock\s+%(\w+).*reset\s+\w+\s+%(\w+),\s*%(\S+)', line)
+        # State register: %name = seq.firreg %next clock %clk reset async %rst, %reset_val : type
+        m = re.match(
+            r'%(\w+)\s*=\s*seq\.firreg\s+%(\w+)\s+clock\s+%(\w+).*reset\s+\w+\s+%(\w+),\s*%(\S+)\s*:\s*(.+)',
+            line,
+        )
         if m:
-            reg_name = m.group(1)
-            next_val = m.group(2)
-            reset_val = m.group(5)
-            module["registers"].append({
-                "name": reg_name,
-                "next": next_val,
-                "reset": reset_val,
+            reg = {
+                "name": m.group(1),
+                "next": m.group(2),
+                "clock": m.group(3),
+                "reset_signal": m.group(4),
+                "reset_value": m.group(5),
+                "type": m.group(6).strip(),
+            }
+            module["registers"].append(reg)
+            # Register is also an SSA value (current value)
+            module["ops"][reg["name"]] = ("register", {"reg": reg})
+
+        # comb.icmp: %r = comb.icmp op %a, %b : type
+        m = re.match(r'%(\w+)\s*=\s*comb\.icmp\s+(\w+)\s+%(\w+),\s*%(\S+)\s*:', line)
+        if m:
+            module["ops"][m.group(1)] = ("icmp", {
+                "op": m.group(2), "lhs": m.group(3), "rhs": m.group(4),
             })
 
-        # Comparisons (comb.icmp)
-        m = re.match(r'%(\w+)\s*=\s*comb\.icmp\s+(\w+)\s+%(\w+),\s*%(\S+)', line)
+        # comb.mux (with optional 'bin'): %r = comb.mux [bin] %sel, %t, %f : type
+        m = re.match(
+            r'%(\w+)\s*=\s*comb\.mux\s+(?:bin\s+)?%(\w+),\s*%(\S+),\s*%(\S+)\s*:', line
+        )
         if m:
-            result, op, lhs, rhs = m.group(1), m.group(2), m.group(3), m.group(4)
-            module["comparisons"].append({
-                "result": result,
-                "op": op,
-                "lhs": lhs,
-                "rhs": rhs,
+            module["ops"][m.group(1)] = ("mux", {
+                "sel": m.group(2), "true": m.group(3), "false": m.group(4),
             })
 
-        # Muxes (comb.mux)
-        m = re.match(r'%(\w+)\s*=\s*comb\.mux\s+(?:bin\s+)?%(\w+),\s*%(\S+),\s*%(\S+)', line)
-        if m:
-            result, sel, true_val, false_val = m.group(1), m.group(2), m.group(3), m.group(4)
-            module["muxes"].append({
-                "result": result,
-                "sel": sel,
-                "true": true_val,
-                "false": false_val,
-            })
+        # comb.and / comb.or / comb.xor: %r = comb.OP %a, %b [, ...] : type
+        for op_name in ("and", "or", "xor"):
+            m = re.match(
+                rf'%(\w+)\s*=\s*comb\.{op_name}\s+(.+?)\s*:', line
+            )
+            if m:
+                operands = [o.strip().lstrip('%') for o in m.group(2).split(',')]
+                module["ops"][m.group(1)] = (op_name, {"operands": operands})
+                break
 
-        # hw.output
-        m = re.match(r'hw\.output\s+%(\w+)', line)
-        if m:
-            module["assigns"].append({"output": m.group(1)})
+        # seq.to_clock (ignore, not needed for extraction)
+        # hw.output (ignore, output values derived from state)
 
     return module
 
 
-def extract_fsm(module: dict) -> dict:
-    """Extract FSM structure from parsed MLIR module."""
+def evaluate(ops: dict, name: str, env: dict, cache: dict, depth: int = 0) -> int:
+    """Evaluate an SSA value given register/input assignments in env.
+
+    env maps SSA names of registers and inputs to concrete integer values.
+    Returns an integer value for the expression.
+    """
+    if depth > 100:
+        return 0  # prevent infinite recursion
+
+    if name in cache:
+        return cache[name]
+
+    if name in env:
+        cache[name] = env[name]
+        return env[name]
+
+    if name not in ops:
+        cache[name] = 0
+        return 0
+
+    op_type, args = ops[name]
+
+    if op_type == "constant":
+        val = args["value"]
+        if val == "true":
+            result = 1
+        elif val == "false":
+            result = 0
+        else:
+            result = int(val)
+        cache[name] = result
+        return result
+
+    if op_type == "register":
+        # Current register value comes from env
+        result = env.get(name, 0)
+        cache[name] = result
+        return result
+
+    if op_type == "icmp":
+        lhs = evaluate(ops, args["lhs"], env, cache, depth + 1)
+        rhs = evaluate(ops, args["rhs"], env, cache, depth + 1)
+        op = args["op"]
+        if op in ("eq", "ceq"):
+            result = 1 if lhs == rhs else 0
+        elif op in ("ne", "cne"):
+            result = 1 if lhs != rhs else 0
+        elif op == "slt":
+            result = 1 if lhs < rhs else 0
+        elif op == "sgt":
+            result = 1 if lhs > rhs else 0
+        elif op == "sle":
+            result = 1 if lhs <= rhs else 0
+        elif op == "sge":
+            result = 1 if lhs >= rhs else 0
+        elif op == "ult":
+            result = 1 if (lhs & 0xFFFFFFFF) < (rhs & 0xFFFFFFFF) else 0
+        else:
+            result = 0
+        cache[name] = result
+        return result
+
+    if op_type == "mux":
+        sel = evaluate(ops, args["sel"], env, cache, depth + 1)
+        if sel:
+            result = evaluate(ops, args["true"], env, cache, depth + 1)
+        else:
+            result = evaluate(ops, args["false"], env, cache, depth + 1)
+        cache[name] = result
+        return result
+
+    if op_type == "and":
+        vals = [evaluate(ops, o, env, cache, depth + 1) for o in args["operands"]]
+        result = vals[0]
+        for v in vals[1:]:
+            result &= v
+        cache[name] = result
+        return result
+
+    if op_type == "or":
+        vals = [evaluate(ops, o, env, cache, depth + 1) for o in args["operands"]]
+        result = vals[0]
+        for v in vals[1:]:
+            result |= v
+        cache[name] = result
+        return result
+
+    if op_type == "xor":
+        vals = [evaluate(ops, o, env, cache, depth + 1) for o in args["operands"]]
+        result = vals[0]
+        for v in vals[1:]:
+            result ^= v
+        cache[name] = result
+        return result
+
+    cache[name] = 0
+    return 0
+
+
+def extract_reactive_system(module: dict) -> dict:
+    """Build a reactive transition system from the MLIR module.
+
+    State dimensions: all seq.firreg registers
+    Inputs: all non-clk/rst input ports
+    Transition: for each (state, input) pair, evaluate the next-state function
+    """
     if not module["registers"]:
         return {"error": "No state registers found"}
 
-    reg = module["registers"][0]
-    reg_name = reg["name"]
+    # Identify state registers and their value ranges
+    registers = []
+    for reg in module["registers"]:
+        typ = reg["type"]
+        m = re.match(r'i(\d+)', typ)
+        width = int(m.group(1)) if m else 1
+        # For signed 2's complement: i2 has values -2, -1, 0, 1
+        if width <= 4:
+            n_values = 2 ** width
+            values = list(range(-(n_values // 2), n_values // 2))
+        else:
+            values = [0, 1]  # abstract large registers to boolean
+        registers.append({
+            "name": reg["name"],
+            "next": reg["next"],
+            "reset_value": reg["reset_value"],
+            "width": width,
+            "values": values,
+        })
 
-    # Find all constants used in comparisons with the state register
-    state_values = {}
-    for cmp in module["comparisons"]:
-        if cmp["lhs"] == reg_name and cmp["rhs"] in module["constants"]:
-            val = module["constants"][cmp["rhs"]]["value"]
-            state_values[cmp["rhs"]] = val
+    # Identify non-clock/reset inputs
+    inputs = [
+        inp for inp in module["inputs"]
+        if inp["name"] not in ("clk", "rst")
+    ]
+    input_names = [inp["name"] for inp in inputs]
 
-    # Map constant names to state names
-    # Use positional encoding: 0=IDLE, 1=WAIT, -2=ACTIVE, -1=DONE (for 2-bit)
-    state_names = {}
-    for const_name, info in module["constants"].items():
-        val = info["value"]
-        typ = info["type"]
-        if typ == "i2":
-            # Map 2-bit values to meaningful names
-            name_map = {"0": "S0", "1": "S1", "-2": "S2", "-1": "S3"}
-            if val in name_map:
-                state_names[const_name] = name_map[val]
+    # Map register reset values to integers
+    ops = module["ops"]
+    for reg in registers:
+        rv = reg["reset_value"]
+        if rv in ops and ops[rv][0] == "constant":
+            val_str = ops[rv][1]["value"]
+            reg["reset_int"] = 0 if val_str == "false" else (1 if val_str == "true" else int(val_str))
+        else:
+            reg["reset_int"] = 0
 
-    # Get reset state
-    reset_const = reg["reset"]
-    reset_state = state_names.get(reset_const, "S0")
+    # Enumerate state space
+    all_reg_values = [reg["values"] for reg in registers]
+    all_states = list(itertools.product(*all_reg_values))
+
+    # Name states: S_val0_val1_... (use register values)
+    def state_name(vals):
+        parts = []
+        for reg, val in zip(registers, vals):
+            parts.append(f"{reg['name']}_{val}")
+        return "_".join(parts)
+
+    initial_vals = tuple(reg["reset_int"] for reg in registers)
+    initial_name = state_name(initial_vals)
+
+    # Enumerate input combinations (i1 inputs → {0, 1})
+    input_values = [[0, 1] for _ in inputs]
+    all_input_combos = list(itertools.product(*input_values)) if inputs else [()]
+
+    # Build transitions
+    transitions = []
+    seen_transitions = set()
+
+    for state_vals in all_states:
+        src_name = state_name(state_vals)
+
+        for input_vals in all_input_combos:
+            # Build environment: register values + input values
+            env = {}
+            for reg, val in zip(registers, state_vals):
+                env[reg["name"]] = val
+            for inp, val in zip(inputs, input_vals):
+                env[inp["name"]] = val
+
+            # Evaluate next-state for each register
+            cache = {}
+            next_vals = []
+            for reg in registers:
+                nv = evaluate(ops, reg["next"], env, cache)
+                # Clamp to valid range
+                if nv not in reg["values"]:
+                    # Wrap: for i2, values are -2..1
+                    n_values = 2 ** reg["width"]
+                    nv = ((nv + n_values // 2) % n_values) - n_values // 2
+                next_vals.append(nv)
+
+            dst_name = state_name(tuple(next_vals))
+
+            # Create label from input combination
+            if input_names:
+                label_parts = [f"{name}_{val}" for name, val in zip(input_names, input_vals)]
+                label = "ev_" + "_".join(label_parts)
+            else:
+                label = "tick"
+
+            key = (src_name, dst_name, label)
+            if key not in seen_transitions:
+                seen_transitions.add(key)
+                transitions.append({
+                    "from": src_name,
+                    "to": dst_name,
+                    "label": label,
+                })
 
     # Build state list
     states = []
-    for const_name, sname in sorted(state_names.items(), key=lambda x: x[1]):
+    for vals in all_states:
+        name = state_name(vals)
         states.append({
-            "name": sname,
-            "initial": sname == reset_state,
+            "name": name,
+            "initial": vals == initial_vals,
         })
 
-    if not states:
-        states = [{"name": "S0", "initial": True}]
+    # Prune unreachable states via BFS
+    reachable = set()
+    queue = [initial_name]
+    while queue:
+        current = queue.pop(0)
+        if current in reachable:
+            continue
+        reachable.add(current)
+        for t in transitions:
+            if t["from"] == current and t["to"] not in reachable:
+                queue.append(t["to"])
 
-    # Build transitions from mux chains
-    # This is a heuristic — trace the mux tree to determine next-state for each condition
-    transitions = []
-    input_names = [inp["name"] for inp in module["inputs"] if inp["name"] not in ("clk", "rst")]
-
-    # For each state, determine which input conditions lead to which next state
-    for src_state_const, src_state_name in state_names.items():
-        for dst_state_const, dst_state_name in state_names.items():
-            # Check if there's a mux that selects dst when in src state
-            for cmp in module["comparisons"]:
-                if cmp["lhs"] == reg_name and cmp["rhs"] == src_state_const:
-                    for mux in module["muxes"]:
-                        if mux["sel"] == cmp["result"]:
-                            # This mux is conditioned on being in src_state
-                            true_val = mux["true"]
-                            if true_val in module["constants"] or true_val == dst_state_const:
-                                pass  # Complex — need deeper tracing
-
-    # Simplified: create transitions based on the known handshake pattern
-    # For a proper implementation, we'd trace the full mux chain.
-    # For now, generate self-loops and let the user refine.
-    for s in states:
-        for inp in input_names:
-            label = f"ev_{inp}"
-            transitions.append({
-                "from": s["name"],
-                "to": s["name"],
-                "label": label,
-            })
-        transitions.append({
-            "from": s["name"],
-            "to": s["name"],
-            "label": "noop",
-        })
+    states = [s for s in states if s["name"] in reachable]
+    transitions = [t for t in transitions if t["from"] in reachable and t["to"] in reachable]
 
     return {
         "module_name": module["name"],
         "states": states,
         "transitions": transitions,
         "inputs": input_names,
-        "register": reg_name,
-        "state_values": {v: k for k, v in state_names.items()},
+        "registers": [r["name"] for r in registers],
+        "initial": initial_name,
+        "total_enumerated": len(all_states),
+        "reachable": len(reachable),
     }
 
 
 def build_espec(fsm: dict, module_name: str) -> dict:
-    """Build .espec.json from extracted FSM."""
+    """Build .espec.json from extracted reactive system."""
     automaton_id = module_name or "FSM"
     context_name = (module_name or "circt_extracted").lower()
 
-    # Controllability: inputs are uncontrollable (environment), noop is uncontrollable
-    input_labels = [f"ev_{inp}" for inp in fsm.get("inputs", [])]
-    all_labels = input_labels + ["noop"]
+    # All labels are uncontrollable (environment drives inputs)
+    all_labels = sorted(set(t["label"] for t in fsm["transitions"]))
 
     return {
         "$schema": "extraction_spec_v1",
@@ -203,7 +362,9 @@ def build_espec(fsm: dict, module_name: str) -> dict:
             "repo": None,
             "commit": None,
             "file": None,
-            "issue": f"Extracted from CIRCT MLIR output for module {module_name}",
+            "issue": f"Reactive system extracted from CIRCT MLIR for module {module_name}. "
+                     f"Registers: {fsm.get('registers', [])}. "
+                     f"States: {fsm.get('reachable', '?')}/{fsm.get('total_enumerated', '?')} reachable.",
         },
         "state_fields": [],
         "methods": [],
@@ -211,19 +372,23 @@ def build_espec(fsm: dict, module_name: str) -> dict:
         "model_config": {
             "context_name": context_name,
             "controllable_labels": [],
-            "uncontrollable_labels": all_labels,
+            "uncontrollable_labels": all_labels + ["noop"],
             "automata": [{
                 "id": automaton_id,
                 "states": fsm["states"],
                 "controllable_labels": [],
-                "transitions": fsm["transitions"],
-                "note": f"Extracted from CIRCT hw/comb/seq dialects. State register: {fsm.get('register', '?')}",
+                "transitions": fsm["transitions"] + [
+                    {"from": s["name"], "to": s["name"], "label": "noop"}
+                    for s in fsm["states"]
+                ],
+                "note": f"Reactive system from CIRCT. Registers: {fsm.get('registers', [])}. "
+                        f"{fsm.get('reachable', '?')}/{fsm.get('total_enumerated', '?')} states reachable.",
             }],
             "properties": [{
                 "id": "safety",
                 "formula": "nu X. ([] X)",
                 "over": automaton_id,
-                "description": "Trivial safety — all states satisfy",
+                "description": "Trivial safety — all reachable states satisfy",
             }],
         },
     }
@@ -231,11 +396,10 @@ def build_espec(fsm: dict, module_name: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract .espec.json from CIRCT MLIR output"
+        description="Extract .espec.json reactive system from CIRCT MLIR output"
     )
     parser.add_argument(
-        "input",
-        nargs="?",
+        "input", nargs="?",
         help="MLIR file (or stdin if omitted)",
     )
     parser.add_argument(
@@ -259,17 +423,16 @@ def main():
     print(f"Inputs: {[i['name'] for i in module['inputs']]}", file=sys.stderr)
     print(f"Outputs: {[o['name'] for o in module['outputs']]}", file=sys.stderr)
     print(f"Registers: {[r['name'] for r in module['registers']]}", file=sys.stderr)
-    print(f"Constants: {len(module['constants'])}", file=sys.stderr)
-    print(f"Comparisons: {len(module['comparisons'])}", file=sys.stderr)
-    print(f"Muxes: {len(module['muxes'])}", file=sys.stderr)
+    print(f"SSA ops: {len(module['ops'])}", file=sys.stderr)
 
-    fsm = extract_fsm(module)
+    fsm = extract_reactive_system(module)
     if "error" in fsm:
         print(f"Error: {fsm['error']}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"States: {[s['name'] for s in fsm['states']]}", file=sys.stderr)
+    print(f"States: {fsm['reachable']}/{fsm['total_enumerated']} reachable", file=sys.stderr)
     print(f"Transitions: {len(fsm['transitions'])}", file=sys.stderr)
+    print(f"Initial: {fsm['initial']}", file=sys.stderr)
 
     espec = build_espec(fsm, module["name"])
 
