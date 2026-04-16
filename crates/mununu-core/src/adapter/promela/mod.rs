@@ -256,27 +256,18 @@ fn create_variable_automaton(
     } else {
         match &var.typename {
             ast::TypeName::Bit | ast::TypeName::Bool => (0i64, 1),
-            ast::TypeName::Byte => {
-                // Auto-bound heuristic anchored at init value:
-                // If init provided: range (0, max(init_val + 3, 3))
-                // If no init: (0, 3) — small default to keep state space manageable
-                if var.init.is_some() {
-                    (0, std::cmp::max(init_val + 3, 3))
-                } else {
-                    (0, 3)
-                }
+            ast::TypeName::Byte if var.init.is_some() => {
+                // Auto-bound heuristic anchored at init value
+                (0, std::cmp::max(init_val + 3, 3))
             }
-            ast::TypeName::Short | ast::TypeName::Int => {
-                // Auto-bound heuristic for large integer types:
-                // Anchor at init value with a small window
-                if var.init.is_some() {
-                    let lo = std::cmp::min(0, init_val - 2);
-                    let hi = std::cmp::max(init_val + 3, 3);
-                    (lo, hi)
-                } else {
-                    (0, 3)
-                }
+            ast::TypeName::Byte => (0, 3),
+            ast::TypeName::Short | ast::TypeName::Int if var.init.is_some() => {
+                // Auto-bound heuristic: anchor at init value with a small window
+                let lo = std::cmp::min(0, init_val - 2);
+                let hi = std::cmp::max(init_val + 3, 3);
+                (lo, hi)
             }
+            ast::TypeName::Short | ast::TypeName::Int => (0, 3),
             ast::TypeName::Mtype => (0, 3), // mtype values are typically small
             _ => (0, 3),                    // conservative default
         }
