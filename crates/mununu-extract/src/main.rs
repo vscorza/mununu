@@ -4,9 +4,10 @@
 //! tree-sitter, derives automata from field domains and method behaviors,
 //! and outputs a `.espec.json` extraction spec.
 
-// Guard/effect extraction has known limitations (collapsible-if from Python
-// extractor patterns, unused variables in partial implementations).
-// These will be resolved as extraction accuracy improves.
+// Known clippy suppressions in extractor.rs — tracked for resolution:
+// - collapsible_if: nested if-let patterns in Python/Rust field extraction
+// - unused_variables: warnings parameter in functions that over-approximate
+// - ptr_arg: &HashSet parameters (correct for our use, clippy prefers &[])
 #![allow(unused_variables, clippy::collapsible_if, clippy::ptr_arg)]
 
 pub mod extractor;
