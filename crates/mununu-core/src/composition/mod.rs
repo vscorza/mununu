@@ -7,8 +7,10 @@
 //! cover the expected behaviour with failing tests to guide the implementation.
 
 mod controllability;
+pub mod hide;
 #[cfg(test)]
 mod labels;
+pub mod minimize;
 mod transition;
 
 use crate::clts::{
