@@ -369,6 +369,15 @@ pub struct ContextVerifyRequest {
     /// When true and counterstrategy is enabled, minimize the counterstrategy automaton.
     #[serde(default)]
     pub minimize_counterstrategy: bool,
+    /// Labels to hide (reclassify as internal) before evaluation.
+    #[serde(default)]
+    pub hide: Vec<String>,
+    /// When true, apply bisimulation minimization before evaluation.
+    #[serde(default)]
+    pub minimize: bool,
+    /// Stub .espec.json content to compose as sidecars (interface automata).
+    #[serde(default)]
+    pub stubs: Vec<SidecarFile>,
 }
 
 /// Response from context verification
@@ -532,4 +541,22 @@ mod tests {
         assert!(!options.minimize);
         assert!(!options.diagnostics.counterexample);
     }
+}
+
+// ============================================================================
+// Extraction Endpoints
+// ============================================================================
+
+/// Response for listing available domain profiles.
+#[derive(Debug, Serialize)]
+pub struct ExtractionDomainsResponse {
+    pub profiles: Vec<DomainProfileInfo>,
+}
+
+/// Summary of a domain profile.
+#[derive(Debug, Serialize)]
+pub struct DomainProfileInfo {
+    pub name: String,
+    pub language: String,
+    pub description: String,
 }

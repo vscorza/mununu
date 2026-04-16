@@ -58,6 +58,10 @@ fn create_router() -> Router {
             "/api/v1/context/import",
             post(handlers::context_import_handler),
         )
+        .route(
+            "/api/v1/extraction/domains",
+            get(handlers::extraction_domains_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

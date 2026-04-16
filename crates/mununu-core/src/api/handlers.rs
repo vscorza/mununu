@@ -331,11 +331,16 @@ pub async fn context_import_handler(
             &request.content,
             &options,
         ),
+        "extraction" | "espec" => {
+            let mut opts = options.clone();
+            opts.mode = Some("vulnerable".to_string());
+            crate::adapter::extraction::ExtractionAdapter::translate(&request.content, &opts)
+        }
         "auto" | "" => crate::adapter::auto_translate(&request.content, &options),
         other => {
             return Err(ApiError::BadRequest {
                 message: format!(
-                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, promela, xstate, systemverilog"
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, promela, xstate, systemverilog, extraction"
                 ),
                 details: None,
             });
@@ -1037,4 +1042,28 @@ fn serialize_controller_to_ctxdsl(
     })?;
 
     Ok(output)
+}
+
+// ============================================================================
+// Extraction Endpoints
+// ============================================================================
+
+/// List available domain profiles for extraction.
+pub async fn extraction_domains_handler()
+-> ApiResult<Json<super::models::ExtractionDomainsResponse>> {
+    use crate::adapter::extraction::ast_extract::domain;
+
+    let profiles = domain::available_profiles()
+        .into_iter()
+        .filter_map(|name| {
+            let profile = domain::get_profile(name)?;
+            Some(super::models::DomainProfileInfo {
+                name: name.to_string(),
+                language: profile.language.to_string(),
+                description: profile.description.to_string(),
+            })
+        })
+        .collect();
+
+    Ok(Json(super::models::ExtractionDomainsResponse { profiles }))
 }
