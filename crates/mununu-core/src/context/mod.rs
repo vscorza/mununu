@@ -5,8 +5,7 @@
 //! shared `LabelStoreBuilder` and registering named CLTS instances.
 
 use crate::clts::{
-    Clts, CltsBuilder, CltsError, DefaultLabelIdx, DefaultStateIdx, LabelId, LabelStoreBuilder,
-    StateId,
+    Clts, CltsBuilder, CltsError, DefaultLabelIdx, DefaultStateIdx, LabelStoreBuilder, StateId,
 };
 use crate::composition::{CompositionOptions, compose};
 use crate::context_dsl::{ContextDoc, IncrementalState, LoadPlan};
@@ -806,144 +805,28 @@ impl Context {
         &self,
         controller: &Clts<DefaultStateIdx, DefaultLabelIdx>,
     ) -> Result<MinimizationOutcome, ContextError> {
-        let state_count = controller.state_count();
-        if state_count <= 1 {
-            return Ok(None);
-        }
+        // Delegate to the public minimization algorithm in composition::minimize.
+        // Pass the shared label store so the minimized CLTS preserves label IDs.
+        let result = crate::composition::minimize::minimize_bisimulation(
+            controller,
+            Some(self.label_store.clone()),
+        )
+        .map_err(ContextError::Controller)?;
 
-        // Partition refinement algorithm: iteratively refine partitions until stable
-        // Each state is assigned to a partition class (initially all in class 0)
-        let mut partition = vec![0usize; state_count];
-        let mut changed = true;
-
-        // Iterate until partition stabilizes (no changes)
-        while changed {
-            changed = false;
-            let mut map: HashMap<StateSignature, usize> = HashMap::new();
-            let mut next_partition = vec![0usize; state_count];
-            let mut next_id = 0usize;
-
-            // Compute signature for each state and assign to partition based on signature
-            for state in controller.states() {
-                // State signature includes: variables (bitset) + transitions (target partition + labels)
-                let signature = StateSignature::new(controller, state, &partition);
-                let entry = map.entry(signature).or_insert_with(|| {
-                    let id = next_id;
-                    next_id += 1;
-                    id
-                });
-                next_partition[state.index()] = *entry;
-            }
-
-            // Check if partition changed
-            if next_partition != partition {
-                partition = next_partition;
-                changed = true;
+        match result {
+            None => Ok(None),
+            Some((minimized, report)) => {
+                // Convert MinimizationReport → ControllerMinimizationReport
+                let ctrl_report = ControllerMinimizationReport {
+                    removed_states: report.states_before.saturating_sub(report.states_after),
+                    removed_transitions: report
+                        .transitions_before
+                        .saturating_sub(report.transitions_after),
+                    merged_states: report.merged_states,
+                };
+                Ok(Some((minimized, ctrl_report)))
             }
         }
-
-        let class_count = partition
-            .iter()
-            .copied()
-            .max()
-            .map(|max| max + 1)
-            .unwrap_or(0);
-
-        if class_count == state_count {
-            return Ok(None);
-        }
-
-        let mut class_members: Vec<Vec<StateId<DefaultStateIdx>>> = vec![Vec::new(); class_count];
-        for state in controller.states() {
-            class_members[partition[state.index()]].push(state);
-        }
-
-        let mut class_info: Vec<(usize, Vec<StateId<DefaultStateIdx>>)> = class_members
-            .into_iter()
-            .enumerate()
-            .filter_map(|(class, mut members)| {
-                if members.is_empty() {
-                    return None;
-                }
-                members.sort_by_key(|state| state.index());
-                Some((class, members))
-            })
-            .collect();
-        if class_info.is_empty() {
-            return Ok(None);
-        }
-
-        class_info.sort_by_key(|(_, members)| members[0].index());
-
-        let mut builder = CltsBuilder::with_label_store(self.label_store.clone());
-        builder.reserve_states(class_info.len());
-
-        let mut mapping = HashMap::new();
-        let mut representatives = Vec::with_capacity(class_info.len());
-        let mut report = ControllerMinimizationReport::default();
-
-        let original_transition_count: usize = controller
-            .states()
-            .map(|state| controller.outgoing(state).len())
-            .sum();
-
-        for (_, members) in &class_info {
-            let representative = members[0];
-            let name = controller
-                .state_name(representative)
-                .unwrap_or("state")
-                .to_owned();
-            let new_state = builder
-                .state_with_name(name)
-                .ok_or(ContextError::Controller(CltsError::IdOverflow {
-                    kind: "state",
-                    value: usize::MAX,
-                }))?;
-
-            if members
-                .iter()
-                .any(|state| controller.initial_states().contains(state))
-            {
-                builder.initial_state_id(new_state);
-            }
-
-            let vars = controller.state_variables(representative);
-            builder.with_variables_for_state(new_state, vars.iter().map(|s| s.as_str()));
-
-            for (idx, state) in members.iter().enumerate() {
-                mapping.insert(*state, new_state);
-                if idx > 0
-                    && let Some(name) = controller.state_name(*state)
-                {
-                    report.merged_states.push(name.to_owned());
-                }
-            }
-
-            representatives.push((representative, new_state));
-        }
-
-        report.removed_states = state_count.saturating_sub(representatives.len());
-
-        let mut new_transition_count = 0usize;
-
-        for (source, new_source) in &representatives {
-            let mut seen = HashSet::new();
-            for transition in controller.outgoing(*source) {
-                if let Some(&target_new) = mapping.get(&transition.target()) {
-                    let key = TransitionKey::new(target_new, transition.labels());
-                    if seen.insert(key) {
-                        builder.transition_ids(*new_source, transition.labels(), target_new);
-                        new_transition_count += 1;
-                    }
-                }
-            }
-        }
-
-        report.removed_transitions = original_transition_count.saturating_sub(new_transition_count);
-
-        let minimized = builder.build().map_err(ContextError::Controller)?;
-
-        Ok(Some((minimized, report)))
     }
 
     /// Saves a registered CLTS to disk.
@@ -1543,95 +1426,9 @@ impl ControllerDiagnostics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// Signature used to determine state equivalence during minimization.
-///
-/// A state's signature captures its observable behavior:
-/// - **Variables**: Bitset representation of variables associated with the state
-/// - **Transitions**: Sorted list of transition signatures, each containing:
-///   - Target partition ID (which partition class the transition leads to)
-///   - Sorted label IDs (the labels on the transition)
-///
-/// Two states with identical signatures are behaviorally equivalent and can be merged.
-/// The signature is computed relative to the current partition, allowing iterative refinement.
-struct StateSignature {
-    variables: BitVec<usize, Lsb0>,
-    transitions: Vec<MinTransitionSignature>,
-}
-
-impl StateSignature {
-    /// Computes the signature for a state given the current partition.
-    ///
-    /// The signature includes:
-    /// 1. **Variables**: Bitset of variables associated with the state
-    /// 2. **Transitions**: For each outgoing transition:
-    ///    - Target partition ID (from current partition)
-    ///    - Sorted label IDs (for canonical ordering)
-    ///
-    /// Transitions are sorted to ensure canonical ordering regardless of construction order.
-    fn new(
-        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
-        state: StateId<DefaultStateIdx>,
-        partition: &[usize],
-    ) -> Self {
-        let variables = clts.state_variable_bitset(state).bits().to_bitvec();
-        let mut transitions: Vec<MinTransitionSignature> = clts
-            .outgoing(state)
-            .iter()
-            .map(|transition| {
-                let mut labels: Vec<usize> = transition
-                    .labels()
-                    .iter()
-                    .map(|label| label.index())
-                    .collect();
-                labels.sort_unstable();
-                MinTransitionSignature {
-                    target_partition: partition[transition.target().index()],
-                    labels,
-                }
-            })
-            .collect();
-        transitions.sort();
-        Self {
-            variables,
-            transitions,
-        }
-    }
-}
-
-/// Signature of a transition used in state minimization.
-///
-/// Contains the target partition ID and sorted label IDs. Used to compare transitions
-/// during partition refinement to determine if states have equivalent transition patterns.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct MinTransitionSignature {
-    /// Partition class ID of the target state (from current partition)
-    target_partition: usize,
-    /// Sorted label IDs for canonical ordering
-    labels: Vec<usize>,
-}
-
-/// Key used to deduplicate transitions when building the minimized controller.
-///
-/// Contains the target state index and sorted label IDs. Used to ensure that
-/// when multiple states are merged, transitions with the same target and labels
-/// are only added once to the minimized controller.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TransitionKey {
-    target: usize,
-    labels: Vec<usize>,
-}
-
-impl TransitionKey {
-    fn new(target: StateId<DefaultStateIdx>, labels: &[LabelId<DefaultLabelIdx>]) -> Self {
-        let mut label_ids: Vec<usize> = labels.iter().map(|label| label.index()).collect();
-        label_ids.sort_unstable();
-        Self {
-            target: target.index(),
-            labels: label_ids,
-        }
-    }
-}
+// StateSignature, MinTransitionSignature, TransitionKey moved to
+// composition::minimize — the public minimization module.
+// Context::minimise_controller now delegates to that module.
 
 /// Explorer used to walk the losing region and derive counterexample/counterstrategy artefacts.
 #[derive(Default)]
