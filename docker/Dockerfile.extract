@@ -1,0 +1,23 @@
+# Dockerfile for mununu-extract (tree-sitter frontend)
+# Produces a lightweight image with the extraction binary.
+#
+# Build:
+#   docker build -f docker/Dockerfile.extract -t mununu-extract .
+#
+# Usage:
+#   docker run --rm -v $(pwd):/work mununu-extract \
+#     /work/config.extract.json --source /work/server.ts --output /work/spec.espec.json
+
+FROM rust:1.91-slim-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+RUN cargo build --release -p mununu-extract
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -m appuser
+COPY --from=builder /build/target/release/mununu-extract /usr/local/bin/
+USER appuser
+ENTRYPOINT ["mununu-extract"]

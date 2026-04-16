@@ -1,0 +1,32 @@
+# Dockerfile for CIRCT-based extraction frontend (SystemVerilog)
+# Includes CIRCT + Slang for SystemVerilog FSM extraction.
+#
+# This is a PLANNED image — CIRCT integration is not yet implemented.
+# The image will provide circt-opt for lowering SV to the fsm dialect.
+#
+# Build:
+#   docker build -f docker/Dockerfile.extract-circt -t mununu-extract-circt .
+#
+# Usage (planned):
+#   docker run --rm -v $(pwd):/work mununu-extract-circt \
+#     /work/design.sv --config /work/circt_config.json --output /work/spec.espec.json
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# CIRCT and Slang would be installed here:
+# RUN curl -L https://github.com/llvm/circt/releases/... -o /opt/circt.tar.gz && ...
+# RUN curl -L https://github.com/MikePopoloski/slang/releases/... -o /opt/slang.tar.gz && ...
+
+RUN useradd -m appuser
+USER appuser
+WORKDIR /work
+
+# Placeholder — extraction script will be added in Phase 7
+ENTRYPOINT ["echo", "CIRCT extraction frontend not yet implemented. See docs/architecture/extraction.md"]
