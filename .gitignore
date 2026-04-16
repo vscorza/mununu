@@ -26,9 +26,9 @@ bench_results/
 # Documentation build
 /doc/
 
-# Claude
-CLAUDE.md
-.claude/
+# Claude Code (user-local)
+.claude/settings.json
+.claude/reviews/
 
 # Private / unpublished material (lives in mununu-private/)
 /paper/
