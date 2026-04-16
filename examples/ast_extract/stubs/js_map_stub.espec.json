@@ -1,0 +1,55 @@
+{
+    "$schema": "extraction_spec_v1",
+    "source": {
+        "repo": "stdlib",
+        "file": "Map.prototype",
+        "issue": "Tier 3 stub: JavaScript Map interface automaton"
+    },
+    "model_config": {
+        "context_name": "js_map_stub",
+        "automata": [
+            {
+                "id": "MapState",
+                "note": "Models a Map's occupancy as a bounded counter (0..3). set() increments, delete() decrements, clear() resets, get() requires non-empty.",
+                "states": [
+                    {"name": "Empty", "initial": true},
+                    {"name": "Has1"},
+                    {"name": "Has2"},
+                    {"name": "Full"}
+                ],
+                "transitions": [
+                    {"from": "Empty", "to": "Has1",  "label": "ev_map_set"},
+                    {"from": "Has1",  "to": "Has2",  "label": "ev_map_set"},
+                    {"from": "Has2",  "to": "Full",  "label": "ev_map_set"},
+                    {"from": "Full",  "to": "Full",  "label": "ev_map_set"},
+
+                    {"from": "Has1",  "to": "Empty", "label": "ev_map_delete"},
+                    {"from": "Has2",  "to": "Has1",  "label": "ev_map_delete"},
+                    {"from": "Full",  "to": "Has2",  "label": "ev_map_delete"},
+
+                    {"from": "Has1",  "to": "Has1",  "label": "ev_map_get"},
+                    {"from": "Has2",  "to": "Has2",  "label": "ev_map_get"},
+                    {"from": "Full",  "to": "Full",  "label": "ev_map_get"},
+
+                    {"from": "Empty", "to": "Empty", "label": "ev_map_clear"},
+                    {"from": "Has1",  "to": "Empty", "label": "ev_map_clear"},
+                    {"from": "Has2",  "to": "Empty", "label": "ev_map_clear"},
+                    {"from": "Full",  "to": "Empty", "label": "ev_map_clear"},
+
+                    {"from": "Empty", "to": "Empty", "label": "noop"},
+                    {"from": "Has1",  "to": "Has1",  "label": "noop"},
+                    {"from": "Has2",  "to": "Has2",  "label": "noop"},
+                    {"from": "Full",  "to": "Full",  "label": "noop"}
+                ]
+            }
+        ],
+        "properties": [
+            {
+                "id": "no_get_when_empty",
+                "formula": "nu X. ((!Empty || ([ev_map_get] false)) && ([] X))",
+                "over": "MapState",
+                "description": "Map.get should not succeed when the map is empty"
+            }
+        ]
+    }
+}

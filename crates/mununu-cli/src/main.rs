@@ -174,6 +174,9 @@ struct ContextEvalArgs {
     /// Apply bisimulation minimization to the target automaton before evaluation.
     #[arg(long = "minimize")]
     minimize: bool,
+    /// Stub .espec.json files to compose with the model (external library interfaces).
+    #[arg(long = "stub", value_name = "FILE")]
+    stubs: Vec<PathBuf>,
     /// Print the internal structure of the context to stdout or a file.
     #[arg(long = "print-structure", value_name = "FILE")]
     print_structure: Option<Option<PathBuf>>,
@@ -1028,12 +1031,25 @@ fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
 }
 
 fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents_mode(
+    let (context_doc, mut sidecar_docs) = load_context_documents_mode(
         &args.context,
         &args.sidecars,
         args.adapter.as_deref(),
         args.mode.as_deref(),
     )?;
+
+    // Load stub files: translate each .espec.json via extraction adapter → CTXDSL → parse as sidecar
+    for stub_path in &args.stubs {
+        let stub_doc = load_with_adapter_mode(stub_path, Some("extraction"), args.mode.as_deref())
+            .map_err(|e| format!("Failed to load stub '{}': {e}", stub_path.display()))?;
+        eprintln!(
+            "Loaded stub: {} ({} automata)",
+            stub_path.display(),
+            stub_doc.automata.len()
+        );
+        sidecar_docs.push(stub_doc);
+    }
+
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let formula = realized
         .formulas
