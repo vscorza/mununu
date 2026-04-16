@@ -193,13 +193,60 @@ fn extract_fields(
     let body_node = match parsed.language {
         SourceLanguage::TypeScript => class_node.child_by_field_name("body"),
         SourceLanguage::Python => class_node.child_by_field_name("body"),
-        SourceLanguage::Rust => Some(*class_node), // struct fields are direct children
+        SourceLanguage::Rust => {
+            // Rust struct fields are inside a field_declaration_list child
+            let mut c = class_node.walk();
+            class_node
+                .children(&mut c)
+                .find(|child| child.kind() == "field_declaration_list")
+                .or(Some(*class_node))
+        }
     };
 
     let body = match body_node {
         Some(b) => b,
         None => return (fields, field_lines),
     };
+
+    // For Python, also extract fields from __init__ body
+    let mut py_init_results: Vec<(String, Option<String>, Option<String>, u32)> = Vec::new();
+    if parsed.language == SourceLanguage::Python {
+        let mut init_cursor = body.walk();
+        for child in body.children(&mut init_cursor) {
+            if child.kind() == "function_definition" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    if parsed.node_text(&name_node) == "__init__" {
+                        py_init_results = extract_py_init_fields(parsed, &child);
+                    }
+                }
+            }
+        }
+    }
+
+    // Process __init__ fields first (Python-specific)
+    for (name, type_str, initial, line) in &py_init_results {
+        if !field_names.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(fd) = build_field_domain(
+            name,
+            type_str.as_deref(),
+            initial.as_deref(),
+            *line,
+            target,
+            profile,
+            warnings,
+        ) {
+            field_lines.push((name.clone(), *line));
+            fields.push(fd);
+        }
+    }
+
+    // Collect fields already found via __init__ to avoid duplicates
+    let init_field_names: HashSet<String> = py_init_results
+        .iter()
+        .map(|(n, _, _, _)| n.clone())
+        .collect();
 
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
@@ -214,73 +261,136 @@ fn extract_fields(
             None => continue,
         };
 
+        // Skip fields already extracted from __init__
+        if init_field_names.contains(&name) {
+            continue;
+        }
+
         // Only include fields that are in the target's state_fields list
         if !field_names.contains(name.as_str()) {
             continue;
         }
 
         let line = line.unwrap_or(0);
-        field_lines.push((name.clone(), line));
-
-        // Determine abstraction
-        let abstraction = if let Some(abs) = target.state_fields.abstraction_for(&name) {
-            abs.type_
-        } else if let Some(prof) = profile {
-            let ts = type_str.as_deref().unwrap_or("unknown");
-            domain::infer_abstraction(prof, ts)
-        } else {
-            // No profile, no override — try to infer from type name
-            if type_str.as_deref() == Some("boolean") || type_str.as_deref() == Some("bool") {
-                AbstractionType::Boolean
-            } else {
-                warnings.push(format!(
-                    "Field '{}' has no abstraction specified and no domain profile; defaulting to boolean",
-                    name
-                ));
-                AbstractionType::Boolean
-            }
-        };
-
-        let bound = target
-            .state_fields
-            .abstraction_for(&name)
-            .and_then(|a| a.bound);
-
-        let variants = target
-            .state_fields
-            .abstraction_for(&name)
-            .and_then(|a| a.variants.clone());
-
-        let initial_value = match &initial {
-            Some(v) if v == "false" || v == "False" => AbstractValue::Bool(false),
-            Some(v) if v == "true" || v == "True" => AbstractValue::Bool(true),
-            Some(v) if v == "0" => AbstractValue::Counter(0),
-            Some(v) if v == "None" || v == "undefined" || v == "null" => {
-                AbstractValue::Present(false)
-            }
-            _ => match abstraction {
-                AbstractionType::Boolean => AbstractValue::Bool(false),
-                AbstractionType::Presence => AbstractValue::Present(false),
-                AbstractionType::BoundedCounter => AbstractValue::Counter(0),
-                AbstractionType::EnumValues => variants
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .map(|v| AbstractValue::Variant(v.clone()))
-                    .unwrap_or(AbstractValue::Bool(false)),
-                AbstractionType::Ignored => continue,
-            },
-        };
-
-        fields.push(FieldDomain {
-            name,
-            abstraction,
-            bound,
-            variants,
-            initial: initial_value,
-        });
+        if let Some(fd) = build_field_domain(
+            &name,
+            type_str.as_deref(),
+            initial.as_deref(),
+            line,
+            target,
+            profile,
+            warnings,
+        ) {
+            field_lines.push((name, line));
+            fields.push(fd);
+        }
     }
 
     (fields, field_lines)
+}
+
+/// Build a FieldDomain from extracted field info (shared by all languages).
+fn build_field_domain(
+    name: &str,
+    type_str: Option<&str>,
+    initial: Option<&str>,
+    _line: u32,
+    target: &TargetConfig,
+    profile: Option<&DomainProfile>,
+    warnings: &mut Vec<String>,
+) -> Option<FieldDomain> {
+    let abstraction = if let Some(abs) = target.state_fields.abstraction_for(name) {
+        abs.type_
+    } else if let Some(prof) = profile {
+        let ts = type_str.unwrap_or("unknown");
+        domain::infer_abstraction(prof, ts)
+    } else {
+        // No profile, no override — infer from type name directly
+        infer_abstraction_no_profile(type_str, name, warnings)
+    };
+
+    if abstraction == AbstractionType::Ignored {
+        return None;
+    }
+
+    let bound = target
+        .state_fields
+        .abstraction_for(name)
+        .and_then(|a| a.bound);
+
+    let variants = target
+        .state_fields
+        .abstraction_for(name)
+        .and_then(|a| a.variants.clone());
+
+    let initial_value = match initial {
+        Some(v) if v == "false" || v == "False" => AbstractValue::Bool(false),
+        Some(v) if v == "true" || v == "True" => AbstractValue::Bool(true),
+        Some("0") => AbstractValue::Counter(0),
+        Some(v) if v == "None" || v == "undefined" || v == "null" => AbstractValue::Present(false),
+        _ => match abstraction {
+            AbstractionType::Boolean => AbstractValue::Bool(false),
+            AbstractionType::Presence => AbstractValue::Present(false),
+            AbstractionType::BoundedCounter => AbstractValue::Counter(0),
+            AbstractionType::EnumValues => variants
+                .as_ref()
+                .and_then(|v| v.first())
+                .map(|v| AbstractValue::Variant(v.clone()))
+                .unwrap_or(AbstractValue::Bool(false)),
+            AbstractionType::Ignored => return None,
+        },
+    };
+
+    Some(FieldDomain {
+        name: name.to_string(),
+        abstraction,
+        bound,
+        variants,
+        initial: initial_value,
+    })
+}
+
+/// Infer abstraction type when no domain profile is available.
+fn infer_abstraction_no_profile(
+    type_str: Option<&str>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> AbstractionType {
+    let ts = match type_str {
+        Some(t) => t.to_lowercase(),
+        None => {
+            warnings.push(format!(
+                "Field '{}' has no type annotation and no domain profile; defaulting to boolean",
+                name
+            ));
+            return AbstractionType::Boolean;
+        }
+    };
+    let ts = ts.trim();
+    if ts == "boolean" || ts == "bool" {
+        AbstractionType::Boolean
+    } else if ts.starts_with("option") || ts == "optional" || ts.ends_with('?') {
+        AbstractionType::Presence
+    } else if ts.contains("map")
+        || ts.contains("dict")
+        || ts.contains("set")
+        || ts.contains("vec")
+        || ts.contains("list")
+        || ts.contains("array")
+        || ts == "int"
+        || ts == "number"
+        || ts.starts_with("i32")
+        || ts.starts_with("u32")
+    {
+        AbstractionType::BoundedCounter
+    } else {
+        warnings.push(format!(
+            "Field '{}' has type '{}' with no domain profile; defaulting to boolean",
+            name,
+            type_str.unwrap_or("unknown")
+        ));
+        AbstractionType::Boolean
+    }
 }
 
 /// Extract a TypeScript class field declaration.
@@ -317,27 +427,33 @@ fn extract_ts_field(
     (name, type_str, initial, line)
 }
 
-/// Extract a Python field from __init__ assignment.
+/// Extract a Python field from a class body node.
+///
+/// Handles two cases:
+/// 1. Class-level `expression_statement` with `self.field = value`
+/// 2. `__init__` method body containing `self.field = value` assignments
+///
+/// For `__init__` assignments, infers type from the RHS value:
+///   True/False → "bool", {} → "dict", [] → "list", None → "optional",
+///   integer literal → "int", string → "str"
 fn extract_py_field(
     parsed: &ParsedSource,
     node: &Node,
 ) -> (Option<String>, Option<String>, Option<String>, Option<u32>) {
-    // Python: expression_statement containing assignment to self.field
-    if node.kind() == "function_definition" {
-        // Look inside __init__ for self.field = value assignments
-        let name_node = node.child_by_field_name("name");
-        if name_node.map(|n| parsed.node_text(&n)) != Some("__init__") {
-            return (None, None, None, None);
-        }
-        // We'd need to recurse into the body — for now return None
-        // and let the method extraction handle __init__ assignments
+    // Case 1: expression_statement at class body level (self.field = value)
+    if node.kind() == "expression_statement" {
+        return extract_py_self_assignment(parsed, node);
     }
 
-    if node.kind() != "expression_statement" {
-        return (None, None, None, None);
-    }
+    // Case 2 is handled by extract_py_init_fields() called from extract_fields()
+    (None, None, None, None)
+}
 
-    // Look for assignment: self.field = value
+/// Extract a single `self.field = value` assignment from an expression_statement.
+fn extract_py_self_assignment(
+    parsed: &ParsedSource,
+    node: &Node,
+) -> (Option<String>, Option<String>, Option<String>, Option<u32>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "assignment" {
@@ -350,14 +466,54 @@ fn extract_py_field(
                         let value = child
                             .child_by_field_name("right")
                             .map(|v| parsed.node_text(&v).to_string());
-                        return (name, None, value, Some(parsed.node_line(node)));
+                        let type_str = value.as_deref().map(infer_py_type_from_value);
+                        return (name, type_str, value, Some(parsed.node_line(node)));
                     }
                 }
             }
         }
     }
-
     (None, None, None, None)
+}
+
+/// Extract all `self.field = value` assignments from a Python `__init__` body.
+fn extract_py_init_fields(
+    parsed: &ParsedSource,
+    init_node: &Node,
+) -> Vec<(String, Option<String>, Option<String>, u32)> {
+    let mut results = Vec::new();
+    let body = match init_node.child_by_field_name("body") {
+        Some(b) => b,
+        None => return results,
+    };
+    let mut cursor = body.walk();
+    for stmt in body.children(&mut cursor) {
+        if stmt.kind() == "expression_statement" {
+            if let (Some(name), type_str, value, Some(line)) =
+                extract_py_self_assignment(parsed, &stmt)
+            {
+                results.push((name, type_str, value, line));
+            }
+        }
+    }
+    results
+}
+
+/// Infer a type string from a Python RHS value literal.
+fn infer_py_type_from_value(value: &str) -> String {
+    let trimmed = value.trim();
+    match trimmed {
+        "True" | "False" => "bool".to_string(),
+        "None" => "optional".to_string(),
+        "{}" => "dict".to_string(),
+        "[]" => "list".to_string(),
+        "set()" => "set".to_string(),
+        _ if trimmed.starts_with('{') => "dict".to_string(),
+        _ if trimmed.starts_with('[') => "list".to_string(),
+        _ if trimmed.parse::<i64>().is_ok() => "int".to_string(),
+        _ if trimmed.starts_with('"') || trimmed.starts_with('\'') => "str".to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Extract a Rust struct field declaration.
@@ -500,19 +656,17 @@ fn extract_guards_and_effects(
     while let Some(node) = stack.pop() {
         match node.kind() {
             "if_statement" => {
-                // Check if condition references a state field
+                // Check if condition references state fields (handles compound && / ||)
                 if let Some(condition) = node.child_by_field_name("condition") {
-                    if let Some(mut guard) =
-                        extract_guard_from_condition(parsed, &condition, field_names)
-                    {
-                        // Early-return pattern: if the if-body contains a throw/return,
-                        // the guard means "reject when condition is true" → invert.
-                        // This is the most common guard pattern in TypeScript/JavaScript.
-                        if is_early_exit_body(parsed, &node) {
-                            guard.condition = invert_guard(guard.condition);
-                        }
-                        guards.push(guard);
-                    }
+                    // Early-return pattern: if the if-body contains a throw/return,
+                    // the method proceeds when the condition is FALSE.
+                    // We apply De Morgan: NOT(a || b) = !a && !b, NOT(a && b) = !a || !b
+                    // Pass `negate=true` to the extraction so it inverts at each leaf
+                    // and swaps || <-> && (De Morgan).
+                    let negate = is_early_exit_body(parsed, &node);
+                    let extracted =
+                        extract_guards_from_condition(parsed, &condition, field_names, negate);
+                    guards.extend(extracted);
                 }
             }
             "assignment_expression" | "augmented_assignment_expression" | "assignment" => {
@@ -588,24 +742,110 @@ fn invert_guard(guard: CallGuard) -> CallGuard {
     }
 }
 
-/// Try to extract a guard from an if-statement condition.
-fn extract_guard_from_condition(
+/// Extract guards from a condition node, handling compound expressions and De Morgan.
+///
+/// When `negate` is true (early-return pattern), De Morgan's law is applied:
+///   NOT(a && b) = NOT a || NOT b → over-approximate (skip, method fires from all states)
+///   NOT(a || b) = NOT a && NOT b → recurse into both sides with inverted leaf guards
+///   NOT(!a) = a → double negation elimination
+///
+/// When `negate` is false (normal guard):
+///   a && b → recurse into both sides (conjunction)
+///   a || b → over-approximate (skip)
+fn extract_guards_from_condition(
+    parsed: &ParsedSource,
+    condition: &Node,
+    field_names: &HashSet<&str>,
+    negate: bool,
+) -> Vec<Guard> {
+    let kind = condition.kind();
+
+    // Handle binary operators: && / and / || / or
+    if kind == "binary_expression" || kind == "boolean_operator" {
+        if let Some(op_node) = condition.child_by_field_name("operator") {
+            let op = parsed.node_text(&op_node);
+            let is_and = op == "&&" || op == "and";
+            let is_or = op == "||" || op == "or";
+
+            if is_and || is_or {
+                // De Morgan: negate swaps AND <-> OR
+                let effective_and = if negate { is_or } else { is_and };
+
+                if effective_and {
+                    // Conjunction: recurse into both sides, collect all guards
+                    let mut result = Vec::new();
+                    if let Some(left) = condition.child_by_field_name("left") {
+                        result.extend(extract_guards_from_condition(
+                            parsed,
+                            &left,
+                            field_names,
+                            negate,
+                        ));
+                    }
+                    if let Some(right) = condition.child_by_field_name("right") {
+                        result.extend(extract_guards_from_condition(
+                            parsed,
+                            &right,
+                            field_names,
+                            negate,
+                        ));
+                    }
+                    return result;
+                } else {
+                    // Disjunction: over-approximate — don't emit guards
+                    return vec![];
+                }
+            }
+        }
+    }
+
+    // Handle ! / not (unary negation): toggle the negate flag (double negation = cancel)
+    if kind == "unary_expression" || kind == "not_operator" {
+        if let Some(operand) = condition
+            .child_by_field_name("argument")
+            .or_else(|| condition.child_by_field_name("operand"))
+        {
+            let text = parsed.node_text(condition);
+            if text.starts_with('!') || text.starts_with("not ") {
+                return extract_guards_from_condition(parsed, &operand, field_names, !negate);
+            }
+        }
+    }
+
+    // Handle parenthesized_expression: unwrap
+    if kind == "parenthesized_expression" {
+        let mut cursor = condition.walk();
+        for child in condition.children(&mut cursor) {
+            if child.kind() != "(" && child.kind() != ")" {
+                return extract_guards_from_condition(parsed, &child, field_names, negate);
+            }
+        }
+    }
+
+    // Base case: look for direct field references
+    if let Some(mut guard) = extract_single_guard(parsed, condition, field_names) {
+        if negate {
+            guard.condition = invert_guard(guard.condition);
+        }
+        vec![guard]
+    } else {
+        vec![]
+    }
+}
+
+/// Extract a single guard from a leaf condition referencing a state field.
+fn extract_single_guard(
     parsed: &ParsedSource,
     condition: &Node,
     field_names: &HashSet<&str>,
 ) -> Option<Guard> {
     let text = parsed.node_text(condition);
 
-    // Look for patterns like:
-    //   this._field, self._field, self.field
-    //   !this._field, not self._field
-    //   this._field === true/false
     for &field in field_names {
         let this_field = format!("this.{field}");
         let self_field = format!("self.{field}");
 
         if text.contains(&this_field) || text.contains(&self_field) {
-            // Determine the guard condition
             let negated = text.starts_with('!')
                 || text.starts_with("not ")
                 || text.contains(&format!("!this.{field}"))

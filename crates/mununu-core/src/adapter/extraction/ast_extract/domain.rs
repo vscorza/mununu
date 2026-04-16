@@ -111,39 +111,90 @@ pub fn classify_controllability(profile: &DomainProfile, method_name: &str) -> C
 }
 
 /// Determine abstraction type for a field based on its source type string.
+///
+/// Recognizes types from TypeScript, Python, and Rust:
+///   bool/boolean → Boolean
+///   Option<T>/undefined/None/?-suffix → Presence
+///   Map/HashMap/BTreeMap/dict/Set/HashSet/Vec/Array/list → BoundedCounter (collection size)
+///   enum/union (|) → EnumValues
+///   string/str/String → Ignored (usually not relevant to state)
+///   number/int/i32/u32/f64/... → Numeric default from profile
 pub fn infer_abstraction(profile: &DomainProfile, type_str: &str) -> AbstractionType {
     let lower = type_str.to_lowercase();
-    if lower == "boolean" || lower == "bool" {
-        profile.abstraction.boolean_default
-    } else if lower.contains("option") || lower.contains("undefined") || lower.ends_with('?') {
-        profile.abstraction.optional_default
-    } else if lower.contains("map")
-        || lower.contains("dict")
-        || lower.contains("hashmap")
-        || lower.contains("set")
-        || lower.contains("vec")
-        || lower.contains("array")
-        || lower.contains("list")
-    {
-        profile.abstraction.map_default
-    } else if lower.contains("enum") || lower.contains('|') {
-        profile.abstraction.enum_default
-    } else if lower.contains("string") || lower == "str" {
-        profile.abstraction.string_default
-    } else if lower.contains("number")
-        || lower.contains("i32")
-        || lower.contains("u32")
-        || lower.contains("i64")
-        || lower.contains("u64")
-        || lower.contains("int")
-        || lower.contains("float")
-        || lower.contains("f64")
-    {
-        profile.abstraction.numeric_default
-    } else {
-        // Unknown type — default to ignored with a warning
-        AbstractionType::Ignored
+    let trimmed = lower.trim();
+
+    // Boolean types (all languages)
+    if trimmed == "boolean" || trimmed == "bool" {
+        return profile.abstraction.boolean_default;
     }
+
+    // Optional/nullable types
+    if trimmed.starts_with("option<")
+        || trimmed.starts_with("option ")
+        || trimmed == "optional"
+        || trimmed.contains("undefined")
+        || trimmed.contains("none")
+        || trimmed.ends_with('?')
+    {
+        return profile.abstraction.optional_default;
+    }
+
+    // Collection types (maps, sets, vectors, arrays, lists)
+    if trimmed.starts_with("map<")
+        || trimmed.starts_with("hashmap<")
+        || trimmed.starts_with("btreemap<")
+        || trimmed.starts_with("indexmap<")
+        || trimmed.starts_with("hashset<")
+        || trimmed.starts_with("btreeset<")
+        || trimmed.starts_with("vec<")
+        || trimmed.starts_with("vecdeque<")
+        || trimmed == "dict"
+        || trimmed.starts_with("dict[")
+        || trimmed == "list"
+        || trimmed.starts_with("list[")
+        || trimmed == "set"
+        || trimmed.starts_with("set[")
+        || trimmed.contains("array")
+        || trimmed.contains("map<")
+        || trimmed.contains("dict")
+    {
+        return profile.abstraction.map_default;
+    }
+
+    // Enum/union types
+    if trimmed.contains("enum") || trimmed.contains('|') {
+        return profile.abstraction.enum_default;
+    }
+
+    // String types
+    if trimmed == "string" || trimmed == "str" || trimmed == "&str" {
+        return profile.abstraction.string_default;
+    }
+
+    // Numeric types (all languages)
+    if trimmed == "number"
+        || trimmed == "int"
+        || trimmed == "float"
+        || trimmed == "usize"
+        || trimmed == "isize"
+        || trimmed.starts_with("i8")
+        || trimmed.starts_with("i16")
+        || trimmed.starts_with("i32")
+        || trimmed.starts_with("i64")
+        || trimmed.starts_with("i128")
+        || trimmed.starts_with("u8")
+        || trimmed.starts_with("u16")
+        || trimmed.starts_with("u32")
+        || trimmed.starts_with("u64")
+        || trimmed.starts_with("u128")
+        || trimmed.starts_with("f32")
+        || trimmed.starts_with("f64")
+    {
+        return profile.abstraction.numeric_default;
+    }
+
+    // Unknown type — default to ignored
+    AbstractionType::Ignored
 }
 
 /// Simple glob matching: supports trailing `*` only.

@@ -342,9 +342,12 @@ fn apply_effects(
                 }
                 CallEffect::ReadOnly | CallEffect::None => {}
                 CallEffect::Unknown => {
-                    // Over-approximate: nondeterministic — handled by caller
-                    // generating transitions for ALL possible values.
-                    // For now, keep current value (under-approximation fallback).
+                    // KNOWN LIMITATION (L6): keeps current value, which is an
+                    // under-approximation. Sound for safety properties if the
+                    // unknown call is idempotent, but unsound for liveness.
+                    // TODO: when `unknown_effect_policy = "havoc"` is configured,
+                    // the caller should expand this into one transition per
+                    // possible field value (nondeterministic over-approximation).
                 }
             }
             if let Some(explicit) = &effect.value {

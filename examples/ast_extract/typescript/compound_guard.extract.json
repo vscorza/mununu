@@ -1,0 +1,22 @@
+{
+    "$schema": "extraction_config_v1",
+    "domain": "mcp_server",
+    "language": "typescript",
+    "source": {
+        "file": "examples/ast_extract/typescript/compound_guard.ts"
+    },
+    "targets": [{
+        "class": "Worker",
+        "automaton_id": "WorkerFSM",
+        "state_fields": ["_ready", "_active"],
+        "methods": {
+            "include": ["activate", "makeReady", "doWork", "reset"]
+        }
+    }],
+    "properties": [{
+        "id": "doWork_only_when_ready_and_active",
+        "formula": "nu X. ((_ready_T__active_T || ([ev_doWork] false)) && ([] X))",
+        "over": "WorkerFSM",
+        "description": "doWork should only fire from state ready=T AND active=T"
+    }]
+}

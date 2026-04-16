@@ -85,9 +85,36 @@ pub fn parse_source(source: &str, language: SourceLanguage) -> Result<ParsedSour
         .parse(source, None)
         .ok_or("Tree-sitter parse returned None")?;
 
-    if tree.root_node().has_error() {
-        // Parse succeeded but tree contains error nodes — warn but continue
-        // (tree-sitter is error-tolerant; partial extraction is still useful)
+    let root = tree.root_node();
+    if root.has_error() {
+        // Count ERROR nodes to assess severity
+        let error_count = count_error_nodes(&root);
+        let total_count = count_all_nodes(&root);
+        let error_pct = if total_count > 0 {
+            (error_count as f64 / total_count as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        if error_pct > 30.0 {
+            return Err(format!(
+                "Tree-sitter parse has too many errors ({} of {} nodes, {:.0}%). \
+                 The source may not be valid {} syntax.",
+                error_count,
+                total_count,
+                error_pct,
+                match language {
+                    SourceLanguage::TypeScript => "TypeScript",
+                    SourceLanguage::Python => "Python",
+                    SourceLanguage::Rust => "Rust",
+                }
+            ));
+        }
+        // Warn but continue — tree-sitter is error-tolerant
+        eprintln!(
+            "Warning: tree-sitter parse contains {} error node(s) out of {} ({:.0}%); extraction may be incomplete",
+            error_count, total_count, error_pct
+        );
     }
 
     Ok(ParsedSource {
@@ -95,6 +122,30 @@ pub fn parse_source(source: &str, language: SourceLanguage) -> Result<ParsedSour
         tree,
         language,
     })
+}
+
+/// Count ERROR nodes in the tree-sitter parse tree.
+fn count_error_nodes(node: &tree_sitter::Node) -> usize {
+    let mut count = if node.is_error() || node.is_missing() {
+        1
+    } else {
+        0
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count += count_error_nodes(&child);
+    }
+    count
+}
+
+/// Count all nodes in the tree-sitter parse tree.
+fn count_all_nodes(node: &tree_sitter::Node) -> usize {
+    let mut count = 1;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count += count_all_nodes(&child);
+    }
+    count
 }
 
 /// Parse a source file from a path, detecting language from extension.

@@ -71,21 +71,30 @@ run_test "TypeScript (sample_server)" \
     "ServerLifecycle" \
     "0"
 
-# Rust: sample_protocol.rs — KNOWN LIMITATION: Rust field extraction
-# doesn't correctly detect types from struct declarations without annotations.
-# Skipped until Rust extractor accuracy improves.
-# run_test "Rust (sample_protocol)" \
-#     "examples/ast_extract/rust/sample_protocol.extract.json" \
-#     "examples/ast_extract/rust/sample_protocol.rs" \
-#     "no_send_after_close" \
-#     "ConnectionFSM" \
-#     "0"
-echo "  Rust (sample_protocol) ... SKIP (known limitation: field type detection)"
+# Rust: sample_protocol.rs — extract and verify (property should FAIL)
+run_test "Rust (sample_protocol)" \
+    "examples/ast_extract/rust/sample_protocol.extract.json" \
+    "examples/ast_extract/rust/sample_protocol.rs" \
+    "no_send_after_close" \
+    "ConnectionFSM" \
+    "0"
 
-# Python: sample_handler.py — KNOWN LIMITATION: Python field extraction
-# from __init__ is not yet implemented (requires body traversal).
-# Skipped until Python extractor improves.
-echo "  Python (sample_handler) ... SKIP (known limitation: __init__ field detection)"
+# Python: sample_handler.py — extract and verify (property should FAIL)
+run_test "Python (sample_handler)" \
+    "examples/ast_extract/python/sample_handler.extract.json" \
+    "examples/ast_extract/python/sample_handler.py" \
+    "no_requests_when_rate_limited" \
+    "HandlerFSM" \
+    "0"
+
+# TypeScript: compound_guard.ts — compound || in early-return (De Morgan → &&)
+# Property should HOLD — doWork only fires from ready=T AND active=T
+run_test "TypeScript (compound guard)" \
+    "examples/ast_extract/typescript/compound_guard.extract.json" \
+    "examples/ast_extract/typescript/compound_guard.ts" \
+    "doWork_only_when_ready_and_active" \
+    "WorkerFSM" \
+    "1"
 
 # SystemVerilog: handshake.sv via adapter (not extraction) — property should HOLD
 echo -n "  SystemVerilog (handshake via adapter) ... "

@@ -15,7 +15,7 @@
     }],
     "properties": [{
         "id": "no_send_after_close",
-        "formula": "nu X. (((!started_T__closed_T && !started_F__closed_T) || ([ev_send] false)) && ([] X))",
+        "formula": "nu X. (((!started_T_closed_T && !started_F_closed_T) || ([ev_send] false)) && ([] X))",
         "over": "ConnectionFSM",
         "description": "send must not fire when closed"
     }]
