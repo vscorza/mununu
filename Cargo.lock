@@ -810,6 +810,10 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tree-sitter",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -818,12 +822,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "mununu-core",
- "serde",
  "serde_json",
- "tree-sitter",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
 ]
 
 [[package]]

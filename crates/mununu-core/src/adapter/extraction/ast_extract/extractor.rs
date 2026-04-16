@@ -6,11 +6,11 @@
 
 use tree_sitter::Node;
 
-use crate::parser::{ParsedSource, SourceLanguage};
-use mununu_core::adapter::extraction::ast_extract::call_summary::{CallEffect, CallGuard};
-use mununu_core::adapter::extraction::ast_extract::config::{AbstractionType, TargetConfig};
-use mununu_core::adapter::extraction::ast_extract::domain::{self, DomainProfile};
-use mununu_core::adapter::extraction::ast_extract::state_space::{
+use super::parser::{ParsedSource, SourceLanguage};
+use crate::adapter::extraction::ast_extract::call_summary::{CallEffect, CallGuard};
+use crate::adapter::extraction::ast_extract::config::{AbstractionType, TargetConfig};
+use crate::adapter::extraction::ast_extract::domain::{self, DomainProfile};
+use crate::adapter::extraction::ast_extract::state_space::{
     AbstractValue, Effect, FieldDomain, Guard, MethodBehavior,
 };
 use std::collections::HashSet;
@@ -550,7 +550,7 @@ fn extract_guards_and_effects(
 /// Check if an if-statement's body is an early-exit (throw, return, break, continue).
 /// If so, the guard condition should be INVERTED — the method proceeds when the
 /// condition is FALSE, not when it's true.
-fn is_early_exit_body(parsed: &ParsedSource, if_node: &Node) -> bool {
+fn is_early_exit_body(_parsed: &ParsedSource, if_node: &Node) -> bool {
     if let Some(consequence) = if_node.child_by_field_name("consequence") {
         let mut cursor = consequence.walk();
         for child in consequence.children(&mut cursor) {
@@ -678,8 +678,8 @@ fn extract_effect_from_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
-    use mununu_core::adapter::extraction::ast_extract::config::*;
+    use crate::adapter::extraction::ast_extract::config::*;
+    use crate::adapter::extraction::ast_extract::parser;
 
     fn make_simple_target(class: &str, fields: &[&str], methods: &[&str]) -> TargetConfig {
         TargetConfig {

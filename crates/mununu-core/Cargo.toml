@@ -24,6 +24,12 @@ tower-http = { version = "0.6", optional = true, features = ["cors", "trace"] }
 tokio = { version = "1", optional = true, features = ["full"] }
 tracing = { version = "0.1", optional = true }
 
+# AST extraction (optional — tree-sitter grammars for source code analysis)
+tree-sitter = { version = "0.24", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-rust = { version = "0.23", optional = true }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.9"
@@ -33,6 +39,7 @@ itoa = "1.0"
 [features]
 default = []
 api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tracing"]
+ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust"]
 syntcomp = []
 
 [[bench]]
