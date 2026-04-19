@@ -5,7 +5,7 @@
 //! The agent selects a domain; the tool applies its heuristics; config
 //! overrides take precedence.
 
-use super::config::AbstractionType;
+use crate::adapter::domain::AbstractionType;
 
 /// A domain profile providing defaults for extraction.
 #[derive(Debug, Clone)]

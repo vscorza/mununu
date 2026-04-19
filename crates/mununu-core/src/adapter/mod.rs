@@ -11,6 +11,7 @@
 //! live in [`ir`], and the CTXDSL emitter in [`emit`].
 
 pub mod aiger;
+pub mod domain;
 pub mod emit;
 pub mod extraction;
 pub mod ir;

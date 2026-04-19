@@ -38,9 +38,10 @@ mununu context eval <CONTEXT> [options]
 | Flag | Description |
 |------|-------------|
 | `--sidecar <FILE>` | Additional CTXDSL sidecar files to merge (repeatable) |
-| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `auto` |
+| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `extraction`, `auto` |
 | `--no-partitions` | Disable guard partitioning during evaluation |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
+| `--print-ctxdsl [FILE]` | Print the intermediate CTXDSL (after adapter translation) to stdout or a file |
 
 **Example**:
 
@@ -98,13 +99,14 @@ mununu context synth <CONTEXT> [options]
 | `--max-counter-traces <N>` | Cap the number of counterstrategy traces collected |
 | `--extract-strategy` | Produce a positional strategy (one controllable transition per state) instead of the full winning-region projection |
 | `--no-proof-obligations` | Skip proof obligation emission for violating initial states |
-| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `auto` |
+| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `extraction`, `auto` |
 | `--dump-json <FILE>` | Write a JSON summary of the synthesis result to a file |
 | `--emit-dsl <FILE>` | Write the synthesized controller as a CTXDSL file |
 | `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog` |
 | `--emit-native <FILE>` | Write the controller in the native format specified by `--output-format` |
 | `--dump-diagnostics <FILE>` | Export diagnostics as a DSL sidecar file |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
+| `--print-ctxdsl [FILE]` | Print the intermediate CTXDSL (after adapter translation) to stdout or a file |
 
 **Example -- realizable**:
 
@@ -343,6 +345,60 @@ mununu context eval design.sv --formula safety --automaton FSM
 ```
 
 See [Adapter Formats](Adapter-Formats.md) for supported formats and limitations.
+
+---
+
+## `mununu sv` — SystemVerilog Analysis Tools
+
+### `mununu sv init`
+
+Generate a skeleton `.mununu.json` annotation sidecar from a SystemVerilog module.
+
+```bash
+mununu sv init <FILE> [--output <FILE>] [--force]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--output <FILE>` | Output path (default: `<stem>.mununu.json` next to the `.sv` file) |
+| `--force` | Overwrite existing sidecar |
+
+**Defaults:** 1-bit registers → `boolean`, enums → `enum` with variants, ≤4-bit → `bounded_counter`, >4-bit → `discover`. Includes a `safety` property placeholder and detected `localparam` values.
+
+**Example:**
+```bash
+mununu sv init examples/systemverilog/fifo.sv
+# → Generated sidecar: examples/systemverilog/fifo.mununu.json
+#   3 signal(s), 3 input(s), 1 property/ies
+```
+
+### `mununu sv discover`
+
+Discover significant register values via SMT analysis. Requires `--features smt` at build time.
+
+```bash
+mununu sv discover <FILE> [--annotation <FILE>] [--output <FILE>] [--max-values <N>]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--annotation <FILE>` | Path to `.mununu.json` (default: auto-detected next to `.sv`) |
+| `--output <FILE>` | Write updated sidecar to a different file |
+| `--max-values <N>` | Max values per signal (default: 32) |
+
+Finds concrete values that make guard conditions satisfiable — even through combinational logic (e.g., `assign y = x * 4; if (y == 12)` → discovers `x = 3`). Updates the sidecar's `discovered_values` section, preserving user-given variant names.
+
+**Example:**
+```bash
+mununu sv discover examples/systemverilog/alu.sv
+# → cmd — 5 value(s):
+#     VAL_0 = 0 (SMT: guard (cmd == 0) at line 0)
+#     VAL_1 = 1 (SMT: guard (cmd == 1) at line 0)
+#     ...
+# → Updated sidecar: examples/systemverilog/alu.mununu.json
+```
+
+See [RTL Verification Pipeline](RTL-Verification-Pipeline) for the full workflow.
 
 ## See Also
 

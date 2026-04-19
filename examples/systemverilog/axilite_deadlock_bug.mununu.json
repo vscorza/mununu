@@ -1,0 +1,33 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "axilite_deadlock_bug",
+  "source": "axilite_deadlock_bug.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "ADDR_WAIT", "DATA_WAIT", "RESPOND"]
+    },
+    {
+      "name": "bvalid_r",
+      "abstraction": "boolean"
+    }
+  ],
+  "inputs": [
+    {"name": "awvalid", "abstraction": "boolean"},
+    {"name": "wvalid", "abstraction": "boolean"},
+    {"name": "bready", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {
+      "id": "no_overlap",
+      "formula": "nu X. ((!bvalid_r_T_state_ADDR_WAIT && !bvalid_r_T_state_DATA_WAIT) && [] X)",
+      "description": "Never accept a new transaction while bvalid is still pending (no overlapping writes)"
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    }
+  ]
+}

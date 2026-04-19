@@ -37,8 +37,8 @@ impl<'a> Parser<'a> {
         self.pos >= self.input.len()
     }
 
-    fn skip_whitespace_and_comments(&mut self) -> Vec<MununuProperty> {
-        let mut props = Vec::new();
+    fn skip_whitespace_and_comments(&mut self) -> Vec<MununuAnnotation> {
+        let mut annotations = Vec::new();
         loop {
             // Skip whitespace
             while self.pos < self.input.len() {
@@ -65,9 +65,9 @@ impl<'a> Parser<'a> {
 
                 // Check for @mununu annotation
                 if let Some(rest) = comment.strip_prefix("@mununu")
-                    && let Some(prop) = parse_mununu_comment(rest.trim())
+                    && let Some(ann) = parse_mununu_annotation(rest.trim())
                 {
-                    props.push(prop);
+                    annotations.push(ann);
                 }
 
                 self.pos += line_end;
@@ -93,7 +93,7 @@ impl<'a> Parser<'a> {
 
             break;
         }
-        props
+        annotations
     }
 
     fn expect_keyword(&mut self, kw: &str) -> Result<(), AdapterError> {
@@ -178,7 +178,36 @@ impl<'a> Parser<'a> {
         if self.pos == start {
             return Err(self.error("expected number".to_string()));
         }
-        self.input[start..self.pos]
+        let num_str = &self.input[start..self.pos];
+        // Check for sized literal: N'bXXX, N'hXX, N'dNN, N'oOO
+        if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'\'' {
+            self.pos += 1; // consume tick
+            self.col += 1;
+            let base = if self.pos < self.input.len() {
+                let b = self.input.as_bytes()[self.pos];
+                self.pos += 1;
+                self.col += 1;
+                b
+            } else {
+                b'd'
+            };
+            let val_start = self.pos;
+            while self.pos < self.input.len()
+                && self.input.as_bytes()[self.pos].is_ascii_alphanumeric()
+            {
+                self.pos += 1;
+                self.col += 1;
+            }
+            let val_str = &self.input[val_start..self.pos];
+            let radix = match base {
+                b'b' | b'B' => 2,
+                b'o' | b'O' => 8,
+                b'h' | b'H' => 16,
+                _ => 10,
+            };
+            return i64::from_str_radix(val_str, radix).or(Ok(0)); // fallback to 0 for unparseable
+        }
+        num_str
             .parse()
             .map_err(|_| self.error("invalid number".to_string()))
     }
@@ -199,10 +228,10 @@ impl<'a> Parser<'a> {
     // -------------------------------------------------------------------
 
     fn parse_module(&mut self) -> Result<Module, AdapterError> {
-        let mut all_props = Vec::new();
+        let mut all_annotations = Vec::new();
 
         // Collect any leading @mununu comments
-        all_props.extend(self.skip_whitespace_and_comments());
+        all_annotations.extend(self.skip_whitespace_and_comments());
 
         self.expect_keyword("module")?;
         let name = self.parse_ident()?;
@@ -221,8 +250,8 @@ impl<'a> Parser<'a> {
         let mut assigns = Vec::new();
 
         loop {
-            let props = self.skip_whitespace_and_comments();
-            all_props.extend(props);
+            let anns = self.skip_whitespace_and_comments();
+            all_annotations.extend(anns);
 
             if self.at_end() || self.peek_keyword("endmodule") {
                 break;
@@ -250,6 +279,23 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword("endmodule")?;
 
+        // Distribute annotations into Module fields
+        let mut mununu_properties = Vec::new();
+        let mut domain_annotations = Vec::new();
+        let mut controllable_signals = Vec::new();
+        let mut input_signals = Vec::new();
+        let mut force_kripke = false;
+
+        for ann in all_annotations {
+            match ann {
+                MununuAnnotation::Property(p) => mununu_properties.push(p),
+                MununuAnnotation::Domain(d) => domain_annotations.push(d),
+                MununuAnnotation::Controllable(sigs) => controllable_signals.extend(sigs),
+                MununuAnnotation::Input(sigs) => input_signals.extend(sigs),
+                MununuAnnotation::ModeKripke => force_kripke = true,
+            }
+        }
+
         Ok(Module {
             name,
             parameters,
@@ -257,7 +303,11 @@ impl<'a> Parser<'a> {
             declarations,
             always_blocks,
             assigns,
-            mununu_properties: all_props,
+            mununu_properties,
+            domain_annotations,
+            controllable_signals,
+            input_signals,
+            force_kripke,
         })
     }
 
@@ -413,6 +463,25 @@ impl<'a> Parser<'a> {
             }
             let variant = self.parse_ident()?;
             variants.push(variant);
+            // Skip optional value assignment: = 3'b001, = 4, etc.
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('=') {
+                self.pos += 1;
+                self.col += 1;
+                // Skip value expression until comma or closing brace
+                while self.pos < self.input.len() {
+                    let ch = self.input.as_bytes()[self.pos];
+                    if ch == b',' || ch == b'}' {
+                        break;
+                    }
+                    if ch == b'\n' {
+                        self.line += 1;
+                        self.col = 0;
+                    }
+                    self.pos += 1;
+                    self.col += 1;
+                }
+            }
             self.skip_whitespace_and_comments();
             if self.remaining().starts_with(',') {
                 self.pos += 1;
@@ -486,6 +555,13 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Statement, AdapterError> {
         self.skip_whitespace_and_comments();
+
+        // Null statement: just a semicolon
+        if self.remaining().starts_with(';') {
+            self.pos += 1;
+            self.col += 1;
+            return Ok(Statement::Block(vec![]));
+        }
 
         if self.peek_keyword("begin") {
             self.expect_keyword("begin")?;
@@ -569,7 +645,18 @@ impl<'a> Parser<'a> {
                 self.expect_char(':')?;
                 default = Some(Box::new(self.parse_statement()?));
             } else {
-                let label = self.parse_ident()?;
+                // Case label can be an identifier (IDLE) or a number (0, 3)
+                self.skip_whitespace_and_comments();
+                let label = if self
+                    .remaining()
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|c| c.is_ascii_digit())
+                {
+                    self.parse_number()?.to_string()
+                } else {
+                    self.parse_ident()?
+                };
                 self.expect_char(':')?;
                 let body = self.parse_statement()?;
                 branches.push(CaseBranch { label, body });
@@ -584,7 +671,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, AdapterError> {
-        self.parse_or_expr()
+        let expr = self.parse_or_expr()?;
+        // Check for ternary: expr ? then : else
+        self.skip_whitespace_and_comments();
+        if self.remaining().starts_with('?') {
+            self.pos += 1;
+            self.col += 1;
+            let then_expr = self.parse_expr()?;
+            self.expect_char(':')?;
+            let else_expr = self.parse_expr()?;
+            Ok(Expr::Ternary {
+                cond: Box::new(expr),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            })
+        } else {
+            Ok(expr)
+        }
     }
 
     fn parse_or_expr(&mut self) -> Result<Expr, AdapterError> {
@@ -608,13 +711,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and_expr(&mut self) -> Result<Expr, AdapterError> {
-        let mut left = self.parse_comparison_expr()?;
+        let mut left = self.parse_bitor_expr()?;
         loop {
             self.skip_whitespace_and_comments();
             if self.remaining().starts_with("&&") {
                 self.pos += 2;
                 self.col += 2;
-                let right = self.parse_comparison_expr()?;
+                let right = self.parse_bitor_expr()?;
                 left = Expr::BinOp {
                     op: BinOp::And,
                     left: Box::new(left),
@@ -627,13 +730,59 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    fn parse_bitor_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut left = self.parse_bitand_expr()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('|')
+                && !self.remaining().starts_with("||")
+                && !self.remaining().starts_with("|=")
+            {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_bitand_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::BitOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitand_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut left = self.parse_comparison_expr()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('&')
+                && !self.remaining().starts_with("&&")
+                && !self.remaining().starts_with("&=")
+            {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_comparison_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::BitAnd,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
     fn parse_comparison_expr(&mut self) -> Result<Expr, AdapterError> {
-        let left = self.parse_unary_expr()?;
+        let left = self.parse_shift_expr()?;
         self.skip_whitespace_and_comments();
         if self.remaining().starts_with("==") {
             self.pos += 2;
             self.col += 2;
-            let right = self.parse_unary_expr()?;
+            let right = self.parse_shift_expr()?;
             Ok(Expr::BinOp {
                 op: BinOp::Eq,
                 left: Box::new(left),
@@ -642,9 +791,46 @@ impl<'a> Parser<'a> {
         } else if self.remaining().starts_with("!=") {
             self.pos += 2;
             self.col += 2;
-            let right = self.parse_unary_expr()?;
+            let right = self.parse_shift_expr()?;
             Ok(Expr::BinOp {
                 op: BinOp::Ne,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else if self.remaining().starts_with("<=") {
+            // Careful: in expression context this is <=, not nonblocking assign
+            self.pos += 2;
+            self.col += 2;
+            let right = self.parse_shift_expr()?;
+            Ok(Expr::BinOp {
+                op: BinOp::Le,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else if self.remaining().starts_with(">=") {
+            self.pos += 2;
+            self.col += 2;
+            let right = self.parse_shift_expr()?;
+            Ok(Expr::BinOp {
+                op: BinOp::Ge,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else if self.remaining().starts_with('<') && !self.remaining().starts_with("<<") {
+            self.pos += 1;
+            self.col += 1;
+            let right = self.parse_shift_expr()?;
+            Ok(Expr::BinOp {
+                op: BinOp::Lt,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else if self.remaining().starts_with('>') && !self.remaining().starts_with(">>") {
+            self.pos += 1;
+            self.col += 1;
+            let right = self.parse_shift_expr()?;
+            Ok(Expr::BinOp {
+                op: BinOp::Gt,
                 left: Box::new(left),
                 right: Box::new(right),
             })
@@ -653,26 +839,170 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_shift_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut left = self.parse_additive_expr()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with("<<") {
+                self.pos += 2;
+                self.col += 2;
+                let right = self.parse_additive_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Shl,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else if self.remaining().starts_with(">>") {
+                self.pos += 2;
+                self.col += 2;
+                let right = self.parse_additive_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Shr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_additive_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut left = self.parse_multiplicative_expr()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('+') && !self.remaining().starts_with("+=") {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_multiplicative_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Add,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else if self.remaining().starts_with('-')
+                && !self.remaining().starts_with("-=")
+                && !self.remaining().starts_with("->")
+            {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_multiplicative_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Sub,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut left = self.parse_unary_expr()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('*') && !self.remaining().starts_with("*=") {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_unary_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Mul,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else if self.remaining().starts_with('/')
+                && !self.remaining().starts_with("/=")
+                && !self.remaining().starts_with("//")
+            {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_unary_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Div,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else if self.remaining().starts_with('%') && !self.remaining().starts_with("%=") {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_unary_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::Mod,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
     fn parse_unary_expr(&mut self) -> Result<Expr, AdapterError> {
         self.skip_whitespace_and_comments();
         if self.remaining().starts_with('!') && !self.remaining().starts_with("!=") {
             self.pos += 1;
             self.col += 1;
-            let inner = self.parse_primary_expr()?;
+            let inner = self.parse_postfix_expr()?;
+            Ok(Expr::Not(Box::new(inner)))
+        } else if self.remaining().starts_with('~') {
+            // Bitwise NOT — treat as logical NOT for abstraction
+            self.pos += 1;
+            self.col += 1;
+            let inner = self.parse_postfix_expr()?;
             Ok(Expr::Not(Box::new(inner)))
         } else if self.remaining().starts_with('|') && !self.remaining().starts_with("||") {
             // Reduction OR: |req
             self.pos += 1;
             self.col += 1;
-            let inner = self.parse_primary_expr()?;
+            let inner = self.parse_postfix_expr()?;
             Ok(Expr::BinOp {
                 op: BinOp::BitOr,
                 left: Box::new(inner),
                 right: Box::new(Expr::Number(0)),
             })
         } else {
-            self.parse_primary_expr()
+            self.parse_postfix_expr()
         }
+    }
+
+    fn parse_postfix_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut expr = self.parse_primary_expr()?;
+        // Handle postfix: bit-select x[i] or bit-slice x[msb:lsb]
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('[') {
+                self.pos += 1;
+                self.col += 1;
+                let index = self.parse_expr()?;
+                self.skip_whitespace_and_comments();
+                if self.remaining().starts_with(':') {
+                    // Bit-slice: x[msb:lsb]
+                    self.pos += 1;
+                    self.col += 1;
+                    let lsb = self.parse_expr()?;
+                    self.expect_char(']')?;
+                    expr = Expr::BitSlice {
+                        base: Box::new(expr),
+                        msb: Box::new(index),
+                        lsb: Box::new(lsb),
+                    };
+                } else {
+                    // Single-bit select: x[i]
+                    self.expect_char(']')?;
+                    expr = Expr::BitSelect {
+                        base: Box::new(expr),
+                        index: Box::new(index),
+                    };
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(expr)
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr, AdapterError> {
@@ -683,6 +1013,26 @@ impl<'a> Parser<'a> {
             let expr = self.parse_expr()?;
             self.expect_char(')')?;
             Ok(expr)
+        } else if self.remaining().starts_with('{') {
+            // Concatenation: {a, b, c}
+            self.pos += 1;
+            self.col += 1;
+            let mut parts = Vec::new();
+            loop {
+                self.skip_whitespace_and_comments();
+                if self.remaining().starts_with('}') {
+                    self.pos += 1;
+                    self.col += 1;
+                    break;
+                }
+                parts.push(self.parse_expr()?);
+                self.skip_whitespace_and_comments();
+                if self.remaining().starts_with(',') {
+                    self.pos += 1;
+                    self.col += 1;
+                }
+            }
+            Ok(Expr::Concat(parts))
         } else if self
             .remaining()
             .as_bytes()
@@ -694,23 +1044,6 @@ impl<'a> Parser<'a> {
             Ok(Expr::Number(n))
         } else {
             let id = self.parse_ident()?;
-            // Check for array index: name[expr]
-            self.skip_whitespace_and_comments();
-            if self.remaining().starts_with('[') {
-                self.skip_balanced('[', ']')?;
-            }
-            // Check for addition/subtraction
-            self.skip_whitespace_and_comments();
-            if self.remaining().starts_with('+') && !self.remaining().starts_with("+=") {
-                self.pos += 1;
-                self.col += 1;
-                let right = self.parse_primary_expr()?;
-                return Ok(Expr::BinOp {
-                    op: BinOp::Add,
-                    left: Box::new(Expr::Ident(id)),
-                    right: Box::new(right),
-                });
-            }
             Ok(Expr::Ident(id))
         }
     }
@@ -825,8 +1158,18 @@ fn expr_to_string(expr: &Expr) -> String {
                 BinOp::And => "&&",
                 BinOp::Or => "||",
                 BinOp::BitOr => "|",
+                BinOp::BitAnd => "&",
                 BinOp::Add => "+",
                 BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Mod => "%",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::Shl => "<<",
+                BinOp::Shr => ">>",
             };
             format!(
                 "({} {op_str} {})",
@@ -834,33 +1177,142 @@ fn expr_to_string(expr: &Expr) -> String {
                 expr_to_string(right)
             )
         }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => format!(
+            "({} ? {} : {})",
+            expr_to_string(cond),
+            expr_to_string(then_expr),
+            expr_to_string(else_expr)
+        ),
+        Expr::BitSelect { base, index } => {
+            format!("{}[{}]", expr_to_string(base), expr_to_string(index))
+        }
+        Expr::BitSlice { base, msb, lsb } => format!(
+            "{}[{}:{}]",
+            expr_to_string(base),
+            expr_to_string(msb),
+            expr_to_string(lsb)
+        ),
+        Expr::Concat(parts) => {
+            let inner: Vec<String> = parts.iter().map(expr_to_string).collect();
+            format!("{{{}}}", inner.join(", "))
+        }
     }
 }
 
-/// Parse a `// @mununu` comment into a property annotation.
-fn parse_mununu_comment(rest: &str) -> Option<MununuProperty> {
-    // Format: @mununu ltl <name>: <formula>
-    // Format: @mununu assume <name>: <formula>
-    // Format: @mununu guarantee <name>: <formula>
-    let (kind, after_kind) = if let Some(r) = rest.strip_prefix("ltl") {
-        (MununuPropertyKind::Ltl, r.trim())
-    } else if let Some(r) = rest.strip_prefix("assume") {
-        (MununuPropertyKind::Assume, r.trim())
-    } else if let Some(r) = rest.strip_prefix("guarantee") {
-        (MununuPropertyKind::Guarantee, r.trim())
+/// Parsed result from a `// @mununu` comment.
+enum MununuAnnotation {
+    Property(MununuProperty),
+    Domain(MununuDomainAnnotation),
+    Controllable(Vec<String>),
+    Input(Vec<String>),
+    ModeKripke,
+}
+
+/// Parse a `// @mununu` comment into an annotation.
+fn parse_mununu_annotation(rest: &str) -> Option<MununuAnnotation> {
+    // Property formats
+    if let Some(r) = rest.strip_prefix("ltl") {
+        return parse_property(MununuPropertyKind::Ltl, r.trim());
+    }
+    if let Some(r) = rest.strip_prefix("assume") {
+        return parse_property(MununuPropertyKind::Assume, r.trim());
+    }
+    if let Some(r) = rest.strip_prefix("guarantee") {
+        return parse_property(MununuPropertyKind::Guarantee, r.trim());
+    }
+
+    // Domain annotation: @mununu domain <name>: <kind>
+    if let Some(r) = rest.strip_prefix("domain") {
+        return parse_domain_annotation(r.trim());
+    }
+
+    // Controllable signals: @mununu controllable sig1, sig2
+    if let Some(r) = rest.strip_prefix("controllable") {
+        let signals = r.trim().split(',').map(|s| s.trim().to_string()).collect();
+        return Some(MununuAnnotation::Controllable(signals));
+    }
+
+    // Input signals: @mununu input sig1, sig2
+    if let Some(r) = rest.strip_prefix("input") {
+        let signals = r.trim().split(',').map(|s| s.trim().to_string()).collect();
+        return Some(MununuAnnotation::Input(signals));
+    }
+
+    // Mode selection: @mununu mode kripke
+    if let Some(r) = rest.strip_prefix("mode")
+        && r.trim() == "kripke"
+    {
+        return Some(MununuAnnotation::ModeKripke);
+    }
+
+    None
+}
+
+fn parse_property(kind: MununuPropertyKind, after_kind: &str) -> Option<MununuAnnotation> {
+    let colon_pos = after_kind.find(':')?;
+    let name = after_kind[..colon_pos].trim().to_string();
+    let formula = after_kind[colon_pos + 1..].trim().to_string();
+    Some(MununuAnnotation::Property(MununuProperty {
+        kind,
+        name,
+        formula,
+    }))
+}
+
+fn parse_domain_annotation(rest: &str) -> Option<MununuAnnotation> {
+    // Format: <register_name>: <kind>
+    let colon_pos = rest.find(':')?;
+    let register_name = rest[..colon_pos].trim().to_string();
+    let kind_str = rest[colon_pos + 1..].trim();
+
+    let domain_kind = if kind_str == "boolean" {
+        DomainAnnotationKind::Boolean
+    } else if kind_str == "ignored" {
+        DomainAnnotationKind::Ignored
+    } else if let Some(range_str) = kind_str.strip_prefix("bounded_counter") {
+        // bounded_counter 0..7
+        let range_str = range_str.trim();
+        let parts: Vec<&str> = range_str.split("..").collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let lower: i64 = parts[0].trim().parse().ok()?;
+        let upper: i64 = parts[1].trim().parse().ok()?;
+        DomainAnnotationKind::BoundedCounter { lower, upper }
+    } else if let Some(variants_str) = kind_str.strip_prefix("enum") {
+        // enum {V1, V2, V3} or enum {IDLE=0, START=3, OTHER}
+        let variants_str = variants_str.trim();
+        let inner = variants_str.strip_prefix('{')?.strip_suffix('}')?;
+        let mut variants = Vec::new();
+        let mut value_map = Vec::new();
+        for item in inner.split(',') {
+            let item = item.trim();
+            if let Some((name, val_str)) = item.split_once('=') {
+                let name = name.trim().to_string();
+                if let Ok(val) = val_str.trim().parse::<i64>() {
+                    value_map.push((name.clone(), val));
+                }
+                variants.push(name);
+            } else {
+                variants.push(item.to_string());
+            }
+        }
+        DomainAnnotationKind::Enum {
+            variants,
+            value_map,
+        }
     } else {
         return None;
     };
 
-    let colon_pos = after_kind.find(':')?;
-    let name = after_kind[..colon_pos].trim().to_string();
-    let formula = after_kind[colon_pos + 1..].trim().to_string();
-
-    Some(MununuProperty {
-        kind,
-        name,
-        formula,
-    })
+    Some(MununuAnnotation::Domain(MununuDomainAnnotation {
+        register_name,
+        domain_kind,
+    }))
 }
 
 #[cfg(test)]

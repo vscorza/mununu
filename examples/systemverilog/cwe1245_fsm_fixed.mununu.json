@@ -1,0 +1,36 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "cwe1245_fsm_fixed",
+  "source": "cwe1245_fsm_fixed.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "READING", "WRITING", "UNDEF"],
+      "value_map": [
+        {"name": "IDLE", "value": 1},
+        {"name": "READING", "value": 2},
+        {"name": "WRITING", "value": 4}
+      ],
+      "note": "One-hot FSM — UNDEF catches all invalid bit patterns (3'b000, 3'b011, 3'b101, 3'b110, 3'b111)"
+    }
+  ],
+  "inputs": [
+    {"name": "req_read", "abstraction": "boolean"},
+    {"name": "req_write", "abstraction": "boolean"},
+    {"name": "grant", "abstraction": "boolean"},
+    {"name": "glitch", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {
+      "id": "recoverable",
+      "formula": "mu X. (state_IDLE || <> X)",
+      "description": "From any state (including after glitch), IDLE is always reachable"
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "All states have successors"
+    }
+  ]
+}

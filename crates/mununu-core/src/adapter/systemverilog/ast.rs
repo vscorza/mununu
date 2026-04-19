@@ -1,7 +1,7 @@
 //! AST types for the supported SystemVerilog subset.
 //!
 //! Covers: module declarations, always_ff/always_comb blocks, case/if-else,
-//! typedef enum, basic expressions, and inline `@mununu` property comments.
+//! typedef enum, basic expressions, and inline `@mununu` property/annotation comments.
 
 /// A SystemVerilog module.
 #[derive(Debug, Clone)]
@@ -15,6 +15,14 @@ pub struct Module {
     pub assigns: Vec<ContinuousAssign>,
     /// Properties extracted from `// @mununu` comments.
     pub mununu_properties: Vec<MununuProperty>,
+    /// Domain annotations from `// @mununu domain` comments.
+    pub domain_annotations: Vec<MununuDomainAnnotation>,
+    /// Signals annotated as controllable via `// @mununu controllable`.
+    pub controllable_signals: Vec<String>,
+    /// Signals annotated as input (uncontrollable) via `// @mununu input`.
+    pub input_signals: Vec<String>,
+    /// Whether Kripke mode is forced via `// @mununu mode kripke`.
+    pub force_kripke: bool,
 }
 
 /// A module parameter.
@@ -103,7 +111,7 @@ pub struct CaseBranch {
     pub body: Statement,
 }
 
-/// A simple expression.
+/// An expression in the supported SystemVerilog subset.
 #[derive(Debug, Clone)]
 pub enum Expr {
     Ident(String),
@@ -116,6 +124,25 @@ pub enum Expr {
     },
     /// Boolean literal or comparison used as a condition
     Bool(bool),
+    /// Ternary: `cond ? then_expr : else_expr`
+    Ternary {
+        cond: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
+    /// Single-bit select: `x[i]`
+    BitSelect {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Bit-range slice: `x[msb:lsb]`
+    BitSlice {
+        base: Box<Expr>,
+        msb: Box<Expr>,
+        lsb: Box<Expr>,
+    },
+    /// Concatenation: `{a, b, c}`
+    Concat(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +152,18 @@ pub enum BinOp {
     And,
     Or,
     BitOr,
+    BitAnd,
     Add,
     Sub,
+    Mul,
+    Div,
+    Mod,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Shl,
+    Shr,
 }
 
 /// Continuous assignment: `assign x = expr;`
@@ -149,4 +186,33 @@ pub enum MununuPropertyKind {
     Ltl,
     Assume,
     Guarantee,
+}
+
+/// A domain annotation from `// @mununu domain <register>: <kind>`.
+#[derive(Debug, Clone)]
+pub struct MununuDomainAnnotation {
+    pub register_name: String,
+    pub domain_kind: DomainAnnotationKind,
+}
+
+/// The domain kind specified in a `// @mununu domain` annotation.
+#[derive(Debug, Clone)]
+pub enum DomainAnnotationKind {
+    /// 1-bit boolean.
+    Boolean,
+    /// Bounded counter with explicit range.
+    BoundedCounter { lower: i64, upper: i64 },
+    /// Named enum variants, optionally with concrete value mappings.
+    ///
+    /// Syntax: `enum {IDLE, BUSY, DONE}` or `enum {IDLE=0, START=3, STOP=255, OTHER}`
+    ///
+    /// When value mappings are present, the last variant without `=` acts as
+    /// catch-all for unmapped values. The `value_map` stores `(variant_name, value)`.
+    Enum {
+        variants: Vec<String>,
+        /// Concrete value → variant mapping. Empty if no `=` used.
+        value_map: Vec<(String, i64)>,
+    },
+    /// Excluded from state space.
+    Ignored,
 }

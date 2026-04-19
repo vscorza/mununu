@@ -107,7 +107,10 @@ Synthesized controllers are emitted as flat XState v5 JSON with a `__mununu` met
 
 ## SystemVerilog
 
-Imports behavioral SystemVerilog RTL descriptions by extracting FSMs from `always_ff` blocks.
+Imports behavioral SystemVerilog RTL descriptions. Two modes:
+
+1. **FSM mode** (default): extracts `typedef enum` FSMs from `always_ff` blocks
+2. **Kripke mode**: builds a Kripke structure from all registers, supporting counters, data-path registers, and mixed enum+register designs
 
 ### Supported Subset
 
@@ -117,21 +120,24 @@ Imports behavioral SystemVerilog RTL descriptions by extracting FSMs from `alway
 | `always_ff @(posedge clk)` | Yes |
 | `always_comb` | Yes |
 | `typedef enum logic` | Yes |
-| `case` / `if-else` | Yes |
+| `case` / `if-else` (including numeric labels) | Yes |
 | `assign` statements | Yes |
 | `// @mununu` property comments | Yes |
-| Registers/logic up to 8 bits | Yes |
+| `// @mununu domain` register annotations | Yes (Kripke mode) |
+| Ternary `? :`, bit-select, bit-slice, concat | Yes |
+| Arithmetic, shifts, comparisons | Yes |
+| `localparam` / `parameter` constants | Yes |
 | Module instantiation | Not yet |
 | Arrays/memories | No |
 | Interfaces/classes | No |
 
 ### Controllability
 
-Derived from port directions:
+Derived from port directions and `@mununu` annotations:
 - `input` ports → **uncontrollable** (environment)
 - `output` ports → **controllable** (system)
-
-Transitions guarded by input signals are classified as uncontrollable.
+- `// @mununu controllable sig1, sig2` → override to controllable
+- `// @mununu input sig1, sig2` → override to uncontrollable
 
 ### Property Specification
 
@@ -143,7 +149,7 @@ Properties are specified via inline comments:
 // @mununu guarantee liveness: G(req -> F grant)
 ```
 
-### FSM Extraction
+### FSM Extraction (Default Mode)
 
 The adapter extracts FSMs from `typedef enum` + `always_ff` + `case(state)` patterns:
 
@@ -161,11 +167,108 @@ always_ff @(posedge clk or posedge rst) begin
 end
 ```
 
+### Kripke Mode (Register-Level Verification)
+
+Activated by `// @mununu mode kripke` or automatically when no `typedef enum` FSM is found. Builds a Kripke structure where each state is a valuation of all active registers.
+
+#### Register Domain Annotations
+
+Each register can be annotated with a domain to control how it contributes to the state space:
+
+```systemverilog
+// @mununu domain counter: bounded_counter 0..7    // 8 abstract values
+// @mununu domain cmd: enum {NOP=0, ADD=1, OTHER}  // 3 named values with numeric mapping
+// @mununu domain data: ignored                     // excluded from state space
+// @mununu domain flag: boolean                     // 2 values (auto-inferred for 1-bit)
+```
+
+**Domain types:**
+
+| Domain | Syntax | Values | Use for |
+|--------|--------|--------|---------|
+| `boolean` | `boolean` | `{false, true}` | 1-bit flags (auto-inferred) |
+| `bounded_counter` | `bounded_counter L..U` | `{L, L+1, ..., U}` | Counters, fill levels, indices |
+| `enum` | `enum {A, B, C}` | Named variants | State machines, command opcodes |
+| `enum` (value-mapped) | `enum {IDLE=0, RUN=3, OTHER}` | Named variants with numeric mapping | Wide registers with significant constants |
+| `ignored` | `ignored` | (excluded) | Data-path registers, buffers |
+
+**Value-mapped enums:** When a wide register (e.g., `logic [7:0] cmd`) is used in comparisons against specific constants (`cmd == 3`, `case(cmd) 0: ... 1: ...`), the constants can be mapped to named variants. The last variant without `=` acts as a catch-all for all other values.
+
+#### Automatic Optimizations
+
+**Cone-of-influence reduction:** Registers not referenced by any property formula (transitively through the dependency graph) are automatically excluded. No annotation needed.
+
+**Constant discovery:** When a wide register is ignored but appears in comparisons or case statements with specific numeric values, a warning is emitted suggesting a value-mapped enum annotation:
+
+```
+warning: Register 'cmd' (8-bit, ignored) uses significant constants: [0, 3, 255].
+         Suggested: // @mununu domain cmd: enum {VAL_0=0, VAL_3=3, VAL_255=255, OTHER}
+```
+
+#### Complete Kripke Example
+
+```systemverilog
+// @mununu mode kripke
+// @mununu domain fill: bounded_counter 0..4
+// @mununu domain data_out_r: ignored
+// @mununu input wr_en, rd_en
+// @mununu ltl safety: nu X. ([] X)
+module fifo(
+    input  logic       clk, input logic rst,
+    input  logic       wr_en, input logic rd_en,
+    input  logic [7:0] data_in,
+    output logic [7:0] data_out,
+    output logic       full, output logic empty
+);
+    typedef enum logic [1:0] {IDLE, WRITING, READING, RDWR} state_t;
+    state_t state;
+    logic [2:0] fill;
+    logic [7:0] data_out_r;
+    localparam DEPTH = 4;
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin state <= IDLE; fill <= 0; end
+        else case (state)
+            IDLE: begin
+                if (wr_en && rd_en) state <= RDWR;
+                else if (wr_en)     state <= WRITING;
+                else if (rd_en)     state <= READING;
+            end
+            WRITING: begin
+                if (fill < DEPTH) fill <= fill + 1;
+                state <= IDLE;
+            end
+            READING: begin
+                if (fill > 0) fill <= fill - 1;
+                state <= IDLE;
+            end
+            RDWR: begin
+                if (fill == 0) fill <= fill + 1;
+                state <= IDLE;
+            end
+        endcase
+    end
+endmodule
+```
+
+State space: 4 (state) x 5 (fill 0..4) = 20 states. `data_out_r` is ignored, `data_in`/`data_out` are ports (not registers).
+
+#### Multi-label transitions
+
+In Kripke mode, each input signal produces its own label. Transitions carry the full set of input signal values as a multi-label, making the CTXDSL output readable at a glance:
+
+```
+transition fill_0_state_IDLE -> fill_0_state_WRITING on label rd_en_F, label wr_en_F;
+transition fill_0_state_IDLE -> fill_0_state_RDWR    on label rd_en_T, label wr_en_T;
+```
+
+This is equivalent to the single-label encoding used by the signal-state path (TLSF/AIGER) but with named per-signal labels instead of compound bitvectors. For value-mapped enums, labels use the variant names (e.g., `cmd_LOAD`, `cmd_ADD`) rather than numeric indices.
+
 ### State Space Limits
 
-- Designs with > 18 state bits (262K states) are **rejected** at parse time
-- Designs with > 12 state bits emit a **warning**
-- Only enum-typed FSMs are supported (no binary-coded state machines)
+- Designs with > 2^18 states (262K) are **rejected**
+- Designs with > 2^12 states emit a **warning**
+- Kripke mode: registers > 4 bits without annotation are auto-ignored with a warning
 
 ### Controller Output
 
@@ -343,6 +446,35 @@ mununu context eval crew.json --adapter crewai --formula can_finish --automaton 
 mununu context eval graph.json --adapter langgraph --formula safety_invariant --automaton langgraph_workflow
 mununu context eval cards.json --adapter a2a --formula safety_invariant --automaton a2a_protocol
 ```
+
+### Inspecting the intermediate CTXDSL
+
+When using an adapter, add `--print-ctxdsl` to see the translated CTXDSL model:
+
+```bash
+# Print to stdout (alongside normal verification output)
+mununu context eval design.sv --adapter sv --formula safety --automaton FSM --print-ctxdsl
+
+# Write to a file
+mununu context eval design.sv --adapter sv --formula safety --automaton FSM --print-ctxdsl output.ctxdsl
+```
+
+This works with all adapters (`--adapter tlsf`, `--adapter sv`, `--adapter xstate`, etc.) and with both `context eval` and `context synth`. The CTXDSL is printed before verification runs, so you can inspect the model even if verification fails.
+
+### SystemVerilog Pipeline
+
+```bash
+# Generate skeleton sidecar from SV module
+mununu sv init design.sv
+
+# Discover significant register values via SMT (requires --features smt)
+mununu sv discover design.sv
+
+# Verify with sidecar (auto-loaded from <stem>.mununu.json)
+mununu context eval design.sv --adapter sv --formula safety --automaton FSM
+```
+
+See [RTL Verification Pipeline](RTL-Verification-Pipeline) for the full annotation workflow.
 
 ### Export
 

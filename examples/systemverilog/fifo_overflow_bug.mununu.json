@@ -1,0 +1,34 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "fifo_overflow_bug",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "WRITING", "READING"]
+    },
+    {
+      "name": "fill",
+      "abstraction": "bounded_counter",
+      "bound": 5,
+      "note": "bounded to 0..5 so overflow to 5 is observable"
+    }
+  ],
+  "inputs": [
+    {"name": "wr_en", "abstraction": "boolean"},
+    {"name": "rd_en", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {
+      "id": "no_overflow",
+      "formula": "nu X. (!fill_5 && [] X)",
+      "description": "Fill level never reaches 5 (overflow beyond DEPTH=4)"
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock"
+    }
+  ],
+  "parameters": {"DEPTH": 4}
+}

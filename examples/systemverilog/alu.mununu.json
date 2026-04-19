@@ -1,0 +1,67 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "alu",
+  "source": "alu.sv",
+  "signals": [
+    {
+      "name": "acc",
+      "abstraction": "bounded_counter",
+      "bound": 7,
+      "note": "4-bit accumulator, bounded to 0..7"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "start",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "operand",
+      "abstraction": "bounded_counter",
+      "bound": 3
+    },
+    {
+      "name": "cmd",
+      "abstraction": "discover"
+    }
+  ],
+  "properties": [
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    }
+  ],
+  "discovered_values": {
+    "cmd": {
+      "values": [
+        {
+          "value": 0,
+          "name": "VAL_0",
+          "from": "SMT: guard (cmd == 0) at line 0"
+        },
+        {
+          "value": 1,
+          "name": "VAL_1",
+          "from": "SMT: guard (cmd == 1) at line 0"
+        },
+        {
+          "value": 2,
+          "name": "VAL_2",
+          "from": "SMT: guard (cmd == 2) at line 0"
+        },
+        {
+          "value": 3,
+          "name": "VAL_3",
+          "from": "SMT: guard (cmd == 3) at line 0"
+        },
+        {
+          "value": 4,
+          "name": "VAL_4",
+          "from": "SMT: guard (cmd == 4) at line 0"
+        }
+      ],
+      "catch_all": "OTHER"
+    }
+  }
+}

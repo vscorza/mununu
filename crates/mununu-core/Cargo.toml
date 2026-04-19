@@ -30,6 +30,9 @@ tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-python = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.23", optional = true }
 
+# SMT solver (optional — z3 for value discovery in RTL verification)
+z3 = { version = "0.20", optional = true, features = ["bundled"] }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.9"
@@ -40,6 +43,7 @@ itoa = "1.0"
 default = []
 api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tracing"]
 ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust"]
+smt = ["dep:z3"]
 syntcomp = []
 
 [[bench]]

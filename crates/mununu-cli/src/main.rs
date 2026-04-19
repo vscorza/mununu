@@ -45,6 +45,11 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ExtractionCommand>,
     },
+    /// SystemVerilog analysis tools (discover significant values).
+    Sv {
+        #[command(subcommand)]
+        command: Box<SvCommand>,
+    },
     /// Start HTTP API server
     Server {
         /// Server address (default: 127.0.0.1:8080)
@@ -88,6 +93,52 @@ struct ExtractionCheckArgs {
     /// Require @model-source header (fail if missing).
     #[arg(long)]
     require_model_source: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum SvCommand {
+    /// Generate a skeleton .mununu.json sidecar from a SystemVerilog module.
+    ///
+    /// Scans the module's declarations and ports, assigns sensible defaults
+    /// (1-bit → boolean, enum → enum, wide → discover), and writes the sidecar.
+    Init(SvInitArgs),
+    /// Discover significant register values via SMT analysis.
+    ///
+    /// Parses the SystemVerilog module, loads the .mununu.json sidecar,
+    /// and uses z3 to find concrete values that make guard conditions
+    /// satisfiable. Updates the sidecar's discovered_values section.
+    Discover(SvDiscoverArgs),
+}
+
+#[derive(Args, Debug)]
+struct SvInitArgs {
+    /// Path to the SystemVerilog source file (.sv).
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    /// Output path for the .mununu.json file.
+    /// Defaults to <stem>.mununu.json next to the .sv file.
+    #[arg(long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+    /// Overwrite existing sidecar file.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
+struct SvDiscoverArgs {
+    /// Path to the SystemVerilog source file (.sv).
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    /// Path to the .mununu.json annotation file.
+    /// If omitted, looks for <stem>.mununu.json next to the .sv file.
+    #[arg(long = "annotation", value_name = "FILE")]
+    annotation: Option<PathBuf>,
+    /// Write the updated sidecar to a different file instead of in-place.
+    #[arg(long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+    /// Maximum number of values to discover per signal (default: 32).
+    #[arg(long = "max-values", default_value = "32")]
+    max_values: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,6 +231,9 @@ struct ContextEvalArgs {
     /// Print the internal structure of the context to stdout or a file.
     #[arg(long = "print-structure", value_name = "FILE")]
     print_structure: Option<Option<PathBuf>>,
+    /// Print the intermediate CTXDSL (after adapter translation) to stdout or a file.
+    #[arg(long = "print-ctxdsl", value_name = "FILE")]
+    print_ctxdsl: Option<Option<PathBuf>>,
 }
 
 #[derive(Args, Debug)]
@@ -235,6 +289,9 @@ struct ContextSynthesizeArgs {
     /// Print the internal structure of the context to stdout or a file.
     #[arg(long = "print-structure", value_name = "FILE")]
     print_structure: Option<Option<PathBuf>>,
+    /// Print the intermediate CTXDSL (after adapter translation) to stdout or a file.
+    #[arg(long = "print-ctxdsl", value_name = "FILE")]
+    print_ctxdsl: Option<Option<PathBuf>>,
     /// Output format for the synthesized controller: ctxdsl (default), xstate, systemverilog.
     #[arg(long = "output-format", value_name = "FORMAT")]
     output_format: Option<String>,
@@ -340,6 +397,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(*command),
         Commands::Extraction { command } => handle_extraction(*command),
+        Commands::Sv { command } => handle_sv(*command),
         Commands::Server { addr } => {
             use std::net::SocketAddr;
             let addr: SocketAddr = addr
@@ -371,6 +429,287 @@ fn handle_extraction(command: ExtractionCommand) -> Result<(), String> {
     match command {
         ExtractionCommand::Validate(args) => extraction_validate(args),
         ExtractionCommand::Check(args) => extraction_check(args),
+    }
+}
+
+fn handle_sv(command: SvCommand) -> Result<(), String> {
+    match command {
+        SvCommand::Init(args) => sv_init(args),
+        SvCommand::Discover(args) => sv_discover(args),
+    }
+}
+
+fn sv_init(args: SvInitArgs) -> Result<(), String> {
+    use mununu_core::adapter::systemverilog::annotation::*;
+    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
+
+    let source = fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
+
+    let module = mununu_core::adapter::systemverilog::parser::parse(&source)
+        .map_err(|e| format!("SV parse error: {e}"))?;
+
+    let output_path = args.output.unwrap_or_else(|| {
+        let stem = args
+            .file
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("module");
+        args.file.with_file_name(format!("{stem}.mununu.json"))
+    });
+
+    if output_path.exists() && !args.force {
+        return Err(format!(
+            "'{}' already exists. Use --force to overwrite.",
+            output_path.display()
+        ));
+    }
+
+    // Build signals from declarations (skip ports)
+    let port_names: std::collections::HashSet<&str> =
+        module.ports.iter().map(|p| p.name.as_str()).collect();
+
+    let mut signals = Vec::new();
+    for decl in &module.declarations {
+        match decl {
+            Declaration::Enum {
+                variants,
+                var_name: Some(var),
+                ..
+            } => {
+                signals.push(SignalAnnotation {
+                    name: var.clone(),
+                    preserve: true,
+                    abstraction: SignalAbstraction::Enum,
+                    bound: None,
+                    variants: Some(variants.clone()),
+                    value_map: None,
+                    note: Some("auto-detected typedef enum".to_string()),
+                });
+            }
+            Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
+                let (abstraction, bound, note) = if *width == 1 {
+                    (SignalAbstraction::Boolean, None, "1-bit flag")
+                } else if *width <= 4 {
+                    (
+                        SignalAbstraction::BoundedCounter,
+                        Some((1i64 << width) - 1),
+                        "small register — bounded counter",
+                    )
+                } else {
+                    (
+                        SignalAbstraction::Discover,
+                        None,
+                        "wide register — run `mununu sv discover` to find significant values",
+                    )
+                };
+                signals.push(SignalAnnotation {
+                    name: name.clone(),
+                    preserve: *width <= 4, // auto-preserve small registers
+                    abstraction,
+                    bound,
+                    variants: None,
+                    value_map: None,
+                    note: Some(note.to_string()),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Build inputs from ports
+    let mut inputs = Vec::new();
+    for port in &module.ports {
+        if port.direction != PortDirection::Input {
+            continue;
+        }
+        if port.name == "clk" || port.name == "rst" || port.name == "rst_n" {
+            continue;
+        }
+        let (abstraction, bound, preserve) = if port.width == 1 {
+            (SignalAbstraction::Boolean, None, true)
+        } else if port.width <= 4 {
+            (
+                SignalAbstraction::BoundedCounter,
+                Some((1i64 << port.width) - 1),
+                true,
+            )
+        } else {
+            (SignalAbstraction::Discover, None, true)
+        };
+        inputs.push(InputAnnotation {
+            name: port.name.clone(),
+            preserve,
+            abstraction,
+            bound,
+            variants: None,
+            value_map: None,
+        });
+    }
+
+    let ann = SvAnnotation {
+        schema: Some("mununu_sv_annotation_v1".to_string()),
+        module: module.name.clone(),
+        source: Some(
+            args.file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        signals,
+        inputs,
+        controllable: vec![],
+        properties: vec![PropertyAnnotation {
+            id: "safety".to_string(),
+            formula: "nu X. ([] X)".to_string(),
+            description: Some("No deadlock — all states have successors".to_string()),
+            role: "guarantee".to_string(),
+        }],
+        discovered_values: HashMap::new(),
+        parameters: module
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.default_value))
+            .collect(),
+    };
+
+    let json =
+        serde_json::to_string_pretty(&ann).map_err(|e| format!("Failed to serialize: {e}"))?;
+    fs::write(&output_path, json)
+        .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
+
+    eprintln!("Generated sidecar: {}", output_path.display());
+    eprintln!(
+        "  {} signal(s), {} input(s), {} property/ies",
+        ann.signals.len(),
+        ann.inputs.len(),
+        ann.properties.len()
+    );
+    eprintln!(
+        "Review the file, then run: mununu sv discover {}",
+        args.file.display()
+    );
+
+    Ok(())
+}
+
+fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
+    // Step 1: Parse the SV file
+    let source = fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
+
+    let _module = mununu_core::adapter::systemverilog::parser::parse(&source)
+        .map_err(|e| format!("SV parse error: {e}"))?;
+
+    eprintln!("Parsed module: {}", _module.name);
+
+    // Step 2: Load or find the sidecar annotation
+    let sidecar_path = if let Some(ref p) = args.annotation {
+        p.clone()
+    } else {
+        mununu_core::adapter::systemverilog::annotation::find_sidecar(&args.file).ok_or_else(
+            || {
+                let stem = args
+                    .file
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_str()
+                    .unwrap_or("");
+                format!(
+                    "No .mununu.json sidecar found. Create one at '{stem}.mununu.json' \
+                     or pass --annotation <path>."
+                )
+            },
+        )?
+    };
+
+    let annotation =
+        mununu_core::adapter::systemverilog::annotation::load_annotation(&sidecar_path)
+            .map_err(|e| format!("Failed to load sidecar: {e}"))?;
+
+    eprintln!("Loaded annotation: {}", sidecar_path.display());
+
+    use mununu_core::adapter::systemverilog::annotation::SignalAbstraction;
+
+    // Count signals + inputs marked for discovery
+    let discover_count = annotation
+        .signals
+        .iter()
+        .filter(|s| s.preserve && s.abstraction == SignalAbstraction::Discover)
+        .count()
+        + annotation
+            .inputs
+            .iter()
+            .filter(|i| i.preserve && i.abstraction == SignalAbstraction::Discover)
+            .count();
+
+    if discover_count == 0 {
+        eprintln!("No signals marked for discovery (abstraction: \"discover\"). Nothing to do.");
+        return Ok(());
+    }
+
+    eprintln!("Discovering values for {} signal(s)...", discover_count);
+
+    #[cfg(not(feature = "smt"))]
+    {
+        let _ = (&_module, &annotation); // suppress unused warnings
+        Err(
+            "SMT discovery requires the 'smt' feature. Rebuild with: cargo build --features smt"
+                .to_string(),
+        )
+    }
+
+    #[cfg(feature = "smt")]
+    {
+        let mut annotation = annotation;
+        let results = mununu_core::adapter::systemverilog::kripke_smt::discover_significant_values(
+            &_module,
+            &annotation,
+        );
+
+        if results.is_empty() {
+            eprintln!("No significant values discovered.");
+        } else {
+            for (signal, discovered) in &results {
+                eprintln!("  {} — {} value(s):", signal, discovered.values.len());
+                for v in &discovered.values {
+                    let from = v.from.as_deref().unwrap_or("unknown");
+                    eprintln!("    {} = {} ({})", v.name, v.value, from);
+                }
+            }
+
+            // Merge into the annotation, preserving user-given names
+            for (signal, discovered) in results {
+                let existing = annotation
+                    .discovered_values
+                    .entry(signal)
+                    .or_insert_with(|| {
+                        mununu_core::adapter::systemverilog::annotation::DiscoveredValues {
+                            values: vec![],
+                            catch_all: "OTHER".to_string(),
+                        }
+                    });
+
+                for new_val in &discovered.values {
+                    if !existing.values.iter().any(|v| v.value == new_val.value) {
+                        existing.values.push(new_val.clone());
+                    }
+                }
+                existing.values.sort_by_key(|v| v.value);
+            }
+        }
+
+        // Write the updated sidecar
+        let output_path = args.output.as_ref().unwrap_or(&sidecar_path);
+        let json = serde_json::to_string_pretty(&annotation)
+            .map_err(|e| format!("Failed to serialize annotation: {e}"))?;
+        fs::write(output_path, json)
+            .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
+        eprintln!("Updated sidecar: {}", output_path.display());
+
+        Ok(())
     }
 }
 
@@ -622,11 +961,13 @@ fn parse_context_file(path: &Path) -> Result<ContextDoc, String> {
 }
 
 /// Read a source file, optionally translating it from an external format first.
+/// Returns `(ContextDoc, Option<ctxdsl_text>)` — the CTXDSL text is `Some` when
+/// an adapter was used (useful for `--print-ctxdsl`).
 fn load_with_adapter_mode(
     path: &Path,
     adapter: Option<&str>,
     mode: Option<&str>,
-) -> Result<ContextDoc, String> {
+) -> Result<(ContextDoc, Option<String>), String> {
     let source = fs::read_to_string(path)
         .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
 
@@ -681,12 +1022,14 @@ fn load_with_adapter_mode(
             output.ctxdsl
         }
         Some("systemverilog") | Some("sv") => {
-            use mununu_core::adapter::{AdapterOptions, FormatAdapter};
+            use mununu_core::adapter::AdapterOptions;
             let options = AdapterOptions::default();
-            let output = mununu_core::adapter::systemverilog::SystemVerilogAdapter::translate(
-                &source, &options,
-            )
-            .map_err(|e| format!("SystemVerilog adapter error: {e}"))?;
+            // Use translate_with_path to enable .mununu.json sidecar loading
+            let output =
+                mununu_core::adapter::systemverilog::SystemVerilogAdapter::translate_with_path(
+                    &source, &options, path,
+                )
+                .map_err(|e| format!("SystemVerilog adapter error: {e}"))?;
             for w in &output.warnings {
                 eprintln!("adapter warning: {}", w.message);
             }
@@ -769,15 +1112,24 @@ fn load_with_adapter_mode(
         }
     };
 
-    parse_context_doc(&ctxdsl_source)
-        .map_err(|err| format!("failed to parse '{}': {err}", path.display()))
+    let was_adapter = adapter.is_some();
+    let doc = parse_context_doc(&ctxdsl_source)
+        .map_err(|err| format!("failed to parse '{}': {err}", path.display()))?;
+    Ok((
+        doc,
+        if was_adapter {
+            Some(ctxdsl_source)
+        } else {
+            None
+        },
+    ))
 }
 
 fn load_context_documents(
     context_path: &Path,
     sidecar_paths: &[PathBuf],
     adapter: Option<&str>,
-) -> Result<(ContextDoc, Vec<ContextDoc>), String> {
+) -> Result<(ContextDoc, Vec<ContextDoc>, Option<String>), String> {
     load_context_documents_mode(context_path, sidecar_paths, adapter, None)
 }
 
@@ -786,13 +1138,13 @@ fn load_context_documents_mode(
     sidecar_paths: &[PathBuf],
     adapter: Option<&str>,
     mode: Option<&str>,
-) -> Result<(ContextDoc, Vec<ContextDoc>), String> {
-    let context_doc = load_with_adapter_mode(context_path, adapter, mode)?;
+) -> Result<(ContextDoc, Vec<ContextDoc>, Option<String>), String> {
+    let (context_doc, ctxdsl_text) = load_with_adapter_mode(context_path, adapter, mode)?;
     let mut sidecar_docs = Vec::with_capacity(sidecar_paths.len());
     for path in sidecar_paths {
         sidecar_docs.push(parse_context_file(path)?);
     }
-    Ok((context_doc, sidecar_docs))
+    Ok((context_doc, sidecar_docs, ctxdsl_text))
 }
 
 fn realize_documents(
@@ -828,6 +1180,28 @@ fn print_context_structure(
 
     if let Some(path) = path_ref {
         println!("Context structure written to {}", path.display());
+    }
+
+    Ok(())
+}
+
+/// Print the intermediate CTXDSL text (after adapter translation) to stdout or a file.
+fn print_ctxdsl_output(ctxdsl: &str, output_path: Option<&PathBuf>) -> Result<(), String> {
+    let mut writer: Box<dyn IoWrite> =
+        if let Some(path) = output_path {
+            Box::new(File::create(path).map_err(|err| {
+                format!("failed to create output file '{}': {err}", path.display())
+            })?)
+        } else {
+            Box::new(io::stdout())
+        };
+
+    writer
+        .write_all(ctxdsl.as_bytes())
+        .map_err(|err| format!("failed to write CTXDSL: {err}"))?;
+
+    if let Some(path) = output_path {
+        eprintln!("CTXDSL written to {}", path.display());
     }
 
     Ok(())
@@ -888,7 +1262,8 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
 
     let context_path = args.files[0].clone();
     let sidecar_paths: Vec<PathBuf> = args.files.iter().skip(1).cloned().collect();
-    let (context_doc, sidecar_docs) = load_context_documents(&context_path, &sidecar_paths, None)?;
+    let (context_doc, sidecar_docs, _) =
+        load_context_documents(&context_path, &sidecar_paths, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let summary = build_context_summary(&context_doc, &sidecar_docs, &realized);
 
@@ -956,7 +1331,8 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
 }
 
 fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars, None)?;
+    let (context_doc, sidecar_docs, _) =
+        load_context_documents(&args.context, &args.sidecars, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let summary = build_context_summary(&context_doc, &sidecar_docs, &realized);
     let json = serde_json::to_string_pretty(&summary)
@@ -972,7 +1348,8 @@ fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
 }
 
 fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars, None)?;
+    let (context_doc, sidecar_docs, _) =
+        load_context_documents(&args.context, &args.sidecars, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let mut automata: Vec<String> = realized.predicates.keys().cloned().collect();
     automata.sort();
@@ -1031,17 +1408,27 @@ fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
 }
 
 fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
-    let (context_doc, mut sidecar_docs) = load_context_documents_mode(
+    let (context_doc, mut sidecar_docs, adapter_ctxdsl) = load_context_documents_mode(
         &args.context,
         &args.sidecars,
         args.adapter.as_deref(),
         args.mode.as_deref(),
     )?;
 
+    // Print intermediate CTXDSL if requested
+    if let Some(output_path) = &args.print_ctxdsl {
+        if let Some(ctxdsl) = &adapter_ctxdsl {
+            print_ctxdsl_output(ctxdsl, output_path.as_ref())?;
+        } else {
+            eprintln!("No adapter translation — CTXDSL is the input file itself");
+        }
+    }
+
     // Load stub files: translate each .espec.json via extraction adapter → CTXDSL → parse as sidecar
     for stub_path in &args.stubs {
-        let stub_doc = load_with_adapter_mode(stub_path, Some("extraction"), args.mode.as_deref())
-            .map_err(|e| format!("Failed to load stub '{}': {e}", stub_path.display()))?;
+        let (stub_doc, _) =
+            load_with_adapter_mode(stub_path, Some("extraction"), args.mode.as_deref())
+                .map_err(|e| format!("Failed to load stub '{}': {e}", stub_path.display()))?;
         eprintln!(
             "Loaded stub: {} ({} automata)",
             stub_path.display(),
@@ -1228,12 +1615,22 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 }
 
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents_mode(
+    let (context_doc, sidecar_docs, adapter_ctxdsl) = load_context_documents_mode(
         &args.context,
         &args.sidecars,
         args.adapter.as_deref(),
         args.mode.as_deref(),
     )?;
+
+    // Print intermediate CTXDSL if requested
+    if let Some(output_path) = &args.print_ctxdsl {
+        if let Some(ctxdsl) = &adapter_ctxdsl {
+            print_ctxdsl_output(ctxdsl, output_path.as_ref())?;
+        } else {
+            eprintln!("No adapter translation — CTXDSL is the input file itself");
+        }
+    }
+
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let realized_formula = realized
         .formulas
@@ -1469,7 +1866,8 @@ fn render_controller_diagnostics(diagnostics: &ControllerDiagnostics) {
 }
 
 fn context_graph(args: ContextGraphArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs) = load_context_documents(&args.context, &args.sidecars, None)?;
+    let (context_doc, sidecar_docs, _) =
+        load_context_documents(&args.context, &args.sidecars, None)?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
 
     // Collect all automata to visualize

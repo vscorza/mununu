@@ -302,6 +302,63 @@ A 4-client scaled version is available at `examples/amba_arbiter_gr1_synthesis.c
 
 ---
 
+## 8. ALU with Accumulator (Kripke Mode)
+
+**Source**: `examples/systemverilog/alu.sv`
+
+An ALU with a 4-bit accumulator and externally driven command/operand inputs. Uses the **Kripke construction** — no explicit FSM enum for the accumulator or command. The command register is abstracted with a value-mapped enum: only the specific opcode constants used in the `case` statement are tracked, plus a catch-all `OTHER`.
+
+**Annotations**:
+```systemverilog
+// @mununu mode kripke
+// @mununu domain acc: bounded_counter 0..7
+// @mununu domain cmd: enum {NOP=0, LOAD=1, ADD=2, SUB=3, CLR=4, OTHER}
+// @mununu domain operand: bounded_counter 0..3
+// @mununu input cmd, operand, start
+```
+
+**State space**: 8 (acc) x 6 (cmd) x 4 (operand) = 192 max, pruned by reachability.
+
+**Key properties**:
+
+| Formula | Body | Checks |
+|---------|------|--------|
+| `safety` | `nu X. ([] X)` | Well-formed automaton, no deadlock |
+
+**Expected result**: Safety is realizable. The Kripke construction correctly models the ALU's accumulator arithmetic with bounded saturation.
+
+**Why this matters**: Demonstrates that Mununu can verify register-level RTL beyond simple FSMs. The value-mapped enum abstraction (`cmd: enum {NOP=0, ...}`) collapses the 8-bit command space to 6 abstract values, making explicit-state verification tractable without losing precision on the relevant opcodes.
+
+---
+
+## 9. Synchronous FIFO Controller (Kripke Mode)
+
+**Source**: `examples/systemverilog/fifo.sv`
+
+A FIFO controller mixing an explicit `typedef enum` FSM (for the control interface) with a bounded counter (for the fill level). Uses the **Kripke construction** via `@mununu mode kripke` to model both dimensions together.
+
+**Annotations**:
+```systemverilog
+// @mununu mode kripke
+// @mununu domain fill: bounded_counter 0..4
+// @mununu domain data_out_r: ignored
+// @mununu input wr_en, rd_en
+```
+
+**State space**: 4 (state: IDLE/WRITING/READING/RDWR) x 5 (fill: 0..4) = 20 max.
+
+**Key properties**:
+
+| Formula | Body | Checks |
+|---------|------|--------|
+| `safety` | `nu X. ([] X)` | No deadlock, well-formed |
+
+**Expected result**: Safety is realizable. The FIFO correctly handles simultaneous read/write, empty-to-full transitions, and maintains fill level invariants. Cone-of-influence automatically excludes `data_out_r` (8-bit data register) since it doesn't affect control flow properties.
+
+**Why this matters**: Shows how `@mununu domain` annotations let you mix enum FSMs with register-level state (counters, flags) in a single model. The data path (`data_out_r`) is excluded from the state space without losing precision on the control properties.
+
+---
+
 ## Pattern Summary
 
 | Pattern | States | Controllable | Key Property Type | Source |
@@ -313,6 +370,44 @@ A 4-client scaled version is available at `examples/amba_arbiter_gr1_synthesis.c
 | SPI Master | 4 | all (full control) | Labeled Modality | `tutorial/examples/02a_single_label.ctxdsl` |
 | AXI Bus Transaction | 4 | master signals | Game-Theoretic Reachability | `tutorial/examples/02b_multi_label.ctxdsl` |
 | AMBA Bus Arbiter | 3+3+3 (composed) | grants, idle | GR(1) No-Starvation | `examples/amba_arbiter_gr1.ctxdsl` |
+| ALU with Accumulator | 192 max | acc | Kripke + value-mapped enum | `examples/systemverilog/alu.sv` |
+| FIFO Controller | 20 | (control) | Kripke + bounded counter | `examples/systemverilog/fifo.sv` |
+| FIFO Overflow Bug/Fix | 18 | (control) | Safety (overflow detection) | `examples/systemverilog/fifo_overflow_*.sv` |
+| AXI-Lite Overlap Bug/Fix | 8 | (control) | Safety (overlapping transactions) | `examples/systemverilog/axilite_deadlock_*.sv` |
+| CWE-1245 FSM Bug/Fix | 4 | (control) | Reachability (recovery from undefined) | `examples/systemverilog/cwe1245_fsm_*.sv` |
+
+---
+
+## 10. FIFO Overflow Bug (Sidecar Pipeline)
+
+**Source**: `examples/systemverilog/fifo_overflow_bug.sv` + `.mununu.json`
+
+FIFO controller missing `if (fill < DEPTH)` guard — fill exceeds capacity. Uses the `.mununu.json` sidecar pipeline with `fill` bounded to 0..5 so overflow to 5 is observable.
+
+**Buggy:** unrealizable for `no_overflow` (fill_5 states are reachable).
+**Fixed:** realizable (guard prevents overflow).
+
+---
+
+## 11. AXI-Lite Overlapping Transactions (Xilinx Bug)
+
+**Source**: `examples/systemverilog/axilite_deadlock_bug.sv` + `.mununu.json`
+
+Based on the Xilinx Vivado AXI-lite slave template bug documented by [ZipCPU](https://zipcpu.com/formal/2019/04/16/axi-mistakes.html). The slave accepts new write transactions while the previous response (`bvalid`) is still pending — corrupting state.
+
+**Buggy:** unrealizable for `no_overlap` (8 states, overlapping states `bvalid_r_T_state_ADDR_WAIT` reachable).
+**Fixed:** realizable (ready signals gated by `!bvalid_r`, only 5 reachable states).
+
+---
+
+## 12. CWE-1245: FSM with Undefined States (Security)
+
+**Source**: `examples/systemverilog/cwe1245_fsm_bug.sv` + `.mununu.json`
+
+Based on MITRE CWE-1245 with real CVEs (CVE-2024-21853, CVE-2024-24968). One-hot encoded FSM without `default` case — fault injection creates an absorbing undefined state that bypasses access control.
+
+**Buggy:** 3/4 states satisfy `recoverable` — `state_UNDEF` cannot return to IDLE (stuck).
+**Fixed:** 4/4 states satisfy `recoverable` — `default` branch forces recovery to IDLE.
 
 ## See Also
 

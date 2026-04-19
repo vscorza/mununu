@@ -4,6 +4,7 @@
 //! state fields, abstraction strategy, controllability — but NOT the
 //! automaton topology. The tool derives states and transitions from the AST.
 
+use crate::adapter::domain::AbstractionType;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -133,21 +134,7 @@ pub struct AbstractionConfig {
     pub variants: Option<Vec<String>>,
 }
 
-/// Available abstraction strategies for state fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AbstractionType {
-    /// Exact boolean (2 states: true/false).
-    Boolean,
-    /// Presence/absence (2 states: None/Some).
-    Presence,
-    /// Bounded counter (0..bound states).
-    BoundedCounter,
-    /// Explicit enum variants.
-    EnumValues,
-    /// Ignored — field not included in state space.
-    Ignored,
-}
+// AbstractionType is re-exported from crate::adapter::domain.
 
 /// Method inclusion/exclusion configuration.
 #[derive(Debug, Clone, Default, Deserialize)]

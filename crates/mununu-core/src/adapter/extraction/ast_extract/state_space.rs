@@ -9,83 +9,8 @@
 //! 5. Generate labels and noop self-loops
 
 use super::call_summary::{CallEffect, CallGuard};
-use super::config::AbstractionType;
+use crate::adapter::domain::{AbstractState, AbstractValue, AbstractionType, FieldDomain};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-
-/// Abstract value in a field's domain.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum AbstractValue {
-    /// Boolean: true or false.
-    Bool(bool),
-    /// Presence: present or absent.
-    Present(bool),
-    /// Bounded counter: 0..bound.
-    Counter(i64),
-    /// Enum variant by name.
-    Variant(String),
-}
-
-impl AbstractValue {
-    pub fn display_short(&self) -> String {
-        match self {
-            AbstractValue::Bool(true) => "T".to_string(),
-            AbstractValue::Bool(false) => "F".to_string(),
-            AbstractValue::Present(true) => "Some".to_string(),
-            AbstractValue::Present(false) => "None".to_string(),
-            AbstractValue::Counter(n) => n.to_string(),
-            AbstractValue::Variant(v) => v.clone(),
-        }
-    }
-}
-
-/// Definition of a field's abstract domain.
-#[derive(Debug, Clone)]
-pub struct FieldDomain {
-    /// Field name (as it appears in source).
-    pub name: String,
-    /// Abstraction type.
-    pub abstraction: AbstractionType,
-    /// Upper bound for bounded counter.
-    pub bound: Option<i64>,
-    /// Explicit variants for enum.
-    pub variants: Option<Vec<String>>,
-    /// Initial value.
-    pub initial: AbstractValue,
-}
-
-impl FieldDomain {
-    /// Enumerate all values in this domain.
-    pub fn values(&self) -> Vec<AbstractValue> {
-        match self.abstraction {
-            AbstractionType::Boolean => vec![AbstractValue::Bool(false), AbstractValue::Bool(true)],
-            AbstractionType::Presence => {
-                vec![AbstractValue::Present(false), AbstractValue::Present(true)]
-            }
-            AbstractionType::BoundedCounter => {
-                let bound = self.bound.unwrap_or(3);
-                (0..=bound).map(AbstractValue::Counter).collect()
-            }
-            AbstractionType::EnumValues => self
-                .variants
-                .as_ref()
-                .map(|vs| {
-                    vs.iter()
-                        .map(|v| AbstractValue::Variant(v.clone()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            AbstractionType::Ignored => vec![],
-        }
-    }
-
-    /// Number of abstract values.
-    pub fn cardinality(&self) -> usize {
-        self.values().len()
-    }
-}
-
-/// A concrete abstract state — assignment of values to all fields.
-pub type AbstractState = BTreeMap<String, AbstractValue>;
 
 /// A guard condition extracted from source.
 #[derive(Debug, Clone)]

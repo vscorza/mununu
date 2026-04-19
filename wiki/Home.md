@@ -25,6 +25,7 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 | [Composition](Composition) | Synchronous, asynchronous, and hierarchical composition with examples |
 | [Mu-Calculus Reference](Mu-Calculus-Reference) | Fixpoints, modalities, controllability-aware operators, common patterns |
 | [Adapter Formats](Adapter-Formats) | Import from XState, SystemVerilog, TLSF, AIGER, Promela; export controllers |
+| [RTL Verification Pipeline](RTL-Verification-Pipeline) | End-to-end SystemVerilog verification with `.mununu.json` sidecars and SMT discovery |
 | [Agentic Orchestration](Agentic-Orchestration) | Verify multi-agent workflows, MCP tool authorization, and handoff protocols |
 | [CLI Reference](CLI-Reference) | Full command reference with adapter import/export examples |
 | [API Reference](API-Reference) | REST API documentation including the import endpoint |

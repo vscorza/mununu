@@ -7,12 +7,11 @@
 use tree_sitter::Node;
 
 use super::parser::{ParsedSource, SourceLanguage};
+use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
 use crate::adapter::extraction::ast_extract::call_summary::{CallEffect, CallGuard};
-use crate::adapter::extraction::ast_extract::config::{AbstractionType, TargetConfig};
+use crate::adapter::extraction::ast_extract::config::TargetConfig;
 use crate::adapter::extraction::ast_extract::domain::{self, DomainProfile};
-use crate::adapter::extraction::ast_extract::state_space::{
-    AbstractValue, Effect, FieldDomain, Guard, MethodBehavior,
-};
+use crate::adapter::extraction::ast_extract::state_space::{Effect, Guard, MethodBehavior};
 use std::collections::{HashMap, HashSet};
 
 /// Result of extracting from a single class/struct target.

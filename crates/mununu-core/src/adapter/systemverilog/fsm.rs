@@ -204,9 +204,31 @@ fn expr_to_guard_name(expr: &Expr) -> String {
             expr_to_guard_name(left),
             expr_to_guard_name(right)
         ),
+        Expr::BinOp {
+            op: BinOp::Lt,
+            left,
+            right,
+        } => format!(
+            "{}_lt_{}",
+            expr_to_guard_name(left),
+            expr_to_guard_name(right)
+        ),
+        Expr::BinOp {
+            op: BinOp::Gt,
+            left,
+            right,
+        } => format!(
+            "{}_gt_{}",
+            expr_to_guard_name(left),
+            expr_to_guard_name(right)
+        ),
         Expr::BinOp { left, .. } => expr_to_guard_name(left),
         Expr::Number(n) => format!("{n}"),
         Expr::Bool(b) => format!("{b}"),
+        Expr::Ternary { cond, .. } => expr_to_guard_name(cond),
+        Expr::BitSelect { base, .. } => expr_to_guard_name(base),
+        Expr::BitSlice { base, .. } => expr_to_guard_name(base),
+        Expr::Concat(_) => "concat".to_string(),
     }
 }
 
