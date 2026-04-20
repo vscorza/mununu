@@ -25,8 +25,9 @@ pub struct RegisterInfo {
     pub domain: FieldDomain,
     pub kind: SignalKind,
     /// Concrete value → variant name mapping (from `enum {IDLE=0, START=3, OTHER}`).
-    /// Used to translate between numeric values and enum variants during evaluation.
     pub value_map: Vec<(String, i64)>,
+    /// Whether this signal is combinational (value computed from `assign` each cycle).
+    pub combinational: bool,
 }
 
 /// Build a Kripke structure from the module's registers and logic.
@@ -243,7 +244,13 @@ pub fn build_kripke_with_config(
             eval_comb_assigns(&comb_assigns, &mut full_val);
 
             // Compute next register state
-            let next_state = compute_next_state(&seq_assigns, reg_state, &full_val, &registers);
+            let next_state = compute_next_state(
+                &seq_assigns,
+                &comb_assigns,
+                reg_state,
+                &full_val,
+                &registers,
+            );
 
             // Find or create the target state name
             if let Some(tgt_name) = state_names.get(&next_state) {
@@ -274,9 +281,14 @@ pub fn build_kripke_with_config(
         .filter_map(|s| {
             let name = &state_names[s];
             if reachable.contains(name) {
+                let valuations: BTreeMap<String, String> = s
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.display_short()))
+                    .collect();
                 Some(StateSpec {
                     name: name.clone(),
                     is_initial: *name == initial_name,
+                    valuations: Some(valuations),
                 })
             } else {
                 None
@@ -385,6 +397,7 @@ fn build_registers_from_config(
                     SignalKind::Internal
                 },
                 value_map: sig_config.value_map.clone(),
+                combinational: sig_config.combinational,
             });
         } else {
             // Signal not in config — default to Ignored
@@ -400,6 +413,7 @@ fn build_registers_from_config(
                 },
                 kind: SignalKind::Internal,
                 value_map: vec![],
+                combinational: false,
             });
         }
     }
@@ -523,6 +537,7 @@ fn extract_registers(module: &Module, warnings: &mut Vec<AdapterWarning>) -> Vec
                     },
                     kind,
                     value_map: vec![],
+                    combinational: false,
                 });
             }
             Declaration::Logic { name, width } => {
@@ -597,6 +612,7 @@ fn extract_registers(module: &Module, warnings: &mut Vec<AdapterWarning>) -> Vec
                     domain,
                     kind,
                     value_map,
+                    combinational: false,
                 });
             }
             _ => {}
@@ -718,7 +734,7 @@ pub fn build_dependency_graph(module: &Module) -> HashMap<String, HashSet<String
     for assign in &module.assigns {
         let mut expr_deps = HashSet::new();
         collect_expr_idents(&assign.value, &mut expr_deps);
-        deps.entry(assign.target.clone())
+        deps.entry(assign.target.name().to_string())
             .or_default()
             .extend(expr_deps);
     }
@@ -732,7 +748,9 @@ fn collect_statement_deps(stmt: &Statement, deps: &mut HashMap<String, HashSet<S
         | Statement::BlockingAssign { target, value } => {
             let mut expr_deps = HashSet::new();
             collect_expr_idents(value, &mut expr_deps);
-            deps.entry(target.clone()).or_default().extend(expr_deps);
+            deps.entry(target.name().to_string())
+                .or_default()
+                .extend(expr_deps);
         }
         Statement::If {
             cond,
@@ -784,7 +802,7 @@ fn collect_assignment_targets(stmt: &Statement) -> Vec<String> {
     let mut targets = Vec::new();
     match stmt {
         Statement::NonblockingAssign { target, .. } | Statement::BlockingAssign { target, .. } => {
-            targets.push(target.clone());
+            targets.push(target.name().to_string());
         }
         Statement::If {
             then_branch,
@@ -887,7 +905,7 @@ fn compute_cone_of_influence(
 /// A combinational assignment: target = expr.
 #[derive(Debug, Clone)]
 struct CombAssign {
-    target: String,
+    target: AssignTarget,
     value: Expr,
 }
 
@@ -932,12 +950,50 @@ fn collect_comb_from_statement(stmt: &Statement, assigns: &mut Vec<CombAssign>) 
 
 /// Evaluate combinational assignments, updating the valuation map.
 fn eval_comb_assigns(assigns: &[CombAssign], values: &mut BTreeMap<String, AbstractValue>) {
-    // Simple single-pass evaluation (assumes no dependency cycles)
+    // Simple single-pass evaluation (assumes no dependency cycles).
+    // If evaluation returns None (e.g., comparison involving an unresolved
+    // value like a catch-all enum variant), default to Bool(false).
+    // This is conservative: unknown comparisons produce "not asserted".
     for assign in assigns {
-        if let Some(result) = eval_expr(&assign.value, values) {
-            values.insert(assign.target.clone(), result);
+        let result = eval_expr(&assign.value, values).unwrap_or(AbstractValue::Bool(false));
+        apply_assign_target(&assign.target, result, values);
+    }
+}
+
+/// Apply a value to an assign target (simple name or bit-slice of a register).
+fn apply_assign_target(
+    target: &AssignTarget,
+    value: AbstractValue,
+    values: &mut BTreeMap<String, AbstractValue>,
+) {
+    match target {
+        AssignTarget::Simple(name) => {
+            values.insert(name.clone(), value);
+        }
+        AssignTarget::BitSlice { base, msb, lsb } => {
+            let old_val = values
+                .get(base)
+                .and_then(|v| match v {
+                    AbstractValue::Counter(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let new_bits = match &value {
+                AbstractValue::Counter(n) => *n,
+                AbstractValue::Bool(b) => *b as i64,
+                _ => 0,
+            };
+            let result = write_bit_slice(old_val, new_bits, *msb, *lsb);
+            values.insert(base.clone(), AbstractValue::Counter(result));
         }
     }
+}
+
+/// Write `new_val` into bits [msb:lsb] of `old_val`, preserving other bits.
+fn write_bit_slice(old_val: i64, new_val: i64, msb: usize, lsb: usize) -> i64 {
+    let width = msb - lsb + 1;
+    let mask = ((1i64 << width) - 1) << lsb;
+    (old_val & !mask) | ((new_val << lsb) & mask)
 }
 
 /// Evaluate an expression against the current valuation.
@@ -1129,7 +1185,7 @@ fn to_i64_pair(lv: &AbstractValue, rv: &AbstractValue) -> Option<(i64, i64)> {
 /// A sequential assignment from always_ff: target <= expr (nonblocking).
 #[derive(Debug, Clone)]
 struct SeqAssign {
-    target: String,
+    target: AssignTarget,
     value: Expr,
     /// Guard conditions (from enclosing if/case)
     guards: Vec<SeqGuard>,
@@ -1240,6 +1296,7 @@ fn collect_seq_from_statement(stmt: &Statement, guards: &[SeqGuard], assigns: &m
 /// evaluation (Variants replaced by Counters via value_map).
 fn compute_next_state(
     seq_assigns: &[SeqAssign],
+    comb_assigns: &[CombAssign],
     reg_state: &AbstractState,
     full_val: &BTreeMap<String, AbstractValue>,
     registers: &[RegisterInfo],
@@ -1248,25 +1305,60 @@ fn compute_next_state(
     let mut next: AbstractState = reg_state.clone();
 
     // Apply sequential assignments whose guards are satisfied.
-    // Skip assignments to Ignored registers — they are not part of the
-    // state space and inserting them would pollute the next-state map,
-    // causing lookups against state_names to fail silently.
+    // Skip assignments to Ignored registers and combinational signals
+    // (combinational values are computed below from comb assigns).
     let ignored: HashSet<&str> = registers
         .iter()
         .filter(|r| r.domain.abstraction == AbstractionType::Ignored)
         .map(|r| r.name.as_str())
         .collect();
+    let comb_signals: HashSet<&str> = registers
+        .iter()
+        .filter(|r| r.combinational)
+        .map(|r| r.name.as_str())
+        .collect();
 
     for assign in seq_assigns {
-        if ignored.contains(assign.target.as_str()) {
+        let target_name = assign.target.name();
+        if ignored.contains(target_name) || comb_signals.contains(target_name) {
             continue;
         }
         if guards_satisfied(&assign.guards, full_val, registers)
             && let Some(result) = eval_expr(&assign.value, full_val)
         {
-            // Clamp to domain bounds
-            let clamped = clamp_to_domain(&assign.target, &result, registers);
-            next.insert(assign.target.clone(), clamped);
+            match &assign.target {
+                AssignTarget::Simple(name) => {
+                    let clamped = clamp_to_domain(name, &result, registers);
+                    next.insert(name.clone(), clamped);
+                }
+                AssignTarget::BitSlice { .. } => {
+                    apply_assign_target(&assign.target, result, &mut next);
+                }
+            }
+        }
+    }
+
+    // Compute combinational outputs from the NEXT register state + inputs.
+    // Build a valuation from the new register state for comb evaluation.
+    if !comb_signals.is_empty() {
+        let mut next_val = full_val.clone();
+        // Override with next register values
+        for (k, v) in &next {
+            next_val.insert(k.clone(), v.clone());
+        }
+        eval_comb_assigns(comb_assigns, &mut next_val);
+
+        for reg in registers {
+            if reg.combinational && reg.domain.abstraction != AbstractionType::Ignored {
+                if let Some(val) = next_val.get(&reg.name) {
+                    let clamped = clamp_to_domain(&reg.name, val, registers);
+                    next.insert(reg.name.clone(), clamped);
+                } else {
+                    // Comb evaluation returned None (e.g., comparison with unknown addr).
+                    // Default to initial value (false for booleans).
+                    next.insert(reg.name.clone(), reg.domain.initial.clone());
+                }
+            }
         }
     }
 

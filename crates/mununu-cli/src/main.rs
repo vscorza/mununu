@@ -485,6 +485,7 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
                     bound: None,
                     variants: Some(variants.clone()),
                     value_map: None,
+                    combinational: false,
                     note: Some("auto-detected typedef enum".to_string()),
                 });
             }
@@ -511,6 +512,7 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
                     bound,
                     variants: None,
                     value_map: None,
+                    combinational: false,
                     note: Some(note.to_string()),
                 });
             }

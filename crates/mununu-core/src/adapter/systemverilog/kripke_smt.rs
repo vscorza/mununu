@@ -42,9 +42,22 @@ pub mod engine {
             return results;
         }
 
-        let comb_defs = collect_comb_definitions(module);
+        let mut comb_defs = collect_comb_definitions(module);
         let guards = collect_guard_exprs(module);
         let widths = collect_signal_widths(module);
+
+        // Inject localparam/parameter values as combinational definitions.
+        // Without this, the SMT engine treats parameter names as free variables,
+        // producing spurious solutions for arbitrary parameter values.
+        for param in &module.parameters {
+            comb_defs
+                .entry(param.name.clone())
+                .or_insert(Expr::Number(param.default_value));
+        }
+        // Sidecar parameter overrides take precedence
+        for (name, value) in &annotation.parameters {
+            comb_defs.insert(name.clone(), Expr::Number(*value));
+        }
 
         for signal_name in &discover_signals {
             let width = widths.get(*signal_name).copied().unwrap_or(32);

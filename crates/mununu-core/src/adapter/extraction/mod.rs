@@ -78,6 +78,7 @@ impl FormatAdapter for ExtractionAdapter {
                 state_count: result.state_count,
                 property_count,
             },
+            state_valuations: Default::default(),
         })
     }
 }
@@ -194,6 +195,7 @@ fn build_automaton(
             StateSpec {
                 name: s.name().to_string(),
                 is_initial,
+                valuations: None,
             }
         })
         .collect();

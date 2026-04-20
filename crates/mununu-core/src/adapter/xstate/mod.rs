@@ -64,6 +64,7 @@ impl FormatAdapter for XStateAdapter {
                 state_count: result.state_count,
                 property_count,
             },
+            state_valuations: Default::default(),
         })
     }
 }
@@ -163,6 +164,7 @@ fn build_automaton_from_region(
         .map(|s| StateSpec {
             name: s.name.clone(),
             is_initial: s.is_initial,
+            valuations: None,
         })
         .collect();
 
@@ -284,10 +286,12 @@ fn create_bool_variable_automaton(name: &str, initial: bool) -> AutomatonSpec {
             StateSpec {
                 name: true_state.clone(),
                 is_initial: initial,
+                valuations: None,
             },
             StateSpec {
                 name: false_state.clone(),
                 is_initial: !initial,
+                valuations: None,
             },
         ],
         transitions: vec![
@@ -340,6 +344,7 @@ fn create_int_variable_automaton(name: &str, lo: i64, hi: i64, initial: i64) -> 
         states.push(StateSpec {
             name: format!("{name}_{v}"),
             is_initial: v == initial,
+            valuations: None,
         });
     }
 

@@ -12,6 +12,29 @@
 use super::ir::*;
 use super::{AdapterError, AdapterErrorKind};
 use crate::ltl::LtlFormula;
+use std::collections::{BTreeMap, HashMap};
+
+/// Extracts structured state valuations from an [`AdapterIR`].
+///
+/// Returns a map of `automaton_name → state_name → { variable → display_value }`.
+/// Only includes states that have valuations attached (from cross-product enumeration).
+pub fn extract_state_valuations(
+    ir: &AdapterIR,
+) -> HashMap<String, HashMap<String, BTreeMap<String, String>>> {
+    let mut result = HashMap::new();
+    for aut in &ir.automata {
+        let mut aut_vals = HashMap::new();
+        for state in &aut.states {
+            if let Some(ref vals) = state.valuations {
+                aut_vals.insert(state.name.clone(), vals.clone());
+            }
+        }
+        if !aut_vals.is_empty() {
+            result.insert(aut.name.clone(), aut_vals);
+        }
+    }
+    result
+}
 
 /// Result of emitting CTXDSL from an IR.
 pub struct EmitResult {
@@ -1040,10 +1063,12 @@ mod tests {
                     StateSpec {
                         name: "idle".into(),
                         is_initial: true,
+                        valuations: None,
                     },
                     StateSpec {
                         name: "critical".into(),
                         is_initial: false,
+                        valuations: None,
                     },
                 ],
                 transitions: vec![

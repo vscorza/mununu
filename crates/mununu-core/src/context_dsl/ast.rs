@@ -1,5 +1,6 @@
 use crate::context_dsl::token::Span;
 use crate::ltl::LtlFormula;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct ContextDoc {
@@ -13,6 +14,10 @@ pub struct ContextDoc {
     pub controllers: Vec<Controller>,
     pub mu_formulas: Vec<MuFormula>,
     pub span: Span,
+    /// Side-channel structured state valuations from adapter cross-product enumeration.
+    /// Keyed by `automaton_name → state_name → { variable → display_value }`.
+    /// Not encoded in CTXDSL text — injected after parsing by adapter callers.
+    pub state_valuations: HashMap<String, HashMap<String, BTreeMap<String, String>>>,
 }
 
 #[derive(Debug, Clone)]

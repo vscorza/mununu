@@ -89,7 +89,25 @@ Each entry controls how an internal register contributes to the state space:
 | `bound` | int | — | Upper bound for `bounded_counter` |
 | `variants` | string[] | — | Enum variant names for `enum` |
 | `value_map` | object[] | — | Numeric mapping for `enum` (e.g., `[{"name": "IDLE", "value": 0}]`) |
+| `combinational` | bool | `false` | Signal is a combinational wire (`assign`), not a register |
 | `note` | string | — | Human-readable note |
+
+#### Combinational outputs
+
+Signals driven by `assign` statements (not `always_ff`) can be included in the state space with `"combinational": true`. Their value is computed from the combinational logic each cycle, not from sequential assignments. This lets properties reference wire values directly:
+
+```json
+{
+  "name": "overlap",
+  "abstraction": "boolean",
+  "combinational": true,
+  "note": "assign overlap = uart_sel && aes_sel"
+}
+```
+
+State names include the wire value: `overlap_T_state_IDLE`, `overlap_F_state_AES_ACCESS`.
+
+When combinational evaluation cannot determine a wire's value (e.g., comparison involving a catch-all enum variant), the wire defaults to `false` (conservative).
 
 ### `inputs` — Input Ports
 

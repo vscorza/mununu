@@ -101,6 +101,7 @@ impl<'a> Parser<'a> {
             controllers,
             mu_formulas,
             span,
+            state_valuations: Default::default(),
         })
     }
 

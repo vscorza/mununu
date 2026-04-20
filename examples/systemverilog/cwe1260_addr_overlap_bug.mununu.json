@@ -1,0 +1,176 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "cwe1260_addr_overlap_bug",
+  "source": "cwe1260_addr_overlap_bug.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": [
+        "IDLE",
+        "UART_ACCESS",
+        "AES_ACCESS"
+      ]
+    },
+    {
+      "name": "overlap",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "computed from assign overlap = uart_sel && aes_sel"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "addr",
+      "abstraction": "discover"
+    },
+    {
+      "name": "req",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "no_overlap",
+      "formula": "nu X. (!overlap_T_state_IDLE && !overlap_T_state_UART_ACCESS && !overlap_T_state_AES_ACCESS && [] X)",
+      "description": "overlap wire is never true — no address matches both regions simultaneously"
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)"
+    }
+  ],
+  "discovered_values": {
+    "addr": {
+      "values": [
+        {
+          "value": 16,
+          "name": "VAL_16",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 17,
+          "name": "VAL_17",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 18,
+          "name": "VAL_18",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 19,
+          "name": "VAL_19",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 20,
+          "name": "VAL_20",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 21,
+          "name": "VAL_21",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 22,
+          "name": "VAL_22",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 23,
+          "name": "VAL_23",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 24,
+          "name": "VAL_24",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 25,
+          "name": "VAL_25",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 26,
+          "name": "VAL_26",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 27,
+          "name": "VAL_27",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 28,
+          "name": "VAL_28",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 29,
+          "name": "VAL_29",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 30,
+          "name": "VAL_30",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 31,
+          "name": "VAL_31",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 32,
+          "name": "VAL_32",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 33,
+          "name": "VAL_33",
+          "from": "SMT: guard (req && uart_sel) at line 0"
+        },
+        {
+          "value": 34,
+          "name": "VAL_34",
+          "from": "SMT: guard (req && aes_sel) at line 0"
+        },
+        {
+          "value": 35,
+          "name": "VAL_35",
+          "from": "SMT: guard (req && aes_sel) at line 0"
+        },
+        {
+          "value": 36,
+          "name": "VAL_36",
+          "from": "SMT: guard (req && aes_sel) at line 0"
+        },
+        {
+          "value": 37,
+          "name": "VAL_37",
+          "from": "SMT: guard (req && aes_sel) at line 0"
+        },
+        {
+          "value": 38,
+          "name": "VAL_38",
+          "from": "SMT: guard (req && aes_sel) at line 0"
+        },
+        {
+          "value": 39,
+          "name": "VAL_39",
+          "from": "SMT: guard (req && aes_sel) at line 0"
+        }
+      ],
+      "catch_all": "OTHER"
+    }
+  },
+  "parameters": {
+    "AES_BASE": 32,
+    "UART_BASE": 16,
+    "AES_LEN": 8,
+    "UART_LEN": 18
+  }
+}

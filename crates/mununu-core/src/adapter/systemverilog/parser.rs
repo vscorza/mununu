@@ -5,10 +5,59 @@
 
 use super::ast::*;
 use crate::adapter::{AdapterError, AdapterErrorKind, SourceLocation};
+use std::collections::HashMap;
+
+/// Type information resolved from packages and typedefs.
+#[derive(Debug, Clone)]
+enum TypeInfo {
+    /// An enum type with its variants and bit-width.
+    Enum {
+        variants: Vec<String>,
+        #[expect(dead_code)]
+        width: usize,
+    },
+    /// A packed struct type with computed field bit-ranges.
+    Struct(StructLayout),
+}
+
+/// Layout of a packed struct — maps field names to bit ranges within the register.
+#[derive(Debug, Clone)]
+struct StructLayout {
+    /// Fields with their bit ranges: (name, msb, lsb).
+    /// Ordered MSB-first (first declared field occupies highest bits).
+    fields: Vec<(String, usize, usize)>,
+    /// Total width in bits.
+    total_width: usize,
+}
 
 /// Parse a SystemVerilog source string into a Module AST.
+///
+/// Handles `package ... endpackage` blocks before the module and resolves
+/// `import pkg::*;` / `import pkg::name;` statements.
 pub fn parse(input: &str) -> Result<Module, AdapterError> {
     let mut parser = Parser::new(input);
+
+    // Parse any packages that appear before the module.
+    // We must not consume @mununu annotations — they belong to the module.
+    // Only skip plain whitespace and check for `package` keyword directly.
+    loop {
+        parser.skip_plain_whitespace();
+        if parser.at_end() {
+            break;
+        }
+        let rem = parser.remaining();
+        let is_package = rem.starts_with("package")
+            && rem
+                .as_bytes()
+                .get(7)
+                .is_none_or(|&c| !c.is_ascii_alphanumeric() && c != b'_');
+        if is_package {
+            parser.parse_package()?;
+        } else {
+            break;
+        }
+    }
+
     parser.parse_module()
 }
 
@@ -17,6 +66,23 @@ struct Parser<'a> {
     pos: usize,
     line: usize,
     col: usize,
+    /// Package definitions parsed before the module.
+    packages: HashMap<String, PackageDecl>,
+    /// Type scope: type names available in the current module (from imports and local typedefs).
+    type_scope: HashMap<String, TypeInfo>,
+    /// Variables that have a struct type — used for resolving `var.field` to bit-slices.
+    var_struct_types: HashMap<String, StructLayout>,
+}
+
+/// Contents of a parsed package.
+#[derive(Debug, Clone, Default)]
+struct PackageDecl {
+    /// Enum types: name → (variants, width)
+    enums: HashMap<String, (Vec<String>, usize)>,
+    /// Packed struct types: name → layout
+    structs: HashMap<String, StructLayout>,
+    /// Parameters: name → value
+    params: HashMap<String, i64>,
 }
 
 impl<'a> Parser<'a> {
@@ -26,6 +92,9 @@ impl<'a> Parser<'a> {
             pos: 0,
             line: 1,
             col: 1,
+            packages: HashMap::new(),
+            type_scope: HashMap::new(),
+            var_struct_types: HashMap::new(),
         }
     }
 
@@ -94,6 +163,24 @@ impl<'a> Parser<'a> {
             break;
         }
         annotations
+    }
+
+    /// Skip whitespace only (no comments). Used when we need to peek ahead
+    /// without consuming `@mununu` annotations that belong to the module.
+    fn skip_plain_whitespace(&mut self) {
+        while self.pos < self.input.len() {
+            let ch = self.input.as_bytes()[self.pos];
+            if ch == b' ' || ch == b'\t' || ch == b'\r' {
+                self.pos += 1;
+                self.col += 1;
+            } else if ch == b'\n' {
+                self.pos += 1;
+                self.line += 1;
+                self.col = 1;
+            } else {
+                break;
+            }
+        }
     }
 
     fn expect_keyword(&mut self, kw: &str) -> Result<(), AdapterError> {
@@ -227,6 +314,233 @@ impl<'a> Parser<'a> {
     // Module parsing
     // -------------------------------------------------------------------
 
+    /// Parse an `import pkg::*;` or `import pkg::name;` statement.
+    ///
+    /// Resolves imported items from the package registry into the module's type scope
+    /// and optionally emits declarations and parameters.
+    fn parse_import(
+        &mut self,
+        declarations: &mut Vec<Declaration>,
+        parameters: &mut Vec<Parameter>,
+    ) -> Result<(), AdapterError> {
+        self.expect_keyword("import")?;
+
+        // Parse package name
+        let pkg_name = self.parse_ident()?;
+        self.expect_str("::")?;
+
+        self.skip_whitespace_and_comments();
+        let is_wildcard = self.remaining().starts_with('*');
+        if is_wildcard {
+            self.pos += 1;
+            self.col += 1;
+        }
+        let item_name = if !is_wildcard {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        self.expect_char(';')?;
+
+        // Resolve from package registry
+        if let Some(pkg) = self.packages.get(&pkg_name).cloned() {
+            if is_wildcard {
+                // Import all items
+                for (type_name, (variants, width)) in &pkg.enums {
+                    self.type_scope.insert(
+                        type_name.clone(),
+                        TypeInfo::Enum {
+                            variants: variants.clone(),
+                            width: *width,
+                        },
+                    );
+                }
+                for (type_name, layout) in &pkg.structs {
+                    self.type_scope
+                        .insert(type_name.clone(), TypeInfo::Struct(layout.clone()));
+                }
+                for (param_name, value) in &pkg.params {
+                    parameters.push(Parameter {
+                        name: param_name.clone(),
+                        default_value: *value,
+                    });
+                }
+            } else if let Some(ref name) = item_name {
+                // Import specific item
+                if let Some((variants, width)) = pkg.enums.get(name) {
+                    self.type_scope.insert(
+                        name.clone(),
+                        TypeInfo::Enum {
+                            variants: variants.clone(),
+                            width: *width,
+                        },
+                    );
+                } else if let Some(layout) = pkg.structs.get(name) {
+                    self.type_scope
+                        .insert(name.clone(), TypeInfo::Struct(layout.clone()));
+                } else if let Some(value) = pkg.params.get(name) {
+                    parameters.push(Parameter {
+                        name: name.clone(),
+                        default_value: *value,
+                    });
+                }
+                // Unknown items are silently ignored (may be unsupported constructs)
+            }
+        }
+        // Unknown packages are silently ignored (may come from external files)
+
+        let _ = declarations; // will be used for struct imports in Phase C
+        Ok(())
+    }
+
+    /// Try to parse a variable declaration using a type from the type scope.
+    ///
+    /// Handles patterns like `priv_lvl_t state;` where `priv_lvl_t` is an imported enum type.
+    /// Returns `None` if the current token is not a known type name.
+    ///
+    /// NOTE: This must not consume whitespace/comments before peeking — the caller
+    /// loop has already consumed them (including `@mununu` annotations).
+    fn try_parse_typed_var_from_scope(&mut self) -> Result<Option<Declaration>, AdapterError> {
+        if self.type_scope.is_empty() {
+            return Ok(None);
+        }
+
+        // Peek at the next identifier without consuming it
+        let saved_pos = self.pos;
+        let _saved_line = self.line;
+        let saved_col = self.col;
+
+        let ident = match self.peek_ident() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Check if this identifier is a known type
+        if let Some(type_info) = self.type_scope.get(&ident).cloned() {
+            // Consume the type name
+            self.pos = saved_pos + ident.len();
+            self.col = saved_col + ident.len();
+
+            // Parse the variable name that follows
+            self.skip_whitespace_and_comments();
+            let var_name = self.parse_ident()?;
+            self.expect_char(';')?;
+
+            match type_info {
+                TypeInfo::Enum { variants, .. } => Ok(Some(Declaration::Enum {
+                    name: ident,
+                    variants,
+                    var_name: Some(var_name),
+                })),
+                TypeInfo::Struct(layout) => {
+                    self.var_struct_types
+                        .insert(var_name.clone(), layout.clone());
+                    Ok(Some(Declaration::Logic {
+                        name: var_name,
+                        width: layout.total_width,
+                    }))
+                }
+            }
+        } else {
+            // Not a type name — position unchanged
+            Ok(None)
+        }
+    }
+
+    /// Peek at the next identifier without advancing the parser position.
+    fn peek_ident(&self) -> Option<String> {
+        let remaining = self.remaining();
+        let start = 0;
+        let mut end = start;
+        while end < remaining.len() {
+            let ch = remaining.as_bytes()[end] as char;
+            if ch.is_alphanumeric() || ch == '_' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if end > start {
+            Some(remaining[start..end].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Expect a specific string literal (e.g., "::").
+    fn expect_str(&mut self, expected: &str) -> Result<(), AdapterError> {
+        self.skip_whitespace_and_comments();
+        if self.remaining().starts_with(expected) {
+            self.pos += expected.len();
+            self.col += expected.len();
+            Ok(())
+        } else {
+            Err(self.error(format!("expected '{expected}'")))
+        }
+    }
+
+    /// Parse a `package <name>; ... endpackage` block and store it in the registry.
+    fn parse_package(&mut self) -> Result<(), AdapterError> {
+        self.skip_whitespace_and_comments();
+        self.expect_keyword("package")?;
+        let name = self.parse_ident()?;
+        self.expect_char(';')?;
+
+        let mut pkg = PackageDecl::default();
+
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.at_end() || self.peek_keyword("endpackage") {
+                break;
+            }
+
+            if self.peek_keyword("typedef") {
+                // Parse typedef (enum or struct) inside package
+                let decl = self.parse_typedef()?;
+                match decl {
+                    Declaration::Enum {
+                        name: type_name,
+                        variants,
+                        ..
+                    } => {
+                        let width = if variants.len() <= 2 {
+                            1
+                        } else {
+                            (variants.len() as f64).log2().ceil() as usize
+                        };
+                        pkg.enums.insert(type_name.clone(), (variants, width));
+                    }
+                    Declaration::Logic {
+                        name: type_name, ..
+                    } => {
+                        // Struct typedef — layout was registered in type_scope during parsing
+                        if let Some(TypeInfo::Struct(layout)) = self.type_scope.get(&type_name) {
+                            pkg.structs.insert(type_name, layout.clone());
+                        }
+                    }
+                }
+            } else if self.peek_keyword("localparam") || self.peek_keyword("parameter") {
+                if let Some(p) = self.parse_localparam()? {
+                    pkg.params.insert(p.name, p.default_value);
+                }
+            } else {
+                // Skip unknown constructs inside package
+                self.skip_to_semicolon_or_end()?;
+            }
+        }
+
+        self.expect_keyword("endpackage")?;
+        // Consume optional semicolon after endpackage (skip whitespace only, not comments)
+        self.skip_plain_whitespace();
+        if self.remaining().starts_with(';') {
+            self.pos += 1;
+            self.col += 1;
+        }
+
+        self.packages.insert(name, pkg);
+        Ok(())
+    }
+
     fn parse_module(&mut self) -> Result<Module, AdapterError> {
         let mut all_annotations = Vec::new();
 
@@ -257,7 +571,9 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            if self.peek_keyword("typedef") {
+            if self.peek_keyword("import") {
+                self.parse_import(&mut declarations, &mut parameters)?;
+            } else if self.peek_keyword("typedef") {
                 declarations.push(self.parse_typedef()?);
             } else if self.peek_keyword("logic") || self.peek_keyword("reg") {
                 declarations.push(self.parse_logic_decl()?);
@@ -271,6 +587,9 @@ impl<'a> Parser<'a> {
                 always_blocks.push(self.parse_always_comb()?);
             } else if self.peek_keyword("assign") {
                 assigns.push(self.parse_assign()?);
+            } else if let Some(decl) = self.try_parse_typed_var_from_scope()? {
+                // Handle variable declarations using imported/typedef'd types
+                declarations.push(decl);
             } else {
                 // Skip unknown constructs until semicolon or block end
                 self.skip_to_semicolon_or_end()?;
@@ -444,6 +763,12 @@ impl<'a> Parser<'a> {
 
     fn parse_typedef(&mut self) -> Result<Declaration, AdapterError> {
         self.expect_keyword("typedef")?;
+
+        // Dispatch: typedef enum ... or typedef struct packed ...
+        if self.peek_keyword("struct") {
+            return self.parse_typedef_struct();
+        }
+
         self.expect_keyword("enum")?;
 
         // Optional: logic [N:0]
@@ -491,6 +816,20 @@ impl<'a> Parser<'a> {
         let type_name = self.parse_ident()?;
         self.expect_char(';')?;
 
+        // Register in type scope for later variable declarations
+        let width = if variants.len() <= 2 {
+            1
+        } else {
+            (variants.len() as f64).log2().ceil() as usize
+        };
+        self.type_scope.insert(
+            type_name.clone(),
+            TypeInfo::Enum {
+                variants: variants.clone(),
+                width,
+            },
+        );
+
         // Look for variable declaration using this type
         let var_name = self.try_parse_typed_var(&type_name)?;
 
@@ -499,6 +838,85 @@ impl<'a> Parser<'a> {
             variants,
             var_name,
         })
+    }
+
+    /// Parse `typedef struct packed { logic [N:0] field; ... } type_name;`
+    ///
+    /// Computes the packed bit layout (fields laid out MSB-first) and registers
+    /// the struct in the type scope. Returns a `Declaration::Logic` with the
+    /// total packed width if a variable is declared.
+    fn parse_typedef_struct(&mut self) -> Result<Declaration, AdapterError> {
+        self.expect_keyword("struct")?;
+        // `packed` is optional but expected for synthesizable code
+        if self.peek_keyword("packed") {
+            self.expect_keyword("packed")?;
+        }
+
+        self.expect_char('{')?;
+
+        // Parse fields: `logic [N:0] field_name;`
+        let mut fields_raw: Vec<(String, usize)> = Vec::new();
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with('}') {
+                self.pos += 1;
+                self.col += 1;
+                break;
+            }
+            // Expect `logic` keyword
+            if self.peek_keyword("logic") {
+                self.expect_keyword("logic")?;
+            }
+            let width = self.parse_optional_width()?;
+            let field_name = self.parse_ident()?;
+            self.expect_char(';')?;
+            fields_raw.push((field_name, width));
+        }
+
+        let type_name = self.parse_ident()?;
+        self.expect_char(';')?;
+
+        // Compute packed layout: fields are MSB-first
+        // First field occupies the highest bits
+        let total_width: usize = fields_raw.iter().map(|(_, w)| w).sum();
+        let mut offset = total_width;
+        let mut fields = Vec::with_capacity(fields_raw.len());
+        for (name, width) in &fields_raw {
+            let msb = offset - 1;
+            let lsb = offset - width;
+            fields.push((name.clone(), msb, lsb));
+            offset -= width;
+        }
+
+        let layout = StructLayout {
+            fields,
+            total_width,
+        };
+
+        // Register in type scope
+        self.type_scope
+            .insert(type_name.clone(), TypeInfo::Struct(layout));
+
+        // Look for variable declaration using this type
+        let var_name = self.try_parse_typed_var(&type_name)?;
+
+        if let Some(ref var) = var_name {
+            // Register this variable as having struct type for field resolution
+            if let Some(TypeInfo::Struct(layout)) = self.type_scope.get(&type_name) {
+                self.var_struct_types.insert(var.clone(), layout.clone());
+            }
+            Ok(Declaration::Logic {
+                name: var.clone(),
+                width: total_width,
+            })
+        } else {
+            // Typedef only, no variable — emit a zero-width Logic placeholder
+            // (the type is in scope for later variable declarations)
+            Ok(Declaration::Logic {
+                name: type_name,
+                width: total_width,
+            })
+        }
     }
 
     fn try_parse_typed_var(&mut self, type_name: &str) -> Result<Option<String>, AdapterError> {
@@ -546,7 +964,31 @@ impl<'a> Parser<'a> {
 
     fn parse_assign(&mut self) -> Result<ContinuousAssign, AdapterError> {
         self.expect_keyword("assign")?;
-        let target = self.parse_ident()?;
+        let base_name = self.parse_ident()?;
+        let target = if self.remaining().starts_with('.') {
+            self.pos += 1;
+            self.col += 1;
+            let field_name = self.parse_ident()?;
+            if let Some(layout) = self.var_struct_types.get(&base_name) {
+                if let Some((_, msb, lsb)) = layout.fields.iter().find(|(n, _, _)| n == &field_name)
+                {
+                    AssignTarget::BitSlice {
+                        base: base_name,
+                        msb: *msb,
+                        lsb: *lsb,
+                    }
+                } else {
+                    return Err(self.error(format!(
+                        "unknown field '{}' on struct variable '{}'",
+                        field_name, base_name
+                    )));
+                }
+            } else {
+                return Err(self.error(format!("'{}' is not a struct variable", base_name)));
+            }
+        } else {
+            AssignTarget::Simple(base_name)
+        };
         self.expect_char('=')?;
         let value = self.parse_expr()?;
         self.expect_char(';')?;
@@ -581,7 +1023,34 @@ impl<'a> Parser<'a> {
             self.parse_case_statement()
         } else {
             // Assignment: target <= expr; or target = expr;
-            let target = self.parse_ident()?;
+            // Handles struct field writes: var.field <= expr;
+            let base_name = self.parse_ident()?;
+            let target = if self.remaining().starts_with('.') {
+                // Struct field write
+                self.pos += 1;
+                self.col += 1;
+                let field_name = self.parse_ident()?;
+                if let Some(layout) = self.var_struct_types.get(&base_name) {
+                    if let Some((_, msb, lsb)) =
+                        layout.fields.iter().find(|(n, _, _)| n == &field_name)
+                    {
+                        AssignTarget::BitSlice {
+                            base: base_name,
+                            msb: *msb,
+                            lsb: *lsb,
+                        }
+                    } else {
+                        return Err(self.error(format!(
+                            "unknown field '{}' on struct variable '{}'",
+                            field_name, base_name
+                        )));
+                    }
+                } else {
+                    return Err(self.error(format!("'{}' is not a struct variable", base_name)));
+                }
+            } else {
+                AssignTarget::Simple(base_name)
+            };
             self.skip_whitespace_and_comments();
             if self.remaining().starts_with("<=") {
                 self.pos += 2;
@@ -998,6 +1467,30 @@ impl<'a> Parser<'a> {
                         index: Box::new(index),
                     };
                 }
+            } else if self.remaining().starts_with('.') {
+                // Struct field access: var.field → BitSlice
+                if let Expr::Ident(ref base_name) = expr
+                    && let Some(layout) = self.var_struct_types.get(base_name).cloned()
+                {
+                    self.pos += 1;
+                    self.col += 1;
+                    let field_name = self.parse_ident()?;
+                    if let Some((_, msb, lsb)) =
+                        layout.fields.iter().find(|(n, _, _)| n == &field_name)
+                    {
+                        expr = Expr::BitSlice {
+                            base: Box::new(expr),
+                            msb: Box::new(Expr::Number(*msb as i64)),
+                            lsb: Box::new(Expr::Number(*lsb as i64)),
+                        };
+                        continue;
+                    }
+                    return Err(self.error(format!(
+                        "unknown field '{}' on struct variable '{}'",
+                        field_name, base_name
+                    )));
+                }
+                break;
             } else {
                 break;
             }
@@ -1129,11 +1622,9 @@ fn extract_reset(stmt: &Statement) -> Option<ResetInfo> {
 fn extract_assignments(stmt: &Statement) -> Vec<(String, String)> {
     let mut result = Vec::new();
     match stmt {
-        Statement::NonblockingAssign { target, value } => {
-            result.push((target.clone(), expr_to_string(value)));
-        }
-        Statement::BlockingAssign { target, value } => {
-            result.push((target.clone(), expr_to_string(value)));
+        Statement::NonblockingAssign { target, value }
+        | Statement::BlockingAssign { target, value } => {
+            result.push((target.name().to_string(), expr_to_string(value)));
         }
         Statement::Block(stmts) => {
             for s in stmts {
@@ -1489,5 +1980,219 @@ mod tests {
         assert_eq!(module.parameters[0].default_value, 2);
         assert_eq!(module.always_blocks.len(), 1);
         assert_eq!(module.mununu_properties.len(), 1);
+    }
+
+    #[test]
+    fn parse_package_and_wildcard_import() {
+        let module = parse(
+            r#"
+            package riscv;
+                typedef enum logic [1:0] {USER, SUPERVISOR, MACHINE} priv_lvl_t;
+                localparam int XLEN = 32;
+            endpackage
+
+            module csr(input logic clk, input logic rst);
+                import riscv::*;
+                priv_lvl_t priv_lvl;
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) priv_lvl <= USER;
+                    else priv_lvl <= MACHINE;
+                end
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(module.name, "csr");
+        // import riscv::* should bring in XLEN as a parameter
+        assert!(
+            module
+                .parameters
+                .iter()
+                .any(|p| p.name == "XLEN" && p.default_value == 32),
+            "XLEN parameter should be imported"
+        );
+        // priv_lvl_t should be resolved to a Declaration::Enum via type scope
+        let has_enum = module.declarations.iter().any(|d| {
+            matches!(
+                d,
+                Declaration::Enum { name, variants, var_name: Some(v) }
+                    if name == "priv_lvl_t" && variants.len() == 3 && v == "priv_lvl"
+            )
+        });
+        assert!(
+            has_enum,
+            "priv_lvl_t priv_lvl should be parsed as enum declaration"
+        );
+    }
+
+    #[test]
+    fn parse_package_and_named_import() {
+        let module = parse(
+            r#"
+            package bus_pkg;
+                typedef enum logic {IDLE, BUSY} bus_state_t;
+            endpackage
+
+            module ctrl(input logic clk, input logic rst);
+                import bus_pkg::bus_state_t;
+                bus_state_t state;
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) state <= IDLE;
+                end
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        let has_enum = module.declarations.iter().any(|d| {
+            matches!(
+                d,
+                Declaration::Enum { var_name: Some(v), .. } if v == "state"
+            )
+        });
+        assert!(
+            has_enum,
+            "bus_state_t state should be parsed as enum declaration"
+        );
+    }
+
+    #[test]
+    fn parse_package_annotations_preserved() {
+        // @mununu annotations before module are preserved even with packages
+        let module = parse(
+            r#"
+            package pkg;
+                localparam int N = 4;
+            endpackage
+
+            // @mununu ltl safety: nu X. ([] X)
+            module test(input logic clk, input logic rst);
+                import pkg::*;
+                logic flag;
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) flag <= 0;
+                    else flag <= 1;
+                end
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(module.mununu_properties.len(), 1);
+        assert_eq!(module.mununu_properties[0].name, "safety");
+        assert!(
+            module.parameters.iter().any(|p| p.name == "N"),
+            "N should be imported from package"
+        );
+    }
+
+    #[test]
+    fn parse_typedef_struct_packed() {
+        let module = parse(
+            r#"
+            // @mununu ltl safety: nu X. ([] X)
+            // @mununu mode kripke
+            module axi(input logic clk, input logic rst);
+                typedef struct packed {
+                    logic [11:0] addr;
+                    logic [2:0]  size;
+                    logic        valid;
+                } axi_aw_t;
+                axi_aw_t aw;
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) aw <= 0;
+                    else aw.valid <= 1;
+                end
+                assign addr_ok = (aw.addr < 12'd100);
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        // Struct variable should appear as a 16-bit Logic declaration
+        let aw_decl = module
+            .declarations
+            .iter()
+            .find(|d| matches!(d, Declaration::Logic { name, .. } if name == "aw"));
+        assert!(aw_decl.is_some(), "aw should be a Logic declaration");
+        if let Some(Declaration::Logic { width, .. }) = aw_decl {
+            assert_eq!(*width, 16, "packed struct total width: 12 + 3 + 1 = 16");
+        }
+
+        // The always_ff should have `aw.valid <= 1` resolved to BitSlice target
+        assert_eq!(module.always_blocks.len(), 1);
+
+        // The assign should contain a BitSlice expression for `aw.addr`
+        assert_eq!(module.assigns.len(), 1);
+    }
+
+    #[test]
+    fn parse_struct_field_layout() {
+        // Verify exact bit layout: MSB-first packing
+        let module = parse(
+            r#"
+            // @mununu ltl safety: nu X. ([] X)
+            // @mununu mode kripke
+            module test(input logic clk, input logic rst, input logic wr);
+                typedef struct packed {
+                    logic [7:0] data;
+                    logic [3:0] tag;
+                    logic       flag;
+                } pkt_t;
+                pkt_t pkt;
+                // @mununu domain pkt: bounded_counter 0..8191
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) pkt <= 0;
+                    else if (wr) pkt.flag <= 1;
+                end
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        // Total width: 8 + 4 + 1 = 13 bits
+        let pkt_decl = module
+            .declarations
+            .iter()
+            .find(|d| matches!(d, Declaration::Logic { name, .. } if name == "pkt"));
+        assert!(pkt_decl.is_some());
+        if let Some(Declaration::Logic { width, .. }) = pkt_decl {
+            assert_eq!(*width, 13, "packed struct: 8 + 4 + 1 = 13");
+        }
+    }
+
+    #[test]
+    fn parse_struct_from_package() {
+        let module = parse(
+            r#"
+            package axi_pkg;
+                typedef struct packed {
+                    logic [7:0] addr;
+                    logic       valid;
+                } req_t;
+            endpackage
+
+            module dut(input logic clk, input logic rst);
+                import axi_pkg::*;
+                req_t req;
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) req <= 0;
+                    else req.valid <= 1;
+                end
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        // req should be 9-bit Logic (8 + 1)
+        let req_decl = module
+            .declarations
+            .iter()
+            .find(|d| matches!(d, Declaration::Logic { name, .. } if name == "req"));
+        assert!(req_decl.is_some(), "req should be declared");
+        if let Some(Declaration::Logic { width, .. }) = req_decl {
+            assert_eq!(*width, 9, "struct: 8 + 1 = 9 bits");
+        }
     }
 }

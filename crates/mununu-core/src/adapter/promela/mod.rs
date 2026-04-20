@@ -92,6 +92,7 @@ impl FormatAdapter for PromelaAdapter {
                 state_count: 0, // computed at composition time
                 property_count: ir.properties.len(),
             },
+            state_valuations: Default::default(),
         })
     }
 }
@@ -121,6 +122,7 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
             .map(|loc| StateSpec {
                 name: loc.label.clone(),
                 is_initial: loc.id == proc_cfg.initial,
+                valuations: None,
             })
             .collect();
 
@@ -281,6 +283,7 @@ fn create_variable_automaton(
         states.push(StateSpec {
             name: state_name.clone(),
             is_initial: val == init_val,
+            valuations: None,
         });
 
         // set_var_val transitions from any state to this value
@@ -330,6 +333,7 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
         states.push(StateSpec {
             name: format!("{}_idle", chan.name),
             is_initial: true,
+            valuations: None,
         });
         let rendezvous_label = format!("rendezvous_{}", chan.name);
         transitions.push(TransitionSpec {
@@ -348,6 +352,7 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
             states.push(StateSpec {
                 name: state_name.clone(),
                 is_initial: k == 0,
+                valuations: None,
             });
         }
 

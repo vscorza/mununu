@@ -82,6 +82,12 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_map: Option<Vec<ValueMapEntry>>,
 
+    /// Whether this signal is combinational (computed from `assign` / `always_comb`).
+    /// Combinational signals are included in the state space but their value is
+    /// computed from the combinational logic each cycle, not from sequential assignments.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub combinational: bool,
+
     /// Human-readable note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -196,6 +202,10 @@ fn default_guarantee() -> String {
     "guarantee".to_string()
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn is_guarantee(v: &str) -> bool {
     v == "guarantee"
 }
@@ -259,6 +269,7 @@ pub struct SignalConfig {
     pub preserve: bool,
     pub domain: FieldDomain,
     pub value_map: Vec<(String, i64)>,
+    pub combinational: bool,
 }
 
 /// Build a merged config from an optional sidecar and the parsed module.
@@ -283,6 +294,7 @@ fn merge_from_sidecar(ann: &SvAnnotation, _module: &Module) -> MergedConfig {
                 preserve: sig.preserve,
                 domain,
                 value_map,
+                combinational: sig.combinational,
             },
         );
     }
@@ -296,6 +308,7 @@ fn merge_from_sidecar(ann: &SvAnnotation, _module: &Module) -> MergedConfig {
                 preserve: inp.preserve,
                 domain,
                 value_map,
+                combinational: false,
             },
         );
     }
@@ -487,6 +500,7 @@ fn resolve_input_domain(
         bound: inp.bound,
         variants: inp.variants.clone(),
         value_map: inp.value_map.clone(),
+        combinational: false,
         note: None,
     };
     resolve_signal_domain(&sig, ann)
@@ -549,6 +563,7 @@ fn merge_from_inline(module: &Module) -> MergedConfig {
                 preserve: domain.abstraction != AbstractionType::Ignored,
                 domain,
                 value_map,
+                combinational: false,
             },
         );
     }

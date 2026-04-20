@@ -137,6 +137,10 @@ pub struct StateSpec {
     pub name: String,
     /// Whether this is an initial state.
     pub is_initial: bool,
+    /// Structured variable-value pairs that define this state.
+    /// Populated by adapters that enumerate states from cross-product domains
+    /// (SV Kripke, extraction). Enables structured predicate matching.
+    pub valuations: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A transition in an explicit automaton.

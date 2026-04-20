@@ -54,6 +54,15 @@ pub struct AdapterOutput {
     pub warnings: Vec<AdapterWarning>,
     /// Metadata about the translation.
     pub source_info: SourceInfo,
+    /// Structured state valuations from cross-product enumeration.
+    /// Keyed by `automaton_name → state_name → { variable → display_value }`.
+    /// Populated by adapters that enumerate states from register/field domains
+    /// (SV Kripke, extraction). Used to wire structured predicate matching
+    /// on the CLTS without encoding valuations in the CTXDSL text format.
+    pub state_valuations: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 }
 
 /// A warning produced during translation.

@@ -1,0 +1,215 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "cwe1262_csr_bypass_bug",
+  "source": "cwe1262_csr_bypass_bug.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": [
+        "IDLE",
+        "GRANTED",
+        "DENIED"
+      ]
+    },
+    {
+      "name": "bypass",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "computed from assign bypass = (priv_lvl < csr_addr[9:8]) && (csr_addr == 833)"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "csr_addr",
+      "abstraction": "discover"
+    },
+    {
+      "name": "priv_lvl",
+      "abstraction": "bounded_counter",
+      "bound": 3
+    },
+    {
+      "name": "csr_req",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "no_bypass",
+      "formula": "nu X. (!bypass_T_state_IDLE && !bypass_T_state_GRANTED && !bypass_T_state_DENIED && [] X)",
+      "description": "bypass wire is never true — no user-mode access to machine CSRs via MEPC exception"
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)"
+    }
+  ],
+  "discovered_values": {
+    "csr_addr": {
+      "values": [
+        {
+          "value": 0,
+          "name": "VAL_0",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 65,
+          "name": "VAL_65",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 736,
+          "name": "VAL_736",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 744,
+          "name": "VAL_744",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 748,
+          "name": "VAL_748",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 752,
+          "name": "VAL_752",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 753,
+          "name": "VAL_753",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 833,
+          "name": "VAL_833",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1089,
+          "name": "VAL_1089",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1153,
+          "name": "VAL_1153",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1185,
+          "name": "VAL_1185",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1201,
+          "name": "VAL_1201",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1209,
+          "name": "VAL_1209",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1213,
+          "name": "VAL_1213",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1214,
+          "name": "VAL_1214",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1215,
+          "name": "VAL_1215",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1217,
+          "name": "VAL_1217",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1470,
+          "name": "VAL_1470",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1713,
+          "name": "VAL_1713",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1715,
+          "name": "VAL_1715",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1726,
+          "name": "VAL_1726",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 1777,
+          "name": "VAL_1777",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 2734,
+          "name": "VAL_2734",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 2796,
+          "name": "VAL_2796",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 2798,
+          "name": "VAL_2798",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3757,
+          "name": "VAL_3757",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3758,
+          "name": "VAL_3758",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3759,
+          "name": "VAL_3759",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3763,
+          "name": "VAL_3763",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3767,
+          "name": "VAL_3767",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3774,
+          "name": "VAL_3774",
+          "from": "SMT: guard (priv_ok) at line 0"
+        },
+        {
+          "value": 3775,
+          "name": "VAL_3775",
+          "from": "SMT: guard (priv_ok) at line 0"
+        }
+      ],
+      "catch_all": "OTHER"
+    }
+  }
+}

@@ -1,3 +1,4 @@
+
 /**
  * Test case for compound guard extraction.
  *

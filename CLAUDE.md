@@ -320,12 +320,21 @@ This applies to: README examples, wiki case studies, blog posts linked from the 
    ```
    The extraction spec is the auditable artifact. It must be committed alongside the claim. The spec validator must pass against the pinned commit.
 
+8. **RTL / SystemVerilog pipeline evidence integrity.** The same verification-first principles apply to the SV Kripke pipeline:
+   - **Never present hand-written data as pipeline output.** If `discovered_values` in a `.mununu.json` sidecar were written by a human or AI agent (not by `mununu sv discover`), they must be disclosed as hand-written. Claims like "SMT discovers x=3" require actually running the discover command.
+   - **Run the pipeline, don't simulate it.** Before presenting verification results in any public material, execute the actual commands and capture real terminal output. Do not fabricate or predict mununu output.
+   - **Properties must come from specifications, not bug knowledge.** Adding a detector register to catch a known bug and then verifying it fires is circular. Properties should come from protocol specs, safety invariants, or security requirements.
+   - **Distinguish syntactic from SMT-discovered values.** Literals found directly in `case` labels are syntactic. Values found through combinational logic inversion are SMT-discovered. Don't claim SMT discovery for trivially visible constants.
+   - **Show counterexample traces.** When a property fails, capture the violating state/transition trace, not just "unrealizable."
+   - These rules apply to both human and AI-agent authored content.
+
 #### What this does NOT restrict
 
 - Tutorial and pedagogical examples can use hand-written CTXDSL freely.
 - Benchmark models (SYNTCOMP, protocol verification) follow their own established methodology.
 - The adapter test suites use synthetic inputs by design.
 - Academic papers may present idealized models if clearly labeled as such in the methodology section.
+- Example `.mununu.json` sidecars with hand-written `discovered_values` are acceptable for tutorials IF disclosed as hand-written in the accompanying documentation.
 
 ### Security (OWASP)
 

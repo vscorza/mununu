@@ -56,6 +56,7 @@ impl FormatAdapter for TlsfAdapter {
                 state_count,
                 property_count: ir.properties.len(),
             },
+            state_valuations: Default::default(),
         })
     }
 }

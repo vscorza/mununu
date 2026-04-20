@@ -3,7 +3,7 @@
 use bitvec::prelude::*;
 use smallvec::SmallVec;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -947,6 +947,11 @@ pub struct Clts<S: IdStorage = DefaultStateIdx, L: IdStorage = DefaultLabelIdx> 
     variables: VariableStore,
     // Maps state IDs to variable sets.
     state_variables: Vec<VariableSetId>,
+    /// Structured variable-value pairs per state, index-aligned with state IDs.
+    /// Populated by adapters that enumerate states from cross-product domains
+    /// (SV Kripke, extraction). Enables structured predicate matching that avoids
+    /// the underscore-delimiter ambiguity of state name parsing.
+    state_valuations: Vec<Option<BTreeMap<String, String>>>,
     // Pool of state sets.
     state_set_pool: Arc<StateSetPoolInner>,
     /// Explicit controllability classification for each label ID.
@@ -1174,7 +1179,7 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
         self.internal_alphabet.contains(&label)
     }
 
-    /// Placeholder until valuations are wired into `Clts`.
+    /// Returns all variable names in the CLTS universe.
     pub fn variables(&self) -> Vec<String> {
         self.variables.all()
     }
@@ -1190,6 +1195,22 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
     pub fn state_variable_bitset(&self, state: StateId<S>) -> VariableBitSet<'_> {
         let id = self.state_variables[state.index()];
         self.variables.bitset(id)
+    }
+
+    /// Returns the structured valuation (variable-name → display-value pairs) for a state,
+    /// if one was provided during construction.
+    ///
+    /// Adapters that enumerate states from cross-product domains (SV Kripke, extraction)
+    /// populate these valuations. Native CTXDSL states typically have `None`.
+    pub fn state_valuation(&self, state: StateId<S>) -> Option<&BTreeMap<String, String>> {
+        self.state_valuations
+            .get(state.index())
+            .and_then(|v| v.as_ref())
+    }
+
+    /// Returns `true` if any state has a structured valuation attached.
+    pub fn has_valuations(&self) -> bool {
+        self.state_valuations.iter().any(|v| v.is_some())
     }
 
     /// Borrows a reusable state-set bit vector sized to this CLTS instance.
@@ -1438,6 +1459,7 @@ impl<S: IdStorage, L: IdStorage> Drop for Clts<S, L> {
         std::mem::take(&mut self.state_map);
         std::mem::take(&mut self.initial_states);
         std::mem::take(&mut self.state_variables);
+        std::mem::take(&mut self.state_valuations);
         std::mem::take(&mut self.label_controllability);
         std::mem::take(&mut self.uncontrollable_alphabet);
         std::mem::take(&mut self.controllable_alphabet);
@@ -1472,6 +1494,8 @@ pub struct CltsBuilder<S: IdStorage = DefaultStateIdx, L: IdStorage = DefaultLab
     labels: LabelStoreBuilder<L>,
     variables: VariableStoreBuilder,
     state_variables: Vec<VariableSetId>,
+    /// Structured variable-value pairs per state, index-aligned.
+    state_valuations: Vec<Option<BTreeMap<String, String>>>,
     // Hint for the state capacity that updates based on capacity growth when threshold is reached.
     state_capacity_hint: usize,
     // Hint for the transition capacity that updates based on capacity growth when threshold is reached.
@@ -1502,6 +1526,7 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
         match StateId::new(next_index) {
             Some(id) => {
                 self.state_variables.push(self.variables.empty());
+                self.state_valuations.push(None);
                 self.state_map.insert(name.clone(), id);
                 self.state_names.push(name);
                 Some(id)
@@ -1530,6 +1555,7 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
         if additional > 0 {
             self.state_names.reserve(additional);
             self.state_variables.reserve(additional);
+            self.state_valuations.reserve(additional);
             self.state_map.reserve(additional);
             self.initial_states.reserve(additional);
         }
@@ -1643,6 +1669,7 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
     pub fn reserve_states(&mut self, additional: usize) -> &mut Self {
         self.state_names.reserve(additional);
         self.state_variables.reserve(additional);
+        self.state_valuations.reserve(additional);
         self.state_map.reserve(additional);
         self.initial_states.reserve(additional);
         self.state_capacity_hint = self.state_capacity_hint.max(self.state_names.capacity());
@@ -1769,6 +1796,24 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             *slot = set_id;
         }
         self.variables.buffer_pool.release(buffer);
+        self
+    }
+
+    /// Attaches a structured valuation (variable-name → display-value map) to a state.
+    ///
+    /// Adapters that enumerate states from cross-product domains (e.g., SV Kripke,
+    /// extraction) use this to record the variable values that define each state.
+    /// This enables structured predicate matching that avoids the underscore-delimiter
+    /// ambiguity of state name parsing.
+    pub fn with_valuation_for_state(
+        &mut self,
+        state: StateId<S>,
+        valuation: BTreeMap<String, String>,
+    ) -> &mut Self {
+        debug_assert!(state.index() < self.state_valuations.len());
+        if let Some(slot) = self.state_valuations.get_mut(state.index()) {
+            *slot = Some(valuation);
+        }
         self
     }
 
@@ -2008,6 +2053,7 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             labels: label_store,
             variables: variable_store,
             state_variables: self.state_variables,
+            state_valuations: self.state_valuations,
             state_set_pool,
             label_controllability,
             uncontrollable_alphabet,
@@ -2029,6 +2075,7 @@ impl<S: IdStorage, L: IdStorage> Default for CltsBuilder<S, L> {
             labels: LabelStoreBuilder::default(),
             variables: VariableStoreBuilder::default(),
             state_variables: Vec::with_capacity(DEFAULT_STATE_RESERVE),
+            state_valuations: Vec::with_capacity(DEFAULT_STATE_RESERVE),
             state_capacity_hint: DEFAULT_STATE_RESERVE,
             transition_capacity_hint: DEFAULT_TRANSITION_RESERVE,
             label_controllability: HashMap::new(),

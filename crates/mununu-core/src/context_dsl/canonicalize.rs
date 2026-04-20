@@ -447,6 +447,7 @@ mod tests {
                 },
             ],
             span: Span::new(0, 0, 0, 0),
+            state_valuations: Default::default(),
         };
 
         canonicalize(&mut doc);
@@ -1254,6 +1255,7 @@ mod tests {
             controllers: Vec::new(),
             mu_formulas: Vec::new(),
             span: Span::new(0, 0, 0, 0),
+            state_valuations: Default::default(),
         };
 
         canonicalize(&mut doc);
@@ -1290,6 +1292,7 @@ mod tests {
                 }),
             }],
             span: Span::new(0, 0, 0, 0),
+            state_valuations: Default::default(),
         };
 
         canonicalize(&mut doc);

@@ -134,7 +134,7 @@ fn extract_transitions_from_body(
     transitions: &mut Vec<FsmTransition>,
 ) {
     match stmt {
-        Statement::NonblockingAssign { target, value } if target == state_var => {
+        Statement::NonblockingAssign { target, value } if target.name() == state_var => {
             let target_state = expr_to_state_name(value);
             let label = if let Some(g) = guard {
                 format!("{source}_to_{target_state}_when_{g}")

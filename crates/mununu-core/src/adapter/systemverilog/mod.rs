@@ -98,6 +98,8 @@ impl SystemVerilogAdapter {
         let mut warnings = Vec::new();
         let ir = to_ir_with_config(&module, options, &config, &mut warnings)?;
 
+        let state_valuations = crate::adapter::emit::extract_state_valuations(&ir);
+
         let result = crate::adapter::emit::emit(&ir).map_err(|e| AdapterError {
             kind: AdapterErrorKind::EmitError,
             message: format!("CTXDSL emission failed: {e}"),
@@ -116,6 +118,7 @@ impl SystemVerilogAdapter {
                 state_count: result.state_count,
                 property_count,
             },
+            state_valuations,
         })
     }
 }
@@ -136,6 +139,8 @@ impl FormatAdapter for SystemVerilogAdapter {
         let mut warnings = Vec::new();
         let ir = to_ir(&module, options, &mut warnings)?;
 
+        let state_valuations = crate::adapter::emit::extract_state_valuations(&ir);
+
         let result = crate::adapter::emit::emit(&ir).map_err(|e| AdapterError {
             kind: AdapterErrorKind::EmitError,
             message: format!("CTXDSL emission failed: {e}"),
@@ -154,6 +159,7 @@ impl FormatAdapter for SystemVerilogAdapter {
                 state_count: result.state_count,
                 property_count,
             },
+            state_valuations,
         })
     }
 }
@@ -230,6 +236,7 @@ fn to_ir(
         .map(|s| StateSpec {
             name: s.name.clone(),
             is_initial: s.is_initial,
+            valuations: None,
         })
         .collect();
 
@@ -448,6 +455,15 @@ mod tests {
         SystemVerilogAdapter::translate(sv, &options).expect("translation should succeed")
     }
 
+    /// Parse CTXDSL and inject side-channel valuations from the adapter output.
+    #[allow(dead_code)]
+    fn parse_with_valuations(output: &AdapterOutput) -> crate::context_dsl::ast::ContextDoc {
+        let mut doc =
+            crate::context_dsl::parse(&output.ctxdsl).expect("CTXDSL parse should succeed");
+        doc.state_valuations = output.state_valuations.clone();
+        doc
+    }
+
     // ---------------------------------------------------------------
     // Kripke path integration tests
     // ---------------------------------------------------------------
@@ -627,8 +643,10 @@ mod tests {
         let sv = include_str!("../../../../../examples/systemverilog/fifo.sv");
         let output = translate_sv(sv);
 
-        let doc = crate::context_dsl::parse(&output.ctxdsl)
+        let mut doc = crate::context_dsl::parse(&output.ctxdsl)
             .unwrap_or_else(|e| panic!("CTXDSL parse failed:\n{}\n\nError: {e}", output.ctxdsl));
+        // Inject structured valuations from the adapter output
+        doc.state_valuations = output.state_valuations.clone();
         let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
         let clts = realized.context.clts("fifo").expect("fifo automaton");
 
@@ -642,6 +660,19 @@ mod tests {
             20,
             "FIFO: 4 states x 5 fill levels = 20"
         );
+
+        // Verify structured valuations are present on the CLTS
+        assert!(
+            clts.has_valuations(),
+            "FIFO CLTS should have structured valuations"
+        );
+        // Verify a specific state's valuation
+        let s0 = clts.state_id("fill_0_state_IDLE").unwrap();
+        let val = clts
+            .state_valuation(s0)
+            .expect("state should have valuation");
+        assert_eq!(val.get("fill").map(|s| s.as_str()), Some("0"));
+        assert_eq!(val.get("state").map(|s| s.as_str()), Some("IDLE"));
 
         // Safety should be realizable
         let formula = realized.formulas.get("safety").expect("safety formula");
@@ -1111,6 +1142,120 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // CWE-1260: Memory region address overlap
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cwe1260_overlap_bug_detected() {
+        let sv = include_str!("../../../../../examples/systemverilog/cwe1260_addr_overlap_bug.sv");
+        let module = parser::parse(sv).unwrap();
+        let ann: annotation::SvAnnotation = serde_json::from_str(include_str!(
+            "../../../../../examples/systemverilog/cwe1260_addr_overlap_bug.mununu.json"
+        ))
+        .unwrap();
+        let config = annotation::merge_config(Some(&ann), &module);
+        let mut warnings = Vec::new();
+        let ir =
+            to_ir_with_config(&module, &AdapterOptions::default(), &config, &mut warnings).unwrap();
+        let result = crate::adapter::emit::emit(&ir).unwrap();
+        let doc = crate::context_dsl::parse(&result.ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let formula = realized.formulas.get("no_overlap").unwrap();
+        let env = realized.environment_for("cwe1260_addr_overlap_bug");
+        let synth = realized
+            .context
+            .synthesise_controller("cwe1260_addr_overlap_bug", &formula.formula, &env, None)
+            .unwrap();
+        assert!(
+            !synth.realizable,
+            "CWE-1260 buggy: UNREALIZABLE (overlap reachable)"
+        );
+    }
+
+    #[test]
+    fn cwe1260_overlap_fix_verified() {
+        let sv =
+            include_str!("../../../../../examples/systemverilog/cwe1260_addr_overlap_fixed.sv");
+        let module = parser::parse(sv).unwrap();
+        let ann: annotation::SvAnnotation = serde_json::from_str(include_str!(
+            "../../../../../examples/systemverilog/cwe1260_addr_overlap_fixed.mununu.json"
+        ))
+        .unwrap();
+        let config = annotation::merge_config(Some(&ann), &module);
+        let mut warnings = Vec::new();
+        let ir =
+            to_ir_with_config(&module, &AdapterOptions::default(), &config, &mut warnings).unwrap();
+        let result = crate::adapter::emit::emit(&ir).unwrap();
+        let doc = crate::context_dsl::parse(&result.ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let formula = realized.formulas.get("no_overlap").unwrap();
+        let env = realized.environment_for("cwe1260_addr_overlap_fixed");
+        let synth = realized
+            .context
+            .synthesise_controller("cwe1260_addr_overlap_fixed", &formula.formula, &env, None)
+            .unwrap();
+        assert!(synth.realizable, "CWE-1260 fixed: REALIZABLE (no overlap)");
+    }
+
+    // ---------------------------------------------------------------
+    // CWE-1262: CSR privilege bypass
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cwe1262_bypass_bug_detected() {
+        let sv = include_str!("../../../../../examples/systemverilog/cwe1262_csr_bypass_bug.sv");
+        let module = parser::parse(sv).unwrap();
+        let ann: annotation::SvAnnotation = serde_json::from_str(include_str!(
+            "../../../../../examples/systemverilog/cwe1262_csr_bypass_bug.mununu.json"
+        ))
+        .unwrap();
+        let config = annotation::merge_config(Some(&ann), &module);
+        let mut warnings = Vec::new();
+        let ir =
+            to_ir_with_config(&module, &AdapterOptions::default(), &config, &mut warnings).unwrap();
+        let result = crate::adapter::emit::emit(&ir).unwrap();
+        let doc = crate::context_dsl::parse(&result.ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let formula = realized.formulas.get("no_bypass").unwrap();
+        let env = realized.environment_for("cwe1262_csr_bypass_bug");
+        let synth = realized
+            .context
+            .synthesise_controller("cwe1262_csr_bypass_bug", &formula.formula, &env, None)
+            .unwrap();
+        assert!(
+            !synth.realizable,
+            "CWE-1262 buggy: UNREALIZABLE (MEPC bypass)"
+        );
+    }
+
+    #[test]
+    fn cwe1262_bypass_fix_verified() {
+        let sv = include_str!("../../../../../examples/systemverilog/cwe1262_csr_bypass_fixed.sv");
+        let module = parser::parse(sv).unwrap();
+        let ann: annotation::SvAnnotation = serde_json::from_str(include_str!(
+            "../../../../../examples/systemverilog/cwe1262_csr_bypass_fixed.mununu.json"
+        ))
+        .unwrap();
+        let config = annotation::merge_config(Some(&ann), &module);
+        let mut warnings = Vec::new();
+        let ir =
+            to_ir_with_config(&module, &AdapterOptions::default(), &config, &mut warnings).unwrap();
+        let result = crate::adapter::emit::emit(&ir).unwrap();
+        let doc = crate::context_dsl::parse(&result.ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let formula = realized.formulas.get("no_bypass").unwrap();
+        let env = realized.environment_for("cwe1262_csr_bypass_fixed");
+        let synth = realized
+            .context
+            .synthesise_controller("cwe1262_csr_bypass_fixed", &formula.formula, &env, None)
+            .unwrap();
+        assert!(
+            synth.realizable,
+            "CWE-1262 fixed: REALIZABLE (uniform check)"
+        );
+    }
+
+    // ---------------------------------------------------------------
     // Existing FSM path tests
     // ---------------------------------------------------------------
 
@@ -1199,5 +1344,160 @@ mod tests {
             .synthesise_controller("arbiter", &formula.formula, &env, None)
             .expect("synthesis should succeed");
         assert!(synth.realizable, "Arbiter safety should be realizable");
+    }
+
+    // ---------------------------------------------------------------
+    // Tier 1: Package + struct integration tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn package_enum_cva6_style() {
+        // CVA6-style: package with privilege level enum, imported into module
+        let sv = r#"
+            package riscv;
+                typedef enum logic [1:0] {USER, SUPERVISOR, MACHINE} priv_lvl_t;
+            endpackage
+
+            // @mununu ltl no_bypass: nu X. ((!illegal_access || [] false) && [] X)
+            // @mununu mode kripke
+            module csr_check(
+                input logic clk, input logic rst,
+                input logic write_req
+            );
+                import riscv::*;
+                priv_lvl_t priv_lvl;
+                logic illegal_access;
+
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) begin
+                        priv_lvl <= USER;
+                        illegal_access <= 0;
+                    end else begin
+                        if (write_req) begin
+                            if (priv_lvl == MACHINE)
+                                illegal_access <= 0;
+                            else
+                                illegal_access <= 1;
+                        end
+                    end
+                end
+            endmodule
+        "#;
+
+        let output = translate_sv(sv);
+        let doc = crate::context_dsl::parse(&output.ctxdsl)
+            .unwrap_or_else(|e| panic!("Parse failed:\n{}\n{e}", output.ctxdsl));
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let clts = realized.context.clts("csr_check").expect("csr_check");
+
+        // 3 priv levels × 2 illegal_access = 6 max states
+        assert!(clts.state_count() > 0 && clts.state_count() <= 6);
+    }
+
+    #[test]
+    fn struct_packed_field_access_kripke() {
+        // Struct with field writes and reads through the full Kripke pipeline
+        let sv = r#"
+            // @mununu ltl safety: nu X. ([] X)
+            // @mununu mode kripke
+            // @mununu domain pkt: bounded_counter 0..31
+            module pkt_proc(
+                input logic clk, input logic rst,
+                input logic send
+            );
+                typedef struct packed {
+                    logic [2:0] tag;
+                    logic [1:0] len;
+                } pkt_t;
+                pkt_t pkt;
+
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) pkt <= 0;
+                    else if (send) begin
+                        pkt.tag <= pkt.tag + 1;
+                    end
+                end
+            endmodule
+        "#;
+
+        let output = translate_sv(sv);
+        let doc = crate::context_dsl::parse(&output.ctxdsl)
+            .unwrap_or_else(|e| panic!("Parse failed:\n{}\n{e}", output.ctxdsl));
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let clts = realized.context.clts("pkt_proc").expect("pkt_proc");
+
+        // pkt is a 5-bit counter (tag:3 + len:2), bounded to 0..31 = 32 states max
+        assert!(
+            clts.state_count() > 0,
+            "pkt_proc should have reachable states"
+        );
+
+        // Safety (no deadlock) should be realizable
+        let formula = realized.formulas.get("safety").expect("safety formula");
+        let env = realized.environment_for("pkt_proc");
+        let synth = realized
+            .context
+            .synthesise_controller("pkt_proc", &formula.formula, &env, None)
+            .expect("synthesis should succeed");
+        assert!(synth.realizable, "pkt_proc safety should be realizable");
+    }
+
+    #[test]
+    fn struct_from_package_kripke() {
+        // Struct defined in package, imported, field access in expressions
+        let sv = r#"
+            package bus_pkg;
+                typedef struct packed {
+                    logic [3:0] addr;
+                    logic       valid;
+                } req_t;
+            endpackage
+
+            // @mununu ltl safety: nu X. ([] X)
+            // @mununu mode kripke
+            // @mununu domain req: bounded_counter 0..31
+            module bus_ctrl(
+                input logic clk, input logic rst,
+                input logic start
+            );
+                import bus_pkg::*;
+                req_t req;
+
+                always_ff @(posedge clk or posedge rst) begin
+                    if (rst) req <= 0;
+                    else if (start) begin
+                        req.valid <= 1;
+                        req.addr <= 5;
+                    end
+                end
+            endmodule
+        "#;
+
+        let output = translate_sv(sv);
+        let doc = crate::context_dsl::parse(&output.ctxdsl)
+            .unwrap_or_else(|e| panic!("Parse failed:\n{}\n{e}", output.ctxdsl));
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let clts = realized.context.clts("bus_ctrl").expect("bus_ctrl");
+
+        assert!(
+            clts.state_count() > 0,
+            "bus_ctrl should have reachable states"
+        );
+
+        // After start: req.valid=1, req.addr=5 → req = (5 << 1) | 1 = 11
+        // Initial: req = 0
+        // Should have at least 2 reachable states
+        assert!(
+            clts.state_count() >= 2,
+            "Should have at least initial and post-start states"
+        );
+
+        let formula = realized.formulas.get("safety").expect("safety formula");
+        let env = realized.environment_for("bus_ctrl");
+        let synth = realized
+            .context
+            .synthesise_controller("bus_ctrl", &formula.formula, &env, None)
+            .expect("synthesis should succeed");
+        assert!(synth.realizable, "bus_ctrl safety should be realizable");
     }
 }

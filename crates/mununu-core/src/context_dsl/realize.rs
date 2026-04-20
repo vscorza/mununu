@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -1068,7 +1068,14 @@ fn build_context_with_compositions(
             }
         }
 
-        let clts = build_automaton(&name, automaton, label_universe, input_signals)?;
+        let aut_valuations = doc.state_valuations.get(&name);
+        let clts = build_automaton(
+            &name,
+            automaton,
+            label_universe,
+            input_signals,
+            aut_valuations,
+        )?;
         automata.push((name, clts));
     }
 
@@ -2138,6 +2145,7 @@ fn build_automaton(
     automaton: &Automaton,
     labels: &LabelUniverse,
     input_signals: &HashSet<String>,
+    state_valuations: Option<&HashMap<String, BTreeMap<String, String>>>,
 ) -> Result<RuntimeClts, RealizationError> {
     // Desugar state groups and wildcards into concrete transitions.
     let automaton = expand_state_selectors(automaton)?;
@@ -2210,12 +2218,18 @@ fn build_automaton(
 
     for state in &automaton.states {
         ensure_supported_state(state)?;
-        builder.state(&state.name.name);
+        let state_id = builder.state_id_or_insert(&state.name.name);
         if state.is_initial {
             builder.initial(&state.name.name);
         }
         if !variable_names.is_empty() {
             builder.with_variables(&state.name.name, variable_names.iter().map(String::as_str));
+        }
+        // Wire structured valuations from the side-channel data if available
+        if let (Some(state_id), Some(vals_map)) = (state_id, state_valuations)
+            && let Some(valuation) = vals_map.get(&state.name.name)
+        {
+            builder.with_valuation_for_state(state_id, valuation.clone());
         }
     }
 

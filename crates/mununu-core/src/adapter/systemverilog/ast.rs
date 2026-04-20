@@ -80,6 +80,36 @@ pub struct ResetInfo {
     pub assignments: Vec<(String, String)>, // (target, value)
 }
 
+/// The left-hand side of an assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignTarget {
+    /// A simple register name: `count <= value`
+    Simple(String),
+    /// A bit-slice of a register: `var[msb:lsb] <= value`
+    /// Used for struct field writes resolved at parse time.
+    BitSlice {
+        base: String,
+        msb: usize,
+        lsb: usize,
+    },
+}
+
+impl AssignTarget {
+    /// Returns the base register name regardless of the target kind.
+    pub fn name(&self) -> &str {
+        match self {
+            AssignTarget::Simple(name) => name,
+            AssignTarget::BitSlice { base, .. } => base,
+        }
+    }
+}
+
+impl PartialEq<&str> for AssignTarget {
+    fn eq(&self, other: &&str) -> bool {
+        self.name() == *other
+    }
+}
+
 /// A statement in an always block.
 #[derive(Debug, Clone)]
 pub enum Statement {
@@ -95,11 +125,11 @@ pub enum Statement {
     },
     Block(Vec<Statement>),
     NonblockingAssign {
-        target: String,
+        target: AssignTarget,
         value: Expr,
     },
     BlockingAssign {
-        target: String,
+        target: AssignTarget,
         value: Expr,
     },
 }
@@ -169,7 +199,7 @@ pub enum BinOp {
 /// Continuous assignment: `assign x = expr;`
 #[derive(Debug, Clone)]
 pub struct ContinuousAssign {
-    pub target: String,
+    pub target: AssignTarget,
     pub value: Expr,
 }
 

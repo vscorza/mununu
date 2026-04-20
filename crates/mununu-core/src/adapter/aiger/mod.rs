@@ -86,6 +86,7 @@ impl FormatAdapter for AigerAdapter {
                 state_count,
                 property_count: ir.properties.len(),
             },
+            state_valuations: Default::default(),
         })
     }
 }
@@ -204,6 +205,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
         .map(|(i, name)| StateSpec {
             name: name.clone(),
             is_initial: i == init_state_idx,
+            valuations: None,
         })
         .collect();
 
