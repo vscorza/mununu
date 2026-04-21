@@ -134,10 +134,10 @@ struct SvInitArgs {
 
 #[derive(Args, Debug)]
 struct SvDiscoverArgs {
-    /// Path to the SystemVerilog source file (.sv).
+    /// Path to the SystemVerilog source file (.sv) or multi-module sidecar (.mununu.json).
     #[arg(value_name = "FILE")]
     file: PathBuf,
-    /// Path to the .mununu.json annotation file.
+    /// Path to the .mununu.json annotation file (for single-module mode).
     /// If omitted, looks for <stem>.mununu.json next to the .sv file.
     #[arg(long = "annotation", value_name = "FILE")]
     annotation: Option<PathBuf>,
@@ -147,6 +147,9 @@ struct SvDiscoverArgs {
     /// Maximum number of values to discover per signal (default: 32).
     #[arg(long = "max-values", default_value = "32")]
     max_values: usize,
+    /// Run discovery on a multi-module sidecar (cross-module + per-module).
+    #[arg(long)]
+    multi: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1324,6 +1327,16 @@ fn sv_init_multi_from_top(
 }
 
 fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
+    // Check if this is a multi-module sidecar
+    if args.multi
+        || args
+            .file
+            .extension()
+            .is_some_and(|ext| ext == "json" || ext == "mununu.json")
+    {
+        return sv_discover_multi(args);
+    }
+
     // Step 1: Parse the SV file
     let source = fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
@@ -1436,6 +1449,216 @@ fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
         fs::write(output_path, json)
             .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
         eprintln!("Updated sidecar: {}", output_path.display());
+
+        Ok(())
+    }
+}
+
+/// Multi-module discovery: runs cross-module SMT discovery for connected
+/// signals marked with `"abstraction": "discover"`, and per-module discovery
+/// for non-connected signals.
+fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
+    use mununu_core::adapter::systemverilog::annotation::*;
+
+    // Load the multi-module sidecar
+    let sidecar_path = &args.file;
+    let is_multi = is_multi_module(sidecar_path)
+        .map_err(|e| format!("Failed to check sidecar format: {e}"))?;
+    if !is_multi {
+        return Err(format!(
+            "'{}' is not a multi-module sidecar (missing \"modules\" key). \
+             Use without --multi for single-module discovery.",
+            sidecar_path.display()
+        ));
+    }
+
+    #[allow(unused_mut)]
+    let mut ann = load_multi_annotation(sidecar_path)
+        .map_err(|e| format!("Failed to load multi-module sidecar: {e}"))?;
+
+    #[allow(unused_variables)]
+    let sidecar_dir = sidecar_path.parent().unwrap_or(std::path::Path::new("."));
+
+    eprintln!(
+        "Multi-module discovery: {} module(s), {} connection(s)",
+        ann.modules.len(),
+        ann.connections.len()
+    );
+
+    // Count discover targets
+    let mut discover_count = 0;
+    for module_entry in &ann.modules {
+        discover_count += module_entry
+            .signals
+            .iter()
+            .filter(|s| s.preserve && s.abstraction == SignalAbstraction::Discover)
+            .count();
+        discover_count += module_entry
+            .inputs
+            .iter()
+            .filter(|i| i.preserve && i.abstraction == SignalAbstraction::Discover)
+            .count();
+    }
+    for conn in &ann.connections {
+        if conn.abstraction == SignalAbstraction::Discover {
+            discover_count += 1;
+        }
+    }
+
+    if discover_count == 0 {
+        eprintln!("No signals or connections marked for discovery. Nothing to do.");
+        return Ok(());
+    }
+
+    eprintln!("Discovering values for {} target(s)...", discover_count);
+
+    #[cfg(not(feature = "smt"))]
+    {
+        Err(
+            "SMT discovery requires the 'smt' feature. Rebuild with: cargo build --features smt"
+                .to_string(),
+        )
+    }
+
+    #[cfg(feature = "smt")]
+    {
+        // Parse all sub-modules
+        let mut parsed_modules: Vec<(mununu_core::adapter::systemverilog::ast::Module, String)> =
+            Vec::new();
+        let mut param_map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, i64>,
+        > = std::collections::HashMap::new();
+
+        for module_entry in &ann.modules {
+            let sv_path = sidecar_dir.join(&module_entry.source);
+            let source = fs::read_to_string(&sv_path)
+                .map_err(|e| format!("Failed to read '{}': {e}", sv_path.display()))?;
+            let module = mununu_core::adapter::systemverilog::parser::parse(&source)
+                .map_err(|e| format!("Parse error in '{}': {e}", sv_path.display()))?;
+            param_map.insert(module_entry.name.clone(), module_entry.parameters.clone());
+            parsed_modules.push((module, module_entry.name.clone()));
+        }
+
+        // Run per-module discovery for non-connected signals
+        for (module, mod_name) in &parsed_modules {
+            let module_entry = ann.modules.iter().find(|m| m.name == *mod_name).unwrap();
+
+            // Build a temporary single-module annotation for per-module discovery
+            let temp_ann = SvAnnotation {
+                schema: None,
+                module: mod_name.clone(),
+                source: Some(module_entry.source.clone()),
+                signals: module_entry.signals.clone(),
+                inputs: module_entry.inputs.clone(),
+                controllable: module_entry.controllable.clone(),
+                properties: vec![],
+                discovered_values: module_entry.discovered_values.clone(),
+                parameters: module_entry.parameters.clone(),
+            };
+
+            let results =
+                mununu_core::adapter::systemverilog::kripke_smt::discover_significant_values(
+                    module, &temp_ann,
+                );
+
+            if !results.is_empty() {
+                eprintln!(
+                    "  Module '{}': discovered {} signal(s)",
+                    mod_name,
+                    results.len()
+                );
+                for (signal, discovered) in &results {
+                    eprintln!("    {} — {} value(s)", signal, discovered.values.len());
+                    for v in &discovered.values {
+                        eprintln!(
+                            "      {} = {} ({})",
+                            v.name,
+                            v.value,
+                            v.from.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                }
+                // Merge into module's discovered_values
+                let entry = ann
+                    .modules
+                    .iter_mut()
+                    .find(|m| m.name == *mod_name)
+                    .unwrap();
+                for (signal, discovered) in results {
+                    let existing =
+                        entry
+                            .discovered_values
+                            .entry(signal)
+                            .or_insert_with(|| DiscoveredValues {
+                                values: vec![],
+                                catch_all: "OTHER".to_string(),
+                            });
+                    for new_val in &discovered.values {
+                        if !existing.values.iter().any(|v| v.value == new_val.value) {
+                            existing.values.push(new_val.clone());
+                        }
+                    }
+                    existing.values.sort_by_key(|v| v.value);
+                }
+            }
+        }
+
+        // Run cross-module discovery for connected signals
+        let module_refs: Vec<(&mununu_core::adapter::systemverilog::ast::Module, &str)> =
+            parsed_modules
+                .iter()
+                .map(|(m, name)| (m, name.as_str()))
+                .collect();
+
+        let cross_results =
+            mununu_core::adapter::systemverilog::kripke_smt::engine::discover_cross_module_values(
+                &module_refs,
+                &ann.connections,
+                &param_map,
+            );
+
+        if !cross_results.is_empty() {
+            eprintln!(
+                "  Cross-module: discovered {} connection(s)",
+                cross_results.len()
+            );
+            for (key, discovered) in &cross_results {
+                eprintln!("    {} — {} value(s)", key, discovered.values.len());
+                for v in &discovered.values {
+                    eprintln!(
+                        "      {} = {} ({})",
+                        v.name,
+                        v.value,
+                        v.from.as_deref().unwrap_or("unknown")
+                    );
+                }
+            }
+            // Merge into top-level discovered_values
+            for (key, discovered) in cross_results {
+                let existing =
+                    ann.discovered_values
+                        .entry(key)
+                        .or_insert_with(|| DiscoveredValues {
+                            values: vec![],
+                            catch_all: "OTHER".to_string(),
+                        });
+                for new_val in &discovered.values {
+                    if !existing.values.iter().any(|v| v.value == new_val.value) {
+                        existing.values.push(new_val.clone());
+                    }
+                }
+                existing.values.sort_by_key(|v| v.value);
+            }
+        }
+
+        // Write updated sidecar
+        let output_path = args.output.as_ref().unwrap_or(sidecar_path);
+        let json =
+            serde_json::to_string_pretty(&ann).map_err(|e| format!("Failed to serialize: {e}"))?;
+        fs::write(output_path, json)
+            .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
+        eprintln!("Updated multi-module sidecar: {}", output_path.display());
 
         Ok(())
     }
