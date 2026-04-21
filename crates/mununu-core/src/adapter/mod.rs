@@ -43,6 +43,7 @@ pub mod emit;
 pub mod extraction;
 pub mod ir;
 pub mod promela;
+pub mod state_enum;
 pub mod systemverilog;
 pub mod tlsf;
 pub mod xstate;

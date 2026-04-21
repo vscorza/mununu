@@ -110,16 +110,12 @@ impl DslWriter {
 }
 
 /// Sanitize a name for use as a CTXDSL identifier.
+/// Sanitize an identifier for valid CTXDSL output.
+///
+/// Delegates to [`crate::guard::sanitize_identifier`] which handles
+/// special character collapsing, leading digit prefixing, and empty strings.
 pub fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    crate::guard::sanitize_identifier(name)
 }
 
 /// Convert a title to snake_case for the context name.

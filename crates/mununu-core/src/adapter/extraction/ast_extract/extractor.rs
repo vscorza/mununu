@@ -344,6 +344,7 @@ fn build_field_domain(
         name: name.to_string(),
         abstraction,
         bound,
+        lower_bound: None,
         variants,
         initial: initial_value,
     })

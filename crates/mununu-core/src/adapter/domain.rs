@@ -65,8 +65,11 @@ pub struct FieldDomain {
     pub name: String,
     /// Abstraction type.
     pub abstraction: AbstractionType,
-    /// Upper bound for bounded counter.
+    /// Upper bound for bounded counter (inclusive).
     pub bound: Option<i64>,
+    /// Lower bound for bounded counter (inclusive, defaults to 0).
+    /// Enables signed integer ranges for adapters like Promela.
+    pub lower_bound: Option<i64>,
     /// Explicit variants for enum.
     pub variants: Option<Vec<String>>,
     /// Initial value.
@@ -74,6 +77,37 @@ pub struct FieldDomain {
 }
 
 impl FieldDomain {
+    /// Create a new `FieldDomain` with default `lower_bound` (0).
+    pub fn new(
+        name: String,
+        abstraction: AbstractionType,
+        bound: Option<i64>,
+        variants: Option<Vec<String>>,
+        initial: AbstractValue,
+    ) -> Self {
+        Self {
+            name,
+            abstraction,
+            bound,
+            lower_bound: None,
+            variants,
+            initial,
+        }
+    }
+
+    /// Create a new `FieldDomain` with explicit lower and upper bounds.
+    /// Useful for signed integer ranges (e.g., Promela `short` variables).
+    pub fn with_range(name: String, lo: i64, hi: i64, initial: i64) -> Self {
+        Self {
+            name,
+            abstraction: AbstractionType::BoundedCounter,
+            bound: Some(hi),
+            lower_bound: Some(lo),
+            variants: None,
+            initial: AbstractValue::Counter(initial),
+        }
+    }
+
     /// Enumerate all values in this domain.
     pub fn values(&self) -> Vec<AbstractValue> {
         match self.abstraction {
@@ -82,8 +116,9 @@ impl FieldDomain {
                 vec![AbstractValue::Present(false), AbstractValue::Present(true)]
             }
             AbstractionType::BoundedCounter => {
-                let bound = self.bound.unwrap_or(DEFAULT_COUNTER_BOUND);
-                (0..=bound).map(AbstractValue::Counter).collect()
+                let lo = self.lower_bound.unwrap_or(0);
+                let hi = self.bound.unwrap_or(DEFAULT_COUNTER_BOUND);
+                (lo..=hi).map(AbstractValue::Counter).collect()
             }
             AbstractionType::EnumValues => self
                 .variants

@@ -14,6 +14,7 @@
 use super::ast::*;
 use crate::adapter::domain::{AbstractState, AbstractValue, AbstractionType, FieldDomain};
 use crate::adapter::ir::*;
+use crate::adapter::state_enum;
 use crate::adapter::{AdapterError, AdapterErrorKind, AdapterWarning, WarningKind};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -157,8 +158,9 @@ pub fn build_kripke_with_config(
         .map(|r| &r.domain)
         .collect();
 
-    let all_reg_states = enumerate_cross_product(&reg_fields);
-    let all_input_combos = enumerate_cross_product(&input_domains.iter().collect::<Vec<_>>());
+    let all_reg_states = state_enum::enumerate_cross_product(&reg_fields);
+    let all_input_combos =
+        state_enum::enumerate_cross_product(&input_domains.iter().collect::<Vec<_>>());
 
     // Step 6: Determine initial state from reset values
     let initial_state = extract_initial_state(module, &registers);
@@ -171,7 +173,7 @@ pub fn build_kripke_with_config(
     let mut state_names: HashMap<AbstractState, String> = HashMap::new();
 
     for reg_state in &all_reg_states {
-        let src_name = make_state_name(reg_state);
+        let src_name = state_enum::make_state_name(reg_state);
         state_names.insert(reg_state.clone(), src_name.clone());
     }
 
@@ -282,7 +284,11 @@ fn prune_unreachable_states(
             .unwrap_or_else(|| "s0".to_string())
     });
 
-    let reachable = bfs_reachable(&initial_name, &transitions);
+    let edges: Vec<(&str, &str)> = transitions
+        .iter()
+        .map(|t| (t.source.as_str(), t.target.as_str()))
+        .collect();
+    let reachable = state_enum::bfs_reachable(&initial_name, &edges);
 
     // Identify combinational registers for valuation enrichment
     let comb_register_names: Vec<&str> = registers
@@ -496,6 +502,7 @@ fn build_registers_from_config(
                     name: name.clone(),
                     abstraction: AbstractionType::Ignored,
                     bound: None,
+                    lower_bound: None,
                     variants: None,
                     initial: AbstractValue::Counter(0),
                 },
@@ -566,6 +573,7 @@ fn build_input_domains_from_config(
                         name: p.name.clone(),
                         abstraction: AbstractionType::Boolean,
                         bound: None,
+                        lower_bound: None,
                         variants: None,
                         initial: AbstractValue::Bool(false),
                     }
@@ -639,6 +647,7 @@ fn extract_registers(module: &Module, warnings: &mut Vec<AdapterWarning>) -> Vec
                         name: var.clone(),
                         abstraction: AbstractionType::EnumValues,
                         bound: None,
+                        lower_bound: None,
                         variants: Some(variants.clone()),
                         initial: AbstractValue::Variant(
                             variants.first().cloned().unwrap_or_default(),
@@ -664,6 +673,7 @@ fn extract_registers(module: &Module, warnings: &mut Vec<AdapterWarning>) -> Vec
                         name: name.clone(),
                         abstraction: AbstractionType::Boolean,
                         bound: None,
+                        lower_bound: None,
                         variants: None,
                         initial: AbstractValue::Bool(false),
                     }
@@ -684,6 +694,7 @@ fn extract_registers(module: &Module, warnings: &mut Vec<AdapterWarning>) -> Vec
                         name: name.clone(),
                         abstraction: AbstractionType::BoundedCounter,
                         bound: Some((1i64 << width) - 1),
+                        lower_bound: None,
                         variants: None,
                         initial: AbstractValue::Counter(0),
                     }
@@ -701,6 +712,7 @@ fn extract_registers(module: &Module, warnings: &mut Vec<AdapterWarning>) -> Vec
                         name: name.clone(),
                         abstraction: AbstractionType::Ignored,
                         bound: None,
+                        lower_bound: None,
                         variants: None,
                         initial: AbstractValue::Counter(0),
                     }
@@ -737,6 +749,7 @@ fn annotation_to_domain(name: &str, ann: &DomainAnnotationKind) -> FieldDomain {
             name: name.to_string(),
             abstraction: AbstractionType::Boolean,
             bound: None,
+            lower_bound: None,
             variants: None,
             initial: AbstractValue::Bool(false),
         },
@@ -744,6 +757,7 @@ fn annotation_to_domain(name: &str, ann: &DomainAnnotationKind) -> FieldDomain {
             name: name.to_string(),
             abstraction: AbstractionType::BoundedCounter,
             bound: Some(*upper),
+            lower_bound: None,
             variants: None,
             initial: AbstractValue::Counter(*lower),
         },
@@ -751,6 +765,7 @@ fn annotation_to_domain(name: &str, ann: &DomainAnnotationKind) -> FieldDomain {
             name: name.to_string(),
             abstraction: AbstractionType::EnumValues,
             bound: None,
+            lower_bound: None,
             variants: Some(variants.clone()),
             initial: AbstractValue::Variant(variants.first().cloned().unwrap_or_default()),
         },
@@ -758,6 +773,7 @@ fn annotation_to_domain(name: &str, ann: &DomainAnnotationKind) -> FieldDomain {
             name: name.to_string(),
             abstraction: AbstractionType::Ignored,
             bound: None,
+            lower_bound: None,
             variants: None,
             initial: AbstractValue::Counter(0),
         },
@@ -1654,47 +1670,6 @@ fn clamp_to_domain(
     }
 }
 
-// ---------------------------------------------------------------------------
-// State enumeration and naming
-// ---------------------------------------------------------------------------
-
-fn enumerate_cross_product(fields: &[&FieldDomain]) -> Vec<AbstractState> {
-    let active_fields: Vec<&&FieldDomain> = fields
-        .iter()
-        .filter(|f| f.abstraction != AbstractionType::Ignored)
-        .collect();
-
-    if active_fields.is_empty() {
-        return vec![BTreeMap::new()];
-    }
-
-    let mut states = vec![BTreeMap::new()];
-    for field in &active_fields {
-        let values = field.values();
-        let mut new_states = Vec::with_capacity(states.len() * values.len());
-        for state in &states {
-            for value in &values {
-                let mut new_state = state.clone();
-                new_state.insert(field.name.clone(), value.clone());
-                new_states.push(new_state);
-            }
-        }
-        states = new_states;
-    }
-    states
-}
-
-fn make_state_name(state: &AbstractState) -> String {
-    if state.is_empty() {
-        return "s0".to_string();
-    }
-    state
-        .iter()
-        .map(|(k, v)| format!("{}_{}", k, v.display_short()))
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
 /// Build individual labels for each input signal in a combination.
 ///
 /// Each input signal gets its own label (e.g., `rd_en_T`, `wr_en_F`),
@@ -1914,32 +1889,6 @@ fn scan_expr_constants(expr: &Expr, constants: &mut HashMap<String, HashSet<i64>
 // ---------------------------------------------------------------------------
 // BFS reachability
 // ---------------------------------------------------------------------------
-
-fn bfs_reachable(initial: &str, transitions: &[TransitionSpec]) -> HashSet<String> {
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for t in transitions {
-        adj.entry(t.source.as_str())
-            .or_default()
-            .push(t.target.as_str());
-    }
-
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    visited.insert(initial.to_string());
-    queue.push_back(initial.to_string());
-
-    while let Some(current) = queue.pop_front() {
-        if let Some(neighbors) = adj.get(current.as_str()) {
-            for &next in neighbors {
-                if visited.insert(next.to_string()) {
-                    queue.push_back(next.to_string());
-                }
-            }
-        }
-    }
-
-    visited
-}
 
 #[cfg(test)]
 mod tests {

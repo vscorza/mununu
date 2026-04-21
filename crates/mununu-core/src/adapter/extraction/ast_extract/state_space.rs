@@ -9,8 +9,9 @@
 //! 5. Generate labels and noop self-loops
 
 use super::call_summary::{CallEffect, CallGuard};
-use crate::adapter::domain::{AbstractState, AbstractValue, AbstractionType, FieldDomain};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use crate::adapter::domain::{AbstractState, AbstractValue, FieldDomain};
+use crate::adapter::state_enum;
+use std::collections::HashMap;
 
 /// A guard condition extracted from source.
 #[derive(Debug, Clone)]
@@ -88,7 +89,8 @@ pub fn derive_automaton(
     add_noop: bool,
 ) -> DerivedAutomaton {
     // Step 1: Enumerate all abstract states (cross-product)
-    let all_states = enumerate_states(fields);
+    let field_refs: Vec<&FieldDomain> = fields.iter().collect();
+    let all_states = state_enum::enumerate_cross_product(&field_refs);
     if all_states.is_empty() {
         return DerivedAutomaton {
             name: automaton_name.to_string(),
@@ -99,16 +101,13 @@ pub fn derive_automaton(
     }
 
     // Step 2: Find initial state
-    let initial_state: AbstractState = fields
-        .iter()
-        .map(|f| (f.name.clone(), f.initial.clone()))
-        .collect();
+    let initial_state = state_enum::initial_state_from_fields(fields);
 
     // Step 3: Name states
     let state_names: HashMap<AbstractState, String> = all_states
         .iter()
         .map(|s| {
-            let auto_name = make_state_name(s, fields);
+            let auto_name = state_enum::make_state_name_ordered(s, fields);
             let name = state_name_overrides
                 .get(&auto_name)
                 .cloned()
@@ -158,9 +157,35 @@ pub fn derive_automaton(
         }
     }
 
-    // Step 6: Prune unreachable states
-    let (reachable_states, reachable_transitions) =
-        prune_unreachable(&initial_state, &state_names, &all_states, &transitions);
+    // Step 6: Prune unreachable states via shared BFS
+    let initial_name = state_names.get(&initial_state).cloned().unwrap_or_default();
+    let edges: Vec<(&str, &str)> = transitions
+        .iter()
+        .map(|t| (t.from.as_str(), t.to.as_str()))
+        .collect();
+    let reachable = state_enum::bfs_reachable(&initial_name, &edges);
+
+    let name_to_state: HashMap<&str, &AbstractState> = all_states
+        .iter()
+        .filter_map(|s| state_names.get(s).map(|n| (n.as_str(), s)))
+        .collect();
+
+    let reachable_states: Vec<DerivedState> = reachable
+        .iter()
+        .filter_map(|name| {
+            let abstract_state = name_to_state.get(name.as_str())?;
+            Some(DerivedState {
+                name: name.clone(),
+                is_initial: *name == initial_name,
+                abstract_state: (*abstract_state).clone(),
+            })
+        })
+        .collect();
+
+    let reachable_transitions: Vec<DerivedTransition> = transitions
+        .into_iter()
+        .filter(|t| reachable.contains(&t.from) && reachable.contains(&t.to))
+        .collect();
 
     DerivedAutomaton {
         name: automaton_name.to_string(),
@@ -168,49 +193,6 @@ pub fn derive_automaton(
         transitions: reachable_transitions,
         controllable_labels,
     }
-}
-
-/// Enumerate all states from the cross-product of field domains.
-fn enumerate_states(fields: &[FieldDomain]) -> Vec<AbstractState> {
-    let active_fields: Vec<&FieldDomain> = fields
-        .iter()
-        .filter(|f| f.abstraction != AbstractionType::Ignored)
-        .collect();
-
-    if active_fields.is_empty() {
-        return vec![BTreeMap::new()];
-    }
-
-    let mut states = vec![BTreeMap::new()];
-    for field in &active_fields {
-        let values = field.values();
-        let mut new_states = Vec::with_capacity(states.len() * values.len());
-        for state in &states {
-            for value in &values {
-                let mut new_state = state.clone();
-                new_state.insert(field.name.clone(), value.clone());
-                new_states.push(new_state);
-            }
-        }
-        states = new_states;
-    }
-    states
-}
-
-/// Generate a state name from field values.
-fn make_state_name(state: &AbstractState, fields: &[FieldDomain]) -> String {
-    fields
-        .iter()
-        .filter(|f| f.abstraction != AbstractionType::Ignored)
-        .map(|f| {
-            let val = state
-                .get(&f.name)
-                .map(|v| v.display_short())
-                .unwrap_or_default();
-            format!("{}_{}", f.name, val)
-        })
-        .collect::<Vec<_>>()
-        .join("_")
 }
 
 /// Check if all guards are satisfied in the given state.
@@ -334,76 +316,17 @@ fn apply_single_effect(state: &mut AbstractState, effect: &Effect, fields: &[Fie
     }
 }
 
-/// Prune unreachable states via BFS from initial state.
-fn prune_unreachable(
-    initial: &AbstractState,
-    state_names: &HashMap<AbstractState, String>,
-    all_states: &[AbstractState],
-    transitions: &[DerivedTransition],
-) -> (Vec<DerivedState>, Vec<DerivedTransition>) {
-    let initial_name = match state_names.get(initial) {
-        Some(n) => n.clone(),
-        None => return (vec![], vec![]),
-    };
-
-    // Build adjacency from transitions
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for t in transitions {
-        adj.entry(t.from.as_str()).or_default().push(t.to.as_str());
-    }
-
-    // BFS
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    visited.insert(initial_name.clone());
-    queue.push_back(initial_name.clone());
-
-    while let Some(current) = queue.pop_front() {
-        if let Some(neighbors) = adj.get(current.as_str()) {
-            for &next in neighbors {
-                if visited.insert(next.to_string()) {
-                    queue.push_back(next.to_string());
-                }
-            }
-        }
-    }
-
-    // Filter states and transitions
-    let name_to_state: HashMap<&str, &AbstractState> = all_states
-        .iter()
-        .filter_map(|s| state_names.get(s).map(|n| (n.as_str(), s)))
-        .collect();
-
-    let states: Vec<DerivedState> = visited
-        .iter()
-        .filter_map(|name| {
-            let abstract_state = name_to_state.get(name.as_str())?;
-            Some(DerivedState {
-                name: name.clone(),
-                is_initial: name == &initial_name,
-                abstract_state: (*abstract_state).clone(),
-            })
-        })
-        .collect();
-
-    let transitions: Vec<DerivedTransition> = transitions
-        .iter()
-        .filter(|t| visited.contains(&t.from) && visited.contains(&t.to))
-        .cloned()
-        .collect();
-
-    (states, transitions)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::domain::AbstractionType;
 
     fn bool_field(name: &str, initial: bool) -> FieldDomain {
         FieldDomain {
             name: name.to_string(),
             abstraction: AbstractionType::Boolean,
             bound: None,
+            lower_bound: None,
             variants: None,
             initial: AbstractValue::Bool(initial),
         }
@@ -414,6 +337,7 @@ mod tests {
             name: name.to_string(),
             abstraction: AbstractionType::BoundedCounter,
             bound: Some(bound),
+            lower_bound: None,
             variants: None,
             initial: AbstractValue::Counter(0),
         }
@@ -421,18 +345,20 @@ mod tests {
 
     #[test]
     fn enumerate_boolean_cross_product() {
-        let fields = vec![bool_field("a", false), bool_field("b", false)];
-        let states = enumerate_states(&fields);
+        let fields = [bool_field("a", false), bool_field("b", false)];
+        let field_refs: Vec<&FieldDomain> = fields.iter().collect();
+        let states = state_enum::enumerate_cross_product(&field_refs);
         assert_eq!(states.len(), 4); // 2 × 2
     }
 
     #[test]
     fn enumerate_mixed_domains() {
-        let fields = vec![
+        let fields = [
             bool_field("flag", false),
             counter_field("count", 2), // 0, 1, 2 = 3 values
         ];
-        let states = enumerate_states(&fields);
+        let field_refs: Vec<&FieldDomain> = fields.iter().collect();
+        let states = state_enum::enumerate_cross_product(&field_refs);
         assert_eq!(states.len(), 6); // 2 × 3
     }
 
@@ -576,6 +502,7 @@ mod tests {
             name: "state".to_string(),
             abstraction: AbstractionType::EnumValues,
             bound: None,
+            lower_bound: None,
             variants: Some(vec!["A".to_string(), "B".to_string(), "C".to_string()]),
             initial: AbstractValue::Variant("A".to_string()),
         }];

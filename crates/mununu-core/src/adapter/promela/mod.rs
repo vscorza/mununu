@@ -19,6 +19,7 @@ use super::{
     AdapterError, AdapterOptions, AdapterOutput, AdapterWarning, FormatAdapter, SourceFormat,
     SourceInfo, WarningKind,
 };
+use crate::adapter::domain::{AbstractValue, FieldDomain};
 use crate::ltl::LtlFormula;
 
 /// Promela adapter implementing [`FormatAdapter`].
@@ -238,13 +239,9 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
     })
 }
 
-/// Create a variable automaton for a bounded variable.
-fn create_variable_automaton(
-    var: &ast::VarDecl,
-    _used_labels: &std::collections::HashSet<String>,
-    options: &AdapterOptions,
-) -> AutomatonSpec {
-    // Check init value
+/// Derive a `FieldDomain` for a Promela variable using type-based heuristics
+/// or explicit user bounds.
+fn promela_var_to_domain(var: &ast::VarDecl, options: &AdapterOptions) -> FieldDomain {
     let init_val = match &var.init {
         Some(ast::Expr::IntLit(n)) => *n,
         Some(ast::Expr::BoolLit(false)) => 0,
@@ -252,33 +249,51 @@ fn create_variable_automaton(
         _ => 0,
     };
 
-    // If user specified explicit bounds for this variable, use those
     let (lo, hi) = if let Some(&(user_lo, user_hi)) = options.variable_bounds.get(&var.name) {
         (user_lo, user_hi)
     } else {
         match &var.typename {
             ast::TypeName::Bit | ast::TypeName::Bool => (0i64, 1),
-            ast::TypeName::Byte if var.init.is_some() => {
-                // Auto-bound heuristic anchored at init value
-                (0, std::cmp::max(init_val + 3, 3))
-            }
+            ast::TypeName::Byte if var.init.is_some() => (0, std::cmp::max(init_val + 3, 3)),
             ast::TypeName::Byte => (0, 3),
             ast::TypeName::Short | ast::TypeName::Int if var.init.is_some() => {
-                // Auto-bound heuristic: anchor at init value with a small window
                 let lo = std::cmp::min(0, init_val - 2);
                 let hi = std::cmp::max(init_val + 3, 3);
                 (lo, hi)
             }
             ast::TypeName::Short | ast::TypeName::Int => (0, 3),
-            ast::TypeName::Mtype => (0, 3), // mtype values are typically small
-            _ => (0, 3),                    // conservative default
+            ast::TypeName::Mtype => (0, 3),
+            _ => (0, 3),
         }
+    };
+
+    FieldDomain::with_range(var.name.clone(), lo, hi, init_val)
+}
+
+/// Create a variable automaton for a bounded variable.
+///
+/// Uses [`FieldDomain`] to derive the value range, then builds set/test
+/// transitions for compositional encoding with process automata.
+fn create_variable_automaton(
+    var: &ast::VarDecl,
+    _used_labels: &std::collections::HashSet<String>,
+    options: &AdapterOptions,
+) -> AutomatonSpec {
+    let domain = promela_var_to_domain(var, options);
+    let values = domain.values();
+    let init_val = match &domain.initial {
+        AbstractValue::Counter(n) => *n,
+        _ => 0,
     };
 
     let mut states = Vec::new();
     let mut transitions = Vec::new();
 
-    for val in lo..=hi {
+    for value in &values {
+        let val = match value {
+            AbstractValue::Counter(n) => *n,
+            _ => continue,
+        };
         let state_name = format!("{}_{}", var.name, val);
         states.push(StateSpec {
             name: state_name.clone(),
@@ -287,7 +302,11 @@ fn create_variable_automaton(
         });
 
         // set_var_val transitions from any state to this value
-        for src_val in lo..=hi {
+        for src_value in &values {
+            let src_val = match src_value {
+                AbstractValue::Counter(n) => *n,
+                _ => continue,
+            };
             let src_name = format!("{}_{}", var.name, src_val);
             let label = format!("set_{}_{}", var.name, val);
             transitions.push(TransitionSpec {
