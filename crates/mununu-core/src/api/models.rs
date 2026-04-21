@@ -203,6 +203,13 @@ pub struct ContextImportRequest {
     pub format: String,
     /// Original filename (used for extension-based detection if format is "auto").
     pub filename: Option<String>,
+    /// Optional sidecar content (.mununu.json for SV, .espec.json for extraction).
+    /// When provided, the adapter uses this for abstraction/property configuration.
+    #[serde(default)]
+    pub sidecar: Option<String>,
+    /// Additional source files (for multi-module SV compositions).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
 }
 
 fn default_import_format() -> String {
@@ -224,6 +231,9 @@ pub struct ContextImportResponse {
     pub signal_count: usize,
     pub state_count: usize,
     pub property_count: usize,
+    /// State valuations for structured predicate matching (when available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_valuations: Option<serde_json::Value>,
 }
 
 // ============================================================================

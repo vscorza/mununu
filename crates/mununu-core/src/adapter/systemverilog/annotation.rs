@@ -1048,6 +1048,138 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
     }
 }
 
+/// A parsed sub-module for in-memory multi-module init (no filesystem access).
+pub struct ParsedSubModule {
+    /// Parsed module AST.
+    pub module: super::ast::Module,
+    /// Source filename (for the sidecar's `source` field).
+    pub source_name: String,
+}
+
+/// Generate a multi-module `MultiModuleSvAnnotation` sidecar from a top-level
+/// module and its sub-module sources. Works entirely in-memory.
+///
+/// This is the shared core logic behind both `mununu sv init --multi` (CLI)
+/// and `POST /api/v1/sv/init` (API with `additional_sources`).
+pub fn generate_multi_sidecar(
+    top_module: &super::ast::Module,
+    sub_modules: &HashMap<String, ParsedSubModule>,
+) -> MultiModuleSvAnnotation {
+    use super::ast::PortDirection;
+
+    // Build wire map from instantiation port bindings
+    let mut wire_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for inst in &top_module.instantiations {
+        for conn in &inst.port_connections {
+            wire_map.entry(conn.signal_name.clone()).or_default().push((
+                inst.instance_name.clone(),
+                inst.module_type.clone(),
+                conn.port_name.clone(),
+            ));
+        }
+    }
+
+    // Derive connections from shared wires
+    let mut connections = Vec::new();
+    let mut connected_inputs: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    for (wire_name, bindings) in &wire_map {
+        if *wire_name == "clk" || *wire_name == "rst" || *wire_name == "rst_n" {
+            continue;
+        }
+        let mut outputs = Vec::new();
+        let mut inputs_on_wire = Vec::new();
+
+        for (inst_name, mod_type, port_name) in bindings {
+            if let Some(sub) = sub_modules.get(mod_type)
+                && let Some(port) = sub.module.ports.iter().find(|p| p.name == *port_name)
+            {
+                match port.direction {
+                    PortDirection::Output => {
+                        outputs.push((inst_name, mod_type, port_name, port.width));
+                    }
+                    PortDirection::Input => {
+                        inputs_on_wire.push((inst_name, mod_type, port_name, port.width));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (out_inst, out_mod, out_port, width) in &outputs {
+            for (in_inst, in_mod, in_port, _) in &inputs_on_wire {
+                let (abstraction, bound) = abstract_width(*width);
+                connections.push(ConnectionSpec {
+                    from: format!("{}.{}", out_mod, out_port),
+                    to: format!("{}.{}", in_mod, in_port),
+                    abstraction,
+                    bound,
+                    variants: None,
+                    value_map: None,
+                    note: Some(format!(
+                        "wire '{}': {}.{} -> {}.{}",
+                        wire_name, out_inst, out_port, in_inst, in_port
+                    )),
+                });
+                connected_inputs.insert((in_mod.to_string(), in_port.to_string()));
+            }
+        }
+    }
+
+    // Build module entries (one per unique instantiated module type)
+    let mut module_entries = Vec::new();
+    let mut seen_types = std::collections::HashSet::new();
+    for inst in &top_module.instantiations {
+        if !seen_types.insert(inst.module_type.clone()) {
+            continue;
+        }
+        if let Some(sub) = sub_modules.get(&inst.module_type) {
+            let signals = build_signal_annotations(&sub.module);
+            let all_inputs = build_input_annotations(&sub.module);
+            let remaining_inputs: Vec<InputAnnotation> = all_inputs
+                .into_iter()
+                .filter(|inp| {
+                    !connected_inputs.contains(&(inst.module_type.clone(), inp.name.clone()))
+                })
+                .collect();
+            let parameters = sub
+                .module
+                .parameters
+                .iter()
+                .map(|p| (p.name.clone(), p.default_value))
+                .collect();
+            module_entries.push(ModuleEntry {
+                name: inst.module_type.clone(),
+                source: sub.source_name.clone(),
+                clock_domain: None,
+                signals,
+                inputs: remaining_inputs,
+                controllable: vec![],
+                parameters,
+                discovered_values: HashMap::new(),
+            });
+        }
+    }
+
+    MultiModuleSvAnnotation {
+        schema: Some("mununu_sv_multi_v1".to_string()),
+        modules: module_entries,
+        connections,
+        composition: Some(CompositionConfig {
+            mode: "synchronous".to_string(),
+            name: "system".to_string(),
+        }),
+        properties: vec![PropertyAnnotation {
+            id: "safety".to_string(),
+            formula: "nu X. ([] X)".to_string(),
+            description: Some("No deadlock — all states have successors".to_string()),
+            role: "guarantee".to_string(),
+        }],
+        discovered_values: HashMap::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -317,6 +317,12 @@ pub async fn context_import_handler(
         details: None,
     })?;
 
+    let state_valuations = if output.state_valuations.is_empty() {
+        None
+    } else {
+        serde_json::to_value(&output.state_valuations).ok()
+    };
+
     Ok(Json(ContextImportResponse {
         success: true,
         ctxdsl: output.ctxdsl,
@@ -325,6 +331,7 @@ pub async fn context_import_handler(
         signal_count: output.source_info.signal_count,
         state_count: output.source_info.state_count,
         property_count: output.source_info.property_count,
+        state_valuations,
     }))
 }
 
@@ -1094,13 +1101,71 @@ pub async fn extraction_extract_handler(
 pub async fn sv_init_handler(
     Json(request): Json<SvInitRequest>,
 ) -> ApiResult<Json<SvInitResponse>> {
-    use crate::adapter::systemverilog::annotation::generate_sidecar;
     use crate::adapter::systemverilog::parser;
 
     let module = parser::parse(&request.source.content).map_err(|e| ApiError::BadRequest {
         message: format!("SV parse error: {e}"),
         details: None,
     })?;
+
+    // Multi-module path: additional sources provided
+    if !request.additional_sources.is_empty() {
+        use crate::adapter::systemverilog::annotation::{ParsedSubModule, generate_multi_sidecar};
+
+        let mut sub_modules = std::collections::HashMap::new();
+        for additional in &request.additional_sources {
+            let sub_mod = parser::parse(&additional.content).map_err(|e| ApiError::BadRequest {
+                message: format!("SV parse error in '{}': {e}", additional.name),
+                details: None,
+            })?;
+            sub_modules.insert(
+                sub_mod.name.clone(),
+                ParsedSubModule {
+                    module: sub_mod,
+                    source_name: additional.name.clone(),
+                },
+            );
+        }
+
+        let multi_sidecar = generate_multi_sidecar(&module, &sub_modules);
+        let sidecar_json =
+            serde_json::to_string_pretty(&multi_sidecar).map_err(|e| ApiError::Internal {
+                message: format!("Failed to serialize sidecar: {e}"),
+                source: None,
+            })?;
+
+        let mut all_signals = Vec::new();
+        let mut all_inputs = Vec::new();
+        for entry in &multi_sidecar.modules {
+            for s in &entry.signals {
+                all_signals.push(SvSignalInfo {
+                    name: format!("{}.{}", entry.name, s.name),
+                    width: 0,
+                    abstraction: format!("{:?}", s.abstraction).to_lowercase(),
+                    preserve: s.preserve,
+                    note: s.note.clone(),
+                });
+            }
+            for i in &entry.inputs {
+                all_inputs.push(SvInputInfo {
+                    name: format!("{}.{}", entry.name, i.name),
+                    abstraction: format!("{:?}", i.abstraction).to_lowercase(),
+                });
+            }
+        }
+
+        return Ok(Json(SvInitResponse {
+            success: true,
+            sidecar: sidecar_json,
+            schema: "mununu_sv_multi_v1".to_string(),
+            signals: all_signals,
+            inputs: all_inputs,
+            warnings: vec![],
+        }));
+    }
+
+    // Single-module path
+    use crate::adapter::systemverilog::annotation::generate_sidecar;
 
     let sidecar = generate_sidecar(&module);
     let sidecar_json = serde_json::to_string_pretty(&sidecar).map_err(|e| ApiError::Internal {
@@ -1113,7 +1178,7 @@ pub async fn sv_init_handler(
         .iter()
         .map(|s| SvSignalInfo {
             name: s.name.clone(),
-            width: 0, // Width not stored in annotation; could be enriched later
+            width: 0,
             abstraction: format!("{:?}", s.abstraction).to_lowercase(),
             preserve: s.preserve,
             note: s.note.clone(),
