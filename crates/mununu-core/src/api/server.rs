@@ -70,6 +70,16 @@ fn create_router() -> Router {
             "/api/v1/extraction/extract",
             post(handlers::extraction_extract_handler),
         )
+        .route("/api/v1/sv/init", post(handlers::sv_init_handler))
+        .route("/api/v1/sv/discover", post(handlers::sv_discover_handler))
+        .route(
+            "/api/v1/extraction/validate",
+            post(handlers::extraction_validate_handler),
+        )
+        .route(
+            "/api/v1/context/predicates",
+            post(handlers::context_predicates_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

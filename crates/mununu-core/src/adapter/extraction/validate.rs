@@ -173,15 +173,35 @@ pub fn validate_spec(
     source_path: &Path,
     drift_window: usize,
 ) -> Result<ValidationReport, String> {
-    let spec: super::ast::ExtractionSpec =
-        serde_json::from_str(spec_json).map_err(|e| format!("Failed to parse spec: {e}"))?;
-
     let source_content = std::fs::read_to_string(source_path).map_err(|e| {
         format!(
             "Failed to read source file '{}': {e}",
             source_path.display()
         )
     })?;
+
+    let mut report = validate_spec_content(spec_json, &source_content, drift_window)?;
+
+    // File-based commit check (only available when source_path is given)
+    let spec: super::ast::ExtractionSpec =
+        serde_json::from_str(spec_json).map_err(|e| format!("Failed to parse spec: {e}"))?;
+    report.commit_match = check_commit_match(&spec, source_path);
+
+    Ok(report)
+}
+
+/// Validate an extraction spec against source content (in-memory).
+///
+/// Like [`validate_spec`] but takes source content as a string instead of
+/// a file path. Used by the API endpoint where content is provided directly.
+/// Does not check commit match (requires file system access).
+pub fn validate_spec_content(
+    spec_json: &str,
+    source_content: &str,
+    drift_window: usize,
+) -> Result<ValidationReport, String> {
+    let spec: super::ast::ExtractionSpec =
+        serde_json::from_str(spec_json).map_err(|e| format!("Failed to parse spec: {e}"))?;
 
     let source_lines: Vec<&str> = source_content.lines().collect();
 
@@ -269,9 +289,6 @@ pub fn validate_spec(
         }
     }
 
-    // Commit check (best-effort)
-    let commit_match = check_commit_match(&spec, source_path);
-
     // Summary
     let exact = anchors
         .iter()
@@ -301,7 +318,7 @@ pub fn validate_spec(
         },
         anchors,
         uncovered,
-        commit_match,
+        commit_match: None, // Set by validate_spec() when file path is available
     })
 }
 

@@ -591,3 +591,134 @@ pub struct ExtractionAutomatonInfo {
     pub state_count: usize,
     pub transition_count: usize,
 }
+
+// ============================================================================
+// SV Init Endpoint
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SvInitRequest {
+    pub source: FileContent,
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SvInitResponse {
+    pub success: bool,
+    pub sidecar: String,
+    pub schema: String,
+    pub signals: Vec<SvSignalInfo>,
+    pub inputs: Vec<SvInputInfo>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SvSignalInfo {
+    pub name: String,
+    pub width: usize,
+    pub abstraction: String,
+    pub preserve: bool,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SvInputInfo {
+    pub name: String,
+    pub abstraction: String,
+}
+
+// ============================================================================
+// SV Discover Endpoint
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SvDiscoverRequest {
+    pub source: FileContent,
+    pub sidecar: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SvDiscoverResponse {
+    pub success: bool,
+    pub sidecar: String,
+    pub discoveries: Vec<SvDiscoveryResult>,
+    pub smt_available: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SvDiscoveryResult {
+    pub signal: String,
+    pub values_found: usize,
+}
+
+// ============================================================================
+// Extraction Validate Endpoint
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ExtractionValidateRequest {
+    pub spec: String,
+    pub source: String,
+    #[serde(default = "default_drift_window")]
+    pub drift_window: usize,
+}
+
+fn default_drift_window() -> usize {
+    5
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExtractionValidateResponse {
+    pub success: bool,
+    pub summary: ValidationSummaryApi,
+    pub anchors: Vec<AnchorResultApi>,
+    pub uncovered: Vec<UncoveredAccessApi>,
+    pub commit_match: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationSummaryApi {
+    pub total: usize,
+    pub exact: usize,
+    pub drifted: usize,
+    pub mismatch: usize,
+    pub error: usize,
+    pub uncovered_accesses: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnchorResultApi {
+    pub id: String,
+    pub section: String,
+    pub status: String,
+    pub line: Option<u32>,
+    pub found_line: Option<u32>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UncoveredAccessApi {
+    pub line: u32,
+    pub field: String,
+    pub content: String,
+}
+
+// ============================================================================
+// Context Predicates Endpoint
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ContextPredicatesRequest {
+    pub context: FileContent,
+    #[serde(default)]
+    pub sidecars: Vec<SidecarFile>,
+    pub automaton: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContextPredicatesResponse {
+    pub success: bool,
+    pub predicates: std::collections::HashMap<String, Vec<String>>,
+}

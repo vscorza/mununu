@@ -879,6 +879,175 @@ fn merge_from_inline(module: &Module) -> MergedConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sidecar generation helpers (shared between CLI and API)
+// ---------------------------------------------------------------------------
+
+/// Determine signal abstraction strategy from bit width.
+///
+/// - 1-bit → Boolean
+/// - 2–4 bit → BoundedCounter (0..2^width-1)
+/// - >4 bit → Discover (needs SMT)
+pub fn abstract_width(width: usize) -> (SignalAbstraction, Option<i64>) {
+    if width == 1 {
+        (SignalAbstraction::Boolean, None)
+    } else if width <= 4 {
+        (
+            SignalAbstraction::BoundedCounter,
+            1i64.checked_shl(width as u32).map(|v| v - 1),
+        )
+    } else {
+        (SignalAbstraction::Discover, None)
+    }
+}
+
+/// Build signal annotations from a module's declarations and output ports.
+///
+/// Walks declarations to find enums and logic signals (excluding ports), then
+/// detects combinational outputs (assign-driven output ports not already in
+/// the signal list).
+pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnotation> {
+    use super::ast::{Declaration, PortDirection};
+    use std::collections::HashSet;
+
+    let port_names: HashSet<&str> = module.ports.iter().map(|p| p.name.as_str()).collect();
+
+    let mut signals = Vec::new();
+    for decl in &module.declarations {
+        match decl {
+            Declaration::Enum {
+                variants,
+                var_name: Some(var),
+                ..
+            } => {
+                signals.push(SignalAnnotation {
+                    name: var.clone(),
+                    preserve: true,
+                    abstraction: SignalAbstraction::Enum,
+                    bound: None,
+                    variants: Some(variants.clone()),
+                    value_map: None,
+                    combinational: false,
+                    note: Some("auto-detected typedef enum".to_string()),
+                });
+            }
+            Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
+                let (abstraction, bound) = abstract_width(*width);
+                let note = match abstraction {
+                    SignalAbstraction::Boolean => "1-bit flag",
+                    SignalAbstraction::BoundedCounter => "small register — bounded counter",
+                    _ => "wide register — run `mununu sv discover` to find significant values",
+                };
+                signals.push(SignalAnnotation {
+                    name: name.clone(),
+                    preserve: *width <= 4,
+                    abstraction,
+                    bound,
+                    variants: None,
+                    value_map: None,
+                    combinational: false,
+                    note: Some(note.to_string()),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Detect combinational output ports (driven by assign statements)
+    for port in &module.ports {
+        if port.direction == PortDirection::Output
+            && module.assigns.iter().any(|a| a.target.name() == port.name)
+            && !signals.iter().any(|s| s.name == port.name)
+        {
+            let (abstraction, bound) = abstract_width(port.width);
+            signals.push(SignalAnnotation {
+                name: port.name.clone(),
+                preserve: true,
+                abstraction,
+                bound,
+                variants: None,
+                value_map: None,
+                combinational: true,
+                note: Some("combinational output (assign-driven)".to_string()),
+            });
+        }
+    }
+
+    signals
+}
+
+/// Build input annotations from a module's input ports, skipping clock/reset.
+pub fn build_input_annotations(module: &super::ast::Module) -> Vec<InputAnnotation> {
+    use super::ast::PortDirection;
+
+    module
+        .ports
+        .iter()
+        .filter(|p| {
+            p.direction == PortDirection::Input
+                && !["clk", "rst", "rst_n"].contains(&p.name.as_str())
+        })
+        .map(|p| {
+            let (abstraction, bound) = abstract_width(p.width);
+            InputAnnotation {
+                name: p.name.clone(),
+                preserve: true,
+                abstraction,
+                bound,
+                variants: None,
+                value_map: None,
+                label_name: None,
+            }
+        })
+        .collect()
+}
+
+/// Merge newly discovered values into an existing `discovered_values` map,
+/// deduplicating by value and sorting.
+pub fn merge_discovered_values(
+    target: &mut HashMap<String, DiscoveredValues>,
+    results: HashMap<String, DiscoveredValues>,
+) {
+    for (signal, discovered) in results {
+        let existing = target.entry(signal).or_insert_with(|| DiscoveredValues {
+            values: vec![],
+            catch_all: "OTHER".to_string(),
+        });
+        for new_val in &discovered.values {
+            if !existing.values.iter().any(|v| v.value == new_val.value) {
+                existing.values.push(new_val.clone());
+            }
+        }
+        existing.values.sort_by_key(|v| v.value);
+    }
+}
+
+/// Generate a complete `SvAnnotation` sidecar from a parsed module.
+///
+/// This is the core logic behind `mununu sv init` — auto-detects signals,
+/// inputs, and generates a skeleton sidecar with sensible defaults.
+pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
+    let signals = build_signal_annotations(module);
+    let inputs = build_input_annotations(module);
+
+    SvAnnotation {
+        schema: Some("mununu_sv_annotation_v1".to_string()),
+        module: module.name.clone(),
+        source: None,
+        signals,
+        inputs,
+        controllable: vec![],
+        properties: vec![PropertyAnnotation {
+            id: "safety".to_string(),
+            formula: "nu X. ([] X)".to_string(),
+            description: Some("No deadlock — all reachable states have successors".to_string()),
+            role: "guarantee".to_string(),
+        }],
+        discovered_values: HashMap::new(),
+        parameters: HashMap::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

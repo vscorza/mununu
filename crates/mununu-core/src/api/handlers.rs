@@ -1089,3 +1089,295 @@ pub async fn extraction_extract_handler(
         details: None,
     })
 }
+
+/// Initialize a SystemVerilog annotation sidecar from parsed module.
+pub async fn sv_init_handler(
+    Json(request): Json<SvInitRequest>,
+) -> ApiResult<Json<SvInitResponse>> {
+    use crate::adapter::systemverilog::annotation::generate_sidecar;
+    use crate::adapter::systemverilog::parser;
+
+    let module = parser::parse(&request.source.content).map_err(|e| ApiError::BadRequest {
+        message: format!("SV parse error: {e}"),
+        details: None,
+    })?;
+
+    let sidecar = generate_sidecar(&module);
+    let sidecar_json = serde_json::to_string_pretty(&sidecar).map_err(|e| ApiError::Internal {
+        message: format!("Failed to serialize sidecar: {e}"),
+        source: None,
+    })?;
+
+    let signals: Vec<SvSignalInfo> = sidecar
+        .signals
+        .iter()
+        .map(|s| SvSignalInfo {
+            name: s.name.clone(),
+            width: 0, // Width not stored in annotation; could be enriched later
+            abstraction: format!("{:?}", s.abstraction).to_lowercase(),
+            preserve: s.preserve,
+            note: s.note.clone(),
+        })
+        .collect();
+
+    let inputs: Vec<SvInputInfo> = sidecar
+        .inputs
+        .iter()
+        .map(|i| SvInputInfo {
+            name: i.name.clone(),
+            abstraction: format!("{:?}", i.abstraction).to_lowercase(),
+        })
+        .collect();
+
+    Ok(Json(SvInitResponse {
+        success: true,
+        sidecar: sidecar_json,
+        schema: "mununu_sv_annotation_v1".to_string(),
+        signals,
+        inputs,
+        warnings: vec![],
+    }))
+}
+
+/// Run SMT-based value discovery on a SystemVerilog module.
+pub async fn sv_discover_handler(
+    Json(request): Json<SvDiscoverRequest>,
+) -> ApiResult<Json<SvDiscoverResponse>> {
+    // Check if SMT feature is available
+    if !cfg!(feature = "smt") {
+        return Ok(Json(SvDiscoverResponse {
+            success: false,
+            sidecar: request.sidecar.clone(),
+            discoveries: vec![],
+            smt_available: false,
+            warnings: vec![
+                "SMT discovery not available: mununu was built without the 'smt' feature. \
+                 Rebuild with `cargo build --features smt` to enable Z3-based value discovery."
+                    .to_string(),
+            ],
+        }));
+    }
+
+    // Parse the SV source
+    use crate::adapter::systemverilog::parser;
+    let _module = parser::parse(&request.source.content).map_err(|e| ApiError::BadRequest {
+        message: format!("SV parse error: {e}"),
+        details: None,
+    })?;
+
+    // Parse the sidecar
+    use crate::adapter::systemverilog::annotation::SvAnnotation;
+    let _sidecar: SvAnnotation =
+        serde_json::from_str(&request.sidecar).map_err(|e| ApiError::BadRequest {
+            message: format!("Failed to parse sidecar JSON: {e}"),
+            details: None,
+        })?;
+
+    // Run SMT discovery (only when feature is enabled)
+    #[cfg(feature = "smt")]
+    {
+        use crate::adapter::systemverilog::annotation::merge_discovered_values;
+        use crate::adapter::systemverilog::kripke_smt::engine;
+
+        let mut sidecar = _sidecar;
+        let results = engine::discover_significant_values(&_module, &sidecar);
+
+        let discoveries: Vec<SvDiscoveryResult> = results
+            .iter()
+            .map(|(signal, dv)| SvDiscoveryResult {
+                signal: signal.clone(),
+                values_found: dv.values.len(),
+            })
+            .collect();
+
+        merge_discovered_values(&mut sidecar.discovered_values, results);
+
+        let updated_sidecar =
+            serde_json::to_string_pretty(&sidecar).map_err(|e| ApiError::Internal {
+                message: format!("Failed to serialize updated sidecar: {e}"),
+                source: None,
+            })?;
+
+        return Ok(Json(SvDiscoverResponse {
+            success: true,
+            sidecar: updated_sidecar,
+            discoveries,
+            smt_available: true,
+            warnings: vec![],
+        }));
+    }
+
+    #[cfg(not(feature = "smt"))]
+    {
+        // This branch is unreachable due to the early return above,
+        // but satisfies the compiler when the smt feature is disabled.
+        unreachable!()
+    }
+}
+
+/// Validate an extraction spec against source code.
+pub async fn extraction_validate_handler(
+    Json(request): Json<ExtractionValidateRequest>,
+) -> ApiResult<Json<ExtractionValidateResponse>> {
+    use crate::adapter::extraction::validate;
+
+    let report =
+        validate::validate_spec_content(&request.spec, &request.source, request.drift_window)
+            .map_err(|e| ApiError::BadRequest {
+                message: format!("Validation failed: {e}"),
+                details: None,
+            })?;
+
+    let anchors: Vec<AnchorResultApi> = report
+        .anchors
+        .iter()
+        .map(|a| match a {
+            validate::AnchorResult::Exact {
+                spec_id,
+                section,
+                line,
+                ..
+            } => AnchorResultApi {
+                id: spec_id.clone(),
+                section: section.clone(),
+                status: "exact".to_string(),
+                line: Some(*line),
+                found_line: Some(*line),
+                message: None,
+            },
+            validate::AnchorResult::Drifted {
+                spec_id,
+                section,
+                expected_line,
+                found_line,
+                ..
+            } => AnchorResultApi {
+                id: spec_id.clone(),
+                section: section.clone(),
+                status: "drifted".to_string(),
+                line: Some(*expected_line),
+                found_line: Some(*found_line),
+                message: Some(format!(
+                    "Drifted from line {} to {}",
+                    expected_line, found_line
+                )),
+            },
+            validate::AnchorResult::Mismatch {
+                spec_id,
+                section,
+                expected_line,
+                expected_pattern,
+                actual_at_line,
+            } => AnchorResultApi {
+                id: spec_id.clone(),
+                section: section.clone(),
+                status: "mismatch".to_string(),
+                line: Some(*expected_line),
+                found_line: None,
+                message: Some(format!(
+                    "Expected '{}', found '{}'",
+                    expected_pattern, actual_at_line
+                )),
+            },
+            validate::AnchorResult::Error {
+                spec_id,
+                section,
+                message,
+            } => AnchorResultApi {
+                id: spec_id.clone(),
+                section: section.clone(),
+                status: "error".to_string(),
+                line: None,
+                found_line: None,
+                message: Some(message.clone()),
+            },
+        })
+        .collect();
+
+    let uncovered: Vec<UncoveredAccessApi> = report
+        .uncovered
+        .iter()
+        .map(|u| UncoveredAccessApi {
+            line: u.line,
+            field: u.field.clone(),
+            content: u.content.clone(),
+        })
+        .collect();
+
+    Ok(Json(ExtractionValidateResponse {
+        success: true,
+        summary: ValidationSummaryApi {
+            total: report.summary.total,
+            exact: report.summary.exact,
+            drifted: report.summary.drifted,
+            mismatch: report.summary.mismatch,
+            error: report.summary.error,
+            uncovered_accesses: report.summary.uncovered_accesses,
+        },
+        anchors,
+        uncovered,
+        commit_match: report.commit_match,
+    }))
+}
+
+/// List predicate names per automaton in a context.
+pub async fn context_predicates_handler(
+    Json(request): Json<ContextPredicatesRequest>,
+) -> ApiResult<Json<ContextPredicatesResponse>> {
+    let instant = Instant::now();
+
+    // Parse main document
+    let context_doc =
+        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
+            message: format!("Context parse error: {e}"),
+            details: None,
+        })?;
+
+    // Parse sidecars
+    let sidecar_docs: Result<Vec<_>, _> = request
+        .sidecars
+        .iter()
+        .map(|s| parse_context_doc(&s.content))
+        .collect();
+
+    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
+        message: format!("Sidecar parse error: {e}"),
+        details: None,
+    })?;
+
+    let realized =
+        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
+            message: format!("Realization error: {e}"),
+            source: None,
+        })?;
+
+    info!(
+        elapsed_ms = instant.elapsed().as_millis() as u64,
+        "predicates: realized"
+    );
+
+    let mut predicates: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for aut_name in realized.context.clts_names() {
+        if let Some(ref filter) = request.automaton
+            && &aut_name != filter
+        {
+            continue;
+        }
+        let preds: Vec<String> = realized
+            .predicate_names(&aut_name)
+            .map(|set| {
+                let mut v: Vec<String> = set.iter().map(|s| s.to_string()).collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        predicates.insert(aut_name, preds);
+    }
+
+    Ok(Json(ContextPredicatesResponse {
+        success: true,
+        predicates,
+    }))
+}

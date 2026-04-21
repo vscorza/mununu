@@ -21,156 +21,9 @@ use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use mununu_core::adapter::systemverilog::annotation::SignalAbstraction;
-
-/// Classify a bit-width into the appropriate signal abstraction and optional
-/// upper bound.  Centralises the recurring pattern used throughout `sv init`.
-///
-/// Returns `(abstraction, bound)` where:
-/// - width == 1  → `(Boolean, None)`
-/// - width 2..=4 → `(BoundedCounter, Some(2^width - 1))`
-/// - width > 4   → `(Discover, None)`
-fn abstract_width(width: usize) -> (SignalAbstraction, Option<i64>) {
-    if width == 1 {
-        (SignalAbstraction::Boolean, None)
-    } else if width <= 4 {
-        (
-            SignalAbstraction::BoundedCounter,
-            1i64.checked_shl(width as u32).map(|v| v - 1),
-        )
-    } else {
-        (SignalAbstraction::Discover, None)
-    }
-}
-
-/// Build signal annotations from a module's declarations and output ports.
-///
-/// Walks declarations to find enums and logic signals (excluding ports), then
-/// detects combinational outputs (assign-driven output ports not already in
-/// the signal list).
-fn build_signal_annotations(
-    module: &mununu_core::adapter::systemverilog::ast::Module,
-) -> Vec<mununu_core::adapter::systemverilog::annotation::SignalAnnotation> {
-    use mununu_core::adapter::systemverilog::annotation::{SignalAbstraction, SignalAnnotation};
-    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
-
-    let port_names: HashSet<&str> = module.ports.iter().map(|p| p.name.as_str()).collect();
-
-    let mut signals = Vec::new();
-    for decl in &module.declarations {
-        match decl {
-            Declaration::Enum {
-                variants,
-                var_name: Some(var),
-                ..
-            } => {
-                signals.push(SignalAnnotation {
-                    name: var.clone(),
-                    preserve: true,
-                    abstraction: SignalAbstraction::Enum,
-                    bound: None,
-                    variants: Some(variants.clone()),
-                    value_map: None,
-                    combinational: false,
-                    note: Some("auto-detected typedef enum".to_string()),
-                });
-            }
-            Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
-                let (abstraction, bound) = abstract_width(*width);
-                let note = match abstraction {
-                    SignalAbstraction::Boolean => "1-bit flag",
-                    SignalAbstraction::BoundedCounter => "small register — bounded counter",
-                    _ => "wide register — run `mununu sv discover` to find significant values",
-                };
-                signals.push(SignalAnnotation {
-                    name: name.clone(),
-                    preserve: *width <= 4,
-                    abstraction,
-                    bound,
-                    variants: None,
-                    value_map: None,
-                    combinational: false,
-                    note: Some(note.to_string()),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    // Detect combinational output ports (driven by assign statements)
-    for port in &module.ports {
-        if port.direction == PortDirection::Output
-            && module.assigns.iter().any(|a| a.target.name() == port.name)
-            && !signals.iter().any(|s| s.name == port.name)
-        {
-            let (abstraction, bound) = abstract_width(port.width);
-            signals.push(SignalAnnotation {
-                name: port.name.clone(),
-                preserve: true,
-                abstraction,
-                bound,
-                variants: None,
-                value_map: None,
-                combinational: true,
-                note: Some("combinational output (assign-driven)".to_string()),
-            });
-        }
-    }
-
-    signals
-}
-
-/// Build input annotations from a module's input ports, skipping clock/reset.
-fn build_input_annotations(
-    module: &mununu_core::adapter::systemverilog::ast::Module,
-) -> Vec<mununu_core::adapter::systemverilog::annotation::InputAnnotation> {
-    use mununu_core::adapter::systemverilog::annotation::InputAnnotation;
-    use mununu_core::adapter::systemverilog::ast::PortDirection;
-
-    module
-        .ports
-        .iter()
-        .filter(|p| {
-            p.direction == PortDirection::Input
-                && !["clk", "rst", "rst_n"].contains(&p.name.as_str())
-        })
-        .map(|p| {
-            let (abstraction, bound) = abstract_width(p.width);
-            InputAnnotation {
-                name: p.name.clone(),
-                preserve: true,
-                abstraction,
-                bound,
-                variants: None,
-                value_map: None,
-                label_name: None,
-            }
-        })
-        .collect()
-}
-
-/// Merge newly discovered values into an existing `discovered_values` map,
-/// deduplicating by value and sorting.
-#[cfg(feature = "smt")]
-fn merge_discovered_values(
-    target: &mut HashMap<String, mununu_core::adapter::systemverilog::annotation::DiscoveredValues>,
-    results: HashMap<String, mununu_core::adapter::systemverilog::annotation::DiscoveredValues>,
-) {
-    use mununu_core::adapter::systemverilog::annotation::DiscoveredValues;
-
-    for (signal, discovered) in results {
-        let existing = target.entry(signal).or_insert_with(|| DiscoveredValues {
-            values: vec![],
-            catch_all: "OTHER".to_string(),
-        });
-        for new_val in &discovered.values {
-            if !existing.values.iter().any(|v| v.value == new_val.value) {
-                existing.values.push(new_val.clone());
-            }
-        }
-        existing.values.sort_by_key(|v| v.value);
-    }
-}
+// SV init helpers live in mununu-core::adapter::systemverilog::annotation
+// (used via wildcard import inside sv_init/sv_init_multi functions)
+use mununu_core::adapter::systemverilog::annotation as sv_annotation;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -824,7 +677,7 @@ fn sv_init_multi_from_top(
         // Create connection for each output→input pair on the same wire
         for (out_inst, out_mod, out_port, width) in &outputs {
             for (in_inst, in_mod, in_port, _) in &inputs_on_wire {
-                let (abstraction, bound) = abstract_width(*width);
+                let (abstraction, bound) = sv_annotation::abstract_width(*width);
                 connections.push(ConnectionSpec {
                     from: format!("{}.{}", out_mod, out_port),
                     to: format!("{}.{}", in_mod, in_port),
