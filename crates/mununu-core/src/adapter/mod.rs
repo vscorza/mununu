@@ -9,6 +9,33 @@
 //!
 //! Each adapter implements the [`FormatAdapter`] trait. The shared IR types
 //! live in [`ir`], and the CTXDSL emitter in [`emit`].
+//!
+//! # Soundness Checklist for Adapter Implementors
+//!
+//! Every adapter must address the following before being considered complete:
+//!
+//! 1. **Unsupported constructs must warn.** Any source-language construct that
+//!    is skipped or partially handled must emit an [`AdapterWarning`] with
+//!    [`WarningKind::UnsupportedConstruct`] and note the soundness impact
+//!    (over-approx or under-approx).
+//!
+//! 2. **State abstraction direction must be documented.** For every field or
+//!    register abstracted into a finite domain, document whether the abstraction
+//!    is an over-approximation (admits more behaviors) or under-approximation
+//!    (admits fewer behaviors) using `// SOUNDNESS:` comments.
+//!
+//! 3. **Guard evaluation failures must be documented.** When `eval_expr` or
+//!    guard evaluation returns `None`/default, document whether the fallback
+//!    is conservative (over-approx: allows transition) or optimistic
+//!    (under-approx: blocks transition).
+//!
+//! 4. **Controllability must be explicit.** Every label must have a clear
+//!    rationale for its controllability classification. If heuristic-based,
+//!    emit [`WarningKind::NeutralControllability`] so the user can override.
+//!
+//! 5. **Known-verdict regression test must exist.** At minimum one test with a
+//!    known-safe and one known-unsafe property, verifying the adapter produces
+//!    a model that gives the expected verdict.
 
 pub mod aiger;
 pub mod domain;

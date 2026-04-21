@@ -50,8 +50,71 @@ pub struct WitnessMap {
     pub witnesses: HashMap<(usize, NodeId), usize>,
 
     /// `(state_index, fixpoint_var_id)` → iteration number when the state
-    /// entered the fixpoint set. Used for obligation ranking in GR(1).
+    /// entered the fixpoint set. Forms the strategy signature for each state.
     pub iteration_ranks: HashMap<(usize, super::FormulaVarId), usize>,
+}
+
+/// A state's strategy signature — its rank tuple under the fixpoint nesting.
+/// Used for lexicographic comparison to determine progressive moves.
+pub type Signature = Vec<usize>;
+
+impl WitnessMap {
+    /// Compute the strategy signature for a state given the formula's fixpoint
+    /// nesting order. Returns a rank vector where each entry corresponds to a
+    /// fixpoint variable (outermost first).
+    ///
+    /// For mu-variables: the iteration at which the state entered the fixpoint
+    /// (lower = closer to goal = better). States not in the fixpoint get `usize::MAX`.
+    ///
+    /// For nu-variables: 0 if the state is in the greatest fixpoint, `usize::MAX` if not.
+    /// (Being in the nu-fixpoint is "good" — the invariant holds.)
+    pub fn signature(
+        &self,
+        state_idx: usize,
+        nesting: &[(super::FormulaVarId, bool)],
+    ) -> Signature {
+        nesting
+            .iter()
+            .map(|(var_id, _is_mu)| {
+                self.iteration_ranks
+                    .get(&(state_idx, *var_id))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            })
+            .collect()
+    }
+
+    /// Returns true if `target`'s signature is lexicographically ≤ `source`'s
+    /// under the mu/nu ordering. This means the target is at least as progressive
+    /// as the source — suitable for a winning strategy move.
+    ///
+    /// For mu-variables: smaller rank is better (fewer iterations to reach goal).
+    /// For nu-variables: smaller rank is better (0 = in fixpoint, MAX = not).
+    /// In both cases, the natural ordering (≤) is "at least as good."
+    pub fn signature_nonincreasing(
+        &self,
+        source_idx: usize,
+        target_idx: usize,
+        nesting: &[(super::FormulaVarId, bool)],
+    ) -> bool {
+        let src = self.signature(source_idx, nesting);
+        let tgt = self.signature(target_idx, nesting);
+        tgt <= src
+    }
+
+    /// Returns true if `target`'s signature is strictly less than `source`'s
+    /// (strict progress). Useful for functional controller extraction where
+    /// we want guaranteed liveness progress.
+    pub fn signature_decreasing(
+        &self,
+        source_idx: usize,
+        target_idx: usize,
+        nesting: &[(super::FormulaVarId, bool)],
+    ) -> bool {
+        let src = self.signature(source_idx, nesting);
+        let tgt = self.signature(target_idx, nesting);
+        tgt < src
+    }
 }
 
 /// Environment that supplies atomic predicate valuations for evaluation.
@@ -1552,7 +1615,11 @@ where
             return Ok(bits);
         }
 
-        // Predicate not found - return empty bitset (conservative: assume false)
+        // SOUNDNESS: under-approx — unknown predicate assumed false (empty bitset).
+        // Conservative for universal (box/nu) modalities: if a property holds with
+        // fewer predicates satisfied, it holds with more. Unsound for existential
+        // (diamond/mu) modalities: a predicate that should be true but is missing
+        // could cause a reachable liveness witness to be missed.
         self.alloc_bitvec(false)
     }
 

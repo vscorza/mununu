@@ -11,10 +11,25 @@ pub mod parser;
 pub mod simplify;
 
 pub use evaluator::{
-    Environment, EvalResult, EvaluationError, EvaluationOptions, WitnessMap, evaluate,
+    Environment, EvalResult, EvaluationError, EvaluationOptions, Signature, WitnessMap, evaluate,
     evaluate_with_options, evaluate_with_options_and_automaton, evaluate_with_witnesses,
 };
 pub use simplify::simplify;
+
+/// Classification of a μ-calculus formula by its fixpoint structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyClass {
+    /// Pure greatest-fixpoint (nu-only): invariance / safety properties.
+    Safety,
+    /// Pure least-fixpoint (mu-only): reachability / guarantee properties.
+    Reachability,
+    /// Mixed fixpoints with alternation depth ≥ 2: liveness / fairness / GR(1).
+    Liveness,
+    /// Has fixpoints but no alternation (depth 1, mixed mu/nu at same level).
+    Mixed,
+    /// No fixpoints at all (propositional).
+    Propositional,
+}
 
 /// Convenience methods for inspecting and traversing [`Node`] values.
 pub trait NodeOps {
@@ -81,6 +96,142 @@ impl Formula {
     /// Returns metadata for the requested fixpoint variable.
     pub fn var(&self, id: FormulaVarId) -> &FormulaVar {
         &self.vars[id.0]
+    }
+
+    /// Returns fixpoint variables in nesting order (outermost first) with their
+    /// polarity. This defines the signature structure for strategy extraction.
+    ///
+    /// Each entry is `(FormulaVarId, is_mu)` where `is_mu = true` for least
+    /// fixpoints and `false` for greatest fixpoints. The ordering determines
+    /// significance in the lexicographic signature comparison: earlier entries
+    /// (outer fixpoints) are more significant.
+    pub fn fixpoint_nesting_order(&self) -> Vec<(FormulaVarId, bool)> {
+        let mut result = Vec::new();
+        self.collect_fixpoint_order(self.root, &mut result);
+        result
+    }
+
+    fn collect_fixpoint_order(&self, id: NodeId, out: &mut Vec<(FormulaVarId, bool)>) {
+        match self.node(id) {
+            Node::Mu { var, body } => {
+                out.push((*var, true));
+                self.collect_fixpoint_order(*body, out);
+            }
+            Node::Nu { var, body } => {
+                out.push((*var, false));
+                self.collect_fixpoint_order(*body, out);
+            }
+            Node::And(l, r) | Node::Or(l, r) => {
+                self.collect_fixpoint_order(*l, out);
+                self.collect_fixpoint_order(*r, out);
+            }
+            Node::Not(inner) => self.collect_fixpoint_order(*inner, out),
+            Node::Modal { target, .. } => self.collect_fixpoint_order(*target, out),
+            Node::True | Node::False | Node::Predicate(_) | Node::Variable(_) => {}
+        }
+    }
+
+    /// Computes the alternation depth of the formula.
+    ///
+    /// Alternation depth counts the maximum nesting of mu inside nu (or vice
+    /// versa). Depth 0 = no fixpoints, depth 1 = single-type fixpoints (safety
+    /// or reachability), depth 2+ = requires memory for correct strategy
+    /// extraction (liveness, GR(1), parity).
+    pub fn alternation_depth(&self) -> usize {
+        self.ad_node(self.root, &mut vec![None; self.nodes.len()])
+    }
+
+    /// Recursive helper for alternation depth computation.
+    /// `cache[node_index]` caches computed depths.
+    fn ad_node(&self, id: NodeId, cache: &mut Vec<Option<usize>>) -> usize {
+        if let Some(d) = cache[id.0] {
+            return d;
+        }
+        let depth = match &self.nodes[id.0] {
+            Node::True | Node::False | Node::Predicate(_) | Node::Variable(_) => 0,
+            Node::Not(inner) => self.ad_node(*inner, cache),
+            Node::And(l, r) | Node::Or(l, r) => {
+                self.ad_node(*l, cache).max(self.ad_node(*r, cache))
+            }
+            Node::Modal { target, .. } => self.ad_node(*target, cache),
+            Node::Mu { body, .. } => {
+                let body_depth = self.ad_node(*body, cache);
+                // Check if the body contains a nu — that's an alternation
+                if self.contains_opposite_fixpoint(*body, true) {
+                    body_depth.max(1) + 1
+                } else {
+                    body_depth.max(1)
+                }
+            }
+            Node::Nu { body, .. } => {
+                let body_depth = self.ad_node(*body, cache);
+                // Check if the body contains a mu — that's an alternation
+                if self.contains_opposite_fixpoint(*body, false) {
+                    body_depth.max(1) + 1
+                } else {
+                    body_depth.max(1)
+                }
+            }
+        };
+        cache[id.0] = Some(depth);
+        depth
+    }
+
+    /// Returns true if the subtree rooted at `id` contains a fixpoint of the
+    /// opposite kind. `looking_for_nu = true` means we're inside a mu and
+    /// looking for a nu (and vice versa).
+    fn contains_opposite_fixpoint(&self, id: NodeId, looking_for_nu: bool) -> bool {
+        match &self.nodes[id.0] {
+            Node::True | Node::False | Node::Predicate(_) | Node::Variable(_) => false,
+            Node::Not(inner) => self.contains_opposite_fixpoint(*inner, looking_for_nu),
+            Node::And(l, r) | Node::Or(l, r) => {
+                self.contains_opposite_fixpoint(*l, looking_for_nu)
+                    || self.contains_opposite_fixpoint(*r, looking_for_nu)
+            }
+            Node::Modal { target, .. } => self.contains_opposite_fixpoint(*target, looking_for_nu),
+            Node::Nu { .. } if looking_for_nu => true,
+            Node::Mu { .. } if !looking_for_nu => true,
+            Node::Mu { body, .. } | Node::Nu { body, .. } => {
+                self.contains_opposite_fixpoint(*body, looking_for_nu)
+            }
+        }
+    }
+
+    /// Classifies this formula into a [`PropertyClass`] based on its fixpoint
+    /// structure.
+    pub fn property_class(&self) -> PropertyClass {
+        let (has_mu, has_nu) = self.fixpoint_kinds(self.root);
+        let ad = self.alternation_depth();
+
+        match (has_mu, has_nu, ad) {
+            (false, false, _) => PropertyClass::Propositional,
+            (false, true, _) => PropertyClass::Safety,
+            (true, false, _) => PropertyClass::Reachability,
+            (true, true, d) if d >= 2 => PropertyClass::Liveness,
+            _ => PropertyClass::Mixed,
+        }
+    }
+
+    /// Returns (has_mu, has_nu) for the subtree rooted at `id`.
+    fn fixpoint_kinds(&self, id: NodeId) -> (bool, bool) {
+        match &self.nodes[id.0] {
+            Node::True | Node::False | Node::Predicate(_) | Node::Variable(_) => (false, false),
+            Node::Not(inner) => self.fixpoint_kinds(*inner),
+            Node::And(l, r) | Node::Or(l, r) => {
+                let (lm, ln) = self.fixpoint_kinds(*l);
+                let (rm, rn) = self.fixpoint_kinds(*r);
+                (lm || rm, ln || rn)
+            }
+            Node::Modal { target, .. } => self.fixpoint_kinds(*target),
+            Node::Mu { body, .. } => {
+                let (_, bn) = self.fixpoint_kinds(*body);
+                (true, bn)
+            }
+            Node::Nu { body, .. } => {
+                let (bm, _) = self.fixpoint_kinds(*body);
+                (bm, true)
+            }
+        }
     }
 }
 
@@ -206,6 +357,7 @@ impl FormulaBuilder {
 
 #[cfg(test)]
 mod tests {
+    use super::PropertyClass;
     use super::parser;
 
     #[test]
@@ -213,5 +365,44 @@ mod tests {
         let parsed = parser::parse("true").expect("formula parses");
         let root = parsed.root();
         assert!(matches!(parsed.node(root), super::Node::True));
+    }
+
+    #[test]
+    fn alternation_depth_propositional() {
+        let f = parser::parse("true && !false").unwrap();
+        assert_eq!(f.alternation_depth(), 0);
+        assert_eq!(f.property_class(), PropertyClass::Propositional);
+    }
+
+    #[test]
+    fn alternation_depth_safety() {
+        // nu X. (p && [] X) — pure greatest fixpoint, depth 1
+        let f = parser::parse("nu X. (p && [] X)").unwrap();
+        assert_eq!(f.alternation_depth(), 1);
+        assert_eq!(f.property_class(), PropertyClass::Safety);
+    }
+
+    #[test]
+    fn alternation_depth_reachability() {
+        // mu X. (p || <> X) — pure least fixpoint, depth 1
+        let f = parser::parse("mu X. (p || <> X)").unwrap();
+        assert_eq!(f.alternation_depth(), 1);
+        assert_eq!(f.property_class(), PropertyClass::Reachability);
+    }
+
+    #[test]
+    fn alternation_depth_liveness() {
+        // nu X. (mu Y. (p || <> Y)) && [] X — mu inside nu, depth 2
+        let f = parser::parse("nu X. ((mu Y. (p || <> Y)) && [] X)").unwrap();
+        assert_eq!(f.alternation_depth(), 2);
+        assert_eq!(f.property_class(), PropertyClass::Liveness);
+    }
+
+    #[test]
+    fn alternation_depth_nested_same_kind() {
+        // nu X. (nu Y. (p && [] Y) && [] X) — nested nu, no alternation, depth 1
+        let f = parser::parse("nu X. ((nu Y. (p && [] Y)) && [] X)").unwrap();
+        assert_eq!(f.alternation_depth(), 1);
+        assert_eq!(f.property_class(), PropertyClass::Safety);
     }
 }

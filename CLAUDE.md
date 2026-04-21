@@ -204,11 +204,32 @@ When in doubt, run `rustup update stable && cargo clippy --all-targets -- -D war
 - Every CTXDSL example in wiki pages must be tested against the binary before publishing.
 - Keep the References page current with new publications and tool comparisons.
 
-### Strategy Extraction & Synthesis Limitations
+### Soundness Guarantees
 
-- **Current controllers are projections** of the winning region, not true strategies. For safety properties (alternation depth 1), the projection IS a valid strategy. For liveness/GR(1) (alternation depth 2+), the controller may need additional structure (obligation tracking) to guarantee progress.
-- **`--extract-strategy` flag**: produces a positional strategy keeping ONE controllable transition per state. This is a heuristic — it picks the first winning controllable transition, not necessarily the optimal one.
-- **GR(1) obligation tracking is NOT implemented.** For `[]<> g_1 && []<> g_2`, the winning region is correct, but the synthesized controller does not cycle through obligations. See Phase 4b in the plan for the Bruse-Friedmann-Lange approach.
+Mununu is a model checker that exhaustively verifies finite-state models. Its verdicts are correct for the model. Whether they transfer to the real system depends on the abstraction:
+
+- **Safety properties + over-approximation → SOUND.** If the model says safe, the real system is safe (within the modeled scope). Over-approximation admits all real behaviors plus possibly more — extra behaviors can only add violations, not hide them.
+- **Liveness properties + over-approximation → UNSOUND.** The model may show spurious progress from noop loops, havoc branches, or async interleaving without fairness.
+- **Safety properties + under-approximation → UNSOUND.** The model may miss violations from behaviors it doesn't capture (e.g., skipped constructs, guard eval returning None).
+
+When contributing adapters or modifying the Kripke builder:
+- Document every `eval_expr → None` choice as over-approx or under-approx using `// SOUNDNESS:` comments
+- Never mix directions within a single model without documenting it
+- Add a soundness regression test for any new abstraction decision
+
+Strategy extraction uses **signature-based selection** from iteration ranks:
+- The winning region / realizability verdict is always correct for ALL mu-calculus formulas (any alternation depth)
+- Counterstrategies are also positional — both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998)
+- Memoryless on the model-checking product = finite-memory on the plant. The memory is the iteration-rank signature from fixpoint evaluation.
+
+### Strategy Extraction & Synthesis Modes
+
+Three `ControllerMode` options:
+- **Projection** (default): keeps ALL transitions between winning states. Not a strategy — just the winning region as a sub-CLTS.
+- **Functional** (`--extract-strategy`): picks ONE controllable transition per state — the one whose target has the lexicographically smallest signature (best mu-progress). Deterministic, correct for all formulas.
+- **Permissive**: keeps ALL controllable transitions whose target signature is ≤ the source's. Maximally permissive supervisor (Ramadge-Wonham canonical). Nondeterministic, composable with other supervisors.
+
+The **signature** of a state is its tuple of iteration ranks per fixpoint variable (outermost first). For mu-variables, smaller rank = closer to goal. The functional strategy picks the most progressive move; the permissive supervisor enables all non-regressive moves.
 - **Lasso traces**: counterexample traces for liveness include lasso format `prefix -> (cycle)^ω` with transition labels (`prefix_labels`, `cycle_labels`). The cycle detection uses DFS in the losing region. The last `cycle_labels` entry is the closing edge back to `cycle[0]`.
 - **Counterstrategy in synthesis response**: The `/context/synthesize` endpoint automatically returns a `counterstrategy` field (with Cytoscape graph elements) for unrealizable cases. The graph is filtered to states reachable from initials via kept transitions (post-strategy-extraction BFS).
 - **Formula inversion**: do NOT negate fixpoint variable references inside the body. Keep variables positive — the dual fixpoint's changed starting point handles the semantics.

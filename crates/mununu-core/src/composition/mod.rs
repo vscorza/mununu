@@ -393,6 +393,12 @@ pub enum CompositionSemantics {
     Synchronous,
     /// Shared alphabet elements fire together; independent actions may
     /// interleave in either order as well as proceed jointly.
+    ///
+    /// SOUNDNESS: over-approx — independent labels can fire freely without
+    /// fairness constraints. One side can idle indefinitely while the other
+    /// progresses. Sound for safety (extra interleavings are conservative),
+    /// unsound for liveness (apparent progress may not exist in reality if
+    /// fairness is assumed but not enforced).
     Asynchronous,
     /// Superset semantics combine the union step with both permutations even
     /// when actions are independent.

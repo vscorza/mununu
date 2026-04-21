@@ -107,6 +107,7 @@ pub async fn context_summarize_handler(
                     diagnostics: None,
                     minimize: rc.options.minimize(),
                     extract_strategy: false,
+                    mode: crate::context::ControllerMode::default(),
                 },
             ) {
                 Ok(syn) => (
@@ -236,6 +237,7 @@ pub async fn context_synthesize_handler(
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: request.options.minimize,
                 extract_strategy: request.options.extract_strategy,
+                mode: crate::context::ControllerMode::default(),
             },
         )
         .map_err(|e| ApiError::Internal {
@@ -428,6 +430,7 @@ pub async fn context_graphs_handler(
                         .minimize_controllers
                         .unwrap_or(rc.options.minimize()),
                     extract_strategy: false,
+                    mode: crate::context::ControllerMode::default(),
                 },
             ) else {
                 continue;

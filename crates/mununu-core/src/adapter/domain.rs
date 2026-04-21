@@ -8,6 +8,14 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+/// Default upper bound for `BoundedCounter` fields when no explicit bound is set.
+///
+/// Chosen as a heuristic: small enough to enumerate quickly (4 states: 0,1,2,3),
+/// large enough to capture common patterns like empty/non-empty/full and off-by-one.
+/// Users should always prefer setting an explicit bound in extraction specs or
+/// sidecar annotations; this default exists only as a fallback.
+pub const DEFAULT_COUNTER_BOUND: i64 = 3;
+
 /// Available abstraction strategies for state fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,7 +82,7 @@ impl FieldDomain {
                 vec![AbstractValue::Present(false), AbstractValue::Present(true)]
             }
             AbstractionType::BoundedCounter => {
-                let bound = self.bound.unwrap_or(3);
+                let bound = self.bound.unwrap_or(DEFAULT_COUNTER_BOUND);
                 (0..=bound).map(AbstractValue::Counter).collect()
             }
             AbstractionType::EnumValues => self

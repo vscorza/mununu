@@ -1189,6 +1189,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: args.minimize,
                 extract_strategy: args.extract_strategy,
+                mode: mununu_core::context::ControllerMode::default(),
             },
         )
         .map_err(|err| format!("controller synthesis failed: {err}"))?;

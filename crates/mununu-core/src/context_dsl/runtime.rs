@@ -42,6 +42,7 @@ impl ResolvedControllerOptions {
             diagnostics: self.diagnostics.as_ref(),
             minimize: self.minimize,
             extract_strategy: false,
+            mode: crate::context::ControllerMode::default(),
         }
     }
 }

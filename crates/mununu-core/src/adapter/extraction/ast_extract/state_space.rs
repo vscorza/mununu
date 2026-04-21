@@ -304,11 +304,15 @@ fn apply_single_effect(state: &mut AbstractState, effect: &Effect, fields: &[Fie
             CallEffect::SetAbsent => *val = AbstractValue::Present(false),
             CallEffect::IncrementCounter => {
                 if let AbstractValue::Counter(n) = val {
+                    // SOUNDNESS: over-approx above bound. Default 3 is a heuristic;
+                    // user should set explicit bound in the extraction spec. States
+                    // above the bound are collapsed to the saturated value, which is
+                    // conservative for safety but may add spurious liveness paths.
                     let bound = fields
                         .iter()
                         .find(|f| f.name == effect.field)
                         .and_then(|f| f.bound)
-                        .unwrap_or(3);
+                        .unwrap_or(crate::adapter::domain::DEFAULT_COUNTER_BOUND);
                     *val = AbstractValue::Counter((*n + 1).min(bound));
                 }
             }

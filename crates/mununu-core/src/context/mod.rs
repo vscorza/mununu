@@ -528,8 +528,16 @@ impl Context {
         env: &Environment,
         options: ControllerSynthesisOptions<'_>,
     ) -> Result<ControllerSynthesis, ContextError> {
+        // Resolve effective mode (legacy extract_strategy maps to Functional)
+        let effective_mode =
+            if options.extract_strategy && options.mode == ControllerMode::Projection {
+                ControllerMode::Functional
+            } else {
+                options.mode
+            };
+
         // When strategy extraction is requested, use witness-guided evaluation
-        let (keep_bits, witness_map) = if options.extract_strategy {
+        let (keep_bits, witness_map) = if effective_mode != ControllerMode::Projection {
             let (bits, wm) =
                 self.evaluate_mu_with_witnesses(source, formula, env, options.evaluation)?;
             (bits, Some(wm))
@@ -560,6 +568,17 @@ impl Context {
         }
 
         let mut diagnostics = ControllerDiagnostics::default();
+        let ad = formula.alternation_depth();
+        let pc = formula.property_class();
+        diagnostics.alternation_depth = Some(ad);
+        diagnostics.property_class = Some(format!("{pc:?}"));
+        if ad >= 2 && options.extract_strategy {
+            diagnostics.messages.push(format!(
+                "Warning: positional strategy extraction used on alternation depth {ad} formula \
+                 (class: {pc:?}). The winning region is correct, but the controller may not \
+                 cycle through obligations. Consider this a best-effort approximation."
+            ));
+        }
         let proof_obligations_enabled = options
             .diagnostics
             .is_none_or(|diag| diag.proof_obligations);
@@ -592,58 +611,89 @@ impl Context {
             mapping.insert(state, new_state);
         }
 
-        // Build set of witnessed transition indices per state (from all diamond nodes)
-        let witnessed_transitions: HashMap<usize, HashSet<usize>> =
-            if let Some(ref wm) = witness_map {
-                let mut per_state: HashMap<usize, HashSet<usize>> = HashMap::new();
-                for (&(state_idx, _node_id), &trans_idx) in &wm.witnesses {
-                    per_state.entry(state_idx).or_default().insert(trans_idx);
-                }
-                per_state
-            } else {
-                HashMap::new()
-            };
+        // Compute fixpoint nesting order for signature-based extraction
+        let nesting = formula.fixpoint_nesting_order();
 
         for (original, mapped) in &mapping {
-            if options.extract_strategy {
-                // Strategy mode: use witness data to select transitions
-                let state_witnesses = witnessed_transitions.get(&original.index());
-                let mut controllable_added = false;
+            match effective_mode {
+                ControllerMode::Functional => {
+                    // Functional mode: for each state, pick ONE controllable
+                    // transition whose target has the best (smallest) signature.
+                    // All uncontrollable transitions are always kept.
+                    //
+                    // SOUNDNESS: The signature ordering ensures liveness progress —
+                    // following signature-decreasing transitions guarantees all mu
+                    // obligations are eventually satisfied. This is the memoryless-
+                    // on-product strategy projected to the plant with signatures as
+                    // the memory component (Zielonka 1998).
+                    let wm = witness_map.as_ref().unwrap();
+                    let mut best_sig: Option<crate::mu_calculus::Signature> = None;
+                    let mut best_trans_idx: Option<usize> = None;
 
-                for (idx, transition) in clts.outgoing(*original).iter().enumerate() {
-                    if let Some(&target_mapped) = mapping.get(&transition.target()) {
-                        if transition.is_controllable(clts) {
-                            // Add controllable transition only if witnessed (or first if no witnesses)
-                            if let Some(witnesses) = state_witnesses {
-                                if witnesses.contains(&idx) {
+                    for (idx, transition) in clts.outgoing(*original).iter().enumerate() {
+                        if let Some(&target_mapped) = mapping.get(&transition.target()) {
+                            if transition.is_controllable(clts) {
+                                let target_sig =
+                                    wm.signature(transition.target().index(), &nesting);
+                                if best_sig.as_ref().is_none_or(|bs| target_sig < *bs) {
+                                    best_sig = Some(target_sig);
+                                    best_trans_idx = Some(idx);
+                                }
+                            } else {
+                                // Always keep uncontrollable transitions
+                                builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                            }
+                        }
+                    }
+                    if let Some(idx) = best_trans_idx {
+                        let transition = &clts.outgoing(*original)[idx];
+                        let target_mapped = mapping[&transition.target()];
+                        builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                    }
+                }
+                ControllerMode::Permissive => {
+                    // Permissive mode: keep ALL controllable transitions whose target
+                    // has a signature that is ≤ the source's signature. This is the
+                    // maximally permissive supervisor (Ramadge-Wonham canonical).
+                    // Nondeterministic but composable with other supervisors.
+                    let wm = witness_map.as_ref().unwrap();
+                    let source_sig = wm.signature(original.index(), &nesting);
+
+                    for transition in clts.outgoing(*original) {
+                        if let Some(&target_mapped) = mapping.get(&transition.target()) {
+                            if transition.is_controllable(clts) {
+                                let target_sig =
+                                    wm.signature(transition.target().index(), &nesting);
+                                if target_sig <= source_sig {
                                     builder.transition_ids(
                                         *mapped,
                                         transition.labels(),
                                         target_mapped,
                                     );
                                 }
-                            } else if !controllable_added {
-                                // No witness data for this state → fall back to first controllable
+                            } else {
+                                // Always keep uncontrollable transitions
                                 builder.transition_ids(*mapped, transition.labels(), target_mapped);
-                                controllable_added = true;
                             }
-                        } else {
-                            // Always keep uncontrollable transitions
-                            builder.transition_ids(*mapped, transition.labels(), target_mapped);
                         }
                     }
                 }
-            } else {
-                // Projection mode: keep all transitions between winning states
-                for transition in clts.outgoing(*original) {
-                    if let Some(&target_mapped) = mapping.get(&transition.target()) {
-                        builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                ControllerMode::Projection => {
+                    // Projection mode: keep all transitions between winning states
+                    for transition in clts.outgoing(*original) {
+                        if let Some(&target_mapped) = mapping.get(&transition.target()) {
+                            builder.transition_ids(*mapped, transition.labels(), target_mapped);
+                        }
                     }
                 }
             }
         }
 
         let mut controller = builder.build().map_err(ContextError::Controller)?;
+
+        diagnostics
+            .messages
+            .push(format!("Controller mode: {:?}.", effective_mode));
         diagnostics.messages.push(format!(
             "Controller realizable: retained {} of {} states.",
             mapping.len(),
@@ -1079,6 +1129,21 @@ impl Default for DiagnosticsOptions {
     }
 }
 
+/// Controller extraction mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ControllerMode {
+    /// Projection: keep all transitions between winning states (default).
+    #[default]
+    Projection,
+    /// Functional: one signature-decreasing controllable transition per state.
+    /// Produces a deterministic controller that guarantees liveness progress.
+    Functional,
+    /// Permissive: all signature-non-increasing controllable transitions.
+    /// Maximally permissive supervisor (Ramadge-Wonham canonical object).
+    /// Nondeterministic but composable with other supervisors.
+    Permissive,
+}
+
 /// Extended controller synthesis configuration, combining evaluation, diagnostics, and post-processing knobs.
 #[derive(Debug, Default)]
 pub struct ControllerSynthesisOptions<'a> {
@@ -1086,9 +1151,10 @@ pub struct ControllerSynthesisOptions<'a> {
     pub diagnostics: Option<&'a DiagnosticsOptions>,
     /// When `true`, run a structural minimisation pass over the synthesised controller.
     pub minimize: bool,
-    /// When `true`, extract a positional strategy: keep only ONE controllable transition
-    /// per state (the controller's chosen action) plus ALL uncontrollable transitions.
-    /// This produces a deterministic controller rather than a full projection.
+    /// Controller extraction mode. See [`ControllerMode`] for options.
+    pub mode: ControllerMode,
+    /// Legacy alias: when `true`, equivalent to `mode = Functional`.
+    /// Deprecated — use `mode` directly.
     pub extract_strategy: bool,
 }
 
@@ -1103,6 +1169,12 @@ pub struct ControllerSynthesis {
 /// Aggregated diagnostics emitted during controller synthesis.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ControllerDiagnostics {
+    /// Classification of the formula by fixpoint structure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property_class: Option<String>,
+    /// Alternation depth of the formula (0 = propositional, 1 = safety/reach, 2+ = liveness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternation_depth: Option<usize>,
     /// User-facing notes about the synthesis outcome.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<String>,
@@ -2180,6 +2252,8 @@ mod tests {
     #[test]
     fn controller_diagnostics_exports_reports() -> TestResult {
         let diagnostics = ControllerDiagnostics {
+            property_class: Some("Safety".into()),
+            alternation_depth: Some(1),
             messages: vec![
                 "Controller realizable: retained 2 of 4 states.".into(),
                 "Initial state(s) excluded from controller: s2.".into(),
