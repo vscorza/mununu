@@ -81,8 +81,6 @@ pub struct CompositionHeuristics {
 pub struct LabelNaming {
     /// Prefix for event labels.
     pub prefix: &'static str,
-    /// Case convention: "preserve", "snake_case", "camelCase".
-    pub case: &'static str,
 }
 
 /// Look up a domain profile by name.
@@ -238,10 +236,7 @@ static PROFILES: &[DomainProfile] = &[
             rationale: "Multiple clients access the server concurrently; \
                        nondeterministic interleaving models concurrent HTTP requests",
         },
-        label_naming: LabelNaming {
-            prefix: "ev_",
-            case: "preserve",
-        },
+        label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
     },
     // Protocol Implementation (Rust)
@@ -270,10 +265,7 @@ static PROFILES: &[DomainProfile] = &[
             rationale: "Single-struct internals are synchronous; \
                        use asynchronous when composing multiple modules",
         },
-        label_naming: LabelNaming {
-            prefix: "ev_",
-            case: "snake_case",
-        },
+        label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
     },
     // Python Server
@@ -301,10 +293,7 @@ static PROFILES: &[DomainProfile] = &[
             default_type: "asynchronous",
             rationale: "Asyncio event loop allows concurrent request handling",
         },
-        label_naming: LabelNaming {
-            prefix: "ev_",
-            case: "snake_case",
-        },
+        label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
     },
     // Hardware RTL
@@ -333,10 +322,7 @@ static PROFILES: &[DomainProfile] = &[
             default_type: "synchronous",
             rationale: "Hardware is clocked; all transitions happen synchronously",
         },
-        label_naming: LabelNaming {
-            prefix: "",
-            case: "snake_case",
-        },
+        label_naming: LabelNaming { prefix: "" },
         add_noop_self_loops: false,
     },
 ];

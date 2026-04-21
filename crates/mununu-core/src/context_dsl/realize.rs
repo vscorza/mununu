@@ -1107,10 +1107,17 @@ fn build_context_with_compositions(
     for (name, clts) in automata {
         context_builder = context_builder.register_clts(name, clts);
     }
-    let context = context_builder.finish_with_checks()?;
+    compose_and_register(doc, &constants, context_builder.finish_with_checks()?)
+}
 
-    // Process compositions: compose automata and register them as new automata.
-    // Also track composition members for predicate projection.
+/// Composes automata according to the document's composition declarations and
+/// registers them into the context. Returns the updated context and a map from
+/// composition names to their (transitively expanded) member automaton names.
+fn compose_and_register(
+    doc: &ContextDoc,
+    constants: &HashMap<String, i64>,
+    context: Context,
+) -> Result<(Context, HashMap<String, Vec<String>>), RealizationError> {
     let mut composition_members: HashMap<String, Vec<String>> = HashMap::new();
     // Topologically sort compositions to support hierarchical composition
     // (compositions referencing other compositions as members).
@@ -1129,13 +1136,13 @@ fn build_context_with_compositions(
             .members
             .iter()
             .filter(|m| {
-                let resolved = resolve_member_name(m, &constants);
+                let resolved = resolve_member_name(m, constants);
                 composition_name_set.contains(&resolved)
             })
             .count();
         in_degree.insert(name.clone(), dep_count);
         for member in &comp.members {
-            let resolved = resolve_member_name(member, &constants);
+            let resolved = resolve_member_name(member, constants);
             if composition_name_set.contains(&resolved) {
                 dependents.entry(resolved).or_default().push(name.clone());
             }
@@ -1191,7 +1198,7 @@ fn build_context_with_compositions(
         let member_names: Vec<String> = composition
             .members
             .iter()
-            .map(|m| resolve_member_name(m, &constants))
+            .map(|m| resolve_member_name(m, constants))
             .collect();
         composition_members.insert(composition_name.clone(), member_names.clone());
 
@@ -2317,29 +2324,14 @@ fn build_automaton(
             }
         }
 
-        // Label-based controllability (proof-of-concept for Phase 3.5)
-        // 1. Epsilon transitions are always uncontrollable
+        // Label-based controllability
         let is_epsilon = matches!(transition.label, TransitionLabel::Epsilon(_))
             || transition
                 .additional_labels
                 .iter()
                 .any(|l| matches!(l, TransitionLabel::Epsilon(_)));
 
-        // 2. Check if any label name matches an input signal
-        let _label_has_input_signal = {
-            let mut label_names = Vec::new();
-            if let TransitionLabel::Named { name, .. } = &transition.label {
-                label_names.push(&name.name);
-            }
-            for additional in &transition.additional_labels {
-                if let TransitionLabel::Named { name, .. } = additional {
-                    label_names.push(&name.name);
-                }
-            }
-            label_names.iter().any(|name| input_signals.contains(*name))
-        };
-
-        // 3. Fall back to guard-based check (for backward compatibility)
+        // Guard-based input signal check (for backward compatibility)
         let guard_has_input_signal = if let Some(ref guard) = transition.guard {
             let guard_identifiers = extract_identifiers_from_expr(guard);
             guard_identifiers
@@ -2372,41 +2364,17 @@ fn build_automaton(
             || !automaton_internal.is_empty();
 
         for (label_id, label_name) in label_ids.iter().zip(label_names.iter()) {
-            // Check if label controllability is already set (use the public method)
-            let needs_setting = {
-                // We need to check if it's set, but we can't access the internal map directly
-                // So we'll just set it - set_label_controllability will overwrite if needed
-                true
-            };
-            if needs_setting {
-                let controllability = if uses_explicit_sets {
-                    if automaton_controllable.contains(label_name)
-                        || automaton_internal.contains(label_name)
-                    {
-                        if automaton_internal.contains(label_name) {
-                            LabelControllability::Internal
-                        } else {
-                            LabelControllability::Controllable
-                        }
-                    } else {
-                        LabelControllability::Uncontrollable
-                    }
-                } else {
-                    // Legacy inference: uncontrollable if matches input signal, is epsilon,
-                    // or is already declared controllable by another automaton.
-                    let is_uncontrollable = label_name == "epsilon"
-                        || is_epsilon
-                        || input_signals.contains(label_name)
-                        || guard_has_input_signal
-                        || externally_controllable.contains(label_name);
-                    if is_uncontrollable {
-                        LabelControllability::Uncontrollable
-                    } else {
-                        LabelControllability::Controllable
-                    }
-                };
-                builder.set_label_controllability(*label_id, controllability);
-            }
+            let controllability = classify_transition_controllability(
+                label_name,
+                uses_explicit_sets,
+                &automaton_controllable,
+                &automaton_internal,
+                is_epsilon,
+                guard_has_input_signal,
+                input_signals,
+                externally_controllable,
+            );
+            builder.set_label_controllability(*label_id, controllability);
         }
         // All transitions are always enabled after unrolling (guards resolved at build time)
         builder.transition(source, &label_ids, target);
@@ -2655,26 +2623,17 @@ fn build_clts_from_unrolled(
         // Determine label controllability
         let uses_explicit_sets =
             !automaton_controllable.is_empty() || !automaton_internal.is_empty();
-        let controllability = if uses_explicit_sets {
-            if automaton_internal.contains(&transition.label) {
-                LabelControllability::Internal
-            } else if automaton_controllable.contains(&transition.label) {
-                LabelControllability::Controllable
-            } else {
-                LabelControllability::Uncontrollable
-            }
-        } else {
-            // Legacy inference: uncontrollable if matches input signal, is epsilon,
-            // or is already declared controllable by another automaton.
-            let is_uncontrollable = transition.label == "epsilon"
-                || input_signals.contains(&transition.label)
-                || externally_controllable.contains(&transition.label);
-            if is_uncontrollable {
-                LabelControllability::Uncontrollable
-            } else {
-                LabelControllability::Controllable
-            }
-        };
+        let is_epsilon = transition.label == "epsilon";
+        let controllability = classify_transition_controllability(
+            &transition.label,
+            uses_explicit_sets,
+            automaton_controllable,
+            automaton_internal,
+            is_epsilon,
+            false, // no guard-based input signal check for unrolled transitions
+            input_signals,
+            externally_controllable,
+        );
         builder.set_label_controllability(label_id, controllability);
 
         // Add transition without guard (all transitions in unrolled CLTS are always enabled)
@@ -2687,6 +2646,47 @@ fn build_clts_from_unrolled(
             name: name.to_owned(),
             error,
         })
+}
+
+/// Classifies a single label's controllability.
+///
+/// When `uses_explicit_sets` is true, classification is based on the automaton's
+/// declared `controllable` / `internal` sets. Otherwise, legacy inference applies:
+/// a label is uncontrollable if it matches an input signal, is epsilon, has a
+/// guard referencing an input signal, or is already owned by another automaton.
+#[allow(clippy::too_many_arguments)]
+fn classify_transition_controllability(
+    label_name: &str,
+    uses_explicit_sets: bool,
+    automaton_controllable: &HashSet<String>,
+    automaton_internal: &HashSet<String>,
+    is_epsilon: bool,
+    guard_has_input_signal: bool,
+    input_signals: &HashSet<String>,
+    externally_controllable: &HashSet<String>,
+) -> LabelControllability {
+    if uses_explicit_sets {
+        if automaton_internal.contains(label_name) {
+            LabelControllability::Internal
+        } else if automaton_controllable.contains(label_name) {
+            LabelControllability::Controllable
+        } else {
+            LabelControllability::Uncontrollable
+        }
+    } else {
+        // Legacy inference: uncontrollable if matches input signal, is epsilon,
+        // or is already declared controllable by another automaton.
+        let is_uncontrollable = label_name == "epsilon"
+            || is_epsilon
+            || input_signals.contains(label_name)
+            || guard_has_input_signal
+            || externally_controllable.contains(label_name);
+        if is_uncontrollable {
+            LabelControllability::Uncontrollable
+        } else {
+            LabelControllability::Controllable
+        }
+    }
 }
 
 fn transition_label_names(transition: &TransitionDecl) -> Vec<String> {

@@ -771,77 +771,30 @@ fn extract_guards_from_condition(
 ) -> Vec<Guard> {
     let kind = condition.kind();
 
-    // Handle binary operators: && / and / || / or
+    // Compound boolean operators (&&, ||, and, or) with De Morgan
     if kind == "binary_expression" || kind == "boolean_operator" {
-        if let Some(op_node) = condition.child_by_field_name("operator") {
-            let op = parsed.node_text(&op_node);
-            let is_and = op == "&&" || op == "and";
-            let is_or = op == "||" || op == "or";
-
-            if is_and || is_or {
-                // De Morgan: negate swaps AND <-> OR
-                let effective_and = if negate { is_or } else { is_and };
-
-                if effective_and {
-                    let mut result = Vec::new();
-                    if let Some(left) = condition.child_by_field_name("left") {
-                        result.extend(extract_guards_from_condition(
-                            parsed,
-                            &left,
-                            field_names,
-                            negate,
-                            var_field_map,
-                        ));
-                    }
-                    if let Some(right) = condition.child_by_field_name("right") {
-                        result.extend(extract_guards_from_condition(
-                            parsed,
-                            &right,
-                            field_names,
-                            negate,
-                            var_field_map,
-                        ));
-                    }
-                    return result;
-                } else {
-                    return vec![];
-                }
-            }
-        }
-    }
-
-    // Handle ! / not (unary negation): toggle the negate flag
-    if kind == "unary_expression" || kind == "not_operator" {
-        if let Some(operand) = condition
-            .child_by_field_name("argument")
-            .or_else(|| condition.child_by_field_name("operand"))
+        if let Some(guards) =
+            extract_guards_from_binary_op(parsed, condition, field_names, negate, var_field_map)
         {
-            let text = parsed.node_text(condition);
-            if text.starts_with('!') || text.starts_with("not ") {
-                return extract_guards_from_condition(
-                    parsed,
-                    &operand,
-                    field_names,
-                    !negate,
-                    var_field_map,
-                );
-            }
+            return guards;
         }
     }
 
-    // Handle parenthesized_expression: unwrap
+    // Unary negation (!, not) — toggle the negate flag
+    if kind == "unary_expression" || kind == "not_operator" {
+        if let Some(guards) =
+            extract_guards_from_negation(parsed, condition, field_names, negate, var_field_map)
+        {
+            return guards;
+        }
+    }
+
+    // Parenthesized expression — unwrap
     if kind == "parenthesized_expression" {
-        let mut cursor = condition.walk();
-        for child in condition.children(&mut cursor) {
-            if child.kind() != "(" && child.kind() != ")" {
-                return extract_guards_from_condition(
-                    parsed,
-                    &child,
-                    field_names,
-                    negate,
-                    var_field_map,
-                );
-            }
+        if let Some(guards) =
+            extract_guards_from_parens(parsed, condition, field_names, negate, var_field_map)
+        {
+            return guards;
         }
     }
 
@@ -854,6 +807,103 @@ fn extract_guards_from_condition(
     } else {
         vec![]
     }
+}
+
+/// Handle binary boolean operators (`&&`/`and`/`||`/`or`) with De Morgan's law.
+///
+/// De Morgan: when negated, AND becomes OR and vice versa.
+/// Effective-AND → recurse into both sides; effective-OR → over-approximate (skip).
+fn extract_guards_from_binary_op(
+    parsed: &ParsedSource,
+    condition: &Node,
+    field_names: &HashSet<&str>,
+    negate: bool,
+    var_field_map: &HashMap<String, String>,
+) -> Option<Vec<Guard>> {
+    let op_node = condition.child_by_field_name("operator")?;
+    let op = parsed.node_text(&op_node);
+    let is_and = op == "&&" || op == "and";
+    let is_or = op == "||" || op == "or";
+
+    if !is_and && !is_or {
+        return None;
+    }
+
+    // De Morgan: negate swaps AND <-> OR
+    let effective_and = if negate { is_or } else { is_and };
+
+    if !effective_and {
+        return Some(vec![]);
+    }
+
+    let mut result = Vec::new();
+    if let Some(left) = condition.child_by_field_name("left") {
+        result.extend(extract_guards_from_condition(
+            parsed,
+            &left,
+            field_names,
+            negate,
+            var_field_map,
+        ));
+    }
+    if let Some(right) = condition.child_by_field_name("right") {
+        result.extend(extract_guards_from_condition(
+            parsed,
+            &right,
+            field_names,
+            negate,
+            var_field_map,
+        ));
+    }
+    Some(result)
+}
+
+/// Handle unary negation (`!` / `not`) — toggles the negate flag and recurses.
+fn extract_guards_from_negation(
+    parsed: &ParsedSource,
+    condition: &Node,
+    field_names: &HashSet<&str>,
+    negate: bool,
+    var_field_map: &HashMap<String, String>,
+) -> Option<Vec<Guard>> {
+    let operand = condition
+        .child_by_field_name("argument")
+        .or_else(|| condition.child_by_field_name("operand"))?;
+    let text = parsed.node_text(condition);
+    if text.starts_with('!') || text.starts_with("not ") {
+        Some(extract_guards_from_condition(
+            parsed,
+            &operand,
+            field_names,
+            !negate,
+            var_field_map,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Handle parenthesized expressions — unwrap and recurse into inner expression.
+fn extract_guards_from_parens(
+    parsed: &ParsedSource,
+    condition: &Node,
+    field_names: &HashSet<&str>,
+    negate: bool,
+    var_field_map: &HashMap<String, String>,
+) -> Option<Vec<Guard>> {
+    let mut cursor = condition.walk();
+    for child in condition.children(&mut cursor) {
+        if child.kind() != "(" && child.kind() != ")" {
+            return Some(extract_guards_from_condition(
+                parsed,
+                &child,
+                field_names,
+                negate,
+                var_field_map,
+            ));
+        }
+    }
+    None
 }
 
 /// Extract a single guard from a leaf condition referencing a state field,
@@ -928,47 +978,14 @@ fn collect_variable_field_bindings(
     let mut stack = vec![*body_node];
 
     while let Some(node) = stack.pop() {
-        // TypeScript/Rust: lexical_declaration or let_declaration
-        // containing `const x = this.field` or `let x = self.field`
+        // TypeScript/Rust: `const x = this.field` / `let x = self.field`
         if node.kind() == "lexical_declaration" || node.kind() == "let_declaration" {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "variable_declarator" {
-                    if let (Some(name_node), Some(value_node)) = (
-                        child.child_by_field_name("name"),
-                        child.child_by_field_name("value"),
-                    ) {
-                        let var_name = parsed.node_text(&name_node).to_string();
-                        let val_text = parsed.node_text(&value_node);
-                        for &field in field_names.iter() {
-                            let this_field = format!("this.{field}");
-                            let self_field = format!("self.{field}");
-                            if val_text == this_field || val_text == self_field {
-                                bindings.insert(var_name.clone(), field.to_string());
-                            }
-                        }
-                    }
-                }
-            }
+            collect_declarator_bindings(parsed, &node, field_names, &mut bindings);
         }
 
-        // Python: assignment `x = self.field` (at statement level)
+        // Python: `x = self.field` (at statement level)
         if node.kind() == "assignment" {
-            if let (Some(left), Some(right)) = (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
-            ) {
-                if left.kind() == "identifier" {
-                    let var_name = parsed.node_text(&left).to_string();
-                    let val_text = parsed.node_text(&right);
-                    for &field in field_names.iter() {
-                        let self_field = format!("self.{field}");
-                        if val_text == self_field {
-                            bindings.insert(var_name.clone(), field.to_string());
-                        }
-                    }
-                }
-            }
+            collect_py_assignment_binding(parsed, &node, field_names, &mut bindings);
         }
 
         // Recurse into children
@@ -979,6 +996,63 @@ fn collect_variable_field_bindings(
     }
 
     bindings
+}
+
+/// Collect variable-to-field bindings from a `const`/`let` declaration (TypeScript/Rust).
+fn collect_declarator_bindings(
+    parsed: &ParsedSource,
+    decl_node: &Node,
+    field_names: &HashSet<&str>,
+    bindings: &mut HashMap<String, String>,
+) {
+    let mut cursor = decl_node.walk();
+    for child in decl_node.children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            if let (Some(name_node), Some(value_node)) = (
+                child.child_by_field_name("name"),
+                child.child_by_field_name("value"),
+            ) {
+                try_bind_field(parsed, &name_node, &value_node, field_names, bindings);
+            }
+        }
+    }
+}
+
+/// Collect a variable-to-field binding from a Python assignment (`x = self.field`).
+fn collect_py_assignment_binding(
+    parsed: &ParsedSource,
+    node: &Node,
+    field_names: &HashSet<&str>,
+    bindings: &mut HashMap<String, String>,
+) {
+    if let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) {
+        if left.kind() == "identifier" {
+            try_bind_field(parsed, &left, &right, field_names, bindings);
+        }
+    }
+}
+
+/// Check if a value node references `this.field` or `self.field`, and if so,
+/// insert the variable-to-field binding.
+fn try_bind_field(
+    parsed: &ParsedSource,
+    name_node: &Node,
+    value_node: &Node,
+    field_names: &HashSet<&str>,
+    bindings: &mut HashMap<String, String>,
+) {
+    let var_name = parsed.node_text(name_node);
+    let val_text = parsed.node_text(value_node);
+    for &field in field_names.iter() {
+        let this_field = format!("this.{field}");
+        let self_field = format!("self.{field}");
+        if val_text == this_field || val_text == self_field {
+            bindings.insert(var_name.to_string(), field.to_string());
+        }
+    }
 }
 
 /// Try to extract an effect from an assignment to a state field.

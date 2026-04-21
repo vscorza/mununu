@@ -175,41 +175,7 @@ pub fn build_kripke_with_config(
         state_names.insert(reg_state.clone(), src_name.clone());
     }
 
-    // Build reverse value map: for registers AND annotated input ports with value_map
-    let mut variant_to_numeric: HashMap<String, HashMap<String, i64>> = registers
-        .iter()
-        .filter(|r| !r.value_map.is_empty())
-        .map(|r| {
-            let map: HashMap<String, i64> = r.value_map.iter().cloned().collect();
-            (r.name.clone(), map)
-        })
-        .collect();
-    if config.from_sidecar {
-        // Sidecar path: use value maps from config only
-        for (name, inp_config) in &config.input_domains {
-            if !inp_config.value_map.is_empty() {
-                let map: HashMap<String, i64> = inp_config.value_map.iter().cloned().collect();
-                variant_to_numeric.insert(name.clone(), map);
-            }
-        }
-        for (name, sig_config) in &config.signal_domains {
-            if !sig_config.value_map.is_empty() && !variant_to_numeric.contains_key(name) {
-                let map: HashMap<String, i64> = sig_config.value_map.iter().cloned().collect();
-                variant_to_numeric.insert(name.clone(), map);
-            }
-        }
-    } else {
-        // Inline path: use value maps from module annotations
-        for ann in &module.domain_annotations {
-            if let DomainAnnotationKind::Enum { value_map, .. } = &ann.domain_kind
-                && !value_map.is_empty()
-                && !variant_to_numeric.contains_key(&ann.register_name)
-            {
-                let map: HashMap<String, i64> = value_map.iter().cloned().collect();
-                variant_to_numeric.insert(ann.register_name.clone(), map);
-            }
-        }
-    }
+    let variant_to_numeric = build_variant_to_numeric(&registers, config, module);
 
     // Inject parameter constants into the valuation context
     // Parameters: merge module defaults with config overrides
@@ -272,9 +238,44 @@ pub fn build_kripke_with_config(
         }
     }
 
-    // Step 8: Prune unreachable states
-    let initial_name = state_names.get(&initial_state).cloned().unwrap_or_else(|| {
-        // If initial state isn't in the enumeration, use first state
+    // Steps 8-9: Prune unreachable states and build state specs
+    let (states, transitions) = prune_unreachable_states(
+        &initial_state,
+        &all_reg_states,
+        &state_names,
+        transitions,
+        &registers,
+        &param_values,
+        &comb_assigns,
+    );
+
+    // Step 10: Build automaton with controllability classification
+    let automaton = build_automaton_spec(module, config, states, transitions);
+
+    // Step 11: Build properties from config
+    let properties = build_property_specs(config);
+
+    let state_count = automaton.states.len();
+    Ok((automaton, properties, state_count))
+}
+
+// ---------------------------------------------------------------------------
+// State pruning and automaton assembly
+// ---------------------------------------------------------------------------
+
+/// Prune unreachable states via BFS and build enriched `StateSpec` entries.
+///
+/// Returns the filtered (states, transitions) pair.
+fn prune_unreachable_states(
+    initial_state: &AbstractState,
+    all_reg_states: &[AbstractState],
+    state_names: &HashMap<AbstractState, String>,
+    transitions: Vec<TransitionSpec>,
+    registers: &[RegisterInfo],
+    param_values: &BTreeMap<String, AbstractValue>,
+    comb_assigns: &[CombAssign],
+) -> (Vec<StateSpec>, Vec<TransitionSpec>) {
+    let initial_name = state_names.get(initial_state).cloned().unwrap_or_else(|| {
         all_reg_states
             .first()
             .map(|s| state_names[s].clone())
@@ -294,34 +295,33 @@ pub fn build_kripke_with_config(
         .iter()
         .filter_map(|s| {
             let name = &state_names[s];
-            if reachable.contains(name) {
-                let mut valuations: BTreeMap<String, String> = s
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.display_short()))
-                    .collect();
+            if !reachable.contains(name) {
+                return None;
+            }
+            let mut valuations: BTreeMap<String, String> = s
+                .iter()
+                .map(|(k, v)| (k.clone(), v.display_short()))
+                .collect();
 
-                // Compute and include combinational signal values in valuations.
-                // This enables state predicates to reference combinational outputs
-                // (e.g., `full_T` for `assign full = (count >= 2)`).
-                if !comb_register_names.is_empty() {
-                    let mut full_val: BTreeMap<String, AbstractValue> = s.clone();
-                    full_val.extend(param_values.clone());
-                    eval_comb_assigns(&comb_assigns, &mut full_val);
-                    for comb_name in &comb_register_names {
-                        if let Some(val) = full_val.get(*comb_name) {
-                            valuations.insert(comb_name.to_string(), val.display_short());
-                        }
+            // Compute and include combinational signal values in valuations.
+            // This enables state predicates to reference combinational outputs
+            // (e.g., `full_T` for `assign full = (count >= 2)`).
+            if !comb_register_names.is_empty() {
+                let mut full_val: BTreeMap<String, AbstractValue> = s.clone();
+                full_val.extend(param_values.clone());
+                eval_comb_assigns(comb_assigns, &mut full_val);
+                for comb_name in &comb_register_names {
+                    if let Some(val) = full_val.get(*comb_name) {
+                        valuations.insert(comb_name.to_string(), val.display_short());
                     }
                 }
-
-                Some(StateSpec {
-                    name: name.clone(),
-                    is_initial: *name == initial_name,
-                    valuations: Some(valuations),
-                })
-            } else {
-                None
             }
+
+            Some(StateSpec {
+                name: name.clone(),
+                is_initial: *name == initial_name,
+                valuations: Some(valuations),
+            })
         })
         .collect();
 
@@ -330,7 +330,16 @@ pub fn build_kripke_with_config(
         .filter(|t| reachable.contains(&t.source) && reachable.contains(&t.target))
         .collect();
 
-    // Step 9: Classify labels by controllability
+    (states, transitions)
+}
+
+/// Build the `AutomatonSpec` with controllability classification.
+fn build_automaton_spec(
+    module: &Module,
+    config: &super::annotation::MergedConfig,
+    states: Vec<StateSpec>,
+    transitions: Vec<TransitionSpec>,
+) -> AutomatonSpec {
     let controllable_set: HashSet<&str> = config.controllable.iter().map(|s| s.as_str()).collect();
 
     let all_labels: HashSet<String> = transitions
@@ -343,16 +352,18 @@ pub fn build_kripke_with_config(
         .cloned()
         .collect();
 
-    let automaton = AutomatonSpec {
+    AutomatonSpec {
         name: module.name.clone(),
         states,
         transitions,
         controllable_labels,
         internal_labels: vec![],
-    };
+    }
+}
 
-    // Step 10: Build properties from config
-    let properties: Vec<PropertySpec> = config
+/// Build property specs from merged config.
+fn build_property_specs(config: &super::annotation::MergedConfig) -> Vec<PropertySpec> {
+    config
         .properties
         .iter()
         .map(|p| {
@@ -369,10 +380,58 @@ pub fn build_kripke_with_config(
                 over: None,
             }
         })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Value-map helpers
+// ---------------------------------------------------------------------------
+
+/// Build a reverse value map (variant name → numeric value) for all registers
+/// and annotated input ports. Used to resolve RTL comparisons like `cmd == 3`
+/// when the register is abstracted as an enum.
+fn build_variant_to_numeric(
+    registers: &[RegisterInfo],
+    config: &super::annotation::MergedConfig,
+    module: &Module,
+) -> HashMap<String, HashMap<String, i64>> {
+    let mut result: HashMap<String, HashMap<String, i64>> = registers
+        .iter()
+        .filter(|r| !r.value_map.is_empty())
+        .map(|r| {
+            let map: HashMap<String, i64> = r.value_map.iter().cloned().collect();
+            (r.name.clone(), map)
+        })
         .collect();
 
-    let state_count = automaton.states.len();
-    Ok((automaton, properties, state_count))
+    if config.from_sidecar {
+        // Sidecar path: use value maps from config only
+        for (name, inp_config) in &config.input_domains {
+            if !inp_config.value_map.is_empty() {
+                let map: HashMap<String, i64> = inp_config.value_map.iter().cloned().collect();
+                result.insert(name.clone(), map);
+            }
+        }
+        for (name, sig_config) in &config.signal_domains {
+            if !sig_config.value_map.is_empty() && !result.contains_key(name) {
+                let map: HashMap<String, i64> = sig_config.value_map.iter().cloned().collect();
+                result.insert(name.clone(), map);
+            }
+        }
+    } else {
+        // Inline path: use value maps from module annotations
+        for ann in &module.domain_annotations {
+            if let DomainAnnotationKind::Enum { value_map, .. } = &ann.domain_kind
+                && !value_map.is_empty()
+                && !result.contains_key(&ann.register_name)
+            {
+                let map: HashMap<String, i64> = value_map.iter().cloned().collect();
+                result.insert(ann.register_name.clone(), map);
+            }
+        }
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------

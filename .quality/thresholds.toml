@@ -1,0 +1,60 @@
+# Quality Map Thresholds
+# These thresholds drive the principle matrix in quality sessions.
+# Change via PR only — never widen a threshold to declare victory.
+
+[kiss]
+red_function_lines = 50
+yellow_function_lines = 30
+red_nesting_depth = 5
+yellow_nesting_depth = 4
+red_params = 6
+yellow_params = 5
+red_cyclomatic = 10       # Tier 1+ (rust-code-analysis)
+yellow_cyclomatic = 7     # Tier 1+
+red_cognitive = 15        # Tier 1+
+yellow_cognitive = 10     # Tier 1+
+
+[dry]
+# Near-duplicate detection threshold (Halstead similarity %, Tier 1+)
+similarity_threshold = 60
+# Repeated pattern count before flagging
+repeated_pattern_threshold = 2
+
+[yagni]
+# Any dead-code clippy warning is a signal
+max_dead_code_warnings = 0
+# Single-impl abstractions are suspicious
+flag_single_impl_traits = true
+# Unused dependencies (Tier 2, cargo-udeps)
+max_unused_deps = 0
+
+[srp]
+red_file_lines = 600
+yellow_file_lines = 400
+red_pub_items = 10
+yellow_pub_items = 7
+red_module_items = 30
+yellow_module_items = 20
+
+[ocp]
+# Tier 1+: concrete-type match sites across files
+max_match_sites = 3
+
+[lsp]
+# Flag impls that panic on documented-total methods
+flag_panicking_impls = true
+
+[isp]
+red_trait_methods = 7
+yellow_trait_methods = 5
+
+[dip]
+# Core modules that must NOT import adapter code
+protected_modules = ["clts", "ltl", "mu_calculus", "composition", "context"]
+forbidden_imports = ["adapter"]
+
+[step_limits]
+# Maximum lines changed per refactoring step before requiring a checkpoint
+max_lines_per_step = 150
+# Maximum files touched per step
+max_files_per_step = 3

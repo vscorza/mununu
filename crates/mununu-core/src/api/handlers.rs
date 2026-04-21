@@ -86,56 +86,19 @@ pub async fn context_summarize_handler(
         })
         .collect();
 
-    // Synthesize declared controllers and collect summaries
-    let eval_options = EvaluationOptions::default();
+    // Report declared controllers (declarations only — no synthesis execution).
+    // Per CLAUDE.md governance: "Never run controller synthesis in summary/informational
+    // endpoints." Synthesis is expensive (state-space exploration) and belongs only in
+    // the synthesis endpoint.
     let mut controllers = Vec::new();
     for rc in realized.controllers.values() {
-        let Some(rf) = realized.formulas.get(&rc.formula) else {
-            continue;
-        };
-        if realized.context.clts(&rc.source).is_none() {
-            continue;
-        }
-        let env = realized.environment_for(&rc.source);
-        let (realizable, states_count, transitions_count) =
-            match realized.context.synthesise_controller_with_options(
-                &rc.source,
-                &rf.formula,
-                &env,
-                ControllerSynthesisOptions {
-                    evaluation: Some(&eval_options),
-                    diagnostics: None,
-                    minimize: rc.options.minimize(),
-                    extract_strategy: false,
-                    mode: crate::context::ControllerMode::default(),
-                },
-            ) {
-                Ok(syn) => (
-                    syn.realizable,
-                    if syn.realizable {
-                        syn.controller.state_count()
-                    } else {
-                        0
-                    },
-                    if syn.realizable {
-                        syn.controller
-                            .states()
-                            .map(|sid| syn.controller.outgoing(sid).len())
-                            .sum()
-                    } else {
-                        0
-                    },
-                ),
-                Err(_) => (false, 0, 0),
-            };
-
         controllers.push(ControllerSummary {
             name: rc.name.clone(),
             source: rc.source.clone(),
             formula: rc.formula.clone(),
-            realizable,
-            states_count,
-            transitions_count,
+            realizable: false,
+            states_count: 0,
+            transitions_count: 0,
         });
     }
 
@@ -439,7 +402,9 @@ pub async fn context_graphs_handler(
                 continue;
             }
             let controller_name = format!("{}_controller", rc.name);
-            let source_clts = realized.context.clts(&rc.source).unwrap();
+            let Some(source_clts) = realized.context.clts(&rc.source) else {
+                continue;
+            };
             if let Ok(elements) = crate::api::graph::controller_to_graph_elements(
                 &syn.controller,
                 source_clts,

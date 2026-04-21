@@ -80,12 +80,9 @@ struct BuiltinSummary {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // ReturnAssignment will be used when the AST extractor is implemented
 enum TargetResolution {
     /// The target field is the object the method is called on (e.g., `this._map.set(...)` → `_map`).
     Receiver,
-    /// The target field is the return value's assignment target.
-    ReturnAssignment,
     /// No target — call doesn't affect state fields.
     None,
 }
@@ -102,17 +99,6 @@ impl CallSummaryLibrary {
         Self { entries }
     }
 
-    /// Look up a call summary.
-    /// `qualified_name` is e.g., "Map.prototype.set", "dict.__setitem__", "HashMap.insert".
-    pub fn lookup(&self, qualified_name: &str) -> Option<&ResolvedCallSummary> {
-        // We store BuiltinSummary internally but expose ResolvedCallSummary
-        // For now, just check if we have an entry
-        std::hint::black_box(qualified_name);
-        std::hint::black_box(&self.entries);
-        // TODO: proper resolution with target field from call site context
-        Option::None
-    }
-
     /// Resolve a call at a specific site, given the receiver field name.
     pub fn resolve(
         &self,
@@ -122,7 +108,6 @@ impl CallSummaryLibrary {
         if let Some(builtin) = self.entries.get(qualified_name) {
             let target_field = match &builtin.target_resolution {
                 TargetResolution::Receiver => receiver_field.map(String::from),
-                TargetResolution::ReturnAssignment => None, // caller must determine
                 TargetResolution::None => None,
             };
             ResolvedCallSummary {
@@ -187,94 +172,62 @@ impl CallSummaryLibrary {
 // Built-in summaries per language
 // ---------------------------------------------------------------------------
 
+/// Helper: build a `BuiltinSummary` whose target is the receiver object.
+fn receiver_entry(effect: CallEffect, guard: CallGuard) -> BuiltinSummary {
+    BuiltinSummary {
+        effect,
+        guard,
+        target_resolution: TargetResolution::Receiver,
+    }
+}
+
 fn typescript_summaries() -> HashMap<String, BuiltinSummary> {
     let mut m = HashMap::new();
-    let r = TargetResolution::Receiver;
 
     // Map
     m.insert(
         "Map.prototype.set".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "Map.prototype.delete".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
     m.insert(
         "Map.prototype.clear".into(),
-        BuiltinSummary {
-            effect: CallEffect::ResetToZero,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ResetToZero, CallGuard::None),
     );
     m.insert(
         "Map.prototype.get".into(),
-        BuiltinSummary {
-            effect: CallEffect::ReadOnly,
-            guard: CallGuard::CounterGtZero,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ReadOnly, CallGuard::CounterGtZero),
     );
     m.insert(
         "Map.prototype.has".into(),
-        BuiltinSummary {
-            effect: CallEffect::ReadOnly,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ReadOnly, CallGuard::None),
     );
 
     // Set
     m.insert(
         "Set.prototype.add".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "Set.prototype.delete".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
     m.insert(
         "Set.prototype.clear".into(),
-        BuiltinSummary {
-            effect: CallEffect::ResetToZero,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ResetToZero, CallGuard::None),
     );
 
     // Array
     m.insert(
         "Array.prototype.push".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "Array.prototype.pop".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::CounterGtZero,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::CounterGtZero),
     );
 
     // Infrastructure (no effect)
@@ -300,92 +253,51 @@ fn typescript_summaries() -> HashMap<String, BuiltinSummary> {
 
 fn python_summaries() -> HashMap<String, BuiltinSummary> {
     let mut m = HashMap::new();
-    let r = TargetResolution::Receiver;
 
     // dict
     m.insert(
         "dict.__setitem__".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "dict.__delitem__".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
     m.insert(
         "dict.clear".into(),
-        BuiltinSummary {
-            effect: CallEffect::ResetToZero,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ResetToZero, CallGuard::None),
     );
     m.insert(
         "dict.get".into(),
-        BuiltinSummary {
-            effect: CallEffect::ReadOnly,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ReadOnly, CallGuard::None),
     );
     m.insert(
         "dict.pop".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
 
     // list
     m.insert(
         "list.append".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "list.pop".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::CounterGtZero,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::CounterGtZero),
     );
     m.insert(
         "list.clear".into(),
-        BuiltinSummary {
-            effect: CallEffect::ResetToZero,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ResetToZero, CallGuard::None),
     );
 
     // set
     m.insert(
         "set.add".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "set.discard".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r,
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
 
     m
@@ -393,76 +305,43 @@ fn python_summaries() -> HashMap<String, BuiltinSummary> {
 
 fn rust_summaries() -> HashMap<String, BuiltinSummary> {
     let mut m = HashMap::new();
-    let r = TargetResolution::Receiver;
 
     // HashMap
     m.insert(
         "HashMap.insert".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "HashMap.remove".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
     m.insert(
         "HashMap.clear".into(),
-        BuiltinSummary {
-            effect: CallEffect::ResetToZero,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ResetToZero, CallGuard::None),
     );
 
     // Vec
     m.insert(
         "Vec.push".into(),
-        BuiltinSummary {
-            effect: CallEffect::IncrementCounter,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
     );
     m.insert(
         "Vec.pop".into(),
-        BuiltinSummary {
-            effect: CallEffect::DecrementCounter,
-            guard: CallGuard::CounterGtZero,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::CounterGtZero),
     );
     m.insert(
         "Vec.clear".into(),
-        BuiltinSummary {
-            effect: CallEffect::ResetToZero,
-            guard: CallGuard::None,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::ResetToZero, CallGuard::None),
     );
 
     // Option
     m.insert(
         "Option.take".into(),
-        BuiltinSummary {
-            effect: CallEffect::SetAbsent,
-            guard: CallGuard::MustBePresent,
-            target_resolution: r.clone(),
-        },
+        receiver_entry(CallEffect::SetAbsent, CallGuard::MustBePresent),
     );
     m.insert(
         "Option.replace".into(),
-        BuiltinSummary {
-            effect: CallEffect::SetPresent,
-            guard: CallGuard::None,
-            target_resolution: r,
-        },
+        receiver_entry(CallEffect::SetPresent, CallGuard::None),
     );
 
     m

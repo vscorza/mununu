@@ -1,7 +1,7 @@
 ---
 name: review-orchestrator
 description: >
-  Runs all four review skills and produces a consolidated review report
+  Runs all five review skills and produces a consolidated review report
   for the mununu Rust codebase.
 model: sonnet
 allowed_tools:
@@ -28,6 +28,7 @@ Run these skills in sequence:
 2. `/design-review` — KISS, DRY, SOLID, YAGNI, module boundaries
 3. `/test-review` — Coverage gaps, three-level adapter testing, property tests
 4. `/security-audit` — Unsafe blocks, API security, dependencies, DoS vectors
+5. `/soundness-check` — SOUNDNESS annotations, eval_expr fallbacks, guard failures, abstraction decisions
 
 Consolidate results into a single Markdown report. Save it to `.claude/reviews/YYYY-MM-DD.md` using today's date.
 
@@ -49,6 +50,9 @@ Traffic-light score per area: GREEN / YELLOW / RED
 {findings}
 
 ### Security
+{findings}
+
+### Soundness Annotations
 {findings}
 
 ### Action Items

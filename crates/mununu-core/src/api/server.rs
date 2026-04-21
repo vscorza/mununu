@@ -2,14 +2,18 @@
 //!
 //! This module configures the Axum HTTP server with routing, CORS, and error handling.
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
-use std::net::SocketAddr;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{Any, CorsLayer},
+    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 
@@ -69,6 +73,11 @@ fn create_router() -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(cors),
+                .layer(cors)
+                .layer(DefaultBodyLimit::max(1_048_576))
+                .layer(TimeoutLayer::with_status_code(
+                    axum::http::StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(30),
+                )),
         )
 }

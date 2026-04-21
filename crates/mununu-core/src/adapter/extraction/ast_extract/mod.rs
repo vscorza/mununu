@@ -11,7 +11,7 @@ pub mod domain;
 pub mod state_space;
 
 #[cfg(feature = "ast-extract")]
-#[allow(unused_variables, clippy::collapsible_if, clippy::ptr_arg)]
+#[allow(clippy::collapsible_if)]
 pub mod extractor;
 #[cfg(feature = "ast-extract")]
 pub mod parser;

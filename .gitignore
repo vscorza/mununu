@@ -13,6 +13,10 @@
 .DS_Store
 Thumbs.db
 
+# Environment files
+*.env
+.env
+
 # Logs
 *.log
 /logs/
@@ -29,6 +33,9 @@ bench_results/
 # Claude Code (user-local)
 .claude/settings.json
 .claude/reviews/
+
+# Quality session artifacts
+/.quality/sessions/
 
 # Private / unpublished material (lives in mununu-private/)
 /paper/

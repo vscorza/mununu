@@ -21,6 +21,157 @@ use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use mununu_core::adapter::systemverilog::annotation::SignalAbstraction;
+
+/// Classify a bit-width into the appropriate signal abstraction and optional
+/// upper bound.  Centralises the recurring pattern used throughout `sv init`.
+///
+/// Returns `(abstraction, bound)` where:
+/// - width == 1  → `(Boolean, None)`
+/// - width 2..=4 → `(BoundedCounter, Some(2^width - 1))`
+/// - width > 4   → `(Discover, None)`
+fn abstract_width(width: usize) -> (SignalAbstraction, Option<i64>) {
+    if width == 1 {
+        (SignalAbstraction::Boolean, None)
+    } else if width <= 4 {
+        (
+            SignalAbstraction::BoundedCounter,
+            1i64.checked_shl(width as u32).map(|v| v - 1),
+        )
+    } else {
+        (SignalAbstraction::Discover, None)
+    }
+}
+
+/// Build signal annotations from a module's declarations and output ports.
+///
+/// Walks declarations to find enums and logic signals (excluding ports), then
+/// detects combinational outputs (assign-driven output ports not already in
+/// the signal list).
+fn build_signal_annotations(
+    module: &mununu_core::adapter::systemverilog::ast::Module,
+) -> Vec<mununu_core::adapter::systemverilog::annotation::SignalAnnotation> {
+    use mununu_core::adapter::systemverilog::annotation::{SignalAbstraction, SignalAnnotation};
+    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
+
+    let port_names: HashSet<&str> = module.ports.iter().map(|p| p.name.as_str()).collect();
+
+    let mut signals = Vec::new();
+    for decl in &module.declarations {
+        match decl {
+            Declaration::Enum {
+                variants,
+                var_name: Some(var),
+                ..
+            } => {
+                signals.push(SignalAnnotation {
+                    name: var.clone(),
+                    preserve: true,
+                    abstraction: SignalAbstraction::Enum,
+                    bound: None,
+                    variants: Some(variants.clone()),
+                    value_map: None,
+                    combinational: false,
+                    note: Some("auto-detected typedef enum".to_string()),
+                });
+            }
+            Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
+                let (abstraction, bound) = abstract_width(*width);
+                let note = match abstraction {
+                    SignalAbstraction::Boolean => "1-bit flag",
+                    SignalAbstraction::BoundedCounter => "small register — bounded counter",
+                    _ => "wide register — run `mununu sv discover` to find significant values",
+                };
+                signals.push(SignalAnnotation {
+                    name: name.clone(),
+                    preserve: *width <= 4,
+                    abstraction,
+                    bound,
+                    variants: None,
+                    value_map: None,
+                    combinational: false,
+                    note: Some(note.to_string()),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Detect combinational output ports (driven by assign statements)
+    for port in &module.ports {
+        if port.direction == PortDirection::Output
+            && module.assigns.iter().any(|a| a.target.name() == port.name)
+            && !signals.iter().any(|s| s.name == port.name)
+        {
+            let (abstraction, bound) = abstract_width(port.width);
+            signals.push(SignalAnnotation {
+                name: port.name.clone(),
+                preserve: true,
+                abstraction,
+                bound,
+                variants: None,
+                value_map: None,
+                combinational: true,
+                note: Some("combinational output (assign-driven)".to_string()),
+            });
+        }
+    }
+
+    signals
+}
+
+/// Build input annotations from a module's input ports, skipping clock/reset.
+fn build_input_annotations(
+    module: &mununu_core::adapter::systemverilog::ast::Module,
+) -> Vec<mununu_core::adapter::systemverilog::annotation::InputAnnotation> {
+    use mununu_core::adapter::systemverilog::annotation::InputAnnotation;
+    use mununu_core::adapter::systemverilog::ast::PortDirection;
+
+    module
+        .ports
+        .iter()
+        .filter(|p| {
+            p.direction == PortDirection::Input
+                && !["clk", "rst", "rst_n"].contains(&p.name.as_str())
+        })
+        .map(|p| {
+            let (abstraction, bound) = abstract_width(p.width);
+            InputAnnotation {
+                name: p.name.clone(),
+                preserve: true,
+                abstraction,
+                bound,
+                variants: None,
+                value_map: None,
+                label_name: None,
+            }
+        })
+        .collect()
+}
+
+/// Merge newly discovered values into an existing `discovered_values` map,
+/// deduplicating by value and sorting.
+#[cfg(feature = "smt")]
+fn merge_discovered_values(
+    target: &mut HashMap<String, mununu_core::adapter::systemverilog::annotation::DiscoveredValues>,
+    results: HashMap<String, mununu_core::adapter::systemverilog::annotation::DiscoveredValues>,
+) {
+    use mununu_core::adapter::systemverilog::annotation::DiscoveredValues;
+
+    for (signal, discovered) in results {
+        let existing = target.entry(signal).or_insert_with(|| DiscoveredValues {
+            values: vec![],
+            catch_all: "OTHER".to_string(),
+        });
+        for new_val in &discovered.values {
+            if !existing.values.iter().any(|v| v.value == new_val.value) {
+                existing.values.push(new_val.clone());
+            }
+        }
+        existing.values.sort_by_key(|v| v.value);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "mununu",
@@ -460,7 +611,6 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
 
 fn sv_init(args: SvInitArgs) -> Result<(), String> {
     use mununu_core::adapter::systemverilog::annotation::*;
-    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
 
     let source = fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
@@ -485,119 +635,8 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
         ));
     }
 
-    // Build signals from declarations (skip ports)
-    let port_names: std::collections::HashSet<&str> =
-        module.ports.iter().map(|p| p.name.as_str()).collect();
-
-    let mut signals = Vec::new();
-    for decl in &module.declarations {
-        match decl {
-            Declaration::Enum {
-                variants,
-                var_name: Some(var),
-                ..
-            } => {
-                signals.push(SignalAnnotation {
-                    name: var.clone(),
-                    preserve: true,
-                    abstraction: SignalAbstraction::Enum,
-                    bound: None,
-                    variants: Some(variants.clone()),
-                    value_map: None,
-                    combinational: false,
-                    note: Some("auto-detected typedef enum".to_string()),
-                });
-            }
-            Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
-                let (abstraction, bound, note) = if *width == 1 {
-                    (SignalAbstraction::Boolean, None, "1-bit flag")
-                } else if *width <= 4 {
-                    (
-                        SignalAbstraction::BoundedCounter,
-                        Some((1i64 << width) - 1),
-                        "small register — bounded counter",
-                    )
-                } else {
-                    (
-                        SignalAbstraction::Discover,
-                        None,
-                        "wide register — run `mununu sv discover` to find significant values",
-                    )
-                };
-                signals.push(SignalAnnotation {
-                    name: name.clone(),
-                    preserve: *width <= 4, // auto-preserve small registers
-                    abstraction,
-                    bound,
-                    variants: None,
-                    value_map: None,
-                    combinational: false,
-                    note: Some(note.to_string()),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    // Build inputs from ports
-    let mut inputs = Vec::new();
-    for port in &module.ports {
-        if port.direction != PortDirection::Input {
-            continue;
-        }
-        if port.name == "clk" || port.name == "rst" || port.name == "rst_n" {
-            continue;
-        }
-        let (abstraction, bound, preserve) = if port.width == 1 {
-            (SignalAbstraction::Boolean, None, true)
-        } else if port.width <= 4 {
-            (
-                SignalAbstraction::BoundedCounter,
-                Some((1i64 << port.width) - 1),
-                true,
-            )
-        } else {
-            (SignalAbstraction::Discover, None, true)
-        };
-        inputs.push(InputAnnotation {
-            name: port.name.clone(),
-            preserve,
-            abstraction,
-            bound,
-            variants: None,
-            value_map: None,
-            label_name: None,
-        });
-    }
-
-    // Detect combinational output ports (driven by assign statements)
-    for port in &module.ports {
-        if port.direction != PortDirection::Output {
-            continue;
-        }
-        // Check if this output is driven by a continuous assign
-        let is_combinational = module.assigns.iter().any(|a| a.target.name() == port.name);
-        if is_combinational && !signals.iter().any(|s| s.name == port.name) {
-            signals.push(SignalAnnotation {
-                name: port.name.clone(),
-                preserve: true,
-                abstraction: if port.width == 1 {
-                    SignalAbstraction::Boolean
-                } else {
-                    SignalAbstraction::BoundedCounter
-                },
-                bound: if port.width > 1 {
-                    Some((1i64 << port.width) - 1)
-                } else {
-                    None
-                },
-                variants: None,
-                value_map: None,
-                combinational: true,
-                note: Some("combinational output (assign-driven)".to_string()),
-            });
-        }
-    }
+    let signals = build_signal_annotations(&module);
+    let inputs = build_input_annotations(&module);
 
     let ann = SvAnnotation {
         schema: Some("mununu_sv_annotation_v1".to_string()),
@@ -673,7 +712,7 @@ fn sv_init_multi_from_top(
     top_module: mununu_core::adapter::systemverilog::ast::Module,
 ) -> Result<(), String> {
     use mununu_core::adapter::systemverilog::annotation::*;
-    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
+    use mununu_core::adapter::systemverilog::ast::PortDirection;
 
     let top_dir = args.file.parent().unwrap_or(std::path::Path::new("."));
 
@@ -698,7 +737,12 @@ fn sv_init_multi_from_top(
         if sub_modules.contains_key(&inst.module_type) {
             continue; // Already parsed this module type
         }
-        let sv_path = top_dir.join(format!("{}.sv", inst.module_type));
+        // Sanitize module type to prevent path traversal (e.g., "../../etc/passwd")
+        let safe_module_name = std::path::Path::new(&inst.module_type)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let sv_path = top_dir.join(format!("{}.sv", safe_module_name));
         if !sv_path.exists() {
             eprintln!(
                 "  warning: cannot find '{}' for module type '{}' — skipping",
@@ -712,103 +756,8 @@ fn sv_init_multi_from_top(
         let module = mununu_core::adapter::systemverilog::parser::parse(&source)
             .map_err(|e| format!("SV parse error in '{}': {e}", sv_path.display()))?;
 
-        let port_names: std::collections::HashSet<&str> =
-            module.ports.iter().map(|p| p.name.as_str()).collect();
-
-        // Build signals
-        let mut signals = Vec::new();
-        for decl in &module.declarations {
-            match decl {
-                Declaration::Enum {
-                    variants,
-                    var_name: Some(var),
-                    ..
-                } => {
-                    signals.push(SignalAnnotation {
-                        name: var.clone(),
-                        preserve: true,
-                        abstraction: SignalAbstraction::Enum,
-                        bound: None,
-                        variants: Some(variants.clone()),
-                        value_map: None,
-                        combinational: false,
-                        note: Some("auto-detected typedef enum".to_string()),
-                    });
-                }
-                Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
-                    let (abstraction, bound) = if *width == 1 {
-                        (SignalAbstraction::Boolean, None)
-                    } else if *width <= 4 {
-                        (SignalAbstraction::BoundedCounter, Some((1i64 << width) - 1))
-                    } else {
-                        (SignalAbstraction::Discover, None)
-                    };
-                    signals.push(SignalAnnotation {
-                        name: name.clone(),
-                        preserve: *width <= 4,
-                        abstraction,
-                        bound,
-                        variants: None,
-                        value_map: None,
-                        combinational: false,
-                        note: None,
-                    });
-                }
-                _ => {}
-            }
-        }
-        // Detect combinational outputs
-        for port in &module.ports {
-            if port.direction == PortDirection::Output
-                && module.assigns.iter().any(|a| a.target.name() == port.name)
-                && !signals.iter().any(|s| s.name == port.name)
-            {
-                signals.push(SignalAnnotation {
-                    name: port.name.clone(),
-                    preserve: true,
-                    abstraction: if port.width == 1 {
-                        SignalAbstraction::Boolean
-                    } else {
-                        SignalAbstraction::BoundedCounter
-                    },
-                    bound: if port.width > 1 {
-                        Some((1i64 << port.width) - 1)
-                    } else {
-                        None
-                    },
-                    variants: None,
-                    value_map: None,
-                    combinational: true,
-                    note: Some("combinational output".to_string()),
-                });
-            }
-        }
-
-        let inputs: Vec<InputAnnotation> = module
-            .ports
-            .iter()
-            .filter(|p| {
-                p.direction == PortDirection::Input
-                    && !["clk", "rst", "rst_n"].contains(&p.name.as_str())
-            })
-            .map(|p| InputAnnotation {
-                name: p.name.clone(),
-                preserve: true,
-                abstraction: if p.width == 1 {
-                    SignalAbstraction::Boolean
-                } else {
-                    SignalAbstraction::Discover
-                },
-                bound: if p.width > 1 && p.width <= 4 {
-                    Some((1i64 << p.width) - 1)
-                } else {
-                    None
-                },
-                variants: None,
-                value_map: None,
-                label_name: None,
-            })
-            .collect();
+        let signals = build_signal_annotations(&module);
+        let inputs = build_input_annotations(&module);
 
         let parameters = module
             .parameters
@@ -875,22 +824,12 @@ fn sv_init_multi_from_top(
         // Create connection for each output→input pair on the same wire
         for (out_inst, out_mod, out_port, width) in &outputs {
             for (in_inst, in_mod, in_port, _) in &inputs_on_wire {
-                let abstraction = if *width == 1 {
-                    SignalAbstraction::Boolean
-                } else if *width <= 4 {
-                    SignalAbstraction::BoundedCounter
-                } else {
-                    SignalAbstraction::Discover
-                };
+                let (abstraction, bound) = abstract_width(*width);
                 connections.push(ConnectionSpec {
                     from: format!("{}.{}", out_mod, out_port),
                     to: format!("{}.{}", in_mod, in_port),
                     abstraction,
-                    bound: if *width > 1 && *width <= 4 {
-                        Some((1i64 << width) - 1)
-                    } else {
-                        None
-                    },
+                    bound,
                     variants: None,
                     value_map: None,
                     note: Some(format!(
@@ -1094,24 +1033,7 @@ fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
             }
 
             // Merge into the annotation, preserving user-given names
-            for (signal, discovered) in results {
-                let existing = annotation
-                    .discovered_values
-                    .entry(signal)
-                    .or_insert_with(|| {
-                        mununu_core::adapter::systemverilog::annotation::DiscoveredValues {
-                            values: vec![],
-                            catch_all: "OTHER".to_string(),
-                        }
-                    });
-
-                for new_val in &discovered.values {
-                    if !existing.values.iter().any(|v| v.value == new_val.value) {
-                        existing.values.push(new_val.clone());
-                    }
-                }
-                existing.values.sort_by_key(|v| v.value);
-            }
+            merge_discovered_values(&mut annotation.discovered_values, results);
         }
 
         // Write the updated sidecar
@@ -1203,7 +1125,11 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
         > = std::collections::HashMap::new();
 
         for module_entry in &ann.modules {
-            let sv_path = sidecar_dir.join(&module_entry.source);
+            // Sanitize source path to prevent path traversal from .mununu.json
+            let safe_source = std::path::Path::new(&module_entry.source)
+                .file_name()
+                .unwrap_or_default();
+            let sv_path = sidecar_dir.join(safe_source);
             let source = fs::read_to_string(&sv_path)
                 .map_err(|e| format!("Failed to read '{}': {e}", sv_path.display()))?;
             let module = mununu_core::adapter::systemverilog::parser::parse(&source)
@@ -1214,7 +1140,13 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
 
         // Run per-module discovery for non-connected signals
         for (module, mod_name) in &parsed_modules {
-            let module_entry = ann.modules.iter().find(|m| m.name == *mod_name).unwrap();
+            let Some(module_entry) = ann.modules.iter().find(|m| m.name == *mod_name) else {
+                eprintln!(
+                    "  warning: no annotation entry for module '{}' — skipping discovery",
+                    mod_name
+                );
+                continue;
+            };
 
             // Build a temporary single-module annotation for per-module discovery
             let temp_ann = SvAnnotation {
@@ -1252,27 +1184,10 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
                     }
                 }
                 // Merge into module's discovered_values
-                let entry = ann
-                    .modules
-                    .iter_mut()
-                    .find(|m| m.name == *mod_name)
-                    .unwrap();
-                for (signal, discovered) in results {
-                    let existing =
-                        entry
-                            .discovered_values
-                            .entry(signal)
-                            .or_insert_with(|| DiscoveredValues {
-                                values: vec![],
-                                catch_all: "OTHER".to_string(),
-                            });
-                    for new_val in &discovered.values {
-                        if !existing.values.iter().any(|v| v.value == new_val.value) {
-                            existing.values.push(new_val.clone());
-                        }
-                    }
-                    existing.values.sort_by_key(|v| v.value);
-                }
+                let Some(entry) = ann.modules.iter_mut().find(|m| m.name == *mod_name) else {
+                    continue;
+                };
+                merge_discovered_values(&mut entry.discovered_values, results);
             }
         }
 
@@ -1307,21 +1222,7 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
                 }
             }
             // Merge into top-level discovered_values
-            for (key, discovered) in cross_results {
-                let existing =
-                    ann.discovered_values
-                        .entry(key)
-                        .or_insert_with(|| DiscoveredValues {
-                            values: vec![],
-                            catch_all: "OTHER".to_string(),
-                        });
-                for new_val in &discovered.values {
-                    if !existing.values.iter().any(|v| v.value == new_val.value) {
-                        existing.values.push(new_val.clone());
-                    }
-                }
-                existing.values.sort_by_key(|v| v.value);
-            }
+            merge_discovered_values(&mut ann.discovered_values, cross_results);
         }
 
         // Write updated sidecar
@@ -1583,6 +1484,22 @@ fn parse_context_file(path: &Path) -> Result<ContextDoc, String> {
     parse_context_doc(&source).map_err(|err| format!("failed to parse '{}': {err}", path.display()))
 }
 
+/// Log adapter warnings and translation summary to stderr, then return the
+/// CTXDSL text.  Shared by every adapter arm in [`load_with_adapter_mode`].
+fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> String {
+    for w in &output.warnings {
+        eprintln!("adapter warning: {}", w.message);
+    }
+    eprintln!(
+        "Translated {}: {} signals, {} states, {} properties",
+        output.source_info.format,
+        output.source_info.signal_count,
+        output.source_info.state_count,
+        output.source_info.property_count,
+    );
+    output.ctxdsl
+}
+
 /// Read a source file, optionally translating it from an external format first.
 /// Returns `(ContextDoc, Option<ctxdsl_text>)` — the CTXDSL text is `Some` when
 /// an adapter was used (useful for `--print-ctxdsl`).
@@ -1591,135 +1508,53 @@ fn load_with_adapter_mode(
     adapter: Option<&str>,
     mode: Option<&str>,
 ) -> Result<(ContextDoc, Option<String>), String> {
+    use mununu_core::adapter::{AdapterOptions, FormatAdapter};
+
     let source = fs::read_to_string(path)
         .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
 
+    let options_default = AdapterOptions::default();
+    let options_with_mode = AdapterOptions {
+        mode: mode.map(|s| s.to_string()),
+        ..Default::default()
+    };
+
     let ctxdsl_source = match adapter {
-        Some("tlsf") => {
-            use mununu_core::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output = mununu_core::adapter::tlsf::TlsfAdapter::translate(&source, &options)
-                .map_err(|e| format!("TLSF adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated TLSF: {} signals, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("aiger") => {
-            use mununu_core::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output = mununu_core::adapter::aiger::AigerAdapter::translate(&source, &options)
-                .map_err(|e| format!("AIGER adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated AIGER: {} signals, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("promela") => {
-            use mununu_core::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output =
-                mununu_core::adapter::promela::PromelaAdapter::translate(&source, &options)
-                    .map_err(|e| format!("Promela adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated Promela: {} signals, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("systemverilog") | Some("sv") => {
-            use mununu_core::adapter::AdapterOptions;
-            let options = AdapterOptions::default();
-            // Use translate_with_path to enable .mununu.json sidecar loading
-            let output =
-                mununu_core::adapter::systemverilog::SystemVerilogAdapter::translate_with_path(
-                    &source, &options, path,
-                )
-                .map_err(|e| format!("SystemVerilog adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated SystemVerilog: {} signals, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("xstate") => {
-            use mununu_core::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output = mununu_core::adapter::xstate::XStateAdapter::translate(&source, &options)
-                .map_err(|e| format!("XState adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated XState: {} events, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("extraction") => {
-            use mununu_core::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions {
-                mode: mode.map(|s| s.to_string()),
-                ..Default::default()
-            };
-            let output =
-                mununu_core::adapter::extraction::ExtractionAdapter::translate(&source, &options)
-                    .map_err(|e| format!("Extraction adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated Extraction (mode: {}): {} labels, {} states, {} properties",
-                mode.unwrap_or("vulnerable"),
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
-        Some("auto") => {
-            let options = mununu_core::adapter::AdapterOptions {
-                mode: mode.map(|s| s.to_string()),
-                ..Default::default()
-            };
-            let output = mununu_core::adapter::auto_translate(&source, &options)
-                .map_err(|e| format!("adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated {}: {} signals, {} states, {} properties",
-                output.source_info.format,
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
+        Some("tlsf") => log_adapter_output(
+            mununu_core::adapter::tlsf::TlsfAdapter::translate(&source, &options_default)
+                .map_err(|e| format!("TLSF adapter error: {e}"))?,
+        ),
+        Some("aiger") => log_adapter_output(
+            mununu_core::adapter::aiger::AigerAdapter::translate(&source, &options_default)
+                .map_err(|e| format!("AIGER adapter error: {e}"))?,
+        ),
+        Some("promela") => log_adapter_output(
+            mununu_core::adapter::promela::PromelaAdapter::translate(&source, &options_default)
+                .map_err(|e| format!("Promela adapter error: {e}"))?,
+        ),
+        Some("systemverilog") | Some("sv") => log_adapter_output(
+            mununu_core::adapter::systemverilog::SystemVerilogAdapter::translate_with_path(
+                &source,
+                &options_default,
+                path,
+            )
+            .map_err(|e| format!("SystemVerilog adapter error: {e}"))?,
+        ),
+        Some("xstate") => log_adapter_output(
+            mununu_core::adapter::xstate::XStateAdapter::translate(&source, &options_default)
+                .map_err(|e| format!("XState adapter error: {e}"))?,
+        ),
+        Some("extraction") => log_adapter_output(
+            mununu_core::adapter::extraction::ExtractionAdapter::translate(
+                &source,
+                &options_with_mode,
+            )
+            .map_err(|e| format!("Extraction adapter error: {e}"))?,
+        ),
+        Some("auto") => log_adapter_output(
+            mununu_core::adapter::auto_translate(&source, &options_with_mode)
+                .map_err(|e| format!("adapter error: {e}"))?,
+        ),
         Some(fmt) => {
             return Err(format!(
                 "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, auto"
@@ -2391,8 +2226,14 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
     }
 
     if args.soundness_report {
-        let synth_clts = realized.context.clts(&args.automaton).unwrap();
-        print_soundness_report(&args.formula, realized_formula, synth_clts);
+        if let Some(synth_clts) = realized.context.clts(&args.automaton) {
+            print_soundness_report(&args.formula, realized_formula, synth_clts);
+        } else {
+            eprintln!(
+                "  warning: automaton '{}' not found — skipping soundness report",
+                args.automaton
+            );
+        }
     }
 
     if let Some(path) = args.dump_json.as_ref() {
@@ -2790,6 +2631,141 @@ struct CytoscapePosition {
     y: f64,
 }
 
+/// Collect action names with controllability annotation from an automaton's
+/// alphabet.  Shared by both DSL and unrolled Cytoscape builders.
+fn collect_action_info(automaton: &mununu_core::context_dsl::ast::Automaton) -> Vec<String> {
+    automaton
+        .alphabet
+        .iter()
+        .map(|label_ref| {
+            let label_name = &label_ref.name.name;
+            let is_controllable = automaton
+                .controllable
+                .iter()
+                .any(|c| c.name.name == *label_name);
+            let is_internal = automaton
+                .internal
+                .iter()
+                .any(|i| i.name.name == *label_name);
+            let action_type = if is_internal {
+                "internal"
+            } else if is_controllable {
+                "controllable"
+            } else {
+                "uncontrollable"
+            };
+            format!("{} ({})", label_name, action_type)
+        })
+        .collect()
+}
+
+/// Classify a label as controllable/internal/uncontrollable from an automaton's
+/// declarations.  Used by both Cytoscape builders for edge `actionType`.
+fn classify_action(
+    automaton: &mununu_core::context_dsl::ast::Automaton,
+    label_names: &[String],
+) -> &'static str {
+    let is_internal = label_names
+        .iter()
+        .any(|l| automaton.internal.iter().any(|i| i.name.name == *l));
+    let is_controllable = label_names
+        .iter()
+        .any(|l| automaton.controllable.iter().any(|c| c.name.name == *l));
+    if is_internal {
+        "internal"
+    } else if is_controllable {
+        "controllable"
+    } else {
+        "uncontrollable"
+    }
+}
+
+/// Parameters for [`build_state_elements`], grouped to stay under the
+/// clippy `too_many_arguments` limit.
+struct StateElementParams {
+    state_id: String,
+    automaton_id: String,
+    label: String,
+    is_initial: bool,
+    is_dead: bool,
+    state_var_str: Option<String>,
+    x: f64,
+    y: f64,
+    entry_node_id: Option<String>,
+    entry_edge_id: Option<String>,
+}
+
+/// Build the Cytoscape elements for a state node plus its entry arrow (if
+/// initial).  Shared by both DSL and unrolled Cytoscape builders.
+fn build_state_elements(p: StateElementParams) -> Vec<CytoscapeElement> {
+    let mut elems = Vec::new();
+
+    let mut classes = vec!["state"];
+    if p.is_initial {
+        classes.push("start");
+    }
+    if p.is_dead {
+        classes.push("dead");
+    }
+
+    elems.push(CytoscapeElement {
+        data: CytoscapeData::Node {
+            id: p.state_id.clone(),
+            parent: Some(p.automaton_id.clone()),
+            label: Some(p.label),
+            vars: p.state_var_str.map(|s| json!(s)),
+            actions: None,
+            note: if p.is_initial {
+                Some("Initial state".to_string())
+            } else if p.is_dead {
+                Some("Terminal state".to_string())
+            } else {
+                None
+            },
+            isStart: Some(p.is_initial),
+            isDead: Some(p.is_dead),
+        },
+        position: Some(CytoscapePosition { x: p.x, y: p.y }),
+        classes: Some(classes.join(" ")),
+    });
+
+    if p.is_initial
+        && let (Some(en_id), Some(ee_id)) = (p.entry_node_id, p.entry_edge_id)
+    {
+        elems.push(CytoscapeElement {
+            data: CytoscapeData::Node {
+                id: en_id.clone(),
+                parent: Some(p.automaton_id),
+                label: None,
+                vars: None,
+                actions: None,
+                note: None,
+                isStart: None,
+                isDead: None,
+            },
+            position: Some(CytoscapePosition { x: 40.0, y: p.y }),
+            classes: Some("entry".to_string()),
+        });
+
+        elems.push(CytoscapeElement {
+            data: CytoscapeData::Edge {
+                id: ee_id,
+                source: en_id,
+                target: p.state_id,
+                label: None,
+                action: None,
+                actionType: Some("start-arrow".to_string()),
+                guard: None,
+                effect: None,
+            },
+            position: None,
+            classes: None,
+        });
+    }
+
+    elems
+}
+
 fn counterstrategy_to_cytoscape(
     clts: &mununu_core::clts::Clts<
         mununu_core::clts::DefaultStateIdx,
@@ -2949,28 +2925,7 @@ fn dsl_automata_to_cytoscape(
             .map(|v| v.name.name.clone())
             .collect();
 
-        // Collect action names with controllability
-        let mut action_info: Vec<String> = Vec::new();
-        for label_ref in &automaton.alphabet {
-            let label_name = &label_ref.name.name;
-            let is_controllable = automaton
-                .controllable
-                .iter()
-                .any(|c| c.name.name == *label_name);
-            let is_internal = automaton
-                .internal
-                .iter()
-                .any(|i| i.name.name == *label_name);
-
-            let action_type = if is_internal {
-                "internal"
-            } else if is_controllable {
-                "controllable"
-            } else {
-                "uncontrollable"
-            };
-            action_info.push(format!("{} ({})", label_name, action_type));
-        }
+        let action_info = collect_action_info(automaton);
 
         // Create automaton compound node
         let automaton_id = automaton_name.clone();
@@ -3026,77 +2981,28 @@ fn dsl_automata_to_cytoscape(
                 })
             };
 
-            let position = CytoscapePosition {
-                x: x_pos,
-                y: y_offset + 100.0,
-            };
             state_positions.insert(state_name.clone(), (x_pos, y_offset + 100.0));
 
-            let mut classes = vec!["state"];
-            if is_initial {
-                classes.push("start");
-            }
-            if is_dead {
-                classes.push("dead");
-            }
-
-            elements.push(CytoscapeElement {
-                data: CytoscapeData::Node {
-                    id: state_id.clone(),
-                    parent: Some(automaton_id.clone()),
-                    label: Some(format!("{}_{}", automaton_name, state_name)),
-                    vars: state_var_str.map(|s| json!(s)),
-                    actions: None,
-                    note: if is_initial {
-                        Some("Initial state".to_string())
-                    } else if is_dead {
-                        Some("Terminal state".to_string())
-                    } else {
-                        None
-                    },
-                    isStart: Some(is_initial),
-                    isDead: Some(is_dead),
+            elements.extend(build_state_elements(StateElementParams {
+                state_id,
+                automaton_id: automaton_id.clone(),
+                label: format!("{}_{}", automaton_name, state_name),
+                is_initial,
+                is_dead,
+                state_var_str,
+                x: x_pos,
+                y: y_offset + 100.0,
+                entry_node_id: if is_initial {
+                    Some(format!("{}_entry", automaton_name))
+                } else {
+                    None
                 },
-                position: Some(position),
-                classes: Some(classes.join(" ")),
-            });
-
-            // Add entry arrow for initial states
-            if is_initial {
-                let entry_id = format!("{}_entry", automaton_name);
-                elements.push(CytoscapeElement {
-                    data: CytoscapeData::Node {
-                        id: entry_id.clone(),
-                        parent: Some(automaton_id.clone()),
-                        label: None,
-                        vars: None,
-                        actions: None,
-                        note: None,
-                        isStart: None,
-                        isDead: None,
-                    },
-                    position: Some(CytoscapePosition {
-                        x: 40.0,
-                        y: y_offset + 100.0,
-                    }),
-                    classes: Some("entry".to_string()),
-                });
-
-                elements.push(CytoscapeElement {
-                    data: CytoscapeData::Edge {
-                        id: format!("{}_entry_edge", automaton_name),
-                        source: entry_id,
-                        target: state_id.clone(),
-                        label: None,
-                        action: None,
-                        actionType: Some("start-arrow".to_string()),
-                        guard: None,
-                        effect: None,
-                    },
-                    position: None,
-                    classes: None,
-                });
-            }
+                entry_edge_id: if is_initial {
+                    Some(format!("{}_entry_edge", automaton_name))
+                } else {
+                    None
+                },
+            }));
 
             x_pos += state_spacing;
         }
@@ -3131,20 +3037,7 @@ fn dsl_automata_to_cytoscape(
             }
             let label_name = all_label_names.join(", ");
 
-            // Determine action type
-            let is_controllable = all_label_names
-                .iter()
-                .any(|l| automaton.controllable.iter().any(|c| c.name.name == *l));
-            let is_internal = all_label_names
-                .iter()
-                .any(|l| automaton.internal.iter().any(|i| i.name.name == *l));
-            let action_type = if is_internal {
-                "internal"
-            } else if is_controllable {
-                "controllable"
-            } else {
-                "uncontrollable"
-            };
+            let action_type = classify_action(automaton, &all_label_names);
 
             // Format guard
             let guard_str = transition
@@ -3348,28 +3241,7 @@ fn unrolled_automata_to_cytoscape(
             .map(|v| v.name.name.clone())
             .collect();
 
-        // Collect action names
-        let mut action_info: Vec<String> = Vec::new();
-        for label_ref in &automaton.alphabet {
-            let label_name = &label_ref.name.name;
-            let is_controllable = automaton
-                .controllable
-                .iter()
-                .any(|c| c.name.name == *label_name);
-            let is_internal = automaton
-                .internal
-                .iter()
-                .any(|i| i.name.name == *label_name);
-
-            let action_type = if is_internal {
-                "internal"
-            } else if is_controllable {
-                "controllable"
-            } else {
-                "uncontrollable"
-            };
-            action_info.push(format!("{} ({})", label_name, action_type));
-        }
+        let action_info = collect_action_info(automaton);
 
         // Create automaton compound node (with "Unrolled" suffix)
         let automaton_id = format!("{}_unrolled", automaton_name);
@@ -3452,77 +3324,31 @@ fn unrolled_automata_to_cytoscape(
                 Some(var_parts.join(", "))
             };
 
-            let position = CytoscapePosition {
-                x: x_pos,
-                y: y_offset + 100.0,
-            };
             state_positions.insert(state_name.clone(), (x_pos, y_offset + 100.0));
 
-            let mut classes = vec!["state"];
-            if is_initial {
-                classes.push("start");
-            }
-            if is_dead {
-                classes.push("dead");
-            }
-
-            elements.push(CytoscapeElement {
-                data: CytoscapeData::Node {
-                    id: state_id.clone(),
-                    parent: Some(automaton_id.clone()),
-                    label: Some(state_name.clone()),
-                    vars: state_var_str.map(|s| json!(s)),
-                    actions: None,
-                    note: if is_initial {
-                        Some("Initial state".to_string())
-                    } else if is_dead {
-                        Some("Terminal state".to_string())
-                    } else {
-                        None
-                    },
-                    isStart: Some(is_initial),
-                    isDead: Some(is_dead),
+            elements.extend(build_state_elements(StateElementParams {
+                state_id,
+                automaton_id: automaton_id.clone(),
+                label: state_name.clone(),
+                is_initial,
+                is_dead,
+                state_var_str,
+                x: x_pos,
+                y: y_offset + 100.0,
+                entry_node_id: if is_initial {
+                    Some(format!("{}_unrolled_entry_{}", automaton_name, state_name))
+                } else {
+                    None
                 },
-                position: Some(position),
-                classes: Some(classes.join(" ")),
-            });
-
-            // Add entry arrow for initial states
-            if is_initial {
-                let entry_id = format!("{}_unrolled_entry_{}", automaton_name, state_name);
-                elements.push(CytoscapeElement {
-                    data: CytoscapeData::Node {
-                        id: entry_id.clone(),
-                        parent: Some(automaton_id.clone()),
-                        label: None,
-                        vars: None,
-                        actions: None,
-                        note: None,
-                        isStart: None,
-                        isDead: None,
-                    },
-                    position: Some(CytoscapePosition {
-                        x: 40.0,
-                        y: y_offset + 100.0,
-                    }),
-                    classes: Some("entry".to_string()),
-                });
-
-                elements.push(CytoscapeElement {
-                    data: CytoscapeData::Edge {
-                        id: format!("{}_unrolled_entry_edge_{}", automaton_name, state_name),
-                        source: entry_id,
-                        target: state_id.clone(),
-                        label: None,
-                        action: None,
-                        actionType: Some("start-arrow".to_string()),
-                        guard: None,
-                        effect: None,
-                    },
-                    position: None,
-                    classes: None,
-                });
-            }
+                entry_edge_id: if is_initial {
+                    Some(format!(
+                        "{}_unrolled_entry_edge_{}",
+                        automaton_name, state_name
+                    ))
+                } else {
+                    None
+                },
+            }));
 
             x_pos += state_spacing;
         }
@@ -3533,19 +3359,7 @@ fn unrolled_automata_to_cytoscape(
             let to_name = transition.to.state_name();
             let label_name = transition.label.clone();
 
-            // Determine action type
-            let is_controllable = automaton
-                .controllable
-                .iter()
-                .any(|c| c.name.name == label_name);
-            let is_internal = automaton.internal.iter().any(|i| i.name.name == label_name);
-            let action_type = if is_internal {
-                "internal"
-            } else if is_controllable {
-                "controllable"
-            } else {
-                "uncontrollable"
-            };
+            let action_type = classify_action(automaton, std::slice::from_ref(&label_name));
 
             let transition_id = format!("{}_unrolled_t{}", automaton_name, idx);
             let source_id = format!("{}_unrolled_{}", automaton_name, from_name);

@@ -53,12 +53,16 @@ pub enum ParseError {
     DuplicateGuardField { field: String, pos: usize },
 }
 
+/// Maximum nesting depth to prevent stack overflow on adversarial input.
+const MAX_PARSE_DEPTH: usize = 256;
+
 #[derive(Debug)]
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
     builder: FormulaBuilder,
     binder_stack: Vec<Binder>,
+    depth: usize,
 }
 
 #[derive(Debug)]
@@ -74,6 +78,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             builder: FormulaBuilder::default(),
             binder_stack: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -110,6 +115,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<NodeId, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(self.error_here(ParseErrorKind::Expected(
+                "expression (maximum nesting depth exceeded)",
+            )));
+        }
+        let result = self.parse_unary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<NodeId, ParseError> {
         self.skip_whitespace();
         if self.try_consume_not() {
             let operand = self.parse_unary()?;
