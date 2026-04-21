@@ -51,6 +51,10 @@ pub struct RealizedFormula {
     pub raw: String,
     pub meta: Meta,
     pub parse_error: Option<String>,
+    /// Classified property type derived from formula structure.
+    pub property_class: crate::mu_calculus::PropertyClass,
+    /// Alternation depth of the formula (0 = propositional, 1 = safety/reach, 2+ = liveness).
+    pub alternation_depth: usize,
 }
 
 /// Metadata describing a guard-derived predicate.
@@ -1036,6 +1040,7 @@ fn build_context_with_compositions(
     let mut controllable_owners: HashMap<String, String> = HashMap::new();
     let mut internal_owners: HashMap<String, String> = HashMap::new();
 
+    // First pass: validate names and collect controllable/internal ownership.
     for automaton in &expanded_automata {
         let name = automaton.name.name.clone();
         if !automaton_names.insert(name.clone()) {
@@ -1067,6 +1072,24 @@ fn build_context_with_compositions(
                 });
             }
         }
+    }
+
+    // Second pass: build each automaton's CLTS with knowledge of external controllability.
+    // Labels declared controllable by OTHER automata should not be inferred controllable
+    // via legacy mode in this automaton.
+    let all_controllable_labels: HashSet<String> = controllable_owners.keys().cloned().collect();
+    for automaton in &expanded_automata {
+        let name = automaton.name.name.clone();
+        // Externally controllable = labels declared controllable by other automata
+        let externally_controllable: HashSet<String> = all_controllable_labels
+            .iter()
+            .filter(|label| {
+                controllable_owners
+                    .get(*label)
+                    .is_some_and(|owner| *owner != name)
+            })
+            .cloned()
+            .collect();
 
         let aut_valuations = doc.state_valuations.get(&name);
         let clts = build_automaton(
@@ -1075,6 +1098,7 @@ fn build_context_with_compositions(
             label_universe,
             input_signals,
             aut_valuations,
+            &externally_controllable,
         )?;
         automata.push((name, clts));
     }
@@ -1339,6 +1363,8 @@ fn collect_formulas(
                     FormulaTargetsKind::Named(list.iter().map(|ident| ident.name.clone()).collect())
                 }
             };
+            let property_class = parsed.property_class();
+            let alternation_depth = parsed.alternation_depth();
             formulas.insert(
                 name.clone(),
                 RealizedFormula {
@@ -1348,6 +1374,8 @@ fn collect_formulas(
                     raw,
                     meta: formula.meta.clone(),
                     parse_error,
+                    property_class,
+                    alternation_depth,
                 },
             );
             Ok::<(), RealizationError>(())
@@ -1500,6 +1528,8 @@ fn generate_structural_predicates(
                 }
             });
 
+            let property_class = parsed.property_class();
+            let alternation_depth = parsed.alternation_depth();
             formulas.insert(
                 has_enabled_name.clone(),
                 RealizedFormula {
@@ -1512,6 +1542,8 @@ fn generate_structural_predicates(
                         comment: Some(metadata_json.to_string()),
                     },
                     parse_error,
+                    property_class,
+                    alternation_depth,
                 },
             );
         }
@@ -1539,6 +1571,8 @@ fn generate_structural_predicates(
                 }
             });
 
+            let property_class = parsed.property_class();
+            let alternation_depth = parsed.alternation_depth();
             formulas.insert(
                 is_deadlock_name.clone(),
                 RealizedFormula {
@@ -1551,6 +1585,8 @@ fn generate_structural_predicates(
                         comment: Some(metadata_json.to_string()),
                     },
                     parse_error,
+                    property_class,
+                    alternation_depth,
                 },
             );
         }
@@ -1618,6 +1654,8 @@ fn generate_structural_predicates(
                     }
                 });
 
+                let property_class = parsed.property_class();
+                let alternation_depth = parsed.alternation_depth();
                 formulas.insert(
                     can_reach_name.clone(),
                     RealizedFormula {
@@ -1630,6 +1668,8 @@ fn generate_structural_predicates(
                             comment: Some(metadata_json.to_string()),
                         },
                         parse_error: None,
+                        property_class,
+                        alternation_depth,
                     },
                 );
             }
@@ -1743,9 +1783,12 @@ fn auto_register_state_name_predicates(
         // Try direct matching on this automaton's own states
         let automaton_predicates = predicates.entry(automaton.clone()).or_default();
         for pred_name in &pred_names {
+            // Try string prefix matching OR structured valuation matching
             let matches_any_state = state_names
                 .iter()
-                .any(|state_name| StateNameMatcher::matches_pattern(pred_name, state_name));
+                .any(|state_name| StateNameMatcher::matches_pattern(pred_name, state_name))
+                || (clts.has_valuations()
+                    && StateNameMatcher::create_bitset_for_pattern(clts, pred_name).any());
 
             if matches_any_state && !automaton_predicates.contains(pred_name) {
                 automaton_predicates.insert(pred_name.clone());
@@ -1787,9 +1830,13 @@ fn auto_register_state_name_predicates(
 
                 let member_predicates = predicates.entry(member_name.clone()).or_default();
                 for pred_name in &pred_names {
+                    // Try string prefix matching OR structured valuation matching
                     let matches_member = member_state_names
                         .iter()
-                        .any(|sn| StateNameMatcher::matches_pattern(pred_name, sn));
+                        .any(|sn| StateNameMatcher::matches_pattern(pred_name, sn))
+                        || (member_clts.has_valuations()
+                            && StateNameMatcher::create_bitset_for_pattern(member_clts, pred_name)
+                                .any());
 
                     if matches_member && !member_predicates.contains(pred_name) {
                         member_predicates.insert(pred_name.clone());
@@ -2146,6 +2193,7 @@ fn build_automaton(
     labels: &LabelUniverse,
     input_signals: &HashSet<String>,
     state_valuations: Option<&HashMap<String, BTreeMap<String, String>>>,
+    externally_controllable: &HashSet<String>,
 ) -> Result<RuntimeClts, RealizationError> {
     // Desugar state groups and wildcards into concrete transitions.
     let automaton = expand_state_selectors(automaton)?;
@@ -2196,6 +2244,7 @@ fn build_automaton(
             input_signals,
             &automaton_controllable,
             &automaton_internal,
+            externally_controllable,
         );
     }
 
@@ -2343,12 +2392,13 @@ fn build_automaton(
                         LabelControllability::Uncontrollable
                     }
                 } else {
-                    // Legacy inference: uncontrollable if matches input signal or is epsilon
-                    // Note: "epsilon" label is always uncontrollable
+                    // Legacy inference: uncontrollable if matches input signal, is epsilon,
+                    // or is already declared controllable by another automaton.
                     let is_uncontrollable = label_name == "epsilon"
                         || is_epsilon
                         || input_signals.contains(label_name)
-                        || guard_has_input_signal;
+                        || guard_has_input_signal
+                        || externally_controllable.contains(label_name);
                     if is_uncontrollable {
                         LabelControllability::Uncontrollable
                     } else {
@@ -2423,6 +2473,7 @@ fn build_automaton_with_unrolling(
     input_signals: &HashSet<String>,
     automaton_controllable: &HashSet<String>,
     automaton_internal: &HashSet<String>,
+    externally_controllable: &HashSet<String>,
 ) -> Result<RuntimeClts, RealizationError> {
     // Convert DSL structures to unrolling format
     let original_states = convert_states_for_unrolling(&automaton.states)?;
@@ -2468,6 +2519,7 @@ fn build_automaton_with_unrolling(
         automaton_controllable,
         automaton_internal,
         &initial_location_names,
+        externally_controllable,
     )
 }
 
@@ -2555,6 +2607,7 @@ fn convert_variables_for_unrolling(
 
 /// Builds a CLTS from unrolled states and transitions.
 /// All guards have been resolved during unrolling, so no guard predicates are needed.
+#[allow(clippy::too_many_arguments)]
 fn build_clts_from_unrolled(
     unrolled: UnrolledClts,
     name: &str,
@@ -2563,6 +2616,7 @@ fn build_clts_from_unrolled(
     automaton_controllable: &HashSet<String>,
     automaton_internal: &HashSet<String>,
     initial_location_names: &HashSet<String>,
+    externally_controllable: &HashSet<String>,
 ) -> Result<RuntimeClts, RealizationError> {
     let mut builder = Clts::builder();
     let mut label_cache: HashMap<String, RuntimeLabelId> = HashMap::new();
@@ -2610,9 +2664,11 @@ fn build_clts_from_unrolled(
                 LabelControllability::Uncontrollable
             }
         } else {
-            // Legacy inference: uncontrollable if matches input signal or is epsilon
-            let is_uncontrollable =
-                transition.label == "epsilon" || input_signals.contains(&transition.label);
+            // Legacy inference: uncontrollable if matches input signal, is epsilon,
+            // or is already declared controllable by another automaton.
+            let is_uncontrollable = transition.label == "epsilon"
+                || input_signals.contains(&transition.label)
+                || externally_controllable.contains(&transition.label);
             if is_uncontrollable {
                 LabelControllability::Uncontrollable
             } else {

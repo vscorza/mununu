@@ -57,6 +57,37 @@ The composition engine supports:
 
 The shared alphabet determines which transitions synchronize. Controllability is inherited from the constituent automata.
 
+## Multi-Module SystemVerilog Composition
+
+The SV adapter supports a multi-module sidecar format (`mununu_sv_multi_v1`) for verifying properties that span module boundaries. The pipeline:
+
+```
+Module A (.sv) + Module B (.sv) + multi-module .mununu.json
+    → Parse each module independently
+    → Build Kripke automaton per module
+    → Annotate shared labels for connections
+    → Emit composed CTXDSL (sync/async)
+    → Verify cross-module properties on the product
+```
+
+### Controllability in Multi-Module Composition
+
+Following Ramadge-Wonham supervisory control theory:
+- **Connected output → input**: the driving module owns the signal (controllable)
+- **Internal registers**: controllable by the owning module (controller's memory)
+- **Unconnected inputs**: uncontrollable (true adversarial environment)
+
+Shared labels between modules use the driving port's name. The receiving module's transitions synchronize on the same label without independently asserting controllability.
+
+### Connection-Level Abstraction
+
+Connections declare abstraction once, applied uniformly to both sides. This prevents abstraction mismatch at composition boundaries (soundness guarantee: same over-approximation on both sides).
+
+### Clock Domain Constraints
+
+- **Same clock domain** (default: synchronous composition): all `always_ff` blocks fire together
+- **Different clock domains**: requires explicit `"mode": "asynchronous"` declaration
+
 ## Current Status
 
 | Feature | Status |
@@ -67,3 +98,5 @@ The shared alphabet determines which transitions synchronize. Controllability is
 | Action hiding | Partial (CTXDSL internal labels) |
 | Bisimulation minimization | Planned |
 | Parallel composition | Implemented (sync + async modes) |
+| Multi-module SV sidecar | Implemented (annotation.rs, mod.rs) |
+| Cross-module SMT discovery | Planned (kripke_smt.rs extension) |

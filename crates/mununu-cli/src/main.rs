@@ -115,6 +115,14 @@ struct SvInitArgs {
     /// Path to the SystemVerilog source file (.sv).
     #[arg(value_name = "FILE")]
     file: PathBuf,
+    /// Enable multi-module mode. If the main file contains module
+    /// instantiations, connections are derived from wire bindings (top-module
+    /// mode). Additional .sv files can be listed for heuristic matching.
+    #[arg(long)]
+    multi: bool,
+    /// Additional .sv files for multi-module sidecar generation.
+    #[arg(long = "with", value_name = "FILE", num_args = 1..)]
+    with: Vec<PathBuf>,
     /// Output path for the .mununu.json file.
     /// Defaults to <stem>.mununu.json next to the .sv file.
     #[arg(long = "output", value_name = "FILE")]
@@ -234,6 +242,9 @@ struct ContextEvalArgs {
     /// Print the intermediate CTXDSL (after adapter translation) to stdout or a file.
     #[arg(long = "print-ctxdsl", value_name = "FILE")]
     print_ctxdsl: Option<Option<PathBuf>>,
+    /// Print a per-property soundness summary after evaluation.
+    #[arg(long = "soundness-report")]
+    soundness_report: bool,
 }
 
 #[derive(Args, Debug)]
@@ -298,6 +309,9 @@ struct ContextSynthesizeArgs {
     /// Path where the native-format controller should be written (requires --output-format).
     #[arg(long = "emit-native", value_name = "FILE")]
     emit_native: Option<PathBuf>,
+    /// Print a per-property soundness summary after synthesis.
+    #[arg(long = "soundness-report")]
+    soundness_report: bool,
 }
 
 #[derive(Args, Debug)]
@@ -434,7 +448,13 @@ fn handle_extraction(command: ExtractionCommand) -> Result<(), String> {
 
 fn handle_sv(command: SvCommand) -> Result<(), String> {
     match command {
-        SvCommand::Init(args) => sv_init(args),
+        SvCommand::Init(args) => {
+            if args.multi || !args.with.is_empty() {
+                sv_init_multi(args)
+            } else {
+                sv_init(args)
+            }
+        }
         SvCommand::Discover(args) => sv_discover(args),
     }
 }
@@ -547,7 +567,37 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
             bound,
             variants: None,
             value_map: None,
+            label_name: None,
         });
+    }
+
+    // Detect combinational output ports (driven by assign statements)
+    for port in &module.ports {
+        if port.direction != PortDirection::Output {
+            continue;
+        }
+        // Check if this output is driven by a continuous assign
+        let is_combinational = module.assigns.iter().any(|a| a.target.name() == port.name);
+        if is_combinational && !signals.iter().any(|s| s.name == port.name) {
+            signals.push(SignalAnnotation {
+                name: port.name.clone(),
+                preserve: true,
+                abstraction: if port.width == 1 {
+                    SignalAbstraction::Boolean
+                } else {
+                    SignalAbstraction::BoundedCounter
+                },
+                bound: if port.width > 1 {
+                    Some((1i64 << port.width) - 1)
+                } else {
+                    None
+                },
+                variants: None,
+                value_map: None,
+                combinational: true,
+                note: Some("combinational output (assign-driven)".to_string()),
+            });
+        }
     }
 
     let ann = SvAnnotation {
@@ -593,6 +643,682 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
         "Review the file, then run: mununu sv discover {}",
         args.file.display()
     );
+
+    Ok(())
+}
+
+fn sv_init_multi(args: SvInitArgs) -> Result<(), String> {
+    use mununu_core::adapter::systemverilog::annotation::*;
+    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
+
+    // Parse the main file first to check for instantiations (top-module mode)
+    let main_source = fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
+    let main_module = mununu_core::adapter::systemverilog::parser::parse(&main_source)
+        .map_err(|e| format!("SV parse error in '{}': {e}", args.file.display()))?;
+
+    // If the main file has instantiations, use top-module mode
+    if !main_module.instantiations.is_empty() {
+        return sv_init_multi_from_top(args, main_module);
+    }
+
+    // Otherwise fall back to heuristic matching with multiple flat files
+    let mut all_files: Vec<PathBuf> = vec![args.file.clone()];
+    all_files.extend(args.with.iter().cloned());
+
+    // Pass 1: Parse all modules
+    struct ParsedModule {
+        path: PathBuf,
+        name: String,
+        module: mununu_core::adapter::systemverilog::ast::Module,
+        signals: Vec<SignalAnnotation>,
+        inputs: Vec<InputAnnotation>,
+        parameters: HashMap<String, i64>,
+    }
+
+    let mut modules = Vec::new();
+    for path in &all_files {
+        let source = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
+        let module = mununu_core::adapter::systemverilog::parser::parse(&source)
+            .map_err(|e| format!("SV parse error in '{}': {e}", path.display()))?;
+
+        let port_names: std::collections::HashSet<&str> =
+            module.ports.iter().map(|p| p.name.as_str()).collect();
+
+        // Build signals (same logic as single-module sv_init)
+        let mut signals = Vec::new();
+        for decl in &module.declarations {
+            match decl {
+                Declaration::Enum {
+                    variants,
+                    var_name: Some(var),
+                    ..
+                } => {
+                    signals.push(SignalAnnotation {
+                        name: var.clone(),
+                        preserve: true,
+                        abstraction: SignalAbstraction::Enum,
+                        bound: None,
+                        variants: Some(variants.clone()),
+                        value_map: None,
+                        combinational: false,
+                        note: Some("auto-detected typedef enum".to_string()),
+                    });
+                }
+                Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
+                    let (abstraction, bound, note) = if *width == 1 {
+                        (SignalAbstraction::Boolean, None, "1-bit flag")
+                    } else if *width <= 4 {
+                        (
+                            SignalAbstraction::BoundedCounter,
+                            Some((1i64 << width) - 1),
+                            "small register — bounded counter",
+                        )
+                    } else {
+                        (
+                            SignalAbstraction::Discover,
+                            None,
+                            "wide register — run discover",
+                        )
+                    };
+                    signals.push(SignalAnnotation {
+                        name: name.clone(),
+                        preserve: *width <= 4,
+                        abstraction,
+                        bound,
+                        variants: None,
+                        value_map: None,
+                        combinational: false,
+                        note: Some(note.to_string()),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Detect combinational output ports
+        for port in &module.ports {
+            if port.direction == PortDirection::Output {
+                let is_combinational = module.assigns.iter().any(|a| a.target.name() == port.name);
+                if is_combinational && !signals.iter().any(|s| s.name == port.name) {
+                    signals.push(SignalAnnotation {
+                        name: port.name.clone(),
+                        preserve: true,
+                        abstraction: if port.width == 1 {
+                            SignalAbstraction::Boolean
+                        } else {
+                            SignalAbstraction::BoundedCounter
+                        },
+                        bound: if port.width > 1 {
+                            Some((1i64 << port.width) - 1)
+                        } else {
+                            None
+                        },
+                        variants: None,
+                        value_map: None,
+                        combinational: true,
+                        note: Some("combinational output (assign-driven)".to_string()),
+                    });
+                }
+            }
+        }
+
+        // Build inputs (all non-clk/rst input ports — connections will filter later)
+        let inputs: Vec<InputAnnotation> = module
+            .ports
+            .iter()
+            .filter(|p| {
+                p.direction == PortDirection::Input
+                    && !["clk", "rst", "rst_n"].contains(&p.name.as_str())
+            })
+            .map(|p| {
+                let (abstraction, bound) = if p.width == 1 {
+                    (SignalAbstraction::Boolean, None)
+                } else if p.width <= 4 {
+                    (
+                        SignalAbstraction::BoundedCounter,
+                        Some((1i64 << p.width) - 1),
+                    )
+                } else {
+                    (SignalAbstraction::Discover, None)
+                };
+                InputAnnotation {
+                    name: p.name.clone(),
+                    preserve: true,
+                    abstraction,
+                    bound,
+                    variants: None,
+                    value_map: None,
+                    label_name: None,
+                }
+            })
+            .collect();
+
+        let parameters: HashMap<String, i64> = module
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.default_value))
+            .collect();
+
+        modules.push(ParsedModule {
+            path: path.clone(),
+            name: module.name.clone(),
+            module,
+            signals,
+            inputs,
+            parameters,
+        });
+    }
+
+    // Pass 2: Detect connections (output→input port matching)
+    let mut connections = Vec::new();
+    let mut connected_inputs: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new(); // (module_name, port_name)
+
+    for (i, mod_a) in modules.iter().enumerate() {
+        for (j, mod_b) in modules.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let b_input_names: std::collections::HashSet<&str> = mod_b
+                .module
+                .ports
+                .iter()
+                .filter(|p| p.direction == PortDirection::Input)
+                .map(|p| p.name.as_str())
+                .collect();
+
+            for port in &mod_a.module.ports {
+                if port.direction != PortDirection::Output {
+                    continue;
+                }
+                // Strategy 1: exact name match
+                if b_input_names.contains(port.name.as_str()) {
+                    let abstraction = if port.width == 1 {
+                        SignalAbstraction::Boolean
+                    } else if port.width <= 4 {
+                        SignalAbstraction::BoundedCounter
+                    } else {
+                        SignalAbstraction::Discover
+                    };
+                    connections.push(ConnectionSpec {
+                        from: format!("{}.{}", mod_a.name, port.name),
+                        to: format!("{}.{}", mod_b.name, port.name),
+                        abstraction,
+                        bound: if port.width > 1 && port.width <= 4 {
+                            Some((1i64 << port.width) - 1)
+                        } else {
+                            None
+                        },
+                        variants: None,
+                        value_map: None,
+                        note: Some(format!(
+                            "auto-detected: {}.{} → {}.{}",
+                            mod_a.name, port.name, mod_b.name, port.name
+                        )),
+                    });
+                    connected_inputs.insert((mod_b.name.clone(), port.name.clone()));
+                    continue;
+                }
+
+                // Strategy 2: AXI prefix strip (m_axi_ ↔ s_axi_ and vice versa)
+                let stripped = port
+                    .name
+                    .strip_prefix("m_axi_")
+                    .or_else(|| port.name.strip_prefix("m_"))
+                    .or_else(|| port.name.strip_prefix("s_axi_"))
+                    .or_else(|| port.name.strip_prefix("s_"))
+                    .map(|s| s.to_string());
+                if let Some(ref base) = stripped {
+                    for prefix in &["s_axi_", "s_", "m_axi_", "m_"] {
+                        let candidate = format!("{prefix}{base}");
+                        // Skip if candidate equals the original name
+                        if candidate == port.name {
+                            continue;
+                        }
+                        if b_input_names.contains(candidate.as_str()) {
+                            let abstraction = if port.width == 1 {
+                                SignalAbstraction::Boolean
+                            } else {
+                                SignalAbstraction::Discover
+                            };
+                            connections.push(ConnectionSpec {
+                                from: format!("{}.{}", mod_a.name, port.name),
+                                to: format!("{}.{}", mod_b.name, candidate),
+                                abstraction,
+                                bound: None,
+                                variants: None,
+                                value_map: None,
+                                note: Some(format!(
+                                    "auto-detected (AXI prefix): {}.{} → {}.{}",
+                                    mod_a.name, port.name, mod_b.name, candidate
+                                )),
+                            });
+                            connected_inputs.insert((mod_b.name.clone(), candidate.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if connections.is_empty() {
+        eprintln!(
+            "warning: no connections detected between modules (no matching output→input port names)"
+        );
+    }
+
+    // Pass 3: Build module entries, removing connected inputs
+    let module_entries: Vec<ModuleEntry> = modules
+        .iter()
+        .map(|m| {
+            let remaining_inputs: Vec<InputAnnotation> = m
+                .inputs
+                .iter()
+                .filter(|inp| !connected_inputs.contains(&(m.name.clone(), inp.name.clone())))
+                .cloned()
+                .collect();
+            ModuleEntry {
+                name: m.name.clone(),
+                source: m
+                    .path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                clock_domain: None,
+                signals: m.signals.clone(),
+                inputs: remaining_inputs,
+                controllable: vec![],
+                parameters: m.parameters.clone(),
+                discovered_values: HashMap::new(),
+            }
+        })
+        .collect();
+
+    // Pass 4: Emit multi-module sidecar
+    let ann = MultiModuleSvAnnotation {
+        schema: Some("mununu_sv_multi_v1".to_string()),
+        modules: module_entries,
+        connections,
+        composition: Some(CompositionConfig {
+            mode: "synchronous".to_string(),
+            name: "system".to_string(),
+        }),
+        properties: vec![PropertyAnnotation {
+            id: "safety".to_string(),
+            formula: "nu X. ([] X)".to_string(),
+            description: Some("No deadlock — all states have successors".to_string()),
+            role: "guarantee".to_string(),
+        }],
+        discovered_values: HashMap::new(),
+    };
+
+    let output_path = args.output.unwrap_or_else(|| {
+        let stem = args
+            .file
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("system");
+        args.file
+            .with_file_name(format!("{stem}_system.mununu.json"))
+    });
+
+    if output_path.exists() && !args.force {
+        return Err(format!(
+            "'{}' already exists. Use --force to overwrite.",
+            output_path.display()
+        ));
+    }
+
+    let json =
+        serde_json::to_string_pretty(&ann).map_err(|e| format!("Failed to serialize: {e}"))?;
+    fs::write(&output_path, json)
+        .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
+
+    eprintln!("Generated multi-module sidecar: {}", output_path.display());
+    eprintln!(
+        "  {} module(s), {} connection(s), {} property/ies",
+        ann.modules.len(),
+        ann.connections.len(),
+        ann.properties.len()
+    );
+    for conn in &ann.connections {
+        eprintln!("  connection: {} → {}", conn.from, conn.to);
+    }
+
+    Ok(())
+}
+
+/// Top-module mode: derive connections from wire bindings in instantiations.
+fn sv_init_multi_from_top(
+    args: SvInitArgs,
+    top_module: mununu_core::adapter::systemverilog::ast::Module,
+) -> Result<(), String> {
+    use mununu_core::adapter::systemverilog::annotation::*;
+    use mununu_core::adapter::systemverilog::ast::{Declaration, PortDirection};
+
+    let top_dir = args.file.parent().unwrap_or(std::path::Path::new("."));
+
+    eprintln!(
+        "Top-module mode: '{}' has {} instantiation(s)",
+        top_module.name,
+        top_module.instantiations.len()
+    );
+
+    // Step 1: Locate and parse each instantiated sub-module
+    struct SubModule {
+        module: mununu_core::adapter::systemverilog::ast::Module,
+        path: PathBuf,
+        signals: Vec<SignalAnnotation>,
+        inputs: Vec<InputAnnotation>,
+        parameters: HashMap<String, i64>,
+    }
+
+    let mut sub_modules: HashMap<String, SubModule> = HashMap::new();
+
+    for inst in &top_module.instantiations {
+        if sub_modules.contains_key(&inst.module_type) {
+            continue; // Already parsed this module type
+        }
+        let sv_path = top_dir.join(format!("{}.sv", inst.module_type));
+        if !sv_path.exists() {
+            eprintln!(
+                "  warning: cannot find '{}' for module type '{}' — skipping",
+                sv_path.display(),
+                inst.module_type
+            );
+            continue;
+        }
+        let source = fs::read_to_string(&sv_path)
+            .map_err(|e| format!("Failed to read '{}': {e}", sv_path.display()))?;
+        let module = mununu_core::adapter::systemverilog::parser::parse(&source)
+            .map_err(|e| format!("SV parse error in '{}': {e}", sv_path.display()))?;
+
+        let port_names: std::collections::HashSet<&str> =
+            module.ports.iter().map(|p| p.name.as_str()).collect();
+
+        // Build signals
+        let mut signals = Vec::new();
+        for decl in &module.declarations {
+            match decl {
+                Declaration::Enum {
+                    variants,
+                    var_name: Some(var),
+                    ..
+                } => {
+                    signals.push(SignalAnnotation {
+                        name: var.clone(),
+                        preserve: true,
+                        abstraction: SignalAbstraction::Enum,
+                        bound: None,
+                        variants: Some(variants.clone()),
+                        value_map: None,
+                        combinational: false,
+                        note: Some("auto-detected typedef enum".to_string()),
+                    });
+                }
+                Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
+                    let (abstraction, bound) = if *width == 1 {
+                        (SignalAbstraction::Boolean, None)
+                    } else if *width <= 4 {
+                        (SignalAbstraction::BoundedCounter, Some((1i64 << width) - 1))
+                    } else {
+                        (SignalAbstraction::Discover, None)
+                    };
+                    signals.push(SignalAnnotation {
+                        name: name.clone(),
+                        preserve: *width <= 4,
+                        abstraction,
+                        bound,
+                        variants: None,
+                        value_map: None,
+                        combinational: false,
+                        note: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Detect combinational outputs
+        for port in &module.ports {
+            if port.direction == PortDirection::Output
+                && module.assigns.iter().any(|a| a.target.name() == port.name)
+                && !signals.iter().any(|s| s.name == port.name)
+            {
+                signals.push(SignalAnnotation {
+                    name: port.name.clone(),
+                    preserve: true,
+                    abstraction: if port.width == 1 {
+                        SignalAbstraction::Boolean
+                    } else {
+                        SignalAbstraction::BoundedCounter
+                    },
+                    bound: if port.width > 1 {
+                        Some((1i64 << port.width) - 1)
+                    } else {
+                        None
+                    },
+                    variants: None,
+                    value_map: None,
+                    combinational: true,
+                    note: Some("combinational output".to_string()),
+                });
+            }
+        }
+
+        let inputs: Vec<InputAnnotation> = module
+            .ports
+            .iter()
+            .filter(|p| {
+                p.direction == PortDirection::Input
+                    && !["clk", "rst", "rst_n"].contains(&p.name.as_str())
+            })
+            .map(|p| InputAnnotation {
+                name: p.name.clone(),
+                preserve: true,
+                abstraction: if p.width == 1 {
+                    SignalAbstraction::Boolean
+                } else {
+                    SignalAbstraction::Discover
+                },
+                bound: if p.width > 1 && p.width <= 4 {
+                    Some((1i64 << p.width) - 1)
+                } else {
+                    None
+                },
+                variants: None,
+                value_map: None,
+                label_name: None,
+            })
+            .collect();
+
+        let parameters = module
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.default_value))
+            .collect();
+
+        sub_modules.insert(
+            inst.module_type.clone(),
+            SubModule {
+                module,
+                path: sv_path,
+                signals,
+                inputs,
+                parameters,
+            },
+        );
+    }
+
+    // Step 2: Build wire map from instantiation port bindings
+    // wire_name → Vec<(instance_name, module_type, port_name)>
+    let mut wire_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for inst in &top_module.instantiations {
+        for conn in &inst.port_connections {
+            wire_map.entry(conn.signal_name.clone()).or_default().push((
+                inst.instance_name.clone(),
+                inst.module_type.clone(),
+                conn.port_name.clone(),
+            ));
+        }
+    }
+
+    // Step 3: Derive connections from shared wires
+    let mut connections = Vec::new();
+    let mut connected_inputs: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    for (wire_name, bindings) in &wire_map {
+        // Skip clk/rst wires
+        if *wire_name == "clk" || *wire_name == "rst" || *wire_name == "rst_n" {
+            continue;
+        }
+
+        // Find output drivers and input receivers
+        let mut outputs = Vec::new();
+        let mut inputs_on_wire = Vec::new();
+
+        for (inst_name, mod_type, port_name) in bindings {
+            if let Some(sub) = sub_modules.get(mod_type)
+                && let Some(port) = sub.module.ports.iter().find(|p| p.name == *port_name)
+            {
+                match port.direction {
+                    PortDirection::Output => {
+                        outputs.push((inst_name, mod_type, port_name, port.width))
+                    }
+                    PortDirection::Input => {
+                        inputs_on_wire.push((inst_name, mod_type, port_name, port.width))
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Create connection for each output→input pair on the same wire
+        for (out_inst, out_mod, out_port, width) in &outputs {
+            for (in_inst, in_mod, in_port, _) in &inputs_on_wire {
+                let abstraction = if *width == 1 {
+                    SignalAbstraction::Boolean
+                } else if *width <= 4 {
+                    SignalAbstraction::BoundedCounter
+                } else {
+                    SignalAbstraction::Discover
+                };
+                connections.push(ConnectionSpec {
+                    from: format!("{}.{}", out_mod, out_port),
+                    to: format!("{}.{}", in_mod, in_port),
+                    abstraction,
+                    bound: if *width > 1 && *width <= 4 {
+                        Some((1i64 << width) - 1)
+                    } else {
+                        None
+                    },
+                    variants: None,
+                    value_map: None,
+                    note: Some(format!(
+                        "wire '{}': {}.{} → {}.{}",
+                        wire_name, out_inst, out_port, in_inst, in_port
+                    )),
+                });
+                connected_inputs.insert((in_mod.to_string(), in_port.to_string()));
+            }
+        }
+    }
+
+    // Step 4: Build module entries
+    let mut module_entries = Vec::new();
+    let mut seen_types = std::collections::HashSet::new();
+    for inst in &top_module.instantiations {
+        if !seen_types.insert(inst.module_type.clone()) {
+            continue; // Skip duplicate module types
+        }
+        if let Some(sub) = sub_modules.get(&inst.module_type) {
+            let remaining_inputs: Vec<InputAnnotation> = sub
+                .inputs
+                .iter()
+                .filter(|inp| {
+                    !connected_inputs.contains(&(inst.module_type.clone(), inp.name.clone()))
+                })
+                .cloned()
+                .collect();
+            module_entries.push(ModuleEntry {
+                name: inst.module_type.clone(),
+                source: sub
+                    .path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                clock_domain: None,
+                signals: sub.signals.clone(),
+                inputs: remaining_inputs,
+                controllable: vec![],
+                parameters: sub.parameters.clone(),
+                discovered_values: HashMap::new(),
+            });
+        }
+    }
+
+    // Step 5: Emit sidecar
+    let ann = MultiModuleSvAnnotation {
+        schema: Some("mununu_sv_multi_v1".to_string()),
+        modules: module_entries,
+        connections,
+        composition: Some(CompositionConfig {
+            mode: "synchronous".to_string(),
+            name: "system".to_string(),
+        }),
+        properties: vec![PropertyAnnotation {
+            id: "safety".to_string(),
+            formula: "nu X. ([] X)".to_string(),
+            description: Some("No deadlock — all states have successors".to_string()),
+            role: "guarantee".to_string(),
+        }],
+        discovered_values: HashMap::new(),
+    };
+
+    let output_path = args.output.unwrap_or_else(|| {
+        let stem = args
+            .file
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("system");
+        args.file
+            .with_file_name(format!("{stem}_system.mununu.json"))
+    });
+    if output_path.exists() && !args.force {
+        return Err(format!(
+            "'{}' already exists. Use --force to overwrite.",
+            output_path.display()
+        ));
+    }
+
+    let json =
+        serde_json::to_string_pretty(&ann).map_err(|e| format!("Failed to serialize: {e}"))?;
+    fs::write(&output_path, json)
+        .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
+
+    eprintln!(
+        "Generated multi-module sidecar (from top): {}",
+        output_path.display()
+    );
+    eprintln!(
+        "  {} module(s), {} connection(s)",
+        ann.modules.len(),
+        ann.connections.len()
+    );
+    for conn in &ann.connections {
+        eprintln!(
+            "  connection: {} → {} ({})",
+            conn.from,
+            conn.to,
+            conn.note.as_deref().unwrap_or("")
+        );
+    }
 
     Ok(())
 }
@@ -1608,6 +2334,38 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         }
     );
 
+    // Soundness trust-level warning for liveness on over-approximate models
+    if formula.alternation_depth >= 2 {
+        let has_noop = eval_clts.states().any(|state| {
+            eval_clts.outgoing(state).iter().any(|t| {
+                t.target() == state
+                    && t.labels().iter().any(|l| {
+                        eval_clts
+                            .label_payload(*l)
+                            .is_some_and(|syms| syms.iter().any(|s| s == "noop" || s == "tau"))
+                    })
+            })
+        });
+        if has_noop {
+            eprintln!(
+                "  [SOUNDNESS WARNING] Trust level: LOW — formula has alternation depth {} \
+                 (class: {:?}) and model contains noop/tau self-loops. Liveness verdicts \
+                 may not transfer to the real system (over-approximation admits spurious progress).",
+                formula.alternation_depth, formula.property_class
+            );
+        } else {
+            eprintln!(
+                "  [SOUNDNESS NOTE] Formula has alternation depth {} (class: {:?}). \
+                 Positional strategy extraction is best-effort for this class.",
+                formula.alternation_depth, formula.property_class
+            );
+        }
+    }
+
+    if args.soundness_report {
+        print_soundness_report(&args.formula, formula, eval_clts);
+    }
+
     // Print structure if requested
     if let Some(output_path) = args.print_structure {
         print_context_structure(&realized.context, output_path)?;
@@ -1689,6 +2447,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: args.minimize,
                 extract_strategy: args.extract_strategy,
+                mode: mununu_core::context::ControllerMode::default(),
             },
         )
         .map_err(|err| format!("controller synthesis failed: {err}"))?;
@@ -1725,6 +2484,21 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
     );
 
     render_controller_diagnostics(&synthesis.diagnostics);
+
+    // Soundness trust-level warning for liveness on over-approximate models
+    if realized_formula.alternation_depth >= 2 {
+        eprintln!(
+            "  [SOUNDNESS WARNING] Trust level: LOW — formula has alternation depth {} \
+             (class: {:?}). The winning region is correct, but the positional controller \
+             may not cycle through obligations for liveness/GR(1) properties.",
+            realized_formula.alternation_depth, realized_formula.property_class
+        );
+    }
+
+    if args.soundness_report {
+        let synth_clts = realized.context.clts(&args.automaton).unwrap();
+        print_soundness_report(&args.formula, realized_formula, synth_clts);
+    }
 
     if let Some(path) = args.dump_json.as_ref() {
         write_controller_json(path, &args.automaton, &args.formula, &synthesis)?;
@@ -1794,6 +2568,52 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn print_soundness_report(
+    formula_name: &str,
+    formula: &mununu_core::context_dsl::RealizedFormula,
+    clts: &Clts<mununu_core::clts::DefaultStateIdx, DefaultLabelIdx>,
+) {
+    let has_noop = clts.states().any(|state| {
+        clts.outgoing(state).iter().any(|t| {
+            t.target() == state
+                && t.labels().iter().any(|l| {
+                    clts.label_payload(*l)
+                        .is_some_and(|syms| syms.iter().any(|s| s == "noop" || s == "tau"))
+                })
+        })
+    });
+
+    let abstraction_dir = if has_noop {
+        "over-approximation (noop/tau self-loops present)"
+    } else {
+        "exact (no detected over-approximation artifacts)"
+    };
+
+    let trust = match (formula.alternation_depth, has_noop) {
+        (0, _) => "HIGH — propositional formula, no fixpoint semantics",
+        (1, _) => "HIGH — safety/reachability (alternation depth 1), memoryless strategy is sound",
+        (_, true) => "LOW — liveness on over-approximate model; verdict may not transfer",
+        (_, false) => {
+            "MEDIUM — liveness formula; winning region correct but controller is best-effort"
+        }
+    };
+
+    println!("\n  ─── Soundness Report ───");
+    println!("  Property:          {formula_name}");
+    println!("  Class:             {:?}", formula.property_class);
+    println!("  Alternation depth: {}", formula.alternation_depth);
+    println!("  Abstraction:       {abstraction_dir}");
+    println!("  Trust level:       {trust}");
+
+    if formula.alternation_depth >= 2 {
+        println!("  Recommendation:    Verify liveness claims against the real system.");
+        println!(
+            "                     Consider adding fairness constraints for async compositions."
+        );
+    }
+    println!();
 }
 
 fn render_controller_diagnostics(diagnostics: &ControllerDiagnostics) {

@@ -1,0 +1,48 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "axilite_write_master",
+  "source": "axilite_write_master.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": [
+        "M_IDLE",
+        "M_ADDR_DATA",
+        "M_WAIT_RESP",
+        "M_RESP_DELAY",
+        "M_RESP_ACK"
+      ],
+      "note": "auto-detected typedef enum"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "cmd_write",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "cmd_slow_resp",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "m_axi_awready",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "m_axi_wready",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "m_axi_bvalid",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    }
+  ]
+}

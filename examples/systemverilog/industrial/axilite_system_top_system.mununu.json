@@ -1,0 +1,145 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "modules": [
+    {
+      "name": "axilite_write_master",
+      "source": "axilite_write_master.sv",
+      "signals": [
+        {
+          "name": "state",
+          "abstraction": "enum",
+          "variants": [
+            "M_IDLE",
+            "M_ADDR_DATA",
+            "M_WAIT_RESP",
+            "M_RESP_DELAY",
+            "M_RESP_ACK"
+          ],
+          "note": "auto-detected typedef enum"
+        },
+        {
+          "name": "m_axi_awvalid",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        },
+        {
+          "name": "m_axi_wvalid",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        },
+        {
+          "name": "m_axi_bready",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        }
+      ],
+      "inputs": [
+        {
+          "name": "cmd_write",
+          "abstraction": "boolean"
+        },
+        {
+          "name": "cmd_slow_resp",
+          "abstraction": "boolean"
+        }
+      ]
+    },
+    {
+      "name": "axilite_write_slave_xilinx_bug",
+      "source": "axilite_write_slave_xilinx_bug.sv",
+      "signals": [
+        {
+          "name": "axi_awready",
+          "abstraction": "boolean"
+        },
+        {
+          "name": "axi_wready",
+          "abstraction": "boolean"
+        },
+        {
+          "name": "axi_bvalid",
+          "abstraction": "boolean"
+        },
+        {
+          "name": "aw_flag",
+          "abstraction": "boolean"
+        },
+        {
+          "name": "s_axi_awready",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        },
+        {
+          "name": "s_axi_wready",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        },
+        {
+          "name": "s_axi_bvalid",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "axilite_write_master.m_axi_wvalid",
+      "to": "axilite_write_slave_xilinx_bug.s_axi_wvalid",
+      "abstraction": "boolean",
+      "note": "wire 'wvalid': master_inst.m_axi_wvalid → slave_inst.s_axi_wvalid"
+    },
+    {
+      "from": "axilite_write_master.m_axi_bready",
+      "to": "axilite_write_slave_xilinx_bug.s_axi_bready",
+      "abstraction": "boolean",
+      "note": "wire 'bready': master_inst.m_axi_bready → slave_inst.s_axi_bready"
+    },
+    {
+      "from": "axilite_write_slave_xilinx_bug.s_axi_awready",
+      "to": "axilite_write_master.m_axi_awready",
+      "abstraction": "boolean",
+      "note": "wire 'awready': slave_inst.s_axi_awready → master_inst.m_axi_awready"
+    },
+    {
+      "from": "axilite_write_slave_xilinx_bug.s_axi_wready",
+      "to": "axilite_write_master.m_axi_wready",
+      "abstraction": "boolean",
+      "note": "wire 'wready': slave_inst.s_axi_wready → master_inst.m_axi_wready"
+    },
+    {
+      "from": "axilite_write_master.m_axi_awvalid",
+      "to": "axilite_write_slave_xilinx_bug.s_axi_awvalid",
+      "abstraction": "boolean",
+      "note": "wire 'awvalid': master_inst.m_axi_awvalid → slave_inst.s_axi_awvalid"
+    },
+    {
+      "from": "axilite_write_slave_xilinx_bug.s_axi_bvalid",
+      "to": "axilite_write_master.m_axi_bvalid",
+      "abstraction": "boolean",
+      "note": "wire 'bvalid': slave_inst.s_axi_bvalid → master_inst.m_axi_bvalid"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "system"
+  },
+  "properties": [
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    },
+    {
+      "id": "no_response_window",
+      "formula": "nu X. ((!axi_bvalid_T || aw_flag_T) && [] X)",
+      "description": "When bvalid is high, aw_flag must also be high (no new writes during pending response)"
+    }
+  ]
+}

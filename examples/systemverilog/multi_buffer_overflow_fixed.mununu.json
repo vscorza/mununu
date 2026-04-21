@@ -1,0 +1,55 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "modules": [
+    {
+      "name": "buffer_producer_fixed",
+      "source": "multi_buffer_producer_fixed.sv",
+      "clock_domain": "clk",
+      "signals": [
+        {"name": "state", "abstraction": "enum", "variants": ["IDLE", "SENDING", "WAIT_ACK"]}
+      ],
+      "inputs": [
+        {"name": "send", "abstraction": "boolean"}
+      ],
+      "controllable": []
+    },
+    {
+      "name": "bounded_buffer",
+      "source": "multi_buffer.sv",
+      "clock_domain": "clk",
+      "signals": [
+        {"name": "count", "abstraction": "bounded_counter", "bound": 3},
+        {"name": "full", "abstraction": "boolean", "combinational": true}
+      ],
+      "inputs": [
+        {"name": "pop", "abstraction": "boolean"}
+      ],
+      "controllable": []
+    }
+  ],
+  "connections": [
+    {
+      "from": "buffer_producer_fixed.push",
+      "to": "bounded_buffer.push",
+      "abstraction": "boolean",
+      "note": "Producer push signal into buffer"
+    },
+    {
+      "from": "bounded_buffer.full",
+      "to": "buffer_producer_fixed.full",
+      "abstraction": "boolean",
+      "note": "Buffer full backpressure signal"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "system"
+  },
+  "properties": [
+    {
+      "id": "no_overflow",
+      "formula": "nu X. (!count_3 && [] X)",
+      "description": "Buffer never overflows: count never reaches 3 (corruption state)"
+    }
+  ]
+}

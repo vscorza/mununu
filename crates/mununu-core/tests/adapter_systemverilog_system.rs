@@ -851,3 +851,542 @@ fn sv_parameterized_arbiter_n2_reachability() {
         "GRANT_A should be reachable from all 3 states"
     );
 }
+
+// ---------------------------------------------------------------
+// Multi-module composition tests
+// ---------------------------------------------------------------
+
+#[test]
+fn multi_module_producer_consumer_translates() {
+    let sidecar_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/multi_producer_consumer.mununu.json");
+    let sidecar_path = sidecar_path.as_path();
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path, &options)
+        .expect("multi-module translation should succeed");
+
+    assert_eq!(
+        output.source_info.format,
+        mununu_core::adapter::SourceFormat::SystemVerilog
+    );
+    assert_eq!(output.source_info.property_count, 1);
+    assert!(output.ctxdsl.contains("automaton producer"));
+    assert!(output.ctxdsl.contains("automaton consumer"));
+    assert!(output.ctxdsl.contains("synchronous system"));
+}
+
+#[test]
+fn multi_module_producer_consumer_realizes() {
+    let sidecar_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/multi_producer_consumer.mununu.json");
+    let sidecar_path = sidecar_path.as_path();
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path, &options)
+        .expect("multi-module translation should succeed");
+
+    eprintln!("Generated CTXDSL:\n{}", output.ctxdsl);
+
+    let doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("CTXDSL realization failed: {e}"));
+
+    // Both individual automata should exist
+    let producer = realized
+        .context
+        .clts("producer")
+        .expect("producer automaton");
+    let consumer = realized
+        .context
+        .clts("consumer")
+        .expect("consumer automaton");
+    assert!(producer.state_count() > 0);
+    assert!(consumer.state_count() > 0);
+
+    // The composed system should exist
+    let system = realized.context.clts("system").expect("composed system");
+    assert!(
+        system.state_count() > 0,
+        "Composed system should have reachable states"
+    );
+
+    // Evaluate the no_deadlock property on the composed system
+    let formula = realized
+        .formulas
+        .get("no_deadlock")
+        .expect("no_deadlock formula");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis should succeed");
+    assert!(
+        synth.realizable,
+        "Composed producer-consumer should be deadlock-free (states: {})",
+        system.state_count()
+    );
+}
+
+#[test]
+fn multi_module_axilite_bug_pipeline() {
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+    let sidecar_path = base.join("multi_axilite_bug.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .expect("multi-module translation should succeed");
+
+    eprintln!("Generated CTXDSL:\n{}", output.ctxdsl);
+    eprintln!("Warnings: {:?}", output.warnings);
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    // Inject structured valuations so formulas can reference register values
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("CTXDSL realization failed: {e}"));
+
+    let master = realized
+        .context
+        .clts("axilite_master")
+        .expect("master automaton");
+    let slave = realized
+        .context
+        .clts("axilite_slave_bug")
+        .expect("slave automaton");
+    eprintln!(
+        "Master states: {}, Slave states: {}",
+        master.state_count(),
+        slave.state_count()
+    );
+
+    let system = realized
+        .context
+        .clts("axi_system")
+        .expect("composed system");
+    eprintln!("Composed system states: {}", system.state_count());
+
+    // Evaluate no_deadlock on the composed system
+    let formula = realized
+        .formulas
+        .get("no_deadlock")
+        .expect("no_deadlock formula");
+    let env = realized.environment_for("axi_system");
+    let synth = realized
+        .context
+        .synthesise_controller("axi_system", &formula.formula, &env, None)
+        .expect("synthesis should succeed");
+
+    eprintln!(
+        "no_deadlock realizable: {} (states: {})",
+        synth.realizable,
+        system.state_count()
+    );
+
+    // Check no_response_drop — this should be UNREALIZABLE (the bug is real)
+    // The property uses valuation-based predicates: pending_T and state_RESPOND
+    // are resolved via structured matching against the slave's state valuations
+    let formula_drop = realized
+        .formulas
+        .get("no_response_drop")
+        .expect("no_response_drop formula");
+    let synth_drop = realized
+        .context
+        .synthesise_controller("axi_system", &formula_drop.formula, &env, None)
+        .expect("synthesis should succeed");
+
+    eprintln!(
+        "no_response_drop realizable: {} (states: {})",
+        synth_drop.realizable,
+        system.state_count()
+    );
+
+    // The buggy slave MUST be unrealizable for no_response_drop:
+    // the master can trigger a response drop via backpressure
+    assert!(
+        !synth_drop.realizable,
+        "Buggy AXI-lite slave: no_response_drop should be UNREALIZABLE (response drop is reachable)"
+    );
+}
+
+#[test]
+fn multi_module_axilite_fixed_pipeline() {
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+    let sidecar_path = base.join("multi_axilite_fixed.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .expect("multi-module translation should succeed");
+
+    eprintln!("FIXED CTXDSL:\n{}", output.ctxdsl);
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("CTXDSL realization failed: {e}"));
+
+    let system = realized
+        .context
+        .clts("axi_system")
+        .expect("composed system");
+
+    // no_response_drop should be REALIZABLE on the fixed slave
+    let formula = realized
+        .formulas
+        .get("no_response_drop")
+        .expect("no_response_drop formula");
+    let env = realized.environment_for("axi_system");
+    let synth = realized
+        .context
+        .synthesise_controller("axi_system", &formula.formula, &env, None)
+        .expect("synthesis should succeed");
+
+    assert!(
+        synth.realizable,
+        "Fixed AXI-lite slave: no_response_drop should be REALIZABLE \
+         (pending guard prevents double-respond, states: {})",
+        system.state_count()
+    );
+}
+
+#[test]
+fn multi_module_buffer_overflow_bug() {
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+    let sidecar_path = base.join("multi_buffer_overflow_bug.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .expect("multi-module translation should succeed");
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("CTXDSL realization failed: {e}"));
+
+    let system = realized.context.clts("system").expect("composed system");
+
+    let formula = realized
+        .formulas
+        .get("no_overflow")
+        .expect("no_overflow formula");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis should succeed");
+
+    assert!(
+        !synth.realizable,
+        "Buggy producer: no_overflow should be UNREALIZABLE \
+         (producer pushes without checking full, states: {})",
+        system.state_count()
+    );
+}
+
+#[test]
+fn multi_module_buffer_overflow_fixed() {
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+    let sidecar_path = base.join("multi_buffer_overflow_fixed.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .expect("multi-module translation should succeed");
+
+    eprintln!("FIXED BUFFER CTXDSL:\n{}", output.ctxdsl);
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("CTXDSL realization failed: {e}"));
+
+    let system = realized.context.clts("system").expect("composed system");
+
+    let formula = realized
+        .formulas
+        .get("no_overflow")
+        .expect("no_overflow formula");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis should succeed");
+
+    assert!(
+        synth.realizable,
+        "Fixed producer: no_overflow should be REALIZABLE \
+         (backpressure prevents push when full, states: {})",
+        system.state_count()
+    );
+}
+
+#[test]
+fn multi_module_sidecar_detection() {
+    use mununu_core::adapter::systemverilog::annotation::is_multi_module;
+
+    let base =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+    let multi_path = base.join("multi_producer_consumer.mununu.json");
+    assert!(is_multi_module(&multi_path).unwrap());
+
+    let single_path = base.join("fifo.mununu.json");
+    assert!(!is_multi_module(&single_path).unwrap());
+}
+
+// ---------------------------------------------------------------
+// Industrial-level multi-module tests (real SV patterns, sv init generated)
+// ---------------------------------------------------------------
+
+#[test]
+fn industrial_axilite_write_system() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/industrial");
+    let sidecar_path = base.join("axilite_write_system.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .unwrap_or_else(|e| panic!("Translation failed: {e:?}"));
+
+    eprintln!("Industrial AXI CTXDSL:\n{}", output.ctxdsl);
+    eprintln!("Warnings: {:?}", output.warnings);
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("Realization failed: {e}"));
+
+    let system = realized
+        .context
+        .clts("axi_write_system")
+        .expect("composed system");
+    eprintln!("Industrial AXI composed states: {}", system.state_count());
+
+    // Check no_deadlock
+    let formula_dl = realized.formulas.get("no_deadlock").expect("no_deadlock");
+    let env = realized.environment_for("axi_write_system");
+    let synth_dl = realized
+        .context
+        .synthesise_controller("axi_write_system", &formula_dl.formula, &env, None)
+        .expect("synthesis failed");
+    eprintln!("no_deadlock: realizable={}", synth_dl.realizable);
+
+    // Check no_response_window — should be UNREALIZABLE on buggy slave
+    // (bvalid=T with aw_flag=F is reachable, allowing a new write during pending response)
+    let formula_rw = realized
+        .formulas
+        .get("no_response_window")
+        .expect("no_response_window formula");
+    let synth_rw = realized
+        .context
+        .synthesise_controller("axi_write_system", &formula_rw.formula, &env, None)
+        .expect("synthesis failed");
+    eprintln!("no_response_window: realizable={}", synth_rw.realizable);
+    assert!(
+        !synth_rw.realizable,
+        "Xilinx bug: no_response_window should be UNREALIZABLE \
+         (aw_flag clears before bready, allowing new writes during pending response)"
+    );
+}
+
+#[test]
+fn industrial_axilite_write_system_fixed() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/industrial");
+    let sidecar_path = base.join("axilite_write_system_fixed.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .unwrap_or_else(|e| panic!("Translation failed: {e:?}"));
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("Realization failed: {e}"));
+
+    let system = realized
+        .context
+        .clts("axi_write_system")
+        .expect("composed system");
+    eprintln!(
+        "Industrial AXI FIXED composed states: {}",
+        system.state_count()
+    );
+
+    let formula_rw = realized
+        .formulas
+        .get("no_response_window")
+        .expect("no_response_window formula");
+    let env = realized.environment_for("axi_write_system");
+    let synth_rw = realized
+        .context
+        .synthesise_controller("axi_write_system", &formula_rw.formula, &env, None)
+        .expect("synthesis failed");
+    eprintln!(
+        "no_response_window (fixed): realizable={}",
+        synth_rw.realizable
+    );
+    assert!(
+        synth_rw.realizable,
+        "Fixed slave: no_response_window should be REALIZABLE \
+         (aw_flag only clears on bvalid&&bready, states: {})",
+        system.state_count()
+    );
+}
+
+#[test]
+fn industrial_noc_overflow_bug() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/industrial");
+    let sidecar_path = base.join("noc_overflow_bug.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .unwrap_or_else(|e| panic!("Translation failed: {e:?}"));
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("Realization failed: {e}"));
+
+    let system = realized.context.clts("system").expect("composed system");
+    eprintln!("NoC overflow bug: {} composed states", system.state_count());
+
+    let formula = realized.formulas.get("no_overflow").expect("no_overflow");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis failed");
+
+    eprintln!("no_overflow: realizable={}", synth.realizable);
+    assert!(
+        !synth.realizable,
+        "Buggy mem engine: no_overflow should be UNREALIZABLE (overflow reachable, states: {})",
+        system.state_count()
+    );
+}
+
+#[test]
+fn industrial_noc_overflow_fixed() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/industrial");
+    let sidecar_path = base.join("noc_overflow_fixed.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .unwrap_or_else(|e| panic!("Translation failed: {e:?}"));
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("Realization failed: {e}"));
+
+    let system = realized.context.clts("system").expect("composed system");
+    eprintln!(
+        "NoC overflow fixed: {} composed states",
+        system.state_count()
+    );
+
+    let formula = realized.formulas.get("no_overflow").expect("no_overflow");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis failed");
+
+    eprintln!("no_overflow: realizable={}", synth.realizable);
+    assert!(
+        synth.realizable,
+        "Fixed mem engine: no_overflow should be REALIZABLE (credit-checked, states: {})",
+        system.state_count()
+    );
+}
+
+/// Test the auto-generated sidecar from `sv init --multi` on the top module.
+/// This validates the full workflow: top module → parse instantiations →
+/// locate sub-modules → derive connections → verify property.
+#[test]
+fn industrial_noc_top_module_generated_sidecar() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/industrial");
+    let sidecar_path = base.join("noc_system_top_system.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .unwrap_or_else(|e| panic!("Translation failed: {e:?}"));
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("Realization failed: {e}"));
+
+    let system = realized.context.clts("system").expect("composed system");
+    eprintln!(
+        "Top-module generated sidecar: {} composed states",
+        system.state_count()
+    );
+
+    // no_overflow should be UNREALIZABLE (buggy engine overflows buffer)
+    let formula = realized.formulas.get("no_overflow").expect("no_overflow");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis failed");
+
+    eprintln!(
+        "no_overflow (top-module sidecar): realizable={}",
+        synth.realizable
+    );
+    assert!(
+        !synth.realizable,
+        "Top-module auto-generated sidecar: no_overflow should be UNREALIZABLE (states: {})",
+        system.state_count()
+    );
+}
+
+/// AXI-Lite top-module test: auto-generated sidecar detects the Xilinx bug.
+#[test]
+fn industrial_axilite_top_module_generated_sidecar() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/systemverilog/industrial");
+    let sidecar_path = base.join("axilite_system_top_system.mununu.json");
+    let options = AdapterOptions::default();
+    let output = SystemVerilogAdapter::translate_multi_module(sidecar_path.as_path(), &options)
+        .unwrap_or_else(|e| panic!("Translation failed: {e:?}"));
+
+    let mut doc = context_dsl::parse(&output.ctxdsl)
+        .unwrap_or_else(|e| panic!("CTXDSL parse failed: {e}\n\n{}", output.ctxdsl));
+    doc.state_valuations = output.state_valuations.clone();
+    let realized = context_dsl::realize_context(&doc, &[])
+        .unwrap_or_else(|e| panic!("Realization failed: {e}"));
+
+    let system = realized.context.clts("system").expect("composed system");
+    eprintln!(
+        "AXI top-module generated: {} composed states",
+        system.state_count()
+    );
+
+    // no_response_window should be UNREALIZABLE (Xilinx bug detected)
+    let formula = realized
+        .formulas
+        .get("no_response_window")
+        .expect("no_response_window");
+    let env = realized.environment_for("system");
+    let synth = realized
+        .context
+        .synthesise_controller("system", &formula.formula, &env, None)
+        .expect("synthesis failed");
+
+    eprintln!(
+        "no_response_window (AXI top-module): realizable={}",
+        synth.realizable
+    );
+    assert!(
+        !synth.realizable,
+        "AXI top-module sidecar: no_response_window should be UNREALIZABLE (Xilinx bug, states: {})",
+        system.state_count()
+    );
+}

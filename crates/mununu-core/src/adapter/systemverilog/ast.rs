@@ -23,6 +23,29 @@ pub struct Module {
     pub input_signals: Vec<String>,
     /// Whether Kripke mode is forced via `// @mununu mode kripke`.
     pub force_kripke: bool,
+    /// Module instantiations (sub-module instances with port bindings).
+    /// Used by `sv init --multi` to derive connections from a top module.
+    pub instantiations: Vec<ModuleInstantiation>,
+}
+
+/// A module instantiation: `module_type instance_name(.port(wire), ...);`
+#[derive(Debug, Clone)]
+pub struct ModuleInstantiation {
+    /// The module type being instantiated (e.g., "axilite_master").
+    pub module_type: String,
+    /// The instance name (e.g., "master_inst").
+    pub instance_name: String,
+    /// Port connections: `.port_name(signal_name)`.
+    pub port_connections: Vec<PortConnection>,
+}
+
+/// A named port connection in a module instantiation.
+#[derive(Debug, Clone)]
+pub struct PortConnection {
+    /// Port name on the sub-module (e.g., "m_axi_awvalid").
+    pub port_name: String,
+    /// Signal/wire name in the parent module (e.g., "awvalid").
+    pub signal_name: String,
 }
 
 /// A module parameter.

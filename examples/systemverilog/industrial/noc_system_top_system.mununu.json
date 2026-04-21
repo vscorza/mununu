@@ -1,0 +1,104 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "modules": [
+    {
+      "name": "mem_engine_bug",
+      "source": "mem_engine_bug.sv",
+      "signals": [
+        {
+          "name": "state",
+          "abstraction": "enum",
+          "variants": [
+            "IDLE",
+            "BEAT_1",
+            "BEAT_2",
+            "BEAT_3",
+            "DONE"
+          ],
+          "note": "auto-detected typedef enum"
+        },
+        {
+          "name": "push",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        }
+      ],
+      "inputs": [
+        {
+          "name": "start",
+          "abstraction": "boolean"
+        }
+      ]
+    },
+    {
+      "name": "noc_buffer",
+      "source": "noc_buffer.sv",
+      "signals": [
+        {
+          "name": "count",
+          "abstraction": "bounded_counter",
+          "bound": 5,
+          "note": "bound set to DEPTH+1 to capture overflow state"
+        },
+        {
+          "name": "credit_avail",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        },
+        {
+          "name": "full",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        },
+        {
+          "name": "empty",
+          "abstraction": "boolean",
+          "combinational": true,
+          "note": "combinational output"
+        }
+      ],
+      "inputs": [
+        {
+          "name": "pop",
+          "abstraction": "boolean"
+        }
+      ],
+      "parameters": {
+        "DEPTH": 4
+      }
+    }
+  ],
+  "connections": [
+    {
+      "from": "mem_engine_bug.push",
+      "to": "noc_buffer.push",
+      "abstraction": "boolean",
+      "note": "wire 'push_wire': engine_inst.push → buffer_inst.push"
+    },
+    {
+      "from": "noc_buffer.credit_avail",
+      "to": "mem_engine_bug.credit_avail",
+      "abstraction": "boolean",
+      "note": "wire 'credit_wire': buffer_inst.credit_avail → engine_inst.credit_avail"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "system"
+  },
+  "properties": [
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    },
+    {
+      "id": "no_overflow",
+      "formula": "nu X. (!count_5 && [] X)",
+      "description": "Buffer count never reaches 5 (overflow past DEPTH=4)"
+    }
+  ]
+}

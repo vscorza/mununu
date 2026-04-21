@@ -1,0 +1,56 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "modules": [
+    {
+      "name": "mem_engine_fixed",
+      "source": "mem_engine_fixed.sv",
+      "clock_domain": "clk",
+      "signals": [
+        {"name": "state", "abstraction": "enum", "variants": ["IDLE", "BEAT_1", "BEAT_2", "BEAT_3", "DONE"]}
+      ],
+      "inputs": [
+        {"name": "start", "abstraction": "boolean"}
+      ],
+      "controllable": []
+    },
+    {
+      "name": "noc_buffer",
+      "source": "noc_buffer.sv",
+      "clock_domain": "clk",
+      "signals": [
+        {"name": "count", "abstraction": "bounded_counter", "bound": 5},
+        {"name": "credit_avail", "abstraction": "boolean", "combinational": true}
+      ],
+      "inputs": [
+        {"name": "pop", "abstraction": "boolean"}
+      ],
+      "parameters": {"DEPTH": 4},
+      "controllable": []
+    }
+  ],
+  "connections": [
+    {
+      "from": "mem_engine_fixed.push",
+      "to": "noc_buffer.push",
+      "abstraction": "boolean",
+      "note": "Engine push requests to buffer"
+    },
+    {
+      "from": "noc_buffer.credit_avail",
+      "to": "mem_engine_fixed.credit_avail",
+      "abstraction": "boolean",
+      "note": "Buffer credit signal to engine (RESPECTED by fixed engine)"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "system"
+  },
+  "properties": [
+    {
+      "id": "no_overflow",
+      "formula": "nu X. (!count_5 && [] X)",
+      "description": "Buffer count never exceeds DEPTH (no overflow/corruption)"
+    }
+  ]
+}

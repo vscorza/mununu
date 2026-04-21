@@ -1,0 +1,36 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "mem_engine_bug",
+  "source": "mem_engine_bug.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": [
+        "IDLE",
+        "BEAT_1",
+        "BEAT_2",
+        "BEAT_3",
+        "DONE"
+      ],
+      "note": "auto-detected typedef enum"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "start",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "credit_avail",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    }
+  ]
+}

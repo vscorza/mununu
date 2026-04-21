@@ -33,7 +33,7 @@ impl SystemVerilogAdapter {
         options: &AdapterOptions,
         sv_path: &std::path::Path,
     ) -> Result<AdapterOutput, AdapterError> {
-        let module = parser::parse(content)?;
+        let (module, mut parse_warnings) = parser::parse_with_warnings(content)?;
 
         // Try to load sidecar
         let sidecar =
@@ -96,6 +96,7 @@ impl SystemVerilogAdapter {
 
         let config = annotation::merge_config(sidecar.as_ref(), &module);
         let mut warnings = Vec::new();
+        warnings.append(&mut parse_warnings);
         let ir = to_ir_with_config(&module, options, &config, &mut warnings)?;
 
         let state_valuations = crate::adapter::emit::extract_state_valuations(&ir);
@@ -121,6 +122,424 @@ impl SystemVerilogAdapter {
             state_valuations,
         })
     }
+
+    /// Translate a multi-module sidecar into a composed AdapterOutput.
+    ///
+    /// Parses each referenced `.sv` file, builds a Kripke automaton per module,
+    /// generates shared labels for connections, and emits a composed IR with
+    /// a composition directive.
+    pub fn translate_multi_module(
+        sidecar_path: &std::path::Path,
+        options: &AdapterOptions,
+    ) -> Result<AdapterOutput, AdapterError> {
+        let ann = annotation::load_multi_annotation(sidecar_path).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: e,
+            location: None,
+        })?;
+
+        let sidecar_dir = sidecar_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        let mut all_automata: Vec<AutomatonSpec> = Vec::new();
+        let mut all_warnings: Vec<AdapterWarning> = Vec::new();
+        let mut all_state_valuations = std::collections::HashMap::new();
+        let mut total_state_count = 0usize;
+        let mut total_signal_count = 0usize;
+
+        // Phase 1: Build each module's Kripke automaton independently
+        for module_entry in &ann.modules {
+            let sv_path = sidecar_dir.join(&module_entry.source);
+            let sv_content = std::fs::read_to_string(&sv_path).map_err(|e| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!(
+                    "failed to read '{}' for module '{}': {e}",
+                    sv_path.display(),
+                    module_entry.name
+                ),
+                location: None,
+            })?;
+
+            let (module, mut parse_warnings) =
+                parser::parse_with_warnings(&sv_content).map_err(|e| AdapterError {
+                    kind: e.kind,
+                    message: format!("in module '{}': {}", module_entry.name, e.message),
+                    location: e.location,
+                })?;
+
+            all_warnings.append(&mut parse_warnings);
+
+            if module.name != module_entry.name {
+                all_warnings.push(AdapterWarning {
+                    kind: super::WarningKind::UnsupportedConstruct,
+                    message: format!(
+                        "sidecar module name '{}' does not match SV module '{}' in '{}'",
+                        module_entry.name, module.name, module_entry.source
+                    ),
+                    location: None,
+                });
+            }
+
+            // Build a per-module SvAnnotation to reuse merge_config
+            let per_module_ann = build_per_module_annotation(module_entry, &ann);
+            let config = annotation::merge_config(Some(&per_module_ann), &module);
+
+            let (automaton, _module_properties, state_count) =
+                kripke::build_kripke_with_config(&module, &config, &mut all_warnings)?;
+
+            // Override automaton name to match the module entry name
+            let mut automaton = AutomatonSpec {
+                name: module_entry.name.clone(),
+                ..automaton
+            };
+
+            // Post-process: add shared output labels for connections where
+            // this module is the driver. The output value is derived from
+            // the source state's valuations (including combinational outputs
+            // resolved via assign statements).
+            annotate_driving_output_labels(
+                &mut automaton,
+                &module_entry.name,
+                &ann.connections,
+                &module,
+            );
+
+            // Extract state valuations for this automaton
+            let ir_for_valuations = AdapterIR {
+                metadata: Metadata {
+                    title: module_entry.name.clone(),
+                    source_format: SourceFormat::SystemVerilog,
+                    description: None,
+                    game_semantics: None,
+                    known_status: None,
+                },
+                signals: vec![],
+                automata: vec![automaton.clone()],
+                compositions: vec![],
+                properties: vec![],
+                controller: None,
+            };
+            let valuations = crate::adapter::emit::extract_state_valuations(&ir_for_valuations);
+            for (k, v) in valuations {
+                all_state_valuations.insert(k, v);
+            }
+
+            total_state_count += state_count;
+            total_signal_count += module.ports.len();
+            all_automata.push(automaton);
+        }
+
+        // Phase 2: Build composition directive
+        let comp_config = ann.composition.as_ref();
+        let comp_name = comp_config
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "system".to_string());
+        let comp_mode = comp_config
+            .map(|c| c.mode.as_str())
+            .unwrap_or("synchronous");
+
+        let member_names: Vec<String> = ann.modules.iter().map(|m| m.name.clone()).collect();
+
+        let composition = match comp_mode {
+            "asynchronous" => super::ir::CompositionSpec::Asynchronous {
+                name: comp_name.clone(),
+                members: member_names,
+            },
+            _ => super::ir::CompositionSpec::Synchronous {
+                name: comp_name.clone(),
+                members: member_names,
+            },
+        };
+
+        // Phase 3: Build properties targeting the composition
+        let properties: Vec<PropertySpec> = ann
+            .properties
+            .iter()
+            .map(|p| {
+                let role = match p.role.as_str() {
+                    "assumption" => PropertyRole::Assumption,
+                    "standalone" => PropertyRole::Standalone,
+                    _ => PropertyRole::Guarantee,
+                };
+                PropertySpec {
+                    name: p.id.clone(),
+                    kind: PropertyKind::Safety,
+                    formula: PropertyFormula::MuCalculus(p.formula.clone()),
+                    role,
+                    over: Some(comp_name.clone()),
+                }
+            })
+            .collect();
+
+        let property_count = properties.len();
+
+        // Controller from first property (if any)
+        let controller = properties.first().map(|p| ControllerSpec {
+            name: "synth".to_string(),
+            source_automaton: comp_name.clone(),
+            formula_name: p.name.clone(),
+        });
+
+        let context_name = options.context_name.as_deref().unwrap_or(&comp_name);
+
+        let ir = AdapterIR {
+            metadata: Metadata {
+                title: context_name.to_string(),
+                source_format: SourceFormat::SystemVerilog,
+                description: Some(format!(
+                    "Multi-module composition of {} SystemVerilog modules",
+                    ann.modules.len()
+                )),
+                game_semantics: None,
+                known_status: None,
+            },
+            signals: vec![],
+            automata: all_automata,
+            compositions: vec![composition],
+            properties,
+            controller,
+        };
+
+        let result = crate::adapter::emit::emit(&ir).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::EmitError,
+            message: format!("CTXDSL emission failed: {e}"),
+            location: None,
+        })?;
+
+        Ok(AdapterOutput {
+            ctxdsl: result.ctxdsl,
+            warnings: all_warnings,
+            source_info: SourceInfo {
+                format: SourceFormat::SystemVerilog,
+                title: Some(context_name.to_string()),
+                signal_count: total_signal_count,
+                state_count: total_state_count,
+                property_count,
+            },
+            state_valuations: all_state_valuations,
+        })
+    }
+}
+
+/// Annotate transitions of a driving module with shared output labels.
+///
+/// For each connection where `module_name` is the `from` side, this function
+/// looks at the source state's valuations for the output port and adds the
+/// shared label (e.g., `grant_1`) to each transition. This enables the
+/// composition engine to synchronize with the receiving module.
+///
+/// Supports both registered outputs (directly in valuations) and combinational
+/// outputs (resolved via `assign port = register` statements).
+fn annotate_driving_output_labels(
+    automaton: &mut AutomatonSpec,
+    module_name: &str,
+    connections: &[annotation::ConnectionSpec],
+    module: &ast::Module,
+) {
+    // Find connections where this module is the driver
+    let driving_connections: Vec<(&str, &str)> = connections
+        .iter()
+        .filter_map(|conn| {
+            let (from_mod, from_port) = conn.parse_from()?;
+            if from_mod == module_name {
+                Some((from_port, from_port)) // shared label uses the driving port name
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if driving_connections.is_empty() {
+        return;
+    }
+
+    // Build a lookup: state_name → valuations
+    let state_valuations: std::collections::HashMap<
+        &str,
+        &std::collections::BTreeMap<String, String>,
+    > = automaton
+        .states
+        .iter()
+        .filter_map(|s| s.valuations.as_ref().map(|v| (s.name.as_str(), v)))
+        .collect();
+
+    // For each transition, compute driving output values using:
+    // 1. Source state valuations (registers + combinational signals already computed)
+    // 2. Input label values on this transition (parsed from label format "name_value")
+    // 3. Assign expressions for outputs not directly in valuations
+    for transition in &mut automaton.transitions {
+        if let Some(valuations) = state_valuations.get(transition.source.as_str()) {
+            for (port_name, label_prefix) in &driving_connections {
+                // Try direct lookup in state valuations (works for registered outputs
+                // and combinational signals already in state space)
+                if let Some(value) = valuations.get(*port_name) {
+                    let output_label = format!("{}_{}", label_prefix, value);
+                    if !transition.labels.contains(&output_label) {
+                        transition.labels.push(output_label);
+                    }
+                    continue;
+                }
+
+                // Fallback: evaluate the assign expression for this output port
+                // using state valuations + input values from transition labels.
+                // This handles `assign push = (state == SENDING) && !full` where
+                // push depends on both register state and input signals.
+                let output_value =
+                    eval_assign_for_transition(port_name, valuations, &transition.labels, module);
+                if let Some(value) = output_value {
+                    let output_label = format!("{}_{}", label_prefix, value);
+                    if !transition.labels.contains(&output_label) {
+                        transition.labels.push(output_label);
+                    }
+                }
+            }
+        }
+    }
+
+    // Mark output labels as controllable (driving module owns them)
+    for (_, label_prefix) in &driving_connections {
+        let output_labels: HashSet<String> = automaton
+            .transitions
+            .iter()
+            .flat_map(|t| t.labels.iter())
+            .filter(|l| l.starts_with(label_prefix))
+            .cloned()
+            .collect();
+        for label in output_labels {
+            if !automaton.controllable_labels.contains(&label) {
+                automaton.controllable_labels.push(label);
+            }
+        }
+    }
+}
+
+/// Evaluate a combinational assign expression for a specific transition.
+///
+/// Builds a valuation from state variables + input labels on the transition,
+/// then evaluates the assign expression to determine the output value.
+///
+/// Returns "T"/"F" for boolean outputs, or a numeric string for counters.
+fn eval_assign_for_transition(
+    port_name: &str,
+    state_valuations: &std::collections::BTreeMap<String, String>,
+    transition_labels: &[String],
+    module: &ast::Module,
+) -> Option<String> {
+    use crate::adapter::domain::AbstractValue;
+
+    // Find the assign for this port
+    let assign = module
+        .assigns
+        .iter()
+        .find(|a| a.target.name() == port_name)?;
+
+    // Build a valuation map from state variables
+    let mut values: std::collections::BTreeMap<String, AbstractValue> =
+        std::collections::BTreeMap::new();
+    for (k, v) in state_valuations {
+        let av = if v == "T" {
+            AbstractValue::Bool(true)
+        } else if v == "F" {
+            AbstractValue::Bool(false)
+        } else if let Ok(n) = v.parse::<i64>() {
+            AbstractValue::Counter(n)
+        } else {
+            AbstractValue::Variant(v.clone())
+        };
+        values.insert(k.clone(), av);
+    }
+
+    // Add input values from transition labels (format: "name_value")
+    for label in transition_labels {
+        if let Some(idx) = label.rfind('_') {
+            let name = &label[..idx];
+            let val_str = &label[idx + 1..];
+            let av = if val_str == "T" {
+                AbstractValue::Bool(true)
+            } else if val_str == "F" {
+                AbstractValue::Bool(false)
+            } else if let Ok(n) = val_str.parse::<i64>() {
+                AbstractValue::Counter(n)
+            } else {
+                AbstractValue::Variant(val_str.to_string())
+            };
+            values.insert(name.to_string(), av);
+        }
+    }
+
+    // Evaluate the assign expression
+    let result = kripke::eval_expr_pub(&assign.value, &values)?;
+    Some(result.display_short())
+}
+
+/// Build a per-module `SvAnnotation` from a `ModuleEntry` and the multi-module
+/// sidecar, incorporating connection-level abstractions into the input domains.
+fn build_per_module_annotation(
+    entry: &annotation::ModuleEntry,
+    multi: &annotation::MultiModuleSvAnnotation,
+) -> annotation::SvAnnotation {
+    let mut inputs = entry.inputs.clone();
+
+    // For each connection where this module is the receiver, add an input
+    // annotation with the connection-level abstraction and a shared label name.
+    for conn in &multi.connections {
+        if let Some((to_mod, to_port)) = conn.parse_to()
+            && to_mod == entry.name
+        {
+            // Check if the user already declared this input
+            if inputs.iter().any(|i| i.name == to_port) {
+                continue;
+            }
+            // Derive the shared label name from the driving port
+            let shared_label = conn.parse_from().map(|(_, port)| port.to_string());
+
+            // Add connection-derived input annotation
+            inputs.push(annotation::InputAnnotation {
+                name: to_port.to_string(),
+                preserve: true,
+                abstraction: conn.abstraction.clone(),
+                bound: conn.bound,
+                variants: conn.variants.clone(),
+                value_map: conn.value_map.clone(),
+                label_name: shared_label,
+            });
+        }
+    }
+
+    // Merge discovered_values: module-local + cross-connection values that
+    // affect this module's ports
+    let mut discovered_values = entry.discovered_values.clone();
+    for conn in &multi.connections {
+        if let Some((from_mod, from_port)) = conn.parse_from()
+            && let Some(disc) = multi
+                .discovered_values
+                .get(&format!("{from_mod}.{from_port}"))
+        {
+            // If this module is the receiver, map discovered values to the input port name
+            if let Some((to_mod, to_port)) = conn.parse_to()
+                && to_mod == entry.name
+            {
+                discovered_values.insert(to_port.to_string(), disc.clone());
+            }
+            // If this module is the driver, map discovered values to the output port name
+            if from_mod == entry.name {
+                discovered_values.insert(from_port.to_string(), disc.clone());
+            }
+        }
+    }
+
+    annotation::SvAnnotation {
+        schema: Some("mununu_sv_annotation_v1".to_string()),
+        module: entry.name.clone(),
+        source: Some(entry.source.clone()),
+        signals: entry.signals.clone(),
+        inputs,
+        controllable: entry.controllable.clone(),
+        properties: vec![], // Properties come from the multi-module level
+        discovered_values,
+        parameters: entry.parameters.clone(),
+    }
 }
 
 impl FormatAdapter for SystemVerilogAdapter {
@@ -134,9 +553,10 @@ impl FormatAdapter for SystemVerilogAdapter {
     }
 
     fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutput, AdapterError> {
-        let module = parser::parse(content)?;
+        let (module, mut parse_warnings) = parser::parse_with_warnings(content)?;
 
         let mut warnings = Vec::new();
+        warnings.append(&mut parse_warnings);
         let ir = to_ir(&module, options, &mut warnings)?;
 
         let state_valuations = crate::adapter::emit::extract_state_valuations(&ir);

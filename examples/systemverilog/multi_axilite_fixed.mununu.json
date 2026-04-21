@@ -1,0 +1,68 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "modules": [
+    {
+      "name": "axilite_master",
+      "source": "multi_axilite_master.sv",
+      "clock_domain": "clk",
+      "signals": [
+        {"name": "state", "abstraction": "enum", "variants": ["IDLE", "ISSUED", "BACKPRESSURE"]}
+      ],
+      "inputs": [
+        {"name": "start", "abstraction": "boolean"},
+        {"name": "ready_delay", "abstraction": "boolean"}
+      ],
+      "controllable": []
+    },
+    {
+      "name": "axilite_slave_fixed",
+      "source": "multi_axilite_slave_fixed.sv",
+      "clock_domain": "clk",
+      "signals": [
+        {"name": "state", "abstraction": "enum", "variants": ["IDLE", "ACTIVE", "RESPOND"]},
+        {"name": "bvalid_r", "abstraction": "boolean"},
+        {"name": "pending", "abstraction": "boolean"}
+      ],
+      "inputs": [],
+      "controllable": []
+    }
+  ],
+  "connections": [
+    {
+      "from": "axilite_master.awvalid",
+      "to": "axilite_slave_fixed.awvalid",
+      "abstraction": "boolean"
+    },
+    {
+      "from": "axilite_master.wvalid",
+      "to": "axilite_slave_fixed.wvalid",
+      "abstraction": "boolean"
+    },
+    {
+      "from": "axilite_master.bready",
+      "to": "axilite_slave_fixed.bready",
+      "abstraction": "boolean"
+    },
+    {
+      "from": "axilite_slave_fixed.bvalid",
+      "to": "axilite_master.bvalid",
+      "abstraction": "boolean"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "axi_system"
+  },
+  "properties": [
+    {
+      "id": "no_deadlock",
+      "formula": "nu X. ([] X)",
+      "description": "Composed system has no deadlock"
+    },
+    {
+      "id": "no_response_drop",
+      "formula": "nu X. ((!pending_T || state_RESPOND) && [] X)",
+      "description": "If pending is true, slave must be in RESPOND (never leaves RESPOND with pending still set)"
+    }
+  ]
+}

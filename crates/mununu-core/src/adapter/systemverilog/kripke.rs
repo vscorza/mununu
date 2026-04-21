@@ -222,6 +222,13 @@ pub fn build_kripke_with_config(
         param_values.insert(name.clone(), AbstractValue::Counter(*val));
     }
 
+    // Build label name overrides for connected inputs (multi-module shared labels)
+    let label_overrides: HashMap<String, String> = config
+        .input_domains
+        .iter()
+        .filter_map(|(name, cfg)| cfg.label_name.as_ref().map(|ln| (name.clone(), ln.clone())))
+        .collect();
+
     for reg_state in &all_reg_states {
         let src_name = &state_names[reg_state];
         for input_combo in &all_input_combos {
@@ -254,7 +261,7 @@ pub fn build_kripke_with_config(
 
             // Find or create the target state name
             if let Some(tgt_name) = state_names.get(&next_state) {
-                let labels = make_input_labels(input_combo);
+                let labels = make_input_labels(input_combo, &label_overrides);
                 transitions.push(TransitionSpec {
                     source: src_name.clone(),
                     target: tgt_name.clone(),
@@ -276,15 +283,37 @@ pub fn build_kripke_with_config(
 
     let reachable = bfs_reachable(&initial_name, &transitions);
 
+    // Identify combinational registers for valuation enrichment
+    let comb_register_names: Vec<&str> = registers
+        .iter()
+        .filter(|r| r.combinational && r.domain.abstraction != AbstractionType::Ignored)
+        .map(|r| r.name.as_str())
+        .collect();
+
     let states: Vec<StateSpec> = all_reg_states
         .iter()
         .filter_map(|s| {
             let name = &state_names[s];
             if reachable.contains(name) {
-                let valuations: BTreeMap<String, String> = s
+                let mut valuations: BTreeMap<String, String> = s
                     .iter()
                     .map(|(k, v)| (k.clone(), v.display_short()))
                     .collect();
+
+                // Compute and include combinational signal values in valuations.
+                // This enables state predicates to reference combinational outputs
+                // (e.g., `full_T` for `assign full = (count >= 2)`).
+                if !comb_register_names.is_empty() {
+                    let mut full_val: BTreeMap<String, AbstractValue> = s.clone();
+                    full_val.extend(param_values.clone());
+                    eval_comb_assigns(&comb_assigns, &mut full_val);
+                    for comb_name in &comb_register_names {
+                        if let Some(val) = full_val.get(*comb_name) {
+                            valuations.insert(comb_name.to_string(), val.display_short());
+                        }
+                    }
+                }
+
                 Some(StateSpec {
                     name: name.clone(),
                     is_initial: *name == initial_name,
@@ -417,6 +446,27 @@ fn build_registers_from_config(
             });
         }
     }
+
+    // Also include output ports that are declared as combinational signals in the sidecar.
+    // These are signals like `assign full = (count >= 2)` that are computed from registers
+    // but need to be tracked in state valuations for predicate resolution and composition.
+    for port in &module.ports {
+        if port.direction == PortDirection::Output
+            && let Some(sig_config) = config.signal_domains.get(&port.name)
+            && sig_config.combinational
+            && !registers.iter().any(|r| r.name == port.name)
+        {
+            registers.push(RegisterInfo {
+                name: port.name.clone(),
+                width: port.width,
+                domain: sig_config.domain.clone(),
+                kind: SignalKind::Output,
+                value_map: sig_config.value_map.clone(),
+                combinational: true,
+            });
+        }
+    }
+
     registers
 }
 
@@ -997,6 +1047,14 @@ fn write_bit_slice(old_val: i64, new_val: i64, msb: usize, lsb: usize) -> i64 {
 }
 
 /// Evaluate an expression against the current valuation.
+/// Public wrapper for expression evaluation (used by multi-module output annotation).
+pub fn eval_expr_pub(
+    expr: &Expr,
+    values: &BTreeMap<String, AbstractValue>,
+) -> Option<AbstractValue> {
+    eval_expr(expr, values)
+}
+
 fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<AbstractValue> {
     match expr {
         Expr::Ident(name) => {
@@ -1035,7 +1093,11 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
                 eval_expr(else_expr, values)
             }
         }
-        // BitSelect, BitSlice, Concat — return None (havoc) for abstract values
+        // SOUNDNESS: under-approx — when operands are abstract (Variant, Bool for
+        // BitSelect index, etc.), we cannot compute a concrete result. Returning None
+        // causes the enclosing assignment to be skipped (transition dropped), which
+        // removes behaviors from the model. Sound for liveness, unsound for safety
+        // (may miss reachable states where a violation occurs).
         Expr::BitSelect { base, index } => {
             let bv = eval_expr(base, values)?;
             let iv = eval_expr(index, values)?;
@@ -1044,7 +1106,7 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
                     let bit = (base_val >> idx) & 1;
                     Some(AbstractValue::Bool(bit != 0))
                 }
-                _ => None,
+                _ => None, // abstract operands → cannot compute
             }
         }
         Expr::BitSlice { base, msb, lsb } => {
@@ -1062,7 +1124,7 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
                     let result = (base_val >> lsb_val) & mask;
                     Some(AbstractValue::Counter(result))
                 }
-                _ => None,
+                _ => None, // abstract operands → cannot compute
             }
         }
         Expr::Concat(parts) => {
@@ -1078,7 +1140,7 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
                     AbstractValue::Bool(b) => {
                         result = (result << 1) | (b as i64);
                     }
-                    _ => return None,
+                    _ => return None, // abstract operands → cannot compute
                 }
             }
             Some(AbstractValue::Counter(result))
@@ -1365,6 +1427,10 @@ fn compute_next_state(
     next
 }
 
+// SOUNDNESS: under-approx — when eval_expr returns None (abstract operands),
+// is_some_and returns false, blocking the transition. This removes behaviors
+// from the model. Sound for liveness, unsound for safety (may miss states
+// reachable through guards that depend on abstract values).
 fn guards_satisfied(
     guards: &[SeqGuard],
     values: &BTreeMap<String, AbstractValue>,
@@ -1443,6 +1509,15 @@ fn guards_satisfied(
     })
 }
 
+/// Clamp an abstract value to fit the register's declared domain.
+///
+/// SOUNDNESS: clamping introduces approximation at domain boundaries:
+/// - BoundedCounter: values above bound are clamped to bound (over-approx above
+///   bound — sound for safety, unsound for liveness). Default bound is 3 when
+///   not specified by the user — this is a heuristic and should be set explicitly.
+/// - EnumValues with unknown variant: mapped to catch-all (over-approx — sound
+///   for safety). Counter values outside value_map fall through as raw counters
+///   (unsound — variant properties become invalid).
 fn clamp_to_domain(
     target: &str,
     value: &AbstractValue,
@@ -1451,7 +1526,12 @@ fn clamp_to_domain(
     if let Some(reg) = registers.iter().find(|r| r.name == target) {
         match (&reg.domain.abstraction, value) {
             (AbstractionType::BoundedCounter, AbstractValue::Counter(n)) => {
-                let bound = reg.domain.bound.unwrap_or(3);
+                // SOUNDNESS: over-approx above bound. User should set explicit
+                // bound in sidecar or annotation.
+                let bound = reg
+                    .domain
+                    .bound
+                    .unwrap_or(crate::adapter::domain::DEFAULT_COUNTER_BOUND);
                 AbstractValue::Counter((*n).max(0).min(bound))
             }
             (AbstractionType::Boolean, AbstractValue::Counter(n)) => AbstractValue::Bool(*n != 0),
@@ -1462,8 +1542,8 @@ fn clamp_to_domain(
                     if variants.contains(name) {
                         return value.clone();
                     }
-                    // Unknown variant name — use catch-all (last variant)
-                    // This handles typos and the eval_expr Ident fallback
+                    // SOUNDNESS: over-approx — unknown variant collapsed to catch-all.
+                    // Sound for safety (extra variant behaviors are conservative).
                     if let Some(last) = variants.last() {
                         return AbstractValue::Variant(last.clone());
                     }
@@ -1498,6 +1578,10 @@ fn clamp_to_domain(
                     if idx < variants.len() {
                         AbstractValue::Variant(variants[idx].clone())
                     } else {
+                        // SOUNDNESS: unsound — counter value outside enum domain
+                        // falls through as raw Counter, losing variant type safety.
+                        // Properties that reference enum variant names will not
+                        // match this state correctly.
                         value.clone()
                     }
                 } else {
@@ -1558,13 +1642,19 @@ fn make_state_name(state: &AbstractState) -> String {
 /// and transitions carry all of them as a multi-label set. This produces
 /// CTXDSL like `transition A -> B on label rd_en_T, label wr_en_F;`
 /// which is more readable than a single concatenated label.
-fn make_input_labels(input_combo: &AbstractState) -> Vec<String> {
+fn make_input_labels(
+    input_combo: &AbstractState,
+    label_overrides: &HashMap<String, String>,
+) -> Vec<String> {
     if input_combo.is_empty() {
         return vec!["tick".to_string()];
     }
     input_combo
         .iter()
-        .map(|(k, v)| format!("{}_{}", k, v.display_short()))
+        .map(|(k, v)| {
+            let label_prefix = label_overrides.get(k).unwrap_or(k);
+            format!("{}_{}", label_prefix, v.display_short())
+        })
         .collect()
 }
 
@@ -1609,7 +1699,10 @@ fn parse_reset_value(value_str: &str, reg: &RegisterInfo) -> AbstractValue {
         match reg.domain.abstraction {
             AbstractionType::Boolean => return AbstractValue::Bool(n != 0),
             AbstractionType::BoundedCounter => {
-                let bound = reg.domain.bound.unwrap_or(3);
+                let bound = reg
+                    .domain
+                    .bound
+                    .unwrap_or(crate::adapter::domain::DEFAULT_COUNTER_BOUND);
                 return AbstractValue::Counter(n.max(0).min(bound));
             }
             _ => return AbstractValue::Counter(n),

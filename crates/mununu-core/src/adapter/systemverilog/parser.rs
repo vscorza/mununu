@@ -4,7 +4,7 @@
 //! case/if-else, assignments, assign statements, and `// @mununu` comments.
 
 use super::ast::*;
-use crate::adapter::{AdapterError, AdapterErrorKind, SourceLocation};
+use crate::adapter::{AdapterError, AdapterErrorKind, AdapterWarning, SourceLocation, WarningKind};
 use std::collections::HashMap;
 
 /// Type information resolved from packages and typedefs.
@@ -35,6 +35,12 @@ struct StructLayout {
 /// Handles `package ... endpackage` blocks before the module and resolves
 /// `import pkg::*;` / `import pkg::name;` statements.
 pub fn parse(input: &str) -> Result<Module, AdapterError> {
+    let (module, _warnings) = parse_with_warnings(input)?;
+    Ok(module)
+}
+
+/// Parse SystemVerilog and return both the AST and any warnings about skipped constructs.
+pub fn parse_with_warnings(input: &str) -> Result<(Module, Vec<AdapterWarning>), AdapterError> {
     let mut parser = Parser::new(input);
 
     // Parse any packages that appear before the module.
@@ -58,7 +64,8 @@ pub fn parse(input: &str) -> Result<Module, AdapterError> {
         }
     }
 
-    parser.parse_module()
+    let module = parser.parse_module()?;
+    Ok((module, parser.warnings))
 }
 
 struct Parser<'a> {
@@ -72,6 +79,8 @@ struct Parser<'a> {
     type_scope: HashMap<String, TypeInfo>,
     /// Variables that have a struct type — used for resolving `var.field` to bit-slices.
     var_struct_types: HashMap<String, StructLayout>,
+    /// Warnings emitted during parsing for unsupported constructs.
+    warnings: Vec<AdapterWarning>,
 }
 
 /// Contents of a parsed package.
@@ -95,7 +104,23 @@ impl<'a> Parser<'a> {
             packages: HashMap::new(),
             type_scope: HashMap::new(),
             var_struct_types: HashMap::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Emit a warning about an unsupported construct being skipped.
+    fn warn_skip(&mut self, construct: &str) {
+        self.warnings.push(AdapterWarning {
+            kind: WarningKind::UnsupportedConstruct,
+            message: format!(
+                "Skipped unsupported construct '{construct}' — model is an under-approximation \
+                 of the full design at this point"
+            ),
+            location: Some(SourceLocation {
+                line: self.line,
+                column: self.col,
+            }),
+        });
     }
 
     fn remaining(&self) -> &'a str {
@@ -448,6 +473,185 @@ impl<'a> Parser<'a> {
     }
 
     /// Peek at the next identifier without advancing the parser position.
+    /// Try to parse a module instantiation: `module_type instance_name(.port(wire), ...);`
+    /// Returns None if the current position doesn't look like an instantiation.
+    fn try_parse_instantiation(
+        &mut self,
+    ) -> Result<Option<super::ast::ModuleInstantiation>, AdapterError> {
+        let saved_pos = self.pos;
+        let _saved_line = self.line;
+        let saved_col = self.col;
+
+        // Try to read: identifier identifier ( or identifier #(
+        let module_type = match self.peek_ident() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Don't consume yet — peek ahead
+        let after_type = saved_pos + module_type.len();
+        let rest = &self.input[after_type..];
+        let trimmed = rest.trim_start();
+
+        // Check if next token is an identifier (instance name) or #( (parameters)
+        let has_params = trimmed.starts_with('#');
+        let after_trim = if has_params {
+            // Skip #(...) with balanced parentheses to find instance name
+            let mut depth = 0;
+            let mut end = 0;
+            for (i, ch) in trimmed.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if end == 0 {
+                return Ok(None);
+            }
+            trimmed[end..].trim_start()
+        } else {
+            trimmed
+        };
+
+        // Check for instance name followed by (
+        let inst_name_end = after_trim
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(after_trim.len());
+        if inst_name_end == 0 {
+            return Ok(None);
+        }
+        let after_inst = after_trim[inst_name_end..].trim_start();
+        if !after_inst.starts_with('(') {
+            return Ok(None);
+        }
+
+        // Confirmed: this is a module instantiation. Now parse it properly.
+        // Consume module_type
+        self.pos = saved_pos + module_type.len();
+        self.col = saved_col + module_type.len();
+        self.skip_plain_whitespace();
+
+        // Skip optional parameter overrides #(...)
+        if self.remaining().starts_with('#') {
+            self.pos += 1;
+            self.col += 1;
+            self.skip_plain_whitespace();
+            self.skip_balanced_parens()?;
+        }
+
+        self.skip_plain_whitespace();
+
+        // Parse instance name
+        let instance_name = self.parse_ident()?;
+        self.skip_plain_whitespace();
+
+        // Parse port connection list: (.port_name(signal_name), ...)
+        self.expect_char('(')?;
+        let mut port_connections = Vec::new();
+
+        loop {
+            self.skip_whitespace_and_comments();
+            if self.remaining().starts_with(')') {
+                self.pos += 1;
+                self.col += 1;
+                break;
+            }
+
+            // Expect .port_name(signal_name) or .port_name() for unconnected
+            if self.remaining().starts_with('.') {
+                self.pos += 1;
+                self.col += 1;
+                let port_name = self.parse_ident()?;
+                self.skip_plain_whitespace();
+                self.expect_char('(')?;
+                self.skip_plain_whitespace();
+                // Handle empty connection: .port_name()
+                if self.remaining().starts_with(')') {
+                    self.pos += 1;
+                    self.col += 1;
+                    // Unconnected port — skip
+                } else {
+                    let signal_name = self.parse_ident()?;
+                    self.skip_plain_whitespace();
+                    self.expect_char(')')?;
+                    port_connections.push(super::ast::PortConnection {
+                        port_name,
+                        signal_name,
+                    });
+                }
+            } else {
+                // Skip positional connection or unknown syntax
+                self.skip_to_char_or_end(',', ')');
+            }
+
+            self.skip_plain_whitespace();
+            if self.remaining().starts_with(',') {
+                self.pos += 1;
+                self.col += 1;
+            }
+        }
+
+        // Expect semicolon
+        self.skip_plain_whitespace();
+        if self.remaining().starts_with(';') {
+            self.pos += 1;
+            self.col += 1;
+        }
+
+        Ok(Some(super::ast::ModuleInstantiation {
+            module_type,
+            instance_name,
+            port_connections,
+        }))
+    }
+
+    /// Skip balanced parentheses (consumes from opening `(` to matching `)`).
+    fn skip_balanced_parens(&mut self) -> Result<(), AdapterError> {
+        if !self.remaining().starts_with('(') {
+            return Ok(());
+        }
+        self.pos += 1;
+        self.col += 1;
+        let mut depth = 1;
+        while depth > 0 && self.pos < self.input.len() {
+            match self.input.as_bytes()[self.pos] as char {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '\n' => {
+                    self.line += 1;
+                    self.col = 0;
+                }
+                _ => {}
+            }
+            self.pos += 1;
+            self.col += 1;
+        }
+        Ok(())
+    }
+
+    /// Skip characters until reaching `target` or `alt` (doesn't consume the target).
+    fn skip_to_char_or_end(&mut self, target: char, alt: char) {
+        while self.pos < self.input.len() {
+            let ch = self.input.as_bytes()[self.pos] as char;
+            if ch == target || ch == alt {
+                return;
+            }
+            if ch == '\n' {
+                self.line += 1;
+                self.col = 0;
+            }
+            self.pos += 1;
+            self.col += 1;
+        }
+    }
+
     fn peek_ident(&self) -> Option<String> {
         let remaining = self.remaining();
         let start = 0;
@@ -525,6 +729,7 @@ impl<'a> Parser<'a> {
                 }
             } else {
                 // Skip unknown constructs inside package
+                self.warn_skip("unknown package-level construct");
                 self.skip_to_semicolon_or_end()?;
             }
         }
@@ -562,6 +767,7 @@ impl<'a> Parser<'a> {
         let mut declarations = Vec::new();
         let mut always_blocks = Vec::new();
         let mut assigns = Vec::new();
+        let mut instantiations = Vec::new();
 
         loop {
             let anns = self.skip_whitespace_and_comments();
@@ -590,8 +796,11 @@ impl<'a> Parser<'a> {
             } else if let Some(decl) = self.try_parse_typed_var_from_scope()? {
                 // Handle variable declarations using imported/typedef'd types
                 declarations.push(decl);
+            } else if let Some(inst) = self.try_parse_instantiation()? {
+                instantiations.push(inst);
             } else {
                 // Skip unknown constructs until semicolon or block end
+                self.warn_skip("unknown module-level construct");
                 self.skip_to_semicolon_or_end()?;
             }
         }
@@ -627,6 +836,7 @@ impl<'a> Parser<'a> {
             controllable_signals,
             input_signals,
             force_kripke,
+            instantiations,
         })
     }
 
@@ -736,6 +946,7 @@ impl<'a> Parser<'a> {
         self.skip_whitespace_and_comments();
         if self.remaining().starts_with('$') {
             // Skip function call like $clog2(N) — treat as unknown
+            self.warn_skip("system function call in parameter initialization");
             self.skip_to_semicolon_or_end()?;
             return Ok(None);
         }
@@ -1065,7 +1276,8 @@ impl<'a> Parser<'a> {
                 self.expect_char(';')?;
                 Ok(Statement::BlockingAssign { target, value })
             } else {
-                // Skip to semicolon
+                // Skip unparseable assignment statement
+                self.warn_skip("unparseable assignment or compound operator");
                 self.skip_to_semicolon_or_end()?;
                 Ok(Statement::Block(vec![]))
             }

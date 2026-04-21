@@ -154,6 +154,218 @@ pub mod engine {
         results
     }
 
+    /// Discover significant values for signals shared across module boundaries.
+    ///
+    /// For each connection with `abstraction: "discover"`, this function:
+    /// 1. Collects guard expressions from ALL modules that reference the signal
+    /// 2. Runs SMT discovery on the combined guard set
+    /// 3. Returns results keyed by `"module.port"` (matching the multi-module sidecar format)
+    ///
+    /// This ensures both sides of a connection use the same discovered domain.
+    pub fn discover_cross_module_values(
+        modules: &[(&Module, &str)], // (parsed module, module name)
+        connections: &[super::super::annotation::ConnectionSpec],
+        parameters: &HashMap<String, HashMap<String, i64>>, // module_name -> param overrides
+    ) -> HashMap<String, DiscoveredValues> {
+        use super::super::annotation::SignalAbstraction;
+        let mut results = HashMap::new();
+
+        for conn in connections {
+            if conn.abstraction != SignalAbstraction::Discover {
+                continue;
+            }
+
+            let (from_mod, from_port) = match conn.parse_from() {
+                Some(v) => v,
+                None => continue,
+            };
+            let (to_mod, to_port) = match conn.parse_to() {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Collect guards from all modules that reference this signal
+            let mut all_guards: Vec<GuardExpr> = Vec::new();
+            let mut combined_comb_defs: HashMap<String, Expr> = HashMap::new();
+            let mut combined_widths: HashMap<String, u32> = HashMap::new();
+            let mut target_width: u32 = 32;
+
+            for (module, mod_name) in modules {
+                // Determine the local signal name for this module
+                let local_name = if *mod_name == from_mod {
+                    from_port
+                } else if *mod_name == to_mod {
+                    to_port
+                } else {
+                    continue;
+                };
+
+                let mut comb_defs = collect_comb_definitions(module);
+                let guards = collect_guard_exprs(module);
+                let widths = collect_signal_widths(module);
+
+                // Inject parameters
+                for param in &module.parameters {
+                    comb_defs
+                        .entry(param.name.clone())
+                        .or_insert(Expr::Number(param.default_value));
+                }
+                if let Some(params) = parameters.get(*mod_name) {
+                    for (name, value) in params {
+                        comb_defs.insert(name.clone(), Expr::Number(*value));
+                    }
+                }
+
+                // Find guards that reference the local signal name
+                for guard in guards {
+                    let deps = collect_expr_deps(&guard.expr, &comb_defs);
+                    if deps.contains(local_name) {
+                        // Rename the local signal to the canonical connection name
+                        let renamed_expr =
+                            rename_signal_in_expr(&guard.expr, local_name, from_port);
+                        all_guards.push(GuardExpr {
+                            expr: renamed_expr,
+                            line: guard.line,
+                        });
+                    }
+                }
+
+                if let Some(w) = widths.get(local_name) {
+                    target_width = *w;
+                }
+                // Merge comb defs (rename local signal → canonical name)
+                for (k, v) in comb_defs {
+                    if k == local_name && *mod_name != from_mod {
+                        combined_comb_defs.insert(from_port.to_string(), v);
+                    } else {
+                        combined_comb_defs.entry(k).or_insert(v);
+                    }
+                }
+                for (k, v) in widths {
+                    combined_widths.entry(k).or_insert(v);
+                }
+            }
+
+            if all_guards.is_empty() {
+                continue;
+            }
+
+            // Run SMT discovery on the combined guard set
+            let guard_exprs: Vec<(Expr, usize)> = all_guards
+                .iter()
+                .map(|g| (g.expr.clone(), g.line))
+                .collect();
+            let sig_name = from_port.to_string();
+            let width = target_width;
+            let comb_defs_for_z3 = combined_comb_defs.clone();
+            let widths_for_z3 = combined_widths.clone();
+
+            let cfg = z3::Config::new();
+            let smt_values: Vec<(i64, String)> = z3::with_z3_config(&cfg, move || {
+                let mut found = Vec::new();
+                for (guard_expr, line) in &guard_exprs {
+                    let solver = z3::Solver::new();
+                    let mut variables: HashMap<String, z3::ast::BV> = HashMap::new();
+
+                    let formula = expr_to_z3(
+                        guard_expr,
+                        &mut variables,
+                        &comb_defs_for_z3,
+                        &widths_for_z3,
+                        width,
+                    );
+
+                    let zero = z3::ast::BV::from_i64(0, formula.get_size());
+                    solver.assert(&formula.eq(&zero).not());
+
+                    let target_var = match variables.get(sig_name.as_str()) {
+                        Some(v) => v.clone(),
+                        None => continue,
+                    };
+
+                    let values = enumerate_values(&solver, &target_var, MAX_VALUES_PER_SIGNAL);
+                    for val in values {
+                        if !found.iter().any(|(v, _): &(i64, String)| *v == val) {
+                            let provenance = format!(
+                                "SMT: cross-module guard ({}) at line {}",
+                                expr_to_short_string(guard_expr),
+                                line
+                            );
+                            found.push((val, provenance));
+                        }
+                    }
+                }
+                found
+            });
+
+            if !smt_values.is_empty() {
+                let mut all_values = smt_values;
+                all_values.sort_by_key(|(v, _)| *v);
+                let discovered = DiscoveredValues {
+                    values: all_values
+                        .iter()
+                        .map(|(val, from)| DiscoveredValue {
+                            value: *val,
+                            name: format!("VAL_{val}"),
+                            from: Some(from.clone()),
+                        })
+                        .collect(),
+                    catch_all: "OTHER".to_string(),
+                };
+                let key = format!("{from_mod}.{from_port}");
+                results.insert(key, discovered);
+            }
+        }
+
+        results
+    }
+
+    /// Rename a signal identifier in an expression tree.
+    fn rename_signal_in_expr(expr: &Expr, old_name: &str, new_name: &str) -> Expr {
+        match expr {
+            Expr::Ident(name) => {
+                if name == old_name {
+                    Expr::Ident(new_name.to_string())
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::BinOp { op, left, right } => Expr::BinOp {
+                op: *op,
+                left: Box::new(rename_signal_in_expr(left, old_name, new_name)),
+                right: Box::new(rename_signal_in_expr(right, old_name, new_name)),
+            },
+            Expr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+            } => Expr::Ternary {
+                cond: Box::new(rename_signal_in_expr(cond, old_name, new_name)),
+                then_expr: Box::new(rename_signal_in_expr(then_expr, old_name, new_name)),
+                else_expr: Box::new(rename_signal_in_expr(else_expr, old_name, new_name)),
+            },
+            Expr::Not(inner) => {
+                Expr::Not(Box::new(rename_signal_in_expr(inner, old_name, new_name)))
+            }
+            Expr::BitSelect { base, index } => Expr::BitSelect {
+                base: Box::new(rename_signal_in_expr(base, old_name, new_name)),
+                index: Box::new(rename_signal_in_expr(index, old_name, new_name)),
+            },
+            Expr::BitSlice { base, msb, lsb } => Expr::BitSlice {
+                base: Box::new(rename_signal_in_expr(base, old_name, new_name)),
+                msb: Box::new(rename_signal_in_expr(msb, old_name, new_name)),
+                lsb: Box::new(rename_signal_in_expr(lsb, old_name, new_name)),
+            },
+            Expr::Concat(parts) => Expr::Concat(
+                parts
+                    .iter()
+                    .map(|p| rename_signal_in_expr(p, old_name, new_name))
+                    .collect(),
+            ),
+            _ => expr.clone(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Guard expression collection
     // -----------------------------------------------------------------------
@@ -233,7 +445,7 @@ pub mod engine {
     fn collect_comb_definitions(module: &Module) -> HashMap<String, Expr> {
         let mut defs = HashMap::new();
         for a in &module.assigns {
-            defs.insert(a.target.clone(), a.value.clone());
+            defs.insert(a.target.name().to_string(), a.value.clone());
         }
         for block in &module.always_blocks {
             if let AlwaysBlock::AlwaysComb { body } = block {
@@ -246,7 +458,7 @@ pub mod engine {
     fn collect_comb_defs_from_stmt(stmt: &Statement, defs: &mut HashMap<String, Expr>) {
         match stmt {
             Statement::BlockingAssign { target, value } => {
-                defs.insert(target.clone(), value.clone());
+                defs.insert(target.name().to_string(), value.clone());
             }
             Statement::Block(stmts) => {
                 for s in stmts {

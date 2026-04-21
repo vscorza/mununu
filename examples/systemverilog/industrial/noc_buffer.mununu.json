@@ -1,0 +1,51 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "noc_buffer",
+  "source": "noc_buffer.sv",
+  "signals": [
+    {
+      "name": "count",
+      "abstraction": "bounded_counter",
+      "bound": 7,
+      "note": "small register — bounded counter"
+    },
+    {
+      "name": "credit_avail",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "combinational output (assign-driven)"
+    },
+    {
+      "name": "full",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "combinational output (assign-driven)"
+    },
+    {
+      "name": "empty",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "combinational output (assign-driven)"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "push",
+      "abstraction": "boolean"
+    },
+    {
+      "name": "pop",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)",
+      "description": "No deadlock — all states have successors"
+    }
+  ],
+  "parameters": {
+    "DEPTH": 4
+  }
+}
