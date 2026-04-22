@@ -292,10 +292,41 @@ pub async fn context_import_handler(
         "aiger" => crate::adapter::aiger::AigerAdapter::translate(&request.content, &options),
         "promela" => crate::adapter::promela::PromelaAdapter::translate(&request.content, &options),
         "xstate" => crate::adapter::xstate::XStateAdapter::translate(&request.content, &options),
-        "systemverilog" | "sv" => crate::adapter::systemverilog::SystemVerilogAdapter::translate(
-            &request.content,
-            &options,
-        ),
+        "systemverilog" | "sv" => {
+            // Check if a multi-module sidecar is provided
+            if let Some(ref sidecar_json) = request.sidecar {
+                let is_multi = sidecar_json.contains("mununu_sv_multi_v1")
+                    || sidecar_json.contains("\"modules\"");
+                if is_multi && !request.additional_sources.is_empty() {
+                    // Multi-module path: build source map and use in-memory composition
+                    let mut sources = std::collections::HashMap::new();
+                    // The primary source might be the top module; sub-modules come from additional_sources
+                    sources.insert(
+                        request.filename.clone().unwrap_or_default(),
+                        request.content.clone(),
+                    );
+                    for src in &request.additional_sources {
+                        sources.insert(src.name.clone(), src.content.clone());
+                    }
+                    crate::adapter::systemverilog::SystemVerilogAdapter::translate_multi_module_content(
+                        sidecar_json,
+                        &sources,
+                        &options,
+                    )
+                } else {
+                    // Single-module with sidecar (future: pass sidecar to translate)
+                    crate::adapter::systemverilog::SystemVerilogAdapter::translate(
+                        &request.content,
+                        &options,
+                    )
+                }
+            } else {
+                crate::adapter::systemverilog::SystemVerilogAdapter::translate(
+                    &request.content,
+                    &options,
+                )
+            }
+        }
         "extraction" | "espec" => {
             let mut opts = options.clone();
             opts.mode = Some("vulnerable".to_string());

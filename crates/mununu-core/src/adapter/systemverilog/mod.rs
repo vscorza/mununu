@@ -320,6 +320,194 @@ impl SystemVerilogAdapter {
             state_valuations: all_state_valuations,
         })
     }
+
+    /// Translate a multi-module sidecar into a composed AdapterOutput (in-memory).
+    ///
+    /// Like [`translate_multi_module`] but takes the sidecar JSON and source
+    /// contents directly — no filesystem access. Used by the API endpoint.
+    ///
+    /// `sources` maps source filenames (matching the sidecar's `"source"` fields)
+    /// to their content strings.
+    pub fn translate_multi_module_content(
+        sidecar_json: &str,
+        sources: &std::collections::HashMap<String, String>,
+        options: &AdapterOptions,
+    ) -> Result<AdapterOutput, AdapterError> {
+        let ann: annotation::MultiModuleSvAnnotation =
+            serde_json::from_str(sidecar_json).map_err(|e| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!("Failed to parse multi-module sidecar: {e}"),
+                location: None,
+            })?;
+
+        let mut all_automata: Vec<AutomatonSpec> = Vec::new();
+        let mut all_warnings: Vec<AdapterWarning> = Vec::new();
+        let mut all_state_valuations = std::collections::HashMap::new();
+        let mut total_state_count = 0usize;
+        let mut total_signal_count = 0usize;
+
+        // Phase 1: Build each module's Kripke automaton
+        for module_entry in &ann.modules {
+            let sv_content = sources
+                .get(&module_entry.source)
+                .ok_or_else(|| AdapterError {
+                    kind: AdapterErrorKind::ParseError,
+                    message: format!(
+                        "Source file '{}' for module '{}' not provided",
+                        module_entry.source, module_entry.name
+                    ),
+                    location: None,
+                })?;
+
+            let (module, mut parse_warnings) =
+                parser::parse_with_warnings(sv_content).map_err(|e| AdapterError {
+                    kind: e.kind,
+                    message: format!("in module '{}': {}", module_entry.name, e.message),
+                    location: e.location,
+                })?;
+
+            all_warnings.append(&mut parse_warnings);
+
+            if module.name != module_entry.name {
+                all_warnings.push(AdapterWarning {
+                    kind: super::WarningKind::UnsupportedConstruct,
+                    message: format!(
+                        "sidecar module name '{}' does not match SV module '{}' in '{}'",
+                        module_entry.name, module.name, module_entry.source
+                    ),
+                    location: None,
+                });
+            }
+
+            let per_module_ann = build_per_module_annotation(module_entry, &ann);
+            let config = annotation::merge_config(Some(&per_module_ann), &module);
+
+            let (automaton, _module_properties, state_count) =
+                kripke::build_kripke_with_config(&module, &config, &mut all_warnings)?;
+
+            let mut automaton = AutomatonSpec {
+                name: module_entry.name.clone(),
+                ..automaton
+            };
+
+            annotate_driving_output_labels(
+                &mut automaton,
+                &module_entry.name,
+                &ann.connections,
+                &module,
+            );
+
+            let ir_for_valuations = AdapterIR {
+                metadata: Metadata {
+                    title: module_entry.name.clone(),
+                    source_format: SourceFormat::SystemVerilog,
+                    description: None,
+                    game_semantics: None,
+                    known_status: None,
+                },
+                signals: vec![],
+                automata: vec![automaton.clone()],
+                compositions: vec![],
+                properties: vec![],
+                controller: None,
+            };
+            let valuations = crate::adapter::emit::extract_state_valuations(&ir_for_valuations);
+            for (k, v) in valuations {
+                all_state_valuations.insert(k, v);
+            }
+
+            total_state_count += state_count;
+            total_signal_count += module.ports.len();
+            all_automata.push(automaton);
+        }
+
+        // Phase 2: Composition
+        let comp_config = ann.composition.as_ref();
+        let comp_name = comp_config
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "system".to_string());
+        let comp_mode = comp_config
+            .map(|c| c.mode.as_str())
+            .unwrap_or("synchronous");
+
+        let member_names: Vec<String> = ann.modules.iter().map(|m| m.name.clone()).collect();
+        let composition = match comp_mode {
+            "asynchronous" => super::ir::CompositionSpec::Asynchronous {
+                name: comp_name.clone(),
+                members: member_names,
+            },
+            _ => super::ir::CompositionSpec::Synchronous {
+                name: comp_name.clone(),
+                members: member_names,
+            },
+        };
+
+        // Phase 3: Properties
+        let properties: Vec<PropertySpec> = ann
+            .properties
+            .iter()
+            .map(|p| {
+                let role = match p.role.as_str() {
+                    "assumption" => PropertyRole::Assumption,
+                    "standalone" => PropertyRole::Standalone,
+                    _ => PropertyRole::Guarantee,
+                };
+                PropertySpec {
+                    name: p.id.clone(),
+                    kind: PropertyKind::Safety,
+                    formula: PropertyFormula::MuCalculus(p.formula.clone()),
+                    role,
+                    over: Some(comp_name.clone()),
+                }
+            })
+            .collect();
+
+        let property_count = properties.len();
+        let controller = properties.first().map(|p| ControllerSpec {
+            name: "synth".to_string(),
+            source_automaton: comp_name.clone(),
+            formula_name: p.name.clone(),
+        });
+
+        let context_name = options.context_name.as_deref().unwrap_or(&comp_name);
+
+        let ir = AdapterIR {
+            metadata: Metadata {
+                title: context_name.to_string(),
+                source_format: SourceFormat::SystemVerilog,
+                description: Some(format!(
+                    "Multi-module composition of {} SystemVerilog modules",
+                    ann.modules.len()
+                )),
+                game_semantics: None,
+                known_status: None,
+            },
+            signals: vec![],
+            automata: all_automata,
+            compositions: vec![composition],
+            properties,
+            controller,
+        };
+
+        let result = crate::adapter::emit::emit(&ir).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::EmitError,
+            message: format!("CTXDSL emission failed: {e}"),
+            location: None,
+        })?;
+
+        Ok(AdapterOutput {
+            ctxdsl: result.ctxdsl,
+            warnings: all_warnings,
+            source_info: SourceInfo {
+                format: SourceFormat::SystemVerilog,
+                title: Some(context_name.to_string()),
+                signal_count: total_signal_count,
+                state_count: total_state_count,
+                property_count,
+            },
+            state_valuations: all_state_valuations,
+        })
+    }
 }
 
 /// Annotate transitions of a driving module with shared output labels.
