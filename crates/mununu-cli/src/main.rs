@@ -886,7 +886,7 @@ fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
             }
 
             // Merge into the annotation, preserving user-given names
-            merge_discovered_values(&mut annotation.discovered_values, results);
+            sv_annotation::merge_discovered_values(&mut annotation.discovered_values, results);
         }
 
         // Write the updated sidecar
@@ -1040,7 +1040,7 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
                 let Some(entry) = ann.modules.iter_mut().find(|m| m.name == *mod_name) else {
                     continue;
                 };
-                merge_discovered_values(&mut entry.discovered_values, results);
+                sv_annotation::merge_discovered_values(&mut entry.discovered_values, results);
             }
         }
 
@@ -1075,7 +1075,7 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
                 }
             }
             // Merge into top-level discovered_values
-            merge_discovered_values(&mut ann.discovered_values, cross_results);
+            sv_annotation::merge_discovered_values(&mut ann.discovered_values, cross_results);
         }
 
         // Write updated sidecar
