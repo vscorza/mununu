@@ -1,0 +1,158 @@
+{
+  "$schema": "extraction_spec_v1",
+  "source": {
+    "file": "combat_system.gd",
+    "class": "CombatSystem"
+  },
+  "state_fields": [
+    {
+      "id": "player_action",
+      "field": "action_state",
+      "type": "enum",
+      "initial": "IDLE",
+      "abstraction": {
+        "source_type": "enum ActionState",
+        "model_type": "5 explicit variants",
+        "soundness": "exact"
+      }
+    },
+    {
+      "id": "health",
+      "field": "health",
+      "type": "bounded_counter",
+      "initial": "Healthy",
+      "abstraction": {
+        "source_type": "int (0..100)",
+        "model_type": "4-band bounded counter: Healthy (76-100), Wounded (26-75), Critical (1-25), Dead (0)",
+        "soundness": "over-approximation: collapses continuous range into 4 bands",
+        "validated": true,
+        "validation_scenario": "Damage of 30 from Healthy reaches Wounded; damage of 80 from Healthy reaches Critical"
+      }
+    },
+    {
+      "id": "enemy_count",
+      "field": "active_enemies",
+      "type": "bounded_counter",
+      "initial": "None",
+      "abstraction": {
+        "source_type": "Array[Enemy].size()",
+        "model_type": "3-band bounded counter: None (0), Active (1-2), Overwhelmed (3+)",
+        "soundness": "over-approximation: treats 3+ as equivalent"
+      }
+    }
+  ],
+  "model_config": {
+    "context_name": "CombatSystem",
+    "controllable_labels": ["ev_spawn_enemy", "ev_grant_powerup"],
+    "uncontrollable_labels": [
+      "ev_attack", "ev_block", "ev_dodge", "ev_get_hit", "ev_stun_end",
+      "ev_enemy_appear", "ev_enemy_defeat",
+      "noop"
+    ],
+    "automata": [
+      {
+        "id": "PlayerAction",
+        "note": "Player combat action state machine",
+        "states": [
+          { "name": "Idle", "initial": true },
+          { "name": "Attacking" },
+          { "name": "Blocking" },
+          { "name": "Dodging" },
+          { "name": "Stunned" }
+        ],
+        "controllable_labels": [],
+        "transitions": [
+          { "from": "Idle", "to": "Attacking", "label": "ev_attack" },
+          { "from": "Idle", "to": "Blocking", "label": "ev_block" },
+          { "from": "Idle", "to": "Dodging", "label": "ev_dodge" },
+          { "from": "Attacking", "to": "Idle", "label": "ev_attack" },
+          { "from": "Blocking", "to": "Idle", "label": "ev_block" },
+          { "from": "Dodging", "to": "Idle", "label": "ev_dodge" },
+          { "from": "Idle", "to": "Stunned", "label": "ev_get_hit" },
+          { "from": "Attacking", "to": "Stunned", "label": "ev_get_hit" },
+          { "from": "Blocking", "to": "Blocking", "label": "ev_get_hit", "comment": "block absorbs hit" },
+          { "from": "Stunned", "to": "Idle", "label": "ev_stun_end" },
+          { "from": "Idle", "to": "Idle", "label": "noop" },
+          { "from": "Attacking", "to": "Attacking", "label": "noop" },
+          { "from": "Blocking", "to": "Blocking", "label": "noop" },
+          { "from": "Dodging", "to": "Dodging", "label": "noop" },
+          { "from": "Stunned", "to": "Stunned", "label": "noop" }
+        ]
+      },
+      {
+        "id": "HealthLevel",
+        "note": "Bounded counter abstraction of player health (int 0..100)",
+        "fields": ["health"],
+        "states": [
+          { "name": "Healthy", "initial": true },
+          { "name": "Wounded" },
+          { "name": "Critical" },
+          { "name": "Dead" }
+        ],
+        "controllable_labels": ["ev_grant_powerup"],
+        "transitions": [
+          { "from": "Healthy", "to": "Wounded", "label": "ev_get_hit" },
+          { "from": "Wounded", "to": "Critical", "label": "ev_get_hit" },
+          { "from": "Critical", "to": "Dead", "label": "ev_get_hit" },
+          { "from": "Wounded", "to": "Healthy", "label": "ev_grant_powerup" },
+          { "from": "Critical", "to": "Wounded", "label": "ev_grant_powerup" },
+          { "from": "Healthy", "to": "Healthy", "label": "ev_attack" },
+          { "from": "Healthy", "to": "Healthy", "label": "ev_block" },
+          { "from": "Healthy", "to": "Healthy", "label": "ev_dodge" },
+          { "from": "Wounded", "to": "Wounded", "label": "ev_attack" },
+          { "from": "Critical", "to": "Critical", "label": "ev_attack" },
+          { "from": "Healthy", "to": "Healthy", "label": "noop" },
+          { "from": "Wounded", "to": "Wounded", "label": "noop" },
+          { "from": "Critical", "to": "Critical", "label": "noop" },
+          { "from": "Dead", "to": "Dead", "label": "noop" }
+        ]
+      },
+      {
+        "id": "EnemyPresence",
+        "note": "Bounded counter abstraction of enemy count",
+        "fields": ["enemy_count"],
+        "states": [
+          { "name": "NoEnemies", "initial": true },
+          { "name": "Active" },
+          { "name": "Overwhelmed" }
+        ],
+        "controllable_labels": ["ev_spawn_enemy"],
+        "transitions": [
+          { "from": "NoEnemies", "to": "Active", "label": "ev_enemy_appear" },
+          { "from": "Active", "to": "Overwhelmed", "label": "ev_enemy_appear" },
+          { "from": "Overwhelmed", "to": "Overwhelmed", "label": "ev_enemy_appear" },
+          { "from": "Active", "to": "NoEnemies", "label": "ev_enemy_defeat" },
+          { "from": "Overwhelmed", "to": "Active", "label": "ev_enemy_defeat" },
+          { "from": "NoEnemies", "to": "NoEnemies", "label": "noop" },
+          { "from": "Active", "to": "Active", "label": "noop" },
+          { "from": "Overwhelmed", "to": "Overwhelmed", "label": "noop" }
+        ]
+      }
+    ],
+    "composition": {
+      "type": "asynchronous",
+      "name": "CombatWorld",
+      "members": ["PlayerAction", "HealthLevel", "EnemyPresence"]
+    },
+    "properties": [
+      {
+        "id": "no_combat_deadlock",
+        "description": "No composed state is a dead end",
+        "template_ref": { "template": "no_deadlock" },
+        "over": "CombatWorld"
+      },
+      {
+        "id": "dead_blocks_attack",
+        "description": "Cannot attack while dead — Dead and Attacking never co-occur",
+        "template_ref": { "template": "mutual_exclusion", "args": { "A": "Dead", "B": "Attacking" } },
+        "over": "CombatWorld"
+      },
+      {
+        "id": "can_recover",
+        "description": "Idle + Healthy is reachable from any state (recovery possible)",
+        "formula": "mu X. ((Idle && Healthy) || <> X)",
+        "over": "CombatWorld"
+      }
+    ]
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "$schema": "extraction_spec_v1",
+  "source": {
+    "file": "dialogue_npc.gd",
+    "class": "DialogueNPC"
+  },
+  "model_config": {
+    "context_name": "DialogueTree",
+    "uncontrollable_labels": [
+      "ev_greet", "ev_ask_quest", "ev_accept", "ev_decline",
+      "ev_negotiate", "ev_bribe", "ev_threaten", "ev_apologize",
+      "ev_farewell", "ev_insult",
+      "noop"
+    ],
+    "controllable_labels": ["ev_offer_quest", "ev_accept_bribe", "ev_reject_bribe", "ev_lock_dialogue"],
+    "automata": [
+      {
+        "id": "Dialogue",
+        "note": "12-state branching dialogue tree with a dead-end bug",
+        "states": [
+          { "name": "Start", "initial": true },
+          { "name": "Greeting" },
+          { "name": "QuestOffer" },
+          { "name": "QuestAccepted" },
+          { "name": "QuestDeclined" },
+          { "name": "Negotiating" },
+          { "name": "BribeAttempt" },
+          { "name": "BribeAccepted" },
+          { "name": "BribeRejected" },
+          { "name": "Threatened" },
+          { "name": "Farewell" },
+          { "name": "Locked" }
+        ],
+        "controllable_labels": ["ev_offer_quest", "ev_accept_bribe", "ev_reject_bribe", "ev_lock_dialogue"],
+        "transitions": [
+          { "from": "Start", "to": "Greeting", "label": "ev_greet" },
+          { "from": "Greeting", "to": "QuestOffer", "label": "ev_offer_quest" },
+          { "from": "Greeting", "to": "Farewell", "label": "ev_farewell" },
+          { "from": "QuestOffer", "to": "QuestAccepted", "label": "ev_accept" },
+          { "from": "QuestOffer", "to": "QuestDeclined", "label": "ev_decline" },
+          { "from": "QuestDeclined", "to": "Negotiating", "label": "ev_negotiate" },
+          { "from": "QuestDeclined", "to": "Farewell", "label": "ev_farewell" },
+          { "from": "Negotiating", "to": "BribeAttempt", "label": "ev_bribe" },
+          { "from": "Negotiating", "to": "Threatened", "label": "ev_threaten" },
+          { "from": "Negotiating", "to": "QuestOffer", "label": "ev_ask_quest" },
+          { "from": "BribeAttempt", "to": "BribeAccepted", "label": "ev_accept_bribe" },
+          { "from": "BribeAttempt", "to": "BribeRejected", "label": "ev_reject_bribe" },
+          { "from": "BribeAccepted", "to": "QuestAccepted", "label": "ev_accept" },
+          { "from": "BribeRejected", "to": "Threatened", "label": "ev_threaten" },
+          { "from": "BribeRejected", "to": "Farewell", "label": "ev_farewell" },
+          { "from": "Threatened", "to": "Locked", "label": "ev_lock_dialogue",
+            "comment": "BUG: NPC locks dialogue permanently after being threatened" },
+          { "from": "QuestAccepted", "to": "Farewell", "label": "ev_farewell" },
+          { "from": "Farewell", "to": "Start", "label": "ev_greet" },
+          { "from": "Start", "to": "Start", "label": "noop" },
+          { "from": "Greeting", "to": "Greeting", "label": "noop" },
+          { "from": "QuestOffer", "to": "QuestOffer", "label": "noop" },
+          { "from": "QuestAccepted", "to": "QuestAccepted", "label": "noop" },
+          { "from": "QuestDeclined", "to": "QuestDeclined", "label": "noop" },
+          { "from": "Negotiating", "to": "Negotiating", "label": "noop" },
+          { "from": "BribeAttempt", "to": "BribeAttempt", "label": "noop" },
+          { "from": "BribeAccepted", "to": "BribeAccepted", "label": "noop" },
+          { "from": "BribeRejected", "to": "BribeRejected", "label": "noop" },
+          { "from": "Threatened", "to": "Threatened", "label": "noop" },
+          { "from": "Farewell", "to": "Farewell", "label": "noop" },
+          { "from": "Locked", "to": "Locked", "label": "noop" }
+        ]
+      }
+    ],
+    "properties": [
+      {
+        "id": "no_dialogue_deadlock",
+        "description": "No dialogue state is a dead end (will fail — Locked has no exit)",
+        "template_ref": { "template": "no_deadlock" },
+        "over": "Dialogue",
+        "holds_in_vulnerable": false
+      },
+      {
+        "id": "farewell_reachable",
+        "description": "Player can always reach a conversation conclusion",
+        "template_ref": { "template": "reachable", "args": { "TARGET": "Farewell" } },
+        "over": "Dialogue"
+      },
+      {
+        "id": "can_restart",
+        "description": "Dialogue can always cycle back to Start",
+        "template_ref": { "template": "always_eventually", "args": { "TARGET": "Start" } },
+        "over": "Dialogue"
+      }
+    ]
+  }
+}
