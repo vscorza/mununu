@@ -242,6 +242,12 @@ pub struct PropertyDef {
     pub formula: Option<String>,
     /// Formula template (alternative name, for backward compat with existing specs).
     pub formula_template: Option<String>,
+    /// Reference to a property template from the template catalog.
+    /// When present, the template is instantiated with the given args to produce
+    /// a mu-calculus formula. If both `formula` and `template_ref` are present,
+    /// `formula` takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_ref: Option<crate::adapter::templates::TemplateRef>,
     /// "over" target automaton or composition name.
     pub over: Option<String>,
     /// Expected verdict in "fixed" mode.
@@ -252,6 +258,9 @@ pub struct PropertyDef {
 
 impl PropertyDef {
     /// Get the formula string, preferring `formula` over `formula_template`.
+    ///
+    /// Does not resolve `template_ref` — callers should use
+    /// [`resolve_formula`] for template-aware resolution.
     pub fn formula_str(&self) -> Option<&str> {
         self.formula.as_deref().or(self.formula_template.as_deref())
     }

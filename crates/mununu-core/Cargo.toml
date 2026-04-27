@@ -29,6 +29,7 @@ tree-sitter = { version = "0.24", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-python = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.23", optional = true }
+tree-sitter-gdscript = { version = "6", optional = true }
 
 # SMT solver (optional — z3 for value discovery in RTL verification)
 z3 = { version = "0.20", optional = true, features = ["bundled"] }
@@ -42,7 +43,7 @@ itoa = "1.0"
 [features]
 default = []
 api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tracing"]
-ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust"]
+ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust", "dep:tree-sitter-gdscript"]
 smt = ["dep:z3"]
 syntcomp = []
 

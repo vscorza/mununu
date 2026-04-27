@@ -134,21 +134,42 @@ fn to_ir(
         None => vec![],
     };
 
-    // Build properties
-    let properties: Vec<PropertySpec> = config
-        .properties
-        .iter()
-        .filter_map(|def| {
-            let formula_str = def.formula_str()?;
-            Some(PropertySpec {
+    // Build properties (raw formula takes precedence; template_ref used as fallback)
+    let template_registry = super::templates::TemplateRegistry::builtin();
+    let mut properties: Vec<PropertySpec> = Vec::new();
+    for def in &config.properties {
+        if let Some(formula_str) = def.formula_str() {
+            // Raw formula provided — use directly
+            properties.push(PropertySpec {
                 name: def.id.clone(),
                 kind: PropertyKind::Safety,
                 formula: PropertyFormula::MuCalculus(formula_str.to_string()),
                 role: PropertyRole::Standalone,
                 over: def.over.clone(),
-            })
-        })
-        .collect();
+            });
+        } else if let Some(tref) = &def.template_ref {
+            // Resolve template reference
+            match template_registry.instantiate(tref) {
+                Ok(inst) => {
+                    properties.push(PropertySpec {
+                        name: def.id.clone(),
+                        kind: inst.kind,
+                        formula: PropertyFormula::MuCalculus(inst.formula),
+                        role: inst.role,
+                        over: def.over.clone(),
+                    });
+                }
+                Err(e) => {
+                    warnings.push(AdapterWarning {
+                        kind: WarningKind::ApproximateTranslation,
+                        message: format!("Property '{}': template resolution failed: {e}", def.id),
+                        location: None,
+                    });
+                }
+            }
+        }
+        // If neither formula nor template_ref: skip silently (existing behavior)
+    }
 
     // Build controller(s)
     let controller = config.controllers.first().map(|def| ControllerSpec {
@@ -591,5 +612,111 @@ mod tests {
         assert!(output.ctxdsl.contains("// @mode: vulnerable"));
         assert!(output.ctxdsl.contains("// @cve: CVE-2026-99999"));
         assert!(output.ctxdsl.contains("// @bug: bug1"));
+    }
+
+    #[test]
+    fn template_ref_resolves_to_formula() {
+        let json = r#"{
+            "$schema": "extraction_spec_v1",
+            "source": {},
+            "model_config": {
+                "context_name": "template_test",
+                "automata": [{
+                    "id": "FSM",
+                    "states": [
+                        {"name": "Idle", "initial": true},
+                        {"name": "Active"},
+                        {"name": "Dead"}
+                    ],
+                    "transitions": [
+                        {"from": "Idle", "to": "Active", "label": "ev_go"},
+                        {"from": "Active", "to": "Dead", "label": "ev_die"},
+                        {"from": "Idle", "to": "Idle", "label": "noop"},
+                        {"from": "Active", "to": "Active", "label": "noop"}
+                    ]
+                }],
+                "properties": [
+                    {
+                        "id": "deadlock_free",
+                        "template_ref": {"template": "no_deadlock"},
+                        "over": "FSM"
+                    },
+                    {
+                        "id": "can_reach_dead",
+                        "template_ref": {"template": "reachable", "args": {"TARGET": "Dead"}},
+                        "over": "FSM"
+                    },
+                    {
+                        "id": "raw_formula_wins",
+                        "formula": "nu X. ([] X)",
+                        "template_ref": {"template": "reachable", "args": {"TARGET": "Idle"}},
+                        "over": "FSM"
+                    }
+                ]
+            }
+        }"#;
+
+        let output = translate_spec(json, "vulnerable");
+
+        // Template "no_deadlock" should produce the formula
+        assert!(output.ctxdsl.contains("formula deadlock_free"));
+        assert!(output.ctxdsl.contains("<> true"));
+
+        // Template "reachable" with TARGET=Dead should produce the formula
+        assert!(output.ctxdsl.contains("formula can_reach_dead"));
+        assert!(output.ctxdsl.contains("Dead"));
+
+        // Raw formula should take precedence over template_ref
+        assert!(output.ctxdsl.contains("formula raw_formula_wins"));
+        assert!(output.ctxdsl.contains("nu X. ([] X)"));
+
+        // Verify the generated CTXDSL parses and realizes successfully
+        let doc = crate::context_dsl::parse(&output.ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        assert!(
+            realized.context.clts("FSM").is_some(),
+            "FSM automaton should exist"
+        );
+        assert!(
+            realized.formulas.contains_key("deadlock_free"),
+            "deadlock_free formula should exist"
+        );
+        assert!(
+            realized.formulas.contains_key("can_reach_dead"),
+            "can_reach_dead formula should exist"
+        );
+    }
+
+    #[test]
+    fn template_ref_with_unknown_template_warns() {
+        let json = r#"{
+            "$schema": "extraction_spec_v1",
+            "source": {},
+            "model_config": {
+                "context_name": "warn_test",
+                "automata": [{
+                    "id": "A",
+                    "states": [{"name": "S0", "initial": true}],
+                    "transitions": [{"from": "S0", "to": "S0", "label": "noop"}]
+                }],
+                "properties": [
+                    {
+                        "id": "bad_template",
+                        "template_ref": {"template": "nonexistent_template"}
+                    }
+                ]
+            }
+        }"#;
+
+        let output = translate_spec(json, "vulnerable");
+        // Should not crash — unknown template produces a warning
+        assert!(
+            output
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("template resolution failed"))
+        );
+        // The property should be skipped (not in CTXDSL)
+        assert!(!output.ctxdsl.contains("formula bad_template"));
     }
 }

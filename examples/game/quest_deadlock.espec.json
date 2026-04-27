@@ -1,0 +1,50 @@
+{
+  "$schema": "extraction_spec_v1",
+  "source": {
+    "file": "quest_manager.gd",
+    "class": "QuestManager"
+  },
+  "model_config": {
+    "context_name": "QuestSystem",
+    "uncontrollable_labels": ["ev_start_a", "ev_start_b", "ev_start_c", "ev_complete_a", "ev_complete_b", "ev_complete_c", "ev_fail"],
+    "automata": [
+      {
+        "id": "QuestProgress",
+        "states": [
+          { "name": "NoQuests", "initial": true },
+          { "name": "QuestA_Active" },
+          { "name": "QuestB_Active" },
+          { "name": "QuestA_Done" },
+          { "name": "QuestB_Done" },
+          { "name": "QuestC_Active" },
+          { "name": "AllComplete" }
+        ],
+        "transitions": [
+          { "from": "NoQuests", "to": "QuestA_Active", "label": "ev_start_a" },
+          { "from": "QuestA_Active", "to": "QuestA_Done", "label": "ev_complete_a" },
+          { "from": "QuestA_Done", "to": "QuestB_Active", "label": "ev_start_b" },
+          { "from": "QuestB_Active", "to": "QuestB_Done", "label": "ev_complete_b" },
+          { "from": "QuestB_Done", "to": "QuestC_Active", "label": "ev_start_c",
+            "comment": "BUG: Quest C requires item from Quest C itself — circular dependency" },
+          { "from": "QuestC_Active", "to": "QuestC_Active", "label": "ev_fail",
+            "comment": "Player gets stuck: cannot complete C without C's reward" }
+        ]
+      }
+    ],
+    "properties": [
+      {
+        "id": "all_quests_completable",
+        "description": "The AllComplete state is reachable from initial",
+        "template_ref": { "template": "reachable", "args": { "TARGET": "AllComplete" } },
+        "over": "QuestProgress",
+        "holds_in_vulnerable": false
+      },
+      {
+        "id": "no_quest_softlock",
+        "description": "No quest state is a dead end",
+        "template_ref": { "template": "no_deadlock" },
+        "over": "QuestProgress"
+      }
+    ]
+  }
+}

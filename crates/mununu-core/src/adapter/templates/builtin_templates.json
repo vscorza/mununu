@@ -1,0 +1,211 @@
+{
+  "version": "1.0",
+  "templates": [
+    {
+      "id": "no_deadlock",
+      "display_name": "No Deadlock",
+      "description": "Every reachable state has at least one enabled transition (no terminal states)",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [],
+      "formula_pattern": "nu X. (<> true && [] X)",
+      "domain_hints": {
+        "game": {},
+        "rtl": {},
+        "agentic": {},
+        "software": {}
+      },
+      "tags": ["deadlock", "softlock", "safety", "liveness"]
+    },
+    {
+      "id": "reachable",
+      "display_name": "Reachable State",
+      "description": "Target predicate is reachable from initial states",
+      "kind": "liveness",
+      "role": "standalone",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "TARGET",
+          "description": "Predicate that should be reachable",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "mu X. (${TARGET} || <> X)",
+      "domain_hints": {
+        "game": { "TARGET": "e.g., Idle, GameOver, Victory" },
+        "rtl": { "TARGET": "e.g., state_IDLE, fill_0" },
+        "agentic": { "TARGET": "e.g., SessionClosed, Authenticated" },
+        "software": { "TARGET": "e.g., Released, Disposed" }
+      },
+      "tags": ["reachability"]
+    },
+    {
+      "id": "never",
+      "display_name": "Never (Invariant)",
+      "description": "A bad predicate never holds in any reachable state",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "BAD",
+          "description": "Predicate that must never hold",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. (!${BAD} && [] X)",
+      "domain_hints": {
+        "game": { "BAD": "e.g., Dead, Softlocked" },
+        "rtl": { "BAD": "e.g., overflow, error_state" },
+        "agentic": { "BAD": "e.g., Unauthorized, DataLeak" },
+        "software": { "BAD": "e.g., NullState, Corrupted" }
+      },
+      "tags": ["safety", "invariant"]
+    },
+    {
+      "id": "always_eventually",
+      "display_name": "Always Eventually",
+      "description": "Target is always eventually reached (GF pattern / recurrence)",
+      "kind": "liveness",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "TARGET",
+          "description": "Predicate that must be revisited infinitely often",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu Y. ((mu X. (${TARGET} || <> X)) && [] Y)",
+      "domain_hints": {
+        "game": { "TARGET": "e.g., Idle, Patrol (return-to-idle)" },
+        "rtl": { "TARGET": "e.g., state_IDLE (reset recovery)" },
+        "agentic": { "TARGET": "e.g., Ready (session cleanup)" },
+        "software": { "TARGET": "e.g., Available (resource release)" }
+      },
+      "tags": ["liveness", "recurrence", "return-to-idle"]
+    },
+    {
+      "id": "bounded",
+      "display_name": "Bounded Resource",
+      "description": "Resource stays within bounds (never overflows or underflows)",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "OVERFLOW",
+          "description": "Predicate for upper-bound violation",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "UNDERFLOW",
+          "description": "Predicate for lower-bound violation",
+          "param_type": { "type": "predicate" },
+          "default": "false",
+          "required": false
+        }
+      ],
+      "formula_pattern": "nu X. (!${OVERFLOW} && !${UNDERFLOW} && [] X)",
+      "domain_hints": {
+        "game": { "OVERFLOW": "e.g., inventory_full", "UNDERFLOW": "e.g., health_0" },
+        "rtl": { "OVERFLOW": "e.g., fill_5 (FIFO depth exceeded)", "UNDERFLOW": "e.g., fill_neg1" },
+        "software": { "OVERFLOW": "e.g., count_max", "UNDERFLOW": "e.g., count_0" }
+      },
+      "tags": ["safety", "bounds", "resource"]
+    },
+    {
+      "id": "response",
+      "display_name": "Response (Request-Grant)",
+      "description": "Every trigger is eventually followed by a response",
+      "kind": "liveness",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "TRIGGER",
+          "description": "Request/trigger predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "RESPONSE",
+          "description": "Expected response predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. ((!${TRIGGER} || mu Y. (${RESPONSE} || <> Y)) && [] X)",
+      "domain_hints": {
+        "rtl": { "TRIGGER": "e.g., req_active", "RESPONSE": "e.g., ack_active" },
+        "agentic": { "TRIGGER": "e.g., RequestReceived", "RESPONSE": "e.g., ResponseSent" },
+        "game": { "TRIGGER": "e.g., QuestAccepted", "RESPONSE": "e.g., QuestComplete" }
+      },
+      "tags": ["liveness", "response", "handshake"]
+    },
+    {
+      "id": "mutual_exclusion",
+      "display_name": "Mutual Exclusion",
+      "description": "Two predicates never hold simultaneously",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "A",
+          "description": "First exclusive predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "B",
+          "description": "Second exclusive predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. (!(${A} && ${B}) && [] X)",
+      "domain_hints": {
+        "game": { "A": "e.g., P1_Acting", "B": "e.g., P2_Acting" },
+        "rtl": { "A": "e.g., grant_0", "B": "e.g., grant_1" },
+        "agentic": { "A": "e.g., Agent1_Active", "B": "e.g., Agent2_Active" }
+      },
+      "tags": ["safety", "mutex", "exclusion"]
+    },
+    {
+      "id": "label_blocked_in_state",
+      "display_name": "Label Blocked in State",
+      "description": "A specific label is impossible when a predicate holds",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "STATE",
+          "description": "State predicate where the label should be blocked",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "LABEL",
+          "description": "Label that must be impossible in that state",
+          "param_type": { "type": "label" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. ((!${STATE} || [${LABEL}] false) && [] X)",
+      "domain_hints": {
+        "game": { "STATE": "e.g., Dead", "LABEL": "e.g., ev_attack" },
+        "software": { "STATE": "e.g., Empty", "LABEL": "e.g., ev_get" },
+        "rtl": { "STATE": "e.g., state_IDLE", "LABEL": "e.g., data_out" }
+      },
+      "tags": ["safety", "guard", "access-control"]
+    }
+  ]
+}
