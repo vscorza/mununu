@@ -50,6 +50,8 @@ pub enum CallGuard {
     MustBeTrue,
     /// Field must be false.
     MustBeFalse,
+    /// Field must equal a specific enum variant (e.g., match case guard).
+    MustEqual(String),
     /// No guard.
     None,
 }

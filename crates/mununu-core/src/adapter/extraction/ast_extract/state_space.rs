@@ -209,6 +209,9 @@ fn guards_satisfied(state: &AbstractState, guards: &[Guard]) -> bool {
             CallGuard::MustBeAbsent => matches!(val, AbstractValue::Present(false)),
             CallGuard::MustBeTrue => matches!(val, AbstractValue::Bool(true)),
             CallGuard::MustBeFalse => matches!(val, AbstractValue::Bool(false)),
+            CallGuard::MustEqual(variant) => {
+                matches!(val, AbstractValue::Variant(v) if v == variant)
+            }
             CallGuard::None => true,
         }
     })

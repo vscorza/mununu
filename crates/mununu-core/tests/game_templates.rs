@@ -189,3 +189,88 @@ fn template_catalog_loads_and_all_templates_instantiate() {
     assert!(r.formula.contains("P1"));
     assert!(r.formula.contains("P2"));
 }
+
+// ---------------------------------------------------------------------------
+// GDScript AST extraction: match-statement support
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ast-extract")]
+#[test]
+fn gdscript_match_extraction_produces_correct_automaton() {
+    let source = include_str!("../../../examples/game/player_controller.gd");
+    let config = include_str!("../../../examples/game/player_controller.extract.json");
+
+    let spec = mununu_core::adapter::extraction::ast_extract::extract_from_source(
+        config, source, "gdscript",
+    )
+    .expect("extraction should succeed");
+
+    // The spec should have one automaton
+    assert_eq!(spec.model_config.automata.len(), 1);
+    let aut = &spec.model_config.automata[0];
+    assert_eq!(aut.id, "PlayerState");
+
+    // Should have 6 states (one per enum variant)
+    let state_names: Vec<&str> = aut.states.iter().map(|s| s.name()).collect();
+    assert_eq!(
+        aut.states.len(),
+        6,
+        "expected 6 states, got {:?}",
+        state_names,
+    );
+
+    // All enum variants should appear as state name suffixes
+    for variant in &["IDLE", "RUNNING", "JUMPING", "FALLING", "ATTACKING", "DEAD"] {
+        assert!(
+            state_names.iter().any(|s| s.ends_with(variant)),
+            "missing state for variant {variant}"
+        );
+    }
+
+    // Key transitions from match cases (state names are prefixed with field name)
+    let has_idle_to_running = aut
+        .transitions
+        .iter()
+        .any(|t| t.from.ends_with("IDLE") && t.to.ends_with("RUNNING"));
+    assert!(has_idle_to_running, "expected IDLE -> RUNNING transition");
+
+    let has_idle_to_jumping = aut
+        .transitions
+        .iter()
+        .any(|t| t.from.ends_with("IDLE") && t.to.ends_with("JUMPING"));
+    assert!(has_idle_to_jumping, "expected IDLE -> JUMPING transition");
+
+    // _on_damage_received should create transitions to DEAD from all states
+    let to_dead_count = aut
+        .transitions
+        .iter()
+        .filter(|t| t.to.ends_with("DEAD") && t.label.contains("damage"))
+        .count();
+    assert!(
+        to_dead_count >= 5,
+        "expected transitions to DEAD from all non-DEAD states"
+    );
+
+    // DEAD should have no outgoing transitions to non-DEAD (softlock!)
+    let dead_exits = aut
+        .transitions
+        .iter()
+        .filter(|t| t.from.ends_with("DEAD") && !t.to.ends_with("DEAD") && t.label != "noop")
+        .count();
+    assert_eq!(dead_exits, 0, "DEAD should have no exits (softlock)");
+
+    // Verify the generated spec can translate to CTXDSL
+    let options = mununu_core::adapter::AdapterOptions {
+        mode: Some("vulnerable".to_string()),
+        ..Default::default()
+    };
+    let spec_json = serde_json::to_string(&spec).expect("spec should serialize");
+    let output =
+        mununu_core::adapter::extraction::ExtractionAdapter::translate(&spec_json, &options)
+            .expect("translation should succeed");
+    assert!(!output.ctxdsl.is_empty(), "CTXDSL should not be empty");
+    assert!(
+        output.ctxdsl.contains("automaton PlayerState"),
+        "CTXDSL should contain PlayerState automaton"
+    );
+}

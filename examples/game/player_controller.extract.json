@@ -1,0 +1,25 @@
+{
+  "$schema": "extraction_config_v1",
+  "domain": "game_fsm",
+  "language": "gdscript",
+  "source": { "file": "examples/game/player_controller.gd" },
+  "targets": [{
+    "class": "CharacterBody2D",
+    "automaton_id": "PlayerState",
+    "state_fields": {
+      "include": ["current_state"],
+      "abstraction_overrides": {
+        "current_state": {
+          "type": "enum_values",
+          "variants": ["IDLE", "RUNNING", "JUMPING", "FALLING", "ATTACKING", "DEAD"]
+        }
+      }
+    },
+    "methods": {
+      "include": ["_physics_process", "_on_damage_received"]
+    }
+  }],
+  "properties": [
+    { "id": "no_softlock", "formula": "nu X. (<> true && [] X)" }
+  ]
+}
