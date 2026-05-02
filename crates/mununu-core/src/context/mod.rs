@@ -2143,10 +2143,12 @@ fn build_parity_game_controller(
                 value: usize::MAX,
             }))?;
         // Mark initial: the position must correspond to a plant initial AND
-        // to the formula root.
+        // to the formula root. The parity-game module NNF-transforms the
+        // formula internally, so use the NNF formula's root from the game,
+        // not the original formula's root (their NodeIds differ).
         let state_obj = StateId::<DefaultStateIdx>::from_index(pos.state)
             .expect("plant state index fits storage");
-        if pos.node == formula.root() && clts.initial_states().contains(&state_obj) {
+        if pos.node == game.formula.root() && clts.initial_states().contains(&state_obj) {
             builder.initial_state_id(state_id);
         }
         let vars = clts.state_variables(state_obj);

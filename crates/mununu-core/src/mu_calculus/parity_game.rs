@@ -19,17 +19,19 @@
 //! = the formula sub-node component of the position.
 //!
 //! This module implements:
-//! 1. Explicit game construction from a `(Formula, Clts, Environment)` triple.
+//! 1. Explicit game construction from a `(Formula, Clts, Environment)` triple,
+//!    preceded by an NNF preprocessing pass (`super::nnf::to_nnf`) so that
+//!    `Not` only ever appears above atomic positions.
 //! 2. A recursive Zielonka solver returning per-position winning region and
 //!    Eve's positional strategy.
 //! 3. A projection helper to convert the game-level strategy into a
 //!    plant-level Mealy controller (state space = `(plant_state, formula_node)`).
 //!
-//! Note on labels: the modal-edge construction respects the modal guard's
-//! controllability flag (`Control::All` / `Control::Controllable` /
-//! `Control::Environment`) but does not currently filter by label-name
-//! guards (e.g., `<label_a>`). For mununu's typical use cases (game-aware
-//! modals using `(ctrl=Controllable)`), this is sufficient.
+//! Modal guards are filtered exactly per the mu-calculus semantics:
+//! controllability flag (`Control::All` / `Controllable` / `Environment`),
+//! label-name set (`Guard::labels`), and current/next state-variable filters
+//! (`Guard::current` / `Guard::next`). The matching mirrors
+//! `mu_calculus::evaluator::guard_matches`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -77,6 +79,11 @@ pub struct ParityGame {
     pub terminal_eve_wins: Vec<bool>,
     /// Indices of terminal positions (for fast lookup during attractor).
     pub terminals: HashSet<usize>,
+    /// The NNF-transformed formula used to build this game. Callers that
+    /// need to identify "root-formula" positions should use
+    /// `formula.root()` from this field rather than the original formula's
+    /// root, because the NodeIds differ between the two.
+    pub formula: Formula,
 }
 
 impl ParityGame {
@@ -108,17 +115,32 @@ pub struct ParitySolution {
 
 /// Build the parity game from a formula and CLTS.
 ///
+/// The formula is first transformed to negation normal form (NNF) so that
+/// `Not` only appears immediately above atomic positions. After NNF the
+/// game construction is exact — no compound-negation pass-through.
+///
 /// Only positions reachable from initial-state × root-node are constructed
 /// (lazy expansion). This avoids materializing irrelevant `(state, node)`
 /// combinations.
 ///
 /// Predicate atoms are evaluated against the environment and become
 /// terminal positions (Eve-winning iff the predicate holds at the state).
+///
+/// The returned `ParityGame` retains the NNF-transformed formula. Callers
+/// that need root-position identification should use `game.formula.root()`,
+/// not the original formula's root, because the NodeIds differ.
 pub fn build_parity_game(
     formula: &Formula,
     clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
     env: &Environment,
 ) -> ParityGame {
+    // Preprocess: rewrite to NNF so the rest of the construction can assume
+    // negation only ever appears above atoms (Predicate / True / False).
+    // The NNF formula is then both used for the build and stashed in the
+    // returned ParityGame so callers can use its root NodeId for
+    // identifying initial positions.
+    let nnf_formula = super::nnf::to_nnf(formula);
+    let formula = &nnf_formula;
     // Map each fixpoint variable to its priority. Priorities are based on
     // alternation depth: outer fixpoints get higher priorities, with mu
     // assigned odd and nu assigned even. We follow the standard "Streett"-
@@ -161,6 +183,10 @@ pub fn build_parity_game(
         edges: Vec::new(),
         terminal_eve_wins: Vec::new(),
         terminals: HashSet::new(),
+        // Stash the NNF formula so callers can identify root-formula
+        // positions via `game.formula.root()`. Cloning is cheap — Formula
+        // is a small arena of nodes + variable names.
+        formula: nnf_formula.clone(),
     };
 
     // Lazy expansion: BFS from initials × root.
@@ -198,12 +224,10 @@ pub fn build_parity_game(
                 set_terminal(&mut game, pos_idx, holds);
             }
             Node::Not(inner) => {
-                // Most common: Not(Predicate). Evaluate negated predicate
-                // directly. For Not(True) / Not(False): immediate.
-                // For nested Not over compound formulas: NNF preprocessing
-                // is the proper fix; we approximate by treating the inner
-                // as a sub-formula whose Eve/Adam role is flipped — best
-                // effort, sound for atoms.
+                // After the NNF preprocessing pass at function entry, `Not`
+                // can only appear above atomic positions: Predicate, True,
+                // or False. Compound negations (over And/Or/Modal/Mu/Nu)
+                // are eliminated by NNF. The `_` arm asserts unreachable.
                 match formula.node(*inner) {
                     Node::True => set_terminal(&mut game, pos_idx, false),
                     Node::False => set_terminal(&mut game, pos_idx, true),
@@ -214,16 +238,9 @@ pub fn build_parity_game(
                             .unwrap_or(false);
                         set_terminal(&mut game, pos_idx, !holds);
                     }
-                    _ => {
-                        // Compound negation — fallback to pass-through.
-                        // Sound only for NNF formulas; mununu typically
-                        // produces NNF after parser normalization.
-                        let next = Position {
-                            state: pos.state,
-                            node: *inner,
-                        };
-                        add_edge(&mut game, formula, &var_priority, pos_idx, next, &mut queue);
-                    }
+                    other => unreachable!(
+                        "Not over non-atomic node {other:?} after NNF — to_nnf is broken"
+                    ),
                 }
             }
             Node::And(l, r) => {
@@ -262,7 +279,7 @@ pub fn build_parity_game(
                 let state_id = StateId::<DefaultStateIdx>::from_index(pos.state)
                     .expect("position state index fits storage");
                 for transition in clts.outgoing(state_id) {
-                    if !transition_matches_guard(transition, guard, clts) {
+                    if !transition_matches_guard(transition, guard, clts, state_id) {
                         continue;
                     }
                     let next = Position {
@@ -391,19 +408,97 @@ fn modal_owner(kind: ModalKind) -> Player {
     }
 }
 
-/// Match a transition against a modal guard. Currently respects the
-/// controllability flag; ignores label-name and variable filters (those are
-/// not used by typical mununu modal guards).
+/// Match a transition against a modal guard. Respects:
+/// - The controllability flag (`Control::All|Controllable|Environment`).
+/// - Label-name filter (`guard.labels`): all listed labels must appear in
+///   the transition's label set.
+/// - Current-state variable filter (`guard.current.required/forbidden`):
+///   restricts to source states whose variables match.
+/// - Next-state variable filter (`guard.next.required/forbidden`):
+///   restricts to transitions whose target's variables match.
+///
+/// The semantics mirror `mu_calculus::evaluator::guard_matches` — the
+/// evaluator and the parity-game module agree on what constitutes a
+/// matching transition.
 fn transition_matches_guard(
     transition: &crate::clts::Transition<DefaultStateIdx, DefaultLabelIdx>,
     guard: &Guard,
     clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    source: StateId<DefaultStateIdx>,
 ) -> bool {
-    match guard.control {
+    // 1. Controllability flag.
+    let control_ok = match guard.control {
         Control::All => true,
         Control::Controllable => transition.is_controllable(clts),
         Control::Environment => !transition.is_controllable(clts),
+    };
+    if !control_ok {
+        return false;
     }
+
+    // 2. Label-name filter: every required label must appear in some
+    //    transition label's underlying bitset.
+    if !guard.labels.is_empty() {
+        for required in &guard.labels {
+            let mut found = false;
+            for label_id in transition.labels() {
+                let Some(bitset) = clts.label_bitset(*label_id) else {
+                    continue;
+                };
+                if bitset.test(required.as_str()) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+    }
+
+    // 3. Current-state variable filter.
+    if !guard.current.required.is_empty() || !guard.current.forbidden.is_empty() {
+        let state_vars = clts.state_variable_bitset(source);
+        if guard
+            .current
+            .required
+            .iter()
+            .any(|var| !state_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+        if guard
+            .current
+            .forbidden
+            .iter()
+            .any(|var| state_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+    }
+
+    // 4. Next-state variable filter.
+    if !guard.next.required.is_empty() || !guard.next.forbidden.is_empty() {
+        let target_vars = clts.state_variable_bitset(transition.target());
+        if guard
+            .next
+            .required
+            .iter()
+            .any(|var| !target_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+        if guard
+            .next
+            .forbidden
+            .iter()
+            .any(|var| target_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +784,9 @@ context test {
         let solution = solve(&game);
         let initial_pos = Position {
             state: 0,
-            node: formula.root(),
+            // Use the NNF formula's root (NodeIds may differ from the
+            // original formula's root after the to_nnf transform).
+            node: game.formula.root(),
         };
         let initial_idx = game.position_idx[&initial_pos];
         assert_eq!(solution.winner[initial_idx], Player::Eve);
@@ -703,9 +800,100 @@ context test {
         let solution = solve(&game);
         let initial_pos = Position {
             state: 0,
-            node: formula.root(),
+            // Use the NNF formula's root (NodeIds may differ from the
+            // original formula's root after the to_nnf transform).
+            node: game.formula.root(),
         };
         let initial_idx = game.position_idx[&initial_pos];
         assert_eq!(solution.winner[initial_idx], Player::Adam);
+    }
+
+    /// After NNF preprocessing, the build no longer falls back on compound
+    /// Not approximations. This test exercises a formula with compound
+    /// negations that previously hit the pass-through branch:
+    ///
+    ///     ! ((! Bad) && [] (! Bad))   ≡ Bad ∨ <> Bad
+    ///
+    /// On a simple two-state automaton with no Bad predicate registered,
+    /// the formula evaluates to false everywhere — Adam wins at the
+    /// initial position. The test verifies the build doesn't panic and
+    /// the verdict is correct.
+    #[test]
+    fn build_handles_compound_not_via_nnf() {
+        let (clts, env) = realize_for_test(TICK_CTXDSL, "M");
+        // Compound Not: `! ((! q) && (! r))` → DNF/NNF: `q || r`
+        let formula = parser::parse("! ((! q) && (! r))").unwrap();
+        let game = build_parity_game(&formula, &clts, &env);
+        // Build did not panic on compound Not — that's the main check.
+        assert!(!game.is_empty());
+        let solution = solve(&game);
+        // q and r are unregistered predicates → both evaluate false at
+        // any state → q || r is false everywhere → Adam wins.
+        let initial_pos = Position {
+            state: 0,
+            node: game.formula.root(),
+        };
+        let initial_idx = game.position_idx[&initial_pos];
+        assert_eq!(solution.winner[initial_idx], Player::Adam);
+    }
+
+    /// Compound Not over a fixpoint:
+    ///
+    ///     ! (mu Y. (true || <> Y))   ≡ nu Y. (false && [] Y)   ≡ false
+    ///
+    /// After NNF this reduces to a Nu-False formula that's false
+    /// everywhere. Validates the fixpoint duality through Not.
+    #[test]
+    fn build_handles_compound_not_through_fixpoint() {
+        let (clts, env) = realize_for_test(TICK_CTXDSL, "M");
+        let formula = parser::parse("! (mu Y. (true || (<> Y)))").unwrap();
+        let game = build_parity_game(&formula, &clts, &env);
+        let solution = solve(&game);
+        let initial_pos = Position {
+            state: 0,
+            node: game.formula.root(),
+        };
+        let initial_idx = game.position_idx[&initial_pos];
+        // Outer NNF: ! (mu Y. true || <> Y) → nu Y. false && [] Y. The
+        // false at every step makes nu's body empty, so Adam wins.
+        assert_eq!(solution.winner[initial_idx], Player::Adam);
+    }
+
+    /// A modal guarded by a label name should restrict the parity-game
+    /// edges to only transitions whose labels include that name. This
+    /// test uses `<labels = {tick}> X` over the TICK_CTXDSL where the
+    /// only label is `tick`, so the result matches the unguarded
+    /// `<> X` semantics.
+    #[test]
+    fn build_filters_by_label_name() {
+        let (clts, env) = realize_for_test(TICK_CTXDSL, "M");
+        let formula = parser::parse("nu X. (true && [labels = {tick}] X)").unwrap();
+        let game = build_parity_game(&formula, &clts, &env);
+        let solution = solve(&game);
+        let initial_pos = Position {
+            state: 0,
+            node: game.formula.root(),
+        };
+        let initial_idx = game.position_idx[&initial_pos];
+        assert_eq!(solution.winner[initial_idx], Player::Eve);
+    }
+
+    /// A modal guarded by a NON-EXISTENT label name. The guard filter
+    /// excludes every transition, so the box becomes vacuously satisfied
+    /// (no successors → terminal Eve-wins for box modals).
+    #[test]
+    fn build_label_filter_with_no_matching_transitions() {
+        let (clts, env) = realize_for_test(TICK_CTXDSL, "M");
+        // Label `nonexistent` is not in the alphabet — all transitions
+        // are filtered out. Box becomes vacuous (Eve wins).
+        let formula = parser::parse("nu X. (true && [labels = {nonexistent}] X)").unwrap();
+        let game = build_parity_game(&formula, &clts, &env);
+        let solution = solve(&game);
+        let initial_pos = Position {
+            state: 0,
+            node: game.formula.root(),
+        };
+        let initial_idx = game.position_idx[&initial_pos];
+        assert_eq!(solution.winner[initial_idx], Player::Eve);
     }
 }

@@ -7,6 +7,7 @@
 pub mod evaluator;
 pub mod invert;
 mod memo;
+pub mod nnf;
 pub mod parity_game;
 pub mod parser;
 pub mod simplify;
