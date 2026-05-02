@@ -112,6 +112,7 @@ Targets must map to a row below. New rows require a literature citation explaini
 | FIFO over-/under-flow | — | Safety on bounded counters | `examples/systemverilog/fifo_overflow_bug.sv` |
 | Multi-module handshake deadlock | 1234 | Async / sync composition + liveness | `examples/systemverilog/industrial/axilite_write_*` |
 | Spec deviation in protocol controller | 707 | Native CTXDSL or extraction | `cwe1245_*`, `mem_engine_*` |
+| Spec ambiguity / contradiction in published standard | 1284 | Native CTXDSL or extraction with the spec text as source-of-truth | (none yet — first target establishes the pattern) |
 
 ### RTL — out of scope (do NOT propose)
 
@@ -130,12 +131,19 @@ Targets must map to a row below. New rows require a literature citation explaini
 | OAuth scope widening on refresh | 284 | State machine of token state | `mcp_oauth_*` |
 | Concurrent tool invocation routing | 362 / 694 | Composition + safety | DoS variants |
 | Auth gating bypass on tool call | 284 | Safety with controllability | `mcp_tool_authorization` |
+| Spec ambiguity / contradiction in MCP / agent protocol | 1284 | Native CTXDSL with spec section + version pin | (none yet) |
 
 ### MCP — out of scope
 
 - Prompt injection per se — content-level, not state-level
 - Model output reliability (hallucination, citation accuracy)
 - Anything requiring LLM behavior modeling
+
+### Spec-level targets
+
+The "Spec ambiguity / contradiction" rows treat published specifications as targets in their own right, not just mining ground for implementation bugs. The source-pin is the spec version (RFC number + section, MCP spec commit, RISC-V profile + section). The reproducer is a citation of two contradictory passages, or one under-specified passage that admits incompatible implementations. These targets are valuable because verification can drive spec corrections upstream — a higher-leverage outcome than per-implementation bug reports.
+
+A spec target is **Class A** only if (a) the contradiction has been independently noted by an implementation issue or erratum, and (b) at least one implementation can be shown to take the divergent path against the pinned commit. Otherwise it is **Class B** (documented spec deviation, hypothetical implementations). It cannot be C or D — there is no "demo" form of a spec target; either the spec passage exists and is ambiguous, or the candidate is rejected.
 
 ## Phase 3 — Source mining
 
@@ -177,11 +185,20 @@ Skip this phase if `--max-fetches` is exhausted; record skipped candidates in th
 
 For each candidate that survived Phase 3:
 
-- **Extraction tractability**: rough state-space estimate (registers × bound × inputs). Must be ≤ 2^14 to comfortably fit, ≤ 2^18 hard limit.
+- **Extraction tractability**: rough state-space estimate (registers × bound × inputs).
+  - **Comfortable**: ≤ 2^14. Original-fidelity model fits; abstractions optional.
+  - **Tight**: 2^14 to 2^18. Lossy abstractions required. Document upfront which abstractions (counter bound, async collapse, Map→BoundedCounter) and which property class they remain sound for. A target that needs liveness verification under tight budget is a near-automatic reject — collapse-to-atomic + over-approx is unsound for liveness.
+  - **Reject**: > 2^18 raw. Do not propose; flag as an adapter-research candidate via the gap-aggregation hook in Phase 6.5.
 - **Required adapter**: native SV (`*.sv` + `.mununu.json`), extraction spec (`.espec.json`), XState (`*.xstate.json`), or "new adapter required" — flag the latter as research effort.
 - **Property class**: safety / liveness / reachability — and a draft mu-calculus skeleton or `template_ref` the verifier could run.
-- **Soundness direction**: which abstractions are needed and why they're sound (over-approx for safety, under-approx for liveness).
+- **Abstraction-soundness direction**: for the property class proposed, name each abstraction and tag it `over-approx` (sound for safety, unsound for liveness) or `under-approx` (unsound for safety). Mixed direction within one model requires a Phase 6 amendment justifying the mix; do not silently allow it.
 - **Effort estimate**: hours of human time to write the spec and CTXDSL — `S` (≤ 2h), `M` (≤ 1d), `L` (≤ 3d), `XL` (>3d).
+- **Prior-art status**: has this property already been verified for this system by another tool / paper / vendor? Run at most one focused web-search per Class-A and Class-B candidate. Outcomes:
+  - `novel` — no public verification known. Eligible for "we proved X" claims.
+  - `partial` — verified at coarser abstraction or for a related property. Eligible with a hedge ("we extend prior work by …").
+  - `done` — fully verified by another tool with a public artifact. Demote to backlog-only; do not pass to Phase 5.5 (see selection rule there).
+
+  Search budget: 1 query per Class A/B candidate, drawn from the `--max-fetches` pool. The query MUST cite the system + the property class, e.g., `OpenTitan PMP "formal verification" site:dl.acm.org` or `LangGraph ToolNode "model checking"`. A null result is acceptable evidence of `novel` for budget-constrained sessions, but the session report must say so explicitly. Skipped queries are tracked under `evidence` in the session log.
 
 A candidate **fails Phase 4** if state-space is intractable, no adapter path exists, or no obvious property class fits. Record the failure.
 
@@ -212,6 +229,8 @@ For each:
 - Reproduction status
 - Effort (S/M/L/XL)
 - Rigor class (A/B/C/D — see below)
+- Impact tier (T1/T2/T3) with one-line justification — see §5b.1
+- Prior-art status (`novel | partial | done`) — see Phase 4
 
 ## 3. Rejected Candidates
 Why each failed Phase 3 or Phase 4. Used to refine search criteria.
@@ -239,17 +258,31 @@ If a target lacks a source-pinned reference, it cannot be Class A or B — demot
 - **For Class A**: fix-commit hash + vulnerable file path + vulnerable line range, AND a public reproducer (CVE description, exploit script, failing test case, or PR diff).
 - **For Class B**: at minimum a *version pin* (Git tag, npm/PyPI version, or release commit) AND an open or closed bug-tracker thread with reproducer pseudocode. The full file path / line range may be recovered during the extraction-spec step rather than at prospecting time. The session report must explicitly note "file path TBD" when this applies.
 
+A `prior-art: done` finding overrides rigor: even an A-grade reproducer must move to backlog-only state, since "we proved X" is no longer novel evidence about mununu's value. The target may be reactivated if a new property class against the same system is later proposed.
+
+### 5b.1 Impact tier (orthogonal to rigor)
+
+Every target also carries one impact tier. Rigor measures evidence strength; impact measures what fixing the bug (or proving the property) would actually buy. The two axes are independent: a Class C demo can be high-impact in concept; a Class A CVE can be a low-impact correctness nit.
+
+- **T1 — High impact.** Privilege escalation, RCE, data leak, compliance-driving correctness (CWE-1262 CSR bypass, CWE-284 OAuth scope widening, MCP cross-thread session contamination). A "we proved no T1 violation" claim is publishable on its own.
+- **T2 — Medium impact.** Availability, partial bypass, reliability under contention (FIFO overflow, multi-handshake deadlock, unreachable FSM state with no security consequence). Worth proving but not standalone-publishable.
+- **T3 — Low impact.** Pure correctness/style (counter overflow with no observable downstream effect, dead-code FSM branch). Backlog-only unless paired with broader claims.
+
+Impact tier MUST carry a one-line justification (e.g., `T1 — auth bypass on privileged tool call, public CVE`). "T1 because important" is not a valid justification.
+
+**Selection rule for Phase 5.5 (revised):** within each rigor class, prefer higher impact tiers. The executor budget should not be spent on Class-A T3 targets while Class-B T1 targets sit unverified.
+
 ### 5c. Cumulative backlog
 
 Append/update rows in `.claude/reviews/prospector/backlog.md`. Format:
 
 ```markdown
-| ID | Name | Domain | Source | Bug class | Rigor | Effort | State | First seen | Last updated |
-|---|---|---|---|---|---|---|---|---|---|
-| RTL-001 | OpenTitan PMP fuzz finding | RTL | github.com/lowRISC/opentitan/issues/12345 (commit abc123) | CWE-1262 | A | M | proposed | 2026-04-30 | 2026-04-30 |
+| ID | Name | Domain | Source | Bug class | Rigor | Impact | Prior-art | Effort | State | First seen | Last updated |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| RTL-001 | OpenTitan PMP fuzz finding | RTL | github.com/lowRISC/opentitan/issues/12345 (commit abc123) | CWE-1262 | A | T1 | novel | M | proposed | 2026-04-30 | 2026-04-30 |
 ```
 
-Update existing rows when their state changes (`proposed → accepted → extracting → done`, or `→ rejected` with reason). Never delete rows. The backlog is the historical record.
+Update existing rows when their state changes (`proposed → accepted → extracting → done`, or `→ rejected` with reason). Never delete rows. The backlog is the historical record. Existing rows missing the Impact / Prior-art columns may be backfilled lazily — when a row is touched for any other reason, populate the missing columns at the same time.
 
 ### 5d. Session log (append-only)
 
@@ -287,10 +320,12 @@ After Phase 5 has written the report and updated the backlog, select up to `--ma
 
 ### Selection priority
 
-1. **New Class A targets** from this session.
-2. **New Class B targets** from this session.
-3. **Existing backlog rows** in state `proposed` whose `last updated` is older than 14 days and that haven't been executed yet (read `executions/` directory to check).
+1. **New Class A targets** from this session, sorted T1 → T2 → T3 by impact tier (§5b.1).
+2. **New Class B targets** from this session, sorted T1 → T2 → T3.
+3. **Existing backlog rows** in state `proposed` whose `last updated` is older than 14 days and that haven't been executed yet (read `executions/` directory to check), sorted T1 → T3 within each rigor class.
 4. Stop at `--max-executions`.
+
+Targets with `prior-art: done` are skipped regardless of rigor — they would not produce novel evidence.
 
 Class C and D targets are NEVER executed — they are demonstration-only and produce no real-system evidence. The executor will reject them at its Phase 0.
 
