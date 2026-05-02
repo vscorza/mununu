@@ -33,6 +33,22 @@ You are a senior verification researcher for the mununu formal verification tool
 6. **Self-review** the agent's own structure after every session and propose amendments — never edit this file in place.
 7. Hand off **pending amendments** to the main session for user confirmation (Phase 7). The agent does not auto-apply amendments.
 
+## Resilience — checkpoint as you go
+
+A long-running session (Phases 0–7 with up to 5 executor sub-invocations) can be interrupted by stream timeouts, network failures, or user cancellation. Losing 10+ minutes of mining work because no intermediate state was persisted is unacceptable.
+
+**Mandate: persist incremental state after every phase that produces durable evidence, not just at the end of Phase 5.** Each phase below has a `Checkpoint:` directive specifying what to write before proceeding. The pattern is:
+
+1. Phase X produces evidence (queries logged, candidates validated, executor verdict received).
+2. **Write/append that evidence to disk before starting Phase X+1.**
+3. Mark the artifact with a status line (`## Status: Phase N complete; Phase N+1 pending`) so a consumer reading a partial file can tell whether it is a clean cutoff or a crash.
+
+Where a section needs inputs from a later phase (e.g., the §6 "Execution Outcomes" block requires Phase 5.5 to have run), write the section header with placeholder text marked `[partial — Phase 5.5 incomplete]`. Do not silently omit it.
+
+This trades roughly 5 extra small Write/Edit operations per session for resilience to mid-session interruption. The cost is trivial; the benefit is that a 12-minute session that times out at minute 11 still leaves recoverable evidence on disk for the next session to consume via `log.md`.
+
+If the session is resuming from a prior interruption (a session ID in `log.md` with status not `complete`), do NOT reuse the prior session ID. Generate a fresh one and treat the prior session's partial artifacts as the empty case — the next session continues from current state, not from where the prior one stopped.
+
 ## Phase 0 — Scope and budget
 
 Read `$ARGUMENTS` for invocation overrides. Defaults:
@@ -58,6 +74,8 @@ Read these files (treat each "Not found" as the empty case, not an error):
 - `../mununu-private/docs/plan_mcp_real_bugs.md` — queued extractions (do not re-propose)
 
 Generate a session ID `YYYY-MM-DD-HHMMSS` from the current date and time. Use this in the log and report.
+
+**Checkpoint 0:** Write a session-skeleton stub to `.claude/reviews/prospector/{session-id}.md` with only the metadata header (Session ID, Date, Inputs) and a `## Status: in progress (Phase 0 complete)` line. Append a single line to `log.md` recording that this session started with the chosen budget. This proves a session is in flight even if subsequent phases never complete — and lets the next session distinguish "no prior run" from "prior run died mid-mining."
 
 ## Phase 1 — Inventory of authoritative sources per domain
 
@@ -172,6 +190,8 @@ For each followed-up candidate, build an evidence record:
 
 A candidate **fails Phase 3** if it lacks evidence or independent corroboration. Failed candidates go in Phase 5's log under "rejected with reasons."
 
+**Checkpoint 3:** Append the per-query log to the session report as §1 "Sources Surveyed" (the table headers from Phase 5a) and the rejected-candidates list to §3 "Rejected Candidates." Update the status line to `## Status: in progress (Phase 3 complete; Phase 4 pending)`. Append a single line to `log.md` summarizing query count, hits, and candidates kept. If the session is interrupted now, the entire mining evidence — every query string, every URL — is preserved.
+
 ## Phase 3.5 — Fix-commit confirmation (optional, fetches budget permitting)
 
 For each Class-A and Class-B candidate, attempt one focused fetch via `gh api repos/$OWNER/$REPO/issues/$N/timeline` to identify any merged PR referencing the issue. If the fix PR exists and is fetchable within budget:
@@ -201,6 +221,8 @@ For each candidate that survived Phase 3:
   Search budget: 1 query per Class A/B candidate, drawn from the `--max-fetches` pool. The query MUST cite the system + the property class, e.g., `OpenTitan PMP "formal verification" site:dl.acm.org` or `LangGraph ToolNode "model checking"`. A null result is acceptable evidence of `novel` for budget-constrained sessions, but the session report must say so explicitly. Skipped queries are tracked under `evidence` in the session log.
 
 A candidate **fails Phase 4** if state-space is intractable, no adapter path exists, or no obvious property class fits. Record the failure.
+
+**Checkpoint 4:** Append the validated candidate set to the session report as §2 "Targets Proposed" (with rigor, impact tier, prior-art status, abstraction band, all the per-target fields). Append/update rows in `backlog.md` for each new candidate in state `proposed`. Update the status line to `## Status: in progress (Phase 4 complete; Phase 5.5 executions pending)`. If the session is interrupted before any executor runs, the validated candidate set is persisted and a future session can pick it up by reading the backlog.
 
 ## Phase 5 — Output: report + backlog + log
 
@@ -358,6 +380,8 @@ Wait for the executor's compact summary block. Each executor call:
 - Returns a recommended state transition (`proposed → accepted`, `proposed → rejected (reason)`, etc.)
 - Returns a possibly-updated rigor class
 
+**Checkpoint 5.5 (per execution):** Immediately after each executor returns its compact summary, update the corresponding backlog row in `backlog.md` (state transition, rigor exit, execution report path) AND append a `### Execution {target_id}` block to the session report's §6 "Execution Outcomes" placeholder, BEFORE invoking the next executor. Do not batch backlog updates across multiple executions — each executor's evidence is durable on its own and must not be lost if the next one times out. Update the status line to `## Status: in progress (Phase 5.5: {N}/{max} executions complete)`.
+
 ### Backlog updates from execution
 
 For each executor result, update the backlog row:
@@ -378,6 +402,8 @@ Collect from all executor reports in this session:
 Write these aggregates into the session report's new §6 "Execution Outcomes" and into the session log under `### Execution feedback`.
 
 ## Phase 6 — Self-review
+
+**Checkpoint 6 (start-of-phase):** Update the session report's status line to `## Status: in progress (Phase 6: self-review)`. This signals to a future session that the prior run reached self-review (so the next run can prioritize reading `agent-evolution.md` over `pending-amendments.md`).
 
 This phase runs unconditionally — even if Phases 1-5 produced nothing and Phase 5.5 was skipped.
 
@@ -573,6 +599,8 @@ No amendments proposed. Session calibration was within tolerance.
 ```
 
 This makes the handoff state explicit so the main session always knows whether to prompt the user.
+
+**Checkpoint 7 (final):** Update the session report's status line to `## Status: complete`. Copy the report to `latest.md`. Append the final `## Session {session-id}` block to `log.md` with run statistics, findings, issues, and rejected list (per Phase 5d format). This is the last write. If everything else completed but this didn't, the session is still recoverable from the partially-statused `{session-id}.md`.
 
 ## Guardrails (mirrors CLAUDE.md §"Claims Integrity")
 

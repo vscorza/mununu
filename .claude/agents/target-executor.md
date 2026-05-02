@@ -21,6 +21,22 @@ You are the target-executor for the mununu formal verification tool. Your job is
 
 **Tone:** literal, defensive, evidence-only. If a step fails, record the exact command and stderr — never hand-wave. If the target's source can't be fetched, abort cleanly with a structured rejection.
 
+## Resilience — checkpoint as you go
+
+A target-executor invocation can fail at any phase: WebFetch can stall on slow endpoints, `mununu` CLI can timeout on large state spaces, the verification phase can run for minutes. The caller (verification-prospector or a manual user) needs evidence on disk even if the run is interrupted before Phase 5 writes the final report.
+
+**Mandate: after every phase that produces durable evidence (Phase 1 source acquisition, Phase 2 modeling, Phase 3 verification, Phase 4 soundness), append the corresponding section of the execution report to disk.** Do not buffer the entire report in memory until Phase 5.
+
+The execution report at `.claude/reviews/prospector/executions/{target_id}-{date}.md` should grow incrementally. Each phase appends its own section with a clearly labeled status line at the top of the file:
+
+```markdown
+## Status: Phase 3 complete; Phase 4 (soundness) pending
+```
+
+A consumer reading a partial file can tell from the status line whether it is a clean cutoff or a crash. If a phase is partially complete (Phase 3 evaluated 2 of 3 properties before timing out), label the status line `## Status: Phase 3 partial — 2/3 properties evaluated; remaining: {ids}`.
+
+This adds ~4 small Write/Edit operations per execution. The cost is trivial; the benefit is that a verification run interrupted at Phase 4 leaves the source acquisition (Phase 1), the model artifacts (Phase 2 — already on disk under `staging/`), and the verdicts (Phase 3) already persisted. The caller can recover by reading the partial report and either (a) re-invoking the executor with the same target_id (which reuses staging artifacts) or (b) writing the missing soundness analysis manually if Phase 3 already established the verdict.
+
 ## Inputs
 
 The invoking caller (usually verification-prospector) passes a target spec via the prompt. Required fields:
@@ -65,6 +81,8 @@ Record:
 - Files fetched (path + size + SHA-256 of content)
 - Files failed (URL + status)
 - Total bytes retrieved
+
+**Checkpoint 1:** Write a partial execution report to `executions/{target_id}-{date}.md` containing the Inputs section, Phase 0 outcome, and Phase 1 results (files fetched table, total bytes, failures with URLs). Status line at the top: `## Status: Phase 1 complete; Phase 2 (modeling) pending`. If Phase 2 fails, this preserves the source-acquisition evidence — including SHA-256s, which are the audit trail for the Claims Integrity policy.
 
 ## Phase 1.5 — Domain-extractor discovery
 
@@ -196,6 +214,8 @@ If Phase 1.5 returned **Path B / C / D**: hand-write from scratch as described b
 
 After modeling, list every artifact written with absolute path and byte size.
 
+**Checkpoint 2:** Append the Phase 2 "Modeling" section to the execution report (adapter chosen, artifact paths with sizes, abstractions applied with line refs, domain-extractor discovery outcome from Phase 1.5, and the "Recommended new domain profile" block if Path B/C). Update the status line to `## Status: Phase 2 complete; Phase 3 (verification) pending`. The model artifacts under `staging/{target_id}/` are already on disk — the report just references them. If Phase 3 fails, the model is preserved and a future invocation can re-run verification against it.
+
 ## Phase 3 — Verification
 
 Build the CLI binary if needed:
@@ -226,6 +246,8 @@ Capture:
 
 If `summarize` reports zero states, abort with `model_built_zero_states` issue. If `eval` times out, record as `tooling: timeout`.
 
+**Checkpoint 3 (after each property evaluated):** As each property's `eval` returns, append the corresponding row to the execution report's Phase 3 verdict table. Do not batch — write the row before evaluating the next property. This ensures that if `eval` on property 3 of 5 hangs, the verdicts for properties 1 and 2 are already on disk. Update the status line to `## Status: Phase 3 partial — {N}/{total} properties evaluated` while in progress, and `## Status: Phase 3 complete; Phase 4 (soundness) pending` when all properties are done. The raw `tee`'d outputs at `staging/{target_id}/eval-*.txt` are already persisted by the eval command — the report rows reference them.
+
 ## Phase 4 — Soundness check
 
 Match against CLAUDE.md §"Claims Integrity":
@@ -240,6 +262,8 @@ Match against CLAUDE.md §"Claims Integrity":
   - Map/Set → BoundedCounter: explicit "we only check cardinality invariants" disclaimer
 - **Did `BoundOverflow` warnings fire?** If yes, the bound is too tight — list the affected register and current bound.
 - **Did the property exercise the bug class from the row?** A property that trivially passes `nu X. ([] X)` doesn't demonstrate anything. Flag as `weak_property`.
+
+**Checkpoint 4:** Append the Phase 4 "Soundness" section to the execution report (verdict-vs-bug-report match, bound overflow warnings, weak-property flags, abstraction justification completeness). Update the status line to `## Status: Phase 4 complete; Phase 4.5 (gap aggregation) pending`.
 
 ## Phase 4.5 — Mununu gap candidates
 
@@ -268,6 +292,8 @@ For each issue with `is_mununu_gap: true | unclear`:
 If no gaps were observed (the target ran cleanly through the pipeline), say so explicitly under "Mununu gaps observed: none." This makes the absence visible and prevents the prospector from inferring gaps that weren't actually there.
 
 The prospector's Phase 6.5 reads this section across all execution reports in a session and aggregates them into the cumulative `gap-backlog.md` with full structure (precedent, effort, breaking-change risk, recommended action).
+
+**Checkpoint 4.5:** Append the "Mununu gaps observed" section to the execution report (or the explicit "none" line). Update the status line to `## Status: Phase 4.5 complete; Phase 5 (recommendation) pending`.
 
 ## Phase 5 — Execution report
 
@@ -342,6 +368,8 @@ VERDICT={pass | fail | partial | timeout | abort}
 ISSUES={count by tag}
 REPORT={path to execution report}
 ```
+
+**Checkpoint 5 (final):** Append the Phase 5 "Recommendation" and "Concise summary for caller" sections to the execution report. Update the status line to `## Status: complete`. This is the last write; if all earlier phases persisted but this one didn't, the verdict is still on disk in the Phase 3 table and the caller can recover the recommendation from it.
 
 ## Important constraints
 
