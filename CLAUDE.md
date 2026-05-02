@@ -133,10 +133,8 @@ mununu context synth machine.xstate --adapter xstate --formula safety --automato
 # Import from SystemVerilog
 mununu context eval design.sv --adapter sv --formula safety --automaton FSM
 
-# Import agentic frameworks (auto-detected from .crew.json / .langgraph.json / .a2a.json)
-mununu context eval crew.crew.json --formula can_finish --automaton crewai_workflow
-mununu context eval graph.langgraph.json --formula safety_invariant --automaton langgraph_workflow
-mununu context eval cards.a2a.json --formula safety_invariant --automaton a2a_protocol
+# Agentic AI orchestration models live in examples/agentic/ as native CTXDSL or
+# as XState JSON imported via the XState adapter. See examples/agentic/README.md.
 
 # Export controller as XState JSON
 mununu context synth machine.xstate --adapter xstate --formula safety --automaton Machine \
@@ -145,7 +143,22 @@ mununu context synth machine.xstate --adapter xstate --formula safety --automato
 # Export controller as SystemVerilog module
 mununu context synth design.sv --adapter sv --formula safety --automaton FSM \
   --output-format systemverilog --emit-native controller.sv
+
+# Export controller as GDScript for Godot
+mununu context synth game.espec.json --adapter extraction --formula safety --automaton FSM \
+  --output-format gdscript --emit-native controller.gd
 ```
+
+## Git Identity
+
+All commits in this repository must use the following author identity:
+
+```
+Name:  Mariano Cerrutti
+Email: vscorza@gmail.com
+```
+
+When committing, pass `--author="Mariano Cerrutti <vscorza@gmail.com>"` or set it via the commit environment. Do not use the machine's default hostname-based email.
 
 ## Environment Variables
 
@@ -235,25 +248,16 @@ The **signature** of a state is its tuple of iteration ranks per fixpoint variab
 - **Formula inversion**: do NOT negate fixpoint variable references inside the body. Keep variables positive — the dual fixpoint's changed starting point handles the semantics.
 - **Nondeterminism and controllability (Skolem paradigm)**: The controller chooses WHICH label to trigger, but cannot choose WHICH outcome occurs when multiple transitions share the same label (nondeterminism). Nondeterministic outcomes are always adversarial — ALL must satisfy — regardless of whether the label is controllable or uncontrollable. Controllability only determines who TRIGGERS the label (controller vs environment), not the outcome.
 
-### Agentic Framework Adapters (CrewAI, LangGraph, A2A)
+### Agentic Orchestration Models
 
-Three native Rust adapters handle agentic AI orchestration formats directly from JSON, with no Python dependency:
+Agentic AI orchestration is currently modeled in two ways:
 
-| Adapter | Module | Extension | Detection Keys |
-|---------|--------|-----------|---------------|
-| CrewAI | `src/adapter/crewai/` | `.crew.json` | `"agents"` + `"tasks"` + `"process"` |
-| LangGraph | `src/adapter/langgraph/` | `.langgraph.json` | `"nodes"` + `"edges"` (no `"agents"`) |
-| A2A | `src/adapter/a2a/` | `.a2a.json` | `"name"` + `"skills"` (no `"agents"`, `"nodes"`, `"states"`) |
+1. **Native CTXDSL** under `examples/agentic/` — files like `mcp_auth.ctxdsl` and `handoff_protocol.ctxdsl` describe agent / supervisor / worker FSMs directly as automata + properties + controllers.
+2. **XState JSON** via the existing XState adapter — files like `examples/agentic/support_pipeline.xstate.json` use the standard `__mununu` block to declare controllable/uncontrollable events and properties; the XState adapter handles parallel regions and translates them to a synchronous composition.
 
-**Architecture — delegation pattern:** Each adapter parses its native JSON, builds an XState-compatible state machine (as `serde_json::Value`), serializes it, and delegates to `XStateAdapter::translate()`. This reuses all XState logic (hierarchy flattening, parallel states, properties, controllability) without duplication. The `SourceFormat` is overridden in the output to report the correct format.
+The property templates registry has an `agentic` domain (see `crates/mununu-core/src/adapter/templates/`) that ships parameterized formulas (mutual-exclusion, no-livelock, bounded-handoff) usable from either entry point.
 
-**CrewAI:** Sequential process → linear task chain (`COMPLETE_*`/`FAIL_*` uncontrollable, `RETRY_*` controllable). Hierarchical process → supervisor + parallel worker regions with `ACTIVATE_*` (controllable) and optional `DELEGATE_*_TO_*` edges.
-
-**LangGraph:** Nodes → states, edges → `NEXT_*` events, conditional edges → `ROUTE_*` events. Controllability classified by regex heuristics (patterns: `human|user|tool_result|sensor|timeout|error|fail` → uncontrollable; routing events → controllable).
-
-**A2A:** Per-agent 5-state lifecycle FSM (idle→queued→in_progress→completed|failed). Skills → `INVOKE_{AGENT}_{SKILL}` (controllable). Multi-agent → parallel composition with auto-generated mutex properties. Accepts single card `{}` or array `[{}, ...]`.
-
-The Python scripts in `tools/` remain as optional convenience wrappers for live Python object introspection (e.g., introspecting a `crewai.Crew` instance). For JSON dict input, the native Rust adapters are preferred.
+There is **no native CrewAI / LangGraph / A2A JSON parser** in the Rust workspace today. The Python scripts under `tools/` are the only path for live introspection of CrewAI/LangGraph/A2A Python objects; for JSON input you must either rewrite as XState or hand-author CTXDSL. Adding native parsers is a deliberate future-work item, not a shipped feature.
 
 ### Extraction Spec Adapter
 
@@ -276,6 +280,18 @@ mununu context eval spec.espec.json --adapter extraction --mode fixed --formula 
 ```
 
 **Spec format**: See `tools/extraction_specs/*.espec.json` in the mununu-private repo for examples. The `model_config` section carries declarative automaton definitions with `states`, `transitions` (mode-filtered), `composition`, `properties` (with per-property `over` targets), and `controllers`.
+
+**Property templates**: Properties in `.espec.json`, `.mununu.json`, and XState `__mununu` blocks can use `template_ref` instead of raw `formula` to reference a named property template. Templates are parameterized mu-calculus patterns (e.g., `no_deadlock`, `reachable(TARGET)`, `bounded(OVERFLOW, UNDERFLOW)`). Resolution happens at adapter translation time — the emitter and evaluator see no difference. See `crates/mununu-core/src/adapter/templates/` for the registry and catalog.
+
+### Game Engine Adapters (Godot)
+
+The extraction adapter supports game state machine verification through `.espec.json` specs and GDScript source extraction:
+
+- **GDScript extraction**: Tree-sitter grammar (`tree-sitter-gdscript` v6) extracts enum-based state machines from `.gd` files. The `game_fsm` domain profile in `src/adapter/extraction/ast_extract/domain.rs` configures controllability (player input = uncontrollable, system actions = controllable), asynchronous composition, and `ev_` label prefix.
+- **Game examples**: `examples/game/` contains `.espec.json` files demonstrating softlock detection, quest deadlocks, and NPC AI loops — all using property templates.
+- **CLI**: `mununu context eval game.espec.json --adapter extraction --template no_deadlock --automaton FSM`
+- **CLI templates**: `mununu templates --domain game` lists templates relevant to game verification.
+- **UI workflow**: The `gameengine` workflow in `mununu-ui/src/types/workflow.ts` provides a 5-step pipeline: Load → Extract → Edit Spec → Translate → Verify.
 
 ### TLSF/AIGER Adapter Encoding (Turn-Based Compound Labels)
 

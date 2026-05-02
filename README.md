@@ -21,7 +21,7 @@ Mununu is a verification tool for analyzing and synthesizing controllers for rea
 - **Composition** &mdash; Synchronous, asynchronous, and superset composition of CLTS components
 - **Controller synthesis** &mdash; Automatic synthesis of controllers satisfying safety and liveness properties
 - **State abstraction** &mdash; Multi-level variable abstraction (Boolean, integer intervals, symbol sets)
-- **Format adapters** &mdash; Import from TLSF, AIGER, Promela, XState, SystemVerilog, CrewAI, LangGraph, and A2A; export controllers to XState JSON or SystemVerilog
+- **Format adapters** &mdash; Import from TLSF, AIGER, Promela, XState, and SystemVerilog (plus extraction-spec inputs from C / Rust / GDScript / TypeScript); export controllers to XState JSON, SystemVerilog, or GDScript
 - **REST API** &mdash; Built-in HTTP server for integration with web frontends
 - **Web UI** &mdash; Interactive editor, graph visualization, and verification via [mununu-ui](https://github.com/vscorza/mununu-ui)
 
@@ -37,9 +37,10 @@ cargo build --release
 cargo run -- context eval examples/hw/handshake.ctxdsl \
   --formula ack_reachable --automaton Handshake
 
-# Synthesize a controller
+# Synthesize a controller (six extraction modes; see wiki/Controller-Modes.md)
 cargo run -- context synth examples/hw/handshake.ctxdsl \
-  --formula safety_invariant --automaton Handshake
+  --formula safety_invariant --automaton Handshake \
+  --controller-mode parity-game
 
 # Generate a graph visualization
 cargo run -- context graph examples/hw/handshake.ctxdsl \
@@ -63,6 +64,8 @@ The `examples/` directory contains ready-to-use CLTS specifications:
 | [Fair Elevator](examples/elevator_gr1.ctxdsl) | 3-floor GR(1) elevator controller | 6+4 | Floor reachability, full traversal |
 | [Sterile Batch Release](examples/sterile_batch_release.ctxdsl) | Pharmaceutical BPM pipeline | 14 | Ship-requires-release, disposition |
 | [AMBA 4-Client Synthesis](examples/amba_arbiter_gr1_synthesis.ctxdsl) | 4-client arbiter with synthesis | 5+12 | 6 mutual exclusion pairs, GR(1) liveness |
+| [Bus Arbiter Retry](examples/bus_arbiter_retry.ctxdsl) | Recurrence-after-stability (alt 4) | 4 | Demonstrates ParityGame mode beyond GR(1) — see [Controller Modes](https://github.com/your-org/mununu/wiki/Controller-Modes) |
+| [Dual-Channel Arbiter](examples/dual_arbiter_alt4.ctxdsl) | Two channels, dual recurrence-after-stability (alt 4) | 16 | Memory + strategy selection — synthesis disables 17 controllable transitions; ParityGame keeps the parity-correct strategy |
 
 ### Agentic AI Orchestration
 
@@ -126,7 +129,7 @@ context handshake {
 
 ```
 src/
-├── adapter/        # Format adapters (TLSF, AIGER, Promela, XState, SystemVerilog, CrewAI, LangGraph, A2A)
+├── adapter/        # Format adapters (TLSF, AIGER, Promela, XState, SystemVerilog, extraction)
 ├── clts/           # Core CLTS data structure (builder, label store, state management)
 ├── composition/    # Synchronous, asynchronous, and superset composition
 ├── context/        # CLTS registry, synthesis, mu-calculus evaluation engine

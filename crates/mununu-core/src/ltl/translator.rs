@@ -9,11 +9,31 @@ use crate::mu_calculus::{Formula, FormulaBuilder, FormulaVarId, Guard, ModalKind
 
 use super::ast::LtlFormula;
 
+/// Threshold above which `translate` emits an alternation-depth warning. The
+/// μ-calculus model-checking complexity is O(|S|^k) where k is the alternation
+/// depth (Emerson-Jutla bound), so depth ≥ 4 begins to produce noticeable
+/// performance degradation on non-trivial state spaces.
+const ALTERNATION_DEPTH_WARN_THRESHOLD: usize = 3;
+
 /// Translates an LTL formula to a μ-calculus formula.
+///
+/// Emits a `[mununu] WARN` line on stderr when the produced formula has
+/// alternation depth ≥ 4 — verification will be slow because the fixpoint
+/// engine's worst-case complexity is `O(|S|^k)` (Emerson-Jutla 1991). priority_roadmap §3.4 / Tier A4.
 pub fn translate(ltl: &LtlFormula) -> Result<Formula, TranslationError> {
     let mut translator = Translator::new();
     let root = translator.translate_formula(ltl)?;
-    Ok(translator.builder.into_formula(root))
+    let formula = translator.builder.into_formula(root);
+    let depth = formula.alternation_depth();
+    if depth > ALTERNATION_DEPTH_WARN_THRESHOLD {
+        eprintln!(
+            "[mununu] WARN: LTL→μ-calculus produced a formula with alternation depth {}; \
+             verification may be slow (worst-case complexity O(|S|^{})). Consider rewriting \
+             the LTL formula in a lower-alternation form if possible.",
+            depth, depth
+        );
+    }
+    Ok(formula)
 }
 
 /// Errors that can occur during LTL to μ-calculus translation.

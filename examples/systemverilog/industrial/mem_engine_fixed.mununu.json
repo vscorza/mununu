@@ -30,7 +30,12 @@
     {
       "id": "safety",
       "formula": "nu X. ([] X)",
-      "description": "No deadlock — all states have successors"
+      "description": "Baseline — all states have successors. Holds on bug AND fixed."
+    },
+    {
+      "id": "stall_when_no_credit",
+      "formula": "nu X. (((! state_BEAT_1) || ([credit_avail_F] state_BEAT_1)) && ((! state_BEAT_2) || ([credit_avail_F] state_BEAT_2)) && ((! state_BEAT_3) || ([credit_avail_F] state_BEAT_3)) && [] X)",
+      "description": "In any BEAT_N state, if credit_avail is low, the engine stays in BEAT_N (does not advance). Bug fails: it advances unconditionally. Fixed passes: advances only when credit_avail is high."
     }
   ]
 }

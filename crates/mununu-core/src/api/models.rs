@@ -92,7 +92,11 @@ pub struct ContextSynthesizeRequest {
     #[serde(default)]
     pub sidecars: Vec<SidecarFile>,
     pub automaton: String,
-    pub formula: String,
+    /// Formula name to synthesise (mutually exclusive with `template_ref`).
+    pub formula: Option<String>,
+    /// Template reference to instantiate (mutually exclusive with `formula`).
+    #[serde(default)]
+    pub template_ref: Option<crate::adapter::templates::TemplateRef>,
     #[serde(default)]
     pub options: SynthesisOptions,
 }
@@ -104,9 +108,17 @@ pub struct SynthesisOptions {
     pub minimize: bool,
     #[serde(default)]
     pub diagnostics: DiagnosticsOptions,
-    /// Extract a positional strategy (one controllable transition per state).
+    /// Legacy positional-strategy flag. When `controller_mode` is set, that
+    /// takes precedence and `extract_strategy` is ignored. Kept for
+    /// backwards compatibility.
     #[serde(default)]
     pub extract_strategy: bool,
+    /// Controller extraction mode. Case-insensitive. One of:
+    /// `"projection"` (default), `"functional"`, `"permissive"`,
+    /// `"signature-memory"`, `"product-game"`, `"parity-game"`.
+    /// When `Some`, overrides `extract_strategy`.
+    #[serde(default)]
+    pub controller_mode: Option<String>,
     /// Output format for the controller: "ctxdsl" (default), "xstate", "systemverilog".
     pub output_format: Option<String>,
 }
@@ -370,7 +382,11 @@ pub struct ContextVerifyRequest {
     #[serde(default)]
     pub sidecars: Vec<SidecarFile>,
     /// If omitted, evaluate ALL formulas defined in the context.
+    /// Mutually exclusive with `template_ref`.
     pub formula: Option<String>,
+    /// Template reference to instantiate (mutually exclusive with `formula`).
+    #[serde(default)]
+    pub template_ref: Option<crate::adapter::templates::TemplateRef>,
     /// If omitted, use the formula's target automaton(s).
     pub automaton: Option<String>,
     /// When true, compute counterstrategy for failed formulas via formula inversion.

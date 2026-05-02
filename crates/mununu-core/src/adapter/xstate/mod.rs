@@ -129,7 +129,7 @@ fn to_ir(
     };
 
     // Build properties from annotations
-    let properties = build_properties(annotations);
+    let properties = build_properties(annotations)?;
 
     // Build controller spec
     let controller = build_controller(annotations, &automata, &compositions);
@@ -404,31 +404,67 @@ fn build_uncontrollable_set(annotations: Option<&MununuAnnotations>) -> HashSet<
 }
 
 /// Build properties from Mununu annotations.
-fn build_properties(annotations: Option<&MununuAnnotations>) -> Vec<PropertySpec> {
+///
+/// Returns `Err(AdapterError)` if any property is malformed (missing both
+/// `formula` and `template_ref`, or referencing an unknown template). This is a
+/// fail-loud behavior: previously such properties were silently dropped, leading
+/// to false-positive "satisfied" verdicts where violations were never checked.
+fn build_properties(
+    annotations: Option<&MununuAnnotations>,
+) -> Result<Vec<PropertySpec>, AdapterError> {
     let ann = match annotations {
         Some(a) => a,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
 
-    ann.properties
-        .iter()
-        .map(|p| {
-            let role = match p.role.as_str() {
-                "assumption" => PropertyRole::Assumption,
-                "guarantee" => PropertyRole::Guarantee,
-                "invariant" => PropertyRole::Invariant,
-                _ => PropertyRole::Standalone,
-            };
+    let registry = crate::adapter::templates::TemplateRegistry::builtin();
+    let mut out = Vec::with_capacity(ann.properties.len());
+    for p in &ann.properties {
+        let role = match p.role.as_str() {
+            "assumption" => PropertyRole::Assumption,
+            "guarantee" => PropertyRole::Guarantee,
+            "invariant" => PropertyRole::Invariant,
+            _ => PropertyRole::Standalone,
+        };
 
-            PropertySpec {
-                name: p.name.clone(),
-                kind: PropertyKind::Safety, // Will be refined based on formula content
-                formula: PropertyFormula::MuCalculus(p.formula.clone()),
-                role,
-                over: None,
+        let formula_str = if let Some(f) = &p.formula {
+            f.clone()
+        } else if let Some(tref) = &p.template_ref {
+            match registry.instantiate(tref) {
+                Ok(inst) => inst.formula,
+                Err(e) => {
+                    return Err(AdapterError {
+                        kind: AdapterErrorKind::ParseError,
+                        message: format!(
+                            "property '{}' references unknown template '{}': {}. \
+                             Add the template to the registry or replace `template_ref` with a raw `formula`.",
+                            p.name, tref.template, e
+                        ),
+                        location: None,
+                    });
+                }
             }
-        })
-        .collect()
+        } else {
+            return Err(AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!(
+                    "property '{}' declares neither `formula` nor `template_ref` — \
+                     cannot translate. Add one of the two fields.",
+                    p.name
+                ),
+                location: None,
+            });
+        };
+
+        out.push(PropertySpec {
+            name: p.name.clone(),
+            kind: PropertyKind::Safety,
+            formula: PropertyFormula::MuCalculus(formula_str),
+            role,
+            over: None,
+        });
+    }
+    Ok(out)
 }
 
 /// Build controller spec if properties exist.

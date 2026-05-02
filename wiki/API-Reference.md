@@ -22,6 +22,7 @@ All request and response bodies use `application/json`. CORS is open by default 
 - [POST /api/v1/context/graphs](#post-apiv1contextgraphs)
 - [POST /api/v1/context/verify](#post-apiv1contextverify)
 - [POST /api/v1/context/import](#post-apiv1contextimport)
+- [GET /api/v1/templates](#get-apiv1templates)
 - [Common Types](#common-types)
 - [Error Responses](#error-responses)
 
@@ -51,6 +52,8 @@ curl http://localhost:3000/api/v1/health
 ## POST /api/v1/context/summarize
 
 Parse a CTXDSL context (with optional sidecar files) and return a summary of all automata, formulas, and declared controllers. Controllers are synthesized on the fly so the response includes realizability and size metrics.
+
+> **Adapter formats:** this endpoint accepts CTXDSL only. To summarize an external format (`.xstate.json`, `.sv`, `.tlsf`, `.aag`/`.aig`, `.pml`, `.espec.json`), first translate via [`POST /api/v1/context/import`](#post-apiv1contextimport) and pass the resulting `ctxdsl` field to this endpoint. The CLI command `mununu context summarize <file> --adapter <format>` does this two-step internally; clients of the HTTP API must do it explicitly. The same convention applies to `/context/verify` and `/context/synthesize`.
 
 ### Request Body
 
@@ -154,6 +157,9 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 |-------|------|---------|-------------|
 | `minimize` | `boolean` | `false` | Apply bisimulation minimization to the controller. |
 | `diagnostics` | `DiagnosticsOptions` | `{}` | Control diagnostic output. |
+| `extract_strategy` | `boolean` | `false` | **Legacy** — equivalent to `controller_mode: "functional"`. When `controller_mode` is set, that takes precedence. |
+| `controller_mode` | `string \| null` | `null` (= `"projection"` or `"functional"` if `extract_strategy=true`) | Controller extraction mode. One of `"projection"`, `"functional"`, `"permissive"`, `"signature-memory"`, `"product-game"`, `"parity-game"`. Case-insensitive; dashes/underscores interchangeable. Unknown values return `400 Bad Request`. See [Controller Modes](Controller-Modes.md) for the full reference. |
+| `output_format` | `string \| null` | `null` | Native controller export format: `"xstate"`, `"systemverilog"`/`"sv"`, or `"gdscript"`/`"gd"`. When set, the response includes a `controller_native` field. |
 
 **DiagnosticsOptions**
 
@@ -435,7 +441,8 @@ Evaluate mu-calculus formulas over automata and report which initial states sati
 |-------|------|----------|-------------|
 | `context` | `FileContent` | Yes | Main CTXDSL file. |
 | `sidecars` | `SidecarFile[]` | No | Sidecar files. Defaults to `[]`. |
-| `formula` | `string \| null` | No | Evaluate a specific formula. `null` evaluates all user-defined formulas. |
+| `formula` | `string \| null` | No | Evaluate a specific formula by name. `null` evaluates all user-defined formulas. Mutually exclusive with `template_ref`. |
+| `template_ref` | `TemplateRef \| null` | No | Instantiate a [property template](Property-Templates) instead of selecting an existing formula. `{"template": "no_deadlock"}` or `{"template": "reachable", "args": {"TARGET": "Idle"}}`. Mutually exclusive with `formula`. |
 | `automaton` | `string \| null` | No | Target automaton. `null` uses each formula's declared targets. |
 | `counterstrategy` | `boolean` | No | Compute counterstrategy for failed formulas. Defaults to `false`. |
 | `minimize_counterstrategy` | `boolean` | No | Apply bisimulation minimization to counterstrategy. Defaults to `false`. |
@@ -580,6 +587,53 @@ curl -X POST http://localhost:3000/api/v1/context/import \
 ```
 
 See [Adapter Formats](Adapter-Formats.md) for details on each supported format.
+
+---
+
+## GET /api/v1/templates
+
+List available property templates. Templates provide parameterized mu-calculus formula patterns that can be used in `template_ref` fields of verify and synthesize requests.
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `domain` | `string` | No | Filter by domain: `game`, `rtl`, `agentic`, `software`, `synthesis`, `universal` |
+
+### Response Body
+
+Without `domain` filter, returns a `TemplateCatalog`:
+
+```json
+{
+  "version": "1.0",
+  "templates": [
+    {
+      "id": "no_deadlock",
+      "display_name": "No Deadlock",
+      "description": "Every reachable state has at least one enabled transition",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [],
+      "formula_pattern": "nu X. (<> true && [] X)",
+      "domain_hints": {},
+      "tags": ["deadlock", "softlock", "safety"]
+    }
+  ]
+}
+```
+
+With `domain` filter, returns a filtered array of `PropertyTemplate` objects.
+
+### Example
+
+```bash
+curl http://localhost:8080/api/v1/templates
+curl http://localhost:8080/api/v1/templates?domain=game
+```
+
+See [Property Templates](Property-Templates) for the full catalog and usage guide.
 
 ---
 

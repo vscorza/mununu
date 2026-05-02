@@ -1084,4 +1084,655 @@ context test {
         projection.controller.state_count(),
         "Same winning region, same state count"
     );
+
+    // SignatureMemory mode: same selection rule as Functional, but state names
+    // are annotated with `__sig_<rank_tuple>`. Demonstrates the signature
+    // memory is now observable at the controller-state level.
+    let sigmem = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::SignatureMemory,
+            },
+        )
+        .unwrap();
+    assert!(
+        sigmem.realizable,
+        "SignatureMemory mode should agree with Functional on realizability"
+    );
+    // State count matches Functional (same selection rule)
+    assert_eq!(
+        sigmem.controller.state_count(),
+        synth.controller.state_count(),
+        "SignatureMemory state count should equal Functional"
+    );
+    // At least one state name carries the signature annotation
+    let has_sig_annotation = sigmem.controller.states().any(|s| {
+        sigmem
+            .controller
+            .state_name(s)
+            .is_some_and(|n| n.contains("__sig_"))
+    });
+    assert!(
+        has_sig_annotation,
+        "Expected at least one state name annotated with `__sig_<...>` in SignatureMemory mode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Product-game (memory-aware Mealy) controller — D1a-substantive
+// ---------------------------------------------------------------------------
+
+/// On a GR(1) formula with two mu obligations, ProductGame mode emits a
+/// controller whose state space is `(plant_state, oblig_idx)` for
+/// `oblig_idx ∈ {0, 1}`. The state count is at most `winning_states × 2`,
+/// every state name carries `__pg_<i>`, and the controller is realizable.
+#[test]
+fn product_game_gr1_realizable() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions, DiagnosticsOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            controllable { label go_a; label go_b; }
+            states {
+                state IDLE initial;
+                state A;
+                state B;
+            }
+            transitions {
+                transition IDLE -> A on label go_a;
+                transition IDLE -> B on label go_b;
+                transition A -> IDLE on label reset;
+                transition B -> IDLE on label reset;
+            }
+            predicates {
+                predicate A = state A;
+                predicate B = state B;
+            }
+        }
+    }
+    mu_formulas {
+        formula gr1 {
+            over M;
+            body = nu X. ((mu Y1. (A || <> Y1)) && (mu Y2. (B || <> Y2)) && [(ctrl=Controllable)] X);
+        }
+    }
+    controllers {
+        controller synth { source M; satisfying gr1; }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("gr1").unwrap();
+    let env = realized.environment_for("M");
+
+    // Functional baseline (one product state per plant state)
+    let functional = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::Functional,
+            },
+        )
+        .unwrap();
+    assert!(functional.realizable);
+
+    let pg = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: Some(&DiagnosticsOptions {
+                    counterexample: false,
+                    deadlock_traces: false,
+                    max_counter_traces: None,
+                    proof_obligations: false,
+                }),
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::ProductGame,
+            },
+        )
+        .unwrap();
+    assert!(
+        pg.realizable,
+        "ProductGame controller for GR(1) should be realizable"
+    );
+
+    // Two mu-obligations → product space ≤ 2× plant states
+    let n_obligs = 2;
+    assert!(
+        pg.controller.state_count() <= functional.controller.state_count() * n_obligs,
+        "ProductGame state count ({}) should be ≤ Functional ({}) × {}",
+        pg.controller.state_count(),
+        functional.controller.state_count(),
+        n_obligs
+    );
+
+    // At least some state names carry the __pg_ annotation
+    let pg_count = pg
+        .controller
+        .states()
+        .filter(|s| {
+            pg.controller
+                .state_name(*s)
+                .is_some_and(|n| n.contains("__pg_"))
+        })
+        .count();
+    assert!(
+        pg_count > 0,
+        "Expected at least one state name annotated with `__pg_<i>` in ProductGame mode"
+    );
+
+    // Diagnostics should mention ProductGame and the obligation count
+    assert!(
+        pg.diagnostics
+            .messages
+            .iter()
+            .any(|m| m.contains("ProductGame")),
+        "Diagnostics should report ProductGame mode"
+    );
+    assert!(
+        pg.diagnostics
+            .messages
+            .iter()
+            .any(|m| m.contains("mu-obligation")),
+        "Diagnostics should report obligation count"
+    );
+}
+
+/// For a pure safety formula (alternation 0, no mu-fixpoints), the obligation
+/// dimension collapses to size 1. The product-game controller has the same
+/// state count as `Functional`, with `__pg_0` annotations.
+#[test]
+fn product_game_no_mus_safety() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            states {
+                state Good initial;
+                state Bad;
+            }
+            transitions {
+                transition Good -> Good on epsilon;
+            }
+            predicates {
+                predicate Bad = state Bad;
+            }
+        }
+    }
+    mu_formulas {
+        formula safety { over M; body = nu X. ((!Bad) && [] X); }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("safety").unwrap();
+    let env = realized.environment_for("M");
+
+    let functional = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::Functional,
+            },
+        )
+        .unwrap();
+    let pg = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::ProductGame,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(pg.realizable, functional.realizable);
+    assert_eq!(
+        pg.controller.state_count(),
+        functional.controller.state_count(),
+        "Pure safety formula has no mu-obligations → product space size = plant size"
+    );
+    // Every retained state should be annotated `__pg_0`
+    let all_pg0 = pg.controller.states().all(|s| {
+        pg.controller
+            .state_name(s)
+            .is_some_and(|n| n.ends_with("__pg_0"))
+    });
+    assert!(all_pg0, "All states should carry `__pg_0` suffix");
+}
+
+/// For a pure reachability formula (single mu, alternation 1), there is one
+/// mu-obligation. Memory dimension still collapses to size 1; the controller
+/// shape matches Functional with `__pg_0` annotations.
+#[test]
+fn product_game_single_mu_reachability() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            controllable { label step; }
+            states {
+                state Start initial;
+                state Goal;
+            }
+            transitions {
+                transition Start -> Goal on label step;
+                transition Goal -> Goal on label step;
+            }
+            predicates {
+                predicate Goal = state Goal;
+            }
+        }
+    }
+    mu_formulas {
+        formula reach { over M; body = mu X. (Goal || <> X); }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("reach").unwrap();
+    let env = realized.environment_for("M");
+
+    let functional = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::Functional,
+            },
+        )
+        .unwrap();
+    let pg = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::ProductGame,
+            },
+        )
+        .unwrap();
+
+    assert!(pg.realizable);
+    assert_eq!(
+        pg.controller.state_count(),
+        functional.controller.state_count(),
+        "Single mu-obligation → product space size = plant size"
+    );
+}
+
+/// Cross-mode agreement check: all four extracting modes (Functional,
+/// SignatureMemory, ProductGame, plus Projection) agree on realizability of
+/// the GR(1) formula. Ensures no mode silently disagrees with the others.
+#[test]
+fn product_game_agrees_with_other_modes_on_realizability() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            controllable { label go_a; label go_b; }
+            states {
+                state IDLE initial;
+                state A;
+                state B;
+            }
+            transitions {
+                transition IDLE -> A on label go_a;
+                transition IDLE -> B on label go_b;
+                transition A -> IDLE on label reset;
+                transition B -> IDLE on label reset;
+            }
+            predicates {
+                predicate A = state A;
+                predicate B = state B;
+            }
+        }
+    }
+    mu_formulas {
+        formula gr1 {
+            over M;
+            body = nu X. ((mu Y1. (A || <> Y1)) && (mu Y2. (B || <> Y2)) && [(ctrl=Controllable)] X);
+        }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("gr1").unwrap();
+    let env = realized.environment_for("M");
+
+    let mk = |mode: ControllerMode| {
+        realized
+            .context
+            .synthesise_controller_with_options(
+                "M",
+                &formula.formula,
+                &env,
+                ControllerSynthesisOptions {
+                    evaluation: None,
+                    diagnostics: None,
+                    minimize: false,
+                    extract_strategy: false,
+                    mode,
+                },
+            )
+            .unwrap()
+    };
+
+    let projection = mk(ControllerMode::Projection);
+    let functional = mk(ControllerMode::Functional);
+    let sigmem = mk(ControllerMode::SignatureMemory);
+    let pg = mk(ControllerMode::ProductGame);
+    let parity = mk(ControllerMode::ParityGame);
+
+    assert_eq!(projection.realizable, functional.realizable);
+    assert_eq!(functional.realizable, sigmem.realizable);
+    assert_eq!(sigmem.realizable, pg.realizable);
+    assert_eq!(pg.realizable, parity.realizable);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: ParityGame mode — full Zielonka synthesis
+// ---------------------------------------------------------------------------
+
+/// ParityGame mode synthesizes a controller via explicit parity-game
+/// construction + Zielonka. For a simple safety formula, the controller is
+/// realizable and emits a CLTS with `__pg_n<node_id>` state names (one per
+/// game position in Eve's winning region).
+#[test]
+fn parity_game_safety_realizable() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            states {
+                state Good initial;
+                state Bad;
+            }
+            transitions {
+                transition Good -> Good on epsilon;
+            }
+            predicates {
+                predicate Bad = state Bad;
+            }
+        }
+    }
+    mu_formulas {
+        formula safety { over M; body = nu X. ((!Bad) && [] X); }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("safety").unwrap();
+    let env = realized.environment_for("M");
+
+    let parity = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::ParityGame,
+            },
+        )
+        .unwrap();
+    assert!(
+        parity.realizable,
+        "Safety formula should be realizable in ParityGame mode"
+    );
+
+    // At least one state should be annotated with `__pg_n<node_id>`
+    let has_pg_naming = parity.controller.states().any(|s| {
+        parity
+            .controller
+            .state_name(s)
+            .is_some_and(|n| n.contains("__pg_n"))
+    });
+    assert!(
+        has_pg_naming,
+        "ParityGame controller should have `__pg_n<id>` state name annotations"
+    );
+}
+
+/// On an unrealizable safety formula (referencing an unreachable nu region),
+/// ParityGame mode reports unrealizable.
+#[test]
+fn parity_game_unrealizable_when_nu_violated() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            states { state s0 initial; }
+            transitions {
+                transition s0 -> s0 on epsilon;
+            }
+        }
+    }
+    mu_formulas {
+        formula impossible { over M; body = nu X. (false && [] X); }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("impossible").unwrap();
+    let env = realized.environment_for("M");
+
+    let parity = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::ParityGame,
+            },
+        )
+        .unwrap();
+    assert!(
+        !parity.realizable,
+        "Formula `nu X. (false && [] X)` is never satisfiable; ParityGame should report unrealizable"
+    );
+}
+
+/// Reachability formula `mu X. (Goal || <> X)` should be realizable when
+/// Goal is reachable. ParityGame mode handles single-mu (alternation 1)
+/// formulas correctly.
+#[test]
+fn parity_game_reachability_realizable() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            states {
+                state Start initial;
+                state Goal;
+            }
+            transitions {
+                transition Start -> Goal on epsilon;
+                transition Goal -> Goal on epsilon;
+            }
+            predicates {
+                predicate Goal = state Goal;
+            }
+        }
+    }
+    mu_formulas {
+        formula reach { over M; body = mu X. (Goal || <> X); }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("reach").unwrap();
+    let env = realized.environment_for("M");
+
+    let parity = realized
+        .context
+        .synthesise_controller_with_options(
+            "M",
+            &formula.formula,
+            &env,
+            ControllerSynthesisOptions {
+                evaluation: None,
+                diagnostics: None,
+                minimize: false,
+                extract_strategy: false,
+                mode: ControllerMode::ParityGame,
+            },
+        )
+        .unwrap();
+    assert!(
+        parity.realizable,
+        "Reachability to Goal should be realizable"
+    );
+}
+
+/// Alternation depth 2 (Buchi-style `nu X. ((mu Y. (P || <> Y)) && [] X)`):
+/// the controller must guarantee fairness — visit P infinitely often.
+/// ParityGame mode should agree with ProductGame on realizability.
+#[test]
+fn parity_game_alternation_2_buchi_agrees_with_product_game() {
+    use mununu_core::context::{ControllerMode, ControllerSynthesisOptions};
+
+    let model = r#"
+context test {
+    automata {
+        automaton M {
+            states {
+                state Idle initial;
+                state Hot;
+            }
+            transitions {
+                transition Idle -> Hot on epsilon;
+                transition Hot -> Idle on epsilon;
+            }
+            predicates {
+                predicate Hot = state Hot;
+            }
+        }
+    }
+    mu_formulas {
+        formula buchi { over M; body = nu X. ((mu Y. (Hot || <> Y)) && [] X); }
+    }
+}
+"#;
+
+    let doc = context_dsl::parse(model).unwrap();
+    let realized =
+        context_dsl::realize_context(&doc, &[]).unwrap_or_else(|e| panic!("Realize failed: {e}"));
+    let formula = realized.formulas.get("buchi").unwrap();
+    let env = realized.environment_for("M");
+
+    let mk = |mode: ControllerMode| {
+        realized
+            .context
+            .synthesise_controller_with_options(
+                "M",
+                &formula.formula,
+                &env,
+                ControllerSynthesisOptions {
+                    evaluation: None,
+                    diagnostics: None,
+                    minimize: false,
+                    extract_strategy: false,
+                    mode,
+                },
+            )
+            .unwrap()
+    };
+
+    let pg = mk(ControllerMode::ProductGame);
+    let parity = mk(ControllerMode::ParityGame);
+
+    // Both modes agree on realizability for alternation 2
+    assert_eq!(
+        pg.realizable, parity.realizable,
+        "ProductGame and ParityGame must agree on alternation-2 realizability"
+    );
 }

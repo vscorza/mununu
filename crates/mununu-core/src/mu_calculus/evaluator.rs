@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::ops::{BitAndAssign, BitOrAssign};
+use std::ops::{BitAndAssign, BitOrAssign, Not};
 use std::sync::Arc;
 
 use bitvec::prelude::*;
@@ -243,6 +243,8 @@ where
         "environment state count does not match CLTS"
     );
 
+    let oob_bits = compute_oob_bits(clts);
+    let not_oob_bits = !oob_bits.clone();
     let mut ctx = EvalContext {
         formula,
         clts,
@@ -252,6 +254,8 @@ where
         guard_cache: HashMap::new(),
         expression_eval_cache: HashMap::new(),
         witness_map: None,
+        not_oob_bits,
+        oob_bits,
     };
     let bindings = HashMap::new();
     let result = ctx.eval_node(formula.root(), &bindings)?;
@@ -279,6 +283,8 @@ where
         "environment state count does not match CLTS"
     );
 
+    let oob_bits = compute_oob_bits(clts);
+    let not_oob_bits = !oob_bits.clone();
     let mut ctx = EvalContext {
         formula,
         clts,
@@ -288,11 +294,75 @@ where
         guard_cache: HashMap::new(),
         expression_eval_cache: HashMap::new(),
         witness_map: Some(WitnessMap::default()),
+        not_oob_bits,
+        oob_bits,
     };
     let bindings = HashMap::new();
     let result = ctx.eval_node(formula.root(), &bindings)?;
     let witnesses = ctx.witness_map.unwrap_or_default();
     Ok((result, witnesses))
+}
+
+/// Evaluate `formula` with three-valued (Kleene) semantics, returning a
+/// [`TritSet`](super::trit::TritSet) — per-state True / False / Unknown verdict.
+///
+/// The three-valued evaluator runs alongside the standard BitVec evaluator
+/// (it does NOT replace it). Both share the OOB sink convention from
+/// `adapter::systemverilog::kripke::OOB_STATE_KEY`. The TritSet path treats OOB
+/// states as `Unknown` for every atomic predicate (`must=false, may=true`),
+/// propagating the Unknown trit through Boolean and modal connectives via
+/// Kleene semantics. Reference: Bruns–Godefroid CONCUR 2000 (generalized model
+/// checking), Huth–Jagadeesan–Schmidt ESOP 2001 (modal transition systems).
+///
+/// This entry point is read-only with respect to existing callers — it does
+/// not change the `BitVec` API. Callers that want sound liveness verdicts on
+/// OOB-reaching examples can use `verdict_at()` to distinguish definitely-true,
+/// definitely-false, and unknown.
+pub fn evaluate_tri<S, L>(
+    formula: &Formula,
+    clts: &Clts<S, L>,
+    env: &Environment,
+) -> Result<super::trit::TritSet, EvaluationError>
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    evaluate_tri_with_options(formula, clts, env, &EvaluationOptions::default())
+}
+
+/// Variant of [`evaluate_tri`] that accepts custom evaluation options.
+pub fn evaluate_tri_with_options<S, L>(
+    formula: &Formula,
+    clts: &Clts<S, L>,
+    env: &Environment,
+    options: &EvaluationOptions,
+) -> Result<super::trit::TritSet, EvaluationError>
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    assert_eq!(
+        clts.state_count(),
+        env.state_count(),
+        "environment state count does not match CLTS"
+    );
+
+    let oob_bits = compute_oob_bits(clts);
+    let not_oob_bits = !oob_bits.clone();
+    let mut ctx = EvalContext {
+        formula,
+        clts,
+        env,
+        options: options.clone(),
+        memo: MemoizationCache::default(),
+        guard_cache: HashMap::new(),
+        expression_eval_cache: HashMap::new(),
+        witness_map: None,
+        not_oob_bits,
+        oob_bits,
+    };
+    let bindings: HashMap<FormulaVarId, super::trit::TritSet> = HashMap::new();
+    ctx.eval_node_tri(formula.root(), &bindings)
 }
 
 fn bit_is_set(bits: &BitVec<usize, Lsb0>, idx: usize) -> bool {
@@ -322,6 +392,39 @@ where
     /// When Some, records transition witnesses for strategy extraction.
     /// None = no overhead; Some = recording witnesses during modal evaluation.
     witness_map: Option<WitnessMap>,
+    /// Precomputed `!oob_bits`: the bitset of states whose CLTS valuation does
+    /// NOT carry the `$oob$ → "true"` marker. Used to enforce OOB-as-bottom
+    /// semantics (Bruns–Godefroid CONCUR 2000 safety projection): every
+    /// freshly-allocated bitset (Node::True, predicate_bits, bitwise_not output,
+    /// Greatest fixpoint init) is AND-ed with this mask so the OOB sink never
+    /// satisfies any positive bitset. Combined with the OOB sink's self-loop
+    /// in the adapter, modal `[a]Z` correctly falsifies safety formulas at
+    /// any source state with a transition to OOB.
+    not_oob_bits: BitVec<usize, Lsb0>,
+    /// Precomputed `oob_bits`: the complement of `not_oob_bits`. Used by the
+    /// three-valued (TritSet) evaluator to construct `Unknown` cells at OOB
+    /// states (must=false, may=true).
+    oob_bits: BitVec<usize, Lsb0>,
+}
+
+/// Compute the bitset of states whose CLTS valuation contains the
+/// `__mununu_oob__ → "true"` out-of-bounds sink marker. Adapters set this
+/// marker when a transition would have exited the abstracted domain (see
+/// `adapter::systemverilog::kripke::OOB_STATE_KEY`).
+fn compute_oob_bits<S, L>(clts: &Clts<S, L>) -> BitVec<usize, Lsb0>
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    let mut bits = BitVec::repeat(false, clts.state_count());
+    for state_id in clts.states() {
+        if let Some(val) = clts.state_valuation(state_id)
+            && val.get("__mununu_oob__").map(|s| s.as_str()) == Some("true")
+        {
+            bits.set(state_id.index(), true);
+        }
+    }
+    bits
 }
 
 impl<'a, S, L> EvalContext<'a, S, L>
@@ -380,6 +483,10 @@ where
         for (mut out, value) in result.iter_mut().zip(input.iter()) {
             out.set(!value);
         }
+        // OOB-as-bottom invariant: bitwise_not flips OOB to true if the input had
+        // OOB cleared. Re-mask so OOB stays bottom under negation (avoids the
+        // polarity bug where !P would satisfy at OOB but P would not).
+        result.bitand_assign(self.not_oob_bits.as_bitslice());
         Ok(result)
     }
 
@@ -1584,7 +1691,14 @@ where
     }
 
     fn alloc_bitvec(&mut self, fill: bool) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        Ok(BitVec::repeat(fill, self.env.state_count()))
+        let mut bits = BitVec::repeat(fill, self.env.state_count());
+        if fill {
+            // OOB-as-bottom invariant: an "all-true" allocation must NOT include
+            // the OOB sink. Otherwise Greatest fixpoints (Nu) and Node::True would
+            // initialize with OOB satisfied, breaking the invariant.
+            bits.bitand_assign(self.not_oob_bits.as_bitslice());
+        }
+        Ok(bits)
     }
 
     fn clone_bitvec(
@@ -1597,19 +1711,23 @@ where
     fn predicate_bits(&mut self, name: &str) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
         // First check pre-computed predicates
         if let Some(bits) = self.env.predicate(name) {
-            return self.clone_bitvec(bits);
+            let mut out = self.clone_bitvec(bits)?;
+            // OOB-as-bottom invariant: pre-computed bitsets may include OOB if
+            // the predicate-map population didn't mask it. Re-mask defensively.
+            out.bitand_assign(self.not_oob_bits.as_bitslice());
+            return Ok(out);
         }
 
-        // Check cache for on-demand evaluation results
+        // Check cache for on-demand evaluation results (already OOB-masked when stored)
         if let Some(bits) = self.expression_eval_cache.get(name).cloned() {
             return Ok(bits);
         }
 
         // Try on-demand evaluation if abstract states are available
         if self.env.has_abstract_states()
-            && let Some(bits) = self.evaluate_expression_on_demand(name)?
+            && let Some(mut bits) = self.evaluate_expression_on_demand(name)?
         {
-            // Cache the result
+            bits.bitand_assign(self.not_oob_bits.as_bitslice());
             let cached = bits.clone();
             self.expression_eval_cache.insert(name.to_string(), cached);
             return Ok(bits);
@@ -1620,6 +1738,7 @@ where
         // fewer predicates satisfied, it holds with more. Unsound for existential
         // (diamond/mu) modalities: a predicate that should be true but is missing
         // could cause a reachable liveness witness to be missed.
+        // (The empty bitset is already OOB-clear; no extra masking needed.)
         self.alloc_bitvec(false)
     }
 
@@ -1759,6 +1878,164 @@ where
             self.clone_bitvec(bits)
         } else {
             self.alloc_bitvec(false)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Three-valued (Kleene) evaluator — runs alongside the BitVec one.
+    // -----------------------------------------------------------------------
+
+    /// Compute the modal-result BitVec given a precomputed target bitset.
+    ///
+    /// Used by the three-valued evaluator: for each modal node, the trit
+    /// evaluator computes the target's `TritSet`, then calls this helper twice
+    /// — once with `target.must` and once with `target.may` — and recombines.
+    /// Modal operators decompose cleanly into two parallel BitVec evaluations
+    /// because they do not mix `must` and `may` (unlike Not).
+    ///
+    /// Witness recording is intentionally skipped on this path; witnesses are
+    /// only meaningful for the BitVec evaluator's positional strategy
+    /// extraction.
+    fn modal_bits_from_target(
+        &mut self,
+        kind: ModalKind,
+        guard: &Guard,
+        target_set: &BitVec<usize, Lsb0>,
+    ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
+        if let Some(bound) = guard.max_steps {
+            return self.eval_modal_bounded(kind, guard, target_set, bound);
+        }
+
+        let mut result = self.alloc_bitvec(false)?;
+        let guard_parts = if self.options.use_partitions {
+            Some(self.guard_partitions(guard))
+        } else {
+            None
+        };
+
+        // NodeId is only used by modal_exists/modal_forall for an unused
+        // `_modal_node_id` parameter (the witness map is consulted by the
+        // caller, not here). Pass NodeId(0) as a placeholder.
+        let placeholder = NodeId(0);
+
+        for state in self.clts.states() {
+            let satisfies = match kind {
+                ModalKind::Diamond => self.modal_exists(
+                    state,
+                    guard,
+                    target_set,
+                    guard_parts.as_deref(),
+                    placeholder,
+                ),
+                ModalKind::Box => self.modal_forall(
+                    state,
+                    guard,
+                    target_set,
+                    guard_parts.as_deref(),
+                    placeholder,
+                ),
+            };
+            if satisfies {
+                result.set(state.index(), true);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Evaluate a formula node under three-valued (Kleene) semantics.
+    ///
+    /// Mirrors [`Self::eval_node`] but operates on [`super::trit::TritSet`]
+    /// instead of `BitVec`. For modal nodes, the target's TritSet is decomposed
+    /// into `(must, may)` and each is fed through `modal_bits_from_target`
+    /// independently — the parallel-evaluation strategy is sound because modal
+    /// operators do not mix polarity. Boolean Not is handled by the `TritSet`
+    /// type, which swaps `(must, may)` and complements per Kleene semantics.
+    fn eval_node_tri(
+        &mut self,
+        node_id: NodeId,
+        bindings: &HashMap<FormulaVarId, super::trit::TritSet>,
+    ) -> Result<super::trit::TritSet, EvaluationError> {
+        match self.formula.node(node_id) {
+            Node::True => Ok(super::trit::TritSet::all_true(
+                self.env.state_count(),
+                &self.oob_bits,
+            )),
+            Node::False => Ok(super::trit::TritSet::all_false(self.env.state_count())),
+            Node::Predicate(name) => {
+                // predicate_bits already masks OOB out (Phase 3) — that's the
+                // must bitset. from_predicate sets OOB in may, giving Unknown
+                // at OOB.
+                let bits = self.predicate_bits(name)?;
+                Ok(super::trit::TritSet::from_predicate(bits, &self.oob_bits))
+            }
+            Node::Variable(var) => {
+                if let Some(t) = bindings.get(var) {
+                    Ok(t.clone())
+                } else {
+                    Ok(super::trit::TritSet::all_false(self.env.state_count()))
+                }
+            }
+            Node::Not(inner) => {
+                let t = self.eval_node_tri(*inner, bindings)?;
+                Ok(t.not())
+            }
+            Node::And(left, right) => {
+                let l = self.eval_node_tri(*left, bindings)?;
+                let r = self.eval_node_tri(*right, bindings)?;
+                Ok(l.and(&r))
+            }
+            Node::Or(left, right) => {
+                let l = self.eval_node_tri(*left, bindings)?;
+                let r = self.eval_node_tri(*right, bindings)?;
+                Ok(l.or(&r))
+            }
+            Node::Modal {
+                kind,
+                guard,
+                target,
+            } => {
+                let target_tri = self.eval_node_tri(*target, bindings)?;
+                let must_target = target_tri.must_true().clone();
+                let may_target = target_tri.may_true().clone();
+                let must_bits = self.modal_bits_from_target(*kind, guard, &must_target)?;
+                let may_bits = self.modal_bits_from_target(*kind, guard, &may_target)?;
+                Ok(super::trit::TritSet::from_parts(must_bits, may_bits))
+            }
+            Node::Mu { var, body } => {
+                self.eval_fixpoint_tri(*var, *body, FixpointKind::Least, bindings)
+            }
+            Node::Nu { var, body } => {
+                self.eval_fixpoint_tri(*var, *body, FixpointKind::Greatest, bindings)
+            }
+        }
+    }
+
+    /// Compute a TritSet fixpoint by Kleene iteration.
+    ///
+    /// `Least` (μ) starts at the all-False trit set. `Greatest` (ν) starts at
+    /// the all-True trit set with OOB held as Unknown. Iterates the body until
+    /// both `must` and `may` stabilize.
+    fn eval_fixpoint_tri(
+        &mut self,
+        var: FormulaVarId,
+        body: NodeId,
+        kind: FixpointKind,
+        bindings: &HashMap<FormulaVarId, super::trit::TritSet>,
+    ) -> Result<super::trit::TritSet, EvaluationError> {
+        let mut current = match kind {
+            FixpointKind::Least => super::trit::TritSet::all_false(self.env.state_count()),
+            FixpointKind::Greatest => {
+                super::trit::TritSet::all_true(self.env.state_count(), &self.oob_bits)
+            }
+        };
+        loop {
+            let mut next_bindings = bindings.clone();
+            next_bindings.insert(var, current.clone());
+            let next = self.eval_node_tri(body, &next_bindings)?;
+            if current.eq_set(&next) {
+                return Ok(next);
+            }
+            current = next;
         }
     }
 }

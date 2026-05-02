@@ -1,0 +1,106 @@
+// Bus Arbiter with Retry — Alternation-4 Recurrence-after-Stability Benchmark
+//
+// This example exercises mununu's `parity-game` controller mode on a formula
+// whose mu-calculus normal form has alternation depth 4 — strictly above the
+// alternation-2 cap of `product-game` and the modes that use signature-based
+// extraction.
+//
+// Property pattern: "Recurrence after stability"
+//
+//     LTL form:    G(req → F(ack ∧ G(retry → F done)))
+//
+// In plain English: every request must eventually be acknowledged, and from
+// that moment on, every retry must eventually be answered by `done` —
+// forever after the first ack. The "forever after" obligation is conditional
+// on having entered the granted region, which the adversary may delay
+// arbitrarily. This pattern is in the Manna–Pnueli Σ₃ class
+// (recurrence-after-stability) and resists collapse to GR(1).
+//
+// In mu-calculus the formula has structure νZ. μY. νX. μW. (...) — three
+// strict mu/nu alternations, alternation depth 4 by mununu's
+// `Formula::alternation_depth()`.
+//
+// Citations:
+//   • Manna & Pnueli, "A Hierarchy of Temporal Properties" (PODC 1990).
+//     Recurrence-after-stability is Σ₃-complete.
+//   • Bradfield, "The modal mu-calculus alternation hierarchy is strict"
+//     (CONCUR 1996 / TCS 1998) — proves the hierarchy doesn't collapse;
+//     formulas at every level are necessary in general.
+//   • Bloem, Galler, Jobstmann, Piterman, Pnueli, Weiglhofer,
+//     "Specify, Compile, Run: Hardware from PSL" (ENTCS 2007) — practical
+//     synthesis beyond GR(1).
+//   • SYNTCOMP TLSF benchmark suite — `lily-demo` and `amba_decomposed_lock_*`
+//     contain triply-nested temporal operators with parity index ≥ 3.
+//
+// CLI:
+//
+//   mununu context synth examples/bus_arbiter_retry.ctxdsl \
+//       --formula recurrence_after_stability --automaton BusArbiter \
+//       --controller-mode parity-game
+//
+// See also: wiki/Controller-Modes.md.
+
+context bus_arbiter_retry {
+    automata {
+        automaton BusArbiter {
+            controllable {
+                label ack;
+                label release;
+                label done;
+            }
+            states {
+                state Idle initial;
+                state Pending;
+                state Granted;
+                state Retrying;
+            }
+            transitions {
+                // Environment-driven request: bus is asked for service
+                transition Idle      -> Pending  on label req;
+                // Controller acknowledges the request
+                transition Pending   -> Granted  on label ack;
+                // Controller releases the bus back to Idle
+                transition Granted   -> Idle     on label release;
+                // Environment may request a retry while bus is held
+                transition Granted   -> Retrying on label retry;
+                // Controller answers the retry (done)
+                transition Retrying  -> Granted  on label done;
+            }
+        }
+    }
+    mu_formulas {
+        // Recurrence-after-stability — alternation depth 4.
+        //
+        //   νZ. ( (¬Pending ∨ μY. ((Granted ∧ νX. ((¬Retrying ∨ μW. (Granted ∨ ◇W)) ∧ □X)) ∨ ◇Y))
+        //         ∧ □Z )
+        //
+        // Reading from the inside out:
+        //   μW. (Granted ∨ ◇W)                 — eventually back to Granted (F Granted)
+        //   νX. ((¬Retrying ∨ μW. ...) ∧ □X)   — globally: Retrying implies F Granted (G(retry → F done))
+        //   μY. ((Granted ∧ νX. ...) ∨ ◇Y)     — eventually reach a Granted state where the inner ν holds
+        //   νZ. ((¬Pending ∨ μY. ...) ∧ □Z)    — globally: Pending implies the eventual-stability goal
+        //
+        // Strict alternation: ν → μ → ν → μ. Three crossings, depth 4.
+        formula recurrence_after_stability {
+            over BusArbiter;
+            body = nu Z. (
+                (
+                    (! Pending) || (mu Y. (
+                        (Granted && (nu X. (
+                            ((! Retrying) || (mu W. (Granted || (<> W))))
+                            && ([] X)
+                        )))
+                        || (<> Y)
+                    ))
+                )
+                && ([] Z)
+            );
+        }
+    }
+    controllers {
+        controller synth {
+            source BusArbiter;
+            satisfying recurrence_after_stability;
+        }
+    }
+}

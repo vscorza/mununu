@@ -12,6 +12,7 @@ pub enum SourceLanguage {
     TypeScript,
     Python,
     Rust,
+    GDScript,
 }
 
 impl SourceLanguage {
@@ -22,6 +23,7 @@ impl SourceLanguage {
             "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript),
             "py" | "pyi" => Some(Self::Python),
             "rs" => Some(Self::Rust),
+            "gd" => Some(Self::GDScript),
             _ => None,
         }
     }
@@ -32,6 +34,7 @@ impl SourceLanguage {
             "typescript" | "ts" | "javascript" | "js" => Some(Self::TypeScript),
             "python" | "py" => Some(Self::Python),
             "rust" | "rs" => Some(Self::Rust),
+            "gdscript" | "gd" | "godot" => Some(Self::GDScript),
             _ => None,
         }
     }
@@ -70,6 +73,7 @@ fn get_ts_language(lang: SourceLanguage) -> Language {
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         SourceLanguage::Python => tree_sitter_python::LANGUAGE.into(),
         SourceLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+        SourceLanguage::GDScript => tree_sitter_gdscript::LANGUAGE.into(),
     }
 }
 
@@ -107,6 +111,7 @@ pub fn parse_source(source: &str, language: SourceLanguage) -> Result<ParsedSour
                     SourceLanguage::TypeScript => "TypeScript",
                     SourceLanguage::Python => "Python",
                     SourceLanguage::Rust => "Rust",
+                    SourceLanguage::GDScript => "GDScript",
                 }
             ));
         }
@@ -278,6 +283,45 @@ impl Connection {
         let parsed = parse_source(source, SourceLanguage::Rust).unwrap();
         assert_eq!(parsed.language, SourceLanguage::Rust);
         assert!(!parsed.tree.root_node().has_error());
+    }
+
+    #[test]
+    fn parse_gdscript_source() {
+        let source = r#"
+enum State { IDLE, RUNNING, JUMPING }
+var current_state: State = State.IDLE
+
+func _physics_process(delta):
+    match current_state:
+        State.IDLE:
+            if Input.is_action_pressed("move"):
+                current_state = State.RUNNING
+        State.RUNNING:
+            if not Input.is_action_pressed("move"):
+                current_state = State.IDLE
+"#;
+        let parsed = parse_source(source, SourceLanguage::GDScript).unwrap();
+        assert_eq!(parsed.language, SourceLanguage::GDScript);
+    }
+
+    #[test]
+    fn detect_gdscript_from_extension() {
+        assert_eq!(
+            SourceLanguage::from_extension("player_controller.gd"),
+            Some(SourceLanguage::GDScript)
+        );
+    }
+
+    #[test]
+    fn detect_gdscript_from_name() {
+        assert_eq!(
+            SourceLanguage::from_name("gdscript"),
+            Some(SourceLanguage::GDScript)
+        );
+        assert_eq!(
+            SourceLanguage::from_name("gd"),
+            Some(SourceLanguage::GDScript)
+        );
     }
 
     #[test]

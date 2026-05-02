@@ -7,14 +7,18 @@
 pub mod evaluator;
 pub mod invert;
 mod memo;
+pub mod parity_game;
 pub mod parser;
 pub mod simplify;
+pub mod trit;
 
 pub use evaluator::{
     Environment, EvalResult, EvaluationError, EvaluationOptions, Signature, WitnessMap, evaluate,
-    evaluate_with_options, evaluate_with_options_and_automaton, evaluate_with_witnesses,
+    evaluate_tri, evaluate_tri_with_options, evaluate_with_options,
+    evaluate_with_options_and_automaton, evaluate_with_witnesses,
 };
 pub use simplify::simplify;
+pub use trit::{Trit, TritSet};
 
 /// Classification of a μ-calculus formula by its fixpoint structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +113,17 @@ impl Formula {
         let mut result = Vec::new();
         self.collect_fixpoint_order(self.root, &mut result);
         result
+    }
+
+    /// Returns the FormulaVarIds of all mu-fixpoints in nesting order
+    /// (outermost first). These are the "obligations" a memory-aware
+    /// controller rotates through to ensure each mu-fixpoint receives fair
+    /// progress under alternation. Used by `ControllerMode::ProductGame`.
+    pub fn mu_obligations(&self) -> Vec<FormulaVarId> {
+        self.fixpoint_nesting_order()
+            .into_iter()
+            .filter_map(|(v, is_mu)| if is_mu { Some(v) } else { None })
+            .collect()
     }
 
     fn collect_fixpoint_order(&self, id: NodeId, out: &mut Vec<(FormulaVarId, bool)>) {
@@ -404,5 +419,37 @@ mod tests {
         let f = parser::parse("nu X. ((nu Y. (p && [] Y)) && [] X)").unwrap();
         assert_eq!(f.alternation_depth(), 1);
         assert_eq!(f.property_class(), PropertyClass::Safety);
+    }
+
+    #[test]
+    fn mu_obligations_returns_all_mu_vars_in_nesting_order() {
+        // GR(1)-like: nu X. ((mu Y1. (A || <> Y1)) && (mu Y2. (B || <> Y2)) && [] X)
+        let f = parser::parse("nu X. ((mu Y1. (A || <> Y1)) && (mu Y2. (B || <> Y2)) && [] X)")
+            .unwrap();
+        let obligations = f.mu_obligations();
+        assert_eq!(
+            obligations.len(),
+            2,
+            "two mu-fixpoints (Y1, Y2) expected as obligations"
+        );
+        // Confirm the names are the mu vars (Y1 outer, Y2 inner) — order is
+        // outermost-first per fixpoint_nesting_order.
+        let names: Vec<&str> = obligations
+            .iter()
+            .map(|v| f.var(*v).name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Y1", "Y2"]);
+    }
+
+    #[test]
+    fn mu_obligations_empty_for_pure_nu_safety() {
+        let f = parser::parse("nu X. (p && [] X)").unwrap();
+        assert!(f.mu_obligations().is_empty());
+    }
+
+    #[test]
+    fn mu_obligations_single_for_pure_reachability() {
+        let f = parser::parse("mu X. (p || <> X)").unwrap();
+        assert_eq!(f.mu_obligations().len(), 1);
     }
 }

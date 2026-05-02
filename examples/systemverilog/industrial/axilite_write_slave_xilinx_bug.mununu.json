@@ -42,7 +42,8 @@
     {
       "id": "safety",
       "formula": "nu X. ([] X)",
-      "description": "No deadlock — all states have successors"
+      "description": "Baseline: no deadlock. Holds on bug AND fixed."
     }
-  ]
+  ],
+  "$comment_distinguishing_property": "The bug (aw_flag clears on data acceptance instead of response acknowledgment) is NOT distinguishable from the fixed version using only this standalone slave model: the Kripke abstraction over the four boolean registers reaches the same set of states whether the flag-clear gate is on `wready && wvalid` or `bvalid && bready`, because the input `s_axi_bready` is unconstrained in this single-module view. The bug only manifests against a master that holds bready low while issuing a new awvalid. To verify the distinguishing property, use the multi-module sidecar `axilite_write_system.mununu.json` (with the master + slave composed) via the HTTP `/api/v1/context/import` endpoint, where the property `no_response_window` (`nu X. ((!axi_bvalid_T || aw_flag_T) && [] X)`) fails on the bug composition and passes on the fixed composition. See examples/systemverilog/industrial/FINDINGS.md for the verification record."
 }

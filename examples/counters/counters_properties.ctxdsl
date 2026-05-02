@@ -1,3 +1,12 @@
+// Sidecar context: declares formulas and a controller over the `Counter`
+// automaton defined in `counters.ctxdsl`. To use, supply both files:
+//
+//   mununu context eval examples/counters/counters.ctxdsl \
+//       --sidecar examples/counters/counters_properties.ctxdsl \
+//       --formula reachability --automaton Counter
+//
+// See examples/counters/README.md for more invocations.
+
 context counters_properties {
     mu_formulas {
         formula reachability {

@@ -34,8 +34,6 @@ enum Token {
     // Operators
     Assign,
     Bang,
-    #[allow(dead_code)]
-    Send,
     Recv,
     Plus,
     Minus,
@@ -1377,26 +1375,6 @@ impl<'a> PromelaParser<'a> {
                 depth += 1;
             }
             if self.current == Token::RBrace {
-                depth -= 1;
-            }
-            if depth > 0 {
-                self.advance()?;
-            }
-        }
-        if depth == 0 {
-            self.advance()?;
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn skip_parens(&mut self) -> Result<(), AdapterError> {
-        let mut depth = 1;
-        while depth > 0 && self.current != Token::Eof {
-            if self.current == Token::LParen {
-                depth += 1;
-            }
-            if self.current == Token::RParen {
                 depth -= 1;
             }
             if depth > 0 {

@@ -78,6 +78,20 @@ pub enum GuardExpressionMetadata {
 }
 
 impl PredicateMetadata {
+    /// Build metadata for a state-name predicate of the form `state == X`.
+    /// Used by both user-declared state-target predicates and the auto-registration
+    /// path that synthesises predicates referenced by formulas.
+    fn state_name_eq(state_name: &str) -> Self {
+        Self {
+            guard: format!("state == {state_name}"),
+            expression: GuardExpressionMetadata::Comparison {
+                left: "state".to_string(),
+                op: "==".to_string(),
+                right: state_name.to_string(),
+            },
+        }
+    }
+
     fn from_json(value: &Value, formula: &RealizedFormula) -> Self {
         let guard = value
             .get("guard")
@@ -330,6 +344,15 @@ pub enum RealizationError {
     Context(#[from] ContextError),
     #[error("unknown state '{state}' referenced by predicate in automaton '{automaton}'")]
     UnknownPredicateState { automaton: String, state: String },
+    #[error(
+        "formula '{formula}' references predicate '{predicate}' that is not registered for any target automaton (typo? Defined predicates for '{automaton}': [{available}])"
+    )]
+    UnknownPredicate {
+        formula: String,
+        predicate: String,
+        automaton: String,
+        available: String,
+    },
     #[error("invalid composition '{name}': {reason}")]
     InvalidComposition { name: String, reason: String },
     #[error("unrolling failed for automaton '{name}': {error}")]
@@ -1488,7 +1511,181 @@ pub fn realize(
         &mut realized.predicate_bitsets,
     )?;
 
+    // B4: fail-loud validation that every predicate referenced in every
+    // formula resolves for at least one target automaton. Catches typos that
+    // would otherwise slip through to evaluation time, where unresolved
+    // predicates silently default to `false` (see SOUNDNESS comment in
+    // evaluator::predicate_bits). Structured/valuation patterns are
+    // skipped (see is_simple_identifier) — only plain-identifier typos
+    // trigger the error.
+    validate_formula_predicates(&realized)?;
+
     Ok(realized)
+}
+
+/// Heuristic: returns true when `name` looks like a plain identifier (the
+/// pattern most likely to be a typo of a state or predicate name) and false
+/// when it looks like a structured/valuation/expression predicate (which is
+/// resolved by the evaluator dynamically and shouldn't be validated
+/// statically).
+///
+/// Plain identifier: starts with a letter or underscore, contains only
+/// alphanumerics and underscores, AND has no underscore-separated `_T_` or
+/// `_state_` infix that would mark it as a valuation-pattern predicate.
+fn is_simple_identifier(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    // Reject obvious valuation-pattern predicates so the dynamic resolver
+    // gets a chance.
+    if name.contains("_T_") || name.contains("_F_") || name.contains("_state_") {
+        return false;
+    }
+    // Reject `field_<digits>` pattern (counter-equals-literal predicates,
+    // e.g., `fill_5`, `count_0`).
+    if let Some(idx) = name.rfind('_') {
+        let suffix = &name[idx + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// B4: post-realize fail-loud validation that every predicate referenced in
+/// every formula resolves for at least one target automaton — either via a
+/// registered predicate name, via composition member projection, or via an
+/// automaton with valuations (where on-demand expression evaluation can
+/// synthesize the predicate at eval time).
+///
+/// Returns an error for each unresolved plain-identifier reference (the
+/// common typo case). Structured/valuation/expression predicates are
+/// skipped because their resolution is dynamic.
+///
+/// Without this check, the evaluator's `predicate_bits` returns an empty
+/// bitset for unknown names — a typo silently defaults to `false` and
+/// corrupts the verdict (see the SOUNDNESS comment in
+/// `evaluator::predicate_bits`).
+fn validate_formula_predicates(realized: &RealizedContext) -> Result<(), RealizationError> {
+    use std::collections::HashSet;
+
+    for formula in realized.formulas.values() {
+        // Skip auto-generated structural predicates — they're synthesized by
+        // the realizer itself and reference predicates also synthesized here.
+        if formula
+            .meta
+            .comment
+            .as_ref()
+            .is_some_and(|c| c.contains("\"type\":\"structural\""))
+        {
+            continue;
+        }
+
+        let mut referenced = HashSet::new();
+        extract_predicate_names(&formula.formula, &mut referenced);
+        if referenced.is_empty() {
+            continue;
+        }
+
+        // Determine target automata for this formula
+        let target_automata: Vec<String> = match &formula.targets {
+            FormulaTargetsKind::Named(names) => names.to_vec(),
+            FormulaTargetsKind::All => realized.context.clts_names().into_iter().collect(),
+        };
+
+        if target_automata.is_empty() {
+            continue;
+        }
+
+        for predicate in &referenced {
+            // Skip anything that doesn't look like a simple identifier — these
+            // are structured/valuation/expression-style predicates whose
+            // resolution path is dynamic and harder to validate statically.
+            // Plain identifier typos (the common case) DO get caught.
+            if !is_simple_identifier(predicate) {
+                continue;
+            }
+
+            // True = the predicate resolves for at least one target automaton
+            let resolves_anywhere = target_automata.iter().any(|automaton| {
+                // Path 1: pre-computed/auto-registered predicate
+                if realized
+                    .predicates
+                    .get(automaton)
+                    .is_some_and(|set| set.contains(predicate))
+                {
+                    return true;
+                }
+
+                // Path 2: composition member exposes it (environment_for projects)
+                if let Some(members) = realized.composition_members.get(automaton)
+                    && members.iter().any(|m| {
+                        realized
+                            .predicates
+                            .get(m)
+                            .is_some_and(|set| set.contains(predicate))
+                    })
+                {
+                    return true;
+                }
+
+                // Path 3: automaton or any of its composition members has
+                // valuations — the predicate may be a valuation-derived
+                // expression that the evaluator (or
+                // auto_register_state_name_predicates with pattern matching)
+                // can resolve on-demand. Over-permits slightly to avoid
+                // false-reject on valid abstract-state / valuation
+                // expressions.
+                if let Some(clts) = realized.context.clts(automaton)
+                    && clts.has_valuations()
+                {
+                    return true;
+                }
+                if let Some(members) = realized.composition_members.get(automaton)
+                    && members
+                        .iter()
+                        .any(|m| realized.context.clts(m).is_some_and(|c| c.has_valuations()))
+                {
+                    return true;
+                }
+
+                false
+            });
+
+            if !resolves_anywhere {
+                let automaton = target_automata.first().cloned().unwrap_or_default();
+                let mut available: Vec<&str> = realized
+                    .predicates
+                    .get(&automaton)
+                    .map(|set| set.iter().map(|s| s.as_str()).collect())
+                    .unwrap_or_default();
+                available.sort();
+                let truncated = if available.len() > 16 {
+                    let mut head: Vec<&str> = available.iter().take(16).copied().collect();
+                    head.push("...");
+                    head.join(", ")
+                } else {
+                    available.join(", ")
+                };
+                return Err(RealizationError::UnknownPredicate {
+                    formula: formula.name.clone(),
+                    predicate: predicate.clone(),
+                    automaton,
+                    available: truncated,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Generates structural predicates for each automaton in the context.
@@ -1724,18 +1921,13 @@ fn register_user_predicates(
                 .or_default()
                 .insert(predicate_name.clone(), bits);
 
-            let metadata = PredicateMetadata {
-                guard: format!("state == {}", state_name),
-                expression: GuardExpressionMetadata::Comparison {
-                    left: "state".to_string(),
-                    op: "==".to_string(),
-                    right: state_name,
-                },
-            };
             predicate_metadata
                 .entry(automaton.clone())
                 .or_default()
-                .insert(predicate_name, metadata);
+                .insert(
+                    predicate_name,
+                    PredicateMetadata::state_name_eq(&state_name),
+                );
         }
     }
     Ok(())
@@ -1806,18 +1998,13 @@ fn auto_register_state_name_predicates(
                     .or_default()
                     .insert(pred_name.clone(), bitset);
 
-                let metadata = PredicateMetadata {
-                    guard: format!("state == {}", pred_name),
-                    expression: GuardExpressionMetadata::Comparison {
-                        left: "state".to_string(),
-                        op: "==".to_string(),
-                        right: pred_name.clone(),
-                    },
-                };
                 predicate_metadata
                     .entry(automaton.clone())
                     .or_default()
-                    .insert(pred_name.clone(), metadata);
+                    .insert(
+                        pred_name.clone(),
+                        PredicateMetadata::state_name_eq(pred_name),
+                    );
             }
         }
 
@@ -1855,18 +2042,13 @@ fn auto_register_state_name_predicates(
                             .or_default()
                             .insert(pred_name.clone(), bitset);
 
-                        let metadata = PredicateMetadata {
-                            guard: format!("state == {}", pred_name),
-                            expression: GuardExpressionMetadata::Comparison {
-                                left: "state".to_string(),
-                                op: "==".to_string(),
-                                right: pred_name.clone(),
-                            },
-                        };
                         predicate_metadata
                             .entry(member_name.clone())
                             .or_default()
-                            .insert(pred_name.clone(), metadata);
+                            .insert(
+                                pred_name.clone(),
+                                PredicateMetadata::state_name_eq(pred_name),
+                            );
                     }
                 }
             }
@@ -2879,6 +3061,80 @@ impl LabelUniverse {
 mod tests {
     use super::*;
     use crate::context_dsl::parse;
+
+    #[test]
+    fn is_simple_identifier_recognizes_typo_candidates() {
+        // Plain identifiers — fail-loud candidates
+        assert!(is_simple_identifier("Bad"));
+        assert!(is_simple_identifier("foo_bar"));
+        assert!(is_simple_identifier("running"));
+
+        // Structured / valuation patterns — skipped (dynamic)
+        assert!(!is_simple_identifier("flag_T_state_IDLE"));
+        assert!(!is_simple_identifier("overlap_T_state_AES_ACCESS"));
+        assert!(!is_simple_identifier("fill_5"));
+        assert!(!is_simple_identifier("count_0"));
+
+        // Junk
+        assert!(!is_simple_identifier(""));
+        assert!(!is_simple_identifier("123abc"));
+        assert!(!is_simple_identifier("with spaces"));
+        assert!(!is_simple_identifier("dot.notation"));
+    }
+
+    #[test]
+    fn unresolved_predicate_fails_realize() {
+        // Plain identifier predicate `Bar` does not match any state nor any
+        // registered predicate. Validator must reject with UnknownPredicate.
+        let doc = parse(
+            r#"
+context typo_test {
+    alphabet { label tick; }
+    automata {
+        automaton M {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on label tick; }
+        }
+    }
+    mu_formulas {
+        formula references_typo { over M; body = nu X. (Bar && [] X); }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let err = realize(&doc, &[]).expect_err("realize rejects unresolved predicate");
+        assert!(
+            matches!(err, RealizationError::UnknownPredicate { ref predicate, .. } if predicate == "Bar"),
+            "expected UnknownPredicate(Bar), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn structured_pattern_predicate_does_not_fail_when_unresolvable() {
+        // Predicates like `field_5` or `flag_T_state_IDLE` skip validation
+        // because their resolution is dynamic. They may still produce empty
+        // bitsets at evaluation time, but that's a separate concern from
+        // typo-detection.
+        let doc = parse(
+            r#"
+context structured_test {
+    alphabet { label tick; }
+    automata {
+        automaton M {
+            states { state s0 initial; }
+            transitions { transition s0 -> s0 on label tick; }
+        }
+    }
+    mu_formulas {
+        formula uses_structured { over M; body = nu X. (field_5 && [] X); }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let _ = realize(&doc, &[]).expect("structured-pattern predicate skipped");
+    }
 
     #[test]
     fn realize_simple_context() {

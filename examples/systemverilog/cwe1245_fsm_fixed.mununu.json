@@ -25,12 +25,17 @@
     {
       "id": "recoverable",
       "formula": "mu X. (state_IDLE || <> X)",
-      "description": "From any state (including after glitch), IDLE is always reachable"
+      "description": "Reachability of IDLE from the current state. Holds in both bug and fixed at IDLE itself; the difference shows in `always_recoverable` below."
+    },
+    {
+      "id": "always_recoverable",
+      "formula": "nu Y. ((mu X. (state_IDLE || <> X)) && [] Y)",
+      "description": "From EVERY reachable state — including after a glitch into UNDEF — IDLE remains reachable. Fixed passes because the default case in the case statement transitions UNDEF back to IDLE."
     },
     {
       "id": "safety",
       "formula": "nu X. ([] X)",
-      "description": "All states have successors"
+      "description": "Baseline: all states have successors. Holds on bug AND fixed."
     }
   ]
 }

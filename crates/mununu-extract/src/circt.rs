@@ -545,6 +545,8 @@ pub fn build_espec(system: &ReactiveSystem) -> ExtractionSpec {
                 system.reachable,
                 system.total_enumerated
             )),
+            fix_pr: None,
+            fix_commit: None,
         },
         state_fields: vec![],
         methods: vec![],
@@ -571,6 +573,7 @@ pub fn build_espec(system: &ReactiveSystem) -> ExtractionSpec {
                 description: Some("Trivial safety — all reachable states satisfy".to_string()),
                 formula: Some("nu X. ([] X)".to_string()),
                 formula_template: None,
+                template_ref: None,
                 over: Some(automaton_id),
                 holds_in_fixed: None,
                 holds_in_vulnerable: None,

@@ -170,7 +170,9 @@ pub struct PropertyAnnotation {
     pub id: String,
 
     /// Mu-calculus formula body.
-    pub formula: String,
+    /// Optional when `template_ref` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
 
     /// Human-readable description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +181,12 @@ pub struct PropertyAnnotation {
     /// Property role: "guarantee" (default), "assumption", or "standalone".
     #[serde(default = "default_guarantee", skip_serializing_if = "is_guarantee")]
     pub role: String,
+
+    /// Reference to a property template from the template catalog.
+    /// When present, the template is instantiated to produce a mu-calculus formula.
+    /// If both `formula` and `template_ref` are present, `formula` takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_ref: Option<crate::adapter::templates::TemplateRef>,
 }
 
 /// SMT-discovered values for a signal.
@@ -852,12 +860,13 @@ fn merge_from_inline(module: &Module) -> MergedConfig {
         .iter()
         .map(|p| PropertyAnnotation {
             id: p.name.clone(),
-            formula: p.formula.clone(),
+            formula: Some(p.formula.clone()),
             description: None,
             role: match p.kind {
                 MununuPropertyKind::Assume => "assumption".to_string(),
                 _ => "guarantee".to_string(),
             },
+            template_ref: None,
         })
         .collect();
 
@@ -1039,9 +1048,10 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         controllable: vec![],
         properties: vec![PropertyAnnotation {
             id: "safety".to_string(),
-            formula: "nu X. ([] X)".to_string(),
+            formula: Some("nu X. ([] X)".to_string()),
             description: Some("No deadlock — all reachable states have successors".to_string()),
             role: "guarantee".to_string(),
+            template_ref: None,
         }],
         discovered_values: HashMap::new(),
         parameters: HashMap::new(),
@@ -1172,9 +1182,10 @@ pub fn generate_multi_sidecar(
         }),
         properties: vec![PropertyAnnotation {
             id: "safety".to_string(),
-            formula: "nu X. ([] X)".to_string(),
+            formula: Some("nu X. ([] X)".to_string()),
             description: Some("No deadlock — all states have successors".to_string()),
             role: "guarantee".to_string(),
+            template_ref: None,
         }],
         discovered_values: HashMap::new(),
     }

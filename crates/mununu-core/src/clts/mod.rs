@@ -193,6 +193,14 @@ impl<S: IdStorage> StateId<S> {
         S::try_from_usize(index).map(Self)
     }
 
+    /// Construct a StateId from a raw `usize` index. Returns `None` if the
+    /// index doesn't fit the underlying storage (e.g., out of range for
+    /// `DefaultStateIdx = u32`). Use when you need to convert an index
+    /// from a bitset/raw lookup back into a typed StateId.
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::new(index)
+    }
+
     pub fn raw(self) -> S {
         self.0
     }

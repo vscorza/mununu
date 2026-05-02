@@ -121,3 +121,9 @@ npm run dev
 - `[] X` = box modality (all successors satisfy X)
 - `<> X` = diamond modality (some successor satisfies X)
 - `< labels = {l} > X` = labeled diamond (some l-successor satisfies X)
+
+## Higher-alternation example: bus arbiter with retry
+
+For hardware-style patterns where a stability event triggers a forever-after recurrence obligation — e.g., a bus that must answer every retry once granted — the resulting property has alternation depth 4 (above GR(1)). [`examples/bus_arbiter_retry.ctxdsl`](../examples/bus_arbiter_retry.ctxdsl) is a 4-state benchmark for this case. The mu-calculus formula is `νZ. μY. νX. μW. (...)` — three strict mu/nu alternations. Use `mununu context synth ... --controller-mode parity-game` for theoretical correctness on this depth; see [`docs/ltl_templates/temporal_logic_patterns.md`](ltl_templates/temporal_logic_patterns.md#beyond-gr1-recurrence-after-stability-σ3) for the pattern reference.
+
+A dual-channel extension is at [`examples/dual_arbiter_alt4.ctxdsl`](../examples/dual_arbiter_alt4.ctxdsl): two independent service loops with their own recurrence-after-stability obligations, plus controllable `swap` transitions that the synthesized strategy must omit. The example demonstrates both required behaviours of memory-aware synthesis — *memory* of which channel's obligation is currently outstanding, and *strategy selection* via implicit disabling of controllable transitions. Functional mode synthesizes 31 transitions while projection keeps all 48; the 17-transition gap is the disabled set.

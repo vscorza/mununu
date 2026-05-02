@@ -143,11 +143,19 @@ pub struct PropertyAnnotation {
     pub name: String,
 
     /// LTL or mu-calculus formula string.
-    pub formula: String,
+    /// Optional when `template_ref` is present.
+    #[serde(default)]
+    pub formula: Option<String>,
 
     /// Property role: `"guarantee"`, `"assumption"`, `"invariant"`, or `"standalone"`.
     #[serde(default = "default_role")]
     pub role: String,
+
+    /// Reference to a property template from the template catalog.
+    /// When present, the template is instantiated to produce a mu-calculus formula.
+    /// If both `formula` and `template_ref` are present, `formula` takes precedence.
+    #[serde(default)]
+    pub template_ref: Option<crate::adapter::templates::TemplateRef>,
 }
 
 fn default_role() -> String {

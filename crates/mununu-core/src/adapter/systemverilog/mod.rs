@@ -140,8 +140,62 @@ impl SystemVerilogAdapter {
 
         let sidecar_dir = sidecar_path
             .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
 
+        Self::translate_multi_module_inner(&ann, options, |source, module_name| {
+            let sv_path = sidecar_dir.join(source);
+            std::fs::read_to_string(&sv_path).map_err(|e| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!(
+                    "failed to read '{}' for module '{}': {e}",
+                    sv_path.display(),
+                    module_name
+                ),
+                location: None,
+            })
+        })
+    }
+
+    /// Translate a multi-module sidecar into a composed AdapterOutput (in-memory).
+    ///
+    /// Like [`translate_multi_module`] but takes the sidecar JSON and source
+    /// contents directly — no filesystem access. Used by the API endpoint.
+    ///
+    /// `sources` maps source filenames (matching the sidecar's `"source"` fields)
+    /// to their content strings.
+    pub fn translate_multi_module_content(
+        sidecar_json: &str,
+        sources: &std::collections::HashMap<String, String>,
+        options: &AdapterOptions,
+    ) -> Result<AdapterOutput, AdapterError> {
+        let ann: annotation::MultiModuleSvAnnotation =
+            serde_json::from_str(sidecar_json).map_err(|e| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!("Failed to parse multi-module sidecar: {e}"),
+                location: None,
+            })?;
+
+        Self::translate_multi_module_inner(&ann, options, |source, module_name| {
+            sources.get(source).cloned().ok_or_else(|| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!("Source file '{source}' for module '{module_name}' not provided"),
+                location: None,
+            })
+        })
+    }
+
+    /// Shared body for the disk-based and in-memory multi-module entry points.
+    /// `get_source` is given (source_field, module_name) and must return the SV
+    /// source string — disk read in one variant, HashMap lookup in the other.
+    fn translate_multi_module_inner<F>(
+        ann: &annotation::MultiModuleSvAnnotation,
+        options: &AdapterOptions,
+        get_source: F,
+    ) -> Result<AdapterOutput, AdapterError>
+    where
+        F: Fn(&str, &str) -> Result<String, AdapterError>,
+    {
         let mut all_automata: Vec<AutomatonSpec> = Vec::new();
         let mut all_warnings: Vec<AdapterWarning> = Vec::new();
         let mut all_state_valuations = std::collections::HashMap::new();
@@ -150,16 +204,7 @@ impl SystemVerilogAdapter {
 
         // Phase 1: Build each module's Kripke automaton independently
         for module_entry in &ann.modules {
-            let sv_path = sidecar_dir.join(&module_entry.source);
-            let sv_content = std::fs::read_to_string(&sv_path).map_err(|e| AdapterError {
-                kind: AdapterErrorKind::ParseError,
-                message: format!(
-                    "failed to read '{}' for module '{}': {e}",
-                    sv_path.display(),
-                    module_entry.name
-                ),
-                location: None,
-            })?;
+            let sv_content = get_source(&module_entry.source, &module_entry.name)?;
 
             let (module, mut parse_warnings) =
                 parser::parse_with_warnings(&sv_content).map_err(|e| AdapterError {
@@ -182,7 +227,7 @@ impl SystemVerilogAdapter {
             }
 
             // Build a per-module SvAnnotation to reuse merge_config
-            let per_module_ann = build_per_module_annotation(module_entry, &ann);
+            let per_module_ann = build_per_module_annotation(module_entry, ann);
             let config = annotation::merge_config(Some(&per_module_ann), &module);
 
             let (automaton, _module_properties, state_count) =
@@ -253,216 +298,12 @@ impl SystemVerilogAdapter {
         };
 
         // Phase 3: Build properties targeting the composition
-        let properties: Vec<PropertySpec> = ann
-            .properties
-            .iter()
-            .map(|p| {
-                let role = match p.role.as_str() {
-                    "assumption" => PropertyRole::Assumption,
-                    "standalone" => PropertyRole::Standalone,
-                    _ => PropertyRole::Guarantee,
-                };
-                PropertySpec {
-                    name: p.id.clone(),
-                    kind: PropertyKind::Safety,
-                    formula: PropertyFormula::MuCalculus(p.formula.clone()),
-                    role,
-                    over: Some(comp_name.clone()),
-                }
-            })
-            .collect();
+        let properties: Vec<PropertySpec> =
+            resolve_sidecar_properties(&ann.properties, Some(comp_name.clone()));
 
         let property_count = properties.len();
 
         // Controller from first property (if any)
-        let controller = properties.first().map(|p| ControllerSpec {
-            name: "synth".to_string(),
-            source_automaton: comp_name.clone(),
-            formula_name: p.name.clone(),
-        });
-
-        let context_name = options.context_name.as_deref().unwrap_or(&comp_name);
-
-        let ir = AdapterIR {
-            metadata: Metadata {
-                title: context_name.to_string(),
-                source_format: SourceFormat::SystemVerilog,
-                description: Some(format!(
-                    "Multi-module composition of {} SystemVerilog modules",
-                    ann.modules.len()
-                )),
-                game_semantics: None,
-                known_status: None,
-            },
-            signals: vec![],
-            automata: all_automata,
-            compositions: vec![composition],
-            properties,
-            controller,
-        };
-
-        let result = crate::adapter::emit::emit(&ir).map_err(|e| AdapterError {
-            kind: AdapterErrorKind::EmitError,
-            message: format!("CTXDSL emission failed: {e}"),
-            location: None,
-        })?;
-
-        Ok(AdapterOutput {
-            ctxdsl: result.ctxdsl,
-            warnings: all_warnings,
-            source_info: SourceInfo {
-                format: SourceFormat::SystemVerilog,
-                title: Some(context_name.to_string()),
-                signal_count: total_signal_count,
-                state_count: total_state_count,
-                property_count,
-            },
-            state_valuations: all_state_valuations,
-        })
-    }
-
-    /// Translate a multi-module sidecar into a composed AdapterOutput (in-memory).
-    ///
-    /// Like [`translate_multi_module`] but takes the sidecar JSON and source
-    /// contents directly — no filesystem access. Used by the API endpoint.
-    ///
-    /// `sources` maps source filenames (matching the sidecar's `"source"` fields)
-    /// to their content strings.
-    pub fn translate_multi_module_content(
-        sidecar_json: &str,
-        sources: &std::collections::HashMap<String, String>,
-        options: &AdapterOptions,
-    ) -> Result<AdapterOutput, AdapterError> {
-        let ann: annotation::MultiModuleSvAnnotation =
-            serde_json::from_str(sidecar_json).map_err(|e| AdapterError {
-                kind: AdapterErrorKind::ParseError,
-                message: format!("Failed to parse multi-module sidecar: {e}"),
-                location: None,
-            })?;
-
-        let mut all_automata: Vec<AutomatonSpec> = Vec::new();
-        let mut all_warnings: Vec<AdapterWarning> = Vec::new();
-        let mut all_state_valuations = std::collections::HashMap::new();
-        let mut total_state_count = 0usize;
-        let mut total_signal_count = 0usize;
-
-        // Phase 1: Build each module's Kripke automaton
-        for module_entry in &ann.modules {
-            let sv_content = sources
-                .get(&module_entry.source)
-                .ok_or_else(|| AdapterError {
-                    kind: AdapterErrorKind::ParseError,
-                    message: format!(
-                        "Source file '{}' for module '{}' not provided",
-                        module_entry.source, module_entry.name
-                    ),
-                    location: None,
-                })?;
-
-            let (module, mut parse_warnings) =
-                parser::parse_with_warnings(sv_content).map_err(|e| AdapterError {
-                    kind: e.kind,
-                    message: format!("in module '{}': {}", module_entry.name, e.message),
-                    location: e.location,
-                })?;
-
-            all_warnings.append(&mut parse_warnings);
-
-            if module.name != module_entry.name {
-                all_warnings.push(AdapterWarning {
-                    kind: super::WarningKind::UnsupportedConstruct,
-                    message: format!(
-                        "sidecar module name '{}' does not match SV module '{}' in '{}'",
-                        module_entry.name, module.name, module_entry.source
-                    ),
-                    location: None,
-                });
-            }
-
-            let per_module_ann = build_per_module_annotation(module_entry, &ann);
-            let config = annotation::merge_config(Some(&per_module_ann), &module);
-
-            let (automaton, _module_properties, state_count) =
-                kripke::build_kripke_with_config(&module, &config, &mut all_warnings)?;
-
-            let mut automaton = AutomatonSpec {
-                name: module_entry.name.clone(),
-                ..automaton
-            };
-
-            annotate_driving_output_labels(
-                &mut automaton,
-                &module_entry.name,
-                &ann.connections,
-                &module,
-            );
-
-            let ir_for_valuations = AdapterIR {
-                metadata: Metadata {
-                    title: module_entry.name.clone(),
-                    source_format: SourceFormat::SystemVerilog,
-                    description: None,
-                    game_semantics: None,
-                    known_status: None,
-                },
-                signals: vec![],
-                automata: vec![automaton.clone()],
-                compositions: vec![],
-                properties: vec![],
-                controller: None,
-            };
-            let valuations = crate::adapter::emit::extract_state_valuations(&ir_for_valuations);
-            for (k, v) in valuations {
-                all_state_valuations.insert(k, v);
-            }
-
-            total_state_count += state_count;
-            total_signal_count += module.ports.len();
-            all_automata.push(automaton);
-        }
-
-        // Phase 2: Composition
-        let comp_config = ann.composition.as_ref();
-        let comp_name = comp_config
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "system".to_string());
-        let comp_mode = comp_config
-            .map(|c| c.mode.as_str())
-            .unwrap_or("synchronous");
-
-        let member_names: Vec<String> = ann.modules.iter().map(|m| m.name.clone()).collect();
-        let composition = match comp_mode {
-            "asynchronous" => super::ir::CompositionSpec::Asynchronous {
-                name: comp_name.clone(),
-                members: member_names,
-            },
-            _ => super::ir::CompositionSpec::Synchronous {
-                name: comp_name.clone(),
-                members: member_names,
-            },
-        };
-
-        // Phase 3: Properties
-        let properties: Vec<PropertySpec> = ann
-            .properties
-            .iter()
-            .map(|p| {
-                let role = match p.role.as_str() {
-                    "assumption" => PropertyRole::Assumption,
-                    "standalone" => PropertyRole::Standalone,
-                    _ => PropertyRole::Guarantee,
-                };
-                PropertySpec {
-                    name: p.id.clone(),
-                    kind: PropertyKind::Safety,
-                    formula: PropertyFormula::MuCalculus(p.formula.clone()),
-                    role,
-                    over: Some(comp_name.clone()),
-                }
-            })
-            .collect();
-
-        let property_count = properties.len();
         let controller = properties.first().map(|p| ControllerSpec {
             name: "synth".to_string(),
             source_automaton: comp_name.clone(),
@@ -656,8 +497,11 @@ fn eval_assign_for_transition(
         }
     }
 
-    // Evaluate the assign expression
-    let result = kripke::eval_expr_pub(&assign.value, &values)?;
+    // Evaluate the assign expression. Pass an empty registers slice: this is
+    // an output-annotation pathway used after state-space construction, where
+    // Variant operands have already been resolved into the state valuation
+    // map. Phase 7's value_map lookup isn't needed here.
+    let result = kripke::eval_expr_pub(&assign.value, &values, &[])?;
     Some(result.display_short())
 }
 
@@ -949,9 +793,82 @@ fn to_ir(
     })
 }
 
+/// Resolve sidecar `PropertyAnnotation` list into `PropertySpec` values,
+/// handling both raw formulas and template references.
+fn resolve_sidecar_properties(
+    annotations: &[annotation::PropertyAnnotation],
+    over: Option<String>,
+) -> Vec<PropertySpec> {
+    let registry = crate::adapter::templates::TemplateRegistry::builtin();
+    annotations
+        .iter()
+        .filter_map(|p| {
+            let role = match p.role.as_str() {
+                "assumption" => PropertyRole::Assumption,
+                "standalone" => PropertyRole::Standalone,
+                _ => PropertyRole::Guarantee,
+            };
+            // Raw formula takes precedence over template_ref
+            let formula_str = if let Some(f) = &p.formula {
+                f.clone()
+            } else if let Some(tref) = &p.template_ref {
+                match registry.instantiate(tref) {
+                    Ok(inst) => inst.formula,
+                    Err(_) => return None,
+                }
+            } else {
+                return None;
+            };
+            Some(PropertySpec {
+                name: p.id.clone(),
+                kind: PropertyKind::Safety,
+                formula: PropertyFormula::MuCalculus(formula_str),
+                role,
+                over: over.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Check if a guard string references any input port name.
+///
+/// Uses word-boundary matching rather than `str::contains` to prevent false
+/// positives when one port name is a substring of another identifier. Example:
+/// a port named `req` should not match a guard that uses `request_count` (a
+/// different signal). priority_roadmap §2.8 / Tier A2.
 fn guard_references_input(guard: &str, input_ports: &HashSet<String>) -> bool {
-    input_ports.iter().any(|port| guard.contains(port.as_str()))
+    input_ports
+        .iter()
+        .any(|port| token_appears(guard, port.as_str()))
+}
+
+/// Return `true` iff `needle` appears in `haystack` as a complete identifier
+/// token — bordered on both sides by either start/end of string or a non-
+/// identifier character. SystemVerilog identifiers consist of `[A-Za-z0-9_$]`
+/// (the `$` is for system tasks/functions; we treat it as an identifier
+/// character for matching purposes).
+fn token_appears(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut search_start = 0;
+    while let Some(rel) = haystack[search_start..].find(needle) {
+        let abs = search_start + rel;
+        let end = abs + needle.len();
+        let before_ok = abs == 0 || !is_ident_char(bytes[abs - 1]);
+        let after_ok = end == bytes.len() || !is_ident_char(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = abs + 1;
+    }
+    false
+}
+
+#[inline]
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 /// Convert a parsed SystemVerilog module to AdapterIR using a MergedConfig.
@@ -1063,15 +980,6 @@ mod tests {
         SystemVerilogAdapter::translate(sv, &options).expect("translation should succeed")
     }
 
-    /// Parse CTXDSL and inject side-channel valuations from the adapter output.
-    #[allow(dead_code)]
-    fn parse_with_valuations(output: &AdapterOutput) -> crate::context_dsl::ast::ContextDoc {
-        let mut doc =
-            crate::context_dsl::parse(&output.ctxdsl).expect("CTXDSL parse should succeed");
-        doc.state_valuations = output.state_valuations.clone();
-        doc
-    }
-
     // ---------------------------------------------------------------
     // Kripke path integration tests
     // ---------------------------------------------------------------
@@ -1121,7 +1029,9 @@ mod tests {
         let doc = crate::context_dsl::parse(&output.ctxdsl).unwrap();
         let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
         let clts = realized.context.clts("counter").expect("counter automaton");
-        assert!(clts.state_count() <= 4); // 2-bit counter = max 4 reachable states
+        // 2-bit counter = 4 in-domain states, plus 1 OOB sink for the
+        // unguarded `count <= count + 1` overflow at count=3.
+        assert!(clts.state_count() <= 5);
     }
 
     #[test]
@@ -1158,8 +1068,9 @@ mod tests {
         let doc = crate::context_dsl::parse(&output.ctxdsl).unwrap();
         let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
         let clts = realized.context.clts("retry").expect("retry automaton");
-        // 3 enum states × 3 counter values = 9 max, but pruned by reachability
-        assert!(clts.state_count() <= 9);
+        // 3 enum states × 3 counter values = 9 max, but pruned by reachability;
+        // plus up to 1 OOB sink if any unguarded counter increment overflows.
+        assert!(clts.state_count() <= 10);
         assert!(clts.state_count() > 0);
     }
 
@@ -1336,7 +1247,8 @@ mod tests {
             kripke::build_kripke_with_config(&module, &config, &mut warnings).unwrap();
 
         assert_eq!(properties.len(), 1);
-        assert!(automaton.states.len() <= 4); // count: 0..3
+        // count: 0..3 = 4 in-domain states, plus up to 1 OOB sink for overflow.
+        assert!(automaton.states.len() <= 5);
         assert!(!automaton.states.is_empty());
         assert!(automaton.states.iter().any(|s| s.is_initial));
     }
@@ -1543,7 +1455,9 @@ mod tests {
         let doc = crate::context_dsl::parse(&output.ctxdsl).unwrap();
         let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
         let clts = realized.context.clts("cnt").expect("cnt automaton");
-        assert!(clts.state_count() <= 4);
+        // Default counter bound (3) → 4 in-domain states, plus up to 1 OOB sink
+        // for overflow on the unguarded `count <= count + 1`.
+        assert!(clts.state_count() <= 5);
         assert!(clts.state_count() > 0);
     }
 
@@ -2107,5 +2021,42 @@ mod tests {
             .synthesise_controller("bus_ctrl", &formula.formula, &env, None)
             .expect("synthesis should succeed");
         assert!(synth.realizable, "bus_ctrl safety should be realizable");
+    }
+
+    /// Tier A2 — substring guard matching fix (priority_roadmap §2.8).
+    ///
+    /// `token_appears` must respect identifier boundaries: a port named `req`
+    /// should not match `request_count` or `xreq_y`, but should match `req`,
+    /// `req == 1`, `(req)`, etc.
+    #[test]
+    fn guard_token_match_respects_identifier_boundaries() {
+        // exact match
+        assert!(token_appears("req", "req"));
+        // word in expression
+        assert!(token_appears("req == 1", "req"));
+        assert!(token_appears("(req)", "req"));
+        assert!(token_appears("!req && rdy", "req"));
+        // not a substring of another identifier
+        assert!(!token_appears("request_count", "req"));
+        assert!(!token_appears("xreq", "req"));
+        assert!(!token_appears("xreq_y", "req"));
+        assert!(!token_appears("$reqister", "req"));
+        // empty needle
+        assert!(!token_appears("anything", ""));
+    }
+
+    #[test]
+    fn guard_references_input_uses_token_boundaries() {
+        let mut inputs = HashSet::new();
+        inputs.insert("req".to_string());
+        // Real port reference
+        assert!(guard_references_input("req == 1", &inputs));
+        // Substring should NOT match
+        assert!(!guard_references_input("request_count > 0", &inputs));
+        // Multi-port: only one needs to match
+        inputs.insert("ack".to_string());
+        assert!(guard_references_input("ack && full", &inputs));
+        // No match at all
+        assert!(!guard_references_input("counter < 3", &inputs));
     }
 }

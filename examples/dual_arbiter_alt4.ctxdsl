@@ -1,0 +1,182 @@
+// Dual-Channel Arbiter — Alt-4 Synthesis with Memory and Strategy Selection
+//
+// Extension of `bus_arbiter_retry.ctxdsl`. Where the original example has a
+// single channel and one alt-4 obligation, this version has TWO independent
+// channels (A and B), each with its own recurrence-after-stability obligation.
+// The synthesized controller must:
+//
+//   1. **Remember which liveness goal it is currently servicing.** Both
+//      channels can be in `Pending`/`Granted`/`Retrying` simultaneously,
+//      and the conjunction of two alt-4 obligations means the controller
+//      must track which obligation is outstanding to make fair progress on
+//      both. This is the canonical case where positional strategies are
+//      insufficient and `ControllerMode::ProductGame` (mu-obligation
+//      rotation) or `ControllerMode::ParityGame` (full parity game over
+//      `(plant_state, formula_subnode)`) is required.
+//
+//   2. **Disable some controllable transitions.** Each `Granted` state has
+//      multiple outgoing controllable transitions (`release` and a `swap`
+//      transition that hands the bus directly to the other channel without
+//      going through `Idle`). The synthesized controller, in any
+//      strategy-extracting mode, picks ONE controllable per state — the
+//      others are implicitly disabled. The `ParityGame` controller's
+//      choice is the parity-strategy-correct one; lower modes pick using
+//      signature ordering only. The `swap` transitions are an honest
+//      example of "the controller must commit to a strategy that omits
+//      some plant transitions": they're never chosen by the parity-game
+//      strategy because they break the round-trip-through-Idle ordering
+//      the obligations rely on.
+//
+// The property is the conjunction of two recurrence-after-stability instances:
+//
+//   G(PendingA → F(GrantedA ∧ G(RetryingA → F GrantedA)))
+//   ∧ G(PendingB → F(GrantedB ∧ G(RetryingB → F GrantedB)))
+//
+// In mu-calculus this body has alternation depth 4 (each conjunct contributes
+// νZ → μY → νX → μW; the conjunction does not increase alternation).
+//
+// Citations:
+//   • Manna & Pnueli, "A Hierarchy of Temporal Properties" (PODC 1990) —
+//     recurrence-after-stability sits in the Σ₃ reactivity class.
+//   • Bradfield, "The modal mu-calculus alternation hierarchy is strict"
+//     (CONCUR 1996 / TCS 1998) — the hierarchy doesn't collapse, so depth-4
+//     formulas are not reducible to GR(1).
+//   • Bruse, Friedmann & Lange, "Certification for Mu-Calculus with Winning
+//     Strategies" (SPIN 2016) — signature-based positional strategy
+//     extraction projected to plant states.
+//   • Zielonka, "Infinite games on finitely coloured graphs" (TCS 1998) —
+//     positional determinacy of parity games, the basis for `parity-game`
+//     synthesis in mununu.
+//
+// CLI:
+//
+//   mununu context synth examples/dual_arbiter_alt4.ctxdsl \
+//       --formula dual_recurrence_after_stability --automaton System \
+//       --controller-mode parity-game
+//
+// See also: examples/bus_arbiter_retry.ctxdsl (single-channel version),
+// wiki/Controller-Modes.md, docs/ltl_templates/temporal_logic_patterns.md.
+
+context dual_arbiter_alt4 {
+    automata {
+        // Channel A — request/ack/retry/done with a controllable swap.
+        automaton ChannelA {
+            controllable {
+                label ackA;
+                label releaseA;
+                label doneA;
+                label swapAtoB;
+            }
+            states {
+                state QuietA initial;
+                state PendingA;
+                state GrantedA;
+                state RetryingA;
+            }
+            transitions {
+                transition QuietA    -> PendingA  on label reqA;
+                transition PendingA  -> GrantedA  on label ackA;
+                transition GrantedA  -> QuietA    on label releaseA;
+                transition GrantedA  -> RetryingA on label retryA;
+                transition RetryingA -> GrantedA  on label doneA;
+                // Controllable shortcut: hand bus directly to channel B's
+                // realm by pretending channel A is no longer active. The
+                // synthesized controller must NOT take this — the obligation
+                // F GrantedA hasn't been re-established yet.
+                transition GrantedA  -> QuietA    on label swapAtoB;
+            }
+        }
+
+        // Channel B — symmetric to ChannelA.
+        automaton ChannelB {
+            controllable {
+                label ackB;
+                label releaseB;
+                label doneB;
+                label swapBtoA;
+            }
+            states {
+                state QuietB initial;
+                state PendingB;
+                state GrantedB;
+                state RetryingB;
+            }
+            transitions {
+                transition QuietB    -> PendingB  on label reqB;
+                transition PendingB  -> GrantedB  on label ackB;
+                transition GrantedB  -> QuietB    on label releaseB;
+                transition GrantedB  -> RetryingB on label retryB;
+                transition RetryingB -> GrantedB  on label doneB;
+                transition GrantedB  -> QuietB    on label swapBtoA;
+            }
+        }
+    }
+
+    composition {
+        // Asynchronous composition: each channel evolves independently.
+        // No shared labels; the channels share NO synchronisation, modelling
+        // two independent service loops the controller must arbitrate.
+        asynchronous System {
+            members [ChannelA, ChannelB];
+        }
+    }
+
+    mu_formulas {
+        // Conjunction of two recurrence-after-stability obligations. Each
+        // conjunct is alternation depth 4 in its mu-calculus normal form;
+        // the conjunction does not increase alternation. The controller
+        // must satisfy BOTH liveness goals — one per channel — picking a
+        // memory-aware strategy that rotates between obligations.
+        formula dual_recurrence_after_stability {
+            over System;
+            body = nu Z. (
+                (
+                    (! PendingA) || (mu YA. (
+                        (GrantedA && (nu XA. (
+                            ((! RetryingA) || (mu WA. (GrantedA || (<> WA))))
+                            && ([] XA)
+                        )))
+                        || (<> YA)
+                    ))
+                )
+                && (
+                    (! PendingB) || (mu YB. (
+                        (GrantedB && (nu XB. (
+                            ((! RetryingB) || (mu WB. (GrantedB || (<> WB))))
+                            && ([] XB)
+                        )))
+                        || (<> YB)
+                    ))
+                )
+                && ([] Z)
+            );
+        }
+
+        // Single-channel reference (alt 4) — same property as
+        // bus_arbiter_retry.ctxdsl, scoped to channel A only. Useful as a
+        // sanity check that channel A's structure mirrors the canonical
+        // single-channel example.
+        formula channel_a_only {
+            over System;
+            body = nu Z. (
+                (
+                    (! PendingA) || (mu YA. (
+                        (GrantedA && (nu XA. (
+                            ((! RetryingA) || (mu WA. (GrantedA || (<> WA))))
+                            && ([] XA)
+                        )))
+                        || (<> YA)
+                    ))
+                )
+                && ([] Z)
+            );
+        }
+    }
+
+    controllers {
+        controller synth {
+            source System;
+            satisfying dual_recurrence_after_stability;
+        }
+    }
+}

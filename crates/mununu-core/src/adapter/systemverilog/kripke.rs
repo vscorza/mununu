@@ -18,6 +18,85 @@ use crate::adapter::state_enum;
 use crate::adapter::{AdapterError, AdapterErrorKind, AdapterWarning, WarningKind};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+/// Reserved valuation key marking the out-of-bounds (OOB) sink state.
+///
+/// The marker survives the CTXDSL identifier sanitizer unchanged (no `$` or
+/// other special characters to be rewritten), so the key in the side-channel
+/// `state_valuations` map matches the actual CTXDSL state name. Collision with
+/// a user-declared SystemVerilog identifier is implausibly unlikely given the
+/// double-underscore + `mununu` namespace.
+///
+/// The mu-calculus evaluator detects this marker and masks every carrying
+/// state out of every formula's satisfying set (`mu_calculus::evaluator::oob_bits`),
+/// giving the OOB sink "bottom" semantics in the BitVec evaluator and
+/// `Unknown` in the trit evaluator. Reference: Bruns–Godefroid CONCUR 2000
+/// (generalized model checking, safety projection).
+pub const OOB_STATE_KEY: &str = "__mununu_oob__";
+
+/// Diagnostic flag returned by `clamp_to_domain` to signal that a value would
+/// have escaped the abstracted domain. The clamped value is still returned so
+/// downstream code can continue, but the caller (typically `compute_next_state`)
+/// collects these flags and routes the affected transition to the OOB sink.
+#[derive(Debug, Clone)]
+pub enum OverflowInfo {
+    InDomain,
+    CounterAbove {
+        register: String,
+        value: i64,
+        bound: i64,
+    },
+    EnumIndexOutOfRange {
+        register: String,
+        index: i64,
+        variant_count: usize,
+    },
+}
+
+impl OverflowInfo {
+    fn is_overflow(&self) -> bool {
+        !matches!(self, OverflowInfo::InDomain)
+    }
+
+    fn register(&self) -> Option<&str> {
+        match self {
+            OverflowInfo::InDomain => None,
+            OverflowInfo::CounterAbove { register, .. } => Some(register),
+            OverflowInfo::EnumIndexOutOfRange { register, .. } => Some(register),
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            OverflowInfo::InDomain => String::new(),
+            OverflowInfo::CounterAbove {
+                register,
+                value,
+                bound,
+            } => format!(
+                "register '{}' would take value {} (bound = {}); transition routed to OOB sink. \
+                 Widen the abstraction domain in the .mununu.json sidecar to recover precision.",
+                register, value, bound
+            ),
+            OverflowInfo::EnumIndexOutOfRange {
+                register,
+                index,
+                variant_count,
+            } => format!(
+                "register '{}' would index variant {} but only {} variants are declared; \
+                 transition routed to OOB sink.",
+                register, index, variant_count
+            ),
+        }
+    }
+}
+
+/// Construct the unique OOB sentinel `AbstractState` shared across the automaton.
+fn make_oob_abstract_state() -> AbstractState {
+    let mut s = BTreeMap::new();
+    s.insert(OOB_STATE_KEY.to_string(), AbstractValue::Bool(true));
+    s
+}
+
 /// Information about a register extracted from the module.
 #[derive(Debug, Clone)]
 pub struct RegisterInfo {
@@ -197,8 +276,16 @@ pub fn build_kripke_with_config(
         .filter_map(|(name, cfg)| cfg.label_name.as_ref().map(|ln| (name.clone(), ln.clone())))
         .collect();
 
+    let mut oob_inserted = false;
+    let oob_state = make_oob_abstract_state();
+    let oob_name = OOB_STATE_KEY.to_string();
+    // Per-register cap on BoundOverflow warnings to prevent log spam from a single
+    // register overflowing in many input combinations.
+    let mut warning_count_per_register: HashMap<String, usize> = HashMap::new();
+    const MAX_WARNINGS_PER_REGISTER: usize = 10;
+
     for reg_state in &all_reg_states {
-        let src_name = &state_names[reg_state];
+        let src_name: String = state_names[reg_state].clone();
         for input_combo in &all_input_combos {
             // Merge register state, input values, and parameters
             let mut full_val: BTreeMap<String, AbstractValue> = reg_state.clone();
@@ -216,10 +303,10 @@ pub fn build_kripke_with_config(
             }
 
             // Evaluate combinational logic
-            eval_comb_assigns(&comb_assigns, &mut full_val);
+            eval_comb_assigns(&comb_assigns, &mut full_val, &registers);
 
-            // Compute next register state
-            let next_state = compute_next_state(
+            // Compute next register state and any overflow flags from clamping
+            let (next_state, overflows) = compute_next_state(
                 &seq_assigns,
                 &comb_assigns,
                 reg_state,
@@ -227,8 +314,58 @@ pub fn build_kripke_with_config(
                 &registers,
             );
 
-            // Find or create the target state name
-            if let Some(tgt_name) = state_names.get(&next_state) {
+            // SOUNDNESS: over-approx — if any register's next-state escapes the
+            // abstracted domain (overflow at clamp_to_domain) OR the resulting
+            // composite state isn't in the enumerated cross-product (e.g.,
+            // BitSlice writes that bypass clamping, or Counter values outside
+            // an enum's value_map), the transition is routed to a designated
+            // OOB sink rather than dropped silently. The mu-calculus evaluator
+            // masks the OOB state out of every formula's satisfying set, so
+            // any source state with a transition here falsifies safety formulas
+            // (`[a]Z` requires OOB ∈ Z; OOB ∉ Z always). Reference:
+            // Bruns–Godefroid CONCUR 2000 (generalized model checking, safety
+            // projection of partial-state semantics).
+            let oob_detected = !overflows.is_empty() || !state_names.contains_key(&next_state);
+
+            if oob_detected {
+                // Lazy creation: insert the OOB sentinel and one self-loop per
+                // input combination on first detection, idempotent thereafter.
+                if !oob_inserted {
+                    state_names.insert(oob_state.clone(), oob_name.clone());
+                    for ic in &all_input_combos {
+                        let labels = make_input_labels(ic, &label_overrides);
+                        transitions.push(TransitionSpec {
+                            source: oob_name.clone(),
+                            target: oob_name.clone(),
+                            labels,
+                        });
+                    }
+                    oob_inserted = true;
+                }
+
+                let labels = make_input_labels(input_combo, &label_overrides);
+                transitions.push(TransitionSpec {
+                    source: src_name.clone(),
+                    target: oob_name.clone(),
+                    labels,
+                });
+
+                for ovf in overflows {
+                    if let Some(reg_name) = ovf.register() {
+                        let count = warning_count_per_register
+                            .entry(reg_name.to_string())
+                            .or_insert(0);
+                        if *count < MAX_WARNINGS_PER_REGISTER {
+                            warnings.push(AdapterWarning {
+                                kind: WarningKind::BoundOverflow,
+                                message: ovf.message(),
+                                location: None,
+                            });
+                            *count += 1;
+                        }
+                    }
+                }
+            } else if let Some(tgt_name) = state_names.get(&next_state) {
                 let labels = make_input_labels(input_combo, &label_overrides);
                 transitions.push(TransitionSpec {
                     source: src_name.clone(),
@@ -236,14 +373,20 @@ pub fn build_kripke_with_config(
                     labels,
                 });
             }
-            // If target is outside domain (e.g., counter overflow), transition is dropped
         }
+    }
+
+    // If OOB was inserted, append it to the state list so prune_unreachable_states
+    // emits a `StateSpec` for it (with the `$oob$` marker valuation).
+    let mut all_reg_states_with_oob = all_reg_states;
+    if oob_inserted {
+        all_reg_states_with_oob.push(oob_state);
     }
 
     // Steps 8-9: Prune unreachable states and build state specs
     let (states, transitions) = prune_unreachable_states(
         &initial_state,
-        &all_reg_states,
+        &all_reg_states_with_oob,
         &state_names,
         transitions,
         &registers,
@@ -255,7 +398,7 @@ pub fn build_kripke_with_config(
     let automaton = build_automaton_spec(module, config, states, transitions);
 
     // Step 11: Build properties from config
-    let properties = build_property_specs(config);
+    let properties = build_property_specs(config)?;
 
     let state_count = automaton.states.len();
     Ok((automaton, properties, state_count))
@@ -304,25 +447,13 @@ fn prune_unreachable_states(
             if !reachable.contains(name) {
                 return None;
             }
-            let mut valuations: BTreeMap<String, String> = s
-                .iter()
-                .map(|(k, v)| (k.clone(), v.display_short()))
-                .collect();
-
-            // Compute and include combinational signal values in valuations.
-            // This enables state predicates to reference combinational outputs
-            // (e.g., `full_T` for `assign full = (count >= 2)`).
-            if !comb_register_names.is_empty() {
-                let mut full_val: BTreeMap<String, AbstractValue> = s.clone();
-                full_val.extend(param_values.clone());
-                eval_comb_assigns(comb_assigns, &mut full_val);
-                for comb_name in &comb_register_names {
-                    if let Some(val) = full_val.get(*comb_name) {
-                        valuations.insert(comb_name.to_string(), val.display_short());
-                    }
-                }
-            }
-
+            let valuations = build_state_valuations(
+                s,
+                &comb_register_names,
+                param_values,
+                comb_assigns,
+                registers,
+            );
             Some(StateSpec {
                 name: name.clone(),
                 is_initial: *name == initial_name,
@@ -337,6 +468,50 @@ fn prune_unreachable_states(
         .collect();
 
     (states, transitions)
+}
+
+/// Build structured valuations for a single Kripke state.
+///
+/// Starts from the register values in `reg_state`, then evaluates combinational
+/// assignments so that predicates can reference combinational outputs such as
+/// `full_T` (derived from `assign full = (count >= 2)`).
+///
+/// Special case: the OOB sink state carries only the `$oob$ → "true"` marker.
+/// Downstream code in the mu-calculus evaluator detects this marker and masks
+/// the state out of every formula's satisfying set (bottom semantics).
+fn build_state_valuations(
+    reg_state: &AbstractState,
+    comb_register_names: &[&str],
+    param_values: &BTreeMap<String, AbstractValue>,
+    comb_assigns: &[CombAssign],
+    registers: &[RegisterInfo],
+) -> BTreeMap<String, String> {
+    if reg_state.contains_key(OOB_STATE_KEY) {
+        let mut v = BTreeMap::new();
+        v.insert(OOB_STATE_KEY.to_string(), "true".to_string());
+        return v;
+    }
+
+    let mut valuations: BTreeMap<String, String> = reg_state
+        .iter()
+        .map(|(k, v)| (k.clone(), v.display_short()))
+        .collect();
+
+    // Compute and include combinational signal values in valuations.
+    // This enables state predicates to reference combinational outputs
+    // (e.g., `full_T` for `assign full = (count >= 2)`).
+    if !comb_register_names.is_empty() {
+        let mut full_val: BTreeMap<String, AbstractValue> = reg_state.clone();
+        full_val.extend(param_values.clone());
+        eval_comb_assigns(comb_assigns, &mut full_val, registers);
+        for comb_name in comb_register_names {
+            if let Some(val) = full_val.get(*comb_name) {
+                valuations.insert(comb_name.to_string(), val.display_short());
+            }
+        }
+    }
+
+    valuations
 }
 
 /// Build the `AutomatonSpec` with controllability classification.
@@ -367,26 +542,61 @@ fn build_automaton_spec(
     }
 }
 
-/// Build property specs from merged config.
-fn build_property_specs(config: &super::annotation::MergedConfig) -> Vec<PropertySpec> {
-    config
-        .properties
-        .iter()
-        .map(|p| {
-            let role = match p.role.as_str() {
-                "assumption" => PropertyRole::Assumption,
-                "standalone" => PropertyRole::Standalone,
-                _ => PropertyRole::Guarantee,
-            };
-            PropertySpec {
-                name: p.id.clone(),
-                kind: PropertyKind::Safety,
-                formula: PropertyFormula::MuCalculus(p.formula.clone()),
-                role,
-                over: None,
+/// Build property specs from merged config, resolving template refs.
+///
+/// Returns `Err(AdapterError)` if any property is malformed (missing both
+/// `formula` and `template_ref`, or referencing an unknown template). This is a
+/// fail-loud behavior: previously such properties were silently dropped, leading
+/// to false-positive "satisfied" verdicts where violations were never checked.
+fn build_property_specs(
+    config: &super::annotation::MergedConfig,
+) -> Result<Vec<PropertySpec>, AdapterError> {
+    let registry = crate::adapter::templates::TemplateRegistry::builtin();
+    let mut out = Vec::with_capacity(config.properties.len());
+    for p in &config.properties {
+        let role = match p.role.as_str() {
+            "assumption" => PropertyRole::Assumption,
+            "standalone" => PropertyRole::Standalone,
+            _ => PropertyRole::Guarantee,
+        };
+        // Raw formula takes precedence over template_ref
+        let formula_str = if let Some(f) = &p.formula {
+            f.clone()
+        } else if let Some(tref) = &p.template_ref {
+            match registry.instantiate(tref) {
+                Ok(inst) => inst.formula,
+                Err(e) => {
+                    return Err(AdapterError {
+                        kind: AdapterErrorKind::ParseError,
+                        message: format!(
+                            "property '{}' references unknown template '{}': {}. \
+                             Add the template to the registry or replace `template_ref` with a raw `formula`.",
+                            p.id, tref.template, e
+                        ),
+                        location: None,
+                    });
+                }
             }
-        })
-        .collect()
+        } else {
+            return Err(AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!(
+                    "property '{}' declares neither `formula` nor `template_ref` — \
+                     cannot translate. Add one of the two fields.",
+                    p.id
+                ),
+                location: None,
+            });
+        };
+        out.push(PropertySpec {
+            name: p.id.clone(),
+            kind: PropertyKind::Safety,
+            formula: PropertyFormula::MuCalculus(formula_str),
+            role,
+            over: None,
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +817,9 @@ fn collect_property_signals_from_config(
 ) -> HashSet<String> {
     let mut signals = HashSet::new();
     for prop in &config.properties {
-        collect_identifiers_from_formula(&prop.formula, &mut signals);
+        if let Some(formula) = &prop.formula {
+            collect_identifiers_from_formula(formula, &mut signals);
+        }
     }
     signals
 }
@@ -1074,13 +1286,18 @@ fn collect_comb_from_statement(stmt: &Statement, assigns: &mut Vec<CombAssign>) 
 }
 
 /// Evaluate combinational assignments, updating the valuation map.
-fn eval_comb_assigns(assigns: &[CombAssign], values: &mut BTreeMap<String, AbstractValue>) {
+fn eval_comb_assigns(
+    assigns: &[CombAssign],
+    values: &mut BTreeMap<String, AbstractValue>,
+    registers: &[RegisterInfo],
+) {
     // Simple single-pass evaluation (assumes no dependency cycles).
     // If evaluation returns None (e.g., comparison involving an unresolved
     // value like a catch-all enum variant), default to Bool(false).
     // This is conservative: unknown comparisons produce "not asserted".
     for assign in assigns {
-        let result = eval_expr(&assign.value, values).unwrap_or(AbstractValue::Bool(false));
+        let result =
+            eval_expr(&assign.value, values, registers).unwrap_or(AbstractValue::Bool(false));
         apply_assign_target(&assign.target, result, values);
     }
 }
@@ -1126,11 +1343,16 @@ fn write_bit_slice(old_val: i64, new_val: i64, msb: usize, lsb: usize) -> i64 {
 pub fn eval_expr_pub(
     expr: &Expr,
     values: &BTreeMap<String, AbstractValue>,
+    registers: &[RegisterInfo],
 ) -> Option<AbstractValue> {
-    eval_expr(expr, values)
+    eval_expr(expr, values, registers)
 }
 
-fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<AbstractValue> {
+fn eval_expr(
+    expr: &Expr,
+    values: &BTreeMap<String, AbstractValue>,
+    registers: &[RegisterInfo],
+) -> Option<AbstractValue> {
     match expr {
         Expr::Ident(name) => {
             // First check the valuation map
@@ -1144,7 +1366,7 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
         Expr::Number(n) => Some(AbstractValue::Counter(*n)),
         Expr::Bool(b) => Some(AbstractValue::Bool(*b)),
         Expr::Not(inner) => {
-            let v = eval_expr(inner, values)?;
+            let v = eval_expr(inner, values, registers)?;
             match v {
                 AbstractValue::Bool(b) => Some(AbstractValue::Bool(!b)),
                 AbstractValue::Counter(n) => Some(AbstractValue::Bool(n == 0)),
@@ -1152,30 +1374,29 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
             }
         }
         Expr::BinOp { op, left, right } => {
-            let lv = eval_expr(left, values)?;
-            let rv = eval_expr(right, values)?;
-            eval_binop(*op, &lv, &rv)
+            let lv = eval_expr(left, values, registers)?;
+            let rv = eval_expr(right, values, registers)?;
+            eval_binop(*op, &lv, &rv, registers)
         }
         Expr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            let cv = eval_expr(cond, values)?;
+            let cv = eval_expr(cond, values, registers)?;
             if is_truthy(&cv) {
-                eval_expr(then_expr, values)
+                eval_expr(then_expr, values, registers)
             } else {
-                eval_expr(else_expr, values)
+                eval_expr(else_expr, values, registers)
             }
         }
-        // SOUNDNESS: under-approx — when operands are abstract (Variant, Bool for
-        // BitSelect index, etc.), we cannot compute a concrete result. Returning None
-        // causes the enclosing assignment to be skipped (transition dropped), which
-        // removes behaviors from the model. Sound for liveness, unsound for safety
-        // (may miss reachable states where a violation occurs).
+        // SOUNDNESS: over-approx via guards_satisfied admit-on-None for operand
+        // shapes the precision recovery doesn't reach (e.g., abstract
+        // index/base in BitSelect). PRECISION (Phase 7): Variant operands are
+        // resolved through value_map lookup before falling back to None.
         Expr::BitSelect { base, index } => {
-            let bv = eval_expr(base, values)?;
-            let iv = eval_expr(index, values)?;
+            let bv = resolve_to_counter(eval_expr(base, values, registers)?, registers);
+            let iv = resolve_to_counter(eval_expr(index, values, registers)?, registers);
             match (&bv, &iv) {
                 (AbstractValue::Counter(base_val), AbstractValue::Counter(idx)) => {
                     let bit = (base_val >> idx) & 1;
@@ -1185,9 +1406,9 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
             }
         }
         Expr::BitSlice { base, msb, lsb } => {
-            let bv = eval_expr(base, values)?;
-            let mv = eval_expr(msb, values)?;
-            let lv = eval_expr(lsb, values)?;
+            let bv = resolve_to_counter(eval_expr(base, values, registers)?, registers);
+            let mv = resolve_to_counter(eval_expr(msb, values, registers)?, registers);
+            let lv = resolve_to_counter(eval_expr(lsb, values, registers)?, registers);
             match (&bv, &mv, &lv) {
                 (
                     AbstractValue::Counter(base_val),
@@ -1206,7 +1427,7 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
             // Concatenation of counter values — shift and combine
             let mut result: i64 = 0;
             for part in parts {
-                let v = eval_expr(part, values)?;
+                let v = resolve_to_counter(eval_expr(part, values, registers)?, registers);
                 match v {
                     AbstractValue::Counter(n) => {
                         // Rough: just shift left by 1 bit per part (imprecise for multi-bit)
@@ -1215,7 +1436,9 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
                     AbstractValue::Bool(b) => {
                         result = (result << 1) | (b as i64);
                     }
-                    _ => return None, // abstract operands → cannot compute
+                    // SOUNDNESS: Variant without a unique value_map mapping —
+                    // over-approx via guards_satisfied admit-on-None.
+                    _ => return None,
                 }
             }
             Some(AbstractValue::Counter(result))
@@ -1223,42 +1446,72 @@ fn eval_expr(expr: &Expr, values: &BTreeMap<String, AbstractValue>) -> Option<Ab
     }
 }
 
-fn eval_binop(op: BinOp, lv: &AbstractValue, rv: &AbstractValue) -> Option<AbstractValue> {
+/// Convert a `Variant` to `Counter` via cross-register `value_map` lookup if
+/// possible (Phase 7 precision recovery). Other shapes pass through unchanged.
+fn resolve_to_counter(v: AbstractValue, registers: &[RegisterInfo]) -> AbstractValue {
+    if let AbstractValue::Variant(name) = &v
+        && let Some(num) = lookup_variant_value(name, registers)
+    {
+        return AbstractValue::Counter(num);
+    }
+    v
+}
+
+fn eval_binop(
+    op: BinOp,
+    lv: &AbstractValue,
+    rv: &AbstractValue,
+    registers: &[RegisterInfo],
+) -> Option<AbstractValue> {
     match op {
-        BinOp::Eq => Some(AbstractValue::Bool(lv == rv)),
-        BinOp::Ne => Some(AbstractValue::Bool(lv != rv)),
+        BinOp::Eq => {
+            // PRECISION (Phase 7): cross-resolve mixed Variant/Counter via value_map
+            // before falling through to plain equality. This makes
+            // `cmd_reg == 3` true when cmd_reg is the Variant "START" with
+            // value_map {START: 3}, even if the L208-216 preprocessing didn't apply.
+            if let Some((l, r)) = to_i64_pair(lv, rv, registers) {
+                return Some(AbstractValue::Bool(l == r));
+            }
+            Some(AbstractValue::Bool(lv == rv))
+        }
+        BinOp::Ne => {
+            if let Some((l, r)) = to_i64_pair(lv, rv, registers) {
+                return Some(AbstractValue::Bool(l != r));
+            }
+            Some(AbstractValue::Bool(lv != rv))
+        }
         BinOp::And => Some(AbstractValue::Bool(is_truthy(lv) && is_truthy(rv))),
         BinOp::Or => Some(AbstractValue::Bool(is_truthy(lv) || is_truthy(rv))),
         BinOp::Lt => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Bool(l < r))
         }
         BinOp::Le => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Bool(l <= r))
         }
         BinOp::Gt => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Bool(l > r))
         }
         BinOp::Ge => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Bool(l >= r))
         }
         BinOp::Add => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l + r))
         }
         BinOp::Sub => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l - r))
         }
         BinOp::Mul => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l * r))
         }
         BinOp::Div => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             if r == 0 {
                 None
             } else {
@@ -1266,7 +1519,7 @@ fn eval_binop(op: BinOp, lv: &AbstractValue, rv: &AbstractValue) -> Option<Abstr
             }
         }
         BinOp::Mod => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             if r == 0 {
                 None
             } else {
@@ -1274,19 +1527,19 @@ fn eval_binop(op: BinOp, lv: &AbstractValue, rv: &AbstractValue) -> Option<Abstr
             }
         }
         BinOp::Shl => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l << r.min(63)))
         }
         BinOp::Shr => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l >> r.min(63)))
         }
         BinOp::BitOr => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l | r))
         }
         BinOp::BitAnd => {
-            let (l, r) = to_i64_pair(lv, rv)?;
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l & r))
         }
     }
@@ -1301,15 +1554,54 @@ fn is_truthy(v: &AbstractValue) -> bool {
     }
 }
 
-fn to_i64_pair(lv: &AbstractValue, rv: &AbstractValue) -> Option<(i64, i64)> {
+/// Search every register's `value_map` for `variant`, returning the numeric
+/// value if exactly one mapping is found.
+///
+/// Phase 7 precision recovery: when a `Variant` flows into `to_i64_pair`,
+/// `BitSelect`, or `Concat` and there is a unique register whose value_map
+/// names the variant, the numeric value can be substituted, recovering the
+/// concrete comparison instead of falling back to None (which would force B5
+/// to admit a phantom transition). Returns None if the variant is not in any
+/// register's value_map, or if multiple registers map it to different values
+/// (ambiguous — fall back to over-approx).
+fn lookup_variant_value(variant: &str, registers: &[RegisterInfo]) -> Option<i64> {
+    let mut found: Option<i64> = None;
+    for reg in registers {
+        for (name, val) in &reg.value_map {
+            if name == variant {
+                match found {
+                    Some(prev) if prev != *val => return None,
+                    Some(_) => {}
+                    None => found = Some(*val),
+                }
+            }
+        }
+    }
+    found
+}
+
+fn to_i64_pair(
+    lv: &AbstractValue,
+    rv: &AbstractValue,
+    registers: &[RegisterInfo],
+) -> Option<(i64, i64)> {
     let l = match lv {
         AbstractValue::Counter(n) => *n,
         AbstractValue::Bool(b) => *b as i64,
+        // PRECISION (Phase 7): try the cross-register value_map lookup before
+        // falling back. This recovers concrete comparisons for Variants whose
+        // value_map preprocessing didn't apply (e.g., variants computed by
+        // combinational logic after L208-216 ran).
+        AbstractValue::Variant(name) => lookup_variant_value(name, registers)?,
+        // SOUNDNESS: over-approx via guards_satisfied admit-on-None. Present
+        // values have no numeric coercion; the guard at L1556 admits the
+        // transition unconditionally, preserving safety.
         _ => return None,
     };
     let r = match rv {
         AbstractValue::Counter(n) => *n,
         AbstractValue::Bool(b) => *b as i64,
+        AbstractValue::Variant(name) => lookup_variant_value(name, registers)?,
         _ => return None,
     };
     Some((l, r))
@@ -1428,6 +1720,10 @@ fn collect_seq_from_statement(stmt: &Statement, guards: &[SeqGuard], assigns: &m
 
 /// Compute the next register state from the current full valuation.
 ///
+/// Returns `(next_state, overflows)`. A non-empty `overflows` vec means at
+/// least one register would have escaped its abstracted domain at this step;
+/// the caller routes the transition to the OOB sink.
+///
 /// `reg_state` is the pre-injection register valuation (Variants for enum
 /// registers). `full_val` is the post-injection valuation used for expression
 /// evaluation (Variants replaced by Counters via value_map).
@@ -1437,13 +1733,10 @@ fn compute_next_state(
     reg_state: &AbstractState,
     full_val: &BTreeMap<String, AbstractValue>,
     registers: &[RegisterInfo],
-) -> AbstractState {
-    // Start from the original register state (pre-injection Variants)
+) -> (AbstractState, Vec<OverflowInfo>) {
     let mut next: AbstractState = reg_state.clone();
+    let mut overflows: Vec<OverflowInfo> = Vec::new();
 
-    // Apply sequential assignments whose guards are satisfied.
-    // Skip assignments to Ignored registers and combinational signals
-    // (combinational values are computed below from comb assigns).
     let ignored: HashSet<&str> = registers
         .iter()
         .filter(|r| r.domain.abstraction == AbstractionType::Ignored)
@@ -1461,11 +1754,14 @@ fn compute_next_state(
             continue;
         }
         if guards_satisfied(&assign.guards, full_val, registers)
-            && let Some(result) = eval_expr(&assign.value, full_val)
+            && let Some(result) = eval_expr(&assign.value, full_val, registers)
         {
             match &assign.target {
                 AssignTarget::Simple(name) => {
-                    let clamped = clamp_to_domain(name, &result, registers);
+                    let (clamped, info) = clamp_to_domain(name, &result, registers);
+                    if info.is_overflow() {
+                        overflows.push(info);
+                    }
                     next.insert(name.clone(), clamped);
                 }
                 AssignTarget::BitSlice { .. } => {
@@ -1475,20 +1771,20 @@ fn compute_next_state(
         }
     }
 
-    // Compute combinational outputs from the NEXT register state + inputs.
-    // Build a valuation from the new register state for comb evaluation.
     if !comb_signals.is_empty() {
         let mut next_val = full_val.clone();
-        // Override with next register values
         for (k, v) in &next {
             next_val.insert(k.clone(), v.clone());
         }
-        eval_comb_assigns(comb_assigns, &mut next_val);
+        eval_comb_assigns(comb_assigns, &mut next_val, registers);
 
         for reg in registers {
             if reg.combinational && reg.domain.abstraction != AbstractionType::Ignored {
                 if let Some(val) = next_val.get(&reg.name) {
-                    let clamped = clamp_to_domain(&reg.name, val, registers);
+                    let (clamped, info) = clamp_to_domain(&reg.name, val, registers);
+                    if info.is_overflow() {
+                        overflows.push(info);
+                    }
                     next.insert(reg.name.clone(), clamped);
                 } else {
                     // Comb evaluation returned None (e.g., comparison with unknown addr).
@@ -1499,21 +1795,31 @@ fn compute_next_state(
         }
     }
 
-    next
+    (next, overflows)
 }
 
-// SOUNDNESS: under-approx — when eval_expr returns None (abstract operands),
-// is_some_and returns false, blocking the transition. This removes behaviors
-// from the model. Sound for liveness, unsound for safety (may miss states
-// reachable through guards that depend on abstract values).
+// SOUNDNESS: over-approx — when eval_expr returns None (abstract operands), the
+// guard is treated as possibly-true and the transition is admitted. This adds
+// phantom transitions but never removes real ones. Sound for safety (the
+// abstract model contains every real behavior, so any safety violation found is
+// also a real violation, modulo the abstraction). UNSOUND for liveness (admitted
+// phantoms can produce spurious progress witnesses that do not exist in the
+// concrete system). Reference: Huth–Jagadeesan–Schmidt ESOP 2001 (modal
+// transition systems), Bruns–Godefroid CONCUR 2000 (generalized model checking).
 fn guards_satisfied(
     guards: &[SeqGuard],
     values: &BTreeMap<String, AbstractValue>,
     registers: &[RegisterInfo],
 ) -> bool {
     guards.iter().all(|g| match g {
-        SeqGuard::If(expr) => eval_expr(expr, values).is_some_and(|v| is_truthy(&v)),
-        SeqGuard::IfNot(expr) => eval_expr(expr, values).is_some_and(|v| !is_truthy(&v)),
+        SeqGuard::If(expr) => match eval_expr(expr, values, registers) {
+            Some(v) => is_truthy(&v),
+            None => true,
+        },
+        SeqGuard::IfNot(expr) => match eval_expr(expr, values, registers) {
+            Some(v) => !is_truthy(&v),
+            None => true,
+        },
         SeqGuard::CaseEq(selector, label) => {
             values.get(selector).is_some_and(|v| match v {
                 AbstractValue::Variant(s) => {
@@ -1584,54 +1890,76 @@ fn guards_satisfied(
     })
 }
 
-/// Clamp an abstract value to fit the register's declared domain.
+/// Clamp an abstract value to fit the register's declared domain, returning the
+/// clamped value plus an `OverflowInfo` flag describing whether the input value
+/// would have escaped the abstracted domain.
 ///
-/// SOUNDNESS: clamping introduces approximation at domain boundaries:
-/// - BoundedCounter: values above bound are clamped to bound (over-approx above
-///   bound — sound for safety, unsound for liveness). Default bound is 3 when
-///   not specified by the user — this is a heuristic and should be set explicitly.
-/// - EnumValues with unknown variant: mapped to catch-all (over-approx — sound
-///   for safety). Counter values outside value_map fall through as raw counters
-///   (unsound — variant properties become invalid).
+/// SOUNDNESS: when the input value escapes the domain, the clamped result is
+/// still in-domain and downstream code can use it; the OverflowInfo flag tells
+/// the caller (typically `compute_next_state`) to also emit an OOB transition
+/// so the abstract model conservatively records that "anything could happen"
+/// from this point. Without the OOB transition, clamping would be a silent
+/// under-approximation: the abstract model would freeze at the bound while the
+/// concrete system continues. Reference: Bruns–Godefroid CONCUR 2000 (sound
+/// fix via partial-state OOB sink).
+///
+/// In-domain cases:
+/// - Boolean coercion (Counter → Bool, Bool → Bool): no overflow concept.
+/// - Enum variant assignment with a known variant: in-domain.
+/// - Enum variant assignment with an unknown variant: collapsed to catch-all
+///   (over-approx, sound for safety) — still in-domain.
+/// - Enum from Counter via value_map (mapped or fallback to catch-all): in-domain.
 fn clamp_to_domain(
     target: &str,
     value: &AbstractValue,
     registers: &[RegisterInfo],
-) -> AbstractValue {
+) -> (AbstractValue, OverflowInfo) {
     if let Some(reg) = registers.iter().find(|r| r.name == target) {
         match (&reg.domain.abstraction, value) {
             (AbstractionType::BoundedCounter, AbstractValue::Counter(n)) => {
-                // SOUNDNESS: over-approx above bound. User should set explicit
-                // bound in sidecar or annotation.
                 let bound = reg
                     .domain
                     .bound
                     .unwrap_or(crate::adapter::domain::DEFAULT_COUNTER_BOUND);
-                AbstractValue::Counter((*n).max(0).min(bound))
+                let clamped = (*n).max(0).min(bound);
+                let info = if *n > bound {
+                    OverflowInfo::CounterAbove {
+                        register: reg.name.clone(),
+                        value: *n,
+                        bound,
+                    }
+                } else {
+                    OverflowInfo::InDomain
+                };
+                (AbstractValue::Counter(clamped), info)
             }
-            (AbstractionType::Boolean, AbstractValue::Counter(n)) => AbstractValue::Bool(*n != 0),
-            (AbstractionType::Boolean, AbstractValue::Bool(_)) => value.clone(),
-            // Variant assignment: validate the name is a known variant
+            (AbstractionType::Boolean, AbstractValue::Counter(n)) => {
+                (AbstractValue::Bool(*n != 0), OverflowInfo::InDomain)
+            }
+            (AbstractionType::Boolean, AbstractValue::Bool(_)) => {
+                (value.clone(), OverflowInfo::InDomain)
+            }
             (AbstractionType::EnumValues, AbstractValue::Variant(name)) => {
                 if let Some(variants) = &reg.domain.variants {
                     if variants.contains(name) {
-                        return value.clone();
+                        return (value.clone(), OverflowInfo::InDomain);
                     }
                     // SOUNDNESS: over-approx — unknown variant collapsed to catch-all.
                     // Sound for safety (extra variant behaviors are conservative).
                     if let Some(last) = variants.last() {
-                        return AbstractValue::Variant(last.clone());
+                        return (AbstractValue::Variant(last.clone()), OverflowInfo::InDomain);
                     }
                 }
-                value.clone()
+                (value.clone(), OverflowInfo::InDomain)
             }
-            // If assigning a counter to an enum, use value_map if available
             (AbstractionType::EnumValues, AbstractValue::Counter(n)) => {
-                // Try value_map first (e.g., enum {IDLE=0, START=3, OTHER})
                 if !reg.value_map.is_empty() {
                     if let Some((variant_name, _)) = reg.value_map.iter().find(|(_, val)| val == n)
                     {
-                        return AbstractValue::Variant(variant_name.clone());
+                        return (
+                            AbstractValue::Variant(variant_name.clone()),
+                            OverflowInfo::InDomain,
+                        );
                     }
                     // Not in map → catch-all (last variant without a mapping)
                     if let Some(variants) = &reg.domain.variants {
@@ -1643,30 +1971,41 @@ fn clamp_to_domain(
                         if let Some(catchall) =
                             variants.iter().find(|v| !mapped_names.contains(v.as_str()))
                         {
-                            return AbstractValue::Variant(catchall.clone());
+                            return (
+                                AbstractValue::Variant(catchall.clone()),
+                                OverflowInfo::InDomain,
+                            );
                         }
                     }
-                    value.clone()
+                    (value.clone(), OverflowInfo::InDomain)
                 } else if let Some(variants) = &reg.domain.variants {
-                    // No value_map — map by index
                     let idx = *n as usize;
                     if idx < variants.len() {
-                        AbstractValue::Variant(variants[idx].clone())
+                        (
+                            AbstractValue::Variant(variants[idx].clone()),
+                            OverflowInfo::InDomain,
+                        )
                     } else {
-                        // SOUNDNESS: unsound — counter value outside enum domain
-                        // falls through as raw Counter, losing variant type safety.
-                        // Properties that reference enum variant names will not
-                        // match this state correctly.
-                        value.clone()
+                        // SOUNDNESS (formerly unsound silent fall-through): index
+                        // outside enum domain now flags overflow, routing the
+                        // transition to OOB. Sound for safety.
+                        (
+                            value.clone(),
+                            OverflowInfo::EnumIndexOutOfRange {
+                                register: reg.name.clone(),
+                                index: *n,
+                                variant_count: variants.len(),
+                            },
+                        )
                     }
                 } else {
-                    value.clone()
+                    (value.clone(), OverflowInfo::InDomain)
                 }
             }
-            _ => value.clone(),
+            _ => (value.clone(), OverflowInfo::InDomain),
         }
     } else {
-        value.clone()
+        (value.clone(), OverflowInfo::InDomain)
     }
 }
 
@@ -1974,7 +2313,7 @@ mod tests {
             left: Box::new(Expr::Ident("a".to_string())),
             right: Box::new(Expr::Ident("b".to_string())),
         };
-        let result = eval_expr(&expr, &values);
+        let result = eval_expr(&expr, &values, &[]);
         assert_eq!(result, Some(AbstractValue::Counter(5)));
     }
 
@@ -1988,7 +2327,7 @@ mod tests {
             then_expr: Box::new(Expr::Number(42)),
             else_expr: Box::new(Expr::Number(0)),
         };
-        let result = eval_expr(&expr, &values);
+        let result = eval_expr(&expr, &values, &[]);
         assert_eq!(result, Some(AbstractValue::Counter(42)));
     }
 
@@ -2002,7 +2341,7 @@ mod tests {
             left: Box::new(Expr::Ident("x".to_string())),
             right: Box::new(Expr::Number(5)),
         };
-        let result = eval_expr(&expr, &values);
+        let result = eval_expr(&expr, &values, &[]);
         assert_eq!(result, Some(AbstractValue::Bool(true)));
     }
 
@@ -2049,8 +2388,11 @@ mod tests {
         let mut warnings = Vec::new();
         let (automaton, properties, _state_count) = build_kripke(&module, &mut warnings).unwrap();
 
-        // 2-bit counter auto-abstracted to bounded_counter 0..3 → 4 values
-        assert!(automaton.states.len() <= 4);
+        // 2-bit counter auto-abstracted to bounded_counter 0..3 → 4 values,
+        // plus 1 OOB sink state for the count=3 + en overflow path.
+        // (The unguarded `count <= count + 1` produces 4 → out-of-domain, now
+        // routed to the OOB sink instead of silently dropped.)
+        assert!(automaton.states.len() <= 5);
         assert!(!automaton.transitions.is_empty());
         assert_eq!(properties.len(), 1);
 

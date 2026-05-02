@@ -52,6 +52,17 @@ pub enum CallGuard {
     MustBeFalse,
     /// Field must equal a specific enum variant (e.g., match case guard).
     MustEqual(String),
+    /// Disjunction of two guards: satisfied when EITHER side is. Used for
+    /// same-field `||` patterns (e.g., `count == 0 || count > MAX`). Both
+    /// inner guards must apply to the same field — cross-field disjunctions
+    /// are over-approximated to `None` upstream.
+    Disjunction(Box<CallGuard>, Box<CallGuard>),
+    /// Conjunction of two guards on the same field: satisfied when BOTH
+    /// sides are. Constructed when applying De Morgan to a negated
+    /// disjunction (`!(a || b)` → `!a && !b`). Cross-field conjunctions
+    /// continue to be expressed as multiple `Vec<Guard>` entries — one
+    /// `Guard` per field.
+    Conjunction(Box<CallGuard>, Box<CallGuard>),
     /// No guard.
     None,
 }
@@ -124,6 +135,51 @@ impl CallSummaryLibrary {
                 guard: CallGuard::None,
                 target_field: receiver_field.map(String::from),
             }
+        }
+    }
+
+    /// B6: Resolve a call by unqualified method name only — useful when the
+    /// receiver type is unknown but the method name uniquely identifies the
+    /// effect (e.g., `<thing>.push(...)` always increments, regardless of
+    /// whether `<thing>` is an Array or a custom class with a similar API).
+    ///
+    /// Returns `Some(effect, guard)` only when ALL builtin entries whose key
+    /// ends with `.<method_name>` (or equals it) agree on effect and guard.
+    /// Disagreement (cross-type ambiguity) returns `None` — callers should
+    /// fall back to over-approximation.
+    pub fn resolve_unqualified(&self, method_name: &str) -> Option<(CallEffect, CallGuard)> {
+        let suffix = format!(".{method_name}");
+        let candidates: Vec<&BuiltinSummary> = self
+            .entries
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix) || k.as_str() == method_name)
+            .map(|(_, v)| v)
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let first = candidates[0];
+        // Require ALL matches to agree — guards conservatively against
+        // cross-type ambiguity (e.g., `clear` would match Map.clear, Set.clear,
+        // dict.clear, all of which agree on ResetToZero, so OK).
+        let all_agree = candidates.iter().all(|c| {
+            c.effect == first.effect
+                && c.guard == first.guard
+                && std::mem::discriminant(&c.target_resolution)
+                    == std::mem::discriminant(&first.target_resolution)
+        });
+        if !all_agree {
+            return None;
+        }
+
+        // Only emit when the resolution is Receiver-based — the only case
+        // we can wire from a `this.<field>.<method>()` call site without
+        // additional type info.
+        match first.target_resolution {
+            TargetResolution::Receiver => Some((first.effect.clone(), first.guard.clone())),
+            TargetResolution::None => None,
         }
     }
 

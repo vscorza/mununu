@@ -78,8 +78,8 @@
     },
     {
       "id": "no_response_window",
-      "formula": "nu X. ((!axi_bvalid_T || aw_flag_T) && [] X)",
-      "description": "When bvalid is high, aw_flag must also be high — preventing new write acceptance while response is pending"
+      "formula": "nu X. ((! aw_flag_F_axi_awready_F_axi_bvalid_T_axi_wready_F) && [] X)",
+      "description": "The orphan-response state (aw_flag=F while axi_bvalid=T — slave reports response pending but flag claims it has accepted no write) is unreachable. Bug composition: state IS reachable because the slave clears aw_flag on data acceptance, allowing a new awvalid before response is acked. Fixed composition: state is unreachable because flag clears only on bvalid+bready."
     }
   ]
 }

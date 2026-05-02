@@ -1,0 +1,25 @@
+INFO {
+  TITLE:       "Request-Grant Arbiter"
+  DESCRIPTION: "Single-channel arbiter: every request is eventually granted, and grant is at most one cycle wide."
+  SEMANTICS:   Mealy
+  TARGET:      Mealy
+}
+
+MAIN {
+  INPUTS {
+    req;
+  }
+
+  OUTPUTS {
+    grant;
+  }
+
+  ASSUMPTIONS {
+    G F req;
+  }
+
+  GUARANTEES {
+    G (req -> F grant);
+    G (grant -> X !grant);
+  }
+}

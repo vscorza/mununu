@@ -37,27 +37,54 @@ impl StateNameMatcher {
     /// Uses structured matching (via `state_valuation()`) when available, falling
     /// back to string prefix matching. This is the primary entry point for
     /// predicate resolution.
+    ///
+    /// SOUNDNESS: the result is masked to clear any OOB sink states (whose
+    /// valuation carries the `$oob$ → "true"` marker). This implements the
+    /// OOB-as-bottom semantics — user-declared predicates never match the OOB
+    /// sink, so safety formulas referencing them correctly fail at any source
+    /// state with a transition to OOB. The defensive mask here complements the
+    /// final mask in `mu_calculus::evaluator::predicate_bits`.
     pub(crate) fn create_bitset_for_pattern(
         clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
         pattern: &str,
     ) -> BitVec<usize, Lsb0> {
         // Try structured matching first if any state has valuations
-        if clts.has_valuations()
-            && let Some(bits) = Self::create_bitset_from_valuations(clts, pattern)
+        let mut bits = if clts.has_valuations()
+            && let Some(b) = Self::create_bitset_from_valuations(clts, pattern)
         {
-            return bits;
-        }
+            b
+        } else {
+            // Fallback: string prefix matching
+            let mut b = BitVec::repeat(false, clts.state_count());
+            for state_id in clts.states() {
+                if let Some(state_name) = clts.state_name(state_id)
+                    && Self::matches_pattern(pattern, state_name)
+                {
+                    b.set(state_id.index(), true);
+                }
+            }
+            b
+        };
 
-        // Fallback: string prefix matching
-        let mut bits = BitVec::repeat(false, clts.state_count());
+        Self::clear_oob_bits(clts, &mut bits);
+        bits
+    }
+
+    /// Clear bits for any state whose CLTS valuation carries the
+    /// `__mununu_oob__ → "true"` out-of-bounds sink marker. Adapters set this
+    /// marker when an abstract transition would have escaped the abstracted
+    /// domain (see `adapter::systemverilog::kripke::OOB_STATE_KEY`).
+    fn clear_oob_bits(
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+        bits: &mut BitVec<usize, Lsb0>,
+    ) {
         for state_id in clts.states() {
-            if let Some(state_name) = clts.state_name(state_id)
-                && Self::matches_pattern(pattern, state_name)
+            if let Some(val) = clts.state_valuation(state_id)
+                && val.get("__mununu_oob__").map(|s| s.as_str()) == Some("true")
             {
-                bits.set(state_id.index(), true);
+                bits.set(state_id.index(), false);
             }
         }
-        bits
     }
 
     /// Attempts structured matching: tries to parse the predicate pattern as

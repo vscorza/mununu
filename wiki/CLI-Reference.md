@@ -30,13 +30,15 @@ mununu context eval <CONTEXT> [options]
 
 | Flag | Description |
 |------|-------------|
-| `--formula <NAME>` | Name of the formula to evaluate (as declared in `mu_formulas`) |
+| `--formula <NAME>` | Name of the formula to evaluate (as declared in `mu_formulas`). Mutually exclusive with `--template`. |
+| `--template <ID>` | Instantiate a [property template](Property-Templates) instead of selecting an existing formula. Mutually exclusive with `--formula`. |
 | `--automaton <NAME>` | Name of the automaton or composition to evaluate over |
 
 **Optional flags**:
 
 | Flag | Description |
 |------|-------------|
+| `--template-arg <KEY=VALUE>` | Template argument binding (repeatable). Requires `--template`. |
 | `--sidecar <FILE>` | Additional CTXDSL sidecar files to merge (repeatable) |
 | `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `extraction`, `auto` |
 | `--no-partitions` | Disable guard partitioning during evaluation |
@@ -56,6 +58,18 @@ mununu context eval examples/hw/handshake.ctxdsl \
 mununu context eval examples/counters/counters.ctxdsl \
     --sidecar examples/counters/counters_properties.ctxdsl \
     --formula safety_invariant --automaton Counter
+```
+
+```bash
+# Evaluate using a property template (no need to write mu-calculus)
+mununu context eval examples/game/player_fsm.espec.json \
+    --adapter extraction \
+    --template no_deadlock --automaton PlayerState
+
+# Template with arguments
+mununu context eval examples/game/quest_deadlock.espec.json \
+    --adapter extraction \
+    --template reachable --template-arg TARGET=AllComplete --automaton QuestProgress
 ```
 
 ```bash
@@ -97,12 +111,13 @@ mununu context synth <CONTEXT> [options]
 | `--counterexample` | Generate counterstrategy traces when unrealizable |
 | `--deadlock-traces` | Capture traces leading to deadlock states |
 | `--max-counter-traces <N>` | Cap the number of counterstrategy traces collected |
-| `--extract-strategy` | Produce a positional strategy (one controllable transition per state) instead of the full winning-region projection |
+| `--extract-strategy` | Legacy flag — equivalent to `--controller-mode functional`. Kept for backwards compatibility. When `--controller-mode` is also provided, `--controller-mode` wins. |
+| `--controller-mode <NAME>` | Controller extraction mode. One of `projection` (default), `functional`, `permissive`, `signature-memory`, `product-game`, `parity-game`. See [Controller Modes](Controller-Modes.md) for the full reference. |
 | `--no-proof-obligations` | Skip proof obligation emission for violating initial states |
 | `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `extraction`, `auto` |
 | `--dump-json <FILE>` | Write a JSON summary of the synthesis result to a file |
 | `--emit-dsl <FILE>` | Write the synthesized controller as a CTXDSL file |
-| `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog` |
+| `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog`, `gdscript` |
 | `--emit-native <FILE>` | Write the controller in the native format specified by `--output-format` |
 | `--dump-diagnostics <FILE>` | Export diagnostics as a DSL sidecar file |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
@@ -119,6 +134,16 @@ mununu context synth tutorial/examples/06_controllability.ctxdsl \
 mununu context synth examples/hw/arbiter.ctxdsl \
     --formula safety_invariant --automaton Arbiter \
     --minimize --dump-json result.json
+
+# GR(1) / Buchi formula with memory-aware controller
+mununu context synth examples/elevator_gr1.ctxdsl \
+    --formula door_always_closes --automaton Elevator \
+    --controller-mode product-game
+
+# Full parity-game synthesis (correct for arbitrary alternation depth)
+mununu context synth examples/elevator_gr1.ctxdsl \
+    --formula door_always_closes --automaton Elevator \
+    --controller-mode parity-game
 ```
 
 **Example -- unrealizable with diagnostics**:
@@ -400,9 +425,47 @@ mununu sv discover examples/systemverilog/alu.sv
 
 See [RTL Verification Pipeline](RTL-Verification-Pipeline) for the full workflow.
 
+## `mununu templates`
+
+List available property templates. Templates provide parameterized mu-calculus formula patterns that can be used with `--template` in `eval` and `synth` commands.
+
+```
+mununu templates [options]
+```
+
+**Optional flags**:
+
+| Flag | Description |
+|------|-------------|
+| `--domain <DOMAIN>` | Filter templates by domain: `game`, `rtl`, `agentic`, `software`, `synthesis` |
+| `--id <ID>` | Show details of a specific template |
+| `--json` | Output as JSON |
+
+**Examples**:
+
+```bash
+# List all templates
+mununu templates
+
+# Filter by domain
+mununu templates --domain game
+
+# Show template details
+mununu templates --id reachable
+
+# JSON output (for scripting)
+mununu templates --json
+```
+
+See [Property Templates](Property-Templates) for the full catalog and usage guide.
+
+---
+
 ## See Also
 
 - [Adapter Formats](Adapter-Formats.md) -- supported external formats
+- [Property Templates](Property-Templates.md) -- parameterized property patterns
+- [Game Engine Integration](Game-Engine-Integration.md) -- game FSM verification
 - [LTL Properties](LTL-Properties.md) -- writing temporal specifications
 - [Controller Synthesis](Controller-Synthesis.md) -- synthesis concepts and examples
 - [Hardware Verification Patterns](Hardware-Verification-Patterns.md) -- example models and properties

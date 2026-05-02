@@ -221,60 +221,45 @@ Composed state: Waiting|WorkingA|IdleB
 
 ## Framework Integration
 
-Mununu includes **native Rust adapters** for three agentic AI orchestration frameworks. Each adapter parses the framework's JSON format directly — no Python or external tools required.
+Mununu does **not** ship native Rust parsers for CrewAI, LangGraph, or A2A JSON today. Two paths cover agentic orchestration:
 
-### LangGraph
+### Path 1: XState JSON (recommended for graph-shaped workflows)
+
+Author the workflow as an XState v5 statechart with a `__mununu` block declaring controllable / uncontrollable events and properties. The XState adapter handles parallel regions and translates them to a synchronous composition.
 
 ```bash
-# Direct import via native adapter (auto-detected from extension)
-mununu context synth workflow.langgraph.json \
-    --formula safety_invariant --automaton langgraph_workflow
-
-# Or with explicit adapter flag
-mununu context synth graph.json --adapter langgraph \
-    --formula safety_invariant --automaton langgraph_workflow
+mununu context synth examples/agentic/support_pipeline.xstate.json \
+    --formula no_tool_over_budget --automaton support_pipeline_system
 ```
 
-**Input:** JSON with `nodes`, `edges`, and `conditional_edges` keys. Nodes become states, edges become events, conditional edges produce routing events. Routing decisions (`ROUTE_*`) are controllable by default; environment-like events (human, tool_result, timeout) are uncontrollable.
+Use this when the workflow is naturally a state chart (sequential pipelines, routed dialogs, parallel watchdogs). LangGraph and CrewAI graphs both translate cleanly to XState by hand or via the Python scripts under `tools/`.
 
-### CrewAI
+### Path 2: Native CTXDSL (recommended for compositional protocols)
+
+Author each agent / supervisor / authorization gate as its own automaton in CTXDSL and compose them. This gives full control over alphabets, controllability, and composition mode (sync / async).
 
 ```bash
-mununu context synth crew.crew.json \
-    --formula can_finish --automaton crewai_workflow
-
-# Or explicit
-mununu context synth crew.json --adapter crewai \
-    --formula safety_invariant --automaton crewai_workflow
+mununu context eval examples/agentic/mcp_auth.ctxdsl \
+    --formula confirm_before_delete --automaton auth_system
+mununu context eval examples/agentic/handoff_protocol.ctxdsl \
+    --formula mutex --automaton handoff_system
 ```
 
-**Input:** JSON with `agents`, `tasks`, and `process` keys. Sequential process → linear state chain with completion/failure/retry per task. Hierarchical process → supervisor + parallel worker regions with delegation support.
+Use this when the protocol has multiple coordinating components (session + confirmation + tool gate, supervisor + workers, etc.) — the explicit composition is clearer than encoding it as nested XState regions.
 
-### A2A Protocol
+### Python Convenience Scripts
 
-```bash
-mununu context synth protocol.a2a.json \
-    --formula mutex_researcher_writer --automaton a2a_protocol_system
-
-# Or explicit
-mununu context synth cards.json --adapter a2a \
-    --formula safety_invariant --automaton a2a_protocol
-```
-
-**Input:** Single agent card or JSON array of cards with `name` and `skills`. Each agent's skills become controllable invocation events. Task lifecycle (idle → queued → in_progress → completed/failed) modeled as state machine. Multi-agent cards produce parallel regions with auto-generated mutual exclusion properties.
-
-### Python Convenience Scripts (Optional)
-
-For users who want to introspect **live Python objects** (e.g., a `crewai.Crew` instance or a compiled `langgraph.graph.CompiledStateGraph`), the Python scripts in `tools/` remain available. They export XState JSON that can then be processed by either the XState or the native adapter:
+For users who want to introspect **live Python objects** (e.g., a `crewai.Crew` instance or a compiled `langgraph.graph.CompiledStateGraph`), the Python scripts in `tools/` are available. They export XState JSON which Path 1 can then consume:
 
 ```bash
-# Live object introspection (requires framework install)
 python3 tools/langgraph_to_xstate.py --input graph.json --output workflow.xstate.json
 python3 tools/crewai_to_xstate.py --input crew.json --output crew.xstate.json
 python3 tools/a2a_to_xstate.py --input card1.json card2.json --output protocol.xstate.json
+
+mununu context eval workflow.xstate.json --formula safety_invariant --automaton workflow_system
 ```
 
-For JSON dict input, the native Rust adapters (`--adapter langgraph|crewai|a2a`) are preferred — they are faster, have no Python dependency, and integrate with auto-detection and the web UI.
+Native Rust parsers for these formats are deliberate future work, not a shipped feature.
 
 ## Web UI
 

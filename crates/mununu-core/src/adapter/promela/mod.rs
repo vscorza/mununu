@@ -207,6 +207,18 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
         });
     }
 
+    // Build a set of bool-variable names so LTL atoms like `flag` can be
+    // rewritten to the corresponding state name `flag_1` of the Var_flag
+    // automaton. Without this, `[] !flag` references the predicate `flag`
+    // which has no resolution path (no state, no registered predicate) and
+    // the evaluator would silently treat it as `false`.
+    let bool_var_names: std::collections::HashSet<String> = program
+        .globals
+        .iter()
+        .filter(|g| matches!(g.typename, ast::TypeName::Bit | ast::TypeName::Bool))
+        .map(|g| g.name.clone())
+        .collect();
+
     // Convert LTL properties
     let properties: Vec<PropertySpec> = program
         .ltl_properties
@@ -216,7 +228,7 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
             PropertySpec {
                 name,
                 kind: PropertyKind::Safety,
-                formula: PropertyFormula::Ltl(convert_ltl(&ltl.formula)),
+                formula: PropertyFormula::Ltl(convert_ltl(&ltl.formula, &bool_var_names)),
                 role: PropertyRole::Standalone,
                 over: None,
             }
@@ -437,24 +449,36 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
 }
 
 /// Convert Promela LTL expression to mununu's LtlFormula.
-fn convert_ltl(expr: &ast::LtlExpr) -> LtlFormula {
+fn convert_ltl(expr: &ast::LtlExpr, bool_vars: &std::collections::HashSet<String>) -> LtlFormula {
     match expr {
         ast::LtlExpr::True => LtlFormula::True,
         ast::LtlExpr::False => LtlFormula::False,
-        ast::LtlExpr::Predicate(name) => LtlFormula::Predicate(name.clone()),
-        ast::LtlExpr::Not(inner) => LtlFormula::Not(Box::new(convert_ltl(inner))),
-        ast::LtlExpr::And(l, r) => {
-            LtlFormula::And(Box::new(convert_ltl(l)), Box::new(convert_ltl(r)))
+        ast::LtlExpr::Predicate(name) => {
+            // Rewrite bare bool-variable atoms to the corresponding state name
+            // so the realize step's auto_register_state_name_predicates can
+            // resolve them against the Var_<name> automaton's `<name>_1` state.
+            if bool_vars.contains(name) {
+                LtlFormula::Predicate(format!("{name}_1"))
+            } else {
+                LtlFormula::Predicate(name.clone())
+            }
         }
-        ast::LtlExpr::Or(l, r) => {
-            LtlFormula::Or(Box::new(convert_ltl(l)), Box::new(convert_ltl(r)))
-        }
-        ast::LtlExpr::Implies(l, r) => {
-            LtlFormula::Implies(Box::new(convert_ltl(l)), Box::new(convert_ltl(r)))
-        }
+        ast::LtlExpr::Not(inner) => LtlFormula::Not(Box::new(convert_ltl(inner, bool_vars))),
+        ast::LtlExpr::And(l, r) => LtlFormula::And(
+            Box::new(convert_ltl(l, bool_vars)),
+            Box::new(convert_ltl(r, bool_vars)),
+        ),
+        ast::LtlExpr::Or(l, r) => LtlFormula::Or(
+            Box::new(convert_ltl(l, bool_vars)),
+            Box::new(convert_ltl(r, bool_vars)),
+        ),
+        ast::LtlExpr::Implies(l, r) => LtlFormula::Implies(
+            Box::new(convert_ltl(l, bool_vars)),
+            Box::new(convert_ltl(r, bool_vars)),
+        ),
         ast::LtlExpr::Iff(l, r) => {
-            let l_conv = convert_ltl(l);
-            let r_conv = convert_ltl(r);
+            let l_conv = convert_ltl(l, bool_vars);
+            let r_conv = convert_ltl(r, bool_vars);
             LtlFormula::And(
                 Box::new(LtlFormula::Implies(
                     Box::new(l_conv.clone()),
@@ -463,20 +487,22 @@ fn convert_ltl(expr: &ast::LtlExpr) -> LtlFormula {
                 Box::new(LtlFormula::Implies(Box::new(r_conv), Box::new(l_conv))),
             )
         }
-        ast::LtlExpr::Always(inner) => LtlFormula::Always(Box::new(convert_ltl(inner))),
-        ast::LtlExpr::Eventually(inner) => LtlFormula::Eventually(Box::new(convert_ltl(inner))),
-        ast::LtlExpr::Next(inner) => LtlFormula::Next(Box::new(convert_ltl(inner))),
+        ast::LtlExpr::Always(inner) => LtlFormula::Always(Box::new(convert_ltl(inner, bool_vars))),
+        ast::LtlExpr::Eventually(inner) => {
+            LtlFormula::Eventually(Box::new(convert_ltl(inner, bool_vars)))
+        }
+        ast::LtlExpr::Next(inner) => LtlFormula::Next(Box::new(convert_ltl(inner, bool_vars))),
         ast::LtlExpr::Until(l, r) => LtlFormula::Until {
-            left: Box::new(convert_ltl(l)),
-            right: Box::new(convert_ltl(r)),
+            left: Box::new(convert_ltl(l, bool_vars)),
+            right: Box::new(convert_ltl(r, bool_vars)),
         },
         ast::LtlExpr::WeakUntil(l, r) => LtlFormula::WeakUntil {
-            left: Box::new(convert_ltl(l)),
-            right: Box::new(convert_ltl(r)),
+            left: Box::new(convert_ltl(l, bool_vars)),
+            right: Box::new(convert_ltl(r, bool_vars)),
         },
         ast::LtlExpr::Release(l, r) => LtlFormula::Release {
-            left: Box::new(convert_ltl(l)),
-            right: Box::new(convert_ltl(r)),
+            left: Box::new(convert_ltl(l, bool_vars)),
+            right: Box::new(convert_ltl(r, bool_vars)),
         },
     }
 }

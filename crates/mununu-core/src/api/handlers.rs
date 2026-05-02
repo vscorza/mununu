@@ -14,7 +14,7 @@ use crate::api::graph::generate_graphs;
 use crate::api::models::*;
 use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, LabelId};
 use crate::context::{ControllerSynthesisOptions, DiagnosticsOptions as ContextDiagnosticsOptions};
-use crate::context_dsl::{RealizedContext, parse as parse_context_doc, realize_context};
+use crate::context_dsl::RealizedContext;
 use crate::guard::sanitize_identifier;
 use crate::mu_calculus::{Environment, EvaluationOptions, Formula};
 
@@ -26,42 +26,65 @@ pub async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
+/// List available property templates.
+pub async fn templates_handler(
+    query: axum::extract::Query<TemplatesQuery>,
+) -> Json<serde_json::Value> {
+    let registry = crate::adapter::templates::TemplateRegistry::builtin();
+
+    if let Some(domain_str) = &query.domain {
+        use crate::adapter::templates::TemplateDomain;
+        let domain = match domain_str.as_str() {
+            "game" => Some(TemplateDomain::Game),
+            "rtl" => Some(TemplateDomain::Rtl),
+            "agentic" => Some(TemplateDomain::Agentic),
+            "software" => Some(TemplateDomain::Software),
+            "synthesis" => Some(TemplateDomain::Synthesis),
+            "universal" => Some(TemplateDomain::Universal),
+            _ => None,
+        };
+        if let Some(d) = domain {
+            let filtered: Vec<_> = registry.for_domain(d);
+            return Json(serde_json::to_value(filtered).unwrap_or_default());
+        }
+    }
+
+    let catalog = registry.catalog();
+    Json(serde_json::to_value(catalog).unwrap_or_default())
+}
+
+/// Query parameters for the templates endpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct TemplatesQuery {
+    pub domain: Option<String>,
+}
+
 /// Summarize context (automata, formulas, controllers)
 pub async fn context_summarize_handler(
     Json(request): Json<ContextSummarizeRequest>,
 ) -> ApiResult<Json<ContextSummarizeResponse>> {
     let handler_start = Instant::now();
 
-    // Parse context document
+    // Cache parse + realize. Subsequent calls with identical content reuse the
+    // realized result, sidestepping CLTS construction / abstraction unrolling.
     let t0 = Instant::now();
-    let context_doc =
-        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
-            message: format!("Failed to parse context: {}", e),
-            details: Some(e.to_string()),
-        })?;
-
-    // Parse sidecar documents
-    let sidecar_docs: Result<Vec<_>, _> = request
+    let sidecar_strs: Vec<&str> = request
         .sidecars
         .iter()
-        .map(|s| parse_context_doc(&s.content))
+        .map(|s| s.content.as_str())
         .collect();
-
-    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
-        message: format!("Failed to parse sidecar: {}", e),
-        details: Some(e.to_string()),
-    })?;
-    let parse_ms = t0.elapsed().as_millis();
-
-    // Realize context
-    let t1 = Instant::now();
-    let realized =
-        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
-            message: format!("Failed to realize context: {}", e),
-            source: None,
-        })?;
-    let realize_ms = t1.elapsed().as_millis();
-    info!(parse_ms, realize_ms, "summarize: parse+realize complete");
+    let (entry, cache_hit) =
+        crate::api::cache::get_or_realize(&request.context.content, &sidecar_strs).map_err(
+            |e| ApiError::BadRequest {
+                message: format!("Failed to parse/realize context: {}", e),
+                details: Some(e.clone()),
+            },
+        )?;
+    let realize_ms = t0.elapsed().as_millis();
+    let context_doc = entry.context_doc.as_ref();
+    let sidecar_docs = entry.sidecar_docs.as_ref();
+    let realized = entry.realized.as_ref();
+    info!(realize_ms, cache_hit, "summarize: parse+realize complete");
 
     // Build summary — include both direct automata and compositions
     let mut automata_names: Vec<String> = context_doc
@@ -69,7 +92,7 @@ pub async fn context_summarize_handler(
         .iter()
         .map(|a| a.name.name.clone())
         .collect();
-    for doc in std::iter::once(&context_doc).chain(sidecar_docs.iter()) {
+    for doc in std::iter::once(context_doc).chain(sidecar_docs.iter()) {
         for comp in &doc.compositions {
             automata_names.push(comp.name.name.clone());
         }
@@ -112,9 +135,9 @@ pub async fn context_summarize_handler(
     };
     let total_ms = handler_start.elapsed().as_millis();
     info!(
-        parse_ms,
         realize_ms,
         total_ms,
+        cache_hit,
         controllers = controllers_count,
         "summarize: complete"
     );
@@ -125,43 +148,98 @@ pub async fn context_summarize_handler(
     }))
 }
 
+/// Resolve the requested controller mode from the API options.
+///
+/// Precedence:
+/// 1. `controller_mode` (if `Some`) is parsed case-insensitively.
+/// 2. Else, `extract_strategy = true` → `Functional` (legacy mapping).
+/// 3. Else, `Projection` (default).
+///
+/// Accepted names: `projection`, `functional`, `permissive`,
+/// `signature-memory`, `product-game`, `parity-game`. The dashes may also
+/// be underscores or removed (e.g., `parity_game` and `paritygame` work).
+fn resolve_controller_mode(
+    mode: &Option<String>,
+    extract_strategy: bool,
+) -> Result<crate::context::ControllerMode, ApiError> {
+    use crate::context::ControllerMode;
+    if let Some(name) = mode {
+        let normalized: String = name
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        return match normalized.as_str() {
+            "projection" => Ok(ControllerMode::Projection),
+            "functional" => Ok(ControllerMode::Functional),
+            "permissive" => Ok(ControllerMode::Permissive),
+            "signaturememory" => Ok(ControllerMode::SignatureMemory),
+            "productgame" => Ok(ControllerMode::ProductGame),
+            "paritygame" => Ok(ControllerMode::ParityGame),
+            other => Err(ApiError::BadRequest {
+                message: format!("Unknown controller_mode '{other}'"),
+                details: Some(
+                    "Valid: projection, functional, permissive, signature-memory, product-game, parity-game".into(),
+                ),
+            }),
+        };
+    }
+    Ok(if extract_strategy {
+        ControllerMode::Functional
+    } else {
+        ControllerMode::Projection
+    })
+}
+
 /// Synthesize controller from ctxdsl specification
 pub async fn context_synthesize_handler(
     Json(request): Json<ContextSynthesizeRequest>,
 ) -> ApiResult<Json<ContextSynthesizeResponse>> {
-    // Parse context document
-    let context_doc =
-        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
-            message: format!("Failed to parse context: {}", e),
-            details: Some(e.to_string()),
-        })?;
+    let handler_start = Instant::now();
 
-    // Parse sidecar documents
-    let sidecar_docs: Result<Vec<_>, _> = request
-        .sidecars
-        .iter()
-        .map(|s| parse_context_doc(&s.content))
-        .collect();
-
-    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
-        message: format!("Failed to parse sidecar: {}", e),
-        details: Some(e.to_string()),
+    // Resolve formula name + synthesized template sidecar BEFORE cache lookup,
+    // so the cache key covers the template-ref instantiation. Repeated requests
+    // with identical context + identical template params hit the cache.
+    let (formula_name, synth_sidecar) = resolve_template_ref_for_cache(
+        &request.formula,
+        &request.template_ref,
+        &request.automaton,
+    )?;
+    let formula_name = formula_name.ok_or_else(|| ApiError::BadRequest {
+        message: "either 'formula' or 'template_ref' must be provided".to_string(),
+        details: None,
     })?;
 
-    // Realize context
-    let realized =
-        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
-            message: format!("Failed to realize context: {}", e),
-            source: None,
-        })?;
+    // Build sidecar string list: original sidecars + (optionally) synthesized template sidecar
+    let mut sidecar_strs: Vec<&str> = request
+        .sidecars
+        .iter()
+        .map(|s| s.content.as_str())
+        .collect();
+    if let Some(ref s) = synth_sidecar {
+        sidecar_strs.push(s.as_str());
+    }
+
+    let (entry, cache_hit) =
+        crate::api::cache::get_or_realize(&request.context.content, &sidecar_strs).map_err(
+            |e| ApiError::BadRequest {
+                message: format!("Failed to parse/realize context: {}", e),
+                details: Some(e.clone()),
+            },
+        )?;
+    let realized = entry.realized.as_ref();
+    info!(
+        realize_ms = handler_start.elapsed().as_millis() as u64,
+        cache_hit, "synthesize: parse+realize complete"
+    );
 
     // Get formula
     let realized_formula =
         realized
             .formulas
-            .get(&request.formula)
+            .get(&formula_name)
             .ok_or_else(|| ApiError::BadRequest {
-                message: format!("Unknown formula '{}'", request.formula),
+                message: format!("Unknown formula '{}'", formula_name),
                 details: None,
             })?;
 
@@ -200,7 +278,10 @@ pub async fn context_synthesize_handler(
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: request.options.minimize,
                 extract_strategy: request.options.extract_strategy,
-                mode: crate::context::ControllerMode::default(),
+                mode: resolve_controller_mode(
+                    &request.options.controller_mode,
+                    request.options.extract_strategy,
+                )?,
             },
         )
         .map_err(|e| ApiError::Internal {
@@ -214,7 +295,7 @@ pub async fn context_synthesize_handler(
         let content = serialize_controller_to_ctxdsl(
             &synthesis.controller,
             &request.automaton,
-            &request.formula,
+            &formula_name,
             formula_raw,
         )?;
         Some(FileContent {
@@ -228,7 +309,7 @@ pub async fn context_synthesize_handler(
     // Compute counterstrategy graph for unrealizable cases
     let counterstrategy = if !synthesis.realizable {
         compute_counterstrategy_result(
-            &realized,
+            realized,
             &request.automaton,
             &realized_formula.formula,
             &env,
@@ -261,6 +342,22 @@ pub async fn context_synthesize_handler(
                 Some(FileContent {
                     name: format!("{}_controller.sv", request.automaton),
                     content: sv,
+                })
+            }
+            Some("gdscript") | Some("gd") => {
+                use crate::adapter::gdscript::emit_controller::{
+                    collect_controllable_labels, controller_to_gdscript,
+                };
+                let controllable = collect_controllable_labels(&synthesis.controller);
+                let gd = controller_to_gdscript(
+                    &synthesis.controller,
+                    &request.automaton,
+                    true,
+                    &controllable,
+                );
+                Some(FileContent {
+                    name: format!("{}_controller.gd", request.automaton),
+                    content: gd,
                 })
             }
             _ => None,
@@ -370,37 +467,34 @@ pub async fn context_import_handler(
 pub async fn context_graphs_handler(
     Json(request): Json<ContextGraphsRequest>,
 ) -> ApiResult<Json<ContextGraphsResponse>> {
-    // Parse context document
-    let context_doc =
-        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
-            message: format!("Failed to parse context: {}", e),
-            details: Some(e.to_string()),
-        })?;
+    let handler_start = Instant::now();
 
-    // Parse sidecar documents
-    let sidecar_docs: Result<Vec<_>, _> = request
+    // Cache parse + realize.
+    let sidecar_strs: Vec<&str> = request
         .sidecars
         .iter()
-        .map(|s| parse_context_doc(&s.content))
+        .map(|s| s.content.as_str())
         .collect();
-
-    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
-        message: format!("Failed to parse sidecar: {}", e),
-        details: Some(e.to_string()),
-    })?;
-
-    // Realize context
-    let realized =
-        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
-            message: format!("Failed to realize context: {}", e),
-            source: None,
-        })?;
+    let (entry, cache_hit) =
+        crate::api::cache::get_or_realize(&request.context.content, &sidecar_strs).map_err(
+            |e| ApiError::BadRequest {
+                message: format!("Failed to parse/realize context: {}", e),
+                details: Some(e.clone()),
+            },
+        )?;
+    let context_doc = entry.context_doc.as_ref();
+    let sidecar_docs = entry.sidecar_docs.as_ref();
+    let realized = entry.realized.as_ref();
+    info!(
+        realize_ms = handler_start.elapsed().as_millis() as u64,
+        cache_hit, "graphs: parse+realize complete"
+    );
 
     // Generate graphs
     let (mut graphs, context_summary) = generate_graphs(
-        &context_doc,
-        &sidecar_docs,
-        &realized,
+        context_doc,
+        sidecar_docs,
+        realized,
         request.automaton.as_deref(),
         &request.graph_types,
     )
@@ -474,38 +568,38 @@ pub async fn context_verify_handler(
     let handler_start = Instant::now();
     let counterstrategy_requested = request.counterstrategy;
 
-    // Parse context document
     let t0 = Instant::now();
-    let context_doc =
-        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
-            message: format!("Failed to parse context: {}", e),
-            details: Some(e.to_string()),
-        })?;
 
-    // Parse sidecar documents
-    let sidecar_docs: Result<Vec<_>, _> = request
+    // Resolve template_ref BEFORE cache lookup so the cache key covers the
+    // template instantiation. Repeated requests with the same context +
+    // template params hit the cache.
+    let (effective_formula, synth_sidecar) = resolve_template_ref_for_cache(
+        &request.formula,
+        &request.template_ref,
+        request.automaton.as_deref().unwrap_or("__default"),
+    )?;
+
+    let mut sidecar_strs: Vec<&str> = request
         .sidecars
         .iter()
-        .map(|s| parse_context_doc(&s.content))
+        .map(|s| s.content.as_str())
         .collect();
+    if let Some(ref s) = synth_sidecar {
+        sidecar_strs.push(s.as_str());
+    }
 
-    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
-        message: format!("Failed to parse sidecar: {}", e),
-        details: Some(e.to_string()),
-    })?;
-    let parse_ms = t0.elapsed().as_millis();
-
-    // Realize context
-    let t1 = Instant::now();
-    let realized =
-        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
-            message: format!("Failed to realize context: {}", e),
-            source: None,
-        })?;
-    let realize_ms = t1.elapsed().as_millis();
+    let (entry, cache_hit) =
+        crate::api::cache::get_or_realize(&request.context.content, &sidecar_strs).map_err(
+            |e| ApiError::BadRequest {
+                message: format!("Failed to parse/realize context: {}", e),
+                details: Some(e.clone()),
+            },
+        )?;
+    let realized = entry.realized.as_ref();
+    let realize_ms = t0.elapsed().as_millis();
     info!(
-        parse_ms,
         realize_ms,
+        cache_hit,
         counterstrategy = counterstrategy_requested,
         "verify: parse+realize complete"
     );
@@ -513,7 +607,7 @@ pub async fn context_verify_handler(
     // Collect formula–automaton pairs to evaluate
     let mut pairs: Vec<(String, String)> = Vec::new();
 
-    if let Some(ref formula_name) = request.formula {
+    if let Some(ref formula_name) = effective_formula {
         // Specific formula requested
         if !realized.formulas.contains_key(formula_name) {
             return Err(ApiError::BadRequest {
@@ -526,7 +620,7 @@ pub async fn context_verify_handler(
         } else {
             // Use the formula's target automata
             let rf = &realized.formulas[formula_name];
-            let automata = resolve_targets(&rf.targets, &realized);
+            let automata = resolve_targets(&rf.targets, realized);
             for a in automata {
                 pairs.push((formula_name.clone(), a));
             }
@@ -545,7 +639,7 @@ pub async fn context_verify_handler(
             if let Some(ref automaton_name) = request.automaton {
                 pairs.push((name.clone(), automaton_name.clone()));
             } else {
-                let automata = resolve_targets(&rf.targets, &realized);
+                let automata = resolve_targets(&rf.targets, realized);
                 for a in automata {
                     pairs.push((name.clone(), a));
                 }
@@ -620,7 +714,7 @@ pub async fn context_verify_handler(
         // Compute counterstrategy for failed formulas when requested
         let counterstrategy = if request.counterstrategy && !satisfied {
             compute_counterstrategy_result(
-                &realized,
+                realized,
                 automaton_name,
                 &rf.formula,
                 &env,
@@ -648,10 +742,10 @@ pub async fn context_verify_handler(
     let eval_ms = t2.elapsed().as_millis();
     let total_ms = handler_start.elapsed().as_millis();
     info!(
-        parse_ms,
         realize_ms,
         eval_ms,
         total_ms,
+        cache_hit,
         formulas = pairs.len(),
         counterstrategy = counterstrategy_requested,
         "verify: complete"
@@ -1294,19 +1388,18 @@ pub async fn sv_discover_handler(
                 source: None,
             })?;
 
-        return Ok(Json(SvDiscoverResponse {
+        Ok(Json(SvDiscoverResponse {
             success: true,
             sidecar: updated_sidecar,
             discoveries,
             smt_available: true,
             warnings: vec![],
-        }));
+        }))
     }
 
     #[cfg(not(feature = "smt"))]
     {
-        // This branch is unreachable due to the early return above,
-        // but satisfies the compiler when the smt feature is disabled.
+        // Stub when smt feature is disabled.
         unreachable!()
     }
 }
@@ -1422,34 +1515,24 @@ pub async fn context_predicates_handler(
 ) -> ApiResult<Json<ContextPredicatesResponse>> {
     let instant = Instant::now();
 
-    // Parse main document
-    let context_doc =
-        parse_context_doc(&request.context.content).map_err(|e| ApiError::BadRequest {
-            message: format!("Context parse error: {e}"),
-            details: None,
-        })?;
-
-    // Parse sidecars
-    let sidecar_docs: Result<Vec<_>, _> = request
+    // Cache parse + realize.
+    let sidecar_strs: Vec<&str> = request
         .sidecars
         .iter()
-        .map(|s| parse_context_doc(&s.content))
+        .map(|s| s.content.as_str())
         .collect();
-
-    let sidecar_docs = sidecar_docs.map_err(|e| ApiError::BadRequest {
-        message: format!("Sidecar parse error: {e}"),
-        details: None,
-    })?;
-
-    let realized =
-        realize_context(&context_doc, &sidecar_docs).map_err(|e| ApiError::Internal {
-            message: format!("Realization error: {e}"),
-            source: None,
-        })?;
+    let (entry, cache_hit) =
+        crate::api::cache::get_or_realize(&request.context.content, &sidecar_strs).map_err(
+            |e| ApiError::BadRequest {
+                message: format!("Context parse/realize error: {e}"),
+                details: None,
+            },
+        )?;
+    let realized = entry.realized.as_ref();
 
     info!(
         elapsed_ms = instant.elapsed().as_millis() as u64,
-        "predicates: realized"
+        cache_hit, "predicates: realized"
     );
 
     let mut predicates: std::collections::HashMap<String, Vec<String>> =
@@ -1476,4 +1559,113 @@ pub async fn context_predicates_handler(
         success: true,
         predicates,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Template resolution helper for API handlers
+// ---------------------------------------------------------------------------
+
+/// Resolve a formula reference (direct name or template_ref) into a name + an
+/// optional synthesized sidecar CTXDSL string.
+///
+/// - When `formula` is given: returns `(Some(name), None)`.
+/// - When `template_ref` is given: instantiates the template, returns
+///   `(Some(template_formula_name), Some(synth_sidecar_ctxdsl))` so the caller
+///   can pass the synthesized string to `cache::get_or_realize` as an extra
+///   sidecar (the cache key then covers the template instantiation, enabling
+///   hits across repeated requests with identical template params).
+/// - When neither is given: returns `(None, None)` — caller decides whether
+///   that's an error.
+fn resolve_template_ref_for_cache(
+    formula: &Option<String>,
+    template_ref: &Option<crate::adapter::templates::TemplateRef>,
+    automaton: &str,
+) -> Result<(Option<String>, Option<String>), ApiError> {
+    if let Some(name) = formula {
+        return Ok((Some(name.clone()), None));
+    }
+
+    let tref = match template_ref {
+        Some(t) => t,
+        None => return Ok((None, None)),
+    };
+
+    let registry = crate::adapter::templates::TemplateRegistry::builtin();
+    let inst = registry
+        .instantiate(tref)
+        .map_err(|e| ApiError::BadRequest {
+            message: format!("Template instantiation failed: {e}"),
+            details: None,
+        })?;
+
+    let formula_name = inst.name.clone();
+    let sidecar_ctxdsl = format!(
+        "context __template_sidecar {{\n  mu_formulas {{\n    formula {formula_name} {{\n      over {automaton};\n      body = {};\n    }}\n  }}\n}}\n",
+        inst.formula
+    );
+    Ok((Some(formula_name), Some(sidecar_ctxdsl)))
+}
+
+#[cfg(test)]
+mod controller_mode_tests {
+    use super::*;
+    use crate::context::ControllerMode;
+
+    #[test]
+    fn resolve_returns_projection_by_default() {
+        assert_eq!(
+            resolve_controller_mode(&None, false).unwrap(),
+            ControllerMode::Projection
+        );
+    }
+
+    #[test]
+    fn resolve_legacy_extract_strategy_maps_to_functional() {
+        assert_eq!(
+            resolve_controller_mode(&None, true).unwrap(),
+            ControllerMode::Functional
+        );
+    }
+
+    #[test]
+    fn resolve_explicit_mode_wins_over_extract_strategy() {
+        assert_eq!(
+            resolve_controller_mode(&Some("projection".into()), true).unwrap(),
+            ControllerMode::Projection
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_all_modes_case_insensitive() {
+        let cases = [
+            ("projection", ControllerMode::Projection),
+            ("Functional", ControllerMode::Functional),
+            ("PERMISSIVE", ControllerMode::Permissive),
+            ("signature-memory", ControllerMode::SignatureMemory),
+            ("signature_memory", ControllerMode::SignatureMemory),
+            ("SignatureMemory", ControllerMode::SignatureMemory),
+            ("product-game", ControllerMode::ProductGame),
+            ("parity-game", ControllerMode::ParityGame),
+            ("ParityGame", ControllerMode::ParityGame),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                resolve_controller_mode(&Some(name.into()), false).unwrap(),
+                expected,
+                "name `{name}` should map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_mode() {
+        let err = resolve_controller_mode(&Some("strict".into()), false).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("Unknown controller_mode"));
+                assert!(message.contains("strict"));
+            }
+            _ => panic!("expected BadRequest, got {err:?}"),
+        }
+    }
 }

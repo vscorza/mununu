@@ -567,6 +567,44 @@ When a GR(1) property is unrealizable, counter strategies show how the environme
 
 ---
 
+## Beyond GR(1): Recurrence after Stability (Σ₃)
+
+The patterns above all sit at alternation depth ≤ 2 in their mu-calculus normal form — that's the GR(1) cap. Real synthesis problems sometimes need more, and mununu's `parity-game` controller mode is the only mode that handles arbitrary alternation correctly.
+
+### Pattern: Recurrence after Stability
+
+A recurrence obligation that becomes active *only after* a stability event has occurred. Once the system reaches a stable region, a separate recurrence property must hold forever within that region — but the adversary controls when (or whether) the stable region is entered.
+
+**LTL:**
+```
+G(req → F(ack ∧ G(retry → F done)))
+```
+
+In English: every request must eventually be acknowledged, and from that ack onward, every retry must eventually be answered by `done` — forever after the first ack.
+
+**Mu-calculus translation** (NNF, with `F→μ` and `G→ν`):
+```
+νZ. ((¬req ∨ μY. ((ack ∧ νX. ((¬retry ∨ μW. (done ∨ ◇W)) ∧ □X)) ∨ ◇Y)) ∧ □Z)
+```
+
+**Alternation depth:** 4. Reading from outside in: `νZ → μY → νX → μW`, three strict alternations. This is genuinely above GR(1) — it does not collapse to a Σ₂ disjunction the way `GFp → GFq` does, because the "forever after" obligation is conditional on *having entered* the post-ack region.
+
+**Provenance:** Manna-Pnueli temporal hierarchy (Σ₃-complete reactivity class). Industrial appearance in SYNTCOMP TLSF benchmarks `lily-demo` and `amba_decomposed_lock_*`.
+
+**Worked example in mununu:** [`examples/bus_arbiter_retry.ctxdsl`](../../examples/bus_arbiter_retry.ctxdsl) — 4-state bus arbiter where the controller must `ack` requests, then handle `retry` events with `done` forever after the first ack, with the option to `release` back to idle. Use `--controller-mode parity-game` for theoretical correctness; lower modes happen to give the same realizability verdict on this small system but their strategies aren't proven correct in general at alt > 2.
+
+```bash
+mununu context synth examples/bus_arbiter_retry.ctxdsl \
+    --formula recurrence_after_stability --automaton BusArbiter \
+    --controller-mode parity-game
+```
+
+**Dual-channel extension:** [`examples/dual_arbiter_alt4.ctxdsl`](../../examples/dual_arbiter_alt4.ctxdsl) composes two independent recurrence-after-stability obligations (one per channel). The controller must (a) rotate between two liveness goals — *memory of which obligation is being served* — and (b) disable some controllable transitions to commit to a strategy. The functional mode synthesizes 31 transitions vs the projection's 48, an explicit demonstration of "the controller disables 17 transitions". Property body remains alt 4 (conjunction doesn't increase alternation).
+
+See [Controller Modes](https://github.com/your-org/mununu/wiki/Controller-Modes) on the wiki for the full mode comparison.
+
+---
+
 ## Pattern Summary Table
 
 | Pattern | LTL | CTL | Synchronous Use Case | Asynchronous Use Case |
@@ -578,6 +616,7 @@ When a GR(1) property is unrealizable, counter strategies show how the environme
 | **Until** | `φ U ψ` | `A(φ U ψ)` | Phase transition | Resource reservation |
 | **Reactivity** | `G(φ → F(ψ))` | `AG(φ → AF(ψ))` | Reactive controller | Event handler |
 | **Conditional Liveness** | `G(φ → GF(ψ))` | `AG(φ → AG(AF(ψ)))` | Periodic task | Fair resource access |
+| **Recurrence after Stability** (Σ₃, alt 4) | `G(req → F(ack ∧ G(retry → F done)))` | — | Bus arbiter with retry | Stateful protocol with delayed obligation |
 | **GR(1) Basic** | `(⋀G(φᵢ) ∧ ⋀GF(φⱼ)) → (⋀G(ψₖ) ∧ ⋀GF(ψₗ))` | N/A | Mutual exclusion with fairness | Producer-consumer |
 | **GR(1) Conditional** | Conditional GR(1) | N/A | Conditional service | Adaptive rate control |
 

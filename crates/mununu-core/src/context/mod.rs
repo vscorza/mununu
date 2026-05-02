@@ -385,6 +385,42 @@ impl Context {
             .map_err(ContextError::from)
     }
 
+    /// Evaluates a μ-calculus formula under three-valued (Kleene) semantics,
+    /// returning a [`TritSet`](crate::mu_calculus::TritSet) per-state verdict.
+    ///
+    /// Unlike [`evaluate_mu`], this path treats OOB sink states as `Unknown`
+    /// for every atomic predicate, propagating the Unknown trit through
+    /// Boolean and modal connectives. Source states whose only path to
+    /// satisfying the formula goes through OOB receive `Unknown` rather than
+    /// the conservative `False` of the BitVec evaluator. Reference:
+    /// Bruns–Godefroid CONCUR 2000.
+    pub fn evaluate_mu_tri(
+        &self,
+        name: &str,
+        formula: &Formula,
+        env: &Environment,
+        options: Option<&EvaluationOptions>,
+    ) -> Result<crate::mu_calculus::TritSet, ContextError> {
+        let clts = self
+            .cltss
+            .get(name)
+            .ok_or_else(|| ContextError::UnknownClts(name.to_owned()))?;
+
+        let expected = clts.state_count();
+        let provided = env.state_count();
+        if expected != provided {
+            return Err(ContextError::EnvironmentMismatch {
+                name: name.to_owned(),
+                expected,
+                provided,
+            });
+        }
+
+        let eval_options = options.cloned().unwrap_or_default();
+        crate::mu_calculus::evaluate_tri_with_options(formula, clts, env, &eval_options)
+            .map_err(ContextError::from)
+    }
+
     /// Evaluates a mu-calculus formula and additionally records a witness map
     /// for strategy extraction. See [`evaluate_with_witnesses`].
     pub fn evaluate_mu_with_witnesses(
@@ -583,6 +619,114 @@ impl Context {
             .diagnostics
             .is_none_or(|diag| diag.proof_obligations);
 
+        // Compute fixpoint nesting order for signature-based extraction.
+        // Used for both Functional/SignatureMemory/Permissive (rank-based
+        // selection) and ProductGame (mu-obligation rotation).
+        let nesting = formula.fixpoint_nesting_order();
+
+        // ProductGame builds its own (plant_state, oblig_idx) state space and
+        // returns directly to the common diagnostics/minimization tail.
+        if effective_mode == ControllerMode::ProductGame {
+            let mut diagnostics = ControllerDiagnostics {
+                alternation_depth: Some(ad),
+                property_class: Some(format!("{pc:?}")),
+                ..Default::default()
+            };
+            let wm = witness_map
+                .as_ref()
+                .expect("ProductGame mode requires witness map");
+            let mut controller =
+                build_product_game_controller(self, clts, &visited, wm, formula, &nesting)?;
+            let kept_states = controller.state_count();
+            diagnostics
+                .messages
+                .push(format!("Controller mode: {:?}.", effective_mode));
+            diagnostics.messages.push(format!(
+                "Product-game controller: {} states across {} mu-obligation(s).",
+                kept_states,
+                formula.mu_obligations().len().max(1)
+            ));
+            if !violating_initials.is_empty() {
+                enrich_diagnostics_for_excluded_initials(
+                    &mut diagnostics,
+                    clts,
+                    &keep_bits,
+                    &violating_initials,
+                    &options,
+                    proof_obligations_enabled,
+                );
+            }
+            if options.diagnostics.is_some_and(|diag| diag.deadlock_traces) {
+                let deadlock_traces = collect_deadlock_traces(clts, &visited, &parent);
+                if !deadlock_traces.is_empty() {
+                    diagnostics.messages.push(format!(
+                        "Deadlock traces recorded: {}",
+                        deadlock_traces.len()
+                    ));
+                    diagnostics.deadlock_traces = deadlock_traces;
+                }
+            }
+            if options.minimize
+                && let Some((minimized, report)) = self.minimise_controller(&controller)?
+            {
+                if report.removed_states > 0 || report.removed_transitions > 0 {
+                    diagnostics.messages.push(format!(
+                        "Controller minimization removed {} state(s) and {} transition(s).",
+                        report.removed_states, report.removed_transitions
+                    ));
+                }
+                diagnostics.minimization = Some(report.clone());
+                controller = minimized;
+            }
+            return Ok(ControllerSynthesis {
+                controller,
+                realizable: true,
+                diagnostics,
+            });
+        }
+
+        // ParityGame: full parity-game synthesis via Zielonka.
+        if effective_mode == ControllerMode::ParityGame {
+            let mut diagnostics = ControllerDiagnostics {
+                alternation_depth: Some(ad),
+                property_class: Some(format!("{pc:?}")),
+                ..Default::default()
+            };
+            let mut controller = build_parity_game_controller(self, clts, formula, env)?;
+            let kept = controller.state_count();
+            diagnostics
+                .messages
+                .push(format!("Controller mode: {:?}.", effective_mode));
+            diagnostics.messages.push(format!(
+                "Parity-game controller: {} positions in winning region.",
+                kept
+            ));
+            // Realizability: at least one initial product position survived
+            // the winning-region prune. The helper marks initial states only
+            // for `(plant_initial, formula_root)` positions that Eve wins.
+            let realizable = !controller.initial_states().is_empty();
+            if !realizable {
+                return build_unrealizable_initials_synthesis(
+                    self,
+                    clts,
+                    &keep_bits,
+                    &violating_initials,
+                    &options,
+                );
+            }
+            if options.minimize
+                && let Some((minimized, report)) = self.minimise_controller(&controller)?
+            {
+                diagnostics.minimization = Some(report.clone());
+                controller = minimized;
+            }
+            return Ok(ControllerSynthesis {
+                controller,
+                realizable: true,
+                diagnostics,
+            });
+        }
+
         let retained = visited.iter().filter(|bit| **bit).count();
         let mut builder = CltsBuilder::with_label_store(self.label_store.clone());
         builder.reserve_states(retained);
@@ -593,7 +737,17 @@ impl Context {
                 continue;
             }
 
-            let name = clts.state_name(state).unwrap_or("state").to_owned();
+            let base_name = clts.state_name(state).unwrap_or("state").to_owned();
+            let name = if effective_mode == ControllerMode::SignatureMemory {
+                if let Some(wm) = witness_map.as_ref() {
+                    let sig = wm.signature(state.index(), &nesting);
+                    format!("{base_name}__sig_{}", format_signature(&sig))
+                } else {
+                    base_name
+                }
+            } else {
+                base_name
+            };
             let new_state = builder
                 .state_with_name(name)
                 .ok_or(ContextError::Controller(CltsError::IdOverflow {
@@ -611,21 +765,22 @@ impl Context {
             mapping.insert(state, new_state);
         }
 
-        // Compute fixpoint nesting order for signature-based extraction
-        let nesting = formula.fixpoint_nesting_order();
-
         for (original, mapped) in &mapping {
             match effective_mode {
-                ControllerMode::Functional => {
-                    // Functional mode: for each state, pick ONE controllable
-                    // transition whose target has the best (smallest) signature.
-                    // All uncontrollable transitions are always kept.
+                ControllerMode::Functional | ControllerMode::SignatureMemory => {
+                    // Functional / SignatureMemory mode: for each state, pick
+                    // ONE controllable transition whose target has the best
+                    // (smallest) signature. All uncontrollable transitions
+                    // are always kept. SignatureMemory differs only in that
+                    // state names are annotated with the iteration-rank
+                    // signature (handled in the mapping construction above).
                     //
                     // SOUNDNESS: The signature ordering ensures liveness progress —
                     // following signature-decreasing transitions guarantees all mu
                     // obligations are eventually satisfied. This is the memoryless-
                     // on-product strategy projected to the plant with signatures as
-                    // the memory component (Zielonka 1998).
+                    // the memory component (Zielonka 1998; Bruse-Friedmann-Lange
+                    // SPIN 2016).
                     let wm = witness_map.as_ref().unwrap();
                     let mut best_sig: Option<crate::mu_calculus::Signature> = None;
                     let mut best_trans_idx: Option<usize> = None;
@@ -685,6 +840,10 @@ impl Context {
                             builder.transition_ids(*mapped, transition.labels(), target_mapped);
                         }
                     }
+                }
+                ControllerMode::ProductGame | ControllerMode::ParityGame => {
+                    // Both modes are handled by their early-return branches above.
+                    unreachable!("ProductGame/ParityGame return before reaching this loop");
                 }
             }
         }
@@ -1142,6 +1301,52 @@ pub enum ControllerMode {
     /// Maximally permissive supervisor (Ramadge-Wonham canonical object).
     /// Nondeterministic but composable with other supervisors.
     Permissive,
+    /// Signature-memory: same selection rule as `Functional`, but each state
+    /// name is annotated with its iteration-rank signature
+    /// (`<state>__sig_<rank0>_<rank1>_...`). The controller is functionally
+    /// identical to `Functional`, but the signature is now an observable
+    /// part of the controller's state — useful for cascading supervisors,
+    /// downstream tools that reason about obligation rank, and proving
+    /// progress at composition boundaries. Reference: Bruse, Friedmann &
+    /// Lange, SPIN 2016 (signature-based positional strategy).
+    ///
+    /// Note: this is plant-level signature exposure. Full memory-aware
+    /// synthesis (where multiple obligation classes coexist per plant state)
+    /// is provided by `ProductGame`.
+    SignatureMemory,
+    /// Memory-aware Mealy controller. State space is `(plant_state, oblig_idx)`
+    /// where `oblig_idx` rotates through the formula's mu-fixpoint
+    /// obligations (in nesting order). Required for correct strategies on
+    /// alternation ≥ 2 formulas (e.g., GR(1), `GFp ∧ GFq`) where a positional
+    /// strategy may fixate on one obligation and starve the other.
+    ///
+    /// At each product state `(s, i)`, the controller picks a controllable
+    /// transition that decreases the iteration rank of `mu_i`. When `mu_i`'s
+    /// rank is already 0 at `s` (obligation locally satisfied), the
+    /// transition advances `oblig_idx` round-robin to ensure fairness across
+    /// all mu-obligations. Uncontrollable transitions are always kept (with
+    /// the same memory advancement rule).
+    ///
+    /// For alternation < 2 (no mus, or single-mu): obligation dimension
+    /// collapses to size 1; the controller has the same shape as
+    /// `Functional` with a constant `__pg_0` suffix on state names.
+    ///
+    /// Reference: Bruse-Friedmann-Lange (SPIN 2016) projected to plant
+    /// states with mu-obligation rotation. Handles alternation 2 correctly
+    /// (the practical case for GR(1) and Buchi properties).
+    ProductGame,
+    /// Full parity-game synthesis. Builds the explicit game over
+    /// `(plant_state, formula_subnode)` positions, solves via Zielonka's
+    /// recursive algorithm, and projects Eve's positional strategy back to
+    /// a plant Mealy controller. Correct for arbitrary alternation
+    /// (parity properties of any depth) — strictly more general than
+    /// `ProductGame` at the cost of a larger state space (one product
+    /// state per pair of plant state and formula sub-node).
+    ///
+    /// Reference: Zielonka 1998 (positional determinacy of parity games);
+    /// Emerson-Jutla. See `crate::mu_calculus::parity_game` for the
+    /// underlying construction and solver.
+    ParityGame,
 }
 
 /// Extended controller synthesis configuration, combining evaluation, diagnostics, and post-processing knobs.
@@ -1760,6 +1965,249 @@ impl CounterExampleExplorer {
             .map(|state| clts.state_name(*state).unwrap_or("state").to_owned())
             .collect()
     }
+}
+
+/// Build a product-game controller for `ControllerMode::ProductGame`.
+///
+/// The product state is `(plant_state, oblig_idx)` where `oblig_idx` indexes
+/// the formula's mu-fixpoint obligations (in nesting order, outermost first).
+/// At each product state, the controller picks a transition that drives
+/// progress on the current obligation (rank-decreasing for that mu); when
+/// the obligation is locally satisfied (rank 0 at the source), the
+/// transition advances `oblig_idx` round-robin to the next obligation.
+///
+/// For formulas with no mu-fixpoints (pure safety), `n_obligs = 1` and the
+/// memory dimension collapses (every product state has `oblig_idx = 0`).
+///
+/// SOUNDNESS: Uncontrollable transitions are always kept and inherit the
+/// same obligation-advance rule. The strategy guarantees fairness across
+/// all mu-obligations: each obligation is serviced infinitely often along
+/// any infinite play.
+fn build_product_game_controller(
+    ctx: &Context,
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    visited: &BitVec<usize, Lsb0>,
+    wm: &crate::mu_calculus::WitnessMap,
+    formula: &Formula,
+    nesting: &[(crate::mu_calculus::FormulaVarId, bool)],
+) -> Result<Clts<DefaultStateIdx, DefaultLabelIdx>, ContextError> {
+    let obligations = formula.mu_obligations();
+    let n_obligs = obligations.len().max(1);
+
+    let mut builder = CltsBuilder::with_label_store(ctx.label_store.clone());
+    let mut mapping: HashMap<(StateId<DefaultStateIdx>, usize), StateId<DefaultStateIdx>> =
+        HashMap::new();
+
+    // Allocate one product state per (winning_plant_state, oblig_idx)
+    let retained_plant = visited.iter().filter(|bit| **bit).count();
+    builder.reserve_states(retained_plant * n_obligs);
+
+    for state in clts.states() {
+        if !visited.get(state.index()).is_some_and(|bit| *bit) {
+            continue;
+        }
+        let base_name = clts.state_name(state).unwrap_or("state").to_owned();
+        for oblig_idx in 0..n_obligs {
+            let name = format!("{base_name}__pg_{oblig_idx}");
+            let new_state = builder
+                .state_with_name(name)
+                .ok_or(ContextError::Controller(CltsError::IdOverflow {
+                    kind: "state",
+                    value: usize::MAX,
+                }))?;
+            // Initial product state: every plant initial paired with oblig_idx = 0.
+            if oblig_idx == 0 && clts.initial_states().contains(&state) {
+                builder.initial_state_id(new_state);
+            }
+            let vars = clts.state_variables(state);
+            builder.with_variables_for_state(new_state, vars.iter().map(|s| s.as_str()));
+            mapping.insert((state, oblig_idx), new_state);
+        }
+    }
+
+    // Helper: rank for the given mu-obligation at a state (None = no obligations).
+    let rank_for_oblig = |state_idx: usize, oblig_idx: usize| -> usize {
+        if obligations.is_empty() {
+            0
+        } else {
+            let var = obligations[oblig_idx];
+            wm.iteration_ranks
+                .get(&(state_idx, var))
+                .copied()
+                .unwrap_or(usize::MAX)
+        }
+    };
+
+    // For each product state, emit transitions according to the strategy
+    for ((original, oblig_idx), mapped) in &mapping {
+        let source_oblig_rank = rank_for_oblig(original.index(), *oblig_idx);
+        // Advance memory if the current obligation is already satisfied at the source
+        let next_oblig = if source_oblig_rank == 0 {
+            (oblig_idx + 1) % n_obligs
+        } else {
+            *oblig_idx
+        };
+
+        // Track the best controllable transition for this product state
+        let mut best_score: Option<(usize, crate::mu_calculus::Signature)> = None;
+        let mut best_trans_idx: Option<usize> = None;
+
+        for (idx, transition) in clts.outgoing(*original).iter().enumerate() {
+            let target_plant = transition.target();
+            let target_in_winning = visited.get(target_plant.index()).is_some_and(|bit| *bit);
+            if !target_in_winning {
+                continue;
+            }
+            let target_mapped = match mapping.get(&(target_plant, next_oblig)) {
+                Some(id) => *id,
+                None => continue,
+            };
+
+            if transition.is_controllable(clts) {
+                // Score: prefer the smallest rank for the active obligation,
+                // tie-break on full signature lex order (preserves outer-mu
+                // non-increase). When source rank is 0 we've already advanced
+                // memory; score against `next_oblig`'s rank instead.
+                let target_oblig_rank = rank_for_oblig(target_plant.index(), next_oblig);
+                let target_full_sig = wm.signature(target_plant.index(), nesting);
+                let score = (target_oblig_rank, target_full_sig);
+                if best_score.as_ref().is_none_or(|s| score < *s) {
+                    best_score = Some(score);
+                    best_trans_idx = Some(idx);
+                }
+            } else {
+                // Uncontrollable transitions are always kept
+                builder.transition_ids(*mapped, transition.labels(), target_mapped);
+            }
+        }
+
+        if let Some(idx) = best_trans_idx {
+            let transition = &clts.outgoing(*original)[idx];
+            let target_plant = transition.target();
+            let target_mapped = mapping[&(target_plant, next_oblig)];
+            builder.transition_ids(*mapped, transition.labels(), target_mapped);
+        }
+    }
+
+    builder.build().map_err(ContextError::Controller)
+}
+
+/// Build a parity-game controller for `ControllerMode::ParityGame`.
+///
+/// Constructs the explicit parity game over `(plant_state, formula_node)`
+/// positions, solves it via Zielonka, and projects Eve's positional strategy
+/// to a CLTS whose state space is the winning region. State names follow
+/// the `<plant_name>__pg_n<node_id>` pattern (one state per game position).
+///
+/// Transitions emitted from each game position:
+/// - Eve-owned, in winning region: ONE outgoing edge per Eve's chosen move.
+/// - Adam-owned, in winning region: all moves into the winning region (the
+///   environment may take any of them; the controller is correct against
+///   all).
+/// - Modal positions retain their original CLTS labels.
+/// - Internal formula-structure moves (And/Or/Nu/Mu/Variable) are emitted
+///   with synthetic labels for traceability.
+fn build_parity_game_controller(
+    ctx: &Context,
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    formula: &Formula,
+    env: &crate::mu_calculus::Environment,
+) -> Result<Clts<DefaultStateIdx, DefaultLabelIdx>, ContextError> {
+    use crate::mu_calculus::parity_game::{Player, build_parity_game, position_name, solve};
+
+    let game = build_parity_game(formula, clts, env);
+    let solution = solve(&game);
+
+    // Identify Eve-winning positions.
+    let n = game.len();
+    let eve_winning: Vec<bool> = (0..n).map(|i| solution.winner[i] == Player::Eve).collect();
+
+    // Allocate one CLTS state per Eve-winning game position.
+    let mut label_store = ctx.label_store.clone();
+    let pg_label = label_store
+        .intern(["pg_step"])
+        .map_err(ContextError::Controller)?;
+    let mut builder = CltsBuilder::with_label_store(label_store);
+    builder.reserve_states(eve_winning.iter().filter(|w| **w).count());
+    let mut mapping: HashMap<usize, StateId<DefaultStateIdx>> = HashMap::new();
+
+    for (idx, pos) in game.positions.iter().enumerate() {
+        if !eve_winning[idx] {
+            continue;
+        }
+        let name = position_name(*pos, clts);
+        let state_id = builder
+            .state_with_name(name)
+            .ok_or(ContextError::Controller(CltsError::IdOverflow {
+                kind: "state",
+                value: usize::MAX,
+            }))?;
+        // Mark initial: the position must correspond to a plant initial AND
+        // to the formula root.
+        let state_obj = StateId::<DefaultStateIdx>::from_index(pos.state)
+            .expect("plant state index fits storage");
+        if pos.node == formula.root() && clts.initial_states().contains(&state_obj) {
+            builder.initial_state_id(state_id);
+        }
+        let vars = clts.state_variables(state_obj);
+        builder.with_variables_for_state(state_id, vars.iter().map(|s| s.as_str()));
+        mapping.insert(idx, state_id);
+    }
+
+    // Emit transitions. For Eve-owned positions in winning region, follow
+    // Eve's strategy (single edge). For Adam-owned positions, keep ALL
+    // edges into the winning region.
+    for (idx, _pos) in game.positions.iter().enumerate() {
+        if !eve_winning[idx] {
+            continue;
+        }
+        let src_mapped = mapping[&idx];
+
+        let edges: Vec<usize> = match game.owners[idx] {
+            Player::Eve => {
+                // Use the strategy if available
+                solution.eve_strategy[idx]
+                    .into_iter()
+                    .filter(|t| eve_winning[*t])
+                    .collect()
+            }
+            Player::Adam => {
+                // Keep all edges that stay in winning region
+                game.edges[idx]
+                    .iter()
+                    .copied()
+                    .filter(|t| eve_winning[*t])
+                    .collect()
+            }
+        };
+
+        for t in edges {
+            let target_mapped = match mapping.get(&t) {
+                Some(id) => *id,
+                None => continue,
+            };
+            // Synthetic label `pg_step` per transition. Keeps the controller
+            // shape consistent with the existing CLTS abstraction.
+            builder.transition_ids(src_mapped, &[pg_label], target_mapped);
+        }
+    }
+
+    builder.build().map_err(ContextError::Controller)
+}
+
+/// Render a signature as a state-name suffix segment. `usize::MAX` is rendered
+/// as `inf` (a state outside the fixpoint, infinitely many iterations away).
+fn format_signature(sig: &crate::mu_calculus::Signature) -> String {
+    sig.iter()
+        .map(|&r| {
+            if r == usize::MAX {
+                "inf".to_string()
+            } else {
+                r.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// Collects deadlock traces by replaying parent pointers back to initial states.

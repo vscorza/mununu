@@ -325,6 +325,53 @@ static PROFILES: &[DomainProfile] = &[
         label_naming: LabelNaming { prefix: "" },
         add_noop_self_loops: false,
     },
+    // Game FSM (GDScript / Godot)
+    DomainProfile {
+        name: "game_fsm",
+        language: "gdscript",
+        description: "Game finite state machines. Player input and physics events are \
+                      uncontrollable (environment); system-initiated transitions \
+                      (spawners, AI decisions) are controllable.",
+        controllability: ControllabilityHeuristics {
+            default: Controllability::Uncontrollable,
+            controllable_patterns: &[
+                "spawn*",
+                "respawn*",
+                "activate*",
+                "deactivate*",
+                "grant*",
+                "revoke*",
+                "set_state*",
+            ],
+            uncontrollable_patterns: &[
+                "_on_*",
+                "_input*",
+                "_unhandled_input*",
+                "_physics_process*",
+                "_process*",
+                "handle_*",
+                "on_*",
+            ],
+            rationale: "Player input and physics callbacks are uncontrollable (environment); \
+                       system-initiated state changes (spawning, AI decisions) are controllable",
+        },
+        abstraction: AbstractionHeuristics {
+            boolean_default: AbstractionType::Boolean,
+            optional_default: AbstractionType::Presence,
+            map_default: AbstractionType::BoundedCounter,
+            default_counter_bound: 5,
+            enum_default: AbstractionType::EnumValues,
+            string_default: AbstractionType::Ignored,
+            numeric_default: AbstractionType::BoundedCounter,
+        },
+        composition: CompositionHeuristics {
+            default_type: "asynchronous",
+            rationale: "Game systems (player, NPC, physics) run independently, \
+                       interacting through shared events",
+        },
+        label_naming: LabelNaming { prefix: "ev_" },
+        add_noop_self_loops: true,
+    },
 ];
 
 #[cfg(test)]
@@ -448,5 +495,52 @@ mod tests {
         assert!(!matches_glob("start", "stop"));
         assert!(matches_glob("onMessage", "on*"));
         assert!(!matches_glob("connect", "handle*"));
+    }
+
+    #[test]
+    fn get_game_fsm_profile() {
+        let profile = get_profile("game_fsm").unwrap();
+        assert_eq!(profile.language, "gdscript");
+        assert_eq!(
+            profile.controllability.default,
+            Controllability::Uncontrollable
+        );
+        assert_eq!(profile.composition.default_type, "asynchronous");
+    }
+
+    #[test]
+    fn classify_game_fsm_controllability() {
+        let profile = get_profile("game_fsm").unwrap();
+        // Player input callbacks → uncontrollable
+        assert_eq!(
+            classify_controllability(profile, "_on_body_entered"),
+            Controllability::Uncontrollable
+        );
+        assert_eq!(
+            classify_controllability(profile, "_physics_process"),
+            Controllability::Uncontrollable
+        );
+        assert_eq!(
+            classify_controllability(profile, "_input"),
+            Controllability::Uncontrollable
+        );
+        // System-initiated → controllable
+        assert_eq!(
+            classify_controllability(profile, "spawn_enemy"),
+            Controllability::Controllable
+        );
+        assert_eq!(
+            classify_controllability(profile, "respawn"),
+            Controllability::Controllable
+        );
+        assert_eq!(
+            classify_controllability(profile, "activate_shield"),
+            Controllability::Controllable
+        );
+        // Unknown → default (uncontrollable)
+        assert_eq!(
+            classify_controllability(profile, "take_damage"),
+            Controllability::Uncontrollable
+        );
     }
 }

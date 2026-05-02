@@ -100,7 +100,7 @@ pub mod engine {
                     );
 
                     let zero = z3::ast::BV::from_i64(0, formula.get_size());
-                    solver.assert(&formula.eq(&zero).not());
+                    solver.assert(formula.eq(&zero).not());
 
                     let target_var = match variables.get(sig_name.as_str()) {
                         Some(v) => v.clone(),
@@ -276,7 +276,7 @@ pub mod engine {
                     );
 
                     let zero = z3::ast::BV::from_i64(0, formula.get_size());
-                    solver.assert(&formula.eq(&zero).not());
+                    solver.assert(formula.eq(&zero).not());
 
                     let target_var = match variables.get(sig_name.as_str()) {
                         Some(v) => v.clone(),
@@ -739,7 +739,7 @@ pub mod engine {
                         if let Some(n) = val.as_i64() {
                             values.push(n);
                             let blocked = z3::ast::BV::from_i64(n, target_var.get_size());
-                            solver.assert(&target_var.eq(&blocked).not());
+                            solver.assert(target_var.eq(&blocked).not());
                         } else {
                             break;
                         }

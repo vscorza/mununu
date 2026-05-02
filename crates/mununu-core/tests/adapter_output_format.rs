@@ -8,6 +8,9 @@ use mununu_core::adapter::xstate::emit_controller::controller_to_xstate_json;
 use mununu_core::adapter::{AdapterOptions, FormatAdapter};
 use mununu_core::context_dsl;
 
+use mununu_core::adapter::gdscript::emit_controller::{
+    collect_controllable_labels, controller_to_gdscript,
+};
 use mununu_core::adapter::systemverilog::SystemVerilogAdapter;
 use mununu_core::adapter::systemverilog::emit_controller::controller_to_systemverilog;
 
@@ -206,4 +209,124 @@ fn unrealizable_output_systemverilog() {
     );
     assert!(sv.contains("unrealizable"));
     assert!(!sv.contains("module empty_controller"));
+}
+
+// ---------------------------------------------------------------------------
+// GDScript round-trip: dialogue tree → synthesize → GDScript controller
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gdscript_dialogue_tree_export() {
+    use mununu_core::adapter::extraction::ExtractionAdapter;
+
+    let json = include_str!("../../../examples/game/dialogue_tree.espec.json");
+    let options = AdapterOptions {
+        mode: Some("vulnerable".to_string()),
+        ..Default::default()
+    };
+    let output = ExtractionAdapter::translate(json, &options).unwrap();
+    let doc = context_dsl::parse(&output.ctxdsl).unwrap();
+    let realized = context_dsl::realize_context(&doc, &[]).unwrap();
+
+    let formula = realized.formulas.get("farewell_reachable").unwrap();
+    let env = realized.environment_for("Dialogue");
+    let synth = realized
+        .context
+        .synthesise_controller("Dialogue", &formula.formula, &env, None)
+        .unwrap();
+
+    assert!(synth.realizable);
+
+    let controllable = collect_controllable_labels(&synth.controller);
+    let gd = controller_to_gdscript(&synth.controller, "Dialogue", true, &controllable);
+
+    assert!(
+        gd.contains("class_name DialogueController"),
+        "missing class_name"
+    );
+    assert!(gd.contains("enum State"), "missing enum");
+    assert!(gd.contains("match current_state"), "missing match");
+    assert!(gd.contains("realizable"), "missing synthesis result");
+    // Locked and Threatened should be removed (not in winning region)
+    assert!(
+        !gd.contains("LOCKED"),
+        "Locked should be excluded from controller"
+    );
+    assert!(
+        !gd.contains("THREATENED"),
+        "Threatened should be excluded from controller"
+    );
+    // Should have action methods (controllable → bool, or uncontrollable → on_ prefix)
+    assert!(
+        gd.contains("-> bool") || gd.contains("func on_"),
+        "should have action methods"
+    );
+    // Must have at least some transition-producing functions
+    assert!(
+        gd.contains("func ev_") || gd.contains("func on_ev_"),
+        "should have event functions"
+    );
+}
+
+#[test]
+fn gdscript_cross_format() {
+    let ctxdsl = r#"
+    context test {
+        alphabet { label go; label stop; }
+        automata {
+            automaton FSM {
+                controllable { label go; label stop; }
+                states { state A initial; state B; }
+                transitions {
+                    transition A -> B on label go;
+                    transition B -> A on label stop;
+                }
+            }
+        }
+        mu_formulas {
+            formula safety { over FSM; body = nu X. ([] X); }
+        }
+        controllers { controller c { source FSM; satisfying safety; } }
+    }
+    "#;
+
+    let doc = context_dsl::parse(ctxdsl).unwrap();
+    let realized = context_dsl::realize_context(&doc, &[]).unwrap();
+    let formula = realized.formulas.get("safety").unwrap();
+    let env = realized.environment_for("FSM");
+    let synth = realized
+        .context
+        .synthesise_controller("FSM", &formula.formula, &env, None)
+        .unwrap();
+
+    assert!(synth.realizable);
+
+    // All three formats should produce valid output for the same system
+    let xstate_json = controller_to_xstate_json(&synth.controller, "FSM", true);
+    let sv = controller_to_systemverilog(&synth.controller, "FSM", true);
+    let controllable = collect_controllable_labels(&synth.controller);
+    let gd = controller_to_gdscript(&synth.controller, "FSM", true, &controllable);
+
+    // All should contain state declarations
+    let xstate_states = serde_json::from_str::<serde_json::Value>(&xstate_json).unwrap()["states"]
+        .as_object()
+        .unwrap()
+        .len();
+    assert!(xstate_states > 0);
+    assert!(sv.contains("typedef enum"));
+    assert!(gd.contains("enum State"));
+
+    // GDScript-specific checks
+    assert!(gd.contains("class_name FSMController"));
+    assert!(gd.contains("extends Node"));
+    assert!(gd.contains("get_state_name"));
+}
+
+#[test]
+fn unrealizable_output_gdscript() {
+    let empty = mununu_core::clts::Clts::builder().build().unwrap();
+    let gd = controller_to_gdscript(&empty, "empty", false, &std::collections::HashSet::new());
+    assert!(gd.contains("UNREALIZABLE"));
+    assert!(!gd.contains("class_name"));
+    assert!(!gd.contains("enum State"));
 }

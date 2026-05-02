@@ -627,6 +627,8 @@ pub fn build_espec(module: &LlvmModule, target_struct: Option<&str>) -> Extracti
                 "Extracted from LLVM IR with GEP analysis. Struct: {}. Methods: {:?}. States: {} reachable.",
                 struct_name, method_names, reachable_count
             )),
+            fix_pr: None,
+            fix_commit: None,
         },
         state_fields: vec![],
         methods: vec![],
@@ -654,6 +656,7 @@ pub fn build_espec(module: &LlvmModule, target_struct: Option<&str>) -> Extracti
                 description: Some("Trivial safety".to_string()),
                 formula: Some("nu X. ([] X)".to_string()),
                 formula_template: None,
+                template_ref: None,
                 over: Some(automaton_id),
                 holds_in_fixed: None,
                 holds_in_vulnerable: None,

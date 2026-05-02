@@ -29,6 +29,7 @@ Run these skills in sequence:
 3. `/test-review` — Coverage gaps, three-level adapter testing, property tests
 4. `/security-audit` — Unsafe blocks, API security, dependencies, DoS vectors
 5. `/soundness-check` — SOUNDNESS annotations, eval_expr fallbacks, guard failures, abstraction decisions
+6. **Parity check** — For each `*.rs` change in scope, identify whether it touches a CLI argument struct (clap-derived `Args` in `crates/mununu-cli/src/main.rs`), an HTTP handler signature (`crates/mununu-core/src/api/handlers.rs`), or a request/response type in `crates/mununu-core/src/api/models.rs`. If yes, verify the corresponding surface in `mununu-ui/src/api/endpoints.ts` and the UI hook that consumes it (`mununu-ui/src/hooks/useCtxdslEditor.ts`, `useSummary.ts`, etc.). Report any drift — a CLI flag with no API counterpart, an API field absent from the UI client types, or a route with no UI consumer — as a finding under the new "CLI / API / UI Parity" section. Also flag the inverse case: code added to one surface but not exercised by either of the others.
 
 Consolidate results into a single Markdown report. Save it to `.claude/reviews/YYYY-MM-DD.md` using today's date.
 
@@ -54,6 +55,9 @@ Traffic-light score per area: GREEN / YELLOW / RED
 
 ### Soundness Annotations
 {findings}
+
+### CLI / API / UI Parity
+{findings — list each cross-surface change in scope and whether all three surfaces are aligned. Format per row: change name | CLI status | API status | UI status | drift?}
 
 ### Action Items
 Priority-ordered list of concrete fixes.

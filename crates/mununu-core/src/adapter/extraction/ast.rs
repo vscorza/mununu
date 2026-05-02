@@ -8,7 +8,28 @@
 //! - Bug documentation with attack chains
 //! - Declarative model configuration (automata, transitions, compositions, properties)
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a JSON value as `Option<String>`, accepting either a string or
+/// a number. Numbers are coerced to their string representation.
+///
+/// This lets spec authors write `"issue": 6533` (the natural form for a
+/// GitHub issue or PR number) instead of being forced to quote it as
+/// `"issue": "6533"`. See GAP-001.
+fn deserialize_int_or_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected string or number, got {other}"
+        ))),
+    }
+}
 
 /// Top-level extraction spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +66,17 @@ pub struct SourceRef {
     pub class: Option<String>,
     pub cve: Option<String>,
     pub ghsa: Option<String>,
+    /// GitHub issue number. Accepts either a string (`"issue": "6533"`) or an
+    /// integer (`"issue": 6533`); both forms are equivalent.
+    #[serde(default, deserialize_with = "deserialize_int_or_string")]
     pub issue: Option<String>,
+    /// Pull-request number that introduced the fix. Accepts string or integer
+    /// form, like `issue`.
+    #[serde(default, deserialize_with = "deserialize_int_or_string")]
+    pub fix_pr: Option<String>,
+    /// Commit hash that introduced the fix.
+    #[serde(default)]
+    pub fix_commit: Option<String>,
 }
 
 /// A state field extracted from source.
@@ -206,7 +237,13 @@ pub struct TransitionDef {
     pub to: String,
     /// Label for this transition.
     pub label: String,
-    /// Mode filter: "both" (default), "vulnerable", or "fixed".
+    /// Mode filter: arbitrary string tag; the default `"both"` means the
+    /// transition is always included regardless of the `--mode` CLI value.
+    /// Any other tag (e.g., `"fixed"`, `"vulnerable"`, `"as_audited"`,
+    /// `"with_provider_cache"`) means the transition is included only when
+    /// the CLI `--mode` matches. The CLI accepts the universal defaults
+    /// `"fixed"` / `"vulnerable"` / `"both"` plus any tag that appears on at
+    /// least one transition in the spec.
     #[serde(default = "default_mode_both")]
     pub mode: String,
     /// Optional traceability back to extraction spec method/guard.
@@ -396,6 +433,58 @@ mod tests {
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].formula_str(), Some("nu X. ((!Bad) && ([] X))"));
         assert_eq!(props[0].over.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn source_ref_accepts_integer_issue() {
+        // GAP-001: `"issue": 6533` (integer) must parse and be coerced to "6533".
+        let json = r#"{
+            "source": { "issue": 6533 },
+            "model_config": { "context_name": "t" }
+        }"#;
+        let spec: ExtractionSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.source.issue, Some("6533".to_string()));
+    }
+
+    #[test]
+    fn source_ref_accepts_string_issue() {
+        // GAP-001: `"issue": "6533"` (string) must continue to parse.
+        let json = r#"{
+            "source": { "issue": "6533" },
+            "model_config": { "context_name": "t" }
+        }"#;
+        let spec: ExtractionSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.source.issue, Some("6533".to_string()));
+    }
+
+    #[test]
+    fn source_ref_accepts_fix_pr_and_fix_commit() {
+        // GAP-001: `fix_pr` (integer) and `fix_commit` (string) must populate.
+        let json = r#"{
+            "source": {
+                "fix_pr": 3126,
+                "fix_commit": "a37c4d6f4928a3e1d91f2061fc6af142b17e0408"
+            },
+            "model_config": { "context_name": "t" }
+        }"#;
+        let spec: ExtractionSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.source.fix_pr, Some("3126".to_string()));
+        assert_eq!(
+            spec.source.fix_commit,
+            Some("a37c4d6f4928a3e1d91f2061fc6af142b17e0408".to_string())
+        );
+    }
+
+    #[test]
+    fn source_ref_fix_fields_default_to_none() {
+        // GAP-001: when `fix_pr` / `fix_commit` are absent, both stay `None`.
+        let json = r#"{
+            "source": { "repo": "foo/bar" },
+            "model_config": { "context_name": "t" }
+        }"#;
+        let spec: ExtractionSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.source.fix_pr, None);
+        assert_eq!(spec.source.fix_commit, None);
     }
 
     #[test]

@@ -419,7 +419,7 @@ context vulnerable_vault {
         // until the balance hits Zero while still in Withdrawing.
         formula no_drain_during_withdrawal {
             over vulnerable_system;
-            body = nu NoDrain. (! (Withdrawing && Zero)) && ([] NoDrain);
+            body = nu NoDrain. ((! (Withdrawing && Zero)) && ([] NoDrain));
         }
     }
 

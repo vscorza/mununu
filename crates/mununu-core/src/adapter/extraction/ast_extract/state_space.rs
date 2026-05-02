@@ -79,7 +79,22 @@ pub struct DerivedTransition {
     pub label: String,
 }
 
+/// State-space size threshold above which a warning is emitted.
+const STATE_SPACE_WARN_THRESHOLD: usize = 1 << 12;
+/// State-space size threshold above which the extractor refuses to enumerate
+/// (matches the SystemVerilog adapter at `kripke.rs:207`).
+const STATE_SPACE_HARD_LIMIT: usize = 1 << 18;
+
 /// Derive an automaton from field domains and method behaviors.
+///
+/// Before cross-product enumeration, this checks the estimated state-space
+/// size against two thresholds:
+/// - **2^12 = 4,096** — emits a `[mununu] WARN` line on stderr so the user
+///   is aware that verification will be slow.
+/// - **2^18 = 262,144** — returns an empty automaton and emits a `[mununu]
+///   ERROR` line on stderr to prevent OOM. The caller treats an empty result
+///   as "extraction skipped"; the user must coarsen field abstractions or set
+///   narrower bounds.
 pub fn derive_automaton(
     automaton_name: &str,
     fields: &[FieldDomain],
@@ -88,8 +103,37 @@ pub fn derive_automaton(
     label_prefix: &str,
     add_noop: bool,
 ) -> DerivedAutomaton {
-    // Step 1: Enumerate all abstract states (cross-product)
+    // Step 0: pre-enumeration state-space size check (priority_roadmap §2.5).
+    // Catches cross-product blowups BEFORE allocating the full state vector.
+    // Uses eprintln rather than a structured warning channel because
+    // `derive_automaton` does not currently thread an AdapterWarning vec; this
+    // keeps the change additive. Future work: surface as AdapterWarning.
     let field_refs: Vec<&FieldDomain> = fields.iter().collect();
+    if let Some(estimated) = state_enum::state_space_size(&field_refs) {
+        if estimated > STATE_SPACE_HARD_LIMIT {
+            eprintln!(
+                "[mununu] ERROR: automaton '{}' estimated at {} states, exceeds hard limit \
+                 ({}). Coarsen field abstractions or set narrower bounds in the extraction \
+                 config. Returning empty automaton.",
+                automaton_name, estimated, STATE_SPACE_HARD_LIMIT
+            );
+            return DerivedAutomaton {
+                name: automaton_name.to_string(),
+                states: vec![],
+                transitions: vec![],
+                controllable_labels: vec![],
+            };
+        }
+        if estimated > STATE_SPACE_WARN_THRESHOLD {
+            eprintln!(
+                "[mununu] WARN: automaton '{}' estimated at {} states (threshold {}); \
+                 verification may be slow.",
+                automaton_name, estimated, STATE_SPACE_WARN_THRESHOLD
+            );
+        }
+    }
+
+    // Step 1: Enumerate all abstract states (cross-product)
     let all_states = state_enum::enumerate_cross_product(&field_refs);
     if all_states.is_empty() {
         return DerivedAutomaton {
@@ -197,12 +241,8 @@ pub fn derive_automaton(
 
 /// Check if all guards are satisfied in the given state.
 fn guards_satisfied(state: &AbstractState, guards: &[Guard]) -> bool {
-    guards.iter().all(|g| {
-        let val = match state.get(&g.field) {
-            Some(v) => v,
-            None => return true, // field not modeled → guard vacuously true
-        };
-        match &g.condition {
+    fn cond_satisfied(val: &AbstractValue, cond: &CallGuard) -> bool {
+        match cond {
             CallGuard::CounterGtZero => matches!(val, AbstractValue::Counter(n) if *n > 0),
             CallGuard::CounterEqZero => matches!(val, AbstractValue::Counter(0)),
             CallGuard::MustBePresent => matches!(val, AbstractValue::Present(true)),
@@ -212,8 +252,18 @@ fn guards_satisfied(state: &AbstractState, guards: &[Guard]) -> bool {
             CallGuard::MustEqual(variant) => {
                 matches!(val, AbstractValue::Variant(v) if v == variant)
             }
+            CallGuard::Disjunction(a, b) => cond_satisfied(val, a) || cond_satisfied(val, b),
+            CallGuard::Conjunction(a, b) => cond_satisfied(val, a) && cond_satisfied(val, b),
             CallGuard::None => true,
         }
+    }
+
+    guards.iter().all(|g| {
+        let val = match state.get(&g.field) {
+            Some(v) => v,
+            None => return true, // field not modeled → guard vacuously true
+        };
+        cond_satisfied(val, &g.condition)
     })
 }
 
@@ -566,5 +616,42 @@ mod tests {
         // from locked_T → locked_F
         assert!(unlock_transitions[0].from.contains("T"));
         assert!(unlock_transitions[0].to.contains("F"));
+    }
+
+    /// Tier A1 — pre-enumeration state-space hard limit.
+    ///
+    /// Twenty boolean fields → 2^20 = 1,048,576 states, well over the 2^18
+    /// hard limit. The pre-check should return an empty automaton without
+    /// allocating the full state vector.
+    #[test]
+    fn pre_enum_state_space_hard_limit_returns_empty() {
+        let fields: Vec<FieldDomain> = (0..20)
+            .map(|i| bool_field(&format!("f_{i}"), false))
+            .collect();
+        let automaton = derive_automaton("TooBig", &fields, &[], &HashMap::new(), "ev_", false);
+        assert!(
+            automaton.states.is_empty(),
+            "expected empty automaton when state space exceeds hard limit, got {} states",
+            automaton.states.len()
+        );
+        assert!(automaton.transitions.is_empty());
+    }
+
+    /// Tier A1 — pre-enumeration state-space warning threshold.
+    ///
+    /// 13 boolean fields = 2^13 = 8,192 states, over the 2^12 warn threshold
+    /// but under the 2^18 hard limit. Should still produce a valid automaton
+    /// but log via `tracing::warn!`.
+    #[test]
+    fn pre_enum_state_space_warn_threshold_still_succeeds() {
+        let fields: Vec<FieldDomain> = (0..13)
+            .map(|i| bool_field(&format!("f_{i}"), false))
+            .collect();
+        let automaton = derive_automaton("Big", &fields, &[], &HashMap::new(), "ev_", false);
+        // No methods → only initial-state's noop self-loops would exist.
+        // What matters here is that we got back a non-empty automaton (i.e.,
+        // the warning didn't short-circuit) and the state count fits.
+        // 2^13 with no transitions becomes 1 reachable state after pruning.
+        assert!(!automaton.states.is_empty());
     }
 }

@@ -42,7 +42,8 @@
     {
       "id": "safety",
       "formula": "nu X. ([] X)",
-      "description": "No deadlock — all states have successors"
+      "description": "Baseline: no deadlock. Holds on bug AND fixed."
     }
-  ]
+  ],
+  "$comment_distinguishing_property": "This standalone slave's Kripke abstraction reaches the same set of states as `axilite_write_slave_xilinx_bug` because the input `s_axi_bready` is unconstrained in the single-module view. The bug/fixed pair is only distinguishable when composed with a master that exercises the backpressure scenario (bready held low). Use the multi-module sidecar `axilite_write_system_fixed.mununu.json` via `POST /api/v1/context/import` to verify the property `no_response_window` (`nu X. ((!axi_bvalid_T || aw_flag_T) && [] X)`), which passes on the fixed composition and fails on the bug composition. See examples/systemverilog/industrial/FINDINGS.md."
 }

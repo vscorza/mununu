@@ -33,6 +33,13 @@ bench_results/
 # Claude Code (user-local)
 .claude/settings.json
 .claude/reviews/
+.claude/plans/
+
+# Debug traces
+.z3-trace
+
+# Python bytecode
+**/__pycache__/
 
 # Quality session artifacts
 /.quality/sessions/

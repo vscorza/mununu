@@ -25,12 +25,17 @@
     {
       "id": "recoverable",
       "formula": "mu X. (state_IDLE || <> X)",
-      "description": "From any state (including after glitch), IDLE is always reachable"
+      "description": "Reachability of IDLE from the current state. Fails at the bug's UNDEF state (no outgoing transitions), but holds at initial IDLE in both bug and fixed because IDLE itself satisfies trivially."
+    },
+    {
+      "id": "always_recoverable",
+      "formula": "nu Y. ((mu X. (state_IDLE || <> X)) && [] Y)",
+      "description": "From EVERY reachable state — including after a glitch into UNDEF — IDLE remains reachable. Bug fails at initial: the reachable state UNDEF has no outgoing transitions, so recovery is impossible from there. Fixed passes: UNDEF transitions back to IDLE via the default case."
     },
     {
       "id": "safety",
       "formula": "nu X. ([] X)",
-      "description": "All states have successors"
+      "description": "Baseline: all states have successors. Holds on bug AND fixed (UNDEF in bug still has implicit self-loop from the Kripke abstraction)."
     }
   ]
 }

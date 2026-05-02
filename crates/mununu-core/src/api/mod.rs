@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod error;
 pub mod graph;
 pub mod handlers;

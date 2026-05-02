@@ -115,6 +115,9 @@ fn test_safety_bounded_buffer() -> TestResult {
                     transition full -> partial on epsilon;
                     transition partial -> empty on epsilon;
                 }
+                predicates {
+                    predicate overflow = state full;
+                }
             }
         }
         mu_formulas {
@@ -168,6 +171,10 @@ fn test_liveness_request_response() -> TestResult {
                     transition idle -> waiting on epsilon;
                     transition waiting -> responding on epsilon;
                     transition responding -> idle on epsilon;
+                }
+                predicates {
+                    predicate request = state waiting;
+                    predicate response = state responding;
                 }
             }
         }
@@ -274,6 +281,9 @@ fn test_liveness_recurrence() -> TestResult {
                 transitions {
                     transition active -> active on epsilon;
                 }
+                predicates {
+                    predicate heartbeat = state active;
+                }
             }
         }
         mu_formulas {
@@ -335,6 +345,12 @@ fn test_reactiveness_conditional_response() -> TestResult {
                 transitions {
                     transition idle -> idle on epsilon;
                 }
+                predicates {
+                    predicate req1 = state idle;
+                    predicate req2 = state idle;
+                    predicate grant1 = state idle;
+                    predicate grant2 = state idle;
+                }
             }
         }
         mu_formulas {
@@ -388,6 +404,10 @@ fn test_gr1_basic_pattern() -> TestResult {
                 }
                 transitions {
                     transition s0 -> s0 on epsilon;
+                }
+                predicates {
+                    predicate env_assume = state s0;
+                    predicate env_justice = state s0;
                 }
             }
         }
@@ -461,6 +481,9 @@ fn test_until_phase_transition() -> TestResult {
                     transition init -> operational on epsilon;
                     transition operational -> operational on epsilon;
                 }
+                predicates {
+                    predicate initialization = state init;
+                }
             }
         }
         mu_formulas {
@@ -518,6 +541,9 @@ fn test_realize_ltl_safety_formula() -> TestResult {
                 transitions {
                     transition s -> s on epsilon;
                 }
+                predicates {
+                    predicate safe = state s;
+                }
             }
         }
         mu_formulas {
@@ -549,6 +575,9 @@ fn test_realize_ltl_liveness_formula() -> TestResult {
                 transitions {
                     transition s -> s on epsilon;
                 }
+                predicates {
+                    predicate completed = state s;
+                }
             }
         }
         mu_formulas {
@@ -577,6 +606,9 @@ fn test_realize_mixed_ltl_and_mu_formulas() -> TestResult {
                 }
                 transitions {
                     transition s -> s on epsilon;
+                }
+                predicates {
+                    predicate safe = state s;
                 }
             }
         }

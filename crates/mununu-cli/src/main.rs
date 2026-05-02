@@ -54,6 +54,8 @@ enum Commands {
         #[command(subcommand)]
         command: Box<SvCommand>,
     },
+    /// List available property templates.
+    Templates(TemplatesArgs),
     /// Start HTTP API server
     Server {
         /// Server address (default: 127.0.0.1:8080)
@@ -152,6 +154,19 @@ struct SvDiscoverArgs {
     multi: bool,
 }
 
+#[derive(Args, Debug)]
+struct TemplatesArgs {
+    /// Filter templates by domain (game, rtl, agentic, software, synthesis).
+    #[arg(long, value_name = "DOMAIN")]
+    domain: Option<String>,
+    /// Show details of a specific template by ID.
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+    /// Output as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum ContextCommand {
     /// Parse and validate main + sidecar documents, optionally copying them to an output folder.
@@ -189,6 +204,13 @@ struct ContextSummarizeArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
+    /// Translate from an external format before processing
+    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
+    #[arg(long = "adapter", value_name = "FORMAT")]
+    adapter: Option<String>,
+    /// Mode for extraction adapter: "fixed" or "vulnerable".
+    #[arg(long = "mode", value_name = "MODE")]
+    mode: Option<String>,
     /// Print the internal structure of the context to stdout or a file.
     #[arg(long = "print-structure", value_name = "FILE")]
     print_structure: Option<Option<PathBuf>>,
@@ -202,6 +224,13 @@ struct ContextPredicatesArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
+    /// Translate from an external format before processing
+    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
+    #[arg(long = "adapter", value_name = "FORMAT")]
+    adapter: Option<String>,
+    /// Mode for extraction adapter: "fixed" or "vulnerable".
+    #[arg(long = "mode", value_name = "MODE")]
+    mode: Option<String>,
     /// Restrict output to a single automaton.
     #[arg(long = "automaton", value_name = "NAME")]
     automaton: Option<String>,
@@ -215,15 +244,22 @@ struct ContextEvalArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
-    /// Translate from an external format before processing (tlsf, aiger, promela, extraction, auto).
+    /// Translate from an external format before processing
+    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     #[arg(long = "mode", value_name = "MODE")]
     mode: Option<String>,
-    /// μ-calculus formula to evaluate.
-    #[arg(long = "formula", value_name = "NAME")]
-    formula: String,
+    /// μ-calculus formula to evaluate (by name from the context).
+    #[arg(long = "formula", value_name = "NAME", conflicts_with = "template")]
+    formula: Option<String>,
+    /// Instantiate a property template instead of selecting an existing formula.
+    #[arg(long = "template", value_name = "ID", conflicts_with = "formula")]
+    template: Option<String>,
+    /// Template argument bindings (KEY=VALUE). Repeatable.
+    #[arg(long = "template-arg", value_name = "KEY=VALUE", requires = "template")]
+    template_args: Vec<String>,
     /// Automaton over which the formula should be evaluated.
     #[arg(long = "automaton", value_name = "NAME")]
     automaton: String,
@@ -258,15 +294,22 @@ struct ContextSynthesizeArgs {
     /// Optional sidecar documents to merge.
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
-    /// Translate from an external format before processing (tlsf, aiger, promela, extraction, auto).
+    /// Translate from an external format before processing
+    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     #[arg(long = "mode", value_name = "MODE")]
     mode: Option<String>,
-    /// μ-calculus formula to synthesise.
-    #[arg(long = "formula", value_name = "NAME")]
-    formula: String,
+    /// μ-calculus formula to synthesise (by name from the context).
+    #[arg(long = "formula", value_name = "NAME", conflicts_with = "template")]
+    formula: Option<String>,
+    /// Instantiate a property template instead of selecting an existing formula.
+    #[arg(long = "template", value_name = "ID", conflicts_with = "formula")]
+    template: Option<String>,
+    /// Template argument bindings (KEY=VALUE). Repeatable.
+    #[arg(long = "template-arg", value_name = "KEY=VALUE", requires = "template")]
+    template_args: Vec<String>,
     /// Automaton over which the controller should be synthesised.
     #[arg(long = "automaton", value_name = "NAME")]
     automaton: String,
@@ -277,8 +320,16 @@ struct ContextSynthesizeArgs {
     #[arg(long)]
     minimize: bool,
     /// Extract a positional strategy: keep only one controllable transition per state.
+    /// Legacy flag — equivalent to `--mode functional`. When `--mode` is also
+    /// provided, `--mode` wins.
     #[arg(long = "extract-strategy")]
     extract_strategy: bool,
+    /// Controller extraction mode. Case-insensitive. One of:
+    /// `projection` (default), `functional`, `permissive`,
+    /// `signature-memory`, `product-game`, `parity-game`. Overrides
+    /// `--extract-strategy` when set.
+    #[arg(long = "controller-mode", value_name = "NAME")]
+    controller_mode: Option<String>,
     /// Emit counterexample/counterstrategy diagnostics when unrealizable.
     #[arg(long)]
     counterexample: bool,
@@ -361,6 +412,101 @@ fn main() {
     }
 }
 
+/// Resolve the controller mode from the CLI flags.
+///
+/// Precedence:
+/// 1. `--mode <name>` (if `Some`) is parsed case-insensitively.
+/// 2. Else, `--extract-strategy` → `Functional` (legacy mapping).
+/// 3. Else, `Projection` (default).
+fn parse_cli_controller_mode(
+    mode: &Option<String>,
+    extract_strategy: bool,
+) -> Result<mununu_core::context::ControllerMode, String> {
+    use mununu_core::context::ControllerMode;
+    if let Some(name) = mode {
+        let normalized: String = name
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        return match normalized.as_str() {
+            "projection" => Ok(ControllerMode::Projection),
+            "functional" => Ok(ControllerMode::Functional),
+            "permissive" => Ok(ControllerMode::Permissive),
+            "signaturememory" => Ok(ControllerMode::SignatureMemory),
+            "productgame" => Ok(ControllerMode::ProductGame),
+            "paritygame" => Ok(ControllerMode::ParityGame),
+            other => Err(format!(
+                "unknown controller mode '{other}' \
+                (valid: projection, functional, permissive, signature-memory, product-game, parity-game)"
+            )),
+        };
+    }
+    Ok(if extract_strategy {
+        ControllerMode::Functional
+    } else {
+        ControllerMode::Projection
+    })
+}
+
+#[cfg(test)]
+mod cli_controller_mode_tests {
+    use super::*;
+    use mununu_core::context::ControllerMode;
+
+    #[test]
+    fn default_is_projection() {
+        assert_eq!(
+            parse_cli_controller_mode(&None, false).unwrap(),
+            ControllerMode::Projection
+        );
+    }
+
+    #[test]
+    fn extract_strategy_maps_to_functional() {
+        assert_eq!(
+            parse_cli_controller_mode(&None, true).unwrap(),
+            ControllerMode::Functional
+        );
+    }
+
+    #[test]
+    fn explicit_mode_wins_over_extract_strategy() {
+        assert_eq!(
+            parse_cli_controller_mode(&Some("projection".into()), true).unwrap(),
+            ControllerMode::Projection
+        );
+    }
+
+    #[test]
+    fn parses_all_modes() {
+        let cases = [
+            ("projection", ControllerMode::Projection),
+            ("functional", ControllerMode::Functional),
+            ("permissive", ControllerMode::Permissive),
+            ("signature-memory", ControllerMode::SignatureMemory),
+            ("Signature_Memory", ControllerMode::SignatureMemory),
+            ("product-game", ControllerMode::ProductGame),
+            ("PARITY-GAME", ControllerMode::ParityGame),
+            ("paritygame", ControllerMode::ParityGame),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                parse_cli_controller_mode(&Some(name.into()), false).unwrap(),
+                expected,
+                "name `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_mode() {
+        let err = parse_cli_controller_mode(&Some("strict".into()), false).unwrap_err();
+        assert!(err.contains("unknown controller mode"));
+        assert!(err.contains("strict"));
+    }
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -415,6 +561,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Context { command } => handle_context(*command),
         Commands::Extraction { command } => handle_extraction(*command),
         Commands::Sv { command } => handle_sv(*command),
+        Commands::Templates(args) => list_templates(args),
         Commands::Server { addr } => {
             use std::net::SocketAddr;
             let addr: SocketAddr = addr
@@ -506,9 +653,10 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
         controllable: vec![],
         properties: vec![PropertyAnnotation {
             id: "safety".to_string(),
-            formula: "nu X. ([] X)".to_string(),
+            formula: Some("nu X. ([] X)".to_string()),
             description: Some("No deadlock — all states have successors".to_string()),
             role: "guarantee".to_string(),
+            template_ref: None,
         }],
         discovered_values: HashMap::new(),
         parameters: module
@@ -740,9 +888,10 @@ fn sv_init_multi_from_top(
         }),
         properties: vec![PropertyAnnotation {
             id: "safety".to_string(),
-            formula: "nu X. ([] X)".to_string(),
+            formula: Some("nu X. ([] X)".to_string()),
             description: Some("No deadlock — all states have successors".to_string()),
             role: "guarantee".to_string(),
+            template_ref: None,
         }],
         discovered_values: HashMap::new(),
     };
@@ -1642,8 +1791,12 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
 }
 
 fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs, _) =
-        load_context_documents(&args.context, &args.sidecars, None)?;
+    let (context_doc, sidecar_docs, _) = load_context_documents_mode(
+        &args.context,
+        &args.sidecars,
+        args.adapter.as_deref(),
+        args.mode.as_deref(),
+    )?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let summary = build_context_summary(&context_doc, &sidecar_docs, &realized);
     let json = serde_json::to_string_pretty(&summary)
@@ -1659,8 +1812,12 @@ fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
 }
 
 fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs, _) =
-        load_context_documents(&args.context, &args.sidecars, None)?;
+    let (context_doc, sidecar_docs, _) = load_context_documents_mode(
+        &args.context,
+        &args.sidecars,
+        args.adapter.as_deref(),
+        args.mode.as_deref(),
+    )?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let mut automata: Vec<String> = realized.predicates.keys().cloned().collect();
     automata.sort();
@@ -1748,11 +1905,20 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         sidecar_docs.push(stub_doc);
     }
 
+    // Resolve formula: either --formula NAME or --template ID [--template-arg K=V]
+    let formula_name = resolve_formula_name(
+        &args.formula,
+        &args.template,
+        &args.template_args,
+        &args.automaton,
+        &mut sidecar_docs,
+    )?;
+
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let formula = realized
         .formulas
-        .get(&args.formula)
-        .ok_or_else(|| format!("unknown formula '{}' in realised context", args.formula))?;
+        .get(&formula_name)
+        .ok_or_else(|| format!("unknown formula '{}' in realised context", formula_name))?;
     let clts = realized
         .context
         .clts(&args.automaton)
@@ -1886,7 +2052,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 
     println!(
         "Formula '{}' over automaton '{}':",
-        args.formula, args.automaton
+        formula_name, args.automaton
     );
     println!(
         "  States satisfying: {}/{}",
@@ -1946,7 +2112,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
     }
 
     if args.soundness_report {
-        print_soundness_report(&args.formula, formula, eval_clts);
+        print_soundness_report(&formula_name, formula, eval_clts);
     }
 
     // Print structure if requested
@@ -1958,7 +2124,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 }
 
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
-    let (context_doc, sidecar_docs, adapter_ctxdsl) = load_context_documents_mode(
+    let (context_doc, mut sidecar_docs, adapter_ctxdsl) = load_context_documents_mode(
         &args.context,
         &args.sidecars,
         args.adapter.as_deref(),
@@ -1974,11 +2140,20 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
         }
     }
 
+    // Resolve formula: either --formula NAME or --template ID [--template-arg K=V]
+    let formula_name = resolve_formula_name(
+        &args.formula,
+        &args.template,
+        &args.template_args,
+        &args.automaton,
+        &mut sidecar_docs,
+    )?;
+
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let realized_formula = realized
         .formulas
-        .get(&args.formula)
-        .ok_or_else(|| format!("unknown formula '{}' in realised context", args.formula))?;
+        .get(&formula_name)
+        .ok_or_else(|| format!("unknown formula '{}' in realised context", formula_name))?;
     if realized.context.clts(&args.automaton).is_none() {
         return Err(format!(
             "unknown automaton '{}' in realised context",
@@ -2030,7 +2205,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                 diagnostics: diagnostics_ref.as_ref(),
                 minimize: args.minimize,
                 extract_strategy: args.extract_strategy,
-                mode: mununu_core::context::ControllerMode::default(),
+                mode: parse_cli_controller_mode(&args.controller_mode, args.extract_strategy)?,
             },
         )
         .map_err(|err| format!("controller synthesis failed: {err}"))?;
@@ -2043,7 +2218,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
 
     println!(
         "Controller synthesis for formula '{}' over automaton '{}':",
-        args.formula, args.automaton
+        formula_name, args.automaton
     );
     println!(
         "  Realizable: {}",
@@ -2080,7 +2255,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
 
     if args.soundness_report {
         if let Some(synth_clts) = realized.context.clts(&args.automaton) {
-            print_soundness_report(&args.formula, realized_formula, synth_clts);
+            print_soundness_report(&formula_name, realized_formula, synth_clts);
         } else {
             eprintln!(
                 "  warning: automaton '{}' not found — skipping soundness report",
@@ -2090,7 +2265,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
     }
 
     if let Some(path) = args.dump_json.as_ref() {
-        write_controller_json(path, &args.automaton, &args.formula, &synthesis)?;
+        write_controller_json(path, &args.automaton, &formula_name, &synthesis)?;
         println!("  JSON summary written to {}", path.display());
     }
 
@@ -2098,7 +2273,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
         write_controller_ctxdsl(
             path,
             &args.automaton,
-            &args.formula,
+            &formula_name,
             realized_formula.raw.as_str(),
             controller,
         )?;
@@ -2127,10 +2302,17 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                     use mununu_core::adapter::systemverilog::emit_controller::controller_to_systemverilog;
                     controller_to_systemverilog(controller, &args.automaton, true)
                 }
+                "gdscript" | "gd" => {
+                    use mununu_core::adapter::gdscript::emit_controller::{
+                        collect_controllable_labels, controller_to_gdscript,
+                    };
+                    let controllable = collect_controllable_labels(controller);
+                    controller_to_gdscript(controller, &args.automaton, true, &controllable)
+                }
                 "ctxdsl" => String::new(), // already handled by --emit-dsl
                 other => {
                     return Err(format!(
-                        "unknown output format '{other}'. Supported: ctxdsl, xstate, systemverilog"
+                        "unknown output format '{other}'. Supported: ctxdsl, xstate, systemverilog, gdscript"
                     ));
                 }
             };
@@ -3912,4 +4094,148 @@ fn sanitize_identifier_cli(value: &str) -> String {
         ident.insert(0, '_');
     }
     ident
+}
+
+// ---------------------------------------------------------------------------
+// Property templates CLI
+// ---------------------------------------------------------------------------
+
+fn list_templates(args: TemplatesArgs) -> Result<(), String> {
+    use mununu_core::adapter::templates::{TemplateDomain, TemplateRegistry};
+
+    let registry = TemplateRegistry::builtin();
+
+    // Show details for a single template
+    if let Some(id) = &args.id {
+        let tmpl = registry
+            .get(id)
+            .ok_or_else(|| format!("unknown template '{id}'"))?;
+        if args.json {
+            let json = serde_json::to_string_pretty(tmpl).map_err(|e| e.to_string())?;
+            println!("{json}");
+        } else {
+            println!("Template: {} ({})", tmpl.id, tmpl.display_name);
+            println!("  {}", tmpl.description);
+            println!("  Kind: {}  Role: {}", tmpl.kind, tmpl.role);
+            println!(
+                "  Domains: {}",
+                tmpl.domains
+                    .iter()
+                    .map(|d| format!("{d:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if tmpl.params.is_empty() {
+                println!("  Parameters: (none)");
+            } else {
+                println!("  Parameters:");
+                for p in &tmpl.params {
+                    let req = if p.required { "required" } else { "optional" };
+                    let default = p
+                        .default
+                        .as_deref()
+                        .map(|d| format!(" [default: {d}]"))
+                        .unwrap_or_default();
+                    println!("    ${} — {} ({req}{default})", p.name, p.description);
+                }
+            }
+            println!("  Formula: {}", tmpl.formula_pattern);
+            if !tmpl.tags.is_empty() {
+                println!("  Tags: {}", tmpl.tags.join(", "));
+            }
+        }
+        return Ok(());
+    }
+
+    // Filter by domain
+    let domain_filter: Option<TemplateDomain> = args.domain.as_deref().and_then(|d| match d {
+        "game" => Some(TemplateDomain::Game),
+        "rtl" => Some(TemplateDomain::Rtl),
+        "agentic" => Some(TemplateDomain::Agentic),
+        "software" => Some(TemplateDomain::Software),
+        "synthesis" => Some(TemplateDomain::Synthesis),
+        "universal" => Some(TemplateDomain::Universal),
+        _ => None,
+    });
+
+    let templates = if let Some(domain) = domain_filter {
+        registry.for_domain(domain)
+    } else {
+        registry.for_domain(TemplateDomain::Universal) // universal returns all
+    };
+
+    if args.json {
+        let catalog = registry.catalog();
+        let json = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
+        println!("{json}");
+    } else {
+        let mut sorted: Vec<_> = templates;
+        sorted.sort_by_key(|t| t.id.clone());
+        for tmpl in &sorted {
+            let params = if tmpl.params.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<_> = tmpl.params.iter().map(|p| format!("${}", p.name)).collect();
+                format!("({})", names.join(", "))
+            };
+            println!("  {}{:<24} {}", tmpl.id, params, tmpl.description);
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve the formula name for eval/synth: either from `--formula` or from `--template`.
+///
+/// When `--template` is provided, instantiates the template and injects a sidecar
+/// CTXDSL document containing the formula so it can be found in the realized context.
+fn resolve_formula_name(
+    formula: &Option<String>,
+    template: &Option<String>,
+    template_args: &[String],
+    automaton: &str,
+    sidecar_docs: &mut Vec<ContextDoc>,
+) -> Result<String, String> {
+    if let Some(name) = formula {
+        return Ok(name.clone());
+    }
+
+    let template_id = template
+        .as_ref()
+        .ok_or("either --formula or --template is required")?;
+
+    // Parse template args
+    let mut args_map = HashMap::new();
+    for arg in template_args {
+        let (key, value) = arg
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --template-arg '{arg}': expected KEY=VALUE"))?;
+        args_map.insert(key.to_string(), value.to_string());
+    }
+
+    let registry = mununu_core::adapter::templates::TemplateRegistry::builtin();
+    let tref = mununu_core::adapter::templates::TemplateRef {
+        template: template_id.clone(),
+        args: args_map,
+    };
+    let inst = registry
+        .instantiate(&tref)
+        .map_err(|e| format!("template instantiation failed: {e}"))?;
+
+    // Generate a sidecar CTXDSL document with the formula
+    let formula_name = inst.name.clone();
+    let sidecar_ctxdsl = format!(
+        "context __template_sidecar {{\n  mu_formulas {{\n    formula {formula_name} {{\n      over {automaton};\n      body = {};\n    }}\n  }}\n}}\n",
+        inst.formula
+    );
+    let sidecar_doc = parse_context_doc(&sidecar_ctxdsl)
+        .map_err(|e| format!("internal error: generated template CTXDSL failed to parse: {e}"))?;
+    sidecar_docs.push(sidecar_doc);
+
+    eprintln!(
+        "Template '{}' → formula '{}': {}",
+        template_id, formula_name, inst.formula
+    );
+
+    Ok(formula_name)
 }

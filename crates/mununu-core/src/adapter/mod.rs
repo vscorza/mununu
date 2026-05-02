@@ -41,6 +41,7 @@ pub mod aiger;
 pub mod domain;
 pub mod emit;
 pub mod extraction;
+pub mod gdscript;
 pub mod ir;
 pub mod promela;
 pub mod state_enum;
@@ -198,6 +199,9 @@ pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str
     if stem.ends_with(".espec") {
         return Some("extraction");
     }
+    if stem.ends_with(".xstate") {
+        return Some("xstate");
+    }
 
     match path.extension().and_then(|e| e.to_str()) {
         Some("tlsf") => Some("tlsf"),
@@ -235,7 +239,61 @@ pub fn auto_translate(
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate), SystemVerilog (.sv/.v), Extraction (.espec.json)".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate or .xstate.json), SystemVerilog (.sv/.v), Extraction (.espec.json)".into(),
         location: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_format_by_extension;
+    use std::path::Path;
+
+    #[test]
+    fn detects_xstate_compound_extension() {
+        assert_eq!(
+            detect_format_by_extension(Path::new("support_pipeline.xstate.json")),
+            Some("xstate")
+        );
+        assert_eq!(
+            detect_format_by_extension(Path::new("/abs/path/auth_flow.xstate.json")),
+            Some("xstate")
+        );
+    }
+
+    #[test]
+    fn detects_extraction_compound_extension() {
+        assert_eq!(
+            detect_format_by_extension(Path::new("game.espec.json")),
+            Some("extraction")
+        );
+    }
+
+    #[test]
+    fn detects_simple_extensions() {
+        assert_eq!(
+            detect_format_by_extension(Path::new("design.sv")),
+            Some("systemverilog")
+        );
+        assert_eq!(
+            detect_format_by_extension(Path::new("model.tlsf")),
+            Some("tlsf")
+        );
+        assert_eq!(
+            detect_format_by_extension(Path::new("circuit.aag")),
+            Some("aiger")
+        );
+        assert_eq!(
+            detect_format_by_extension(Path::new("proc.pml")),
+            Some("promela")
+        );
+    }
+
+    #[test]
+    fn returns_none_for_unknown_or_plain_json() {
+        assert_eq!(detect_format_by_extension(Path::new("README.md")), None);
+        // A plain .json file (not .xstate.json or .espec.json) should not auto-route.
+        // Content-based detection via `auto_translate` is the right path here.
+        assert_eq!(detect_format_by_extension(Path::new("payload.json")), None);
+    }
 }

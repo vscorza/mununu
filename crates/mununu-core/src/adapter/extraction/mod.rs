@@ -9,8 +9,14 @@
 //! ```
 //!
 //! The spec's `model_config` section carries declarative automaton definitions
-//! with mode-filtered transitions, enabling both "fixed" and "vulnerable"
-//! variants from a single spec file.
+//! with mode-filtered transitions. Each transition may be tagged with an
+//! arbitrary `mode` string (e.g., `"fixed"`, `"vulnerable"`, `"as_audited"`,
+//! `"with_provider_cache"`); the special value `"both"` (the default) means
+//! "always include." The `--mode` CLI flag selects which transitions to
+//! include: a transition is kept iff its `mode` is `"both"` or matches the
+//! requested mode. The universal defaults `"fixed"`, `"vulnerable"`, and
+//! `"both"` are always accepted by the CLI; any other mode value is accepted
+//! iff at least one transition in the loaded spec is tagged with it.
 
 pub mod ast;
 pub mod ast_extract;
@@ -45,10 +51,28 @@ impl FormatAdapter for ExtractionAdapter {
 
         let mode = options.mode.as_deref().unwrap_or("vulnerable");
 
-        if mode != "fixed" && mode != "vulnerable" {
+        // Build the set of valid modes: the universal defaults plus the union
+        // of per-transition `mode` tags found in the loaded spec. This lets
+        // spec authors use any investigation framing (e.g., `as_audited` vs
+        // `with_provider_cache`) without being locked into the bug/fix
+        // dichotomy.
+        let mut valid_modes: std::collections::HashSet<&str> =
+            ["fixed", "vulnerable", "both"].into_iter().collect();
+        for aut in &spec.model_config.automata {
+            for t in &aut.transitions {
+                valid_modes.insert(t.mode.as_str());
+            }
+        }
+
+        if !valid_modes.contains(mode) {
+            let mut sorted: Vec<&str> = valid_modes.iter().copied().collect();
+            sorted.sort();
             return Err(AdapterError {
                 kind: AdapterErrorKind::ParseError,
-                message: format!("Invalid mode '{mode}'. Must be 'fixed' or 'vulnerable'."),
+                message: format!(
+                    "Invalid mode '{mode}'. Valid modes for this spec: {}.",
+                    sorted.join(", ")
+                ),
                 location: None,
             });
         }
@@ -134,12 +158,16 @@ fn to_ir(
         None => vec![],
     };
 
-    // Build properties (raw formula takes precedence; template_ref used as fallback)
+    // Build properties (raw formula takes precedence; template_ref used as fallback).
+    //
+    // SOUNDNESS (Phase 9 audit, analogous to A1-A4 in SV/XState): a missing or
+    // invalid property is fail-loud, not silently dropped. Previously, template
+    // resolution failures emitted a warning but returned an incomplete property
+    // list — the property was never checked, leading to false-positive verdicts.
     let template_registry = super::templates::TemplateRegistry::builtin();
     let mut properties: Vec<PropertySpec> = Vec::new();
     for def in &config.properties {
         if let Some(formula_str) = def.formula_str() {
-            // Raw formula provided — use directly
             properties.push(PropertySpec {
                 name: def.id.clone(),
                 kind: PropertyKind::Safety,
@@ -148,7 +176,6 @@ fn to_ir(
                 over: def.over.clone(),
             });
         } else if let Some(tref) = &def.template_ref {
-            // Resolve template reference
             match template_registry.instantiate(tref) {
                 Ok(inst) => {
                     properties.push(PropertySpec {
@@ -160,15 +187,28 @@ fn to_ir(
                     });
                 }
                 Err(e) => {
-                    warnings.push(AdapterWarning {
-                        kind: WarningKind::ApproximateTranslation,
-                        message: format!("Property '{}': template resolution failed: {e}", def.id),
+                    return Err(AdapterError {
+                        kind: AdapterErrorKind::ParseError,
+                        message: format!(
+                            "property '{}' references unknown template '{}': {e}. \
+                             Add the template to the registry or replace `template_ref` with a raw `formula`.",
+                            def.id, tref.template
+                        ),
                         location: None,
                     });
                 }
             }
+        } else {
+            return Err(AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!(
+                    "property '{}' declares neither `formula` nor `template_ref` — \
+                     cannot translate. Add one of the two fields.",
+                    def.id
+                ),
+                location: None,
+            });
         }
-        // If neither formula nor template_ref: skip silently (existing behavior)
     }
 
     // Build controller(s)
@@ -288,6 +328,19 @@ fn build_description(spec: &ExtractionSpec, mode: &str) -> String {
         parts.push(format!("Issue: {issue}"));
     }
 
+    if let Some(fix_pr) = &spec.source.fix_pr {
+        parts.push(format!("Fix PR: {fix_pr}"));
+    }
+
+    if let Some(fix_commit) = &spec.source.fix_commit {
+        let short = if fix_commit.len() > 12 {
+            &fix_commit[..12]
+        } else {
+            fix_commit
+        };
+        parts.push(format!("Fix commit: {short}"));
+    }
+
     parts.join(" | ")
 }
 
@@ -318,6 +371,12 @@ fn build_provenance_header(spec: &ExtractionSpec, mode: &str) -> String {
     }
     if let Some(issue) = &spec.source.issue {
         lines.push(format!("// @issue: {issue}"));
+    }
+    if let Some(fix_pr) = &spec.source.fix_pr {
+        lines.push(format!("// @fix-pr: {fix_pr}"));
+    }
+    if let Some(fix_commit) = &spec.source.fix_commit {
+        lines.push(format!("// @fix-commit: {fix_commit}"));
     }
 
     // Attack chain summary (if bugs documented)
@@ -484,6 +543,195 @@ mod tests {
         // Fixed mode: ev_request transition filtered out
         let fixed = translate_spec(json, "fixed");
         assert!(!fixed.ctxdsl.contains("ev_request"));
+    }
+
+    /// GAP-002: arbitrary mode strings (e.g. investigation framings other than
+    /// the bug/fix dichotomy) are accepted iff at least one transition in the
+    /// loaded spec is tagged with that mode. The per-transition filter then
+    /// keeps transitions whose `mode` is `"both"` or matches the requested mode.
+    #[test]
+    fn mode_accepts_custom_string() {
+        let json = r#"{
+            "$schema": "extraction_spec_v1",
+            "source": {},
+            "model_config": {
+                "context_name": "custom_mode_test",
+                "automata": [{
+                    "id": "A",
+                    "states": [
+                        {"name": "S0", "initial": true},
+                        {"name": "S1"}
+                    ],
+                    "transitions": [
+                        {"from": "S0", "to": "S1", "label": "ev_audited", "mode": "as_audited"},
+                        {"from": "S0", "to": "S1", "label": "ev_cached", "mode": "with_provider_cache"},
+                        {"from": "S0", "to": "S0", "label": "ev_shared", "mode": "both"},
+                        {"from": "S1", "to": "S1", "label": "noop"},
+                        {"from": "S0", "to": "S0", "label": "noop"}
+                    ]
+                }]
+            }
+        }"#;
+
+        let output = translate_spec(json, "as_audited");
+        assert!(
+            output.ctxdsl.contains("ev_audited"),
+            "as_audited transition must be kept under --mode as_audited"
+        );
+        assert!(
+            output.ctxdsl.contains("ev_shared"),
+            "`mode: \"both\"` transition must always be kept"
+        );
+        assert!(
+            !output.ctxdsl.contains("ev_cached"),
+            "with_provider_cache transition must be filtered out under --mode as_audited"
+        );
+    }
+
+    /// GAP-002: an unknown mode value produces an error message that lists the
+    /// valid modes for the loaded spec (sorted), so authors can self-correct.
+    #[test]
+    fn mode_rejects_unknown_mode() {
+        let json = r#"{
+            "$schema": "extraction_spec_v1",
+            "source": {},
+            "model_config": {
+                "context_name": "unknown_mode_test",
+                "automata": [{
+                    "id": "A",
+                    "states": [
+                        {"name": "S0", "initial": true},
+                        {"name": "S1"}
+                    ],
+                    "transitions": [
+                        {"from": "S0", "to": "S1", "label": "ev_audited", "mode": "as_audited"},
+                        {"from": "S0", "to": "S1", "label": "ev_cached", "mode": "with_provider_cache"},
+                        {"from": "S0", "to": "S0", "label": "ev_shared", "mode": "both"}
+                    ]
+                }]
+            }
+        }"#;
+
+        let options = AdapterOptions {
+            mode: Some("unknown_xyz".to_string()),
+            ..Default::default()
+        };
+        let result = ExtractionAdapter::translate(json, &options);
+        assert!(
+            result.is_err(),
+            "unknown mode should produce an AdapterError"
+        );
+        let err = result.err().unwrap();
+        assert!(
+            err.message.contains("unknown_xyz"),
+            "error must reference the bad mode: {}",
+            err.message
+        );
+        // The valid-modes list is the union of universal defaults
+        // (fixed, vulnerable, both) and the spec's per-transition tags
+        // (as_audited, with_provider_cache, both). Sorted: as_audited, both,
+        // fixed, vulnerable, with_provider_cache.
+        for expected in [
+            "as_audited",
+            "both",
+            "fixed",
+            "vulnerable",
+            "with_provider_cache",
+        ] {
+            assert!(
+                err.message.contains(expected),
+                "error message should list valid mode '{expected}'. Got: {}",
+                err.message
+            );
+        }
+    }
+
+    /// GAP-002: with no `--mode` flag, the default remains `"vulnerable"` so
+    /// existing CLI invocations and specs that rely on the default keep working.
+    #[test]
+    fn mode_default_still_vulnerable() {
+        let json = r#"{
+            "$schema": "extraction_spec_v1",
+            "source": {},
+            "model_config": {
+                "context_name": "default_mode_test",
+                "automata": [{
+                    "id": "A",
+                    "states": [
+                        {"name": "Open", "initial": true},
+                        {"name": "Closed"}
+                    ],
+                    "transitions": [
+                        {"from": "Open", "to": "Closed", "label": "ev_close"},
+                        {"from": "Closed", "to": "Closed", "label": "ev_vuln_only", "mode": "vulnerable"},
+                        {"from": "Closed", "to": "Closed", "label": "ev_fix_only", "mode": "fixed"},
+                        {"from": "Open", "to": "Open", "label": "noop"},
+                        {"from": "Closed", "to": "Closed", "label": "noop"}
+                    ]
+                }]
+            }
+        }"#;
+
+        // No `mode` field set on AdapterOptions → default applies.
+        let options = AdapterOptions::default();
+        let output = ExtractionAdapter::translate(json, &options)
+            .expect("default mode (vulnerable) should be accepted");
+        assert!(
+            output.ctxdsl.contains("@mode: vulnerable"),
+            "default mode must be 'vulnerable'"
+        );
+        assert!(
+            output.ctxdsl.contains("ev_vuln_only"),
+            "vulnerable transition must be kept under default mode"
+        );
+        assert!(
+            !output.ctxdsl.contains("ev_fix_only"),
+            "fixed-only transition must be filtered out under default (vulnerable) mode"
+        );
+    }
+
+    /// GAP-002: the universal defaults `fixed`, `vulnerable`, `both` are always
+    /// accepted even if the spec only uses custom tags. They simply select the
+    /// implicit-`"both"` transitions in that case.
+    #[test]
+    fn mode_universal_defaults() {
+        let json = r#"{
+            "$schema": "extraction_spec_v1",
+            "source": {},
+            "model_config": {
+                "context_name": "universal_defaults_test",
+                "automata": [{
+                    "id": "A",
+                    "states": [
+                        {"name": "S0", "initial": true},
+                        {"name": "S1"}
+                    ],
+                    "transitions": [
+                        {"from": "S0", "to": "S1", "label": "ev_audited", "mode": "as_audited"},
+                        {"from": "S0", "to": "S1", "label": "ev_cached", "mode": "with_provider_cache"},
+                        {"from": "S0", "to": "S0", "label": "ev_always"},
+                        {"from": "S1", "to": "S1", "label": "noop"},
+                        {"from": "S0", "to": "S0", "label": "noop"}
+                    ]
+                }]
+            }
+        }"#;
+
+        // `--mode fixed` is a universal default — the spec uses no `fixed`
+        // tags, so only the implicit-`both` transitions remain.
+        let output = translate_spec(json, "fixed");
+        assert!(
+            output.ctxdsl.contains("ev_always"),
+            "implicit-`both` transition must be kept under universal default --mode fixed"
+        );
+        assert!(
+            !output.ctxdsl.contains("ev_audited"),
+            "custom-tagged transition must be filtered out under --mode fixed"
+        );
+        assert!(
+            !output.ctxdsl.contains("ev_cached"),
+            "custom-tagged transition must be filtered out under --mode fixed"
+        );
     }
 
     #[test]
@@ -688,7 +936,10 @@ mod tests {
     }
 
     #[test]
-    fn template_ref_with_unknown_template_warns() {
+    fn template_ref_with_unknown_template_is_error() {
+        // Phase 9 (Soundness audit): unknown templates were previously silently
+        // dropped, leading to false-positive verdicts where the property was
+        // never checked. The fix is fail-loud: an `AdapterError::ParseError`.
         let json = r#"{
             "$schema": "extraction_spec_v1",
             "source": {},
@@ -708,15 +959,23 @@ mod tests {
             }
         }"#;
 
-        let output = translate_spec(json, "vulnerable");
-        // Should not crash — unknown template produces a warning
+        let options = AdapterOptions {
+            mode: Some("vulnerable".to_string()),
+            ..Default::default()
+        };
+        let result = ExtractionAdapter::translate(json, &options);
         assert!(
-            output
-                .warnings
-                .iter()
-                .any(|w| w.message.contains("template resolution failed"))
+            result.is_err(),
+            "Unknown template_ref must produce an AdapterError, not silent drop. \
+             Got: {:?}",
+            result.map(|o| o.warnings.len())
         );
-        // The property should be skipped (not in CTXDSL)
-        assert!(!output.ctxdsl.contains("formula bad_template"));
+        if let Err(e) = result {
+            assert!(
+                e.message.contains("template") || e.message.contains("nonexistent_template"),
+                "Error message should reference the missing template. Got: {}",
+                e.message
+            );
+        }
     }
 }

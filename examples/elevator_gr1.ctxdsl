@@ -137,7 +137,7 @@ context elevator_gr1 {
         // Ensures the door mechanism is not a dead end.
         formula door_always_closes {
             over Elevator;
-            body = nu X. ([] (mu Y. (Floor0 || Floor1 || Floor2 || <> Y))) && ([] X);
+            body = nu X. (([] (mu Y. (Floor0 || Floor1 || Floor2 || <> Y))) && ([] X));
         }
 
         // From Floor0, Floor2 is reachable (full traversal possible).
