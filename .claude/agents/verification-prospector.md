@@ -91,18 +91,20 @@ This list is part of the agent definition and is revised in Phase 6 (self-review
 - DARPA SSITH program reports
 - OpenTitan, lowRISC, Ibex, CVA6 issue trackers — filter for `state-machine`, `fsm`, `protocol`, `bug`
 - OpenCores top-100 cores README + issues
+- HWE-Bench (`arxiv.org/abs/2604.14709` — "HWE-Bench: Benchmarking LLM Agents on Real-World Hardware Bug Repair Tasks") — every entry is a commit-pinned hardware bug. Scrape the benchmark's accompanying repo once and treat each entry as a Class-A-eligible candidate. Highest density per fetch among Phase-1 RTL sources.
 - Industry advisories: Intel SA-*, AMD-SB-*, ARM SDEN — only entries describing state-machine logic flaws, not microarchitectural side channels
 - Academic venues, last two years: DAC, ICCAD, FMCAD, CAV, MICRO, ASPLOS — abstract search for `formal verification` + `RTL` + `bug found`
 
-### Phase 1.1 — Quick-depth source priority (RTL)
+### Phase 1.1 — RTL source priority (all depths)
 
-Under `--depth quick`, prioritize the following three sources in order before any other RTL listing:
+Regardless of depth, prioritize the following sources in order before any other RTL listing. Under `--depth standard` and `--depth deep`, the deeper budget can supplement these with the remaining Phase-1 sources, but the priority order remains:
 
-1. **OpenTitan / lowRISC / Ibex / CVA6 issue trackers** (filter: `Type:Bug` + `state-machine` or `fsm`). Highest signal-per-query for concrete code + commit pins.
+1. **OpenTitan / lowRISC / Ibex / CVA6 / caliptra-rtl issue trackers** (filter: `Type:Bug` + `state-machine` or `fsm`). Highest signal-per-query for concrete code + commit pins.
 2. **CWE-1194 hardware-view child CWEs**, fetching the *Observed Examples* section directly rather than searching NVD.
-3. **FMCAD / DAC last-two-years abstract search** (formal-verification + "bug found"). Authoritative but slow to hit; reserve for `--depth standard`+.
+3. **HWE-Bench** (per the inventory bullet above) — mechanical Class-A density.
+4. **FMCAD / DAC last-two-years abstract search** (formal-verification + "bug found"). Authoritative but slow to hit.
 
-NVD CVE keyword search and GitHub Security Advisories under-perform for RTL state-machine bugs (the advisory taxonomy is biased toward CIA-classified exploits) and should be skipped under `--depth quick`.
+NVD CVE keyword search and GitHub Security Advisories under-perform for RTL state-machine bugs (the advisory taxonomy is biased toward CIA-classified exploits) and should be skipped at all depths unless prior priority sources are exhausted.
 
 ### MCP sources
 
@@ -190,6 +192,8 @@ For each followed-up candidate, build an evidence record:
 
 A candidate **fails Phase 3** if it lacks evidence or independent corroboration. Failed candidates go in Phase 5's log under "rejected with reasons."
 
+**Diagnostic-stuck heuristic.** If a single repository surfaces 4 or more open issues with the same symptom phrase and zero merged fix PRs across all of them, treat the cluster as "diagnostic-stuck" and skip it for this session. Record the skip under `evidence` in the session log with the repository + symptom phrase. The cluster becomes eligible again only after a maintainer-acknowledged root-cause comment lands on any one of the issues.
+
 **Checkpoint 3:** Append the per-query log to the session report as §1 "Sources Surveyed" (the table headers from Phase 5a) and the rejected-candidates list to §3 "Rejected Candidates." Update the status line to `## Status: in progress (Phase 3 complete; Phase 4 pending)`. Append a single line to `log.md` summarizing query count, hits, and candidates kept. If the session is interrupted now, the entire mining evidence — every query string, every URL — is preserved.
 
 ## Phase 3.5 — Fix-commit confirmation (optional, fetches budget permitting)
@@ -212,7 +216,7 @@ For each candidate that survived Phase 3:
 - **Required adapter**: native SV (`*.sv` + `.mununu.json`), extraction spec (`.espec.json`), XState (`*.xstate.json`), or "new adapter required" — flag the latter as research effort.
 - **Property class**: safety / liveness / reachability — and a draft mu-calculus skeleton or `template_ref` the verifier could run.
 - **Abstraction-soundness direction**: for the property class proposed, name each abstraction and tag it `over-approx` (sound for safety, unsound for liveness) or `under-approx` (unsound for safety). Mixed direction within one model requires a Phase 6 amendment justifying the mix; do not silently allow it.
-- **Effort estimate**: hours of human time to write the spec and CTXDSL — `S` (≤ 2h), `M` (≤ 1d), `L` (≤ 3d), `XL` (>3d).
+- **Effort estimate**: hours of human time to write the spec and CTXDSL — `S` (≤ 2h), `M` (≤ 1d), `L` (≤ 3d), `XL` (>3d). When the target involves an industrial protocol with formal handshake conventions or fairness assumptions (AXI, AHB, OPC UA, OAuth, WS-*, gRPC streaming), inflate the estimate by one band (S → M, M → L, L → XL). Industrial protocols carry handshake conventions and fairness assumptions that cannot be modeled in the time of a single-FSM target of the same nominal size.
 - **Prior-art status**: has this property already been verified for this system by another tool / paper / vendor? Run at most one focused web-search per Class-A and Class-B candidate. Outcomes:
   - `novel` — no public verification known. Eligible for "we proved X" claims.
   - `partial` — verified at coarser abstraction or for a related property. Eligible with a hedge ("we extend prior work by …").
@@ -382,6 +386,14 @@ Wait for the executor's compact summary block. Each executor call:
 
 **Checkpoint 5.5 (per execution):** Immediately after each executor returns its compact summary, update the corresponding backlog row in `backlog.md` (state transition, rigor exit, execution report path) AND append a `### Execution {target_id}` block to the session report's §6 "Execution Outcomes" placeholder, BEFORE invoking the next executor. Do not batch backlog updates across multiple executions — each executor's evidence is durable on its own and must not be lost if the next one times out. Update the status line to `## Status: in progress (Phase 5.5: {N}/{max} executions complete)`.
 
+### Fallback: Agent / Task tool not available
+
+Some harnesses do not expose the `Agent` (or `Task`) tool that this phase requires for sub-agent invocation. If `ToolSearch select:Agent,Task` returns "No matching deferred tools found" (and the broader keyword search confirms no Agent-equivalent exists), treat the run as `--max-executions 0`:
+
+- Skip Phase 5.5 entirely; record the skip in the session report's §6 with the verbatim reason "Agent / Task sub-agent tool not available in this harness."
+- Continue to Phase 6, Phase 6.5 (which gracefully handles zero execution reports — see Phase 6.5 "Empty case"), and Phase 7.
+- In Phase 7, surface a `gap-promotion` amendment candidate proposing one of two design fixes: (a) document a parent-session-side fallback for the executor leg, or (b) migrate `target-executor` from sub-agent to skill so the prospector can invoke it via the always-available `Skill` tool.
+
 ### Backlog updates from execution
 
 For each executor result, update the backlog row:
@@ -398,6 +410,7 @@ Collect from all executor reports in this session:
 - **Common failure tags** — which executor issue tags (`fetch`, `modeling`, `tooling`, `soundness`, `scope`) recurred?
 - **Adapter readiness** — which adapter paths produced trustworthy verdicts? Which need work?
 - **Bound-overflow patterns** — how often did `BoundOverflow` warnings fire? On which register types?
+- **RTL trace-validation outcomes (executor Phase 3.5).** For RTL targets with unrealizable verdicts, did the Verilator simulation in `hw-verif:latest` reproduce the model trace (`match`), diverge from it (`divergent`), or report `inconclusive` (e.g., the upstream source could not be slimmed without reshaping the FSM)? Per CLAUDE.md §"Claims Integrity" the trace must be reproduced before any RTL finding is promoted. A pattern of `divergent` results across multiple targets means the SV adapter's abstraction is unsound and should be raised as an amendment in Phase 6. A pattern of `inconclusive` results means the slimming-pattern guidance for executor Phase 3.5 needs sharpening.
 
 Write these aggregates into the session report's new §6 "Execution Outcomes" and into the session log under `### Execution feedback`.
 

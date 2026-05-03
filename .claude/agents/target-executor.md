@@ -25,7 +25,7 @@ You are the target-executor for the mununu formal verification tool. Your job is
 
 A target-executor invocation can fail at any phase: WebFetch can stall on slow endpoints, `mununu` CLI can timeout on large state spaces, the verification phase can run for minutes. The caller (verification-prospector or a manual user) needs evidence on disk even if the run is interrupted before Phase 5 writes the final report.
 
-**Mandate: after every phase that produces durable evidence (Phase 1 source acquisition, Phase 2 modeling, Phase 3 verification, Phase 4 soundness), append the corresponding section of the execution report to disk.** Do not buffer the entire report in memory until Phase 5.
+**Mandate: after every phase that produces durable evidence (Phase 1 source acquisition, Phase 2 modeling, Phase 3 verification, Phase 3.5 RTL trace validation when applicable, Phase 4 soundness), append the corresponding section of the execution report to disk.** Do not buffer the entire report in memory until Phase 5.
 
 The execution report at `.claude/reviews/prospector/executions/{target_id}-{date}.md` should grow incrementally. Each phase appends its own section with a clearly labeled status line at the top of the file:
 
@@ -246,7 +246,51 @@ Capture:
 
 If `summarize` reports zero states, abort with `model_built_zero_states` issue. If `eval` times out, record as `tooling: timeout`.
 
-**Checkpoint 3 (after each property evaluated):** As each property's `eval` returns, append the corresponding row to the execution report's Phase 3 verdict table. Do not batch — write the row before evaluating the next property. This ensures that if `eval` on property 3 of 5 hangs, the verdicts for properties 1 and 2 are already on disk. Update the status line to `## Status: Phase 3 partial — {N}/{total} properties evaluated` while in progress, and `## Status: Phase 3 complete; Phase 4 (soundness) pending` when all properties are done. The raw `tee`'d outputs at `staging/{target_id}/eval-*.txt` are already persisted by the eval command — the report rows reference them.
+**Checkpoint 3 (after each property evaluated):** As each property's `eval` returns, append the corresponding row to the execution report's Phase 3 verdict table. Do not batch — write the row before evaluating the next property. This ensures that if `eval` on property 3 of 5 hangs, the verdicts for properties 1 and 2 are already on disk. Update the status line to `## Status: Phase 3 partial — {N}/{total} properties evaluated` while in progress, and `## Status: Phase 3 complete; Phase 3.5 (RTL trace validation) pending` when all properties are done. The raw `tee`'d outputs at `staging/{target_id}/eval-*.txt` are already persisted by the eval command — the report rows reference them.
+
+## Phase 3.5 — RTL counterexample-trace validation (RTL targets only)
+
+**When this phase fires.** Domain == `RTL` AND at least one property was unrealizable. Skip otherwise (non-RTL domain, or every property realizable — there is no counterexample to validate).
+
+The mununu verdict is correct *for the abstracted Kripke structure*. Phase 3.5 demonstrates the verdict is also reproducible against the close-to-source SystemVerilog under simulation. Per CLAUDE.md §"Claims Integrity" and §"RTL / SystemVerilog pipeline evidence integrity", every public claim about a finding in real RTL must be backed by a concrete execution trace exercising the abstracted path against the actual implementation. A model-level lasso/counterexample with no simulator reproduction does NOT qualify.
+
+**Procedure.**
+
+1. Re-run synthesis with diagnostics for each unrealizable property to get a structured counterexample:
+
+   ```bash
+   target/release/mununu context synth "$ARTIFACT" \
+     --adapter sv --formula "$PROPERTY_ID" --automaton "$AUTOMATON" \
+     --counterexample --max-counter-traces 3 \
+     --dump-json staging/{target_id}/synth-{property_id}.json \
+     2>&1 | tee staging/{target_id}/synth-{property_id}.txt
+   ```
+
+   Parse `diagnostics.counterstrategy.transitions[]` to identify the entry edge into the failing region (e.g., `BOOT_IDLE -> UNDEF` on `glitch=T`) and the self-loop or absorbing pattern at the destination.
+
+2. Build a minimal Verilator reproduction at `staging/{target_id}/repro/`:
+   - One `.sv` file per case-modifier variant relevant to the bug (e.g., upstream pre-fix syntax, plain-`case` baseline, upstream literal fix). Strip out unrelated surrounding logic; preserve the exact case header, enum, and reset semantics from the upstream source.
+   - One C++ Verilator testbench that resets the FSM, then writes the failing-region terminal state into the relevant register (the simulator equivalent of the modeled fault hypothesis), then ticks for N cycles applying the trace's input labels, then asserts the post-trace state matches the LTS prediction.
+   - One `Makefile` with at minimum a `sim` verb. Mirror `.claude/reviews/prospector/staging/RTL-002/repro/Makefile` for shape.
+
+3. Run the simulation in the sibling `hw-verif:latest` container:
+
+   ```bash
+   docker run --rm -v "$(pwd):/work" hw-verif:latest \
+     make -C staging/{target_id}/repro sim
+   ```
+
+   `hw-verif:latest` provides Verilator and the OSS CAD Suite. It is owned by `../hw-verification-uba` and intentionally not in `mununu-dev` (size).
+
+4. Record the result in the execution report under a new `## Phase 3.5 — Trace validation` section:
+   - For each variant simulated: did the post-trace register hold the failing-region state? did the simulator fire its own assertion (`unique` keyword)? what did the simulator do that the model said it would?
+   - **Verdict outcomes:** `match` (simulation reproduces LTS), `divergent` (model says X, sim says Y — surface as finding), or `inconclusive` (sim could not reach the trace inputs without using `force`; document as limitation, not finding).
+
+5. **What goes in the public report:** every claim that a real-design behavior was confirmed must cite the simulation transcript. A purely model-level claim is acceptable but must be labeled "LTS witness only — not reproduced in simulation." Same rule for synthesis claims about realizability.
+
+**When validation is impossible.** If the upstream source has dependencies that cannot be slimmed without reshaping the FSM (e.g., embedded vendor IP, package files referencing macros not in scope), document the limitation. The trace becomes "LTS witness only" and the execution report's Phase 5 recommendation is downgraded by one rigor level.
+
+**Checkpoint 3.5:** After each variant simulated, append a row to the Phase 3.5 table in the execution report (variant name, command, outcome line). Update the status line to `## Status: Phase 3.5 complete; Phase 4 (soundness) pending` when all variants are recorded. The raw simulation transcripts at `staging/{target_id}/repro/sim-*.txt` are persisted by the make rule — the report rows reference them.
 
 ## Phase 4 — Soundness check
 
