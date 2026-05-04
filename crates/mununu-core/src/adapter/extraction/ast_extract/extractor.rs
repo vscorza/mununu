@@ -505,10 +505,16 @@ fn extract_fields(
     if parsed.language == SourceLanguage::Python {
         let mut init_cursor = body.walk();
         for child in body.children(&mut init_cursor) {
-            if child.kind() == "function_definition" {
-                if let Some(name_node) = child.child_by_field_name("name") {
+            // GAP-005h: decorated methods (`@classmethod`, `@staticmethod`,
+            // `@property`, etc.) appear as `decorated_definition` in tree-
+            // sitter-python, with the actual `function_definition` as the
+            // `definition` child. Descend to find __init__ regardless of
+            // whether it's wrapped in a decorator.
+            let actual = unwrap_python_decorator(child);
+            if actual.kind() == "function_definition" {
+                if let Some(name_node) = actual.child_by_field_name("name") {
                     if parsed.node_text(&name_node) == "__init__" {
-                        py_init_results = extract_py_init_fields(parsed, &child);
+                        py_init_results = extract_py_init_fields(parsed, &actual);
                     }
                 }
             }
@@ -1207,15 +1213,38 @@ fn find_method_nodes<'a>(
 
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        if child.kind() == method_kind {
-            if let Some(name_node) = child.child_by_field_name("name") {
+        // GAP-005h: in Python, `@classmethod` / `@staticmethod` / `@property` /
+        // `@dataclass`-driven methods appear as `decorated_definition` with
+        // the actual `function_definition` as the `definition` child. Descend
+        // through the decoration so the method is reachable regardless of
+        // whether it's wrapped. Non-Python languages don't have this layer.
+        let actual = if parsed.language == SourceLanguage::Python {
+            unwrap_python_decorator(child)
+        } else {
+            child
+        };
+        if actual.kind() == method_kind {
+            if let Some(name_node) = actual.child_by_field_name("name") {
                 let name = parsed.node_text(&name_node).to_string();
-                results.push((name, child));
+                results.push((name, actual));
             }
         }
     }
 
     results
+}
+
+/// GAP-005h: Python decorator unwrap. `decorated_definition` is the AST
+/// shape tree-sitter-python emits for `@classmethod def foo()` / `@property
+/// def bar()` / `@dataclass class Baz` etc. The actual definition lives in
+/// the `definition` child. For non-decorated nodes, this is the identity.
+fn unwrap_python_decorator<'a>(node: Node<'a>) -> Node<'a> {
+    if node.kind() == "decorated_definition" {
+        if let Some(def) = node.child_by_field_name("definition") {
+            return def;
+        }
+    }
+    node
 }
 
 /// Extract method behaviors, splitting match-statement cases into separate behaviors.
@@ -3177,6 +3206,71 @@ class Server {
             }),
             "expected SetPresent effect on _transport from `new Transport(...)`, got {:?}",
             connect.effects
+        );
+    }
+
+    /// GAP-005h — Python `@classmethod` / `@staticmethod` / `@property`
+    /// decorated methods are reachable. Tree-sitter-python wraps them in
+    /// `decorated_definition` whose `definition` child is the actual
+    /// `function_definition`. Pre-fix, the class-body walker filtered
+    /// strictly on `function_definition` and silently skipped decorated
+    /// methods. Surfaced by MCP-003 post-patch re-validation, where every
+    /// method on `Scope` is `@classmethod`-decorated.
+    ///
+    /// This test follows the test-methodology lesson from the GAP-005
+    /// validation round: use a realistic decorator pattern (not the
+    /// minimal example), so adjacent gaps surface in the test suite
+    /// instead of in production fixtures.
+    #[test]
+    fn extract_python_classmethod_decorated_methods_reachable() {
+        let source = r#"
+import contextvars
+
+_scope = contextvars.ContextVar("scope")
+
+class Scope:
+    @classmethod
+    def enter(cls, value):
+        _scope.set(value)
+    @classmethod
+    def leave(cls, token):
+        _scope.reset(token)
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::Python).unwrap();
+        let target = make_simple_target("Scope", &["_scope"], &["enter", "leave"]);
+        let profile = domain::get_profile("python_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        // The methods must be reachable through the @classmethod wrapper.
+        assert!(
+            result.methods.iter().any(|m| m.name == "enter"),
+            "expected `enter` (under @classmethod) to be extracted, got methods {:?}",
+            result.methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        assert!(
+            result.methods.iter().any(|m| m.name == "leave"),
+            "expected `leave` (under @classmethod) to be extracted, got methods {:?}",
+            result.methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+
+        // The end-to-end fields-AND-effects assertion: enter() must
+        // produce an IncrementCounter effect on _scope, leave() a
+        // DecrementCounter. This is the lesson from MCP-003: pure
+        // method-detection isn't enough; the effect chain through the
+        // call-summary library must also work.
+        let enter = result.methods.iter().find(|m| m.name == "enter").unwrap();
+        assert!(
+            enter.effects.iter().any(|e| {
+                e.field == "_scope"
+                    && matches!(
+                        e.effect,
+                        crate::adapter::extraction::ast_extract::call_summary::CallEffect::IncrementCounter
+                    )
+            }),
+            "expected IncrementCounter on _scope from `_scope.set(value)` \
+             inside @classmethod, got {:?}",
+            enter.effects
         );
     }
 
