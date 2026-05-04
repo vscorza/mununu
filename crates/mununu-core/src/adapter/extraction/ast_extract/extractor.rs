@@ -335,10 +335,17 @@ fn scan_module_level_state(
                         Some(r) => classify_typescript_module_rhs(parsed, &r),
                         None => {
                             // No initializer; check the type annotation for
-                            // `T | undefined` to infer Presence.
+                            // `T | undefined` to infer Presence, then fall
+                            // back to GAP-005d's class-typed-singleton
+                            // heuristic (any uppercase-typed bare decl).
                             grand
                                 .child_by_field_name("type")
                                 .and_then(|t| classify_typescript_optional_type(parsed, &t))
+                                .or_else(|| {
+                                    grand.child_by_field_name("type").and_then(|t| {
+                                        classify_typescript_class_typed_singleton(parsed, &t)
+                                    })
+                                })
                         }
                     };
                     if let Some((type_str, initial)) = classified {
@@ -429,6 +436,28 @@ fn classify_typescript_optional_type<'a>(
         return Some(("?", "None"));
     }
     None
+}
+
+/// GAP-005d: bare typed module-level declarations like
+/// `let manager: KnowledgeGraphManager;` (no initializer, no `| undefined`)
+/// indicate a singleton slot that's "absent until assigned." Treat any
+/// class-named (uppercase-leading-character) type as a `Presence` singleton.
+/// Lowercase types (`string`, `number`, `boolean`, `unknown`) are skipped
+/// to avoid flooding the model with built-in scalars that the user didn't
+/// model intentionally — those should be listed in
+/// `state_fields.abstraction_overrides` if needed.
+fn classify_typescript_class_typed_singleton<'a>(
+    parsed: &'a ParsedSource,
+    type_node: &Node<'a>,
+) -> Option<(&'static str, &'static str)> {
+    let text = parsed.node_text(type_node);
+    let stripped = text.strip_prefix(':').unwrap_or(text).trim();
+    let first = stripped.chars().next()?;
+    if first.is_ascii_uppercase() {
+        Some(("?", "None"))
+    } else {
+        None
+    }
 }
 
 /// Extract field domains from a class/struct.
@@ -550,7 +579,173 @@ fn extract_fields(
         }
     }
 
+    // GAP-005c: TypeScript constructor parameter properties — the shorthand
+    // `constructor(private foo: T) {}` declares `foo` as a class field
+    // implicitly. Tree-sitter encodes it as a `required_parameter` with an
+    // `accessibility_modifier` child, NOT as `public_field_definition` /
+    // `property_declaration`. The body walker above never reaches it
+    // because the constructor is a `method_definition`, not a field. This
+    // scan descends into the constructor and emits a field for each
+    // accessibility-modified parameter. Surfaced by MCP-005 (the
+    // `KnowledgeGraphManager(private memoryFilePath: string)` pattern).
+    //
+    // tree-sitter-typescript exposes method names and parameters as
+    // positional children of `method_definition`, not via field-names.
+    // Walk children by kind to find them robustly.
+    if parsed.language == SourceLanguage::TypeScript {
+        let mut body_cursor = body.walk();
+        for child in body.children(&mut body_cursor) {
+            if child.kind() != "method_definition" {
+                continue;
+            }
+            // Find the method name (`property_identifier`) and the
+            // `formal_parameters` child by walking children — tree-sitter-
+            // typescript exposes these positionally, not via field names.
+            let mut method_cursor = child.walk();
+            let mut is_constructor = false;
+            let mut params: Option<Node> = None;
+            for sub in child.children(&mut method_cursor) {
+                match sub.kind() {
+                    "property_identifier" => {
+                        if parsed.node_text(&sub) == "constructor" {
+                            is_constructor = true;
+                        }
+                    }
+                    "formal_parameters" => {
+                        params = Some(sub);
+                    }
+                    _ => {}
+                }
+            }
+            if !is_constructor {
+                continue;
+            }
+            let Some(params) = params else { continue };
+            let mut p_cursor = params.walk();
+            for param in params.children(&mut p_cursor) {
+                if param.kind() != "required_parameter" {
+                    continue;
+                }
+                let (name, type_str, initial, line) =
+                    extract_ts_constructor_param_property(parsed, &param);
+                let Some(name) = name else { continue };
+                if !field_names.contains(name.as_str()) {
+                    continue;
+                }
+                if fields.iter().any(|f| f.name == name) {
+                    // Already collected via the body walker (shouldn't
+                    // happen for constructor params, but defensive).
+                    continue;
+                }
+                let line = line.unwrap_or(0);
+                if let Some(fd) = build_field_domain(
+                    &name,
+                    type_str.as_deref(),
+                    initial.as_deref(),
+                    target,
+                    profile,
+                    &inferred_bounds,
+                    warnings,
+                ) {
+                    field_lines.push((name, line));
+                    fields.push(fd);
+                }
+            }
+        }
+    }
+
     (fields, field_lines)
+}
+
+/// GAP-005c: extract a TypeScript constructor parameter property
+/// (`constructor(private foo: T = init) {}`). Returns
+/// `(name, type, initial_value, line)` if the parameter has an
+/// accessibility modifier, otherwise all-None.
+///
+/// tree-sitter-typescript represents this as:
+/// ```text
+/// required_parameter
+///   accessibility_modifier "private"
+///   identifier "foo"
+///   "?"                  // optional marker (only if `foo?: T`)
+///   type_annotation
+///     ":"
+///     <type_node>
+///   "="                  // only if there's an initializer
+///   <init expr>
+/// ```
+/// Children are positional (not field-named for the most part), so this
+/// function walks them once and collects by kind.
+fn extract_ts_constructor_param_property(
+    parsed: &ParsedSource,
+    param: &Node,
+) -> (Option<String>, Option<String>, Option<String>, Option<u32>) {
+    if param.kind() != "required_parameter" {
+        return (None, None, None, None);
+    }
+
+    let mut has_modifier = false;
+    let mut name: Option<String> = None;
+    let mut type_str: Option<String> = None;
+    let mut initial: Option<String> = None;
+    let mut is_optional = false;
+    let mut seen_name = false;
+    let mut seen_assign = false;
+
+    let mut cursor = param.walk();
+    for child in param.children(&mut cursor) {
+        let kind = child.kind();
+        match kind {
+            "accessibility_modifier" | "readonly" => {
+                has_modifier = true;
+            }
+            "identifier" | "property_identifier" if !seen_name => {
+                name = Some(parsed.node_text(&child).to_string());
+                seen_name = true;
+            }
+            "type_annotation" => {
+                // type_annotation children: `:` then the actual type node.
+                let mut tcursor = child.walk();
+                let raw = child
+                    .children(&mut tcursor)
+                    .find(|c| c.kind() != ":")
+                    .map(|c| parsed.node_text(&c).to_string())
+                    .unwrap_or_else(|| parsed.node_text(&child).to_string());
+                type_str = Some(raw);
+            }
+            _ => {
+                // Detect optional `?` marker after the name.
+                if seen_name && !seen_assign && parsed.node_text(&child) == "?" {
+                    is_optional = true;
+                }
+                // After `=`, the next non-trivia child is the initializer.
+                if seen_assign && initial.is_none() {
+                    let txt = parsed.node_text(&child).trim();
+                    if !txt.is_empty() {
+                        initial = Some(txt.to_string());
+                    }
+                }
+                if parsed.node_text(&child) == "=" {
+                    seen_assign = true;
+                }
+            }
+        }
+    }
+
+    if !has_modifier {
+        // Normal parameter, not a parameter-property.
+        return (None, None, None, None);
+    }
+
+    if is_optional {
+        if let Some(t) = type_str.as_mut() {
+            if !t.ends_with('?') {
+                t.push('?');
+            }
+        }
+    }
+
+    (name, type_str, initial, Some(parsed.node_line(param)))
 }
 
 /// Build a FieldDomain from extracted field info (shared by all languages).
@@ -2825,6 +3020,130 @@ class C {
             "module-level _ctx should not be picked up by protocol_implementation \
              profile (module_level_scan=false), got {:?}",
             result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// GAP-005c — TypeScript constructor parameter property
+    /// (`constructor(private foo: T) {}`). Tree-sitter encodes this as a
+    /// `required_parameter` with an `accessibility_modifier`, NOT a
+    /// `public_field_definition`, so the body walker misses it. The
+    /// dedicated constructor scan in `extract_fields` recovers it.
+    /// Type is `boolean` (state-bearing); the MCP-005 fixture used
+    /// `string` which `mcp_server` profile maps to `Ignored` — that's a
+    /// separate, intentional behavior (strings are not auto-modeled);
+    /// users who want string fields modeled should set abstraction
+    /// overrides explicitly.
+    #[test]
+    fn extract_typescript_constructor_param_property() {
+        let source = "class C {\n    constructor(private flag: boolean) {}\n}\n";
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("C", &["flag"], &[]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        assert!(
+            result.fields.iter().any(|f| f.name == "flag"),
+            "expected `flag` constructor-param-property to be extracted, \
+             got fields {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        let flag = result.fields.iter().find(|f| f.name == "flag").unwrap();
+        assert_eq!(
+            flag.abstraction,
+            crate::adapter::domain::AbstractionType::Boolean
+        );
+    }
+
+    /// GAP-005c — non-modified constructor parameters are NOT emitted as
+    /// fields (they're just regular parameters, not parameter-properties).
+    /// Regression guard.
+    #[test]
+    fn extract_typescript_non_modified_constructor_param_not_a_field() {
+        let source = r#"
+class C {
+    constructor(plain: string) {}
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("C", &["plain"], &[]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        assert!(
+            !result.fields.iter().any(|f| f.name == "plain"),
+            "non-modified constructor parameter should NOT be a field"
+        );
+    }
+
+    /// GAP-005d — bare typed module-level declarations of class-named types
+    /// (uppercase-leading) are recognized as `Presence` singletons.
+    #[test]
+    fn extract_typescript_bare_typed_module_decl_classlike() {
+        let source = r#"
+class KnowledgeGraphManager {}
+
+let manager: KnowledgeGraphManager;
+
+class Wrapper {
+    init(): void {
+        manager = new KnowledgeGraphManager();
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("Wrapper", &["manager"], &["init"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        assert!(
+            result.fields.iter().any(|f| f.name == "manager"),
+            "expected `let manager: KnowledgeGraphManager;` to be detected as \
+             a module-level Presence singleton, got fields {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        let manager = result.fields.iter().find(|f| f.name == "manager").unwrap();
+        assert_eq!(
+            manager.abstraction,
+            crate::adapter::domain::AbstractionType::Presence
+        );
+    }
+
+    /// GAP-005d — bare typed module-level declarations of *builtin* lowercase
+    /// types (`string`, `number`, etc.) are NOT picked up. The intent is to
+    /// avoid flooding the model with built-in scalars; users who want them
+    /// should set abstraction overrides explicitly.
+    #[test]
+    fn extract_typescript_bare_typed_module_decl_builtin_skipped() {
+        let source = r#"
+let MEMORY_FILE_PATH: string;
+
+class C {
+    init(): void {
+        MEMORY_FILE_PATH = "x";
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("C", &["MEMORY_FILE_PATH"], &["init"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        // Should NOT be treated as state — `string` is a builtin, not a class.
+        assert!(
+            !result.fields.iter().any(|f| f.name == "MEMORY_FILE_PATH"),
+            "bare-typed bulitin (`string`) should NOT be detected as \
+             module-level state, got {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        // ... and the GAP-005g warning should fire because the user listed
+        // it but it wasn't found.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("MEMORY_FILE_PATH")),
+            "expected GAP-005g warning about unrecognized field, got {:?}",
+            result.warnings
         );
     }
 
