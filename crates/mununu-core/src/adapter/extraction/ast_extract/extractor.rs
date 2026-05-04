@@ -57,7 +57,7 @@ pub fn extract_target(
         .map(|s| s.as_str())
         .collect();
 
-    let (fields, field_lines) = extract_fields(
+    let (mut fields, mut field_lines) = extract_fields(
         parsed,
         &field_node,
         &field_names,
@@ -65,6 +65,26 @@ pub fn extract_target(
         profile,
         &mut warnings,
     );
+
+    // Module-level state scan (GAP-005 step 2).
+    // For domains where the most idiomatic state lives at module scope
+    // (Python `ContextVar`, JavaScript `AsyncLocalStorage`, shared `Map`/
+    // `Set` registries), walk the AST root and synthesize state fields
+    // that the class-body scan would miss. Per-target config can override
+    // the profile default.
+    let module_level_enabled = target
+        .state_fields
+        .module_level_override()
+        .unwrap_or_else(|| profile.is_some_and(|p| p.module_level_scan));
+    if module_level_enabled {
+        let (mut ml_fields, mut ml_lines) =
+            scan_module_level_state(parsed, &field_names, target, profile, &mut warnings);
+        // Dedup by name — class-scope match wins over module-scope.
+        ml_fields.retain(|f| !fields.iter().any(|existing| existing.name == f.name));
+        ml_lines.retain(|(name, _)| ml_fields.iter().any(|f| f.name == *name));
+        fields.extend(ml_fields);
+        field_lines.extend(ml_lines);
+    }
 
     // Extract methods
     let method_filter = &target.methods;
@@ -189,6 +209,207 @@ fn find_ts_class<'a>(node: &Node<'a>, parsed: &ParsedSource, class_name: &str) -
                 return Some(found);
             }
         }
+    }
+    None
+}
+
+/// Scan the AST root for module-level state-field declarations.
+///
+/// This is the GAP-005 step 2 entry point — runs in addition to the
+/// class-body field extraction when `module_level_scan` is enabled on the
+/// active domain profile (or explicitly opted-in via
+/// `state_fields.module_level: true`). It catches the patterns
+/// where state lives outside `self.*` / `this.*`:
+///
+/// - **Python**: top-level `expression_statement` containing an assignment
+///   whose RHS is `contextvars.ContextVar(...)`, `dict()`/`{}`, or
+///   `set()` — synthesized as a `BoundedCounter` state field for the
+///   `python_server` profile (token-sequence depth or collection
+///   cardinality, both abstracted as bounded counters).
+/// - **TypeScript**: top-level `lexical_declaration` (const/let) whose
+///   RHS is `new AsyncLocalStorage(...)`, `new Map(...)`, or
+///   `new Set(...)` — same `BoundedCounter` synthesis. The
+///   `mcp_server` profile's `optional_default: Presence` already
+///   handles `let _t: T | undefined`, so the type-string is forwarded
+///   through `infer_abstraction` for that case.
+///
+/// A discovered field is only added when its name appears in the
+/// target's `state_fields.include` list. This preserves the existing
+/// "user lists what they care about" convention; the module-level scan
+/// just lets the user list module-scope names alongside instance-scope
+/// names without the extractor needing two separate config knobs.
+fn scan_module_level_state(
+    parsed: &ParsedSource,
+    field_names: &HashSet<&str>,
+    target: &TargetConfig,
+    profile: Option<&DomainProfile>,
+    warnings: &mut Vec<String>,
+) -> (Vec<FieldDomain>, Vec<(String, u32)>) {
+    let mut fields = Vec::new();
+    let mut field_lines = Vec::new();
+    let inferred_bounds = infer_counter_bounds_from_source(&parsed.source, field_names);
+
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+
+    match parsed.language {
+        SourceLanguage::Python => {
+            for child in root.children(&mut cursor) {
+                // Module-level: `_NAME = <RHS>`
+                if child.kind() != "expression_statement" {
+                    continue;
+                }
+                let mut inner = child.walk();
+                for grand in child.children(&mut inner) {
+                    if grand.kind() != "assignment" {
+                        continue;
+                    }
+                    let lhs = grand.child_by_field_name("left");
+                    let rhs = grand.child_by_field_name("right");
+                    let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+                        continue;
+                    };
+                    if lhs.kind() != "identifier" {
+                        continue;
+                    }
+                    let name = parsed.node_text(&lhs).to_string();
+                    if !field_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    if let Some((type_str, initial)) = classify_python_module_rhs(parsed, &rhs) {
+                        if let Some(fd) = build_field_domain(
+                            &name,
+                            Some(type_str),
+                            Some(initial),
+                            target,
+                            profile,
+                            &inferred_bounds,
+                            warnings,
+                        ) {
+                            field_lines.push((name.clone(), parsed.node_line(&grand)));
+                            fields.push(fd);
+                        }
+                    }
+                }
+            }
+        }
+        SourceLanguage::TypeScript => {
+            for child in root.children(&mut cursor) {
+                // Module-level: `const NAME = <RHS>` / `let NAME = <RHS>`
+                if child.kind() != "lexical_declaration" && child.kind() != "variable_declaration" {
+                    continue;
+                }
+                let mut inner = child.walk();
+                for grand in child.children(&mut inner) {
+                    if grand.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let name_node = grand.child_by_field_name("name");
+                    let rhs = grand.child_by_field_name("value");
+                    let Some(name_node) = name_node else { continue };
+                    if name_node.kind() != "identifier" {
+                        continue;
+                    }
+                    let name = parsed.node_text(&name_node).to_string();
+                    if !field_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    let classified = match rhs {
+                        Some(r) => classify_typescript_module_rhs(parsed, &r),
+                        None => {
+                            // No initializer; check the type annotation for
+                            // `T | undefined` to infer Presence.
+                            grand
+                                .child_by_field_name("type")
+                                .and_then(|t| classify_typescript_optional_type(parsed, &t))
+                        }
+                    };
+                    if let Some((type_str, initial)) = classified {
+                        if let Some(fd) = build_field_domain(
+                            &name,
+                            Some(type_str),
+                            Some(initial),
+                            target,
+                            profile,
+                            &inferred_bounds,
+                            warnings,
+                        ) {
+                            field_lines.push((name.clone(), parsed.node_line(&grand)));
+                            fields.push(fd);
+                        }
+                    }
+                }
+            }
+        }
+        // Module-level scanning is intentionally not supported for Rust
+        // and the other languages — module-scope state is uncommon in
+        // those domains and the profiles default `module_level_scan: false`.
+        _ => {}
+    }
+
+    (fields, field_lines)
+}
+
+/// Classify a Python module-level assignment's RHS into (type_str, initial)
+/// suitable for `build_field_domain`. Returns None if the RHS doesn't match
+/// a known module-level state pattern.
+fn classify_python_module_rhs<'a>(
+    parsed: &'a ParsedSource,
+    rhs: &Node<'a>,
+) -> Option<(&'static str, &'static str)> {
+    let text = parsed.node_text(rhs);
+    // contextvars.ContextVar("name", default=...) — token-sequence depth
+    if rhs.kind() == "call" && text.contains("ContextVar(") {
+        return Some(("dict", "0"));
+    }
+    // `{}` or `set()` or `dict()` — collection cardinality
+    if rhs.kind() == "dictionary" || text == "{}" {
+        return Some(("dict", "0"));
+    }
+    if rhs.kind() == "set" || text == "set()" {
+        return Some(("set", "0"));
+    }
+    if rhs.kind() == "call" && (text.starts_with("dict(") || text.starts_with("set(")) {
+        return Some(("dict", "0"));
+    }
+    None
+}
+
+/// Classify a TypeScript module-level assignment's RHS into
+/// (type_str, initial). Returns None for non-state RHS.
+fn classify_typescript_module_rhs<'a>(
+    parsed: &'a ParsedSource,
+    rhs: &Node<'a>,
+) -> Option<(&'static str, &'static str)> {
+    if rhs.kind() != "new_expression" {
+        return None;
+    }
+    let constructor = rhs.child_by_field_name("constructor")?;
+    let cname = parsed.node_text(&constructor);
+    // `new AsyncLocalStorage<X>()` — run-context depth
+    if cname == "AsyncLocalStorage" {
+        return Some(("dict", "0"));
+    }
+    // `new Map(...)` / `new Set(...)` — collection cardinality
+    if cname == "Map" || cname == "Set" {
+        return Some(("dict", "0"));
+    }
+    // `new WeakMap(...)` / `new WeakSet(...)` — same
+    if cname == "WeakMap" || cname == "WeakSet" {
+        return Some(("dict", "0"));
+    }
+    None
+}
+
+/// If a TypeScript type annotation is `T | undefined`, return ("?", "None")
+/// so build_field_domain routes to `optional_default` (Presence).
+fn classify_typescript_optional_type<'a>(
+    parsed: &'a ParsedSource,
+    type_node: &Node<'a>,
+) -> Option<(&'static str, &'static str)> {
+    let text = parsed.node_text(type_node);
+    if text.contains("undefined") || text.ends_with('?') {
+        return Some(("?", "None"));
     }
     None
 }
@@ -2471,6 +2692,103 @@ class C {
         assert_eq!(
             started.abstraction,
             crate::adapter::domain::AbstractionType::Boolean
+        );
+    }
+
+    /// GAP-005 step 2 — Python module-level `ContextVar` is detected when the
+    /// `python_server` profile's `module_level_scan` is enabled (the default).
+    #[test]
+    fn extract_python_module_level_contextvar() {
+        let source = r#"
+import contextvars
+
+_scope = contextvars.ContextVar("scope")
+
+class Scope:
+    def __init__(self):
+        pass
+    def enter(self):
+        _scope.set("inside")
+    def leave(self):
+        _scope.reset(None)
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::Python).unwrap();
+        let target = make_simple_target("Scope", &["_scope"], &["enter", "leave"]);
+        let profile = domain::get_profile("python_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        let scope = result.fields.iter().find(|f| f.name == "_scope");
+        assert!(
+            scope.is_some(),
+            "expected module-level _scope to be detected, got fields {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scope.unwrap().abstraction,
+            crate::adapter::domain::AbstractionType::BoundedCounter
+        );
+    }
+
+    /// GAP-005 step 2 — TypeScript module-level `new AsyncLocalStorage(...)`
+    /// is detected when the `mcp_server` profile is active.
+    #[test]
+    fn extract_typescript_module_level_async_local_storage() {
+        let source = r#"
+const _ctx = new AsyncLocalStorage<string>();
+
+class Runner {
+    run(value: string): void {
+        _ctx.run(value, () => {});
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("Runner", &["_ctx"], &["run"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        let ctx = result.fields.iter().find(|f| f.name == "_ctx");
+        assert!(
+            ctx.is_some(),
+            "expected module-level _ctx to be detected, got fields {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx.unwrap().abstraction,
+            crate::adapter::domain::AbstractionType::BoundedCounter
+        );
+    }
+
+    /// GAP-005 step 2 — regression guard: profiles with
+    /// `module_level_scan: false` (e.g., `protocol_implementation`) do NOT
+    /// pick up module-level state, even if the language pattern would
+    /// otherwise match.
+    #[test]
+    fn extract_module_level_disabled_in_other_profiles() {
+        let source = r#"
+const _ctx = new Map();
+
+class C {
+    public set(): void {
+        _ctx.set("k", "v");
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("C", &["_ctx"], &["set"]);
+        // protocol_implementation has module_level_scan = false
+        let profile = domain::get_profile("protocol_implementation");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        // _ctx must NOT appear because this profile's module_level_scan is off.
+        assert!(
+            !result.fields.iter().any(|f| f.name == "_ctx"),
+            "module-level _ctx should not be picked up by protocol_implementation \
+             profile (module_level_scan=false), got {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
         );
     }
 }

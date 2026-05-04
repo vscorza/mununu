@@ -110,6 +110,16 @@ impl StateFieldsConfig {
             StateFieldsConfig::Detailed(d) => d.abstraction_overrides.get(field),
         }
     }
+
+    /// Whether the user explicitly opted in/out of module-level state
+    /// scanning for this target. `None` means "use the domain profile's
+    /// `module_level_scan` default."
+    pub fn module_level_override(&self) -> Option<bool> {
+        match self {
+            StateFieldsConfig::Simple(_) => None,
+            StateFieldsConfig::Detailed(d) => d.module_level,
+        }
+    }
 }
 
 /// Detailed state fields configuration.
@@ -120,6 +130,13 @@ pub struct StateFieldsDetailed {
     /// Abstraction overrides per field.
     #[serde(default)]
     pub abstraction_overrides: HashMap<String, AbstractionConfig>,
+    /// Per-target opt-in/out for module-level state scanning. When set,
+    /// overrides the domain profile's `module_level_scan` default.
+    /// `Some(true)` enables scanning even on profiles where it's off by
+    /// default; `Some(false)` disables it on profiles where it's on.
+    /// `None` (the default) defers to the profile.
+    #[serde(default)]
+    pub module_level: Option<bool>,
 }
 
 /// How to abstract a state field.

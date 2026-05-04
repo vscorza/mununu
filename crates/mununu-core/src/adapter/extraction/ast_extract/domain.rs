@@ -26,6 +26,13 @@ pub struct DomainProfile {
     pub label_naming: LabelNaming,
     /// Whether to add noop self-loops on all states.
     pub add_noop_self_loops: bool,
+    /// Whether the extractor should scan module-level (top-level)
+    /// declarations for state fields in addition to instance attributes.
+    /// Profiles where this is `true`: `mcp_server`, `python_server` —
+    /// because TS `AsyncLocalStorage` / Python `ContextVar` patterns are
+    /// idiomatic in those domains. Per-target config can override via
+    /// `state_fields.module_level: bool`.
+    pub module_level_scan: bool,
 }
 
 /// Rules for determining whether a method is controllable.
@@ -238,6 +245,7 @@ static PROFILES: &[DomainProfile] = &[
         },
         label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
+        module_level_scan: true,
     },
     // Protocol Implementation (Rust)
     DomainProfile {
@@ -267,6 +275,7 @@ static PROFILES: &[DomainProfile] = &[
         },
         label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
+        module_level_scan: false,
     },
     // Python Server
     DomainProfile {
@@ -295,6 +304,7 @@ static PROFILES: &[DomainProfile] = &[
         },
         label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
+        module_level_scan: true,
     },
     // Hardware RTL
     DomainProfile {
@@ -324,6 +334,7 @@ static PROFILES: &[DomainProfile] = &[
         },
         label_naming: LabelNaming { prefix: "" },
         add_noop_self_loops: false,
+        module_level_scan: false,
     },
     // Game FSM (GDScript / Godot)
     DomainProfile {
@@ -371,6 +382,7 @@ static PROFILES: &[DomainProfile] = &[
         },
         label_naming: LabelNaming { prefix: "ev_" },
         add_noop_self_loops: true,
+        module_level_scan: false,
     },
 ];
 
