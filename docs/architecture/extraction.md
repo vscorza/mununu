@@ -139,3 +139,114 @@ This test covers:
 4. **SystemVerilog** (`handshake.sv`): Native adapter. Property `safety` HOLDS.
 
 All property violations are intentional — they demonstrate the tool's ability to detect missing guards in real code patterns.
+
+## Compositional extraction
+
+Single-class extraction produces one automaton from one source class. **Compositional extraction** stitches multiple instances of one or more classes into a multi-automaton model, applying per-instance label rewriting so the existing CLTS composition engine can interleave them correctly.
+
+### When to use it
+
+The canonical use case is **concurrency / race-condition modeling**: N workers contending for one shared resource. Most agentic and MCP-server bugs that show up in the prospector backlog have this shape — MCP-001 (LangGraph parallel-interrupt = 2 ToolCalls + 1 ToolNode), MCP-002 (langgraphjs AsyncLocalStorage = 2 Workers + 1 Provider), MCP-005 (mcp-server-memory file race = 2 Workers + 1 file). Pre-compositional-extraction these were hand-modeled.
+
+### Configuration
+
+Add an `instances` and (optionally) `shared` field to the `composition` block in the extract config:
+
+```json
+{
+  "$schema": "extraction_config_v1",
+  "domain": "mcp_server",
+  "language": "typescript",
+  "source": { "file": "src/memory/index.ts" },
+  "targets": [
+    { "class": "KnowledgeGraphManager", "state_fields": ["state"], "methods": { "include": ["load", "save"] } }
+  ],
+  "composition": {
+    "type": "asynchronous",
+    "name": "memory_write_race",
+    "instances": [
+      { "of": "KnowledgeGraphManager", "as": "worker_a" },
+      { "of": "KnowledgeGraphManager", "as": "worker_b" }
+    ],
+    "shared": ["ev_save"]
+  }
+}
+```
+
+The `instances` array declares the topology. Each entry has `of` (class name to scan, must match a `target.class`) and `as` (instance name, becomes the automaton id). The `shared` array names the labels that synchronize across instances.
+
+### Label rewriting semantics
+
+For each instance `<name>` of class `<C>`:
+
+1. Run single-class extraction on `<C>` (the existing post-GAP-005 pipeline, unchanged).
+2. Set the resulting automaton's id to `<name>`.
+3. Rewrite every label `L` to `<name>__<L>`, **except** labels listed in `composition.shared`. Shared labels are kept verbatim across all instances.
+
+The composition engine at [crates/mununu-core/src/composition/mod.rs](../../crates/mununu-core/src/composition/mod.rs) already enforces the rest: shared labels (alphabet intersection) fire jointly across instances; disjoint labels interleave. **Prefix-by-default makes the safe choice (independence) the no-config behavior** — users opt in to synchronization by listing labels.
+
+### Worked example: MCP-005 file race
+
+For the `KnowledgeGraphManager` class with methods `load` and `save`, the config above produces:
+
+| Instance | Labels |
+|---|---|
+| `worker_a` | `worker_a__ev_load`, `ev_save` (shared) |
+| `worker_b` | `worker_b__ev_load`, `ev_save` (shared) |
+
+The composition's alphabet intersection is `{ev_save}` — the synchronization point. The async-composition engine interleaves the prefixed `*__ev_load` labels (worker-internal work) and forces both workers' `ev_save` to fire jointly, producing the canonical race topology.
+
+### Important notes
+
+- **The label prefix from the domain profile applies first.** The `mcp_server` profile prefixes events with `ev_`, so `composition.shared` should list `ev_save` (not `save`). The label-rewriting comparison uses the post-prefix label name.
+- **`noop` is never shared.** The state-space engine adds noop self-loops to keep states reachable; if they synchronized across instances, no instance could ever progress independently. The rewriter explicitly excludes `noop` from sharing regardless of the user's `shared` list.
+- **Class-to-instance lookup is by name.** Each `instance.of` must match a `target.class` declared in the same config. An instance referencing an unknown class is a hard error, not a silent skip.
+- **The `members` field of the resulting espec is auto-populated from the resolved instance names** — users don't write it manually when using `instances`.
+
+### CLI / API access
+
+```bash
+# CLI: extract using a compositional config (no new flags needed)
+mununu-extract ast manager_compose.extract.json --source src/memory/index.ts \
+  --output composed.espec.json
+
+# CLI: list supported composition modes inline
+mununu-extract ast --list-composition-modes /dev/null --source /dev/null
+
+# API: same shape as single-class extraction
+curl -X POST http://localhost:8080/api/v1/extraction/extract \
+  -H "Content-Type: application/json" \
+  -d '{"config": "...", "source": "...", "language": "typescript"}'
+
+# API: list composition modes
+curl http://localhost:8080/api/v1/extraction/composition-modes
+```
+
+### Concurrency property templates
+
+Five concurrency-specific property templates ship in the agentic / universal domains for use over compositional extractions:
+
+| Template | Use |
+|---|---|
+| `no_clobber` | Safety: shared resource never enters a corrupt state. |
+| `clobber_reachable` | Liveness witness: corruption state is reachable. Pair with `no_clobber` to confirm the safety property is non-vacuous. |
+| `mutual_exclusion_3` | 3-way pairwise exclusion. (`mutual_exclusion` already covers 2-way.) |
+| `bounded_handoff` | Handoff request is eventually completed. |
+| `no_lost_update` | Every started write becomes externally visible. |
+
+List them: `mununu templates --domain agentic`.
+
+### Verification end-to-end
+
+After extraction, the composition is verified with the existing toolchain:
+
+```bash
+mununu context eval composed.espec.json --formula no_clobber --automaton memory_write_race
+mununu context eval composed.espec.json --formula clobber_reachable --automaton memory_write_race
+```
+
+The verdicts confirm the bug witness. For MCP-005, `no_clobber` fails (0/1 initials) and `clobber_reachable` holds (1/1) — the race is reachable.
+
+### Out of scope (Phase B follow-up)
+
+This document covers Phase A — manual configuration. Pattern-based auto-detection (recognize `asyncio.gather`, `multiprocessing.Process`, `Promise.all` in source and synthesize the `instances` + `shared` declarations automatically) is filed as future work. It requires data-flow analysis the current cursor-walk doesn't do.
