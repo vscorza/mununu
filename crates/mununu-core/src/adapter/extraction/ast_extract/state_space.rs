@@ -60,6 +60,9 @@ pub struct DerivedAutomaton {
     pub transitions: Vec<DerivedTransition>,
     /// Controllable labels.
     pub controllable_labels: Vec<String>,
+    /// Diagnostic warnings produced during derivation (degenerate model,
+    /// state-space size hints). Empty for typical extractions.
+    pub warnings: Vec<String>,
 }
 
 /// A derived state.
@@ -122,6 +125,7 @@ pub fn derive_automaton(
                 states: vec![],
                 transitions: vec![],
                 controllable_labels: vec![],
+                warnings: vec![],
             };
         }
         if estimated > STATE_SPACE_WARN_THRESHOLD {
@@ -141,6 +145,7 @@ pub fn derive_automaton(
             states: vec![],
             transitions: vec![],
             controllable_labels: vec![],
+            warnings: vec![],
         };
     }
 
@@ -231,11 +236,30 @@ pub fn derive_automaton(
         .filter(|t| reachable.contains(&t.from) && reachable.contains(&t.to))
         .collect();
 
+    let mut warnings = Vec::new();
+    let non_noop_transitions = reachable_transitions
+        .iter()
+        .filter(|t| t.label != "noop")
+        .count();
+    if reachable_states.len() <= 1 && non_noop_transitions == 0 {
+        warnings.push(format!(
+            "[mununu] WARN: automaton '{}' is degenerate ({} states, {} non-noop transitions). \
+             Likely cause: state lives outside `self.*` / `this.*` (module-level ContextVar / \
+             AsyncLocalStorage / shared handles, or in fields not currently scanned by the \
+             extractor — abstract class, private with `?`, dataclass). Consider listing the \
+             missing fields in state_fields.include or enabling state_fields.module_level.",
+            automaton_name,
+            reachable_states.len(),
+            non_noop_transitions,
+        ));
+    }
+
     DerivedAutomaton {
         name: automaton_name.to_string(),
         states: reachable_states,
         transitions: reachable_transitions,
         controllable_labels,
+        warnings,
     }
 }
 
@@ -653,5 +677,129 @@ mod tests {
         // the warning didn't short-circuit) and the state count fits.
         // 2^13 with no transitions becomes 1 reachable state after pruning.
         assert!(!automaton.states.is_empty());
+    }
+
+    /// GAP-005 step 0 — degenerate-model warning fires on a 1-state / 0-transition
+    /// derivation. This is the canonical "extractor only saw `self.*` and missed
+    /// module-level state" outcome.
+    #[test]
+    fn degenerate_model_emits_warning() {
+        // One bool field, no methods — produces a single reachable state with
+        // no non-noop transitions.
+        let fields = [bool_field("only_field", false)];
+        let automaton = derive_automaton(
+            "Degenerate",
+            &fields,
+            &[],
+            &HashMap::new(),
+            "ev_",
+            false, // no noop self-loops, so transitions count is genuinely 0
+        );
+        assert_eq!(automaton.states.len(), 1, "expected 1 reachable state");
+        assert_eq!(
+            automaton.transitions.len(),
+            0,
+            "expected 0 transitions for a degenerate model"
+        );
+        assert_eq!(
+            automaton.warnings.len(),
+            1,
+            "expected exactly one degenerate-model warning"
+        );
+        assert!(
+            automaton.warnings[0].contains("degenerate"),
+            "warning should mention 'degenerate', got: {}",
+            automaton.warnings[0]
+        );
+        assert!(
+            automaton.warnings[0].contains("Degenerate"),
+            "warning should reference the automaton name 'Degenerate', got: {}",
+            automaton.warnings[0]
+        );
+    }
+
+    /// GAP-005 step 0 — non-degenerate models produce no degenerate warning.
+    /// Regression guard: ensure the warning doesn't fire on healthy automata.
+    #[test]
+    fn non_degenerate_emits_no_warning() {
+        let fields = [bool_field("started", false), bool_field("closed", false)];
+        let methods = [
+            MethodBehavior {
+                name: "start".to_string(),
+                guards: vec![Guard {
+                    field: "started".to_string(),
+                    condition: CallGuard::MustBeFalse,
+                }],
+                effects: vec![Effect {
+                    field: "started".to_string(),
+                    effect: CallEffect::SetTrue,
+                    value: None,
+                }],
+                controllable: true,
+                line_start: None,
+                line_end: None,
+            },
+            MethodBehavior {
+                name: "close".to_string(),
+                guards: vec![Guard {
+                    field: "closed".to_string(),
+                    condition: CallGuard::MustBeFalse,
+                }],
+                effects: vec![Effect {
+                    field: "closed".to_string(),
+                    effect: CallEffect::SetTrue,
+                    value: None,
+                }],
+                controllable: true,
+                line_start: None,
+                line_end: None,
+            },
+        ];
+        let automaton = derive_automaton(
+            "Lifecycle",
+            &fields,
+            &methods,
+            &HashMap::new(),
+            "ev_",
+            false,
+        );
+        assert!(
+            automaton.states.len() > 1,
+            "expected multi-state automaton, got {}",
+            automaton.states.len()
+        );
+        assert!(
+            !automaton.transitions.is_empty(),
+            "expected at least one transition"
+        );
+        assert!(
+            automaton.warnings.is_empty(),
+            "expected no warnings for non-degenerate automaton, got: {:?}",
+            automaton.warnings
+        );
+    }
+
+    /// GAP-005 step 0 — noop self-loops don't suppress the degenerate warning.
+    /// A 1-state automaton with only noop self-loops is still degenerate from
+    /// the user's perspective (no real behavior captured); the count of
+    /// non-noop transitions is what matters.
+    #[test]
+    fn degenerate_with_noop_self_loops_still_warns() {
+        let fields = [bool_field("only_field", false)];
+        let automaton = derive_automaton(
+            "DegenerateWithNoops",
+            &fields,
+            &[],
+            &HashMap::new(),
+            "ev_",
+            true, // noop self-loops enabled
+        );
+        // Noop self-loop adds 1 transition per state, but they shouldn't
+        // mask the degenerate condition.
+        assert!(
+            !automaton.warnings.is_empty(),
+            "noop-only automaton should still trigger the degenerate warning"
+        );
+        assert!(automaton.warnings[0].contains("degenerate"));
     }
 }

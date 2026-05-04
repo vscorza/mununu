@@ -101,6 +101,17 @@ pub fn extract_from_source(
 
         all_automata.push(automaton_def);
         all_warnings.extend(extracted.warnings);
+        all_warnings.extend(derived.warnings);
+    }
+
+    // Surface accumulated warnings to stderr. Mirrors the existing
+    // `eprintln!` pattern used by the state-space size guards in
+    // `state_space::derive_automaton`.
+    for warning in &all_warnings {
+        eprintln!("{warning}");
+    }
+    if !all_warnings.is_empty() {
+        eprintln!("Extracted with {} warnings.", all_warnings.len());
     }
 
     let context_name = config.context_name.clone().unwrap_or_else(|| {
