@@ -2011,6 +2011,17 @@ fn resolve_receiver_to_field<'a>(
                 return Some(field);
             }
         }
+        // GAP-005 step 3: bare-identifier receiver. For module-level state
+        // (`_scope.set(...)`, `_ctx.run(...)`), the receiver is just the
+        // field name with no `this.` / `self.` prefix. Match if the bare
+        // identifier appears in `field_names`. This is gated implicitly by
+        // the user's `state_fields.include` list — only names the user
+        // declared as state are eligible, so a local variable named
+        // `_scope` shadowing a module-level name would only resolve here
+        // if the user explicitly listed `_scope` as state.
+        if stripped == field || trimmed == field {
+            return Some(field);
+        }
     }
     None
 }
@@ -2087,8 +2098,16 @@ fn extract_effect_from_assignment(
                 "0" => (CallEffect::ResetToZero, None),
                 "None" | "undefined" | "null" => (CallEffect::SetAbsent, None),
                 _ => {
+                    // GAP-005 step 3: constructor calls (`new Foo(args)`) on
+                    // the RHS are treated as a "set present" mutation. Without
+                    // this, `this._transport = new Transport(opts)` (the
+                    // canonical MCP-004 pattern) classified as `Unknown` and
+                    // produced no observable transition.
+                    if right_text.starts_with("new ") && right_text.contains('(') {
+                        (CallEffect::SetPresent, None)
+                    }
                     // Check for increment patterns: field + 1, field += 1
-                    if right_text.contains("+") && right_text.contains("1") {
+                    else if right_text.contains("+") && right_text.contains("1") {
                         (CallEffect::IncrementCounter, None)
                     } else if right_text.contains("-") && right_text.contains("1") {
                         (CallEffect::DecrementCounter, None)
@@ -2789,6 +2808,75 @@ class C {
             "module-level _ctx should not be picked up by protocol_implementation \
              profile (module_level_scan=false), got {:?}",
             result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// GAP-005 step 3 — constructor calls on the RHS produce SetPresent.
+    /// Pre-fix: `this._transport = new Transport(opts)` classified as
+    /// CallEffect::Unknown and contributed nothing to the model.
+    #[test]
+    fn extract_constructor_call_as_set_present() {
+        let source = r#"
+class Server {
+    private _transport?: Transport;
+
+    connect(t: Transport): void {
+        this._transport = new Transport(t);
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("Server", &["_transport"], &["connect"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        let connect = result.methods.iter().find(|m| m.name == "connect").unwrap();
+        assert!(
+            connect.effects.iter().any(|e| {
+                e.field == "_transport"
+                    && matches!(
+                        e.effect,
+                        crate::adapter::extraction::ast_extract::call_summary::CallEffect::SetPresent
+                    )
+            }),
+            "expected SetPresent effect on _transport from `new Transport(...)`, got {:?}",
+            connect.effects
+        );
+    }
+
+    /// GAP-005 step 3 — bare-identifier receivers (module-level state)
+    /// resolve to the corresponding field. Pre-fix: `_ctx.set(k, v)` had
+    /// receiver `_ctx`, which `resolve_receiver_to_field` rejected because
+    /// it only matched `this.<field>` / `self.<field>`.
+    #[test]
+    fn extract_bare_receiver_resolves_to_module_level_field() {
+        let source = r#"
+const _ctx = new Map();
+
+class C {
+    add(): void {
+        _ctx.set("k", "v");
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("C", &["_ctx"], &["add"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        let add = result.methods.iter().find(|m| m.name == "add").unwrap();
+        // Map.set on a bounded-counter abstraction is IncrementCounter
+        // per the call-summary library.
+        assert!(
+            add.effects.iter().any(|e| {
+                e.field == "_ctx"
+                    && matches!(
+                        e.effect,
+                        crate::adapter::extraction::ast_extract::call_summary::CallEffect::IncrementCounter
+                    )
+            }),
+            "expected IncrementCounter on _ctx via bare-receiver resolution, got {:?}",
+            add.effects
         );
     }
 }
