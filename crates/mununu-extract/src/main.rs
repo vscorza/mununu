@@ -44,6 +44,13 @@ enum Command {
         /// List available domain profiles and exit.
         #[arg(long)]
         list_domains: bool,
+
+        /// List supported composition modes (synchronous / asynchronous)
+        /// with one-line semantics, then exit. Mirrors `--list-domains`.
+        /// Useful when authoring a `composition.type` field in an
+        /// extract config and wanting to know the trade-offs.
+        #[arg(long)]
+        list_composition_modes: bool,
     },
 
     /// Extract reactive system from CIRCT MLIR output.
@@ -85,12 +92,14 @@ fn main() {
             output,
             language,
             list_domains,
+            list_composition_modes,
         } => run_ast(
             &config,
             &source,
             output.as_deref(),
             language.as_deref(),
             list_domains,
+            list_composition_modes,
         ),
         Command::Circt { input, output } => run_circt(input.as_deref(), output.as_deref()),
         Command::Llvm {
@@ -112,6 +121,7 @@ fn run_ast(
     output: Option<&std::path::Path>,
     language: Option<&str>,
     list_domains: bool,
+    list_composition_modes: bool,
 ) -> Result<(), String> {
     if list_domains {
         println!("Available domain profiles:");
@@ -119,6 +129,21 @@ fn run_ast(
             let profile = ast_extract::domain::get_profile(name).unwrap();
             println!("  {name:30} — {}", profile.description);
         }
+        return Ok(());
+    }
+
+    if list_composition_modes {
+        println!("Available composition modes:");
+        println!(
+            "  synchronous   — Shared-alphabet labels fire jointly across instances; \n\
+             \x20                independent labels collapse into a single joint step."
+        );
+        println!(
+            "  asynchronous  — Shared-alphabet labels fire jointly; independent labels \n\
+             \x20                interleave in either order without fairness constraints. \n\
+             \x20                Sound for safety; unsound for liveness without explicit \n\
+             \x20                fairness assumptions."
+        );
         return Ok(());
     }
 

@@ -587,6 +587,21 @@ pub struct DomainProfileInfo {
     pub description: String,
 }
 
+/// Response for listing supported composition modes (sync vs async).
+/// Surfaces the same options the espec / extract config accepts in
+/// `composition.type`. Mirrors the shape of `ExtractionDomainsResponse`.
+#[derive(Debug, Serialize)]
+pub struct CompositionModesResponse {
+    pub modes: Vec<CompositionModeInfo>,
+}
+
+/// Description of one composition mode.
+#[derive(Debug, Serialize)]
+pub struct CompositionModeInfo {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
 /// Request for AST-based extraction from source code.
 #[derive(Debug, Deserialize)]
 pub struct ExtractionExtractRequest {

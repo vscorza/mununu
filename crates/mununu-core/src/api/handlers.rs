@@ -1168,6 +1168,28 @@ pub async fn extraction_domains_handler()
     Ok(Json(super::models::ExtractionDomainsResponse { profiles }))
 }
 
+/// List the supported composition modes consumed by `composition.type`
+/// in the extract config / espec. Static — derived from the
+/// `CompositionSemantics` enum's variants and their soundness notes.
+pub async fn extraction_composition_modes_handler()
+-> ApiResult<Json<super::models::CompositionModesResponse>> {
+    let modes = vec![
+        super::models::CompositionModeInfo {
+            name: "synchronous",
+            description: "Shared-alphabet labels fire jointly across instances; \
+                          independent labels collapse into a single joint step.",
+        },
+        super::models::CompositionModeInfo {
+            name: "asynchronous",
+            description: "Shared-alphabet labels fire jointly; independent labels \
+                          interleave in either order without fairness constraints. \
+                          Sound for safety; unsound for liveness without explicit \
+                          fairness assumptions.",
+        },
+    ];
+    Ok(Json(super::models::CompositionModesResponse { modes }))
+}
+
 /// Extract a model from source code using the AST-based extraction pipeline.
 ///
 /// Requires the `ast-extract` feature flag.
@@ -1667,5 +1689,97 @@ mod controller_mode_tests {
             }
             _ => panic!("expected BadRequest, got {err:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod composition_modes_handler_tests {
+    use super::*;
+
+    /// Smoke test for the new `/api/v1/extraction/composition-modes`
+    /// endpoint. Confirms both modes are present, in the expected order,
+    /// with non-empty descriptions.
+    #[tokio::test]
+    async fn composition_modes_handler_returns_both_modes() {
+        let response = extraction_composition_modes_handler()
+            .await
+            .expect("handler should not error");
+        let Json(body) = response;
+        assert_eq!(body.modes.len(), 2);
+        assert_eq!(body.modes[0].name, "synchronous");
+        assert_eq!(body.modes[1].name, "asynchronous");
+        assert!(!body.modes[0].description.is_empty());
+        assert!(!body.modes[1].description.is_empty());
+        // The async description carries the soundness caveat — sound for
+        // safety / unsound for liveness — which is the key thing UI users
+        // need to see when picking a mode.
+        assert!(body.modes[1].description.contains("liveness"));
+    }
+}
+
+#[cfg(all(test, feature = "ast-extract"))]
+mod compositional_extract_handler_tests {
+    use super::*;
+    use crate::api::models::ExtractionExtractRequest;
+
+    /// End-to-end smoke test for the existing `/api/v1/extraction/extract`
+    /// endpoint with a compositional config. The endpoint passes the
+    /// schema through to `extract_from_source`, so the new
+    /// `composition.instances` + `composition.shared` fields flow through
+    /// transparently — but a regression here would be invisible without
+    /// an explicit test, so we add one.
+    #[tokio::test]
+    async fn extraction_extract_handler_handles_composition() {
+        let config = serde_json::json!({
+            "$schema": "extraction_config_v1",
+            "domain": "mcp_server",
+            "language": "typescript",
+            "source": { "file": "test.ts" },
+            "targets": [
+                {
+                    "class": "Worker",
+                    "state_fields": ["state"],
+                    "methods": { "include": ["save"] }
+                }
+            ],
+            "composition": {
+                "type": "asynchronous",
+                "name": "race",
+                "instances": [
+                    { "of": "Worker", "as": "worker_a" },
+                    { "of": "Worker", "as": "worker_b" }
+                ],
+                "shared": ["ev_save"]
+            }
+        });
+        let source = "class Worker {\n    private state: boolean = false;\n    public save(): void { this.state = true; }\n}\n";
+        let req = ExtractionExtractRequest {
+            config: config.to_string(),
+            source: source.to_string(),
+            language: Some("typescript".to_string()),
+        };
+        let response = extraction_extract_handler(Json(req))
+            .await
+            .expect("handler should succeed");
+        let Json(body) = response;
+        assert!(body.success);
+        // The espec response carries the JSON-serialized
+        // ExtractionSpec; deserialize and assert the composition shape.
+        let spec: serde_json::Value =
+            serde_json::from_str(&body.espec).expect("espec should be valid JSON");
+        let automata = spec["model_config"]["automata"]
+            .as_array()
+            .expect("automata should be an array");
+        assert_eq!(automata.len(), 2, "expected 2 instance automata");
+        assert_eq!(automata[0]["id"], "worker_a");
+        assert_eq!(automata[1]["id"], "worker_b");
+        let comp = &spec["model_config"]["composition"];
+        assert_eq!(comp["type"], "asynchronous");
+        let members = comp["members"]
+            .as_array()
+            .expect("members should be an array");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], "worker_a");
+        assert_eq!(members[1], "worker_b");
     }
 }
