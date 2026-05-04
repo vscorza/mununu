@@ -206,6 +206,145 @@
         "rtl": { "STATE": "e.g., state_IDLE", "LABEL": "e.g., data_out" }
       },
       "tags": ["safety", "guard", "access-control"]
+    },
+    {
+      "id": "no_clobber",
+      "display_name": "No Clobber (Compositional)",
+      "description": "A shared resource never enters a corrupt state under concurrent access. Pairs with `clobber_reachable` for a non-vacuous witness — always ship both together so a passing safety verdict isn't trivially satisfied by an empty model.",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["agentic", "universal"],
+      "params": [
+        {
+          "name": "RESOURCE_CORRUPT",
+          "description": "Predicate marking the corrupted state of the shared resource (typically a state name on the resource automaton).",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. (!${RESOURCE_CORRUPT} && [] X)",
+      "domain_hints": {
+        "agentic": { "RESOURCE_CORRUPT": "e.g., F_clobbered, T755_LLMReturnedContaminated" },
+        "software": { "RESOURCE_CORRUPT": "e.g., FileCorrupted, Inconsistent" },
+        "rtl": { "RESOURCE_CORRUPT": "e.g., bus_collision, state_undef" }
+      },
+      "tags": ["safety", "concurrency", "composition", "race"]
+    },
+    {
+      "id": "clobber_reachable",
+      "display_name": "Clobber Reachable (Witness)",
+      "description": "Reachability witness for the corrupted-resource state. Always shipped alongside `no_clobber` to confirm the safety property isn't trivially satisfied by an empty model. A failing reachability check on a passing safety check signals an over-restrictive abstraction.",
+      "kind": "liveness",
+      "role": "standalone",
+      "domains": ["agentic", "universal"],
+      "params": [
+        {
+          "name": "RESOURCE_CORRUPT",
+          "description": "The same predicate `no_clobber` checks against.",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "mu X. (${RESOURCE_CORRUPT} || <> X)",
+      "domain_hints": {
+        "agentic": { "RESOURCE_CORRUPT": "e.g., F_clobbered, T755_LLMReturnedContaminated" },
+        "software": { "RESOURCE_CORRUPT": "e.g., FileCorrupted, Inconsistent" },
+        "rtl": { "RESOURCE_CORRUPT": "e.g., bus_collision, state_undef" }
+      },
+      "tags": ["liveness", "reachability", "concurrency", "composition", "witness"]
+    },
+    {
+      "id": "mutual_exclusion_3",
+      "display_name": "Mutual Exclusion (3-way)",
+      "description": "Three predicates are pairwise exclusive — at most one holds in any reachable state. Useful for compositions with three contending instances (e.g., three workers competing for one resource). The existing `mutual_exclusion` template covers the 2-way case.",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["universal"],
+      "params": [
+        {
+          "name": "A",
+          "description": "First exclusive predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "B",
+          "description": "Second exclusive predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "C",
+          "description": "Third exclusive predicate",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. (!(${A} && ${B}) && !(${A} && ${C}) && !(${B} && ${C}) && [] X)",
+      "domain_hints": {
+        "agentic": { "A": "e.g., WorkerA_Holds", "B": "e.g., WorkerB_Holds", "C": "e.g., WorkerC_Holds" },
+        "rtl": { "A": "e.g., grant_0", "B": "e.g., grant_1", "C": "e.g., grant_2" },
+        "software": { "A": "e.g., LockedByA", "B": "e.g., LockedByB", "C": "e.g., LockedByC" }
+      },
+      "tags": ["safety", "mutex", "exclusion", "concurrency", "composition"]
+    },
+    {
+      "id": "bounded_handoff",
+      "display_name": "Bounded Handoff",
+      "description": "Once a handoff is triggered, completion is reachable from there in finite steps. Maps to MCP-001's parallel-interrupt resume pattern (after the resume request, the resume must eventually take effect).",
+      "kind": "liveness",
+      "role": "guarantee",
+      "domains": ["agentic", "universal"],
+      "params": [
+        {
+          "name": "HANDOFF_TRIGGERED",
+          "description": "Predicate marking the handoff/resume request.",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "HANDOFF_COMPLETE",
+          "description": "Predicate marking the handoff/resume completion.",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. ((!${HANDOFF_TRIGGERED} || mu Y. (${HANDOFF_COMPLETE} || <> Y)) && [] X)",
+      "domain_hints": {
+        "agentic": { "HANDOFF_TRIGGERED": "e.g., A_ResumeRequested", "HANDOFF_COMPLETE": "e.g., A_ResumeApplied" },
+        "rtl": { "HANDOFF_TRIGGERED": "e.g., req_active", "HANDOFF_COMPLETE": "e.g., grant_active" },
+        "software": { "HANDOFF_TRIGGERED": "e.g., TaskQueued", "HANDOFF_COMPLETE": "e.g., TaskExecuted" }
+      },
+      "tags": ["liveness", "handoff", "concurrency", "composition", "response"]
+    },
+    {
+      "id": "no_lost_update",
+      "display_name": "No Lost Update",
+      "description": "Every started write becomes externally visible — no overwrite suppresses an in-flight update. Direct match for MCP-002's contamination patterns (a write that's started must commit before another write supersedes it).",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["agentic", "universal"],
+      "params": [
+        {
+          "name": "WRITE_STARTED",
+          "description": "Predicate marking that a write has been initiated by some component.",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "WRITE_VISIBLE",
+          "description": "Predicate marking that the write's effect is observable in the shared resource (committed).",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. ((!${WRITE_STARTED} || ${WRITE_VISIBLE}) && [] X)",
+      "domain_hints": {
+        "agentic": { "WRITE_STARTED": "e.g., A_LoadV0, T755_Set", "WRITE_VISIBLE": "e.g., A_SaveCommitted, T755_Returned" },
+        "software": { "WRITE_STARTED": "e.g., WriteIssued", "WRITE_VISIBLE": "e.g., WritePersisted" },
+        "rtl": { "WRITE_STARTED": "e.g., wr_req", "WRITE_VISIBLE": "e.g., wr_ack" }
+      },
+      "tags": ["safety", "consistency", "concurrency", "composition", "atomicity"]
     }
   ]
 }

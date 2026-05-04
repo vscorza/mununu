@@ -568,4 +568,129 @@ mod tests {
         let reg2 = TemplateRegistry::from_json(&json).unwrap();
         assert_eq!(reg.templates.len(), reg2.templates.len());
     }
+
+    /// Concurrency-template suite (compositional MCP). Confirms all five new
+    /// templates are registered, instantiate cleanly, and produce formulas
+    /// with the expected param substitutions. The pair `no_clobber` /
+    /// `clobber_reachable` is asserted together — they're meant to ship as
+    /// a non-vacuous safety+witness pair.
+    #[test]
+    fn concurrency_templates_registered() {
+        let reg = TemplateRegistry::builtin();
+        for id in [
+            "no_clobber",
+            "clobber_reachable",
+            "mutual_exclusion_3",
+            "bounded_handoff",
+            "no_lost_update",
+        ] {
+            assert!(
+                reg.get(id).is_some(),
+                "expected concurrency template `{id}` to be registered"
+            );
+        }
+        // Every concurrency template must be in the `agentic` domain
+        // listing — that's the headline domain for compositional MCP.
+        let agentic = reg.for_domain(TemplateDomain::Agentic);
+        let agentic_ids: Vec<&str> = agentic.iter().map(|t| t.id.as_str()).collect();
+        for id in [
+            "no_clobber",
+            "clobber_reachable",
+            "bounded_handoff",
+            "no_lost_update",
+        ] {
+            assert!(
+                agentic_ids.contains(&id),
+                "expected `{id}` to surface for the agentic domain, got {:?}",
+                agentic_ids
+            );
+        }
+    }
+
+    #[test]
+    fn no_clobber_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "no_clobber".to_string(),
+            args: [("RESOURCE_CORRUPT".to_string(), "F_clobbered".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("F_clobbered"));
+        assert!(result.formula.contains("nu X."));
+        assert_eq!(result.kind, PropertyKind::Safety);
+    }
+
+    #[test]
+    fn clobber_reachable_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "clobber_reachable".to_string(),
+            args: [("RESOURCE_CORRUPT".to_string(), "F_clobbered".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("F_clobbered"));
+        assert!(result.formula.contains("mu X."));
+        assert_eq!(result.kind, PropertyKind::Liveness);
+    }
+
+    #[test]
+    fn mutual_exclusion_3_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "mutual_exclusion_3".to_string(),
+            args: [
+                ("A".to_string(), "X1".to_string()),
+                ("B".to_string(), "X2".to_string()),
+                ("C".to_string(), "X3".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("X1"));
+        assert!(result.formula.contains("X2"));
+        assert!(result.formula.contains("X3"));
+        // Three pairwise-exclusion clauses.
+        assert!(result.formula.matches("&&").count() >= 3);
+    }
+
+    #[test]
+    fn bounded_handoff_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "bounded_handoff".to_string(),
+            args: [
+                ("HANDOFF_TRIGGERED".to_string(), "Req".to_string()),
+                ("HANDOFF_COMPLETE".to_string(), "Ack".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("Req"));
+        assert!(result.formula.contains("Ack"));
+        assert_eq!(result.kind, PropertyKind::Liveness);
+    }
+
+    #[test]
+    fn no_lost_update_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "no_lost_update".to_string(),
+            args: [
+                ("WRITE_STARTED".to_string(), "WriteIssued".to_string()),
+                ("WRITE_VISIBLE".to_string(), "WritePersisted".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("WriteIssued"));
+        assert!(result.formula.contains("WritePersisted"));
+        assert_eq!(result.kind, PropertyKind::Safety);
+    }
 }
