@@ -162,8 +162,19 @@ fn find_class_nodes<'a>(
 }
 
 /// Find a TypeScript class declaration, handling export wrappers.
+///
+/// Recognizes three node kinds:
+/// - `class_declaration` — `class Foo { ... }` (the common case)
+/// - `abstract_class_declaration` — `abstract class Foo { ... }` (MCP-004
+///   hit this with the `Protocol` base class; without this branch, abstract
+///   bases were silently skipped and produced degenerate models)
+/// - `class_expression` — `const Foo = class { ... }` (occasionally used
+///   for inline factory patterns in MCP SDKs)
 fn find_ts_class<'a>(node: &Node<'a>, parsed: &ParsedSource, class_name: &str) -> Option<Node<'a>> {
-    if node.kind() == "class_declaration" {
+    if matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class_expression"
+    ) {
         if let Some(name_node) = node.child_by_field_name("name") {
             if parsed.node_text(&name_node) == class_name {
                 return Some(*node);
@@ -418,6 +429,20 @@ fn infer_abstraction_no_profile(
 
 /// Extract a TypeScript class field declaration.
 /// Returns (name, type, initial_value, line).
+///
+/// Tree-sitter for TypeScript represents `private foo: T` as a
+/// `public_field_definition` with an `accessibility_modifier` child whose
+/// text is `private` (the node-kind name is misleadingly fixed). So this
+/// function handles all accessibility levels via the same node-kind set.
+///
+/// Optional fields (`foo?: T`) are detected by a `?` token sibling between
+/// the name and the type — this token is not retrievable via
+/// `child_by_field_name`, only by walking the children. When found, the
+/// `?` is appended to the returned type string so the downstream
+/// `domain::infer_abstraction` (which already routes types ending in `?`
+/// to `optional_default`) classifies the field as a `Presence`-abstracted
+/// state field instead of treating it as a plain `Transport` reference
+/// (which would otherwise fall to `Ignored`).
 fn extract_ts_field(
     parsed: &ParsedSource,
     node: &Node,
@@ -431,14 +456,44 @@ fn extract_ts_field(
         .child_by_field_name("name")
         .map(|n| parsed.node_text(&n).to_string());
 
+    // Detect the optional `?` marker. Tree-sitter encodes it as a literal
+    // `?` token between the property name and the type annotation. Walk the
+    // direct children once and look for a `?` after the name.
+    let is_optional = {
+        let mut cursor = node.walk();
+        let mut seen_name = false;
+        let mut found_optional = false;
+        for child in node.children(&mut cursor) {
+            let kind = child.kind();
+            if !seen_name
+                && (kind == "property_identifier" || kind == "private_property_identifier")
+            {
+                seen_name = true;
+                continue;
+            }
+            if seen_name && parsed.node_text(&child) == "?" {
+                found_optional = true;
+                break;
+            }
+        }
+        found_optional
+    };
+
     let type_str = node.child_by_field_name("type").map(|type_node| {
         // Type annotation: `: boolean` → extract the type name
         let mut cursor = type_node.walk();
-        type_node
+        let raw = type_node
             .children(&mut cursor)
             .find(|c| c.kind() != ":")
             .map(|c| parsed.node_text(&c).to_string())
-            .unwrap_or_else(|| parsed.node_text(&type_node).to_string())
+            .unwrap_or_else(|| parsed.node_text(&type_node).to_string());
+        if is_optional && !raw.ends_with('?') {
+            // Append the marker so domain::infer_abstraction's
+            // `ends_with('?')` branch routes the field to optional_default.
+            format!("{raw}?")
+        } else {
+            raw
+        }
     });
 
     let initial = node
@@ -2329,6 +2384,93 @@ class Transport {
             }),
             "expected IncrementCounter effect on _map, got {:?}",
             add.effects
+        );
+    }
+
+    /// GAP-005 step 1 — `abstract class Foo` is recognized.
+    /// Pre-fix: `find_ts_class()` only matched `class_declaration`, so abstract
+    /// bases (e.g., the MCP-004 `Protocol` class) were silently skipped.
+    #[test]
+    fn extract_typescript_abstract_class() {
+        let source = r#"
+abstract class Protocol {
+    protected _started: boolean = false;
+
+    start(): void {
+        if (this._started) { return; }
+        this._started = true;
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("Protocol", &["_started"], &["start"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        assert_eq!(
+            result.fields.len(),
+            1,
+            "expected 1 field on the abstract class, got {:?}",
+            result.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert!(result.fields.iter().any(|f| f.name == "_started"));
+        assert_eq!(result.methods.len(), 1, "expected 1 method");
+    }
+
+    /// GAP-005 step 1 — optional fields (`field?: T`) get the `Presence`
+    /// abstraction from `optional_default` instead of being treated as a
+    /// plain reference type and falling to `Ignored`.
+    /// Mirrors the MCP-004 `private _transport?: Transport` pattern.
+    #[test]
+    fn extract_typescript_optional_field_uses_presence() {
+        let source = r#"
+class Server {
+    private _transport?: Transport;
+
+    connect(t: Transport): void {
+        if (this._transport) { return; }
+        this._transport = t;
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("Server", &["_transport"], &["connect"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        let transport = result
+            .fields
+            .iter()
+            .find(|f| f.name == "_transport")
+            .unwrap_or_else(|| panic!("expected _transport field, got {:?}", result.fields));
+        assert_eq!(
+            transport.abstraction,
+            crate::adapter::domain::AbstractionType::Presence,
+            "expected Presence abstraction (from optional_default), got {:?}",
+            transport.abstraction
+        );
+    }
+
+    /// GAP-005 step 1 — regression guard: a non-optional field continues to
+    /// behave as before (Boolean abstraction for `: boolean`, etc.).
+    #[test]
+    fn extract_typescript_non_optional_field_unchanged() {
+        let source = r#"
+class C {
+    private _started: boolean = false;
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("C", &["_started"], &[]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        let started = result.fields.iter().find(|f| f.name == "_started").unwrap();
+        assert_eq!(
+            started.abstraction,
+            crate::adapter::domain::AbstractionType::Boolean
         );
     }
 }
