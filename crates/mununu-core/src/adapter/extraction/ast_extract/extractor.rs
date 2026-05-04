@@ -3270,6 +3270,91 @@ class C {
         );
     }
 
+    /// GAP-005e/f — diagnostic test. The MCP-004 postfix `connect()`
+    /// pattern: if-throw guard, then field assignment. Verifies:
+    ///   - The assignment produces an effect (GAP-005e check).
+    ///   - The state-space derivation produces a sound set of
+    ///     transitions for `ev_connect` (GAP-005f check — should
+    ///     ideally be exactly `_transport=absent → _transport=present`,
+    ///     or at most an Unknown-havoc set that includes the correct
+    ///     edge).
+    #[test]
+    fn extract_typescript_if_throw_then_assign_produces_effect() {
+        let source = r#"
+class Server {
+    private _transport?: Transport;
+
+    connect(t: Transport): void {
+        if (this._transport) { throw new Error("Already connected"); }
+        this._transport = t;
+    }
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let target = make_simple_target("Server", &["_transport"], &["connect"]);
+        let profile = domain::get_profile("mcp_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+        let connect = result
+            .methods
+            .iter()
+            .find(|m| m.name == "connect")
+            .expect("connect method should be extracted");
+
+        assert!(
+            !connect.effects.is_empty(),
+            "expected connect() to produce at least one effect; got {:?}",
+            connect.effects
+        );
+
+        // GAP-005f exploratory: derive the automaton and inspect
+        // ev_connect transitions. Document what the current behavior
+        // produces; treat as soundness-checked rather than strict
+        // assertion (because the parameter-assignment-as-Unknown
+        // havoc is over-approx, which is sound for safety).
+        use crate::adapter::extraction::ast_extract::state_space;
+        let label_prefix = profile.unwrap().label_naming.prefix;
+        let derived = state_space::derive_automaton(
+            "Server",
+            &result.fields,
+            &result.methods,
+            &std::collections::HashMap::new(),
+            label_prefix,
+            true, // add_noop, mirror what extract_from_source does
+        );
+
+        let ev_connect_transitions: Vec<_> = derived
+            .transitions
+            .iter()
+            .filter(|t| t.label == "ev_connect")
+            .collect();
+
+        // We expect at least one ev_connect transition. The exact set
+        // depends on whether the assignment is classified as Unknown
+        // (havoc — multiple edges) or SetPresent (one edge); both are
+        // acceptable for this test, the point is non-empty.
+        assert!(
+            !ev_connect_transitions.is_empty(),
+            "expected at least one ev_connect transition, got: {:?}",
+            derived.transitions
+        );
+        // The model should also produce at least one state-mutating
+        // transition (a transition where source != target). This is
+        // GAP-005b's degenerate-warning calibration check applied to
+        // this fixture.
+        let mutating: Vec<_> = derived
+            .transitions
+            .iter()
+            .filter(|t| t.from != t.to)
+            .collect();
+        assert!(
+            !mutating.is_empty(),
+            "expected at least one state-mutating transition for \
+             this fixture (the connect's None→Some edge), got: {:?}",
+            derived.transitions
+        );
+    }
+
     /// GAP-005 step 3 — bare-identifier receivers (module-level state)
     /// resolve to the corresponding field. Pre-fix: `_ctx.set(k, v)` had
     /// receiver `_ctx`, which `resolve_receiver_to_field` rejected because

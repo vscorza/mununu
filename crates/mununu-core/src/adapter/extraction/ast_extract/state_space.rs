@@ -273,14 +273,35 @@ pub fn derive_automaton(
 
 /// Check if all guards are satisfied in the given state.
 fn guards_satisfied(state: &AbstractState, guards: &[Guard]) -> bool {
+    // GAP-005e/f: MustBeTrue / MustBeFalse use JavaScript/Python truthiness
+    // semantics — they're produced by the extractor for `if (this.foo)` /
+    // `if not self.foo` style guards, where the AST gives no signal about
+    // whether `foo` is Boolean or Optional. So we accept both:
+    //   MustBeTrue  matches Bool(true)  OR Present(true)
+    //   MustBeFalse matches Bool(false) OR Present(false)
+    // The dedicated MustBePresent / MustBeAbsent guards keep their strict
+    // Presence-only semantics for callers that explicitly want them
+    // (e.g., explicit `null` / `undefined` checks).
+    //
+    // Pre-fix bug: extracting `if (this._transport)` on a Presence-
+    // abstracted field produced a `MustBeFalse` guard (after early-exit
+    // inversion) that never matched the initial `Present(false)` state,
+    // so no `ev_connect` transitions were emitted from the auto-extracted
+    // model. Surfaced by MCP-004 re-validation.
     fn cond_satisfied(val: &AbstractValue, cond: &CallGuard) -> bool {
         match cond {
             CallGuard::CounterGtZero => matches!(val, AbstractValue::Counter(n) if *n > 0),
             CallGuard::CounterEqZero => matches!(val, AbstractValue::Counter(0)),
             CallGuard::MustBePresent => matches!(val, AbstractValue::Present(true)),
             CallGuard::MustBeAbsent => matches!(val, AbstractValue::Present(false)),
-            CallGuard::MustBeTrue => matches!(val, AbstractValue::Bool(true)),
-            CallGuard::MustBeFalse => matches!(val, AbstractValue::Bool(false)),
+            CallGuard::MustBeTrue => matches!(
+                val,
+                AbstractValue::Bool(true) | AbstractValue::Present(true)
+            ),
+            CallGuard::MustBeFalse => matches!(
+                val,
+                AbstractValue::Bool(false) | AbstractValue::Present(false)
+            ),
             CallGuard::MustEqual(variant) => {
                 matches!(val, AbstractValue::Variant(v) if v == variant)
             }
