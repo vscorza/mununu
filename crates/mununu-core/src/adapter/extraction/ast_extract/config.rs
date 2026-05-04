@@ -186,6 +186,33 @@ pub struct CompositionConfig {
     pub type_: String,
     /// Composition name.
     pub name: String,
+    /// Per-instance declarations. When non-empty, the extraction pipeline
+    /// produces one automaton per instance (each scanned from the named
+    /// `class`) and applies per-instance label rewriting. Empty means the
+    /// legacy "one automaton per target" behavior (instances synthesized
+    /// from `targets[]` directly).
+    #[serde(default)]
+    pub instances: Vec<InstanceDecl>,
+    /// Labels that synchronize across instances. By default every label is
+    /// rewritten with a per-instance prefix (full async / no synchronization).
+    /// Labels listed here are kept verbatim across all instances, becoming
+    /// the alphabet intersection that the existing composition engine uses
+    /// to enforce joint firing.
+    #[serde(default)]
+    pub shared: Vec<String>,
+}
+
+/// One instance in a compositional extraction. The `as` (renamed `as_` in
+/// Rust because `as` is a keyword) becomes the automaton id, and all of
+/// that instance's labels (except those in `composition.shared`) are
+/// rewritten as `<as>__<label>`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceDecl {
+    /// Class name to scan in the source (must match a `target.class`).
+    pub of: String,
+    /// Instance name; becomes the automaton id and the per-instance prefix.
+    #[serde(rename = "as")]
+    pub as_: String,
 }
 
 /// Property to verify.

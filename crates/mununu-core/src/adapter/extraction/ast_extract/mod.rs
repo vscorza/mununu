@@ -54,54 +54,46 @@ pub fn extract_from_source(
     let mut all_automata = Vec::new();
     let mut all_warnings = Vec::new();
 
-    for target in &config.targets {
-        let extracted = extractor::extract_target(&parsed, target, profile)?;
+    // Compositional path (Phase A): when `composition.instances` is
+    // non-empty, produce one automaton per instance, looking up the
+    // matching target by `instance.of == target.class`. Apply per-instance
+    // label rewriting with `composition.shared` as the synchronization set.
+    // Legacy path (instances empty): one automaton per target, no rewriting.
+    let instance_driven = config
+        .composition
+        .as_ref()
+        .map(|c| !c.instances.is_empty())
+        .unwrap_or(false);
 
-        let label_prefix = profile.map(|p| p.label_naming.prefix).unwrap_or("ev_");
-        let add_noop = profile.map(|p| p.add_noop_self_loops).unwrap_or(true);
-
-        let derived = state_space::derive_automaton(
-            &extracted.automaton_id,
-            &extracted.fields,
-            &extracted.methods,
-            &target.state_names,
-            label_prefix,
-            add_noop,
-        );
-
-        let automaton_def = super::ast::AutomatonDef {
-            id: derived.name.clone(),
-            states: derived
-                .states
+    if instance_driven {
+        let comp = config.composition.as_ref().unwrap();
+        let shared: std::collections::HashSet<&str> =
+            comp.shared.iter().map(String::as_str).collect();
+        for instance in &comp.instances {
+            let target = config
+                .targets
                 .iter()
-                .map(|s| {
-                    super::ast::StateDef::Structured(super::ast::StateDefStructured {
-                        name: s.name.clone(),
-                        initial: s.is_initial,
-                    })
-                })
-                .collect(),
-            controllable_labels: derived.controllable_labels.clone(),
-            transitions: derived
-                .transitions
-                .iter()
-                .map(|t| super::ast::TransitionDef {
-                    from: t.from.clone(),
-                    to: t.to.clone(),
-                    label: t.label.clone(),
-                    mode: "both".to_string(),
-                    derived_from: None,
-                    comment: None,
-                })
-                .collect(),
-            fields: vec![],
-            note: None,
-            role: None,
-        };
-
-        all_automata.push(automaton_def);
-        all_warnings.extend(extracted.warnings);
-        all_warnings.extend(derived.warnings);
+                .find(|t| t.class == instance.of)
+                .ok_or_else(|| {
+                    format!(
+                        "composition.instances declares an instance of class '{}' \
+                         but no matching target with that class was found",
+                        instance.of
+                    )
+                })?;
+            let (mut automaton_def, target_warnings) =
+                build_automaton_def(&parsed, target, profile, Some(&instance.as_))?;
+            rewrite_labels_for_instance(&mut automaton_def, &instance.as_, &shared);
+            all_automata.push(automaton_def);
+            all_warnings.extend(target_warnings);
+        }
+    } else {
+        for target in &config.targets {
+            let (automaton_def, target_warnings) =
+                build_automaton_def(&parsed, target, profile, None)?;
+            all_automata.push(automaton_def);
+            all_warnings.extend(target_warnings);
+        }
     }
 
     // Surface accumulated warnings to stderr. Mirrors the existing
@@ -175,4 +167,249 @@ pub fn extract_from_source(
             controllers: vec![],
         },
     })
+}
+
+/// Build an `AutomatonDef` for one target. Pulled out of the main loop in
+/// `extract_from_source` so the legacy "one automaton per target" path and
+/// the new compositional "one automaton per instance" path share the same
+/// extract → derive → assemble pipeline.
+///
+/// `automaton_id_override` is `Some(instance_name)` for compositional
+/// extraction (the instance's `as` value becomes the automaton id), `None`
+/// for the legacy path (the target's `automaton_id` or `class` is used).
+#[cfg(feature = "ast-extract")]
+fn build_automaton_def(
+    parsed: &parser::ParsedSource,
+    target: &config::TargetConfig,
+    profile: Option<&domain::DomainProfile>,
+    automaton_id_override: Option<&str>,
+) -> Result<(super::ast::AutomatonDef, Vec<String>), String> {
+    let extracted = extractor::extract_target(parsed, target, profile)?;
+    let label_prefix = profile.map(|p| p.label_naming.prefix).unwrap_or("ev_");
+    let add_noop = profile.map(|p| p.add_noop_self_loops).unwrap_or(true);
+
+    let id = automaton_id_override.unwrap_or(&extracted.automaton_id);
+    let derived = state_space::derive_automaton(
+        id,
+        &extracted.fields,
+        &extracted.methods,
+        &target.state_names,
+        label_prefix,
+        add_noop,
+    );
+
+    let automaton_def = super::ast::AutomatonDef {
+        id: derived.name.clone(),
+        states: derived
+            .states
+            .iter()
+            .map(|s| {
+                super::ast::StateDef::Structured(super::ast::StateDefStructured {
+                    name: s.name.clone(),
+                    initial: s.is_initial,
+                })
+            })
+            .collect(),
+        controllable_labels: derived.controllable_labels.clone(),
+        transitions: derived
+            .transitions
+            .iter()
+            .map(|t| super::ast::TransitionDef {
+                from: t.from.clone(),
+                to: t.to.clone(),
+                label: t.label.clone(),
+                mode: "both".to_string(),
+                derived_from: None,
+                comment: None,
+            })
+            .collect(),
+        fields: vec![],
+        note: None,
+        role: None,
+    };
+
+    let mut warnings = extracted.warnings;
+    warnings.extend(derived.warnings);
+    Ok((automaton_def, warnings))
+}
+
+/// Rewrite labels on an automaton for compositional extraction. Every label
+/// `L` not in the `shared` set becomes `<instance_name>__<L>`. Labels in
+/// `shared` are kept verbatim, becoming the synchronization points across
+/// instances (the existing composition engine's alphabet-intersection logic
+/// then forces them to fire together).
+///
+/// Pure function operating on a single automaton's transitions and
+/// controllable_labels. The `noop` label is a special case used by the
+/// state-space engine to keep states reachable; it is always per-instance-
+/// prefixed (never shared) so noops don't accidentally synchronize across
+/// instances, which would prevent independent progress.
+#[cfg(feature = "ast-extract")]
+fn rewrite_labels_for_instance(
+    automaton: &mut super::ast::AutomatonDef,
+    instance_name: &str,
+    shared: &std::collections::HashSet<&str>,
+) {
+    fn rewrite(label: &str, instance: &str, shared: &std::collections::HashSet<&str>) -> String {
+        if label == "noop" || !shared.contains(label) {
+            format!("{instance}__{label}")
+        } else {
+            label.to_string()
+        }
+    }
+
+    for transition in &mut automaton.transitions {
+        transition.label = rewrite(&transition.label, instance_name, shared);
+    }
+    for label in &mut automaton.controllable_labels {
+        *label = rewrite(label, instance_name, shared);
+    }
+}
+
+#[cfg(feature = "ast-extract")]
+#[cfg(test)]
+mod compositional_tests {
+    use super::*;
+
+    fn sample_automaton(id: &str) -> super::super::ast::AutomatonDef {
+        super::super::ast::AutomatonDef {
+            id: id.to_string(),
+            states: vec![],
+            controllable_labels: vec!["save".to_string(), "internal_op".to_string()],
+            transitions: vec![
+                super::super::ast::TransitionDef {
+                    from: "s0".to_string(),
+                    to: "s1".to_string(),
+                    label: "save".to_string(),
+                    mode: "both".to_string(),
+                    derived_from: None,
+                    comment: None,
+                },
+                super::super::ast::TransitionDef {
+                    from: "s1".to_string(),
+                    to: "s1".to_string(),
+                    label: "internal_op".to_string(),
+                    mode: "both".to_string(),
+                    derived_from: None,
+                    comment: None,
+                },
+                super::super::ast::TransitionDef {
+                    from: "s0".to_string(),
+                    to: "s0".to_string(),
+                    label: "noop".to_string(),
+                    mode: "both".to_string(),
+                    derived_from: None,
+                    comment: None,
+                },
+            ],
+            fields: vec![],
+            note: None,
+            role: None,
+        }
+    }
+
+    #[test]
+    fn compose_two_instances_no_shared() {
+        // shared: empty — every label gets per-instance prefix, including
+        // labels with the same name across instances. Result: completely
+        // independent (no synchronization).
+        let mut a = sample_automaton("worker_a");
+        let mut b = sample_automaton("worker_b");
+        let shared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        rewrite_labels_for_instance(&mut a, "worker_a", &shared);
+        rewrite_labels_for_instance(&mut b, "worker_b", &shared);
+
+        let a_labels: Vec<&String> = a.transitions.iter().map(|t| &t.label).collect();
+        let b_labels: Vec<&String> = b.transitions.iter().map(|t| &t.label).collect();
+
+        assert!(a_labels.contains(&&"worker_a__save".to_string()));
+        assert!(a_labels.contains(&&"worker_a__internal_op".to_string()));
+        assert!(a_labels.contains(&&"worker_a__noop".to_string()));
+        assert!(b_labels.contains(&&"worker_b__save".to_string()));
+        // No label is shared between the two instances.
+        for la in &a_labels {
+            assert!(
+                !b_labels.contains(la),
+                "label {la} should not appear in worker_b after rewriting"
+            );
+        }
+        // Controllable labels are also rewritten.
+        assert_eq!(
+            a.controllable_labels,
+            vec![
+                "worker_a__save".to_string(),
+                "worker_a__internal_op".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_two_instances_with_shared() {
+        // shared: ["save"] — both instances keep `save` verbatim, so they
+        // synchronize on it; `internal_op` gets per-instance prefix.
+        let mut a = sample_automaton("worker_a");
+        let mut b = sample_automaton("worker_b");
+        let shared: std::collections::HashSet<&str> = ["save"].iter().copied().collect();
+        rewrite_labels_for_instance(&mut a, "worker_a", &shared);
+        rewrite_labels_for_instance(&mut b, "worker_b", &shared);
+
+        let a_labels: Vec<&String> = a.transitions.iter().map(|t| &t.label).collect();
+        let b_labels: Vec<&String> = b.transitions.iter().map(|t| &t.label).collect();
+
+        // `save` is shared verbatim.
+        assert!(a_labels.contains(&&"save".to_string()));
+        assert!(b_labels.contains(&&"save".to_string()));
+        // `internal_op` is per-instance.
+        assert!(a_labels.contains(&&"worker_a__internal_op".to_string()));
+        assert!(b_labels.contains(&&"worker_b__internal_op".to_string()));
+        assert!(!a_labels.contains(&&"worker_b__internal_op".to_string()));
+        // `noop` is never shared, even if accidentally listed.
+        assert!(a_labels.contains(&&"worker_a__noop".to_string()));
+        assert!(b_labels.contains(&&"worker_b__noop".to_string()));
+        // Controllable labels: shared ones verbatim, others prefixed.
+        assert!(a.controllable_labels.contains(&"save".to_string()));
+        assert!(
+            a.controllable_labels
+                .contains(&"worker_a__internal_op".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_label_rewrite_function_unit() {
+        // Edge cases: empty automaton; all-shared; noop-shared (must still
+        // be prefixed); duplicate labels; empty instance name (still works
+        // mechanically — the prefix becomes `__label`, not crashable).
+        let mut empty = super::super::ast::AutomatonDef {
+            id: "x".to_string(),
+            states: vec![],
+            controllable_labels: vec![],
+            transitions: vec![],
+            fields: vec![],
+            note: None,
+            role: None,
+        };
+        let shared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        rewrite_labels_for_instance(&mut empty, "x", &shared);
+        assert!(empty.transitions.is_empty());
+
+        // All-shared: nothing gets prefixed (except noop).
+        let mut a = sample_automaton("a");
+        let all_shared: std::collections::HashSet<&str> =
+            ["save", "internal_op"].iter().copied().collect();
+        rewrite_labels_for_instance(&mut a, "a", &all_shared);
+        let labels: Vec<&String> = a.transitions.iter().map(|t| &t.label).collect();
+        assert!(labels.contains(&&"save".to_string()));
+        assert!(labels.contains(&&"internal_op".to_string()));
+        // noop is always per-instance regardless of `shared`.
+        assert!(labels.contains(&&"a__noop".to_string()));
+
+        // noop in shared: still per-instance (the rewrite explicitly
+        // excludes it from sharing to preserve independent progress).
+        let mut b = sample_automaton("b");
+        let noop_shared: std::collections::HashSet<&str> = ["noop"].iter().copied().collect();
+        rewrite_labels_for_instance(&mut b, "b", &noop_shared);
+        let b_labels: Vec<&String> = b.transitions.iter().map(|t| &t.label).collect();
+        assert!(b_labels.contains(&&"b__noop".to_string()));
+        assert!(!b_labels.contains(&&"noop".to_string()));
+    }
 }
