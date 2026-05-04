@@ -237,20 +237,28 @@ pub fn derive_automaton(
         .collect();
 
     let mut warnings = Vec::new();
-    let non_noop_transitions = reachable_transitions
+    // GAP-005b: count transitions that actually mutate the state — i.e.,
+    // go from a source state to a *different* target state. Pre-fix logic
+    // counted any non-`noop` transition, which over-counted method-name-
+    // labeled self-loops (e.g., `s0 --ev_close--> s0` on a 1-state model).
+    // Self-loops contribute no real behavior, so the degenerate-model check
+    // should ignore them. Surfaced by MCP-004 + MCP-005 re-validation
+    // (independent reproductions); the warning failed to fire on the very
+    // cases it was meant to catch.
+    let state_mutating_transitions = reachable_transitions
         .iter()
-        .filter(|t| t.label != "noop")
+        .filter(|t| t.from != t.to)
         .count();
-    if reachable_states.len() <= 1 && non_noop_transitions == 0 {
+    if reachable_states.len() <= 1 && state_mutating_transitions == 0 {
         warnings.push(format!(
-            "[mununu] WARN: automaton '{}' is degenerate ({} states, {} non-noop transitions). \
+            "[mununu] WARN: automaton '{}' is degenerate ({} states, {} state-mutating transitions). \
              Likely cause: state lives outside `self.*` / `this.*` (module-level ContextVar / \
              AsyncLocalStorage / shared handles, or in fields not currently scanned by the \
              extractor — abstract class, private with `?`, dataclass). Consider listing the \
              missing fields in state_fields.include or enabling state_fields.module_level.",
             automaton_name,
             reachable_states.len(),
-            non_noop_transitions,
+            state_mutating_transitions,
         ));
     }
 
@@ -799,6 +807,63 @@ mod tests {
         assert!(
             !automaton.warnings.is_empty(),
             "noop-only automaton should still trigger the degenerate warning"
+        );
+        assert!(automaton.warnings[0].contains("degenerate"));
+    }
+
+    /// GAP-005b — method-name-labeled self-loops don't mask the degenerate
+    /// warning. Pre-fix bug (surfaced by MCP-004 + MCP-005 re-validation):
+    /// the warning's trigger condition counted any non-`noop` transition,
+    /// so a 1-state automaton with `s0 --ev_close--> s0` self-loops looked
+    /// like "8 non-noop transitions" and the warning silently dropped.
+    /// Fix: count transitions that go from a source state to a *different*
+    /// target state (i.e., transitions that actually mutate state); self-
+    /// loops contribute no real behavior regardless of label.
+    #[test]
+    fn degenerate_with_method_labeled_self_loops_still_warns() {
+        let fields = [bool_field("only_field", false)];
+        // A method whose effect is "set the only_field to false" — but
+        // it's already false, so the effect is a self-loop (no state
+        // change). Combined with `add_noop=false`, the only transitions
+        // produced will be method-name-labeled self-loops.
+        let methods = [MethodBehavior {
+            name: "close".to_string(),
+            guards: vec![Guard {
+                field: "only_field".to_string(),
+                condition: CallGuard::MustBeFalse,
+            }],
+            effects: vec![Effect {
+                field: "only_field".to_string(),
+                effect: CallEffect::SetFalse,
+                value: None,
+            }],
+            controllable: true,
+            line_start: None,
+            line_end: None,
+        }];
+        let automaton = derive_automaton(
+            "DegenerateWithMethodSelfLoops",
+            &fields,
+            &methods,
+            &HashMap::new(),
+            "ev_",
+            false, // no noop layer — only the method-labeled self-loops
+        );
+        assert_eq!(
+            automaton.states.len(),
+            1,
+            "expected 1 reachable state for this fixture"
+        );
+        // The method should have produced at least one transition (a
+        // self-loop labeled `ev_close`), so this is the regression case.
+        assert!(
+            automaton.transitions.iter().any(|t| t.label == "ev_close"),
+            "expected an ev_close transition (self-loop)"
+        );
+        assert!(
+            !automaton.warnings.is_empty(),
+            "warning should fire even though there's a method-labeled \
+             self-loop — no transition mutates state, so this is degenerate"
         );
         assert!(automaton.warnings[0].contains("degenerate"));
     }

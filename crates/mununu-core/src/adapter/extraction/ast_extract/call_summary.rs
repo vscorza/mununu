@@ -358,6 +358,25 @@ fn python_summaries() -> HashMap<String, BuiltinSummary> {
         receiver_entry(CallEffect::DecrementCounter, CallGuard::None),
     );
 
+    // contextvars.ContextVar — token-sequence depth abstracted as a bounded
+    // counter. `set(value) → token`: increment. `reset(token)`: decrement
+    // (guarded gt-zero — must have set first). `get(default)`: read-only.
+    // GAP-005a: surfaced by MCP-003 validation; field detection (GAP-005
+    // step 2) worked, but methods produced no effects because these entries
+    // were missing — the resulting automaton was still 1-state degenerate.
+    m.insert(
+        "ContextVar.set".into(),
+        receiver_entry(CallEffect::IncrementCounter, CallGuard::None),
+    );
+    m.insert(
+        "ContextVar.reset".into(),
+        receiver_entry(CallEffect::DecrementCounter, CallGuard::CounterGtZero),
+    );
+    m.insert(
+        "ContextVar.get".into(),
+        receiver_entry(CallEffect::ReadOnly, CallGuard::None),
+    );
+
     m
 }
 

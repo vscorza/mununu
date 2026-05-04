@@ -86,6 +86,23 @@ pub fn extract_target(
         field_lines.extend(ml_lines);
     }
 
+    // GAP-005g: warn on `state_fields.include` names that neither the
+    // class-body scan nor the module-level scan produced. Pre-fix, an
+    // unrecognized field name was silently dropped — the user only learned
+    // of the typo or shape-mismatch by inspecting the output espec.
+    let detected: HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    for requested in target.state_fields.field_names() {
+        if !detected.contains(requested.as_str()) {
+            warnings.push(format!(
+                "[mununu] WARN: state field '{}' listed in state_fields.include was not \
+                 detected (neither as a class-body field nor as a module-level declaration). \
+                 Check the field name spelling, the class scope, and (for module-level state) \
+                 the domain profile's `module_level_scan` flag.",
+                requested
+            ));
+        }
+    }
+
     // Extract methods
     let method_filter = &target.methods;
     let include_set: HashSet<&str> = method_filter.include.iter().map(|s| s.as_str()).collect();
@@ -2841,6 +2858,96 @@ class Server {
             }),
             "expected SetPresent effect on _transport from `new Transport(...)`, got {:?}",
             connect.effects
+        );
+    }
+
+    /// GAP-005a — `ContextVar.set(value)` on a module-level
+    /// `_x = ContextVar(...)` field produces an `IncrementCounter` effect.
+    /// This was missing from `python_summaries()` pre-fix, so MCP-003's
+    /// re-validation found the field but no methods produced transitions.
+    /// This is the end-to-end fields-AND-effects test pattern (the lesson
+    /// learned from the validation round).
+    #[test]
+    fn extract_python_module_level_contextvar_methods_produce_effects() {
+        let source = r#"
+import contextvars
+
+_scope = contextvars.ContextVar("scope")
+
+class Scope:
+    def __init__(self):
+        pass
+    def enter(self, value):
+        _scope.set(value)
+    def leave(self, token):
+        _scope.reset(token)
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::Python).unwrap();
+        let target = make_simple_target("Scope", &["_scope"], &["enter", "leave"]);
+        let profile = domain::get_profile("python_server");
+
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        // Field detection (Step 2 — already covered by an earlier test).
+        assert!(result.fields.iter().any(|f| f.name == "_scope"));
+
+        // GAP-005a regression: the method bodies must produce real effects
+        // on `_scope`, otherwise the resulting automaton stays 1-state.
+        let enter = result.methods.iter().find(|m| m.name == "enter").unwrap();
+        assert!(
+            enter.effects.iter().any(|e| {
+                e.field == "_scope"
+                    && matches!(e.effect, crate::adapter::extraction::ast_extract::call_summary::CallEffect::IncrementCounter)
+            }),
+            "expected IncrementCounter on _scope from `_scope.set(value)`, got {:?}",
+            enter.effects
+        );
+        let leave = result.methods.iter().find(|m| m.name == "leave").unwrap();
+        assert!(
+            leave.effects.iter().any(|e| {
+                e.field == "_scope"
+                    && matches!(e.effect, crate::adapter::extraction::ast_extract::call_summary::CallEffect::DecrementCounter)
+            }),
+            "expected DecrementCounter on _scope from `_scope.reset(token)`, got {:?}",
+            leave.effects
+        );
+    }
+
+    /// GAP-005g — `state_fields.include` names that neither class-body nor
+    /// module-level scan finds produce a warning instead of being silently
+    /// dropped. Surfaced by MCP-005 re-validation: the user's spec asked
+    /// for `memoryFilePath` and `knowledgeGraphManager` but neither was
+    /// recognized; the espec was empty and the user had no signal.
+    #[test]
+    fn extract_warns_on_unrecognized_state_field_names() {
+        let source = r#"
+class C {
+    public _real_field: boolean = false;
+}
+"#;
+        let parsed = parser::parse_source(source, SourceLanguage::TypeScript).unwrap();
+        // Spec lists a bogus field name alongside a real one.
+        let target = make_simple_target("C", &["_real_field", "_misspelled_or_missing"], &[]);
+        let profile = domain::get_profile("mcp_server");
+        let result = extract_target(&parsed, &target, profile).unwrap();
+
+        // The real field is detected.
+        assert!(result.fields.iter().any(|f| f.name == "_real_field"));
+        // The bogus field is NOT detected.
+        assert!(
+            !result
+                .fields
+                .iter()
+                .any(|f| f.name == "_misspelled_or_missing")
+        );
+        // But a warning was emitted for it.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("_misspelled_or_missing") && w.contains("not detected") }),
+            "expected warning about unrecognized field name, got: {:?}",
+            result.warnings
         );
     }
 
