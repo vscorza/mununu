@@ -11,26 +11,40 @@ permissions:
   contents: read
 
 env:
-  CARGO_TERM_COLOR: always
   CI: true
 
 jobs:
+  # Build the pinned dev image once and run the same `make ci` line that
+  # contributors use locally. The hw-verif principle: same docker run
+  # invocation must work locally and in CI — if it doesn't, the contract
+  # is broken.
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build mununu-dev image
+        uses: docker/build-push-action@v6
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Run tests
-        run: cargo test --lib --bins --tests --examples -- --nocapture
-      - name: Test API module
-        run: cargo test --lib api --features api
+          context: .
+          file: docker/Dockerfile.dev
+          load: true
+          tags: mununu-dev:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run lint + tests in the dev image
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/work mununu-dev:latest \
+            make ci
+
+      - name: Run API-feature tests in the dev image
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/work mununu-dev:latest \
+            cargo test --lib api --features api
 
   security-audit:
     runs-on: ubuntu-latest

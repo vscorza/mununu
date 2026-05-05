@@ -1,0 +1,62 @@
+# Reproducible dev/test image for the mununu Rust workspace.
+#
+# Source is mounted at runtime, NOT baked in. Image rebuilds are rare;
+# host edits are live. Same `docker run` line works locally and in CI.
+#
+# Build:
+#   docker build -f docker/Dockerfile.dev -t mununu-dev .
+#
+# Create a named volume for cargo's target dir (so subsequent runs stay
+# warm). The container writes there via CARGO_TARGET_DIR=/cargo-target
+# rather than to the host's target/ — the host's local cargo workflow
+# stays independent.
+#   docker volume create mununu-target
+#
+# Ephemeral (one-off):
+#   docker run --rm \
+#     -v $(pwd):/work -v mununu-target:/cargo-target \
+#     mununu-dev make ci
+#
+# Persistent (faster for iterative work):
+#   docker run -d --name mununu-dev-c \
+#     -v $(pwd):/work -v mununu-target:/cargo-target \
+#     mununu-dev sleep infinity
+#   docker exec mununu-dev-c make ci
+#   docker stop mununu-dev-c && docker rm mununu-dev-c
+#
+# RTL counterexample validation (Verilator) is intentionally NOT in this
+# image — use the sibling `hw-verif:latest` image from
+# ../hw-verification-uba for that.
+
+ARG RUST_VERSION=1.91
+FROM rust:${RUST_VERSION}-slim-bookworm
+
+# Native deps required to build mununu's tree-sitter grammars and OpenSSL
+# bindings. `python3` is used by helper scripts in scripts/. Single
+# layer, --no-install-recommends, lists cleaned in the same RUN.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        cmake \
+        git \
+        curl \
+        ca-certificates \
+        make \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# rustfmt and clippy are normally bundled in the rust:* official images,
+# but install explicitly so the image is robust to upstream changes.
+RUN rustup component add rustfmt clippy
+
+# Use a container-side cargo target directory so the host's target/ is
+# never touched by container builds. This avoids cargo cache thrashing
+# when host and container use different toolchain hashes (e.g., the
+# host's stable doesn't match the image's pinned RUST_VERSION). Mount
+# a named volume here for cross-run caching:
+#   docker run --rm -v $(pwd):/work -v mununu-target:/cargo-target ...
+ENV CARGO_TARGET_DIR=/cargo-target
+RUN mkdir -p /cargo-target
+
+WORKDIR /work

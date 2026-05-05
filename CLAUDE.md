@@ -19,20 +19,53 @@ See `docs/architecture/` for the three-layer model (extraction → adaptation �
 
 ## CI Requirements
 
-Before considering work done, verify all CI checks pass locally (same as GitHub PR requirements):
+Before considering work done, verify all CI checks pass locally. The same `make ci` command is used locally and in GitHub Actions — if a contributor cannot reproduce a CI failure with one command, the contract is broken.
 
 ```bash
-# 1. Check formatting
-cargo fmt --all -- --check
+# Inside the pinned dev image (recommended — matches CI exactly):
+docker build -f docker/Dockerfile.dev -t mununu-dev .
+docker volume create mununu-target
+docker run --rm -v $(pwd):/work -v mununu-target:/cargo-target mununu-dev make ci
 
-# 2. Run clippy (must pass with no warnings — workspace-wide)
-cargo clippy --workspace --all-targets -- -D warnings
-
-# 3. Run tests (workspace-wide)
-cargo test --workspace
+# Or directly on the host:
+make ci    # = make lint && make test
 ```
 
-The `security-audit` job runs `cargo audit` for vulnerabilities. The `dependency-check` job is non-blocking.
+`make ci` runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`. The `security-audit` job runs `cargo audit` for vulnerabilities. The `dependency-check` job is non-blocking.
+
+## Reproducible Dev Container
+
+`docker/Dockerfile.dev` pins the Rust toolchain and native build deps so every contributor and the CI runner execute the exact same commands.
+
+```bash
+# Build image (rare — only on Dockerfile/toolchain changes)
+docker build -f docker/Dockerfile.dev -t mununu-dev .
+
+# Create a named volume for cargo's target dir so subsequent runs stay warm.
+# The container writes to /cargo-target (CARGO_TARGET_DIR), NOT to the host's
+# target/. Host and container caches stay independent.
+docker volume create mununu-target
+
+# Ephemeral run (one-off command, warm cargo cache via named volume)
+docker run --rm \
+  -v $(pwd):/work \
+  -v mununu-target:/cargo-target \
+  mununu-dev make <verb>
+
+# Persistent container (faster for iterative work)
+docker run -d --name mununu-dev-c \
+  -v $(pwd):/work \
+  -v mununu-target:/cargo-target \
+  mununu-dev sleep infinity
+docker exec mununu-dev-c make <verb>
+docker stop mununu-dev-c && docker rm mununu-dev-c
+```
+
+The Makefile verbs are: `build`, `test`, `lint`, `verify`, `ci` (= lint + test), `clean`. Run `make help` for the index.
+
+If you skip the `mununu-target` volume, the container compiles from scratch every run (no cache survives the `--rm`). The host's `target/` is never written to by the container, so host-side `cargo` and container-side `make` do not contend for the same artifacts.
+
+**RTL counterexample validation** uses the sibling `hw-verif:latest` image from `../hw-verification-uba` (the OSS CAD Suite is too heavy for the mununu dev image). Per-target reproductions live under `.claude/reviews/prospector/staging/<TARGET>/repro/Makefile` and are invoked as `docker run --rm -v $(pwd):/work hw-verif:latest make -C <leaf> sim`.
 
 ## Pre-commit Hooks
 
@@ -46,19 +79,23 @@ The pre-commit hook runs: `cargo fmt --check`, `cargo clippy`, `cargo test`.
 
 ## Build Commands
 
-```bash
-# Format and lint (workspace-wide)
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
+The root `Makefile` exposes the canonical verbs (`make help` for the index). Direct `cargo` invocations for finer-grained work:
 
-# Build individual crates
+```bash
+# Workspace-wide via Makefile (host or `mununu-dev` container — same command)
+make build       # cargo build --release for cli + extract
+make test        # cargo test --workspace
+make lint        # cargo fmt --check + cargo clippy -D warnings
+make verify      # build + run mununu against examples/hw/handshake.ctxdsl
+make ci          # lint + test (the gate)
+make clean       # cargo clean
+
+# Individual crates / finer cargo invocations
 cargo build -p mununu-core                    # core library
 cargo build -p mununu-cli                     # CLI binary (mununu)
 cargo build -p mununu-extract                 # extraction binary (mununu-extract)
 cargo build --release -p mununu-cli           # release CLI
 
-# Run tests
-cargo test --workspace                        # all workspace tests
 cargo test -p mununu-core                     # core lib tests only
 cargo test -p mununu-extract                  # extraction tests only
 cargo test -p mununu-core test_name           # specific test
@@ -363,6 +400,7 @@ This applies to: README examples, wiki case studies, blog posts linked from the 
    - **Properties must come from specifications, not bug knowledge.** Adding a detector register to catch a known bug and then verifying it fires is circular. Properties should come from protocol specs, safety invariants, or security requirements.
    - **Distinguish syntactic from SMT-discovered values.** Literals found directly in `case` labels are syntactic. Values found through combinational logic inversion are SMT-discovered. Don't claim SMT discovery for trivially visible constants.
    - **Show counterexample traces.** When a property fails, capture the violating state/transition trace, not just "unrealizable."
+   - **Validate the trace under simulation.** Whenever an RTL diagnostic (counterexample or counterstrategy from `mununu context synth --counterexample`) is used to support a public claim, the trace must be reproduced against the close-to-source SystemVerilog under Verilator, in the sibling `hw-verif:latest` Docker image. The reproduction lives in `staging/{target_id}/repro/` with a `.sv` per case-modifier variant relevant to the bug, a Verilator C++ testbench that drives the trace inputs (using `force` for fault hypotheses), and a `Makefile` with a `sim` verb. The simulation transcript is the evidence; a model-only lasso/counterexample is labeled "LTS witness only — not reproduced in simulation" and downgrades the rigor by one level. See the `target-executor` agent's Phase 3.5 for the procedure and `.claude/reviews/prospector/staging/RTL-002/repro/` for the canonical pattern.
    - These rules apply to both human and AI-agent authored content.
 
 #### What this does NOT restrict

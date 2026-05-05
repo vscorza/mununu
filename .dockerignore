@@ -1,0 +1,36 @@
+# Keep Docker build context small and avoid leaking secrets.
+# The dev image (docker/Dockerfile.dev) does not COPY anything, so this
+# mainly affects build speed for the production images that do COPY src.
+
+target/
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+.DS_Store
+
+# Local artifacts
+*.log
+*.vcd
+obj_dir/
+obj_unique/
+obj_plain/
+obj_fixed/
+logs/
+
+# Secrets / env
+.env
+.env.*
+*.key
+*.pem
+credentials*.json
+
+# Private materials (per CLAUDE.md "Private Files Policy" — these dirs
+# are gitignored too, but listed here as a defense in depth)
+paper/
+artifact/
+examples/syntcomp/
+examples/scalable/
+tutorial/
+wiki/
