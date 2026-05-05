@@ -602,6 +602,29 @@ pub struct CompositionModeInfo {
     pub description: &'static str,
 }
 
+/// Phase B request: scan source for concurrency idioms and propose
+/// `composition.instances[]` / `shared[]` blocks. Output is
+/// suggestion-grade — the user reviews each finding before promoting
+/// it into the extract config.
+#[derive(Debug, Deserialize)]
+pub struct ProposeCompositionRequest {
+    /// Source content to scan.
+    pub source: String,
+    /// Source language (`typescript` / `python` / `rust` / `gdscript`).
+    /// When omitted, the API requires the caller to specify it — there
+    /// is no `source.file` extension to infer from at this endpoint.
+    pub language: Option<String>,
+}
+
+/// Phase B response: list of detected concurrency findings, in source
+/// order. An empty `findings` list is the common case (no concurrency
+/// patterns present); not an error.
+#[derive(Debug, Serialize)]
+pub struct ProposeCompositionResponse {
+    pub findings:
+        Vec<crate::adapter::extraction::ast_extract::concurrency_detect::DetectedConcurrency>,
+}
+
 /// Request for AST-based extraction from source code.
 #[derive(Debug, Deserialize)]
 pub struct ExtractionExtractRequest {

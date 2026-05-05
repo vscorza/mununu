@@ -1168,6 +1168,37 @@ pub async fn extraction_domains_handler()
     Ok(Json(super::models::ExtractionDomainsResponse { profiles }))
 }
 
+/// Phase B — scan source for concurrency idioms and return findings
+/// the caller can use to seed a `composition.instances[]` block. Pure
+/// pass-through to `concurrency_detect::detect_concurrency`.
+#[cfg(feature = "ast-extract")]
+pub async fn extraction_propose_composition_handler(
+    Json(request): Json<super::models::ProposeCompositionRequest>,
+) -> ApiResult<Json<super::models::ProposeCompositionResponse>> {
+    use crate::adapter::extraction::ast_extract::{concurrency_detect, parser};
+
+    let lang_name = request
+        .language
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "missing required field `language`".to_string(),
+            details: Some("supported values: typescript, python, rust, gdscript".to_string()),
+        })?;
+    let lang =
+        parser::SourceLanguage::from_name(lang_name).ok_or_else(|| ApiError::BadRequest {
+            message: format!("unknown language: {lang_name}"),
+            details: Some("supported values: typescript, python, rust, gdscript".to_string()),
+        })?;
+
+    let parsed = parser::parse_source(&request.source, lang).map_err(|e| ApiError::BadRequest {
+        message: format!("parse error: {e}"),
+        details: None,
+    })?;
+
+    let findings = concurrency_detect::detect_concurrency(&parsed);
+    Ok(Json(super::models::ProposeCompositionResponse { findings }))
+}
+
 /// List the supported composition modes consumed by `composition.type`
 /// in the extract config / espec. Static — derived from the
 /// `CompositionSemantics` enum's variants and their soundness notes.

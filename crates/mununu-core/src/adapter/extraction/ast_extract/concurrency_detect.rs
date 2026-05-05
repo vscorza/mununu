@@ -36,13 +36,14 @@
 //!   ancestor of this work.
 
 use super::parser::{ParsedSource, SourceLanguage};
+use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 /// One detected concurrency idiom in source. The detector produces a
 /// list of these per file scan; each one is a **suggestion** the user
 /// can promote into a `composition.instances[]` / `shared[]` block (or
 /// discard, or edit).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectedConcurrency {
     /// Identifier of the detector that produced this finding (e.g.,
     /// `"python_asyncio_gather"`, `"typescript_promise_all"`). Provides

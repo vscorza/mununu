@@ -71,6 +71,10 @@ fn create_router() -> Router {
             get(handlers::extraction_composition_modes_handler),
         )
         .route(
+            "/api/v1/extraction/propose-composition",
+            post(handlers::extraction_propose_composition_handler),
+        )
+        .route(
             "/api/v1/extraction/extract",
             post(handlers::extraction_extract_handler),
         )

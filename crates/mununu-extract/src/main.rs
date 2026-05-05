@@ -51,6 +51,17 @@ enum Command {
         /// extract config and wanting to know the trade-offs.
         #[arg(long)]
         list_composition_modes: bool,
+
+        /// Phase B: scan source for concurrency idioms (asyncio.gather,
+        /// Promise.all, etc.) and print findings as JSON to stdout
+        /// (or `--output`). Skips full extraction. Useful as a pre-pass
+        /// when authoring a `composition.instances[]` block — the
+        /// findings list call sites and suggested instance counts.
+        ///
+        /// The config argument is still required (used to resolve the
+        /// source language when not explicitly set via `--language`).
+        #[arg(long)]
+        propose_composition: bool,
     },
 
     /// Extract reactive system from CIRCT MLIR output.
@@ -93,6 +104,7 @@ fn main() {
             language,
             list_domains,
             list_composition_modes,
+            propose_composition,
         } => run_ast(
             &config,
             &source,
@@ -100,6 +112,7 @@ fn main() {
             language.as_deref(),
             list_domains,
             list_composition_modes,
+            propose_composition,
         ),
         Command::Circt { input, output } => run_circt(input.as_deref(), output.as_deref()),
         Command::Llvm {
@@ -122,6 +135,7 @@ fn run_ast(
     language: Option<&str>,
     list_domains: bool,
     list_composition_modes: bool,
+    propose_composition: bool,
 ) -> Result<(), String> {
     if list_domains {
         println!("Available domain profiles:");
@@ -152,6 +166,10 @@ fn run_ast(
 
     let source_content = std::fs::read_to_string(source_path)
         .map_err(|e| format!("Failed to read source '{}': {e}", source_path.display()))?;
+
+    if propose_composition {
+        return run_propose_composition(&source_content, source_path, language, output);
+    }
 
     let language = language
         .or_else(|| {
@@ -190,6 +208,44 @@ fn run_ast(
     }
 
     write_json(&spec, output)
+}
+
+/// Phase B — scan a source file for concurrency idioms (asyncio.gather,
+/// Promise.all, etc.) and emit findings as JSON. Pre-pass for authoring
+/// a `composition.instances[]` block: each finding is suggestion-grade
+/// and the user reviews before promoting it into the extract config.
+fn run_propose_composition(
+    source_content: &str,
+    source_path: &std::path::Path,
+    language: Option<&str>,
+    output: Option<&std::path::Path>,
+) -> Result<(), String> {
+    use ast_extract::concurrency_detect;
+    use ast_extract::parser;
+
+    let lang = language
+        .and_then(parser::SourceLanguage::from_name)
+        .or_else(|| {
+            source_path
+                .to_str()
+                .and_then(parser::SourceLanguage::from_extension)
+        })
+        .ok_or_else(|| {
+            format!(
+                "Could not infer source language from '{}' — pass --language",
+                source_path.display()
+            )
+        })?;
+
+    let parsed = parser::parse_source(source_content, lang)?;
+    let findings = concurrency_detect::detect_concurrency(&parsed);
+
+    eprintln!("Detected {} concurrency idiom(s)", findings.len());
+    for f in &findings {
+        eprintln!("  line {}: {} — {}", f.line, f.detector_id, f.description);
+    }
+
+    write_json(&findings, output)
 }
 
 fn run_circt(
