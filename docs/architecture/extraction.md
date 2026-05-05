@@ -249,6 +249,51 @@ mununu context eval composed.espec.json --formula clobber_reachable --automaton 
 
 The verdicts confirm the bug witness. For MCP-005, `no_clobber` fails (0/1 initials) and `clobber_reachable` holds (1/1) — the race is reachable.
 
-### Out of scope (Phase B follow-up)
+### Phase B — pattern-based auto-detection
 
-This document covers Phase A — manual configuration. Pattern-based auto-detection (recognize `asyncio.gather`, `multiprocessing.Process`, `Promise.all` in source and synthesize the `instances` + `shared` declarations automatically) is filed as future work. It requires data-flow analysis the current cursor-walk doesn't do.
+Phase B layers a **suggestion-grade** pre-pass on top of Phase A. The detector at `crates/mununu-core/src/adapter/extraction/ast_extract/concurrency_detect.rs` walks the tree-sitter AST and surfaces known concurrency idioms:
+
+| Detector | Fires on | Output |
+|----------|----------|--------|
+| `python_asyncio_gather` | `asyncio.gather(a(), b(), …)` | branch count + `task_<i>` instance names |
+| `typescript_promise_all` | `Promise.all([…])` / `Promise.allSettled([…])` | branch count + `task_<i>` instance names |
+
+Each finding is a `DetectedConcurrency` record:
+
+```json
+{
+  "detector_id": "python_asyncio_gather",
+  "description": "asyncio.gather over 2 coroutine(s)",
+  "line": 254,
+  "branch_count": 2,
+  "suggested_instance_names": ["task_0", "task_1"],
+  "suggested_class_hint": null
+}
+```
+
+**Three entry points:**
+
+| Surface | Invocation |
+|---------|-----------|
+| CLI | `mununu-extract ast <config> --source <file> --propose-composition` |
+| HTTP | `POST /api/v1/extraction/propose-composition` with `{source, language}` |
+| Web UI | `Suggest from source (Phase B)` button on the compose-step `CompositionEditor` |
+
+**Phase B is suggestion-only.** The output is a *list of starting points*, not a finished `composition.instances[]` block. The user reviews each finding, edits instance names to fit the domain, and adds the `shared[]` labels that name the resource the instances contend over. The Phase A engine still does the actual label-rewriting and composition.
+
+**Validation against the prospector backlog** (2026-05-02 run on the staging fixtures):
+
+| Fixture | Source | Expected | Detector output | Notes |
+|---------|--------|----------|-----------------|-------|
+| MCP-001 | `tool_node_prefix.py` | LangGraph parallel-interrupt; dynamic gather | `1 finding` (`asyncio.gather` at line 254, dynamic args) | Branch count `null` because the gather is over `*coros` — correct conservative output. |
+| MCP-002 | `pregel_index.ts` | langgraphjs AsyncLocalStorage; `Promise.all` over mapped tasks | `2 findings` (lines 2144, 2155) | Both `null` branch counts — non-literal iterables. Detector flags both call sites. |
+| MCP-005 | `index.ts` (mcp-server-memory) | File race via two unsynchronized `writeFile` calls | `0 findings` | **Correctly silent** — MCP-005's race is implicit (no `gather` / `Promise.all`); the contention is in the host that calls the manager twice in flight. Phase B does not produce false positives on this shape; the user must hand-author `composition.instances[]` for it. |
+
+The MCP-005 result is the most informative: silence on a real race witness is the **expected** behavior at the current detector layer (B1, syntactic). Recovering this case requires shared-resource inference (B3) and resource-shape detection — explicitly out of scope for the initial Phase B layer per `~/.claude/plans/phase-b-auto-detection.md`.
+
+### Out of scope (Phase B+ follow-ups)
+
+- **B2 — shared-label inference**: today the suggested config has empty `shared`. A future layer can mine module-level mutable state (file paths, channels, registries) read or written by multiple instances and propose them as candidate sync points.
+- **B3 — resource-shape detection**: the MCP-005-style implicit race (two unsynchronized writers) requires reasoning about the *call graph at the caller*, not the callee. Filed as a separate gap.
+- **B4 — Query DSL / IR**: detectors currently use direct cursor walks. Migrating to a tree-sitter Query DSL or a small IR would simplify adding new idioms (`multiprocessing.Process`, `tokio::spawn`, `std::thread::spawn`).
+- **B5 — Andersen-style points-to**: cross-file concurrency analysis requires a points-to layer the cursor-walk doesn't have. Out of scope for this iteration.
