@@ -4,7 +4,7 @@
 
 Compositional extraction lets you generate **multi-automaton models** from source code in one pass — for concurrency / race-condition modeling where N instances of a class contend for a shared resource. Pre-Phase-A this work was done by hand, writing the espec's `composition` block manually after looking at source. With compositional extraction, the user declares the topology in the extract config and the extractor stitches the per-instance automata together with correct label rewriting.
 
-The complementary [Composition](Composition.md) page covers synchronous / asynchronous composition semantics in depth. This page focuses on the extraction-time mechanics.
+The complementary [Composition](Composition.md) page covers synchronous / asynchronous composition semantics in depth. This page focuses on the extraction-time mechanics. For a hands-on, copy-pasteable walkthrough with a working public fixture, see [Compositional-Extraction-Tutorial](Compositional-Extraction-Tutorial.md).
 
 ## When to use it
 

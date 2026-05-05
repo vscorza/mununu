@@ -1,0 +1,50 @@
+{
+    "$schema": "extraction_config_v1",
+    "domain": "mcp_server",
+    "language": "typescript",
+    "source": {
+        "file": "examples/ast_extract/typescript/parallel_workers.ts"
+    },
+    "targets": [{
+        "class": "Worker",
+        "automaton_id": "Worker",
+        "state_fields": ["_committed"],
+        "methods": {
+            "include": ["commit", "reset"]
+        }
+    }],
+    "composition": {
+        "type": "asynchronous",
+        "name": "two_writer_race",
+        "instances": [
+            {"of": "Worker", "as": "worker_a"},
+            {"of": "Worker", "as": "worker_b"}
+        ],
+        "shared": [],
+        "resources": [{
+            "name": "shared_file",
+            "states": ["clean", "written_by_a", "written_by_b", "clobbered"],
+            "initial": "clean",
+            "transitions": [
+                {"from": "clean", "to": "written_by_a", "label": "worker_a__ev_commit"},
+                {"from": "clean", "to": "written_by_b", "label": "worker_b__ev_commit"},
+                {"from": "written_by_a", "to": "clobbered", "label": "worker_b__ev_commit"},
+                {"from": "written_by_b", "to": "clobbered", "label": "worker_a__ev_commit"}
+            ]
+        }]
+    },
+    "properties": [
+        {
+            "id": "no_clobber",
+            "formula": "nu X. (!clobbered && [] X)",
+            "over": "two_writer_race",
+            "description": "The shared resource never reaches the clobbered state under any interleaving."
+        },
+        {
+            "id": "clobber_reachable",
+            "formula": "mu X. (clobbered || <> X)",
+            "over": "two_writer_race",
+            "description": "The clobbered state is reachable — non-vacuous witness."
+        }
+    ]
+}

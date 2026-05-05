@@ -1,0 +1,42 @@
+# Expected verdicts for examples/ast_extract/typescript/parallel_workers_compositional.extract.json
+#
+# This file documents the verdicts the compositional pipeline should
+# produce when run against `parallel_workers.ts`. Use it as a smoke
+# test: re-run the extract → eval pipeline and diff your output
+# against these numbers.
+
+# Step 1 — extraction:
+$ mununu-extract ast examples/ast_extract/typescript/parallel_workers_compositional.extract.json \
+    --source examples/ast_extract/typescript/parallel_workers.ts \
+    --output /tmp/parallel_workers.espec.json
+Extracted: 3 automata, 2 properties
+  worker_a — 2 states, 5 transitions
+  worker_b — 2 states, 5 transitions
+  shared_file — 4 states, 4 transitions
+
+# Step 2 — `no_clobber` (safety: file never clobbered).
+# Expected: FAILS. With shared=[] and no synchronization on commit,
+# both workers can interleave and reach the `clobbered` state.
+$ mununu context eval /tmp/parallel_workers.espec.json \
+    --formula no_clobber --automaton two_writer_race
+Formula 'no_clobber' over automaton 'two_writer_race':
+  States satisfying: 0/9
+    (none)
+  Initial states satisfying: 0/1
+    (none)
+
+# Step 3 — `clobber_reachable` (witness: clobbered is reachable).
+# Expected: HOLDS at every state. Confirms the no_clobber failure
+# isn't an artifact of an empty / vacuous model.
+$ mununu context eval /tmp/parallel_workers.espec.json \
+    --formula clobber_reachable --automaton two_writer_race
+Formula 'clobber_reachable' over automaton 'two_writer_race':
+  States satisfying: 9/9
+  Initial states satisfying: 1/1
+    clean|_committed_F|_committed_F
+
+# The pair `(no_clobber fails, clobber_reachable holds)` is the
+# canonical race-detection signature — exactly what GAP-009's
+# vacuity warning was designed to make visible. If you see
+# `(no_clobber fails, clobber_reachable also fails)`, the model
+# collapsed to a single state and the verdict is vacuous.
