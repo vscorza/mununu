@@ -624,12 +624,24 @@ fn to_ir(
 ) -> Result<AdapterIR, AdapterError> {
     let module_name = options.context_name.as_deref().unwrap_or(&module.name);
 
-    // Decide path: Kripke if forced, or if no enum FSM is found
+    // Build the inline-merged config so auto-detected combinational outputs
+    // (driven from `always_comb` or `assign`) flow into signal_domains and
+    // the Kripke builder treats them correctly. Without this, an FSM that
+    // emits a combinational output would silently drop the comb logic.
+    let inline_config = annotation::merge_config(None, module);
+
+    // Decide path: Kripke if forced, if there are inline domain annotations,
+    // if there are auto-detected combinational outputs, or if no enum FSM is
+    // found.
     let use_kripke = module.force_kripke
         || !module.domain_annotations.is_empty()
+        || !inline_config.signal_domains.is_empty()
         || fsm::extract_fsm(module).is_none();
 
     if use_kripke {
+        if !inline_config.signal_domains.is_empty() {
+            return to_ir_kripke_with_config(module, module_name, &inline_config, warnings);
+        }
         return to_ir_kripke(module, module_name, warnings);
     }
 

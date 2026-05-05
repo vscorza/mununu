@@ -1390,3 +1390,448 @@ fn industrial_axilite_top_module_generated_sidecar() {
         system.state_count()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case-modifier and `inside` operator coverage (IEEE 1800 §12.5.3)
+//
+// Real production RTL (Caliptra, OpenTitan, BSV-derived ASICs, etc.) frequently
+// prefixes `case` with `unique` / `unique0` / `priority`, uses `casex` instead
+// of `casez`, and uses the `inside` operator to make set-membership matching
+// explicit. These are verification-time hints — they do not change the LTS we
+// build for the labels we accept (bare identifiers and integer literals). The
+// parser must accept them and silently discard.
+//
+// Each test pairs the new-keyword form with a plain-`case` baseline and
+// asserts identical state counts and realizability verdicts — soundness
+// regression coverage that no LTS-level change leaks in.
+// ---------------------------------------------------------------------------
+
+const PLAIN_CASE_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else case (state)
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+const UNIQUE_CASE_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else unique case (state)
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+const UNIQUE_CASEZ_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else unique casez (state)
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+const UNIQUE_CASE_INSIDE_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else unique case (state) inside
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+                default: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+const UNIQUE0_CASE_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else unique0 case (state)
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+const PRIORITY_CASE_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else priority case (state)
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+const CASEX_SV: &str = r#"
+    // @mununu ltl safety: nu X. ([] X)
+    module case_demo(
+        input logic clk, input logic rst,
+        input logic go
+    );
+        typedef enum logic [1:0] {S0, S1, S2} state_t;
+        state_t state;
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= S0;
+            else casex (state)
+                S0: if (go) state <= S1;
+                S1: state <= S2;
+                S2: state <= S0;
+            endcase
+        end
+    endmodule
+"#;
+
+fn case_demo_state_count(sv: &str) -> usize {
+    let (_output, realized) = translate_and_realize(sv);
+    realized
+        .context
+        .clts("case_demo")
+        .expect("case_demo automaton")
+        .state_count()
+}
+
+#[test]
+fn parses_unique_case() {
+    assert_eq!(
+        case_demo_state_count(UNIQUE_CASE_SV),
+        case_demo_state_count(PLAIN_CASE_SV),
+        "`unique case` must produce the same LTS as plain `case`"
+    );
+}
+
+#[test]
+fn parses_unique_casez() {
+    assert_eq!(
+        case_demo_state_count(UNIQUE_CASEZ_SV),
+        case_demo_state_count(PLAIN_CASE_SV),
+        "`unique casez` must produce the same LTS as plain `case`"
+    );
+}
+
+#[test]
+fn parses_unique_case_inside() {
+    // `inside` adds a `default:` branch in this fixture — the `inside` form
+    // is the canonical exhaustive style. Resulting state count is the same
+    // because the default re-enters S0, which is already reachable.
+    assert_eq!(
+        case_demo_state_count(UNIQUE_CASE_INSIDE_SV),
+        case_demo_state_count(PLAIN_CASE_SV),
+        "`unique case (sel) inside` must produce the same LTS as plain `case`"
+    );
+}
+
+#[test]
+fn parses_unique0_case() {
+    assert_eq!(
+        case_demo_state_count(UNIQUE0_CASE_SV),
+        case_demo_state_count(PLAIN_CASE_SV),
+        "`unique0 case` must produce the same LTS as plain `case`"
+    );
+}
+
+#[test]
+fn parses_priority_case() {
+    assert_eq!(
+        case_demo_state_count(PRIORITY_CASE_SV),
+        case_demo_state_count(PLAIN_CASE_SV),
+        "`priority case` must produce the same LTS as plain `case`"
+    );
+}
+
+#[test]
+fn parses_casex() {
+    assert_eq!(
+        case_demo_state_count(CASEX_SV),
+        case_demo_state_count(PLAIN_CASE_SV),
+        "`casex` must produce the same LTS as `casez` / `case` for non-wildcard labels"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// always_comb top-of-block defaults + nested control-flow
+//
+// IEEE 1800 §10.4 / §12.5.3: inside always_comb, top-of-block default
+// assignments execute on every activation; case-arm assignments overwrite them
+// when an arm matches. When no arm matches and there is no `default:`, the
+// top-of-block defaults survive — no latch, no X, no synthesis warning.
+//
+// This is the idiom invoked by the chipsalliance/caliptra-rtl#150 maintainer
+// ("the default values should all be defined at the start of the always_comb
+// block, falling into the default case would be an error condition") and the
+// adapter must respect it for any FSM whose recovery behavior depends on the
+// difference between top-of-block defaults and case-arm overrides.
+// ---------------------------------------------------------------------------
+
+const COMB_DEFAULT_PARTIAL_CASE_SV: &str = r#"
+    // @mununu ltl ack_only_in_act: nu X. ([] X)
+    module ack_fsm(
+        input  logic clk,
+        input  logic rst,
+        input  logic req,
+        output logic ack
+    );
+        typedef enum logic [1:0] { IDLE, REQ_S, ACT, DONE } state_t;
+        state_t state;
+
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= IDLE;
+            else case (state)
+                IDLE:   if (req) state <= REQ_S;
+                REQ_S:  state <= ACT;
+                ACT:    state <= DONE;
+                DONE:   state <= IDLE;
+            endcase
+        end
+
+        // Top-of-block default + partial case (no `default:`).
+        // ack must be 1 only in ACT and 0 everywhere else.
+        always_comb begin
+            ack = 1'b0;
+            case (state)
+                ACT: ack = 1'b1;
+            endcase
+        end
+    endmodule
+"#;
+
+const COMB_DEFAULT_EXPLICIT_DEFAULT_SV: &str = r#"
+    // @mununu ltl ack_only_in_act: nu X. ([] X)
+    module ack_fsm(
+        input  logic clk,
+        input  logic rst,
+        input  logic req,
+        output logic ack
+    );
+        typedef enum logic [1:0] { IDLE, REQ_S, ACT, DONE } state_t;
+        state_t state;
+
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= IDLE;
+            else case (state)
+                IDLE:   if (req) state <= REQ_S;
+                REQ_S:  state <= ACT;
+                ACT:    state <= DONE;
+                DONE:   state <= IDLE;
+            endcase
+        end
+
+        // Same FSM with an explicit `default:` arm that re-states the
+        // top-of-block default. Must produce the same LTS as the partial-case
+        // version above — the lint-silencing pattern is functionally redundant.
+        always_comb begin
+            ack = 1'b0;
+            case (state)
+                ACT: ack = 1'b1;
+                default: ack = 1'b0;
+            endcase
+        end
+    endmodule
+"#;
+
+const COMB_DEFAULT_UNIQUE_CASE_SV: &str = r#"
+    // @mununu ltl ack_only_in_act: nu X. ([] X)
+    module ack_fsm(
+        input  logic clk,
+        input  logic rst,
+        input  logic req,
+        output logic ack
+    );
+        typedef enum logic [1:0] { IDLE, REQ_S, ACT, DONE } state_t;
+        state_t state;
+
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= IDLE;
+            else case (state)
+                IDLE:   if (req) state <= REQ_S;
+                REQ_S:  state <= ACT;
+                ACT:    state <= DONE;
+                DONE:   state <= IDLE;
+            endcase
+        end
+
+        // `unique case` plus partial case + top-of-block default. Must match
+        // the plain-case version: `unique` is a runtime-assertion / synthesis
+        // hint and does not change the LTS for binary-literal labels.
+        always_comb begin
+            ack = 1'b0;
+            unique case (state)
+                ACT: ack = 1'b1;
+            endcase
+        end
+    endmodule
+"#;
+
+const COMB_DEFAULT_NESTED_IF_SV: &str = r#"
+    // @mununu ltl ok: nu X. ([] X)
+    module nested_if_fsm(
+        input  logic clk,
+        input  logic rst,
+        input  logic enable,
+        input  logic req,
+        output logic ack
+    );
+        typedef enum logic [1:0] { IDLE, REQ_S, ACT, DONE } state_t;
+        state_t state;
+
+        always_ff @(posedge clk or posedge rst) begin
+            if (rst) state <= IDLE;
+            else case (state)
+                IDLE:   if (req) state <= REQ_S;
+                REQ_S:  state <= ACT;
+                ACT:    state <= DONE;
+                DONE:   state <= IDLE;
+            endcase
+        end
+
+        // Nested if inside always_comb on top of a top-of-block default.
+        // ack = enable && (state == ACT). The if/else and the case arm both
+        // contribute guards; the comb collector must preserve them.
+        always_comb begin
+            ack = 1'b0;
+            if (enable) begin
+                case (state)
+                    ACT: ack = 1'b1;
+                endcase
+            end
+        end
+    endmodule
+"#;
+
+fn ack_fsm_state_count(sv: &str) -> usize {
+    let (_output, realized) = translate_and_realize(sv);
+    realized
+        .context
+        .clts("ack_fsm")
+        .expect("ack_fsm automaton")
+        .state_count()
+}
+
+#[test]
+fn comb_default_partial_case_distinguishes_act_from_others() {
+    // The state space is over the (state, ack) cross-product. With ack
+    // correctly tracking the top-of-block default + ACT-arm override, the
+    // ack=1 state should appear paired only with state=ACT (one combination),
+    // and ack=0 states should appear paired with each of the other three
+    // states (three combinations). Total: 4 reachable states. With the OLD
+    // collector (which dropped the case control flow), all four ack-on-state
+    // combinations would have been admitted by last-wins eval, doubling the
+    // reachable space.
+    let (_output, realized) = translate_and_realize(COMB_DEFAULT_PARTIAL_CASE_SV);
+    let clts = realized
+        .context
+        .clts("ack_fsm")
+        .expect("ack_fsm automaton should exist");
+    // We expect 4 reachable states (one per FSM state, with ack determined
+    // combinationally by the state). If guards were ignored, ack would
+    // diverge from state, producing 8 reachable states.
+    assert_eq!(
+        clts.state_count(),
+        4,
+        "ack must be a deterministic function of state — got {} states",
+        clts.state_count()
+    );
+}
+
+#[test]
+fn comb_default_explicit_default_matches_partial_case() {
+    assert_eq!(
+        ack_fsm_state_count(COMB_DEFAULT_PARTIAL_CASE_SV),
+        ack_fsm_state_count(COMB_DEFAULT_EXPLICIT_DEFAULT_SV),
+        "explicit `default: ack = 1'b0;` must produce the same LTS as the partial-case form \
+         (the upstream Caliptra-RTL #150 patch pattern: lint silenced, semantics unchanged)"
+    );
+}
+
+#[test]
+fn comb_default_unique_case_matches_plain_case() {
+    assert_eq!(
+        ack_fsm_state_count(COMB_DEFAULT_PARTIAL_CASE_SV),
+        ack_fsm_state_count(COMB_DEFAULT_UNIQUE_CASE_SV),
+        "`unique case` is a runtime-assertion / synthesis hint — must not change the LTS"
+    );
+}
+
+#[test]
+fn comb_default_nested_if_inside_case() {
+    // With ack = enable && (state == ACT), the reachable state space is over
+    // (state, enable, ack). enable is a 1-bit input so it's free; ack is
+    // determined by state and enable. Reachable combinations:
+    //   - (IDLE, *, 0), (REQ_S, *, 0), (DONE, *, 0)        : 6 states
+    //   - (ACT, 0, 0), (ACT, 1, 1)                          : 2 states
+    // But `enable` is an input, not a register — it does not factor into
+    // the cross-product enumeration. The relevant invariant is that the
+    // state count matches the FSM state count (4) with ack correctly bound.
+    let (_output, realized) = translate_and_realize(COMB_DEFAULT_NESTED_IF_SV);
+    let clts = realized
+        .context
+        .clts("nested_if_fsm")
+        .expect("nested_if_fsm automaton should exist");
+    // ack splits ACT into (enable=0, ack=0) and (enable=1, ack=1); the other
+    // states all have ack=0 regardless of enable. So we get 4 (state) + 1
+    // extra (ACT splits into ack=0 and ack=1) = 5 reachable register states.
+    assert_eq!(
+        clts.state_count(),
+        5,
+        "nested if/case in always_comb must preserve guards — got {} states",
+        clts.state_count()
+    );
+}

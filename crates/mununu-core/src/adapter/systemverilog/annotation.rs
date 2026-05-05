@@ -877,6 +877,76 @@ fn merge_from_inline(module: &Module) -> MergedConfig {
         .map(|p| (p.name.clone(), p.default_value))
         .collect();
 
+    // Auto-detect combinational output ports driven by `always_comb` and add
+    // them to signal_domains so the Kripke builder treats them as
+    // combinational signals (computed each cycle from the comb logic, not as
+    // sequential registers). Without this, an `output logic foo` driven from
+    // `always_comb` would be silently treated as a stateful register that
+    // never gets updated.
+    //
+    // We deliberately do NOT auto-add `assign`-driven outputs here: the
+    // legacy FSM-extraction path handles them implicitly (output is treated
+    // as a pure function of state), and forcing those modules into the
+    // Kripke path would change their state space and break existing tests.
+    // Modules that need `assign`-driven outputs in the Kripke path can opt
+    // in via an inline `@mununu domain` annotation or via a sidecar.
+    //
+    // Skip ports whose domains were already declared via an inline
+    // `@mununu domain foo: ...` annotation — explicit always wins.
+    use super::ast::PortDirection;
+    for port in &module.ports {
+        if port.direction != PortDirection::Output {
+            continue;
+        }
+        if signal_domains.contains_key(&port.name) {
+            continue;
+        }
+        let driven_by_always_comb = always_comb_writes_signal(module, port.name.as_str());
+        if !driven_by_always_comb {
+            continue;
+        }
+        let (domain, value_map) = if port.width == 1 {
+            (
+                FieldDomain {
+                    name: port.name.clone(),
+                    abstraction: AbstractionType::Boolean,
+                    bound: None,
+                    lower_bound: None,
+                    variants: None,
+                    initial: AbstractValue::Bool(false),
+                },
+                vec![],
+            )
+        } else if port.width <= 4 {
+            (
+                FieldDomain {
+                    name: port.name.clone(),
+                    abstraction: AbstractionType::BoundedCounter,
+                    bound: Some((1i64 << port.width) - 1),
+                    lower_bound: None,
+                    variants: None,
+                    initial: AbstractValue::Counter(0),
+                },
+                vec![],
+            )
+        } else {
+            // Wider combinational outputs without an explicit @mununu domain
+            // annotation are skipped — the user must annotate them to bound
+            // the state space.
+            continue;
+        };
+        signal_domains.insert(
+            port.name.clone(),
+            SignalConfig {
+                preserve: true,
+                domain,
+                value_map,
+                combinational: true,
+                label_name: None,
+            },
+        );
+    }
+
     MergedConfig {
         signal_domains,
         input_domains: HashMap::new(),
@@ -962,27 +1032,83 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
         }
     }
 
-    // Detect combinational output ports (driven by assign statements)
+    // Detect combinational output ports — driven either by `assign`
+    // statements or by `always_comb` blocks. The latter is the canonical
+    // SystemVerilog idiom for FSM next-state logic and conditional output
+    // generation; without this detection, a `output logic foo` driven from
+    // `always_comb` would be silently treated as a sequential register and
+    // its combinational logic discarded.
     for port in &module.ports {
-        if port.direction == PortDirection::Output
-            && module.assigns.iter().any(|a| a.target.name() == port.name)
-            && !signals.iter().any(|s| s.name == port.name)
-        {
-            let (abstraction, bound) = abstract_width(port.width);
-            signals.push(SignalAnnotation {
-                name: port.name.clone(),
-                preserve: true,
-                abstraction,
-                bound,
-                variants: None,
-                value_map: None,
-                combinational: true,
-                note: Some("combinational output (assign-driven)".to_string()),
-            });
+        if port.direction == PortDirection::Output && !signals.iter().any(|s| s.name == port.name) {
+            let driven_by_assign = module.assigns.iter().any(|a| a.target.name() == port.name);
+            let driven_by_always_comb = always_comb_writes_signal(module, port.name.as_str());
+            if driven_by_assign || driven_by_always_comb {
+                let (abstraction, bound) = abstract_width(port.width);
+                let note = if driven_by_assign {
+                    "combinational output (assign-driven)"
+                } else {
+                    "combinational output (always_comb-driven)"
+                };
+                signals.push(SignalAnnotation {
+                    name: port.name.clone(),
+                    preserve: true,
+                    abstraction,
+                    bound,
+                    variants: None,
+                    value_map: None,
+                    combinational: true,
+                    note: Some(note.to_string()),
+                });
+            }
         }
     }
 
     signals
+}
+
+/// Returns true if any `always_comb` block in `module` contains a `BlockingAssign`
+/// targeting `signal_name` (recursively walks `if`/`case`/`Block` statements).
+fn always_comb_writes_signal(module: &super::ast::Module, signal_name: &str) -> bool {
+    use super::ast::AlwaysBlock;
+    for block in &module.always_blocks {
+        if let AlwaysBlock::AlwaysComb { body } = block
+            && statement_writes_signal(body, signal_name)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn statement_writes_signal(stmt: &super::ast::Statement, signal_name: &str) -> bool {
+    use super::ast::Statement;
+    match stmt {
+        Statement::BlockingAssign { target, .. } => target.name() == signal_name,
+        Statement::Block(stmts) => stmts
+            .iter()
+            .any(|s| statement_writes_signal(s, signal_name)),
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_writes_signal(then_branch, signal_name)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|e| statement_writes_signal(e, signal_name))
+        }
+        Statement::Case {
+            branches, default, ..
+        } => {
+            branches
+                .iter()
+                .any(|b| statement_writes_signal(&b.body, signal_name))
+                || default
+                    .as_ref()
+                    .is_some_and(|d| statement_writes_signal(d, signal_name))
+        }
+        Statement::NonblockingAssign { .. } => false,
+    }
 }
 
 /// Build input annotations from a module's input ports, skipping clock/reset.

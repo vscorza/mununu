@@ -1230,7 +1230,13 @@ impl<'a> Parser<'a> {
             Ok(Statement::Block(stmts))
         } else if self.peek_keyword("if") {
             self.parse_if_statement()
-        } else if self.peek_keyword("case") || self.peek_keyword("casez") {
+        } else if self.peek_keyword("case")
+            || self.peek_keyword("casez")
+            || self.peek_keyword("casex")
+            || self.peek_keyword("unique0")
+            || self.peek_keyword("unique")
+            || self.peek_keyword("priority")
+        {
             self.parse_case_statement()
         } else {
             // Assignment: target <= expr; or target = expr;
@@ -1306,11 +1312,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case_statement(&mut self) -> Result<Statement, AdapterError> {
-        // consume 'case' or 'casez'
+        // Optional case modifier (`unique`, `unique0`, `priority`). These are
+        // IEEE 1800 §12.5.3 verification-time hints — they assert label
+        // exhaustiveness or priority order at simulation/synthesis time but
+        // do not change the LTS for the labels we model. Accept and discard.
+        // Check `unique0` before `unique` because the former is a longer
+        // match for the same prefix (peek_keyword guards against this, but
+        // explicit ordering is clearer).
+        if self.peek_keyword("unique0") {
+            self.expect_keyword("unique0")?;
+        } else if self.peek_keyword("unique") {
+            self.expect_keyword("unique")?;
+        } else if self.peek_keyword("priority") {
+            self.expect_keyword("priority")?;
+        }
+        // consume 'case', 'casez', or 'casex'
         self.parse_ident()?;
         self.expect_char('(')?;
         let selector = self.parse_ident()?;
         self.expect_char(')')?;
+        // Optional `inside` operator (`case (sel) inside`). Switches case-item
+        // matching to set membership; for the bare identifier/number labels
+        // accepted by our case-item parser, this reduces to plain `case`.
+        if self.peek_keyword("inside") {
+            self.expect_keyword("inside")?;
+        }
 
         let mut branches = Vec::new();
         let mut default = None;

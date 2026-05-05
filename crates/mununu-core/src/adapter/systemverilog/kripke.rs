@@ -667,7 +667,32 @@ fn build_registers_from_config(
     if !config.from_sidecar {
         // Inline annotations — use the original extract_registers which
         // auto-detects signals and applies inline @mununu overrides.
-        return extract_registers(module, warnings);
+        let mut registers = extract_registers(module, warnings);
+
+        // Inline path also gets auto-detected combinational outputs (from
+        // `merge_from_inline`'s output-port scan): add them as Kripke
+        // registers if they're declared `combinational` in the merged
+        // config. Without this, an `output logic ack` driven from
+        // `always_comb` is invisible to the state space and its comb logic
+        // is silently discarded.
+        for port in &module.ports {
+            if port.direction == PortDirection::Output
+                && let Some(sig_config) = config.signal_domains.get(&port.name)
+                && sig_config.combinational
+                && !registers.iter().any(|r| r.name == port.name)
+            {
+                registers.push(RegisterInfo {
+                    name: port.name.clone(),
+                    width: port.width,
+                    domain: sig_config.domain.clone(),
+                    kind: SignalKind::Output,
+                    value_map: sig_config.value_map.clone(),
+                    combinational: true,
+                });
+            }
+        }
+
+        return registers;
     }
 
     let mut registers = Vec::new();
@@ -1239,11 +1264,22 @@ fn compute_cone_of_influence(
 // Combinational logic evaluation
 // ---------------------------------------------------------------------------
 
-/// A combinational assignment: target = expr.
+/// A combinational assignment: target = expr, with the conjunction of `if` /
+/// `case` guards under which the assignment fires. An empty guard list means
+/// unconditional — the SV "top-of-`always_comb`" default-assignment idiom.
+///
+/// SOUNDNESS: collected in source order so that `eval_comb_assigns` applies
+/// last-write-wins, matching IEEE 1800 §10.4 procedural-block semantics.
+/// Top-of-block defaults appear first with empty guards; case-arm overrides
+/// appear later with non-empty guards. When the guards hold, the override
+/// wins; when they do not, the earlier default survives. This is what the
+/// Caliptra-RTL maintainer relies on in chipsalliance/caliptra-rtl#150.
 #[derive(Debug, Clone)]
 struct CombAssign {
     target: AssignTarget,
     value: Expr,
+    /// Guard conjunction (reused from the always_ff path).
+    guards: Vec<SeqGuard>,
 }
 
 /// Collect all combinational assignments (assign + always_comb).
@@ -1254,48 +1290,119 @@ fn collect_comb_assigns(module: &Module) -> Vec<CombAssign> {
         assigns.push(CombAssign {
             target: a.target.clone(),
             value: a.value.clone(),
+            guards: Vec::new(),
         });
     }
 
     for block in &module.always_blocks {
         if let AlwaysBlock::AlwaysComb { body } = block {
-            collect_comb_from_statement(body, &mut assigns);
+            collect_comb_from_statement(body, &[], &mut assigns);
         }
     }
 
     assigns
 }
 
-fn collect_comb_from_statement(stmt: &Statement, assigns: &mut Vec<CombAssign>) {
+fn collect_comb_from_statement(
+    stmt: &Statement,
+    guards: &[SeqGuard],
+    assigns: &mut Vec<CombAssign>,
+) {
     match stmt {
         Statement::BlockingAssign { target, value } => {
             assigns.push(CombAssign {
                 target: target.clone(),
                 value: value.clone(),
+                guards: guards.to_vec(),
             });
         }
         Statement::Block(stmts) => {
             for s in stmts {
-                collect_comb_from_statement(s, assigns);
+                collect_comb_from_statement(s, guards, assigns);
             }
         }
-        // For if/case in always_comb, we'd need conditional evaluation.
-        // For now, skip complex control flow in comb blocks.
+        Statement::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let mut then_guards = guards.to_vec();
+            then_guards.push(SeqGuard::If(cond.clone()));
+            collect_comb_from_statement(then_branch, &then_guards, assigns);
+
+            if let Some(else_br) = else_branch {
+                let mut else_guards = guards.to_vec();
+                else_guards.push(SeqGuard::IfNot(cond.clone()));
+                collect_comb_from_statement(else_br, &else_guards, assigns);
+            }
+        }
+        Statement::Case {
+            selector,
+            branches,
+            default,
+        } => {
+            for branch in branches {
+                let mut case_guards = guards.to_vec();
+                case_guards.push(SeqGuard::CaseEq(selector.clone(), branch.label.clone()));
+                collect_comb_from_statement(&branch.body, &case_guards, assigns);
+            }
+            // SOUNDNESS: a missing `default:` arm is NOT modeled as register-
+            // hold here — that is the always_ff path's role. Inside always_comb,
+            // when no arm matches and there is no `default:`, the SV-defined
+            // behavior is "the top-of-block default assignments stand". Those
+            // defaults were already collected by the recursion above, so we
+            // simply emit nothing for the no-match path. If a `default:` arm
+            // IS present, we collect it under the negated disjunction of the
+            // arm guards — the same pattern used by collect_seq_from_statement
+            // (line 1703).
+            if let Some(d) = default {
+                let mut default_guards = guards.to_vec();
+                for branch in branches {
+                    default_guards.push(SeqGuard::CaseNeq(selector.clone(), branch.label.clone()));
+                }
+                collect_comb_from_statement(d, &default_guards, assigns);
+            }
+            // SOUNDNESS: `case` vs `casez` vs `casex` are all matched as exact
+            // equality on the selector by guards_satisfied (line ~1809). For
+            // binary-literal labels (no `?`/`Z`/`X` wildcards in the label
+            // itself) this is sound. For wildcard labels we under-approximate
+            // — wildcard arms that should match multiple encodings are matched
+            // only on the literal pattern. This is a known limitation; flag it
+            // in the adapter's warnings if any case label contains wildcard
+            // characters in future work.
+        }
+        // SOUNDNESS: unhandled statement kinds (e.g., for-loops, function
+        // calls) are dropped. This is unsound for comb blocks that use them
+        // — the SV adapter parser does not currently emit such statements,
+        // so the path is unreachable in practice, but if a new Statement
+        // variant is added the compiler's exhaustiveness check will not
+        // fire here. Keep this comment in sync with ast::Statement.
         _ => {}
     }
 }
 
 /// Evaluate combinational assignments, updating the valuation map.
+///
+/// SOUNDNESS: applies assignments in source order, last-write-wins, filtering
+/// each by its `guards`. This matches IEEE 1800 §10.4 always_comb semantics:
+/// top-of-block defaults (empty guards) execute unconditionally, then case-arm
+/// overrides execute when their guards hold. When `guards_satisfied` admits an
+/// arm whose selector cannot be evaluated (None), we conservatively let the
+/// arm fire — over-approx, sound for safety. If `eval_expr` on the RHS returns
+/// None we fall back to `Bool(false)` for backward compatibility with the
+/// previous behavior; this is conservative for output assertions ("not
+/// asserted") but UNSOUND for any signal whose default value is non-zero. The
+/// fix is to either default the signal at the top of the block (the Caliptra
+/// idiom) or to track signal-specific reset values — preferred direction.
 fn eval_comb_assigns(
     assigns: &[CombAssign],
     values: &mut BTreeMap<String, AbstractValue>,
     registers: &[RegisterInfo],
 ) {
-    // Simple single-pass evaluation (assumes no dependency cycles).
-    // If evaluation returns None (e.g., comparison involving an unresolved
-    // value like a catch-all enum variant), default to Bool(false).
-    // This is conservative: unknown comparisons produce "not asserted".
     for assign in assigns {
+        if !guards_satisfied(&assign.guards, values, registers) {
+            continue;
+        }
         let result =
             eval_expr(&assign.value, values, registers).unwrap_or(AbstractValue::Bool(false));
         apply_assign_target(&assign.target, result, values);
