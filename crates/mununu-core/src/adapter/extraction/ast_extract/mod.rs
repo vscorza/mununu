@@ -87,6 +87,16 @@ pub fn extract_from_source(
             all_automata.push(automaton_def);
             all_warnings.extend(target_warnings);
         }
+        // GAP-008: emit hand-modeled shared resources as additional
+        // automata. They sit alongside the per-instance automata in the
+        // composition's `members` list. Resource labels are NOT
+        // per-instance-prefixed — they're authored verbatim, so a label
+        // matching one declared in `composition.shared` (or one on an
+        // instance automaton) synchronizes via alphabet intersection.
+        for resource in &comp.resources {
+            let resource_def = build_resource_automaton_def(resource)?;
+            all_automata.push(resource_def);
+        }
     } else {
         for target in &config.targets {
             let (automaton_def, target_warnings) =
@@ -231,6 +241,82 @@ fn build_automaton_def(
     let mut warnings = extracted.warnings;
     warnings.extend(derived.warnings);
     Ok((automaton_def, warnings))
+}
+
+/// GAP-008: build an `AutomatonDef` from a hand-modeled `ResourceDecl`
+/// (no source scanning). Resources are authored declaratively in the
+/// extract config; this function converts the declarative form into the
+/// existing `AutomatonDef` shape used by the composition emit pipeline.
+///
+/// Validation: the `initial` state must be present in `states`, and every
+/// transition's `from` / `to` must reference declared states. A bad spec
+/// fails extraction with a clear actionable error rather than silently
+/// producing a malformed automaton.
+#[cfg(feature = "ast-extract")]
+fn build_resource_automaton_def(
+    resource: &config::ResourceDecl,
+) -> Result<super::ast::AutomatonDef, String> {
+    let states_set: std::collections::HashSet<&str> =
+        resource.states.iter().map(String::as_str).collect();
+    if !states_set.contains(resource.initial.as_str()) {
+        return Err(format!(
+            "composition.resources['{}'].initial = '{}' is not in `states` (declared: {:?})",
+            resource.name, resource.initial, resource.states
+        ));
+    }
+    for (i, t) in resource.transitions.iter().enumerate() {
+        if !states_set.contains(t.from.as_str()) {
+            return Err(format!(
+                "composition.resources['{}'].transitions[{}].from = '{}' \
+                 is not in `states` (declared: {:?})",
+                resource.name, i, t.from, resource.states
+            ));
+        }
+        if !states_set.contains(t.to.as_str()) {
+            return Err(format!(
+                "composition.resources['{}'].transitions[{}].to = '{}' \
+                 is not in `states` (declared: {:?})",
+                resource.name, i, t.to, resource.states
+            ));
+        }
+    }
+
+    let states = resource
+        .states
+        .iter()
+        .map(|name| {
+            super::ast::StateDef::Structured(super::ast::StateDefStructured {
+                name: name.clone(),
+                initial: name == &resource.initial,
+            })
+        })
+        .collect();
+
+    let transitions = resource
+        .transitions
+        .iter()
+        .map(|t| super::ast::TransitionDef {
+            from: t.from.clone(),
+            to: t.to.clone(),
+            label: t.label.clone(),
+            mode: "both".to_string(),
+            derived_from: None,
+            comment: None,
+        })
+        .collect();
+
+    Ok(super::ast::AutomatonDef {
+        id: resource.name.clone(),
+        states,
+        controllable_labels: resource.controllable_labels.clone(),
+        transitions,
+        fields: vec![],
+        note: Some(format!(
+            "Hand-modeled resource declared via composition.resources[\"{}\"]",
+            resource.name
+        )),
+        role: None,
+    })
 }
 
 /// Rewrite labels on an automaton for compositional extraction. Every label

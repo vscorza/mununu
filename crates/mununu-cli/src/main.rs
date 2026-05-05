@@ -1487,8 +1487,18 @@ fn parse_context_file(path: &Path) -> Result<ContextDoc, String> {
 }
 
 /// Log adapter warnings and translation summary to stderr, then return the
-/// CTXDSL text.  Shared by every adapter arm in [`load_with_adapter_mode`].
-fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> String {
+/// CTXDSL text and the structured state valuations.  Shared by every adapter
+/// arm in [`load_with_adapter_mode`]. The state valuations are a side-channel
+/// from cross-product enumeration (SV Kripke, extraction); the caller must
+/// inject them into the parsed `ContextDoc` so the realizer can resolve
+/// field-based predicates like `boot_fsm_ps_BOOT_IDLE` over composite state
+/// names like `boot_fsm_ns_BOOT_IDLE_boot_fsm_ps_BOOT_IDLE`.
+type StateValuationsMap = std::collections::HashMap<
+    String,
+    std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+>;
+
+fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, StateValuationsMap) {
     for w in &output.warnings {
         eprintln!("adapter warning: {}", w.message);
     }
@@ -1499,7 +1509,7 @@ fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> String {
         output.source_info.state_count,
         output.source_info.property_count,
     );
-    output.ctxdsl
+    (output.ctxdsl, output.state_valuations)
 }
 
 /// Read a source file, optionally translating it from an external format first.
@@ -1521,7 +1531,7 @@ fn load_with_adapter_mode(
         ..Default::default()
     };
 
-    let ctxdsl_source = match adapter {
+    let (ctxdsl_source, state_valuations) = match adapter {
         Some("tlsf") => log_adapter_output(
             mununu_core::adapter::tlsf::TlsfAdapter::translate(&source, &options_default)
                 .map_err(|e| format!("TLSF adapter error: {e}"))?,
@@ -1568,13 +1578,16 @@ fn load_with_adapter_mode(
                 eprintln!("Auto-detected format '{}' from extension", fmt);
                 return load_with_adapter_mode(path, Some(fmt), mode);
             }
-            source
+            (source, std::collections::HashMap::new())
         }
     };
 
     let was_adapter = adapter.is_some();
-    let doc = parse_context_doc(&ctxdsl_source)
+    let mut doc = parse_context_doc(&ctxdsl_source)
         .map_err(|err| format!("failed to parse '{}': {err}", path.display()))?;
+    // Inject the side-channel state valuations from the adapter so the
+    // realizer can resolve field-based predicates over composite state names.
+    doc.state_valuations = state_valuations;
     Ok((
         doc,
         if was_adapter {
@@ -2049,6 +2062,16 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         })
         .collect();
     initial_satisfying.sort();
+
+    // GAP-009: vacuous-property warning. Surfaced by the 2026-05-04
+    // compositional validations on MCP-001 / MCP-005, where per-instance
+    // automata collapsed to 1 state and verdicts numerically matched the
+    // hand baselines by coincidence. The check + message are extracted
+    // into `vacuity_warning_for_state_count` for unit testability;
+    // surfaced via stderr alongside the existing soundness warnings.
+    if let Some(msg) = vacuity_warning_for_state_count(eval_clts.state_count()) {
+        eprintln!("{msg}");
+    }
 
     println!(
         "Formula '{}' over automaton '{}':",
@@ -4238,4 +4261,69 @@ fn resolve_formula_name(
     );
 
     Ok(formula_name)
+}
+
+/// GAP-009: returns a warning message when the model is small enough that
+/// any verdict is vacuously satisfied, otherwise None.
+///
+/// A 1-state model can only produce 0/1 or 1/1 verdicts regardless of
+/// formula content — the property never gets a chance to discriminate.
+/// A 0-state model is the empty case (typically a result of upstream
+/// extraction failure) — verdicts are nominally 0/0, also vacuous.
+///
+/// The threshold is intentionally tight (≤ 1). A 2+-state model can in
+/// principle witness real behavior, even if some properties are still
+/// trivially satisfied; that case is left for a follow-up predicate-level
+/// vacuity check (out of scope for GAP-009).
+fn vacuity_warning_for_state_count(state_count: usize) -> Option<String> {
+    if state_count <= 1 {
+        Some(format!(
+            "[mununu] WARN: model has {state_count} reachable state(s); verdicts are \
+             vacuously satisfied regardless of formula content. The property \
+             may appear to hold (or fail) without genuinely witnessing or \
+             excluding the modeled behavior. Confirm the model has \
+             sufficient state-space distinction before relying on this verdict."
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod vacuity_warning_tests {
+    use super::vacuity_warning_for_state_count;
+
+    /// 1-state and 0-state models trigger the vacuity warning.
+    /// The MCP-001 / MCP-005 compositional validation pathology was
+    /// per-instance automata collapsing to 1 state; the composed product
+    /// stayed 1 state. Both verdicts (`no_clobber 0/1`, `clobber_reachable
+    /// 1/1`) coincidentally matched the hand baselines but were vacuous.
+    #[test]
+    fn vacuity_warning_fires_for_one_state_model() {
+        let warning = vacuity_warning_for_state_count(1)
+            .expect("1-state models must trigger the vacuity warning");
+        assert!(warning.contains("vacuously satisfied"));
+        assert!(warning.contains("1 reachable state"));
+    }
+
+    #[test]
+    fn vacuity_warning_fires_for_zero_state_model() {
+        // The empty case — typically a result of upstream extraction
+        // failure (e.g., class not found). Worth warning about even
+        // though the user usually gets a different error first.
+        let warning = vacuity_warning_for_state_count(0)
+            .expect("0-state models must trigger the vacuity warning");
+        assert!(warning.contains("vacuously satisfied"));
+    }
+
+    #[test]
+    fn vacuity_warning_silent_for_normal_models() {
+        // 2+ state models can witness real behavior; no warning.
+        for n in [2, 4, 16, 100, 4096] {
+            assert!(
+                vacuity_warning_for_state_count(n).is_none(),
+                "did not expect vacuity warning for {n}-state model",
+            );
+        }
+    }
 }

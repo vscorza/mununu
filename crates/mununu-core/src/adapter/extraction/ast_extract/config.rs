@@ -200,6 +200,14 @@ pub struct CompositionConfig {
     /// to enforce joint firing.
     #[serde(default)]
     pub shared: Vec<String>,
+    /// GAP-008: Hand-modeled shared resources alongside the per-instance
+    /// classes. Each `ResourceDecl` is emitted as an `AutomatonDef`
+    /// directly from the declarative spec (no source scanning). Resource
+    /// labels join the composition's alphabet naturally — a label that
+    /// matches a label on an instance automaton synchronizes with it.
+    /// Default empty: composition is purely instance-driven.
+    #[serde(default)]
+    pub resources: Vec<ResourceDecl>,
 }
 
 /// One instance in a compositional extraction. The `as` (renamed `as_` in
@@ -213,6 +221,50 @@ pub struct InstanceDecl {
     /// Instance name; becomes the automaton id and the per-instance prefix.
     #[serde(rename = "as")]
     pub as_: String,
+}
+
+/// GAP-008: A hand-modeled shared resource in a compositional extraction.
+/// Unlike `InstanceDecl`, a resource is NOT scanned from source code —
+/// it's authored declaratively in the extract config. Lets the user model
+/// shared external state (file, message channel, async-context registry,
+/// database) that the per-instance source classes interact with.
+///
+/// Labels on resource transitions participate in the alphabet
+/// intersection naturally: a label matching `composition.shared[]` (or
+/// matching a label on an instance automaton) synchronizes with that
+/// instance via the existing composition engine. Resource labels are NOT
+/// per-instance-prefixed — they're authored verbatim.
+///
+/// The MCP-005, MCP-001, and MCP-002 hand baselines all factored a
+/// resource of this shape (FileVar, Dispatcher, PostgresSaver
+/// respectively) — this struct lets the user declare them in the config
+/// instead of writing the espec composition section by hand.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResourceDecl {
+    /// Resource automaton id (becomes a member of the composition).
+    pub name: String,
+    /// State names. Each becomes a reachable state in the resulting
+    /// automaton.
+    pub states: Vec<String>,
+    /// Initial state name. Must be one of `states`.
+    pub initial: String,
+    /// Transitions on this resource. Labels participate in alphabet
+    /// intersection — a label matching one declared in
+    /// `composition.shared[]` (or matching an instance's label) becomes
+    /// the synchronization point.
+    pub transitions: Vec<ResourceTransition>,
+    /// Labels treated as controllable for synthesis. Default: every
+    /// label is uncontrollable (resources usually model the environment).
+    #[serde(default)]
+    pub controllable_labels: Vec<String>,
+}
+
+/// One transition on a resource automaton.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResourceTransition {
+    pub from: String,
+    pub to: String,
+    pub label: String,
 }
 
 /// Property to verify.
