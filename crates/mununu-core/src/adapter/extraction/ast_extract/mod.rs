@@ -12,6 +12,9 @@ pub mod state_space;
 
 #[cfg(feature = "ast-extract")]
 #[allow(clippy::collapsible_if)]
+pub mod concurrency_detect;
+#[cfg(feature = "ast-extract")]
+#[allow(clippy::collapsible_if)]
 pub mod extractor;
 #[cfg(feature = "ast-extract")]
 pub mod parser;
