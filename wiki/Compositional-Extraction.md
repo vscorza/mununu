@@ -115,6 +115,8 @@ Five concurrency-specific property templates ship in the agentic / universal dom
 mununu templates --domain agentic
 ```
 
+> **Template freshness:** the registry that powers `mununu templates`, `GET /api/v1/templates`, and the UI template picker loads `builtin_templates.json` at **compile time** via Rust's `include_str!`. New templates added to that JSON file only appear in the binary's catalog after `cargo build`. If `mununu templates` is missing a template you just added, rebuild first: `cargo build --release -p mununu-cli`. The same caveat applies to the running API server (restart it) and to any UI build that bundles a stale binary.
+
 | Template | Pattern | Use |
 |---|---|---|
 | `no_clobber` | `nu X. (!RESOURCE_CORRUPT && [] X)` | Safety: the shared resource never enters a corrupt state. |

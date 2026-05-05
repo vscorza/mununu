@@ -236,6 +236,8 @@ Five concurrency-specific property templates ship in the agentic / universal dom
 
 List them: `mununu templates --domain agentic`.
 
+> **GAP-010 — template freshness caveat:** the template registry loads `crates/mununu-core/src/adapter/templates/builtin_templates.json` at compile time via `include_str!`. New templates added to that file only appear in the binary's catalog after `cargo build`. If `mununu templates` is missing a template you just added, rebuild the binary first (`cargo build --release -p mununu-cli`). This applies to API listings (`GET /api/v1/templates`) and UI template pickers as well — they all read from the same compile-time-embedded registry.
+
 ### Verification end-to-end
 
 After extraction, the composition is verified with the existing toolchain:
