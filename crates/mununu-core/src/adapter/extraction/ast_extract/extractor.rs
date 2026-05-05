@@ -612,10 +612,8 @@ fn extract_fields(
             let mut params: Option<Node> = None;
             for sub in child.children(&mut method_cursor) {
                 match sub.kind() {
-                    "property_identifier" => {
-                        if parsed.node_text(&sub) == "constructor" {
-                            is_constructor = true;
-                        }
+                    "property_identifier" if parsed.node_text(&sub) == "constructor" => {
+                        is_constructor = true;
                     }
                     "formal_parameters" => {
                         params = Some(sub);
