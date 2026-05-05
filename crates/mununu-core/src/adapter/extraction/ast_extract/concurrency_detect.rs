@@ -79,8 +79,7 @@ pub fn detect_concurrency(parsed: &ParsedSource) -> Vec<DetectedConcurrency> {
             scan_python(parsed, &mut findings);
         }
         SourceLanguage::TypeScript => {
-            // TODO B1.3: Promise.all, Worker. Filed in
-            // ~/.claude/plans/phase-b-auto-detection.md commit 3.
+            scan_typescript(parsed, &mut findings);
         }
         SourceLanguage::Rust | SourceLanguage::GDScript => {
             // Out of scope for v0.1.
@@ -211,6 +210,151 @@ fn analyze_python_arguments(
     (count, dynamic, hint)
 }
 
+/// Walk the TypeScript AST for known concurrency call signatures.
+/// Currently recognizes `Promise.all(...)` and `Promise.allSettled(...)`.
+/// Extends to `new Worker(...)` and `setInterval` in later commits.
+fn scan_typescript(parsed: &ParsedSource, out: &mut Vec<DetectedConcurrency>) {
+    let root = parsed.tree.root_node();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        // tree-sitter-typescript: `call_expression` with `function:
+        // member_expression` (Promise.all) and `arguments` (a single
+        // array literal in the canonical case).
+        if node.kind() == "call_expression" {
+            if let Some(finding) = match_typescript_promise_all(parsed, &node) {
+                out.push(finding);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Match `Promise.all([arg, arg, ...])` and `Promise.allSettled([...])`.
+/// The two methods have identical detection shape — they differ only in
+/// error semantics (allSettled doesn't short-circuit on first rejection)
+/// which has no bearing on the modeled topology.
+fn match_typescript_promise_all(
+    parsed: &ParsedSource,
+    call_node: &Node,
+) -> Option<DetectedConcurrency> {
+    let function = call_node.child_by_field_name("function")?;
+    if function.kind() != "member_expression" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    let property = function.child_by_field_name("property")?;
+    if parsed.node_text(&object) != "Promise" {
+        return None;
+    }
+    let method_name = parsed.node_text(&property);
+    if method_name != "all" && method_name != "allSettled" {
+        return None;
+    }
+
+    let arguments = call_node.child_by_field_name("arguments")?;
+    // arguments is `arguments` containing one or more values. The
+    // canonical Promise.all takes a single iterable argument (typically
+    // an array literal). When the argument is a literal array, count
+    // its elements. When it's anything else (variable, spread, generator
+    // call), treat as dynamic.
+    let (count, dynamic, hint) = analyze_typescript_arguments(parsed, &arguments);
+    let line = parsed.node_line(call_node);
+
+    let (branch_count, suggested_instance_names) = if dynamic {
+        (None, Vec::new())
+    } else {
+        let names = (0..count).map(|i| format!("task_{i}")).collect();
+        (Some(count as u32), names)
+    };
+
+    let detector_id = format!("typescript_promise_{method_name}");
+
+    Some(DetectedConcurrency {
+        detector_id,
+        description: if dynamic {
+            format!(
+                "Promise.{method_name} over a non-literal iterable; branch count not statically known"
+            )
+        } else {
+            format!("Promise.{method_name} over {count} promise(s)")
+        },
+        line,
+        branch_count,
+        suggested_instance_names,
+        suggested_class_hint: hint,
+    })
+}
+
+/// Walk a TS `arguments` node for a `Promise.all(...)` call. Returns
+/// `(count, dynamic, class_hint)`. The canonical case is a single
+/// array literal with N elements; other shapes (variables, generators,
+/// computed iterables) collapse to dynamic.
+fn analyze_typescript_arguments(
+    parsed: &ParsedSource,
+    arguments: &Node,
+) -> (usize, bool, Option<String>) {
+    // Find the first non-delimiter child.
+    let mut cursor = arguments.walk();
+    let mut first_arg: Option<Node> = None;
+    for child in arguments.children(&mut cursor) {
+        if matches!(child.kind(), "(" | ")" | ",") {
+            continue;
+        }
+        first_arg = Some(child);
+        break;
+    }
+    let arg = match first_arg {
+        Some(a) => a,
+        None => return (0, false, None),
+    };
+
+    // Canonical case: array literal `[...]`. Walk its elements.
+    if arg.kind() == "array" {
+        let mut count = 0usize;
+        let mut dynamic = false;
+        let mut hints: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut a_cursor = arg.walk();
+        for elem in arg.children(&mut a_cursor) {
+            let kind = elem.kind();
+            if matches!(kind, "[" | "]" | ",") {
+                continue;
+            }
+            if kind == "spread_element" {
+                dynamic = true;
+                continue;
+            }
+            count += 1;
+            // Best-effort class-hint: if the element is a method call
+            // on a receiver, record that receiver. Skip `this.*` since
+            // that's the extracted class itself.
+            if kind == "call_expression" {
+                if let Some(func) = elem.child_by_field_name("function") {
+                    if func.kind() == "member_expression" {
+                        if let Some(receiver) = func.child_by_field_name("object") {
+                            let r = parsed.node_text(&receiver).to_string();
+                            if r != "this" && !r.is_empty() {
+                                hints.insert(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let hint = if hints.len() == 1 {
+            hints.into_iter().next()
+        } else {
+            None
+        };
+        return (count, dynamic, hint);
+    }
+
+    // Non-literal argument (variable, generator call, spread): dynamic.
+    (0, true, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +470,110 @@ async def main():
         assert!(
             findings.is_empty(),
             "asyncio.run is not asyncio.gather; detector must not produce a false positive"
+        );
+    }
+
+    #[test]
+    fn detect_typescript_promise_all_two_calls() {
+        let source = r#"
+class Worker {
+    async run(): Promise<void> {
+        await Promise.all([client.send("a"), client.send("b")]);
+    }
+}
+"#;
+        let parsed = parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let findings = detect_concurrency(&parsed);
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected one Promise.all finding, got {findings:?}"
+        );
+        let f = &findings[0];
+        assert_eq!(f.detector_id, "typescript_promise_all");
+        assert_eq!(f.branch_count, Some(2));
+        assert_eq!(f.suggested_instance_names, vec!["task_0", "task_1"]);
+        assert_eq!(f.suggested_class_hint.as_deref(), Some("client"));
+    }
+
+    #[test]
+    fn detect_typescript_promise_all_settled() {
+        // allSettled has identical detection shape; only error semantics
+        // differ, which doesn't affect the modeled topology.
+        let source = r#"
+async function run() {
+    const results = await Promise.allSettled([a.fetch(), b.fetch(), c.fetch()]);
+}
+"#;
+        let parsed = parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let findings = detect_concurrency(&parsed);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].detector_id, "typescript_promise_allSettled");
+        assert_eq!(findings[0].branch_count, Some(3));
+        assert!(
+            findings[0].suggested_class_hint.is_none(),
+            "three distinct receivers — no consensus hint"
+        );
+    }
+
+    #[test]
+    fn detect_typescript_promise_all_with_spread() {
+        // Spread element makes count dynamic.
+        let source = r#"
+async function run(tasks: Promise<void>[]) {
+    await Promise.all([...tasks, extra()]);
+}
+"#;
+        let parsed = parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let findings = detect_concurrency(&parsed);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].branch_count.is_none(),
+            "spread element produces dynamic branch count"
+        );
+    }
+
+    #[test]
+    fn detect_typescript_promise_all_with_variable_argument() {
+        // Non-literal argument — branch count unknown.
+        let source = r#"
+async function run(tasks: Promise<void>[]) {
+    await Promise.all(tasks);
+}
+"#;
+        let parsed = parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let findings = detect_concurrency(&parsed);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].branch_count.is_none());
+    }
+
+    #[test]
+    fn detect_typescript_no_promise_all_returns_empty() {
+        let source = r#"
+class Worker {
+    async run(): Promise<string> {
+        return await this.fetch();
+    }
+}
+"#;
+        let parsed = parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let findings = detect_concurrency(&parsed);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detect_typescript_only_promise_all_not_other_member_calls() {
+        // Promise.resolve / Promise.race etc. should not match.
+        let source = r#"
+async function run() {
+    return await Promise.resolve(42);
+}
+"#;
+        let parsed = parse_source(source, SourceLanguage::TypeScript).unwrap();
+        let findings = detect_concurrency(&parsed);
+        assert!(
+            findings.is_empty(),
+            "Promise.resolve must not match the all/allSettled detector"
         );
     }
 }
