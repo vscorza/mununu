@@ -144,34 +144,8 @@ pub fn build_parity_game(
     // identifying initial positions.
     let nnf_formula = super::nnf::to_nnf(formula);
     let formula = &nnf_formula;
-    // Map each fixpoint variable to its priority. Priorities are based on
-    // alternation depth: outer fixpoints get higher priorities, with mu
-    // assigned odd and nu assigned even. We follow the standard "Streett"-
-    // style assignment where higher priority = more outer.
-    let nesting = formula.fixpoint_nesting_order();
-    let mut var_priority: HashMap<FormulaVarId, usize> = HashMap::new();
-    let total_levels = nesting.len();
-    for (level, (var, is_mu)) in nesting.iter().enumerate() {
-        // Outermost fixpoint gets priority `total_levels` (or `total_levels - 1`
-        // depending on parity). Innermost gets priority 0 or 1.
-        let base = total_levels - level;
-        let priority = if *is_mu {
-            // mu → odd; ensure odd
-            if base.is_multiple_of(2) {
-                base + 1
-            } else {
-                base
-            }
-        } else {
-            // nu → even
-            if base.is_multiple_of(2) {
-                base
-            } else {
-                base + 1
-            }
-        };
-        var_priority.insert(*var, priority);
-    }
+
+    let var_priority = assign_var_priorities(formula);
 
     // Map each fixpoint variable to its body NodeId so we can resolve
     // `Variable(X)` to "edge to body of binder for X".
@@ -190,6 +164,14 @@ pub fn build_parity_game(
         // positions via `game.formula.root()`. Cloning is cheap — Formula
         // is a small arena of nodes + variable names.
         formula: nnf_formula.clone(),
+    };
+
+    let ctx = BuildContext {
+        formula,
+        clts,
+        env,
+        var_priority: &var_priority,
+        var_body: &var_body,
     };
 
     // Lazy expansion: BFS from initials × root.
@@ -211,119 +193,191 @@ pub fn build_parity_game(
             continue;
         }
 
-        let node = formula.node(pos.node);
-        match node {
-            Node::True => {
-                set_terminal(&mut game, pos_idx, true);
-            }
-            Node::False => {
-                set_terminal(&mut game, pos_idx, false);
-            }
-            Node::Predicate(name) => {
-                let holds = env
-                    .predicate(name)
-                    .map(|bits| bits.get(pos.state).is_some_and(|b| *b))
-                    .unwrap_or(false);
-                set_terminal(&mut game, pos_idx, holds);
-            }
-            Node::Not(inner) => {
-                // After the NNF preprocessing pass at function entry, `Not`
-                // can only appear above atomic positions: Predicate, True,
-                // or False. Compound negations (over And/Or/Modal/Mu/Nu)
-                // are eliminated by NNF. The `_` arm asserts unreachable.
-                match formula.node(*inner) {
-                    Node::True => set_terminal(&mut game, pos_idx, false),
-                    Node::False => set_terminal(&mut game, pos_idx, true),
-                    Node::Predicate(name) => {
-                        let holds = env
-                            .predicate(name)
-                            .map(|bits| bits.get(pos.state).is_some_and(|b| *b))
-                            .unwrap_or(false);
-                        set_terminal(&mut game, pos_idx, !holds);
-                    }
-                    other => unreachable!(
-                        "Not over non-atomic node {other:?} after NNF — to_nnf is broken"
-                    ),
-                }
-            }
-            Node::And(l, r) => {
-                let p_l = Position {
-                    state: pos.state,
-                    node: *l,
-                };
-                let p_r = Position {
-                    state: pos.state,
-                    node: *r,
-                };
-                game.owners[pos_idx] = Player::Adam;
-                add_edge(&mut game, formula, &var_priority, pos_idx, p_l, &mut queue);
-                add_edge(&mut game, formula, &var_priority, pos_idx, p_r, &mut queue);
-            }
-            Node::Or(l, r) => {
-                let p_l = Position {
-                    state: pos.state,
-                    node: *l,
-                };
-                let p_r = Position {
-                    state: pos.state,
-                    node: *r,
-                };
-                game.owners[pos_idx] = Player::Eve;
-                add_edge(&mut game, formula, &var_priority, pos_idx, p_l, &mut queue);
-                add_edge(&mut game, formula, &var_priority, pos_idx, p_r, &mut queue);
-            }
-            Node::Modal {
-                kind,
-                guard,
-                target,
-            } => {
-                let owner = modal_owner(*kind);
-                game.owners[pos_idx] = owner;
-                let state_id = StateId::<DefaultStateIdx>::from_index(pos.state)
-                    .expect("position state index fits storage");
-                for transition in clts.outgoing(state_id) {
-                    if !transition_matches_guard(transition, guard, clts, state_id) {
-                        continue;
-                    }
-                    let next = Position {
-                        state: transition.target().index(),
-                        node: *target,
-                    };
-                    add_edge(&mut game, formula, &var_priority, pos_idx, next, &mut queue);
-                }
-                // If no outgoing transitions matched, the position has no
-                // successors. Box with no successors is vacuously
-                // satisfied (Eve wins); Diamond with no successors is
-                // unsatisfiable (Adam wins).
-                if game.edges[pos_idx].is_empty() {
-                    let eve_wins = matches!(kind, ModalKind::Box);
-                    set_terminal(&mut game, pos_idx, eve_wins);
-                }
-            }
-            Node::Mu { body, .. } | Node::Nu { body, .. } => {
-                let next = Position {
-                    state: pos.state,
-                    node: *body,
-                };
-                game.owners[pos_idx] = Player::Eve; // free move; either player works
-                add_edge(&mut game, formula, &var_priority, pos_idx, next, &mut queue);
-            }
-            Node::Variable(var) => {
-                let body = var_body
-                    .get(var)
-                    .copied()
-                    .expect("variable should have a binder");
-                let next = Position {
-                    state: pos.state,
-                    node: body,
-                };
-                game.owners[pos_idx] = Player::Eve; // free move
-                add_edge(&mut game, formula, &var_priority, pos_idx, next, &mut queue);
-            }
-        }
+        expand_position(pos, pos_idx, &ctx, &mut game, &mut queue);
     }
 
     game
+}
+
+/// Assign a parity priority to each fixpoint variable. Priorities follow
+/// the standard "Streett"-style assignment: outer fixpoints get higher
+/// priorities, mu-bound variables are odd, nu-bound variables are even.
+/// The total range is `[0, formula.fixpoint_nesting_order().len()]`.
+fn assign_var_priorities(formula: &Formula) -> HashMap<FormulaVarId, usize> {
+    let nesting = formula.fixpoint_nesting_order();
+    let total_levels = nesting.len();
+    let mut var_priority = HashMap::with_capacity(total_levels);
+    for (level, (var, is_mu)) in nesting.iter().enumerate() {
+        // Outermost fixpoint gets priority `total_levels` (or
+        // `total_levels - 1` depending on parity). Innermost gets 0 or 1.
+        let base = total_levels - level;
+        let priority = if *is_mu {
+            // mu → odd; ensure odd
+            if base.is_multiple_of(2) {
+                base + 1
+            } else {
+                base
+            }
+        } else {
+            // nu → even; ensure even
+            if base.is_multiple_of(2) {
+                base
+            } else {
+                base + 1
+            }
+        };
+        var_priority.insert(*var, priority);
+    }
+    var_priority
+}
+
+/// Read-only view of the inputs `expand_position` needs. Bundles the
+/// formula, plant CLTS, predicate environment, and the two precomputed
+/// variable maps so the helper's signature stays under the
+/// `clippy::too_many_arguments` threshold and the immutable-vs-mutable
+/// boundary in BFS is explicit.
+struct BuildContext<'a> {
+    formula: &'a Formula,
+    clts: &'a Clts<DefaultStateIdx, DefaultLabelIdx>,
+    env: &'a Environment,
+    var_priority: &'a HashMap<FormulaVarId, usize>,
+    var_body: &'a HashMap<FormulaVarId, NodeId>,
+}
+
+/// Expand a single BFS position by dispatching on the formula node at
+/// `pos.node`. Atomic positions (`True` / `False` / `Predicate`, plus
+/// `Not` over atoms after NNF) become terminals; compound positions
+/// (`And` / `Or` / `Modal` / `Mu` / `Nu` / `Variable`) get successor
+/// edges added and the successors enqueued for later expansion.
+///
+/// Owner assignment follows standard parity-game encoding:
+/// - `And` → Adam (∀ subformula must hold)
+/// - `Or` → Eve (∃ subformula holds)
+/// - `Modal` → `modal_owner(kind)` (Box → Adam, Diamond → Eve)
+/// - `Mu` / `Nu` / `Variable` → free move (Eve, by convention; either
+///   works since the position has exactly one successor).
+fn expand_position(
+    pos: Position,
+    pos_idx: usize,
+    ctx: &BuildContext<'_>,
+    game: &mut ParityGame,
+    queue: &mut Vec<Position>,
+) {
+    let formula = ctx.formula;
+    let clts = ctx.clts;
+    let env = ctx.env;
+    let var_priority = ctx.var_priority;
+    let var_body = ctx.var_body;
+    let node = formula.node(pos.node);
+    match node {
+        Node::True => {
+            set_terminal(game, pos_idx, true);
+        }
+        Node::False => {
+            set_terminal(game, pos_idx, false);
+        }
+        Node::Predicate(name) => {
+            let holds = env
+                .predicate(name)
+                .map(|bits| bits.get(pos.state).is_some_and(|b| *b))
+                .unwrap_or(false);
+            set_terminal(game, pos_idx, holds);
+        }
+        Node::Not(inner) => {
+            // After the NNF preprocessing pass at function entry, `Not`
+            // can only appear above atomic positions: Predicate, True,
+            // or False. Compound negations (over And/Or/Modal/Mu/Nu)
+            // are eliminated by NNF. The `_` arm asserts unreachable.
+            match formula.node(*inner) {
+                Node::True => set_terminal(game, pos_idx, false),
+                Node::False => set_terminal(game, pos_idx, true),
+                Node::Predicate(name) => {
+                    let holds = env
+                        .predicate(name)
+                        .map(|bits| bits.get(pos.state).is_some_and(|b| *b))
+                        .unwrap_or(false);
+                    set_terminal(game, pos_idx, !holds);
+                }
+                other => {
+                    unreachable!("Not over non-atomic node {other:?} after NNF — to_nnf is broken")
+                }
+            }
+        }
+        Node::And(l, r) => {
+            let p_l = Position {
+                state: pos.state,
+                node: *l,
+            };
+            let p_r = Position {
+                state: pos.state,
+                node: *r,
+            };
+            game.owners[pos_idx] = Player::Adam;
+            add_edge(game, formula, var_priority, pos_idx, p_l, queue);
+            add_edge(game, formula, var_priority, pos_idx, p_r, queue);
+        }
+        Node::Or(l, r) => {
+            let p_l = Position {
+                state: pos.state,
+                node: *l,
+            };
+            let p_r = Position {
+                state: pos.state,
+                node: *r,
+            };
+            game.owners[pos_idx] = Player::Eve;
+            add_edge(game, formula, var_priority, pos_idx, p_l, queue);
+            add_edge(game, formula, var_priority, pos_idx, p_r, queue);
+        }
+        Node::Modal {
+            kind,
+            guard,
+            target,
+        } => {
+            let owner = modal_owner(*kind);
+            game.owners[pos_idx] = owner;
+            let state_id = StateId::<DefaultStateIdx>::from_index(pos.state)
+                .expect("position state index fits storage");
+            for transition in clts.outgoing(state_id) {
+                if !transition_matches_guard(transition, guard, clts, state_id) {
+                    continue;
+                }
+                let next = Position {
+                    state: transition.target().index(),
+                    node: *target,
+                };
+                add_edge(game, formula, var_priority, pos_idx, next, queue);
+            }
+            // If no outgoing transitions matched, the position has no
+            // successors. Box with no successors is vacuously
+            // satisfied (Eve wins); Diamond with no successors is
+            // unsatisfiable (Adam wins).
+            if game.edges[pos_idx].is_empty() {
+                let eve_wins = matches!(kind, ModalKind::Box);
+                set_terminal(game, pos_idx, eve_wins);
+            }
+        }
+        Node::Mu { body, .. } | Node::Nu { body, .. } => {
+            let next = Position {
+                state: pos.state,
+                node: *body,
+            };
+            game.owners[pos_idx] = Player::Eve; // free move; either player works
+            add_edge(game, formula, var_priority, pos_idx, next, queue);
+        }
+        Node::Variable(var) => {
+            let body = var_body
+                .get(var)
+                .copied()
+                .expect("variable should have a binder");
+            let next = Position {
+                state: pos.state,
+                node: body,
+            };
+            game.owners[pos_idx] = Player::Eve; // free move
+            add_edge(game, formula, var_priority, pos_idx, next, queue);
+        }
+    }
 }
 
 /// Convert a position into a terminal: add a self-loop with priority
