@@ -4,6 +4,8 @@
 //! evaluators, optimisers) can share when working with μ-calculus formulas that
 //! reference CLTS labels, controllability metadata, and variable valuations.
 
+use crate::clts::{Clts, IdStorage, StateId, Transition};
+
 pub mod evaluator;
 pub mod invert;
 mod memo;
@@ -369,6 +371,98 @@ impl FormulaBuilder {
     pub fn into_formula(self, root: NodeId) -> Formula {
         Formula::new(root, self.nodes, self.vars)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared guard filter — used by both the evaluator and the parity game
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `transition` passes the label and state-variable sub-filters
+/// of `guard`.
+///
+/// This is the common "phase 2–4" filter shared by:
+/// - [`evaluator::EvalContext::guard_matches`] (which additionally handles
+///   controllability at the `eval_modal` dispatch level before calling here).
+/// - [`parity_game::transition_matches_guard`] (which checks controllability
+///   upfront, then delegates here for the label and variable filters).
+///
+/// Checks performed (in order):
+/// 1. **Label-name filter**: every name in `guard.labels` must appear in at
+///    least one of the transition's label bitsets.
+/// 2. **Current-state variable filter**: `guard.current.required` names must
+///    all be present in the source state's variable set; `guard.current.forbidden`
+///    names must all be absent.
+/// 3. **Next-state variable filter**: same logic applied to the target state.
+///
+/// Controllability (`guard.control`) is **not** checked here. Callers are
+/// responsible for controllability filtering before calling this function.
+pub(crate) fn guard_matches_labels_and_vars<S, L>(
+    source: StateId<S>,
+    transition: &Transition<S, L>,
+    guard: &Guard,
+    clts: &Clts<S, L>,
+) -> bool
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    // 1. Label-name filter: every required label must appear in at least one
+    //    of the transition's label bitsets.
+    if !guard.labels.is_empty() {
+        for required in &guard.labels {
+            let found = transition.labels().iter().any(|label_id| {
+                clts.label_bitset(*label_id)
+                    .is_some_and(|bitset| bitset.test(required.as_str()))
+            });
+            if !found {
+                return false;
+            }
+        }
+    }
+
+    // 2. Current-state variable filter.
+    if !guard.current.required.is_empty() || !guard.current.forbidden.is_empty() {
+        let state_vars = clts.state_variable_bitset(source);
+        if guard
+            .current
+            .required
+            .iter()
+            .any(|var| !state_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+        if guard
+            .current
+            .forbidden
+            .iter()
+            .any(|var| state_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+    }
+
+    // 3. Next-state variable filter.
+    if !guard.next.required.is_empty() || !guard.next.forbidden.is_empty() {
+        let target_vars = clts.state_variable_bitset(transition.target());
+        if guard
+            .next
+            .required
+            .iter()
+            .any(|var| !target_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+        if guard
+            .next
+            .forbidden
+            .iter()
+            .any(|var| target_vars.contains(var.as_str()))
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]

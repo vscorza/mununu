@@ -39,7 +39,10 @@ use bitvec::prelude::{BitVec, Lsb0};
 
 use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, StateId};
 
-use super::{Control, Environment, Formula, FormulaVarId, Guard, ModalKind, Node, NodeId};
+use super::{
+    Control, Environment, Formula, FormulaVarId, Guard, ModalKind, Node, NodeId,
+    guard_matches_labels_and_vars,
+};
 
 /// A position in the parity game: a `(plant_state, formula_node)` pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,16 +413,10 @@ fn modal_owner(kind: ModalKind) -> Player {
 
 /// Match a transition against a modal guard. Respects:
 /// - The controllability flag (`Control::All|Controllable|Environment`).
-/// - Label-name filter (`guard.labels`): all listed labels must appear in
-///   the transition's label set.
-/// - Current-state variable filter (`guard.current.required/forbidden`):
-///   restricts to source states whose variables match.
-/// - Next-state variable filter (`guard.next.required/forbidden`):
-///   restricts to transitions whose target's variables match.
-///
-/// The semantics mirror `mu_calculus::evaluator::guard_matches` — the
-/// evaluator and the parity-game module agree on what constitutes a
-/// matching transition.
+/// - Label-name filter, current-state variable filter, and next-state variable
+///   filter — all delegated to the shared
+///   [`super::guard_matches_labels_and_vars`] helper so that parity-game and
+///   evaluator semantics stay in sync.
 fn transition_matches_guard(
     transition: &crate::clts::Transition<DefaultStateIdx, DefaultLabelIdx>,
     guard: &Guard,
@@ -436,69 +433,8 @@ fn transition_matches_guard(
         return false;
     }
 
-    // 2. Label-name filter: every required label must appear in some
-    //    transition label's underlying bitset.
-    if !guard.labels.is_empty() {
-        for required in &guard.labels {
-            let mut found = false;
-            for label_id in transition.labels() {
-                let Some(bitset) = clts.label_bitset(*label_id) else {
-                    continue;
-                };
-                if bitset.test(required.as_str()) {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return false;
-            }
-        }
-    }
-
-    // 3. Current-state variable filter.
-    if !guard.current.required.is_empty() || !guard.current.forbidden.is_empty() {
-        let state_vars = clts.state_variable_bitset(source);
-        if guard
-            .current
-            .required
-            .iter()
-            .any(|var| !state_vars.contains(var.as_str()))
-        {
-            return false;
-        }
-        if guard
-            .current
-            .forbidden
-            .iter()
-            .any(|var| state_vars.contains(var.as_str()))
-        {
-            return false;
-        }
-    }
-
-    // 4. Next-state variable filter.
-    if !guard.next.required.is_empty() || !guard.next.forbidden.is_empty() {
-        let target_vars = clts.state_variable_bitset(transition.target());
-        if guard
-            .next
-            .required
-            .iter()
-            .any(|var| !target_vars.contains(var.as_str()))
-        {
-            return false;
-        }
-        if guard
-            .next
-            .forbidden
-            .iter()
-            .any(|var| target_vars.contains(var.as_str()))
-        {
-            return false;
-        }
-    }
-
-    true
+    // 2–4. Label and variable filters — shared with the evaluator.
+    guard_matches_labels_and_vars(source, transition, guard, clts)
 }
 
 // ---------------------------------------------------------------------------
@@ -895,5 +831,52 @@ context test {
         };
         let initial_idx = game.position_idx[&initial_pos];
         assert_eq!(solution.winner[initial_idx], Player::Eve);
+    }
+
+    /// Pinning test for the shared `guard_matches_labels_and_vars` function:
+    /// verifies that the free function (shared between evaluator and parity
+    /// game) produces the same label-filter results as the parity-game
+    /// build would produce by inspecting which edges are actually generated.
+    ///
+    /// Concretely: on TICK_CTXDSL the only transition label is `tick`.
+    /// A guard requiring `{tick}` should match exactly the one transition
+    /// available; a guard requiring `{other}` should match none.
+    #[test]
+    fn shared_guard_filter_matches_expected_transitions() {
+        use super::guard_matches_labels_and_vars;
+        use crate::clts::StateId;
+
+        let (clts, _env) = realize_for_test(TICK_CTXDSL, "M");
+
+        // Get the first initial state — s0 at index 0
+        let s0 = StateId::<DefaultStateIdx>::from_index(0).expect("s0 exists");
+
+        let mut matching_tick = 0usize;
+        let mut matching_other = 0usize;
+
+        let guard_tick = super::Guard {
+            labels: vec!["tick".to_string()],
+            ..Default::default()
+        };
+        let guard_other = super::Guard {
+            labels: vec!["other".to_string()],
+            ..Default::default()
+        };
+
+        for transition in clts.outgoing(s0) {
+            if guard_matches_labels_and_vars(s0, transition, &guard_tick, &clts) {
+                matching_tick += 1;
+            }
+            if guard_matches_labels_and_vars(s0, transition, &guard_other, &clts) {
+                matching_other += 1;
+            }
+        }
+
+        // TICK_CTXDSL has exactly one transition out of s0 (s0 -> s1 on tick)
+        assert_eq!(
+            matching_tick, 1,
+            "guard {{tick}} must match the tick transition"
+        );
+        assert_eq!(matching_other, 0, "guard {{other}} must match nothing");
     }
 }

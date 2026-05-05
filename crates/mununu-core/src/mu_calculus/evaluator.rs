@@ -7,7 +7,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use super::{
-    Control, Formula, FormulaVarId, Guard, ModalKind, Node, NodeId, NodeOps, memo::MemoizationCache,
+    Control, Formula, FormulaVarId, Guard, ModalKind, Node, NodeId, NodeOps,
+    guard_matches_labels_and_vars, memo::MemoizationCache,
 };
 use crate::clts::{Clts, IdStorage, LabelId, StateId, Transition};
 
@@ -1567,77 +1568,11 @@ where
         transition: &Transition<S, L>,
         guard: &Guard,
     ) -> bool {
-        // Label guard
-        if !guard.labels.is_empty() {
-            let mut has_all = true;
-            for label in &guard.labels {
-                let mut label_found = false;
-                for label_id in transition.labels() {
-                    let Some(bitset) = self.clts.label_bitset(*label_id) else {
-                        continue;
-                    };
-                    if bitset.test(label.as_str()) {
-                        label_found = true;
-                        break;
-                    }
-                }
-                if !label_found {
-                    has_all = false;
-                    break;
-                }
-            }
-            if !has_all {
-                return false;
-            }
-        }
-
-        // Current state variable guard
-        if !guard.current.required.is_empty() || !guard.current.forbidden.is_empty() {
-            let state_vars_bitset = self.clts.state_variable_bitset(state);
-            if !guard.current.required.is_empty()
-                && guard
-                    .current
-                    .required
-                    .iter()
-                    .any(|var| !state_vars_bitset.contains(var.as_str()))
-            {
-                return false;
-            }
-            if !guard.current.forbidden.is_empty()
-                && guard
-                    .current
-                    .forbidden
-                    .iter()
-                    .any(|var| state_vars_bitset.contains(var.as_str()))
-            {
-                return false;
-            }
-        }
-
-        // Next state variable guard
-        if !guard.next.required.is_empty() || !guard.next.forbidden.is_empty() {
-            let succ_bits = self.clts.state_variable_bitset(transition.target());
-            if !guard.next.required.is_empty()
-                && guard
-                    .next
-                    .required
-                    .iter()
-                    .any(|var| !succ_bits.contains(var.as_str()))
-            {
-                return false;
-            }
-            if !guard.next.forbidden.is_empty()
-                && guard
-                    .next
-                    .forbidden
-                    .iter()
-                    .any(|var| succ_bits.contains(var.as_str()))
-            {
-                return false;
-            }
-        }
-
-        true
+        // Label and variable filters are shared with the parity-game module via
+        // the free `guard_matches_labels_and_vars` function. Controllability is
+        // handled at the `eval_modal` / `modal_exists` / `modal_forall` level
+        // before this method is called, so we do not check it here.
+        guard_matches_labels_and_vars(state, transition, guard, self.clts)
     }
 
     fn eval_fixpoint(
