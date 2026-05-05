@@ -1,3 +1,8 @@
 [toolchain]
-channel = "stable"
+# Pinned exactly so host devs, the dev container, and CI all run the
+# same clippy lint set. The Dockerfile.dev's ARG RUST_VERSION mirrors
+# this pin (drift between the two is the silent-fail case we want to
+# catch in PR review). To bump: update both files in the same commit
+# and re-run `make ci` locally first to surface any new lints.
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]

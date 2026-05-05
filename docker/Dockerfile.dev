@@ -28,7 +28,11 @@
 # image — use the sibling `hw-verif:latest` image from
 # ../hw-verification-uba for that.
 
-ARG RUST_VERSION=1.91
+# Mirror of rust-toolchain.toml's `channel`. The workspace's
+# rust-toolchain.toml is authoritative — rustup honors it at runtime
+# and will download a different toolchain if this ARG drifts. Keep
+# the two in lockstep on every bump.
+ARG RUST_VERSION=1.95
 FROM rust:${RUST_VERSION}-slim-bookworm
 
 # Native deps required to build mununu's tree-sitter grammars and OpenSSL

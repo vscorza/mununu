@@ -205,19 +205,32 @@ When committing, pass `--author="Mariano Cerrutti <vscorza@gmail.com>"` or set i
 
 ## Rust Version
 
-Requires Rust 1.91+ (Edition 2024).
+The workspace pins an exact Rust version in two places:
+
+- [rust-toolchain.toml](rust-toolchain.toml) — `channel = "1.95.0"`. rustup honors this at runtime, so host devs, CI, and the dev container all use the same toolchain.
+- [docker/Dockerfile.dev](docker/Dockerfile.dev) — `ARG RUST_VERSION=1.95`. Mirrors the toolchain pin so the base image's bundled toolchain matches.
+
+**Bumping the toolchain** is a two-file change in one commit:
+
+1. Edit `rust-toolchain.toml`'s `channel`.
+2. Edit the matching `ARG RUST_VERSION` in `docker/Dockerfile.dev`.
+3. Run `make ci` locally — new clippy lints often surface on bumps and fixing them is part of the bump commit.
+
+Drift between the two pins is silent: rustup will auto-download the toolchain `rust-toolchain.toml` names regardless of the image's bundled version, so CI may pass against a "wrong" toolchain. Treat any PR that touches one but not the other as a review red flag.
+
+Edition is 2024 (set in each `Cargo.toml`).
 
 ## Clippy Compatibility
 
-CI runs clippy from the latest stable Rust toolchain. Newer Rust versions introduce new clippy lints that may break the build. Always write code that passes the **latest** clippy, not just the local version. Common patterns to avoid:
+The pinned toolchain locks the lint set, so contributors don't get bitten by surprise lints from upstream Rust releases. Common patterns to avoid (from past bumps — keep these in mind when writing new code):
 
 - **`unnecessary_unwrap`**: After checking `x.is_some()`, use `if let Some(v) = x` instead of `x.unwrap()`.
 - **`needless_return`**: Don't use explicit `return` at the end of a function body.
 - **`redundant_closure`**: Use `foo` instead of `|x| foo(x)` when passing to `.map()` etc.
+- **`collapsible_match`** (Rust 1.95+): A nested `if` inside a `match` arm should become an arm guard — `Pat if cond => { ... }` rather than `Pat => { if cond { ... } }`.
+- **`implicit_borrowing` (Edition 2024)**: Closure patterns like `|(&(a, _), _)|` are not allowed in Rust 2024 — use `|((a, _), _)| *a` instead.
 
-- **`implicit_borrowing` (Edition 2024)**: Closure patterns like `|(&(a, _), _)|` are not allowed in Rust 2024 — use `|((a, _), _)| *a` instead. CI uses the latest stable Rust, so always update your local toolchain before committing.
-
-When in doubt, run `rustup update stable && cargo clippy --all-targets -- -D warnings` to check against the latest lints. The project includes `rust-toolchain.toml` pinned to `stable` to ensure version parity with CI.
+When bumping, run `cargo clippy --workspace --all-targets -- -D warnings` against the new toolchain *before* committing the pin change so any new lint failures land in the same commit.
 
 ## Governance Rules
 
