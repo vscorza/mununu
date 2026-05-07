@@ -17,6 +17,24 @@ Thumbs.db
 *.env
 .env
 
+# Secrets / credentials
+# Block common file types that hold private keys, certificates, and tokens.
+# If a legitimate fixture trips one of these, allow-list it explicitly with `!path/to/fixture`.
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.gpg
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*credentials*.json
+*service-account*.json
+secrets.toml
+.secrets/
+
 # Logs
 *.log
 /logs/
@@ -26,6 +44,12 @@ Thumbs.db
 /test_output/
 bench_results/
 /.mununu_dsl_debug/
+
+# Reproducible-experiments scaffold: target/test-fixtures/ holds canonical
+# CLTS fixtures rebuilt from seeds, and per-EXP bench stdout is captured
+# alongside the criterion archive but the live run log shouldn't be tracked.
+**/bench-stdout.log
+.repro-EXP-*/
 
 # Documentation build
 /doc/

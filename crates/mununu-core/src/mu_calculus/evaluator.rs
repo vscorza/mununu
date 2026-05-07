@@ -37,6 +37,89 @@ impl Default for EvaluationOptions {
 /// Bitset result representing the states that satisfy the evaluated formula.
 pub type EvalResult = BitVec<usize, Lsb0>;
 
+/// Iteration ranks indexed `[var.index()][state_idx]`, with `u32::MAX`
+/// sentinel for "state never entered the fixpoint." Replaces the prior
+/// `HashMap<(usize, FormulaVarId), usize>` (EXP-0002, plan §A1).
+///
+/// Memory: O(num_fixpoint_vars × state_count) × 4 bytes, dense.
+/// Compare to the HashMap upper bound of ~48 B per (state, var) entry —
+/// at 1M states × 4 fixpoint vars, 16 MB SoA vs ~192 MB worst-case map.
+///
+/// Access pattern: written once per state per fixpoint iteration (the
+/// "first entry" event), read sequentially per state during signature
+/// extraction (`signature()` and ProductGame obligation tracking).
+///
+/// Sentinel rationale: `u32::MAX` is a safe ceiling because fixpoint
+/// iteration is bounded by `state_count` (Tarski) and `state_count` fits
+/// in `u32` per the existing `DefaultStateIdx = u32` convention. Returns
+/// the `usize::MAX` sentinel from `get_rank()` so callers (which expect
+/// the prior HashMap-style "not present" semantics) stay byte-compatible.
+#[derive(Debug, Clone, Default)]
+pub struct IterationRanks {
+    rows: Vec<Vec<u32>>,
+}
+
+impl IterationRanks {
+    pub fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    /// Record that `state_idx` entered the fixpoint bound to `var` at
+    /// `iteration`. First-write-wins (subsequent writes for the same
+    /// (var, state) are silently dropped, matching the HashMap-era
+    /// `if now_in && !was_in` semantics: a state only enters a fixpoint
+    /// once during a single fixpoint solve).
+    pub fn record(
+        &mut self,
+        var: super::FormulaVarId,
+        state_idx: usize,
+        iteration: usize,
+        state_count: usize,
+    ) {
+        let v = var.index();
+        if self.rows.len() <= v {
+            self.rows.resize_with(v + 1, Vec::new);
+        }
+        let row = &mut self.rows[v];
+        if row.is_empty() {
+            row.resize(state_count, u32::MAX);
+        }
+        let bucket = &mut row[state_idx];
+        if *bucket == u32::MAX {
+            // Saturate at u32::MAX-1 so `u32::MAX` reliably signals
+            // "absent". For any realistic CLTS this is unreachable; the
+            // saturation just keeps the sentinel meaning unambiguous.
+            let value: u32 = iteration.try_into().unwrap_or(u32::MAX - 1);
+            *bucket = value.min(u32::MAX - 1);
+        }
+    }
+
+    /// Returns the iteration at which `state_idx` entered the fixpoint
+    /// bound to `var`, or `usize::MAX` if the state never entered.
+    /// `usize::MAX` is the prior HashMap-era "absent" semantics.
+    pub fn get_rank(&self, var: super::FormulaVarId, state_idx: usize) -> usize {
+        self.rows
+            .get(var.index())
+            .and_then(|row| row.get(state_idx).copied())
+            .filter(|&v| v != u32::MAX)
+            .map(|v| v as usize)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Number of distinct (var, state) entries recorded. Useful in tests.
+    pub fn len(&self) -> usize {
+        self.rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|&&v| v != u32::MAX)
+            .count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Records which transition was chosen at each (state, modality) pair
 /// during fixpoint evaluation. This constitutes a positional winning
 /// strategy on the model-checking game.
@@ -50,9 +133,11 @@ pub struct WitnessMap {
     /// which outgoing transition was the witness (the controller's chosen move).
     pub witnesses: HashMap<(usize, NodeId), usize>,
 
-    /// `(state_index, fixpoint_var_id)` → iteration number when the state
-    /// entered the fixpoint set. Forms the strategy signature for each state.
-    pub iteration_ranks: HashMap<(usize, super::FormulaVarId), usize>,
+    /// Iteration ranks per (fixpoint_var, state). See [`IterationRanks`].
+    /// Replaced the previous `HashMap<(usize, FormulaVarId), usize>` in
+    /// EXP-0002. Read via `get_rank()` for HashMap-style "absent → MAX"
+    /// semantics; written via `record()` from the fixpoint loop.
+    pub iteration_ranks: IterationRanks,
 }
 
 /// A state's strategy signature — its rank tuple under the fixpoint nesting.
@@ -76,12 +161,7 @@ impl WitnessMap {
     ) -> Signature {
         nesting
             .iter()
-            .map(|(var_id, _is_mu)| {
-                self.iteration_ranks
-                    .get(&(state_idx, *var_id))
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            })
+            .map(|(var_id, _is_mu)| self.iteration_ranks.get_rank(*var_id, state_idx))
             .collect()
     }
 
@@ -115,6 +195,74 @@ impl WitnessMap {
         let src = self.signature(source_idx, nesting);
         let tgt = self.signature(target_idx, nesting);
         tgt < src
+    }
+}
+
+#[cfg(test)]
+mod iteration_ranks_tests {
+    use super::*;
+
+    fn var(i: usize) -> super::super::FormulaVarId {
+        super::super::FormulaVarId(i)
+    }
+
+    #[test]
+    fn fresh_returns_max_for_any_var_state() {
+        let r = IterationRanks::new();
+        assert_eq!(r.get_rank(var(0), 0), usize::MAX);
+        assert_eq!(r.get_rank(var(99), 99), usize::MAX);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn record_then_read_preserves_iteration() {
+        let mut r = IterationRanks::new();
+        r.record(var(0), 3, 7, 16);
+        assert_eq!(r.get_rank(var(0), 3), 7);
+        // Other (var, state) pairs remain absent.
+        assert_eq!(r.get_rank(var(0), 4), usize::MAX);
+        assert_eq!(r.get_rank(var(1), 3), usize::MAX);
+    }
+
+    #[test]
+    fn record_first_write_wins() {
+        // Mirrors the HashMap-era `if now_in && !was_in` semantic where
+        // a state only enters a fixpoint once during a solve.
+        let mut r = IterationRanks::new();
+        r.record(var(0), 5, 1, 8);
+        r.record(var(0), 5, 9, 8); // ignored
+        assert_eq!(r.get_rank(var(0), 5), 1);
+    }
+
+    #[test]
+    fn record_grows_rows_and_columns_lazily() {
+        let mut r = IterationRanks::new();
+        r.record(var(2), 4, 3, 8);
+        // Row 0 and 1 should not have been allocated yet.
+        assert_eq!(r.rows.len(), 3);
+        assert!(r.rows[0].is_empty());
+        assert!(r.rows[1].is_empty());
+        assert_eq!(r.rows[2].len(), 8);
+        assert_eq!(r.get_rank(var(2), 4), 3);
+    }
+
+    #[test]
+    fn len_counts_only_set_entries() {
+        let mut r = IterationRanks::new();
+        r.record(var(0), 0, 1, 4);
+        r.record(var(0), 2, 5, 4);
+        r.record(var(1), 1, 2, 4);
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn iteration_value_caps_below_sentinel() {
+        // Recording an iteration > u32::MAX-1 must not collide with the
+        // sentinel; absent entries continue to read as usize::MAX.
+        let mut r = IterationRanks::new();
+        r.record(var(0), 0, usize::MAX, 1);
+        // Whatever value got stored, the entry must be reachable (not absent).
+        assert!(r.get_rank(var(0), 0) < usize::MAX);
     }
 }
 
@@ -1604,7 +1752,8 @@ where
                         && !was_in
                         && let Some(ref mut wm) = self.witness_map
                     {
-                        wm.iteration_ranks.insert((state_idx, var), iteration);
+                        wm.iteration_ranks
+                            .record(var, state_idx, iteration, state_count);
                     }
                 }
             }

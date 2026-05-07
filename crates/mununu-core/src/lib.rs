@@ -16,6 +16,12 @@ pub mod ltl;
 pub mod mu_calculus;
 pub mod persistence;
 
+#[cfg(any(test, feature = "test_support"))]
+pub mod test_support;
+
+#[cfg(any(test, feature = "test_support"))]
+pub mod bench_support;
+
 #[cfg(feature = "api")]
 pub mod api;
 

@@ -43,19 +43,13 @@ impl StringVecPool {
     }
 }
 
-/// Returns the next capacity hint for builder collections.
-///
-/// We grow buckets by ~20% to stay amortised (large enough to avoid frequent
-/// reallocations while still keeping peak memory under control for big benches).
-/// Grows capacity by ~20% increments, with a minimum increment of 1.
-///
-fn grow_capacity(current: usize, default_hint: usize) -> usize {
-    if current == 0 {
-        return default_hint;
-    }
-    let increment = (current / 5).max(1);
-    current.saturating_add(increment)
-}
+// EXP-0004: removed `grow_capacity()` (~20% increments) in favor of
+// Vec::push's native amortized doubling. The 20% wrapper produced more,
+// smaller reallocations than Vec's default strategy (e.g., ~25 reallocs
+// to reach 1M states vs ~12 with doubling). It also coordinated parallel
+// Vecs into a single reserve call, which is no longer needed when each
+// Vec doubles independently. Callers who know their final size should
+// pre-allocate explicitly via `reserve_states` / `reserve_transitions`.
 
 /// Records symbols into a shared symbol universe, marking the cache as dirty.
 ///
@@ -727,7 +721,7 @@ impl<L: IdStorage> LabelStore<L> {
 pub struct LabelStoreBuilder<L: IdStorage> {
     entries: Vec<Arc<[String]>>,
     entry_map: HashMap<Arc<[String]>, LabelId<L>>,
-    entry_capacity_hint: usize,
+    // EXP-0004: entry_capacity_hint removed; Vec/HashMap handle growth.
     // Tracks which alphabet symbols have already been interned. This lets us
     // avoid recomputing the universe during `build()`.
     symbol_set: HashSet<String>,
@@ -739,24 +733,6 @@ pub struct LabelStoreBuilder<L: IdStorage> {
 }
 
 impl<L: IdStorage> LabelStoreBuilder<L> {
-    fn ensure_entry_capacity(&mut self) {
-        if self.entries.len() < self.entries.capacity() {
-            return;
-        }
-
-        let current = self
-            .entry_capacity_hint
-            .max(self.entries.capacity())
-            .max(DEFAULT_LABEL_RESERVE);
-        let next = grow_capacity(current, DEFAULT_LABEL_RESERVE);
-        self.entry_capacity_hint = next;
-        let additional = next.saturating_sub(self.entries.capacity());
-        if additional > 0 {
-            self.entries.reserve(additional);
-            self.entry_map.reserve(additional);
-        }
-    }
-
     fn record_symbols(&mut self, payload: &[String]) {
         record_symbols_into_universe(
             &mut self.symbol_set,
@@ -804,8 +780,6 @@ impl<L: IdStorage> LabelStoreBuilder<L> {
             self.buffer_pool.release(buffer);
             return Ok(id);
         }
-
-        self.ensure_entry_capacity();
         let next = self.entries.len();
         let id = LabelId::new(next).ok_or(CltsError::IdOverflow {
             kind: "label",
@@ -857,8 +831,6 @@ impl<L: IdStorage> LabelStoreBuilder<L> {
             symbols.clear();
             return Ok(id);
         }
-
-        self.ensure_entry_capacity();
         let owned = std::mem::take(symbols);
         let arc: Arc<[String]> = Arc::from(owned.into_boxed_slice());
         let next = self.entries.len();
@@ -886,7 +858,6 @@ impl<L: IdStorage> LabelStoreBuilder<L> {
         let LabelStoreBuilder {
             entries,
             entry_map: _,
-            entry_capacity_hint: _,
             symbol_set: _,
             symbols,
             symbols_dirty,
@@ -915,7 +886,6 @@ impl<L: IdStorage> Default for LabelStoreBuilder<L> {
         Self {
             entries: Vec::with_capacity(DEFAULT_LABEL_RESERVE),
             entry_map: HashMap::with_capacity(DEFAULT_LABEL_RESERVE),
-            entry_capacity_hint: DEFAULT_LABEL_RESERVE,
             // Tracks which alphabet symbols have already been interned. This lets us
             // avoid recomputing the universe during `build()`.
             symbol_set: HashSet::with_capacity(DEFAULT_LABEL_RESERVE),
@@ -1504,10 +1474,9 @@ pub struct CltsBuilder<S: IdStorage = DefaultStateIdx, L: IdStorage = DefaultLab
     state_variables: Vec<VariableSetId>,
     /// Structured variable-value pairs per state, index-aligned.
     state_valuations: Vec<Option<BTreeMap<String, String>>>,
-    // Hint for the state capacity that updates based on capacity growth when threshold is reached.
-    state_capacity_hint: usize,
-    // Hint for the transition capacity that updates based on capacity growth when threshold is reached.
-    transition_capacity_hint: usize,
+    // EXP-0004: capacity-hint fields removed. Vec::push handles growth
+    // by amortized doubling; explicit pre-sizing goes through
+    // `reserve_states` / `reserve_transitions`.
     // Explicit controllability classification for labels, set via `set_label_controllability`.
     /// If not set, controllability is inferred from transition kinds during build.
     label_controllability: HashMap<LabelId<L>, LabelControllability>,
@@ -1528,8 +1497,6 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             return Some(id);
         }
 
-        self.ensure_state_capacity();
-
         let next_index = self.state_names.len();
         match StateId::new(next_index) {
             Some(id) => {
@@ -1546,47 +1513,11 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
         }
     }
 
-    /// Ensures the internal state storage has headroom for a new element.
-    fn ensure_state_capacity(&mut self) {
-        if self.state_names.len() < self.state_names.capacity() {
-            return;
-        }
-
-        let current = self
-            .state_capacity_hint
-            .max(self.state_names.capacity())
-            .max(DEFAULT_STATE_RESERVE);
-        let next = grow_capacity(current, DEFAULT_STATE_RESERVE);
-        self.state_capacity_hint = next;
-        let additional = next.saturating_sub(self.state_names.capacity());
-
-        if additional > 0 {
-            self.state_names.reserve(additional);
-            self.state_variables.reserve(additional);
-            self.state_valuations.reserve(additional);
-            self.state_map.reserve(additional);
-            self.initial_states.reserve(additional);
-        }
-    }
-
-    /// Ensures the transition staging buffer has headroom for a new element.
-    fn ensure_transition_capacity(&mut self) {
-        if self.transitions.len() < self.transitions.capacity() {
-            return;
-        }
-
-        let current = self
-            .transition_capacity_hint
-            .max(self.transitions.capacity())
-            .max(DEFAULT_TRANSITION_RESERVE);
-        let next = grow_capacity(current, DEFAULT_TRANSITION_RESERVE);
-        self.transition_capacity_hint = next;
-        let additional = next.saturating_sub(self.transitions.capacity());
-
-        if additional > 0 {
-            self.transitions.reserve(additional);
-        }
-    }
+    // EXP-0004: ensure_*_capacity removed in favor of Vec::push's
+    // amortized doubling. Each parallel Vec (state_names, state_variables,
+    // state_valuations, transitions) grows independently when push hits
+    // capacity. Callers who know their final size pre-allocate via
+    // `reserve_states` / `reserve_transitions`.
 
     /// Adds a state to the CLTS if it does not already exist.
     ///
@@ -1680,16 +1611,12 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
         self.state_valuations.reserve(additional);
         self.state_map.reserve(additional);
         self.initial_states.reserve(additional);
-        self.state_capacity_hint = self.state_capacity_hint.max(self.state_names.capacity());
         self
     }
 
     /// Reserves additional capacity for staged transitions.
     pub fn reserve_transitions(&mut self, additional: usize) -> &mut Self {
         self.transitions.reserve(additional);
-        self.transition_capacity_hint = self
-            .transition_capacity_hint
-            .max(self.transitions.capacity());
         self
     }
 
@@ -1857,7 +1784,6 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
     ) -> &mut Self {
         debug_assert!(from.index() < self.state_variables.len());
         debug_assert!(to.index() < self.state_variables.len());
-        self.ensure_transition_capacity();
         let small_vec: SmallVec<[LabelId<L>; 4]> = labels.iter().copied().collect();
         self.transitions.push(TransitionSpec {
             from,
@@ -2084,8 +2010,6 @@ impl<S: IdStorage, L: IdStorage> Default for CltsBuilder<S, L> {
             variables: VariableStoreBuilder::default(),
             state_variables: Vec::with_capacity(DEFAULT_STATE_RESERVE),
             state_valuations: Vec::with_capacity(DEFAULT_STATE_RESERVE),
-            state_capacity_hint: DEFAULT_STATE_RESERVE,
-            transition_capacity_hint: DEFAULT_TRANSITION_RESERVE,
             label_controllability: HashMap::new(),
         }
     }
@@ -2142,7 +2066,7 @@ pub struct VariableSetId(usize);
 pub struct VariableStoreBuilder {
     sets: Vec<Arc<[String]>>,
     index: HashMap<Arc<[String]>, VariableSetId>,
-    set_capacity_hint: usize,
+    // EXP-0004: set_capacity_hint removed; Vec/HashMap handle growth.
     // Mirrors the label-store cache: collect the variable universe once and
     // lazily sort it so `build()` does not rebuild the data from scratch every
     // time.
@@ -2159,7 +2083,6 @@ impl Default for VariableStoreBuilder {
         Self {
             sets: Vec::with_capacity(DEFAULT_VARIABLE_RESERVE),
             index: HashMap::with_capacity(DEFAULT_VARIABLE_RESERVE),
-            set_capacity_hint: DEFAULT_VARIABLE_RESERVE,
             // Mirrors the label-store cache: collect the variable universe once and
             // lazily sort it so `build()` does not rebuild the data from scratch every
             // time.
@@ -2178,23 +2101,8 @@ impl VariableStoreBuilder {
         self.intern(std::iter::empty::<&str>())
     }
 
-    fn ensure_set_capacity(&mut self) {
-        if self.sets.len() < self.sets.capacity() {
-            return;
-        }
-
-        let current = self
-            .set_capacity_hint
-            .max(self.sets.capacity())
-            .max(DEFAULT_VARIABLE_RESERVE);
-        let next = grow_capacity(current, DEFAULT_VARIABLE_RESERVE);
-        self.set_capacity_hint = next;
-        let additional = next.saturating_sub(self.sets.capacity());
-        if additional > 0 {
-            self.sets.reserve(additional);
-            self.index.reserve(additional);
-        }
-    }
+    // EXP-0004: ensure_set_capacity removed. Vec::push and HashMap::insert
+    // handle growth by doubling.
 
     fn record_symbols(&mut self, payload: &[String]) {
         record_symbols_into_universe(
@@ -2239,8 +2147,6 @@ impl VariableStoreBuilder {
             self.buffer_pool.release(buffer);
             return id;
         }
-
-        self.ensure_set_capacity();
         let id = VariableSetId(self.sets.len());
         let owned = std::mem::take(&mut buffer);
         let arc: Arc<[String]> = Arc::from(owned.into_boxed_slice());
@@ -2289,8 +2195,6 @@ impl VariableStoreBuilder {
             vars.clear();
             return id;
         }
-
-        self.ensure_set_capacity();
         let owned = std::mem::take(vars);
         let arc: Arc<[String]> = Arc::from(owned.into_boxed_slice());
         let id = VariableSetId(self.sets.len());
@@ -2304,7 +2208,6 @@ impl VariableStoreBuilder {
         let VariableStoreBuilder {
             sets,
             index: _,
-            set_capacity_hint: _,
             symbol_set: _,
             symbols,
             symbols_dirty,

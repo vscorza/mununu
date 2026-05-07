@@ -2031,10 +2031,7 @@ fn build_product_game_controller(
             0
         } else {
             let var = obligations[oblig_idx];
-            wm.iteration_ranks
-                .get(&(state_idx, var))
-                .copied()
-                .unwrap_or(usize::MAX)
+            wm.iteration_ranks.get_rank(var, state_idx)
         }
     };
 

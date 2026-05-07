@@ -229,6 +229,17 @@ impl StateSignature {
             })
             .collect();
         transitions.sort();
+        // Use set-semantics on the outgoing-transition fingerprint, matching
+        // standard strong bisimulation (Kanellakis-Smolka 1990, van
+        // Glabbeek-Weijland 1996): two transitions with the same target block
+        // and the same label set are the same edge. Without this dedup, the
+        // partition refinement uses multiset semantics while the quotient
+        // construction (`seen: HashSet<TransitionKey>` below) uses set
+        // semantics — the inconsistency breaks idempotence: states with
+        // different transition multiplicity can become bisimilar after the
+        // quotient flattens duplicates, so a second pass finds further
+        // merges.
+        transitions.dedup();
         Self {
             variables,
             transitions,
@@ -395,5 +406,46 @@ mod tests {
         let clts = build_diamond_clts();
         let (_minimized, report) = minimize_bisimulation(&clts, None).unwrap().unwrap();
         assert!(report.transitions_after < report.transitions_before);
+    }
+
+    #[test]
+    fn idempotence_under_set_semantics() {
+        // Regression test for the multiset-vs-set inconsistency: state X has
+        // two transitions [c]→Y, [c]→Z while state W has one [c]→V. After
+        // bisimulation Y, Z, V land in the same equivalence class. Without
+        // set-semantics on the partition signature, X's signature is
+        // {(class, [c]), (class, [c])} and W's is {(class, [c])} — different
+        // multisets — so they don't merge on the first pass. The quotient
+        // construction then dedupes X's two transitions to one, and a
+        // second pass would find X and W bisimilar. With set-semantics on
+        // the partition signature (`transitions.dedup()` in
+        // StateSignature::compute), the first pass already sees them as
+        // bisimilar and the second pass returns None.
+        let mut builder = Clts::builder();
+        let x = builder.state_with_name("X".to_string()).unwrap();
+        let y = builder.state_with_name("Y".to_string()).unwrap();
+        let z = builder.state_with_name("Z".to_string()).unwrap();
+        let w = builder.state_with_name("W".to_string()).unwrap();
+        let v = builder.state_with_name("V".to_string()).unwrap();
+        builder.initial_state_id(x);
+
+        let c = builder.labels().intern(["c"]).unwrap();
+        builder.set_label_controllability(c, LabelControllability::Controllable);
+
+        builder.transition_ids(x, &[c], y);
+        builder.transition_ids(x, &[c], z);
+        builder.transition_ids(w, &[c], v);
+
+        let clts = builder.build().unwrap();
+        assert_eq!(clts.state_count(), 5);
+
+        let (m1, _) = minimize_bisimulation(&clts, None).unwrap().unwrap();
+        let second = minimize_bisimulation(&m1, None).unwrap();
+        assert!(
+            second.is_none(),
+            "minimize must be idempotent: second pass got {} states from {}-state input",
+            second.as_ref().map(|(c, _)| c.state_count()).unwrap_or(0),
+            m1.state_count(),
+        );
     }
 }

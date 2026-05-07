@@ -34,11 +34,25 @@ tree-sitter-gdscript = { version = "6", optional = true }
 # SMT solver (optional — z3 for value discovery in RTL verification)
 z3 = { version = "0.20", optional = true, features = ["bundled"] }
 
+# Optional / feature-gated:
+#   `test_support`: deterministic CLTS generators (chain/ring/grid/hypercube/...)
+#       used by tests, proptests, stress tests, and the bench harness fixtures.
+#   `stress`: gates the tier-3 stress tests in tests/stress_*.rs.
+#   `dhat`: enables the dhat heap profiler in stress tests.
+# These features pull `rand`/`rand_chacha` (deterministic via ChaCha20Rng) and
+# `dhat` only when needed, so release builds and the default feature set stay
+# allocation-free of test machinery.
+rand = { version = "0.8", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+dhat = { version = "0.3", optional = true }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.9"
 tempfile = "3.24"
 itoa = "1.0"
+rand = "0.8"
+rand_chacha = "0.3"
 
 [features]
 default = []
@@ -46,6 +60,11 @@ api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tracing"]
 ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust", "dep:tree-sitter-gdscript"]
 smt = ["dep:z3"]
 syntcomp = []
+# Optimization-programme features (see notebook/0000-overview.md). Each is
+# additive and can be enabled per-bench, per-test, or per-CI-tier.
+test_support = ["dep:rand", "dep:rand_chacha"]
+stress = ["test_support"]
+dhat = ["dep:dhat"]
 
 [[bench]]
 name = "clts_composition"
@@ -62,3 +81,37 @@ harness = false
 [[bench]]
 name = "xstate"
 harness = false
+
+# Optimization-programme isolated benches. Each requires the test_support
+# feature for deterministic CLTS generators (rand_chacha::ChaCha20Rng).
+# Run with:
+#   cargo bench --features test_support --bench <name>
+[[bench]]
+name = "clts_construction"
+harness = false
+required-features = ["test_support"]
+
+[[bench]]
+name = "composition_only"
+harness = false
+required-features = ["test_support"]
+
+[[bench]]
+name = "minimization_only"
+harness = false
+required-features = ["test_support"]
+
+[[bench]]
+name = "mu_calculus_only"
+harness = false
+required-features = ["test_support"]
+
+# dhat memory-profile binary for EXP-0002b-mem. Replays the
+# synthesis_product_game/grid_32x32 workload with dhat's heap profiler
+# wired to the global allocator. Produces dhat-heap.json in cwd; archive
+# alongside the EXP. Requires both test_support (for the fixture) and
+# dhat (for the profiler).
+[[bin]]
+name = "dhat_synthesis"
+path = "src/bin/dhat_synthesis.rs"
+required-features = ["test_support", "dhat"]
