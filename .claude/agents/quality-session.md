@@ -34,11 +34,13 @@ Read `.quality/thresholds.toml` for the principle thresholds.
 
 ## Phase 2: Principle Matrix
 
-Using the inventory data and thresholds, build an entity × principle signal matrix.
+Build an entity × principle signal matrix by combining qualitative review with quantitative thresholds.
 
-Evaluate each module and flagged file against these principles:
+**Step 1: qualitative review.** Invoke the `/design-review` skill on the same target scope used for the inventory. Capture its KISS / DRY / SOLID / YAGNI findings — those are the project's canonical principle definitions; do not restate them here.
 
-| Principle | RED signal | YELLOW signal |
+**Step 2: quantitative augmentation.** Using the inventory data from Phase 1 and `.quality/thresholds.toml`, apply the following metric-driven signals on top of `/design-review`'s findings. These are the tier-2 thresholds that turn a qualitative concern into a RED/YELLOW cell:
+
+| Principle | RED metric | YELLOW metric |
 |-----------|-----------|---------------|
 | **KISS** | fn > 50 lines, nesting > 4, params > 5 | fn > 30 lines, nesting > 3 |
 | **DRY** | near-duplicate function bodies, copy-pasted error handling | repeated 3-line patterns across files |
@@ -46,7 +48,9 @@ Evaluate each module and flagged file against these principles:
 | **SRP** | file > 600 SLOC, > 10 pub items | file > 400 SLOC, > 7 pub items |
 | **DIP** | core module (`clts/`, `ltl/`, `mu_calculus/`, `composition/`) imports `adapter` | high fan-out to leaf modules |
 
-For each flagged cell, record: entity path, metric name, current value, threshold, one-line root-cause hypothesis.
+(SRP and DIP are SOLID sub-principles `/design-review` covers qualitatively; the thresholds above are mununu-specific tightening.)
+
+**Step 3: merge.** For each entity, record one row: entity path, principle, status (`RED` if any metric trips the RED column OR `/design-review` flags a major violation; `YELLOW` if only metric thresholds trip OR `/design-review` flags a minor concern; `GREEN` otherwise), the triggering signal (metric name + value, or `/design-review` quote), and a one-line root-cause hypothesis.
 
 Render the matrix as a Markdown table in the session directory.
 

@@ -12,6 +12,7 @@ allowed_tools:
   - Bash
   - Write
   - Agent
+  - Skill
   - WebSearch
   - WebFetch
 ---
@@ -295,15 +296,11 @@ Only recommend content that can be backed by a working, verified example.
 
 ## Phase 5: CLI / API / UI Parity Check
 
-When a finding implies a change to a feature exposed to users (a flag, an endpoint, a file format, an example workflow), the agent must explicitly verify the change applies consistently across all three surfaces:
+For every finding from Phase 2 / 3 that implies a change to a feature exposed to users (a flag, an endpoint, a file format, an example workflow), invoke the `/parity-check` skill on the feature name or affected file list. Embed the skill's Markdown table verbatim under the "Tool Change Recommendations" section of the report.
 
-- **CLI** -- `crates/mununu-cli/src/main.rs` (clap argument structs and command handlers)
-- **HTTP API** -- `crates/mununu-core/src/api/handlers.rs` (request/response types) and `crates/mununu-core/src/api/server.rs` (routes)
-- **UI** -- `mununu-ui/src/api/endpoints.ts` (typed clients) and the hook/component that uses the endpoint (e.g. `mununu-ui/src/hooks/useCtxdslEditor.ts`, `mununu-ui/src/hooks/useSummary.ts`)
+The skill's report determines whether each recommended change is aligned across all three surfaces; this agent only catalogs which findings need parity-check coverage and consumes the skill's output. It does not re-derive the surface inventory or the drift classification.
 
-The report's "Tool Change Recommendations" section must, for each recommended change, list which of the three surfaces are affected and which need to be updated to maintain parity. If a recommendation only updates one surface, the agent must justify why the others legitimately do not need to change (e.g. the API stays decomposed via `/import` + `/summarize`, while the CLI offers a one-shot convenience flag).
-
-Pre-existing parity gaps discovered during the audit are themselves findings and must be reported under "Cohesion Recommendations" with surface labels (e.g., "CLI accepts `--adapter` on `eval` but API `/verify` requires the caller to chain `/import` -- document or align"). Use the same format as `axilite_write_slave_xilinx_*` weak-property findings: state the gap, the surfaces involved, and the proposed alignment.
+Pre-existing parity gaps surfaced by `/parity-check` are themselves findings and must also appear under "Cohesion Recommendations" with surface labels (e.g., "CLI accepts `--adapter` on `eval` but API `/verify` requires the caller to chain `/import` — document or align").
 
 When proposing new examples (Phase 3), confirm the example is reachable from all three surfaces. Each new example file should be loadable from the UI's editor (file extension recognized by `ADAPTER_EXTENSIONS`), summarizable via the CLI, and verifiable via the API. If an example only works on the CLI, treat it as an incomplete deliverable.
 

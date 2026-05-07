@@ -58,6 +58,7 @@ Read `$ARGUMENTS` for invocation overrides. Defaults:
 - `--max-fetches N` — default `4` per domain
 - `--depth quick|standard|deep` — default `standard`. `quick` halves the budget. Under `--depth quick`, allocate the budget asymmetrically: 60% to the harder domain (currently RTL) and 40% to the easier domain (currently MCP). Public MCP-bug source-of-truth (issue trackers) is denser than public RTL-bug source-of-truth, so equal split under-performs for RTL. `deep` doubles the budget and keeps the equal split.
 - `--max-executions N` — cap on Phase 5.5 target-executor invocations. Defaults: `quick=1`, `standard=3`, `deep=5`. Set to `0` to skip execution entirely (discovery-only run).
+- `--check-sources` — switch to source-health audit mode. Skip mining, taxonomy, and execution; instead, walk every URL in the Phase 1 inventory, record HTTP status, and emit a `sources_health.md` report. See **Phase 1.0** below.
 
 At session start:
 
@@ -77,9 +78,46 @@ Generate a session ID `YYYY-MM-DD-HHMMSS` from the current date and time. Use th
 
 **Checkpoint 0:** Write a session-skeleton stub to `.claude/reviews/prospector/{session-id}.md` with only the metadata header (Session ID, Date, Inputs) and a `## Status: in progress (Phase 0 complete)` line. Append a single line to `log.md` recording that this session started with the chosen budget. This proves a session is in flight even if subsequent phases never complete — and lets the next session distinguish "no prior run" from "prior run died mid-mining."
 
+## Phase 1.0 — Source-health audit (`--check-sources` only)
+
+When invoked with `--check-sources`, run this phase and stop after writing the report — do not enter Phase 1 mining, do not consume the search/fetch budget for candidate discovery, do not invoke `target-executor`.
+
+1. Walk every URL listed in **Phase 1 — Inventory of authoritative sources per domain** (both `### RTL sources` and `### MCP sources` lists, plus the Phase 1.1 priority block).
+2. For each URL, issue a HEAD request via `WebFetch` (or GET if HEAD is not supported). Record:
+   - HTTP status (`200`, `301`, `404`, `5xx`, `timeout`)
+   - Final URL after redirects (if 3xx)
+   - `Last-Modified` header if present, else "unknown"
+3. Classify each entry:
+   - **green** — `200` and (Last-Modified within 18 months OR no header but URL points to an actively updated repo/issue tracker)
+   - **yellow** — `200` but Last-Modified > 18 months OR redirected to a different host
+   - **red** — `404`, `5xx`, or repeated timeout
+4. Write `.claude/reviews/prospector/sources_health-{session-id}.md` with one section per source category and a per-URL table:
+
+   ```markdown
+   # Source health — {session-id}
+   Date: {YYYY-MM-DD}
+
+   ## RTL sources
+   | URL | Status | Last-Modified | Classification | Note |
+   |---|---|---|---|---|
+
+   ## MCP sources
+   | URL | Status | Last-Modified | Classification | Note |
+   |---|---|---|---|---|
+
+   ## Recommended Phase 1 amendments
+   - Drop / replace: {url} — {reason}
+   - Down-weight: {url} — {reason}
+   ```
+
+5. Append a one-line entry to `log.md` summarizing the run (e.g., `2026-05-05-XXXXXX  --check-sources  RTL: 8 green / 2 yellow / 1 red; MCP: 6 green / 0 yellow / 0 red`).
+6. The `Recommended Phase 1 amendments` block is consumed by Phase 6 self-review on the next normal run; the agent does not edit its own file.
+
+Cap network usage at 30 HEAD/GET requests for this phase. If the inventory has grown beyond that, paginate across runs (record which URLs were checked vs deferred in the report).
+
 ## Phase 1 — Inventory of authoritative sources per domain
 
-This list is part of the agent definition and is revised in Phase 6 (self-review). Always re-evaluate freshness — flag any URL that 404s or has not been updated in the last 18 months.
+This list is part of the agent definition and is revised in Phase 6 (self-review). Always re-evaluate freshness — flag any URL that 404s or has not been updated in the last 18 months. Run `--check-sources` periodically (Phase 1.0) to mechanize this freshness check.
 
 ### RTL sources
 

@@ -1,12 +1,22 @@
 ---
 name: quality-inventory
 description: >
-  Collects code quality metrics at project, module, and file levels.
-  Detects available tool tier and adapts measurement accordingly.
-  Use when asked to measure, inventory, or baseline code quality.
+  Collects code quality metrics at project, module, and file levels, or
+  installs measurement tools to upgrade the metrics tier when invoked with
+  `--setup`. Detects available tool tier and adapts measurement accordingly.
+  Use when asked to measure, inventory, baseline, or set up code quality.
 ---
 
-Collect quality metrics for $ARGUMENTS (or `crates/` if no args). Output a structured inventory.
+## Mode dispatch
+
+Inspect `$ARGUMENTS`:
+
+- If it contains `--setup` (with or without a tier specifier), jump to **Setup mode** below.
+- Otherwise, run the default **Inventory mode** on the scope (or `crates/` if no scope is given). Strip any `--` flags before treating the remainder as a scope path.
+
+## Inventory mode
+
+Collect quality metrics for the given scope. Output a structured inventory.
 
 ## Tool Tier Detection
 
@@ -185,7 +195,58 @@ Date: {YYYY-MM-DD}
 - file.rs:L — core module imports adapter
 
 ### Missing Tool Tiers
-To unlock more metrics, run `/quality-setup` to install Tier {next} tools.
+To unlock more metrics, run `/quality-inventory --setup` to install Tier {next} tools.
 ```
 
 When called from the quality-session agent, also write the raw data to the path specified in $ARGUMENTS (e.g., `.quality/sessions/<id>/before.json`).
+
+## Setup mode
+
+Install measurement tools to upgrade the inventory tier. Detect the current tier first, then install the next tier's tools.
+
+### Tier detection
+
+```bash
+echo "=== Current Tool Availability ==="
+command -v tokei >/dev/null 2>&1 && echo "✓ tokei" || echo "✗ tokei"
+command -v rust-code-analysis-cli >/dev/null 2>&1 && echo "✓ rust-code-analysis" || echo "✗ rust-code-analysis"
+command -v cargo-modules >/dev/null 2>&1 && echo "✓ cargo-modules" || echo "✗ cargo-modules"
+command -v cargo-geiger >/dev/null 2>&1 && echo "✓ cargo-geiger" || echo "✗ cargo-geiger"
+command -v cargo-udeps >/dev/null 2>&1 && echo "✓ cargo-udeps" || echo "✗ cargo-udeps"
+command -v cargo-mutants >/dev/null 2>&1 && echo "✓ cargo-mutants" || echo "✗ cargo-mutants"
+command -v cargo-nextest >/dev/null 2>&1 && echo "✓ cargo-nextest" || echo "✗ cargo-nextest"
+```
+
+### Tier 1 — SLOC & complexity
+
+```bash
+cargo install tokei
+cargo install rust-code-analysis-cli
+```
+
+**Unlocks**: accurate SLOC (comments/blanks excluded), cyclomatic complexity, cognitive complexity, Halstead metrics per function.
+
+### Tier 2 — Coupling & unsafe surface
+
+```bash
+cargo install cargo-modules
+cargo install cargo-geiger
+cargo install cargo-udeps
+```
+
+**Unlocks**: module dependency graph, afferent/efferent coupling, instability index, precise unsafe surface area, unused dependency detection.
+
+`cargo-udeps` requires nightly: `rustup install nightly` if not already present.
+
+### Tier 3 — Mutation testing
+
+```bash
+cargo install cargo-mutants
+cargo install cargo-nextest
+```
+
+**Unlocks**: mutation testing scores, parallel test execution, per-test timing.
+
+### After installation
+
+Re-run `/quality-inventory` (without `--setup`) to verify the new tier is detected and additional metrics are collected. Report which tier was achieved and what new metrics are now available.
