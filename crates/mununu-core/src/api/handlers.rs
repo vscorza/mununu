@@ -387,6 +387,26 @@ pub async fn context_import_handler(
     let result = match request.format.as_str() {
         "tlsf" => crate::adapter::tlsf::TlsfAdapter::translate(&request.content, &options),
         "aiger" => crate::adapter::aiger::AigerAdapter::translate(&request.content, &options),
+        "btor2" | "btor" => {
+            crate::adapter::btor2::Btor2Adapter::translate(&request.content, &options)
+        }
+        "sv-yosys" | "yosys" => {
+            // Yosys-driven SV elaboration via child process. Parity with the
+            // CLI `--adapter sv-yosys` flag.
+            let yopts = if !request.additional_sources.is_empty() {
+                let mut additional = std::collections::HashMap::new();
+                for src in &request.additional_sources {
+                    additional.insert(src.name.clone(), src.content.clone());
+                }
+                crate::adapter::yosys::YosysOptions {
+                    additional_sources: additional.into_iter().collect(),
+                    ..Default::default()
+                }
+            } else {
+                crate::adapter::yosys::YosysOptions::default()
+            };
+            crate::adapter::yosys::translate_sv(&request.content, &options, &yopts)
+        }
         "promela" => crate::adapter::promela::PromelaAdapter::translate(&request.content, &options),
         "xstate" => crate::adapter::xstate::XStateAdapter::translate(&request.content, &options),
         "systemverilog" | "sv" => {
@@ -433,7 +453,7 @@ pub async fn context_import_handler(
         other => {
             return Err(ApiError::BadRequest {
                 message: format!(
-                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, promela, xstate, systemverilog, extraction"
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction"
                 ),
                 details: None,
             });

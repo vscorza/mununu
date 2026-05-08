@@ -560,8 +560,9 @@ Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela) and tran
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `content` | string | Yes | Raw file content in the source format |
-| `format` | string | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"promela"`, `"xstate"`, `"systemverilog"` |
+| `format` | string | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"btor2"` (or `"btor"`), `"promela"`, `"xstate"`, `"systemverilog"` (hand-written parser), `"sv-yosys"` (or `"yosys"`, Yosys-driven elaboration), `"extraction"` |
 | `filename` | string | No | Original filename (used for extension-based detection if format is `"auto"`) |
+| `additional_sources` | array | No | Extra SV source files to compile alongside the primary input (Yosys path only). Each entry: `{name, content}`. |
 
 ### Response Body
 

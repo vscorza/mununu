@@ -40,7 +40,7 @@ mununu context eval <CONTEXT> [options]
 |------|-------------|
 | `--template-arg <KEY=VALUE>` | Template argument binding (repeatable). Requires `--template`. |
 | `--sidecar <FILE>` | Additional CTXDSL sidecar files to merge (repeatable) |
-| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `extraction`, `auto` |
+| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `btor2` (or `btor`), `promela`, `xstate`, `systemverilog` (or `sv`, hand-written parser), `sv-yosys` (or `yosys`, Yosys-driven elaboration), `extraction`, `auto` |
 | `--no-partitions` | Disable guard partitioning during evaluation |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
 | `--print-ctxdsl [FILE]` | Print the intermediate CTXDSL (after adapter translation) to stdout or a file |
@@ -114,7 +114,7 @@ mununu context synth <CONTEXT> [options]
 | `--extract-strategy` | Legacy flag — equivalent to `--controller-mode functional`. Kept for backwards compatibility. When `--controller-mode` is also provided, `--controller-mode` wins. |
 | `--controller-mode <NAME>` | Controller extraction mode. One of `projection` (default), `functional`, `permissive`, `signature-memory`, `product-game`, `parity-game`. See [Controller Modes](Controller-Modes.md) for the full reference. |
 | `--no-proof-obligations` | Skip proof obligation emission for violating initial states |
-| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `promela`, `xstate`, `systemverilog` (or `sv`), `extraction`, `auto` |
+| `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `btor2` (or `btor`), `promela`, `xstate`, `systemverilog` (or `sv`, hand-written parser), `sv-yosys` (or `yosys`, Yosys-driven elaboration), `extraction`, `auto` |
 | `--dump-json <FILE>` | Write a JSON summary of the synthesis result to a file |
 | `--emit-dsl <FILE>` | Write the synthesized controller as a CTXDSL file |
 | `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog`, `gdscript` |

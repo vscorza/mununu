@@ -15,6 +15,19 @@ Component automata (.espec.json)
 
 Each step is optional. Simple models may skip directly to verification.
 
+## CLTS + CTXDSL Capability Surface
+
+The internal model is richer than most adapters use. Reach for these primitives when expressing source-language features — re-encoding them via state-name mangling or parallel single-label transitions inflates state space and obscures semantics.
+
+| Capability | CLTS API | CTXDSL syntax | When to reach for it |
+|---|---|---|---|
+| Multi-label transitions | `Transition.labels: SmallVec<[LabelId; 4]>` ([`clts/mod.rs:265`](../../crates/mununu-core/src/clts/mod.rs#L265)) | `transition s -> t on label a, label b;` ([`parser.rs:733`](../../crates/mununu-core/src/context_dsl/parser.rs#L733)) | A source event carries several semantic tags simultaneously (controllability class + signal name + payload kind). One edge, several labels — *not* parallel single-label edges. |
+| Per-state predicates (Kripke APs) | `state_variable_bitset` / `state_valuation` ([`clts/mod.rs:1173`](../../crates/mununu-core/src/clts/mod.rs#L1173)) | `predicates { predicate foo = state S1; }` ([`parser.rs:485`](../../crates/mununu-core/src/context_dsl/parser.rs#L485)) | A property talks about *what is true in a state* (e.g. "request asserted") rather than *which transition led here*. Avoid suffixing state names with attribute values. |
+| Per-label controllability | `LabelControllability` ([`clts/mod.rs:248`](../../crates/mununu-core/src/clts/mod.rs#L248)) | `automaton A { controllable { ... } internal { ... } }` ([`ast.rs:81`](../../crates/mununu-core/src/context_dsl/ast.rs#L81)) | Always — declare controllability once at the automaton level. Transition controllability is *derived*; do not fold it into label-name prefixes. |
+| Rich modal guards | `Guard { labels, current, next, control, max_steps }` ([`mu_calculus/mod.rs:323`](../../crates/mununu-core/src/mu_calculus/mod.rs#L323)); parser keys `labels`, `req_cur`, `forb_cur`, `req_next`, `forb_next`, `ctrl`, `steps` ([`mu_calculus/parser.rs:420`](../../crates/mununu-core/src/mu_calculus/parser.rs#L420)) | `[(labels = {a}, req_next = {active}, ctrl = controllable)] φ` | A property is naturally phrased "via *this* transition class, the next state must satisfy *this* predicate" — pack the constraint into one modality instead of decomposing into nested formulas. `req_next` / `forb_next` are the most under-used keys. |
+
+**Worked references**: the signal-state emit path at [`adapter/emit.rs:587-872`](../../crates/mununu-core/src/adapter/emit.rs#L587-L872) (turn-aware `[(ctrl=Controllable)]` guards) and the SystemVerilog Kripke builder at [`adapter/systemverilog/kripke.rs:450`](../../crates/mununu-core/src/adapter/systemverilog/kripke.rs#L450) (state valuations) exercise three of the four primitives end-to-end on real targets.
+
 ## External Code Summaries (3-Tier)
 
 When extracted automata call external libraries, those calls need summaries.

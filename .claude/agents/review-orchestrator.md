@@ -28,7 +28,7 @@ Run these skills in sequence:
 2. `/design-review` — KISS, DRY, SOLID, YAGNI, module boundaries
 3. `/test-review` — Coverage gaps, three-level adapter testing, property tests
 4. `/security-audit` — Unsafe blocks, API security, dependencies, DoS vectors
-5. `/soundness-check` — SOUNDNESS annotations, eval_expr fallbacks, guard failures, abstraction decisions
+5. `/soundness-check` — SOUNDNESS annotations, eval_expr fallbacks, guard failures, abstraction decisions, and adapter capability under-use (multi-label transitions, state predicates, per-label controllability, rich modal guards) per CLAUDE.md `### Adapter / Emitter Capability Use`
 6. `/parity-check` — CLI ↔ API ↔ UI alignment for any change in scope that touches user-facing surfaces. Pass the changed-file list (the same scope used for steps 1–5) as the argument. Embed the skill's Markdown table verbatim under the "CLI / API / UI Parity" section of the consolidated report.
 
 Consolidate results into a single Markdown report. Save it to `.claude/reviews/YYYY-MM-DD.md` using today's date.

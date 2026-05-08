@@ -298,6 +298,23 @@ The **signature** of a state is its tuple of iteration ranks per fixpoint variab
 - **Formula inversion**: do NOT negate fixpoint variable references inside the body. Keep variables positive — the dual fixpoint's changed starting point handles the semantics.
 - **Nondeterminism and controllability (Skolem paradigm)**: The controller chooses WHICH label to trigger, but cannot choose WHICH outcome occurs when multiple transitions share the same label (nondeterminism). Nondeterministic outcomes are always adversarial — ALL must satisfy — regardless of whether the label is controllable or uncontrollable. Controllability only determines who TRIGGERS the label (controller vs environment), not the outcome.
 
+### Adapter / Emitter Capability Use
+
+The CLTS data model and CTXDSL grammar already express more than most adapters reach for. When writing or modifying an extractor, adapter, or emitter, prefer these primitives over re-encoding source-language features as state-name suffixes or parallel single-label edges:
+
+- **Multi-label transitions**: a single CLTS edge carries a `SmallVec<[LabelId; 4]>` of labels — see `crates/mununu-core/src/clts/mod.rs:265`. CTXDSL syntax: `transition s -> t on label a, label b;` (parser at `crates/mununu-core/src/context_dsl/parser.rs:733`, AST at `crates/mununu-core/src/context_dsl/ast.rs:156`). Multi-labeled edges are *one* transition, not parallel transitions — use this when a source event carries several semantic tags (e.g. controllability class + signal name + payload kind).
+- **Per-state predicates**: Kripke-style state labeling is supported via `state_variable_bitset` (`crates/mununu-core/src/clts/mod.rs:1173`) and `state_valuation` (`crates/mununu-core/src/clts/mod.rs:1178`). CTXDSL declaration: `predicates { predicate foo = state S1; }` (parser at `crates/mununu-core/src/context_dsl/parser.rs:485`). Use these instead of encoding state attributes into state names.
+- **Per-label controllability**: `LabelControllability { Controllable, Internal, Uncontrollable }` at `crates/mununu-core/src/clts/mod.rs:248`. Transition controllability is *derived* from labels — declare it once in the automaton's `controllable { ... }` / `internal { ... }` blocks (`crates/mununu-core/src/context_dsl/ast.rs:81`), do not fold it into label-name prefixes.
+- **Rich modal guards**: `Guard { labels, current, next, control, max_steps }` at `crates/mununu-core/src/mu_calculus/mod.rs:323`. A single `[...]` or `<...>` modality can constrain *all five* axes — labels, current-state predicates (`req_cur` / `forb_cur`), next-state predicates (`req_next` / `forb_next`), controllability class (`ctrl = controllable | environment | all`), and step bound (`steps`). Parser keys at `crates/mununu-core/src/mu_calculus/parser.rs:420`. Syntax: `[(labels = {a}, req_next = {active}, ctrl = controllable)] φ`. Reach for `req_next` / `forb_next` whenever a property is naturally phrased "after this transition the system must be in a state where …" — no adapter currently exploits this and it is the most under-used primitive.
+
+**Reference implementations** that already exercise the rich surface:
+- Signal-state emit path with turn-aware `[(ctrl=Controllable)]` guards: `crates/mununu-core/src/adapter/emit.rs:587-872`.
+- SystemVerilog Kripke valuations: `crates/mununu-core/src/adapter/systemverilog/kripke.rs:450`.
+
+**Anti-pattern**: do not re-encode source features as state-name suffixes (e.g. `S1_req_high`) or as parallel single-label edges between the same source/target pair when a multi-label edge fits.
+
+**Rule**: when adding or modifying an adapter or emitter, prefer these primitives. If a primitive is intentionally unused, leave a one-line comment explaining why (e.g. `// AIGER inputs are single-bit; multi-label has no semantic content here`). Reviewers and the `/soundness-check` skill flag silent under-use.
+
 ### Agentic Orchestration Models
 
 Agentic AI orchestration is currently modeled in two ways:

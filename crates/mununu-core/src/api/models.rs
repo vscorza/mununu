@@ -210,7 +210,9 @@ pub struct ProofObligation {
 pub struct ContextImportRequest {
     /// Raw file content in the source format.
     pub content: String,
-    /// Source format hint: "auto", "tlsf", "aiger", "promela", "xstate", "systemverilog".
+    /// Source format hint: "auto", "tlsf", "aiger", "btor2", "promela", "xstate",
+    /// "systemverilog" (hand-written SV adapter), "sv-yosys" (Yosys-driven SV
+    /// elaboration → BTOR2 → CLTS — Phase 1 RTL roadmap), "extraction".
     #[serde(default = "default_import_format")]
     pub format: String,
     /// Original filename (used for extension-based detection if format is "auto").

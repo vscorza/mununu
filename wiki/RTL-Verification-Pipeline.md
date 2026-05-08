@@ -2,11 +2,20 @@
 
 > **Alpha Software** — Mununu is under active development. APIs, syntax, and behavior may change.
 
-This page describes the end-to-end pipeline for verifying SystemVerilog RTL designs using Mununu's Kripke construction and `.mununu.json` annotation sidecars.
+Mununu has **two RTL ingestion paths** today:
+
+- **Hand-written SV parser** (`--adapter sv`): the original FSM-class adapter, with `.mununu.json` annotation sidecars driving abstraction (`FieldDomain` Boolean / Presence / BoundedCounter / EnumValues / Ignored, `discovered_values`, COI). Best for small SystemVerilog FSMs where you want to author the abstraction explicitly.
+- **Yosys-driven path** (`--adapter sv-yosys`): elaborate via Yosys to BTOR2, then bit-blast through the [BTOR2 reader](Adapter-Formats#btor2--yosys-rtl-phase-1). Generate blocks, parameter elaboration, packages, and structural SV that the hand-written parser cannot handle all flow through Yosys's mature elaboration. The price is no automatic abstraction — the BTOR2 reader bit-blasts within the `MAX_STATE_BITS = 16` cap and rejects designs beyond it.
+
+The roadmap unifies the two paths: the BTOR2 reader will gain a shared `adapter/sidecar/` module so the same `.mununu.json` schema feeds both paths, and the BTOR2 bit-blaster will consume `FieldDomain` instead of raw bit-vectors. Until that lands, the hand-written and Yosys paths are independent.
 
 ---
 
-## Pipeline Overview
+## Hand-written SV Parser Path
+
+This page below documents the hand-written SV path with `.mununu.json` sidecars. For the Yosys path, see [Adapter Formats — BTOR2 + Yosys](Adapter-Formats#btor2--yosys-rtl-phase-1) and the corpus walkthrough in `examples/btor2/README.md`.
+
+### Pipeline Overview
 
 ```
 SV Source → Parse → Load Sidecar → (optional: SMT Discovery) → Build Abstraction → Kripke → Verify

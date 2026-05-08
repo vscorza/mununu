@@ -1540,6 +1540,19 @@ fn load_with_adapter_mode(
             mununu_core::adapter::aiger::AigerAdapter::translate(&source, &options_default)
                 .map_err(|e| format!("AIGER adapter error: {e}"))?,
         ),
+        Some("btor2") | Some("btor") => log_adapter_output(
+            mununu_core::adapter::btor2::Btor2Adapter::translate(&source, &options_default)
+                .map_err(|e| format!("BTOR2 adapter error: {e}"))?,
+        ),
+        Some("sv-yosys") | Some("yosys") => {
+            // Yosys-driven SV elaboration → BTOR2 → CLTS.
+            // Per Phase 1 of the RTL roadmap (S1: Yosys-as-front-end).
+            let yopts = mununu_core::adapter::yosys::YosysOptions::default();
+            log_adapter_output(
+                mununu_core::adapter::yosys::translate_sv(&source, &options_default, &yopts)
+                    .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
+            )
+        }
         Some("promela") => log_adapter_output(
             mununu_core::adapter::promela::PromelaAdapter::translate(&source, &options_default)
                 .map_err(|e| format!("Promela adapter error: {e}"))?,
@@ -1569,7 +1582,7 @@ fn load_with_adapter_mode(
         ),
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, auto"
             ));
         }
         None => {

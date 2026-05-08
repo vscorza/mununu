@@ -22,6 +22,8 @@ This project is a formal verification tool. Adapter code translates external for
 
 5. **Nondeterministic transitions (havoc)**: Where a transition has multiple targets for the same label, verify there's a comment explaining this is intentional over-approximation.
 
+6. **Capability under-use**: in adapter / emitter code, flag patterns that re-encode features the CLTS / CTXDSL layer already supports — emitting parallel single-label transitions where a multi-label edge fits, suffixing state names with predicate values where state predicates fit, folding controllability into label-name prefixes where `LabelControllability` fits, or emitting LTL where a `[(req_next = {...})]` guard would be more direct. Cross-reference CLAUDE.md `### Adapter / Emitter Capability Use`. Severity: LOW — a maintenance / review hint, not a soundness bug. If the under-use is intentional (e.g. AIGER inputs are single-bit), require a one-line comment in the adapter explaining why.
+
 ## Search Patterns
 
 Use these grep patterns to find potential violations:
@@ -35,6 +37,10 @@ skip_to_semicolon|skip_braces|skip_unknown
 
 # Guard failures
 guard.*None|eval_guard.*false
+
+# Capability under-use (item 6) — adapter files only
+labels:\s*vec!\[[^,\]]+\]      # single-element label vectors
+controllable_labels:\s*vec!\[\] # hardcoded empty controllability
 ```
 
 ## Output Format

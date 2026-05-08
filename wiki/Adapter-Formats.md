@@ -11,9 +11,11 @@ Mununu can import specifications from external formats and export synthesized co
 | **CTXDSL** | `.ctxdsl` | Native | Native | — |
 | **TLSF** | `.tlsf` | Yes | No | Signal-state (turn-based) |
 | **AIGER** | `.aag`, `.aig` | Yes | No | Signal-state (turn-based) |
+| **BTOR2** | `.btor`, `.btor2` | Yes | No | Explicit automaton |
 | **Promela** | `.pml`, `.promela` | Yes | No | Explicit automaton |
 | **XState** | `.xstate`, `.json` | Yes | Yes | Explicit automaton |
-| **SystemVerilog** | `.sv`, `.v` | Yes | Yes | Explicit automaton |
+| **SystemVerilog** (hand-written parser) | `.sv`, `.v` | Yes | Yes | Explicit automaton |
+| **SystemVerilog via Yosys** | `.sv`, `.v` (with `--adapter sv-yosys`) | Yes | No | Explicit automaton |
 | **Extraction Spec** | `.espec.json` | Yes | No | Explicit automaton |
 
 > The **Extraction Spec** adapter handles `.espec.json` files from the extraction pipeline (source code analysis) and game engine integration. Properties can use `template_ref` to reference [Property Templates](Property-Templates) instead of raw mu-calculus formulas. See [Game Engine Integration](Game-Engine-Integration) for game-specific use cases.
@@ -290,6 +292,78 @@ module FSM_controller (
     end
 endmodule
 ```
+
+---
+
+## BTOR2 + Yosys (RTL Phase 1)
+
+BTOR2 (Niemetz–Preiner–Wolf, FMCAD 2018) is the de facto open-source word-level verification IR. Mununu's BTOR2 adapter parses the file, bit-blasts state and input bit-vectors into explicit valuations, and turns each `bad` / `constraint` / `fair` / `justice` line into a μ-calculus property. The **Yosys driver** (`adapter::yosys`) chains a child-process Yosys invocation onto the BTOR2 reader so a `.sv` file flows end-to-end as `SV → Yosys → BTOR2 → CLTS`.
+
+### Pipeline
+
+```
+.sv  ──►  yosys (child process)  ──►  design.btor  ──►  BTOR2 reader  ──►  AdapterIR  ──►  CTXDSL  ──►  CLTS
+                  │                                            │
+                  └─ async2sync, chformal -lower, …            └─ per-signal labels, drop clock,
+                                                                   filter chformal latches
+```
+
+**Yosys script** (`adapter::yosys::build_script`):
+
+```text
+read_verilog -formal -sv <source.sv>;
+hierarchy -auto-top;
+proc; flatten;
+async2sync;          # NOT clk2fflogic — preserves the synchronous structure
+chformal -lower;     # SVA → bad / constraint / fair / justice
+dffunmap;
+setundef -zero;      # X → 0; bit-blaster does not model X-prop
+write_btor design.btor
+```
+
+### How the BTOR2 reader treats the design
+
+Four CLTS-aligned transformations applied at read time (per [`adapter::btor2::bit_blast`](../crates/mununu-core/src/adapter/btor2/bit_blast.rs)):
+
+1. **Per-signal labels.** Each transition carries one `<signal>=<value>` label per non-clock input — `transition s0 -> s253 on label rst_0;` — using mununu's native multi-label transition support. Properties refer to individual signals via `[(rst_0)] φ` rather than enumerating compound `env_NNNN` strings. The CLTS alphabet shrinks from `2^N` (compound) to `2N` (per-signal-value) entries.
+2. **Implicit clock.** Each CLTS transition represents one clock edge; `clk` does not appear in the alphabet. The reader auto-detects clock-shaped input names (`clk`, `clock`, `ck`, `clk_i`, `i_clk`, `iclk`, `clki`) and elides them from enumeration. Multi-clock and negedge designs are out of scope for Phase 1 — the reader errors explicitly.
+3. **Synchronous Yosys script.** `async2sync` (rather than `clk2fflogic`) preserves the synchronous structure. `clk2fflogic` would introduce a `value + shadow + previous-clk` triple-state-cell encoding per FF group; `async2sync` produces one BTOR2 state cell per FF, matching mununu's "transition = one clock edge" semantics natively.
+4. **Enumerated state names + valuations side-channel.** State names are `s0, s1, …, sN-1`. Per-state register valuations are carried via the existing `StateSpec.valuations` side-channel (the same mechanism the SV adapter uses) so user-written formulas like `state == 0` resolve via the on-demand expression evaluator. Synthetic `chformal -lower` property-tracking latches are filtered out of valuations so user formulas don't reference them.
+
+### Yosys SVA support
+
+Yosys 0.59's `read_verilog -formal -sv` is a synthesis frontend, not a full SystemVerilog assertion frontend. It accepts:
+
+- Immediate assertions inside `always @(posedge clk)`: `assert (boolean_expr);`
+- Immediate assumes / covers: `assume (...)`, `cover (...)`
+
+It does **not** accept temporal SVA: `assert property (...)`, `|->`, `|=>`, `##N`, `s_eventually`, `$stable`, `$rose`, `$past`, `nexttime`, `default clocking`, PSL/FL syntax. The full SVA story arrives in **Phase 2** of the [RTL roadmap](RTL-Verification-Pipeline) (`adapter/sva/`), independent of the Yosys frontend. Until then, properties needing temporal operators are encoded with **shadow-register patterns** — a pre-cycle latch tracks the antecedent, an immediate Boolean assertion tests the consequent. This mirrors how every working OSS Yosys SVA example is actually written. See `examples/btor2/` in the repo for a corpus.
+
+### State-bit budget
+
+The bit-blaster caps total state at `MAX_STATE_BITS = 16` (≈ 65 K explicit states) and inputs at `MAX_INPUT_BITS = 10` per step. Beyond that, the design is rejected with `StateSpaceOverflow` — the documented escape hatch is compose-and-decompose (Phase 3) before BTOR2 hand-off to an external symbolic engine (Pono / AVR / BtorMC).
+
+### CLI
+
+```bash
+# Drive Yosys end-to-end:
+mununu context eval design.sv --adapter sv-yosys --formula safety_bad_0 --automaton Circuit
+
+# Or hand mununu an existing BTOR2 file:
+mununu context eval design.btor --adapter btor2 --formula safety_bad_0 --automaton Circuit
+
+# Auto-detection works for both .sv (via Yosys when --adapter sv-yosys, hand-written parser otherwise) and .btor / .btor2 (via the BTOR2 reader directly).
+```
+
+### Soundness
+
+- **Bit-blasting is exact** for the operators marked `is_blastable()` in [`btor2::ast::Op`](../crates/mununu-core/src/adapter/btor2/ast.rs).
+- **Implicit clock is sound for posedge-only single-clock designs** — multi-clock and negedge are explicitly rejected at read time.
+- **`async2sync` preserves synchronous structure** for both register cells and `chformal`-lowered assertions.
+- **`setundef -zero`** in the Yosys script makes X / undef bits deterministic; X-aware verification is out of mununu's roadmap scope.
+- **Verific check:** the driver refuses to use a Yosys binary built with the commercial Verific frontend (license-incompatible).
+
+See the in-repo `examples/btor2/README.md` for a concrete corpus walkthrough (`safety_demo`, `traffic_light`, `bounded_counter_with_assume`, `fair_arbiter`, `handshake_protocol`).
 
 ---
 

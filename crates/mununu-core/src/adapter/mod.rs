@@ -38,6 +38,7 @@
 //!    a model that gives the expected verdict.
 
 pub mod aiger;
+pub mod btor2;
 pub mod domain;
 pub mod emit;
 pub mod extraction;
@@ -49,6 +50,7 @@ pub mod systemverilog;
 pub mod templates;
 pub mod tlsf;
 pub mod xstate;
+pub mod yosys;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -140,6 +142,7 @@ pub struct SourceInfo {
 pub enum SourceFormat {
     Tlsf,
     Aiger,
+    Btor2,
     Promela,
     XState,
     SystemVerilog,
@@ -151,6 +154,7 @@ impl fmt::Display for SourceFormat {
         match self {
             SourceFormat::Tlsf => write!(f, "TLSF"),
             SourceFormat::Aiger => write!(f, "AIGER"),
+            SourceFormat::Btor2 => write!(f, "BTOR2"),
             SourceFormat::Promela => write!(f, "Promela"),
             SourceFormat::XState => write!(f, "XState"),
             SourceFormat::SystemVerilog => write!(f, "SystemVerilog"),
@@ -206,6 +210,7 @@ pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str
     match path.extension().and_then(|e| e.to_str()) {
         Some("tlsf") => Some("tlsf"),
         Some("aag") | Some("aig") => Some("aiger"),
+        Some("btor") | Some("btor2") => Some("btor2"),
         Some("pml") | Some("promela") => Some("promela"),
         Some("xstate") => Some("xstate"),
         Some("sv") | Some("v") => Some("systemverilog"),
@@ -224,6 +229,9 @@ pub fn auto_translate(
     if aiger::AigerAdapter::detect(content) {
         return aiger::AigerAdapter::translate(content, options);
     }
+    if btor2::Btor2Adapter::detect(content) {
+        return btor2::Btor2Adapter::translate(content, options);
+    }
     if promela::PromelaAdapter::detect(content) {
         return promela::PromelaAdapter::translate(content, options);
     }
@@ -239,7 +247,7 @@ pub fn auto_translate(
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), Promela (.pml), XState (.xstate or .xstate.json), SystemVerilog (.sv/.v), Extraction (.espec.json)".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), BTOR2 (.btor/.btor2), Promela (.pml), XState (.xstate or .xstate.json), SystemVerilog (.sv/.v via Yosys frontend), Extraction (.espec.json)".into(),
         location: None,
     })
 }
