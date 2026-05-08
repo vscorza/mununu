@@ -1531,6 +1531,23 @@ fn load_with_adapter_mode(
         ..Default::default()
     };
 
+    // BTOR2 / sv-yosys auto-load `.mununu.json` next to the source so
+    // the bit-blaster's `FieldDomain` abstraction kicks in. SV adapter
+    // already does this via filesystem convention; this mirrors it.
+    let load_btor_sidecar = |opts: &AdapterOptions| -> AdapterOptions {
+        let mut o = opts.clone();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let candidate = path.with_file_name(format!("{stem}.mununu.json"));
+            if candidate.exists()
+                && let Ok(content) = fs::read_to_string(&candidate)
+            {
+                eprintln!("Loaded sidecar: {}", candidate.display());
+                o.sidecar_json = Some(content);
+            }
+        }
+        o
+    };
+
     let (ctxdsl_source, state_valuations) = match adapter {
         Some("tlsf") => log_adapter_output(
             mununu_core::adapter::tlsf::TlsfAdapter::translate(&source, &options_default)
@@ -1541,16 +1558,23 @@ fn load_with_adapter_mode(
                 .map_err(|e| format!("AIGER adapter error: {e}"))?,
         ),
         Some("btor2") | Some("btor") => log_adapter_output(
-            mununu_core::adapter::btor2::Btor2Adapter::translate(&source, &options_default)
-                .map_err(|e| format!("BTOR2 adapter error: {e}"))?,
+            mununu_core::adapter::btor2::Btor2Adapter::translate(
+                &source,
+                &load_btor_sidecar(&options_default),
+            )
+            .map_err(|e| format!("BTOR2 adapter error: {e}"))?,
         ),
         Some("sv-yosys") | Some("yosys") => {
             // Yosys-driven SV elaboration → BTOR2 → CLTS.
             // Per Phase 1 of the RTL roadmap (S1: Yosys-as-front-end).
             let yopts = mununu_core::adapter::yosys::YosysOptions::default();
             log_adapter_output(
-                mununu_core::adapter::yosys::translate_sv(&source, &options_default, &yopts)
-                    .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
+                mununu_core::adapter::yosys::translate_sv(
+                    &source,
+                    &load_btor_sidecar(&options_default),
+                    &yopts,
+                )
+                .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
             )
         }
         Some("promela") => log_adapter_output(

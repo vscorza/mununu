@@ -24,7 +24,7 @@ use std::collections::HashMap;
 /// annotation produced by Yosys: `5 state 4 cnt`. The parser collects
 /// these into `Map<NID, name>`; this function inverts the relationship
 /// for sidecar lookup.
-pub fn invert_symbol_table(symbols: &HashMap<u64, String>) -> HashMap<String, u64> {
+pub fn invert_symbol_table(symbols: &HashMap<i64, String>) -> HashMap<String, i64> {
     let mut out = HashMap::new();
     for (nid, name) in symbols {
         out.insert(name.clone(), *nid);
@@ -42,8 +42,8 @@ pub fn invert_symbol_table(symbols: &HashMap<u64, String>) -> HashMap<String, u6
 /// resolver's input-shaped path); see [`build_input_field_domains`].
 pub fn build_field_domains_for_btor2(
     annotation: &SvAnnotation,
-    symbols: &HashMap<u64, String>,
-) -> HashMap<u64, (FieldDomain, Vec<(String, i64)>)> {
+    symbols: &HashMap<i64, String>,
+) -> HashMap<i64, (FieldDomain, Vec<(String, i64)>)> {
     let name_to_nid = invert_symbol_table(symbols);
     let mut out = HashMap::new();
     for sig in &annotation.signals {
@@ -61,8 +61,8 @@ pub fn build_field_domains_for_btor2(
 /// delegates to the shared resolver.
 pub fn build_input_field_domains(
     annotation: &SvAnnotation,
-    symbols: &HashMap<u64, String>,
-) -> HashMap<u64, (FieldDomain, Vec<(String, i64)>)> {
+    symbols: &HashMap<i64, String>,
+) -> HashMap<i64, (FieldDomain, Vec<(String, i64)>)> {
     use crate::adapter::systemverilog::annotation::SignalAnnotation;
 
     let name_to_nid = invert_symbol_table(symbols);
@@ -110,13 +110,13 @@ mod tests {
     #[test]
     fn invert_symbol_table_round_trips() {
         let mut symbols = HashMap::new();
-        symbols.insert(5u64, "cnt".to_string());
-        symbols.insert(7u64, "state".to_string());
+        symbols.insert(5i64, "cnt".to_string());
+        symbols.insert(7i64, "state".to_string());
 
         let name_to_nid = invert_symbol_table(&symbols);
 
-        assert_eq!(name_to_nid.get("cnt"), Some(&5u64));
-        assert_eq!(name_to_nid.get("state"), Some(&7u64));
+        assert_eq!(name_to_nid.get("cnt"), Some(&5i64));
+        assert_eq!(name_to_nid.get("state"), Some(&7i64));
         assert_eq!(name_to_nid.get("missing"), None);
     }
 
@@ -135,12 +135,12 @@ mod tests {
         });
 
         let mut symbols = HashMap::new();
-        symbols.insert(5u64, "cnt".to_string());
-        symbols.insert(99u64, "unrelated".to_string());
+        symbols.insert(5i64, "cnt".to_string());
+        symbols.insert(99i64, "unrelated".to_string());
 
         let domains = build_field_domains_for_btor2(&ann, &symbols);
         assert_eq!(domains.len(), 1);
-        let (fd, _vm) = domains.get(&5u64).expect("cnt should resolve");
+        let (fd, _vm) = domains.get(&5i64).expect("cnt should resolve");
         assert_eq!(fd.bound, Some(7));
     }
 
@@ -157,7 +157,7 @@ mod tests {
             combinational: false,
             note: None,
         });
-        let symbols: HashMap<u64, String> = HashMap::new();
+        let symbols: HashMap<i64, String> = HashMap::new();
 
         let domains = build_field_domains_for_btor2(&ann, &symbols);
         assert!(domains.is_empty());
@@ -195,10 +195,10 @@ mod tests {
             },
         );
         let mut symbols = HashMap::new();
-        symbols.insert(11u64, "ptr".to_string());
+        symbols.insert(11i64, "ptr".to_string());
 
         let domains = build_field_domains_for_btor2(&ann, &symbols);
-        let (fd, vm) = domains.get(&11u64).expect("ptr should resolve");
+        let (fd, vm) = domains.get(&11i64).expect("ptr should resolve");
         assert_eq!(fd.variants.as_ref().map(|v| v.len()), Some(3)); // ZERO, MAX, OTHER
         assert_eq!(vm.len(), 2);
     }

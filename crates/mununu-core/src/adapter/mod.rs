@@ -76,6 +76,14 @@ pub struct AdapterOptions {
     pub context_name: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     pub mode: Option<String>,
+    /// Raw `.mununu.json` content. When present, the BTOR2 reader (and
+    /// any future adapter) parses it through
+    /// [`crate::adapter::sidecar::resolve_to_field_domain`] to bound
+    /// per-state-cell value enumeration. The SV adapter loads its
+    /// sidecar via filesystem convention (next to the .sv source); the
+    /// BTOR2 reader takes the JSON in-memory because the BTOR2 source
+    /// may itself live in memory (the Yosys driver case).
+    pub sidecar_json: Option<String>,
 }
 
 /// Output from a successful adapter translation.

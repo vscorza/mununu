@@ -296,28 +296,47 @@ fn enumerate_and_blast(
         });
     }
 
-    let total_state_combos = combinations_of(&state_meta);
+    // Phase 1 sub-deliverable 2: when the caller passes a `.mununu.json`
+    // sidecar, load it and resolve each named state cell to a
+    // [`FieldDomain`]. Cells with a sidecar entry get bounded per the
+    // declared abstraction (BoundedCounter, EnumValues, …); cells
+    // without an entry fall back to full bit-blast over their width.
+    let cell_domains = build_cell_domains(&state_meta, &symbols, options, warnings)?;
+    let cells = CellEnumeration::build(&state_meta, &cell_domains);
+
+    let total_state_combos = cells.total_combos();
     let total_input_combos = combinations_of_inputs(&input_meta);
 
-    let state_names = enumerate_state_names(&state_meta, total_state_combos);
+    let state_names = enumerate_state_names(total_state_combos);
 
     // Initial state derived from `init` lines (defaulting state to 0 where
     // no init is declared — matches BTOR2 convention).
     let init_state_idx = {
         let mut init_env = make_initial_env(file, &state_meta, &input_meta, true);
         evaluate_pure(file, &mut init_env, /*honor_init=*/ true)?;
-        encode_state(&init_env, &state_meta)
+        encode_state(&init_env, &state_meta, &cells).unwrap_or(0)
     };
 
     // Build transitions by walking every (state, input) combination.
     // Each transition carries one label per input signal (`signal_value`)
-    // — multi-label transitions, the natural CLTS encoding. Compound
-    // `in_S_v__T_w__…` strings are gone; the alphabet shrinks from the
-    // product of signal value-sets to their union.
+    // — multi-label transitions, the natural CLTS encoding.
+    //
+    // SOUNDNESS: When the bit-blaster is given a sidecar that bounds a
+    // state cell tighter than its BTOR2 width allows, the design's
+    // next-state function may transition to a value outside the
+    // declared abstraction (e.g., `cnt + 1` overflows past `bound`).
+    // Stage 2B drops these transitions and emits a warning — this is
+    // an *under-approximation* (we miss some reachable behaviors).
+    // Sound for liveness; **unsound for safety** under tight bounds.
+    // The OOB-sink upgrade (transitions to a designated "anything bad"
+    // sink state) is tracked as a follow-up. The warning lets the
+    // user widen bounds or run `mununu sv discover` to enlarge the
+    // declared value set.
     let mut transitions: Vec<TransitionSpec> = Vec::new();
+    let mut oob_dropped: usize = 0;
     for (state_idx, state_name) in state_names.iter().enumerate() {
         for input_idx in 0..total_input_combos {
-            let mut env = make_step_env(&state_meta, &input_meta, state_idx, input_idx);
+            let mut env = make_step_env(&state_meta, &input_meta, &cells, state_idx, input_idx);
             evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
 
             // Evaluate every constraint — if any is false in (state, input)
@@ -330,7 +349,10 @@ fn enumerate_and_blast(
             // Compute next-state assignment.
             let mut next_env = env.clone();
             apply_next(file, &mut next_env, &state_meta)?;
-            let next_state_idx = encode_state(&next_env, &state_meta);
+            let Some(next_state_idx) = encode_state(&next_env, &state_meta, &cells) else {
+                oob_dropped += 1;
+                continue;
+            };
 
             transitions.push(TransitionSpec {
                 source: state_name.clone(),
@@ -338,6 +360,18 @@ fn enumerate_and_blast(
                 labels: signal_labels_for_input(input_idx, &input_meta),
             });
         }
+    }
+    if oob_dropped > 0 {
+        warnings.push(AdapterWarning {
+            kind: WarningKind::ApproximateTranslation,
+            message: format!(
+                "{oob_dropped} transitions dropped because they led to a state \
+                 outside the sidecar-declared abstraction. Under-approximation: \
+                 sound for liveness, unsound for safety. Widen bounds or run \
+                 `mununu sv discover` to enlarge declared value sets."
+            ),
+            location: None,
+        });
     }
 
     // Build signal list — inputs are labels, states are state-vars.
@@ -384,7 +418,7 @@ fn enumerate_and_blast(
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let vals = build_state_valuations(i, &state_meta);
+            let vals = build_state_valuations(i, &state_meta, &cells, &cell_domains);
             StateSpec {
                 name: n.clone(),
                 is_initial: i == init_state_idx,
@@ -413,7 +447,7 @@ fn enumerate_and_blast(
         internal_labels: vec![],
     };
 
-    let properties = build_properties(file, &state_meta, &input_meta, &state_names)?;
+    let properties = build_properties(file, &state_meta, &input_meta, &cells, &state_names)?;
 
     Ok(BlastOutput {
         signals,
@@ -426,6 +460,7 @@ fn build_properties(
     file: &Btor2File,
     state_meta: &[StateMeta],
     input_meta: &[InputMeta],
+    cells: &CellEnumeration,
     state_names: &[String],
 ) -> Result<Vec<PropertySpec>, AdapterError> {
     let mut out = Vec::new();
@@ -441,7 +476,7 @@ fn build_properties(
         for (state_idx, state_name) in state_names.iter().enumerate() {
             let mut found = false;
             for input_idx in 0..total_input_combos {
-                let mut env = make_step_env(state_meta, input_meta, state_idx, input_idx);
+                let mut env = make_step_env(state_meta, input_meta, cells, state_idx, input_idx);
                 evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
                 if !constraints_hold(file, &env)? {
                     continue;
@@ -480,7 +515,7 @@ fn build_properties(
         for (state_idx, state_name) in state_names.iter().enumerate() {
             let mut found = false;
             for input_idx in 0..total_input_combos {
-                let mut env = make_step_env(state_meta, input_meta, state_idx, input_idx);
+                let mut env = make_step_env(state_meta, input_meta, cells, state_idx, input_idx);
                 evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
                 if !constraints_hold(file, &env)? {
                     continue;
@@ -521,7 +556,7 @@ fn build_properties(
         for (state_idx, state_name) in state_names.iter().enumerate() {
             let mut found = false;
             for input_idx in 0..total_input_combos {
-                let mut env = make_step_env(state_meta, input_meta, state_idx, input_idx);
+                let mut env = make_step_env(state_meta, input_meta, cells, state_idx, input_idx);
                 evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
                 if !constraints_hold(file, &env)? {
                     continue;
@@ -638,6 +673,59 @@ struct InputMeta {
     is_clock: bool,
 }
 
+/// Parse `options.sidecar_json` (when present) and resolve each
+/// state-cell symbol against its `signals[]` entries via the shared
+/// resolver in [`crate::adapter::sidecar`]. Returns a NID-keyed map
+/// from BTOR2 state-cell IDs to their declared [`FieldDomain`] plus
+/// value-name map (for [`AbstractionType::EnumValues`] domains).
+///
+/// Sidecar parse errors are reported as adapter warnings, not hard
+/// failures — a malformed sidecar should not break the CLI's auto-load
+/// path. Cells without a sidecar entry simply do not appear in the
+/// returned map; callers fall back to full-width bit-blast for those.
+fn build_cell_domains(
+    state_meta: &[StateMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    options: &AdapterOptions,
+    warnings: &mut Vec<AdapterWarning>,
+) -> Result<CellDomainMap, AdapterError> {
+    let Some(json) = &options.sidecar_json else {
+        return Ok(std::collections::HashMap::new());
+    };
+
+    // Permissive parse: a malformed sidecar is a warning, not a fatal
+    // adapter error — the caller can still bit-blast the design.
+    let annotation = match serde_json::from_str::<
+        crate::adapter::systemverilog::annotation::SvAnnotation,
+    >(json)
+    {
+        Ok(a) => a,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::UnsupportedConstruct,
+                message: format!(
+                    "adapter/btor2: failed to parse .mununu.json sidecar ({e}); falling back to full bit-blast"
+                ),
+                location: None,
+            });
+            return Ok(std::collections::HashMap::new());
+        }
+    };
+
+    // Restrict to state-cell symbols (don't pollute with input names).
+    let state_symbols: std::collections::HashMap<i64, String> = state_meta
+        .iter()
+        .filter_map(|sm| symbols.get(&sm.nid).map(|s| (sm.nid, s.clone())))
+        .collect();
+
+    Ok(
+        crate::adapter::sidecar::btor2_resolver::build_field_domains_for_btor2(
+            &annotation,
+            &state_symbols,
+        ),
+    )
+}
+
 /// Recognize clock signals by name (case-insensitive). Single-clock
 /// posedge designs are Phase 1's whole scope; multi-clock and negedge
 /// will surface in Phase 3 / 4 when compositional decomposition lands.
@@ -656,6 +744,151 @@ fn sort_of(node: &Node) -> Nid {
     }
 }
 
+/// Per-state-cell sidecar resolution: NID → (declared abstraction,
+/// integer→variant-name map). Built by [`build_cell_domains`] and
+/// consumed by [`CellEnumeration::build`] / [`build_state_valuations`].
+type CellDomainMap =
+    std::collections::HashMap<i64, (crate::adapter::domain::FieldDomain, Vec<(String, i64)>)>;
+
+/// Per-state-cell enumeration plan. Drives state-space size, decode
+/// (combo → per-cell concrete bit-vector values), and encode (per-cell
+/// values → combo).
+///
+/// Each cell carries a `Vec<u128>` of allowed concrete values:
+/// - **No sidecar entry**: full bit-blast — `0..(1 << cell.width)`.
+/// - **Sidecar `BoundedCounter` (bound N)**: `0..=N`.
+/// - **Sidecar `Boolean`**: `[0, 1]`.
+/// - **Sidecar `EnumValues` / `Discover`**: the `value_map`'s integer
+///   values, plus `0` as the catch-all when no exact match.
+/// - **Sidecar `Ignored`**: a single value `0` (the cell is pinned).
+///
+/// The total state space is the **product** of per-cell value-set sizes
+/// — mixed-radix encoding, not bit-packed. Replaces the prior flat
+/// `0..(1 << total_state_bits)` enumeration which inflated to
+/// `MAX_STATE_BITS = 16` for any width-3 register.
+struct CellEnumeration {
+    /// Per state cell, the concrete bit-vector values to enumerate.
+    /// Indexed by state-cell index in `state_meta` order.
+    per_cell: Vec<Vec<u128>>,
+    /// Per state cell, cached `per_cell[i].len()` (the radix base).
+    radices: Vec<usize>,
+}
+
+impl CellEnumeration {
+    fn build(state_meta: &[StateMeta], cell_domains: &CellDomainMap) -> Self {
+        let per_cell: Vec<Vec<u128>> = state_meta
+            .iter()
+            .map(|sm| {
+                if let Some((fd, vm)) = cell_domains.get(&sm.nid) {
+                    Self::values_for_field_domain(fd, vm, sm.width)
+                } else {
+                    // Fallback: full bit-blast over the cell's BTOR2 width.
+                    let cap = sm.width.min(31); // u128 safety
+                    (0..(1u128 << cap)).collect()
+                }
+            })
+            .collect();
+        let radices: Vec<usize> = per_cell.iter().map(|v| v.len().max(1)).collect();
+        CellEnumeration { per_cell, radices }
+    }
+
+    fn values_for_field_domain(
+        fd: &crate::adapter::domain::FieldDomain,
+        vm: &[(String, i64)],
+        width: u32,
+    ) -> Vec<u128> {
+        use crate::adapter::domain::{AbstractValue, AbstractionType};
+        let mask = if width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
+        };
+        let to_concrete = |av: &AbstractValue| -> Option<u128> {
+            match av {
+                AbstractValue::Bool(b) | AbstractValue::Present(b) => Some(if *b { 1 } else { 0 }),
+                AbstractValue::Counter(c) => {
+                    if *c < 0 {
+                        None
+                    } else {
+                        Some((*c as u128) & mask)
+                    }
+                }
+                AbstractValue::Variant(name) => vm
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| (*v as u128) & mask),
+            }
+        };
+        match fd.abstraction {
+            AbstractionType::Ignored => vec![0u128],
+            _ => {
+                let mut values: Vec<u128> = fd.values().iter().filter_map(to_concrete).collect();
+                // Catch-all variant has no value_map entry; default to 0
+                // (won't collide if the user-named variants don't include 0).
+                if values.is_empty() {
+                    values.push(0u128);
+                }
+                values.sort_unstable();
+                values.dedup();
+                values
+            }
+        }
+    }
+
+    fn total_combos(&self) -> usize {
+        self.radices
+            .iter()
+            .fold(1usize, |a, r| a.saturating_mul(*r))
+    }
+
+    /// Decode a linear combo index into per-cell concrete values.
+    /// Cell 0 is the lowest digit (changes fastest).
+    #[allow(dead_code)]
+    fn decode(&self, combo: usize) -> Vec<u128> {
+        let mut rem = combo;
+        let mut out = Vec::with_capacity(self.per_cell.len());
+        for (i, cell_values) in self.per_cell.iter().enumerate() {
+            let radix = self.radices[i];
+            let pick = rem % radix;
+            rem /= radix;
+            out.push(*cell_values.get(pick).unwrap_or(&0));
+        }
+        out
+    }
+
+    /// Encode per-cell concrete values back to a linear combo index.
+    /// Returns `None` if any value is not in its cell's allowed set —
+    /// this happens when the design's transition function lands a state
+    /// outside the sidecar-declared abstraction (e.g., a counter
+    /// exceeding its bound). The caller treats this as out-of-bounds.
+    fn encode(&self, values: &[u128]) -> Option<usize> {
+        let mut combo = 0usize;
+        let mut multiplier = 1usize;
+        for (i, &v) in values.iter().enumerate() {
+            let radix = self.radices[i];
+            let idx = self.per_cell[i].iter().position(|x| *x == v)?;
+            combo = combo.checked_add(idx.checked_mul(multiplier)?)?;
+            multiplier = multiplier.checked_mul(radix)?;
+        }
+        Some(combo)
+    }
+
+    /// Per-cell concrete value at this combo — for callers that need a
+    /// single cell's value (e.g., env construction, valuations).
+    fn value_at(&self, combo: usize, cell_idx: usize) -> u128 {
+        let mut rem = combo;
+        for (i, radix) in self.radices.iter().enumerate() {
+            let pick = rem % radix;
+            if i == cell_idx {
+                return *self.per_cell[i].get(pick).unwrap_or(&0);
+            }
+            rem /= radix;
+        }
+        0
+    }
+}
+
+#[allow(dead_code)]
 fn combinations_of(meta: &[StateMeta]) -> usize {
     meta.iter()
         .fold(1usize, |acc, m| acc.saturating_mul(1usize << m.width))
@@ -680,7 +913,7 @@ fn combinations_of_inputs(meta: &[InputMeta]) -> usize {
 /// `state == 0` resolve via the predicate-via-valuations path in the
 /// evaluator. The compound `s_<sym1>_<v1>__<sym2>_<v2>__...` form was
 /// pure file-size cost — unique state names are all that's needed.
-fn enumerate_state_names(_meta: &[StateMeta], total: usize) -> Vec<String> {
+fn enumerate_state_names(total: usize) -> Vec<String> {
     if total == 0 {
         return vec!["s0".into()];
     }
@@ -700,9 +933,11 @@ fn enumerate_state_names(_meta: &[StateMeta], total: usize) -> Vec<String> {
 fn build_state_valuations(
     combo: usize,
     meta: &[StateMeta],
+    cells: &CellEnumeration,
+    cell_domains: &CellDomainMap,
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
-    for sm in meta {
+    for (i, sm) in meta.iter().enumerate() {
         // Only emit user-named cells. Synthetic cells from `chformal
         // -lower` start with a digit (e.g. `_n_…`) or contain `$`; they
         // don't appear in the user's source so they shouldn't appear in
@@ -710,8 +945,20 @@ fn build_state_valuations(
         if sm.symbol.starts_with("st") && sm.symbol.contains("_n") {
             continue;
         }
-        let v = extract_combo(combo, meta, sm.nid);
-        out.insert(sm.symbol.clone(), v.to_string());
+        let v = cells.value_at(combo, i);
+        // For enum/discover cells, prefer the variant name from the
+        // value-name map (matched by integer value); otherwise display
+        // the raw integer. The on-demand expression evaluator parses
+        // both forms (`state == 0` works for either).
+        let display = cell_domains
+            .get(&sm.nid)
+            .and_then(|(_, vm)| {
+                vm.iter()
+                    .find(|(_, val)| (*val as u128) == v)
+                    .map(|(n, _)| n.clone())
+            })
+            .unwrap_or_else(|| v.to_string());
+        out.insert(sm.symbol.clone(), display);
     }
     out
 }
@@ -743,6 +990,10 @@ fn signal_labels_for_input(combo: usize, meta: &[InputMeta]) -> Vec<String> {
     }
 }
 
+/// Legacy bit-shift extraction — kept for historical reference. The
+/// active code path uses [`CellEnumeration::value_at`], which respects
+/// the per-cell `FieldDomain` mixed-radix encoding.
+#[allow(dead_code)]
 fn extract_combo(combo: usize, meta: &[StateMeta], target_nid: Nid) -> u128 {
     let mut shift = 0u32;
     for sm in meta {
@@ -778,12 +1029,13 @@ fn extract_input_combo(combo: usize, meta: &[InputMeta], target_nid: Nid) -> u12
 fn make_step_env(
     state_meta: &[StateMeta],
     input_meta: &[InputMeta],
+    cells: &CellEnumeration,
     state_idx: usize,
     input_idx: usize,
 ) -> Env {
     let mut env = Env::default();
-    for sm in state_meta {
-        let bits = extract_combo(state_idx, state_meta, sm.nid);
+    for (i, sm) in state_meta.iter().enumerate() {
+        let bits = cells.value_at(state_idx, i);
         env.values.insert(sm.nid, BvValue::new(bits, sm.width));
     }
     for im in input_meta {
@@ -816,20 +1068,24 @@ fn make_initial_env(
     env
 }
 
-fn encode_state(env: &Env, state_meta: &[StateMeta]) -> usize {
-    let mut combo = 0usize;
-    let mut shift = 0u32;
-    for sm in state_meta {
-        let v = env
-            .values
-            .get(&sm.nid)
-            .copied()
-            .unwrap_or(BvValue::zero(sm.width));
-        let bits = (v.bits as usize) & ((1usize << sm.width) - 1);
-        combo |= bits << shift;
-        shift += sm.width;
-    }
-    combo
+/// Encode an evaluator [`Env`] back into a linear state-combo index via
+/// the [`CellEnumeration`]'s mixed-radix scheme. Returns `None` when
+/// the env's per-cell values are not all in their declared abstraction
+/// — caller decides whether to drop the transition (under-approx) or
+/// route to an OOB sink (over-approx). Stage 2B of the BTOR2 sidecar
+/// integration uses the drop semantics; OOB sink is a follow-up.
+fn encode_state(env: &Env, state_meta: &[StateMeta], cells: &CellEnumeration) -> Option<usize> {
+    let values: Vec<u128> = state_meta
+        .iter()
+        .map(|sm| {
+            env.values
+                .get(&sm.nid)
+                .copied()
+                .unwrap_or(BvValue::zero(sm.width))
+                .bits
+        })
+        .collect();
+    cells.encode(&values)
 }
 
 fn read_operand(env: &Env, op: Operand) -> Option<BvValue> {

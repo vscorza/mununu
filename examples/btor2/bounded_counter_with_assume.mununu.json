@@ -1,0 +1,14 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "bounded_counter_with_assume",
+  "source": "bounded_counter_with_assume.sv",
+  "signals": [
+    {
+      "name": "cnt",
+      "preserve": true,
+      "abstraction": "bounded_counter",
+      "bound": 3,
+      "note": "3-bit counter saturating at 7; bounded to 3 for the abstraction (covers reset → 0, count up to 1, exit-window state, and overflow proxy)."
+    }
+  ]
+}
