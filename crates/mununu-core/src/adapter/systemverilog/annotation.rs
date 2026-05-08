@@ -599,160 +599,18 @@ fn merge_from_sidecar(ann: &SvAnnotation, _module: &Module) -> MergedConfig {
     }
 }
 
+/// Resolve a sidecar `SignalAnnotation` into a [`FieldDomain`].
+///
+/// Delegates to the shared resolver in [`crate::adapter::sidecar`] so the
+/// SV-direct path and the BTOR2-via-Yosys path consume the **same**
+/// abstraction logic. Phase-1 sub-deliverable 1 of the RTL roadmap; see
+/// [`as-a-business-and-velvety-stallman.md`](https://github.com/vscorza/mununu/blob/main/.claude/plans/as-a-business-and-velvety-stallman.md)
+/// §5.
 fn resolve_signal_domain(
     sig: &SignalAnnotation,
     ann: &SvAnnotation,
 ) -> (FieldDomain, Vec<(String, i64)>) {
-    if !sig.preserve {
-        return (
-            FieldDomain {
-                name: sig.name.clone(),
-                abstraction: AbstractionType::Ignored,
-                bound: None,
-                lower_bound: None,
-                variants: None,
-                initial: AbstractValue::Counter(0),
-            },
-            vec![],
-        );
-    }
-
-    match &sig.abstraction {
-        SignalAbstraction::Boolean => (
-            FieldDomain {
-                name: sig.name.clone(),
-                abstraction: AbstractionType::Boolean,
-                bound: None,
-                lower_bound: None,
-                variants: None,
-                initial: AbstractValue::Bool(false),
-            },
-            vec![],
-        ),
-
-        SignalAbstraction::BoundedCounter => {
-            let bound = sig.bound.unwrap_or(3);
-            (
-                FieldDomain {
-                    name: sig.name.clone(),
-                    abstraction: AbstractionType::BoundedCounter,
-                    bound: Some(bound),
-                    lower_bound: None,
-                    variants: None,
-                    initial: AbstractValue::Counter(0),
-                },
-                vec![],
-            )
-        }
-
-        SignalAbstraction::Enum => {
-            let mut variants = sig.variants.clone().unwrap_or_default();
-            let mut value_map = Vec::new();
-
-            if let Some(vm) = &sig.value_map {
-                for entry in vm {
-                    value_map.push((entry.name.clone(), entry.value));
-                    if !variants.contains(&entry.name) {
-                        variants.push(entry.name.clone());
-                    }
-                }
-            }
-
-            // Add catch-all if not present
-            if variants.is_empty() {
-                variants.push("OTHER".to_string());
-            }
-
-            (
-                FieldDomain {
-                    name: sig.name.clone(),
-                    abstraction: AbstractionType::EnumValues,
-                    bound: None,
-                    lower_bound: None,
-                    variants: Some(variants),
-                    initial: AbstractValue::Variant(
-                        sig.variants
-                            .as_ref()
-                            .and_then(|v| v.first().cloned())
-                            .unwrap_or_else(|| "OTHER".to_string()),
-                    ),
-                },
-                value_map,
-            )
-        }
-
-        SignalAbstraction::Discover => {
-            // Check if discovered_values exist for this signal
-            if let Some(discovered) = ann.discovered_values.get(&sig.name) {
-                let mut variants: Vec<String> =
-                    discovered.values.iter().map(|v| v.name.clone()).collect();
-                variants.push(discovered.catch_all.clone());
-
-                let value_map: Vec<(String, i64)> = discovered
-                    .values
-                    .iter()
-                    .map(|v| (v.name.clone(), v.value))
-                    .collect();
-
-                (
-                    FieldDomain {
-                        name: sig.name.clone(),
-                        abstraction: AbstractionType::EnumValues,
-                        bound: None,
-                        lower_bound: None,
-                        variants: Some(variants.clone()),
-                        initial: AbstractValue::Variant(
-                            variants.first().cloned().unwrap_or_default(),
-                        ),
-                    },
-                    value_map,
-                )
-            } else {
-                // No discovered values yet — mark as Ignored with a warning
-                // (the user should run `mununu sv discover` first)
-                (
-                    FieldDomain {
-                        name: sig.name.clone(),
-                        abstraction: AbstractionType::Ignored,
-                        bound: None,
-                        lower_bound: None,
-                        variants: None,
-                        initial: AbstractValue::Counter(0),
-                    },
-                    vec![],
-                )
-            }
-        }
-
-        SignalAbstraction::BitBlast => {
-            // Treat as bounded_counter 0..(2^width - 1)
-            // Width comes from the SV declaration, not available here — use bound
-            let bound = sig.bound.unwrap_or(15); // default 4-bit
-            (
-                FieldDomain {
-                    name: sig.name.clone(),
-                    abstraction: AbstractionType::BoundedCounter,
-                    bound: Some(bound),
-                    lower_bound: None,
-                    variants: None,
-                    initial: AbstractValue::Counter(0),
-                },
-                vec![],
-            )
-        }
-
-        SignalAbstraction::Ignored => (
-            FieldDomain {
-                name: sig.name.clone(),
-                abstraction: AbstractionType::Ignored,
-                bound: None,
-                lower_bound: None,
-                variants: None,
-                initial: AbstractValue::Counter(0),
-            },
-            vec![],
-        ),
-    }
+    crate::adapter::sidecar::resolve_to_field_domain(sig, ann)
 }
 
 fn resolve_input_domain(

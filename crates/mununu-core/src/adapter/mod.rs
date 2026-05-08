@@ -45,6 +45,7 @@ pub mod extraction;
 pub mod gdscript;
 pub mod ir;
 pub mod promela;
+pub mod sidecar;
 pub mod state_enum;
 pub mod systemverilog;
 pub mod templates;
