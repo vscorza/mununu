@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ============================================================================
 // Common Types
@@ -248,6 +249,13 @@ pub struct ContextImportResponse {
     /// State valuations for structured predicate matching (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_valuations: Option<serde_json::Value>,
+    /// Per-transition observations from adapters that model Mealy
+    /// outputs. Shape: `{ <automaton>: [ { source, target, labels:
+    /// [...], observations: { signal: value, ... } }, ... ], ... }`.
+    /// Display-only metadata for trace renderers — the formal
+    /// evaluator never consults this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_observations: Option<serde_json::Value>,
 }
 
 // ============================================================================
@@ -348,6 +356,11 @@ pub enum GraphElementData {
         vars: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         actions: Vec<String>,
+        /// Structured per-state variable valuations (e.g., `{is_red: "0", is_green: "1"}`).
+        /// Sourced from `Clts::state_valuation()` — populated by adapter side-channels
+        /// (SV Kripke, BTOR2, extraction) and CTXDSL `valuations { ... }` blocks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        valuations: Option<BTreeMap<String, String>>,
     },
     Edge {
         id: String,
@@ -491,6 +504,7 @@ mod tests {
             parent: Some("parent".to_string()),
             vars: vec!["x".to_string(), "y".to_string()],
             actions: vec!["start".to_string()],
+            valuations: None,
         };
         let json = serde_json::to_string(&node).unwrap();
         let deserialized: GraphElementData = serde_json::from_str(&json).unwrap();
@@ -523,6 +537,7 @@ mod tests {
                 parent: None,
                 vars: vec![],
                 actions: vec![],
+                valuations: None,
             },
             position: Some(GraphPosition { x: 100.0, y: 200.0 }),
             classes: Some("state start".to_string()),

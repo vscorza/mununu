@@ -1498,7 +1498,12 @@ type StateValuationsMap = std::collections::HashMap<
     std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
 >;
 
-fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, StateValuationsMap) {
+type TransitionObservationsMap =
+    std::collections::HashMap<String, Vec<mununu_core::adapter::TransitionObservation>>;
+
+fn log_adapter_output(
+    output: mununu_core::adapter::AdapterOutput,
+) -> (String, StateValuationsMap, TransitionObservationsMap) {
     for w in &output.warnings {
         eprintln!("adapter warning: {}", w.message);
     }
@@ -1509,7 +1514,11 @@ fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, S
         output.source_info.state_count,
         output.source_info.property_count,
     );
-    (output.ctxdsl, output.state_valuations)
+    (
+        output.ctxdsl,
+        output.state_valuations,
+        output.transition_observations,
+    )
 }
 
 /// Read a source file, optionally translating it from an external format first.
@@ -1548,7 +1557,7 @@ fn load_with_adapter_mode(
         o
     };
 
-    let (ctxdsl_source, state_valuations) = match adapter {
+    let (ctxdsl_source, state_valuations, transition_observations) = match adapter {
         Some("tlsf") => log_adapter_output(
             mununu_core::adapter::tlsf::TlsfAdapter::translate(&source, &options_default)
                 .map_err(|e| format!("TLSF adapter error: {e}"))?,
@@ -1615,7 +1624,11 @@ fn load_with_adapter_mode(
                 eprintln!("Auto-detected format '{}' from extension", fmt);
                 return load_with_adapter_mode(path, Some(fmt), mode);
             }
-            (source, std::collections::HashMap::new())
+            (
+                source,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
         }
     };
 
@@ -1625,6 +1638,7 @@ fn load_with_adapter_mode(
     // Inject the side-channel state valuations from the adapter so the
     // realizer can resolve field-based predicates over composite state names.
     doc.state_valuations = state_valuations;
+    doc.transition_observations = transition_observations;
     Ok((
         doc,
         if was_adapter {
@@ -2301,7 +2315,16 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
         hash = controller.structural_hash()
     );
 
-    render_controller_diagnostics(&synthesis.diagnostics);
+    let trace_obs = context_doc
+        .transition_observations
+        .get(&args.automaton)
+        .cloned()
+        .unwrap_or_default();
+    render_controller_diagnostics(
+        &synthesis.diagnostics,
+        realized.context.clts(&args.automaton),
+        &trace_obs,
+    );
 
     // Soundness trust-level warning for liveness on over-approximate models
     if realized_formula.alternation_depth >= 2 {
@@ -2447,7 +2470,97 @@ fn print_soundness_report(
     println!();
 }
 
-fn render_controller_diagnostics(diagnostics: &ControllerDiagnostics) {
+/// Pretty-print a trace (sequence of state names) with per-state
+/// valuations and per-transition observations when the renderer has
+/// access to the realized CLTS and the adapter's observation table.
+///
+/// Output shape:
+///   <label>:
+///     [0] s0  state=RED, is_red=1, is_green=0, is_yellow=0
+///       --[rst_0]--> {gnt=00}
+///     [1] s1  state=GREEN, is_red=0, is_green=1, is_yellow=0
+///     ...
+///
+/// State valuations come from `Clts::state_valuation(state_id)`. The
+/// per-transition observation row matches by `(source, target)` and
+/// label-set; if multiple transitions share that key the first match
+/// wins (BTOR2 enumerates one transition per (state, input)).
+fn print_trace(
+    label: &str,
+    states: &[String],
+    clts: Option<
+        &mununu_core::clts::Clts<
+            mununu_core::clts::DefaultStateIdx,
+            mununu_core::clts::DefaultLabelIdx,
+        >,
+    >,
+    transition_obs: &[mununu_core::adapter::TransitionObservation],
+) {
+    if states.is_empty() {
+        println!("    {label}: (empty)");
+        return;
+    }
+    // If we have neither CLTS nor observations, fall back to the
+    // compact arrow-joined form to avoid bloating output.
+    if clts.is_none() && transition_obs.is_empty() {
+        println!("    {label}: {}", states.join(" -> "));
+        return;
+    }
+    println!("    {label}:");
+    let valuation_for = |name: &str| -> Option<String> {
+        let clts = clts?;
+        let id = clts.state_id(name).ok()?;
+        let v = clts.state_valuation(id)?;
+        if v.is_empty() {
+            None
+        } else {
+            Some(
+                v.iter()
+                    .map(|(k, val)| format!("{k}={val}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    };
+    let obs_for = |from: &str, to: &str| -> Option<String> {
+        let row = transition_obs
+            .iter()
+            .find(|o| o.source == from && o.target == to)?;
+        if row.observations.is_empty() {
+            None
+        } else {
+            Some(
+                row.observations
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    };
+    for (i, name) in states.iter().enumerate() {
+        let vals = valuation_for(name)
+            .map(|s| format!("  {{{s}}}"))
+            .unwrap_or_default();
+        println!("      [{i}] {name}{vals}");
+        if let Some(next) = states.get(i + 1)
+            && let Some(obs) = obs_for(name, next)
+        {
+            println!("            ↳ observed: {obs}");
+        }
+    }
+}
+
+fn render_controller_diagnostics(
+    diagnostics: &ControllerDiagnostics,
+    clts: Option<
+        &mununu_core::clts::Clts<
+            mununu_core::clts::DefaultStateIdx,
+            mununu_core::clts::DefaultLabelIdx,
+        >,
+    >,
+    transition_obs: &[mununu_core::adapter::TransitionObservation],
+) {
     let has_details = !diagnostics.messages.is_empty()
         || !diagnostics.violating_initials.is_empty()
         || diagnostics.counterexample_trace.is_some()
@@ -2473,28 +2586,47 @@ fn render_controller_diagnostics(diagnostics: &ControllerDiagnostics) {
         );
     }
     if let Some(trace) = &diagnostics.counterexample_trace {
-        println!("    counterexample trace: {}", trace.join(" -> "));
+        print_trace("counterexample trace", trace, clts, transition_obs);
     }
     if !diagnostics.deadlock_traces.is_empty() {
         for (idx, trace) in diagnostics.deadlock_traces.iter().enumerate() {
-            println!("    deadlock trace #{idx}: {}", trace.join(" -> "));
+            print_trace(
+                &format!("deadlock trace #{idx}"),
+                trace,
+                clts,
+                transition_obs,
+            );
         }
     }
     if !diagnostics.counterstrategy_traces.is_empty() {
         for (idx, trace) in diagnostics.counterstrategy_traces.iter().enumerate() {
-            println!("    counterstrategy trace #{idx}: {}", trace.join(" -> "));
+            print_trace(
+                &format!("counterstrategy trace #{idx}"),
+                trace,
+                clts,
+                transition_obs,
+            );
         }
     }
     if !diagnostics.lasso_traces.is_empty() {
         for (idx, lasso) in diagnostics.lasso_traces.iter().enumerate() {
             if lasso.cycle.is_empty() {
-                println!("    lasso trace #{idx}: {}", lasso.prefix.join(" -> "));
-            } else {
-                println!(
-                    "    lasso trace #{idx}: {} -> ({})^ω",
-                    lasso.prefix.join(" -> "),
-                    lasso.cycle.join(" -> ")
+                print_trace(
+                    &format!("lasso trace #{idx}"),
+                    &lasso.prefix,
+                    clts,
+                    transition_obs,
                 );
+            } else {
+                let mut combined = lasso.prefix.clone();
+                combined.extend(lasso.cycle.iter().cloned());
+                print_trace(
+                    &format!("lasso trace #{idx} (prefix + cycle)"),
+                    &combined,
+                    clts,
+                    transition_obs,
+                );
+                println!("      cycle repeats: ({})^ω", lasso.cycle.join(" -> "));
             }
         }
     }
@@ -2696,6 +2828,11 @@ enum CytoscapeData {
         vars: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         actions: Option<serde_json::Value>,
+        /// Structured per-state valuations (`{key: value}`). Sourced from
+        /// `Clts::state_valuation()`. Rendered inline under the state label
+        /// by the Cytoscape style function in `generate_cytoscape_html`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        valuations: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2784,6 +2921,10 @@ struct StateElementParams {
     is_initial: bool,
     is_dead: bool,
     state_var_str: Option<String>,
+    /// Structured per-state valuations keyed by variable name. Sourced from
+    /// `Clts::state_valuation()`. The HTML template renders them inline
+    /// under the state label as `{key1=val1, key2=val2}`.
+    state_valuations: Option<std::collections::BTreeMap<String, String>>,
     x: f64,
     y: f64,
     entry_node_id: Option<String>,
@@ -2810,6 +2951,10 @@ fn build_state_elements(p: StateElementParams) -> Vec<CytoscapeElement> {
             label: Some(p.label),
             vars: p.state_var_str.map(|s| json!(s)),
             actions: None,
+            valuations: p
+                .state_valuations
+                .filter(|m| !m.is_empty())
+                .map(|m| json!(m)),
             note: if p.is_initial {
                 Some("Initial state".to_string())
             } else if p.is_dead {
@@ -2834,6 +2979,7 @@ fn build_state_elements(p: StateElementParams) -> Vec<CytoscapeElement> {
                 label: None,
                 vars: None,
                 actions: None,
+                valuations: None,
                 note: None,
                 isStart: None,
                 isDead: None,
@@ -2883,6 +3029,7 @@ fn counterstrategy_to_cytoscape(
             parent: None,
             vars: None,
             actions: None,
+            valuations: None,
             note: None,
             isStart: None,
             isDead: None,
@@ -2905,6 +3052,11 @@ fn counterstrategy_to_cytoscape(
             classes.push("start");
         }
 
+        let val = clts
+            .state_valuation(state_id)
+            .filter(|m| !m.is_empty())
+            .map(|m| json!(m));
+
         elements.push(CytoscapeElement {
             data: CytoscapeData::Node {
                 id: node_id,
@@ -2912,6 +3064,7 @@ fn counterstrategy_to_cytoscape(
                 parent: Some(automaton_name.to_string()),
                 vars: None,
                 actions: None,
+                valuations: val,
                 note: None,
                 isStart: Some(is_initial),
                 isDead: Some(false),
@@ -3039,6 +3192,7 @@ fn dsl_automata_to_cytoscape(
                 } else {
                     Some(json!(action_info))
                 },
+                valuations: None,
                 note: None,
                 isStart: None,
                 isDead: None,
@@ -3078,6 +3232,11 @@ fn dsl_automata_to_cytoscape(
 
             state_positions.insert(state_name.clone(), (x_pos, y_offset + 100.0));
 
+            let state_valuations = clts
+                .state_id(state_name)
+                .ok()
+                .and_then(|sid| clts.state_valuation(sid).cloned());
+
             elements.extend(build_state_elements(StateElementParams {
                 state_id,
                 automaton_id: automaton_id.clone(),
@@ -3085,6 +3244,7 @@ fn dsl_automata_to_cytoscape(
                 is_initial,
                 is_dead,
                 state_var_str,
+                state_valuations,
                 x: x_pos,
                 y: y_offset + 100.0,
                 entry_node_id: if is_initial {
@@ -3355,6 +3515,7 @@ fn unrolled_automata_to_cytoscape(
                 } else {
                     Some(json!(action_info))
                 },
+                valuations: None,
                 note: None,
                 isStart: None,
                 isDead: None,
@@ -3428,6 +3589,7 @@ fn unrolled_automata_to_cytoscape(
                 is_initial,
                 is_dead,
                 state_var_str,
+                state_valuations: None,
                 x: x_pos,
                 y: y_offset + 100.0,
                 entry_node_id: if is_initial {
@@ -3553,17 +3715,26 @@ fn generate_cytoscape_html(elements: &[CytoscapeElement]) -> Result<String, Stri
         {
           selector: "node.state",
           style: {
-            "shape": "ellipse",
+            "shape": "round-rectangle",
             "background-color": "#ffffff",
             "border-width": 1,
             "border-style": "solid",
             "border-color": "#000000",
-            "width": 60,
-            "height": 60,
-            "label": "data(label)",
+            "width": "label",
+            "height": "label",
+            "padding": "8px",
+            "label": ele => {
+              const base = ele.data("label") || "";
+              const v = ele.data("valuations");
+              if (v && typeof v === "object" && Object.keys(v).length > 0) {
+                const pairs = Object.keys(v).map(k => k + "=" + v[k]).join(", ");
+                return base + "\n{" + pairs + "}";
+              }
+              return base;
+            },
             "font-size": 12,
             "text-wrap": "wrap",
-            "text-max-width": 70,
+            "text-max-width": 200,
             "text-halign": "center",
             "text-valign": "center"
           }
