@@ -120,6 +120,7 @@ impl SystemVerilogAdapter {
                 property_count,
             },
             state_valuations,
+            transition_observations: Default::default(),
         })
     }
 
@@ -347,6 +348,7 @@ impl SystemVerilogAdapter {
                 property_count,
             },
             state_valuations: all_state_valuations,
+            transition_observations: Default::default(),
         })
     }
 }
@@ -612,6 +614,7 @@ impl FormatAdapter for SystemVerilogAdapter {
                 property_count,
             },
             state_valuations,
+            transition_observations: Default::default(),
         })
     }
 }
@@ -759,6 +762,7 @@ fn to_ir(
                 formula: PropertyFormula::MuCalculus(p.formula.clone()),
                 role,
                 over: None,
+                description: None,
             }
         })
         .collect();
@@ -837,6 +841,7 @@ fn resolve_sidecar_properties(
                 formula: PropertyFormula::MuCalculus(formula_str),
                 role,
                 over: over.clone(),
+                description: None,
             })
         })
         .collect()

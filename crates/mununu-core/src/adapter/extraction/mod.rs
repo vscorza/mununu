@@ -103,6 +103,7 @@ impl FormatAdapter for ExtractionAdapter {
                 property_count,
             },
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         })
     }
 }
@@ -174,6 +175,7 @@ fn to_ir(
                 formula: PropertyFormula::MuCalculus(formula_str.to_string()),
                 role: PropertyRole::Standalone,
                 over: def.over.clone(),
+                description: None,
             });
         } else if let Some(tref) = &def.template_ref {
             match template_registry.instantiate(tref) {
@@ -184,6 +186,7 @@ fn to_ir(
                         formula: PropertyFormula::MuCalculus(inst.formula),
                         role: inst.role,
                         over: def.over.clone(),
+                        description: None,
                     });
                 }
                 Err(e) => {

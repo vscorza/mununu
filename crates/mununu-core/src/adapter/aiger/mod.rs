@@ -87,6 +87,7 @@ impl FormatAdapter for AigerAdapter {
                 property_count: ir.properties.len(),
             },
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         })
     }
 }
@@ -273,6 +274,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                 formula: PropertyFormula::MuCalculus(format!("nu X. ((!({bad_pred})) && ([] X))")),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             });
         }
     }
@@ -316,6 +318,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                 )),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             });
         }
     }
@@ -354,6 +357,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                 )),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             });
         }
     }

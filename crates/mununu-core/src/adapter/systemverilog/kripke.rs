@@ -594,6 +594,7 @@ fn build_property_specs(
             formula: PropertyFormula::MuCalculus(formula_str),
             role,
             over: None,
+            description: None,
         });
     }
     Ok(out)

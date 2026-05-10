@@ -57,6 +57,7 @@ impl FormatAdapter for TlsfAdapter {
                 property_count: ir.properties.len(),
             },
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         })
     }
 }
@@ -100,6 +101,7 @@ fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR,
             formula: PropertyFormula::Ltl(assume.clone()),
             role: PropertyRole::Assumption,
             over: None,
+            description: None,
         });
     }
 
@@ -110,6 +112,7 @@ fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR,
             formula: PropertyFormula::Ltl(inv.clone()),
             role: PropertyRole::Invariant,
             over: None,
+            description: None,
         });
     }
 
@@ -120,6 +123,7 @@ fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR,
             formula: PropertyFormula::Ltl(guar.clone()),
             role: PropertyRole::Guarantee,
             over: None,
+            description: None,
         });
     }
 
