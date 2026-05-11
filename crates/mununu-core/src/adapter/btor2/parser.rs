@@ -350,17 +350,16 @@ pub fn collect_symbols(file: &Btor2File) -> HashMap<Nid, String> {
             symbol: Some(name),
             ..
         } = &line.node
+            && let Some(state_nid) = trace_to_state(file, args)
         {
-            if let Some(state_nid) = trace_to_state(file, args) {
-                let entry = out.entry(state_nid);
-                match entry {
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(name.clone());
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut o) => {
-                        if is_synthetic(o.get()) {
-                            o.insert(name.clone());
-                        }
+            let entry = out.entry(state_nid);
+            match entry {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(name.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if is_synthetic(o.get()) {
+                        o.insert(name.clone());
                     }
                 }
             }
