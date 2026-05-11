@@ -501,6 +501,7 @@ fn build_properties(
                 formula: PropertyFormula::MuCalculus(format!("nu X. ((!({pred})) && ([] X))")),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             });
         }
     }
@@ -542,6 +543,7 @@ fn build_properties(
                 )),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             });
         }
     }
@@ -583,6 +585,7 @@ fn build_properties(
                 )),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             });
         }
     }
@@ -1476,6 +1479,7 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
             property_count,
         },
         state_valuations,
+        transition_observations: Default::default(),
     })
 }
 

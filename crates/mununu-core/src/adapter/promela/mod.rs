@@ -94,6 +94,7 @@ impl FormatAdapter for PromelaAdapter {
                 property_count: ir.properties.len(),
             },
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         })
     }
 }
@@ -231,6 +232,7 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
                 formula: PropertyFormula::Ltl(convert_ltl(&ltl.formula, &bool_var_names)),
                 role: PropertyRole::Standalone,
                 over: None,
+                description: None,
             }
         })
         .collect();

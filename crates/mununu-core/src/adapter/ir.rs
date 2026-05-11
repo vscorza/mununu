@@ -177,6 +177,13 @@ pub struct PropertySpec {
     /// Explicit "over" target automaton or composition name.
     /// If `None`, the emitter uses the first automaton as default.
     pub over: Option<String>,
+    /// Optional human-readable description of what the property asserts —
+    /// e.g. the original assertion expression recovered from a chformal
+    /// lowering. Emitted as a `// <description>` comment above the
+    /// `formula` block in CTXDSL so users can distinguish properties
+    /// whose state-name disjunction collapses to the same vacuous-true
+    /// formula text.
+    pub description: Option<String>,
 }
 
 /// Classification of a temporal property.
