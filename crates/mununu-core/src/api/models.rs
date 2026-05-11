@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ============================================================================
 // Common Types
@@ -348,6 +349,11 @@ pub enum GraphElementData {
         vars: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         actions: Vec<String>,
+        /// Structured per-state variable valuations (e.g. `{is_red: "0", phase: "green"}`).
+        /// Sourced from `Clts::state_valuation()` — populated by adapter side-channels
+        /// (SV Kripke, BTOR2, extraction) injected through `ContextDoc.state_valuations`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        valuations: Option<BTreeMap<String, String>>,
     },
     Edge {
         id: String,
@@ -491,6 +497,7 @@ mod tests {
             parent: Some("parent".to_string()),
             vars: vec!["x".to_string(), "y".to_string()],
             actions: vec!["start".to_string()],
+            valuations: None,
         };
         let json = serde_json::to_string(&node).unwrap();
         let deserialized: GraphElementData = serde_json::from_str(&json).unwrap();
@@ -523,6 +530,7 @@ mod tests {
                 parent: None,
                 vars: vec![],
                 actions: vec![],
+                valuations: None,
             },
             position: Some(GraphPosition { x: 100.0, y: 200.0 }),
             classes: Some("state start".to_string()),
