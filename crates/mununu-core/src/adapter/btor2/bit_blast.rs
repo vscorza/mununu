@@ -1155,7 +1155,7 @@ fn evaluate_pure(file: &Btor2File, env: &mut Env, honor_init: bool) -> Result<()
                     env.values.insert(*state, v);
                 }
             }
-            Node::Op { sort, op, args } => {
+            Node::Op { sort, op, args, .. } => {
                 let width = parser::bv_width(file, *sort)
                     .ok_or_else(|| constancy_err(line, "operator references non-bitvec sort"))?;
                 let result =

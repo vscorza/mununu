@@ -167,10 +167,27 @@ fn parse_op(kw: &str, args: &[&str], source_line: usize) -> Result<Node, Adapter
         )?);
     }
 
+    // Capture the trailing symbol (e.g. `uext SORT NID 0 fill`). The number
+    // of immediates depends on the op; for slice it's 2 (upper, lower), for
+    // uext/sext it's 1 (amount), and for the rest it's 0. Anything past
+    // (1 + arity + immediates) that doesn't start with a comment marker is
+    // the symbol.
+    let immediates_count = match kw {
+        "slice" => 2,
+        "uext" | "sext" => 1,
+        _ => 0,
+    };
+    let symbol_idx = 1 + arity + immediates_count;
+    let symbol = args
+        .get(symbol_idx)
+        .filter(|s| !s.starts_with(';'))
+        .map(|s| s.to_string());
+
     Ok(Node::Op {
         sort,
         op,
         args: operands,
+        symbol,
     })
 }
 
@@ -294,8 +311,21 @@ fn parse_err(source_line: usize, msg: String) -> AdapterError {
 
 /// Compute symbol-table style symbols for inputs and states (best-effort).
 /// Used by the bit-blaster to populate human-readable signal names.
+///
+/// Yosys's `write_btor` typically attaches synthetic names like
+/// `$auto$async2sync.cc:234:execute$30` to state lines, while the
+/// user's actual register names (`fill`, `state`, …) appear as no-op
+/// `uext _ NID 0 NAME` alias ops. To surface user-visible names on
+/// `valuations { … }` blocks, we also walk the alias chain: for each Op
+/// with a symbol, we trace its operand graph backward looking for the
+/// first reachable State and attach the symbol to it (only when the
+/// state has no user-visible symbol of its own — synthetic compiler
+/// names are recognised by their `$auto$` / `$0` prefixes and treated
+/// as overridable).
 pub fn collect_symbols(file: &Btor2File) -> HashMap<Nid, String> {
     let mut out = HashMap::new();
+
+    // Pass 1: collect direct Input/State symbols.
     for line in &file.lines {
         match &line.node {
             Node::Input {
@@ -309,7 +339,60 @@ pub fn collect_symbols(file: &Btor2File) -> HashMap<Nid, String> {
             _ => {}
         }
     }
+
+    // Pass 2: trace `Op { symbol: Some(NAME) }` aliases (Yosys's `uext _ _ 0 NAME`
+    // pattern) back to their underlying state lines and attach the user-
+    // visible name. Only overrides synthetic compiler-generated names.
+    let is_synthetic = |s: &str| s.starts_with('$');
+    for line in &file.lines {
+        if let Node::Op {
+            args,
+            symbol: Some(name),
+            ..
+        } = &line.node
+            && let Some(state_nid) = trace_to_state(file, args)
+        {
+            let entry = out.entry(state_nid);
+            match entry {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(name.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if is_synthetic(o.get()) {
+                        o.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
     out
+}
+
+/// Walk the operand graph backward from a list of operands, returning
+/// the nid of the first State node reachable. Returns `None` if no state
+/// is found within a small bounded traversal (cycles + width are guarded
+/// to keep this O(n) overall across the whole file).
+fn trace_to_state(file: &Btor2File, args: &[crate::adapter::btor2::ast::Operand]) -> Option<Nid> {
+    let mut stack: Vec<Nid> = args.iter().map(|o| o.nid()).collect();
+    let mut seen: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    while let Some(nid) = stack.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::State { .. } => return Some(line.nid),
+            Node::Op { args, .. } => {
+                for o in args {
+                    stack.push(o.nid());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Resolve the bit-vector width of a sort node. Returns `None` if the
