@@ -18,6 +18,11 @@ pub struct ContextDoc {
     /// Keyed by `automaton_name → state_name → { variable → display_value }`.
     /// Not encoded in CTXDSL text — injected after parsing by adapter callers.
     pub state_valuations: HashMap<String, HashMap<String, BTreeMap<String, String>>>,
+    /// Side-channel per-transition Mealy observations from adapters that model
+    /// input-dependent outputs. Keyed by `automaton_name → list of observation
+    /// rows`. Not encoded in CTXDSL text — injected after parsing by adapter
+    /// callers and consumed by trace renderers (CLI counterexample / counterstrategy).
+    pub transition_observations: HashMap<String, Vec<crate::adapter::TransitionObservation>>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +137,18 @@ pub struct StateDecl {
     pub name: Ident,
     pub index: Option<StateIndexSpec>,
     pub is_initial: bool,
+    /// Per-state variable initialiser overrides, written as
+    /// `vars { x = 1; y = 2; }` inside the optional outer block on a state
+    /// declaration. These flow through the unrolling pipeline and become
+    /// part of the unrolled state space.
     pub overrides: Vec<Assignment>,
+    /// Per-state structured valuations, written as `valuations { is_red = 1; … }`
+    /// inside the optional outer block on a state declaration. These do not
+    /// affect the formal model — they are display-only metadata that the
+    /// realize layer registers on the CLTS via `Clts::with_valuation_for_state`
+    /// and that the trace renderer prints alongside state names in
+    /// counterexamples / counterstrategies.
+    pub valuations: Vec<Assignment>,
 }
 
 #[derive(Debug, Clone)]

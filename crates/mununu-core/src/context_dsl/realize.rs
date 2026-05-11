@@ -19,7 +19,7 @@ use bitvec::prelude::{BitVec, Lsb0};
 use super::ast::{
     AlphabetEntry, Automaton, CompositionKind, ContextDoc, Expr, ExprKind, FormulaExpr,
     FormulaTargets, Meta, PredicateDecl, PredicateTarget, StateDecl, StateRef, StateSelector,
-    TransitionDecl, TransitionLabel,
+    TransitionDecl, TransitionLabel, UnaryOp,
 };
 use super::runtime::ResolvedControllerOptions;
 use super::state_matching::StateNameMatcher;
@@ -28,6 +28,51 @@ use super::traversal::AstTraverser;
 type RuntimeClts = Clts<DefaultStateIdx, DefaultLabelIdx>;
 type RuntimeBuilder = CltsBuilder<DefaultStateIdx, DefaultLabelIdx>;
 type RuntimeLabelId = LabelId<DefaultLabelIdx>;
+
+/// Coerce the right-hand side of a `valuations { key = value; }` entry into a
+/// display string. Valuations are display-only metadata, so we only support
+/// expressions that have an obvious string representation: integer literals,
+/// identifiers (used as enum-like names), grouped sub-expressions, and
+/// negated integer literals. Anything richer is rejected — adapters that need
+/// computed values should populate `ContextDoc.state_valuations` directly via
+/// the side-channel.
+fn valuation_value_to_string(expr: &Expr) -> Result<String, RealizationError> {
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(n.to_string()),
+        ExprKind::Ident(id) => Ok(id.name.clone()),
+        ExprKind::Group(inner) => valuation_value_to_string(inner),
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => {
+            if let ExprKind::Integer(n) = &expr.kind {
+                Ok(format!("-{n}"))
+            } else {
+                Err(RealizationError::UnsupportedFeature {
+                    feature: "non-literal valuation expression",
+                })
+            }
+        }
+        _ => Err(RealizationError::UnsupportedFeature {
+            feature: "complex valuation expression (only integers, identifiers, and negated integers are supported)",
+        }),
+    }
+}
+
+/// Build the merged valuation map for a state: starts from the side-channel
+/// adapter-injected map (if any) and overlays hand-written
+/// `valuations { … }` entries on top (user wins on collision).
+fn merged_state_valuation(
+    state: &StateDecl,
+    side_channel: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>, RealizationError> {
+    let mut merged: BTreeMap<String, String> = side_channel.cloned().unwrap_or_default();
+    for assign in &state.valuations {
+        let value = valuation_value_to_string(&assign.expr)?;
+        merged.insert(assign.target.name.clone(), value);
+    }
+    Ok(merged)
+}
 
 /// Result of realising a DSL context into runtime structures.
 #[derive(Debug)]
@@ -943,6 +988,7 @@ fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Auto
                         index: None,
                         is_initial: state.is_initial,
                         overrides: state.overrides.clone(),
+                        valuations: state.valuations.clone(),
                     });
                 } else {
                     // Different iteration variable — keep as-is for now
@@ -957,6 +1003,7 @@ fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Auto
                         index: None,
                         is_initial: state.is_initial,
                         overrides: state.overrides.clone(),
+                        valuations: state.valuations.clone(),
                     });
                 } else {
                     states.push(state.clone());
@@ -2463,11 +2510,15 @@ fn build_automaton(
         if !variable_names.is_empty() {
             builder.with_variables(&state.name.name, variable_names.iter().map(String::as_str));
         }
-        // Wire structured valuations from the side-channel data if available
-        if let (Some(state_id), Some(vals_map)) = (state_id, state_valuations)
-            && let Some(valuation) = vals_map.get(&state.name.name)
-        {
-            builder.with_valuation_for_state(state_id, valuation.clone());
+        // Wire structured valuations from the side-channel data and overlay
+        // hand-written `valuations { … }` entries on top. Hand-written entries
+        // win on key collision so authors can correct adapter-emitted defaults.
+        if let Some(state_id) = state_id {
+            let side_channel = state_valuations.and_then(|m| m.get(&state.name.name));
+            let merged = merged_state_valuation(state, side_channel)?;
+            if !merged.is_empty() {
+                builder.with_valuation_for_state(state_id, merged);
+            }
         }
     }
 

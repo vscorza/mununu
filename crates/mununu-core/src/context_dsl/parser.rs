@@ -102,6 +102,7 @@ impl<'a> Parser<'a> {
             mu_formulas,
             span,
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         })
     }
 
@@ -681,18 +682,56 @@ impl<'a> Parser<'a> {
         };
 
         let is_initial = self.match_keyword(Keyword::Initial);
-        let overrides = if self.match_symbol(Symbol::LBrace) {
-            self.expect_keyword(Keyword::Vars)?;
-            self.expect_symbol(Symbol::LBrace)?;
-            let mut items = Vec::new();
+        // Optional outer block carrying zero or more sub-blocks. Each sub-block
+        // is either `vars { ... }` (per-state initialiser overrides) or
+        // `valuations { ... }` (per-state structured display metadata). They
+        // may appear in any order; either may be omitted.
+        let (overrides, valuations) = if self.match_symbol(Symbol::LBrace) {
+            let mut overrides: Vec<Assignment> = Vec::new();
+            let mut valuations: Vec<Assignment> = Vec::new();
+            let mut saw_vars = false;
+            let mut saw_valuations = false;
             while !self.check_symbol(Symbol::RBrace) {
-                items.push(self.parse_assignment()?);
+                let block_span = self.peek().span;
+                if self.match_keyword(Keyword::Vars) {
+                    if saw_vars {
+                        return Err(ParseError::DuplicateItem {
+                            name: "vars".into(),
+                            span: block_span,
+                        });
+                    }
+                    saw_vars = true;
+                    self.expect_symbol(Symbol::LBrace)?;
+                    while !self.check_symbol(Symbol::RBrace) {
+                        overrides.push(self.parse_assignment()?);
+                    }
+                    self.expect_symbol(Symbol::RBrace)?;
+                } else if self.match_keyword(Keyword::Valuations) {
+                    if saw_valuations {
+                        return Err(ParseError::DuplicateItem {
+                            name: "valuations".into(),
+                            span: block_span,
+                        });
+                    }
+                    saw_valuations = true;
+                    self.expect_symbol(Symbol::LBrace)?;
+                    while !self.check_symbol(Symbol::RBrace) {
+                        valuations.push(self.parse_assignment()?);
+                    }
+                    self.expect_symbol(Symbol::RBrace)?;
+                } else {
+                    let found = self.peek_kind().clone();
+                    return Err(ParseError::UnexpectedToken {
+                        found,
+                        expected: "`vars` or `valuations` block",
+                        span: block_span,
+                    });
+                }
             }
             self.expect_symbol(Symbol::RBrace)?;
-            self.expect_symbol(Symbol::RBrace)?;
-            items
+            (overrides, valuations)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         self.expect_symbol(Symbol::Semicolon)?;
@@ -702,6 +741,7 @@ impl<'a> Parser<'a> {
             index,
             is_initial,
             overrides,
+            valuations,
         })
     }
 
