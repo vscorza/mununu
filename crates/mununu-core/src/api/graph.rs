@@ -3,7 +3,7 @@
 //! This module extracts graph generation logic from the CLI for use in the REST API.
 //! It converts automata into graph elements that can be serialized to JSON for visualization.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use crate::abstraction::unrolling::{
     Effect, OriginalState, OriginalTransition, UnrollingOptions, VariableDecl, unroll_states,
@@ -18,17 +18,6 @@ use crate::api::models::{
     AutomatonSummary, ContextSummary, GraphData, GraphElement, GraphElementData, GraphMetadata,
     GraphPosition, GraphType, GraphTypeResponse,
 };
-
-/// Look up structured per-state valuations on a CLTS by state name. Returns
-/// `None` when the state is unknown or has no valuation attached.
-fn valuation_for_state(
-    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
-    state_name: &str,
-) -> Option<BTreeMap<String, String>> {
-    let sid = clts.state_id(state_name).ok()?;
-    let v = clts.state_valuation(sid)?;
-    if v.is_empty() { None } else { Some(v.clone()) }
-}
 
 /// Generate graphs from context based on request parameters.
 ///
@@ -384,7 +373,6 @@ pub fn counterstrategy_to_graph_elements(
             parent: None,
             vars: Vec::new(),
             actions: Vec::new(),
-            valuations: None,
         },
         position: None,
         classes: None,
@@ -410,7 +398,6 @@ pub fn counterstrategy_to_graph_elements(
                 parent: Some(automaton_id.clone()),
                 vars: Vec::new(),
                 actions: Vec::new(),
-                valuations: valuation_for_state(clts, &state_name),
             },
             position: Some(GraphPosition {
                 x: x_pos,
@@ -428,7 +415,6 @@ pub fn counterstrategy_to_graph_elements(
                     parent: Some(automaton_id.clone()),
                     vars: Vec::new(),
                     actions: Vec::new(),
-                    valuations: None,
                 },
                 position: Some(GraphPosition {
                     x: 40.0,
@@ -501,7 +487,6 @@ fn clts_to_graph_elements_with_labels(
             parent: None,
             vars: Vec::new(),
             actions: Vec::new(),
-            valuations: None,
         },
         position: None,
         classes: None,
@@ -522,17 +507,6 @@ fn clts_to_graph_elements_with_labels(
             classes.push("dead");
         }
 
-        // Prefer valuations from `clts` itself; for synthesized controllers (which inherit
-        // state IDs but may not carry valuations), fall back to the source CLTS by name.
-        let state_valuations = clts.state_valuation(state_id).cloned().or_else(|| {
-            label_source.and_then(|src| {
-                src.state_id(&state_name)
-                    .ok()
-                    .and_then(|sid| src.state_valuation(sid).cloned())
-            })
-        });
-        let state_valuations = state_valuations.filter(|m| !m.is_empty());
-
         elements.push(GraphElement {
             data: GraphElementData::Node {
                 id: node_id.clone(),
@@ -540,7 +514,6 @@ fn clts_to_graph_elements_with_labels(
                 parent: Some(automaton_id.clone()),
                 vars: Vec::new(),
                 actions: Vec::new(),
-                valuations: state_valuations,
             },
             position: Some(GraphPosition {
                 x: x_pos,
@@ -559,7 +532,6 @@ fn clts_to_graph_elements_with_labels(
                     parent: Some(automaton_id.clone()),
                     vars: Vec::new(),
                     actions: Vec::new(),
-                    valuations: None,
                 },
                 position: Some(GraphPosition {
                     x: 40.0,
@@ -720,7 +692,6 @@ fn dsl_automata_to_graph_elements(
                 parent: None,
                 vars: var_names.clone(),
                 actions: action_info.clone(),
-                valuations: None,
             },
             position: None,
             classes: None,
@@ -750,8 +721,6 @@ fn dsl_automata_to_graph_elements(
                     .unwrap_or_default()
             };
 
-            let state_valuations = valuation_for_state(clts, state_name);
-
             let position = GraphPosition {
                 x: x_pos,
                 y: y_offset + 100.0,
@@ -772,7 +741,6 @@ fn dsl_automata_to_graph_elements(
                     parent: Some(automaton_id.clone()),
                     vars: state_vars,
                     actions: Vec::new(),
-                    valuations: state_valuations,
                 },
                 position: Some(position),
                 classes: Some(classes.join(" ")),
@@ -788,7 +756,6 @@ fn dsl_automata_to_graph_elements(
                         parent: Some(automaton_id.clone()),
                         vars: Vec::new(),
                         actions: Vec::new(),
-                        valuations: None,
                     },
                     position: Some(GraphPosition {
                         x: 40.0,
@@ -1100,7 +1067,6 @@ fn unrolled_automata_to_graph_elements(
                 parent: None,
                 vars: var_names.clone(),
                 actions: action_info.clone(),
-                valuations: None,
             },
             position: None,
             classes: None,
@@ -1174,7 +1140,6 @@ fn unrolled_automata_to_graph_elements(
                     parent: Some(automaton_id.clone()),
                     vars: state_vars,
                     actions: Vec::new(),
-                    valuations: None,
                 },
                 position: Some(position),
                 classes: Some(classes.join(" ")),
@@ -1190,7 +1155,6 @@ fn unrolled_automata_to_graph_elements(
                         parent: Some(automaton_id.clone()),
                         vars: Vec::new(),
                         actions: Vec::new(),
-                        valuations: None,
                     },
                     position: Some(GraphPosition {
                         x: 40.0,
