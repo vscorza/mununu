@@ -72,6 +72,13 @@ pub enum Node {
         sort: Nid,
         op: Op,
         args: Vec<Operand>,
+        /// Optional trailing symbol from the BTOR2 line (`<nid> uext <sort>
+        /// <nid> 0 <name>`). Yosys uses no-op `uext _ _ 0 NAME` lines as
+        /// named aliases of internal nets — we forward the name through the
+        /// alias chain to the underlying state so user-given register names
+        /// (`fill`, `state`, …) appear on `valuations { … }` blocks instead
+        /// of synthetic `$auto$async2sync.cc:…` strings.
+        symbol: Option<String>,
     },
 
     /// `<nid> init <sort> <state> <value>`
