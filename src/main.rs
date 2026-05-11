@@ -45,6 +45,11 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ExtractionCommand>,
     },
+    /// Contract assume-guarantee tooling.
+    Contract {
+        #[command(subcommand)]
+        command: Box<ContractCommand>,
+    },
     #[cfg(feature = "api")]
     /// Start HTTP API server
     Server {
@@ -52,6 +57,25 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ContractCommand {
+    /// Validate a contract set's discharge graph.
+    ///
+    /// Reads a JSON ContractSet, runs Tarjan SCC over the
+    /// guarantor→consumer graph, reports the verdict.
+    Validate(ContractValidateArgs),
+}
+
+#[derive(Args, Debug)]
+struct ContractValidateArgs {
+    /// Path to the contract set JSON.
+    #[arg(value_name = "CONTRACT_SET")]
+    contract_set: PathBuf,
+    /// Output the verdict as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -332,6 +356,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(*command),
         Commands::Extraction { command } => handle_extraction(*command),
+        Commands::Contract { command } => handle_contract(*command),
         #[cfg(feature = "api")]
         Commands::Server { addr } => {
             use std::net::SocketAddr;
@@ -364,6 +389,130 @@ fn handle_extraction(command: ExtractionCommand) -> Result<(), String> {
     match command {
         ExtractionCommand::Validate(args) => extraction_validate(args),
         ExtractionCommand::Check(args) => extraction_check(args),
+    }
+}
+
+fn handle_contract(command: ContractCommand) -> Result<(), String> {
+    match command {
+        ContractCommand::Validate(args) => contract_validate(args),
+    }
+}
+
+fn contract_validate(args: ContractValidateArgs) -> Result<(), String> {
+    use mununu::contract::{ContractSet, discharge};
+
+    let body = std::fs::read_to_string(&args.contract_set)
+        .map_err(|e| format!("failed to read {}: {e}", args.contract_set.display()))?;
+    let set: ContractSet = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse contract set JSON: {e}"))?;
+    let verdict = discharge::validate(&set);
+
+    if args.json {
+        let rendered = serde_json::to_string_pretty(&verdict)
+            .map_err(|e| format!("failed to serialise verdict: {e}"))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    render_discharge_verdict_text(&verdict);
+    Ok(())
+}
+
+fn render_discharge_verdict_text(verdict: &mununu::contract::discharge::DischargeVerdict) {
+    use mununu::contract::discharge::DischargeVerdict;
+    match verdict {
+        DischargeVerdict::Acyclic {
+            topological,
+            unmet_environment,
+        } => {
+            println!("discharge: acyclic");
+            if !topological.is_empty() {
+                println!("  topological order:");
+                for id in topological {
+                    println!("    - {id}");
+                }
+            }
+            if !unmet_environment.is_empty() {
+                println!("  declared env assumptions with no in-graph guarantor:");
+                for id in unmet_environment {
+                    println!("    - {id}  (expected — accepted as top-level env)");
+                }
+            }
+        }
+        DischargeVerdict::Circular {
+            cycles,
+            acyclic_remainder,
+        } => {
+            println!("discharge: circular reasoning required");
+            println!("  cycles:");
+            for cycle in cycles {
+                println!("    - [{}]", cycle.join(" -> "));
+            }
+            if !acyclic_remainder.is_empty() {
+                println!("  acyclic remainder (singletons):");
+                for id in acyclic_remainder {
+                    println!("    - {id}");
+                }
+            }
+            println!("  → mununu refuses to silently accept circular discharge.");
+            println!("    HITL must approve, or one cycle clause must be rewritten");
+            println!("    to be unconditional.");
+        }
+        DischargeVerdict::PotentiallyCircular {
+            unresolved,
+            partial,
+        } => {
+            println!("discharge: potentially circular (unresolved clauses)");
+            println!("  unresolved ids (refresh corpus or fill in clauses):");
+            for id in unresolved {
+                println!("    - {id}");
+            }
+            println!("  partial verdict over the resolved portion:");
+            render_discharge_verdict_text_indented(partial, 4);
+        }
+        DischargeVerdict::Unmet {
+            missing_dischargers,
+            partial,
+        } => {
+            println!("discharge: unmet obligations");
+            println!("  assumptions without any guarantor or env declaration:");
+            for id in missing_dischargers {
+                println!("    - {id}");
+            }
+            println!("  partial verdict over the rest:");
+            render_discharge_verdict_text_indented(partial, 4);
+        }
+    }
+}
+
+fn render_discharge_verdict_text_indented(
+    verdict: &mununu::contract::discharge::DischargeVerdict,
+    indent: usize,
+) {
+    use mununu::contract::discharge::DischargeVerdict;
+    let pad = " ".repeat(indent);
+    match verdict {
+        DischargeVerdict::Acyclic { topological, .. } => {
+            println!("{pad}acyclic ({} clauses)", topological.len());
+        }
+        DischargeVerdict::Circular { cycles, .. } => {
+            println!("{pad}circular ({} cycle(s))", cycles.len());
+        }
+        DischargeVerdict::PotentiallyCircular { unresolved, .. } => {
+            println!(
+                "{pad}potentially circular ({} unresolved id(s))",
+                unresolved.len()
+            );
+        }
+        DischargeVerdict::Unmet {
+            missing_dischargers,
+            ..
+        } => {
+            println!(
+                "{pad}unmet ({} missing discharger(s))",
+                missing_dischargers.len()
+            );
+        }
     }
 }
 

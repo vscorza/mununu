@@ -89,6 +89,10 @@ fn create_router() -> Router {
             post(handlers::context_predicates_handler),
         )
         .route("/api/v1/templates", get(handlers::templates_handler))
+        .route(
+            "/api/v1/contract/validate",
+            post(handlers::contract_validate_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

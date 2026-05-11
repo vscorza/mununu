@@ -110,7 +110,7 @@ The canonical tag table, per-language syntax wrappers, and worked example live i
 
 Two layers of contracts:
 
-- **Global properties** (current state). One set of formulas applied to the composed system. Mununu's IR already carries `PropertyRole::{Assumption, Guarantee, Standalone}` ([adapter/ir.rs:211](../../crates/mununu-core/src/adapter/ir.rs#L211)). This layer exists and is wired through.
+- **Global properties** (current state). One set of formulas applied to the composed system. Mununu's IR already carries `PropertyRole::{Assumption, Guarantee, Invariant, Standalone}` ([adapter/ir.rs:211](../../crates/mununu-core/src/adapter/ir.rs#L211)). This layer exists and is wired through. The contract IR treats `Invariant` as a guarantee with universal temporal scope (it is wrapped in `G` by the emitter).
 - **Per-component contracts** (new). `(A_m, G_m)` per module `m`. When `m` is black-box, `A_m` is *required* (without it the chaotic stub is the only option) and `G_m` is enforced *by axiom* on the stub automaton.
 
 The discharge rule, following Pnueli (1985) and Abadi & Lamport (1995): a global guarantee `G_top` is provable from `(⋀_m A_m → G_m) ∧ (⋀ environment-of-top assumptions)`, with the side condition that every `A_m` consumed by a sibling must be guaranteed by either another module's `G_k` or by the top-level environment.

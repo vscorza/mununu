@@ -9,6 +9,7 @@ pub mod clts;
 pub mod composition;
 pub mod context;
 pub mod context_dsl;
+pub mod contract;
 pub mod examples;
 pub mod guard;
 pub mod iter;
