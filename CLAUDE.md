@@ -448,6 +448,29 @@ This applies to: README examples, wiki case studies, blog posts linked from the 
 - Validate and constrain all external input.
 - No sensitive data in logs.
 
+### Git Operations & Destructive Commands
+
+**Destructive git operations require explicit user instruction in the current session prompt.** This applies to:
+
+- `git reset --hard` (discards working tree changes — irrecoverable from reflog)
+- `git push --force` / `git push -f` / `git push --force-with-lease` (overwrites remote history)
+- `git checkout -- <paths>` / `git restore <paths>` (discards working tree changes for paths)
+- `git clean -f` / `git clean -fd` (deletes untracked files)
+- `git branch -D <branch>` (force-deletes a branch with unmerged commits)
+- `git stash drop` / `git stash clear`
+- `git rebase --interactive` followed by squash/drop of unpushed-but-staged work
+
+**Why**: working-tree state is not recoverable from `git reflog` — only commits are. A `--hard` reset on a working tree carrying hours of uncommitted work permanently loses that work unless an editor's local history snapshot exists. (See incident: `.claude/plans/update-the-graph-endpoint-crystalline-frost.md` — a botched revert + `--hard` reset cost ~1730 lines of in-flight work that VSCode local history, Time Machine, and APFS snapshots could not recover.)
+
+**How to apply**:
+- Never run any of the above commands "to clean up" or "to reset state" unless the user has typed an instruction containing the specific command (e.g. "do a hard reset to main", "force-push the rebase").
+- If a botched `git revert` or merge-conflict resolution is in progress, prefer `git revert --abort`, `git merge --abort`, `git cherry-pick --abort`, or `git reset --soft` (which preserves working tree).
+- If the working tree must be discarded for a routine operation (e.g. switching branches), first run `git stash push -u -m "<reason>"` to preserve untracked files too. Surface the stash to the user.
+- For pre-commit hook failures, *create a new commit* — never `--amend` and never `--no-verify` unless the user explicitly authorised it.
+- Before any operation that may modify the working tree of files the user has been actively editing, snapshot via a "savepoint" branch + push to remote (`git checkout -b recovery/savepoint-<date> && git add -A && git commit --no-verify -m "savepoint" && git push -u origin <branch>`).
+
+**Agents must propagate this rule.** Any subagent invocation that performs git operations on a real repo (not an `isolation: "worktree"` clone) inherits this restriction. Subagents may take destructive actions only inside `isolation: "worktree"` agents (the worktree is a throwaway clone).
+
 ## Private Files Policy
 
 Sensitive or unpublished materials must live in the **sibling private repo**, not in this repo:
