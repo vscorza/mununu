@@ -1,6 +1,5 @@
 # Rust
 /target/
-**/target/
 *.pdb
 
 # IDE

@@ -66,10 +66,6 @@ test_support = ["dep:rand", "dep:rand_chacha"]
 stress = ["test_support"]
 dhat = ["dep:dhat"]
 
-[[test]]
-name = "api_graph_valuations"
-required-features = ["api"]
-
 [[bench]]
 name = "clts_composition"
 harness = false
