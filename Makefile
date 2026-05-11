@@ -18,7 +18,7 @@ PROPTEST_CASES ?= 64
 
 .PHONY: build test lint verify ci clean help \
         test-fast test-properties stress fuzz proptest-deep \
-        coverage mem-profile \
+        coverage mem-profile sweep \
         bench-baseline bench-compare bench-record \
         experiment replay publish-prep
 
@@ -41,6 +41,9 @@ help:
 	@echo "Coverage / memory:"
 	@echo "  coverage        - cargo-llvm-cov HTML + JSON summary"
 	@echo "  mem-profile     - run dhat-instrumented stress tests"
+	@echo
+	@echo "Disk hygiene:"
+	@echo "  sweep           - cargo sweep on mununu's siblings under ~/git_repo/ (dry-run; SWEEP_APPLY=1 to delete)"
 	@echo
 	@echo "Benchmarks:"
 	@echo "  bench-baseline  - cargo bench --save-baseline $(BASELINE)"
@@ -88,6 +91,12 @@ coverage:
 
 mem-profile:
 	$(CARGO) test --workspace --features dhat,stress --tests 'stress_*' -- --ignored --nocapture
+
+# Reclaim Cargo build artifacts on mununu's siblings under ~/git_repo/.
+# Default: dry-run (shows what would be removed). Set SWEEP_APPLY=1 to delete.
+# Override age threshold with SWEEP_DAYS=N (default 14).
+sweep:
+	@./scripts/sweep_targets.sh
 
 lint:
 	$(CARGO) fmt --all -- --check
