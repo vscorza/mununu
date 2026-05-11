@@ -104,6 +104,32 @@ pub struct AdapterOutput {
         String,
         std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     >,
+    /// Per-transition signal observations, keyed by automaton name.
+    /// The inner vector mirrors the order of transitions emitted in the
+    /// CTXDSL text — adapters that populate it (currently the BTOR2
+    /// reader, for Mealy outputs) record `signal → value` pairs that
+    /// depend on the input combination of the transition.
+    ///
+    /// These are *display-only* metadata, never consulted by the
+    /// formal evaluator. The CLI / UI trace renderer queries them when
+    /// rendering counterexamples and counterstrategies so the user
+    /// sees Mealy output values per cycle.
+    pub transition_observations: std::collections::HashMap<String, Vec<TransitionObservation>>,
+}
+
+/// A single per-transition observation row, emitted by adapters that
+/// expose Mealy-style outputs. Used only for trace presentation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TransitionObservation {
+    pub source: String,
+    pub target: String,
+    /// Labels on the transition, mirroring `IRTransition.labels`. The
+    /// renderer matches an observation row to a CLTS transition by
+    /// `(source, target, sorted-labels)`.
+    pub labels: Vec<String>,
+    /// `signal_name → display_value` for signals whose value depends
+    /// on the input portion of this transition.
+    pub observations: std::collections::BTreeMap<String, String>,
 }
 
 /// A warning produced during translation.

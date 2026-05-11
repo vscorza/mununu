@@ -112,6 +112,35 @@ states {
 }
 ```
 
+#### Per-state valuations (display metadata)
+
+A state may carry a `valuations { … }` block with structured `key = value;` pairs. Values are integer literals or identifiers. The model checker ignores them; the trace renderer and the graph view print them under the state name as `{key1=val1, key2=val2}`.
+
+Use this to hand-author examples that display the same per-state valuations adapter-driven flows (BTOR2, SV-yosys, extraction) inject through the side-channel:
+
+```
+states {
+    state Green initial {
+        valuations {
+            is_red = 0;
+            is_green = 1;
+            is_yellow = 0;
+            phase = green;
+        }
+    };
+    state Yellow {
+        valuations {
+            is_red = 0;
+            is_green = 0;
+            is_yellow = 1;
+            phase = yellow;
+        }
+    };
+}
+```
+
+The block lives inside the optional outer state block; it can coexist with a `vars { … }` block in any order. Reserved-keyword names (e.g. `state`, `on`, `group`) are accepted as keys so the round-trip with adapter-emitted CTXDSL is safe. See [`examples/hw/traffic_light_valuations.ctxdsl`](https://github.com/vscorza/mununu/blob/main/examples/hw/traffic_light_valuations.ctxdsl) for the canonical worked example.
+
 ### Controllable
 
 The `controllable` block lists labels that the controller is allowed to enable or disable. Labels not listed here are treated as **uncontrollable** (environment actions that the controller cannot prevent).

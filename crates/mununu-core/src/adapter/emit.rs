@@ -118,6 +118,25 @@ pub fn sanitize(name: &str) -> String {
     crate::guard::sanitize_identifier(name)
 }
 
+/// Format a valuation value for emission inside a `valuations { … }` block.
+/// Emits integer literals (`-?\d+`) verbatim so they round-trip through the
+/// parser's `ExprKind::Integer`/`Unary{Neg, Integer}` path; everything else is
+/// sanitized as an identifier (round-tripping through `ExprKind::Ident`).
+fn sanitize_valuation_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let is_int = !trimmed.is_empty()
+        && trimmed
+            .strip_prefix('-')
+            .unwrap_or(trimmed)
+            .chars()
+            .all(|c| c.is_ascii_digit());
+    if is_int {
+        trimmed.to_string()
+    } else {
+        sanitize(trimmed)
+    }
+}
+
 /// Convert a title to snake_case for the context name.
 fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
@@ -486,10 +505,36 @@ fn emit_explicit(ir: &AdapterIR) -> Result<String, AdapterError> {
         w.write_line("states {");
         w.indent();
         for state in &aut.states {
-            if state.is_initial {
-                w.write_line(&format!("state {} initial;", sanitize(&state.name)));
+            // Emit state declaration. When the state carries structured
+            // valuations (set by adapters like BTOR2 from cross-product
+            // enumeration of register values), emit them as a `valuations { … }`
+            // block inside the state's optional outer block. The realize layer
+            // re-registers these on the CLTS via `Clts::with_valuation_for_state`,
+            // so the round-trip emit → parse → realize preserves them.
+            let head = if state.is_initial {
+                format!("state {} initial", sanitize(&state.name))
             } else {
-                w.write_line(&format!("state {};", sanitize(&state.name)));
+                format!("state {}", sanitize(&state.name))
+            };
+            match state.valuations.as_ref().filter(|m| !m.is_empty()) {
+                None => w.write_line(&format!("{head};")),
+                Some(vals) => {
+                    w.write_line(&format!("{head} {{"));
+                    w.indent();
+                    w.write_line("valuations {");
+                    w.indent();
+                    for (k, v) in vals.iter() {
+                        w.write_line(&format!(
+                            "{} = {};",
+                            sanitize(k),
+                            sanitize_valuation_value(v)
+                        ));
+                    }
+                    w.deindent();
+                    w.write_line("}");
+                    w.deindent();
+                    w.write_line("};");
+                }
             }
         }
         w.deindent();

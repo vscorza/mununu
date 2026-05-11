@@ -470,6 +470,11 @@ pub async fn context_import_handler(
     } else {
         serde_json::to_value(&output.state_valuations).ok()
     };
+    let transition_observations = if output.transition_observations.is_empty() {
+        None
+    } else {
+        serde_json::to_value(&output.transition_observations).ok()
+    };
 
     Ok(Json(ContextImportResponse {
         success: true,
@@ -480,6 +485,7 @@ pub async fn context_import_handler(
         state_count: output.source_info.state_count,
         property_count: output.source_info.property_count,
         state_valuations,
+        transition_observations,
     }))
 }
 

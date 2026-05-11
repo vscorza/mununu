@@ -306,6 +306,7 @@ mod tests {
                             span: Span::new(0, 0, 0, 0),
                         },
                     }],
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("A"),
@@ -318,6 +319,7 @@ mod tests {
                             span: Span::new(0, 0, 0, 0),
                         },
                     }],
+                    valuations: Vec::new(),
                 },
             ],
             transitions: vec![
@@ -448,6 +450,7 @@ mod tests {
             ],
             span: Span::new(0, 0, 0, 0),
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         };
 
         canonicalize(&mut doc);
@@ -664,18 +667,21 @@ mod tests {
                     index: None,
                     is_initial: true,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T1"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T2"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -831,18 +837,21 @@ mod tests {
                     index: None,
                     is_initial: true,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T1"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T2"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -1031,12 +1040,14 @@ mod tests {
                     index: None,
                     is_initial: true,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -1116,18 +1127,21 @@ mod tests {
                     index: None,
                     is_initial: true,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T1"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T2"),
                     index: None,
                     is_initial: false,
                     overrides: Vec::new(),
+                    valuations: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -1256,6 +1270,7 @@ mod tests {
             mu_formulas: Vec::new(),
             span: Span::new(0, 0, 0, 0),
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         };
 
         canonicalize(&mut doc);
@@ -1293,6 +1308,7 @@ mod tests {
             }],
             span: Span::new(0, 0, 0, 0),
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         };
 
         canonicalize(&mut doc);
@@ -1328,6 +1344,7 @@ mod tests {
                     },
                 },
             ],
+            valuations: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);

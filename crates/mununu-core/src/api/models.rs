@@ -249,6 +249,11 @@ pub struct ContextImportResponse {
     /// State valuations for structured predicate matching (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_valuations: Option<serde_json::Value>,
+    /// Per-transition Mealy observations (when the adapter emits them).
+    /// Keyed by automaton name; each entry is a list of
+    /// `{source, target, labels, observations}` rows. Used by trace renderers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_observations: Option<serde_json::Value>,
 }
 
 // ============================================================================

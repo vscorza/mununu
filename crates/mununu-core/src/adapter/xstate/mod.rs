@@ -65,6 +65,7 @@ impl FormatAdapter for XStateAdapter {
                 property_count,
             },
             state_valuations: Default::default(),
+            transition_observations: Default::default(),
         })
     }
 }
@@ -462,6 +463,7 @@ fn build_properties(
             formula: PropertyFormula::MuCalculus(formula_str),
             role,
             over: None,
+            description: None,
         });
     }
     Ok(out)
