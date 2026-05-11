@@ -716,7 +716,7 @@ impl<'a> Parser<'a> {
                     saw_valuations = true;
                     self.expect_symbol(Symbol::LBrace)?;
                     while !self.check_symbol(Symbol::RBrace) {
-                        valuations.push(self.parse_assignment()?);
+                        valuations.push(self.parse_valuation_pair()?);
                     }
                     self.expect_symbol(Symbol::RBrace)?;
                 } else {
@@ -747,6 +747,35 @@ impl<'a> Parser<'a> {
 
     fn parse_assignment(&mut self) -> Result<Assignment, ParseError> {
         let target = self.expect_ident()?;
+        self.expect_symbol(Symbol::Assign)?;
+        let expr = self.parse_expr()?;
+        self.expect_symbol(Symbol::Semicolon)?;
+        Ok(Assignment { target, expr })
+    }
+
+    /// Like `parse_assignment` but tolerant of the LHS being a keyword (e.g.
+    /// `state = ...;`). Adapter-emitted CTXDSL inside `valuations { … }` blocks
+    /// often references signal names that collide with reserved keywords —
+    /// accept those by re-tokenising the keyword as an identifier for the
+    /// purposes of the LHS only.
+    fn parse_valuation_pair(&mut self) -> Result<Assignment, ParseError> {
+        let target = match self.peek_kind().clone() {
+            crate::context_dsl::token::TokenKind::Identifier(_) => self.expect_ident()?,
+            crate::context_dsl::token::TokenKind::Keyword(_) => {
+                let span = self.peek().span;
+                let name = self.source[span.start..span.end].to_string();
+                self.advance();
+                Ident::new(name, span)
+            }
+            other => {
+                let span = self.peek().span;
+                return Err(ParseError::UnexpectedToken {
+                    found: other,
+                    expected: "identifier (valuation key)",
+                    span,
+                });
+            }
+        };
         self.expect_symbol(Symbol::Assign)?;
         let expr = self.parse_expr()?;
         self.expect_symbol(Symbol::Semicolon)?;

@@ -1167,9 +1167,16 @@ mod tests {
             .context
             .synthesise_controller("alu", &formula.formula, &env, None)
             .expect("synthesis should succeed");
+        // The ALU has a reachable OOB sink (acc overflow). Once Phase C/4 emits
+        // the OOB-marker valuation through CTXDSL, the mu-calculus evaluator
+        // recognises the sink as a bottom state, and `nu X. ([] X)` does not
+        // hold from `acc_0` because some path leads to the OOB sink. Synth
+        // therefore reports unrealizable — the *right* answer for the ALU as
+        // written. To make it realizable the user would need a wider `acc`
+        // bound or a guard that prevents the overflowing transitions.
         assert!(
-            synth.realizable,
-            "ALU safety should be realizable (states: {})",
+            !synth.realizable,
+            "ALU safety should be unrealizable due to reachable OOB sink (states: {})",
             clts.state_count()
         );
     }
