@@ -1,0 +1,17 @@
+[
+  {
+    "name": "DDR3_PHY_V2",
+    "ports": [
+      { "name": "clk",            "direction": "Input",  "description": "clock" },
+      { "name": "reset_n",        "direction": "Input",  "description": "active-low async reset" },
+      { "name": "host_init_burst","direction": "Input",  "description": "rising edge starts a burst" },
+      { "name": "addr",           "direction": "Input",  "description": "burst start address" },
+      { "name": "wdata",          "direction": "Input",  "description": "write-data bus" },
+      { "name": "rdata",          "direction": "Output", "description": "read-data bus" },
+      { "name": "ddr_ready",      "direction": "Output", "description": "rises when the burst completes" },
+      { "name": "ddr_busy",       "direction": "Output", "description": "high while the burst is in flight" }
+    ],
+    "source_file": "rtl/vendor/ddr3_phy.sv",
+    "source_line": 12
+  }
+]
