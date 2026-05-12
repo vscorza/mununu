@@ -1,0 +1,63 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "dmr_top",
+  "source": "dmr_top.sv",
+  "_note": "DMR commit-gate fault-tolerance contract example. One-hot single-bit-flip fault model (XOR with shifted mask). See README.md for the explicit list of what this DOES and DOES NOT verify.",
+  "signals": [
+    {
+      "name": "commit_valid_r",
+      "abstraction": "boolean",
+      "note": "Registered comparator output."
+    },
+    {
+      "name": "broadcast_valid_r",
+      "abstraction": "boolean",
+      "note": "External broadcast handshake — registered same cycle as commit_valid_r."
+    },
+    {
+      "name": "broadcast_data_r",
+      "abstraction": "bounded_counter",
+      "bound": 15,
+      "note": "4-bit registered broadcast payload."
+    },
+    {
+      "name": "y_b_q",
+      "abstraction": "bounded_counter",
+      "bound": 15,
+      "note": "Pipelined fault-free golden reference."
+    },
+    {
+      "name": "corrupted_broadcast_r",
+      "abstraction": "boolean",
+      "note": "Observer: latches if broadcast_data_r ever disagrees with y_b_q while commit_valid_r is high. Safety property in observable form."
+    }
+  ],
+  "inputs": [
+    {
+      "name": "x",
+      "abstraction": "bounded_counter",
+      "bound": 15
+    },
+    {
+      "name": "flip_idx",
+      "abstraction": "bounded_counter",
+      "bound": 3
+    },
+    {
+      "name": "flip_en",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "no_corrupt_broadcast",
+      "formula": "nu X. (!corrupted_broadcast_r_T && [] X)",
+      "description": "Safety: the observer never latches a mismatch. Under the one-hot single-bit-flip fault model on y_a, commit_valid only asserts when y_a_post == y_b, so broadcast_data always equals the pipelined reference y_b_q."
+    },
+    {
+      "id": "no_deadlock",
+      "formula": "nu X. ([] X)",
+      "description": "Baseline: every reachable state has at least one outgoing transition."
+    }
+  ]
+}

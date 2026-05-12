@@ -1656,6 +1656,13 @@ fn eval_binop(
             let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l | r))
         }
+        BinOp::BitXor => {
+            // SOUNDNESS: like BitOr/BitAnd, the result is not masked to the
+            // declared source width — caller must keep operands within the
+            // bounded_counter range. The OOB-sink mechanic catches escapees.
+            let (l, r) = to_i64_pair(lv, rv, registers)?;
+            Some(AbstractValue::Counter(l ^ r))
+        }
         BinOp::BitAnd => {
             let (l, r) = to_i64_pair(lv, rv, registers)?;
             Some(AbstractValue::Counter(l & r))

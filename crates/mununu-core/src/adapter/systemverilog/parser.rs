@@ -1438,7 +1438,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_bitor_expr(&mut self) -> Result<Expr, AdapterError> {
-        let mut left = self.parse_bitand_expr()?;
+        let mut left = self.parse_bitxor_expr()?;
         loop {
             self.skip_whitespace_and_comments();
             if self.remaining().starts_with('|')
@@ -1447,9 +1447,34 @@ impl<'a> Parser<'a> {
             {
                 self.pos += 1;
                 self.col += 1;
-                let right = self.parse_bitand_expr()?;
+                let right = self.parse_bitxor_expr()?;
                 left = Expr::BinOp {
                     op: BinOp::BitOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitxor_expr(&mut self) -> Result<Expr, AdapterError> {
+        let mut left = self.parse_bitand_expr()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            // Binary XOR `^`. Reject `^=` (assignment) and `^~`/`~^` (XNOR,
+            // not yet supported — bail rather than mis-parse).
+            if self.remaining().starts_with('^')
+                && !self.remaining().starts_with("^=")
+                && !self.remaining().starts_with("^~")
+            {
+                self.pos += 1;
+                self.col += 1;
+                let right = self.parse_bitand_expr()?;
+                left = Expr::BinOp {
+                    op: BinOp::BitXor,
                     left: Box::new(left),
                     right: Box::new(right),
                 };
@@ -1887,6 +1912,7 @@ fn expr_to_string(expr: &Expr) -> String {
                 BinOp::And => "&&",
                 BinOp::Or => "||",
                 BinOp::BitOr => "|",
+                BinOp::BitXor => "^",
                 BinOp::BitAnd => "&",
                 BinOp::Add => "+",
                 BinOp::Sub => "-",
@@ -2432,5 +2458,82 @@ mod tests {
         if let Some(Declaration::Logic { width, .. }) = req_decl {
             assert_eq!(*width, 9, "struct: 8 + 1 = 9 bits");
         }
+    }
+
+    #[test]
+    fn parse_bitxor_expression() {
+        let module = parse(
+            r#"
+            module xor_test(input logic [3:0] a, input logic [3:0] b);
+                logic [3:0] y;
+                assign y = a ^ b;
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(module.assigns.len(), 1);
+        match &module.assigns[0].value {
+            Expr::BinOp { op, .. } => assert_eq!(*op, BinOp::BitXor),
+            other => panic!("expected BinOp::BitXor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bitxor_precedence_between_and_or() {
+        // SystemVerilog precedence: `&` > `^` > `|`.
+        // `a & b ^ c | d` must parse as `((a & b) ^ c) | d`.
+        let module = parse(
+            r#"
+            module prec_test(input logic [3:0] a, input logic [3:0] b, input logic [3:0] c, input logic [3:0] d);
+                logic [3:0] y;
+                assign y = a & b ^ c | d;
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        let Expr::BinOp { op, left, right } = &module.assigns[0].value else {
+            panic!("expected outer BinOp");
+        };
+        assert_eq!(*op, BinOp::BitOr, "outermost op must be |");
+        assert!(matches!(right.as_ref(), Expr::Ident(n) if n == "d"));
+        let Expr::BinOp {
+            op: inner_op,
+            left: xor_l,
+            right: xor_r,
+        } = left.as_ref()
+        else {
+            panic!("expected nested BinOp on the left of |");
+        };
+        assert_eq!(*inner_op, BinOp::BitXor, "middle op must be ^");
+        assert!(matches!(xor_r.as_ref(), Expr::Ident(n) if n == "c"));
+        let Expr::BinOp { op: and_op, .. } = xor_l.as_ref() else {
+            panic!("expected nested BinOp on the left of ^");
+        };
+        assert_eq!(*and_op, BinOp::BitAnd, "innermost op must be &");
+    }
+
+    #[test]
+    fn parse_bitxor_with_shift_and_ternary() {
+        // The DMR fault-injection pattern that motivated XOR support
+        // (examples/hw/dmr_commit_4bit/dmr_top.sv).
+        let module = parse(
+            r#"
+            module flip_test(input logic [3:0] x, input logic [1:0] idx, input logic en);
+                logic [3:0] y;
+                assign y = en ? (x ^ (4'b0001 << idx)) : x;
+            endmodule
+            "#,
+        )
+        .unwrap();
+
+        let Expr::Ternary { then_expr, .. } = &module.assigns[0].value else {
+            panic!("expected outer ternary");
+        };
+        let Expr::BinOp { op, .. } = then_expr.as_ref() else {
+            panic!("expected XOR inside then-branch");
+        };
+        assert_eq!(*op, BinOp::BitXor);
     }
 }

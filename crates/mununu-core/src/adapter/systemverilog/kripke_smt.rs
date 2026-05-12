@@ -597,6 +597,7 @@ pub mod engine {
                     BinOp::Shr => l.bvlshr(&r),
                     BinOp::BitAnd => l.bvand(&r),
                     BinOp::BitOr => l.bvor(&r),
+                    BinOp::BitXor => l.bvxor(&r),
                     BinOp::And => {
                         let zero = z3::ast::BV::from_i64(0, l.get_size());
                         let one = z3::ast::BV::from_i64(1, l.get_size());
@@ -777,6 +778,7 @@ pub mod engine {
                     BinOp::Or => "||",
                     BinOp::BitAnd => "&",
                     BinOp::BitOr => "|",
+                    BinOp::BitXor => "^",
                     BinOp::Shl => "<<",
                     BinOp::Shr => ">>",
                 };
