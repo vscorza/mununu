@@ -77,6 +77,21 @@ enum ContractCommand {
     Gaps(ContractGapsArgs),
     /// Discover a phase-1 contract from a black-box interface description.
     Discover(ContractDiscoverArgs),
+    /// Emit interface + gap-report sidecars for a list of black-box modules.
+    Sidecars(ContractSidecarsArgs),
+}
+
+#[derive(Args, Debug)]
+struct ContractSidecarsArgs {
+    /// Path to a JSON file containing a list of `BlackBoxInterface` objects.
+    #[arg(value_name = "INTERFACES")]
+    interfaces: PathBuf,
+    /// Directory to write the sidecar files; created if missing.
+    #[arg(long, value_name = "DIR")]
+    out_dir: PathBuf,
+    /// Emit an additional `Fairness` gap marker per module.
+    #[arg(long)]
+    emit_fairness_gap: bool,
 }
 
 #[derive(Args, Debug)]
@@ -668,7 +683,42 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
         ContractCommand::Validate(args) => contract_validate(args),
         ContractCommand::Gaps(args) => contract_gaps(args),
         ContractCommand::Discover(args) => contract_discover(args),
+        ContractCommand::Sidecars(args) => contract_sidecars(args),
     }
+}
+
+fn contract_sidecars(args: ContractSidecarsArgs) -> Result<(), String> {
+    use mununu_core::contract::discover::{
+        BlackBoxInterface, DiscoverOptions, build_blackbox_sidecars,
+    };
+
+    let body = std::fs::read_to_string(&args.interfaces)
+        .map_err(|e| format!("failed to read {}: {e}", args.interfaces.display()))?;
+    let interfaces: Vec<BlackBoxInterface> = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse interfaces JSON (expected array): {e}"))?;
+
+    std::fs::create_dir_all(&args.out_dir)
+        .map_err(|e| format!("failed to create {}: {e}", args.out_dir.display()))?;
+
+    let opts = DiscoverOptions {
+        force_controllable: &[],
+        force_uncontrollable: &[],
+        emit_fairness_gap: args.emit_fairness_gap,
+    };
+    let sidecars = build_blackbox_sidecars(&interfaces, &opts);
+
+    for sidecar in &sidecars {
+        let target = args.out_dir.join(&sidecar.filename);
+        std::fs::write(&target, &sidecar.content)
+            .map_err(|e| format!("failed to write {}: {e}", target.display()))?;
+        println!("wrote: {}", target.display());
+    }
+    println!(
+        "wrote {} sidecar(s) for {} black-box module(s)",
+        sidecars.len(),
+        interfaces.len(),
+    );
+    Ok(())
 }
 
 fn contract_discover(args: ContractDiscoverArgs) -> Result<(), String> {

@@ -106,6 +106,72 @@ pub struct DiscoverOptions<'a> {
     pub emit_fairness_gap: bool,
 }
 
+/// Convert a list of discovered black-box interfaces into the adapter
+/// sidecar files the rest of the contract subsystem consumes.
+///
+/// Used by adapters that have just detected one or more black-box
+/// submodules during extraction (e.g., yosys frontend hitting
+/// `(* blackbox *)`, or the custom-SV pipeline encountering an
+/// instantiation not listed in its multi-module sidecar). The
+/// adapter calls this helper to get a `Vec<AdapterSidecar>` it can
+/// attach to its `AdapterOutput`; the caller (CLI / API) writes the
+/// sidecars to disk next to the primary CTXDSL output.
+///
+/// For each black-box interface, two sidecars are emitted:
+///   - `<module>.interface.json` — the `BlackBoxInterface` itself.
+///   - `<module>.gap_report.json` — a `GapMarkerReport` with the
+///     phase-1 default gaps (OutputSequencing covering outputs;
+///     Fairness opt-in).
+///
+/// This is Document B § B.7.3's load-bearing helper: the moment the
+/// contract subsystem stops being a separate JSON workflow and becomes
+/// an automatic byproduct of extraction.
+pub fn build_blackbox_sidecars(
+    interfaces: &[BlackBoxInterface],
+    options: &DiscoverOptions<'_>,
+) -> Vec<crate::adapter::AdapterSidecar> {
+    use crate::adapter::{AdapterSidecar, SidecarOrigin};
+
+    let mut sidecars = Vec::with_capacity(interfaces.len() * 2);
+    for iface in interfaces {
+        let phase1 = discover_phase1(iface, options);
+
+        // Interface JSON. Use `to_string_pretty` so the file is
+        // human-readable and stable for diffing.
+        if let Ok(interface_json) = serde_json::to_string_pretty(&iface) {
+            sidecars.push(AdapterSidecar {
+                filename: format!("{}.interface.json", sanitize_filename(&iface.name)),
+                content: interface_json,
+                origin: SidecarOrigin::BlackBoxInterface,
+            });
+        }
+
+        // Gap-report JSON.
+        if let Ok(gap_json) = serde_json::to_string_pretty(&phase1.gaps) {
+            sidecars.push(AdapterSidecar {
+                filename: format!("{}.gap_report.json", sanitize_filename(&iface.name)),
+                content: gap_json,
+                origin: SidecarOrigin::BlackBoxGapReport,
+            });
+        }
+    }
+    sidecars
+}
+
+/// Make a filename-safe version of a module name. Lowercase ASCII +
+/// digits + `_` + `-` are kept; everything else becomes `_`.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Run phase 1 discovery on a black-box interface. Always emits at least
 /// one gap marker (chaotic-stub default).
 pub fn discover_phase1(iface: &BlackBoxInterface, options: &DiscoverOptions<'_>) -> Phase1Output {
@@ -281,6 +347,50 @@ mod tests {
         assert_eq!(out.gaps.len(), 2);
         assert_eq!(out.gaps.markers[0].kind, GapKind::OutputSequencing);
         assert_eq!(out.gaps.markers[1].kind, GapKind::Fairness);
+    }
+
+    #[test]
+    fn build_sidecars_produces_interface_and_gap_files() {
+        use crate::adapter::SidecarOrigin;
+
+        let iface = BlackBoxInterface {
+            name: "DDR3_PHY_V2".to_string(),
+            ports: vec![
+                port("clk", BoundaryDirection::Input),
+                port("data_out", BoundaryDirection::Output),
+            ],
+            source_file: Some("rtl/vendor/ddr3.sv".to_string()),
+            source_line: Some(10),
+        };
+        let sidecars = build_blackbox_sidecars(&[iface], &DiscoverOptions::default());
+        assert_eq!(sidecars.len(), 2);
+        assert_eq!(sidecars[0].origin, SidecarOrigin::BlackBoxInterface);
+        assert_eq!(sidecars[0].filename, "DDR3_PHY_V2.interface.json");
+        assert!(sidecars[0].content.contains("\"name\": \"DDR3_PHY_V2\""));
+        assert_eq!(sidecars[1].origin, SidecarOrigin::BlackBoxGapReport);
+        assert_eq!(sidecars[1].filename, "DDR3_PHY_V2.gap_report.json");
+        // Phase-1 emits an OutputSequencing gap for any black box with
+        // at least one output.
+        assert!(sidecars[1].content.contains("output_sequencing"));
+        assert!(sidecars[1].content.contains("data_out"));
+    }
+
+    #[test]
+    fn build_sidecars_sanitises_filename_chars() {
+        let iface = BlackBoxInterface {
+            name: "vendor/IP::Block 1".to_string(),
+            ports: vec![port("out", BoundaryDirection::Output)],
+            source_file: None,
+            source_line: None,
+        };
+        let sidecars = build_blackbox_sidecars(&[iface], &DiscoverOptions::default());
+        assert_eq!(sidecars[0].filename, "vendor_IP__Block_1.interface.json");
+    }
+
+    #[test]
+    fn build_sidecars_empty_input_yields_empty_output() {
+        let sidecars = build_blackbox_sidecars(&[], &DiscoverOptions::default());
+        assert!(sidecars.is_empty());
     }
 
     #[test]

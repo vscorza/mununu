@@ -86,6 +86,47 @@ pub struct AdapterOptions {
     pub sidecar_json: Option<String>,
 }
 
+/// A sidecar file the adapter produced alongside its CTXDSL output.
+///
+/// Used by the contract subsystem (Document A § A5 / Document B § B.3
+/// row "Black-box submodule handling"): when an adapter encounters a
+/// black-box module it cannot fully extract, it emits a phase-1 contract
+/// description (`BlackBoxInterface`) and a phase-1 gap-marker report
+/// (`GapMarkerReport`) as side outputs. Callers (CLI / API / UI) write
+/// the sidecars to disk next to the primary CTXDSL file so the rest of
+/// the `mununu contract …` workflow can consume them without the user
+/// hand-authoring JSON.
+///
+/// The adapter does **not** decide where the file lands — it returns the
+/// suggested filename (relative to the primary CTXDSL output's parent
+/// directory) and the rendered content. The caller is responsible for
+/// the final write path and any conflict resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSidecar {
+    /// Suggested filename, relative to the primary output's parent
+    /// directory. Example: `"ddr3_phy.interface.json"`.
+    pub filename: String,
+    /// Rendered file content (pretty-printed JSON for the contract
+    /// sidecars; the caller writes it byte-for-byte).
+    pub content: String,
+    /// Why this sidecar was emitted. Carried through to user-facing
+    /// reports so the operator can see at a glance which adapter slot
+    /// produced what.
+    pub origin: SidecarOrigin,
+}
+
+/// Why an `AdapterSidecar` exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarOrigin {
+    /// A `BlackBoxInterface` description for a module the adapter
+    /// classified as black-box (un-elaborated submodule, vendor IP,
+    /// `(* blackbox *)` attribute).
+    BlackBoxInterface,
+    /// A `GapMarkerReport` for the same module, prefilled with the
+    /// chaotic-stub default gaps.
+    BlackBoxGapReport,
+}
+
 /// Output from a successful adapter translation.
 #[derive(Debug, Clone)]
 pub struct AdapterOutput {
@@ -95,6 +136,13 @@ pub struct AdapterOutput {
     pub warnings: Vec<AdapterWarning>,
     /// Metadata about the translation.
     pub source_info: SourceInfo,
+    /// Sidecar files the adapter produced alongside the CTXDSL.
+    /// Currently used by the contract subsystem to emit
+    /// `BlackBoxInterface` + `GapMarkerReport` JSONs when the adapter
+    /// encounters a black-box submodule. See [`AdapterSidecar`] for the
+    /// shape.
+    #[doc(hidden)] // kept hidden until B3 lands at least one producer
+    pub sidecars: Vec<AdapterSidecar>,
     /// Structured state valuations from cross-product enumeration.
     /// Keyed by `automaton_name → state_name → { variable → display_value }`.
     /// Populated by adapters that enumerate states from register/field domains

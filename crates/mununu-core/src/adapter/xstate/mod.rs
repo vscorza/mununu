@@ -55,6 +55,7 @@ impl FormatAdapter for XStateAdapter {
         let signal_count = count_events(&machine);
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl: result.ctxdsl,
             warnings,
             source_info: SourceInfo {

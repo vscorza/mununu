@@ -77,6 +77,7 @@ impl FormatAdapter for AigerAdapter {
         let emit_result = super::emit::emit(&ir)?;
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl: emit_result.ctxdsl,
             warnings,
             source_info: SourceInfo {
