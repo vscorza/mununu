@@ -1860,6 +1860,19 @@ type StateValuationsMap = std::collections::HashMap<
 >;
 
 fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, StateValuationsMap) {
+    log_adapter_output_with_dir(output, None)
+}
+
+/// Like [`log_adapter_output`] but, when `sidecar_dir` is `Some`, writes
+/// every `AdapterSidecar` the adapter attached (e.g. the yosys frontend's
+/// auto-emitted `BlackBoxInterface.json` + `GapMarkerReport.json` files,
+/// per Document B task B3) into that directory. Designed so callers that
+/// know where the source file lives can park the sidecars right next to
+/// it without the CLI inventing an output structure.
+fn log_adapter_output_with_dir(
+    output: mununu_core::adapter::AdapterOutput,
+    sidecar_dir: Option<&std::path::Path>,
+) -> (String, StateValuationsMap) {
     for w in &output.warnings {
         eprintln!("adapter warning: {}", w.message);
     }
@@ -1870,6 +1883,21 @@ fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, S
         output.source_info.state_count,
         output.source_info.property_count,
     );
+    if let Some(dir) = sidecar_dir {
+        for sidecar in &output.sidecars {
+            let target = dir.join(&sidecar.filename);
+            match std::fs::write(&target, &sidecar.content) {
+                Ok(()) => eprintln!("auto-emitted sidecar: {}", target.display()),
+                Err(e) => eprintln!("warning: failed to write sidecar {}: {e}", target.display()),
+            }
+        }
+    } else if !output.sidecars.is_empty() {
+        eprintln!(
+            "adapter produced {} sidecar(s); no source directory known so they were not written. \
+             Call this via a flow that knows the source path (e.g. `context eval <file> --adapter yosys`) to enable auto-write.",
+            output.sidecars.len(),
+        );
+    }
     (output.ctxdsl, output.state_valuations)
 }
 
@@ -1928,14 +1956,21 @@ fn load_with_adapter_mode(
         Some("sv-yosys") | Some("yosys") => {
             // Yosys-driven SV elaboration → BTOR2 → CLTS.
             // Per Phase 1 of the RTL roadmap (S1: Yosys-as-front-end).
-            let yopts = mununu_core::adapter::yosys::YosysOptions::default();
-            log_adapter_output(
+            // Sidecars emitted for `(* blackbox *)` modules (Document B
+            // task B3) land in the source file's parent directory so the
+            // user finds them next to the `.sv` they just ran.
+            let yopts = mununu_core::adapter::yosys::YosysOptions {
+                primary_source_path: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            log_adapter_output_with_dir(
                 mununu_core::adapter::yosys::translate_sv(
                     &source,
                     &load_btor_sidecar(&options_default),
                     &yopts,
                 )
                 .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
+                path.parent(),
             )
         }
         Some("promela") => log_adapter_output(

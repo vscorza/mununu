@@ -5,17 +5,18 @@
 # output, and produces a byte-deterministic transcript at
 # `transcript.txt`.
 #
-# Today's slice exercises:
-#   - `mununu contract sidecars` against the hand-authored
-#     `blackbox_interfaces.json` — the same JSON shape the yosys
-#     adapter will auto-emit once Document B's yosys integration ships.
-#   - `mununu context eval` against the hand-authored SoC composition.
-#
-# When the yosys-side auto-emission lands, this script will gain a
-# step that runs the yosys adapter on `soc.sv` and cross-checks the
-# auto-emitted sidecars against the hand-authored ones (byte-identical).
-# That step is intentionally not present today; the README explains
-# why.
+# Three pieces of the dual-frontend story:
+#   1. Manual path — `mununu contract sidecars` against a hand-authored
+#      `blackbox_interfaces.json`. Demonstrates the JSON shape the
+#      contract subsystem consumes.
+#   2. **Automatic path** — `mununu --adapter yosys` (via the
+#      mununu-cli binary) on `soc.sv`. The yosys frontend detects the
+#      `(* blackbox *)` attribute on `ddr3_phy_v2`, parses the
+#      pre-flatten hierarchy snapshot, and auto-emits the same JSON
+#      sidecars next to the source file.
+#   3. Cross-check — both paths produce the same module name and
+#      port/direction shape. The auto-emitted file's source location
+#      points at the user's actual `.sv` (not the yosys tempdir).
 #
 # Run from the repo root:
 #   ./examples/industrial/dual_frontend_soc/validate.sh
@@ -28,8 +29,13 @@ EXAMPLE_DIR="examples/industrial/dual_frontend_soc"
 TRANSCRIPT="$EXAMPLE_DIR/transcript.txt"
 SIDECARS_DIR="$EXAMPLE_DIR/sidecars_generated"
 
-echo "build: mununu binary (cargo)" 1>&2
-cargo build --quiet --bin mununu
+echo "build: mununu-cli binary (cargo)" 1>&2
+# The example uses the `mununu-cli` package's binary specifically (it
+# has both the `contract sidecars` subcommand from M1's PR #10 *and*
+# the `--adapter yosys` flag that triggers the new auto-emission). The
+# root crate's binary has only the former, so building mununu-cli
+# overwrites `target/debug/mununu` with the superset version.
+cargo build --quiet -p mununu-cli --bin mununu
 
 strip_logs() {
     perl -pe '
@@ -78,6 +84,23 @@ rm -rf "$SIDECARS_DIR"
         ./target/debug/mununu contract gaps \
             "$SIDECARS_DIR/DDR3_PHY_V2.gap_report.json" \
             --strict-contracts
+
+    # ----- Automatic path -------------------------------------------
+    # Remove any prior auto-emitted file so the next run is a clean
+    # repro of "yosys discovers, then emits."
+    rm -f "$EXAMPLE_DIR/ddr3_phy_v2.interface.json" \
+          "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json"
+
+    run "5a. AUTO-emit sidecars by running the yosys frontend on soc.sv" \
+        ./target/debug/mununu context summarize \
+            "$EXAMPLE_DIR/soc.sv" \
+            --adapter yosys
+
+    run "5b. Inspect the auto-emitted interface JSON" \
+        cat "$EXAMPLE_DIR/ddr3_phy_v2.interface.json"
+
+    run "5c. Inspect the auto-emitted gap-report JSON" \
+        cat "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json"
 
     run "6. SoC composition — well-formedness (safety, under chaotic DDR)" \
         ./target/debug/mununu context eval \

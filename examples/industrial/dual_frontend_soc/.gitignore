@@ -1,1 +1,6 @@
 sidecars_generated/
+# Auto-emitted by the yosys frontend when validate.sh runs step 5a.
+# Checked into source control would create churn; the README documents
+# how to regenerate them.
+ddr3_phy_v2.interface.json
+ddr3_phy_v2.gap_report.json
