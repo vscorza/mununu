@@ -1,0 +1,15 @@
+{
+  "name": "RSA_V2",
+  "ports": [
+    { "name": "clk",           "direction": "Input",  "description": "clock" },
+    { "name": "reset_n",       "direction": "Input",  "description": "async reset, active low" },
+    { "name": "start_verify",  "direction": "Input",  "description": "rising edge starts a signature verify" },
+    { "name": "signature",     "direction": "Input",  "description": "2048-bit signature word" },
+    { "name": "hash",          "direction": "Input",  "description": "256-bit message hash" },
+    { "name": "pubkey",        "direction": "Input",  "description": "2048-bit RSA public key" },
+    { "name": "verify_done",   "direction": "Output", "description": "rises when verify_ok is stable" },
+    { "name": "verify_ok",     "direction": "Output", "description": "1 if signature valid, 0 otherwise" }
+  ],
+  "source_file": "rtl/vendor/rsa_verify_v2.sv",
+  "source_line": 12
+}

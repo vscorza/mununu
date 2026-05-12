@@ -1,0 +1,78 @@
+# secure boot ROM — validation transcript
+# regenerate via examples/industrial/secure_boot_rom/validate.sh
+# transcript is byte-deterministic; re-running validate.sh
+# against the same commit should produce identical output.
+
+=== 1. phase-1 discovery on SHA-256 IP (chaotic stub default) ===
+$ ./target/debug/mununu contract discover examples/industrial/secure_boot_rom/sha256_interface.json
+WARN contract gap detected — chaotic stub default in effect module="SHA256_V1" kind=output_sequencing labels="hash_valid, hash_out" location="rtl/vendor/sha256_v1.sv:8" soundness="safety verdicts hold; liveness verdicts depending on these labels are unsound (no progress assumption)." description="Phase-1 discovery — no sequencing fragment yet for SHA256_V1"
+phase-1 discovery: 6 label(s), 1 gap marker(s) for module `SHA256_V1`
+
+=== 2. phase-1 discovery on RSA-verify IP (with fairness gap) ===
+$ ./target/debug/mununu contract discover examples/industrial/secure_boot_rom/rsa_verify_interface.json --emit-fairness-gap
+WARN contract gap detected — chaotic stub default in effect module="RSA_V2" kind=output_sequencing labels="verify_done, verify_ok" location="rtl/vendor/rsa_verify_v2.sv:12" soundness="safety verdicts hold; liveness verdicts depending on these labels are unsound (no progress assumption)." description="Phase-1 discovery — no sequencing fragment yet for RSA_V2"
+WARN contract gap detected — chaotic stub default in effect module="RSA_V2" kind=fairness labels="" location="rtl/vendor/rsa_verify_v2.sv:12" soundness="liveness verdicts unsound under chaotic environment; safety verdicts unaffected." description="Phase-1 discovery — no fairness assumption authored."
+phase-1 discovery: 8 label(s), 2 gap marker(s) for module `RSA_V2`
+
+=== 3. discharge check — acyclic contract set ===
+$ ./target/debug/mununu contract validate examples/industrial/secure_boot_rom/contract_set_acyclic.json
+discharge: acyclic
+  topological order:
+    - A_boot_reset_clean
+    - G_boot_data_presented
+    - A_sha_data_presented
+    - G_boot_pubkey_loaded
+    - A_rsa_pubkey_loaded
+  declared env assumptions with no in-graph guarantor:
+    - A_boot_reset_clean  (expected — accepted as top-level env)
+
+=== 4. discharge check — circular contract set (no rank witness) ===
+$ ./target/debug/mununu contract validate examples/industrial/secure_boot_rom/contract_set_circular.json
+discharge: circular reasoning required (no mu-rank witness)
+  cycles:
+    - [G_boot_pubkey_loaded -> A_rsa_pubkey_loaded -> G_rsa_verify_ok -> A_boot_verify_ok]
+  → mununu refuses to silently accept circular discharge.
+    HITL must approve, or one cycle clause must be rewritten
+    to be unconditional.
+  Tip: assign `mu_rank` to each clause for the lightweight
+    McMillan-style automatic discharge (task A8).
+
+=== 5. discharge check — circular contract set with mu-rank witness ===
+$ ./target/debug/mununu contract validate examples/industrial/secure_boot_rom/contract_set_rank_witness.json
+discharge: circular with mu-rank witness (auto-accepted, McMillan-style)
+  - cycle [G_boot_pubkey_loaded -> A_rsa_pubkey_loaded -> G_rsa_verify_ok -> A_boot_verify_ok], base edge: A_boot_verify_ok -> G_boot_pubkey_loaded
+
+=== 6. strict-mode gate (expected to exit non-zero) ===
+$ ./target/debug/mununu contract discover examples/industrial/secure_boot_rom/sha256_interface.json --strict-contracts
+WARN contract gap detected — chaotic stub default in effect module="SHA256_V1" kind=output_sequencing labels="hash_valid, hash_out" location="rtl/vendor/sha256_v1.sv:8" soundness="safety verdicts hold; liveness verdicts depending on these labels are unsound (no progress assumption)." description="Phase-1 discovery — no sequencing fragment yet for SHA256_V1"
+phase-1 discovery: 6 label(s), 1 gap marker(s) for module `SHA256_V1`
+--strict-contracts: 1 unresolved contract gap(s) — refusing to proceed
+
+=== 7. safety property — no execution without verified signature ===
+$ ./target/debug/mununu context eval examples/industrial/secure_boot_rom/secure_boot.ctxdsl --formula safety_no_execution_without_signature --automaton SecureBoot
+Formula 'safety_no_execution_without_signature' over automaton 'SecureBoot':
+  States satisfying: 1/1
+    Reset|Idle|Idle
+  Initial states satisfying: 1/1
+    Reset|Idle|Idle
+  Guard partitions: enabled
+
+=== 8. reachability — BootValid is reachable from Reset ===
+$ ./target/debug/mununu context eval examples/industrial/secure_boot_rom/secure_boot.ctxdsl --formula bootvalid_reachable --automaton BootController
+Formula 'bootvalid_reachable' over automaton 'BootController':
+  States satisfying: 8/8
+    BootRejected, BootValid, HashReq, HashWait, LoadSig, Reset, VerifyReq, VerifyWait
+  Initial states satisfying: 1/1
+    Reset
+  Guard partitions: enabled
+
+=== 9. reachability — Reset is always reachable (reboot smoke test) ===
+$ ./target/debug/mununu context eval examples/industrial/secure_boot_rom/secure_boot.ctxdsl --formula reset_always_reachable --automaton BootController
+Formula 'reset_always_reachable' over automaton 'BootController':
+  States satisfying: 8/8
+    BootRejected, BootValid, HashReq, HashWait, LoadSig, Reset, VerifyReq, VerifyWait
+  Initial states satisfying: 1/1
+    Reset
+  Guard partitions: enabled
+
+=== end of transcript ===

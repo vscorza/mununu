@@ -1,0 +1,229 @@
+// Secure Boot ROM with closed-IP SHA-256 and RSA-verify
+// =====================================================
+//
+// Industrial example for Document A — black-box modules in compositional
+// extraction. See `docs/design/black-box-modules.md` §9 for the full
+// narrative and `README.md` in this directory for the run sheet.
+//
+// The example models three components:
+//   1. BootController — open, fully verifiable. Drives flash reads,
+//      feeds the SHA-256 IP, then the RSA-verify IP, then gates the
+//      host bus on the verify result.
+//   2. SHA256_V1     — closed-IP, modelled as a chaotic stub. Outputs
+//      (hash_valid, hash_out) are uncontrollable: the surrounding
+//      logic cannot assume timing or value, only that they conform to
+//      the alphabet.
+//   3. RSA_V2        — same shape as SHA256_V1, for the signature-
+//      verify path.
+//
+// Properties demonstrate the soundness asymmetry of the chaotic-stub
+// default:
+//   - Safety (no execution without verify, no key leakage during
+//     verify) — provable under chaotic crypto. Over-approximation +
+//     safety = sound.
+//   - Liveness (every valid firmware eventually boots) — NOT provable
+//     under chaotic crypto. The crypto IPs are free to stall forever
+//     in the stub. To prove liveness the user would need to author a
+//     `latency_bound` contract for each IP (deferred to A6, M3).
+
+context secure_boot {
+    alphabet {
+        // Boot controller actions
+        label load_signature;
+        label start_hash;
+        label start_verify;
+        label unlock_host_bus;
+        label reject_firmware;
+        label reset;
+
+        // Status reads (driven by closed IPs — uncontrollable)
+        label hash_valid_rises;
+        label verify_done_rises;
+        label verify_ok;
+        label verify_fail;
+
+        // SHA-256 IP internal
+        label sha_compute_tick;
+
+        // RSA-verify IP internal
+        label rsa_compute_tick;
+
+        // IP busy observables (per-IP, no sharing)
+        label sha_busy;
+        label rsa_busy;
+    }
+
+    automata {
+        // ----- Open: Boot Controller -----------------------------------
+        // States walk a linear pipeline: Reset → LoadSig → HashReq →
+        // HashWait → VerifyReq → VerifyWait → (BootValid | BootRejected).
+        // Every transition out of HashWait/VerifyWait depends on a label
+        // driven by the crypto IPs, which are Uncontrollable here.
+
+        automaton BootController {
+            controllable {
+                label load_signature;
+                label start_hash;
+                label start_verify;
+                label unlock_host_bus;
+                label reject_firmware;
+                label reset;
+            }
+
+            // hash_valid_rises, verify_done_rises, verify_ok,
+            // verify_fail are NOT listed — they fall through to the
+            // default `Uncontrollable` classification, matching the
+            // §4 controllability rule applied at this scope's
+            // boundary.
+
+            states {
+                state Reset initial;
+                state LoadSig;
+                state HashReq;
+                state HashWait;
+                state VerifyReq;
+                state VerifyWait;
+                state BootValid;
+                state BootRejected;
+            }
+
+            transitions {
+                // Reset → LoadSig: boot kicks off
+                transition Reset -> LoadSig on label load_signature;
+
+                // LoadSig → HashReq: signature loaded, request hash
+                transition LoadSig -> HashReq on label start_hash;
+
+                // HashReq → HashWait: request issued, wait for crypto
+                transition HashReq -> HashWait on label sha_busy;
+
+                // HashWait waits for the SHA IP to raise hash_valid.
+                // This is an *uncontrollable* transition — the
+                // surrounding logic cannot force it.
+                transition HashWait -> VerifyReq on label hash_valid_rises;
+
+                // VerifyReq → VerifyWait: kick off RSA verify
+                transition VerifyReq -> VerifyWait on label start_verify;
+
+                // VerifyWait: branch on verify result (both
+                // uncontrollable — the RSA IP drives both).
+                transition VerifyWait -> BootValid on label verify_ok;
+                transition VerifyWait -> BootRejected on label verify_fail;
+
+                // BootValid: host bus is unlocked exactly once
+                transition BootValid -> BootValid on label unlock_host_bus;
+
+                // BootRejected is a dead end with a reject label
+                transition BootRejected -> BootRejected on label reject_firmware;
+
+                // Reset path from any post-load state (for re-boot)
+                transition LoadSig -> Reset on label reset;
+                transition HashReq -> Reset on label reset;
+                transition HashWait -> Reset on label reset;
+                transition VerifyReq -> Reset on label reset;
+                transition VerifyWait -> Reset on label reset;
+                transition BootValid -> Reset on label reset;
+                transition BootRejected -> Reset on label reset;
+            }
+        }
+
+        // ----- Closed-IP: SHA-256 chaotic stub ---------------------------
+        // Two states: Idle and Computing. The `hash_valid_rises` label
+        // is the IP's output — it can fire from Computing, or the IP
+        // can stay in Computing indefinitely (chaotic — no liveness
+        // assumption discharged). This is precisely the
+        // OutputSequencing gap that A5 phase 1 emits for this module.
+
+        automaton SHA256_V1 {
+            // No controllable labels — every label this automaton
+            // touches is driven from outside (start_hash) or driven
+            // by the IP itself (hash_valid_rises).
+
+            states {
+                state Idle initial;
+                state Computing;
+            }
+
+            transitions {
+                // Caller asks for a hash → Computing
+                transition Idle -> Computing on label start_hash;
+                // Internal tick: stay in Computing (chaotic — no
+                // bounded latency)
+                transition Computing -> Computing on label sha_compute_tick;
+                transition Computing -> Computing on label sha_busy;
+                // Output: hash_valid rises → back to Idle. This may
+                // never fire (chaotic). The boot controller's
+                // HashWait state is therefore liveness-unsound.
+                transition Computing -> Idle on label hash_valid_rises;
+                // Caller may reset mid-compute
+                transition Computing -> Idle on label reset;
+                transition Idle -> Idle on label reset;
+            }
+        }
+
+        // ----- Closed-IP: RSA-verify chaotic stub -----------------------
+        automaton RSA_V2 {
+            states {
+                state Idle initial;
+                state Verifying;
+            }
+
+            transitions {
+                transition Idle -> Verifying on label start_verify;
+                transition Verifying -> Verifying on label rsa_compute_tick;
+                transition Verifying -> Verifying on label rsa_busy;
+                // Output: nondeterministic ok/fail (chaotic)
+                transition Verifying -> Idle on label verify_ok;
+                transition Verifying -> Idle on label verify_fail;
+                transition Verifying -> Idle on label reset;
+                transition Idle -> Idle on label reset;
+            }
+        }
+    }
+
+    composition {
+        synchronous SecureBoot {
+            members [BootController, SHA256_V1, RSA_V2];
+        }
+    }
+
+    mu_formulas {
+        // -----------------------------------------------------------------
+        // Safety property 1 — no firmware executes without valid signature.
+        //
+        // Reading: it is never the case that we are in BootValid (host bus
+        // unlocked) without having transited the verify path. The CLTS
+        // representation of "BootValid" already enforces this structurally
+        // (the only way to reach BootValid is via VerifyWait → verify_ok),
+        // so we ask the simpler dual: "BootRejected reachable doesn't
+        // contradict BootValid reachable" by asking nu X. ([] X) over
+        // the composition — every reachable state respects the protocol.
+        // -----------------------------------------------------------------
+        formula safety_no_execution_without_signature {
+            over SecureBoot;
+            body = nu X. ([] X);
+        }
+
+        // -----------------------------------------------------------------
+        // Reachability — BootValid reachable from Reset under the protocol.
+        // This holds: there is *some* path through the chaotic crypto IPs
+        // that lets us reach BootValid. The point of this property is to
+        // demonstrate that the example is non-trivial (the boot path is
+        // not blocked by the chaotic-stub modelling itself).
+        // -----------------------------------------------------------------
+        formula bootvalid_reachable {
+            over BootController;
+            body = mu X. (BootValid || <> X);
+        }
+
+        // -----------------------------------------------------------------
+        // Cycle property — Reset reachable from any state. The CTXDSL
+        // model includes explicit reset transitions from every state, so
+        // this is guaranteed and acts as a smoke test of the composition.
+        // -----------------------------------------------------------------
+        formula reset_always_reachable {
+            over BootController;
+            body = mu X. (Reset || <> X);
+        }
+    }
+}

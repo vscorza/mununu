@@ -1,0 +1,28 @@
+{
+  "_doc": [
+    "Same cycle shape as contract_set_circular.json, but every clause",
+    "now carries a mu_rank annotation. The lightweight McMillan-style",
+    "check (task A8) finds a strict rank descent around the cycle with",
+    "a single base edge — the discharge is auto-accepted.",
+    "",
+    "Ranks chosen so that walking the cycle in discharge-edge order",
+    "(G_boot_pubkey_loaded → A_rsa_pubkey_loaded → G_rsa_verify_ok →",
+    " A_boot_verify_ok → G_boot_pubkey_loaded) gives deltas",
+    "(-1, -1, -1, +3): three strict descents and one base edge.",
+    "",
+    "Expected verdict: discharge: circular with mu-rank witness"
+  ],
+  "clauses": [
+    { "id": "G_boot_pubkey_loaded", "kind": "guarantee",  "owner": "BootController", "mu_rank": 4 },
+    { "id": "A_rsa_pubkey_loaded",  "kind": "assumption", "owner": "RSA_V2",         "mu_rank": 3 },
+    { "id": "G_rsa_verify_ok",      "kind": "guarantee",  "owner": "RSA_V2",         "mu_rank": 2 },
+    { "id": "A_boot_verify_ok",     "kind": "assumption", "owner": "BootController", "mu_rank": 1 }
+  ],
+  "discharges": [
+    { "discharger": "G_boot_pubkey_loaded", "dischargee": "A_rsa_pubkey_loaded" },
+    { "discharger": "A_rsa_pubkey_loaded",  "dischargee": "G_rsa_verify_ok" },
+    { "discharger": "G_rsa_verify_ok",      "dischargee": "A_boot_verify_ok" },
+    { "discharger": "A_boot_verify_ok",     "dischargee": "G_boot_pubkey_loaded" }
+  ],
+  "environment_assumptions": []
+}
