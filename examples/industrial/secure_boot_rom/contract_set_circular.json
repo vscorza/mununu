@@ -1,0 +1,25 @@
+{
+  "_doc": [
+    "Deliberately broken variant: the boot controller's pubkey-loaded",
+    "guarantee depends on RSA producing a verify_ok beforehand (an",
+    "implementation mistake), creating a circular A/G dependency.",
+    "",
+    "Cycle:  G_boot_pubkey_loaded → A_rsa_pubkey_loaded → G_rsa_verify_ok",
+    "        → A_boot_verify_ok → G_boot_pubkey_loaded",
+    "",
+    "Expected verdict: discharge: circular reasoning required (no rank witness)"
+  ],
+  "clauses": [
+    { "id": "G_boot_pubkey_loaded", "kind": "guarantee",  "owner": "BootController" },
+    { "id": "A_rsa_pubkey_loaded",  "kind": "assumption", "owner": "RSA_V2" },
+    { "id": "G_rsa_verify_ok",      "kind": "guarantee",  "owner": "RSA_V2" },
+    { "id": "A_boot_verify_ok",     "kind": "assumption", "owner": "BootController" }
+  ],
+  "discharges": [
+    { "discharger": "G_boot_pubkey_loaded", "dischargee": "A_rsa_pubkey_loaded" },
+    { "discharger": "A_rsa_pubkey_loaded",  "dischargee": "G_rsa_verify_ok" },
+    { "discharger": "G_rsa_verify_ok",      "dischargee": "A_boot_verify_ok" },
+    { "discharger": "A_boot_verify_ok",     "dischargee": "G_boot_pubkey_loaded" }
+  ],
+  "environment_assumptions": []
+}

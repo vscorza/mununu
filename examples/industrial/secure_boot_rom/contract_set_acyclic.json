@@ -1,0 +1,32 @@
+{
+  "_doc": [
+    "Acyclic discharge graph for the secure boot composition.",
+    "",
+    "Reading the clauses:",
+    "  - G_boot_pubkey_loaded:  the boot controller guarantees pubkey is",
+    "                           loaded before start_verify rises.",
+    "  - A_rsa_pubkey_loaded:   the RSA IP assumes pubkey is loaded.",
+    "                           Discharged by G_boot_pubkey_loaded.",
+    "  - G_boot_data_presented: the boot controller guarantees data_in is",
+    "                           stable across start_hash.",
+    "  - A_sha_data_presented:  the SHA IP assumes data is stable.",
+    "                           Discharged by G_boot_data_presented.",
+    "  - A_boot_reset_clean:    the boot controller assumes a clean reset.",
+    "                           Declared as a top-level environment",
+    "                           assumption (no in-graph discharger needed).",
+    "",
+    "Expected verdict: discharge: acyclic"
+  ],
+  "clauses": [
+    { "id": "G_boot_pubkey_loaded",  "kind": "guarantee",  "owner": "BootController" },
+    { "id": "A_rsa_pubkey_loaded",   "kind": "assumption", "owner": "RSA_V2" },
+    { "id": "G_boot_data_presented", "kind": "guarantee",  "owner": "BootController" },
+    { "id": "A_sha_data_presented",  "kind": "assumption", "owner": "SHA256_V1" },
+    { "id": "A_boot_reset_clean",    "kind": "assumption", "owner": "BootController" }
+  ],
+  "discharges": [
+    { "discharger": "G_boot_pubkey_loaded",  "dischargee": "A_rsa_pubkey_loaded" },
+    { "discharger": "G_boot_data_presented", "dischargee": "A_sha_data_presented" }
+  ],
+  "environment_assumptions": ["A_boot_reset_clean"]
+}

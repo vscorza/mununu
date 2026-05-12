@@ -1,0 +1,13 @@
+{
+  "name": "SHA256_V1",
+  "ports": [
+    { "name": "clk",          "direction": "Input",  "description": "clock" },
+    { "name": "reset_n",      "direction": "Input",  "description": "async reset, active low" },
+    { "name": "start_hash",   "direction": "Input",  "description": "rising edge starts a SHA-256 compute" },
+    { "name": "data_in",      "direction": "Input",  "description": "32-bit data word for current block" },
+    { "name": "hash_valid",   "direction": "Output", "description": "rises when hash_out is stable" },
+    { "name": "hash_out",     "direction": "Output", "description": "256-bit digest, valid while hash_valid is high" }
+  ],
+  "source_file": "rtl/vendor/sha256_v1.sv",
+  "source_line": 8
+}
