@@ -1,0 +1,39 @@
+{
+  "_note": "Fault-tolerance contract set for the 4-bit DMR commit gate. Discharge is a linear chain: A_env <- G_compare <- G_commit <- G_top. Tarjan SCC returns Acyclic. See README.md for what the contract does and does not entail.",
+  "clauses": [
+    {
+      "id": "A_env",
+      "kind": "assumption",
+      "owner": "env",
+      "description": "Adversary may flip exactly ONE bit of replica_a's output (y_a) per cycle. Encoded structurally as `y_a ^ (4'b0001 << flip_idx)` gated by flip_en. The mask is one-hot by construction — MBU is excluded by encoding, not by assumption.",
+      "provenance": "user_authored"
+    },
+    {
+      "id": "G_compare",
+      "kind": "guarantee",
+      "owner": "comparator",
+      "description": "Combinational signal `equal` is high iff y_a_post == y_b. Structurally derived from the SV body; under A_env the comparator de-asserts on any one-hot flip.",
+      "provenance": "user_authored"
+    },
+    {
+      "id": "G_commit",
+      "kind": "guarantee",
+      "owner": "commit_stage",
+      "description": "broadcast_valid and commit_valid only assert when the previous cycle's `equal` was high. Same-cycle registers; no detached commit path.",
+      "provenance": "user_authored"
+    },
+    {
+      "id": "G_top",
+      "kind": "invariant",
+      "owner": "dmr_top",
+      "description": "Observer `corrupted_broadcast` never latches. Equivalently: every cycle where commit_valid is high has broadcast_data == y_b_q (the pipelined fault-free reference).",
+      "provenance": "user_authored"
+    }
+  ],
+  "discharges": [
+    { "discharger": "G_compare", "dischargee": "A_env" },
+    { "discharger": "G_commit", "dischargee": "G_compare" },
+    { "discharger": "G_top", "dischargee": "G_commit" }
+  ],
+  "environment_assumptions": ["A_env"]
+}

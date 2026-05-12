@@ -1,0 +1,25 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "dmr_top_broken",
+  "source": "dmr_top_broken.sv",
+  "_note": "Sidecar for the broken (negative control) variant. Same one-hot fault model as dmr_top.mununu.json; expected verdict on no_corrupt_broadcast is UNSAT.",
+  "signals": [
+    { "name": "commit_valid_r",       "abstraction": "boolean" },
+    { "name": "broadcast_valid_r",    "abstraction": "boolean" },
+    { "name": "broadcast_data_r",     "abstraction": "bounded_counter", "bound": 15 },
+    { "name": "y_b_q",                "abstraction": "bounded_counter", "bound": 15 },
+    { "name": "corrupted_broadcast_r","abstraction": "boolean" }
+  ],
+  "inputs": [
+    { "name": "x",        "abstraction": "bounded_counter", "bound": 15 },
+    { "name": "flip_idx", "abstraction": "bounded_counter", "bound": 3 },
+    { "name": "flip_en",  "abstraction": "boolean" }
+  ],
+  "properties": [
+    {
+      "id": "no_corrupt_broadcast",
+      "formula": "nu X. (!corrupted_broadcast_r_T && [] X)",
+      "description": "Same safety property as the intact design. Expected verdict: UNSAT — the observer latches as soon as flip_en=1 fires a one-hot flip and the commit register propagates the corrupted value."
+    }
+  ]
+}
