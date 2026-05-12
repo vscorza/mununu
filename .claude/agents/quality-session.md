@@ -156,3 +156,4 @@ Write `.quality/sessions/<session-id>/report.md` containing:
 - **Never delete a test to close a cell.** Tests are load-bearing evidence.
 - **Never widen a threshold.** Thresholds in `.quality/thresholds.toml` change only via their own PR.
 - **Step size limit**: if a step would touch > 150 lines or > 3 files, break it down further.
+- **Renames and removals re-anchor docs.** If a Phase-5 step renames, moves, or removes a Rust symbol that is referenced from `wiki/**`, `docs/**`, `README.md`, or `examples/**/README.md`, the same step must update every affected anchor and the session must run `/docs-traceability` on the touched doc paths before the matrix cell is allowed to clear. See `CLAUDE.md` → Governance Rules → **Documentation Traceability**. A session that leaves a broken anchor is not "done" even if metrics improved.

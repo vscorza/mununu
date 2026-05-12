@@ -66,6 +66,21 @@ enum ContractCommand {
     /// Reads a JSON ContractSet, runs Tarjan SCC over the
     /// guarantor→consumer graph, reports the verdict.
     Validate(ContractValidateArgs),
+    /// Inspect a gap-marker report; emit diagnostics and optional sidecar.
+    ///
+    /// Consumes a JSON `GapMarkerReport` (typically produced by the
+    /// discovery pipeline, task A5). Emits one structured diagnostic per
+    /// gap, optionally writes a `.contract.todo.json` skeleton, and
+    /// returns a non-zero exit code under `--strict-contracts`.
+    Gaps(ContractGapsArgs),
+    /// Discover a phase-1 contract from a black-box interface description.
+    ///
+    /// Reads a JSON `BlackBoxInterface` (module name + ordered port list
+    /// with directions), classifies each label via the shared
+    /// controllability rule (task A4), and emits gap markers describing
+    /// what is still unknown (task A5 phase 1). The full automaton /
+    /// formula discovery from source comments + corpus is phase 2/3.
+    Discover(ContractDiscoverArgs),
 }
 
 #[derive(Args, Debug)]
@@ -74,6 +89,54 @@ struct ContractValidateArgs {
     #[arg(value_name = "CONTRACT_SET")]
     contract_set: PathBuf,
     /// Output the verdict as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ContractDiscoverArgs {
+    /// Path to the black-box interface JSON.
+    /// Schema: `mununu_core::contract::discover::BlackBoxInterface`.
+    #[arg(value_name = "INTERFACE")]
+    interface: PathBuf,
+    /// Force these labels to Controllable regardless of port direction.
+    /// Escape hatch per Document A §4.ii.
+    #[arg(long, value_name = "LABELS")]
+    force_controllable: Vec<String>,
+    /// Force these labels to Uncontrollable regardless of port direction.
+    #[arg(long, value_name = "LABELS")]
+    force_uncontrollable: Vec<String>,
+    /// Emit an additional `Fairness` gap marker. Off by default — the
+    /// adapter knows whether the module has any liveness story.
+    #[arg(long)]
+    emit_fairness_gap: bool,
+    /// Output the Phase1Output as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Treat any emitted gap marker as a hard error.
+    #[arg(long)]
+    strict_contracts: bool,
+    /// Write a `.contract.todo.json` sidecar next to the source file
+    /// at this path.
+    #[arg(long, value_name = "SOURCE")]
+    write_sidecar: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ContractGapsArgs {
+    /// Path to the gap-marker report JSON
+    /// (matches `mununu_core::contract::gap::GapMarkerReport`).
+    #[arg(value_name = "GAP_REPORT")]
+    gap_report: PathBuf,
+    /// Fail with a non-zero exit code if the report contains any gap.
+    /// Use in CI for safety-critical projects.
+    #[arg(long)]
+    strict_contracts: bool,
+    /// Write a `.contract.todo.json` skeleton next to the source file
+    /// at this path (the sidecar is created as `<file>.contract.todo.json`).
+    #[arg(long, value_name = "SOURCE")]
+    write_sidecar: Option<PathBuf>,
+    /// Emit the report as JSON to stdout (in addition to diagnostics).
     #[arg(long)]
     json: bool,
 }
@@ -395,7 +458,100 @@ fn handle_extraction(command: ExtractionCommand) -> Result<(), String> {
 fn handle_contract(command: ContractCommand) -> Result<(), String> {
     match command {
         ContractCommand::Validate(args) => contract_validate(args),
+        ContractCommand::Gaps(args) => contract_gaps(args),
+        ContractCommand::Discover(args) => contract_discover(args),
     }
+}
+
+fn contract_discover(args: ContractDiscoverArgs) -> Result<(), String> {
+    use mununu::contract::discover::{BlackBoxInterface, DiscoverOptions, discover_phase1};
+
+    let body = std::fs::read_to_string(&args.interface)
+        .map_err(|e| format!("failed to read {}: {e}", args.interface.display()))?;
+    let iface: BlackBoxInterface =
+        serde_json::from_str(&body).map_err(|e| format!("failed to parse interface JSON: {e}"))?;
+
+    let force_c: Vec<&str> = args.force_controllable.iter().map(|s| s.as_str()).collect();
+    let force_u: Vec<&str> = args
+        .force_uncontrollable
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let opts = DiscoverOptions {
+        force_controllable: &force_c,
+        force_uncontrollable: &force_u,
+        emit_fairness_gap: args.emit_fairness_gap,
+    };
+    let output = discover_phase1(&iface, &opts);
+    output.gaps.emit_diagnostics();
+
+    if let Some(source) = &args.write_sidecar {
+        let target = output
+            .gaps
+            .write_todo_sidecar(source)
+            .map_err(|e| format!("failed to write contract.todo.json: {e}"))?;
+        println!("wrote sidecar: {}", target.display());
+    }
+
+    if args.json {
+        let rendered = serde_json::to_string_pretty(&output)
+            .map_err(|e| format!("failed to serialise output: {e}"))?;
+        println!("{rendered}");
+    } else {
+        println!(
+            "phase-1 discovery: {} label(s), {} gap marker(s) for module `{}`",
+            output.labels.len(),
+            output.gaps.len(),
+            output.module
+        );
+    }
+
+    if args.strict_contracts && output.gaps.is_strict_failure() {
+        return Err(format!(
+            "--strict-contracts: {} unresolved contract gap(s) — refusing to proceed",
+            output.gaps.len()
+        ));
+    }
+    Ok(())
+}
+
+fn contract_gaps(args: ContractGapsArgs) -> Result<(), String> {
+    use mununu::contract::gap::GapMarkerReport;
+
+    let body = std::fs::read_to_string(&args.gap_report)
+        .map_err(|e| format!("failed to read {}: {e}", args.gap_report.display()))?;
+    let report: GapMarkerReport =
+        serde_json::from_str(&body).map_err(|e| format!("failed to parse gap report JSON: {e}"))?;
+
+    // Always emit structured diagnostics so the user sees every gap.
+    report.emit_diagnostics();
+
+    if let Some(source) = &args.write_sidecar {
+        let target = report
+            .write_todo_sidecar(source)
+            .map_err(|e| format!("failed to write contract.todo.json sidecar: {e}"))?;
+        println!("wrote sidecar: {}", target.display());
+    }
+
+    if args.json {
+        let rendered = serde_json::to_string_pretty(&report)
+            .map_err(|e| format!("failed to serialise report: {e}"))?;
+        println!("{rendered}");
+    } else {
+        println!(
+            "gap report: {} marker(s) across {} module(s)",
+            report.len(),
+            report.by_module().len(),
+        );
+    }
+
+    if args.strict_contracts && report.is_strict_failure() {
+        return Err(format!(
+            "--strict-contracts: {} unresolved contract gap(s) — refusing to proceed",
+            report.len()
+        ));
+    }
+    Ok(())
 }
 
 fn contract_validate(args: ContractValidateArgs) -> Result<(), String> {
@@ -439,11 +595,31 @@ fn render_discharge_verdict_text(verdict: &mununu::contract::discharge::Discharg
                 }
             }
         }
+        DischargeVerdict::CircularWithRankWitness {
+            cycles,
+            acyclic_remainder,
+        } => {
+            println!("discharge: circular with mu-rank witness (auto-accepted, McMillan-style)");
+            for cycle in cycles {
+                println!(
+                    "  - cycle [{}], base edge: {} -> {}",
+                    cycle.cycle.join(" -> "),
+                    cycle.base_edge.0,
+                    cycle.base_edge.1,
+                );
+            }
+            if !acyclic_remainder.is_empty() {
+                println!("  acyclic remainder:");
+                for id in acyclic_remainder {
+                    println!("    - {id}");
+                }
+            }
+        }
         DischargeVerdict::Circular {
             cycles,
             acyclic_remainder,
         } => {
-            println!("discharge: circular reasoning required");
+            println!("discharge: circular reasoning required (no mu-rank witness)");
             println!("  cycles:");
             for cycle in cycles {
                 println!("    - [{}]", cycle.join(" -> "));
@@ -457,6 +633,8 @@ fn render_discharge_verdict_text(verdict: &mununu::contract::discharge::Discharg
             println!("  → mununu refuses to silently accept circular discharge.");
             println!("    HITL must approve, or one cycle clause must be rewritten");
             println!("    to be unconditional.");
+            println!("  Tip: assign `mu_rank` to each clause for the lightweight");
+            println!("    McMillan-style automatic discharge (task A8).");
         }
         DischargeVerdict::PotentiallyCircular {
             unresolved,
@@ -497,6 +675,12 @@ fn render_discharge_verdict_text_indented(
         }
         DischargeVerdict::Circular { cycles, .. } => {
             println!("{pad}circular ({} cycle(s))", cycles.len());
+        }
+        DischargeVerdict::CircularWithRankWitness { cycles, .. } => {
+            println!(
+                "{pad}circular with mu-rank witness ({} cycle(s))",
+                cycles.len()
+            );
         }
         DischargeVerdict::PotentiallyCircular { unresolved, .. } => {
             println!(

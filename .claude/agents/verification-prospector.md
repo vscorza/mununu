@@ -290,8 +290,8 @@ N targets proposed (Class A: x, B: y, C: z, D: w). Domains covered. Highest-impa
 For each:
 - ID, name, source URL, commit pin
 - Bug class + CWE/CVE
-- Adapter path + state-space estimate
-- Property skeleton (mu-calculus or template_ref)
+- Adapter path + state-space estimate — name the live Rust adapter module that will process the target (e.g., `crates/mununu-core/src/adapter/systemverilog/mod.rs`) and the surface that will expose it (CLI subcommand, API route, UI workflow). A target that cannot be tied to an existing adapter symbol must list the adapter as `new — proposed` and append a Phase 6.5 GAP entry so the proposal is traceable to either alive code or an explicit gap.
+- Property skeleton (mu-calculus or template_ref) — if the skeleton uses a template, cite the template's registry entry path (`crates/mununu-core/src/adapter/templates/...rs`); template references with no registry entry are rejected at Phase 4.
 - Reproduction status
 - Effort (S/M/L/XL)
 - Rigor class (A/B/C/D — see below)
@@ -665,6 +665,7 @@ This makes the handoff state explicit so the main session always knows whether t
 6. **Self-improvement is non-mutating.** Phase 6 may write `agent-evolution.md` and Phase 7 may write `pending-amendments.md`, but neither this agent nor `target-executor` edits any agent definition file in place. The user reviews and applies amendments manually via the main session.
 7. **No execution of demonstrations.** Class C and D targets are NEVER passed to `target-executor` — running a synthetic demo through the pipeline produces no real-system evidence and dilutes the executor's reports.
 8. **Class-promotion requires evidence.** A target's `Rigor` may move from B to A only when the executor's verdict witnessed the bug AND the bug report's behavior is reproducible. Otherwise, the rigor class stays put — even after a successful execution.
+9. **Traceability of proposals.** Every proposed target must name (a) the live Rust adapter module that will consume it and (b) the user-facing surface (CLI subcommand, API route, UI workflow) that will expose the verification. Proposals that cannot tie back to existing code must include a paired Phase 6.5 gap entry, satisfying `CLAUDE.md` → Governance Rules → **Documentation Traceability**. The report's §2 "Targets Proposed" entries serve as the anchors for any public claim derived from this session.
 
 ## Reuse from existing agents
 

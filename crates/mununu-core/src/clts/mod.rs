@@ -244,7 +244,9 @@ pub enum CltsError {
 pub type CltsResult<T> = std::result::Result<T, CltsError>;
 
 /// Classification of label controllability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum LabelControllability {
     /// Controllable: The system can choose to take this action.
     Controllable,

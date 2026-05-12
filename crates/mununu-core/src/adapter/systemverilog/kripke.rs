@@ -1018,6 +1018,15 @@ fn annotation_to_domain(name: &str, ann: &DomainAnnotationKind) -> FieldDomain {
     }
 }
 
+/// Classify a SystemVerilog signal as Input / Output / Internal /
+/// Neutral. This is the SV-side mapping of the shared port-direction
+/// rule from `crate::controllability` (Document A §4); the custom-SV
+/// pipeline historically classified into `SignalKind` rather than the
+/// CLTS `LabelControllability`, so this thin wrapper preserves the
+/// established surface while documenting the connection.
+///
+/// Override lists are still honoured as escape hatches per
+/// Document A §4.ii.
 fn classify_signal(
     name: &str,
     controllable: &HashSet<&str>,
@@ -1030,7 +1039,8 @@ fn classify_signal(
     if input_override.contains(name) {
         return SignalKind::Input;
     }
-    // Check port direction
+    // Port direction at the module boundary — the canonical input to the
+    // shared `controllability::classify_from_direction` rule.
     for port in &module.ports {
         if port.name == name {
             return match port.direction {

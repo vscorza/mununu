@@ -12,6 +12,8 @@
 //! as a JSON-serialisable Rust value.
 
 pub mod discharge;
+pub mod discover;
+pub mod gap;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -33,6 +35,14 @@ pub struct ContractClause {
     /// Provenance — where the clause came from.
     #[serde(default)]
     pub provenance: ClauseProvenance,
+    /// Optional mu-calculus rank used by the lightweight McMillan-style
+    /// circular-discharge check (task A8). Roughly: the alternation depth
+    /// at which this clause's underlying fixpoint sits. Larger rank =
+    /// further from the base case. Cycles whose ranks strictly decrease
+    /// at every edge except one designated base edge can be discharged
+    /// by well-founded induction (see `discharge::mu_rank_witness`).
+    #[serde(default)]
+    pub mu_rank: Option<u32>,
 }
 
 /// Kind of contract clause. Mirrors the IR's `PropertyRole` enum but
@@ -168,6 +178,7 @@ mod tests {
             owner: owner.to_string(),
             description: None,
             provenance: ClauseProvenance::UserAuthored,
+            mu_rank: None,
         }
     }
 

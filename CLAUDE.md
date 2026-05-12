@@ -266,6 +266,49 @@ When bumping, run `cargo clippy --workspace --all-targets -- -D warnings` agains
 - Update wiki pages when: DSL syntax changes, new endpoints are added, UI flow changes, new composition modes or formula operators are introduced.
 - Every CTXDSL example in wiki pages must be tested against the binary before publishing.
 - Keep the References page current with new publications and tool comparisons.
+- Every wiki page must comply with **Documentation Traceability** (below). Pages that describe behavior without a source-of-truth anchor are treated as orphaned and slated for removal.
+
+### Documentation Traceability
+
+**Rule**: every documentation page or section that describes a feature, flag, endpoint, file format, syntax form, or behavior must be traceable to a *live* code artifact (Rust `struct` / `enum` / `fn`, clap arg, axum handler, TypeScript client, or a checked-in configuration file) that is reachable from at least one of mununu's three user-facing surfaces — **CLI**, **HTTP API**, or **UI**. Documentation that cannot point at such an artifact is either obsolete, aspirational, or unverifiable, and must be marked or removed.
+
+**Why**: doc rot is the single most common reason users distrust the tool. Anchoring docs to symbols (not prose) lets reviewers grep for drift the moment code is renamed, removed, or made unreachable from any surface. It also forces feature work to ship docs alongside code, instead of after.
+
+**Where this applies**: `wiki/**`, `docs/**` (except `docs/architecture/` design notes and `docs/witness_refinement_plan.md`-style planning docs, which must be tagged `> Status: planning` at the top), `README.md`, `examples/**/README.md`, and the `description:` / inline guidance inside `.claude/agents/**` and `.claude/skills/**`.
+
+**Anchor format**: every H2 / H3 section that documents a concrete capability must carry a *Source of truth* line near the top of the section, formatted as:
+
+```markdown
+> Source of truth: [`<symbol or path>`](<relative path>#L<line>) — surface: CLI | API | UI | (CLI+API+UI)
+```
+
+The `<relative path>` must be a real file in this workspace (`crates/...`, `mununu-ui/...`, `tools/...`, etc.). Line numbers are optional but recommended when pointing at a specific item inside a long file. The surface tag declares which of the three surfaces actually exposes the documented behavior:
+
+- **CLI**: a clap subcommand or flag in `crates/mununu-cli/src/main.rs`
+- **API**: a handler in `crates/mununu-core/src/api/handlers.rs` (route in `server.rs`, types in `models.rs`)
+- **UI**: a typed client in `mununu-ui/src/api/endpoints.ts` or a hook/component that exercises the behavior
+
+A section may legitimately tag a single surface (e.g., a CLI-only developer convenience) but must justify the single-surface choice in the same line: `surface: CLI-only — developer convenience that decomposes into /import + /eval on the API`.
+
+**What this does NOT cover**:
+
+- Pedagogical "concept" sections that explain *what* mu-calculus is, *what* a Kripke structure is, etc. — these anchor to a textbook reference, not to code. Tag them `> Concept: <one-line>` so the docs-traceability skill skips them.
+- Planning, vision, or future-work documents — tag them `> Status: planning` at the top of the file.
+- Tutorial prose that walks the reader through running an example — these anchor to the example file path (which itself must be reachable from all three surfaces under the existing parity rules).
+
+**Acceptable forms of "alive"**:
+
+- The symbol is referenced (not just declared) by code that ends up on a user-facing surface — `git grep` finds at least one call site that the CLI, API, or UI exercises.
+- The configuration file is consumed by a binary or test target that ships (`tools/extraction_spec_schema.json`, `rust-toolchain.toml`, `docker/Dockerfile.dev`).
+
+**Unacceptable**:
+
+- Anchoring to a symbol that is `#[allow(dead_code)]`, only referenced by deleted tests, or behind a non-default feature flag that no surface enables.
+- Anchoring to a file outside the repo, a closed-source dependency, or `mununu-private/`.
+
+**Drift detection**: the `/docs-traceability` skill (run by `/review-orchestrator` and `/domain-adequacy`) walks every Markdown file under the covered paths, parses the `> Source of truth:` lines, and verifies each anchor (a) resolves to a real path, (b) the symbol exists at the cited line (when a line is given), and (c) the surface tag matches at least one reachable mention on that surface. Broken anchors fail the check. New sections without an anchor fail the check unless tagged `> Concept:` or `> Status: planning`.
+
+**When code is renamed or removed**: the same commit must update every documentation anchor that points at the old symbol. The `/parity-check` and `/docs-traceability` skills are complementary — `/parity-check` confirms a *feature* is wired across surfaces; `/docs-traceability` confirms a *doc page* still points at code that exists. Both must pass for a change to ship.
 
 ### Soundness Guarantees
 

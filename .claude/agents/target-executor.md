@@ -388,6 +388,7 @@ Raw output excerpts at `staging/{target_id}/eval-*.txt`.
 - BoundOverflow warnings? {none | list with bounds}
 - Weak property flag? {none | property id}
 - Abstraction justifications: {complete | gaps: list}
+- Code anchors: every soundness claim that references mununu behavior (e.g., "the SV adapter encodes nondeterminism via …", "the Kripke builder uses over-approximation when guard evaluation returns None") MUST cite the live Rust file:line that implements the cited behavior. Use the format `[`{symbol}`](crates/.../path.rs#L{line})` so the same anchors satisfy `CLAUDE.md` → Governance Rules → **Documentation Traceability**. If the executor cannot find a code anchor for a claim, downgrade the claim to "asserted by spec, not verified against source" and flag it under Phase 5 issues with tag `soundness`.
 
 ## Phase 5 — Issues encountered
 Each issue tagged: `fetch | modeling | tooling | soundness | scope`.

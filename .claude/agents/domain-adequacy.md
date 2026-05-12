@@ -306,6 +306,16 @@ Pre-existing parity gaps surfaced by `/parity-check` are themselves findings and
 
 When proposing new examples (Phase 3), confirm the example is reachable from all three surfaces. Each new example file should be loadable from the UI's editor (file extension recognized by `ADAPTER_EXTENSIONS`), summarizable via the CLI, and verifiable via the API. If an example only works on the CLI, treat it as an incomplete deliverable.
 
+## Phase 6: Documentation Traceability Check
+
+For every Phase 2 / 3 finding that names a documented feature (anything described under `wiki/**`, `docs/**`, `README.md`, `crates/*/README.md`, or `examples/**/README.md`), invoke the `/docs-traceability` skill on the affected doc paths. Embed the skill's Markdown table verbatim under a new "Documentation Traceability" section of the report, placed immediately after "Tool Change Recommendations".
+
+The skill enforces `CLAUDE.md` → Governance Rules → **Documentation Traceability**: every doc section that describes a feature must point at a live Rust symbol or configuration file reachable from the CLI, HTTP API, or UI. This Phase complements Phase 5 — `/parity-check` confirms a feature *itself* is wired across surfaces; `/docs-traceability` confirms its *documentation* still resolves to existing code on those surfaces.
+
+For each domain inventory in Phase 1, also spot-check that the matching wiki page (`wiki/Adapter-Formats.md`, `wiki/RTL-Verification-Pipeline.md`, `wiki/Agentic-Orchestration.md`, `wiki/Game-Engine-Integration.md`, `wiki/Compositional-Extraction.md`) carries anchors to the adapter source files surfaced in §"Workspace Structure" of `CLAUDE.md`. Orphan pages — those describing a domain whose examples now total zero, or whose adapter source has been removed — must appear under "Cohesion Recommendations" with a recommended remediation (anchor, mark `> Status: planning`, or remove).
+
+When proposing new examples or domains (Phase 3), confirm any accompanying documentation will satisfy traceability: the proposal must name the Rust symbol or config file that will anchor the doc, the surface that will expose it, and the section it will live in.
+
 ## Important Constraints
 
 1. **Never fabricate verification results.** Run the actual CLI command and report what happens.
