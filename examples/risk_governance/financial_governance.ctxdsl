@@ -1,0 +1,199 @@
+// Financial risk-governance protocol
+//
+// Generic pedagogical example. Two FSMs compose into a trading-desk
+// governance supervisor:
+//
+//   DrawdownMonitor    — env drives drawdown moves; controller must reach
+//                        the kill-switch (Halted) once a critical breach
+//                        occurs.
+//   InstrumentValidator — linear workflow gate that any new execution
+//                         instrument must traverse before being deployed
+//                         live. No edge bypasses SimValidated.
+//
+// The joint property `no_deploy_when_halted` fails on the raw async
+// composition (the validator can deploy regardless of drawdown state).
+// Synthesis derives a supervisor that disables deploy_live in any
+// composite state where the drawdown FSM is in Halted.
+//
+// Scope: this models the protocol layer only. Quantitative dynamics
+// (option premium decay, volatility regimes, tail behaviour of any
+// specific derivative) are out of scope and belong in probabilistic
+// model checkers (PRISM, Storm) or Monte Carlo backtesters.
+
+context risk_governance {
+    alphabet {
+        // DrawdownMonitor labels — env drives drawdown moves
+        label dd_5;
+        label dd_10;
+        label dd_critical;
+        label recover;
+        label cut_50pct;
+        label flatten;
+        label reset_session;
+        // InstrumentValidator labels — workflow gating
+        label backtest_pass;
+        label backtest_fail;
+        label sim_validate;
+        label sim_fail;
+        label mark_eligible;
+        label deploy_live;
+        label live_active;
+    }
+
+    automata {
+        // Drawdown response state machine.
+        // Uncontrollable (env): dd_5, dd_10, dd_critical, recover
+        // Controllable (ctrl):  cut_50pct, flatten, reset_session
+        automaton DrawdownMonitor {
+            controllable {
+                label cut_50pct;
+                label flatten;
+                label reset_session;
+            }
+
+            states {
+                state Normal initial {
+                    valuations {
+                        drawdown_pct = 0;
+                        phase = normal;
+                    }
+                };
+                state Watch {
+                    valuations {
+                        drawdown_pct = 5;
+                        phase = watch;
+                    }
+                };
+                state Reducing {
+                    valuations {
+                        drawdown_pct = 15;
+                        phase = reducing;
+                    }
+                };
+                state CriticalBreach {
+                    valuations {
+                        drawdown_pct = 25;
+                        kill_switch_pending = 1;
+                    }
+                };
+                state Halted {
+                    valuations {
+                        drawdown_pct = 25;
+                        kill_switch_active = 1;
+                    }
+                };
+            }
+
+            transitions {
+                // Env drives the drawdown level
+                transition Normal -> Watch on label dd_5;
+                transition Watch -> Normal on label recover;
+                transition Watch -> Reducing on label dd_10;
+                transition Reducing -> Watch on label recover;
+                transition Reducing -> CriticalBreach on label dd_critical;
+                transition CriticalBreach -> CriticalBreach on label dd_critical;
+
+                // Controller's available responses
+                transition Reducing -> Reducing on label cut_50pct;
+                transition CriticalBreach -> Halted on label flatten;
+                transition Halted -> Normal on label reset_session;
+            }
+        }
+
+        // Instrument-validation gate.
+        // Uncontrollable (env): backtest_fail, sim_fail
+        // Controllable (ctrl):  backtest_pass, sim_validate, mark_eligible,
+        //                       deploy_live, live_active
+        //
+        // The linear sequence Proposed -> Backtested -> SimValidated ->
+        // LiveEligible -> Live is enforced structurally: there is no edge
+        // that bypasses SimValidated.
+        automaton InstrumentValidator {
+            controllable {
+                label backtest_pass;
+                label sim_validate;
+                label mark_eligible;
+                label deploy_live;
+                label live_active;
+            }
+
+            states {
+                state Proposed initial;
+                state Backtested;
+                state SimValidated;
+                state LiveEligible;
+                state Live;
+            }
+
+            transitions {
+                transition Proposed -> Backtested on label backtest_pass;
+                transition Proposed -> Proposed on label backtest_fail;
+                transition Backtested -> SimValidated on label sim_validate;
+                transition Backtested -> Proposed on label sim_fail;
+                transition SimValidated -> LiveEligible on label mark_eligible;
+                transition LiveEligible -> Live on label deploy_live;
+                transition Live -> Live on label live_active;
+            }
+        }
+    }
+
+    composition {
+        // Async interleaving: the validator workflow and the drawdown
+        // monitor evolve independently. The joint correctness property
+        // becomes a synthesis constraint, not a structural invariant.
+        asynchronous governance_system {
+            members [DrawdownMonitor, InstrumentValidator];
+        }
+    }
+
+    mu_formulas {
+        // Sanity: every reachable composite state has at least one
+        // outgoing transition.
+        formula no_deadlock {
+            over governance_system;
+            body = nu X. (<> true && [] X);
+        }
+
+        // Bounded liveness: once the drawdown FSM enters CriticalBreach,
+        // Halted is reachable. Under `mununu context synth`, this checks
+        // that the controller can force the kill-switch (flatten is
+        // controllable and CriticalBreach -flatten-> Halted exists).
+        formula kill_switch_bounded_liveness {
+            over governance_system;
+            body = nu X. (
+                ((! CriticalBreach) || (mu Y. (Halted || <> Y)))
+                && ([] X)
+            );
+        }
+
+        // Joint safety: while the drawdown FSM is in Halted, the
+        // deploy_live transition must be disabled. Fails on the raw async
+        // composition — the witness state is Halted|LiveEligible, which
+        // is reachable when env drives drawdown to critical and the
+        // controller flattens while the validator is in LiveEligible.
+        //
+        // mununu's `synth` reports this as unrealizable: the structural
+        // winning region excludes the initial state. The fix requires
+        // either richer modelling (a controller-driven downgrade from
+        // LiveEligible, so the validator can be moved out before
+        // flattening) or game-aware modalities under a turn-based
+        // encoding. See the README for the discussion.
+        formula no_deploy_when_halted {
+            over governance_system;
+            body = nu X. (
+                ((! Halted) || ([deploy_live] false))
+                && ([] X)
+            );
+        }
+    }
+
+    controllers {
+        // Synthesize a supervisor that forces the kill-switch from
+        // CriticalBreach. Realizable: flatten is controllable and reaches
+        // Halted in one step.
+        controller kill_switch_supervisor {
+            source governance_system;
+            satisfying kill_switch_bounded_liveness;
+        }
+    }
+}
