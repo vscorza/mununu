@@ -110,7 +110,7 @@ The canonical tag table, per-language syntax wrappers, and worked example live i
 
 Two layers of contracts:
 
-- **Global properties** (current state). One set of formulas applied to the composed system. Mununu's IR already carries `PropertyRole::{Assumption, Guarantee, Standalone}` ([adapter/ir.rs:211](../../crates/mununu-core/src/adapter/ir.rs#L211)). This layer exists and is wired through.
+- **Global properties** (current state). One set of formulas applied to the composed system. Mununu's IR already carries `PropertyRole::{Assumption, Guarantee, Invariant, Standalone}` ([adapter/ir.rs:211](../../crates/mununu-core/src/adapter/ir.rs#L211)). This layer exists and is wired through. The contract IR treats `Invariant` as a guarantee with universal temporal scope (it is wrapped in `G` by the emitter).
 - **Per-component contracts** (new). `(A_m, G_m)` per module `m`. When `m` is black-box, `A_m` is *required* (without it the chaotic stub is the only option) and `G_m` is enforced *by axiom* on the stub automaton.
 
 The discharge rule, following Pnueli (1985) and Abadi & Lamport (1995): a global guarantee `G_top` is provable from `(⋀_m A_m → G_m) ∧ (⋀ environment-of-top assumptions)`, with the side condition that every `A_m` consumed by a sibling must be guaranteed by either another module's `G_k` or by the top-level environment.
@@ -351,15 +351,15 @@ Time elapses between writing this document and starting the work. The codebase m
 **Scope:** the §2.i pipeline restricted to fields 1, 2, and 5 of the contract object. For each detected black-box module, produce a contract object with the interface alphabet, controllability classification, and a gap marker explaining what is unknown. No automaton fragments, no formulas yet.
 **Validation:** test against three input shapes — SV with `(* blackbox *)`, BTOR2 with declared external inputs, and TS with an opaque microservice call (`CallEffect::Unknown`).
 
-### 8.6 Task A6 — discovery pipeline phase 2 (automaton fragments from source-comments + corpus)
-**Touches:** `crates/mununu-core/src/contract/discover.rs`, plus corpus client (depends on Document D §D.2).
-**Scope:** extend phase 1 with the source-comment metadata reader (§2.vi, schema in D §D.5) and the corpus lookup. Each discovered fragment is tagged with provenance.
-**Validation:** golden tests against a small set of vendor-supplied annotation patterns.
+### 8.6 Task A6 — (moved to Document D)
+**Originally:** discovery pipeline phase 2 — automaton fragments from source-comments + corpus.
+**Now owned by:** [Document D §D.8](contract-corpus-and-config.md#d8-implementation-plan), milestone M3.
+**Why moved:** A6's two inputs — source-comment grammar and contract corpus — are both Document D deliverables (§D.5 and §D.2). Implementing A6 before D would force speculative API choices; implementing it alongside D keeps the contracts honest. Until M3 lands, mununu emits chaotic stubs (A5 phase 1) with full diagnostic visibility (A3), which is the right safety posture.
 
-### 8.7 Task A7 — HITL stage-4 UX (CLI affordance first; UI later)
-**Touches:** `mununu-cli` (new `mununu contract review` subcommand), [mununu-ui](../../mununu-ui/) (later).
-**Scope:** CLI affordance to surface proposed contracts, soundness flags, and "what changes if you accept" preview. UI integration is a follow-up under the same task.
-**Validation:** scripted end-to-end run on the §9 industrial example: extract → review → discharge → verify.
+### 8.7 Task A7 — (moved to Document D)
+**Originally:** HITL stage-4 UX — `mununu contract review` CLI + UI surface.
+**Now owned by:** [Document D §D.8](contract-corpus-and-config.md#d8-implementation-plan), milestone M3.
+**Why moved:** A7 surfaces proposed contracts to the user for approval / edit / rejection. Useful proposals come from the corpus (D §D.2), source-comment discovery (A6, now also M3), and L\* learning (D §D.6). Shipping A7 before those are wired produces an empty review screen. The full HITL flow lands with D as one coherent UX.
 
 ### 8.8 Task A8 — lightweight McMillan-style circular discharge
 **Touches:** `crates/mununu-core/src/contract/discharge.rs` (extending A2), [crates/mununu-core/src/mu_calculus/](../../crates/mununu-core/src/mu_calculus/).
@@ -369,20 +369,20 @@ Time elapses between writing this document and starting the work. The codebase m
 
 ### 8.9 Sequencing summary
 
-The recommended landing order is **A1, A2, A3, A4, A8, A5, A6, A7**. Each row delivers value standalone:
+The recommended landing order for tasks owned by Document A is **A1, A2, A3, A4, A8, A5**. A6 and A7 have moved to Document D's M3 implementation plan — they depend on D's deliverables, and shipping them earlier would force speculative API choices.
 
-| Task | Standalone value |
-|---|---|
-| A1 | Foundational plumbing; no user-visible change |
-| A2 | Discharge check usable as `mununu contract validate` against any hand-authored contract set |
-| A3 | Existing "silently ignore unparsed modules" bug fixed |
-| A4 | Three controllability heuristics collapse to one rule |
-| A8 | Lightweight circular-discharge check; auto-discharges most well-formed cycles |
-| A5 | First version of the discovery pipeline; phase 1 only |
-| A6 | Source-comment + corpus integration |
-| A7 | End-to-end HITL workflow in CLI |
+| Task | Owner | Standalone value |
+|---|---|---|
+| A1 | M1 | Foundational plumbing; no user-visible change |
+| A2 | M1 | Discharge check usable as `mununu contract validate` against any hand-authored contract set |
+| A3 | M1 | Existing "silently ignore unparsed modules" bug fixed |
+| A4 | M1 | Three controllability heuristics collapse to one rule |
+| A8 | M1 | Lightweight circular-discharge check; auto-discharges most well-formed cycles |
+| A5 | M1 | First version of the discovery pipeline; phase 1 only |
+| A6 | **M3 (Doc D)** | Source-comment + corpus integration |
+| A7 | **M3 (Doc D)** | End-to-end HITL workflow |
 
-Tasks A1–A3 are the minimum viable slice; if work pauses after A3, mununu has gained the highest-leverage pieces (foundational types, circular-reasoning detection, gap visibility) without taking on the deeper extraction work. A8 slots in after A4 because it benefits from the unified controllability rule when building the discharge graph for cross-frontend cases.
+Tasks A1–A3 are the minimum viable slice; if work pauses after A3, mununu has gained the highest-leverage pieces (foundational types, circular-reasoning detection, gap visibility) without taking on the deeper extraction work. A8 slots in after A4 because it benefits from the unified controllability rule when building the discharge graph for cross-frontend cases. A5 phase 1 closes M1; phase 2 work (A6) and the HITL UX (A7) wait for D.
 
 ## 9. Industrial example — secure boot ROM with closed-IP crypto
 
@@ -540,13 +540,13 @@ The publication only proceeds after all four gates pass.
 
 ## 11. What comes next
 
-When this document is marked **implemented** (tasks A1–A7 landed), **validated** (the §9 example transcript is reproducible), and **published** (the §10 Substack + LinkedIn posts are live), the next document to tackle is:
+When this document is marked **implemented** (tasks A1–A5 + A8 landed; A6 and A7 are now owned by Document D's M3), **validated** (the §9 example transcript is reproducible), and **published** (the §10 Substack + LinkedIn posts are live), the next document to tackle is:
 
 → **[Document B — RTL frontend unification](rtl-frontend-unification.md)** and its accompanying implementation plan.
 
 Document B is independent of Document A's industrial example but anchors on Document A's controllability rule (§4) and chaotic-stub recommendation (§2). Tackling B next gives mununu's RTL pipelines a consistent contract story before the codesign use case (Document C) tries to compose across them.
 
-The full roadmap order: **A → B → D → C → governance update**. See the planning file at `.claude/plans/i-want-you-to-distributed-orbit.md` for the milestone breakdown.
+The full roadmap order: **A → B → D → C → governance update**. Document D's M3 picks up the deferred A6 (corpus-driven discovery phase 2) and A7 (HITL stage-4 UX) alongside D's own corpus + sidecar work. See the planning file at `.claude/plans/i-want-you-to-distributed-orbit.md` for the milestone breakdown.
 
 ---
 

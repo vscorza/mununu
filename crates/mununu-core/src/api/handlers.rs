@@ -1225,6 +1225,19 @@ pub async fn extraction_propose_composition_handler(
     Ok(Json(super::models::ProposeCompositionResponse { findings }))
 }
 
+/// Stub when ast-extract feature is not enabled. Mirrors the pattern used
+/// for `extraction_extract_handler` so route registration in `server.rs`
+/// can stay unconditional.
+#[cfg(not(feature = "ast-extract"))]
+pub async fn extraction_propose_composition_handler(
+    Json(_request): Json<super::models::ProposeCompositionRequest>,
+) -> ApiResult<Json<super::models::ProposeCompositionResponse>> {
+    Err(ApiError::BadRequest {
+        message: "AST extraction not available. Build with --features ast-extract".to_string(),
+        details: None,
+    })
+}
+
 /// List the supported composition modes consumed by `composition.type`
 /// in the extract config / espec. Static — derived from the
 /// `CompositionSemantics` enum's variants and their soundness notes.
@@ -1683,6 +1696,110 @@ fn resolve_template_ref_for_cache(
         inst.formula
     );
     Ok((Some(formula_name), Some(sidecar_ctxdsl)))
+}
+
+/// Validate an assume/guarantee contract set's discharge graph.
+///
+/// Mirrors the `mununu contract validate` CLI subcommand. Accepts a
+/// `ContractSet` JSON body, runs the §3.x SCC analysis, returns the
+/// verdict.
+pub async fn contract_validate_handler(
+    Json(set): Json<crate::contract::ContractSet>,
+) -> ApiResult<Json<crate::contract::discharge::DischargeVerdict>> {
+    let verdict = crate::contract::discharge::validate(&set);
+    Ok(Json(verdict))
+}
+
+/// Request body for `POST /api/v1/contract/discover`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ContractDiscoverRequest {
+    pub interface: crate::contract::discover::BlackBoxInterface,
+    #[serde(default)]
+    pub force_controllable: Vec<String>,
+    #[serde(default)]
+    pub force_uncontrollable: Vec<String>,
+    #[serde(default)]
+    pub emit_fairness_gap: bool,
+}
+
+/// Run phase-1 contract discovery on a black-box interface description.
+/// Mirrors `mununu contract discover`. The structured `tracing::warn!`
+/// diagnostics still fire on the server side; the response carries the
+/// full `Phase1Output` (labels + gap markers) for the UI to render.
+pub async fn contract_discover_handler(
+    Json(request): Json<ContractDiscoverRequest>,
+) -> ApiResult<Json<crate::contract::discover::Phase1Output>> {
+    use crate::contract::discover::{DiscoverOptions, discover_phase1};
+
+    let force_c: Vec<&str> = request
+        .force_controllable
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let force_u: Vec<&str> = request
+        .force_uncontrollable
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let opts = DiscoverOptions {
+        force_controllable: &force_c,
+        force_uncontrollable: &force_u,
+        emit_fairness_gap: request.emit_fairness_gap,
+    };
+    let output = discover_phase1(&request.interface, &opts);
+    output.gaps.emit_diagnostics();
+    Ok(Json(output))
+}
+
+#[cfg(test)]
+mod contract_handler_tests {
+    use super::*;
+    use crate::contract::{
+        ClauseKind, ClauseProvenance, ContractClause, ContractSet, DischargeEdge,
+        discharge::DischargeVerdict,
+    };
+
+    fn clause(id: &str, kind: ClauseKind) -> ContractClause {
+        ContractClause {
+            id: id.to_string(),
+            kind,
+            owner: "test".to_string(),
+            description: None,
+            provenance: ClauseProvenance::UserAuthored,
+            mu_rank: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_validate_handler_returns_acyclic_for_linear_set() {
+        let set = ContractSet {
+            clauses: vec![
+                clause("G_a", ClauseKind::Guarantee),
+                clause("A_b", ClauseKind::Assumption),
+            ],
+            discharges: vec![DischargeEdge {
+                discharger: "G_a".to_string(),
+                dischargee: "A_b".to_string(),
+            }],
+            environment_assumptions: vec![],
+        };
+        let Json(verdict) = contract_validate_handler(Json(set)).await.unwrap();
+        assert!(matches!(verdict, DischargeVerdict::Acyclic { .. }));
+    }
+
+    #[tokio::test]
+    async fn contract_validate_handler_returns_circular_for_self_loop() {
+        let set = ContractSet {
+            clauses: vec![clause("X", ClauseKind::Guarantee)],
+            discharges: vec![DischargeEdge {
+                discharger: "X".to_string(),
+                dischargee: "X".to_string(),
+            }],
+            environment_assumptions: vec![],
+        };
+        let Json(verdict) = contract_validate_handler(Json(set)).await.unwrap();
+        assert!(matches!(verdict, DischargeVerdict::Circular { .. }));
+    }
 }
 
 #[cfg(test)]
