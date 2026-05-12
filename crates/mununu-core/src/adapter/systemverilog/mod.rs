@@ -338,8 +338,66 @@ impl SystemVerilogAdapter {
             location: None,
         })?;
 
+        // Document B task B3 (custom-SV half): for each blackbox module
+        // entry in the sidecar, parse its source to extract the port
+        // list and auto-emit `<name>.interface.json` +
+        // `<name>.gap_report.json` sidecars. The chaotic-stub semantics
+        // are entirely conveyed by the emitted JSON; no Kripke is
+        // built for the blackbox module (the user explicitly opted out
+        // of modelling it).
+        let mut sidecars = Vec::new();
+        if !ann.blackbox_modules.is_empty() {
+            let mut blackboxes = Vec::with_capacity(ann.blackbox_modules.len());
+            for bb_entry in &ann.blackbox_modules {
+                let sv_content = match get_source(&bb_entry.source, &bb_entry.name) {
+                    Ok(s) => s,
+                    Err(_e) => {
+                        all_warnings.push(AdapterWarning {
+                            kind: super::WarningKind::UnsupportedConstruct,
+                            message: format!(
+                                "blackbox module '{}' source '{}' could not be read; skipping sidecar emission for this module",
+                                bb_entry.name, bb_entry.source
+                            ),
+                            location: None,
+                        });
+                        continue;
+                    }
+                };
+                let (module, _parse_warnings) = match parser::parse_with_warnings(&sv_content) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        all_warnings.push(AdapterWarning {
+                            kind: super::WarningKind::UnsupportedConstruct,
+                            message: format!(
+                                "blackbox module '{}' failed to parse: {}; skipping sidecar emission",
+                                bb_entry.name, e.message
+                            ),
+                            location: None,
+                        });
+                        continue;
+                    }
+                };
+                blackboxes.push(blackbox_interface_from_module(
+                    &module,
+                    &bb_entry.name,
+                    &bb_entry.source,
+                ));
+            }
+            if !blackboxes.is_empty() {
+                let opts = crate::contract::discover::DiscoverOptions {
+                    force_controllable: &[],
+                    force_uncontrollable: &[],
+                    emit_fairness_gap: false,
+                };
+                sidecars.extend(crate::contract::discover::build_blackbox_sidecars(
+                    &blackboxes,
+                    &opts,
+                ));
+            }
+        }
+
         Ok(AdapterOutput {
-            sidecars: Vec::new(),
+            sidecars,
             ctxdsl: result.ctxdsl,
             warnings: all_warnings,
             source_info: SourceInfo {
@@ -359,6 +417,46 @@ impl SystemVerilogAdapter {
 ///
 /// For each connection where `module_name` is the `from` side, this function
 /// looks at the source state's valuations for the output port and adds the
+/// Build a `BlackBoxInterface` description from a parsed SV `Module`.
+///
+/// Used by `translate_multi_module_inner` when the sidecar's
+/// `blackbox_modules` list names a module the user wants treated as a
+/// closed-IP boundary — Document B task B3 custom-SV half. The
+/// resulting `BlackBoxInterface` carries the same shape the yosys-side
+/// auto-emission produces, so both pipelines feed the same JSON
+/// downstream into `mununu contract discover` / `mununu contract gaps`.
+fn blackbox_interface_from_module(
+    module: &ast::Module,
+    user_supplied_name: &str,
+    source_path: &str,
+) -> crate::contract::discover::BlackBoxInterface {
+    use crate::contract::discover::{BlackBoxInterface, PortDescriptor};
+    use crate::controllability::BoundaryDirection;
+
+    let ports: Vec<PortDescriptor> = module
+        .ports
+        .iter()
+        .map(|p| {
+            let direction = match p.direction {
+                ast::PortDirection::Input => BoundaryDirection::Input,
+                ast::PortDirection::Output => BoundaryDirection::Output,
+                ast::PortDirection::Inout => BoundaryDirection::Inout,
+            };
+            PortDescriptor {
+                name: p.name.clone(),
+                direction,
+                description: None,
+            }
+        })
+        .collect();
+    BlackBoxInterface {
+        name: user_supplied_name.to_string(),
+        ports,
+        source_file: Some(source_path.to_string()),
+        source_line: None,
+    }
+}
+
 /// shared label (e.g., `grant_1`) to each transition. This enables the
 /// composition engine to synchronize with the receiving module.
 ///
@@ -2085,5 +2183,114 @@ mod tests {
         assert!(guard_references_input("ack && full", &inputs));
         // No match at all
         assert!(!guard_references_input("counter < 3", &inputs));
+    }
+
+    // ---------------------------------------------------------------
+    // Document B task B3 (custom-SV half) — blackbox sidecar emission
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn translate_multi_module_emits_sidecars_for_blackbox_entries() {
+        use crate::adapter::SidecarOrigin;
+        use std::collections::HashMap;
+
+        // Real module with a Kripke. Empty `always_ff` keeps the
+        // parser happy; we only care that translation succeeds.
+        let real_sv = r#"
+            module real_thing(input clk, input req, output reg ack);
+                always_ff @(posedge clk) begin
+                    if (req) ack <= 1;
+                    else ack <= 0;
+                end
+            endmodule
+        "#;
+        // Blackbox module — body could be anything, only the port
+        // list matters for the sidecar.
+        let bb_sv = r#"
+            module vendor_ip(
+                input clk,
+                input start,
+                output ready,
+                output done
+            );
+            endmodule
+        "#;
+
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_multi_v1",
+            "modules": [
+                { "name": "real_thing", "source": "real.sv" }
+            ],
+            "blackbox_modules": [
+                { "name": "vendor_ip", "source": "vendor.sv" }
+            ]
+        });
+        let mut sources = HashMap::new();
+        sources.insert("real.sv".to_string(), real_sv.to_string());
+        sources.insert("vendor.sv".to_string(), bb_sv.to_string());
+
+        let out = SystemVerilogAdapter::translate_multi_module_content(
+            &sidecar.to_string(),
+            &sources,
+            &AdapterOptions::default(),
+        )
+        .expect("multi-module translate should succeed");
+
+        let iface = out
+            .sidecars
+            .iter()
+            .find(|s| s.origin == SidecarOrigin::BlackBoxInterface)
+            .expect("expected an interface sidecar");
+        assert_eq!(iface.filename, "vendor_ip.interface.json");
+        assert!(iface.content.contains("\"name\": \"vendor_ip\""));
+        assert!(iface.content.contains("\"direction\": \"Input\""));
+        assert!(iface.content.contains("\"direction\": \"Output\""));
+        // The source_file should be the path the user supplied, not the
+        // module name.
+        assert!(iface.content.contains("\"source_file\": \"vendor.sv\""));
+
+        let gap = out
+            .sidecars
+            .iter()
+            .find(|s| s.origin == SidecarOrigin::BlackBoxGapReport)
+            .expect("expected a gap-report sidecar");
+        assert_eq!(gap.filename, "vendor_ip.gap_report.json");
+        assert!(gap.content.contains("output_sequencing"));
+    }
+
+    #[test]
+    fn translate_multi_module_warns_on_unreadable_blackbox_source() {
+        use std::collections::HashMap;
+
+        let real_sv = r#"
+            module real_thing(input clk, output reg ack);
+                always_ff @(posedge clk) ack <= 1;
+            endmodule
+        "#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_multi_v1",
+            "modules": [
+                { "name": "real_thing", "source": "real.sv" }
+            ],
+            "blackbox_modules": [
+                // Source is intentionally missing from the sources map.
+                { "name": "vendor_ip", "source": "does_not_exist.sv" }
+            ]
+        });
+        let mut sources = HashMap::new();
+        sources.insert("real.sv".to_string(), real_sv.to_string());
+
+        let out = SystemVerilogAdapter::translate_multi_module_content(
+            &sidecar.to_string(),
+            &sources,
+            &AdapterOptions::default(),
+        )
+        .expect("multi-module translate should not fail on missing bb source");
+        assert!(out.sidecars.is_empty());
+        let has_warning = out.warnings.iter().any(|w| {
+            w.message.contains("blackbox module 'vendor_ip'")
+                && w.message.contains("could not be read")
+        });
+        assert!(has_warning, "expected a warning about the missing source");
     }
 }
