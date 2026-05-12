@@ -93,7 +93,8 @@ gap report: 1 marker(s) across 1 module(s)
 
 === 5a. AUTO-emit sidecars by running the yosys frontend on soc.sv ===
 $ ./target/debug/mununu context summarize examples/industrial/dual_frontend_soc/soc.sv --adapter yosys
-adapter warning: All BTOR2 inputs treated as uncontrollable (no --controllable-inputs specified)
+Loaded sidecar: examples/industrial/dual_frontend_soc/soc.mununu.json
+adapter warning: adapter/btor2: failed to parse .mununu.json sidecar (missing field `module` at line 32 column 1); falling back to full bit-blast
 Translated SystemVerilog: 10 signals, 32 states, 0 properties
 auto-emitted sidecar: examples/industrial/dual_frontend_soc/ddr3_phy_v2.interface.json
 auto-emitted sidecar: examples/industrial/dual_frontend_soc/ddr3_phy_v2.gap_report.json
@@ -188,7 +189,45 @@ $ cat examples/industrial/dual_frontend_soc/ddr3_phy_v2.gap_report.json
   ]
 }
 
-=== 6. SoC composition — well-formedness (safety, under chaotic DDR) ===
+=== 5d. AUTO-emit sidecars by running the custom-SV multi-module path ===
+$ ./target/debug/mununu context summarize examples/industrial/dual_frontend_soc/soc.mununu.json --adapter sv-multi
+Translated SystemVerilog: 5 signals, 2 states, 0 properties
+auto-emitted sidecar: examples/industrial/dual_frontend_soc/ddr3_phy_v2.interface.json
+auto-emitted sidecar: examples/industrial/dual_frontend_soc/ddr3_phy_v2.gap_report.json
+{
+  "context": "soc_custom_sv",
+  "sidecar_count": 0,
+  "automata": [
+    {
+      "name": "uart_only",
+      "state_count": 2,
+      "transition_count": 2
+    }
+  ],
+  "controllers": [],
+  "formulas": [],
+  "guard_predicates": {
+    "soc_custom_sv": [
+      "soc_custom_sv_has_enabled_transition",
+      "soc_custom_sv_is_deadlock_state"
+    ],
+    "uart_only": [
+      "uart_only_has_enabled_transition",
+      "uart_only_is_deadlock_state"
+    ]
+  }
+}
+
+=== 6. Side-by-side cross-check: both pipelines agree on the BlackBoxInterface ===
+$ diff <(jq normalised yosys.iface) <(jq normalised custom-sv.iface)
+OK: yosys and custom-SV produced structurally-identical BlackBoxInterface JSONs
+
+=== 7. Same cross-check for the GapMarkerReport ===
+$ diff <(jq normalised yosys.gap) <(jq normalised custom-sv.gap)
+OK: yosys and custom-SV produced structurally-identical GapMarkerReport JSONs
+
+
+=== 8. SoC composition — well-formedness (safety, under chaotic DDR) ===
 $ ./target/debug/mununu context eval examples/industrial/dual_frontend_soc/soc.ctxdsl --formula soc_well_formed --automaton SoC
 [mununu] WARN: model has 1 reachable state(s); verdicts are vacuously satisfied regardless of formula content. The property may appear to hold (or fail) without genuinely witnessing or excluding the modeled behavior. Confirm the model has sufficient state-space distinction before relying on this verdict.
 Formula 'soc_well_formed' over automaton 'SoC':
@@ -198,7 +237,7 @@ Formula 'soc_well_formed' over automaton 'SoC':
     Idle|Idle|Idle
   Guard partitions: enabled
 
-=== 7. Host can reach the DDR burst-wait state ===
+=== 9. Host can reach the DDR burst-wait state ===
 $ ./target/debug/mununu context eval examples/industrial/dual_frontend_soc/soc.ctxdsl --formula burst_path_reachable --automaton HostController
 Formula 'burst_path_reachable' over automaton 'HostController':
   States satisfying: 3/3
@@ -207,7 +246,7 @@ Formula 'burst_path_reachable' over automaton 'HostController':
     Idle
   Guard partitions: enabled
 
-=== 8. Host can reach the UART send path ===
+=== 10. Host can reach the UART send path ===
 $ ./target/debug/mununu context eval examples/industrial/dual_frontend_soc/soc.ctxdsl --formula uart_send_reachable --automaton HostController
 Formula 'uart_send_reachable' over automaton 'HostController':
   States satisfying: 3/3

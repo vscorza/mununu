@@ -277,16 +277,37 @@ fn enumerate_and_blast(
         });
     }
 
-    // Honor `--controllable-inputs` by symbolic match. Clock inputs are
-    // never controllable by construction — the controller does not
-    // schedule the clock edge, the world does.
+    // Two-stage controllability classification (Document B task B1):
+    //
+    //   1. If the upstream frontend captured port directions before any
+    //      flattening / inlining (typically the yosys driver populating
+    //      `options.port_directions` from the pre-flatten `write_json`
+    //      hierarchy snapshot), apply the §4 rule — input direction →
+    //      Uncontrollable, output direction → Controllable. Inputs not
+    //      named in the map keep the historical "Uncontrollable" default
+    //      (the right call for BTOR2 inputs that originated as cut points
+    //      from `cutpoint -blackbox`).
+    //   2. `--controllable-inputs` remains the escape hatch and runs
+    //      *after* (1), so an explicit list always wins.
+    //
+    // Clock inputs are never controllable by construction — the controller
+    // does not schedule the clock edge, the world does.
+    use crate::controllability::BoundaryDirection;
     let mut input_meta = input_meta;
+    let derived_from_directions = !options.port_directions.is_empty();
     for im in input_meta.iter_mut() {
-        if !im.is_clock && options.controllable_inputs.iter().any(|c| c == &im.symbol) {
+        if im.is_clock {
+            continue;
+        }
+        if let Some(dir) = options.port_directions.get(&im.symbol) {
+            im.controllable = matches!(dir, BoundaryDirection::Output);
+        }
+        if options.controllable_inputs.iter().any(|c| c == &im.symbol) {
             im.controllable = true;
         }
     }
-    if !input_meta.is_empty() && options.controllable_inputs.is_empty() {
+    if !input_meta.is_empty() && options.controllable_inputs.is_empty() && !derived_from_directions
+    {
         warnings.push(AdapterWarning {
             kind: WarningKind::NeutralControllability,
             message:
