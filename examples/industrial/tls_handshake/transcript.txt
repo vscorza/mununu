@@ -1,0 +1,64 @@
+# TLS handshake — validation transcript
+# regenerate via examples/industrial/tls_handshake/validate.sh
+# transcript is byte-deterministic; re-running validate.sh
+# against the same commit should produce identical output.
+
+=== 1. corpus query — AES-CTR contract exists and resolves ===
+$ ./target/debug/mununu contract query rtl_crypto/aes_ctr --corpus corpus
+found 1 contract candidate(s) for rtl_crypto/aes_ctr:
+  1. rtl_crypto/aes_ctr @ 1.0.0  [mununu-verified (NIST SP 800-38A counter-mode reference (illustrative — no real vendor silicon was modelled))]
+       AES-CTR symmetric cipher block contract. Captures the canonical request/done handshake plus the safety guarantee that the cipher never emits ciphertext bytes before a nonce has been loaded for the current session. ILLUSTRATIVE: this entry demonstrates the corpus schema for Document D's TLS handshake industrial example; it is not derived from any specific vendor silicon.
+
+=== 2. phase-2 discovery — AES_CTR_v1 (annotation + corpus hit) ===
+$ ./target/debug/mununu contract discover examples/industrial/tls_handshake/aes_ctr_interface.json --corpus corpus
+WARN contract gap detected — chaotic stub default in effect module="AES_CTR_v1" kind=latency_bound labels="done, cipher_out" location="rtl/vendor/aes_ctr_v1.sv:8" soundness="bounded-time properties cannot be discharged without an authored latency bound." description="Phase-2 discovery — 1 guarantee clause(s) + 1 corpus resolution(s) found on AES_CTR_v1; latency bound still unauthored"
+phase-1 discovery: 8 label(s), 1 gap marker(s) for module `AES_CTR_v1`
+  corpus: resolved `contract://rtl_crypto/aes_ctr@1.0.0?alt=strict_iv` → rtl_crypto/aes_ctr@1.0.0 [alt `strict_iv` ok]
+
+=== 3. phase-2 discovery — TRNG_V2 (annotation + corpus miss) ===
+$ ./target/debug/mununu contract discover examples/industrial/tls_handshake/rng_interface.json --corpus corpus
+WARN contract gap detected — chaotic stub default in effect module="TRNG_V2" kind=output_sequencing labels="rand_valid, rand_out" location="rtl/vendor/trng_v2.sv:8" soundness="safety verdicts hold; liveness verdicts depending on these labels are unsound (no progress assumption)." description="Phase-1 discovery — no sequencing fragment yet for TRNG_V2"
+phase-1 discovery: 5 label(s), 1 gap marker(s) for module `TRNG_V2`
+  corpus: `contract://rtl_crypto/trng@2.0.0` not found (rtl_crypto/trng@2.0.0)
+
+=== 4. phase-2 discovery — AES_CTR_v1 without --corpus (NoCorpus) ===
+$ ./target/debug/mununu contract discover examples/industrial/tls_handshake/aes_ctr_interface.json
+WARN contract gap detected — chaotic stub default in effect module="AES_CTR_v1" kind=latency_bound labels="done, cipher_out" location="rtl/vendor/aes_ctr_v1.sv:8" soundness="bounded-time properties cannot be discharged without an authored latency bound." description="Phase-2 discovery — 1 guarantee clause(s) found on AES_CTR_v1; latency bound still unauthored"
+phase-1 discovery: 8 label(s), 1 gap marker(s) for module `AES_CTR_v1`
+  corpus: `contract://rtl_crypto/aes_ctr@1.0.0?alt=strict_iv` referenced but no corpus supplied (use --corpus)
+
+=== 5. strict-mode gate — AES_CTR_v1 (exits non-zero on residual gap) ===
+$ ./target/debug/mununu contract discover examples/industrial/tls_handshake/aes_ctr_interface.json --corpus corpus --strict-contracts
+WARN contract gap detected — chaotic stub default in effect module="AES_CTR_v1" kind=latency_bound labels="done, cipher_out" location="rtl/vendor/aes_ctr_v1.sv:8" soundness="bounded-time properties cannot be discharged without an authored latency bound." description="Phase-2 discovery — 1 guarantee clause(s) + 1 corpus resolution(s) found on AES_CTR_v1; latency bound still unauthored"
+phase-1 discovery: 8 label(s), 1 gap marker(s) for module `AES_CTR_v1`
+  corpus: resolved `contract://rtl_crypto/aes_ctr@1.0.0?alt=strict_iv` → rtl_crypto/aes_ctr@1.0.0 [alt `strict_iv` ok]
+--strict-contracts: 1 unresolved contract gap(s) — refusing to proceed
+
+=== 6. safety property — every reachable composed state respects the protocol ===
+$ ./target/debug/mununu context eval examples/industrial/tls_handshake/tls_handshake.ctxdsl --formula safety_protocol_respected --automaton TLSSession
+Formula 'safety_protocol_respected' over automaton 'TLSSession':
+  States satisfying: 4/4
+    Computing|ClientHello|Generating, Computing|ServerHello|Generating, Computing|ServerHello|Idle, Idle|Idle|Idle
+  Initial states satisfying: 1/1
+    Idle|Idle|Idle
+  Guard partitions: enabled
+
+=== 7. reachability — Application reachable from Idle ===
+$ ./target/debug/mununu context eval examples/industrial/tls_handshake/tls_handshake.ctxdsl --formula application_reachable --automaton TLSHandshake
+Formula 'application_reachable' over automaton 'TLSHandshake':
+  States satisfying: 8/8
+    Application, CipherReady, ClientHello, Finished, Idle, KeyDeriv, NonceReq, ServerHello
+  Initial states satisfying: 1/1
+    Idle
+  Guard partitions: enabled
+
+=== 8. reachability — Idle reachable from any state (teardown smoke test) ===
+$ ./target/debug/mununu context eval examples/industrial/tls_handshake/tls_handshake.ctxdsl --formula idle_always_reachable --automaton TLSHandshake
+Formula 'idle_always_reachable' over automaton 'TLSHandshake':
+  States satisfying: 8/8
+    Application, CipherReady, ClientHello, Finished, Idle, KeyDeriv, NonceReq, ServerHello
+  Initial states satisfying: 1/1
+    Idle
+  Guard partitions: enabled
+
+=== end of transcript ===

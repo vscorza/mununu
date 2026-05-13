@@ -1,0 +1,32 @@
+{
+  "name": "AES_CTR_v1",
+  "ports": [
+    { "name": "clk",         "direction": "Input",  "description": "clock" },
+    { "name": "reset_n",     "direction": "Input",  "description": "async reset, active low" },
+    { "name": "start",       "direction": "Input",  "description": "rising edge starts an AES-CTR block" },
+    { "name": "key_in",      "direction": "Input",  "description": "128-bit AES key for the current session" },
+    { "name": "nonce_in",    "direction": "Input",  "description": "64-bit nonce/IV for the current session" },
+    { "name": "plain_in",    "direction": "Input",  "description": "128-bit plaintext block" },
+    { "name": "done",        "direction": "Output", "description": "rises when cipher_out is stable for this block" },
+    { "name": "cipher_out",  "direction": "Output", "description": "128-bit ciphertext block" }
+  ],
+  "source_file": "rtl/vendor/aes_ctr_v1.sv",
+  "source_line": 8,
+  "annotations": [
+    {
+      "tag": "blackbox",
+      "value": "",
+      "source_line": 6
+    },
+    {
+      "tag": "interface",
+      "value": "contract://rtl_crypto/aes_ctr@1.0.0?alt=strict_iv",
+      "source_line": 7
+    },
+    {
+      "tag": "guarantee",
+      "value": "G(start -> eventually done)",
+      "source_line": 8
+    }
+  ]
+}

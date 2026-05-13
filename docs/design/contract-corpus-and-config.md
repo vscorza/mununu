@@ -355,6 +355,8 @@ Recommended landing order: **D1 → D2 → D3 → D4 → A6 → A7 → D5**. Eac
 
 ## D.9 Industrial example — TLS handshake with closed-IP crypto and corpus contracts
 
+> **What shipped (M3.c, 2026-05-13):** [`examples/industrial/tls_handshake/`](../../examples/industrial/tls_handshake/) demonstrates the **corpus + annotations + discovery** slice end-to-end. The shipped slice covers two of the three contract sources (corpus hit + corpus miss with reference URI); HMAC's source-comment-only path, the `.mununu/` directory layout (§D.3), and the `mununu contract review` HITL UX (Document A §A7) are explicitly deferred to follow-up work. The shipped `validate.sh` reproduces a byte-deterministic `transcript.txt` against the pinned commit.
+
 The example exercises the corpus + annotations + discharge end-to-end against a recognisable security-critical use case: a **TLS handshake state machine** that drives a closed-IP AES core and a closed-IP RNG.
 
 ### D.9.1 Why this example
