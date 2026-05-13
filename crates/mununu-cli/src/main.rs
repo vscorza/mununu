@@ -81,6 +81,22 @@ enum ContractCommand {
     Sidecars(ContractSidecarsArgs),
     /// Query the contract corpus for matching entries.
     Query(ContractQueryArgs),
+    /// HITL stage-4 — surface proposed clauses for human review.
+    Review(ContractReviewArgs),
+}
+
+#[derive(Args, Debug)]
+struct ContractReviewArgs {
+    /// Path to the black-box interface JSON (Phase 1 discovery input).
+    #[arg(value_name = "INTERFACE")]
+    interface: PathBuf,
+    /// Optional contract corpus root used to resolve
+    /// `@mununu_interface contract://` URIs into reference proposals.
+    #[arg(long, value_name = "DIR")]
+    corpus: Option<PathBuf>,
+    /// Emit the package as JSON to stdout.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -713,6 +729,94 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
         ContractCommand::Discover(args) => contract_discover(args),
         ContractCommand::Sidecars(args) => contract_sidecars(args),
         ContractCommand::Query(args) => contract_query(args),
+        ContractCommand::Review(args) => contract_review(args),
+    }
+}
+
+fn contract_review(args: ContractReviewArgs) -> Result<(), String> {
+    use mununu_core::contract::discover::{BlackBoxInterface, DiscoverOptions};
+    use mununu_core::contract::review::{ProposalCounts, build_review_package};
+    use mununu_core::corpus::Corpus;
+
+    let body = std::fs::read_to_string(&args.interface)
+        .map_err(|e| format!("failed to read {}: {e}", args.interface.display()))?;
+    let iface: BlackBoxInterface =
+        serde_json::from_str(&body).map_err(|e| format!("failed to parse interface JSON: {e}"))?;
+
+    let corpus = match &args.corpus {
+        Some(root) => Some(
+            Corpus::load(root)
+                .map_err(|e| format!("failed to load corpus at {}: {e}", root.display()))?,
+        ),
+        None => None,
+    };
+
+    let opts = DiscoverOptions {
+        force_controllable: &[],
+        force_uncontrollable: &[],
+        emit_fairness_gap: false,
+        corpus: corpus.as_ref(),
+    };
+    let pkg = build_review_package(&iface, &opts);
+    let counts = ProposalCounts::from_package(&pkg);
+
+    if args.json {
+        let rendered = serde_json::to_string_pretty(&pkg)
+            .map_err(|e| format!("failed to serialise package: {e}"))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    println!(
+        "review for module `{}` — {} proposal(s) [{} assume, {} guarantee, {} corpus]",
+        pkg.module,
+        counts.total(),
+        counts.source_comment_assumptions,
+        counts.source_comment_guarantees,
+        counts.corpus_references,
+    );
+    println!(
+        "  alphabet: {} label(s), {} gap marker(s)",
+        pkg.phase1.labels.len(),
+        pkg.phase1.gaps.len(),
+    );
+    if pkg.proposed_clauses.is_empty() {
+        println!(
+            "  (no proposals — interface has no @mununu_* clauses or resolved corpus entries)"
+        );
+        return Ok(());
+    }
+    for (i, p) in pkg.proposed_clauses.iter().enumerate() {
+        println!();
+        println!("[{}] {} ({} on {})", i + 1, p.id, p.kind, p.owner,);
+        if let Some(desc) = &p.description {
+            println!("    formula : {desc}");
+        }
+        println!(
+            "    source  : {}",
+            render_proposal_provenance(&p.provenance)
+        );
+        if let Some(note) = &p.soundness_note {
+            println!("    note    : {note}");
+        }
+    }
+    Ok(())
+}
+
+fn render_proposal_provenance(p: &mununu_core::contract::review::ProposalProvenance) -> String {
+    use mununu_core::contract::review::ProposalProvenance;
+    match p {
+        ProposalProvenance::SourceComment { tag, source_line } => match source_line {
+            Some(line) => format!("@mununu_{tag} (line {line})"),
+            None => format!("@mununu_{tag}"),
+        },
+        ProposalProvenance::Corpus {
+            entry_id,
+            alternative,
+        } => match alternative {
+            Some(a) => format!("corpus:{entry_id} alt={a}"),
+            None => format!("corpus:{entry_id}"),
+        },
     }
 }
 
