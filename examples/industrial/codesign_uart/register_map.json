@@ -1,0 +1,75 @@
+{
+  "peripheral": "UART_LITE",
+  "base_address": "0x40010000",
+  "description": "Illustrative UART-Lite register map for the Document C §C.4 worked example. Schema: tools/register_map_schema.json. Not derived from any specific commercial silicon.",
+  "registers": [
+    {
+      "name": "CTRL",
+      "offset": 0,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "description": "Control register. Firmware writes both bits; peripheral observes them.",
+      "fields": [
+        {
+          "name": "tx_start",
+          "bits": [0, 0],
+          "sv_signal": "uart_inst.ctrl_reg[0]",
+          "c_accessor": "UART->CTRL.bit.tx_start",
+          "description": "Rising edge starts a transmit of the byte currently in DATA."
+        },
+        {
+          "name": "enable",
+          "bits": [1, 1],
+          "sv_signal": "uart_inst.ctrl_reg[1]",
+          "c_accessor": "UART->CTRL.bit.enable",
+          "description": "Master enable. Clearing this pauses both TX and RX."
+        }
+      ]
+    },
+    {
+      "name": "STATUS",
+      "offset": 4,
+      "width_bits": 32,
+      "direction": "RO",
+      "visibility_class": "status",
+      "access_path": "mmio_direct",
+      "description": "Status register. Peripheral writes; firmware reads. Concurrent reads from firmware are safe.",
+      "fields": [
+        {
+          "name": "tx_busy",
+          "bits": [0, 0],
+          "sv_signal": "uart_inst.tx_busy",
+          "c_accessor": "UART->STATUS.bit.tx_busy",
+          "description": "High while a transmit is in flight. Firmware polls this before writing DATA."
+        },
+        {
+          "name": "rx_ready",
+          "bits": [1, 1],
+          "sv_signal": "uart_inst.rx_ready",
+          "c_accessor": "UART->STATUS.bit.rx_ready",
+          "description": "High when a received byte is available in DATA."
+        }
+      ]
+    },
+    {
+      "name": "DATA",
+      "offset": 8,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "data",
+      "access_path": "mmio_direct",
+      "description": "Data register. On writes, the low 8 bits become the next TX byte. On reads, the low 8 bits return the latest received byte and rx_ready is cleared as a side-effect.",
+      "fields": [
+        {
+          "name": "byte",
+          "bits": [0, 7],
+          "sv_signal": "uart_inst.data_reg",
+          "c_accessor": "UART->DATA",
+          "description": "8-bit data payload."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mununu.dev/schemas/register_map.json",
+  "title": "Mununu register-map sidecar",
+  "description": "Schema for the HW/SW codesign register-map sidecar (Document C task C1). A descriptive specification of a memory-mapped peripheral's register layout, with per-field mappings to the SV signal path and the C accessor expression. Coupling synthesis (Task C2) consumes this file plus the two extracted automata to produce a unified AdapterIR. The exact path on disk is conventionally `.mununu/coupling/register_maps/<peripheral>.json` but is not enforced by the schema.",
+  "type": "object",
+  "required": ["peripheral", "base_address", "registers"],
+  "additionalProperties": false,
+  "properties": {
+    "peripheral": {
+      "type": "string",
+      "description": "Logical name of the peripheral, e.g. UART_LITE.",
+      "minLength": 1
+    },
+    "base_address": {
+      "type": "string",
+      "description": "Base address as a string so hex literals round-trip exactly. Accepts 0x… / 0b… / plain decimal.",
+      "pattern": "^(0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)$"
+    },
+    "registers": {
+      "type": "array",
+      "description": "Ordered list of register definitions. Order is preserved on disk for human readability; lookups go by name.",
+      "items": { "$ref": "#/$defs/Register" }
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional human-readable description of the peripheral."
+    },
+    "contract_uri": {
+      "type": "string",
+      "description": "Optional reference to a corpus contract describing this peripheral's external interface, e.g. contract://rtl_protocol/axi4_lite_slave@1.0.0.",
+      "format": "uri"
+    }
+  },
+  "$defs": {
+    "Register": {
+      "type": "object",
+      "required": ["name", "offset", "width_bits", "direction"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Register name as it appears in the datasheet.",
+          "minLength": 1
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Byte offset from the peripheral base.",
+          "minimum": 0
+        },
+        "width_bits": {
+          "type": "integer",
+          "description": "Register width in bits — typically 8, 16, 32, or 64.",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "direction": {
+          "type": "string",
+          "description": "Direction relative to firmware: RW (firmware reads + writes; peripheral may also update), RO (firmware reads; peripheral writes), WO (firmware writes; peripheral reacts).",
+          "enum": ["RW", "RO", "WO"]
+        },
+        "visibility_class": {
+          "type": "string",
+          "description": "Standard concurrency-semantics class. Defaults to `other` when omitted.",
+          "enum": [
+            "control",
+            "status",
+            "data",
+            "interrupt_flag",
+            "clear_on_read",
+            "other"
+          ]
+        },
+        "access_path": {
+          "type": "string",
+          "description": "How firmware reaches the register. Defaults to `mmio_direct` when omitted.",
+          "enum": ["mmio_direct", "mmio_bridge", "dma"]
+        },
+        "fields": {
+          "type": "array",
+          "description": "Ordered list of bit-fields inside the register.",
+          "items": { "$ref": "#/$defs/Field" }
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "Field": {
+      "type": "object",
+      "required": ["name", "bits"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bits": {
+          "type": "array",
+          "description": "Bit range as [low, high] (inclusive). [0, 0] is a single bit at position 0.",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "sv_signal": {
+          "type": "string",
+          "description": "SV signal path this field maps onto, e.g. uart_inst.ctrl_reg[0]. Empty until authored."
+        },
+        "c_accessor": {
+          "type": "string",
+          "description": "C accessor expression, e.g. UART->CTRL.bit.tx_start. Empty until authored."
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
