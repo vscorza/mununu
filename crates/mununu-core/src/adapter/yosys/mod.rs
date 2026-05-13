@@ -302,11 +302,25 @@ fn parse_blackbox_modules(hier_json: &str) -> Vec<crate::contract::discover::Bla
             .map(parse_yosys_src)
             .unwrap_or((None, None));
 
+        // Document D task D4 + Document A task A6: collect any
+        // `mununu_*` annotations yosys preserved in the attribute
+        // map, so the auto-emitted `BlackBoxInterface` carries the
+        // vendor-supplied A/G clauses + interface URIs along with
+        // the bare port list.
+        let annotations = attrs
+            .map(|a| {
+                crate::mununu_annotations::extract_from_yosys_attributes(
+                    &serde_json::Value::Object(a.clone()),
+                )
+            })
+            .unwrap_or_default();
+
         out.push(BlackBoxInterface {
             name: name.clone(),
             ports,
             source_file,
             source_line,
+            annotations,
         });
     }
     // Deterministic order for downstream consumers.

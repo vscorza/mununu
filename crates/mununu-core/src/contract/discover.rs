@@ -63,6 +63,19 @@ pub struct BlackBoxInterface {
     /// Optional source line for diagnostics.
     #[serde(default)]
     pub source_line: Option<u32>,
+    /// Source-comment annotations (`@mununu_*` tags) attached to this
+    /// module. Populated by Document D task D4 — both the yosys
+    /// frontend (from yosys's `write_json` attribute map) and the
+    /// custom-SV frontend (from `extract_from_sv_source`) feed the same
+    /// `MununuAnnotation` shape here. Phase-2 discovery (task A6)
+    /// uses these to:
+    ///   - replace the default `OutputSequencing` gap with a smaller
+    ///     gap when `@mununu_guarantee` clauses are present;
+    ///   - flag `@mununu_interface` URIs for corpus lookup;
+    ///   - apply `@mununu_controllable` / `@mununu_uncontrollable`
+    ///     overrides before the §4 classifier runs.
+    #[serde(default)]
+    pub annotations: Vec<crate::mununu_annotations::MununuAnnotation>,
 }
 
 /// A single classified interface label emitted by phase 1.
@@ -172,20 +185,113 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// A2.6-style summary of the annotations a `BlackBoxInterface`
+/// carries — used by `discover_phase1` to decide what kind of gap to
+/// emit and by future HITL UX to surface the contract-source mix.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotationSummary {
+    /// Whether `@mununu_blackbox` is present (redundant once the
+    /// caller has decided it's a black box, but kept so downstream
+    /// reports can show "user-marked" vs "adapter-inferred").
+    pub has_blackbox_tag: bool,
+    /// Number of `@mununu_assume` clauses.
+    pub assume_count: usize,
+    /// Number of `@mununu_guarantee` clauses.
+    pub guarantee_count: usize,
+    /// Contract URIs referenced via `@mununu_interface <uri>`.
+    /// Populated as raw strings; downstream code parses
+    /// `contract://domain/name@version[?alt=…]` into a corpus query.
+    pub interface_refs: Vec<String>,
+    /// Per-label controllability overrides.
+    pub controllable_overrides: Vec<String>,
+    /// Per-label uncontrollability overrides.
+    pub uncontrollable_overrides: Vec<String>,
+}
+
+impl AnnotationSummary {
+    /// Build a summary by walking the annotations of a black-box
+    /// interface.
+    pub fn from_annotations(annotations: &[crate::mununu_annotations::MununuAnnotation]) -> Self {
+        use crate::mununu_annotations::MununuTag;
+        let mut s = AnnotationSummary::default();
+        for ann in annotations {
+            match ann.tag {
+                MununuTag::Blackbox => s.has_blackbox_tag = true,
+                MununuTag::Assume => s.assume_count += 1,
+                MununuTag::Guarantee => s.guarantee_count += 1,
+                MununuTag::Interface => {
+                    if !ann.value.is_empty() {
+                        s.interface_refs.push(ann.value.clone());
+                    }
+                }
+                MununuTag::Controllable => {
+                    if !ann.value.is_empty() {
+                        s.controllable_overrides.push(ann.value.clone());
+                    }
+                }
+                MununuTag::Uncontrollable => {
+                    if !ann.value.is_empty() {
+                        s.uncontrollable_overrides.push(ann.value.clone());
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    /// Whether at least one *progress* clause is present
+    /// (`@mununu_guarantee`). When true, the output-sequencing gap can
+    /// be downgraded to a latency-bound gap because the user has
+    /// asserted at least some sequencing behaviour about the outputs.
+    pub fn has_progress_clause(&self) -> bool {
+        self.guarantee_count > 0
+    }
+}
+
 /// Run phase 1 discovery on a black-box interface. Always emits at least
 /// one gap marker (chaotic-stub default).
+///
+/// **Phase-2 behaviour (Document A task A6).** When the interface carries
+/// `@mununu_guarantee` annotations, the default `OutputSequencing` gap
+/// is downgraded to a `LatencyBound` gap — the user has authored at
+/// least some sequencing behaviour about the outputs, so the verifier
+/// no longer needs to assume *no* progress. The gap's description
+/// includes the count of A/G clauses so the HITL review can see what
+/// the contract actually contains.
 pub fn discover_phase1(iface: &BlackBoxInterface, options: &DiscoverOptions<'_>) -> Phase1Output {
+    // 0. Summarise any source-comment annotations attached to the
+    //    interface. The summary drives the §A6 phase-2 adjustments:
+    //    annotation-derived overrides are folded into the
+    //    controllability classifier, and the default
+    //    `OutputSequencing` gap is downgraded to a `LatencyBound`
+    //    gap when at least one guarantee clause is present.
+    let summary = AnnotationSummary::from_annotations(&iface.annotations);
+    let extra_controllable: Vec<&str> = summary
+        .controllable_overrides
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let extra_uncontrollable: Vec<&str> = summary
+        .uncontrollable_overrides
+        .iter()
+        .map(String::as_str)
+        .collect();
+
     // 1. Classify each port via the shared controllability helper.
+    //    Annotation-derived overrides are merged with whatever the
+    //    caller passed; both lists win over port direction.
     let labels: Vec<InterfaceLabel> = iface
         .ports
         .iter()
         .map(|port| {
-            let controllability = classify_label(
-                &port.name,
-                port.direction,
-                options.force_controllable,
-                options.force_uncontrollable,
-            );
+            // Build a per-port view of the merged override lists. We
+            // collect into owned vecs because the call signature
+            // takes `&[&str]` slices.
+            let mut force_c: Vec<&str> = options.force_controllable.to_vec();
+            force_c.extend(extra_controllable.iter().copied());
+            let mut force_u: Vec<&str> = options.force_uncontrollable.to_vec();
+            force_u.extend(extra_uncontrollable.iter().copied());
+            let controllability = classify_label(&port.name, port.direction, &force_c, &force_u);
             InterfaceLabel {
                 name: port.name.clone(),
                 controllability,
@@ -197,8 +303,11 @@ pub fn discover_phase1(iface: &BlackBoxInterface, options: &DiscoverOptions<'_>)
 
     // 2. Gap markers — at minimum, an `OutputSequencing` gap covering all
     //    outputs (the chaotic-stub default cannot prove liveness on
-    //    output labels). Phase 2 will replace this with discovered
-    //    automaton fragments when annotations / corpus entries exist.
+    //    output labels). Phase 2 (this branch, when at least one
+    //    `@mununu_guarantee` annotation is present) downgrades it to a
+    //    `LatencyBound` gap — the user has authored at least some
+    //    sequencing behaviour about the outputs, so the verifier no
+    //    longer needs to assume *no* progress.
     let mut gaps = GapMarkerReport::new();
     let output_labels: Vec<String> = labels
         .iter()
@@ -213,14 +322,29 @@ pub fn discover_phase1(iface: &BlackBoxInterface, options: &DiscoverOptions<'_>)
         _ => None,
     };
     if !output_labels.is_empty() {
+        let (kind, description) = if summary.has_progress_clause() {
+            (
+                GapKind::LatencyBound,
+                format!(
+                    "Phase-2 discovery — {} guarantee clause(s) found on {}; \
+                     latency bound still unauthored",
+                    summary.guarantee_count, iface.name
+                ),
+            )
+        } else {
+            (
+                GapKind::OutputSequencing,
+                format!(
+                    "Phase-1 discovery — no sequencing fragment yet for {}",
+                    iface.name
+                ),
+            )
+        };
         gaps.push(GapMarker {
             module: iface.name.clone(),
-            kind: GapKind::OutputSequencing,
+            kind,
             labels: output_labels,
-            description: Some(format!(
-                "Phase-1 discovery — no sequencing fragment yet for {}",
-                iface.name
-            )),
+            description: Some(description),
             source_location: source_location.clone(),
         });
     }
@@ -266,6 +390,7 @@ mod tests {
             ],
             source_file: None,
             source_line: None,
+            annotations: Vec::new(),
         };
         let out = discover_phase1(&iface, &DiscoverOptions::default());
         assert_eq!(out.module, "FifoIp");
@@ -301,6 +426,7 @@ mod tests {
             ],
             source_file: Some("rtl/sha.sv".to_string()),
             source_line: Some(42),
+            annotations: Vec::new(),
         };
         let out = discover_phase1(&iface, &DiscoverOptions::default());
         assert_eq!(out.gaps.len(), 1);
@@ -323,6 +449,7 @@ mod tests {
             ],
             source_file: None,
             source_line: None,
+            annotations: Vec::new(),
         };
         let out = discover_phase1(&iface, &DiscoverOptions::default());
         assert!(out.gaps.is_empty());
@@ -338,6 +465,7 @@ mod tests {
             ],
             source_file: None,
             source_line: None,
+            annotations: Vec::new(),
         };
         let opts = DiscoverOptions {
             emit_fairness_gap: true,
@@ -361,6 +489,7 @@ mod tests {
             ],
             source_file: Some("rtl/vendor/ddr3.sv".to_string()),
             source_line: Some(10),
+            annotations: Vec::new(),
         };
         let sidecars = build_blackbox_sidecars(&[iface], &DiscoverOptions::default());
         assert_eq!(sidecars.len(), 2);
@@ -382,9 +511,111 @@ mod tests {
             ports: vec![port("out", BoundaryDirection::Output)],
             source_file: None,
             source_line: None,
+            annotations: Vec::new(),
         };
         let sidecars = build_blackbox_sidecars(&[iface], &DiscoverOptions::default());
         assert_eq!(sidecars[0].filename, "vendor_IP__Block_1.interface.json");
+    }
+
+    #[test]
+    fn annotations_summary_counts_each_tag_kind() {
+        use crate::mununu_annotations::{MununuAnnotation, MununuTag};
+        let anns = vec![
+            MununuAnnotation::new(MununuTag::Blackbox, ""),
+            MununuAnnotation::new(MununuTag::Assume, "G(reset -> idle within 8)"),
+            MununuAnnotation::new(MununuTag::Guarantee, "G(req -> ack)"),
+            MununuAnnotation::new(MununuTag::Guarantee, "G(write -> response within K)"),
+            MununuAnnotation::new(MununuTag::Interface, "contract://rtl_memory/axi4_slave@2"),
+            MununuAnnotation::new(MununuTag::Controllable, "reset_n"),
+        ];
+        let summary = AnnotationSummary::from_annotations(&anns);
+        assert!(summary.has_blackbox_tag);
+        assert_eq!(summary.assume_count, 1);
+        assert_eq!(summary.guarantee_count, 2);
+        assert_eq!(
+            summary.interface_refs,
+            vec!["contract://rtl_memory/axi4_slave@2".to_string()]
+        );
+        assert_eq!(summary.controllable_overrides, vec!["reset_n".to_string()]);
+        assert!(summary.has_progress_clause());
+    }
+
+    #[test]
+    fn phase1_downgrades_gap_when_guarantee_present() {
+        use crate::mununu_annotations::{MununuAnnotation, MununuTag};
+        let iface = BlackBoxInterface {
+            name: "DDR_PHY".to_string(),
+            ports: vec![
+                port("clk", BoundaryDirection::Input),
+                port("data_out", BoundaryDirection::Output),
+            ],
+            source_file: Some("rtl/ddr.sv".to_string()),
+            source_line: Some(10),
+            annotations: vec![MununuAnnotation::new(
+                MununuTag::Guarantee,
+                "G(awvalid -> awready)",
+            )],
+        };
+        let out = discover_phase1(&iface, &DiscoverOptions::default());
+        assert_eq!(out.gaps.len(), 1);
+        assert_eq!(
+            out.gaps.markers[0].kind,
+            GapKind::LatencyBound,
+            "presence of @mununu_guarantee should downgrade OutputSequencing to LatencyBound"
+        );
+        assert!(
+            out.gaps.markers[0]
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("Phase-2"),
+            "description should signal phase-2 vs phase-1"
+        );
+    }
+
+    #[test]
+    fn phase1_keeps_output_sequencing_when_no_guarantees() {
+        let iface = BlackBoxInterface {
+            name: "PlainBlackBox".to_string(),
+            ports: vec![port("out", BoundaryDirection::Output)],
+            source_file: None,
+            source_line: None,
+            annotations: vec![],
+        };
+        let out = discover_phase1(&iface, &DiscoverOptions::default());
+        assert_eq!(out.gaps.markers[0].kind, GapKind::OutputSequencing);
+    }
+
+    #[test]
+    fn annotation_overrides_steer_controllability() {
+        use crate::mununu_annotations::{MununuAnnotation, MununuTag};
+        // `reset_n` is an Input → would normally classify as
+        // Uncontrollable. The `@mununu_controllable` annotation flips
+        // it. `data_out` is an Output → normally Controllable; the
+        // `@mununu_uncontrollable` annotation flips it.
+        let iface = BlackBoxInterface {
+            name: "Quirky".to_string(),
+            ports: vec![
+                port("reset_n", BoundaryDirection::Input),
+                port("data_out", BoundaryDirection::Output),
+            ],
+            source_file: None,
+            source_line: None,
+            annotations: vec![
+                MununuAnnotation::new(MununuTag::Controllable, "reset_n"),
+                MununuAnnotation::new(MununuTag::Uncontrollable, "data_out"),
+            ],
+        };
+        let out = discover_phase1(&iface, &DiscoverOptions::default());
+        let by = |name: &str| out.labels.iter().find(|l| l.name == name).unwrap();
+        assert_eq!(
+            by("reset_n").controllability,
+            LabelControllability::Controllable
+        );
+        assert_eq!(
+            by("data_out").controllability,
+            LabelControllability::Uncontrollable
+        );
     }
 
     #[test]
@@ -403,6 +634,7 @@ mod tests {
             ],
             source_file: None,
             source_line: None,
+            annotations: Vec::new(),
         };
         let opts = DiscoverOptions {
             force_controllable: &["reset_n"],

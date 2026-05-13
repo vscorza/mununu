@@ -381,6 +381,7 @@ impl SystemVerilogAdapter {
                     &module,
                     &bb_entry.name,
                     &bb_entry.source,
+                    &sv_content,
                 ));
             }
             if !blackboxes.is_empty() {
@@ -429,6 +430,7 @@ fn blackbox_interface_from_module(
     module: &ast::Module,
     user_supplied_name: &str,
     source_path: &str,
+    source_text: &str,
 ) -> crate::contract::discover::BlackBoxInterface {
     use crate::contract::discover::{BlackBoxInterface, PortDescriptor};
     use crate::controllability::BoundaryDirection;
@@ -449,11 +451,22 @@ fn blackbox_interface_from_module(
             }
         })
         .collect();
+
+    // Document D task D4 + Document A task A6: scan the raw SV
+    // source for `@mununu_*` annotations (Verilog attribute syntax
+    // plus `// @mununu_xxx` and `/* @mununu_xxx */` comments). The
+    // custom-SV parser does not yet hand us the attributes on its
+    // AST, so we scan the source text directly. Both the SV and the
+    // yosys frontends feed the same `MununuAnnotation` shape into
+    // `BlackBoxInterface.annotations`.
+    let annotations = crate::mununu_annotations::extract_from_sv_source(source_text);
+
     BlackBoxInterface {
         name: user_supplied_name.to_string(),
         ports,
         source_file: Some(source_path.to_string()),
         source_line: None,
+        annotations,
     }
 }
 
