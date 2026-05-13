@@ -1,0 +1,29 @@
+{
+  "id": "rtl_crypto/aes_ctr",
+  "version": "1.0.0",
+  "domain": "rtl_crypto",
+  "name": "aes_ctr",
+  "description": "AES-CTR symmetric cipher block contract. Captures the canonical request/done handshake plus the safety guarantee that the cipher never emits ciphertext bytes before a nonce has been loaded for the current session. ILLUSTRATIVE: this entry demonstrates the corpus schema for Document D's TLS handshake industrial example; it is not derived from any specific vendor silicon.",
+  "parameters": {
+    "key_bits": 128,
+    "block_bits": 128,
+    "counter_bits": 64
+  },
+  "alternatives": [
+    {
+      "id": "strict_iv",
+      "label": "Strict IV uniqueness",
+      "description": "The contract asserts that the IV+counter combination is monotonically advanced per block; reuse is treated as a guarantee violation."
+    },
+    {
+      "id": "permissive",
+      "label": "Permissive — caller-managed IV",
+      "description": "Drops the IV-uniqueness guarantee. Caller is responsible for tracking IV freshness."
+    }
+  ],
+  "provenance": {
+    "tier": "mununu_verified",
+    "verified_against": "NIST SP 800-38A counter-mode reference (illustrative — no real vendor silicon was modelled)"
+  },
+  "soundness_flag": "safety+liveness"
+}

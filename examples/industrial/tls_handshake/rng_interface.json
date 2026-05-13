@@ -1,0 +1,24 @@
+{
+  "name": "TRNG_V2",
+  "ports": [
+    { "name": "clk",         "direction": "Input",  "description": "clock" },
+    { "name": "reset_n",     "direction": "Input",  "description": "async reset, active low" },
+    { "name": "req",         "direction": "Input",  "description": "request a fresh 64-bit random word" },
+    { "name": "rand_valid",  "direction": "Output", "description": "rises when rand_out is fresh and stable" },
+    { "name": "rand_out",    "direction": "Output", "description": "64-bit random word; never repeated within a session per `rng_freshness` contract" }
+  ],
+  "source_file": "rtl/vendor/trng_v2.sv",
+  "source_line": 8,
+  "annotations": [
+    {
+      "tag": "blackbox",
+      "value": "",
+      "source_line": 6
+    },
+    {
+      "tag": "interface",
+      "value": "contract://rtl_crypto/trng@2.0.0",
+      "source_line": 7
+    }
+  ]
+}
