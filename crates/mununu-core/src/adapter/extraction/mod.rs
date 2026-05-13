@@ -93,6 +93,7 @@ impl FormatAdapter for ExtractionAdapter {
         let ctxdsl = build_provenance_header(&spec, mode) + &result.ctxdsl;
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl,
             warnings,
             source_info: SourceInfo {

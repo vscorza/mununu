@@ -1469,6 +1469,7 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
     }
 
     Ok(AdapterOutput {
+        sidecars: Vec::new(),
         ctxdsl: emit_result.ctxdsl,
         warnings,
         source_info: SourceInfo {

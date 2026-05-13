@@ -1,0 +1,146 @@
+// Small SoC with one closed-IP submodule
+// ========================================
+//
+// Industrial example for Document B (RTL frontend unification) §B.8.
+// Models a tiny SoC fragment that exercises:
+//   - a host controller (open, fully verifiable),
+//   - a UART peripheral (open, with a clean protocol FSM),
+//   - a DDR3 PHY (closed-IP black box, modelled as a chaotic stub).
+//
+// The composition shows the seam-vs-core principle in action: the open
+// pieces compose as ordinary mununu automata; the closed piece is a
+// 2-state chaotic stub with uncontrollable outputs, exactly as
+// Document A §2 prescribes.
+//
+// What the example demonstrates against today's mununu binary on main:
+//   - Safety property over the host bus is provable under chaotic DDR.
+//   - The DDR PHY's "ready" output is Uncontrollable from the host
+//     side (port-direction → controllability rule, Document A §4).
+//   - `mununu contract sidecars` produces the same JSON shape an
+//     adapter would auto-emit once Document B's yosys-side
+//     integration lands.
+
+context dual_frontend_soc {
+    alphabet {
+        // Host controller actions
+        label host_init_burst;
+        label host_complete_burst;
+        label host_reset;
+        // Bus protocol observables
+        label ddr_busy;
+        label ddr_ready;
+        // UART protocol observables
+        label uart_tx_start;
+        label uart_tx_done;
+        // Internal ticks
+        label ddr_compute_tick;
+        label uart_baud_tick;
+    }
+
+    automata {
+        // ----- Open: Host controller --------------------------------------
+        automaton HostController {
+            controllable {
+                label host_init_burst;
+                label host_complete_burst;
+                label host_reset;
+                label uart_tx_start;
+            }
+
+            states {
+                state Idle initial;
+                state BurstWait;
+                state UartTx;
+            }
+
+            transitions {
+                transition Idle -> BurstWait on label host_init_burst;
+                transition BurstWait -> BurstWait on label ddr_busy;
+                transition BurstWait -> Idle on label ddr_ready;
+                transition BurstWait -> Idle on label host_complete_burst;
+                transition Idle -> UartTx on label uart_tx_start;
+                transition UartTx -> Idle on label uart_tx_done;
+                // Reset paths
+                transition BurstWait -> Idle on label host_reset;
+                transition UartTx -> Idle on label host_reset;
+                transition Idle -> Idle on label host_reset;
+            }
+        }
+
+        // ----- Closed-IP: DDR3 PHY chaotic stub ---------------------------
+        // 2 states. host_init_burst kicks it off; ddr_ready may fire
+        // *or* the stub may loop in Busy indefinitely (chaotic — no
+        // bounded-latency contract is authored here).
+        automaton DDR3_PHY_V2 {
+            states {
+                state Idle initial;
+                state Busy;
+            }
+
+            transitions {
+                transition Idle -> Busy on label host_init_burst;
+                transition Busy -> Busy on label ddr_compute_tick;
+                transition Busy -> Busy on label ddr_busy;
+                // Output: ddr_ready rises → back to Idle. Chaotic.
+                transition Busy -> Idle on label ddr_ready;
+                transition Busy -> Idle on label host_reset;
+                transition Idle -> Idle on label host_reset;
+            }
+        }
+
+        // ----- Open: UART peripheral --------------------------------------
+        automaton UART {
+            controllable {
+                label uart_baud_tick;
+                label uart_tx_done;
+            }
+
+            states {
+                state Idle initial;
+                state Sending;
+            }
+
+            transitions {
+                transition Idle -> Sending on label uart_tx_start;
+                transition Sending -> Sending on label uart_baud_tick;
+                transition Sending -> Idle on label uart_tx_done;
+                transition Idle -> Idle on label host_reset;
+                transition Sending -> Idle on label host_reset;
+            }
+        }
+    }
+
+    composition {
+        synchronous SoC {
+            members [HostController, DDR3_PHY_V2, UART];
+        }
+    }
+
+    mu_formulas {
+        // -----------------------------------------------------------------
+        // Safety: the SoC composition is always in a well-formed state.
+        // (Trivially true for this composition; the value is that the
+        // verifier reaches a fixpoint over the chaotic DDR3_PHY_V2.)
+        // -----------------------------------------------------------------
+        formula soc_well_formed {
+            over SoC;
+            body = nu X. ([] X);
+        }
+
+        // -----------------------------------------------------------------
+        // Reachability: the host can issue a DDR burst and complete it.
+        // -----------------------------------------------------------------
+        formula burst_path_reachable {
+            over HostController;
+            body = mu X. (BurstWait || <> X);
+        }
+
+        // -----------------------------------------------------------------
+        // Reachability: UART send path exists.
+        // -----------------------------------------------------------------
+        formula uart_send_reachable {
+            over HostController;
+            body = mu X. (UartTx || <> X);
+        }
+    }
+}

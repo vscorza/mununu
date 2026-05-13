@@ -77,6 +77,21 @@ enum ContractCommand {
     Gaps(ContractGapsArgs),
     /// Discover a phase-1 contract from a black-box interface description.
     Discover(ContractDiscoverArgs),
+    /// Emit interface + gap-report sidecars for a list of black-box modules.
+    Sidecars(ContractSidecarsArgs),
+}
+
+#[derive(Args, Debug)]
+struct ContractSidecarsArgs {
+    /// Path to a JSON file containing a list of `BlackBoxInterface` objects.
+    #[arg(value_name = "INTERFACES")]
+    interfaces: PathBuf,
+    /// Directory to write the sidecar files; created if missing.
+    #[arg(long, value_name = "DIR")]
+    out_dir: PathBuf,
+    /// Emit an additional `Fairness` gap marker per module.
+    #[arg(long)]
+    emit_fairness_gap: bool,
 }
 
 #[derive(Args, Debug)]
@@ -668,7 +683,42 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
         ContractCommand::Validate(args) => contract_validate(args),
         ContractCommand::Gaps(args) => contract_gaps(args),
         ContractCommand::Discover(args) => contract_discover(args),
+        ContractCommand::Sidecars(args) => contract_sidecars(args),
     }
+}
+
+fn contract_sidecars(args: ContractSidecarsArgs) -> Result<(), String> {
+    use mununu_core::contract::discover::{
+        BlackBoxInterface, DiscoverOptions, build_blackbox_sidecars,
+    };
+
+    let body = std::fs::read_to_string(&args.interfaces)
+        .map_err(|e| format!("failed to read {}: {e}", args.interfaces.display()))?;
+    let interfaces: Vec<BlackBoxInterface> = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse interfaces JSON (expected array): {e}"))?;
+
+    std::fs::create_dir_all(&args.out_dir)
+        .map_err(|e| format!("failed to create {}: {e}", args.out_dir.display()))?;
+
+    let opts = DiscoverOptions {
+        force_controllable: &[],
+        force_uncontrollable: &[],
+        emit_fairness_gap: args.emit_fairness_gap,
+    };
+    let sidecars = build_blackbox_sidecars(&interfaces, &opts);
+
+    for sidecar in &sidecars {
+        let target = args.out_dir.join(&sidecar.filename);
+        std::fs::write(&target, &sidecar.content)
+            .map_err(|e| format!("failed to write {}: {e}", target.display()))?;
+        println!("wrote: {}", target.display());
+    }
+    println!(
+        "wrote {} sidecar(s) for {} black-box module(s)",
+        sidecars.len(),
+        interfaces.len(),
+    );
+    Ok(())
 }
 
 fn contract_discover(args: ContractDiscoverArgs) -> Result<(), String> {
@@ -1810,6 +1860,19 @@ type StateValuationsMap = std::collections::HashMap<
 >;
 
 fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, StateValuationsMap) {
+    log_adapter_output_with_dir(output, None)
+}
+
+/// Like [`log_adapter_output`] but, when `sidecar_dir` is `Some`, writes
+/// every `AdapterSidecar` the adapter attached (e.g. the yosys frontend's
+/// auto-emitted `BlackBoxInterface.json` + `GapMarkerReport.json` files,
+/// per Document B task B3) into that directory. Designed so callers that
+/// know where the source file lives can park the sidecars right next to
+/// it without the CLI inventing an output structure.
+fn log_adapter_output_with_dir(
+    output: mununu_core::adapter::AdapterOutput,
+    sidecar_dir: Option<&std::path::Path>,
+) -> (String, StateValuationsMap) {
     for w in &output.warnings {
         eprintln!("adapter warning: {}", w.message);
     }
@@ -1820,6 +1883,21 @@ fn log_adapter_output(output: mununu_core::adapter::AdapterOutput) -> (String, S
         output.source_info.state_count,
         output.source_info.property_count,
     );
+    if let Some(dir) = sidecar_dir {
+        for sidecar in &output.sidecars {
+            let target = dir.join(&sidecar.filename);
+            match std::fs::write(&target, &sidecar.content) {
+                Ok(()) => eprintln!("auto-emitted sidecar: {}", target.display()),
+                Err(e) => eprintln!("warning: failed to write sidecar {}: {e}", target.display()),
+            }
+        }
+    } else if !output.sidecars.is_empty() {
+        eprintln!(
+            "adapter produced {} sidecar(s); no source directory known so they were not written. \
+             Call this via a flow that knows the source path (e.g. `context eval <file> --adapter yosys`) to enable auto-write.",
+            output.sidecars.len(),
+        );
+    }
     (output.ctxdsl, output.state_valuations)
 }
 
@@ -1878,14 +1956,21 @@ fn load_with_adapter_mode(
         Some("sv-yosys") | Some("yosys") => {
             // Yosys-driven SV elaboration → BTOR2 → CLTS.
             // Per Phase 1 of the RTL roadmap (S1: Yosys-as-front-end).
-            let yopts = mununu_core::adapter::yosys::YosysOptions::default();
-            log_adapter_output(
+            // Sidecars emitted for `(* blackbox *)` modules (Document B
+            // task B3) land in the source file's parent directory so the
+            // user finds them next to the `.sv` they just ran.
+            let yopts = mununu_core::adapter::yosys::YosysOptions {
+                primary_source_path: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            log_adapter_output_with_dir(
                 mununu_core::adapter::yosys::translate_sv(
                     &source,
                     &load_btor_sidecar(&options_default),
                     &yopts,
                 )
                 .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
+                path.parent(),
             )
         }
         Some("promela") => log_adapter_output(

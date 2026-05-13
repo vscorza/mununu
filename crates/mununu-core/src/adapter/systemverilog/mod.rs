@@ -110,6 +110,7 @@ impl SystemVerilogAdapter {
         let property_count = ir.properties.len();
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl: result.ctxdsl,
             warnings,
             source_info: SourceInfo {
@@ -338,6 +339,7 @@ impl SystemVerilogAdapter {
         })?;
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl: result.ctxdsl,
             warnings: all_warnings,
             source_info: SourceInfo {
@@ -604,6 +606,7 @@ impl FormatAdapter for SystemVerilogAdapter {
         let property_count = ir.properties.len();
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl: result.ctxdsl,
             warnings,
             source_info: SourceInfo {

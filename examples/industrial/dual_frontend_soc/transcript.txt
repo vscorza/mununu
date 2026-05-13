@@ -1,0 +1,219 @@
+# dual-frontend SoC — validation transcript
+# regenerate via examples/industrial/dual_frontend_soc/validate.sh
+# transcript is byte-deterministic; re-running validate.sh
+# against the same commit should produce identical output.
+
+=== 1. Emit sidecars for the DDR3 PHY black box ===
+$ ./target/debug/mununu contract sidecars examples/industrial/dual_frontend_soc/blackbox_interfaces.json --out-dir examples/industrial/dual_frontend_soc/sidecars_generated
+wrote: examples/industrial/dual_frontend_soc/sidecars_generated/DDR3_PHY_V2.interface.json
+wrote: examples/industrial/dual_frontend_soc/sidecars_generated/DDR3_PHY_V2.gap_report.json
+wrote 2 sidecar(s) for 1 black-box module(s)
+
+=== 2. Inspect the auto-emitted interface JSON ===
+$ cat examples/industrial/dual_frontend_soc/sidecars_generated/DDR3_PHY_V2.interface.json
+{
+  "name": "DDR3_PHY_V2",
+  "ports": [
+    {
+      "name": "clk",
+      "direction": "Input",
+      "description": "clock"
+    },
+    {
+      "name": "reset_n",
+      "direction": "Input",
+      "description": "active-low async reset"
+    },
+    {
+      "name": "host_init_burst",
+      "direction": "Input",
+      "description": "rising edge starts a burst"
+    },
+    {
+      "name": "addr",
+      "direction": "Input",
+      "description": "burst start address"
+    },
+    {
+      "name": "wdata",
+      "direction": "Input",
+      "description": "write-data bus"
+    },
+    {
+      "name": "rdata",
+      "direction": "Output",
+      "description": "read-data bus"
+    },
+    {
+      "name": "ddr_ready",
+      "direction": "Output",
+      "description": "rises when the burst completes"
+    },
+    {
+      "name": "ddr_busy",
+      "direction": "Output",
+      "description": "high while the burst is in flight"
+    }
+  ],
+  "source_file": "rtl/vendor/ddr3_phy.sv",
+  "source_line": 12
+}
+
+=== 3. Inspect the auto-emitted gap-report JSON ===
+$ cat examples/industrial/dual_frontend_soc/sidecars_generated/DDR3_PHY_V2.gap_report.json
+{
+  "markers": [
+    {
+      "module": "DDR3_PHY_V2",
+      "kind": "output_sequencing",
+      "labels": [
+        "rdata",
+        "ddr_ready",
+        "ddr_busy"
+      ],
+      "description": "Phase-1 discovery — no sequencing fragment yet for DDR3_PHY_V2",
+      "source_location": {
+        "file": "rtl/vendor/ddr3_phy.sv",
+        "line": 12
+      }
+    }
+  ]
+}
+
+=== 4. Discover phase-1 contract using the auto-emitted interface ===
+$ ./target/debug/mununu contract discover examples/industrial/dual_frontend_soc/sidecars_generated/DDR3_PHY_V2.interface.json
+WARN contract gap detected — chaotic stub default in effect module="DDR3_PHY_V2" kind=output_sequencing labels="rdata, ddr_ready, ddr_busy" location="rtl/vendor/ddr3_phy.sv:12" soundness="safety verdicts hold; liveness verdicts depending on these labels are unsound (no progress assumption)." description="Phase-1 discovery — no sequencing fragment yet for DDR3_PHY_V2"
+phase-1 discovery: 8 label(s), 1 gap marker(s) for module `DDR3_PHY_V2`
+
+=== 5. Run the gap diagnostic (strict mode expected to exit non-zero) ===
+$ ./target/debug/mununu contract gaps examples/industrial/dual_frontend_soc/sidecars_generated/DDR3_PHY_V2.gap_report.json --strict-contracts
+WARN contract gap detected — chaotic stub default in effect module="DDR3_PHY_V2" kind=output_sequencing labels="rdata, ddr_ready, ddr_busy" location="rtl/vendor/ddr3_phy.sv:12" soundness="safety verdicts hold; liveness verdicts depending on these labels are unsound (no progress assumption)." description="Phase-1 discovery — no sequencing fragment yet for DDR3_PHY_V2"
+gap report: 1 marker(s) across 1 module(s)
+--strict-contracts: 1 unresolved contract gap(s) — refusing to proceed
+
+=== 5a. AUTO-emit sidecars by running the yosys frontend on soc.sv ===
+$ ./target/debug/mununu context summarize examples/industrial/dual_frontend_soc/soc.sv --adapter yosys
+adapter warning: All BTOR2 inputs treated as uncontrollable (no --controllable-inputs specified)
+Translated SystemVerilog: 10 signals, 32 states, 0 properties
+auto-emitted sidecar: examples/industrial/dual_frontend_soc/ddr3_phy_v2.interface.json
+auto-emitted sidecar: examples/industrial/dual_frontend_soc/ddr3_phy_v2.gap_report.json
+{
+  "context": "btor2_design",
+  "sidecar_count": 0,
+  "automata": [
+    {
+      "name": "Circuit",
+      "state_count": 32,
+      "transition_count": 1024
+    }
+  ],
+  "controllers": [],
+  "formulas": [],
+  "guard_predicates": {
+    "Circuit": [
+      "Circuit_has_enabled_transition",
+      "Circuit_is_deadlock_state"
+    ]
+  }
+}
+
+=== 5b. Inspect the auto-emitted interface JSON ===
+$ cat examples/industrial/dual_frontend_soc/ddr3_phy_v2.interface.json
+{
+  "name": "ddr3_phy_v2",
+  "ports": [
+    {
+      "name": "addr",
+      "direction": "Input",
+      "description": null
+    },
+    {
+      "name": "clk",
+      "direction": "Input",
+      "description": null
+    },
+    {
+      "name": "ddr_busy",
+      "direction": "Output",
+      "description": null
+    },
+    {
+      "name": "ddr_ready",
+      "direction": "Output",
+      "description": null
+    },
+    {
+      "name": "host_init_burst",
+      "direction": "Input",
+      "description": null
+    },
+    {
+      "name": "rdata",
+      "direction": "Output",
+      "description": null
+    },
+    {
+      "name": "reset_n",
+      "direction": "Input",
+      "description": null
+    },
+    {
+      "name": "wdata",
+      "direction": "Input",
+      "description": null
+    }
+  ],
+  "source_file": "examples/industrial/dual_frontend_soc/soc.sv",
+  "source_line": 16
+}
+
+=== 5c. Inspect the auto-emitted gap-report JSON ===
+$ cat examples/industrial/dual_frontend_soc/ddr3_phy_v2.gap_report.json
+{
+  "markers": [
+    {
+      "module": "ddr3_phy_v2",
+      "kind": "output_sequencing",
+      "labels": [
+        "ddr_busy",
+        "ddr_ready",
+        "rdata"
+      ],
+      "description": "Phase-1 discovery — no sequencing fragment yet for ddr3_phy_v2",
+      "source_location": {
+        "file": "examples/industrial/dual_frontend_soc/soc.sv",
+        "line": 16
+      }
+    }
+  ]
+}
+
+=== 6. SoC composition — well-formedness (safety, under chaotic DDR) ===
+$ ./target/debug/mununu context eval examples/industrial/dual_frontend_soc/soc.ctxdsl --formula soc_well_formed --automaton SoC
+[mununu] WARN: model has 1 reachable state(s); verdicts are vacuously satisfied regardless of formula content. The property may appear to hold (or fail) without genuinely witnessing or excluding the modeled behavior. Confirm the model has sufficient state-space distinction before relying on this verdict.
+Formula 'soc_well_formed' over automaton 'SoC':
+  States satisfying: 1/1
+    Idle|Idle|Idle
+  Initial states satisfying: 1/1
+    Idle|Idle|Idle
+  Guard partitions: enabled
+
+=== 7. Host can reach the DDR burst-wait state ===
+$ ./target/debug/mununu context eval examples/industrial/dual_frontend_soc/soc.ctxdsl --formula burst_path_reachable --automaton HostController
+Formula 'burst_path_reachable' over automaton 'HostController':
+  States satisfying: 3/3
+    BurstWait, Idle, UartTx
+  Initial states satisfying: 1/1
+    Idle
+  Guard partitions: enabled
+
+=== 8. Host can reach the UART send path ===
+$ ./target/debug/mununu context eval examples/industrial/dual_frontend_soc/soc.ctxdsl --formula uart_send_reachable --automaton HostController
+Formula 'uart_send_reachable' over automaton 'HostController':
+  States satisfying: 3/3
+    BurstWait, Idle, UartTx
+  Initial states satisfying: 1/1
+    Idle
+  Guard partitions: enabled
+
+=== end of transcript ===

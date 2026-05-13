@@ -52,6 +52,13 @@ pub struct YosysOptions {
     pub additional_sources: Vec<(String, String)>,
     /// Skip the Verific-taint check (for testing).
     pub skip_verific_check: bool,
+    /// Optional original path of the primary SV source. Used only to
+    /// rewrite the `source_file` field of any auto-emitted black-box
+    /// sidecar (Document B task B3) — yosys sees the SV through a
+    /// per-call tempdir, so without this hint the sidecars would point
+    /// at `/tmp/.../work.sv`. The user expects the path of the file
+    /// they actually invoked mununu on.
+    pub primary_source_path: Option<String>,
 }
 
 /// SV-via-Yosys adapter — wraps the BTOR2 path with a Yosys subprocess.
@@ -99,7 +106,8 @@ pub fn translate_sv(
     }
 
     let btor_path = tmp.path().join("design.btor");
-    let script = build_script(&sources, yopts.top.as_deref(), &btor_path);
+    let hier_json_path = tmp.path().join("hier.json");
+    let script = build_script(&sources, yopts.top.as_deref(), &btor_path, &hier_json_path);
 
     let output = Command::new(&yosys)
         .arg("-q")
@@ -145,7 +153,158 @@ pub fn translate_sv(
         format: SourceFormat::SystemVerilog,
         ..out.source_info
     };
+
+    // Document B task B2 + B3 (yosys half): scan the pre-flatten
+    // hierarchy snapshot for `(* blackbox *)` modules and auto-emit
+    // `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars for
+    // each. The hierarchy file is best-effort — if yosys did not
+    // produce it, we proceed without sidecars rather than failing the
+    // whole translation.
+    if let Ok(hier_body) = std::fs::read_to_string(&hier_json_path) {
+        let mut blackboxes = parse_blackbox_modules(&hier_body);
+        // Rewrite the tempdir path back to the user's primary source
+        // path when known. Yosys saw the SV as `<tempdir>/work.sv`;
+        // the user expects to see the path they actually invoked
+        // mununu on.
+        if let Some(real_path) = yopts.primary_source_path.as_ref() {
+            let tempdir_prefix = primary.to_string_lossy().into_owned();
+            for bb in blackboxes.iter_mut() {
+                if let Some(ref src) = bb.source_file
+                    && src == &tempdir_prefix
+                {
+                    bb.source_file = Some(real_path.clone());
+                }
+            }
+        }
+        if !blackboxes.is_empty() {
+            let opts = crate::contract::discover::DiscoverOptions {
+                force_controllable: &[],
+                force_uncontrollable: &[],
+                emit_fairness_gap: false,
+            };
+            let sidecars = crate::contract::discover::build_blackbox_sidecars(&blackboxes, &opts);
+            out.sidecars.extend(sidecars);
+        }
+    }
+
     Ok(out)
+}
+
+/// Parse the yosys `write_json` output and extract any modules with the
+/// `(* blackbox *)` attribute as `BlackBoxInterface` records. Returns an
+/// empty Vec on parse failures — the sidecar emission is best-effort
+/// and should not fail the whole adapter run if yosys's JSON schema
+/// drifts under us.
+///
+/// Yosys's JSON layout (per `yosys -p 'write_json --help'`):
+///
+/// ```text
+/// {
+///   "modules": {
+///     "<name>": {
+///       "attributes": { "blackbox": "00…001", "src": "foo.sv:10.1-..." },
+///       "ports":      { "<port>": { "direction": "input|output|inout", "bits": [...] } },
+///       …
+///     }
+///   }
+/// }
+/// ```
+fn parse_blackbox_modules(hier_json: &str) -> Vec<crate::contract::discover::BlackBoxInterface> {
+    use crate::contract::discover::{BlackBoxInterface, PortDescriptor};
+    use crate::controllability::BoundaryDirection;
+
+    let root: serde_json::Value = match serde_json::from_str(hier_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let modules = match root.get("modules").and_then(|m| m.as_object()) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for (name, body) in modules {
+        let attrs = body.get("attributes").and_then(|a| a.as_object());
+        let is_blackbox = attrs
+            .and_then(|a| a.get("blackbox"))
+            .map(|v| {
+                // yosys serialises bool attributes as bitstrings; any
+                // string ending in '1' counts as set.
+                v.as_str().is_some_and(|s| s.ends_with('1'))
+            })
+            .unwrap_or(false);
+        if !is_blackbox {
+            continue;
+        }
+
+        // Pull ports in declaration order. yosys preserves order in
+        // serde_json::Map under the `preserve_order` feature; without
+        // that feature the iteration is undefined. We sort the port
+        // names alphabetically as a deterministic fallback — the
+        // adapter's tests in §B.7.3 / §B.8 do not depend on port
+        // declaration order.
+        let mut ports: Vec<PortDescriptor> = Vec::new();
+        if let Some(port_map) = body.get("ports").and_then(|p| p.as_object()) {
+            let mut names: Vec<&String> = port_map.keys().collect();
+            names.sort();
+            for port_name in names {
+                let port_body = match port_map.get(port_name) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let direction_str = port_body
+                    .get("direction")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("input");
+                let direction = match direction_str {
+                    "input" => BoundaryDirection::Input,
+                    "output" => BoundaryDirection::Output,
+                    "inout" => BoundaryDirection::Inout,
+                    _ => BoundaryDirection::Internal,
+                };
+                ports.push(PortDescriptor {
+                    name: port_name.clone(),
+                    direction,
+                    description: None,
+                });
+            }
+        }
+
+        // Source location, parsed from yosys's `src` attribute when
+        // present. yosys's format is e.g. `"foo.sv:10.1-25.6"` —
+        // we keep only the filename and the first line number.
+        let (source_file, source_line) = attrs
+            .and_then(|a| a.get("src"))
+            .and_then(|v| v.as_str())
+            .map(parse_yosys_src)
+            .unwrap_or((None, None));
+
+        out.push(BlackBoxInterface {
+            name: name.clone(),
+            ports,
+            source_file,
+            source_line,
+        });
+    }
+    // Deterministic order for downstream consumers.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Best-effort parse of yosys's `src` attribute into `(file, line)`.
+/// Examples that should round-trip:
+/// - `"foo.sv:10.1-25.6"` → `("foo.sv", 10)`
+/// - `"path/with:colon/foo.sv:5"` → `("path/with:colon/foo.sv", 5)` (last `:` before line)
+fn parse_yosys_src(src: &str) -> (Option<String>, Option<u32>) {
+    let Some(colon) = src.rfind(':') else {
+        return (Some(src.to_string()), None);
+    };
+    let file_part = &src[..colon];
+    let line_part = &src[colon + 1..];
+    // Strip "<line>.<col>-..." down to just the line.
+    let line_only = line_part.split(['.', '-']).next().unwrap_or(line_part);
+    let line: Option<u32> = line_only.parse().ok();
+    (Some(file_part.to_string()), line)
 }
 
 /// Find a usable yosys binary.
@@ -210,8 +369,15 @@ fn verify_no_verific(yosys: &Path) -> Result<(), AdapterError> {
 /// 1. `read_verilog -formal -sv` — parse, enabling SVA / formal constructs.
 /// 2. `hierarchy -top X` — select the design's root.
 /// 3. `proc` — lower always-blocks to RTL netlist.
-/// 4. `flatten` — inline submodule instances.
-/// 5. `async2sync` — convert async-reset / async-set cells to plain
+/// 4. `write_json <hier>` — **before flatten** — capture the elaborated
+///    hierarchy (modules, ports with directions, attributes) so the
+///    driver can detect `(* blackbox *)` modules and auto-emit
+///    `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars
+///    (Document B task B2 + B3). Without this snapshot, `flatten`
+///    erases module boundaries before the driver gets a chance to see
+///    them.
+/// 5. `flatten` — inline submodule instances.
+/// 6. `async2sync` — convert async-reset / async-set cells to plain
 ///    synchronous DFFs while **preserving the synchronous structure**
 ///    (the clock is implicit in BTOR2's `state` semantics, not exposed
 ///    as edge-detect combinational logic). This lets `chformal -lower`
@@ -221,15 +387,20 @@ fn verify_no_verific(yosys: &Path) -> Result<(), AdapterError> {
 ///    produced ~3 state cells per user FF group; this script produces
 ///    1, matching mununu's "each CLTS transition = one clock edge"
 ///    semantics natively.
-/// 6. `chformal -lower` — translate SVA `assert` / `assume` / `cover` into
+/// 7. `chformal -lower` — translate SVA `assert` / `assume` / `cover` into
 ///    BTOR2 `bad` / `constraint` / fair / `justice` signals. No-op if no
 ///    SVA is present in the design.
-/// 7. `dffunmap` — unmap SDFF (synchronous-reset) cells to plain DFF +
+/// 8. `dffunmap` — unmap SDFF (synchronous-reset) cells to plain DFF +
 ///    explicit reset logic (write_btor only accepts plain DFF).
-/// 8. `setundef -zero` — replace any remaining X / undef bits with 0
+/// 9. `setundef -zero` — replace any remaining X / undef bits with 0
 ///    (deterministic; bit-blaster does not model X-prop).
-/// 9. `write_btor` — emit the BTOR2.
-fn build_script(sources: &[PathBuf], top: Option<&str>, btor_out: &Path) -> String {
+/// 10. `write_btor` — emit the BTOR2.
+fn build_script(
+    sources: &[PathBuf],
+    top: Option<&str>,
+    btor_out: &Path,
+    hier_json_out: &Path,
+) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
         .map(|p| format!("read_verilog -formal -sv {}", p.display()))
@@ -238,9 +409,16 @@ fn build_script(sources: &[PathBuf], top: Option<&str>, btor_out: &Path) -> Stri
         Some(t) => format!("hierarchy -top {t}"),
         None => "hierarchy -auto-top".to_string(),
     };
+    // `cutpoint -blackbox` between the hierarchy snapshot and `flatten`
+    // replaces every output of every `(* blackbox *)` cell with an
+    // `$anyseq` (free variable) cell. This is what makes the rest of
+    // the pipeline succeed even when the blackbox body is empty — the
+    // blackbox's outputs become uncontrollable free signals, exactly
+    // the chaotic-stub semantics Document A §2 prescribes.
     format!(
-        "{}; {hier}; proc; flatten; async2sync; chformal -lower; dffunmap; setundef -zero; write_btor {}",
+        "{}; {hier}; proc; write_json {}; cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; setundef -zero; write_btor {}",
         read_cmds.join("; "),
+        hier_json_out.display(),
         btor_out.display()
     )
 }
@@ -272,6 +450,7 @@ pub fn translate_sv_multi(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         skip_verific_check: false,
+        primary_source_path: None,
     };
     translate_sv(primary, options, &yopts)
 }
@@ -326,6 +505,7 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controllability::BoundaryDirection;
 
     fn yosys_available() -> bool {
         Command::new("yosys")
@@ -334,6 +514,120 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+
+    // ----- Hierarchy JSON parser tests (yosys-free) ------------------
+
+    #[test]
+    fn parse_blackbox_modules_extracts_marked_modules() {
+        let hier = r#"{
+            "modules": {
+                "top": {
+                    "attributes": { "top": "00000000000000000000000000000001" },
+                    "ports": {
+                        "clk": { "direction": "input", "bits": [2] },
+                        "data": { "direction": "output", "bits": [3] }
+                    }
+                },
+                "ddr_phy": {
+                    "attributes": {
+                        "blackbox": "00000000000000000000000000000001",
+                        "src": "rtl/vendor/ddr_phy.sv:12.1-30.6"
+                    },
+                    "ports": {
+                        "clk": { "direction": "input", "bits": [4] },
+                        "data_out": { "direction": "output", "bits": [5, 6, 7] }
+                    }
+                }
+            }
+        }"#;
+        let bb = parse_blackbox_modules(hier);
+        assert_eq!(bb.len(), 1);
+        let m = &bb[0];
+        assert_eq!(m.name, "ddr_phy");
+        assert_eq!(m.source_file.as_deref(), Some("rtl/vendor/ddr_phy.sv"));
+        assert_eq!(m.source_line, Some(12));
+        // Ports sorted alphabetically (clk then data_out)
+        assert_eq!(m.ports.len(), 2);
+        let clk = m.ports.iter().find(|p| p.name == "clk").unwrap();
+        assert_eq!(clk.direction, BoundaryDirection::Input);
+        let data_out = m.ports.iter().find(|p| p.name == "data_out").unwrap();
+        assert_eq!(data_out.direction, BoundaryDirection::Output);
+    }
+
+    #[test]
+    fn parse_blackbox_modules_ignores_non_blackbox() {
+        let hier = r#"{
+            "modules": {
+                "top": {
+                    "attributes": {},
+                    "ports": { "clk": { "direction": "input", "bits": [2] } }
+                }
+            }
+        }"#;
+        assert!(parse_blackbox_modules(hier).is_empty());
+    }
+
+    #[test]
+    fn parse_blackbox_modules_handles_inout() {
+        let hier = r#"{
+            "modules": {
+                "bidir": {
+                    "attributes": { "blackbox": "00000000000000000000000000000001" },
+                    "ports": { "data": { "direction": "inout", "bits": [3] } }
+                }
+            }
+        }"#;
+        let bb = parse_blackbox_modules(hier);
+        assert_eq!(bb.len(), 1);
+        assert_eq!(bb[0].ports[0].direction, BoundaryDirection::Inout);
+    }
+
+    #[test]
+    fn parse_blackbox_modules_returns_empty_on_bad_json() {
+        assert!(parse_blackbox_modules("not json").is_empty());
+        assert!(parse_blackbox_modules("{}").is_empty());
+        assert!(parse_blackbox_modules(r#"{"modules":"not-an-object"}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_yosys_src_handles_typical_format() {
+        assert_eq!(
+            parse_yosys_src("foo.sv:10.1-25.6"),
+            (Some("foo.sv".to_string()), Some(10))
+        );
+        assert_eq!(
+            parse_yosys_src("rtl/vendor/ddr.sv:42"),
+            (Some("rtl/vendor/ddr.sv".to_string()), Some(42))
+        );
+        // Files without a line number — should still return the path.
+        assert_eq!(
+            parse_yosys_src("standalone.sv"),
+            (Some("standalone.sv".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn parse_blackbox_modules_deterministic_order() {
+        // Two black-box modules — output should be sorted by name.
+        let hier = r#"{
+            "modules": {
+                "zzz_module": {
+                    "attributes": { "blackbox": "1" },
+                    "ports": {}
+                },
+                "aaa_module": {
+                    "attributes": { "blackbox": "1" },
+                    "ports": {}
+                }
+            }
+        }"#;
+        let bb = parse_blackbox_modules(hier);
+        assert_eq!(bb.len(), 2);
+        assert_eq!(bb[0].name, "aaa_module");
+        assert_eq!(bb[1].name, "zzz_module");
+    }
+
+    // ----- Yosys subprocess integration tests (require yosys binary) -
 
     #[test]
     fn locate_yosys_finds_binary_or_errors() {
@@ -421,5 +715,72 @@ endmodule
             out.ctxdsl.contains("safety_bad_"),
             "expected a `safety_bad_*` formula in the emitted CTXDSL"
         );
+    }
+
+    #[test]
+    fn yosys_emits_blackbox_sidecars_for_marked_submodules() {
+        if !yosys_available() {
+            eprintln!("skip: yosys not installed");
+            return;
+        }
+        // A trivial design: top instantiates a (* blackbox *) submodule.
+        // The driver should auto-emit BlackBoxInterface + GapMarkerReport
+        // sidecars for `vendor_ip` and attach them to AdapterOutput.
+        let sv = r#"
+            (* blackbox *)
+            module vendor_ip(
+                input clk,
+                input start,
+                output ready,
+                output [7:0] data_out
+            );
+            endmodule
+
+            module top(input clk, input start, output ready);
+                wire [7:0] _data_out;
+                vendor_ip ip(.clk(clk), .start(start), .ready(ready),
+                             .data_out(_data_out));
+            endmodule
+        "#;
+        let opts = AdapterOptions::default();
+        let yopts = YosysOptions {
+            top: Some("top".into()),
+            ..Default::default()
+        };
+        let out = translate_sv(sv, &opts, &yopts).expect("yosys translate");
+
+        let iface_sidecars: Vec<_> = out
+            .sidecars
+            .iter()
+            .filter(|s| s.origin == crate::adapter::SidecarOrigin::BlackBoxInterface)
+            .collect();
+        assert_eq!(
+            iface_sidecars.len(),
+            1,
+            "expected exactly one BlackBoxInterface sidecar, got {} (sidecars: {:?})",
+            iface_sidecars.len(),
+            out.sidecars.iter().map(|s| &s.filename).collect::<Vec<_>>()
+        );
+        assert_eq!(iface_sidecars[0].filename, "vendor_ip.interface.json");
+        assert!(iface_sidecars[0].content.contains("vendor_ip"));
+        assert!(
+            iface_sidecars[0]
+                .content
+                .contains("\"direction\": \"Output\"")
+        );
+        assert!(
+            iface_sidecars[0]
+                .content
+                .contains("\"direction\": \"Input\"")
+        );
+
+        let gap_sidecars: Vec<_> = out
+            .sidecars
+            .iter()
+            .filter(|s| s.origin == crate::adapter::SidecarOrigin::BlackBoxGapReport)
+            .collect();
+        assert_eq!(gap_sidecars.len(), 1);
+        assert_eq!(gap_sidecars[0].filename, "vendor_ip.gap_report.json");
+        assert!(gap_sidecars[0].content.contains("output_sequencing"));
     }
 }

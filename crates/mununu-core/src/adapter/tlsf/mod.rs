@@ -47,6 +47,7 @@ impl FormatAdapter for TlsfAdapter {
         }
 
         Ok(AdapterOutput {
+            sidecars: Vec::new(),
             ctxdsl: emit_result.ctxdsl,
             warnings,
             source_info: SourceInfo {
