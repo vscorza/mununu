@@ -137,6 +137,10 @@ struct ContractDiscoverArgs {
     /// at this path.
     #[arg(long, value_name = "SOURCE")]
     write_sidecar: Option<PathBuf>,
+    /// Optional contract corpus root used to resolve
+    /// `@mununu_interface contract://` URIs on the interface.
+    #[arg(long, value_name = "DIR")]
+    corpus: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -152,6 +156,10 @@ struct ContractSidecarsArgs {
     /// Emit an additional `Fairness` gap marker per module.
     #[arg(long)]
     emit_fairness_gap: bool,
+    /// Optional contract corpus root used to resolve
+    /// `@mununu_interface contract://` URIs on each interface.
+    #[arg(long, value_name = "DIR")]
+    corpus: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -598,6 +606,7 @@ fn contract_query(args: ContractQueryArgs) -> Result<(), String> {
 
 fn contract_sidecars(args: ContractSidecarsArgs) -> Result<(), String> {
     use mununu::contract::discover::{BlackBoxInterface, DiscoverOptions, build_blackbox_sidecars};
+    use mununu::corpus::Corpus;
 
     let body = std::fs::read_to_string(&args.interfaces)
         .map_err(|e| format!("failed to read {}: {e}", args.interfaces.display()))?;
@@ -607,10 +616,19 @@ fn contract_sidecars(args: ContractSidecarsArgs) -> Result<(), String> {
     std::fs::create_dir_all(&args.out_dir)
         .map_err(|e| format!("failed to create {}: {e}", args.out_dir.display()))?;
 
+    let corpus = match &args.corpus {
+        Some(root) => Some(
+            Corpus::load(root)
+                .map_err(|e| format!("failed to load corpus at {}: {e}", root.display()))?,
+        ),
+        None => None,
+    };
+
     let opts = DiscoverOptions {
         force_controllable: &[],
         force_uncontrollable: &[],
         emit_fairness_gap: args.emit_fairness_gap,
+        corpus: corpus.as_ref(),
     };
     let sidecars = build_blackbox_sidecars(&interfaces, &opts);
 
@@ -630,11 +648,20 @@ fn contract_sidecars(args: ContractSidecarsArgs) -> Result<(), String> {
 
 fn contract_discover(args: ContractDiscoverArgs) -> Result<(), String> {
     use mununu::contract::discover::{BlackBoxInterface, DiscoverOptions, discover_phase1};
+    use mununu::corpus::Corpus;
 
     let body = std::fs::read_to_string(&args.interface)
         .map_err(|e| format!("failed to read {}: {e}", args.interface.display()))?;
     let iface: BlackBoxInterface =
         serde_json::from_str(&body).map_err(|e| format!("failed to parse interface JSON: {e}"))?;
+
+    let corpus = match &args.corpus {
+        Some(root) => Some(
+            Corpus::load(root)
+                .map_err(|e| format!("failed to load corpus at {}: {e}", root.display()))?,
+        ),
+        None => None,
+    };
 
     let force_c: Vec<&str> = args.force_controllable.iter().map(|s| s.as_str()).collect();
     let force_u: Vec<&str> = args
@@ -646,6 +673,7 @@ fn contract_discover(args: ContractDiscoverArgs) -> Result<(), String> {
         force_controllable: &force_c,
         force_uncontrollable: &force_u,
         emit_fairness_gap: args.emit_fairness_gap,
+        corpus: corpus.as_ref(),
     };
     let output = discover_phase1(&iface, &opts);
     output.gaps.emit_diagnostics();
@@ -669,6 +697,56 @@ fn contract_discover(args: ContractDiscoverArgs) -> Result<(), String> {
             output.gaps.len(),
             output.module
         );
+        for res in &output.corpus_resolutions {
+            match res.status {
+                mununu::contract::discover::ResolutionStatus::Resolved => {
+                    let alt = match res.alternative_matched {
+                        Some(true) => format!(
+                            " [alt `{}` ok]",
+                            res.parsed.alternative.as_deref().unwrap_or("")
+                        ),
+                        Some(false) => format!(
+                            " [alt `{}` MISSING on entry]",
+                            res.parsed.alternative.as_deref().unwrap_or("")
+                        ),
+                        None => String::new(),
+                    };
+                    println!(
+                        "  corpus: resolved `{}` → {}{alt}",
+                        res.raw_uri,
+                        res.matched_ids.join(", "),
+                    );
+                }
+                mununu::contract::discover::ResolutionStatus::NotFound => {
+                    println!(
+                        "  corpus: `{}` not found ({}/{}{})",
+                        res.raw_uri,
+                        res.parsed.domain,
+                        res.parsed.name,
+                        res.parsed
+                            .version
+                            .as_ref()
+                            .map(|v| format!("@{v}"))
+                            .unwrap_or_default(),
+                    );
+                }
+                mununu::contract::discover::ResolutionStatus::NoCorpus => {
+                    println!(
+                        "  corpus: `{}` referenced but no corpus supplied (use --corpus)",
+                        res.raw_uri,
+                    );
+                }
+                mununu::contract::discover::ResolutionStatus::Malformed => {
+                    println!("  corpus: `{}` malformed URI", res.raw_uri);
+                }
+                mununu::contract::discover::ResolutionStatus::SidecarReference => {
+                    println!(
+                        "  corpus: `{}` is a sidecar reference (skipped)",
+                        res.raw_uri
+                    );
+                }
+            }
+        }
     }
 
     if args.strict_contracts && output.gaps.is_strict_failure() {

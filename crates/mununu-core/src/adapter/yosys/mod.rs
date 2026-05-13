@@ -204,6 +204,7 @@ pub fn translate_sv(
                 force_controllable: &[],
                 force_uncontrollable: &[],
                 emit_fairness_gap: false,
+                corpus: None,
             };
             let sidecars = crate::contract::discover::build_blackbox_sidecars(&blackboxes, &opts);
             out.sidecars.extend(sidecars);

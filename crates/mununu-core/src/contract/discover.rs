@@ -24,8 +24,10 @@
 //! have — SV port lists, MCP tool schemas, C function signatures, …
 
 use crate::clts::LabelControllability;
+use crate::contract::contract_uri::{ContractUri, parse_contract_uri};
 use crate::contract::gap::{GapKind, GapMarker, GapMarkerReport};
 use crate::controllability::{BoundaryDirection, classify_label};
+use crate::corpus::Corpus;
 use serde::{Deserialize, Serialize};
 
 /// A single port / parameter / channel on a black-box module's interface.
@@ -102,6 +104,57 @@ pub struct Phase1Output {
     /// sequencing or formulas, so every black-box module starts with at
     /// least an `OutputSequencing` gap).
     pub gaps: GapMarkerReport,
+    /// Corpus lookups produced from `@mununu_interface contract://`
+    /// annotations during phase 2. Empty when no `contract://` URI is
+    /// referenced or when no corpus was supplied to `DiscoverOptions`.
+    #[serde(default)]
+    pub corpus_resolutions: Vec<CorpusResolution>,
+}
+
+/// Outcome of resolving a single `@mununu_interface contract://` URI
+/// against the supplied corpus.
+///
+/// Document D §D.2's query helper is purely functional — this struct
+/// surfaces the result back to the user so HITL UX can show:
+/// "vendor declared `contract://X@Y`; mununu found 2 candidates in
+/// the corpus; chose Z by parameter-match + provenance."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusResolution {
+    /// The URI as it appeared on the annotation.
+    pub raw_uri: String,
+    /// Parsed shape of the URI.
+    pub parsed: ContractUri,
+    /// What happened — found / not-found / no-corpus / malformed.
+    pub status: ResolutionStatus,
+    /// IDs of corpus entries that matched (top-ranked first). Empty for
+    /// any non-`Resolved` status.
+    #[serde(default)]
+    pub matched_ids: Vec<String>,
+    /// If the URI requested an alternative, whether that alternative
+    /// exists on the chosen entry. `None` when no alternative was
+    /// requested.
+    #[serde(default)]
+    pub alternative_matched: Option<bool>,
+}
+
+/// Outcome of a single corpus lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionStatus {
+    /// Found at least one matching entry; `matched_ids` carries them.
+    Resolved,
+    /// The URI parsed but no corpus entry matched the
+    /// `(domain, name)` tuple.
+    NotFound,
+    /// No corpus was passed via `DiscoverOptions::corpus`.
+    NoCorpus,
+    /// The URI failed to parse — kept here so the diagnostic surfaces
+    /// the malformed annotation rather than silently dropping it.
+    Malformed,
+    /// The URI used an unrecognised scheme (e.g. a relative sidecar
+    /// path). The annotation is preserved for HITL UX but no corpus
+    /// lookup was attempted.
+    SidecarReference,
 }
 
 /// Configuration knobs for `discover_phase1`.
@@ -117,6 +170,13 @@ pub struct DiscoverOptions<'a> {
     /// usual `OutputSequencing` one. Adapters that know the module is
     /// purely combinational (no liveness story) can disable this.
     pub emit_fairness_gap: bool,
+    /// Optional corpus for resolving `@mununu_interface contract://`
+    /// annotations. When supplied, phase-2 discovery issues a corpus
+    /// query per URI and records the outcome in
+    /// `Phase1Output::corpus_resolutions`. When `None`, URI annotations
+    /// are recorded with `ResolutionStatus::NoCorpus` so the
+    /// diagnostic still surfaces the unresolved reference.
+    pub corpus: Option<&'a Corpus>,
 }
 
 /// Convert a list of discovered black-box interfaces into the adapter
@@ -321,14 +381,34 @@ pub fn discover_phase1(iface: &BlackBoxInterface, options: &DiscoverOptions<'_>)
         }),
         _ => None,
     };
+    // 2.b Resolve any `@mununu_interface contract://` URIs against the
+    //     corpus (when supplied). A successful resolution is treated as
+    //     evidence of progress — equivalent in effect to one or more
+    //     guarantee clauses, so the gap is downgraded the same way.
+    let corpus_resolutions = resolve_interface_uris(&summary.interface_refs, options.corpus);
+    let corpus_hit = corpus_resolutions
+        .iter()
+        .any(|r| matches!(r.status, ResolutionStatus::Resolved));
+
     if !output_labels.is_empty() {
-        let (kind, description) = if summary.has_progress_clause() {
+        let (kind, description) = if summary.has_progress_clause() || corpus_hit {
+            let suffix = if corpus_hit {
+                format!(
+                    " + {} corpus resolution(s)",
+                    corpus_resolutions
+                        .iter()
+                        .filter(|r| matches!(r.status, ResolutionStatus::Resolved))
+                        .count()
+                )
+            } else {
+                String::new()
+            };
             (
                 GapKind::LatencyBound,
                 format!(
-                    "Phase-2 discovery — {} guarantee clause(s) found on {}; \
+                    "Phase-2 discovery — {} guarantee clause(s){} found on {}; \
                      latency bound still unauthored",
-                    summary.guarantee_count, iface.name
+                    summary.guarantee_count, suffix, iface.name
                 ),
             )
         } else {
@@ -362,12 +442,125 @@ pub fn discover_phase1(iface: &BlackBoxInterface, options: &DiscoverOptions<'_>)
         module: iface.name.clone(),
         labels,
         gaps,
+        corpus_resolutions,
     }
+}
+
+/// Resolve a list of `@mununu_interface` URI strings against the
+/// supplied corpus. Every URI produces exactly one
+/// `CorpusResolution` so the diagnostic surfaces what was found *and*
+/// what was missing.
+fn resolve_interface_uris(
+    interface_refs: &[String],
+    corpus: Option<&Corpus>,
+) -> Vec<CorpusResolution> {
+    use std::collections::BTreeMap;
+    let mut out = Vec::with_capacity(interface_refs.len());
+    for raw in interface_refs {
+        // Distinguish `contract://` URIs from opaque sidecar paths so
+        // HITL UX can surface the difference.
+        let parsed = match parse_contract_uri(raw) {
+            Some(u) => u,
+            None => {
+                if raw
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("contract://")
+                {
+                    out.push(CorpusResolution {
+                        raw_uri: raw.clone(),
+                        parsed: ContractUri {
+                            domain: String::new(),
+                            name: String::new(),
+                            version: None,
+                            alternative: None,
+                            raw: raw.clone(),
+                        },
+                        status: ResolutionStatus::Malformed,
+                        matched_ids: Vec::new(),
+                        alternative_matched: None,
+                    });
+                } else {
+                    out.push(CorpusResolution {
+                        raw_uri: raw.clone(),
+                        parsed: ContractUri {
+                            domain: String::new(),
+                            name: String::new(),
+                            version: None,
+                            alternative: None,
+                            raw: raw.clone(),
+                        },
+                        status: ResolutionStatus::SidecarReference,
+                        matched_ids: Vec::new(),
+                        alternative_matched: None,
+                    });
+                }
+                continue;
+            }
+        };
+        let Some(corp) = corpus else {
+            out.push(CorpusResolution {
+                raw_uri: raw.clone(),
+                parsed,
+                status: ResolutionStatus::NoCorpus,
+                matched_ids: Vec::new(),
+                alternative_matched: None,
+            });
+            continue;
+        };
+        // Phase-2 corpus query: empty parameter map. The annotation
+        // grammar does not carry parameters yet; a richer URI shape
+        // (`?param=value`) is reserved for follow-up work.
+        let params: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut hits = corp.query(&parsed.domain, &parsed.name, &params);
+        // If a version was pinned, narrow the candidates first; if
+        // nothing matches the pin, keep the broader ranked list so the
+        // HITL UX can show "you asked for @2.0.1 but the corpus only
+        // has @1.0.0 / @2.0.0".
+        if let Some(version) = &parsed.version {
+            let pinned: Vec<_> = hits
+                .iter()
+                .copied()
+                .filter(|e| e.version == *version)
+                .collect();
+            if !pinned.is_empty() {
+                hits = pinned;
+            }
+        }
+        if hits.is_empty() {
+            out.push(CorpusResolution {
+                raw_uri: raw.clone(),
+                parsed,
+                status: ResolutionStatus::NotFound,
+                matched_ids: Vec::new(),
+                alternative_matched: None,
+            });
+            continue;
+        }
+        let matched_ids: Vec<String> = hits
+            .iter()
+            .map(|e| format!("{}@{}", e.id, e.version))
+            .collect();
+        let alternative_matched = parsed.alternative.as_ref().map(|alt| {
+            hits.first()
+                .is_some_and(|e| e.alternatives.iter().any(|a| a.id == *alt))
+        });
+        out.push(CorpusResolution {
+            raw_uri: raw.clone(),
+            parsed,
+            status: ResolutionStatus::Resolved,
+            matched_ids,
+            alternative_matched,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::corpus::{Alternative, ContractEntry, Provenance};
+    use crate::mununu_annotations::{MununuAnnotation, MununuTag};
 
     fn port(name: &str, direction: BoundaryDirection) -> PortDescriptor {
         PortDescriptor {
@@ -375,6 +568,31 @@ mod tests {
             direction,
             description: None,
         }
+    }
+
+    fn annotation(tag: MununuTag, value: &str) -> MununuAnnotation {
+        MununuAnnotation::new(tag, value)
+    }
+
+    fn corpus_with_axi() -> crate::corpus::Corpus {
+        crate::corpus::Corpus::from_entries(vec![ContractEntry {
+            id: "rtl_protocol/axi4_slave".to_string(),
+            version: "2.0.1".to_string(),
+            domain: "rtl_protocol".to_string(),
+            name: "axi4_slave".to_string(),
+            description: None,
+            parameters: Default::default(),
+            contract: None,
+            alternatives: vec![Alternative {
+                id: "strict".to_string(),
+                label: "Strict".to_string(),
+                description: None,
+            }],
+            provenance: Provenance::MununuVerified {
+                verified_against: None,
+            },
+            soundness_flag: None,
+        }])
     }
 
     #[test]
@@ -656,5 +874,109 @@ mod tests {
             by("status").controllability,
             LabelControllability::Uncontrollable
         );
+    }
+
+    #[test]
+    fn corpus_uri_resolves_against_supplied_corpus() {
+        let corpus = corpus_with_axi();
+        let iface = BlackBoxInterface {
+            name: "vendor_axi".to_string(),
+            ports: vec![
+                port("clk", BoundaryDirection::Input),
+                port("status", BoundaryDirection::Output),
+            ],
+            source_file: None,
+            source_line: None,
+            annotations: vec![annotation(
+                MununuTag::Interface,
+                "contract://rtl_protocol/axi4_slave@2.0.1?alt=strict",
+            )],
+        };
+        let opts = DiscoverOptions {
+            corpus: Some(&corpus),
+            ..DiscoverOptions::default()
+        };
+        let out = discover_phase1(&iface, &opts);
+        assert_eq!(out.corpus_resolutions.len(), 1);
+        let res = &out.corpus_resolutions[0];
+        assert!(matches!(res.status, ResolutionStatus::Resolved));
+        assert_eq!(res.matched_ids, vec!["rtl_protocol/axi4_slave@2.0.1"]);
+        assert_eq!(res.alternative_matched, Some(true));
+        // A corpus hit downgrades the OutputSequencing gap to LatencyBound,
+        // and the description names the corpus resolution.
+        assert_eq!(out.gaps.markers[0].kind, GapKind::LatencyBound);
+        assert!(
+            out.gaps.markers[0]
+                .description
+                .as_ref()
+                .unwrap()
+                .contains("corpus resolution")
+        );
+    }
+
+    #[test]
+    fn corpus_uri_with_no_corpus_records_no_corpus_status() {
+        let iface = BlackBoxInterface {
+            name: "vendor_axi".to_string(),
+            ports: vec![port("status", BoundaryDirection::Output)],
+            source_file: None,
+            source_line: None,
+            annotations: vec![annotation(
+                MununuTag::Interface,
+                "contract://rtl_protocol/axi4_slave",
+            )],
+        };
+        let out = discover_phase1(&iface, &DiscoverOptions::default());
+        assert_eq!(out.corpus_resolutions.len(), 1);
+        assert!(matches!(
+            out.corpus_resolutions[0].status,
+            ResolutionStatus::NoCorpus
+        ));
+        // No corpus hit and no guarantee clause → gap stays OutputSequencing.
+        assert_eq!(out.gaps.markers[0].kind, GapKind::OutputSequencing);
+    }
+
+    #[test]
+    fn corpus_uri_not_found_records_not_found_status() {
+        let corpus = corpus_with_axi();
+        let iface = BlackBoxInterface {
+            name: "vendor_unknown".to_string(),
+            ports: vec![port("status", BoundaryDirection::Output)],
+            source_file: None,
+            source_line: None,
+            annotations: vec![annotation(
+                MununuTag::Interface,
+                "contract://rtl_memory/ddr3@1.0",
+            )],
+        };
+        let opts = DiscoverOptions {
+            corpus: Some(&corpus),
+            ..DiscoverOptions::default()
+        };
+        let out = discover_phase1(&iface, &opts);
+        assert_eq!(out.corpus_resolutions.len(), 1);
+        assert!(matches!(
+            out.corpus_resolutions[0].status,
+            ResolutionStatus::NotFound
+        ));
+        // No hit → gap stays OutputSequencing.
+        assert_eq!(out.gaps.markers[0].kind, GapKind::OutputSequencing);
+    }
+
+    #[test]
+    fn non_contract_uri_is_treated_as_sidecar_reference() {
+        let iface = BlackBoxInterface {
+            name: "vendor".to_string(),
+            ports: vec![port("o", BoundaryDirection::Output)],
+            source_file: None,
+            source_line: None,
+            annotations: vec![annotation(MununuTag::Interface, "./local-sidecar.json")],
+        };
+        let out = discover_phase1(&iface, &DiscoverOptions::default());
+        assert_eq!(out.corpus_resolutions.len(), 1);
+        assert!(matches!(
+            out.corpus_resolutions[0].status,
+            ResolutionStatus::SidecarReference
+        ));
     }
 }
