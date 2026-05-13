@@ -1255,6 +1255,7 @@ fn sv_init_multi_from_top(
             template_ref: None,
         }],
         discovered_values: HashMap::new(),
+        blackbox_modules: Vec::new(),
     };
 
     let output_path = args.output.unwrap_or_else(|| {
@@ -1985,6 +1986,47 @@ fn load_with_adapter_mode(
             )
             .map_err(|e| format!("SystemVerilog adapter error: {e}"))?,
         ),
+        Some("sv-multi") => {
+            // Custom-SV multi-module path. Input is the sidecar JSON;
+            // source files are looked up relative to the sidecar's
+            // directory. Auto-emits black-box sidecars per Document B
+            // task B3 custom-SV half.
+            use std::collections::HashMap;
+            let sidecar_dir = path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            // Pre-load every source file the sidecar references so the
+            // multi-module path's get_source closure resolves them
+            // off disk.
+            let ann: mununu_core::adapter::systemverilog::annotation::MultiModuleSvAnnotation =
+                serde_json::from_str(&source)
+                    .map_err(|e| format!("sv-multi: failed to parse sidecar JSON: {e}"))?;
+            let mut sources: HashMap<String, String> = HashMap::new();
+            let mut all_refs: Vec<String> = ann
+                .modules
+                .iter()
+                .map(|m| m.source.clone())
+                .chain(ann.blackbox_modules.iter().map(|m| m.source.clone()))
+                .collect();
+            all_refs.sort();
+            all_refs.dedup();
+            for src_path in &all_refs {
+                let full = sidecar_dir.join(src_path);
+                let content = std::fs::read_to_string(&full)
+                    .map_err(|e| format!("sv-multi: failed to read '{}': {e}", full.display()))?;
+                sources.insert(src_path.clone(), content);
+            }
+            log_adapter_output_with_dir(
+                mununu_core::adapter::systemverilog::SystemVerilogAdapter::translate_multi_module_content(
+                    &source,
+                    &sources,
+                    &options_default,
+                )
+                .map_err(|e| format!("sv-multi adapter error: {e}"))?,
+                Some(&sidecar_dir),
+            )
+        }
         Some("xstate") => log_adapter_output(
             mununu_core::adapter::xstate::XStateAdapter::translate(&source, &options_default)
                 .map_err(|e| format!("XState adapter error: {e}"))?,

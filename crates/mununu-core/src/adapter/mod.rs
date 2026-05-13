@@ -84,6 +84,21 @@ pub struct AdapterOptions {
     /// BTOR2 reader takes the JSON in-memory because the BTOR2 source
     /// may itself live in memory (the Yosys driver case).
     pub sidecar_json: Option<String>,
+    /// Direction map for top-module ports the upstream frontend
+    /// captured before any flattening / inlining destroyed the
+    /// module-boundary information. Used by the BTOR2 reader (when
+    /// the yosys driver populates this from the pre-flatten
+    /// `write_json`) to classify BTOR2 inputs by direction instead of
+    /// defaulting every input to `Uncontrollable`.
+    ///
+    /// This is Document B task B1's plumbing: the §4 rule says
+    /// "controllability follows the direction at the surrounding
+    /// scope's boundary." When `port_directions` is non-empty, the
+    /// reader classifies each input by looking up its name here; any
+    /// input *not* in the map keeps the historical "Uncontrollable"
+    /// default (the right call for BTOR2 inputs that originated as
+    /// cut points from `cutpoint -blackbox`).
+    pub port_directions: HashMap<String, crate::controllability::BoundaryDirection>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.

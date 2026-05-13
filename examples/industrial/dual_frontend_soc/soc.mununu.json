@@ -1,0 +1,32 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "_doc": [
+    "Custom-SV multi-module sidecar for the dual-frontend cross-check.",
+    "Lists the UART as a real module (Kripke automaton) and the DDR3",
+    "PHY as a black-box (port list extracted; chaotic-stub semantics",
+    "conveyed via the emitted .interface.json + .gap_report.json).",
+    "",
+    "Run via:",
+    "  mununu context summarize soc.mununu.json --adapter sv",
+    "",
+    "Both auto-emitted JSONs land next to soc.mununu.json; the",
+    "ddr3_phy_v2.interface.json matches the one yosys produces for",
+    "the same module (modulo source_file metadata)."
+  ],
+  "modules": [
+    {
+      "name": "uart_only",
+      "source": "uart_only.sv"
+    }
+  ],
+  "blackbox_modules": [
+    {
+      "name": "ddr3_phy_v2",
+      "source": "ddr3_phy_v2_decl.sv"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "soc_custom_sv"
+  }
+}

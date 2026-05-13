@@ -248,6 +248,35 @@ pub struct MultiModuleSvAnnotation {
     /// Populated by `mununu sv discover`; never hand-written.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub discovered_values: HashMap<String, DiscoveredValues>,
+
+    /// Submodules to treat as black boxes (closed IP, vendor
+    /// wrappers, etc.). For each listed module, the adapter parses the
+    /// source file to capture the port list, then auto-emits
+    /// `<module>.interface.json` + `<module>.gap_report.json` sidecars
+    /// alongside its CTXDSL output — the same JSON shape the yosys
+    /// frontend emits on `(* blackbox *)` detection (Document B task
+    /// B3). The custom-SV path uses this explicit list because its
+    /// parser does not recognise the `(* blackbox *)` attribute today;
+    /// the user opts in by naming the modules here. Black-box entries
+    /// are **not** built as Kripke automata — only their port lists
+    /// are extracted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blackbox_modules: Vec<BlackboxModuleEntry>,
+}
+
+/// A black-box submodule entry in a multi-module SV sidecar.
+///
+/// The custom-SV adapter parses the source file to extract the module's
+/// port list (used to build the `BlackBoxInterface` sidecar emission)
+/// but does **not** build a Kripke automaton for it. The chaotic-stub
+/// semantics are entirely conveyed via the emitted JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlackboxModuleEntry {
+    /// Module name (must match an SV module declaration in `source`).
+    pub name: String,
+
+    /// Path to the `.sv` source file (relative to the sidecar).
+    pub source: String,
 }
 
 /// Configuration for a single module within a multi-module sidecar.
@@ -1172,6 +1201,7 @@ pub fn generate_multi_sidecar(
             template_ref: None,
         }],
         discovered_values: HashMap::new(),
+        blackbox_modules: Vec::new(),
     }
 }
 

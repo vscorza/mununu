@@ -142,11 +142,34 @@ pub fn translate_sv(
         location: None,
     })?;
 
+    // Document B task B1: capture the top module's port directions
+    // from the pre-flatten hierarchy snapshot, feed them through the
+    // BTOR2 reader so it can classify inputs by direction instead of
+    // defaulting every input to `Uncontrollable`. Falls back to the
+    // historical behaviour if the hierarchy file isn't readable.
+    let top_directions: std::collections::HashMap<
+        String,
+        crate::controllability::BoundaryDirection,
+    > = std::fs::read_to_string(&hier_json_path)
+        .ok()
+        .map(|body| parse_top_module_port_directions(&body, yopts.top.as_deref()))
+        .unwrap_or_default();
+
+    let btor_options = if top_directions.is_empty() {
+        options.clone()
+    } else {
+        crate::adapter::AdapterOptions {
+            port_directions: top_directions,
+            ..options.clone()
+        }
+    };
+
     // Hand the BTOR2 to the BTOR2 adapter.
-    let mut out = super::btor2::Btor2Adapter::translate(&btor, options).map_err(|mut e| {
-        e.message = format!("adapter/yosys: BTOR2 reader failed: {}", e.message);
-        e
-    })?;
+    let mut out =
+        super::btor2::Btor2Adapter::translate(&btor, &btor_options).map_err(|mut e| {
+            e.message = format!("adapter/yosys: BTOR2 reader failed: {}", e.message);
+            e
+        })?;
 
     // Re-tag the source format so users see this as the SV-via-Yosys path.
     out.source_info = SourceInfo {
@@ -288,6 +311,103 @@ fn parse_blackbox_modules(hier_json: &str) -> Vec<crate::contract::discover::Bla
     }
     // Deterministic order for downstream consumers.
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Extract the top module's port directions from yosys's pre-flatten
+/// `write_json` output. Returns an empty map when the JSON cannot be
+/// parsed, the top module cannot be identified, or it has no ports.
+///
+/// Identifies the top module by:
+///   1. Explicit `top` argument when provided (matches what `hierarchy -top X`
+///      saw).
+///   2. Otherwise the single module with the `attributes.top = 1` attribute
+///      that yosys emits when running `hierarchy -auto-top`.
+///   3. Otherwise the first non-blackbox module by sorted name (deterministic
+///      fallback).
+///
+/// Used by Document B task B1 — feeding the §4 controllability rule
+/// (port direction → controllability) into the BTOR2 reader for top-
+/// module inputs.
+fn parse_top_module_port_directions(
+    hier_json: &str,
+    explicit_top: Option<&str>,
+) -> std::collections::HashMap<String, crate::controllability::BoundaryDirection> {
+    use crate::controllability::BoundaryDirection;
+    use std::collections::HashMap;
+
+    let root: serde_json::Value = match serde_json::from_str(hier_json) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let modules = match root.get("modules").and_then(|m| m.as_object()) {
+        Some(m) => m,
+        None => return HashMap::new(),
+    };
+
+    let top_name: String = match explicit_top {
+        Some(t) if modules.contains_key(t) => t.to_string(),
+        _ => {
+            let mut auto_top: Option<&String> = None;
+            for (name, body) in modules {
+                let is_top = body
+                    .get("attributes")
+                    .and_then(|a| a.get("top"))
+                    .map(|v| v.as_str().is_some_and(|s| s.ends_with('1')))
+                    .unwrap_or(false);
+                if is_top {
+                    auto_top = Some(name);
+                    break;
+                }
+            }
+            if let Some(name) = auto_top {
+                name.clone()
+            } else {
+                // Pick the first non-blackbox module deterministically.
+                let mut candidates: Vec<&String> = modules
+                    .iter()
+                    .filter(|(_, body)| {
+                        let is_bb = body
+                            .get("attributes")
+                            .and_then(|a| a.get("blackbox"))
+                            .map(|v| v.as_str().is_some_and(|s| s.ends_with('1')))
+                            .unwrap_or(false);
+                        !is_bb
+                    })
+                    .map(|(name, _)| name)
+                    .collect();
+                candidates.sort();
+                match candidates.first() {
+                    Some(name) => (*name).clone(),
+                    None => return HashMap::new(),
+                }
+            }
+        }
+    };
+
+    let body = match modules.get(&top_name) {
+        Some(b) => b,
+        None => return HashMap::new(),
+    };
+    let port_map = match body.get("ports").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return HashMap::new(),
+    };
+
+    let mut out = HashMap::new();
+    for (name, info) in port_map {
+        let direction_str = info
+            .get("direction")
+            .and_then(|d| d.as_str())
+            .unwrap_or("input");
+        let direction = match direction_str {
+            "input" => BoundaryDirection::Input,
+            "output" => BoundaryDirection::Output,
+            "inout" => BoundaryDirection::Inout,
+            _ => BoundaryDirection::Internal,
+        };
+        out.insert(name.clone(), direction);
+    }
     out
 }
 
@@ -587,6 +707,61 @@ mod tests {
         assert!(parse_blackbox_modules("not json").is_empty());
         assert!(parse_blackbox_modules("{}").is_empty());
         assert!(parse_blackbox_modules(r#"{"modules":"not-an-object"}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_top_module_port_directions_uses_explicit_top() {
+        let hier = r#"{
+            "modules": {
+                "top": {
+                    "attributes": { "top": "00000000000000000000000000000001" },
+                    "ports": {
+                        "clk":  { "direction": "input",  "bits": [2] },
+                        "data": { "direction": "output", "bits": [3] }
+                    }
+                },
+                "vendor_ip": {
+                    "attributes": { "blackbox": "00000000000000000000000000000001" },
+                    "ports": {
+                        "stuff": { "direction": "input", "bits": [4] }
+                    }
+                }
+            }
+        }"#;
+        let dirs = parse_top_module_port_directions(hier, Some("top"));
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs.get("clk"), Some(&BoundaryDirection::Input));
+        assert_eq!(dirs.get("data"), Some(&BoundaryDirection::Output));
+        assert!(
+            !dirs.contains_key("stuff"),
+            "should not include blackbox ports"
+        );
+    }
+
+    #[test]
+    fn parse_top_module_port_directions_falls_back_to_top_attr() {
+        let hier = r#"{
+            "modules": {
+                "tower": {
+                    "attributes": { "top": "1" },
+                    "ports": { "go": { "direction": "input", "bits": [2] } }
+                },
+                "leaf": {
+                    "attributes": {},
+                    "ports": { "x": { "direction": "input", "bits": [3] } }
+                }
+            }
+        }"#;
+        let dirs = parse_top_module_port_directions(hier, None);
+        // Picked `tower` because of attributes.top = 1
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs.contains_key("go"));
+    }
+
+    #[test]
+    fn parse_top_module_port_directions_returns_empty_for_bad_json() {
+        assert!(parse_top_module_port_directions("not json", None).is_empty());
+        assert!(parse_top_module_port_directions("{}", None).is_empty());
     }
 
     #[test]

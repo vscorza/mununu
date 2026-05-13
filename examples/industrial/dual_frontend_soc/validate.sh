@@ -102,19 +102,73 @@ rm -rf "$SIDECARS_DIR"
     run "5c. Inspect the auto-emitted gap-report JSON" \
         cat "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json"
 
-    run "6. SoC composition — well-formedness (safety, under chaotic DDR)" \
+    # ----- Stash yosys output before the cross-check runs -----------
+    cp "$EXAMPLE_DIR/ddr3_phy_v2.interface.json" "$EXAMPLE_DIR/sidecars_generated/yosys_ddr3_phy_v2.interface.json"
+    cp "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json" "$EXAMPLE_DIR/sidecars_generated/yosys_ddr3_phy_v2.gap_report.json"
+    rm -f "$EXAMPLE_DIR/ddr3_phy_v2.interface.json" \
+          "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json"
+
+    run "5d. AUTO-emit sidecars by running the custom-SV multi-module path" \
+        ./target/debug/mununu context summarize \
+            "$EXAMPLE_DIR/soc.mununu.json" \
+            --adapter sv-multi
+
+    # ----- Side-by-side cross-check (Document B § B.8 climax) -------
+    # Both pipelines emitted the same interface JSON; compare them.
+    # source_file / source_line / description fields naturally differ
+    # (each pipeline reports its own view of the source). Strip those
+    # via jq, sort the labels array (the two pipelines may iterate
+    # ports in different orders), and the rest should be byte-identical.
+    printf '\n=== 6. Side-by-side cross-check: both pipelines agree on the BlackBoxInterface ===\n'
+    printf '$ diff <(jq normalised yosys.iface) <(jq normalised custom-sv.iface)\n'
+    if diff \
+        <(jq -S 'del(.source_file, .source_line, .ports[].description) | (.ports |= sort_by(.name))' \
+            "$EXAMPLE_DIR/sidecars_generated/yosys_ddr3_phy_v2.interface.json") \
+        <(jq -S 'del(.source_file, .source_line, .ports[].description) | (.ports |= sort_by(.name))' \
+            "$EXAMPLE_DIR/ddr3_phy_v2.interface.json") \
+        > /dev/null; then
+        echo "OK: yosys and custom-SV produced structurally-identical BlackBoxInterface JSONs"
+    else
+        echo "MISMATCH: the two pipelines disagree on the port list"
+        diff \
+            <(jq -S 'del(.source_file, .source_line, .ports[].description) | (.ports |= sort_by(.name))' \
+                "$EXAMPLE_DIR/sidecars_generated/yosys_ddr3_phy_v2.interface.json") \
+            <(jq -S 'del(.source_file, .source_line, .ports[].description) | (.ports |= sort_by(.name))' \
+                "$EXAMPLE_DIR/ddr3_phy_v2.interface.json") || true
+    fi
+
+    printf '\n=== 7. Same cross-check for the GapMarkerReport ===\n'
+    printf '$ diff <(jq normalised yosys.gap) <(jq normalised custom-sv.gap)\n'
+    if diff \
+        <(jq -S 'del(.markers[].source_location, .markers[].description) | (.markers[].labels |= sort)' \
+            "$EXAMPLE_DIR/sidecars_generated/yosys_ddr3_phy_v2.gap_report.json") \
+        <(jq -S 'del(.markers[].source_location, .markers[].description) | (.markers[].labels |= sort)' \
+            "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json") \
+        > /dev/null; then
+        echo "OK: yosys and custom-SV produced structurally-identical GapMarkerReport JSONs"
+    else
+        echo "MISMATCH: the two pipelines disagree on the gap report"
+        diff \
+            <(jq -S 'del(.markers[].source_location, .markers[].description) | (.markers[].labels |= sort)' \
+                "$EXAMPLE_DIR/sidecars_generated/yosys_ddr3_phy_v2.gap_report.json") \
+            <(jq -S 'del(.markers[].source_location, .markers[].description) | (.markers[].labels |= sort)' \
+                "$EXAMPLE_DIR/ddr3_phy_v2.gap_report.json") || true
+    fi
+    printf '\n'
+
+    run "8. SoC composition — well-formedness (safety, under chaotic DDR)" \
         ./target/debug/mununu context eval \
             "$EXAMPLE_DIR/soc.ctxdsl" \
             --formula soc_well_formed \
             --automaton SoC
 
-    run "7. Host can reach the DDR burst-wait state" \
+    run "9. Host can reach the DDR burst-wait state" \
         ./target/debug/mununu context eval \
             "$EXAMPLE_DIR/soc.ctxdsl" \
             --formula burst_path_reachable \
             --automaton HostController
 
-    run "8. Host can reach the UART send path" \
+    run "10. Host can reach the UART send path" \
         ./target/debug/mununu context eval \
             "$EXAMPLE_DIR/soc.ctxdsl" \
             --formula uart_send_reachable \
