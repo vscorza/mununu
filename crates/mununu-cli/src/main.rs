@@ -61,6 +61,11 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ContractCommand>,
     },
+    /// HW/SW codesign tools — register-map sidecars + coupling synthesis.
+    Codesign {
+        #[command(subcommand)]
+        command: Box<CodesignCommand>,
+    },
     /// Start HTTP API server
     Server {
         /// Server address (default: 127.0.0.1:8080)
@@ -187,6 +192,46 @@ struct ContractGapsArgs {
     /// Emit the report as JSON to stdout.
     #[arg(long)]
     json: bool,
+}
+
+// ============================================================================
+// Codesign — Document C task C2 (slice 1)
+// ============================================================================
+
+#[derive(Subcommand, Debug)]
+enum CodesignCommand {
+    /// Emit the coupling CTXDSL fragment for a register-map sidecar.
+    ///
+    /// Reads the register-map JSON (Document C task C1 schema, see
+    /// `tools/register_map_schema.json`) and emits a CTXDSL fragment
+    /// containing the alphabet of rendezvous labels, a chaotic-stub
+    /// peripheral automaton, and an asynchronous composition block.
+    /// The user pastes the fragment into a hand-authored
+    /// `context <name> { … }` block alongside their firmware
+    /// automaton.
+    Couple(CodesignCoupleArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignCoupleArgs {
+    /// Path to the register-map JSON sidecar.
+    #[arg(value_name = "REGISTER_MAP")]
+    register_map: PathBuf,
+    /// Override the peripheral automaton name (default: uppercased
+    /// peripheral name from the sidecar).
+    #[arg(long, value_name = "NAME")]
+    peripheral_automaton: Option<String>,
+    /// Override the composition name (default: `<PERIPHERAL>System`).
+    #[arg(long, value_name = "NAME")]
+    composition_name: Option<String>,
+    /// Names of firmware automata to include in the composition.
+    /// Pass multiple via repeated flags or a comma-separated list.
+    #[arg(long = "firmware-member", value_name = "AUTOMATON")]
+    firmware_members: Vec<String>,
+    /// Validate the register-map and exit non-zero if any issue is
+    /// reported, instead of just printing warnings.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -688,6 +733,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Sv { command } => handle_sv(*command),
         Commands::Templates(args) => list_templates(args),
         Commands::Contract { command } => handle_contract(*command),
+        Commands::Codesign { command } => handle_codesign(*command),
         Commands::Server { addr } => {
             use std::net::SocketAddr;
             let addr: SocketAddr = addr
@@ -731,6 +777,45 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
         ContractCommand::Query(args) => contract_query(args),
         ContractCommand::Review(args) => contract_review(args),
     }
+}
+
+fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
+    match command {
+        CodesignCommand::Couple(args) => codesign_couple(args),
+    }
+}
+
+fn codesign_couple(args: CodesignCoupleArgs) -> Result<(), String> {
+    use mununu_core::codesign::coupling::{CouplingOptions, emit_coupling_fragment};
+    use mununu_core::codesign::register_map::RegisterMap;
+
+    let body = std::fs::read_to_string(&args.register_map)
+        .map_err(|e| format!("failed to read {}: {e}", args.register_map.display()))?;
+    let map: RegisterMap = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+
+    let issues = map.validate();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("warning: {issue}");
+        }
+        if args.strict {
+            return Err(format!(
+                "--strict: {} register-map issue(s) — refusing to proceed",
+                issues.len()
+            ));
+        }
+    }
+
+    let firmware_refs: Vec<&str> = args.firmware_members.iter().map(String::as_str).collect();
+    let opts = CouplingOptions {
+        peripheral_automaton: args.peripheral_automaton.as_deref(),
+        composition_name: args.composition_name.as_deref(),
+        firmware_members: &firmware_refs,
+    };
+    let fragment = emit_coupling_fragment(&map, &opts);
+    print!("{fragment}");
+    Ok(())
 }
 
 fn contract_review(args: ContractReviewArgs) -> Result<(), String> {
