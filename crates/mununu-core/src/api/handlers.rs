@@ -1751,6 +1751,68 @@ pub async fn contract_discover_handler(
     Ok(Json(output))
 }
 
+/// Request body for `POST /api/v1/contract/query`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ContractQueryRequest {
+    /// `<domain>/<name>` identifier, e.g. `"rtl_protocol/axi4_slave"`.
+    pub id: String,
+    /// Filesystem path of the corpus root the server should load.
+    pub corpus: std::path::PathBuf,
+    /// Parameters to match against. Each value is a JSON value
+    /// (number, string, bool, etc.).
+    #[serde(default)]
+    pub parameters: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Response from `POST /api/v1/contract/query`. The body carries the
+/// ranked candidate list directly.
+#[derive(Debug, serde::Serialize)]
+pub struct ContractQueryResponse {
+    pub candidates: Vec<crate::corpus::ContractEntry>,
+}
+
+/// Query the contract corpus (Document D task D2).
+///
+/// Loads the corpus rooted at `request.corpus`, runs the
+/// `(domain, name, parameters)` query, and returns the ranked
+/// candidate list.
+pub async fn contract_query_handler(
+    Json(request): Json<ContractQueryRequest>,
+) -> ApiResult<Json<ContractQueryResponse>> {
+    let (domain, name) = match request.id.split_once('/') {
+        Some((d, n)) if !d.is_empty() && !n.is_empty() => (d.to_string(), n.to_string()),
+        _ => {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "expected `<domain>/<name>`, got '{}' — example: rtl_protocol/axi4_slave",
+                    request.id
+                ),
+                details: None,
+            });
+        }
+    };
+
+    let corpus = if request.corpus.exists() {
+        crate::corpus::Corpus::load(&request.corpus).map_err(|e| ApiError::BadRequest {
+            message: format!(
+                "failed to load corpus from {}: {e}",
+                request.corpus.display()
+            ),
+            details: None,
+        })?
+    } else {
+        crate::corpus::Corpus::empty()
+    };
+
+    let candidates: Vec<crate::corpus::ContractEntry> = corpus
+        .query(&domain, &name, &request.parameters)
+        .into_iter()
+        .cloned()
+        .collect();
+
+    Ok(Json(ContractQueryResponse { candidates }))
+}
+
 #[cfg(test)]
 mod contract_handler_tests {
     use super::*;

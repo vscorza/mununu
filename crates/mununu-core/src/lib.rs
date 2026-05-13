@@ -11,6 +11,7 @@ pub mod context;
 pub mod context_dsl;
 pub mod contract;
 pub mod controllability;
+pub mod corpus;
 pub mod examples;
 pub mod guard;
 pub mod iter;
