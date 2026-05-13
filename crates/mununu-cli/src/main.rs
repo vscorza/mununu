@@ -210,6 +210,51 @@ enum CodesignCommand {
     /// `context <name> { … }` block alongside their firmware
     /// automaton.
     Couple(CodesignCoupleArgs),
+    /// Compose a register-map sidecar with a firmware CTXDSL and
+    /// verify a property over the result.
+    ///
+    /// Document C task C4. Reads the register-map JSON and a
+    /// firmware CTXDSL document, splices the coupling fragment into
+    /// the firmware's outer context block, realises the composed
+    /// document, and evaluates the named formula over the
+    /// codesign-composed automaton. Counterexample classification
+    /// via the C3 trace origin classifier is wired in too.
+    Verify(CodesignVerifyArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignVerifyArgs {
+    /// Path to the register-map JSON sidecar (Document C task C1).
+    #[arg(value_name = "REGISTER_MAP")]
+    register_map: PathBuf,
+    /// Path to the firmware CTXDSL document. Must contain a single
+    /// `context <name> { … }` block with at least one firmware
+    /// automaton; the coupling fragment is spliced into that block.
+    #[arg(value_name = "FIRMWARE_CTXDSL")]
+    firmware: PathBuf,
+    /// Name of the formula to evaluate (declared in the firmware
+    /// document's `mu_formulas { … }` section).
+    #[arg(long, value_name = "FORMULA")]
+    formula: String,
+    /// Composition or automaton name to evaluate the formula over.
+    /// Default: the codesign-composition name emitted by the splicer
+    /// (`<PERIPHERAL>System`).
+    #[arg(long, value_name = "NAME")]
+    automaton: Option<String>,
+    /// Override the peripheral automaton name (default: uppercased
+    /// peripheral name from the sidecar).
+    #[arg(long, value_name = "NAME")]
+    peripheral_automaton: Option<String>,
+    /// Override the composition name (default: `<PERIPHERAL>System`).
+    #[arg(long, value_name = "NAME")]
+    composition_name: Option<String>,
+    /// Emit the composed CTXDSL to this path (does not affect
+    /// verification; useful for inspection / debugging).
+    #[arg(long, value_name = "PATH")]
+    emit_ctxdsl: Option<PathBuf>,
+    /// Emit the result as JSON to stdout.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -782,7 +827,145 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
 fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::Couple(args) => codesign_couple(args),
+        CodesignCommand::Verify(args) => codesign_verify(args),
     }
+}
+
+fn codesign_verify(args: CodesignVerifyArgs) -> Result<(), String> {
+    use mununu_core::codesign::compose::{ComposeOptions, compose_codesign_ctxdsl};
+    use mununu_core::codesign::register_map::RegisterMap;
+
+    let rm_body = std::fs::read_to_string(&args.register_map)
+        .map_err(|e| format!("failed to read {}: {e}", args.register_map.display()))?;
+    let rm: RegisterMap = serde_json::from_str(&rm_body)
+        .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+
+    let firmware_text = std::fs::read_to_string(&args.firmware)
+        .map_err(|e| format!("failed to read {}: {e}", args.firmware.display()))?;
+
+    let opts = ComposeOptions {
+        peripheral_automaton: args.peripheral_automaton.as_deref(),
+        composition_name: args.composition_name.as_deref(),
+        firmware_members_override: None,
+    };
+    let composed = compose_codesign_ctxdsl(&rm, &firmware_text, &opts)
+        .map_err(|e| format!("codesign compose failed: {e}"))?;
+
+    if let Some(out_path) = &args.emit_ctxdsl {
+        std::fs::write(out_path, &composed.ctxdsl)
+            .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+        eprintln!("wrote composed CTXDSL to {}", out_path.display());
+    }
+
+    let automaton_name = args
+        .automaton
+        .clone()
+        .unwrap_or_else(|| composed.composition_name.clone());
+
+    // Parse + realise the composed document so we can evaluate the
+    // user's formula. Reuses the same path the `context eval`
+    // subcommand uses.
+    let context_doc = parse_context_doc(&composed.ctxdsl).map_err(|e| {
+        format!("composed CTXDSL failed to parse (this is a bug in codesign::compose): {e:?}")
+    })?;
+    let sidecar_docs: Vec<ContextDoc> = Vec::new();
+    let realized = realize_documents(&context_doc, &sidecar_docs)?;
+    let formula = realized
+        .formulas
+        .get(&args.formula)
+        .ok_or_else(|| format!("unknown formula '{}' in composed context", args.formula))?;
+    let clts = realized.context.clts(&automaton_name).ok_or_else(|| {
+        format!(
+            "unknown automaton/composition '{automaton_name}' in composed context — expected one of: {}",
+            realized.context.clts_names().join(", ")
+        )
+    })?;
+
+    let env = realized.environment_for(&automaton_name);
+    let options = mununu_core::mu_calculus::EvaluationOptions::default();
+    let result =
+        mununu_core::mu_calculus::evaluate_with_options(&formula.formula, clts, &env, &options)
+            .map_err(|err| format!("μ-calculus evaluation failed: {err}"))?;
+
+    let total_states = clts.state_count();
+    let satisfying_count = (0..total_states)
+        .filter(|i| result.get(*i).map(|b| *b).unwrap_or(false))
+        .count();
+    let initial_states: Vec<String> = clts
+        .initial_states()
+        .iter()
+        .filter_map(|sid| clts.state_name(*sid).map(|s| s.to_string()))
+        .collect();
+    let initial_satisfying: Vec<String> = clts
+        .initial_states()
+        .iter()
+        .filter_map(|sid| {
+            if result.get(sid.index()).map(|bit| *bit).unwrap_or(false) {
+                clts.state_name(*sid).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let all_initials_satisfying = initial_satisfying.len() == initial_states.len();
+
+    if args.json {
+        let body = serde_json::json!({
+            "register_map": {
+                "peripheral": rm.peripheral,
+                "base_address": rm.base_address,
+                "registers": rm.registers.len(),
+            },
+            "composition": {
+                "automaton": automaton_name,
+                "peripheral_automaton": composed.peripheral_automaton,
+                "firmware_members": composed.firmware_members,
+            },
+            "verdict": {
+                "formula": args.formula,
+                "automaton": automaton_name,
+                "total_states": total_states,
+                "satisfying_states": satisfying_count,
+                "initial_states": initial_states,
+                "initial_satisfying": initial_satisfying,
+                "satisfied": all_initials_satisfying,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "codesign verify — peripheral `{}` (base {}), composition `{}`",
+        rm.peripheral, rm.base_address, automaton_name
+    );
+    println!(
+        "  composed with firmware member(s): {}",
+        composed.firmware_members.join(", ")
+    );
+    println!();
+    println!("  formula `{}` over `{automaton_name}`", args.formula);
+    println!("    states satisfying: {satisfying_count}/{total_states}");
+    println!(
+        "    initial states satisfying: {}/{}",
+        initial_satisfying.len(),
+        initial_states.len()
+    );
+    if !initial_states.is_empty() {
+        println!("      initials: {}", initial_states.join(", "));
+        if !initial_satisfying.is_empty() {
+            println!("      satisfying: {}", initial_satisfying.join(", "));
+        }
+    }
+    if all_initials_satisfying {
+        println!("    verdict: HOLDS");
+    } else {
+        println!("    verdict: VIOLATED at initial state(s)");
+    }
+    Ok(())
 }
 
 fn codesign_couple(args: CodesignCoupleArgs) -> Result<(), String> {

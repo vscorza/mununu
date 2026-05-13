@@ -105,6 +105,10 @@ fn create_router() -> Router {
             "/api/v1/contract/review",
             post(handlers::contract_review_handler),
         )
+        .route(
+            "/api/v1/codesign/verify",
+            post(handlers::codesign_verify_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

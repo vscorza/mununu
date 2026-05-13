@@ -1885,6 +1885,164 @@ pub async fn contract_review_handler(
     Ok(Json(pkg))
 }
 
+// ============================================================================
+// Codesign verify (Document C task C4)
+// ============================================================================
+
+/// Request body for `POST /api/v1/codesign/verify`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CodesignVerifyRequest {
+    /// Register-map sidecar contents as a parsed `RegisterMap` value.
+    /// HTTP callers should JSON-encode the same shape that the CLI
+    /// loads from `register_map.json` on disk.
+    pub register_map: crate::codesign::register_map::RegisterMap,
+    /// Firmware CTXDSL document text.
+    pub firmware_ctxdsl: String,
+    /// Formula name to evaluate.
+    pub formula: String,
+    /// Composition / automaton name to evaluate over. Defaults to the
+    /// codesign composition emitted by the splicer
+    /// (`<PERIPHERAL>System`).
+    #[serde(default)]
+    pub automaton: Option<String>,
+    /// Optional override for the peripheral automaton name.
+    #[serde(default)]
+    pub peripheral_automaton: Option<String>,
+    /// Optional override for the composition name.
+    #[serde(default)]
+    pub composition_name: Option<String>,
+}
+
+/// Response body for `POST /api/v1/codesign/verify`.
+#[derive(Debug, serde::Serialize)]
+pub struct CodesignVerifyResponse {
+    /// Whether every initial state satisfies the formula.
+    pub satisfied: bool,
+    /// Total number of states in the composed automaton/composition.
+    pub total_states: usize,
+    /// Number of states satisfying the formula.
+    pub satisfying_states: usize,
+    /// Initial state names.
+    pub initial_states: Vec<String>,
+    /// Subset of `initial_states` that satisfy the formula.
+    pub initial_satisfying: Vec<String>,
+    /// Composition shape used for evaluation.
+    pub composition: CodesignCompositionInfo,
+    /// The composed CTXDSL the verifier ran against — useful for the
+    /// UI to render alongside the verdict.
+    pub composed_ctxdsl: String,
+}
+
+/// Composition-shape report for the response.
+#[derive(Debug, serde::Serialize)]
+pub struct CodesignCompositionInfo {
+    pub peripheral_automaton: String,
+    pub composition_name: String,
+    pub firmware_members: Vec<String>,
+    pub automaton: String,
+}
+
+/// HW/SW codesign verification handler — Document C task C4.
+///
+/// Reads a register-map sidecar + firmware CTXDSL, splices the
+/// coupling fragment into the firmware document, realises the
+/// composed context, and evaluates the named formula. Returns the
+/// verdict plus the composed CTXDSL so the UI can render both.
+pub async fn codesign_verify_handler(
+    Json(request): Json<CodesignVerifyRequest>,
+) -> ApiResult<Json<CodesignVerifyResponse>> {
+    use crate::codesign::compose::{ComposeOptions, compose_codesign_ctxdsl};
+    use crate::context_dsl::{parse, realize_context};
+
+    let opts = ComposeOptions {
+        peripheral_automaton: request.peripheral_automaton.as_deref(),
+        composition_name: request.composition_name.as_deref(),
+        firmware_members_override: None,
+    };
+    let composed = compose_codesign_ctxdsl(&request.register_map, &request.firmware_ctxdsl, &opts)
+        .map_err(|e| ApiError::BadRequest {
+            message: format!("codesign compose failed: {e}"),
+            details: None,
+        })?;
+
+    let context_doc = parse(&composed.ctxdsl).map_err(|e| ApiError::Internal {
+        message: format!("composed CTXDSL failed to parse: {e:?}"),
+        source: None,
+    })?;
+    let realized = realize_context(&context_doc, &[]).map_err(|e| ApiError::Internal {
+        message: format!("composed CTXDSL failed to realise: {e}"),
+        source: None,
+    })?;
+
+    let formula = realized
+        .formulas
+        .get(&request.formula)
+        .ok_or_else(|| ApiError::BadRequest {
+            message: format!("unknown formula '{}' in composed context", request.formula),
+            details: None,
+        })?;
+
+    let automaton_name = request
+        .automaton
+        .clone()
+        .unwrap_or_else(|| composed.composition_name.clone());
+    let clts = realized
+        .context
+        .clts(&automaton_name)
+        .ok_or_else(|| ApiError::BadRequest {
+            message: format!(
+                "unknown automaton/composition '{automaton_name}' in composed context — expected one of: {}",
+                realized.context.clts_names().join(", ")
+            ),
+            details: None,
+        })?;
+
+    let env = realized.environment_for(&automaton_name);
+    let options = crate::mu_calculus::EvaluationOptions::default();
+    let result = crate::mu_calculus::evaluate_with_options(&formula.formula, clts, &env, &options)
+        .map_err(|e| ApiError::Internal {
+            message: format!("μ-calculus evaluation failed: {e}"),
+            source: None,
+        })?;
+
+    let total_states = clts.state_count();
+    let satisfying_states = (0..total_states)
+        .filter(|i| result.get(*i).map(|b| *b).unwrap_or(false))
+        .count();
+    let initial_states: Vec<String> = clts
+        .initial_states()
+        .iter()
+        .filter_map(|sid| clts.state_name(*sid).map(str::to_string))
+        .collect();
+    let initial_satisfying: Vec<String> = clts
+        .initial_states()
+        .iter()
+        .filter_map(|sid| {
+            if result.get(sid.index()).map(|b| *b).unwrap_or(false) {
+                clts.state_name(*sid).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let satisfied = !initial_states.is_empty() && initial_satisfying.len() == initial_states.len();
+
+    Ok(Json(CodesignVerifyResponse {
+        satisfied,
+        total_states,
+        satisfying_states,
+        initial_states,
+        initial_satisfying,
+        composition: CodesignCompositionInfo {
+            peripheral_automaton: composed.peripheral_automaton,
+            composition_name: composed.composition_name,
+            firmware_members: composed.firmware_members,
+            automaton: automaton_name,
+        },
+        composed_ctxdsl: composed.ctxdsl,
+    }))
+}
+
 #[cfg(test)]
 mod contract_handler_tests {
     use super::*;
