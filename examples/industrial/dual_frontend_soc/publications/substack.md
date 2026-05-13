@@ -62,11 +62,9 @@ That's a friction the discipline can't survive long-term. The whole point of the
 
 The fix is staged in three steps:
 
-1. **Stage 1 (now, in M2):** when an adapter detects a black-box module, it auto-emits the `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars alongside its CTXDSL output. The library helper is `contract::discover::build_blackbox_sidecars()`; the CLI exposes it as `mununu contract sidecars`.
-2. **Stage 2 (M3, Document D):** source-comment annotations (`@mununu_guarantee` on the wrapper module) populate the discovered contract with vendor-supplied A/G clauses. The relocated task A6.
-3. **Stage 3 (post-M3):** CTXDSL grammar extension for inline `contract { ... }` blocks. The discharge check becomes a precondition of every `mununu context eval / synth`. Contracts stop being a separate command and become part of the standard verify flow.
-
-This commit lands the library + CLI layer of stage 1. The yosys-side auto-emission (the producer that calls `build_blackbox_sidecars` during extraction) is the explicit deferred follow-up. The hand-authored interface JSON + `mununu contract sidecars` stand in for the auto-emission today — the JSON shape is identical, only the producer is different.
+1. **Stage 1 (M2):** when an adapter detects a black-box module, it auto-emits the `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars alongside its CTXDSL output. The library helper is `contract::discover::build_blackbox_sidecars()`; the CLI exposes it as `mununu contract sidecars`. **Shipped.** Both the custom-SV and yosys frontends call this helper today; the example in this post walks the auto-emitted sidecars.
+2. **Stage 2 (M3, Document D):** source-comment annotations (`@mununu_guarantee` on the wrapper module) populate the discovered contract with vendor-supplied A/G clauses. The relocated task A6. **Shipped.** The TLS handshake example at [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake) demonstrates `@mununu_guarantee` + `@mununu_interface contract://…` flowing through to the HITL review surface.
+3. **Stage 3 (post-M3):** CTXDSL grammar extension for inline `contract { ... }` blocks. The discharge check becomes a precondition of every `mununu context eval / synth`. Contracts stop being a separate command and become part of the standard verify flow. **Still deferred** — not blocking any user case today, but the natural next step once Document C's HW/SW codesign implementation lands.
 
 ## Walking the example
 
@@ -109,7 +107,7 @@ Per [mununu's claims-integrity rules](https://github.com/vscorza/mununu/blob/mai
 
 - No claim mununu found a bug in any commercial DDR3 PHY or any specific SoC.
 - The example uses `mununu contract sidecars` as a stand-in for adapter auto-emission. The JSON shape is identical to what the yosys-side integration will produce, but the producer is different until that integration lands.
-- No vendor `@mununu_guarantee` source-comment annotations yet — those land in M3 (Document D, relocated task A6).
+- This particular example does not exercise vendor `@mununu_guarantee` source-comment annotations. The annotation grammar shipped in M3 (Document D, relocated task A6); a separate worked example — the TLS handshake — exercises it. This example deliberately stays at the chaotic-stub baseline so the reader can see what the unannotated default looks like across both RTL frontends.
 - The proof is conditional on the chaotic-stub contract; a vendor-supplied latency-bound contract would tighten it.
 
 ## Where this fits
@@ -120,10 +118,10 @@ What mununu adds is the integration: a contract subsystem that connects to extra
 
 ## What's next
 
-This is M2 of a four-document roadmap.
+This is post 2 of a four-document arc. The rest has since shipped (design + implementation where noted):
 
-- **Document D** — contract corpus + unified `.mununu/` config + the relocated A6/A7 (source-comment annotations + HITL UX). M3.
-- **Document C** — HW/SW codesign extraction. The capstone post — a peripheral RTL + firmware C combined, with a register-map sidecar coupling the two sides for cross-boundary formal verification. M4.
+- **Document D** — contract corpus + source-comment annotation grammar + `contract://` URI resolution + the relocated A6 (corpus-driven phase-2 discovery) and A7 (HITL stage-4 review surface). **Design + corpus + annotations + URI resolution + HITL review shipped.** Worked example: [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake). The originally-proposed `.mununu/` directory unification was reassessed post-M3 — co-located sidecars won — and most of D §D.3 is descoped. The L\* learning surface (D5/D6) was reassessed as long-tail follow-up and is not queued.
+- **Document C** — HW/SW codesign extraction. The capstone post — a peripheral RTL + firmware C combined, with a register-map sidecar coupling the two sides for cross-boundary formal verification. **Design landed; implementation is the next milestone.**
 
 The repo: [github.com/vscorza/mununu](https://github.com/vscorza/mununu).
 The example: [`examples/industrial/dual_frontend_soc/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/dual_frontend_soc).

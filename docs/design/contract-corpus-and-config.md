@@ -104,6 +104,19 @@ The corpus returns the entry; alternative `strict` is selected per the URI. The 
 
 ## D.3 Unified configuration / sidecar story
 
+> **Post-M3 reassessment (2026-05-13).** Most of this section's pitch did not survive contact with reality. Shipping M1 + M2 + M3 produced a different pattern than the unified directory the original D.3 sketch proposed:
+>
+> - **Co-located sidecars won.** `BlackBoxInterface.json` + `GapMarkerReport.json` are auto-emitted next to the source they describe. `.contract.todo.json` writes next to source. Co-location proved more discoverable than a centralised `.mununu/` tree.
+> - **Annotation-driven contract references replaced `contracts/refs.json`.** Each black-box module's `@mununu_interface contract://…` annotation IS the reference. The discovery pipeline reads it directly from `BlackBoxInterface.annotations`. There is no second-level "refs file."
+> - **Corpus already lives at repo root**, not under `.mununu/`. `corpus/rtl_protocol/...` and `corpus/rtl_crypto/...` shipped in M3. The flat layout works.
+>
+> The remaining pieces of D.3 that still hold up:
+>
+> - The **`coupling/register_maps/`** subdirectory is still the right home for Doc C's register-map sidecars. The capstone needs *some* per-project location for these, and the rest of the tree being descoped does not change that.
+> - The principle "files stay small and focused" survives; it's just been realised through per-source-file co-location rather than through a per-concern central directory.
+>
+> The sections below are kept as the original design record. Treat §D.3.2's full directory tree as **superseded** except for the `coupling/register_maps/` row. Treat §D.3.4's migration story as unnecessary — there is nothing to migrate. The "alphabet soup" criticism in §D.3.1 still describes the legacy formats, but the unification *happened differently* than predicted.
+
 ### D.3.1 Current state
 
 Mununu has accumulated several config artefact shapes, each evolved for a specific adapter:
@@ -247,6 +260,8 @@ The discovery pipeline returns a contract automaton built from the named AXI4-sl
 Ship the parser shim for one language first (SystemVerilog — it has the largest existing annotation footprint, the M2 yosys path already detects `(* blackbox *)`), then add C / TS / Rust / Python in subsequent passes. The vocabulary is fixed; the per-language wrapper is a small extractor each time.
 
 ## D.6 L\* learning surface (`mununu contract learn`)
+
+> **Post-M3 reassessment (2026-05-13): long-tail follow-up, no implementation queued.** L\* was proposed as the third contract source for cases where neither a corpus entry nor a source-comment annotation is available. After shipping M1 + M3 with corpus + annotations, no user case has surfaced that needed L\* — the two existing sources cover the common pattern. The A7 review surface's `ProposalProvenance` enum at [crates/mununu-core/src/contract/review.rs](../../crates/mununu-core/src/contract/review.rs) is open, so adding L\* later remains a one-place change. **Treat this section as a design placeholder.** No CLI subcommand, HTTP endpoint, or UI panel is committed; the engineering investment (teacher–student loop, counterexample-guided refinement, hooking the verifier as the teacher) does not match a real demand signal today. Revisit if a user case asks for it.
 
 Owned by D because L\* is one of three *contract sources* alongside corpus lookup (§D.2) and source-comment annotations (§D.5). Putting all three in one document lets users reason about contract provenance in one place.
 
