@@ -17,6 +17,7 @@ pub mod guard;
 pub mod iter;
 pub mod ltl;
 pub mod mu_calculus;
+pub mod mununu_annotations;
 pub mod persistence;
 
 #[cfg(any(test, feature = "test_support"))]
