@@ -1,0 +1,105 @@
+# UART codesign — validation transcript
+# regenerate via examples/industrial/codesign_uart/validate.sh
+# transcript is byte-deterministic; re-running validate.sh
+# against the same commit should produce identical output.
+
+=== 1. emit the coupling fragment from the register-map sidecar ===
+$ ./target/debug/mununu codesign couple examples/industrial/codesign_uart/register_map.json --firmware-member UartDriver
+    // ----------------------------------------------------------
+    // Coupling fragment emitted by mununu codesign couple
+    // Peripheral: UART_LITE
+    // Base address: 0x40010000
+    // Coupling is asynchronous — Document C §C.5 soundness rule.
+    // ----------------------------------------------------------
+
+    alphabet {
+        label wr_ctrl_tx_start;   // wr CTRL.tx_start — Controllable
+        label wr_ctrl_enable;   // wr CTRL.enable — Controllable
+        label rd_ctrl_tx_start;   // rd CTRL.tx_start — Uncontrollable
+        label rd_ctrl_enable;   // rd CTRL.enable — Uncontrollable
+        label rd_status_tx_busy;   // rd STATUS.tx_busy — Uncontrollable
+        label rd_status_rx_ready;   // rd STATUS.rx_ready — Uncontrollable
+        label wr_data_byte;   // wr DATA.byte — Controllable
+        label rd_data_byte;   // rd DATA.byte — Uncontrollable
+    }
+
+    automata {
+        automaton UART_LITE {
+        states {
+            state Idle initial;
+            state Busy_ctrl;
+            state Busy_status;
+            state Busy_data;
+        }
+
+        transitions {
+            transition Idle -> Busy_ctrl on label wr_ctrl_tx_start;
+            transition Busy_ctrl -> Idle on label wr_ctrl_tx_start;
+            transition Idle -> Busy_ctrl on label wr_ctrl_enable;
+            transition Busy_ctrl -> Idle on label wr_ctrl_enable;
+            transition Idle -> Idle on label rd_ctrl_tx_start;
+            transition Idle -> Busy_ctrl on label rd_ctrl_tx_start;
+            transition Busy_ctrl -> Idle on label rd_ctrl_tx_start;
+            transition Idle -> Idle on label rd_ctrl_enable;
+            transition Idle -> Busy_ctrl on label rd_ctrl_enable;
+            transition Busy_ctrl -> Idle on label rd_ctrl_enable;
+            // CTRL (RW, control)
+            transition Idle -> Idle on label rd_status_tx_busy;
+            transition Idle -> Busy_status on label rd_status_tx_busy;
+            transition Busy_status -> Idle on label rd_status_tx_busy;
+            transition Idle -> Idle on label rd_status_rx_ready;
+            transition Idle -> Busy_status on label rd_status_rx_ready;
+            transition Busy_status -> Idle on label rd_status_rx_ready;
+            // STATUS (RO, status)
+            transition Idle -> Busy_data on label wr_data_byte;
+            transition Busy_data -> Idle on label wr_data_byte;
+            transition Idle -> Idle on label rd_data_byte;
+            transition Idle -> Busy_data on label rd_data_byte;
+            transition Busy_data -> Idle on label rd_data_byte;
+            // DATA (RW, data)
+        }
+        }
+    }
+
+    composition {
+        asynchronous UART_LITESystem {
+            members [UART_LITE, UartDriver];
+        }
+    }
+
+=== 2. codesign verify — init_reachable (smoke test) ===
+$ ./target/debug/mununu codesign verify examples/industrial/codesign_uart/register_map.json examples/industrial/codesign_uart/firmware.ctxdsl --formula init_reachable
+codesign verify — peripheral `UART_LITE` (base 0x40010000), composition `UART_LITESystem`
+  composed with firmware member(s): UartDriver
+
+  formula `init_reachable` over `UART_LITESystem`
+    states satisfying: 16/16
+    initial states satisfying: 1/1
+      initials: Idle|Init
+      satisfying: Idle|Init
+    verdict: HOLDS
+
+=== 3. codesign verify — safety_protocol_respected (over composed system) ===
+$ ./target/debug/mununu codesign verify examples/industrial/codesign_uart/register_map.json examples/industrial/codesign_uart/firmware.ctxdsl --formula safety_protocol_respected
+codesign verify — peripheral `UART_LITE` (base 0x40010000), composition `UART_LITESystem`
+  composed with firmware member(s): UartDriver
+
+  formula `safety_protocol_respected` over `UART_LITESystem`
+    states satisfying: 16/16
+    initial states satisfying: 1/1
+      initials: Idle|Init
+      satisfying: Idle|Init
+    verdict: HOLDS
+
+=== 4. codesign verify — sending_reachable (expected: VIOLATED under chaotic peripheral) ===
+$ ./target/debug/mununu codesign verify examples/industrial/codesign_uart/register_map.json examples/industrial/codesign_uart/firmware.ctxdsl --formula sending_reachable
+codesign verify — peripheral `UART_LITE` (base 0x40010000), composition `UART_LITESystem`
+  composed with firmware member(s): UartDriver
+
+  formula `sending_reachable` over `UART_LITESystem`
+    states satisfying: 8/16
+    initial states satisfying: 0/1
+      initials: Idle|Init
+    verdict: VIOLATED at initial state(s)
+
+=== end of transcript ===

@@ -1,0 +1,134 @@
+// Hand-authored firmware automaton for the Document C §C.4 worked example.
+// =========================================================================
+//
+// Industrial example for Document C — HW/SW codesign extraction. Models
+// the firmware side of a UART driver issuing a single `uart_send(byte)`
+// call against the UART_LITE peripheral described in `register_map.json`.
+//
+// The C-side source this automaton corresponds to:
+//
+//     void uart_send(uint8_t byte) {
+//         while (UART->STATUS.bit.tx_busy)
+//             ; // poll until peripheral is idle
+//         UART->DATA = byte;            // write data
+//         UART->CTRL.bit.tx_start = 1;  // raise tx_start
+//     }
+//
+// The labels `rd_status_tx_busy`, `wr_data_byte`, and `wr_ctrl_tx_start`
+// are the rendezvous labels emitted by `mununu codesign couple` from the
+// register-map sidecar. They are the *only* labels the firmware shares
+// with the peripheral.
+//
+// Slice 1 of codesign verification (Doc C §C.7's "connecting tissue
+// first" simplification) keeps the firmware hand-authored. C5
+// (libclang-backed C extraction) would generate this automaton from the
+// C source above. Until C5 lands, the hand-authored form is what
+// `mununu codesign verify` consumes.
+
+context CoupledUartFirmware {
+    alphabet {
+        // Optional firmware-internal tick (cycles spent polling between
+        // status reads). Modelled as a self-loop on Polling so the
+        // chaotic stub on the peripheral side can interleave its own
+        // internal activity.
+        label tick;
+        // Explicit reset event the user can fire from the API or the
+        // verifier's environment.
+        label reset;
+    }
+
+    automata {
+        automaton UartDriver {
+            controllable {
+                // Firmware drives both write rendezvous labels. The
+                // peripheral observes them; per Doc A §4 controllability
+                // rule applied at the register boundary, write-rendezvous
+                // labels are Controllable from the firmware's side and
+                // must NOT also appear in the peripheral's `controllable`
+                // block (C2's emitter handles this correctly).
+                label wr_data_byte;
+                label wr_ctrl_tx_start;
+                // The firmware also drives the polling event — it's
+                // firmware's choice when to issue a read.
+                label rd_status_tx_busy;
+                // Internal firmware actions.
+                label tick;
+                label reset;
+            }
+
+            states {
+                state Init initial;
+                state Polling;
+                state Ready;
+                state Sending;
+            }
+
+            transitions {
+                // Init: the firmware enters `uart_send` and starts polling.
+                transition Init -> Polling on label rd_status_tx_busy;
+
+                // Polling: firmware can spin on the read (status still
+                // busy), advance to Ready (status idle), or absorb an
+                // internal `tick` (no observable side-effect — just
+                // models cycles spent polling so the peripheral can
+                // interleave).
+                transition Polling -> Polling on label rd_status_tx_busy;
+                transition Polling -> Polling on label tick;
+                transition Polling -> Ready on label rd_status_tx_busy;
+
+                // Ready: firmware writes the data byte. This is the
+                // synchronisation point with the peripheral.
+                transition Ready -> Sending on label wr_data_byte;
+
+                // Sending: firmware raises tx_start; transaction ends;
+                // firmware returns to Init for the next call.
+                transition Sending -> Init on label wr_ctrl_tx_start;
+
+                // Explicit reset: at any reachable state, firmware can
+                // be reset back to Init. Models system-level recovery
+                // and serves as the canonical smoke-test target for
+                // the `init_reachable` formula.
+                transition Polling -> Init on label reset;
+                transition Ready -> Init on label reset;
+                transition Sending -> Init on label reset;
+                transition Init -> Init on label reset;
+            }
+        }
+    }
+
+    mu_formulas {
+        // -----------------------------------------------------------------
+        // Smoke test: Init is reachable from every state. Holds because
+        // every state has an explicit reset transition back to Init.
+        // -----------------------------------------------------------------
+        formula init_reachable {
+            over UartDriver;
+            body = mu X. (Init || <> X);
+        }
+
+        // -----------------------------------------------------------------
+        // Reachability: the firmware can reach Sending. Non-trivial —
+        // requires the peripheral's chaotic stub to admit the right
+        // sequence of `rd_status_tx_busy` events. Holds because the
+        // chaotic stub admits at least one path through.
+        // -----------------------------------------------------------------
+        formula sending_reachable {
+            over UartDriver;
+            body = mu X. (Sending || <> X);
+        }
+
+        // -----------------------------------------------------------------
+        // Safety (over the composed system): every reachable composed
+        // state respects the protocol. Same shape as the secure_boot_rom
+        // and tls_handshake examples: `nu X. ([] X)` over the
+        // codesign composition. Sound under chaotic-stub default
+        // (Doc A §2): safety verdicts over an over-approximation
+        // transfer to any real system whose peripheral behaves at
+        // least as chaotically.
+        // -----------------------------------------------------------------
+        formula safety_protocol_respected {
+            over UART_LITESystem;
+            body = nu X. ([] X);
+        }
+    }
+}
