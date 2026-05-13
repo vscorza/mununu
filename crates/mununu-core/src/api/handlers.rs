@@ -1828,6 +1828,63 @@ pub async fn contract_query_handler(
     Ok(Json(ContractQueryResponse { candidates }))
 }
 
+/// Request body for `POST /api/v1/contract/review`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ContractReviewRequest {
+    pub interface: crate::contract::discover::BlackBoxInterface,
+    #[serde(default)]
+    pub force_controllable: Vec<String>,
+    #[serde(default)]
+    pub force_uncontrollable: Vec<String>,
+    #[serde(default)]
+    pub emit_fairness_gap: bool,
+    /// Optional contract corpus root used to resolve
+    /// `@mununu_interface contract://` URIs into reference proposals.
+    #[serde(default)]
+    pub corpus: Option<std::path::PathBuf>,
+}
+
+/// HITL stage-4 review surface — Document A §A7 / Document D §D.8.
+///
+/// Wraps phase-2 discovery and adds a flat list of proposed clauses
+/// extracted from `@mununu_assume` / `@mununu_guarantee` annotations
+/// and resolved corpus references. The approve/edit/reject UX lives in
+/// the CLI / UI surfaces.
+pub async fn contract_review_handler(
+    Json(request): Json<ContractReviewRequest>,
+) -> ApiResult<Json<crate::contract::review::ReviewPackage>> {
+    use crate::contract::discover::DiscoverOptions;
+    use crate::contract::review::build_review_package;
+    use crate::corpus::Corpus;
+
+    let force_c: Vec<&str> = request
+        .force_controllable
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let force_u: Vec<&str> = request
+        .force_uncontrollable
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let corpus = match &request.corpus {
+        Some(root) => Some(Corpus::load(root).map_err(|e| ApiError::BadRequest {
+            message: format!("failed to load corpus at {}: {e}", root.display()),
+            details: None,
+        })?),
+        None => None,
+    };
+    let opts = DiscoverOptions {
+        force_controllable: &force_c,
+        force_uncontrollable: &force_u,
+        emit_fairness_gap: request.emit_fairness_gap,
+        corpus: corpus.as_ref(),
+    };
+    let pkg = build_review_package(&request.interface, &opts);
+    pkg.phase1.gaps.emit_diagnostics();
+    Ok(Json(pkg))
+}
+
 #[cfg(test)]
 mod contract_handler_tests {
     use super::*;

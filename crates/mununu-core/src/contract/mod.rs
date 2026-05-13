@@ -15,6 +15,7 @@ pub mod contract_uri;
 pub mod discharge;
 pub mod discover;
 pub mod gap;
+pub mod review;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
