@@ -2,7 +2,7 @@
 
 > **Status:** Design-stage reasoning. Not shipped architecture.
 > **Audience:** Adapter authors and tool integrators who need a single home for "how contracts are written down" and "where mununu's project config lives."
-> **Companion documents:** [A — Black-box modules in compositional extraction](black-box-modules.md), [B — RTL frontend unification](rtl-frontend-unification.md), [C — HW/SW codesign extraction](hw-sw-codesign-extraction.md) (deferred).
+> **Companion documents:** [A — Black-box modules in compositional extraction](black-box-modules.md), [B — RTL frontend unification](rtl-frontend-unification.md), [C — HW/SW codesign extraction](hw-sw-codesign-extraction.md) (design landed; implementation deferred).
 
 ## D.1 Why one document covers both
 
@@ -466,9 +466,9 @@ Drafts are not written before §D.9 is reproducible.
 
 When this document is marked **implemented** (tasks D1–D5 + A6 + A7 landed), **validated** (the §D.9 transcript is reproducible), and **published** (the §D.10 posts are live), the next document to tackle is:
 
-→ **[Document C — HW/SW codesign extraction](hw-sw-codesign-extraction.md)** (deferred) and its accompanying implementation plan.
+→ **[Document C — HW/SW codesign extraction](hw-sw-codesign-extraction.md)** (design landed; implementation deferred).
 
-Document C is the **capstone publication** for the four-document arc. It composes Document A's controllability rule, Document B's dual-frontend unification, and Document D's corpus + sidecar layout into one industrial use case: peripheral RTL + firmware C, coupled via a register-map sidecar (the format defined here in §D.3.2 under `coupling/register_maps/`).
+Document C is the **capstone** for the four-document arc. It composes Document A's controllability rule, Document B's dual-frontend unification, and Document D's corpus + sidecar layout into one industrial use case: peripheral RTL + firmware C, coupled via a register-map sidecar (the format sketched here in §D.3.2 under `coupling/register_maps/` and developed in Document C §C.3.2).
 
 The full roadmap order: **A → B → D → C → governance update**. See the planning file at `.claude/plans/i-want-you-to-distributed-orbit.md` for the milestone breakdown.
 

@@ -2,7 +2,7 @@
 
 > **Status:** Design-stage reasoning. Not shipped architecture.
 > **Audience:** Adapter authors choosing where to slot new RTL functionality, and reviewers asking why mununu keeps two SystemVerilog pipelines.
-> **Companion documents:** [A — Black-box modules in compositional extraction](black-box-modules.md), [C — HW/SW codesign extraction](hw-sw-codesign-extraction.md) (deferred), [D — Contract corpus and config](contract-corpus-and-config.md) (deferred).
+> **Companion documents:** [A — Black-box modules in compositional extraction](black-box-modules.md), [D — Contract corpus and config](contract-corpus-and-config.md), [C — HW/SW codesign extraction](hw-sw-codesign-extraction.md) (design landed; implementation deferred).
 
 ## B.1 Why we have two RTL pipelines
 
