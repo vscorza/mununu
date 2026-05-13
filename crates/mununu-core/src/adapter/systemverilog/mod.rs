@@ -389,6 +389,7 @@ impl SystemVerilogAdapter {
                     force_controllable: &[],
                     force_uncontrollable: &[],
                     emit_fairness_gap: false,
+                    corpus: None,
                 };
                 sidecars.extend(crate::contract::discover::build_blackbox_sidecars(
                     &blackboxes,

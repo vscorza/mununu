@@ -1720,16 +1720,23 @@ pub struct ContractDiscoverRequest {
     pub force_uncontrollable: Vec<String>,
     #[serde(default)]
     pub emit_fairness_gap: bool,
+    /// Optional contract corpus root used to resolve
+    /// `@mununu_interface contract://` URIs on the interface. Mirrors
+    /// the CLI's `--corpus` flag for three-surface parity.
+    #[serde(default)]
+    pub corpus: Option<std::path::PathBuf>,
 }
 
 /// Run phase-1 contract discovery on a black-box interface description.
 /// Mirrors `mununu contract discover`. The structured `tracing::warn!`
 /// diagnostics still fire on the server side; the response carries the
-/// full `Phase1Output` (labels + gap markers) for the UI to render.
+/// full `Phase1Output` (labels + gap markers + corpus resolutions) for
+/// the UI to render.
 pub async fn contract_discover_handler(
     Json(request): Json<ContractDiscoverRequest>,
 ) -> ApiResult<Json<crate::contract::discover::Phase1Output>> {
     use crate::contract::discover::{DiscoverOptions, discover_phase1};
+    use crate::corpus::Corpus;
 
     let force_c: Vec<&str> = request
         .force_controllable
@@ -1741,10 +1748,18 @@ pub async fn contract_discover_handler(
         .iter()
         .map(|s| s.as_str())
         .collect();
+    let corpus = match &request.corpus {
+        Some(root) => Some(Corpus::load(root).map_err(|e| ApiError::BadRequest {
+            message: format!("failed to load corpus at {}: {e}", root.display()),
+            details: None,
+        })?),
+        None => None,
+    };
     let opts = DiscoverOptions {
         force_controllable: &force_c,
         force_uncontrollable: &force_u,
         emit_fairness_gap: request.emit_fairness_gap,
+        corpus: corpus.as_ref(),
     };
     let output = discover_phase1(&request.interface, &opts);
     output.gaps.emit_diagnostics();

@@ -11,6 +11,7 @@
 //! is deferred to a follow-up task; this module currently consumes contracts
 //! as a JSON-serialisable Rust value.
 
+pub mod contract_uri;
 pub mod discharge;
 pub mod discover;
 pub mod gap;
