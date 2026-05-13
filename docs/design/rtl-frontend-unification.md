@@ -143,6 +143,9 @@ The diagnostic warning (one `tracing::warn!` per gap) fires at extraction time, 
 - One `WARN contract gap detected — chaotic stub default in effect` per gap, with module / kind / labels / soundness fields.
 
 ### B.7.4 Task B4 — shared composition-spec helper
+
+> **Post-M2 reassessment (2026-05-13): lost most of its leverage.** The dual-frontend SoC example shipped in M2.c demonstrates that both pipelines emit structurally-identical `BlackBoxInterface.json` (verified by `jq` normalisation in `examples/industrial/dual_frontend_soc/validate.sh`). The unification happened via **convention** — both paths call `contract::discover::build_blackbox_sidecars()` — rather than via an explicit shared composition-spec helper. Lifting `ConnectionSpec` into a separate helper today would be **code-reduction without behaviour change**. Worth doing only if a *third* RTL frontend lands (e.g. CIRCT via [crates/mununu-extract](../../crates/mununu-extract/)) and the duplication becomes painful. Until then, B4 is descoped; the two paths converge on the same output through shared lower-level helpers (`build_blackbox_sidecars`) rather than a shared composition primitive.
+
 **Touches:** [crates/mununu-core/src/adapter/](../../crates/mununu-core/src/adapter/) (new `compose.rs` or extend `emit.rs`).
 **Scope:** lift the `ConnectionSpec` data type ([annotation.rs:302](../../crates/mununu-core/src/adapter/systemverilog/annotation.rs#L302)) + composition-emission code (the body of [`generate_multi_sidecar` at annotation.rs:1058](../../crates/mununu-core/src/adapter/systemverilog/annotation.rs#L1058)) out of the custom-SV path into a shared helper both frontends call. The custom-SV port-binding logic becomes the canonical implementation; yosys's new black-box-aware path calls into it.
 **Validation:** the dual-frontend SoC example (§B.8) produces structurally identical composition specs from both frontends (same composition name, same member list, same shared-label set).

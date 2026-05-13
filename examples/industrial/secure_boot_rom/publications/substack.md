@@ -197,7 +197,7 @@ Per [mununu's claims-integrity rules](https://github.com/vscorza/mununu/blob/mai
 - It does not claim mununu found a vulnerability in any commercial secure-boot ROM. The vendor-IP black boxes are stylised; the boot controller is hand-authored for the demonstration.
 - It does not claim the closed-IP contract clauses are accurate to any vendor's real datasheet. They are illustrative of the *contract shape*.
 - It does not prove a real device is secure. The proof is conditional on the contracts; the contracts are conditional on the vendors honouring their datasheets.
-- It does not yet exercise vendor source-comment annotations (`@mununu_guarantee` on the wrapper module) or contract-corpus lookups. Those land in milestone M3 (Document D, the contract corpus and config document).
+- This particular example does not exercise vendor source-comment annotations (`@mununu_guarantee` on the wrapper module) or contract-corpus lookups. Those mechanisms shipped in milestone M3 (Document D, the contract corpus and config document) and a separate worked example — the TLS handshake at `examples/industrial/tls_handshake/` — exercises them end-to-end. The secure boot ROM example deliberately stays at the chaotic-stub baseline so the reader can see the unannotated default behaviour.
 
 What the example *does* claim: every concept Document A introduces — chaotic stub, gap markers, controllability rule, discharge graph, mu-rank witness — is exercised end-to-end against the mununu binary on `main`, with a byte-deterministic transcript anyone can reproduce.
 
@@ -217,13 +217,12 @@ What mununu contributes is the *integration*: a single workflow that pulls all o
 
 ## What's next
 
-This is M1 of a four-document roadmap. Up next:
+This is post 1 of a four-document arc. The rest of the arc has since shipped (design + implementation where noted):
 
-- **Document B** — RTL frontend unification (custom SV path + yosys/BTOR2 path → one contract surface).
-- **Document D** — Contract corpus + unified `.mununu/` config (the corpus you query for vendor contracts; the source-comment grammar; the L\* assumption learning surface).
-- **Document C** — HW/SW codesign extraction (peripheral RTL + firmware C, with a register-map sidecar coupling the two sides for cross-boundary formal verification).
-
-The example will grow with each. The next iteration of the secure boot example will exercise vendor `@mununu_guarantee` annotations once Document D's source-comment grammar lands (task A6 in the implementation plan).
+- **Document B** — RTL frontend unification (custom SV path + yosys/BTOR2 path → one contract surface). **Design + B1–B3 implementation shipped.** Worked example: [`examples/industrial/dual_frontend_soc/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/dual_frontend_soc).
+- **Document D** — Contract corpus + source-comment annotation grammar (the corpus you query for vendor contracts; the `@mununu_*` tag vocabulary; the `contract://` URI resolution). **Design + D1, D2, D4, A6 implementation shipped.** Worked example: [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake). L\* assumption learning (D5/D6) was reassessed post-M3 as long-tail follow-up and is not queued.
+- **Document A task A7** (HITL stage-4 review surface) — **shipped after this post was drafted**: `mununu contract review` CLI subcommand + `POST /api/v1/contract/review` HTTP endpoint + a Review sub-tab in the UI surface the proposed clauses extracted from the annotations + corpus references shipped in Document D.
+- **Document C** — HW/SW codesign extraction (peripheral RTL + firmware C, with a register-map sidecar coupling the two sides for cross-boundary formal verification). **Design landed; implementation is the next milestone.**
 
 The repo: [github.com/vscorza/mununu](https://github.com/vscorza/mununu).
 The example: [`examples/industrial/secure_boot_rom/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/secure_boot_rom).

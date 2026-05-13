@@ -272,12 +272,15 @@ Write a scoping-log entry at `.claude/plans/scoping-logs/hw-sw-codesign-extracti
 **Scope:** end-to-end three-surface entry point. CLI: `mununu codesign verify <sv> <c-or-ctxdsl> --register-map <path> --formula <name>`. HTTP: `POST /api/v1/codesign/verify`. UI: new "Codesign" sub-tab in ContractPanel or a new top-level panel.
 **Validation:** three-surface parity check via the existing `parity-check` skill.
 
-### §C.9.5 Task C5 — libclang backend for `mununu-extract`
+### §C.9.5 Task C5 — libclang backend for `mununu-extract` (with C-side `@mununu_*` wrappers)
 
-**Touches:** new feature flag `--backend libclang` on [crates/mununu-extract](../../crates/mununu-extract/), depends on `clang-sys` crate.
+**Touches:** new feature flag `--backend libclang` on [crates/mununu-extract](../../crates/mununu-extract/), depends on `clang-sys` crate. Also extends [crates/mununu-core/src/mununu_annotations/mod.rs](../../crates/mununu-core/src/mununu_annotations/mod.rs) with a C-flavoured wrapper parser.
 **Scope:** C-side extraction. Parses C source via libclang, resolves preprocessor + types, produces an `AdapterIR` shape matching the existing TypeScript / Python / Rust paths. Stripped down to firmware-relevant constructs: register access, polling loops, ISR handlers.
-**Validation:** the §C.4 example's firmware extracts to a 4-state automaton matching the hand-authored CTXDSL from §C.9.2. Standalone deliverable: even without §C.9.6 polish, it covers the common firmware shape.
-**Out of scope:** full C semantics. Deferred follow-ups: function pointers, recursion, complex pointer arithmetic, vendor-specific compiler extensions.
+
+**Bundled scope — C language wrappers for the annotation grammar.** Document D §D.5 reserved a tag vocabulary across SV / C / TS / Rust / Python; only the SV wrappers ship today. The C wrappers (`/** @mununu_*  ... */` Doxygen comments on function/struct/typedef declarations) **are not optional for this task** — without them a firmware engineer cannot attach `@mununu_guarantee` to an ISR or `@mununu_assume` to an interrupt-latency contract, and the discovery pipeline cannot lift those into proposed clauses for the HITL review surface (the same flow shipped in PR vscorza/mununu#20). C wrappers therefore land **in the same PR as the libclang backend**, not as a separate follow-up. The other languages (TS / Rust / Python) remain long-tail; ship them only when a real demand signal appears.
+
+**Validation:** the §C.4 example's firmware extracts to a 4-state automaton matching the hand-authored CTXDSL from §C.9.2; a vendor-supplied `/** @mununu_guarantee = "G(start -> eventually done)" */` on the `uart_send` function flows through to a `ProposedClause` in the `mununu contract review` output.
+**Out of scope:** full C semantics. Deferred follow-ups: function pointers, recursion, complex pointer arithmetic, vendor-specific compiler extensions. Also out of scope: TS / Rust / Python annotation wrappers — long-tail until requested.
 
 ### §C.9.6 Task C6 — IP-XACT / CMSIS-SVD importer
 
