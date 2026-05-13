@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(dirs.get("clk"), Some(&BoundaryDirection::Input));
         assert_eq!(dirs.get("data"), Some(&BoundaryDirection::Output));
         assert!(
-            dirs.get("stuff").is_none(),
+            !dirs.contains_key("stuff"),
             "should not include blackbox ports"
         );
     }
