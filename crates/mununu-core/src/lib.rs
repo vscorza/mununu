@@ -6,6 +6,7 @@
 pub mod abstraction;
 pub mod adapter;
 pub mod clts;
+pub mod codesign;
 pub mod composition;
 pub mod context;
 pub mod context_dsl;
