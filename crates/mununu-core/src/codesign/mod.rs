@@ -22,12 +22,16 @@
 //! - **C3 — interleaved trace origin classifier (slice 1)** in
 //!   [`trace`]. Tags trace steps as `[SW]` / `[HW]` / `[BUS]` based on
 //!   a caller-supplied label partition.
+//! - **C4 — codesign composition (slice 1)** in [`compose`]. Splices
+//!   the coupling fragment into a user-authored firmware CTXDSL and
+//!   round-trip-validates the result through the parser. The CLI /
+//!   HTTP surfaces in `mununu-cli` and `api::handlers` consume it.
 //!
-//! Follow-up slices in §C.9 of the design doc: C4 (`mununu codesign
-//! verify` three-surface entry point that consumes the C3 classifier),
-//! C5 (libclang C extraction + `@mununu_*` C wrappers), C6 (IP-XACT /
-//! CMSIS-SVD importer).
+//! Follow-up slices in §C.9 of the design doc: C5 (libclang C
+//! extraction + `@mununu_*` C wrappers), C6 (IP-XACT / CMSIS-SVD
+//! importer).
 
+pub mod compose;
 pub mod coupling;
 pub mod register_map;
 pub mod trace;

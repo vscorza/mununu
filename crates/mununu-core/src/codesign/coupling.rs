@@ -250,18 +250,22 @@ pub fn emit_peripheral_stub_ctxdsl(rm: &RegisterMap, options: &CouplingOptions<'
 
     // Controllable / internal sets must list every label that is
     // not the default (Uncontrollable in CTXDSL).
-    let controllable: Vec<&RendezvousLabel> = labels
-        .iter()
-        .filter(|l| matches!(l.controllability, LabelControllability::Controllable))
-        .collect();
-    if !controllable.is_empty() {
-        let _ = writeln!(buf, "        controllable {{");
-        for l in &controllable {
-            let _ = writeln!(buf, "            label {};", l.name);
-        }
-        let _ = writeln!(buf, "        }}");
-        let _ = writeln!(buf);
-    }
+    // The peripheral stub MUST NOT claim any rendezvous label as
+    // `controllable`. Firmware drives the `wr_*` labels (the firmware
+    // automaton declares them in its own `controllable { … }` block);
+    // the peripheral merely observes/responds. `rd_*` labels are
+    // chaotic outputs neither side controls. Declaring write labels
+    // as controllable here would conflict with the firmware's
+    // declaration at realise time. The label classifications on
+    // `RendezvousLabel` describe the labels from *firmware's*
+    // perspective and are surfaced for downstream consumers (e.g.
+    // the trace classifier in `codesign::trace`); they do not
+    // determine what the peripheral stub itself declares.
+    //
+    // We deliberately suppress unused-variable lints rather than
+    // dropping the call to `labels`, because `labels` documents
+    // intent and is consumed by the per-register loops below.
+    let _labels = &labels;
 
     let _ = writeln!(buf, "        states {{");
     let _ = writeln!(buf, "            state Idle initial;");
@@ -637,28 +641,24 @@ mod tests {
     }
 
     #[test]
-    fn peripheral_stub_declares_write_labels_as_controllable() {
+    fn peripheral_stub_does_not_emit_a_controllable_block() {
+        // The peripheral stub MUST NOT claim any rendezvous label as
+        // `controllable`. Firmware drives writes (the firmware
+        // automaton declares them); reads are chaotic outputs neither
+        // side controls. Claiming writes here would conflict with the
+        // firmware's declaration at realise time, which the CTXDSL
+        // realiser rejects with a "duplicate controllable label"
+        // error. The label classifications on `RendezvousLabel` are
+        // surfaced for downstream consumers (e.g. the trace
+        // classifier) but do not affect the peripheral stub's own
+        // declarations.
         let m = uart_map();
         let stub = emit_peripheral_stub_ctxdsl(&m, &CouplingOptions::default());
-        // The `controllable { … }` block must list every wr_* label.
-        assert!(stub.contains("controllable {"));
-        assert!(stub.contains("label wr_ctrl_tx_start;"));
-        assert!(stub.contains("label wr_ctrl_enable;"));
-        assert!(stub.contains("label wr_data;"));
-    }
-
-    #[test]
-    fn peripheral_stub_does_not_declare_reads_as_controllable() {
-        let m = uart_map();
-        let stub = emit_peripheral_stub_ctxdsl(&m, &CouplingOptions::default());
-        // No `controllable { label rd_…; }`.
-        let lines = stub.lines().filter(|l| l.contains("controllable"));
-        for line in lines {
-            assert!(
-                !line.contains("rd_"),
-                "read label should not be in controllable block: {line}"
-            );
-        }
+        assert!(
+            !stub.contains("controllable {"),
+            "peripheral stub must not emit a `controllable {{ … }}` block; \
+             firmware owns the wr_* labels"
+        );
     }
 
     #[test]
