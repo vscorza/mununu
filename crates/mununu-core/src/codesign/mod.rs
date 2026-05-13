@@ -20,4 +20,5 @@
 //! wrappers (C5), and the IP-XACT / CMSIS-SVD importer (C6) are
 //! follow-up slices in §C.9 of the design doc.
 
+pub mod coupling;
 pub mod register_map;
