@@ -90,6 +90,14 @@ enum ContractCommand {
     /// extraction (Document B task B3) — exposed as a CLI so users can
     /// run the conversion in batch.
     Sidecars(ContractSidecarsArgs),
+    /// Query the contract corpus for entries matching a
+    /// `(domain, name, parameters)` tuple.
+    ///
+    /// Document D task D2. The corpus root is a directory whose
+    /// subtree contains `<domain>/<name>@<version>.json` entries.
+    /// Results are ranked by parameter-match exactness, then
+    /// provenance trust tier, then version recency.
+    Query(ContractQueryArgs),
 }
 
 #[derive(Args, Debug)]
@@ -144,6 +152,26 @@ struct ContractSidecarsArgs {
     /// Emit an additional `Fairness` gap marker per module.
     #[arg(long)]
     emit_fairness_gap: bool,
+}
+
+#[derive(Args, Debug)]
+struct ContractQueryArgs {
+    /// `<domain>/<name>` identifier (e.g. `rtl_protocol/axi4_slave`).
+    #[arg(value_name = "DOMAIN/NAME")]
+    id: String,
+    /// Corpus root directory. Defaults to `./corpus` if not specified.
+    /// The directory subtree is scanned recursively for `.json` files
+    /// matching the [`ContractEntry`] schema.
+    #[arg(long, value_name = "DIR", default_value = "corpus")]
+    corpus: PathBuf,
+    /// Parameters to match against, expressed as `key=jsonvalue` pairs.
+    /// JSON values let the user pass `width=32`, `parity="none"`,
+    /// `has_qos=false`, etc. Repeatable.
+    #[arg(long = "param", value_name = "KEY=VALUE", num_args = 0..)]
+    params: Vec<String>,
+    /// Output the candidate list as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -485,7 +513,87 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
         ContractCommand::Gaps(args) => contract_gaps(args),
         ContractCommand::Discover(args) => contract_discover(args),
         ContractCommand::Sidecars(args) => contract_sidecars(args),
+        ContractCommand::Query(args) => contract_query(args),
     }
+}
+
+fn contract_query(args: ContractQueryArgs) -> Result<(), String> {
+    use mununu::corpus::Corpus;
+    use std::collections::BTreeMap;
+
+    let (domain, name) = match args.id.split_once('/') {
+        Some((d, n)) if !d.is_empty() && !n.is_empty() => (d, n),
+        _ => {
+            return Err(format!(
+                "expected DOMAIN/NAME, got '{}' — example: rtl_protocol/axi4_slave",
+                args.id
+            ));
+        }
+    };
+
+    // Parse repeated --param key=jsonvalue arguments.
+    let mut params: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for raw in &args.params {
+        let (key, value_str) = raw
+            .split_once('=')
+            .ok_or_else(|| format!("--param expects KEY=VALUE, got '{raw}'"))?;
+        let value: serde_json::Value = serde_json::from_str(value_str)
+            .or_else(|_| Ok::<_, ()>(serde_json::Value::String(value_str.to_string())))
+            .unwrap();
+        params.insert(key.to_string(), value);
+    }
+
+    let corpus = if args.corpus.exists() {
+        Corpus::load(&args.corpus)
+            .map_err(|e| format!("failed to load corpus from {}: {e}", args.corpus.display()))?
+    } else {
+        eprintln!(
+            "warning: corpus directory '{}' does not exist; using empty corpus",
+            args.corpus.display()
+        );
+        Corpus::empty()
+    };
+
+    let hits = corpus.query(domain, name, &params);
+
+    if args.json {
+        let body = serde_json::to_string_pretty(&hits)
+            .map_err(|e| format!("failed to serialise corpus hits: {e}"))?;
+        println!("{body}");
+        return Ok(());
+    }
+
+    if hits.is_empty() {
+        println!("no contract entries match {domain}/{name} with the supplied parameters");
+        return Ok(());
+    }
+    println!(
+        "found {} contract candidate(s) for {domain}/{name}:",
+        hits.len()
+    );
+    for (i, entry) in hits.iter().enumerate() {
+        let provenance = match &entry.provenance {
+            mununu::corpus::Provenance::MununuVerified { verified_against } => {
+                format!(
+                    "mununu-verified ({})",
+                    verified_against.as_deref().unwrap_or("no reference")
+                )
+            }
+            mununu::corpus::Provenance::Vendor { name, .. } => format!("vendor:{name}"),
+            mununu::corpus::Provenance::Community { .. } => "community".to_string(),
+        };
+        println!(
+            "  {}. {} @ {}  [{}]",
+            i + 1,
+            entry.id,
+            entry.version,
+            provenance,
+        );
+        if let Some(desc) = &entry.description {
+            println!("       {desc}");
+        }
+    }
+    Ok(())
 }
 
 fn contract_sidecars(args: ContractSidecarsArgs) -> Result<(), String> {

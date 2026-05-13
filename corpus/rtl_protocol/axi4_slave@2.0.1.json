@@ -1,0 +1,29 @@
+{
+  "id": "rtl_protocol/axi4_slave",
+  "version": "2.0.1",
+  "domain": "rtl_protocol",
+  "name": "axi4_slave",
+  "description": "AXI4 slave protocol contract — strict ordering variant. Captures the canonical AMBA AXI4 slave handshake: AWREADY → AWVALID acceptance; WLAST closes the data phase; BVALID rises after the last write beat. ILLUSTRATIVE: this entry demonstrates the corpus schema for Document D, it is not derived from any specific vendor's silicon.",
+  "parameters": {
+    "addr_width": 32,
+    "data_width": 64,
+    "has_qos": false
+  },
+  "alternatives": [
+    {
+      "id": "strict",
+      "label": "Strict ordering",
+      "description": "Responses are returned in the order requests were accepted."
+    },
+    {
+      "id": "permissive",
+      "label": "Out-of-order responses allowed",
+      "description": "BRESP may return out of order; the contract drops the strict-ordering guarantee."
+    }
+  ],
+  "provenance": {
+    "tier": "mununu_verified",
+    "verified_against": "ARM AMBA AXI4 specification rev I (illustrative — no real vendor silicon was modelled)"
+  },
+  "soundness_flag": "safety+liveness"
+}

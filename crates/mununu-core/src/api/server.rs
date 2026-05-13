@@ -97,6 +97,10 @@ fn create_router() -> Router {
             "/api/v1/contract/discover",
             post(handlers::contract_discover_handler),
         )
+        .route(
+            "/api/v1/contract/query",
+            post(handlers::contract_query_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
