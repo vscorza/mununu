@@ -16,6 +16,7 @@ pub mod corpus;
 pub mod examples;
 pub mod guard;
 pub mod iter;
+pub mod llvm_ir;
 pub mod ltl;
 pub mod mu_calculus;
 pub mod mununu_annotations;

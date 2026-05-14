@@ -277,6 +277,15 @@ struct CodesignExtractCArgs {
     /// `--register-map`).
     #[arg(long = "synthesize-automaton")]
     synthesize_automaton: bool,
+    /// Extraction backend (`ast` default, `llvm` for phase-L1+ lift).
+    #[arg(long, value_enum, default_value = "ast")]
+    backend: CExtractBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CExtractBackend {
+    Ast,
+    Llvm,
 }
 
 #[derive(Args, Debug)]
@@ -681,6 +690,36 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
 }
 
 fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
+    match args.backend {
+        CExtractBackend::Ast => codesign_extract_c_ast(args),
+        CExtractBackend::Llvm => codesign_extract_c_llvm(args),
+    }
+}
+
+fn codesign_extract_c_llvm(args: CodesignExtractCArgs) -> Result<(), String> {
+    use mununu::codesign::c_extract_llvm::{LlvmExtractOptions, extract_c_via_llvm};
+
+    if args.register_map.is_some() || args.synthesize_automaton {
+        return Err(
+            "--backend llvm: --register-map / --synthesize-automaton are not yet implemented (phase L2 / L3)"
+                .to_string(),
+        );
+    }
+    let opts = LlvmExtractOptions {
+        clang_path: args.clang,
+        include_paths: args.include_paths,
+        defines: args.defines,
+        extra_clang_args: args.extra_clang_args,
+    };
+    let extraction = extract_c_via_llvm(&args.file, &opts)
+        .map_err(|e| format!("LLVM C extraction failed: {e}"))?;
+    let json = serde_json::to_string_pretty(&extraction)
+        .map_err(|e| format!("failed to serialise extraction: {e}"))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn codesign_extract_c_ast(args: CodesignExtractCArgs) -> Result<(), String> {
     use mununu::codesign::c_extract::{CExtractOptions, extract_c_via_clang};
     use mununu::codesign::register_map::RegisterMap;
 

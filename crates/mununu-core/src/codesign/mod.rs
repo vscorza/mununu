@@ -36,6 +36,7 @@
 //! importers are deferred sibling tasks under C6's umbrella.
 
 pub mod c_extract;
+pub mod c_extract_llvm;
 pub mod compose;
 pub mod coupling;
 pub mod register_map;
