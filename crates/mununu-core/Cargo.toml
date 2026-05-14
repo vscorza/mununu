@@ -17,6 +17,13 @@ bitvec = "1.0"
 smallvec = "1.15"
 regex = "1.12"
 
+# CMSIS-SVD / IP-XACT importer for register-map sidecars (Document C
+# task C6). Small, zero-dep DOM parser well-suited to one-shot config
+# parsing. Pulled in unconditionally because `codesign::svd_import` is
+# a default feature of the codesign module — the importer is the only
+# realistic way to author register maps for any non-toy peripheral.
+roxmltree = "0.20"
+
 # Tracing — used unconditionally for structured diagnostics (gap markers,
 # soundness warnings, perf instrumentation). No-op when no subscriber is
 # installed, so the cost is negligible for library callers.
