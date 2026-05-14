@@ -112,6 +112,145 @@ impl MununuAnnotation {
     }
 }
 
+/// Extract all mununu annotations from raw C / C++ source text.
+///
+/// The expected vendor convention is **Doxygen** blocks attached to
+/// function / struct / typedef declarations:
+///
+/// ```c
+/// /**
+///  * Send a byte over the UART. Blocks until the peripheral is ready.
+///  *
+///  * @mununu_guarantee G(start -> eventually done)
+///  * @mununu_assume    G(start -> !reset)
+///  */
+/// void uart_send(uint8_t byte);
+/// ```
+///
+/// Recognises:
+///   - `/** ... @mununu_<tag> [value] ... */` Doxygen blocks
+///     (multi-line — the canonical form for vendor-supplied
+///     contract annotations). Each `@mununu_*` tag is extracted
+///     independently, with `source_line` set to the line the tag
+///     itself appears on.
+///   - `/* @mununu_<tag> [value] */` single-line block comments.
+///   - `// @mununu_<tag> [value]` line comments.
+///
+/// Verilog-style `(* mununu_* *)` attributes are **not** recognised
+/// here — they are SV syntax and would never appear in C source.
+/// Use [`extract_from_sv_source`] for SV.
+///
+/// Unknown tags are silently skipped (the file may carry Doxygen
+/// `@param` / `@return` / `@brief` and other non-mununu tags; we
+/// ignore them).
+pub fn extract_from_c_source(text: &str) -> Vec<MununuAnnotation> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Doxygen block `/** … */` — must check before `/*` since
+        // `/**` is a strict prefix of `/*`. We treat `/**/` (empty
+        // Doxygen block) as a single-line block.
+        if i + 2 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'*' {
+            // Find the closing `*/`. Search starts after the opening
+            // `/**` (3 bytes).
+            let body_start = i + 3;
+            if let Some(end_rel) = find_block_end(&bytes[body_start..]) {
+                let body_end = body_start + end_rel;
+                let body = &text[body_start..body_end];
+                for ann in parse_doxygen_block(body, line_of(text, body_start)) {
+                    out.push(ann);
+                }
+                i = body_end + 2; // past `*/`
+                continue;
+            } else {
+                // Unterminated Doxygen block — give up on the rest of
+                // the file rather than mis-extract.
+                break;
+            }
+        }
+        // Single-line block comment `/* … */` (NOT Doxygen).
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let body_start = i + 2;
+            if let Some(end_rel) = find_block_end(&bytes[body_start..]) {
+                let body_end = body_start + end_rel;
+                let body = &text[body_start..body_end];
+                if let Some(ann) = parse_line_comment_body(body) {
+                    out.push(ann.with_line(line_of(text, body_start)));
+                }
+                i = body_end + 2;
+                continue;
+            } else {
+                break;
+            }
+        }
+        // Line comment `// …`.
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            // Find end of line.
+            let body_start = i + 2;
+            let end_rel = bytes[body_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(bytes.len() - body_start);
+            let body = &text[body_start..body_start + end_rel];
+            if let Some(ann) = parse_line_comment_body(body) {
+                out.push(ann.with_line(line_of(text, body_start)));
+            }
+            i = body_start + end_rel;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Find the byte offset of the closing `*/` inside `body`. Returns
+/// `None` if no closing sequence is found (unterminated comment).
+fn find_block_end(body: &[u8]) -> Option<usize> {
+    let mut j = 0usize;
+    while j + 1 < body.len() {
+        if body[j] == b'*' && body[j + 1] == b'/' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 1-based line number of `byte_offset` within `text`.
+fn line_of(text: &str, byte_offset: usize) -> u32 {
+    text[..byte_offset.min(text.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count() as u32
+        + 1
+}
+
+/// Parse the body of a `/** … */` Doxygen block. Walks line-by-line,
+/// strips the leading ` * ` decoration, and runs each line through
+/// the same `@mununu_<tag>` extractor used for `// …` comments.
+///
+/// Multiple `@mununu_*` tags may appear in the same block. Each
+/// tag's `source_line` is set to the line within the file where the
+/// tag itself sits (not the block's opening `/**`).
+fn parse_doxygen_block(body: &str, block_start_line: u32) -> Vec<MununuAnnotation> {
+    let mut out = Vec::new();
+    for (line_idx, raw_line) in body.lines().enumerate() {
+        // Strip Doxygen's leading ` * ` decoration. We tolerate any
+        // number of leading spaces and either `*` or no leading
+        // marker (some authors don't add the per-line `*`).
+        let trimmed = raw_line.trim_start();
+        let cleaned = trimmed
+            .strip_prefix('*')
+            .map(|s| s.trim_start())
+            .unwrap_or(trimmed);
+        if let Some(ann) = parse_line_comment_body(cleaned) {
+            out.push(ann.with_line(block_start_line + line_idx as u32));
+        }
+    }
+    out
+}
+
 /// Extract all mununu annotations from raw SystemVerilog source text.
 ///
 /// Recognises:
@@ -361,5 +500,174 @@ mod tests {
     fn extract_yosys_empty_attributes() {
         let attrs = json!({});
         assert!(extract_from_yosys_attributes(&attrs).is_empty());
+    }
+
+    // ========================================================================
+    // C / Doxygen wrapper tests — Document C task C5, slice 1.
+    // ========================================================================
+
+    #[test]
+    fn c_extract_single_line_doxygen() {
+        let src = "/** @mununu_blackbox */\nvoid foo(void);\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].tag, MununuTag::Blackbox);
+        assert_eq!(anns[0].value, "");
+    }
+
+    #[test]
+    fn c_extract_multiline_doxygen_with_multiple_tags() {
+        let src = "/**\n\
+                   * Send a byte over UART.\n\
+                   *\n\
+                   * @mununu_guarantee G(start -> eventually done)\n\
+                   * @mununu_assume    G(start -> !reset)\n\
+                   */\n\
+                   void uart_send(uint8_t byte);\n";
+        let anns = extract_from_c_source(src);
+        // Two tags inside the block.
+        assert_eq!(anns.len(), 2);
+        let by_tag: std::collections::HashMap<_, _> = anns.iter().map(|a| (a.tag, a)).collect();
+        assert_eq!(
+            by_tag[&MununuTag::Guarantee].value,
+            "G(start -> eventually done)"
+        );
+        assert_eq!(by_tag[&MununuTag::Assume].value, "G(start -> !reset)");
+    }
+
+    #[test]
+    fn c_extract_line_comment() {
+        let src = "// @mununu_assume G(req -> ack)\nvoid foo(void);\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].tag, MununuTag::Assume);
+        assert_eq!(anns[0].value, "G(req -> ack)");
+    }
+
+    #[test]
+    fn c_extract_single_line_non_doxygen_block_comment() {
+        let src = "/* @mununu_interface contract://rtl_crypto/aes_ctr@1.0.0 */\nvoid foo(void);\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].tag, MununuTag::Interface);
+        assert_eq!(anns[0].value, "contract://rtl_crypto/aes_ctr@1.0.0");
+    }
+
+    #[test]
+    fn c_extract_mixed_forms_in_one_file() {
+        let src = "/** @mununu_blackbox */\n\
+                   /* @mununu_interface contract://x/y@1 */\n\
+                   // @mununu_guarantee G(a -> b)\n\
+                   void foo(void);\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 3);
+        let tags: std::collections::HashSet<_> = anns.iter().map(|a| a.tag).collect();
+        assert!(tags.contains(&MununuTag::Blackbox));
+        assert!(tags.contains(&MununuTag::Interface));
+        assert!(tags.contains(&MununuTag::Guarantee));
+    }
+
+    #[test]
+    fn c_extract_ignores_verilog_style_attributes() {
+        // SV syntax `(* mununu_blackbox *)` would be a syntax error
+        // in C; we must not accidentally pick it up here.
+        let src = "(* mununu_blackbox *)\nvoid foo(void);\n";
+        let anns = extract_from_c_source(src);
+        assert!(
+            anns.is_empty(),
+            "Verilog attributes must not be recognised in C"
+        );
+    }
+
+    #[test]
+    fn c_extract_ignores_unrelated_doxygen_tags() {
+        let src = "/**\n\
+                   * @param byte  the data byte to send\n\
+                   * @return 0 on success\n\
+                   * @brief Sends a byte\n\
+                   */\n\
+                   int uart_send(uint8_t byte);\n";
+        let anns = extract_from_c_source(src);
+        assert!(
+            anns.is_empty(),
+            "non-mununu Doxygen tags must be ignored, got: {anns:?}"
+        );
+    }
+
+    #[test]
+    fn c_extract_line_numbers_point_to_the_tag_not_the_block_start() {
+        let src = "/**\n\
+                   * @mununu_guarantee G(start -> eventually done)\n\
+                   */\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 1);
+        // The Doxygen block starts at line 1; the tag is on line 2.
+        assert_eq!(anns[0].source_line, Some(2));
+    }
+
+    #[test]
+    fn c_extract_doxygen_block_without_leading_stars_is_tolerated() {
+        // Some authors write Doxygen without the per-line `*`.
+        let src = "/**\n\
+                   @mununu_blackbox\n\
+                   @mununu_guarantee G(p -> q)\n\
+                   */\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 2);
+    }
+
+    #[test]
+    fn c_extract_unterminated_block_does_not_panic() {
+        // Defensive: a malformed file should produce zero annotations
+        // (or at most the well-formed ones before the bad block) but
+        // never panic.
+        let src = "/** @mununu_blackbox\nvoid never_closed(void);\n";
+        let _anns = extract_from_c_source(src);
+        // No assertion on count — just that we didn't panic.
+    }
+
+    #[test]
+    fn c_extract_quoted_values_are_unquoted() {
+        let src = "// @mununu_interface \"contract://x/y@1\"\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns[0].value, "contract://x/y@1");
+    }
+
+    #[test]
+    fn c_extract_distinguishes_double_star_from_single_star_block() {
+        // Both `/**` and `/*` are valid block-comment openers; the
+        // parser must pick the right scanning rule. Doxygen blocks
+        // can carry multiple tags; single-`/*` blocks are treated as
+        // a single line.
+        let src = "/* @mununu_blackbox */\n\
+                   /** @mununu_guarantee G(a -> b) */\n";
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 2);
+    }
+
+    #[test]
+    fn c_extract_realistic_uart_send_header() {
+        let src = r#"
+            /**
+             * @brief  Send a byte over UART.
+             * @param  byte the payload
+             * @return 0 on success
+             *
+             * @mununu_assume    G(uart_send -> !uart_in_reset)
+             * @mununu_guarantee G(uart_send -> eventually uart_idle)
+             */
+            int uart_send(uint8_t byte);
+
+            /**
+             * @mununu_interface contract://rtl_peripheral/uart_lite@1.0
+             */
+            extern struct uart_t * const UART;
+        "#;
+        let anns = extract_from_c_source(src);
+        assert_eq!(anns.len(), 3);
+        let by_tag: std::collections::HashSet<_> = anns.iter().map(|a| a.tag).collect();
+        assert!(by_tag.contains(&MununuTag::Assume));
+        assert!(by_tag.contains(&MununuTag::Guarantee));
+        assert!(by_tag.contains(&MununuTag::Interface));
     }
 }
