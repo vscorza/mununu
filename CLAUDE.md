@@ -328,6 +328,36 @@ Strategy extraction uses **signature-based selection** from iteration ranks:
 - Counterstrategies are also positional — both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998)
 - Memoryless on the model-checking product = finite-memory on the plant. The memory is the iteration-rank signature from fixpoint evaluation.
 
+### Black-Box Modules and Contracts
+
+Mununu's contract subsystem makes black-box components first-class: peripheral RTL with no body, vendor IP behind an interface, firmware calling out to an unverified library. The framework spans Documents A (foundations), B (RTL frontend unification), D (corpus + annotations), and C (HW/SW codesign). The shipped surface is in [`crates/mununu-core/src/contract/`](crates/mununu-core/src/contract/), [`crates/mununu-core/src/corpus/`](crates/mununu-core/src/corpus/), [`crates/mununu-core/src/codesign/`](crates/mununu-core/src/codesign/), and [`crates/mununu-core/src/mununu_annotations/`](crates/mununu-core/src/mununu_annotations/).
+
+**The chaotic-stub default is sound by construction, but never silent.** When an adapter encounters a black-box module it has no body for (yosys `(* blackbox *)`, custom-SV instantiation without a sidecar entry, software call falling through to `CallEffect::Unknown`), it produces a *chaotic stub*: every behaviour the interface admits, at every timing. Pessimism is mandatory — under-approximation is unsound for safety. The user must never accept the default *silently*; every black-box discovery emits a structured `tracing::warn!` diagnostic naming the module, the gap kind, the labels affected, and the soundness consequence. `--strict-contracts` promotes those warnings to hard errors for safety-critical CI.
+
+**The discharge graph catches circular reasoning automatically.** When the user authors assume/guarantee clauses across components, the realiser runs Tarjan SCC over the `guarantor → consumer` graph at [`contract/discharge.rs`](crates/mununu-core/src/contract/discharge.rs). Acyclic discharge = standard Pnueli 1985 linear discharge. Cyclic = mununu attempts a lightweight mu-rank witness check (Document A §3.x); if no witness, the cycle is reported and verification refuses to silently proceed without explicit user approval. No PR may introduce a circular discharge that lacks either a rank witness or an explicit user sign-off.
+
+**Annotations are the in-source contract anchors.** The `@mununu_*` tag vocabulary (`@mununu_blackbox`, `@mununu_assume`, `@mununu_guarantee`, `@mununu_interface`, `@mununu_controllable`, `@mununu_uncontrollable`) appears on the source side of the boundary — Verilog attributes `(* mununu_xxx = "…" *)` for SV today, with Doxygen-style `/** @mununu_xxx ... */` reserved for C/TS/Rust/Python under Task C5. The grammar parser at [`mununu_annotations/mod.rs`](crates/mununu-core/src/mununu_annotations/mod.rs) strips the wrapper and feeds the inner tag + value to a single downstream consumer. The discovery pipeline lifts annotations into `BlackBoxInterface.annotations[]` and the HITL review surface turns them into `ProposedClause` objects the user accepts / edits / rejects.
+
+**The corpus replaces hand-authored stubs with vetted contracts.** A `@mununu_interface = "contract://rtl_protocol/axi4_slave@2.0.1?alt=strict"` annotation resolves against the corpus at [`corpus/`](corpus/) during discovery; a hit downgrades the default `OutputSequencing` gap to `LatencyBound` (the corpus entry implies the missing progress assumption) and tags the discharged clauses with `provenance: Corpus { id }`. Misses are surfaced as structured diagnostics — the user must either author a local entry or accept the chaotic-stub default. Contract entries follow Document D §D.2's schema; the corpus is file-backed today, with SQLite + remote service tiers reserved for follow-up.
+
+**HW/SW codesign uses a register-map sidecar as the coupling spec.** [`crates/mununu-core/src/codesign/register_map.rs`](crates/mununu-core/src/codesign/register_map.rs) defines the JSON schema (mirrored at [`tools/register_map_schema.json`](tools/register_map_schema.json)). Each register-field bit maps to both an SV signal path and a C accessor expression. `mununu codesign couple` emits the CTXDSL coupling fragment (alphabet of rendezvous labels + chaotic peripheral stub + asynchronous composition block) the user splices into hand-authored firmware. `mununu codesign verify` does the splice automatically, realises the composition, and evaluates a named formula. Asynchronous composition is the only sound choice (Doc C §C.5 — bus arbitration is non-deterministic; synchronous one-step rendezvous is unsound for racy access).
+
+**Three-surface parity is enforced** for every new contract / codesign capability. CLI subcommand + HTTP route + UI panel must all ship in the same PR — the `parity-check` skill flags drift. Today: `mununu contract validate|gaps|discover|sidecars|query|review`, `mununu codesign couple|verify`. HTTP routes mirror at `/api/v1/contract/*` and `/api/v1/codesign/*`. UI: `ContractPanel` (Validate / Discover / Query / Review sub-tabs) and `CodesignPanel` in `mununu-ui`.
+
+**Sidecars are co-located, not centralised.** Adapter-detected black-boxes auto-emit `<module>.interface.json` + `<module>.gap_report.json` sidecars next to the source they describe. `.contract.todo.json` skeletons are written next to source when discovery produces gap markers. The originally-proposed `.mununu/` central project directory (Doc D §D.3) was scoped down post-M3 — co-located sidecars proved more discoverable than a central tree, and the only piece of the central tree that survived is the `.mununu/coupling/register_maps/` slot for Doc C's register-map sidecars.
+
+**Soundness rules specific to codesign** (Doc C §C.5):
+- Bus arbitration is non-deterministic → asynchronous composition is mandatory; synchronous coupling is unsound for racy access.
+- Interrupt latency is a top-level environment assumption → treat as an unguaranteed clause at the top of the discharge graph; HITL must approve.
+- Embedded C memory model defaults to sequential consistency with an explicit warning → under-approximation alternatives must be opt-in and labelled.
+
+**Pointers to the design documents** (which carry the precedent review, the implementation plans, and the open questions):
+
+- [`docs/design/black-box-modules.md`](docs/design/black-box-modules.md) — Document A.
+- [`docs/design/rtl-frontend-unification.md`](docs/design/rtl-frontend-unification.md) — Document B.
+- [`docs/design/contract-corpus-and-config.md`](docs/design/contract-corpus-and-config.md) — Document D.
+- [`docs/design/hw-sw-codesign-extraction.md`](docs/design/hw-sw-codesign-extraction.md) — Document C.
+
 ### Strategy Extraction & Synthesis Modes
 
 Three `ControllerMode` options:
@@ -468,7 +498,15 @@ This applies to: README examples, wiki case studies, blog posts linked from the 
    ```
    The extraction spec is the auditable artifact. It must be committed alongside the claim. The spec validator must pass against the pinned commit.
 
-8. **RTL / SystemVerilog pipeline evidence integrity.** The same verification-first principles apply to the SV Kripke pipeline:
+8. **Editorial framing for publications (LinkedIn, Substack, blog posts, conference talks).** Long-form public content must lead with a realistic, impactful example — a concrete system, a concrete property, and a concrete consequence — and treat mununu features as secondary, introduced only where they directly serve the example.
+   - **Lede is the example, not the tool.** The headline, opening paragraph, and pull quotes must describe the system and what could go wrong with it (a UART controller drops a byte under back-pressure; a payment FSM admits a double-spend interleaving; an MCP server leaks a session across tenants). They must not headline a mununu feature ("we shipped a new coupling-synthesis pass", "our register-map sidecar now supports …"). Feature launches belong in release notes or technical READMEs, not in public storytelling pieces.
+   - **Features appear when they earn the right.** A capability (a new adapter, a new template, a new CLI flag, a new emit mode) may only be named when (a) it is what made the example tractable, or (b) it changes how the reader would reproduce the result. It is introduced inline, *after* the example has been set up, and tied back to a code anchor per Documentation Traceability rules.
+   - **No feature catalogs.** A bulleted list of "what's new" without an example attached to each bullet is rejected. If the post genuinely needs to enumerate features, those features must be grouped under the example each one supported, not under the release.
+   - **Impact must be concrete.** "Realistic and impactful" means the example references real systems with public source-of-truth (per Rule 1), or — for Class C demonstrations — clearly labels itself as a pattern study with named real-world analogs. Synthetic toy automata ("a 3-state safety property") do not qualify as the lede of a public post.
+   - **One example per post, by default.** A LinkedIn or Substack post lives or dies on a single clear story. Multi-example posts are allowed only when the examples share a single, named thread (e.g., "three controller-synthesis examples in industrial UART variants").
+   - **Applies to**: LinkedIn posts, Substack/Medium articles, conference talks, demo videos, podcast prep notes, and any agent-generated content suggestion that targets these channels. Does not apply to internal release notes, CHANGELOG entries, wiki reference pages, or API documentation, which may lead with the feature.
+
+9. **RTL / SystemVerilog pipeline evidence integrity.** The same verification-first principles apply to the SV Kripke pipeline:
    - **Never present hand-written data as pipeline output.** If `discovered_values` in a `.mununu.json` sidecar were written by a human or AI agent (not by `mununu sv discover`), they must be disclosed as hand-written. Claims like "SMT discovers x=3" require actually running the discover command.
    - **Run the pipeline, don't simulate it.** Before presenting verification results in any public material, execute the actual commands and capture real terminal output. Do not fabricate or predict mununu output.
    - **Properties must come from specifications, not bug knowledge.** Adding a detector register to catch a known bug and then verifying it fires is circular. Properties should come from protocol specs, safety invariants, or security requirements.
