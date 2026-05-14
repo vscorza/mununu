@@ -242,6 +242,33 @@ enum CodesignCommand {
     Verify(CodesignVerifyArgs),
     /// Import a CMSIS-SVD file into one register-map JSON per peripheral.
     ImportSvd(CodesignImportSvdArgs),
+    /// Extract C function declarations + their `@mununu_*` annotations
+    /// from a C source file via a `clang -ast-dump=json` shell-out.
+    ///
+    /// Document C task C5, slice 2.a.
+    ExtractC(CodesignExtractCArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignExtractCArgs {
+    /// Path to the C source file.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    /// Path to the clang binary. Defaults to `clang` (PATH).
+    #[arg(long, value_name = "PATH")]
+    clang: Option<PathBuf>,
+    /// Include paths (repeatable).
+    #[arg(long = "include", value_name = "DIR")]
+    include_paths: Vec<PathBuf>,
+    /// Preprocessor defines (repeatable).
+    #[arg(long = "define", value_name = "DEF")]
+    defines: Vec<String>,
+    /// Extra clang arguments (advanced).
+    #[arg(long = "clang-arg", value_name = "ARG")]
+    extra_clang_args: Vec<String>,
+    /// Treat any warning as a hard error.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -640,8 +667,41 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::Couple(args) => codesign_couple(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
+        CodesignCommand::ExtractC(args) => codesign_extract_c(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
     }
+}
+
+fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
+    use mununu::codesign::c_extract::{CExtractOptions, extract_c_via_clang};
+
+    let opts = CExtractOptions {
+        clang_path: args.clang,
+        include_paths: args.include_paths,
+        defines: args.defines,
+        extra_clang_args: args.extra_clang_args,
+    };
+    let extraction =
+        extract_c_via_clang(&args.file, &opts).map_err(|e| format!("C extraction failed: {e}"))?;
+
+    if args.strict && !extraction.warnings.is_empty() {
+        for w in &extraction.warnings {
+            eprintln!("warning: {w}");
+        }
+        return Err(format!(
+            "--strict: {} extraction warning(s) — refusing to proceed",
+            extraction.warnings.len()
+        ));
+    }
+
+    for w in &extraction.warnings {
+        eprintln!("warning: {w}");
+    }
+
+    let json = serde_json::to_string_pretty(&extraction)
+        .map_err(|e| format!("failed to serialise extraction: {e}"))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn codesign_import_svd(args: CodesignImportSvdArgs) -> Result<(), String> {
