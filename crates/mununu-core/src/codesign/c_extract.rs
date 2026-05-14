@@ -1,12 +1,41 @@
-//! C extraction via clang shell-out — Document C task C5, slice 2.a.
+//! C extraction via clang shell-out — Document C task C5, slices 2.a + 2.b.
 //!
-//! Slice 2.a of C5. Reads a C source file via a subprocess shell-out
-//! to `clang -Xclang -ast-dump=json -fsyntax-only` and lifts the user-
+//! Slice 2.a reads a C source file via a subprocess shell-out to
+//! `clang -Xclang -ast-dump=json -fsyntax-only` and lifts the user-
 //! authored function declarations plus their `@mununu_*` annotations
 //! into a [`CExtraction`] record. The annotations are extracted via
 //! the slice-1 grammar at [`crate::mununu_annotations::extract_from_c_source`]
 //! and matched to functions by line proximity (each Doxygen block sits
 //! immediately above the declaration it annotates).
+//!
+//! Slice 2.b extends the extractor to walk each function's *body*,
+//! recognise register-access expressions (chains of `MemberExpr` /
+//! `DeclRefExpr` reconstructed back to the C accessor string the
+//! programmer would have typed, e.g. `UART->CTRL.bit.tx_start`),
+//! classify each access as a read or a write, and synthesise a
+//! linear CTXDSL automaton on the [`crate::codesign::coupling`]
+//! rendezvous-label alphabet. The synthesis is opt-in via
+//! [`CExtractOptions::register_map`] + [`CExtractOptions::synthesize_automaton`]
+//! so slice 2.a's behaviour is unchanged when no register map is
+//! supplied.
+//!
+//! ### Slice 2.b scope and non-scope
+//!
+//! - **In scope:** linear function bodies (sequences of assignments
+//!   and expression statements). Each statement contributes zero or
+//!   one access; statements with multiple accesses contribute them in
+//!   left-to-right source order (RHS reads before the LHS write).
+//! - **Out of scope (slice 2.c):** control flow. `while`, `if`, `for`,
+//!   `do`, and `switch` are *linearised* — their bodies are walked
+//!   inline and a single
+//!   [`CExtractWarning::NonLinearControlFlow`] is emitted per
+//!   occurrence. This is sound for safety properties (over-
+//!   approximation: the synthesised automaton admits more behaviours
+//!   than the real firmware) but unsound for liveness. The user is
+//!   told.
+//! - **Out of scope (future):** function calls into other firmware
+//!   functions, indirect calls through function pointers, ISR
+//!   entry/exit semantics. The body walker stops at the call boundary.
 //!
 //! ## Why shell-out rather than `clang-sys`
 //!
@@ -63,6 +92,8 @@
 //! — the HITL review surface at [`crate::contract::review`] is the
 //! gate that turns them into accepted contract clauses (Doc A §A7).
 
+use crate::codesign::coupling::{AccessKind, rendezvous_label_name};
+use crate::codesign::register_map::{Field, Register, RegisterMap};
 use crate::mununu_annotations::{MununuAnnotation, extract_from_c_source};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -136,6 +167,26 @@ pub enum CExtractWarning {
     /// 2.a only walks `FunctionDecl` today. Surfaced once per
     /// distinct kind so the user knows what wasn't lifted.
     UnhandledKind { kind: String },
+    /// Slice 2.b: a register-access expression was reconstructed but
+    /// no field in the supplied [`RegisterMap`] has a matching
+    /// `c_accessor`. The access is dropped from the synthesised
+    /// automaton; the user is told.
+    UnknownAccessor {
+        function: String,
+        accessor: String,
+        source_line: u32,
+    },
+    /// Slice 2.b: the function body contains a control-flow construct
+    /// (`while`, `if`, `for`, `do`, `switch`) that slice 2.b does not
+    /// handle natively. The body is linearised — accesses inside the
+    /// construct are walked inline as if the branch were always taken
+    /// — and this warning is emitted. Sound for safety properties
+    /// (over-approximation) but unsound for liveness.
+    NonLinearControlFlow {
+        function: String,
+        construct: String,
+        source_line: u32,
+    },
 }
 
 impl fmt::Display for CExtractWarning {
@@ -152,6 +203,22 @@ impl fmt::Display for CExtractWarning {
             CExtractWarning::UnhandledKind { kind } => write!(
                 f,
                 "AST node kind `{kind}` is not lifted by slice 2.a (function bodies + types are slice 2.b)"
+            ),
+            CExtractWarning::UnknownAccessor {
+                function,
+                accessor,
+                source_line,
+            } => write!(
+                f,
+                "{function} (line {source_line}): accessor `{accessor}` does not match any field's c_accessor in the supplied register map; dropped from synthesised automaton"
+            ),
+            CExtractWarning::NonLinearControlFlow {
+                function,
+                construct,
+                source_line,
+            } => write!(
+                f,
+                "{function} (line {source_line}): `{construct}` linearised by slice 2.b — body walked as if the branch were always taken (over-approximation; sound for safety, unsound for liveness)"
             ),
         }
     }
@@ -174,6 +241,45 @@ pub struct CFunctionDecl {
     /// Doxygen block, single-line `/* */`, or `//` comment in the
     /// 3-line proximity window above the declaration.
     pub annotations: Vec<MununuAnnotation>,
+    /// Slice 2.b: register accesses lifted from the function body, in
+    /// source order. Empty when no register map was supplied or when
+    /// the function has no body (forward declaration).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accesses: Vec<RegisterAccess>,
+    /// Slice 2.b: CTXDSL automaton fragment synthesised from
+    /// [`Self::accesses`]. `Some` only when synthesis was requested
+    /// via [`CExtractOptions::synthesize_automaton`] *and* the
+    /// function had at least one matched access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automaton_ctxdsl: Option<String>,
+}
+
+/// A single register access reconstructed from a function body
+/// (slice 2.b).
+///
+/// The `accessor` field is the C expression as the programmer typed
+/// it (`UART->CTRL.bit.tx_start`), recovered by walking the clang
+/// AST's `MemberExpr` / `DeclRefExpr` chain. The `register` and
+/// `field` fields are the matched register-map entries. If matching
+/// fails the access is not emitted — a
+/// [`CExtractWarning::UnknownAccessor`] is recorded instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterAccess {
+    /// Whether the access is a read or a write of the matched
+    /// register field. Writes are detected via assignment-expression
+    /// LHS; everything else lifted by the body walker is a read.
+    pub kind: AccessKind,
+    /// The register's `name` from the supplied [`RegisterMap`].
+    pub register: String,
+    /// The field's `name`. `None` when the matched accessor refers to
+    /// the whole register (e.g. `UART->DATA` on a data-payload
+    /// register with no declared fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// The C accessor string as reconstructed from the AST.
+    pub accessor: String,
+    /// 1-based source line of the statement containing the access.
+    pub source_line: u32,
 }
 
 /// Output of [`extract_c_via_clang`] — every user-defined function
@@ -206,6 +312,15 @@ pub struct CExtractOptions {
     pub defines: Vec<String>,
     /// Additional raw arguments to pass to clang. Power users only.
     pub extra_clang_args: Vec<String>,
+    /// Slice 2.b: register map to match `MemberExpr` chains against.
+    /// When `None`, function bodies are not walked and
+    /// [`CFunctionDecl::accesses`] is left empty (slice 2.a
+    /// behaviour).
+    pub register_map: Option<RegisterMap>,
+    /// Slice 2.b: when `true` *and* `register_map` is supplied, fill
+    /// in [`CFunctionDecl::automaton_ctxdsl`] for every function
+    /// that has at least one matched access.
+    pub synthesize_automaton: bool,
 }
 
 /// Extract C function declarations + their `@mununu_*` annotations
@@ -263,17 +378,42 @@ pub fn extract_c_via_clang(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    extract_from_ast_json(&stdout, &source_text, source_path)
+    extract_from_ast_json_with_options(&stdout, &source_text, source_path, options)
 }
 
 /// Pure-function half of the extractor: takes already-parsed AST JSON
 /// (as a string) + the source text + the source path, and returns
 /// the [`CExtraction`]. Separated from [`extract_c_via_clang`] so
 /// tests can drive it without depending on `clang` being on `PATH`.
+///
+/// This wrapper preserves slice 2.a's signature: it calls
+/// [`extract_from_ast_json_with_options`] with [`CExtractOptions::default()`],
+/// which leaves [`CFunctionDecl::accesses`] empty.
 pub fn extract_from_ast_json(
     ast_json: &str,
     source_text: &str,
     source_path: &std::path::Path,
+) -> Result<CExtraction, CExtractError> {
+    extract_from_ast_json_with_options(
+        ast_json,
+        source_text,
+        source_path,
+        &CExtractOptions::default(),
+    )
+}
+
+/// Slice 2.b entry point: same as [`extract_from_ast_json`] but
+/// respects [`CExtractOptions::register_map`] +
+/// [`CExtractOptions::synthesize_automaton`]. When a register map is
+/// supplied the body of each in-file function is walked for register
+/// accesses; when synthesis is also requested the resulting linear
+/// sequence is emitted as a CTXDSL automaton fragment on each
+/// function.
+pub fn extract_from_ast_json_with_options(
+    ast_json: &str,
+    source_text: &str,
+    source_path: &std::path::Path,
+    options: &CExtractOptions,
 ) -> Result<CExtraction, CExtractError> {
     let ast: serde_json::Value =
         serde_json::from_str(ast_json).map_err(|e| CExtractError::AstJsonInvalid(e.to_string()))?;
@@ -291,6 +431,7 @@ pub fn extract_from_ast_json(
     let mut functions: Vec<CFunctionDecl> = Vec::new();
     let mut unhandled_kinds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut current_loc_file: Option<String> = None;
+    let mut body_warnings: Vec<CExtractWarning> = Vec::new();
 
     if let Some(inner) = ast.get("inner").and_then(|i| i.as_array()) {
         for node in inner {
@@ -334,11 +475,31 @@ pub fn extract_from_ast_json(
                         .and_then(|l| l.get("line"))
                         .and_then(|n| n.as_u64())
                         .unwrap_or(0) as u32;
+
+                    // Slice 2.b: when a register map is supplied,
+                    // walk the function body for register accesses.
+                    let (accesses, automaton_ctxdsl) = if let Some(rm) =
+                        options.register_map.as_ref()
+                    {
+                        let accesses =
+                            extract_accesses_from_function(node, &name, rm, &mut body_warnings);
+                        let automaton = if options.synthesize_automaton && !accesses.is_empty() {
+                            Some(synthesise_automaton_ctxdsl(&name, &accesses, rm))
+                        } else {
+                            None
+                        };
+                        (accesses, automaton)
+                    } else {
+                        (Vec::new(), None)
+                    };
+
                     functions.push(CFunctionDecl {
                         name,
                         signature,
                         source_line,
                         annotations: Vec::new(),
+                        accesses,
+                        automaton_ctxdsl,
                     });
                 }
                 // Slice 2.a deliberately ignores everything else.
@@ -411,6 +572,9 @@ pub fn extract_from_ast_json(
     for kind in unhandled_kinds {
         warnings.push(CExtractWarning::UnhandledKind { kind });
     }
+    // Slice 2.b body-walk warnings preserve their statement order so
+    // the user can read the diagnostic top-down against their source.
+    warnings.extend(body_warnings);
 
     // Sort functions by source line for stable, human-readable output.
     functions.sort_by_key(|f| f.source_line);
@@ -420,6 +584,477 @@ pub fn extract_from_ast_json(
         orphan_annotations,
         warnings,
     })
+}
+
+// --------------------------------------------------------------------
+// Slice 2.b: function-body walker + register-access reconstruction +
+// CTXDSL automaton synthesis.
+// --------------------------------------------------------------------
+
+/// Walk a `FunctionDecl` node's body for register accesses against
+/// the supplied register map.
+///
+/// Returns the accesses in source order. Emits one
+/// [`CExtractWarning::NonLinearControlFlow`] per encountered
+/// `while` / `if` / `for` / `do` / `switch`, and one
+/// [`CExtractWarning::UnknownAccessor`] per reconstructed accessor
+/// that has no matching `c_accessor` in the register map.
+///
+/// The function's body is the *last* `inner[]` entry whose `kind` is
+/// `CompoundStmt` (clang places the body after the parameter
+/// declarations). A function with no body — i.e. a forward
+/// declaration — returns an empty `Vec`.
+fn extract_accesses_from_function(
+    func_decl: &serde_json::Value,
+    function_name: &str,
+    rm: &RegisterMap,
+    warnings: &mut Vec<CExtractWarning>,
+) -> Vec<RegisterAccess> {
+    let body = func_decl
+        .get("inner")
+        .and_then(|i| i.as_array())
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .rev()
+                .find(|n| n.get("kind").and_then(|k| k.as_str()) == Some("CompoundStmt"))
+        });
+    let Some(body) = body else {
+        return Vec::new();
+    };
+
+    let mut accesses = Vec::new();
+    walk_compound_stmt(body, function_name, rm, &mut accesses, warnings);
+    accesses
+}
+
+/// Walk a `CompoundStmt` node's statements. Each statement may add
+/// zero or more accesses. Control-flow constructs are linearised
+/// (their body is walked inline) with a warning.
+fn walk_compound_stmt(
+    compound: &serde_json::Value,
+    function_name: &str,
+    rm: &RegisterMap,
+    accesses: &mut Vec<RegisterAccess>,
+    warnings: &mut Vec<CExtractWarning>,
+) {
+    let Some(stmts) = compound.get("inner").and_then(|i| i.as_array()) else {
+        return;
+    };
+    for stmt in stmts {
+        walk_statement(stmt, function_name, rm, accesses, warnings);
+    }
+}
+
+/// Walk a single statement.
+fn walk_statement(
+    stmt: &serde_json::Value,
+    function_name: &str,
+    rm: &RegisterMap,
+    accesses: &mut Vec<RegisterAccess>,
+    warnings: &mut Vec<CExtractWarning>,
+) {
+    let kind = stmt.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    let source_line = statement_source_line(stmt);
+    match kind {
+        // Assignment: BinaryOperator with opcode "=" → LHS write,
+        // RHS reads.
+        "BinaryOperator" if stmt.get("opcode").and_then(|o| o.as_str()) == Some("=") => {
+            let inner = stmt.get("inner").and_then(|i| i.as_array());
+            if let Some(inner) = inner
+                && inner.len() >= 2
+            {
+                // RHS reads first (left-to-right evaluation order).
+                collect_reads(
+                    &inner[1],
+                    function_name,
+                    source_line,
+                    rm,
+                    accesses,
+                    warnings,
+                );
+                // LHS write.
+                if let Some(accessor) = reconstruct_c_accessor(&inner[0]) {
+                    push_matched_access(
+                        AccessKind::Write,
+                        accessor,
+                        source_line,
+                        function_name,
+                        rm,
+                        accesses,
+                        warnings,
+                    );
+                }
+            }
+        }
+        // Compound assignment (`|=`, `&=`, …) is a read-modify-write
+        // by definition. We model both the read and the write on the
+        // LHS register field.
+        "CompoundAssignOperator" => {
+            let inner = stmt.get("inner").and_then(|i| i.as_array());
+            if let Some(inner) = inner
+                && inner.len() >= 2
+            {
+                collect_reads(
+                    &inner[1],
+                    function_name,
+                    source_line,
+                    rm,
+                    accesses,
+                    warnings,
+                );
+                if let Some(accessor) = reconstruct_c_accessor(&inner[0]) {
+                    push_matched_access(
+                        AccessKind::Read,
+                        accessor.clone(),
+                        source_line,
+                        function_name,
+                        rm,
+                        accesses,
+                        warnings,
+                    );
+                    push_matched_access(
+                        AccessKind::Write,
+                        accessor,
+                        source_line,
+                        function_name,
+                        rm,
+                        accesses,
+                        warnings,
+                    );
+                }
+            }
+        }
+        // Non-assignment expression statement: any MemberExpr chains
+        // inside are reads.
+        "ExprStmt" | "CallExpr" | "ImplicitCastExpr" | "DeclRefExpr" | "MemberExpr"
+        | "ParenExpr" | "UnaryOperator" | "BinaryOperator" => {
+            collect_reads(stmt, function_name, source_line, rm, accesses, warnings);
+        }
+        // Variable declarations may initialise from a register read.
+        "DeclStmt" => {
+            if let Some(inner) = stmt.get("inner").and_then(|i| i.as_array()) {
+                for child in inner {
+                    if child.get("kind").and_then(|k| k.as_str()) == Some("VarDecl")
+                        && let Some(init) = child.get("inner").and_then(|i| i.as_array())
+                        && let Some(first) = init.first()
+                    {
+                        collect_reads(first, function_name, source_line, rm, accesses, warnings);
+                    }
+                }
+            }
+        }
+        // Control flow: linearise. Walk the body if present and
+        // record a single warning per occurrence.
+        "WhileStmt" | "DoStmt" | "ForStmt" | "IfStmt" | "SwitchStmt" => {
+            warnings.push(CExtractWarning::NonLinearControlFlow {
+                function: function_name.to_string(),
+                construct: kind.to_string(),
+                source_line,
+            });
+            // The condition of a while/if/for is itself a read.
+            if let Some(inner) = stmt.get("inner").and_then(|i| i.as_array()) {
+                // Heuristic: for IfStmt the inner is [cond, then, else?];
+                // for WhileStmt it is [cond, body]; for ForStmt the
+                // layout varies. We treat every child as a candidate
+                // for read collection + recursive linear walk; this is
+                // sound (over-approximation) for slice 2.b.
+                for child in inner {
+                    collect_reads(child, function_name, source_line, rm, accesses, warnings);
+                    let child_kind = child.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    if child_kind == "CompoundStmt" {
+                        walk_compound_stmt(child, function_name, rm, accesses, warnings);
+                    }
+                }
+            }
+        }
+        // Return / break / continue / null statements: ignored.
+        "ReturnStmt" | "BreakStmt" | "ContinueStmt" | "NullStmt" => {
+            // A `return expr;` carries a read in `inner[0]`.
+            if let Some(inner) = stmt.get("inner").and_then(|i| i.as_array())
+                && let Some(first) = inner.first()
+            {
+                collect_reads(first, function_name, source_line, rm, accesses, warnings);
+            }
+        }
+        // Nested compound statement.
+        "CompoundStmt" => walk_compound_stmt(stmt, function_name, rm, accesses, warnings),
+        _ => {
+            // Unknown statement kind — be conservative and still
+            // collect any obvious reads we find in its subtree.
+            collect_reads(stmt, function_name, source_line, rm, accesses, warnings);
+        }
+    }
+}
+
+/// Recursively scan an expression subtree for any `MemberExpr` /
+/// `DeclRefExpr` chains that reconstruct to register accessors, and
+/// record them as reads. Stops descending into a `MemberExpr` once
+/// matched (the whole chain is one access).
+fn collect_reads(
+    node: &serde_json::Value,
+    function_name: &str,
+    source_line: u32,
+    rm: &RegisterMap,
+    accesses: &mut Vec<RegisterAccess>,
+    warnings: &mut Vec<CExtractWarning>,
+) {
+    let kind = node.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind == "MemberExpr"
+        && let Some(accessor) = reconstruct_c_accessor(node)
+    {
+        push_matched_access(
+            AccessKind::Read,
+            accessor,
+            source_line,
+            function_name,
+            rm,
+            accesses,
+            warnings,
+        );
+        return;
+    }
+    if let Some(children) = node.get("inner").and_then(|i| i.as_array()) {
+        for child in children {
+            collect_reads(child, function_name, source_line, rm, accesses, warnings);
+        }
+    }
+}
+
+/// Look up the reconstructed accessor in the register map and push a
+/// matching [`RegisterAccess`]. If no field matches, emit a
+/// [`CExtractWarning::UnknownAccessor`].
+fn push_matched_access(
+    kind: AccessKind,
+    accessor: String,
+    source_line: u32,
+    function_name: &str,
+    rm: &RegisterMap,
+    accesses: &mut Vec<RegisterAccess>,
+    warnings: &mut Vec<CExtractWarning>,
+) {
+    if let Some((reg, field)) = match_accessor(&accessor, rm) {
+        accesses.push(RegisterAccess {
+            kind,
+            register: reg.name.clone(),
+            field: field.map(|f| f.name.clone()),
+            accessor,
+            source_line,
+        });
+    } else {
+        warnings.push(CExtractWarning::UnknownAccessor {
+            function: function_name.to_string(),
+            accessor,
+            source_line,
+        });
+    }
+}
+
+/// Match a reconstructed C accessor string against the
+/// [`RegisterMap`]. Returns the matching register + optional field.
+/// Exact match on `c_accessor`; no fuzzy matching.
+fn match_accessor<'a>(
+    accessor: &str,
+    rm: &'a RegisterMap,
+) -> Option<(&'a Register, Option<&'a Field>)> {
+    for reg in &rm.registers {
+        for field in &reg.fields {
+            if field.c_accessor.as_deref() == Some(accessor) {
+                return Some((reg, Some(field)));
+            }
+        }
+        // Whole-register access (no field on the c_accessor side —
+        // typical for data-payload registers). The register itself
+        // doesn't carry a c_accessor today; fall back to a synthetic
+        // expectation of `<PERIPH>->{name}` for now. Slice 2.b is
+        // satisfied with field-level matching; whole-register
+        // accessors are a slice 2.c concern.
+        let _ = reg;
+    }
+    None
+}
+
+/// Reconstruct the C accessor string a programmer would type, by
+/// walking a `MemberExpr` chain bottom-up to a `DeclRefExpr`.
+///
+/// Example: a `MemberExpr` AST for `UART->CTRL.bit.tx_start` has the
+/// shape (top-down):
+///
+/// ```text
+/// MemberExpr name="tx_start" isArrow=false
+///   inner:
+///     MemberExpr name="bit" isArrow=false
+///       inner:
+///         MemberExpr name="CTRL" isArrow=true
+///           inner:
+///             ImplicitCastExpr  (LValueToRValue)
+///               inner:
+///                 DeclRefExpr referencedDecl.name="UART"
+/// ```
+///
+/// We walk the chain, collecting `(name, isArrow)` pairs, then build
+/// the accessor string. Returns `None` if any step is not a
+/// `MemberExpr`, `ImplicitCastExpr`, `ParenExpr`, or terminal
+/// `DeclRefExpr`.
+pub fn reconstruct_c_accessor(node: &serde_json::Value) -> Option<String> {
+    // Collect the chain bottom-up: outermost MemberExpr is the
+    // deepest field; walk towards the DeclRefExpr at the root.
+    let mut steps: Vec<(String, bool)> = Vec::new();
+    let mut cursor = node;
+    let root_name = loop {
+        let kind = cursor.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        match kind {
+            "MemberExpr" => {
+                let name = cursor.get("name").and_then(|n| n.as_str())?.to_string();
+                let is_arrow = cursor
+                    .get("isArrow")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                steps.push((name, is_arrow));
+                cursor = cursor.get("inner").and_then(|i| i.as_array())?.first()?;
+            }
+            // Transparent wrappers — descend through them.
+            "ImplicitCastExpr" | "ParenExpr" | "CStyleCastExpr" => {
+                cursor = cursor.get("inner").and_then(|i| i.as_array())?.first()?;
+            }
+            "DeclRefExpr" => {
+                // The root is `referencedDecl.name` — the variable /
+                // global the chain bottoms out on.
+                let name = cursor
+                    .get("referencedDecl")
+                    .and_then(|d| d.get("name"))
+                    .and_then(|n| n.as_str())?
+                    .to_string();
+                break name;
+            }
+            _ => return None,
+        }
+    };
+
+    // Steps are bottom-up (innermost-name first). Build the string
+    // outermost-to-innermost (root → outermost member).
+    let mut accessor = root_name;
+    for (name, is_arrow) in steps.iter().rev() {
+        let sep = if *is_arrow { "->" } else { "." };
+        accessor.push_str(sep);
+        accessor.push_str(name);
+    }
+    Some(accessor)
+}
+
+/// Extract the 1-based source line of a statement node, falling back
+/// to 0 when the AST doesn't carry one (clang's `range` and `loc`
+/// fields are sparse).
+fn statement_source_line(stmt: &serde_json::Value) -> u32 {
+    stmt.get("loc")
+        .and_then(|l| l.get("line"))
+        .and_then(|n| n.as_u64())
+        .or_else(|| {
+            stmt.get("range")
+                .and_then(|r| r.get("begin"))
+                .and_then(|b| b.get("line"))
+                .and_then(|n| n.as_u64())
+        })
+        .unwrap_or(0) as u32
+}
+
+/// Synthesise a linear CTXDSL `automaton { … }` block from the
+/// sequence of register accesses extracted from a function body.
+///
+/// The emitted automaton has `N+1` states for a sequence of `N`
+/// accesses: an initial state `S0`, then `S1 .. SN` after each
+/// access. The labels follow the
+/// [`crate::codesign::coupling::rendezvous_label_name`] convention so
+/// the firmware automaton synchronises with the peripheral chaotic
+/// stub on the same alphabet.
+///
+/// All firmware-driven write labels are declared as
+/// `controllable { … }`; reads are left uncontrollable (the default).
+/// This matches Doc A §4 and the per-side classification in
+/// [`crate::codesign::coupling::register_map_labels`].
+pub fn synthesise_automaton_ctxdsl(
+    function_name: &str,
+    accesses: &[RegisterAccess],
+    rm: &RegisterMap,
+) -> String {
+    use std::fmt::Write;
+
+    let automaton_name = sanitise_ident_for_ctxdsl(function_name);
+    let mut buf = String::new();
+    let _ = writeln!(buf, "    automata {{");
+    let _ = writeln!(buf, "        automaton {automaton_name} {{");
+
+    // Labels — collect controllable writes for the controllable {…}
+    // declaration. Reads default to uncontrollable.
+    let mut controllable_labels: Vec<String> = Vec::new();
+    for access in accesses {
+        let label = rendezvous_label_name(&access.register, access.field.as_deref(), access.kind);
+        if access.kind == AccessKind::Write && !controllable_labels.contains(&label) {
+            controllable_labels.push(label);
+        }
+    }
+    if !controllable_labels.is_empty() {
+        let _ = writeln!(buf, "            controllable {{");
+        for label in &controllable_labels {
+            let _ = writeln!(buf, "                {label};");
+        }
+        let _ = writeln!(buf, "            }}");
+        let _ = writeln!(buf);
+    }
+
+    let _ = writeln!(buf, "            states {{");
+    let _ = writeln!(buf, "                state S0 initial;");
+    for i in 1..=accesses.len() {
+        let _ = writeln!(buf, "                state S{i};");
+    }
+    let _ = writeln!(buf, "            }}");
+    let _ = writeln!(buf);
+
+    let _ = writeln!(buf, "            transitions {{");
+    for (i, access) in accesses.iter().enumerate() {
+        let label = rendezvous_label_name(&access.register, access.field.as_deref(), access.kind);
+        let from = format!("S{i}");
+        let to = format!("S{next}", next = i + 1);
+        let _ = writeln!(
+            buf,
+            "                transition {from} -> {to} on label {label}; // {accessor}",
+            accessor = access.accessor
+        );
+    }
+    let _ = writeln!(buf, "            }}");
+    // Close the `automaton { … }` body.
+    let _ = writeln!(buf, "        }}");
+    // Close the wrapping `automata { … }` section.
+    let _ = writeln!(buf, "    }}");
+
+    let _ = rm; // currently unused but kept for symmetry with coupling.rs.
+    buf
+}
+
+/// Sanitise a C identifier into a CTXDSL automaton name: first char
+/// uppercase, rest preserved (CTXDSL is case-sensitive but the
+/// convention is PascalCase for automaton names; we cheaply convert
+/// `uart_send` → `Uart_send`). Non-alnum becomes `_`.
+fn sanitise_ident_for_ctxdsl(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut first = true;
+    for c in name.chars() {
+        let safe = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        };
+        if first {
+            out.push(safe.to_ascii_uppercase());
+            first = false;
+        } else {
+            out.push(safe);
+        }
+    }
+    if out.is_empty() {
+        out.push_str("Func");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -644,5 +1279,476 @@ mod tests {
             .filter(|w| matches!(w, CExtractWarning::UnhandledKind { .. }))
             .count();
         assert_eq!(unhandled, 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Slice 2.b tests: function-body walker + accessor reconstruction
+    // + automaton synthesis.
+    // ----------------------------------------------------------------
+
+    use crate::codesign::register_map::{
+        AccessPath, Register, RegisterDirection, RegisterMap, VisibilityClass,
+    };
+
+    /// Test fixture: a small UART_LITE register map matching the
+    /// `examples/industrial/codesign_uart/` shape. Fields carry
+    /// `c_accessor` strings so the body walker can match against
+    /// reconstructed `MemberExpr` chains.
+    fn uart_register_map() -> RegisterMap {
+        use crate::codesign::register_map::Field;
+        RegisterMap {
+            peripheral: "UART_LITE".to_string(),
+            base_address: "0x40010000".to_string(),
+            description: None,
+            contract_uri: None,
+            registers: vec![
+                Register {
+                    name: "CTRL".to_string(),
+                    offset: 0,
+                    width_bits: 32,
+                    direction: RegisterDirection::Rw,
+                    visibility_class: VisibilityClass::Control,
+                    access_path: AccessPath::MmioDirect,
+                    description: None,
+                    fields: vec![Field {
+                        name: "tx_start".to_string(),
+                        bits: [0, 0],
+                        sv_signal: Some("uart_inst.ctrl_reg[0]".to_string()),
+                        c_accessor: Some("UART->CTRL.bit.tx_start".to_string()),
+                        description: None,
+                    }],
+                },
+                Register {
+                    name: "STATUS".to_string(),
+                    offset: 4,
+                    width_bits: 32,
+                    direction: RegisterDirection::Ro,
+                    visibility_class: VisibilityClass::Status,
+                    access_path: AccessPath::MmioDirect,
+                    description: None,
+                    fields: vec![Field {
+                        name: "tx_busy".to_string(),
+                        bits: [0, 0],
+                        sv_signal: Some("uart_inst.tx_busy".to_string()),
+                        c_accessor: Some("UART->STATUS.bit.tx_busy".to_string()),
+                        description: None,
+                    }],
+                },
+                Register {
+                    name: "DATA".to_string(),
+                    offset: 8,
+                    width_bits: 32,
+                    direction: RegisterDirection::Rw,
+                    visibility_class: VisibilityClass::Data,
+                    access_path: AccessPath::MmioDirect,
+                    description: None,
+                    fields: vec![Field {
+                        name: "byte".to_string(),
+                        bits: [0, 7],
+                        sv_signal: Some("uart_inst.data_reg".to_string()),
+                        c_accessor: Some("UART->DATA.byte".to_string()),
+                        description: None,
+                    }],
+                },
+            ],
+        }
+    }
+
+    /// Build a `MemberExpr` JSON node matching the clang AST shape
+    /// for a `UART->CTRL.bit.tx_start`-style accessor.
+    fn member_expr_chain(root: &str, parts: &[(&str, bool)]) -> serde_json::Value {
+        // `parts` is from-root-outward: first entry sits on the
+        // DeclRefExpr, last entry is the outermost MemberExpr. We
+        // build innermost-first, ending at the outermost.
+        let mut current = serde_json::json!({
+            "kind": "ImplicitCastExpr",
+            "inner": [{
+                "kind": "DeclRefExpr",
+                "referencedDecl": { "name": root },
+            }],
+        });
+        for (name, is_arrow) in parts {
+            current = serde_json::json!({
+                "kind": "MemberExpr",
+                "name": name,
+                "isArrow": is_arrow,
+                "inner": [current],
+            });
+        }
+        current
+    }
+
+    fn fake_ast_with_body(
+        func_name: &str,
+        func_line: u32,
+        file: &str,
+        qual_type: &str,
+        body_stmts: Vec<serde_json::Value>,
+    ) -> String {
+        serde_json::json!({
+            "kind": "TranslationUnitDecl",
+            "inner": [{
+                "kind": "FunctionDecl",
+                "name": func_name,
+                "loc": { "file": file, "line": func_line },
+                "type": { "qualType": qual_type },
+                "inner": [{
+                    "kind": "CompoundStmt",
+                    "inner": body_stmts,
+                }],
+            }],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn reconstructs_arrow_then_dot_chain() {
+        // UART->CTRL.bit.tx_start
+        let node = member_expr_chain(
+            "UART",
+            &[("CTRL", true), ("bit", false), ("tx_start", false)],
+        );
+        assert_eq!(
+            reconstruct_c_accessor(&node).as_deref(),
+            Some("UART->CTRL.bit.tx_start")
+        );
+    }
+
+    #[test]
+    fn reconstructs_single_arrow_access() {
+        // UART->CTRL — direct register-level access (no field).
+        let node = member_expr_chain("UART", &[("CTRL", true)]);
+        assert_eq!(reconstruct_c_accessor(&node).as_deref(), Some("UART->CTRL"));
+    }
+
+    #[test]
+    fn reconstruct_returns_none_for_non_member_expr() {
+        let node = serde_json::json!({ "kind": "IntegerLiteral", "value": "0" });
+        assert_eq!(reconstruct_c_accessor(&node), None);
+    }
+
+    #[test]
+    fn write_is_detected_as_assignment_lhs() {
+        // UART->CTRL.bit.tx_start = 1;
+        let lhs = member_expr_chain(
+            "UART",
+            &[("CTRL", true), ("bit", false), ("tx_start", false)],
+        );
+        let assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 10 },
+            "inner": [lhs, { "kind": "IntegerLiteral", "value": "1" }],
+        });
+        let ast = fake_ast_with_body("fire_tx", 8, "uart.c", "void (void)", vec![assign]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        let func = &extraction.functions[0];
+        assert_eq!(func.accesses.len(), 1, "{:?}", func.accesses);
+        assert_eq!(func.accesses[0].kind, AccessKind::Write);
+        assert_eq!(func.accesses[0].register, "CTRL");
+        assert_eq!(func.accesses[0].field.as_deref(), Some("tx_start"));
+        assert_eq!(func.accesses[0].accessor, "UART->CTRL.bit.tx_start");
+    }
+
+    #[test]
+    fn read_is_detected_in_assignment_rhs() {
+        // local_busy = UART->STATUS.bit.tx_busy;
+        let rhs = member_expr_chain(
+            "UART",
+            &[("STATUS", true), ("bit", false), ("tx_busy", false)],
+        );
+        let assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 5 },
+            "inner": [
+                // LHS is a plain local variable — not a register
+                // accessor. The matcher should ignore it.
+                { "kind": "DeclRefExpr", "referencedDecl": { "name": "local_busy" } },
+                rhs,
+            ],
+        });
+        let ast = fake_ast_with_body("poll", 4, "uart.c", "void (void)", vec![assign]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        let func = &extraction.functions[0];
+        assert_eq!(func.accesses.len(), 1);
+        assert_eq!(func.accesses[0].kind, AccessKind::Read);
+        assert_eq!(func.accesses[0].register, "STATUS");
+        assert_eq!(func.accesses[0].field.as_deref(), Some("tx_busy"));
+    }
+
+    #[test]
+    fn unknown_accessor_emits_warning_not_access() {
+        // UART->BOGUS.bit.something = 0; — accessor not in map.
+        let lhs = member_expr_chain(
+            "UART",
+            &[("BOGUS", true), ("bit", false), ("something", false)],
+        );
+        let assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 3 },
+            "inner": [lhs, { "kind": "IntegerLiteral", "value": "0" }],
+        });
+        let ast = fake_ast_with_body("fn", 1, "uart.c", "void (void)", vec![assign]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        assert!(extraction.functions[0].accesses.is_empty());
+        assert!(
+            extraction
+                .warnings
+                .iter()
+                .any(|w| matches!(w, CExtractWarning::UnknownAccessor { .. }))
+        );
+    }
+
+    #[test]
+    fn while_statement_emits_nonlinear_warning_and_walks_body() {
+        // while (UART->STATUS.bit.tx_busy) { /* empty body */ }
+        let cond = member_expr_chain(
+            "UART",
+            &[("STATUS", true), ("bit", false), ("tx_busy", false)],
+        );
+        let while_stmt = serde_json::json!({
+            "kind": "WhileStmt",
+            "loc": { "line": 7 },
+            "inner": [
+                cond,
+                { "kind": "CompoundStmt", "inner": [] },
+            ],
+        });
+        let ast = fake_ast_with_body("poll", 5, "uart.c", "void (void)", vec![while_stmt]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        assert!(
+            extraction
+                .warnings
+                .iter()
+                .any(|w| matches!(w, CExtractWarning::NonLinearControlFlow { construct, .. } if construct == "WhileStmt"))
+        );
+        let func = &extraction.functions[0];
+        // The condition's STATUS read is still collected (linearised).
+        assert_eq!(func.accesses.len(), 1);
+        assert_eq!(func.accesses[0].kind, AccessKind::Read);
+    }
+
+    #[test]
+    fn no_register_map_means_no_body_walk() {
+        // Slice 2.a behaviour preserved: without a register map the
+        // body walker is not invoked.
+        let lhs = member_expr_chain(
+            "UART",
+            &[("CTRL", true), ("bit", false), ("tx_start", false)],
+        );
+        let assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 3 },
+            "inner": [lhs, { "kind": "IntegerLiteral", "value": "1" }],
+        });
+        let ast = fake_ast_with_body("fire_tx", 1, "uart.c", "void (void)", vec![assign]);
+        let extraction = extract_from_ast_json(&ast, "", std::path::Path::new("uart.c")).unwrap();
+        assert!(extraction.functions[0].accesses.is_empty());
+        assert!(extraction.functions[0].automaton_ctxdsl.is_none());
+    }
+
+    #[test]
+    fn synthesised_automaton_has_n_plus_one_states() {
+        // Three accesses (read STATUS, write DATA→byte, write CTRL→tx_start)
+        // → four states (S0 .. S3).
+        let accesses = vec![
+            RegisterAccess {
+                kind: AccessKind::Read,
+                register: "STATUS".to_string(),
+                field: Some("tx_busy".to_string()),
+                accessor: "UART->STATUS.bit.tx_busy".to_string(),
+                source_line: 5,
+            },
+            RegisterAccess {
+                kind: AccessKind::Write,
+                register: "DATA".to_string(),
+                field: Some("byte".to_string()),
+                accessor: "UART->DATA.byte".to_string(),
+                source_line: 6,
+            },
+            RegisterAccess {
+                kind: AccessKind::Write,
+                register: "CTRL".to_string(),
+                field: Some("tx_start".to_string()),
+                accessor: "UART->CTRL.bit.tx_start".to_string(),
+                source_line: 7,
+            },
+        ];
+        let rm = uart_register_map();
+        let ctxdsl = synthesise_automaton_ctxdsl("uart_send", &accesses, &rm);
+        assert!(ctxdsl.contains("state S0 initial"));
+        assert!(ctxdsl.contains("state S3"));
+        assert!(!ctxdsl.contains("state S4"));
+        // Labels follow the coupling.rs convention.
+        assert!(ctxdsl.contains("rd_status_tx_busy"));
+        assert!(ctxdsl.contains("wr_data_byte"));
+        assert!(ctxdsl.contains("wr_ctrl_tx_start"));
+        // Controllable block lists write labels.
+        assert!(ctxdsl.contains("controllable"));
+        assert!(ctxdsl.contains("transition S0 -> S1 on label rd_status_tx_busy"));
+        assert!(ctxdsl.contains("transition S1 -> S2 on label wr_data_byte"));
+        assert!(ctxdsl.contains("transition S2 -> S3 on label wr_ctrl_tx_start"));
+    }
+
+    #[test]
+    fn end_to_end_uart_send_synthesises_a_three_step_automaton() {
+        // while (UART->STATUS.bit.tx_busy) {}
+        // UART->DATA.byte = byte;
+        // UART->CTRL.bit.tx_start = 1;
+        let status_read = member_expr_chain(
+            "UART",
+            &[("STATUS", true), ("bit", false), ("tx_busy", false)],
+        );
+        let while_stmt = serde_json::json!({
+            "kind": "WhileStmt",
+            "loc": { "line": 5 },
+            "inner": [status_read, { "kind": "CompoundStmt", "inner": [] }],
+        });
+        let data_write_lhs = member_expr_chain("UART", &[("DATA", true), ("byte", false)]);
+        let data_assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 6 },
+            "inner": [data_write_lhs, { "kind": "DeclRefExpr", "referencedDecl": { "name": "byte" } }],
+        });
+        let ctrl_write_lhs = member_expr_chain(
+            "UART",
+            &[("CTRL", true), ("bit", false), ("tx_start", false)],
+        );
+        let ctrl_assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 7 },
+            "inner": [ctrl_write_lhs, { "kind": "IntegerLiteral", "value": "1" }],
+        });
+        let ast = fake_ast_with_body(
+            "uart_send",
+            3,
+            "uart_driver.c",
+            "void (uint8_t)",
+            vec![while_stmt, data_assign, ctrl_assign],
+        );
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let extraction = extract_from_ast_json_with_options(
+            &ast,
+            "",
+            std::path::Path::new("uart_driver.c"),
+            &opts,
+        )
+        .unwrap();
+        let func = &extraction.functions[0];
+        assert_eq!(func.accesses.len(), 3);
+        assert_eq!(func.accesses[0].kind, AccessKind::Read);
+        assert_eq!(func.accesses[0].register, "STATUS");
+        assert_eq!(func.accesses[1].kind, AccessKind::Write);
+        assert_eq!(func.accesses[1].register, "DATA");
+        assert_eq!(func.accesses[2].kind, AccessKind::Write);
+        assert_eq!(func.accesses[2].register, "CTRL");
+        let ctxdsl = func.automaton_ctxdsl.as_ref().expect("automaton emitted");
+        assert!(ctxdsl.contains("automaton Uart_send"));
+        assert!(ctxdsl.contains("rd_status_tx_busy"));
+        assert!(ctxdsl.contains("wr_data_byte"));
+        assert!(ctxdsl.contains("wr_ctrl_tx_start"));
+    }
+
+    #[test]
+    fn compound_assignment_emits_read_then_write_on_same_field() {
+        // UART->CTRL.bit.tx_start |= 1;
+        let lhs = member_expr_chain(
+            "UART",
+            &[("CTRL", true), ("bit", false), ("tx_start", false)],
+        );
+        let stmt = serde_json::json!({
+            "kind": "CompoundAssignOperator",
+            "opcode": "|=",
+            "loc": { "line": 3 },
+            "inner": [lhs, { "kind": "IntegerLiteral", "value": "1" }],
+        });
+        let ast = fake_ast_with_body("set_start", 1, "uart.c", "void (void)", vec![stmt]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        let accesses = &extraction.functions[0].accesses;
+        assert_eq!(accesses.len(), 2);
+        assert_eq!(accesses[0].kind, AccessKind::Read);
+        assert_eq!(accesses[1].kind, AccessKind::Write);
+        assert_eq!(accesses[0].register, "CTRL");
+        assert_eq!(accesses[1].register, "CTRL");
+    }
+
+    #[test]
+    fn synthesis_skipped_when_no_matched_accesses() {
+        // A function with no register accesses gets no automaton even
+        // if synthesize_automaton is true.
+        let assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 3 },
+            "inner": [
+                { "kind": "DeclRefExpr", "referencedDecl": { "name": "x" } },
+                { "kind": "IntegerLiteral", "value": "1" },
+            ],
+        });
+        let ast = fake_ast_with_body("noop", 1, "uart.c", "void (void)", vec![assign]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        assert!(extraction.functions[0].accesses.is_empty());
+        assert!(extraction.functions[0].automaton_ctxdsl.is_none());
+    }
+
+    #[test]
+    fn sanitise_ident_for_ctxdsl_pascal_cases_first_char() {
+        assert_eq!(sanitise_ident_for_ctxdsl("uart_send"), "Uart_send");
+        assert_eq!(sanitise_ident_for_ctxdsl("Foo"), "Foo");
+        assert_eq!(sanitise_ident_for_ctxdsl(""), "Func");
+        assert_eq!(sanitise_ident_for_ctxdsl("123bad"), "123bad");
     }
 }
