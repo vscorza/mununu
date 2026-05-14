@@ -1,37 +1,33 @@
-# A contract corpus for hardware verification: a TLS handshake walkthrough
+# Verifying a TLS handshake driving closed-IP AES — without hand-writing the AES contract
 
 > **Draft for Substack publication.** Source: `examples/industrial/tls_handshake/`. The transcript embedded below reproduces byte-for-byte by running `./examples/industrial/tls_handshake/validate.sh` against the pinned commit. **Do not publish until the four-gate validation checklist in `examples/industrial/tls_handshake/publications/README.md` passes.**
 
 ---
 
-Last time, in [post 1 of this series](../../secure_boot_rom/publications/substack.md), we walked through how a model checker handles closed-IP modules — the chaotic-stub default, the explicit gap markers, and the lightweight McMillan check that catches circular reasoning before verification starts. The story ended on a deliberate cliffhanger: if every black-box module in your design starts life as a chaotic stub, and chaotic stubs are useless for liveness, you would spend most of your verification budget writing the same contracts for the same well-known IP over and over.
-
-Most of the closed-IP modules in industry are *not unique*. AXI4-slave is AXI4-slave. AES-CTR is AES-CTR. SHA-256 is SHA-256. The behaviour each contract has to describe is essentially the same across vendors. Hand-writing them per project is wasted work, and the lack of a shared library is a real adoption blocker for compositional verification.
-
-This post walks through the next piece of the story: a **contract corpus** — a queryable, version-pinned repository of vetted black-box contracts — and an annotation grammar that lets a vendor's RTL point directly at a corpus entry. The discovery pipeline resolves the URI, replaces the chaotic stub with the vetted contract, and reports exactly what changed.
-
-The worked example is a **TLS handshake state machine** driving a closed-IP AES-CTR core and a closed-IP TRNG. It is the architecture in every commercial TLS termination device — smart NICs, hardware security modules, embedded TLS accelerators. Mainstream, not academic.
-
-You can reproduce every command. The example lives at [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake) in the mununu repository. The transcript below is byte-deterministic — run `validate.sh` against the same commit and you will get the same output character-for-character.
-
-## The problem the corpus solves
-
-A TLS handshake state machine looks roughly like this:
+A TLS handshake state machine drives every commercial TLS termination device: smart NICs, hardware security modules, embedded TLS accelerators in routers and edge gateways. The architecture is mainstream:
 
 ```
 Idle → ClientHello → ServerHello → KeyDeriv → NonceReq → CipherReady →
    Finished → Application (records loop)
 ```
 
-Every transition out of `KeyDeriv` waits for the AES core to confirm a derived key. Every transition out of `NonceReq` waits for the TRNG to deliver a fresh nonce. Every record in the `Application` loop waits for the AES core to encrypt or decrypt.
+Every transition out of `KeyDeriv` waits for an AES core to confirm a derived key. Every transition out of `NonceReq` waits for a TRNG to deliver a fresh nonce. Every record in the `Application` loop waits for the AES core to encrypt or decrypt. Two of those three components — the AES core and the TRNG — arrived as closed IP. You have the datasheet; you do not have the body.
 
-If you model the AES core as a chaotic stub, the handshake might never make it past `KeyDeriv` in the model — the chaotic stub is free to stall forever. Your safety properties still hold (over-approximation + safety = sound), but you cannot prove the handshake completes, you cannot prove a bounded latency, you cannot prove the device makes forward progress. To prove anything beyond raw safety, you need a *contract* for the AES core: an assumption you make about its behaviour, on top of which your proof can build.
+The verification stakes are the same as for any TLS device: a session key leak is a breach; a deadlock in `KeyDeriv` is a production outage; a missed protocol invariant is a compliance failure. You want to prove safety properties about the handshake — "no session key is transmitted in cleartext", "no nonce is reused" — and you want to know how the closed crypto and the closed entropy source factor into that proof.
 
-The question is where that contract comes from.
+If you model the AES core as a chaotic stub (the conservative default any compositional verifier needs to start from), the handshake might never make it past `KeyDeriv` in the model — the chaotic stub is free to stall forever. Safety properties still hold (over-approximation + safety = sound). But you cannot prove the handshake completes, you cannot prove a bounded latency, and the closed-IP modules silently bound how much your proof can claim.
 
-Today, the answer in most formal-verification flows is "you write it by hand." Every project, every team, every audit. Most of that work duplicates work that someone, somewhere, has already done — because AES-CTR is AES-CTR. The vendor's datasheet specifies the same handshake; the same standard (NIST SP 800-38A) defines the same modes; the same safety obligations apply.
+To prove anything beyond raw safety you need a *contract* for the AES core: an assumption about its behaviour, on top of which your proof can build. The question is where that contract comes from.
 
-Mununu's design document for this work — [Document D: contract corpus + unified config](https://github.com/vscorza/mununu/blob/main/docs/design/contract-corpus-and-config.md) — proposes a shared library. The precedent is well-established outside hardware: the Accellera Open Verification Library (OVL) is a parameterised assertion-checker library; SV-COMP ships 30,000+ public C verification benchmarks; SMT-LIB is the gold standard for queryable verification artefacts. The hardware side does not yet have an equivalent for *component contracts*. Document D's contribution is putting one together.
+Today, the answer in most formal-verification flows is "you write it by hand." Every project, every team, every audit. Most of that work duplicates work someone, somewhere, has already done — because **AES-CTR is AES-CTR.** The same standard (NIST SP 800-38A) defines the same modes; the same safety obligations apply; the same handshake shape sits in every datasheet.
+
+This post walks through what changes when the same closed-IP module can be matched against a *shared* library of vetted contracts instead. The worked example lives at [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake) and is reproducible end-to-end: run `validate.sh` against the pinned commit and you get the byte-deterministic transcript quoted below.
+
+## A queryable library, modelled on what already worked elsewhere
+
+Most non-hardware verification ecosystems have already solved the per-project duplication problem with a shared library: the Accellera Open Verification Library (OVL) for parameterised assertion-checkers; the SV-COMP repository of 30,000+ public C verification benchmarks; SMT-LIB for queryable solver artefacts. None of these is novel. What was missing was the hardware-side equivalent for *component contracts*.
+
+A **contract corpus** — what [`docs/design/contract-corpus-and-config.md`](https://github.com/vscorza/mununu/blob/main/docs/design/contract-corpus-and-config.md) calls the M3 deliverable — is that equivalent: a queryable, version-pinned repository of vetted black-box contracts, structured as a directory tree, one file per entry. Annotations on closed-IP wrappers point directly at corpus entries via a URI; the discovery pipeline resolves the URI, replaces the chaotic stub with the vetted contract, and reports exactly what changed. The rest of this post walks the example end-to-end.
 
 ## What the corpus actually looks like
 

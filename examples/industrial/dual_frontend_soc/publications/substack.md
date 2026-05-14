@@ -1,84 +1,43 @@
-# Two RTL frontends, one IR: what to unify and what to keep separate
+# Verifying an SoC that mixes open RTL and closed-IP DDR
 
 > **Draft for Substack publication.** Source: `examples/industrial/dual_frontend_soc/`. The transcript embedded below reproduces byte-for-byte by running `./examples/industrial/dual_frontend_soc/validate.sh` against the pinned commit. **Do not publish until the four-gate validation checklist in `publications/README.md` passes.**
 
 ---
 
-Mununu, the open-source compositional model checker for reactive systems, has two SystemVerilog frontends. One is a Rust-native pipeline that parses a tightly-scoped subset of SV and builds explicit-state Kripke structures via SMT. The other shells out to yosys, runs `flatten`, and bit-blasts the resulting BTOR2 netlist. Same input language, two completely different extraction techniques.
+Take a small SoC fragment: an open-source host controller that drives an open-source UART peripheral and a closed-IP DDR3 PHY. The host and the UART are yours — written in SystemVerilog, available in source. The DDR PHY arrived as a vendor netlist: a port list, a datasheet, and `(* blackbox *)` on the wrapper. The verification question your customer asks is innocuous: *prove the SoC always reaches its DDR burst path and its UART send path, regardless of what the DDR controller does internally.*
 
-People ask why. The instinct is "one of them must be the wrong call." It isn't. They serve two different verification audiences, and the right move is to **unify their seams and leave their cores alone**.
+This is the SoC that lives behind every recent automotive infotainment unit, embedded vision system, and edge-AI accelerator. The kernel of formal RTL verification is not "do I trust my own SV?" — it is "what happens when half the design is opaque?"
 
-This post walks the design — Document B in mununu's four-document roadmap — and exercises it against a small SoC example. The transcript reproduces byte-for-byte.
+There are two reasonable ways to answer the question for an SoC like this.
 
-## Why two pipelines
+The **protocol-level** answer treats registers as enums, models counters with explicit bounds, and asks "does the handshake sequence ever deadlock?" That answer needs a verifier that preserves symbolic state — losing the abstraction collapses to a state space too large to enumerate.
 
-The two paths started at different times for different reasons.
+The **gate-level** answer bit-blasts everything, including the open RTL, and asks "is there a corner case where the carry chain overflows?" That answer needs a verifier that drops every abstraction and reasons over arbitrary widths.
 
-The **custom-SV pipeline** is the original one. It parses SV directly and produces symbolic Kripke structures: registers as enums, counters with explicit bounds, combinational logic evaluated via z3. It was built for protocol-level verification — handshake correctness, request-grant fairness, FIFO occupancy bounds. When the abstraction holds, the state space stays tractable even on real-world RTL.
+You should not have to pick. The SoC has both kinds of questions; you should be able to ask both. This post walks through how that works in practice — against the example at [`examples/industrial/dual_frontend_soc/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/dual_frontend_soc), reproducible byte-for-byte.
 
-The **yosys frontend** came later. It hands the SV to yosys's mature parser, runs the standard `prep → proc → flatten → async2sync → chformal -lower` script, captures the BTOR2 output, and bit-blasts. It's the path for *bit-exact* properties: overflow, sign-extension, post-synthesis correctness on arbitrary SV.
+## Two frontends, one IR
 
-Two precision tiers, two audiences. The custom-SV path is the one for "I want to know my AXI arbiter is fair." The yosys path is the one for "I want to know my carry chain doesn't overflow in this corner case."
+mununu, the [open-source compositional model checker](https://github.com/vscorza/mununu) the example runs against, ships two SystemVerilog frontends. One is a Rust-native pipeline that parses a tightly-scoped subset of SV and builds symbolic Kripke structures via SMT — that is the protocol-level path. The other shells out to yosys, runs `flatten`, and bit-blasts the resulting BTOR2 netlist — that is the gate-level path. Same input language, two completely different extraction techniques.
 
-People who haven't thought about it want to collapse them. The argument for collapsing is "one pipeline is simpler than two." The argument against is more interesting.
+People ask why. The instinct is "one of them must be the wrong call." It isn't. The dual-frontend SoC example is the answer: an SoC with two different verification questions you want answered against two different precision tiers, with one shared CTXDSL definition and one shared composition primitive.
 
-## The CIRCT pattern
+The architectural reference is [CIRCT](https://circt.llvm.org/), the canonical multi-frontend hardware compiler built on MLIR. CIRCT supports multiple frontend dialects (FIRRTL, several SV dialects, Calyx) all lowering through a common middle (`hw`, `comb`, `seq`, `sv`). Different syntaxes, different abstraction tiers, but one IR everything funnels through and one set of passes that operate on the shared dialects. The principle CIRCT made mainstream: **unify the seams, leave the cores free**.
 
-The canonical multi-frontend hardware compiler today is [CIRCT](https://circt.llvm.org/) — Circuit IR Compilers and Tools, built on MLIR. CIRCT supports multiple frontend dialects (FIRRTL, several SV dialects, Calyx) all lowering through a common middle (`hw`, `comb`, `seq`, `sv`). Different syntaxes, different abstraction tiers, but one IR everything funnels through and one set of passes that operate on the shared dialects.
+mununu's two pipelines land in the same shape: one IR (`AdapterIR`), one composition primitive, one controllability rule, one set of property roles. The internal extraction techniques — bit-blasting vs SMT-backed Kripke — stay distinct because they serve different precision tiers. The example exercises this principle end-to-end.
 
-The principle CIRCT made mainstream: **unify the seams, leave the cores free**. Each frontend can specialise — FIRRTL is parameterised hardware generation, the SV dialects are the SV-2017 surface, Calyx is software-style with a hardware semantics. They share the middle. The middle is where the leverage is.
+## What the SoC example actually does
 
-Mununu's two pipelines should land in the same shape: one IR (`AdapterIR`), one composition primitive, one controllability rule, one set of property roles. The internal extraction techniques — bit-blasting vs SMT-backed Kripke — stay distinct because they serve different precision tiers.
+The SoC has three modules. The `HostController` and `UART` are hand-authored CTXDSL automata representing the open RTL. The `DDR3_PHY_V2` is a 2-state chaotic stub modelling the closed IP — exactly the chaotic-stub default from [Document A](https://github.com/vscorza/mununu/blob/main/docs/design/black-box-modules.md) §2. They compose asynchronously over a shared label alphabet: `req_burst`, `addr_valid`, `rdata`, `ddr_ready`, `ddr_busy`, and the UART's send/receive labels.
 
-## What can be unified
+The first thing the example walks is how the DDR PHY's interface JSON came into existence. In a real flow, mununu's extractor would emit it automatically when it encountered `(* blackbox *)` in the SV. The example uses `mununu contract sidecars` — the library helper the adapters call — to produce the same JSON shape directly:
 
-Concretely:
-
-- **Output IR.** Both pipelines produce `AdapterIR`. Already aligned.
-- **CTXDSL emission.** Shared via `crates/mununu-core/src/adapter/emit.rs`. Already aligned.
-- **Property roles.** The IR has `PropertyRole::{Assumption, Guarantee, Invariant, Standalone}`. The custom-SV path uses them; the yosys path mostly produces `Standalone` today. Should be reconciled — `chformal -lower` knows the difference between `assert` and `assume`, the BTOR2 reader can keep the distinction.
-- **Controllability rule.** Document A §4 says: classify labels by the port direction at the current scope's boundary. The shared classifier lives at `crates/mununu-core/src/controllability.rs`. The custom-SV path uses it; the yosys path defaults to "all inputs uncontrollable" because flatten throws away the port directions. **The directions are in the SV AST yosys parsed.** They're just being discarded at the BTOR2 emission boundary. Fix.
-- **Black-box submodule handling.** When either pipeline encounters a `(* blackbox *)` module, it should emit `<module>.interface.json` + `<module>.gap_report.json` sidecars next to the CTXDSL output — the same JSON shape mununu's contract subsystem already consumes. This is the stage-1 integration between extraction and contracts.
-- **Composition spec.** Both pipelines should emit the same `CompositionSpec` for the same shared design.
-
-## What should not be unified
-
-The list of things that *must* stay separate:
-
-- **Abstraction tier.** Symbolic enums vs gate-level bit-exactness. They are different verification questions. Force one and you lose half the audience.
-- **Parser.** Yosys has a mature SV-2017 frontend. Replicating it in Rust would burn engineering years for a tiny gain in homogeneity. Don't.
-- **Clock semantics.** Yosys's `async2sync` is a synthesis-grade abstraction; custom SV preserves clock-domain detail. Different verification problems.
-- **Bit-width.** Bounded counters in custom SV; native arbitrary width in BTOR2.
-- **SV language coverage.** Yosys handles classes, interfaces, generates, packages. Custom SV is the opinionated path for SV-written-the-mununu-way.
-- **External tool dependency.** Custom SV is pure Rust; yosys is a subprocess. Custom SV is the only path if you can't ship yosys (WASM builds, restricted CI).
-
-The point of this list is to prevent the "we should collapse this" reflex. Each row has a real trade-off.
-
-## The stage-1 integration
-
-Until this week, mununu's contract subsystem and its extraction pipelines lived in parallel. The contract subsystem could validate discharge graphs and discover phase-1 contracts from `BlackBoxInterface` JSON. But the JSON was hand-authored — even though mununu's extractors had *just parsed the source* and knew exactly what ports each black-box module had.
-
-That's a friction the discipline can't survive long-term. The whole point of the contract subsystem is to make black-box handling first-class, not to ask users to re-describe modules mununu already understands.
-
-The fix is staged in three steps:
-
-1. **Stage 1 (M2):** when an adapter detects a black-box module, it auto-emits the `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars alongside its CTXDSL output. The library helper is `contract::discover::build_blackbox_sidecars()`; the CLI exposes it as `mununu contract sidecars`. **Shipped.** Both the custom-SV and yosys frontends call this helper today; the example in this post walks the auto-emitted sidecars.
-2. **Stage 2 (M3, Document D):** source-comment annotations (`@mununu_guarantee` on the wrapper module) populate the discovered contract with vendor-supplied A/G clauses. The relocated task A6. **Shipped.** The TLS handshake example at [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake) demonstrates `@mununu_guarantee` + `@mununu_interface contract://…` flowing through to the HITL review surface.
-3. **Stage 3 (post-M3):** CTXDSL grammar extension for inline `contract { ... }` blocks. The discharge check becomes a precondition of every `mununu context eval / synth`. Contracts stop being a separate command and become part of the standard verify flow. **Still deferred** — not blocking any user case today, but the natural next step once Document C's HW/SW codesign implementation lands.
-
-## Walking the example
-
-The repo has [`examples/industrial/dual_frontend_soc/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/dual_frontend_soc). Run it:
-
-```bash
-./examples/industrial/dual_frontend_soc/validate.sh
+```
+DDR3_PHY_V2.interface.json     # the port list with directions
+DDR3_PHY_V2.gap_report.json    # one OutputSequencing gap
 ```
 
-The example models a tiny SoC fragment: a host controller, a UART peripheral, and a closed-IP DDR3 PHY. The host and UART are open and verifiable; the DDR3 PHY is a 2-state chaotic stub with uncontrollable outputs, exactly the chaotic-stub default from [Document A](https://github.com/vscorza/mununu/blob/main/docs/design/black-box-modules.md) §2.
-
-Step 1 calls `mununu contract sidecars` against a hand-authored `blackbox_interfaces.json`. The CLI produces two JSON files — `DDR3_PHY_V2.interface.json` and `DDR3_PHY_V2.gap_report.json` — in the output directory. Same JSON shape an auto-emitting adapter will produce once yosys integration lands.
-
-Step 4 runs `mununu contract discover` against the auto-emitted interface. The discovery pipeline classifies each port (clock and reset as `Uncontrollable`, the three output signals as `Uncontrollable` from the host's perspective per the §4 rule), and emits one `OutputSequencing` gap covering the outputs:
+The interface JSON is what the discovery pipeline consumes. Running `mununu contract discover DDR3_PHY_V2.interface.json` against it returns:
 
 ```
 WARN contract gap detected — chaotic stub default in effect
@@ -89,9 +48,13 @@ WARN contract gap detected — chaotic stub default in effect
 phase-1 discovery: 8 label(s), 1 gap marker(s) for module `DDR3_PHY_V2`
 ```
 
-Step 5 runs `mununu contract gaps --strict-contracts` against the auto-emitted gap report. Strict mode exits non-zero because the gap is unmet. In CI for a safety-critical product, this is the gate that prevents shipping a verification under chaotic-stub semantics without an authored contract.
+The labels classified as `Uncontrollable` are the ones the host controller cannot drive — exactly the §4 controllability rule applied at the black-box boundary: peripheral outputs are uncontrollable from the host's perspective, peripheral inputs are controllable. The gap report says "you have not authored progress assumptions for the DDR outputs"; the warning makes the soundness consequence explicit.
 
-Steps 6-8 verify three mu-calculus properties over the composed SoC. All hold:
+For a safety-critical product, `mununu contract gaps --strict-contracts` against the gap report exits non-zero. That is the CI gate that prevents shipping a verification result under chaotic-stub semantics without an authored progress contract.
+
+## The verdicts
+
+With the composition wired up, three properties over the SoC:
 
 ```
 soc_well_formed         →  SAT (1/1 reachable composed states)
@@ -99,29 +62,55 @@ burst_path_reachable    →  SAT (host can reach the DDR burst path)
 uart_send_reachable     →  SAT (host can reach the UART send path)
 ```
 
-Note the trade-off the chaotic stub forces. The safety properties hold *under chaotic DDR*. That's the substantive claim — the host controller is well-formed regardless of how the DDR PHY behaves internally. A liveness property like "every DDR burst eventually completes" would *not* hold under chaotic crypto and would need a vendor-supplied latency contract.
+All three hold *under chaotic DDR*. That is the substantive claim: the host controller is well-formed and can reach its burst and send paths regardless of how the DDR PHY behaves internally — as long as the PHY conforms to its interface alphabet. A liveness property like "every DDR burst eventually completes" would *not* hold under chaotic crypto and would need a vendor-supplied latency-bound contract on `ddr_ready`.
+
+That is the trade-off the chaotic stub forces, and it is the right trade-off. Over-approximation + safety = sound. Over-approximation + liveness = unsound; the system tells you so.
+
+## The principle the example demonstrates
+
+There is a checklist behind this: which parts of the two pipelines were unified at the seams, and which were deliberately left divergent.
+
+The unified items are the ones that should never have been per-pipeline in the first place:
+
+- **Output IR.** Both pipelines produce `AdapterIR`. Already aligned.
+- **CTXDSL emission.** Shared via `crates/mununu-core/src/adapter/emit.rs`.
+- **Property roles.** The IR has `PropertyRole::{Assumption, Guarantee, Invariant, Standalone}`. The custom-SV path uses them; the yosys path mostly produces `Standalone` today — `chformal -lower` knows the difference between `assert` and `assume`, the BTOR2 reader can keep the distinction.
+- **Controllability rule.** The shared classifier lives at `crates/mununu-core/src/controllability.rs`. The custom-SV path uses it; the yosys path defaults to "all inputs uncontrollable" today because `flatten` throws away the port directions even though the SV AST yosys parsed contains them. That gap is the next refactor.
+- **Black-box submodule handling.** When either pipeline encounters a `(* blackbox *)` module, it emits `<module>.interface.json` + `<module>.gap_report.json` sidecars next to the CTXDSL output — the same JSON shape mununu's contract subsystem already consumes. **This stage-1 integration is what shipped with M2.** Both frontends call `contract::discover::build_blackbox_sidecars()` today.
+- **Composition spec.** Both pipelines emit the same `CompositionSpec` for the same shared design.
+
+The deliberately-divergent items are the ones that exist because the two precision tiers are different verification questions:
+
+- **Abstraction tier.** Symbolic enums vs gate-level bit-exactness.
+- **Parser.** Yosys has a mature SV-2017 frontend. Replicating it in Rust would burn engineering years for a tiny gain in homogeneity. Don't.
+- **Clock semantics.** Yosys's `async2sync` is a synthesis-grade abstraction; custom SV preserves clock-domain detail.
+- **Bit-width.** Bounded counters in custom SV; native arbitrary width in BTOR2.
+- **SV language coverage.** Yosys handles classes, interfaces, generates, packages. Custom SV is the opinionated path for SV-written-the-mununu-way.
+- **External tool dependency.** Custom SV is pure Rust; yosys is a subprocess. Custom SV is the only path if you can't ship yosys (WASM builds, restricted CI).
+
+Each row in the second list has a real trade-off. Collapsing them would lose half the audience.
 
 ## What this example does not claim
 
 Per [mununu's claims-integrity rules](https://github.com/vscorza/mununu/blob/main/CLAUDE.md):
 
-- No claim mununu found a bug in any commercial DDR3 PHY or any specific SoC.
+- No claim that any commercial DDR3 PHY or any specific SoC has a bug.
 - The example uses `mununu contract sidecars` as a stand-in for adapter auto-emission. The JSON shape is identical to what the yosys-side integration will produce, but the producer is different until that integration lands.
-- This particular example does not exercise vendor `@mununu_guarantee` source-comment annotations. The annotation grammar shipped in M3 (Document D, relocated task A6); a separate worked example — the TLS handshake — exercises it. This example deliberately stays at the chaotic-stub baseline so the reader can see what the unannotated default looks like across both RTL frontends.
+- The example does not exercise vendor `@mununu_guarantee` source-comment annotations. The annotation grammar ships in the [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake) example — the next post in this series. This example deliberately stays at the chaotic-stub baseline so the reader can see what the unannotated default looks like across both RTL frontends.
 - The proof is conditional on the chaotic-stub contract; a vendor-supplied latency-bound contract would tighten it.
 
 ## Where this fits
 
-The architectural reference is CIRCT and MLIR — multi-frontend hardware infrastructure built on the "unify the seams, leave the cores free" principle. The compositional foundations come from Alur & Henzinger's *Reactive Modules* (FMSD 1999) and de Alfaro & Henzinger's *Interface Automata* (ESEC/FSE 2001). The yosys primitives this work builds on (`hierarchy`, `(* blackbox *)`, `cutpoint -blackbox`) are mainstream, used in OpenTitan's formal flows and across SymbiYosys.
+The compositional foundations come from Alur & Henzinger's *Reactive Modules* (FMSD 1999) and de Alfaro & Henzinger's *Interface Automata* (ESEC/FSE 2001). The yosys primitives this work builds on (`hierarchy`, `(* blackbox *)`, `cutpoint -blackbox`) are mainstream — used in OpenTitan's formal flows and across SymbiYosys.
 
-What mununu adds is the integration: a contract subsystem that connects to extraction at the adapter boundary, so the user never has to hand-author what the extractor already knows.
+What is new is the stage-1 integration between the extractors and the contract subsystem. Until this milestone, the contract subsystem and the extraction pipelines lived in parallel. The contract subsystem could validate discharge graphs and discover phase-1 contracts from `BlackBoxInterface` JSON, but the JSON had to be hand-authored — even though the extractors had just parsed the source and knew exactly what ports each black-box module had. The stage-1 integration is what closes that gap: adapters auto-emit the sidecars, the contract subsystem consumes them, the chaotic-stub default and its diagnostics are now end-to-end.
 
 ## What's next
 
-This is post 2 of a four-document arc. The rest has since shipped (design + implementation where noted):
+This is post 2 of a four-part series. Each remaining post leads with a different real-world architecture:
 
-- **Document D** — contract corpus + source-comment annotation grammar + `contract://` URI resolution + the relocated A6 (corpus-driven phase-2 discovery) and A7 (HITL stage-4 review surface). **Design + corpus + annotations + URI resolution + HITL review shipped.** Worked example: [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake). The originally-proposed `.mununu/` directory unification was reassessed post-M3 — co-located sidecars won — and most of D §D.3 is descoped. The L\* learning surface (D5/D6) was reassessed as long-tail follow-up and is not queued.
-- **Document C** — HW/SW codesign extraction. The capstone post — a peripheral RTL + firmware C combined, with a register-map sidecar coupling the two sides for cross-boundary formal verification. **Design landed; implementation is the next milestone.**
+- **Post 3 — A TLS handshake driving closed-IP crypto.** When the closed IP is *not unique* (AES-CTR is AES-CTR), a shared corpus replaces per-project contract authoring. Worked example: [`examples/industrial/tls_handshake/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/tls_handshake).
+- **Post 4 — A UART driver + UART peripheral.** Cross-boundary HW/SW codesign verification: firmware C + peripheral SV with a register-map sidecar gluing the two sides. Worked example: [`examples/industrial/codesign_uart/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/codesign_uart).
 
 The repo: [github.com/vscorza/mununu](https://github.com/vscorza/mununu).
 The example: [`examples/industrial/dual_frontend_soc/`](https://github.com/vscorza/mununu/tree/main/examples/industrial/dual_frontend_soc).
