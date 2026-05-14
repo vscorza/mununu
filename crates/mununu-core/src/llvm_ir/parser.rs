@@ -109,7 +109,7 @@ fn regexes() -> &'static Regexes {
         )
         .unwrap(),
         gep: Regex::new(
-            r"^\s*%(\w+)\s*=\s*getelementptr\s+(inbounds\s+)?(\S+?),\s*ptr\s+(\S+?)(.+)\s*$",
+            r"^\s*%(\w+)\s*=\s*getelementptr\s+(inbounds\s+)?(\S+?),\s*ptr\s+([%@][\w.]+)(.+)\s*$",
         )
         .unwrap(),
         inttoptr: Regex::new(r"^\s*%(\w+)\s*=\s*inttoptr\s+\S+\s+(\S+)\s+to\s+ptr\s*$").unwrap(),
@@ -699,19 +699,25 @@ define void @uart_send(i8 noundef zeroext %0) #0 {
             })
             .expect("found load of @UART");
         assert_eq!(load_uart, PointerOperand::Global("UART".into()));
-        // %5 = getelementptr ... %4, i32 0, i32 1
-        let gep = bb3
+        // %5 = getelementptr ... ptr %4, i32 0, i32 1
+        // Crucially, the base must be Ssa("4") — not the empty string
+        // a lazy regex would yield.
+        let (gep_base, gep_indices) = bb3
             .instructions
             .iter()
             .find_map(|i| match i {
                 Instruction::Gep {
-                    result, indices, ..
-                } if result == "5" => Some(indices.clone()),
+                    result,
+                    base,
+                    indices,
+                    ..
+                } if result == "5" => Some((base.clone(), indices.clone())),
                 _ => None,
             })
             .expect("found gep producing %5");
+        assert_eq!(gep_base, PointerOperand::Ssa("4".into()), "GEP base");
         assert_eq!(
-            gep,
+            gep_indices,
             vec![GepIndex::Const(0), GepIndex::Const(1)],
             "field-index-1 GEP"
         );

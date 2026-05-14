@@ -698,21 +698,52 @@ fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
 
 fn codesign_extract_c_llvm(args: CodesignExtractCArgs) -> Result<(), String> {
     use mununu::codesign::c_extract_llvm::{LlvmExtractOptions, extract_c_via_llvm};
+    use mununu::codesign::register_map::RegisterMap;
 
-    if args.register_map.is_some() || args.synthesize_automaton {
-        return Err(
-            "--backend llvm: --register-map / --synthesize-automaton are not yet implemented (phase L2 / L3)"
-                .to_string(),
-        );
-    }
+    let register_map = match args.register_map.as_ref() {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("failed to read register-map {}: {e}", path.display()))?;
+            let rm: RegisterMap = serde_json::from_slice(&bytes).map_err(|e| {
+                format!(
+                    "failed to parse register-map {} as JSON: {e}",
+                    path.display()
+                )
+            })?;
+            let issues = rm.validate();
+            if !issues.is_empty() {
+                for issue in &issues {
+                    eprintln!("register-map validation: {issue}");
+                }
+                return Err(format!(
+                    "register-map {} has {} validation issue(s) \u{2014} refusing to proceed",
+                    path.display(),
+                    issues.len()
+                ));
+            }
+            Some(rm)
+        }
+        None => {
+            if args.synthesize_automaton {
+                return Err("--synthesize-automaton requires --register-map <JSON>".to_string());
+            }
+            None
+        }
+    };
+
     let opts = LlvmExtractOptions {
         clang_path: args.clang,
         include_paths: args.include_paths,
         defines: args.defines,
         extra_clang_args: args.extra_clang_args,
+        register_map,
+        synthesize_automaton: args.synthesize_automaton,
     };
     let extraction = extract_c_via_llvm(&args.file, &opts)
         .map_err(|e| format!("LLVM C extraction failed: {e}"))?;
+    for w in &extraction.warnings {
+        eprintln!("warning: {w}");
+    }
     let json = serde_json::to_string_pretty(&extraction)
         .map_err(|e| format!("failed to serialise extraction: {e}"))?;
     println!("{json}");
