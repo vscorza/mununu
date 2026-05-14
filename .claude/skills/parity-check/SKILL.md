@@ -21,9 +21,24 @@ If $ARGUMENTS is empty, derive scope from `git diff --name-only HEAD~1 HEAD`. Ot
 
 | Surface | Files |
 |---|---|
-| **CLI** | `crates/mununu-cli/src/main.rs` (clap `Args` structs and command handlers) |
+| **CLI** | `crates/mununu-cli/src/main.rs` and `src/main.rs` (clap `Args` structs and command handlers — note that mununu ships *two* binaries named `mununu`; a feature that exists on one but not the other is itself a parity drift) |
 | **HTTP API** | `crates/mununu-core/src/api/handlers.rs` (request/response signatures), `crates/mununu-core/src/api/models.rs` (types), `crates/mununu-core/src/api/server.rs` (routes) |
 | **UI** | `mununu-ui/src/api/endpoints.ts` (typed clients), `mununu-ui/src/hooks/useCtxdslEditor.ts`, `mununu-ui/src/hooks/useSummary.ts`, and any other hook/component that consumes the endpoint |
+
+## Known feature groups and where they live
+
+When scope determination identifies a change in one of these groups, search every group member across all three surfaces. Drift inside a group is the most common kind of parity failure.
+
+| Group | CLI subcommand(s) | HTTP route(s) | UI component(s) |
+|---|---|---|---|
+| **Context core** | `mununu context summarize\|eval\|synthesize\|graph\|merge\|predicates` | `/api/v1/context/{summarize,eval,synthesize,graphs,verify,import,predicates}` | `UnifiedEditor` (Summary / Graphs / Verification tabs) |
+| **Extraction** | `mununu extraction validate\|check` | (validation is library-only today) | `ExtractionPanel` |
+| **Contracts** | `mununu contract validate\|gaps\|discover\|sidecars\|query\|review` | `/api/v1/contract/{validate,discover,query,review}` | `ContractPanel` (Validate / Discover / Query / Review sub-tabs) |
+| **Codesign (HW/SW)** | `mununu codesign couple\|verify` | `/api/v1/codesign/verify` | `CodesignPanel` |
+| **SV / RTL** | `mununu sv init\|discover` | `/api/v1/context/import` (with `format=sv-yosys`/`systemverilog`) | Import workflows in `UnifiedEditor` |
+| **Templates** | `mununu templates` | `/api/v1/templates` | `TemplatePicker` |
+
+A new feature added to any of these groups must wire all three columns in the same PR. A feature added *outside* these groups (a new top-level subcommand or skill) must either land in all three surfaces or carry an explicit "CLI-only / API-only" justification under Procedure step 3.
 
 ## Procedure
 
