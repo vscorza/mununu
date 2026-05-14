@@ -270,6 +270,23 @@ struct CodesignExtractCArgs {
     /// `coupling`-module rendezvous labels.
     #[arg(long = "synthesize-automaton")]
     synthesize_automaton: bool,
+    /// Extraction backend. `ast` (default) walks clang's
+    /// `-ast-dump=json` output. `llvm` shells out to
+    /// `clang -emit-llvm -S` and parses the textual IR — the
+    /// principled-lift path documented in
+    /// `docs/design/c-extraction-correctness-scope.md` §4. Phase L1
+    /// emits a structural IR summary; register-access matching +
+    /// automaton synthesis land in phases L2 and L3.
+    #[arg(long, value_enum, default_value = "ast")]
+    backend: CExtractBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CExtractBackend {
+    /// Slice-2 AST pattern matching (today's default).
+    Ast,
+    /// Phase-L1+ LLVM-IR lift (principled alternative).
+    Llvm,
 }
 
 #[derive(Args, Debug)]
@@ -905,6 +922,37 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
 }
 
 fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
+    match args.backend {
+        CExtractBackend::Ast => codesign_extract_c_ast(args),
+        CExtractBackend::Llvm => codesign_extract_c_llvm(args),
+    }
+}
+
+fn codesign_extract_c_llvm(args: CodesignExtractCArgs) -> Result<(), String> {
+    use mununu_core::codesign::c_extract_llvm::{LlvmExtractOptions, extract_c_via_llvm};
+
+    if args.register_map.is_some() || args.synthesize_automaton {
+        return Err(
+            "--backend llvm: --register-map / --synthesize-automaton are not yet implemented (phase L2 / L3)"
+                .to_string(),
+        );
+    }
+
+    let opts = LlvmExtractOptions {
+        clang_path: args.clang,
+        include_paths: args.include_paths,
+        defines: args.defines,
+        extra_clang_args: args.extra_clang_args,
+    };
+    let extraction = extract_c_via_llvm(&args.file, &opts)
+        .map_err(|e| format!("LLVM C extraction failed: {e}"))?;
+    let json = serde_json::to_string_pretty(&extraction)
+        .map_err(|e| format!("failed to serialise extraction: {e}"))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn codesign_extract_c_ast(args: CodesignExtractCArgs) -> Result<(), String> {
     use mununu_core::codesign::c_extract::{CExtractOptions, extract_c_via_clang};
     use mununu_core::codesign::register_map::RegisterMap;
 
