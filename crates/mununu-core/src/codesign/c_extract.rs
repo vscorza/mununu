@@ -25,17 +25,30 @@
 //!   and expression statements). Each statement contributes zero or
 //!   one access; statements with multiple accesses contribute them in
 //!   left-to-right source order (RHS reads before the LHS write).
-//! - **Out of scope (slice 2.c):** control flow. `while`, `if`, `for`,
-//!   `do`, and `switch` are *linearised* — their bodies are walked
-//!   inline and a single
-//!   [`CExtractWarning::NonLinearControlFlow`] is emitted per
-//!   occurrence. This is sound for safety properties (over-
-//!   approximation: the synthesised automaton admits more behaviours
-//!   than the real firmware) but unsound for liveness. The user is
-//!   told.
+//! - **Slice 2.c (this iteration):** `while (single_register_read) ;`
+//!   (or `{}`) is recognised as a *state-creating* construct — the
+//!   synthesiser emits a dedicated `Loop_i` state with a self-loop
+//!   plus a same-label exit, faithfully reproducing the Doc C §C.4
+//!   hand-authored polling shape. Anything more than the canonical
+//!   polling idiom — non-trivial condition, side-effecting body —
+//!   still falls back to slice-2.b linearisation with the structured
+//!   [`CExtractWarning::NonLinearControlFlow`] warning.
+//! - **Other control flow (linearised):** `if`, `for`, `do`, `switch`
+//!   bodies are walked inline and a `NonLinearControlFlow` warning is
+//!   emitted per occurrence. Sound for safety (over-approximation),
+//!   unsound for liveness; the user is told.
 //! - **Out of scope (future):** function calls into other firmware
 //!   functions, indirect calls through function pointers, ISR
 //!   entry/exit semantics. The body walker stops at the call boundary.
+//!
+//! ### Correctness bounds and the principled alternative
+//!
+//! What the extractor claims and what it does *not* claim is bounded
+//! explicitly in [`docs/design/c-extraction-correctness-scope.md`](../../../../docs/design/c-extraction-correctness-scope.md).
+//! Re-read that document before opening any PR that adds a slice
+//! beyond 2.c. The principled alternative (LLVM-IR / CFG / predicate
+//! abstraction) is scoped there too, with the triggers that would
+//! justify switching paths.
 //!
 //! ## Why shell-out rather than `clang-sys`
 //!
@@ -280,6 +293,53 @@ pub struct RegisterAccess {
     pub accessor: String,
     /// 1-based source line of the statement containing the access.
     pub source_line: u32,
+    /// Slice 2.c: control-flow context for this access. Defaults to
+    /// [`AccessFlow::Linear`] — slice 2.b's behaviour. Polling loops
+    /// detected in slice 2.c emit `PollingLoop`, which makes the
+    /// automaton synthesiser create a state with a self-loop on the
+    /// access label rather than chaining through a fresh state.
+    #[serde(default, skip_serializing_if = "AccessFlow::is_linear")]
+    pub flow: AccessFlow,
+}
+
+/// Control-flow context for a [`RegisterAccess`] (slice 2.c).
+///
+/// `Linear` is the slice-2.b default — one access produces one
+/// transition from the previous state to a new state.
+///
+/// `PollingLoop` is the slice-2.c special case for `while (cond) ;`
+/// (or `while (cond) {}` with an empty body) where `cond` is a
+/// single register-access read. It produces *three* transitions on
+/// the same label, all sharing one new state:
+/// - `prev → Loop_<i>` (enter the loop — read returns "stay polling")
+/// - `Loop_<i> → Loop_<i>` (loop iteration — read still busy)
+/// - `Loop_<i> → next` (exit the loop — read returns "go")
+///
+/// Only the *exit* transition advances state. This is the smallest
+/// faithful encoding of a polling loop: the verifier sees that the
+/// firmware may stay in `Loop_<i>` arbitrarily long (over-
+/// approximation — sound for safety) and that it eventually leaves
+/// via the same label (matching the hand-authored Doc C §C.4
+/// `firmware.ctxdsl` shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessFlow {
+    /// Default. One linear transition `prev → next` on the access
+    /// label.
+    #[default]
+    Linear,
+    /// Polling-loop pattern. Three transitions on the same label
+    /// sharing one new state — see [`AccessFlow`] doc-comment.
+    PollingLoop,
+}
+
+impl AccessFlow {
+    /// Used by `#[serde(skip_serializing_if = "AccessFlow::is_linear")]`
+    /// to keep the wire format identical to slice 2.b when the access
+    /// is the default linear flow.
+    pub fn is_linear(&self) -> bool {
+        matches!(self, AccessFlow::Linear)
+    }
 }
 
 /// Output of [`extract_c_via_clang`] — every user-defined function
@@ -744,21 +804,61 @@ fn walk_statement(
                 }
             }
         }
-        // Control flow: linearise. Walk the body if present and
-        // record a single warning per occurrence.
-        "WhileStmt" | "DoStmt" | "ForStmt" | "IfStmt" | "SwitchStmt" => {
+        // Slice 2.c: a `while (cond) ;` / `while (cond) {}` where
+        // `cond` is exactly one register-access read maps to the
+        // canonical polling-loop pattern (`PollingLoop` flow). Any
+        // other while shape — non-trivial condition, side-effecting
+        // body — falls back to slice-2.b linearisation with the
+        // standard `NonLinearControlFlow` warning.
+        "WhileStmt" => {
+            let inner = stmt.get("inner").and_then(|i| i.as_array());
+            let cond = inner.and_then(|nodes| nodes.first());
+            let body = inner.and_then(|nodes| nodes.get(1));
+            let body_is_empty = body.is_none_or(is_empty_or_inert_body);
+            let cond_accessor = cond
+                .and_then(reconstruct_single_read_accessor)
+                .filter(|acc| match_accessor(acc, rm).is_some());
+
+            if let (true, Some(accessor)) = (body_is_empty, cond_accessor) {
+                push_matched_access_with_flow(
+                    AccessKind::Read,
+                    AccessFlow::PollingLoop,
+                    accessor,
+                    source_line,
+                    function_name,
+                    rm,
+                    accesses,
+                    warnings,
+                );
+            } else {
+                warnings.push(CExtractWarning::NonLinearControlFlow {
+                    function: function_name.to_string(),
+                    construct: kind.to_string(),
+                    source_line,
+                });
+                if let Some(nodes) = inner {
+                    for child in nodes {
+                        collect_reads(child, function_name, source_line, rm, accesses, warnings);
+                        let child_kind = child.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        if child_kind == "CompoundStmt" {
+                            walk_compound_stmt(child, function_name, rm, accesses, warnings);
+                        }
+                    }
+                }
+            }
+        }
+        // Other control flow: linearise. Same shape as slice 2.b.
+        "DoStmt" | "ForStmt" | "IfStmt" | "SwitchStmt" => {
             warnings.push(CExtractWarning::NonLinearControlFlow {
                 function: function_name.to_string(),
                 construct: kind.to_string(),
                 source_line,
             });
-            // The condition of a while/if/for is itself a read.
             if let Some(inner) = stmt.get("inner").and_then(|i| i.as_array()) {
                 // Heuristic: for IfStmt the inner is [cond, then, else?];
-                // for WhileStmt it is [cond, body]; for ForStmt the
-                // layout varies. We treat every child as a candidate
-                // for read collection + recursive linear walk; this is
-                // sound (over-approximation) for slice 2.b.
+                // for ForStmt the layout varies. We treat every child as
+                // a candidate for read collection + recursive linear walk;
+                // this is sound (over-approximation) for slice 2.b/c.
                 for child in inner {
                     collect_reads(child, function_name, source_line, rm, accesses, warnings);
                     let child_kind = child.get("kind").and_then(|k| k.as_str()).unwrap_or("");
@@ -824,8 +924,37 @@ fn collect_reads(
 /// Look up the reconstructed accessor in the register map and push a
 /// matching [`RegisterAccess`]. If no field matches, emit a
 /// [`CExtractWarning::UnknownAccessor`].
+///
+/// Slice 2.b wrapper — always emits a `Linear` access. Slice 2.c
+/// constructs `PollingLoop` accesses via
+/// [`push_matched_access_with_flow`].
 fn push_matched_access(
     kind: AccessKind,
+    accessor: String,
+    source_line: u32,
+    function_name: &str,
+    rm: &RegisterMap,
+    accesses: &mut Vec<RegisterAccess>,
+    warnings: &mut Vec<CExtractWarning>,
+) {
+    push_matched_access_with_flow(
+        kind,
+        AccessFlow::Linear,
+        accessor,
+        source_line,
+        function_name,
+        rm,
+        accesses,
+        warnings,
+    );
+}
+
+/// Slice 2.c entry point. Same as [`push_matched_access`] but lets
+/// the caller mark the access as a [`AccessFlow::PollingLoop`].
+#[allow(clippy::too_many_arguments)]
+fn push_matched_access_with_flow(
+    kind: AccessKind,
+    flow: AccessFlow,
     accessor: String,
     source_line: u32,
     function_name: &str,
@@ -840,6 +969,7 @@ fn push_matched_access(
             field: field.map(|f| f.name.clone()),
             accessor,
             source_line,
+            flow,
         });
     } else {
         warnings.push(CExtractWarning::UnknownAccessor {
@@ -942,6 +1072,55 @@ pub fn reconstruct_c_accessor(node: &serde_json::Value) -> Option<String> {
     Some(accessor)
 }
 
+/// Slice 2.c: reconstruct the accessor for a *single* register read
+/// from a `while`-condition expression.
+///
+/// A polling loop's condition typically looks like
+/// `UART->STATUS.bit.tx_busy` (a single `MemberExpr` chain wrapped in
+/// `ImplicitCastExpr(LValueToRValue)`). Anything more complex — a
+/// boolean combination, a comparison, a function call — returns
+/// `None`, which makes the WhileStmt handler fall back to the
+/// slice-2.b linearisation.
+fn reconstruct_single_read_accessor(node: &serde_json::Value) -> Option<String> {
+    // Walk transparent wrappers down to the first MemberExpr we can
+    // hand to `reconstruct_c_accessor`. Anything non-trivial (binary
+    // ops, calls, parenthesised compound expressions) returns None.
+    let mut cursor = node;
+    loop {
+        let kind = cursor.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        match kind {
+            "ImplicitCastExpr" | "ParenExpr" | "CStyleCastExpr" => {
+                cursor = cursor.get("inner").and_then(|i| i.as_array())?.first()?;
+            }
+            "MemberExpr" => return reconstruct_c_accessor(cursor),
+            _ => return None,
+        }
+    }
+}
+
+/// Slice 2.c: a polling loop's body is "inert" if it has no statements,
+/// or only statements that do not touch registers (e.g. a single
+/// `NullStmt` for `while (cond) ;`, or a `CompoundStmt` whose own
+/// `inner` is empty for `while (cond) {}`).
+///
+/// Returns `true` for the inert cases the slice-2.c PollingLoop
+/// encoding faithfully represents. Returns `false` for any body with
+/// statements; those fall through to slice-2.b linearisation since
+/// representing a side-effecting loop body in a single state would
+/// elide information.
+fn is_empty_or_inert_body(node: &serde_json::Value) -> bool {
+    let kind = node.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    match kind {
+        "NullStmt" => true,
+        "CompoundStmt" => node
+            .get("inner")
+            .and_then(|i| i.as_array())
+            .map(|stmts| stmts.is_empty())
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
 /// Extract the 1-based source line of a statement node, falling back
 /// to 0 when the AST doesn't carry one (clang's `range` and `loc`
 /// fields are sparse).
@@ -1004,8 +1183,15 @@ pub fn synthesise_automaton_ctxdsl(
 
     let _ = writeln!(buf, "            states {{");
     let _ = writeln!(buf, "                state S0 initial;");
-    for i in 1..=accesses.len() {
-        let _ = writeln!(buf, "                state S{i};");
+    for (i, access) in accesses.iter().enumerate() {
+        // Slice 2.c: each PollingLoop access introduces a dedicated
+        // `Loop_i` state sitting between S_{i} and S_{i+1}, declared
+        // in chronological order (Loop first, then the main-line
+        // state the loop exits into).
+        if access.flow == AccessFlow::PollingLoop {
+            let _ = writeln!(buf, "                state Loop{i};");
+        }
+        let _ = writeln!(buf, "                state S{idx};", idx = i + 1);
     }
     let _ = writeln!(buf, "            }}");
     let _ = writeln!(buf);
@@ -1015,11 +1201,37 @@ pub fn synthesise_automaton_ctxdsl(
         let label = rendezvous_label_name(&access.register, access.field.as_deref(), access.kind);
         let from = format!("S{i}");
         let to = format!("S{next}", next = i + 1);
-        let _ = writeln!(
-            buf,
-            "                transition {from} -> {to} on label {label}; // {accessor}",
-            accessor = access.accessor
-        );
+        match access.flow {
+            AccessFlow::Linear => {
+                let _ = writeln!(
+                    buf,
+                    "                transition {from} -> {to} on label {label}; // {accessor}",
+                    accessor = access.accessor
+                );
+            }
+            AccessFlow::PollingLoop => {
+                let loop_state = format!("Loop{i}");
+                // Enter the loop on the read.
+                let _ = writeln!(
+                    buf,
+                    "                transition {from} -> {loop_state} on label {label}; // {accessor} (enter loop)",
+                    accessor = access.accessor
+                );
+                // Loop iteration: still polling — same label, same state.
+                let _ = writeln!(
+                    buf,
+                    "                transition {loop_state} -> {loop_state} on label {label}; // {accessor} (loop iteration)",
+                    accessor = access.accessor
+                );
+                // Exit the loop on the same label — the read returns the
+                // value that breaks the polling condition.
+                let _ = writeln!(
+                    buf,
+                    "                transition {loop_state} -> {to} on label {label}; // {accessor} (exit loop)",
+                    accessor = access.accessor
+                );
+            }
+        }
     }
     let _ = writeln!(buf, "            }}");
     // Close the `automaton { … }` body.
@@ -1523,8 +1735,11 @@ mod tests {
     }
 
     #[test]
-    fn while_statement_emits_nonlinear_warning_and_walks_body() {
+    fn slice2c_polling_loop_with_empty_body_is_recognised() {
         // while (UART->STATUS.bit.tx_busy) { /* empty body */ }
+        // Slice 2.c: this is the canonical polling-loop idiom. The
+        // access is marked PollingLoop and NO NonLinearControlFlow
+        // warning is emitted.
         let cond = member_expr_chain(
             "UART",
             &[("STATUS", true), ("bit", false), ("tx_busy", false)],
@@ -1546,16 +1761,172 @@ mod tests {
         let extraction =
             extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
                 .unwrap();
+        let func = &extraction.functions[0];
+        assert_eq!(func.accesses.len(), 1);
+        assert_eq!(func.accesses[0].kind, AccessKind::Read);
+        assert_eq!(func.accesses[0].flow, AccessFlow::PollingLoop);
+        assert!(
+            !extraction
+                .warnings
+                .iter()
+                .any(|w| matches!(w, CExtractWarning::NonLinearControlFlow { .. })),
+            "slice 2.c handles the empty-body polling loop without a linearisation warning"
+        );
+    }
+
+    #[test]
+    fn slice2c_polling_loop_null_body_is_recognised() {
+        // while (UART->STATUS.bit.tx_busy) ;   (body is a NullStmt)
+        let cond = member_expr_chain(
+            "UART",
+            &[("STATUS", true), ("bit", false), ("tx_busy", false)],
+        );
+        let while_stmt = serde_json::json!({
+            "kind": "WhileStmt",
+            "loc": { "line": 7 },
+            "inner": [cond, { "kind": "NullStmt" }],
+        });
+        let ast = fake_ast_with_body("poll", 5, "uart.c", "void (void)", vec![while_stmt]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        let func = &extraction.functions[0];
+        assert_eq!(func.accesses.len(), 1);
+        assert_eq!(func.accesses[0].flow, AccessFlow::PollingLoop);
+    }
+
+    #[test]
+    fn slice2c_falls_back_to_linearisation_for_nontrivial_body() {
+        // while (UART->STATUS.bit.tx_busy) { UART->CTRL.bit.tx_start = 1; }
+        // The body has a side effect → slice 2.c cannot use the
+        // PollingLoop encoding. Falls back to slice-2.b linearisation
+        // with the NonLinearControlFlow warning.
+        let cond = member_expr_chain(
+            "UART",
+            &[("STATUS", true), ("bit", false), ("tx_busy", false)],
+        );
+        let body_lhs = member_expr_chain(
+            "UART",
+            &[("CTRL", true), ("bit", false), ("tx_start", false)],
+        );
+        let body_assign = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "=",
+            "loc": { "line": 8 },
+            "inner": [body_lhs, { "kind": "IntegerLiteral", "value": "1" }],
+        });
+        let while_stmt = serde_json::json!({
+            "kind": "WhileStmt",
+            "loc": { "line": 7 },
+            "inner": [
+                cond,
+                { "kind": "CompoundStmt", "inner": [body_assign] },
+            ],
+        });
+        let ast = fake_ast_with_body("poll", 5, "uart.c", "void (void)", vec![while_stmt]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
         assert!(
             extraction
                 .warnings
                 .iter()
-                .any(|w| matches!(w, CExtractWarning::NonLinearControlFlow { construct, .. } if construct == "WhileStmt"))
+                .any(|w| matches!(w, CExtractWarning::NonLinearControlFlow { .. })),
+            "non-trivial body must surface the linearisation warning"
         );
         let func = &extraction.functions[0];
-        // The condition's STATUS read is still collected (linearised).
+        // No access carries the PollingLoop flow — the body forced
+        // the slice-2.b linearisation path.
+        assert!(
+            func.accesses.iter().all(|a| a.flow == AccessFlow::Linear),
+            "linearised accesses must not be marked PollingLoop"
+        );
+        // Every emitted access maps to either the condition's STATUS
+        // read or the body's CTRL.tx_start write. The exact count
+        // depends on how many times the body subtree is visited; what
+        // matters is the flow flag stays Linear.
+        assert!(!func.accesses.is_empty());
+    }
+
+    #[test]
+    fn slice2c_falls_back_when_condition_is_not_a_single_read() {
+        // while (UART->STATUS.bit.tx_busy && some_flag) ;
+        // The condition is a binary && — slice 2.c cannot recognise
+        // it as a single register read. Falls back to slice-2.b
+        // linearisation; the single accessor reachable inside the &&
+        // is still collected as a Linear read.
+        let cond_lhs = member_expr_chain(
+            "UART",
+            &[("STATUS", true), ("bit", false), ("tx_busy", false)],
+        );
+        let cond = serde_json::json!({
+            "kind": "BinaryOperator",
+            "opcode": "&&",
+            "inner": [
+                cond_lhs,
+                { "kind": "DeclRefExpr", "referencedDecl": { "name": "some_flag" } },
+            ],
+        });
+        let while_stmt = serde_json::json!({
+            "kind": "WhileStmt",
+            "loc": { "line": 7 },
+            "inner": [cond, { "kind": "NullStmt" }],
+        });
+        let ast = fake_ast_with_body("poll", 5, "uart.c", "void (void)", vec![while_stmt]);
+        let rm = uart_register_map();
+        let opts = CExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let extraction =
+            extract_from_ast_json_with_options(&ast, "", std::path::Path::new("uart.c"), &opts)
+                .unwrap();
+        assert!(
+            extraction
+                .warnings
+                .iter()
+                .any(|w| matches!(w, CExtractWarning::NonLinearControlFlow { .. }))
+        );
+        let func = &extraction.functions[0];
         assert_eq!(func.accesses.len(), 1);
-        assert_eq!(func.accesses[0].kind, AccessKind::Read);
+        assert_eq!(func.accesses[0].flow, AccessFlow::Linear);
+    }
+
+    #[test]
+    fn slice2c_polling_loop_emits_three_transitions_on_same_label() {
+        // Synthesis test against a PollingLoop access.
+        let accesses = vec![RegisterAccess {
+            kind: AccessKind::Read,
+            register: "STATUS".to_string(),
+            field: Some("tx_busy".to_string()),
+            accessor: "UART->STATUS.bit.tx_busy".to_string(),
+            source_line: 7,
+            flow: AccessFlow::PollingLoop,
+        }];
+        let rm = uart_register_map();
+        let ctxdsl = synthesise_automaton_ctxdsl("poll", &accesses, &rm);
+        // The Loop state and main-line state both exist.
+        assert!(ctxdsl.contains("state Loop0"));
+        assert!(ctxdsl.contains("state S1"));
+        // Three transitions on the same rd_status_tx_busy label.
+        let occurrences = ctxdsl.matches("rd_status_tx_busy").count();
+        assert!(
+            occurrences >= 3,
+            "expected ≥3 rd_status_tx_busy occurrences (enter/iterate/exit), got {occurrences} in:\n{ctxdsl}"
+        );
+        assert!(ctxdsl.contains("S0 -> Loop0 on label rd_status_tx_busy"));
+        assert!(ctxdsl.contains("Loop0 -> Loop0 on label rd_status_tx_busy"));
+        assert!(ctxdsl.contains("Loop0 -> S1 on label rd_status_tx_busy"));
     }
 
     #[test]
@@ -1589,6 +1960,7 @@ mod tests {
                 field: Some("tx_busy".to_string()),
                 accessor: "UART->STATUS.bit.tx_busy".to_string(),
                 source_line: 5,
+                flow: AccessFlow::Linear,
             },
             RegisterAccess {
                 kind: AccessKind::Write,
@@ -1596,6 +1968,7 @@ mod tests {
                 field: Some("byte".to_string()),
                 accessor: "UART->DATA.byte".to_string(),
                 source_line: 6,
+                flow: AccessFlow::Linear,
             },
             RegisterAccess {
                 kind: AccessKind::Write,
@@ -1603,6 +1976,7 @@ mod tests {
                 field: Some("tx_start".to_string()),
                 accessor: "UART->CTRL.bit.tx_start".to_string(),
                 source_line: 7,
+                flow: AccessFlow::Linear,
             },
         ];
         let rm = uart_register_map();
@@ -1676,12 +2050,19 @@ mod tests {
         assert_eq!(func.accesses.len(), 3);
         assert_eq!(func.accesses[0].kind, AccessKind::Read);
         assert_eq!(func.accesses[0].register, "STATUS");
+        // Slice 2.c: the polling loop's status read is marked
+        // PollingLoop so the synthesiser emits the Polling state.
+        assert_eq!(func.accesses[0].flow, AccessFlow::PollingLoop);
         assert_eq!(func.accesses[1].kind, AccessKind::Write);
         assert_eq!(func.accesses[1].register, "DATA");
+        assert_eq!(func.accesses[1].flow, AccessFlow::Linear);
         assert_eq!(func.accesses[2].kind, AccessKind::Write);
         assert_eq!(func.accesses[2].register, "CTRL");
+        assert_eq!(func.accesses[2].flow, AccessFlow::Linear);
         let ctxdsl = func.automaton_ctxdsl.as_ref().expect("automaton emitted");
         assert!(ctxdsl.contains("automaton Uart_send"));
+        // The synthesised automaton has the canonical Polling state.
+        assert!(ctxdsl.contains("state Loop0"));
         assert!(ctxdsl.contains("rd_status_tx_busy"));
         assert!(ctxdsl.contains("wr_data_byte"));
         assert!(ctxdsl.contains("wr_ctrl_tx_start"));
