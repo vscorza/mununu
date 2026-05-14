@@ -1,15 +1,16 @@
-# LinkedIn post — A contract corpus for hardware verification: walking a TLS handshake
+# LinkedIn post — A TLS handshake with closed-IP AES — and what shared contracts buy you
 
 > **Draft for LinkedIn.** Target: 150–200 words. Source artefact: `examples/industrial/tls_handshake/`. Do not publish until the four-gate validation checklist in `examples/industrial/tls_handshake/publications/README.md` passes.
 
 ---
 
-Every TLS device on the planet wires an open handshake state machine to a few closed-IP crypto blocks — AES, RNG, sometimes HMAC. Verifying the handshake requires *some* assumption about what those blocks do. Hand-writing a fresh contract for every project is wasted work — most of those contracts are about the same well-known IP.
+Every commercial TLS termination device — smart NIC, HSM, edge-gateway accelerator — wires an open handshake state machine to a few closed-IP crypto blocks: AES, RNG, occasionally HMAC. Verifying the handshake requires *some* assumption about what those blocks do. Hand-writing a fresh contract for every project is wasted work, because AES-CTR is AES-CTR. NIST SP 800-38A is the same standard, regardless of vendor.
 
-Mununu just shipped a contract corpus: a queryable repository of vetted black-box contracts. Vendors annotate their RTL with `@mununu_interface contract://rtl_crypto/aes_ctr@1.0.0?alt=strict_iv`; the discovery pipeline resolves the URI against the corpus and replaces the default chaotic stub with the vetted contract automatically. Misses are surfaced as structured diagnostics so you know what's missing.
+I wrote a worked example walking the architecture in every commercial TLS device. The AES core's wrapper carries a one-line annotation pointing at a shared library entry; the discovery pipeline resolves it and replaces the default chaotic stub with the vetted contract automatically. The default `output_sequencing` gap downgrades to `latency_bound` — what you'd gain locally is now a single missing clause, not a whole contract. The TRNG entry deliberately misses on purpose, demonstrating the structured diagnostic that tells you exactly what's missing.
 
-I wrote a worked example: a TLS handshake driving a closed-IP AES-CTR core and a closed-IP TRNG. The AES URI hits the corpus and the gap downgrades from `output_sequencing` to `latency_bound`. The TRNG URI misses on purpose, showing the user the missing-contract diagnostic. Every command runs against the open-source mununu binary on main; the transcript is byte-deterministic, regenerable by running `./examples/industrial/tls_handshake/validate.sh`.
+Safety properties hold over all reachable composed states under chaotic crypto. A liveness verdict would still need a vendor-supplied latency-bound contract — the gap report says so.
 
+Reproducible end-to-end: `./examples/industrial/tls_handshake/validate.sh`.
 Full write-up: [Substack link TBD].
 Code: github.com/vscorza/mununu.
 
