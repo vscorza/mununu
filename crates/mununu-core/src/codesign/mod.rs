@@ -35,6 +35,7 @@
 //! extraction + `@mununu_*` C wrappers). IP-XACT and SystemRDL
 //! importers are deferred sibling tasks under C6's umbrella.
 
+pub mod c_extract;
 pub mod compose;
 pub mod coupling;
 pub mod register_map;
