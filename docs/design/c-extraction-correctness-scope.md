@@ -1,16 +1,25 @@
 # C extraction correctness scope (Doc C §C.5b)
 
-> Status: design / decision note. Cited from
+> Status: historical note + bounded soundness statement for the
+> shipped LLVM-IR-based C extractor. Cited from
 > [`docs/design/hw-sw-codesign-extraction.md`](hw-sw-codesign-extraction.md)
-> §C.5 and from the slice-implementation comments in
-> [`crates/mununu-core/src/codesign/c_extract.rs`](../../crates/mununu-core/src/codesign/c_extract.rs).
+> §C.5 and from the module-level comments in
+> [`crates/mununu-core/src/codesign/c_extract_llvm.rs`](../../crates/mununu-core/src/codesign/c_extract_llvm.rs).
 >
-> The document bounds the **correctness claims** the C extractor makes
-> today and names the principled alternative (LLVM-IR / CFG /
-> predicate abstraction) the project would need to switch to if those
-> bounds proved insufficient. It is not a roadmap commitment — it is
-> the explicit "stop and evaluate" gate the project commits to running
-> before adding any further C-extraction slices.
+> **Update (phase L3)**: the project switched from the AST-pattern
+> approach this document originally argued *against* to the
+> principled LLVM-IR / CFG approach. The "stop and evaluate" gate
+> §4.5 names fired with motivating-example trigger (2) — the queue
+> of slice-2.c-and-beyond examples grew to six concrete cases, and
+> the switch was authorised. The implementation roadmap is at
+> `~/.claude/plans/i-want-you-to-distributed-orbit.md`; phases L1
+> (IR parser), L2 (register-access matcher), L3 (polling-loop
+> detection + bit-field RMW collapsing + AST backend removal) have
+> shipped.
+>
+> Sections 1–3 below describe the *original* AST-pattern approach
+> and its limitations — they're kept for historical context. Section
+> 4 was the proposed alternative and is now the shipped backend.
 
 ## 1. What the C extractor currently does
 

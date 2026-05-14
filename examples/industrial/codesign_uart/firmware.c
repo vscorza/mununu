@@ -2,16 +2,16 @@
  * firmware.c — the C-side of the Document C §C.4 codesign example.
  *
  * The hand-authored CTXDSL automaton at `firmware.ctxdsl` was written
- * from this source. As of M4 / Doc C task C5 slice 2.b, `mununu
- * codesign extract-c` can walk this file and emit a linear CTXDSL
- * automaton on the same rendezvous-label alphabet — see
- * `extract-c-demo.sh` next to this file.
+ * from this source. As of M4 / Doc C phase L3, `mununu codesign
+ * extract-c` walks this file via the LLVM-IR backend and emits a
+ * matching CTXDSL automaton with polling-loop detection and
+ * bit-field RMW collapsing — see `extract-c-demo.sh` next to this
+ * file.
  *
  * The `UART_TypeDef` shape mirrors the canonical Cortex-M HAL
  * convention (`UART->CTRL.bit.tx_start`, `UART->STATUS.bit.tx_busy`,
- * `UART->DATA.byte`) so the reconstructed accessor strings line up
- * with the `c_accessor` field on each register-map entry. The values
- * 0x40010000 / 0x4 / 0x8 match the offsets in `register_map.json`.
+ * `UART->DATA.byte`). The base address 0x40010000 + offsets 0/4/8
+ * match `register_map.json`.
  *
  * ILLUSTRATIVE — this is not derived from any specific vendor SDK;
  * the shape is industry-standard but the addresses + naming are
@@ -43,14 +43,13 @@ typedef struct {
     } DATA;
 } UART_TypeDef;
 
-/* In a real linker script `UART` would resolve to the peripheral's
- * base address (here 0x40010000). For the model-extraction demo we
- * keep it as an extern declaration so clang's AST emits a
- * DeclRefExpr the body walker can match against the register-map's
- * `c_accessor` strings (`UART->CTRL.bit.tx_start`, …). Slice 2.b
- * pre-expands #define-based base-pointers away; the extern form is
- * the canonical recipe Doc C §C.5 names as the work-around. */
-extern volatile UART_TypeDef *const UART;
+/* Canonical STM32/NXP/Microchip HAL convention: the peripheral
+ * base pointer is a `#define` macro that resolves to a literal
+ * address at compile time. The LLVM-IR backend doesn't care
+ * which spelling the C source uses — clang's IR has the address
+ * either way. See `firmware_macro.c` for the macro-form variant
+ * tested side-by-side for parity. */
+#define UART ((volatile UART_TypeDef *)0x40010000u)
 
 /**
  * @brief Send one byte through the UART peripheral.

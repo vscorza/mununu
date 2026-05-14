@@ -378,6 +378,372 @@ fn summarise_function(
 }
 
 // --------------------------------------------------------------------
+// Phase L3 / L4: pre-pass plan — polling loops + bit-field RMW.
+// --------------------------------------------------------------------
+
+/// Pre-pass output used by [`extract_register_accesses`] to refine
+/// what it emits.
+///
+/// Phase L3 + L4 both belong here because they're recognised by
+/// looking at IR shapes *before* the linear walker decides what to
+/// emit. Keeping the recognition in a pre-pass leaves the walker
+/// itself simple.
+#[derive(Debug, Default)]
+struct ExtractionPlan {
+    /// Phase L3: SSA names of `load volatile` instructions that are
+    /// the polling read of a `while (cond) ;`-style loop. These get
+    /// emitted with `flow: PollingLoop` rather than `Linear`.
+    polling_loop_loads: std::collections::HashSet<String>,
+    /// Phase L3: basic-block labels that are the back-edge body of a
+    /// polling loop. The walker skips them entirely — they have no
+    /// register accesses by construction.
+    skip_blocks: std::collections::HashSet<String>,
+    /// Phase L4: SSA names of `load volatile` instructions that are
+    /// the read half of a bit-field read-modify-write sequence.
+    /// These are silently consumed; the matching store gets
+    /// resolved with [`Self::rmw_store_field`] instead of the
+    /// default first-field fallback.
+    rmw_consumed_loads: std::collections::HashSet<String>,
+    /// Phase L4: SSA name of a `store volatile` → name of the field
+    /// whose bits the RMW touches. The walker uses this to emit the
+    /// right field on the store side.
+    rmw_store_field: std::collections::HashMap<String, String>,
+}
+
+/// Build the pre-pass plan for a function. Scans the function once
+/// and records every polling loop + every bit-field RMW pattern it
+/// finds.
+fn build_extraction_plan(
+    f: &crate::llvm_ir::Function,
+    rm: &RegisterMap,
+    ssa_defs: &HashMap<&str, &Instruction>,
+) -> ExtractionPlan {
+    let mut plan = ExtractionPlan::default();
+
+    // --- Phase L4 pre-pass: bit-field RMW recognition. ---
+    //
+    // For each `store volatile`, check whether the stored value is
+    // `or (and (load volatile %ptr, MASK), BITS)` where the load
+    // reads from the same pointer the store writes to. If so:
+    //   - mark the load as `rmw_consumed_loads` (skip it),
+    //   - compute the touched-bit mask from `(~MASK) | BITS`,
+    //   - find the register-map field whose bit range overlaps the
+    //     touched bits and record it under `rmw_store_field`.
+    for bb in &f.basic_blocks {
+        for instr in &bb.instructions {
+            let Instruction::Store {
+                value: crate::llvm_ir::ValueOperand::Ssa(store_value_ssa),
+                dest: store_dest,
+                volatile: true,
+                ..
+            } = instr
+            else {
+                continue;
+            };
+            // store value should trace back to `or (and load_result, BITS)`.
+            let Some(or_instr) = ssa_defs.get(store_value_ssa.as_str()) else {
+                continue;
+            };
+            let (or_a, or_b) = match or_instr {
+                Instruction::BinaryOp {
+                    op: crate::llvm_ir::BinaryOp::Or,
+                    a,
+                    b,
+                    ..
+                } => (a, b),
+                _ => continue,
+            };
+            let (and_ssa, or_bits) = match (or_a, or_b) {
+                (
+                    crate::llvm_ir::ValueOperand::Ssa(and_ssa),
+                    crate::llvm_ir::ValueOperand::LiteralInt(bits),
+                )
+                | (
+                    crate::llvm_ir::ValueOperand::LiteralInt(bits),
+                    crate::llvm_ir::ValueOperand::Ssa(and_ssa),
+                ) => (and_ssa.clone(), *bits),
+                _ => continue,
+            };
+            let Some(and_instr) = ssa_defs.get(and_ssa.as_str()) else {
+                continue;
+            };
+            let (and_load_ssa, and_mask) = match and_instr {
+                Instruction::BinaryOp {
+                    op: crate::llvm_ir::BinaryOp::And,
+                    a,
+                    b,
+                    ..
+                } => match (a, b) {
+                    (
+                        crate::llvm_ir::ValueOperand::Ssa(load_ssa),
+                        crate::llvm_ir::ValueOperand::LiteralInt(mask),
+                    )
+                    | (
+                        crate::llvm_ir::ValueOperand::LiteralInt(mask),
+                        crate::llvm_ir::ValueOperand::Ssa(load_ssa),
+                    ) => (load_ssa.clone(), *mask),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            // The and's first operand must be a volatile load whose
+            // source is the same pointer as the store's dest.
+            let Some(load_instr) = ssa_defs.get(and_load_ssa.as_str()) else {
+                continue;
+            };
+            let Instruction::Load {
+                source: load_source,
+                volatile: true,
+                ..
+            } = load_instr
+            else {
+                continue;
+            };
+            if load_source != store_dest {
+                continue;
+            }
+            // Compute touched bits. AND mask `M` means bits ~M are
+            // cleared; OR with BITS sets those bits. So the touched
+            // set is (`~M`) ∪ `BITS`. We treat as u64 for the bit-set
+            // computation.
+            let touched: u64 = ((!and_mask as u64) | (or_bits as u64)) & 0xFFFF_FFFF;
+            // Match touched bits against register fields. We need to
+            // know which register the store targets — resolve its
+            // pointer through the SSA defs.
+            let Some(addr) = resolve_pointer(store_dest, ssa_defs) else {
+                continue;
+            };
+            let register = match &addr {
+                ResolvedAddress::GlobalFieldIndex { field_index, .. } => {
+                    let Ok(idx) = usize::try_from(*field_index) else {
+                        continue;
+                    };
+                    let Some(r) = rm.registers.get(idx) else {
+                        continue;
+                    };
+                    r
+                }
+                ResolvedAddress::AbsoluteAddress(abs) => {
+                    let Some(base) = rm.base_address_value() else {
+                        continue;
+                    };
+                    let Some(r) = rm.registers.iter().find(|r| {
+                        let lo = base.wrapping_add(r.offset);
+                        let hi = lo.wrapping_add(u64::from(r.width_bits / 8));
+                        *abs >= lo && *abs < hi
+                    }) else {
+                        continue;
+                    };
+                    r
+                }
+                ResolvedAddress::InlineConstexprGep {
+                    base_addr,
+                    field_index,
+                } => {
+                    let Some(map_base) = rm.base_address_value() else {
+                        continue;
+                    };
+                    if *base_addr != map_base {
+                        continue;
+                    }
+                    let Ok(idx) = usize::try_from(*field_index) else {
+                        continue;
+                    };
+                    let Some(r) = rm.registers.get(idx) else {
+                        continue;
+                    };
+                    r
+                }
+            };
+            let touched_field = register.fields.iter().find(|fld| {
+                // Field's bit range is [fld.bits[0] .. fld.bits[1]].
+                let mut mask: u64 = 0;
+                for b in fld.bits[0]..=fld.bits[1] {
+                    mask |= 1u64 << b;
+                }
+                touched & mask != 0
+            });
+            let Some(touched_field) = touched_field else {
+                continue;
+            };
+            plan.rmw_consumed_loads.insert(and_load_ssa);
+            // Identify the store by its dest pointer SSA — there's
+            // only one store per (load, store) pair in this pattern.
+            if let PointerOperand::Ssa(dest_ssa) = store_dest {
+                // We key by the store-value's SSA so the walker can
+                // look it up at emit time.
+                plan.rmw_store_field
+                    .insert(store_value_ssa.clone(), touched_field.name.clone());
+                let _ = dest_ssa; // currently unused; kept for clarity.
+            }
+        }
+    }
+
+    // --- Phase L3 pre-pass: polling-loop recognition. ---
+    //
+    // A loop header H satisfies:
+    //   - H's terminator is `BrCond { cond, if_true, if_false }`.
+    //   - One of {if_true, if_false} (call it B, the back-edge body)
+    //     has terminator `Br { target: H }` and no volatile
+    //     loads/stores in its instructions.
+    //   - H contains exactly one volatile load whose result feeds
+    //     `cond` (directly or via an `icmp` whose operand chains
+    //     back to the load).
+    for header in &f.basic_blocks {
+        let Terminator::BrCond {
+            cond,
+            if_true,
+            if_false,
+        } = &header.terminator
+        else {
+            continue;
+        };
+        // Find the back-edge body — the successor that branches back
+        // to the header and has no register accesses.
+        let candidate_back_edges = [if_true, if_false];
+        let back_edge_label = candidate_back_edges.iter().find(|&succ_label| {
+            let succ = f.basic_blocks.iter().find(|b| &b.label == *succ_label);
+            let Some(succ) = succ else { return false };
+            if !matches!(
+                succ.terminator,
+                Terminator::Br { ref target } if target == &header.label
+            ) {
+                return false;
+            }
+            // The back-edge body must have no volatile loads/stores.
+            !succ.instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::Load { volatile: true, .. }
+                        | Instruction::Store { volatile: true, .. }
+                )
+            })
+        });
+        let Some(&back_edge_label) = back_edge_label else {
+            continue;
+        };
+
+        // Find the single volatile load in the header.
+        let volatile_loads: Vec<&Instruction> = header
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Load { volatile: true, .. }))
+            .collect();
+        if volatile_loads.len() != 1 {
+            continue;
+        }
+        let load = volatile_loads[0];
+        let Instruction::Load {
+            result: load_result,
+            ..
+        } = load
+        else {
+            continue;
+        };
+        // Trace cond back to confirm it depends on this load.
+        let cond_ssa = match cond {
+            crate::llvm_ir::ValueOperand::Ssa(s) => s,
+            _ => continue,
+        };
+        if !value_depends_on(cond_ssa, load_result, ssa_defs) {
+            continue;
+        }
+
+        plan.polling_loop_loads.insert(load_result.clone());
+        plan.skip_blocks.insert(back_edge_label.clone());
+    }
+
+    plan
+}
+
+/// Returns `true` when the SSA value rooted at `start_ssa` transitively
+/// depends on `target_ssa` via the instructions in `ssa_defs`. Used
+/// to confirm a `cond` traces back to a polling-loop's volatile load.
+fn value_depends_on(
+    start_ssa: &str,
+    target_ssa: &str,
+    ssa_defs: &HashMap<&str, &Instruction>,
+) -> bool {
+    if start_ssa == target_ssa {
+        return true;
+    }
+    let mut stack: Vec<&str> = vec![start_ssa];
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        if name == target_ssa {
+            return true;
+        }
+        let Some(instr) = ssa_defs.get(name) else {
+            continue;
+        };
+        for operand in operand_ssas(instr) {
+            stack.push(operand);
+        }
+    }
+    false
+}
+
+/// Collect the SSA names an instruction's operands reference. Phase
+/// L3's `value_depends_on` walks this graph backward.
+fn operand_ssas<'a>(instr: &'a Instruction) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    let push_pointer = |out: &mut Vec<&'a str>, p: &'a PointerOperand| {
+        if let PointerOperand::Ssa(s) = p {
+            out.push(s);
+        }
+    };
+    let push_value = |out: &mut Vec<&'a str>, v: &'a crate::llvm_ir::ValueOperand| {
+        if let crate::llvm_ir::ValueOperand::Ssa(s) = v {
+            out.push(s);
+        }
+    };
+    match instr {
+        Instruction::Load { source, .. } => push_pointer(&mut out, source),
+        Instruction::Store { value, dest, .. } => {
+            push_value(&mut out, value);
+            push_pointer(&mut out, dest);
+        }
+        Instruction::Gep { base, indices, .. } => {
+            push_pointer(&mut out, base);
+            for idx in indices {
+                if let GepIndex::Dynamic(s) = idx {
+                    out.push(s);
+                }
+            }
+        }
+        Instruction::BinaryOp { a, b, .. } | Instruction::Icmp { a, b, .. } => {
+            push_value(&mut out, a);
+            push_value(&mut out, b);
+        }
+        Instruction::Trunc { source, .. }
+        | Instruction::ZExt { source, .. }
+        | Instruction::SExt { source, .. }
+        | Instruction::Bitcast { source, .. }
+        | Instruction::PtrToInt { source, .. } => out.push(source),
+        Instruction::Phi { incoming, .. } => {
+            for (val, _) in incoming {
+                push_value(&mut out, val);
+            }
+        }
+        Instruction::Call { args, .. } => {
+            for arg in args {
+                // args are raw token strings; pick the ones that start with %.
+                if let Some(rest) = arg.strip_prefix('%')
+                    && !rest.is_empty()
+                {
+                    out.push(rest);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+// --------------------------------------------------------------------
 // Phase L2: register-access identification from IR.
 // --------------------------------------------------------------------
 
@@ -392,6 +758,12 @@ enum ResolvedAddress {
     /// An inline-constant byte address — `*(volatile T *)0x40010000`
     /// or an `inttoptr` instruction with a literal value.
     AbsoluteAddress(u64),
+    /// An inline `getelementptr` constexpr over an `inttoptr` literal,
+    /// the shape clang emits for `MACRO->FIELD` accesses where `MACRO`
+    /// is `#define`d to a literal address. The matcher resolves this
+    /// against the register map by checking `base_addr == map.base`
+    /// and using `field_index` as the register position.
+    InlineConstexprGep { base_addr: u64, field_index: i64 },
 }
 
 /// Walk `f`'s `load volatile` / `store volatile` instructions in
@@ -403,11 +775,8 @@ fn extract_register_accesses(
     warnings: &mut Vec<LlvmExtractWarning>,
 ) -> Vec<RegisterAccess> {
     // Build an SSA-name → producing-instruction lookup over the
-    // whole function. Phase L2 only needs read-only traversal; the
-    // lookup is keyed by the SSA `result` field. Source-order
-    // iteration on the basic-block list gives us the natural
-    // dominance ordering for the in-source-order patterns clang
-    // emits at `-O0`.
+    // whole function. The plan below uses it for backwards-tracing
+    // (e.g. resolving a store's value through `or → and → load`).
     let mut ssa_defs: HashMap<&str, &Instruction> = HashMap::new();
     for bb in &f.basic_blocks {
         for instr in &bb.instructions {
@@ -417,32 +786,66 @@ fn extract_register_accesses(
         }
     }
 
+    let plan = build_extraction_plan(f, rm, &ssa_defs);
+
     let mut accesses: Vec<RegisterAccess> = Vec::new();
     let mut current_line: u32 = 0;
     for bb in &f.basic_blocks {
-        // Approximate source-line ordering by basic-block traversal —
-        // phase L2 doesn't have real source-line info because the IR
-        // doesn't carry !dbg metadata by default. We use a monotonic
-        // counter so the synthesiser's S0 → S1 → ... numbering stays
-        // stable.
+        if plan.skip_blocks.contains(&bb.label) {
+            // Phase L3: skip the polling-loop's back-edge body. It
+            // has no register accesses by construction.
+            continue;
+        }
+        // Approximate source-line ordering by basic-block traversal.
         for instr in &bb.instructions {
             current_line = current_line.saturating_add(1);
-            let (pointer, kind) = match instr {
+            let (pointer, kind, instr_result) = match instr {
                 Instruction::Load {
                     volatile: true,
                     source,
+                    result,
                     ..
-                } => (source, AccessKind::Read),
+                } => (source, AccessKind::Read, Some(result.as_str())),
+                Instruction::Store {
+                    volatile: true,
+                    dest,
+                    value: crate::llvm_ir::ValueOperand::Ssa(value_ssa),
+                    ..
+                } => (dest, AccessKind::Write, Some(value_ssa.as_str())),
                 Instruction::Store {
                     volatile: true,
                     dest,
                     ..
-                } => (dest, AccessKind::Write),
+                } => (dest, AccessKind::Write, None),
                 _ => continue,
             };
+            // Phase L4: drop loads consumed by a bit-field RMW.
+            if let (AccessKind::Read, Some(r)) = (kind, instr_result)
+                && plan.rmw_consumed_loads.contains(r)
+            {
+                continue;
+            }
             match resolve_pointer(pointer, &ssa_defs) {
                 Some(addr) => {
-                    if let Some(access) = match_address_to_register(&addr, rm, kind, current_line) {
+                    let field_override = if kind == AccessKind::Write {
+                        instr_result.and_then(|r| plan.rmw_store_field.get(r).cloned())
+                    } else {
+                        None
+                    };
+                    let flow = match (kind, instr_result) {
+                        (AccessKind::Read, Some(r)) if plan.polling_loop_loads.contains(r) => {
+                            AccessFlow::PollingLoop
+                        }
+                        _ => AccessFlow::Linear,
+                    };
+                    if let Some(access) = match_address_to_register(
+                        &addr,
+                        rm,
+                        kind,
+                        current_line,
+                        flow,
+                        field_override.as_deref(),
+                    ) {
                         accesses.push(access);
                     } else {
                         warnings.push(LlvmExtractWarning::UnknownAccessor {
@@ -456,6 +859,10 @@ fn extract_register_accesses(
                         PointerOperand::Ssa(s) => s.clone(),
                         PointerOperand::Global(g) => format!("@{g}"),
                         PointerOperand::InlineConstAddr(a) => format!("0x{a:x}"),
+                        PointerOperand::InlineGep {
+                            base_addr,
+                            field_index,
+                        } => format!("inline_gep(0x{base_addr:x}, field {field_index})"),
                     };
                     warnings.push(LlvmExtractWarning::UnresolvedPointer {
                         function: f.name.clone(),
@@ -464,8 +871,6 @@ fn extract_register_accesses(
                 }
             }
         }
-        // Walk through conditional/unconditional branches to keep the
-        // current-line counter advancing across basic blocks.
         if let Terminator::Br { .. } | Terminator::BrCond { .. } = bb.terminator {
             current_line = current_line.saturating_add(1);
         }
@@ -511,6 +916,13 @@ fn resolve_pointer(
             field_index: 0,
         }),
         PointerOperand::InlineConstAddr(addr) => Some(ResolvedAddress::AbsoluteAddress(*addr)),
+        PointerOperand::InlineGep {
+            base_addr,
+            field_index,
+        } => Some(ResolvedAddress::InlineConstexprGep {
+            base_addr: *base_addr,
+            field_index: *field_index,
+        }),
         PointerOperand::Ssa(name) => {
             let def = ssa_defs.get(name.as_str())?;
             resolve_instruction_as_address(def, ssa_defs)
@@ -556,11 +968,21 @@ fn resolve_instruction_as_address(
                         field_index,
                     })
                 }
-                ResolvedAddress::AbsoluteAddress(_) => {
-                    // GEP through a literal address — not yet
-                    // supported; would need struct-layout info to
-                    // compute byte offset.
-                    None
+                ResolvedAddress::AbsoluteAddress(addr) => {
+                    // GEP through a literal address — synthesise an
+                    // InlineConstexprGep with the base + new field
+                    // index. Phase L4 may refine this with proper
+                    // byte-offset reasoning.
+                    Some(ResolvedAddress::InlineConstexprGep {
+                        base_addr: addr,
+                        field_index,
+                    })
+                }
+                ResolvedAddress::InlineConstexprGep { base_addr, .. } => {
+                    Some(ResolvedAddress::InlineConstexprGep {
+                        base_addr,
+                        field_index,
+                    })
                 }
             }
         }
@@ -609,6 +1031,8 @@ fn match_address_to_register(
     rm: &RegisterMap,
     kind: AccessKind,
     source_line: u32,
+    flow: AccessFlow,
+    field_override: Option<&str>,
 ) -> Option<RegisterAccess> {
     let register: &Register = match addr {
         ResolvedAddress::GlobalFieldIndex { field_index, .. } => {
@@ -625,17 +1049,33 @@ fn match_address_to_register(
                 *abs >= lo && *abs < hi
             })?
         }
+        ResolvedAddress::InlineConstexprGep {
+            base_addr,
+            field_index,
+        } => {
+            // Match the constexpr base against the register-map
+            // peripheral base. Mismatch → no register; the caller
+            // surfaces an UnknownAccessor warning.
+            let map_base = rm.base_address_value()?;
+            if *base_addr != map_base {
+                return None;
+            }
+            let idx = usize::try_from(*field_index).ok()?;
+            rm.registers.get(idx)?
+        }
     };
 
-    // Phase L2: when the register has fields, pick the field that
-    // looks like the canonical "first" field (lowest bit-range). A
-    // proper per-field expansion is phase L4. When the register has
-    // no fields, emit a whole-register access.
-    let field_name = register
-        .fields
-        .iter()
-        .min_by_key(|f| f.bits[0])
-        .map(|f| f.name.clone());
+    // Phase L4: when the bit-field RMW pre-pass identified which
+    // field a write touched, use that name. Otherwise fall back to
+    // the lowest-bit field (phase-L2 behaviour). Whole-register
+    // accesses with no fields emit `field: None`.
+    let field_name = field_override.map(str::to_string).or_else(|| {
+        register
+            .fields
+            .iter()
+            .min_by_key(|f| f.bits[0])
+            .map(|f| f.name.clone())
+    });
 
     Some(RegisterAccess {
         kind,
@@ -643,7 +1083,7 @@ fn match_address_to_register(
         field: field_name,
         accessor: format!("(IR-resolved @{addr:?})"),
         source_line,
-        flow: AccessFlow::Linear,
+        flow,
     })
 }
 
@@ -680,6 +1120,12 @@ define void @uart_send(i8 noundef zeroext %0) {
   %12 = load ptr, ptr @UART, align 8
   %13 = getelementptr inbounds %struct.UART_TypeDef, ptr %12, i32 0, i32 2
   store volatile i8 %11, ptr %13, align 4
+  %14 = load ptr, ptr @UART, align 8
+  %15 = getelementptr inbounds %struct.UART_TypeDef, ptr %14, i32 0, i32 0
+  %16 = load volatile i32, ptr %15, align 4
+  %17 = and i32 %16, -2
+  %18 = or i32 %17, 1
+  store volatile i32 %18, ptr %15, align 4
   ret void
 }
 "#;
@@ -694,8 +1140,10 @@ define void @uart_send(i8 noundef zeroext %0) {
         assert_eq!(f.num_parameters, 1);
         // entry + %3 + %9 + %10
         assert_eq!(f.num_basic_blocks, 4);
-        assert_eq!(f.num_volatile_loads, 1);
-        assert_eq!(f.num_volatile_stores, 1);
+        // 1 STATUS poll-load + 1 CTRL bit-field RMW load.
+        assert_eq!(f.num_volatile_loads, 2);
+        // 1 DATA write + 1 CTRL bit-field RMW store.
+        assert_eq!(f.num_volatile_stores, 2);
         assert_eq!(f.num_inttoptr, 0);
     }
 
@@ -808,22 +1256,23 @@ define void @uart_send(i8 noundef zeroext %0) {
 
     #[test]
     fn l2_extracts_two_volatile_accesses_in_firmware() {
-        // The FIRMWARE_IR fixture has one volatile load (STATUS) and
-        // one volatile store (DATA). Phase L2 must match both to
-        // register-map entries.
+        // The FIRMWARE_IR fixture now contains: a polling read of
+        // STATUS, a write to DATA, and a bit-field RMW on CTRL.
+        // L3+L4 must produce 3 accesses (polling read, DATA write,
+        // CTRL write — the RMW load is collapsed).
         let opts = LlvmExtractOptions {
             register_map: Some(uart_register_map()),
             ..Default::default()
         };
         let ext = extract_from_ir_text_with_options(FIRMWARE_IR, &opts).unwrap();
         let f = &ext.functions[0];
-        assert_eq!(f.accesses.len(), 2, "{:#?}", f.accesses);
-        // First access: load volatile from STATUS (field index 1).
+        assert_eq!(f.accesses.len(), 3, "{:#?}", f.accesses);
         assert_eq!(f.accesses[0].kind, AccessKind::Read);
         assert_eq!(f.accesses[0].register, "STATUS");
-        // Second access: store volatile to DATA (field index 2).
         assert_eq!(f.accesses[1].kind, AccessKind::Write);
         assert_eq!(f.accesses[1].register, "DATA");
+        assert_eq!(f.accesses[2].kind, AccessKind::Write);
+        assert_eq!(f.accesses[2].register, "CTRL");
     }
 
     #[test]
@@ -837,7 +1286,7 @@ define void @uart_send(i8 noundef zeroext %0) {
     }
 
     #[test]
-    fn l2_synthesises_linear_automaton_when_requested() {
+    fn l3_synthesises_automaton_with_polling_loop_state() {
         let opts = LlvmExtractOptions {
             register_map: Some(uart_register_map()),
             synthesize_automaton: true,
@@ -846,13 +1295,8 @@ define void @uart_send(i8 noundef zeroext %0) {
         let ext = extract_from_ir_text_with_options(FIRMWARE_IR, &opts).unwrap();
         let f = &ext.functions[0];
         let ctxdsl = f.automaton_ctxdsl.as_ref().expect("automaton emitted");
-        // Phase L2's linear synthesis: S0 → S1 → S2 with no Loop_i
-        // state. Phase L3 will add Loop0 for the polling loop.
         assert!(ctxdsl.contains("state S0 initial"));
-        assert!(ctxdsl.contains("state S1"));
-        assert!(ctxdsl.contains("state S2"));
-        assert!(!ctxdsl.contains("Loop0"), "phase L3 territory");
-        // Labels come from the rendezvous-label convention.
+        assert!(ctxdsl.contains("state Loop0"));
         assert!(ctxdsl.contains("rd_status_tx_busy"));
         assert!(ctxdsl.contains("wr_data_byte"));
     }
@@ -936,6 +1380,26 @@ define void @bad_index(i32 %0) {
 
     #[test]
     #[ignore]
+    fn debug_dump_plan() {
+        let m = crate::llvm_ir::parse_module(FIRMWARE_IR).unwrap();
+        let f = &m.functions[0];
+        let mut ssa_defs: HashMap<&str, &Instruction> = HashMap::new();
+        for bb in &f.basic_blocks {
+            for instr in &bb.instructions {
+                if let Some(result) = instruction_result(instr) {
+                    ssa_defs.insert(result, instr);
+                }
+            }
+        }
+        let plan = build_extraction_plan(f, &uart_register_map(), &ssa_defs);
+        eprintln!("polling_loop_loads: {:?}", plan.polling_loop_loads);
+        eprintln!("skip_blocks: {:?}", plan.skip_blocks);
+        eprintln!("rmw_consumed_loads: {:?}", plan.rmw_consumed_loads);
+        eprintln!("rmw_store_field: {:?}", plan.rmw_store_field);
+    }
+
+    #[test]
+    #[ignore]
     fn debug_dump_firmware_ir() {
         let m = crate::llvm_ir::parse_module(FIRMWARE_IR).unwrap();
         for f in &m.functions {
@@ -957,6 +1421,129 @@ define void @bad_index(i32 %0) {
         eprintln!("Warnings: {:#?}", ext.warnings);
     }
 
+    // ----------------------------------------------------------------
+    // Phase L3 / L4 tests — polling-loop + bit-field RMW.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn l3_polling_loop_detected_in_firmware_ir() {
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(FIRMWARE_IR, &opts).unwrap();
+        let status_read = &ext.functions[0].accesses[0];
+        assert_eq!(status_read.kind, AccessKind::Read);
+        assert_eq!(status_read.register, "STATUS");
+        assert_eq!(
+            status_read.flow,
+            AccessFlow::PollingLoop,
+            "polling-loop read must carry PollingLoop flow"
+        );
+    }
+
+    #[test]
+    fn l4_bitfield_rmw_collapses_to_single_write() {
+        // The IR carries a load-modify-store sequence on CTRL:
+        //   %16 = load volatile i32 ptr %15
+        //   %17 = and i32 %16, -2
+        //   %18 = or i32 %17, 1
+        //   store volatile i32 %18, ptr %15
+        // Phase L4 must drop the load and emit ONE write to
+        // CTRL.tx_start (bit 0).
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(FIRMWARE_IR, &opts).unwrap();
+        let ctrl_accesses: Vec<&RegisterAccess> = ext.functions[0]
+            .accesses
+            .iter()
+            .filter(|a| a.register == "CTRL")
+            .collect();
+        assert_eq!(ctrl_accesses.len(), 1, "RMW must collapse to one access");
+        assert_eq!(ctrl_accesses[0].kind, AccessKind::Write);
+        assert_eq!(ctrl_accesses[0].field.as_deref(), Some("tx_start"));
+    }
+
+    #[test]
+    fn l3_parity_with_slice2c_on_firmware_ir() {
+        // The full parity gate: the LLVM backend must produce the
+        // canonical S0 → Loop0 → S1 → S2 → S3 shape, same labels as
+        // slice 2.c's `synthesise_automaton_ctxdsl` would.
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(FIRMWARE_IR, &opts).unwrap();
+        let f = &ext.functions[0];
+        assert_eq!(f.accesses.len(), 3, "{:#?}", f.accesses);
+        let ctxdsl = f.automaton_ctxdsl.as_ref().unwrap();
+        // Loop state, post-loop state, two write states.
+        for marker in [
+            "state S0 initial",
+            "state Loop0",
+            "state S1",
+            "state S2",
+            "state S3",
+            "transition S0 -> Loop0 on label rd_status_tx_busy",
+            "transition Loop0 -> Loop0 on label rd_status_tx_busy",
+            "transition Loop0 -> S1 on label rd_status_tx_busy",
+            "transition S1 -> S2 on label wr_data_byte",
+            "transition S2 -> S3 on label wr_ctrl_tx_start",
+        ] {
+            assert!(
+                ctxdsl.contains(marker),
+                "missing marker `{marker}` in:\n{ctxdsl}"
+            );
+        }
+        assert!(
+            !ctxdsl.contains("state S4"),
+            "L3+L4 collapse must yield no S4"
+        );
+    }
+
+    #[test]
+    fn l4_bitfield_picks_field_from_or_bits_not_lowest_bit() {
+        // A bit-field write that targets a field at bits [4, 7] (not
+        // [0, 0]) must select that field, not fall back to the
+        // lowest-bit field.
+        let mut rm = uart_register_map();
+        // Append a higher-bit field to CTRL.
+        rm.registers[0].fields.push(Field {
+            name: "tx_mode".to_string(),
+            bits: [4, 7],
+            sv_signal: None,
+            c_accessor: Some("UART->CTRL.bit.tx_mode".to_string()),
+            description: None,
+        });
+        // IR: read CTRL, AND with 0xFFFFFF0F (clear bits 4-7), OR with
+        // 0x00000020 (set bit 5), store back.
+        let ir = r#"%struct.UART_TypeDef = type { i32, i32, i32 }
+@UART = external constant ptr, align 8
+define void @set_mode() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 0
+  %3 = load volatile i32, ptr %2, align 4
+  %4 = and i32 %3, -241
+  %5 = or i32 %4, 32
+  store volatile i32 %5, ptr %2, align 4
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(rm),
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(ir, &opts).unwrap();
+        let f = &ext.functions[0];
+        assert_eq!(f.accesses.len(), 1);
+        assert_eq!(f.accesses[0].kind, AccessKind::Write);
+        assert_eq!(f.accesses[0].register, "CTRL");
+        assert_eq!(f.accesses[0].field.as_deref(), Some("tx_mode"));
+    }
+
     #[test]
     fn l2_round_trips_warnings_through_serde() {
         let opts = LlvmExtractOptions {
@@ -967,6 +1554,6 @@ define void @bad_index(i32 %0) {
         let json = serde_json::to_string_pretty(&ext).unwrap();
         let parsed: LlvmExtraction = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.functions.len(), 1);
-        assert_eq!(parsed.functions[0].accesses.len(), 2);
+        assert_eq!(parsed.functions[0].accesses.len(), 3);
     }
 }

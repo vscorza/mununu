@@ -299,6 +299,14 @@ pub enum PointerOperand {
     /// Captured as a u64 so phase L2 can match against the
     /// register-map's base-address window.
     InlineConstAddr(u64),
+    /// `getelementptr inbounds (T, ptr inttoptr (i64 N to ptr), i32 0, i32 K)` —
+    /// an inline GEP constexpr clang generates when the base pointer
+    /// is a `#define` macro. Captured as base-address + field index
+    /// so phase L2's `match_address_to_register` can use the same
+    /// `GlobalFieldIndex` lookup path. Captures one inline-GEP form;
+    /// other shapes still surface as `Ssa(raw_text)` and trigger an
+    /// `UnresolvedPointer` warning.
+    InlineGep { base_addr: u64, field_index: i64 },
 }
 
 /// A value operand — what appears in non-pointer positions (the RHS
