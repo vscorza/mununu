@@ -82,9 +82,9 @@ The expected transcript is checked into `transcript.txt`.
 |---|---|
 | `register_map.json` | The UART_LITE register-map sidecar (Doc C §C.3.2 schema). Three registers (CTRL, STATUS, DATA) with per-field SV signal + C accessor mappings. |
 | `firmware.c` | The C source the firmware automaton corresponds to: `uart_send(uint8_t)` polls `STATUS.tx_busy`, writes `DATA.byte`, raises `CTRL.tx_start`. Carries `@mununu_guarantee` + `@mununu_assume` annotations the discovery pipeline lifts into proposed contract clauses. |
-| `firmware.ctxdsl` | Hand-authored firmware automaton modelling `uart_send(byte)`: Init → Polling → Ready → Sending → Init. Uses the rendezvous label names `mununu codesign couple` produces. Adds the polling self-loop, the internal `tick` cycle marker, and the system-reset transitions that slice 2.b's linear synthesiser cannot infer from the C source. |
+| `firmware.ctxdsl` | Hand-authored firmware automaton modelling `uart_send(byte)`: Init → Polling → Ready → Sending → Init. Uses the rendezvous label names `mununu codesign couple` produces. Adds the internal `tick` cycle marker and the system-reset transitions that slice 2.b/2.c's automatic synthesiser cannot infer from the C source alone. |
 | `validate.sh` | Reproduces the transcript end-to-end. Does **not** depend on clang — keeps the transcript reproducible on any host. |
-| `extract-c-demo.sh` | Opt-in demonstration of Doc C task C5 slice 2.b: runs `mununu codesign extract-c firmware.c --register-map register_map.json --synthesize-automaton` to lift the three register accesses (`rd_status_tx_busy`, `wr_data_byte`, `wr_ctrl_tx_start`) and synthesise the corresponding linear CTXDSL automaton. Requires `clang` on `$PATH`. |
+| `extract-c-demo.sh` | Opt-in demonstration of Doc C task C5 slices 2.b + 2.c: runs `mununu codesign extract-c firmware.c --register-map register_map.json --synthesize-automaton`. Lifts the three register accesses (`rd_status_tx_busy`, `wr_data_byte`, `wr_ctrl_tx_start`), recognises the `while (UART->STATUS.bit.tx_busy);` polling idiom as a state-creating construct (slice 2.c), and synthesises a CTXDSL automaton with the canonical S0 → Loop0 ⤴ → S1 → S2 → S3 shape. Requires `clang` on `$PATH`. |
 | `transcript.txt` | The byte-deterministic transcript `validate.sh` produces; cited as evidence. |
 
 ## Provenance

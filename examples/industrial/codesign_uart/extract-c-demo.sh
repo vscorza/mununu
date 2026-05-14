@@ -59,19 +59,28 @@ cat "$HAND_AUTHORED"
 
 printf '\n=== Comparison notes ===\n'
 cat <<'EOF'
-Slice 2.b produces a linear automaton with one state per matched register
-access in source order. The hand-authored automaton has the same set of
-rendezvous-label transitions but adds:
-  - A polling self-loop on the status read (a `while` body becomes the
-    Polling state with `rd_status_tx_busy` looping back to itself).
-  - Internal `tick` self-loops modelling cycles spent polling between
-    status reads (no syntactic anchor in the C source).
-  - Explicit `reset` transitions from every state back to Init for
-    system-level recovery.
+Slice 2.b produces a linear automaton with one state per matched
+register access in source order. Slice 2.c additionally recognises the
+canonical `while (cond) ;` polling idiom — when the loop's condition is
+a single register-access read and the body is empty or inert, it emits
+a dedicated `Loop_i` state with three transitions on the same access
+label (enter, iterate, exit). For `uart_send` the synthesised shape is
+now S0 → Loop0 ⤴ → S1 → S2 → S3, matching the hand-authored
+Init/Polling/Ready/Sending up to state-name renaming.
 
-Slice 2.c (Doc C §C.5 frontier) extends the body walker to recognise
-`while (cond)` and `if (cond) ... else` as state-creating constructs
-rather than linearising them. Until then, slice 2.b is the
-over-approximation baseline and the hand-authored CTXDSL is the
-canonical model the verifier consumes.
+Two structural gaps remain between the synthesised automaton and the
+hand-authored CTXDSL — both deliberate, neither blocking:
+  - Internal `tick` self-loops modelling cycles spent polling between
+    status reads. The C source has no syntactic anchor for these; they
+    represent the verifier's environment, not the firmware's source.
+  - Explicit `reset` transitions from every state back to Init for
+    system-level recovery. Reset is an environment event, not a
+    firmware-source construct.
+
+Anything beyond `while (single_read)` — `if/else`, `for` with a
+side-effecting body, `switch`, non-trivial condition expressions — still
+falls back to the slice-2.b linearisation with a structured
+`NonLinearControlFlow` warning. The hand-authored CTXDSL remains the
+canonical model whenever synthesis cannot represent a construct
+faithfully.
 EOF

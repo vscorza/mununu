@@ -195,6 +195,10 @@ Three places where the standard mununu soundness rules need codesign-specific ex
 - **Interrupt latency is an environment assumption.** Firmware-side properties typically rely on "interrupt service routine runs within N cycles of IRQ rising." This is a contract on the surrounding system (interrupt controller, CPU pipeline). Treat as a **top-level assumption** following Document A §3 stage-4 HITL approval. The contract sits at the *top* of the discharge graph; no peer guarantees it.
 - **Memory model for C extraction.** Embedded C is often not sequentially consistent (compiler reordering, weakly-ordered AHB). The C extractor **must declare its memory model**; properties about volatile / barrier-free access patterns require either an SC abstraction (under-approx → unsound for safety) or an explicit weak-memory composition. Recommend **SC as default with explicit warning**, since most embedded firmware code intends SC but doesn't always achieve it. The same `// SOUNDNESS:` comment discipline from `CLAUDE.md` applies — every memory-model choice must be documented at the extraction site.
 
+### C.5b C-extraction correctness scope
+
+The C extractor (Task C5) ships in slices. Each slice extends what the AST-level pattern matcher can faithfully represent without claiming formal equivalence to the C source. The bounds of what slices *can* and *cannot* prove, and the principled alternative (LLVM-IR / CFG / predicate abstraction) the project would switch to if AST pattern matching proved insufficient, live in [`docs/design/c-extraction-correctness-scope.md`](c-extraction-correctness-scope.md). Every PR that adds a slice beyond 2.c must re-read that document and document the trigger justifying the new slice; if no trigger fires the slice is paused and the principled-lift work is scoped out as a separate milestone.
+
 ## C.6 Industrial prioritisation within Document C
 
 Within HW/SW codesign, sub-cases ranked by tractability and industrial reach:
