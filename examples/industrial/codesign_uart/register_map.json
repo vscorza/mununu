@@ -66,8 +66,8 @@
           "name": "byte",
           "bits": [0, 7],
           "sv_signal": "uart_inst.data_reg",
-          "c_accessor": "UART->DATA",
-          "description": "8-bit data payload."
+          "c_accessor": "UART->DATA.byte",
+          "description": "8-bit data payload. The accessor matches the union member firmware writes in `firmware.c`."
         }
       ]
     }
