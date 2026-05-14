@@ -26,12 +26,17 @@
 //!   the coupling fragment into a user-authored firmware CTXDSL and
 //!   round-trip-validates the result through the parser. The CLI /
 //!   HTTP surfaces in `mununu-cli` and `api::handlers` consume it.
+//! - **C6 — CMSIS-SVD importer** in [`svd_import`]. Translates a
+//!   CMSIS-SVD XML file into one `RegisterMap` per peripheral. The
+//!   `sv_signal` and `c_accessor` fields start empty per Doc C
+//!   §C.9.6 — the user authors those post-import.
 //!
 //! Follow-up slices in §C.9 of the design doc: C5 (libclang C
-//! extraction + `@mununu_*` C wrappers), C6 (IP-XACT / CMSIS-SVD
-//! importer).
+//! extraction + `@mununu_*` C wrappers). IP-XACT and SystemRDL
+//! importers are deferred sibling tasks under C6's umbrella.
 
 pub mod compose;
 pub mod coupling;
 pub mod register_map;
+pub mod svd_import;
 pub mod trace;

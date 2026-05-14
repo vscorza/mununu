@@ -240,6 +240,25 @@ enum CodesignCommand {
     /// Compose a register-map sidecar with a firmware CTXDSL and
     /// verify a property over the result.
     Verify(CodesignVerifyArgs),
+    /// Import a CMSIS-SVD file into one register-map JSON per peripheral.
+    ImportSvd(CodesignImportSvdArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignImportSvdArgs {
+    /// Path to the CMSIS-SVD XML file.
+    #[arg(value_name = "SVD")]
+    svd: PathBuf,
+    /// Output directory for the imported register-map JSON files.
+    /// Default: write JSON to stdout (no files created).
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    /// Import only the named peripheral.
+    #[arg(long, value_name = "NAME")]
+    peripheral: Option<String>,
+    /// Treat any structural warning as a hard error.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -620,8 +639,89 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
 fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::Couple(args) => codesign_couple(args),
+        CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
     }
+}
+
+fn codesign_import_svd(args: CodesignImportSvdArgs) -> Result<(), String> {
+    use mununu::codesign::svd_import::import_svd;
+
+    let body = std::fs::read_to_string(&args.svd)
+        .map_err(|e| format!("failed to read {}: {e}", args.svd.display()))?;
+    let import = import_svd(&body).map_err(|e| format!("SVD import failed: {e}"))?;
+
+    for w in &import.warnings {
+        eprintln!("warning: {w}");
+    }
+    if args.strict && !import.warnings.is_empty() {
+        return Err(format!(
+            "--strict: {} SVD warning(s) — refusing to proceed",
+            import.warnings.len()
+        ));
+    }
+
+    let filtered: Vec<_> = match &args.peripheral {
+        Some(name) => import
+            .maps
+            .into_iter()
+            .filter(|m| m.peripheral == *name)
+            .collect(),
+        None => import.maps,
+    };
+
+    if filtered.is_empty() {
+        return Err(match args.peripheral {
+            Some(name) => format!("no peripheral named `{name}` in {}", args.svd.display()),
+            None => format!(
+                "SVD file {} contains no importable peripherals",
+                args.svd.display()
+            ),
+        });
+    }
+
+    if let Some(dir) = &args.out_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+        for map in &filtered {
+            let path = dir.join(format!(
+                "{}.json",
+                sanitize_filename_legacy(&map.peripheral)
+            ));
+            let json = serde_json::to_string_pretty(map)
+                .map_err(|e| format!("failed to serialise {}: {e}", map.peripheral))?;
+            std::fs::write(&path, json)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            eprintln!("wrote {} → {}", map.peripheral, path.display());
+        }
+        eprintln!(
+            "imported {} peripheral(s) from {}",
+            filtered.len(),
+            args.svd.display()
+        );
+    } else if filtered.len() == 1 {
+        let json = serde_json::to_string_pretty(&filtered[0])
+            .map_err(|e| format!("failed to serialise: {e}"))?;
+        println!("{json}");
+    } else {
+        let json = serde_json::to_string_pretty(&filtered)
+            .map_err(|e| format!("failed to serialise: {e}"))?;
+        println!("{json}");
+    }
+
+    Ok(())
+}
+
+fn sanitize_filename_legacy(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn codesign_couple(args: CodesignCoupleArgs) -> Result<(), String> {
