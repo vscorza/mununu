@@ -78,7 +78,8 @@ pub struct RendezvousLabel {
 }
 
 /// Kind of register access a `RendezvousLabel` represents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AccessKind {
     /// Firmware reads (peripheral may have written; firmware observes).
     Read,
@@ -140,25 +141,35 @@ pub fn register_map_labels(rm: &RegisterMap) -> Vec<RendezvousLabel> {
 }
 
 fn register_label(register: &Register, field: Option<&Field>, kind: AccessKind) -> RendezvousLabel {
-    let name = match field {
-        Some(f) => format!(
-            "{kind}_{reg}_{field}",
-            kind = kind.as_str(),
-            reg = sanitise_ident(&register.name),
-            field = sanitise_ident(&f.name)
-        ),
-        None => format!(
-            "{kind}_{reg}",
-            kind = kind.as_str(),
-            reg = sanitise_ident(&register.name)
-        ),
-    };
+    let name = rendezvous_label_name(&register.name, field.map(|f| f.name.as_str()), kind);
     RendezvousLabel {
         name,
         kind,
         register: register.name.clone(),
         field: field.map(|f| f.name.clone()),
         controllability: classify_access(register, kind),
+    }
+}
+
+/// Canonical rendezvous-label name for a register / field / access
+/// kind, matching the convention used by [`register_map_labels`].
+///
+/// Exposed so [`crate::codesign::c_extract`] (slice 2.b) can emit
+/// firmware-side transitions that synchronise with the peripheral
+/// stub on the exact same label spelling.
+pub fn rendezvous_label_name(register: &str, field: Option<&str>, kind: AccessKind) -> String {
+    match field {
+        Some(f) => format!(
+            "{kind}_{reg}_{field}",
+            kind = kind.as_str(),
+            reg = sanitise_ident(register),
+            field = sanitise_ident(f)
+        ),
+        None => format!(
+            "{kind}_{reg}",
+            kind = kind.as_str(),
+            reg = sanitise_ident(register)
+        ),
     }
 }
 

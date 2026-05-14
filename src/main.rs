@@ -269,6 +269,14 @@ struct CodesignExtractCArgs {
     /// Treat any warning as a hard error.
     #[arg(long)]
     strict: bool,
+    /// Path to a register-map JSON file. Enables slice-2.b body walk
+    /// + register-access matching.
+    #[arg(long = "register-map", value_name = "JSON")]
+    register_map: Option<PathBuf>,
+    /// Synthesise a linear CTXDSL automaton per function (requires
+    /// `--register-map`).
+    #[arg(long = "synthesize-automaton")]
+    synthesize_automaton: bool,
 }
 
 #[derive(Args, Debug)]
@@ -674,12 +682,46 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
 
 fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
     use mununu::codesign::c_extract::{CExtractOptions, extract_c_via_clang};
+    use mununu::codesign::register_map::RegisterMap;
+
+    let register_map = match args.register_map.as_ref() {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("failed to read register-map {}: {e}", path.display()))?;
+            let rm: RegisterMap = serde_json::from_slice(&bytes).map_err(|e| {
+                format!(
+                    "failed to parse register-map {} as JSON: {e}",
+                    path.display()
+                )
+            })?;
+            let issues = rm.validate();
+            if !issues.is_empty() {
+                for issue in &issues {
+                    eprintln!("register-map validation: {issue}");
+                }
+                return Err(format!(
+                    "register-map {} has {} validation issue(s) — refusing to proceed",
+                    path.display(),
+                    issues.len()
+                ));
+            }
+            Some(rm)
+        }
+        None => {
+            if args.synthesize_automaton {
+                return Err("--synthesize-automaton requires --register-map <JSON>".to_string());
+            }
+            None
+        }
+    };
 
     let opts = CExtractOptions {
         clang_path: args.clang,
         include_paths: args.include_paths,
         defines: args.defines,
         extra_clang_args: args.extra_clang_args,
+        register_map,
+        synthesize_automaton: args.synthesize_automaton,
     };
     let extraction =
         extract_c_via_clang(&args.file, &opts).map_err(|e| format!("C extraction failed: {e}"))?;
