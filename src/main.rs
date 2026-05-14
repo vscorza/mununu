@@ -277,15 +277,6 @@ struct CodesignExtractCArgs {
     /// `--register-map`).
     #[arg(long = "synthesize-automaton")]
     synthesize_automaton: bool,
-    /// Extraction backend (`ast` default, `llvm` for phase-L1+ lift).
-    #[arg(long, value_enum, default_value = "ast")]
-    backend: CExtractBackend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum CExtractBackend {
-    Ast,
-    Llvm,
 }
 
 #[derive(Args, Debug)]
@@ -690,13 +681,6 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
 }
 
 fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
-    match args.backend {
-        CExtractBackend::Ast => codesign_extract_c_ast(args),
-        CExtractBackend::Llvm => codesign_extract_c_llvm(args),
-    }
-}
-
-fn codesign_extract_c_llvm(args: CodesignExtractCArgs) -> Result<(), String> {
     use mununu::codesign::c_extract_llvm::{LlvmExtractOptions, extract_c_via_llvm};
     use mununu::codesign::register_map::RegisterMap;
 
@@ -739,77 +723,20 @@ fn codesign_extract_c_llvm(args: CodesignExtractCArgs) -> Result<(), String> {
         register_map,
         synthesize_automaton: args.synthesize_automaton,
     };
-    let extraction = extract_c_via_llvm(&args.file, &opts)
-        .map_err(|e| format!("LLVM C extraction failed: {e}"))?;
-    for w in &extraction.warnings {
-        eprintln!("warning: {w}");
-    }
-    let json = serde_json::to_string_pretty(&extraction)
-        .map_err(|e| format!("failed to serialise extraction: {e}"))?;
-    println!("{json}");
-    Ok(())
-}
-
-fn codesign_extract_c_ast(args: CodesignExtractCArgs) -> Result<(), String> {
-    use mununu::codesign::c_extract::{CExtractOptions, extract_c_via_clang};
-    use mununu::codesign::register_map::RegisterMap;
-
-    let register_map = match args.register_map.as_ref() {
-        Some(path) => {
-            let bytes = std::fs::read(path)
-                .map_err(|e| format!("failed to read register-map {}: {e}", path.display()))?;
-            let rm: RegisterMap = serde_json::from_slice(&bytes).map_err(|e| {
-                format!(
-                    "failed to parse register-map {} as JSON: {e}",
-                    path.display()
-                )
-            })?;
-            let issues = rm.validate();
-            if !issues.is_empty() {
-                for issue in &issues {
-                    eprintln!("register-map validation: {issue}");
-                }
-                return Err(format!(
-                    "register-map {} has {} validation issue(s) — refusing to proceed",
-                    path.display(),
-                    issues.len()
-                ));
-            }
-            Some(rm)
-        }
-        None => {
-            if args.synthesize_automaton {
-                return Err("--synthesize-automaton requires --register-map <JSON>".to_string());
-            }
-            None
-        }
-    };
-
-    let opts = CExtractOptions {
-        clang_path: args.clang,
-        include_paths: args.include_paths,
-        defines: args.defines,
-        extra_clang_args: args.extra_clang_args,
-        register_map,
-        synthesize_automaton: args.synthesize_automaton,
-    };
     let extraction =
-        extract_c_via_clang(&args.file, &opts).map_err(|e| format!("C extraction failed: {e}"))?;
-
+        extract_c_via_llvm(&args.file, &opts).map_err(|e| format!("C extraction failed: {e}"))?;
     if args.strict && !extraction.warnings.is_empty() {
         for w in &extraction.warnings {
             eprintln!("warning: {w}");
         }
         return Err(format!(
-            "--strict: {} extraction warning(s) — refusing to proceed",
+            "--strict: {} extraction warning(s) \u{2014} refusing to proceed",
             extraction.warnings.len()
         ));
     }
-
     for w in &extraction.warnings {
         eprintln!("warning: {w}");
     }
-
     let json = serde_json::to_string_pretty(&extraction)
         .map_err(|e| format!("failed to serialise extraction: {e}"))?;
     println!("{json}");

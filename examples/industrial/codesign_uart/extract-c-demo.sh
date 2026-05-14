@@ -59,28 +59,34 @@ cat "$HAND_AUTHORED"
 
 printf '\n=== Comparison notes ===\n'
 cat <<'EOF'
-Slice 2.b produces a linear automaton with one state per matched
-register access in source order. Slice 2.c additionally recognises the
-canonical `while (cond) ;` polling idiom — when the loop's condition is
-a single register-access read and the body is empty or inert, it emits
-a dedicated `Loop_i` state with three transitions on the same access
-label (enter, iterate, exit). For `uart_send` the synthesised shape is
-now S0 → Loop0 ⤴ → S1 → S2 → S3, matching the hand-authored
-Init/Polling/Ready/Sending up to state-name renaming.
+The extractor now runs against LLVM IR (clang -emit-llvm -S), not
+clang's AST. The IR-based backend:
+  - Recognises polling loops at the IR level via back-edge analysis
+    (a basic block with a BrCond terminator whose back-edge body is
+    empty + a volatile load whose result feeds the condition). The
+    matched read is marked `flow: polling_loop`, producing a Loop_i
+    state with three transitions on the same access label.
+  - Collapses bit-field read-modify-store sequences (clang lowers
+    `CTRL.bit.tx_start = 1` to a load → and → or → store quartet)
+    into a single write to the touched field, identified by the
+    AND-mask complement.
+  - Handles BOTH the `extern volatile T *const NAME` form AND the
+    `#define NAME ((T *)0xADDR)` form (the canonical STM32/NXP/Microchip
+    HAL convention). The IR has the address either way; the parser
+    extracts it from `getelementptr (...inttoptr (i64 N to ptr)...)`
+    constexprs as well as from SSA `getelementptr` instructions.
 
-Two structural gaps remain between the synthesised automaton and the
-hand-authored CTXDSL — both deliberate, neither blocking:
+For `uart_send` the synthesised shape is S0 → Loop0 ⤴ → S1 → S2 → S3,
+matching the hand-authored Init/Polling/Ready/Sending up to
+state-name renaming. Two structural gaps remain — both deliberate,
+neither blocking:
   - Internal `tick` self-loops modelling cycles spent polling between
-    status reads. The C source has no syntactic anchor for these; they
-    represent the verifier's environment, not the firmware's source.
-  - Explicit `reset` transitions from every state back to Init for
-    system-level recovery. Reset is an environment event, not a
-    firmware-source construct.
+    status reads. The C source has no syntactic anchor for these.
+  - Explicit `reset` transitions for system-level recovery. Reset is
+    an environment event, not a firmware-source construct.
 
-Anything beyond `while (single_read)` — `if/else`, `for` with a
-side-effecting body, `switch`, non-trivial condition expressions — still
-falls back to the slice-2.b linearisation with a structured
-`NonLinearControlFlow` warning. The hand-authored CTXDSL remains the
+Anything beyond the recognised idioms still falls back to linearisation
+with a structured warning. The hand-authored CTXDSL remains the
 canonical model whenever synthesis cannot represent a construct
-faithfully.
+faithfully — see docs/design/c-extraction-correctness-scope.md.
 EOF

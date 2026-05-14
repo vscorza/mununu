@@ -101,11 +101,11 @@ fn regexes() -> &'static Regexes {
         alloca: Regex::new(r"^\s*%(\w+)\s*=\s*alloca\s+([^,]+?)(?:,\s*align\s+(\d+))?\s*$")
             .unwrap(),
         load: Regex::new(
-            r"^\s*%(\w+)\s*=\s*load\s+(volatile\s+)?([^,]+?),\s*ptr\s+(\S+?)(?:,\s*align\s+(\d+))?\s*$",
+            r"^\s*%(\w+)\s*=\s*load\s+(volatile\s+)?([^,]+?),\s*ptr\s+(.+?)(?:,\s*align\s+(\d+))?\s*$",
         )
         .unwrap(),
         store: Regex::new(
-            r"^\s*store\s+(volatile\s+)?(\S+)\s+(\S+?),\s*ptr\s+(\S+?)(?:,\s*align\s+(\d+))?\s*$",
+            r"^\s*store\s+(volatile\s+)?(\S+)\s+(\S+?),\s*ptr\s+(.+?)(?:,\s*align\s+(\d+))?\s*$",
         )
         .unwrap(),
         gep: Regex::new(
@@ -517,21 +517,76 @@ fn parse_pointer_operand(text: &str) -> PointerOperand {
         return PointerOperand::Ssa(rest.to_string());
     }
     // Inline `inttoptr (i64 0x40010000 to ptr)` literal.
-    if let Some(inner) = trimmed
-        .strip_prefix("inttoptr")
+    if let Some(addr) = parse_inline_inttoptr(trimmed) {
+        return PointerOperand::InlineConstAddr(addr);
+    }
+    // Inline `getelementptr inbounds (T, ptr inttoptr (i64 N to ptr), i32 0, i32 K)`.
+    // Clang emits this when the source's base pointer is a #define
+    // macro that resolves to a literal address — the entire GEP is a
+    // constexpr rather than an SSA instruction. We extract the
+    // (base_addr, field_index) pair so the matcher can route it
+    // through the same path as a non-constexpr GEP.
+    if let Some(gep_inner) = trimmed
+        .strip_prefix("getelementptr")
+        .and_then(|s| s.trim().strip_prefix("inbounds").or(Some(s)))
         .and_then(|s| s.trim().strip_prefix('('))
-        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| s.trim_end_matches(',').strip_suffix(')'))
+        && let Some((base_addr, field_index)) = parse_inline_gep_inner(gep_inner)
     {
-        // inner is e.g. "i64 0x40010000 to ptr"
-        let mut tokens = inner.split_whitespace();
-        let _ty = tokens.next();
-        if let Some(value_tok) = tokens.next()
-            && let Some(v) = parse_int_literal(value_tok)
-        {
-            return PointerOperand::InlineConstAddr(v);
-        }
+        return PointerOperand::InlineGep {
+            base_addr,
+            field_index,
+        };
     }
     PointerOperand::Ssa(trimmed.to_string())
+}
+
+/// Parse an `inttoptr (i64 N to ptr)` inline constexpr to its u64
+/// address. Returns `None` for anything that doesn't match.
+fn parse_inline_inttoptr(text: &str) -> Option<u64> {
+    let inner = text
+        .strip_prefix("inttoptr")
+        .and_then(|s| s.trim().strip_prefix('('))
+        .and_then(|s| s.strip_suffix(')'))?;
+    // inner is e.g. "i64 0x40010000 to ptr"
+    let mut tokens = inner.split_whitespace();
+    let _ty = tokens.next()?;
+    let value_tok = tokens.next()?;
+    parse_int_literal(value_tok)
+}
+
+/// Parse the inside of an inline `getelementptr (...)` constexpr.
+/// Recognises the shape clang emits for `MACRO->FIELD` accesses:
+/// `<type>, ptr inttoptr (i64 N to ptr), i32 0, i32 K`.
+fn parse_inline_gep_inner(inner: &str) -> Option<(u64, i64)> {
+    // Find the `inttoptr (...)` subexpression. Its closing paren is
+    // matched against the inner `(`.
+    let intoptr_idx = inner.find("inttoptr")?;
+    let after = &inner[intoptr_idx..];
+    let open = after.find('(')?;
+    // Match the parenthesis. Constexpr expressions don't nest more
+    // than one level for the shapes we care about.
+    let close = after[open + 1..].find(')')?;
+    let inttoptr_text = &after[..open + 1 + close + 1];
+    let base_addr = parse_inline_inttoptr(inttoptr_text)?;
+    // Everything after the `inttoptr (...)` is the GEP indices.
+    let rest = &after[open + 1 + close + 1..];
+    let idx_text = rest.trim_start_matches(',').trim();
+    let mut field_index: Option<i64> = None;
+    for (i, part) in idx_text.split(',').enumerate() {
+        let mut toks = part.split_whitespace();
+        let _ty = toks.next();
+        let value_tok = toks.next()?;
+        let value: i64 = parse_int_literal(value_tok)? as i64;
+        // First index (i == 0) must be the struct-base 0.
+        if i == 0 && value != 0 {
+            return None;
+        }
+        if i == 1 {
+            field_index = Some(value);
+        }
+    }
+    Some((base_addr, field_index?))
 }
 
 fn parse_int_literal(s: &str) -> Option<u64> {
