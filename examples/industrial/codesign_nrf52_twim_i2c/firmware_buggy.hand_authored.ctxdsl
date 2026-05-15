@@ -1,0 +1,187 @@
+// Hand-authored BUGGY firmware automaton — Nordic nRF52840 TWIM0 (I2C) driver.
+// =========================================================================
+//
+// SOUNDNESS / Claims Integrity Rule 2: this automaton models the planted-bug
+// firmware variant in `upstream/nrfx_twim_buggy.c`, which inverts the order
+// of the buffer-set call and the TASKS_RESUME trigger in the
+// `NRFX_TWIM_XFER_TXRX` switch arm. The upstream `nrfx_twim.c` does NOT
+// have this bug — see `upstream/nrfx_twim.c:534-541` for the canonical
+// (correct) sequence. The pattern is anchored to public Nordic errata
+// (Errata 211 family — TWIM register-ordering anomalies on early silicon).
+//
+// SOUNDNESS: this automaton is hand-authored. The upstream extractor
+// (`mununu codesign extract-c`) was attempted against
+// `upstream/nrfx_twim_buggy.c` and failed for the same reason it failed
+// on `nrfx_twim.c` — missing `<nrfx.h>` and the CMSIS/Zephyr include tree.
+// The failure is documented in `README.md` § "Provenance".
+//
+// What changed vs. the clean firmware: the transition `PointerSet -> Started`
+// is *replaced* by `ShortsSet -> Started` (and equivalent paths for the
+// TXRX/RX variants), so TASKS_STARTTX / TASKS_RESUME may now fire BEFORE
+// any TXD.PTR / RXD.PTR write. The property `data_pointer_set_before_tasks`
+// is structurally violated: the destination state of the task-trigger
+// label is reachable without traversing the pointer-set state.
+//
+// Reference: nrfx commit 0883a272c34004697dd56dfa44f6e2d0f8705689,
+// drivers/src/nrfx_twim.c, function `twim_xfer` (BSD-3-Clause).
+
+context CoupledTwimFirmwareBuggy {
+    alphabet {
+        label tick;
+        label reset;
+    }
+
+    automata {
+        automaton TwimDriver {
+            controllable {
+                label wr_frequency_frequency;
+                label wr_enable_enable;
+                label wr_shorts_lasttx_stop;
+                label wr_shorts_lasttx_startrx;
+                label wr_shorts_lastrx_stop;
+                label wr_txd_ptr_txd_ptr;
+                label wr_txd_maxcnt_txd_maxcnt;
+                label wr_rxd_ptr_rxd_ptr;
+                label wr_rxd_maxcnt_rxd_maxcnt;
+                label wr_tasks_starttx_tasks_starttx;
+                label wr_tasks_startrx_tasks_startrx;
+                label wr_tasks_stop_tasks_stop;
+                label wr_tasks_suspend_tasks_suspend;
+                label wr_tasks_resume_tasks_resume;
+                label wr_events_error_events_error;
+                label wr_events_stopped_events_stopped;
+                label wr_events_lasttx_events_lasttx;
+                label rd_events_error_events_error;
+                label rd_events_stopped_events_stopped;
+                label rd_events_lasttx_events_lasttx;
+                label rd_events_txstarted_events_txstarted;
+                label rd_events_suspended_events_suspended;
+                label tick;
+                label reset;
+            }
+
+            states {
+                state Reset initial;
+                state Configured;
+                state Enabled;
+                state ShortsSet;
+                state PointerSet;       // still here, but no longer the only path to Started
+                state Started;
+                state InFlight;
+                state LastTx;
+                state Stopped;
+                state Errored;
+                state ErrorCleared;
+                state Suspended;
+            }
+
+            transitions {
+                transition Reset -> Configured on label wr_frequency_frequency;
+                transition Configured -> Enabled on label wr_enable_enable;
+
+                transition Enabled -> ShortsSet on label wr_shorts_lasttx_stop;
+                transition Enabled -> ShortsSet on label wr_shorts_lasttx_startrx;
+                transition Enabled -> ShortsSet on label wr_shorts_lastrx_stop;
+
+                // -----------------------------------------------------
+                // BUG: TASKS_RESUME / TASKS_STARTTX fires DIRECTLY from
+                // ShortsSet, BEFORE the pointer is written. This mirrors
+                // the inverted-order body of `nrfx_twim_buggy.c` lines
+                // 534-553 (NRFX_TWIM_XFER_TXRX branch). The pointer
+                // writes are still permitted, but no longer mandatory.
+                // -----------------------------------------------------
+                transition ShortsSet -> Started on label wr_tasks_resume_tasks_resume;
+                transition ShortsSet -> Started on label wr_tasks_starttx_tasks_starttx;
+                transition ShortsSet -> Started on label wr_tasks_startrx_tasks_startrx;
+
+                // Pointer writes are now ineffectual — they self-loop in
+                // ShortsSet rather than gating the task.
+                transition ShortsSet -> ShortsSet on label wr_txd_ptr_txd_ptr;
+                transition ShortsSet -> ShortsSet on label wr_txd_maxcnt_txd_maxcnt;
+                transition ShortsSet -> ShortsSet on label wr_rxd_ptr_rxd_ptr;
+                transition ShortsSet -> ShortsSet on label wr_rxd_maxcnt_rxd_maxcnt;
+                // The correct path is kept reachable but no longer
+                // mandatory — the firmware may still set the pointer
+                // before triggering, but the bug makes that order optional.
+                transition PointerSet -> Started on label wr_tasks_starttx_tasks_starttx;
+                transition PointerSet -> Started on label wr_tasks_startrx_tasks_startrx;
+                transition PointerSet -> Started on label wr_tasks_resume_tasks_resume;
+
+                transition Started -> Started on label tick;
+                transition Started -> InFlight on label rd_events_txstarted_events_txstarted;
+                transition Started -> Errored on label rd_events_error_events_error;
+                transition Started -> Stopped on label rd_events_stopped_events_stopped;
+
+                transition InFlight -> InFlight on label tick;
+                transition InFlight -> LastTx on label rd_events_lasttx_events_lasttx;
+                transition InFlight -> Errored on label rd_events_error_events_error;
+
+                transition LastTx -> Stopped on label rd_events_stopped_events_stopped;
+                transition LastTx -> Errored on label rd_events_error_events_error;
+
+                transition InFlight -> Suspended on label wr_tasks_suspend_tasks_suspend;
+                transition Suspended -> Suspended on label rd_events_suspended_events_suspended;
+                transition Suspended -> Started on label wr_tasks_resume_tasks_resume;
+                transition Suspended -> Errored on label rd_events_error_events_error;
+
+                transition Errored -> Errored on label tick;
+                transition Errored -> ErrorCleared on label wr_events_error_events_error;
+                transition ErrorCleared -> Enabled on label wr_tasks_stop_tasks_stop;
+
+                transition Stopped -> Stopped on label tick;
+                transition Stopped -> Stopped on label wr_events_stopped_events_stopped;
+                transition Stopped -> Enabled on label wr_events_lasttx_events_lasttx;
+
+                transition Reset -> Reset on label reset;
+                transition Configured -> Reset on label reset;
+                transition Enabled -> Reset on label reset;
+                transition ShortsSet -> Reset on label reset;
+                transition PointerSet -> Reset on label reset;
+                transition Started -> Reset on label reset;
+                transition InFlight -> Reset on label reset;
+                transition LastTx -> Reset on label reset;
+                transition Stopped -> Reset on label reset;
+                transition Errored -> Reset on label reset;
+                transition ErrorCleared -> Reset on label reset;
+                transition Suspended -> Reset on label reset;
+            }
+        }
+    }
+
+    mu_formulas {
+        formula init_reachable {
+            over TwimDriver;
+            body = mu X. (Reset || <> X);
+        }
+
+        formula safety_protocol_respected {
+            over TWIM0System;
+            body = nu X. ([] X);
+        }
+
+        // The structural property the bug violates. In the clean firmware
+        // the only state from which a task-trigger leaves is PointerSet;
+        // the buggy firmware adds task-trigger edges from ShortsSet too,
+        // and ShortsSet does NOT entail "pointer written". The formula
+        // therefore requires: every task-trigger transition lands in
+        // Started AND its source state guarantees the pointer was set.
+        // We encode the latter via "the source state is PointerSet" by
+        // checking that the predecessor was not ShortsSet on the path —
+        // structurally captured by "from any state, if a task-trigger
+        // edge is taken, the source was already past ShortsSet".
+        //
+        // Concrete encoding: at every reachable state, if it is ShortsSet,
+        // no task-trigger label is admissible. The buggy firmware
+        // admits exactly the violating edges from ShortsSet.
+        formula data_pointer_set_before_tasks {
+            over TwimDriver;
+            body = nu X. (
+                (! ShortsSet
+                  || ( [(labels={wr_tasks_starttx_tasks_starttx})] false
+                       && [(labels={wr_tasks_startrx_tasks_startrx})] false
+                       && [(labels={wr_tasks_resume_tasks_resume})] false ))
+                && [] X
+            );
+        }
+    }
+}

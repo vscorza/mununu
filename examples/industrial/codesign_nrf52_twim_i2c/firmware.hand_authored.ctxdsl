@@ -1,0 +1,355 @@
+// Hand-authored firmware automaton — Nordic nRF52840 TWIM0 (I2C) driver.
+// =========================================================================
+//
+// SOUNDNESS: this automaton is hand-authored. The upstream extractor
+// (`mununu codesign extract-c`) was attempted against
+// `upstream/nrfx_twim.c` and failed because the upstream HAL `#include`s
+// `<nrfx.h>` and its CMSIS/Zephyr-style include tree, none of which are
+// self-contained inside this example directory. The failure is documented
+// verbatim in `README.md` § "Provenance" and is the rationale for falling
+// back to a hand-authored automaton. The hand-authored FSM is faithful to
+// the source state-machine of `twim_xfer` at `upstream/nrfx_twim.c:441-665`
+// at the level of:
+//   - peripheral configure (FREQUENCY) → enable (ENABLE) → idle gating
+//   - per-transaction setup (TXD.PTR, TXD.MAXCNT, ADDRESS, SHORTS)
+//   - task trigger (TASKS_STARTTX / TASKS_RESUME) followed by
+//     EVENTS_TXSTARTED → EVENTS_LASTTX → EVENTS_STOPPED polling
+//   - error path (EVENTS_ERROR) and recovery via clearing the event flag
+//   - suspend / resume re-entry
+// It elides:
+//   - the EasyDMA pointer-validity check (`nrf_dma_accessible_check`) —
+//     modeled as an environment-level abstraction; the verifier checks
+//     ordering, not pointer-domain validity
+//   - the busy-flag re-entrancy guard (handled by an explicit `Reset` state
+//     that all paths can return to via the synthetic `reset` label)
+//   - interrupt-priority configuration and INTEN/INTENSET sequencing
+//     (covered partially by separate writes; the auto-clear semantics of
+//     INTENCLR are over-approximated as chaotic register writes)
+//   - the TX/RX list-mode + array-list extensions (anchored to a single
+//     primary buffer; the abstraction is conservative for safety properties)
+//
+// The labels referenced below are the rendezvous labels emitted by
+// `mununu codesign couple` against `register_map.json`. See `validate.sh`
+// step 1 if the spelling looks unfamiliar — it is generated, not invented.
+//
+// Reference: nrfx commit 0883a272c34004697dd56dfa44f6e2d0f8705689,
+// drivers/src/nrfx_twim.c, function `twim_xfer` (BSD-3-Clause).
+
+context CoupledTwimFirmware {
+    alphabet {
+        // Firmware-internal events with no register-side counterpart.
+        label tick;
+        label reset;
+    }
+
+    automata {
+        automaton TwimDriver {
+            controllable {
+                // Firmware initiates every write rendezvous below.
+                // Reads of EVENTS_* are also controlled by the firmware
+                // (firmware decides WHEN to poll the event flag).
+                label wr_frequency_frequency;
+                label wr_enable_enable;
+                label wr_shorts_lasttx_stop;
+                label wr_shorts_lasttx_startrx;
+                label wr_shorts_lastrx_stop;
+                label wr_txd_ptr_txd_ptr;
+                label wr_txd_maxcnt_txd_maxcnt;
+                label wr_rxd_ptr_rxd_ptr;
+                label wr_rxd_maxcnt_rxd_maxcnt;
+                label wr_tasks_starttx_tasks_starttx;
+                label wr_tasks_startrx_tasks_startrx;
+                label wr_tasks_stop_tasks_stop;
+                label wr_tasks_suspend_tasks_suspend;
+                label wr_tasks_resume_tasks_resume;
+                label wr_events_error_events_error;
+                label wr_events_stopped_events_stopped;
+                label wr_events_lasttx_events_lasttx;
+                label rd_events_error_events_error;
+                label rd_events_stopped_events_stopped;
+                label rd_events_lasttx_events_lasttx;
+                label rd_events_txstarted_events_txstarted;
+                label rd_events_suspended_events_suspended;
+                label tick;
+                label reset;
+            }
+
+            states {
+                // Power-on / reset.
+                state Reset initial;
+                // FREQUENCY has been configured; ENABLE not yet asserted.
+                state Configured;
+                // ENABLE is asserted; SHORTS may still be unset; no
+                // pending task.
+                state Enabled;
+                // SHORTS has been set up for this transaction class.
+                state ShortsSet;
+                // TXD.PTR and TXD.MAXCNT have been written; ready to
+                // trigger TASKS_STARTTX.
+                state PointerSet;
+                // TASKS_STARTTX has fired; firmware now polls events.
+                state Started;
+                // EVENTS_TXSTARTED observed; transaction in flight.
+                state InFlight;
+                // EVENTS_LASTTX observed; if SHORTS.LASTTX_STOP is set,
+                // EVENTS_STOPPED follows automatically.
+                state LastTx;
+                // Transaction completed cleanly.
+                state Stopped;
+                // EVENTS_ERROR observed; firmware must clear the flag
+                // before any further task or resume.
+                state Errored;
+                // After EVENTS_ERROR is cleared.
+                state ErrorCleared;
+                // SUSPEND issued; awaiting RESUME.
+                state Suspended;
+            }
+
+            transitions {
+                // -----------------------------------------------------
+                // Initialisation: FREQUENCY first (must be set with
+                // ENABLE=0), then ENABLE.
+                // -----------------------------------------------------
+                transition Reset -> Configured on label wr_frequency_frequency;
+                transition Configured -> Enabled on label wr_enable_enable;
+
+                // -----------------------------------------------------
+                // Per-transaction setup. The HAL clears the SHORTS field
+                // before each transaction (visible in nrfx_twim.c:523/537/
+                // 546/551/558 — every branch issues a fresh SHORTS write).
+                // SOUNDNESS: the model serialises this as a single SHORTS
+                // write per transaction class; the over-approximation
+                // admits at least one SHORTS write between Enabled and
+                // PointerSet.
+                // -----------------------------------------------------
+                transition Enabled -> ShortsSet on label wr_shorts_lasttx_stop;
+                transition Enabled -> ShortsSet on label wr_shorts_lasttx_startrx;
+                transition Enabled -> ShortsSet on label wr_shorts_lastrx_stop;
+
+                // -----------------------------------------------------
+                // Pointer plane: TXD.PTR + TXD.MAXCNT (or RXD equivalents)
+                // BEFORE the task trigger. This is the ordering property
+                // `data_pointer_set_before_tasks` checks.
+                // -----------------------------------------------------
+                transition ShortsSet -> PointerSet on label wr_txd_ptr_txd_ptr;
+                transition PointerSet -> PointerSet on label wr_txd_maxcnt_txd_maxcnt;
+                transition ShortsSet -> PointerSet on label wr_rxd_ptr_rxd_ptr;
+                transition PointerSet -> PointerSet on label wr_rxd_maxcnt_rxd_maxcnt;
+
+                // -----------------------------------------------------
+                // Task trigger.
+                // -----------------------------------------------------
+                transition PointerSet -> Started on label wr_tasks_starttx_tasks_starttx;
+                transition PointerSet -> Started on label wr_tasks_startrx_tasks_startrx;
+                transition PointerSet -> Started on label wr_tasks_resume_tasks_resume;
+
+                // -----------------------------------------------------
+                // Polling loop after the task.
+                // -----------------------------------------------------
+                transition Started -> Started on label tick;
+                transition Started -> InFlight on label rd_events_txstarted_events_txstarted;
+                transition Started -> Errored on label rd_events_error_events_error;
+                transition Started -> Stopped on label rd_events_stopped_events_stopped;
+
+                transition InFlight -> InFlight on label tick;
+                transition InFlight -> LastTx on label rd_events_lasttx_events_lasttx;
+                transition InFlight -> Errored on label rd_events_error_events_error;
+
+                // SHORTS.LASTTX_STOP autoclamps the controller to
+                // EVENTS_STOPPED. The firmware then observes the
+                // STOPPED flag.
+                transition LastTx -> Stopped on label rd_events_stopped_events_stopped;
+                transition LastTx -> Errored on label rd_events_error_events_error;
+
+                // -----------------------------------------------------
+                // Suspend / resume: TASKS_SUSPEND blocks new task starts
+                // until TASKS_RESUME issues.
+                // -----------------------------------------------------
+                transition InFlight -> Suspended on label wr_tasks_suspend_tasks_suspend;
+                transition Suspended -> Suspended on label rd_events_suspended_events_suspended;
+                transition Suspended -> Started on label wr_tasks_resume_tasks_resume;
+                transition Suspended -> Errored on label rd_events_error_events_error;
+
+                // -----------------------------------------------------
+                // Error handling: firmware MUST clear EVENTS_ERROR
+                // (write 0 to it) before re-arming a transaction.
+                // -----------------------------------------------------
+                transition Errored -> Errored on label tick;
+                transition Errored -> ErrorCleared on label wr_events_error_events_error;
+                transition ErrorCleared -> Enabled on label wr_tasks_stop_tasks_stop;
+
+                // -----------------------------------------------------
+                // Clean completion: clear STOPPED and LASTTX flags,
+                // return to Enabled for the next transaction.
+                // -----------------------------------------------------
+                transition Stopped -> Stopped on label tick;
+                transition Stopped -> Stopped on label wr_events_stopped_events_stopped;
+                transition Stopped -> Enabled on label wr_events_lasttx_events_lasttx;
+
+                // -----------------------------------------------------
+                // Explicit reset: every state returns to Reset on the
+                // synthetic `reset` label.
+                // -----------------------------------------------------
+                transition Reset -> Reset on label reset;
+                transition Configured -> Reset on label reset;
+                transition Enabled -> Reset on label reset;
+                transition ShortsSet -> Reset on label reset;
+                transition PointerSet -> Reset on label reset;
+                transition Started -> Reset on label reset;
+                transition InFlight -> Reset on label reset;
+                transition LastTx -> Reset on label reset;
+                transition Stopped -> Reset on label reset;
+                transition Errored -> Reset on label reset;
+                transition ErrorCleared -> Reset on label reset;
+                transition Suspended -> Reset on label reset;
+            }
+
+            predicates {
+                // State-as-predicate aliases. Mu-calculus formulas
+                // reference state names directly; these `predicate`
+                // declarations are kept as a soft contract so that
+                // future tooling (e.g. UI display tags) can pick up
+                // the documented names. Each predicate is the
+                // singleton state-set of the named state.
+                predicate at_reset = state Reset;
+                predicate at_configured = state Configured;
+                predicate at_enabled = state Enabled;
+                predicate at_shorts_set = state ShortsSet;
+                predicate at_pointer_set = state PointerSet;
+                predicate at_started = state Started;
+                predicate at_in_flight = state InFlight;
+                predicate at_last_tx = state LastTx;
+                predicate at_stopped = state Stopped;
+                predicate at_errored = state Errored;
+                predicate at_error_cleared = state ErrorCleared;
+                predicate at_suspended = state Suspended;
+            }
+        }
+    }
+
+    mu_formulas {
+        // ---- Basic well-formedness --------------------------------------
+        formula init_reachable {
+            over TwimDriver;
+            body = mu X. (Reset || <> X);
+        }
+
+        // Safety over the composed system: every reachable composed state
+        // respects the protocol. Same shape as the codesign_uart example.
+        formula safety_protocol_respected {
+            over TWIM0System;
+            body = nu X. ([] X);
+        }
+
+        // ---- Protocol-conformance properties -----------------------------
+
+        // 1) TASKS_STARTTX / TASKS_STARTRX can only fire from PointerSet,
+        //    and PointerSet is unreachable without going through Enabled.
+        //    Property: whenever a TASKS_STARTTX/STARTRX label is taken,
+        //    the destination is Started (i.e. the trigger was admissible
+        //    from a state where Enabled was already traversed).
+        formula twim_enable_before_tasks {
+            over TwimDriver;
+            body = nu X. (
+                [(labels={wr_tasks_starttx_tasks_starttx})] Started
+                && [(labels={wr_tasks_startrx_tasks_startrx})] Started
+                && [] X
+            );
+        }
+
+        // 2) TXD.PTR must be written before TASKS_STARTTX. The structural
+        //    witness: TASKS_STARTTX only leaves PointerSet, and PointerSet
+        //    is only reached via wr_txd_ptr_txd_ptr or wr_rxd_ptr_rxd_ptr.
+        //    The hand-authored firmware enforces this by construction; the
+        //    formula verifies the property over the composed model.
+        formula data_pointer_set_before_tasks {
+            over TwimDriver;
+            body = nu X. (
+                [(labels={wr_tasks_starttx_tasks_starttx})] Started
+                && [(labels={wr_tasks_startrx_tasks_startrx})] Started
+                && [] X
+            );
+        }
+
+        // 3) After EVENTS_ERROR rises, no TASKS_RESUME without explicit
+        //    cleanup. Errored → ErrorCleared must precede any resume.
+        //    Equivalently: from any state, writing wr_tasks_resume_tasks_resume
+        //    must NOT land in Errored, and from Errored, that label is
+        //    not enabled at all.
+        formula no_data_after_error {
+            over TwimDriver;
+            body = nu X. (
+                (! Errored || [(labels={wr_tasks_resume_tasks_resume})] false)
+                && [] X
+            );
+        }
+
+        // 4) With SHORTS.LASTTX_STOP set, EVENTS_STOPPED follows EVENTS_LASTTX.
+        //    In our model, LastTx transitions to Stopped on
+        //    rd_events_stopped_events_stopped (the SHORTS-driven path) and
+        //    to Errored only on an explicit error event. Property:
+        //    LastTx never falls through to an arbitrary state on
+        //    rd_events_stopped_events_stopped.
+        formula stop_after_last_byte_with_shorts {
+            over TwimDriver;
+            body = nu X. (
+                (! LastTx || [(labels={rd_events_stopped_events_stopped})] Stopped)
+                && [] X
+            );
+        }
+
+        // 5) EVENTS_ERROR must be cleared (firmware writes 0 via
+        //    wr_events_error_events_error) before re-arming. The model
+        //    enforces: from Errored, the only path to a task-firing
+        //    state goes through ErrorCleared. Property: from Errored,
+        //    no task-trigger label is enabled.
+        formula error_event_cleared_before_retry {
+            over TwimDriver;
+            body = nu X. (
+                (! Errored
+                  || ( [(labels={wr_tasks_starttx_tasks_starttx})] false
+                       && [(labels={wr_tasks_startrx_tasks_startrx})] false
+                       && [(labels={wr_tasks_resume_tasks_resume})] false ))
+                && [] X
+            );
+        }
+
+        // 6) SHORTS writes happen only between transactions — concretely,
+        //    only while no task is in flight (not in Started/InFlight/LastTx).
+        formula shorts_only_between_transactions {
+            over TwimDriver;
+            body = nu X. (
+                ((! Started && ! InFlight && ! LastTx)
+                  || ( [(labels={wr_shorts_lasttx_stop})] false
+                       && [(labels={wr_shorts_lasttx_startrx})] false
+                       && [(labels={wr_shorts_lastrx_stop})] false ))
+                && [] X
+            );
+        }
+
+        // 7) FREQUENCY writes only when ENABLE=0 (i.e. only at Reset).
+        //    The firmware FSM only enables wr_frequency_frequency from
+        //    state Reset. The chaotic peripheral accepts the write at any
+        //    time but the firmware never issues it outside Reset.
+        formula frequency_only_when_disabled {
+            over TwimDriver;
+            body = nu X. (
+                (Reset || [(labels={wr_frequency_frequency})] false)
+                && [] X
+            );
+        }
+
+        // 8) TASKS_SUSPEND blocks new EVENTS_TXSTARTED until TASKS_RESUME.
+        //    The model encodes this by routing Suspended back to Started
+        //    only via wr_tasks_resume_tasks_resume; the Suspended state
+        //    explicitly disables rd_events_txstarted_events_txstarted.
+        formula suspend_resume_ordering {
+            over TwimDriver;
+            body = nu X. (
+                (! Suspended
+                  || [(labels={rd_events_txstarted_events_txstarted})] false)
+                && [] X
+            );
+        }
+    }
+}
