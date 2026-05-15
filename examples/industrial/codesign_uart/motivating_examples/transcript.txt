@@ -271,7 +271,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
 }
 
 === Example 8: CMSIS-style struct-member access (--cmsis-stubs) ===
-$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton --cmsis-stubs --include /var/folders/cp/dgzzd8w16l90rnvkvx8532m80000gn/T/tmp.P2Tsc7IqsC
+$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton --cmsis-stubs --include /var/folders/cp/dgzzd8w16l90rnvkvx8532m80000gn/T/tmp.iMYGUpnfVk
 {
   "source_filename": "examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c",
   "target_triple": "x86_64-apple-macosx26.0.0",
@@ -315,6 +315,60 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
   "external_globals": [],
   "struct_types": [
     "%struct.UART_LITE_Type",
+    "%union.anon",
+    "%union.anon.0",
+    "%union.anon.2"
+  ]
+}
+
+=== Example 9: in-source state-name annotations (MUNUNU_STATE markers) ===
+$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_9_state_name_annotations.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton --cmsis-stubs
+{
+  "source_filename": "examples/industrial/codesign_uart/motivating_examples/example_9_state_name_annotations.c",
+  "target_triple": "x86_64-apple-macosx26.0.0",
+  "functions": [
+    {
+      "name": "uart_send_byte",
+      "return_type": "void",
+      "num_parameters": 1,
+      "num_basic_blocks": 4,
+      "num_instructions": 14,
+      "num_volatile_loads": 2,
+      "num_volatile_stores": 2,
+      "num_inttoptr": 0,
+      "accesses": [
+        {
+          "kind": "read",
+          "register": "STATUS",
+          "field": "tx_busy",
+          "accessor": "(IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 })",
+          "source_line": 5,
+          "flow": "polling_loop",
+          "source_state_hint": "Polling"
+        },
+        {
+          "kind": "write",
+          "register": "DATA",
+          "field": "byte",
+          "accessor": "(IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })",
+          "source_line": 11,
+          "source_state_hint": "Ready"
+        },
+        {
+          "kind": "write",
+          "register": "CTRL",
+          "field": "tx_start",
+          "accessor": "(IR-resolved @AbsoluteAddress(1073807360))",
+          "source_line": 16,
+          "source_state_hint": "Sending"
+        }
+      ],
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send_byte {\n            controllable {\n                wr_data_byte;\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state Polling initial;\n                state Loop0;\n                state Ready;\n                state Sending;\n                state S3;\n            }\n\n            transitions {\n                transition Polling -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> Ready on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition Ready -> Sending on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition Sending -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+    }
+  ],
+  "external_globals": [],
+  "struct_types": [
+    "%struct.UART_TypeDef",
     "%union.anon",
     "%union.anon.0",
     "%union.anon.2"

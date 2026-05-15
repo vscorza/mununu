@@ -29,6 +29,14 @@ pub struct Module {
     pub struct_types: BTreeMap<String, StructType>,
     /// Module-level globals: `@name = … <type>`.
     pub globals: Vec<Global>,
+    /// Module-level string constants from clang's lowering of C
+    /// string literals: `@.str = private unnamed_addr constant
+    /// [N x i8] c"…\00", align 1`. Keyed by the global name (with
+    /// the leading `@` stripped); value is the unescaped string.
+    /// Used by phase-L9 marker-call recognition (`MUNUNU_STATE("Name")`)
+    /// — the call passes `ptr @.strX` and the matcher dereferences
+    /// through this table to recover `"Name"`.
+    pub string_constants: BTreeMap<String, String>,
     /// Function definitions.
     pub functions: Vec<Function>,
 }

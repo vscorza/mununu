@@ -45,7 +45,7 @@ use crate::codesign::coupling::AccessKind;
 use crate::codesign::register_map::{Register, RegisterMap};
 use crate::llvm_ir::{GepIndex, Instruction, Module, PointerOperand, Terminator, parse_module};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -382,7 +382,14 @@ fn summarise(module: &Module, source_text: &str, options: &LlvmExtractOptions) -
         .iter()
         .map(|f| {
             let is_isr = isr_function_names.contains(&f.name);
-            summarise_function(f, options, &module_fns, is_isr, &mut warnings)
+            summarise_function(
+                f,
+                options,
+                &module_fns,
+                &module.string_constants,
+                is_isr,
+                &mut warnings,
+            )
         })
         .collect();
 
@@ -429,6 +436,7 @@ fn summarise_function(
     f: &crate::llvm_ir::Function,
     options: &LlvmExtractOptions,
     module_fns: &HashMap<&str, &crate::llvm_ir::Function>,
+    string_constants: &BTreeMap<String, String>,
     is_isr: bool,
     warnings: &mut Vec<LlvmExtractWarning>,
 ) -> LlvmFunctionSummary {
@@ -458,6 +466,7 @@ fn summarise_function(
             f,
             rm,
             module_fns,
+            string_constants,
             &mut visiting,
             HashMap::new(), // entry-point: no caller bindings yet
             warnings,
@@ -1057,6 +1066,7 @@ fn extract_register_accesses(
     f: &crate::llvm_ir::Function,
     rm: &RegisterMap,
     module_fns: &HashMap<&str, &crate::llvm_ir::Function>,
+    string_constants: &BTreeMap<String, String>,
     visiting: &mut std::collections::HashSet<String>,
     param_bindings: HashMap<String, ResolvedAddress>,
     warnings: &mut Vec<LlvmExtractWarning>,
@@ -1078,6 +1088,10 @@ fn extract_register_accesses(
 
     let mut accesses: Vec<RegisterAccess> = Vec::new();
     let mut current_line: u32 = 0;
+    // Phase L9 (gap 1): running state-name hint, updated each time we
+    // see a `call void @__mununu_state(ptr @.strN)` marker. Applied
+    // to every RegisterAccess emitted until the next marker.
+    let mut current_state_hint: Option<String> = None;
     for bb in &f.basic_blocks {
         if plan.skip_blocks.contains(&bb.label) {
             // Phase L3: skip the polling-loop's back-edge body. It
@@ -1087,19 +1101,28 @@ fn extract_register_accesses(
         // Approximate source-line ordering by basic-block traversal.
         for instr in &bb.instructions {
             current_line = current_line.saturating_add(1);
-            // Phase L5 / L5.5: when we hit a call to a function
-            // defined in the same module, build parameter bindings
-            // from the call's arguments (resolved against the
-            // caller's ctx) and recurse into the callee with those
-            // bindings. External calls fall through silently.
+            // Phase L5 / L5.5 / L9: dispatch on call instructions.
+            // Three cases: (a) marker call to `__mununu_state` —
+            // update `current_state_hint` and continue; (b) call to a
+            // function defined in the same module — recurse; (c)
+            // call to an external symbol — fall through silently.
             if let Instruction::Call { callee, args, .. } = instr {
                 let target = callee.trim_start_matches('@');
+                if target == "__mununu_state" {
+                    if let Some(arg) = args.first()
+                        && let Some(name) = lookup_state_marker_name(arg, string_constants)
+                    {
+                        current_state_hint = Some(name);
+                    }
+                    continue;
+                }
                 if let Some(callee_fn) = module_fns.get(target) {
                     let callee_bindings = build_callee_param_bindings(callee_fn, args, &ctx);
                     let callee_accesses = extract_register_accesses(
                         callee_fn,
                         rm,
                         module_fns,
+                        string_constants,
                         visiting,
                         callee_bindings,
                         warnings,
@@ -1147,7 +1170,7 @@ fn extract_register_accesses(
                         }
                         _ => AccessFlow::Linear,
                     };
-                    if let Some(access) = match_address_to_register(
+                    if let Some(mut access) = match_address_to_register(
                         &addr,
                         rm,
                         kind,
@@ -1155,6 +1178,7 @@ fn extract_register_accesses(
                         flow,
                         field_override.as_deref(),
                     ) {
+                        access.source_state_hint = current_state_hint.clone();
                         accesses.push(access);
                     } else {
                         warnings.push(LlvmExtractWarning::UnknownAccessor {
@@ -1556,7 +1580,42 @@ fn match_address_to_register(
         accessor: format!("(IR-resolved @{addr:?})"),
         source_line,
         flow,
+        source_state_hint: None,
     })
+}
+
+/// Phase L9 (gap 1): parse a single argument string from a
+/// `call void @__mununu_state(...)` instruction and resolve the
+/// referenced string-constant global to its decoded payload.
+///
+/// clang lowers `MUNUNU_STATE("Polling")` to one of two shapes
+/// (depending on optimisation level and target):
+///
+/// ```text
+/// call void @__mununu_state(ptr noundef @.str)
+/// call void @__mununu_state(ptr noundef getelementptr inbounds (...))
+/// ```
+///
+/// Both forms reference a module-level `@.strN` global whose payload
+/// the parser captured in `string_constants`. We accept the first
+/// form natively and the second form by finding `@.strN` anywhere in
+/// the argument text — the GEP indices are always `i32 0, i32 0` for
+/// `[N x i8]` strings, so the global name is the only payload-bearing
+/// component.
+fn lookup_state_marker_name(
+    arg_text: &str,
+    string_constants: &BTreeMap<String, String>,
+) -> Option<String> {
+    let at_pos = arg_text.find('@')?;
+    let after_at = &arg_text[at_pos + 1..];
+    let end = after_at
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .unwrap_or(after_at.len());
+    let global_name = &after_at[..end];
+    if global_name.is_empty() {
+        return None;
+    }
+    string_constants.get(global_name).cloned()
 }
 
 #[cfg(test)]
@@ -2427,5 +2486,106 @@ define void @uart_send() {
         let parsed: LlvmExtraction = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.functions.len(), 1);
         assert_eq!(parsed.functions[0].accesses.len(), 3);
+    }
+
+    #[test]
+    fn lookup_state_marker_name_handles_clang_arg_shapes() {
+        let mut consts = BTreeMap::new();
+        consts.insert(".str".to_string(), "Polling".to_string());
+        consts.insert(".str.1".to_string(), "Ready".to_string());
+
+        // Plain `ptr noundef @.str` shape (clang -O0 default).
+        assert_eq!(
+            lookup_state_marker_name("ptr noundef @.str", &consts),
+            Some("Polling".to_string())
+        );
+        // `@.str.1` with dot in the name.
+        assert_eq!(
+            lookup_state_marker_name("ptr noundef @.str.1", &consts),
+            Some("Ready".to_string())
+        );
+        // Inline `getelementptr` constexpr shape: still finds the
+        // global because the global name has no `(` inside it.
+        assert_eq!(
+            lookup_state_marker_name(
+                "ptr noundef getelementptr inbounds ([8 x i8], ptr @.str, i32 0, i32 0)",
+                &consts
+            ),
+            Some("Polling".to_string())
+        );
+        // Missing global → None.
+        assert_eq!(
+            lookup_state_marker_name("ptr noundef @.missing", &consts),
+            None
+        );
+        // Arg with no `@` at all → None.
+        assert_eq!(lookup_state_marker_name("i32 42", &consts), None);
+    }
+
+    #[test]
+    fn mununu_state_markers_rename_synthesised_automaton_states() {
+        // Minimal IR: two volatile writes to CTRL.tx_start, separated
+        // by a `__mununu_state` marker. The marker before the second
+        // write should rename the state between the two accesses.
+        let ir = r#"; ModuleID = 'state_marker_demo.c'
+source_filename = "state_marker_demo.c"
+target triple = "x86_64-apple-macosx26.0.0"
+
+@UART = external constant ptr, align 8
+@.str = private unnamed_addr constant [8 x i8] c"Polling\00", align 1
+@.str.1 = private unnamed_addr constant [6 x i8] c"Ready\00", align 1
+
+%struct.UART_TypeDef = type { %union.anon }
+
+declare void @__mununu_state(ptr noundef)
+
+define void @demo() {
+  call void @__mununu_state(ptr noundef @.str)
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 0
+  store volatile i32 1, ptr %2, align 4
+  call void @__mununu_state(ptr noundef @.str.1)
+  %3 = load ptr, ptr @UART, align 8
+  %4 = getelementptr inbounds %struct.UART_TypeDef, ptr %3, i32 0, i32 0
+  store volatile i32 1, ptr %4, align 4
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(ir, &opts).unwrap();
+        assert_eq!(ext.functions.len(), 1);
+        let f = &ext.functions[0];
+        assert_eq!(f.accesses.len(), 2, "two writes expected, markers consumed");
+        assert_eq!(
+            f.accesses[0].source_state_hint.as_deref(),
+            Some("Polling"),
+            "first access should be tagged with 'Polling'"
+        );
+        assert_eq!(
+            f.accesses[1].source_state_hint.as_deref(),
+            Some("Ready"),
+            "second access should be tagged with 'Ready'"
+        );
+        let automaton = f.automaton_ctxdsl.as_ref().expect("automaton synthesised");
+        assert!(
+            automaton.contains("state Polling initial"),
+            "initial state should be 'Polling'; got:\n{automaton}"
+        );
+        assert!(
+            automaton.contains("state Ready;"),
+            "intermediate state should be 'Ready'; got:\n{automaton}"
+        );
+        assert!(
+            automaton.contains("Polling -> Ready"),
+            "first transition should be Polling -> Ready; got:\n{automaton}"
+        );
+        assert!(
+            automaton.contains("Ready -> S2"),
+            "second transition should be Ready -> S2; got:\n{automaton}"
+        );
     }
 }

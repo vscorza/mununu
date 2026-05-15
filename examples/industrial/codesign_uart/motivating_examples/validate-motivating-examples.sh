@@ -120,6 +120,18 @@ CMSIS_HEADER
 
     rm -rf "$L8_TMP"
 
+    # Phase L9 / gap (1) — Example 9 uses MUNUNU_STATE() markers to
+    # rename the synthesised CTXDSL states from S0/S1/… to
+    # user-supplied names (Polling, Ready, Sending). The header is
+    # shipped under crates/mununu-core/cmsis-stubs and lives on the
+    # include path under `--cmsis-stubs`.
+    run "Example 9: in-source state-name annotations (MUNUNU_STATE markers)" \
+        ./target/debug/mununu codesign extract-c \
+            "$DIR/example_9_state_name_annotations.c" \
+            --register-map "$REGISTER_MAP" \
+            --synthesize-automaton \
+            --cmsis-stubs
+
     printf '\n=== end of transcript ===\n'
 } > "$TRANSCRIPT"
 
