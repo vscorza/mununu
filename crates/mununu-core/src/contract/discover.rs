@@ -294,6 +294,11 @@ impl AnnotationSummary {
                         s.uncontrollable_overrides.push(ann.value.clone());
                     }
                 }
+                // Phase L6: `@mununu_isr` does not affect the
+                // discovery summary — it's consumed by the
+                // codesign extractor's ISR detection, not by the
+                // contract pipeline. Ignore here.
+                MununuTag::Isr => {}
             }
         }
         s
