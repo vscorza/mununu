@@ -46,6 +46,13 @@ pub enum MununuTag {
     Controllable,
     /// `@mununu_uncontrollable <label>` — controllability override.
     Uncontrollable,
+    /// `@mununu_isr` (phase L6) — declares the annotated function as
+    /// an Interrupt Service Routine. The codesign synthesiser emits
+    /// it as a separate top-level automaton composed
+    /// asynchronously with the main-thread automaton, matching the
+    /// reactive-modules ISR + main-thread interleaving in Doc C
+    /// §C.5. Annotation-only; no naming-convention defaults.
+    Isr,
 }
 
 impl MununuTag {
@@ -60,6 +67,7 @@ impl MununuTag {
             "interface" => Some(MununuTag::Interface),
             "controllable" => Some(MununuTag::Controllable),
             "uncontrollable" => Some(MununuTag::Uncontrollable),
+            "isr" => Some(MununuTag::Isr),
             _ => None,
         }
     }
@@ -73,6 +81,7 @@ impl MununuTag {
             MununuTag::Interface => "interface",
             MununuTag::Controllable => "controllable",
             MununuTag::Uncontrollable => "uncontrollable",
+            MununuTag::Isr => "isr",
         }
     }
 }

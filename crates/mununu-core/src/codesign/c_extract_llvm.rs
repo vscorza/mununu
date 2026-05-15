@@ -202,6 +202,12 @@ pub struct LlvmExtraction {
     /// matcher. Empty when no register map was supplied.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<LlvmExtractWarning>,
+    /// Phase L6: top-level CTXDSL `compositions { ... }` block
+    /// emitted when at least one function carries `@mununu_isr`.
+    /// Composes the main-thread automaton asynchronously with each
+    /// ISR. `None` when no ISRs are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition_ctxdsl: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +235,11 @@ pub struct LlvmFunctionSummary {
     /// function has at least one matched access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automaton_ctxdsl: Option<String>,
+    /// Phase L6: `true` when the function carries an `@mununu_isr`
+    /// annotation. ISR functions get composed asynchronously with
+    /// the main thread in [`LlvmExtraction::composition_ctxdsl`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_isr: bool,
 }
 
 /// Extract LLVM IR from a C source file and produce a structural
@@ -281,7 +292,10 @@ pub fn extract_c_via_llvm(
         });
     }
     let ir_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    extract_from_ir_text_with_options(&ir_text, options)
+    // Phase L6: read the source file too, so we can lift `@mununu_*`
+    // annotations from comments and tag functions accordingly.
+    let source_text = std::fs::read_to_string(source_path).unwrap_or_default();
+    extract_from_ir_text_with_options_and_source(&ir_text, &source_text, options)
 }
 
 /// Pure-function half of the extractor — takes an IR text and
@@ -298,13 +312,36 @@ pub fn extract_from_ir_text_with_options(
     ir_text: &str,
     options: &LlvmExtractOptions,
 ) -> Result<LlvmExtraction, LlvmExtractError> {
-    let module: Module =
-        parse_module(ir_text).map_err(|e| LlvmExtractError::IrParseFailed(e.to_string()))?;
-    Ok(summarise(&module, options))
+    extract_from_ir_text_with_options_and_source(ir_text, "", options)
 }
 
-fn summarise(module: &Module, options: &LlvmExtractOptions) -> LlvmExtraction {
+/// Phase L6 entry point — same as
+/// [`extract_from_ir_text_with_options`] but with the C source
+/// alongside the IR so the extractor can lift `@mununu_*`
+/// annotations from comments. ISR-annotated functions are tagged
+/// in the output and composed asynchronously with the rest.
+pub fn extract_from_ir_text_with_options_and_source(
+    ir_text: &str,
+    source_text: &str,
+    options: &LlvmExtractOptions,
+) -> Result<LlvmExtraction, LlvmExtractError> {
+    let module: Module =
+        parse_module(ir_text).map_err(|e| LlvmExtractError::IrParseFailed(e.to_string()))?;
+    Ok(summarise(&module, source_text, options))
+}
+
+fn summarise(module: &Module, source_text: &str, options: &LlvmExtractOptions) -> LlvmExtraction {
     use crate::llvm_ir::GlobalKind;
+
+    // Phase L6: lift `@mununu_*` annotations from C source and map
+    // each `@mununu_isr` annotation to the function it sits above
+    // by line-proximity scanning (the next `<ret> NAME(` declaration
+    // after the annotation owns it).
+    let isr_function_names: std::collections::HashSet<String> = if source_text.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        detect_isr_functions(source_text)
+    };
 
     let external_globals: Vec<String> = module
         .globals
@@ -330,8 +367,21 @@ fn summarise(module: &Module, options: &LlvmExtractOptions) -> LlvmExtraction {
     let functions: Vec<LlvmFunctionSummary> = module
         .functions
         .iter()
-        .map(|f| summarise_function(f, options, &module_fns, &mut warnings))
+        .map(|f| {
+            let is_isr = isr_function_names.contains(&f.name);
+            summarise_function(f, options, &module_fns, is_isr, &mut warnings)
+        })
         .collect();
+
+    // Phase L6: emit a top-level CTXDSL `compositions { ... }` block
+    // when any ISR functions are present. The composition is
+    // asynchronous (Doc C §C.5): main-thread + each ISR interleave
+    // non-deterministically.
+    let composition_ctxdsl = if !isr_function_names.is_empty() {
+        Some(synthesise_compositions_ctxdsl(&functions))
+    } else {
+        None
+    };
 
     LlvmExtraction {
         source_filename: module.source_filename.clone(),
@@ -340,6 +390,7 @@ fn summarise(module: &Module, options: &LlvmExtractOptions) -> LlvmExtraction {
         external_globals,
         struct_types,
         warnings,
+        composition_ctxdsl,
     }
 }
 
@@ -347,6 +398,7 @@ fn summarise_function(
     f: &crate::llvm_ir::Function,
     options: &LlvmExtractOptions,
     module_fns: &HashMap<&str, &crate::llvm_ir::Function>,
+    is_isr: bool,
     warnings: &mut Vec<LlvmExtractWarning>,
 ) -> LlvmFunctionSummary {
     let num_instructions: usize = f.basic_blocks.iter().map(|b| b.instructions.len()).sum();
@@ -395,6 +447,7 @@ fn summarise_function(
         num_inttoptr,
         accesses,
         automaton_ctxdsl,
+        is_isr,
     }
 }
 
@@ -762,6 +815,104 @@ fn operand_ssas<'a>(instr: &'a Instruction) -> Vec<&'a str> {
         _ => {}
     }
     out
+}
+
+// --------------------------------------------------------------------
+// Phase L6: ISR detection + asynchronous composition emission.
+// --------------------------------------------------------------------
+
+/// Scan C source text for `@mununu_isr` annotations and return the
+/// set of function names they apply to. Each annotation owns the
+/// next function declaration line below it (within a 10-line
+/// window). Annotation-only — no naming-convention defaults; a
+/// function not carrying `@mununu_isr` is *not* an ISR even if its
+/// name ends in `_IRQHandler`.
+fn detect_isr_functions(source_text: &str) -> std::collections::HashSet<String> {
+    use crate::mununu_annotations::{MununuTag, extract_from_c_source};
+    use regex::Regex;
+    let mut out = std::collections::HashSet::new();
+    let isr_annotations: Vec<u32> = extract_from_c_source(source_text)
+        .into_iter()
+        .filter(|a| a.tag == MununuTag::Isr)
+        .filter_map(|a| a.source_line)
+        .collect();
+    if isr_annotations.is_empty() {
+        return out;
+    }
+    // Scan source lines. For each ISR annotation, look for the next
+    // function-declaration line within 10 lines below it.
+    let fn_decl = Regex::new(r"^\s*(?:static\s+)?(?:inline\s+)?\S+\s+(\w+)\s*\(").unwrap();
+    let lines: Vec<&str> = source_text.lines().collect();
+    for ann_line in &isr_annotations {
+        let start = *ann_line as usize;
+        let end = (start + 10).min(lines.len());
+        for line in lines.iter().take(end).skip(start) {
+            if let Some(caps) = fn_decl.captures(line) {
+                out.insert(caps[1].to_string());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Emit a top-level CTXDSL `compositions { ... }` block composing
+/// the non-ISR functions asynchronously with each ISR function.
+/// Doc C §C.5 mandates asynchronous composition for ISR + main-
+/// thread interleaving (synchronous would be unsound — ISRs
+/// preempt the main thread at arbitrary points).
+fn synthesise_compositions_ctxdsl(functions: &[LlvmFunctionSummary]) -> String {
+    use std::fmt::Write;
+    let main_thread_fns: Vec<&LlvmFunctionSummary> = functions
+        .iter()
+        .filter(|f| !f.is_isr && f.automaton_ctxdsl.is_some())
+        .collect();
+    let isr_fns: Vec<&LlvmFunctionSummary> = functions
+        .iter()
+        .filter(|f| f.is_isr && f.automaton_ctxdsl.is_some())
+        .collect();
+    let mut buf = String::new();
+    let _ = writeln!(buf, "    compositions {{");
+    let _ = writeln!(buf, "        composition Codesign = asynchronous {{");
+    for f in &main_thread_fns {
+        let _ = writeln!(buf, "            member {};", ctxdsl_ident(&f.name));
+    }
+    for f in &isr_fns {
+        let _ = writeln!(
+            buf,
+            "            member {};   // ISR",
+            ctxdsl_ident(&f.name)
+        );
+    }
+    let _ = writeln!(buf, "        }};");
+    let _ = writeln!(buf, "    }}");
+    buf
+}
+
+/// Sanitise a function name into a CTXDSL identifier shape that
+/// matches what `synthesise_automaton_ctxdsl` emits (first char
+/// uppercase, rest as-is).
+fn ctxdsl_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut first = true;
+    for c in name.chars() {
+        let safe = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        };
+        if first {
+            out.push(safe.to_ascii_uppercase());
+            first = false;
+        } else {
+            out.push(safe);
+        }
+    }
+    if out.is_empty() {
+        "Func".to_string()
+    } else {
+        out
+    }
 }
 
 // --------------------------------------------------------------------
@@ -1673,6 +1824,122 @@ define void @uart_send(i8 %0) {
             "got warnings: {:?}",
             ext.warnings
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase L6 tests — @mununu_isr annotation + async composition.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn l6_detects_isr_annotation_in_source() {
+        let source = r#"
+/* main thread driver */
+void uart_send(uint8_t byte) {}
+
+/**
+ * @mununu_isr
+ */
+void UART_IRQHandler(void) {}
+"#;
+        let isrs = detect_isr_functions(source);
+        assert!(isrs.contains("UART_IRQHandler"), "got: {isrs:?}");
+        assert!(!isrs.contains("uart_send"));
+    }
+
+    #[test]
+    fn l6_marks_isr_function_in_summary() {
+        let ir = r#"@UART = external constant ptr, align 8
+define void @uart_send() {
+  ret void
+}
+define void @UART_IRQHandler() {
+  ret void
+}
+"#;
+        let source = r#"
+void uart_send(uint8_t byte) {}
+
+/**
+ * @mununu_isr
+ */
+void UART_IRQHandler(void) {}
+"#;
+        let ext = extract_from_ir_text_with_options_and_source(
+            ir,
+            source,
+            &LlvmExtractOptions::default(),
+        )
+        .unwrap();
+        let isr = ext
+            .functions
+            .iter()
+            .find(|f| f.name == "UART_IRQHandler")
+            .unwrap();
+        assert!(isr.is_isr);
+        let send = ext
+            .functions
+            .iter()
+            .find(|f| f.name == "uart_send")
+            .unwrap();
+        assert!(!send.is_isr);
+    }
+
+    #[test]
+    fn l6_emits_async_composition_when_isr_present() {
+        let ir = r#"@UART = external constant ptr, align 8
+%struct.UART_TypeDef = type { i32, i32, i32 }
+define void @uart_send() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 2
+  store volatile i8 0, ptr %2, align 4
+  ret void
+}
+define void @UART_IRQHandler() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 1
+  %3 = load volatile i32, ptr %2, align 4
+  ret void
+}
+"#;
+        let source = r#"
+void uart_send(uint8_t byte) {}
+
+/**
+ * @mununu_isr
+ */
+void UART_IRQHandler(void) {}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options_and_source(ir, source, &opts).unwrap();
+        let comp = ext
+            .composition_ctxdsl
+            .as_ref()
+            .expect("composition emitted when ISR present");
+        assert!(comp.contains("compositions"));
+        assert!(comp.contains("asynchronous"));
+        assert!(comp.contains("Uart_send"));
+        assert!(comp.contains("UART_IRQHandler") || comp.contains("Uart_irqhandler"));
+        assert!(comp.contains("// ISR"));
+    }
+
+    #[test]
+    fn l6_no_composition_when_no_isr_annotation() {
+        let ir = r#"define void @uart_send() {
+  ret void
+}
+"#;
+        let source = "void uart_send(uint8_t byte) {}\n";
+        let ext = extract_from_ir_text_with_options_and_source(
+            ir,
+            source,
+            &LlvmExtractOptions::default(),
+        )
+        .unwrap();
+        assert!(ext.composition_ctxdsl.is_none());
     }
 
     #[test]
