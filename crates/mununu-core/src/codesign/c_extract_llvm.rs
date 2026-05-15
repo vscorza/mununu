@@ -122,6 +122,13 @@ pub struct LlvmExtractOptions {
     /// alphabet. Phase L3 will extend this with polling-loop
     /// detection.
     pub synthesize_automaton: bool,
+    /// Phase L7: when `true` and ≥2 non-ISR functions have
+    /// synthesised automata, emit a top-level `Driver` automaton
+    /// that non-deterministically dispatches to each entry point
+    /// via `call_<fn>` / `return_<fn>` rendezvous labels. Disabled
+    /// by default so single-entry-point use cases get a cleaner
+    /// output without the dispatch layer.
+    pub driver_mode: bool,
 }
 
 /// Phase L2 warnings — the register-access matcher's structured
@@ -208,6 +215,12 @@ pub struct LlvmExtraction {
     /// ISR. `None` when no ISRs are present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composition_ctxdsl: Option<String>,
+    /// Phase L7: top-level CTXDSL `Driver` automaton that non-
+    /// deterministically dispatches to each non-ISR entry point.
+    /// `Some` only when [`LlvmExtractOptions::driver_mode`] is set
+    /// AND ≥2 non-ISR functions have synthesised automata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_ctxdsl: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +396,23 @@ fn summarise(module: &Module, source_text: &str, options: &LlvmExtractOptions) -
         None
     };
 
+    // Phase L7: emit a top-level Driver automaton when driver_mode
+    // is on and ≥2 non-ISR entry points have synthesised automata.
+    // The driver non-deterministically dispatches to each entry.
+    let driver_ctxdsl = if options.driver_mode {
+        let non_isr_with_automaton: Vec<&LlvmFunctionSummary> = functions
+            .iter()
+            .filter(|f| !f.is_isr && f.automaton_ctxdsl.is_some())
+            .collect();
+        if non_isr_with_automaton.len() >= 2 {
+            Some(synthesise_driver_ctxdsl(&non_isr_with_automaton))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     LlvmExtraction {
         source_filename: module.source_filename.clone(),
         target_triple: module.target_triple.clone(),
@@ -391,6 +421,7 @@ fn summarise(module: &Module, source_text: &str, options: &LlvmExtractOptions) -
         struct_types,
         warnings,
         composition_ctxdsl,
+        driver_ctxdsl,
     }
 }
 
@@ -885,6 +916,79 @@ fn synthesise_compositions_ctxdsl(functions: &[LlvmFunctionSummary]) -> String {
         );
     }
     let _ = writeln!(buf, "        }};");
+    let _ = writeln!(buf, "    }}");
+    buf
+}
+
+/// Phase L7: emit a top-level `Driver` automaton that non-
+/// deterministically dispatches to each non-ISR entry point. Each
+/// entry's automaton stays separate; the driver's role is to model
+/// "the application can call any entry point at any time."
+///
+/// The emitted shape:
+///
+/// ```ctxdsl
+/// automata {
+///     automaton Driver {
+///         controllable {
+///             call_uart_send;
+///             call_uart_recv;
+///             return_uart_send;
+///             return_uart_recv;
+///         }
+///         states {
+///             state Idle initial;
+///             state Calling_uart_send;
+///             state Calling_uart_recv;
+///         }
+///         transitions {
+///             transition Idle -> Calling_uart_send on label call_uart_send;
+///             transition Calling_uart_send -> Idle on label return_uart_send;
+///             transition Idle -> Calling_uart_recv on label call_uart_recv;
+///             transition Calling_uart_recv -> Idle on label return_uart_recv;
+///         }
+///     }
+/// }
+/// ```
+///
+/// The per-function automata are unchanged; the user wires them
+/// into the driver by adding matching `call_<fn>` / `return_<fn>`
+/// transitions at their entry/exit states (or via a CTXDSL
+/// composition block with shared labels).
+fn synthesise_driver_ctxdsl(entries: &[&LlvmFunctionSummary]) -> String {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let _ = writeln!(buf, "    automata {{");
+    let _ = writeln!(buf, "        automaton Driver {{");
+    let _ = writeln!(buf, "            controllable {{");
+    for f in entries {
+        let _ = writeln!(buf, "                call_{name};", name = f.name);
+        let _ = writeln!(buf, "                return_{name};", name = f.name);
+    }
+    let _ = writeln!(buf, "            }}");
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "            states {{");
+    let _ = writeln!(buf, "                state Idle initial;");
+    for f in entries {
+        let _ = writeln!(buf, "                state Calling_{name};", name = f.name);
+    }
+    let _ = writeln!(buf, "            }}");
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "            transitions {{");
+    for f in entries {
+        let _ = writeln!(
+            buf,
+            "                transition Idle -> Calling_{name} on label call_{name};",
+            name = f.name
+        );
+        let _ = writeln!(
+            buf,
+            "                transition Calling_{name} -> Idle on label return_{name};",
+            name = f.name
+        );
+    }
+    let _ = writeln!(buf, "            }}");
+    let _ = writeln!(buf, "        }}");
     let _ = writeln!(buf, "    }}");
     buf
 }
@@ -1940,6 +2044,129 @@ void UART_IRQHandler(void) {}
         )
         .unwrap();
         assert!(ext.composition_ctxdsl.is_none());
+    }
+
+    // ----------------------------------------------------------------
+    // Phase L7 tests — multi-entry driver composition.
+    // ----------------------------------------------------------------
+
+    fn two_entry_driver_ir() -> &'static str {
+        r#"@UART = external constant ptr, align 8
+%struct.UART_TypeDef = type { i32, i32, i32 }
+define void @uart_send() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 2
+  store volatile i8 0, ptr %2, align 4
+  ret void
+}
+define void @uart_recv() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 1
+  %3 = load volatile i32, ptr %2, align 4
+  ret void
+}
+"#
+    }
+
+    #[test]
+    fn l7_driver_off_by_default() {
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(two_entry_driver_ir(), &opts).unwrap();
+        assert!(ext.driver_ctxdsl.is_none());
+    }
+
+    #[test]
+    fn l7_driver_emits_when_two_entries_and_driver_mode_on() {
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            driver_mode: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(two_entry_driver_ir(), &opts).unwrap();
+        let driver = ext.driver_ctxdsl.as_ref().expect("Driver emitted");
+        for marker in [
+            "automaton Driver",
+            "state Idle initial",
+            "state Calling_uart_send",
+            "state Calling_uart_recv",
+            "Idle -> Calling_uart_send on label call_uart_send",
+            "Calling_uart_send -> Idle on label return_uart_send",
+            "Idle -> Calling_uart_recv on label call_uart_recv",
+            "Calling_uart_recv -> Idle on label return_uart_recv",
+        ] {
+            assert!(driver.contains(marker), "missing `{marker}` in:\n{driver}");
+        }
+    }
+
+    #[test]
+    fn l7_driver_suppressed_with_only_one_entry() {
+        let single = r#"define void @uart_send() {
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            driver_mode: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(single, &opts).unwrap();
+        // Only one function and it has no accesses → no automaton →
+        // no driver (would be a single-entry dispatch, pointless).
+        assert!(ext.driver_ctxdsl.is_none());
+    }
+
+    #[test]
+    fn l7_driver_excludes_isr_functions() {
+        let ir = r#"@UART = external constant ptr, align 8
+%struct.UART_TypeDef = type { i32, i32, i32 }
+define void @uart_send() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 2
+  store volatile i8 0, ptr %2, align 4
+  ret void
+}
+define void @uart_recv() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 1
+  %3 = load volatile i32, ptr %2, align 4
+  ret void
+}
+define void @UART_IRQHandler() {
+  %1 = load ptr, ptr @UART, align 8
+  %2 = getelementptr inbounds %struct.UART_TypeDef, ptr %1, i32 0, i32 1
+  %3 = load volatile i32, ptr %2, align 4
+  ret void
+}
+"#;
+        let source = r#"
+void uart_send(uint8_t byte) {}
+void uart_recv(uint8_t *out) {}
+
+/**
+ * @mununu_isr
+ */
+void UART_IRQHandler(void) {}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            driver_mode: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options_and_source(ir, source, &opts).unwrap();
+        let driver = ext.driver_ctxdsl.as_ref().expect("Driver emitted");
+        assert!(driver.contains("Calling_uart_send"));
+        assert!(driver.contains("Calling_uart_recv"));
+        // The ISR is composed *asynchronously* via the L6
+        // composition block, not dispatched by the Driver.
+        assert!(!driver.contains("UART_IRQHandler"));
+        assert!(ext.composition_ctxdsl.is_some());
     }
 
     #[test]
