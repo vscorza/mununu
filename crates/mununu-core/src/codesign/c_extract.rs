@@ -137,9 +137,16 @@ pub fn synthesise_automaton_ctxdsl(
         }
     }
     if !controllable_labels.is_empty() {
+        // CTXDSL's `controllable { ... }` block expects each entry as
+        // `label NAME;` (parser at
+        // `crate::context_dsl::parser::parse_label_block` calls
+        // `expect_keyword(Keyword::Label)`). Without the `label`
+        // keyword the synthesised CTXDSL fails to parse when spliced
+        // into a `context { ... }` block — which broke the end-to-end
+        // "extract C → eval against CTXDSL" workflow before this fix.
         let _ = writeln!(buf, "            controllable {{");
         for label in &controllable_labels {
-            let _ = writeln!(buf, "                {label};");
+            let _ = writeln!(buf, "                label {label};");
         }
         let _ = writeln!(buf, "            }}");
         let _ = writeln!(buf);
@@ -390,6 +397,56 @@ mod tests {
         assert!(
             ctxdsl.contains("Ready -> S2"),
             "expected linear transition Ready -> S2; got:\n{ctxdsl}"
+        );
+    }
+
+    #[test]
+    fn synthesised_automaton_parses_back_through_ctxdsl_parser() {
+        // Regression for the missing-`label`-keyword bug: the
+        // synthesised `controllable { ... }` used to emit
+        // `wr_data_byte;` without the `label` keyword, which the
+        // CTXDSL parser rejected (it calls
+        // `expect_keyword(Keyword::Label)` on every entry). The fix
+        // emits `label wr_data_byte;` instead. This test wraps the
+        // synthesised fragment in a `context { ... }` block and
+        // confirms it round-trips through the parser.
+        let accesses = vec![
+            RegisterAccess {
+                kind: AccessKind::Read,
+                register: "CTRL".to_string(),
+                field: Some("tx_start".to_string()),
+                accessor: "(IR)".to_string(),
+                source_line: 1,
+                flow: AccessFlow::PollingLoop,
+                source_state_hint: None,
+            },
+            RegisterAccess {
+                kind: AccessKind::Write,
+                register: "CTRL".to_string(),
+                field: Some("tx_start".to_string()),
+                accessor: "(IR)".to_string(),
+                source_line: 2,
+                flow: AccessFlow::Linear,
+                source_state_hint: None,
+            },
+        ];
+        let fragment = synthesise_automaton_ctxdsl("demo", &accesses, &uart_register_map());
+        // The fragment is the `automata { ... }` block alone; wrap it
+        // in a context for the parser.
+        let full = format!("context Demo {{\n{fragment}}}\n");
+        let parsed = crate::context_dsl::parse(&full).unwrap_or_else(|e| {
+            panic!("synthesised CTXDSL failed to parse: {e:?}\n--- source ---\n{full}")
+        });
+        assert_eq!(parsed.automata.len(), 1);
+        let auto = &parsed.automata[0];
+        assert_eq!(auto.name.name, "Demo");
+        // The controllable block carries the write label.
+        assert!(
+            auto.controllable
+                .iter()
+                .any(|l| l.name.name == "wr_ctrl_tx_start"),
+            "expected wr_ctrl_tx_start in controllable block; got {:?}",
+            auto.controllable
         );
     }
 }

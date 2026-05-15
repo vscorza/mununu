@@ -29,7 +29,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
           "source_line": 1
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_status_clear {\n            controllable {\n                wr_status_tx_busy;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n            }\n\n            transitions {\n                transition S0 -> S1 on label wr_status_tx_busy; // (IR-resolved @AbsoluteAddress(1073807364))\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_status_clear {\n            controllable {\n                label wr_status_tx_busy;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n            }\n\n            transitions {\n                transition S0 -> S1 on label wr_status_tx_busy; // (IR-resolved @AbsoluteAddress(1073807364))\n            }\n        }\n    }\n"
     }
   ],
   "external_globals": [],
@@ -68,7 +68,7 @@ warning: uart_read_status: could not resolve pointer operand %4 of a volatile lo
           "source_line": 5
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                wr_data_byte;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n                state S2;\n            }\n\n            transitions {\n                transition S0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 })\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                label wr_data_byte;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n                state S2;\n            }\n\n            transitions {\n                transition S0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 })\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n            }\n        }\n    }\n"
     },
     {
       "name": "uart_read_status",
@@ -129,7 +129,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
           "source_line": 8
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                wr_data_byte;\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n                state S2;\n            }\n\n            transitions {\n                transition S0 -> S1 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S1 -> S2 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                label wr_data_byte;\n                label wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n                state S2;\n            }\n\n            transitions {\n                transition S0 -> S1 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S1 -> S2 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
     },
     {
       "name": "UART_IRQHandler",
@@ -194,7 +194,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
           "source_line": 4
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_init {\n            controllable {\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n            }\n\n            transitions {\n                transition S0 -> S1 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_init {\n            controllable {\n                label wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n            }\n\n            transitions {\n                transition S0 -> S1 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
     },
     {
       "name": "uart_send",
@@ -229,7 +229,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
           "source_line": 13
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                wr_data_byte;\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state Loop0;\n                state S1;\n                state S2;\n                state S3;\n            }\n\n            transitions {\n                transition S0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S2 -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                label wr_data_byte;\n                label wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state Loop0;\n                state S1;\n                state S2;\n                state S3;\n            }\n\n            transitions {\n                transition S0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S2 -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
     },
     {
       "name": "uart_recv",
@@ -271,7 +271,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
 }
 
 === Example 8: CMSIS-style struct-member access (--cmsis-stubs) ===
-$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton --cmsis-stubs --include /var/folders/cp/dgzzd8w16l90rnvkvx8532m80000gn/T/tmp.iMYGUpnfVk
+$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton --cmsis-stubs --include /var/folders/cp/dgzzd8w16l90rnvkvx8532m80000gn/T/tmp.hZf13TvV5s
 {
   "source_filename": "examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c",
   "target_triple": "x86_64-apple-macosx26.0.0",
@@ -309,7 +309,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
           "source_line": 13
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_send_byte {\n            controllable {\n                wr_data_byte;\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state Loop0;\n                state S1;\n                state S2;\n                state S3;\n            }\n\n            transitions {\n                transition S0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S2 -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send_byte {\n            controllable {\n                label wr_data_byte;\n                label wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state Loop0;\n                state S1;\n                state S2;\n                state S3;\n            }\n\n            transitions {\n                transition S0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S2 -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
     }
   ],
   "external_globals": [],
@@ -363,7 +363,7 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
           "source_state_hint": "Sending"
         }
       ],
-      "automaton_ctxdsl": "    automata {\n        automaton Uart_send_byte {\n            controllable {\n                wr_data_byte;\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state Polling initial;\n                state Loop0;\n                state Ready;\n                state Sending;\n                state S3;\n            }\n\n            transitions {\n                transition Polling -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> Ready on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition Ready -> Sending on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition Sending -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send_byte {\n            controllable {\n                label wr_data_byte;\n                label wr_ctrl_tx_start;\n            }\n\n            states {\n                state Polling initial;\n                state Loop0;\n                state Ready;\n                state Sending;\n                state S3;\n            }\n\n            transitions {\n                transition Polling -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> Ready on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition Ready -> Sending on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition Sending -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
     }
   ],
   "external_globals": [],
