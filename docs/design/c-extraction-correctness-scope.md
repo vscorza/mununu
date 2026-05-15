@@ -71,13 +71,26 @@ sound, but never silent"):
   [`examples/industrial/codesign_uart/firmware.c`](../../examples/industrial/codesign_uart/firmware.c)
   is to declare base pointers as `extern volatile T *const NAME` so
   the AST emits a real `DeclRefExpr`.
-- **No interprocedural reasoning.** Calls to other firmware functions
-  are walked into `collect_reads` if they wrap a register access in an
-  argument, but the callee's own register accesses are not lifted.
-  Function-call composition is the slice-2.d frontier (not queued).
-- **No interrupt / ISR semantics.** Functions named `*_IRQHandler`
-  (CMSIS convention) or annotated as ISRs do not enter the synthesised
-  automaton as parallel components. Slice-2.e frontier.
+- ~~**No interprocedural reasoning.**~~ **Partially closed by phase L5.**
+  Calls to functions defined in the same module are now inlined at the
+  call site: the callee's body is walked recursively and its register
+  accesses are spliced into the caller's list. **L5.5 gap, queued**:
+  pointer-parameter aliasing. A callee that takes a peripheral pointer
+  parameter (`void uart_wait_idle(volatile UART_TypeDef *u)`) and
+  dereferences `u` will hit the alloca-store-load round-trip clang emits
+  at `-O0` and produce `UnresolvedPointer` warnings — the parameter's
+  resolved address from the caller is not propagated into the callee's
+  alloca. The L5 test fixture uses a callee touching `@UART` directly,
+  which sidesteps this. The fix requires tracking alloca-store-load
+  round-trips so the callee's parameter SSA resolves to the caller's
+  argument's resolved address. Real-world helper-function support is
+  L5.5.
+- ~~**No interrupt / ISR semantics.**~~ **Closed by phase L6.** Functions
+  annotated `@mununu_isr` are tagged in the function summary and
+  composed asynchronously with the main-thread automaton via the
+  emitted `composition_ctxdsl` block. Naming-convention defaults
+  (`*_IRQHandler`, `*_isr`) are deliberately NOT honoured — annotation-
+  only. Real-clang validation: `motivating_examples/example_5_isr_with_main_thread.c`.
 
 Soundness *for safety properties* is preserved through three
 mechanisms:
