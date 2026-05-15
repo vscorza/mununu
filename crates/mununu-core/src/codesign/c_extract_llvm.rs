@@ -454,7 +454,14 @@ fn summarise_function(
 
     let (accesses, automaton_ctxdsl) = if let Some(rm) = options.register_map.as_ref() {
         let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let accesses = extract_register_accesses(f, rm, module_fns, &mut visiting, warnings);
+        let accesses = extract_register_accesses(
+            f,
+            rm,
+            module_fns,
+            &mut visiting,
+            HashMap::new(), // entry-point: no caller bindings yet
+            warnings,
+        );
         let automaton = if options.synthesize_automaton && !accesses.is_empty() {
             Some(crate::codesign::c_extract::synthesise_automaton_ctxdsl(
                 &f.name, &accesses, rm,
@@ -521,8 +528,9 @@ struct ExtractionPlan {
 fn build_extraction_plan(
     f: &crate::llvm_ir::Function,
     rm: &RegisterMap,
-    ssa_defs: &HashMap<&str, &Instruction>,
+    ctx: &ResolverCtx<'_>,
 ) -> ExtractionPlan {
+    let ssa_defs = &ctx.ssa_defs;
     let mut plan = ExtractionPlan::default();
 
     // --- Phase L4 pre-pass: bit-field RMW recognition. ---
@@ -615,7 +623,7 @@ fn build_extraction_plan(
             // Match touched bits against register fields. We need to
             // know which register the store targets — resolve its
             // pointer through the SSA defs.
-            let Some(addr) = resolve_pointer(store_dest, ssa_defs) else {
+            let Some(addr) = resolve_pointer(store_dest, ctx) else {
                 continue;
             };
             let register = match &addr {
@@ -1050,6 +1058,7 @@ fn extract_register_accesses(
     rm: &RegisterMap,
     module_fns: &HashMap<&str, &crate::llvm_ir::Function>,
     visiting: &mut std::collections::HashSet<String>,
+    param_bindings: HashMap<String, ResolvedAddress>,
     warnings: &mut Vec<LlvmExtractWarning>,
 ) -> Vec<RegisterAccess> {
     // Phase L5: cycle guard for the interprocedural walk. A function
@@ -1062,19 +1071,10 @@ fn extract_register_accesses(
         return Vec::new();
     }
 
-    // Build an SSA-name → producing-instruction lookup over the
-    // whole function. The plan below uses it for backwards-tracing
-    // (e.g. resolving a store's value through `or → and → load`).
-    let mut ssa_defs: HashMap<&str, &Instruction> = HashMap::new();
-    for bb in &f.basic_blocks {
-        for instr in &bb.instructions {
-            if let Some(result) = instruction_result(instr) {
-                ssa_defs.insert(result, instr);
-            }
-        }
-    }
-
-    let plan = build_extraction_plan(f, rm, &ssa_defs);
+    // Phase L5.5: build the resolver context — SSA defs, store-to-
+    // alloca lookup, and parameter bindings from the caller.
+    let ctx = build_resolver_ctx(f, param_bindings);
+    let plan = build_extraction_plan(f, rm, &ctx);
 
     let mut accesses: Vec<RegisterAccess> = Vec::new();
     let mut current_line: u32 = 0;
@@ -1087,16 +1087,23 @@ fn extract_register_accesses(
         // Approximate source-line ordering by basic-block traversal.
         for instr in &bb.instructions {
             current_line = current_line.saturating_add(1);
-            // Phase L5: when we hit a call to a function defined in
-            // the same module, recursively extract its accesses and
-            // splice them into the caller's list at this point.
-            // External calls fall through silently — the verifier
-            // sees no accesses for them (chaotic-stub equivalent).
-            if let Instruction::Call { callee, .. } = instr {
+            // Phase L5 / L5.5: when we hit a call to a function
+            // defined in the same module, build parameter bindings
+            // from the call's arguments (resolved against the
+            // caller's ctx) and recurse into the callee with those
+            // bindings. External calls fall through silently.
+            if let Instruction::Call { callee, args, .. } = instr {
                 let target = callee.trim_start_matches('@');
                 if let Some(callee_fn) = module_fns.get(target) {
-                    let callee_accesses =
-                        extract_register_accesses(callee_fn, rm, module_fns, visiting, warnings);
+                    let callee_bindings = build_callee_param_bindings(callee_fn, args, &ctx);
+                    let callee_accesses = extract_register_accesses(
+                        callee_fn,
+                        rm,
+                        module_fns,
+                        visiting,
+                        callee_bindings,
+                        warnings,
+                    );
                     accesses.extend(callee_accesses);
                 }
                 continue;
@@ -1127,7 +1134,7 @@ fn extract_register_accesses(
             {
                 continue;
             }
-            match resolve_pointer(pointer, &ssa_defs) {
+            match resolve_pointer(pointer, &ctx) {
                 Some(addr) => {
                     let field_override = if kind == AccessKind::Write {
                         instr_result.and_then(|r| plan.rmw_store_field.get(r).cloned())
@@ -1209,10 +1216,129 @@ fn instruction_result(instr: &Instruction) -> Option<&str> {
 /// through GEP / `load ptr, ptr @global` / `inttoptr` / `bitcast`
 /// chains. Returns `None` when the chain is too complex (e.g.,
 /// dynamic GEP indices, multi-step pointer arithmetic).
-fn resolve_pointer(
-    pointer: &PointerOperand,
-    ssa_defs: &HashMap<&str, &Instruction>,
-) -> Option<ResolvedAddress> {
+/// Phase L5.5: per-function context the resolver needs to handle
+/// alloca-store-load round-trips and pointer-parameter aliasing.
+/// Built once at the top of [`extract_register_accesses`] and
+/// threaded through the resolver functions.
+#[derive(Default)]
+struct ResolverCtx<'a> {
+    /// SSA name → producing instruction.
+    ssa_defs: HashMap<&'a str, &'a Instruction>,
+    /// Alloca SSA name → the single store that initialises it.
+    /// Multi-store allocas (loop variables, etc.) are not tracked —
+    /// the resolver returns None for those, surfacing
+    /// `UnresolvedPointer`.
+    store_to_alloca: HashMap<String, &'a Instruction>,
+    /// Phase L5.5: function-parameter SSA name → caller's resolved
+    /// argument address. Empty for the entry-point caller; populated
+    /// when recursing into a callee.
+    param_bindings: HashMap<String, ResolvedAddress>,
+}
+
+/// Phase L5.5: zip a call site's arguments against the callee's
+/// parameters and resolve each pointer-shaped argument to a
+/// `ResolvedAddress` (in the caller's context). The bindings the
+/// callee will then use to resolve its own parameter SSA names.
+///
+/// Non-pointer arguments (i8 / i32 literals, etc.) don't matter for
+/// register-access matching and are silently skipped. Pointer
+/// arguments that we can't resolve in the caller (complex
+/// expressions) are also skipped — the callee will surface them as
+/// `UnresolvedPointer` warnings.
+fn build_callee_param_bindings(
+    callee: &crate::llvm_ir::Function,
+    call_args: &[String],
+    caller_ctx: &ResolverCtx<'_>,
+) -> HashMap<String, ResolvedAddress> {
+    let mut bindings = HashMap::new();
+    for (param, arg_text) in callee.parameters.iter().zip(call_args.iter()) {
+        let Some(param_name) = param.name.as_ref() else {
+            continue;
+        };
+        if !param.ty.contains("ptr") {
+            continue;
+        }
+        let pointer = parse_call_arg_as_pointer(arg_text);
+        if let Some(addr) = resolve_pointer(&pointer, caller_ctx) {
+            bindings.insert(param_name.clone(), addr);
+        }
+    }
+    bindings
+}
+
+/// Cheap shape parser for a call-site argument. Strips the `<type>
+/// [attrs...]` prefix and inspects the value portion. Recognises:
+/// - `@global` → Global
+/// - `%ssa` → Ssa
+/// - `inttoptr (i64 N to ptr)` → InlineConstAddr
+/// - `getelementptr (...inttoptr (i64 N to ptr)... i32 0, i32 K)` → InlineGep
+fn parse_call_arg_as_pointer(arg_text: &str) -> PointerOperand {
+    let trimmed = arg_text.trim().trim_end_matches(',');
+    // Strip the type+attribute prefix to leave just the value
+    // portion. The shapes we care about start with `@`, `%`, or a
+    // keyword like `inttoptr` / `getelementptr`. Find the first such
+    // token.
+    let mut value_start = 0;
+    for (i, c) in trimmed.char_indices() {
+        if c == '@' || c == '%' {
+            value_start = i;
+            break;
+        }
+        let rest = &trimmed[i..];
+        if rest.starts_with("inttoptr") || rest.starts_with("getelementptr") {
+            value_start = i;
+            break;
+        }
+    }
+    let value = trimmed[value_start..].trim();
+    if let Some(rest) = value.strip_prefix('@') {
+        return PointerOperand::Global(rest.to_string());
+    }
+    if let Some(rest) = value.strip_prefix('%') {
+        return PointerOperand::Ssa(rest.to_string());
+    }
+    // Inline `inttoptr (...)` or `getelementptr (...)` — defer to
+    // the parser's shared helpers (re-exported here as
+    // `parse_inline_pointer_expr`).
+    if let Some(op) = crate::llvm_ir::parser::parse_inline_pointer_expr(value) {
+        return op;
+    }
+    PointerOperand::Ssa(value.to_string())
+}
+
+fn build_resolver_ctx<'a>(
+    f: &'a crate::llvm_ir::Function,
+    param_bindings: HashMap<String, ResolvedAddress>,
+) -> ResolverCtx<'a> {
+    let mut ssa_defs: HashMap<&str, &Instruction> = HashMap::new();
+    let mut store_to_alloca: HashMap<String, &Instruction> = HashMap::new();
+    for bb in &f.basic_blocks {
+        for instr in &bb.instructions {
+            if let Some(result) = instruction_result(instr) {
+                ssa_defs.insert(result, instr);
+            }
+            // Phase L5.5: track stores that initialise allocas.
+            // Allocas have form `%X = alloca <ty>` and are
+            // initialised by `store value, ptr %X`. We register only
+            // the FIRST store per alloca — subsequent stores are
+            // ignored (loop-bodies, conditional updates).
+            if let Instruction::Store {
+                dest: PointerOperand::Ssa(dest_name),
+                ..
+            } = instr
+            {
+                store_to_alloca.entry(dest_name.clone()).or_insert(instr);
+            }
+        }
+    }
+    ResolverCtx {
+        ssa_defs,
+        store_to_alloca,
+        param_bindings,
+    }
+}
+
+fn resolve_pointer(pointer: &PointerOperand, ctx: &ResolverCtx<'_>) -> Option<ResolvedAddress> {
     match pointer {
         PointerOperand::Global(name) => Some(ResolvedAddress::GlobalFieldIndex {
             global: name.clone(),
@@ -1227,15 +1353,21 @@ fn resolve_pointer(
             field_index: *field_index,
         }),
         PointerOperand::Ssa(name) => {
-            let def = ssa_defs.get(name.as_str())?;
-            resolve_instruction_as_address(def, ssa_defs)
+            // Phase L5.5: SSA names that are function parameters are
+            // not in `ssa_defs` (they have no producing instruction).
+            // Check the parameter bindings first.
+            if let Some(addr) = ctx.param_bindings.get(name) {
+                return Some(addr.clone());
+            }
+            let def = ctx.ssa_defs.get(name.as_str())?;
+            resolve_instruction_as_address(def, ctx)
         }
     }
 }
 
 fn resolve_instruction_as_address(
     instr: &Instruction,
-    ssa_defs: &HashMap<&str, &Instruction>,
+    ctx: &ResolverCtx<'_>,
 ) -> Option<ResolvedAddress> {
     match instr {
         // GEP: trace the base and add the field index. Phase L2 only
@@ -1263,7 +1395,7 @@ fn resolve_instruction_as_address(
                 }
             }
             let field_index = field_index?;
-            let base_addr = resolve_pointer(base, ssa_defs)?;
+            let base_addr = resolve_pointer(base, ctx)?;
             match base_addr {
                 ResolvedAddress::GlobalFieldIndex { global, .. } => {
                     Some(ResolvedAddress::GlobalFieldIndex {
@@ -1300,11 +1432,48 @@ fn resolve_instruction_as_address(
             global: name.clone(),
             field_index: 0,
         }),
+        // Phase L5.5: `load ptr, ptr %alloca` — the standard
+        // alloca-store-load round-trip clang emits at -O0 to spill
+        // function parameters to the stack. If %alloca has exactly
+        // one store, the load's result is the stored value.
+        // Resolve the stored value back through the resolver.
+        Instruction::Load {
+            source: PointerOperand::Ssa(alloca_name),
+            volatile: false,
+            ..
+        } => {
+            // Is %alloca_name an alloca?
+            let alloca_def = ctx.ssa_defs.get(alloca_name.as_str())?;
+            if !matches!(alloca_def, Instruction::Alloca { .. }) {
+                return None;
+            }
+            // Find the store that initialised it.
+            let store = ctx.store_to_alloca.get(alloca_name)?;
+            let Instruction::Store { value, .. } = store else {
+                return None;
+            };
+            // Resolve the stored value. It's typically an SSA name —
+            // either an earlier instruction or a function parameter.
+            match value {
+                crate::llvm_ir::ValueOperand::Ssa(stored_ssa) => {
+                    // Check parameter bindings first (the parameter
+                    // SSA wouldn't be in ssa_defs).
+                    if let Some(addr) = ctx.param_bindings.get(stored_ssa) {
+                        return Some(addr.clone());
+                    }
+                    // Otherwise resolve the SSA via its producing
+                    // instruction.
+                    let def = ctx.ssa_defs.get(stored_ssa.as_str())?;
+                    resolve_instruction_as_address(def, ctx)
+                }
+                _ => None,
+            }
+        }
         Instruction::IntToPtr { value, .. } => Some(ResolvedAddress::AbsoluteAddress(*value)),
         Instruction::Bitcast { source, .. } => {
             // Bitcast preserves address; resolve the source SSA.
-            let def = ssa_defs.get(source.as_str())?;
-            resolve_instruction_as_address(def, ssa_defs)
+            let def = ctx.ssa_defs.get(source.as_str())?;
+            resolve_instruction_as_address(def, ctx)
         }
         _ => None,
     }
@@ -1686,15 +1855,8 @@ define void @bad_index(i32 %0) {
     fn debug_dump_plan() {
         let m = crate::llvm_ir::parse_module(FIRMWARE_IR).unwrap();
         let f = &m.functions[0];
-        let mut ssa_defs: HashMap<&str, &Instruction> = HashMap::new();
-        for bb in &f.basic_blocks {
-            for instr in &bb.instructions {
-                if let Some(result) = instruction_result(instr) {
-                    ssa_defs.insert(result, instr);
-                }
-            }
-        }
-        let plan = build_extraction_plan(f, &uart_register_map(), &ssa_defs);
+        let ctx = build_resolver_ctx(f, HashMap::new());
+        let plan = build_extraction_plan(f, &uart_register_map(), &ctx);
         eprintln!("polling_loop_loads: {:?}", plan.polling_loop_loads);
         eprintln!("skip_blocks: {:?}", plan.skip_blocks);
         eprintln!("rmw_consumed_loads: {:?}", plan.rmw_consumed_loads);
@@ -1933,6 +2095,58 @@ define void @uart_send(i8 %0) {
     // ----------------------------------------------------------------
     // Phase L6 tests — @mununu_isr annotation + async composition.
     // ----------------------------------------------------------------
+
+    // ----------------------------------------------------------------
+    // Phase L5.5 test — pointer-parameter alias tracking.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn l5_5_pointer_parameter_alias_tracked_through_alloca() {
+        // The caller passes @UART to a helper that dereferences its
+        // parameter. Phase L5.5 chases the callee's alloca-store-load
+        // round-trip back to the parameter SSA, then looks up the
+        // parameter binding from the caller's argument. The STATUS
+        // read inside the helper must surface in the caller's
+        // access list.
+        let ir = r#"%struct.UART_TypeDef = type { i32, i32, i32 }
+@UART = external constant ptr, align 8
+
+define internal void @uart_read_status(ptr noundef %0) {
+  %2 = alloca ptr, align 8
+  store ptr %0, ptr %2, align 8
+  %3 = load ptr, ptr %2, align 8
+  %4 = getelementptr inbounds %struct.UART_TypeDef, ptr %3, i32 0, i32 1
+  %5 = load volatile i32, ptr %4, align 4
+  ret void
+}
+
+define void @uart_send() {
+  %1 = load ptr, ptr @UART, align 8
+  call void @uart_read_status(ptr noundef %1)
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(ir, &opts).unwrap();
+        let send = ext
+            .functions
+            .iter()
+            .find(|f| f.name == "uart_send")
+            .expect("uart_send extracted");
+        // The STATUS read from inside uart_read_status must surface
+        // in uart_send's accesses — L5.5 followed the parameter
+        // alias through the alloca round-trip.
+        assert!(
+            send.accesses
+                .iter()
+                .any(|a| a.register == "STATUS" && a.kind == AccessKind::Read),
+            "L5.5 must lift the parameter-aliased STATUS read into the caller's accesses; got: {:#?}",
+            send.accesses
+        );
+    }
 
     #[test]
     fn l6_detects_isr_annotation_in_source() {
