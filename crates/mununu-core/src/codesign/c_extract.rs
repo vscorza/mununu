@@ -51,6 +51,13 @@ pub struct RegisterAccess {
     /// Control-flow context for this access.
     #[serde(default, skip_serializing_if = "AccessFlow::is_linear")]
     pub flow: AccessFlow,
+    /// Phase-L9 (gap 1 from the verification audit): user-supplied
+    /// name for the SOURCE state of this access's transition,
+    /// emitted by a `MUNUNU_STATE("Name")` marker call in the C
+    /// source. The synthesiser uses this name instead of the
+    /// default `S<i>` when rendering the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_state_hint: Option<String>,
 }
 
 /// Control-flow context for a [`RegisterAccess`].
@@ -138,13 +145,27 @@ pub fn synthesise_automaton_ctxdsl(
         let _ = writeln!(buf);
     }
 
+    // Phase L9 (gap 1): state-name resolution. `state_names[i]` is
+    // the name of the state reached just before access[i] (so
+    // `state_names[0]` is the initial state, and `state_names[N]` is
+    // the terminal state after the last access). The default name is
+    // `S{i}`; a `MUNUNU_STATE("Foo")` marker upstream of access[i]
+    // populates `access[i].source_state_hint` and renames
+    // `state_names[i]` to `Foo` (sanitised to a CTXDSL identifier).
+    let mut state_names: Vec<String> = (0..=accesses.len()).map(|i| format!("S{i}")).collect();
+    for (i, access) in accesses.iter().enumerate() {
+        if let Some(hint) = &access.source_state_hint {
+            state_names[i] = sanitise_state_name(hint);
+        }
+    }
+
     let _ = writeln!(buf, "            states {{");
-    let _ = writeln!(buf, "                state S0 initial;");
+    let _ = writeln!(buf, "                state {} initial;", state_names[0]);
     for (i, access) in accesses.iter().enumerate() {
         if access.flow == AccessFlow::PollingLoop {
             let _ = writeln!(buf, "                state Loop{i};");
         }
-        let _ = writeln!(buf, "                state S{idx};", idx = i + 1);
+        let _ = writeln!(buf, "                state {};", state_names[i + 1]);
     }
     let _ = writeln!(buf, "            }}");
     let _ = writeln!(buf);
@@ -152,8 +173,8 @@ pub fn synthesise_automaton_ctxdsl(
     let _ = writeln!(buf, "            transitions {{");
     for (i, access) in accesses.iter().enumerate() {
         let label = rendezvous_label_name(&access.register, access.field.as_deref(), access.kind);
-        let from = format!("S{i}");
-        let to = format!("S{next}", next = i + 1);
+        let from = &state_names[i];
+        let to = &state_names[i + 1];
         match access.flow {
             AccessFlow::Linear => {
                 let _ = writeln!(
@@ -188,6 +209,29 @@ pub fn synthesise_automaton_ctxdsl(
 
     let _ = rm; // unused — kept for parity with coupling.rs's emitter signature.
     buf
+}
+
+/// Phase L9 (gap 1): sanitise a user-supplied state-name hint from
+/// a `MUNUNU_STATE("…")` marker into a CTXDSL state identifier.
+/// CTXDSL states are parsed as plain identifiers, so any non-alnum
+/// becomes `_`; a leading digit is prefixed with `S_` so the result
+/// starts with a letter; empty input falls back to `S`.
+fn sanitise_state_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return "S".to_string();
+    }
+    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        out.insert_str(0, "S_");
+    }
+    out
 }
 
 /// Sanitise a C identifier into a CTXDSL automaton name: first
@@ -265,6 +309,7 @@ mod tests {
             accessor: "(IR)".to_string(),
             source_line: 1,
             flow: AccessFlow::Linear,
+            source_state_hint: None,
         }];
         let ctxdsl = synthesise_automaton_ctxdsl("fire", &accesses, &uart_register_map());
         assert!(ctxdsl.contains("state S0 initial"));
@@ -282,11 +327,69 @@ mod tests {
             accessor: "(IR)".to_string(),
             source_line: 1,
             flow: AccessFlow::PollingLoop,
+            source_state_hint: None,
         }];
         let ctxdsl = synthesise_automaton_ctxdsl("poll", &accesses, &uart_register_map());
         assert!(ctxdsl.contains("state Loop0"));
         assert!(ctxdsl.contains("state S1"));
         let n = ctxdsl.matches("rd_ctrl_tx_start").count();
         assert!(n >= 3, "expected ≥3 enter/iterate/exit; got {n}");
+    }
+
+    #[test]
+    fn sanitise_state_name_handles_edge_cases() {
+        assert_eq!(sanitise_state_name("Polling"), "Polling");
+        assert_eq!(sanitise_state_name("Tx Ready"), "Tx_Ready");
+        assert_eq!(sanitise_state_name("3State"), "S_3State");
+        assert_eq!(sanitise_state_name(""), "S");
+        assert_eq!(sanitise_state_name("with-dashes"), "with_dashes");
+    }
+
+    #[test]
+    fn state_hint_renames_source_states_in_synthesised_automaton() {
+        let accesses = vec![
+            RegisterAccess {
+                kind: AccessKind::Read,
+                register: "CTRL".to_string(),
+                field: Some("tx_start".to_string()),
+                accessor: "(IR)".to_string(),
+                source_line: 1,
+                flow: AccessFlow::PollingLoop,
+                source_state_hint: Some("Polling".to_string()),
+            },
+            RegisterAccess {
+                kind: AccessKind::Write,
+                register: "CTRL".to_string(),
+                field: Some("tx_start".to_string()),
+                accessor: "(IR)".to_string(),
+                source_line: 2,
+                flow: AccessFlow::Linear,
+                source_state_hint: Some("Ready".to_string()),
+            },
+        ];
+        let ctxdsl = synthesise_automaton_ctxdsl("uart_send", &accesses, &uart_register_map());
+        // Initial state is renamed by the first hint.
+        assert!(
+            ctxdsl.contains("state Polling initial"),
+            "expected initial state renamed to 'Polling'; got:\n{ctxdsl}"
+        );
+        // Second hint renames the state between the two accesses.
+        assert!(ctxdsl.contains("state Ready;"));
+        // Terminal state after the last access keeps its default
+        // name since no further hint applies.
+        assert!(ctxdsl.contains("state S2;"));
+        // Transitions reference the renamed states.
+        assert!(
+            ctxdsl.contains("Polling -> Loop0"),
+            "expected polling-loop entry from 'Polling' state; got:\n{ctxdsl}"
+        );
+        assert!(
+            ctxdsl.contains("Loop0 -> Ready"),
+            "expected polling-loop exit into 'Ready' state; got:\n{ctxdsl}"
+        );
+        assert!(
+            ctxdsl.contains("Ready -> S2"),
+            "expected linear transition Ready -> S2; got:\n{ctxdsl}"
+        );
     }
 }

@@ -57,6 +57,7 @@ struct Regexes {
     target_triple: Regex,
     struct_type: Regex,
     global: Regex,
+    string_constant: Regex,
     define: Regex,
     bb_label: Regex,
     preds_comment: Regex,
@@ -92,6 +93,15 @@ fn regexes() -> &'static Regexes {
         struct_type: Regex::new(r#"^\s*%([\w."]+?)\s*=\s*type\s*\{(.*)\}\s*$"#).unwrap(),
         global: Regex::new(
             r"^\s*@([\w.]+)\s*=\s*((?:[\w_]+\s+)*)(constant|global)\s+(\S+)(?:.*?align\s+(\d+))?",
+        )
+        .unwrap(),
+        // Phase L9: string constants emitted by clang for C string
+        // literals — `@.str = private unnamed_addr constant [N x i8]
+        // c"…\00", align 1`. Captures the global name and the raw
+        // string body (escape sequences left as-is; the unescaper
+        // runs after capture).
+        string_constant: Regex::new(
+            r#"^\s*@([\w.]+)\s*=\s*[\w\s_]*?constant\s+\[\d+\s+x\s+i8\]\s+c"([^"]*)""#,
         )
         .unwrap(),
         define: Regex::new(r"^\s*define\s+(?:[^@]*?\s)?(\S+)\s+@([\w.]+)\((.*?)\)").unwrap(),
@@ -191,6 +201,19 @@ pub fn parse_module(ir_text: &str) -> Result<Module, ParseError> {
                     fields,
                 };
                 module.struct_types.insert(name, st);
+                continue;
+            }
+            // Phase L9: string-constant lines like
+            // `@.str = private unnamed_addr constant [8 x i8] c"Polling\00"`
+            // get recorded in `module.string_constants` so the
+            // marker-call matcher can resolve `@.str` to "Polling".
+            // Matched BEFORE the general global regex, which would
+            // otherwise consume them.
+            if let Some(caps) = r.string_constant.captures(line) {
+                let name = caps[1].to_string();
+                let raw = caps[2].to_string();
+                let unescaped = unescape_llvm_c_string(&raw);
+                module.string_constants.insert(name, unescaped);
                 continue;
             }
             if let Some(caps) = r.global.captures(line) {
@@ -634,6 +657,40 @@ fn parse_phi_incoming(text: &str) -> Vec<(ValueOperand, String)> {
 
 /// Drop trailing `!metadata, !N, !something` annotations from a line
 /// so the instruction regexes don't have to account for them.
+/// Unescape an LLVM-IR C string literal body. Handles the common
+/// escape sequences clang emits: `\NN` hex byte escapes (notably
+/// `\00` for the null terminator), `\\` for backslash. Other bytes
+/// pass through verbatim. The trailing `\00` terminator is
+/// stripped.
+fn unescape_llvm_c_string(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+            if bytes[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Strip the trailing NUL terminator clang emits.
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn strip_trailing_metadata(line: &str) -> &str {
     // Find ", !" — that marks the start of a metadata-annotation
     // suffix on an instruction (e.g. `br label %3, !llvm.loop !6`).
