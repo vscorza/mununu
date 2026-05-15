@@ -92,6 +92,34 @@ run() {
             --synthesize-automaton \
             --driver-mode
 
+    # Phase L8 — Example 8 needs a CMSIS-style uart_cmsis.h header
+    # alongside the C source. Generate it on the fly from the
+    # register-map sidecar.
+    L8_TMP="$(mktemp -d)"
+    cat > "$L8_TMP/uart_cmsis.h" <<'CMSIS_HEADER'
+#pragma once
+#include <stdint.h>
+#ifndef __IO
+#define __IO volatile
+#endif
+typedef struct {
+    union { __IO uint32_t reg; struct { uint32_t tx_start:1; uint32_t enable:1; uint32_t reserved:30; } bit; } CTRL;
+    union { __IO uint32_t reg; struct { uint32_t tx_busy:1; uint32_t rx_ready:1; uint32_t reserved:30; } bit; } STATUS;
+    union { __IO uint32_t reg; uint8_t byte; } DATA;
+} UART_LITE_Type;
+#define UART ((volatile UART_LITE_Type *)0x40010000u)
+CMSIS_HEADER
+
+    run "Example 8: CMSIS-style struct-member access (--cmsis-stubs)" \
+        ./target/debug/mununu codesign extract-c \
+            "$DIR/example_8_cmsis_struct_access.c" \
+            --register-map "$REGISTER_MAP" \
+            --synthesize-automaton \
+            --cmsis-stubs \
+            --include "$L8_TMP"
+
+    rm -rf "$L8_TMP"
+
     printf '\n=== end of transcript ===\n'
 } > "$TRANSCRIPT"
 

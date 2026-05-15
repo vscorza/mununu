@@ -37,6 +37,7 @@
 
 pub mod c_extract;
 pub mod c_extract_llvm;
+pub mod cmsis_emit;
 pub mod compose;
 pub mod coupling;
 pub mod register_map;

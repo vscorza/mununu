@@ -247,6 +247,20 @@ enum CodesignCommand {
     ///
     /// Document C task C5, slice 2.a.
     ExtractC(CodesignExtractCArgs),
+    /// Phase L8: emit a CMSIS-DEVICE-style C header from an SVD.
+    EmitCmsisHeader(CodesignEmitCmsisHeaderArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignEmitCmsisHeaderArgs {
+    #[arg(long, value_name = "SVD")]
+    svd: Option<PathBuf>,
+    #[arg(long = "register-map", value_name = "JSON")]
+    register_map: Option<PathBuf>,
+    #[arg(long, value_name = "NAME")]
+    peripheral: Option<String>,
+    #[arg(long = "vendor-prefix", value_name = "PREFIX", default_value = "")]
+    vendor_prefix: String,
 }
 
 #[derive(Args, Debug)]
@@ -281,6 +295,9 @@ struct CodesignExtractCArgs {
     /// each non-ISR entry point. Disabled by default.
     #[arg(long = "driver-mode")]
     driver_mode: bool,
+    /// Phase L8: include the bundled cmsis-stubs/ directory.
+    #[arg(long = "cmsis-stubs")]
+    cmsis_stubs: bool,
 }
 
 #[derive(Args, Debug)]
@@ -677,6 +694,7 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
 
 fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
+        CodesignCommand::EmitCmsisHeader(args) => codesign_emit_cmsis_header(args),
         CodesignCommand::Couple(args) => codesign_couple(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
@@ -719,9 +737,13 @@ fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
         }
     };
 
+    let mut include_paths = args.include_paths;
+    if args.cmsis_stubs {
+        include_paths.insert(0, locate_cmsis_stubs());
+    }
     let opts = LlvmExtractOptions {
         clang_path: args.clang,
-        include_paths: args.include_paths,
+        include_paths,
         defines: args.defines,
         extra_clang_args: args.extra_clang_args,
         register_map,
@@ -746,6 +768,61 @@ fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to serialise extraction: {e}"))?;
     println!("{json}");
     Ok(())
+}
+
+fn codesign_emit_cmsis_header(args: CodesignEmitCmsisHeaderArgs) -> Result<(), String> {
+    use mununu::codesign::cmsis_emit::{CmsisEmitOptions, emit_cmsis_header};
+    use mununu::codesign::register_map::RegisterMap;
+    use mununu::codesign::svd_import::import_svd;
+    let owned_maps: Vec<RegisterMap> = match (&args.svd, &args.register_map) {
+        (Some(svd), None) => {
+            let body = std::fs::read_to_string(svd)
+                .map_err(|e| format!("failed to read {}: {e}", svd.display()))?;
+            import_svd(&body)
+                .map_err(|e| format!("SVD import failed: {e}"))?
+                .maps
+        }
+        (None, Some(rm_path)) => {
+            let body = std::fs::read_to_string(rm_path)
+                .map_err(|e| format!("failed to read {}: {e}", rm_path.display()))?;
+            vec![
+                serde_json::from_str::<RegisterMap>(&body)
+                    .map_err(|e| format!("failed to parse register-map JSON: {e}"))?,
+            ]
+        }
+        (Some(_), Some(_)) => return Err("use --svd OR --register-map".to_string()),
+        (None, None) => return Err("--svd or --register-map required".to_string()),
+    };
+    let maps: Vec<&RegisterMap> = match &args.peripheral {
+        Some(n) => owned_maps.iter().filter(|rm| &rm.peripheral == n).collect(),
+        None => owned_maps.iter().collect(),
+    };
+    if maps.is_empty() {
+        return Err("no matching peripherals".to_string());
+    }
+    let options = CmsisEmitOptions {
+        vendor_prefix: &args.vendor_prefix,
+        struct_type_name: None,
+    };
+    for rm in &maps {
+        print!("{}", emit_cmsis_header(rm, &options));
+        println!();
+    }
+    Ok(())
+}
+
+fn locate_cmsis_stubs() -> PathBuf {
+    let candidates: &[PathBuf] = &[
+        PathBuf::from("crates/mununu-core/cmsis-stubs"),
+        PathBuf::from("../crates/mununu-core/cmsis-stubs"),
+        PathBuf::from("../share/mununu/cmsis-stubs"),
+    ];
+    for c in candidates {
+        if c.is_dir() {
+            return c.clone();
+        }
+    }
+    candidates[0].clone()
 }
 
 fn codesign_import_svd(args: CodesignImportSvdArgs) -> Result<(), String> {

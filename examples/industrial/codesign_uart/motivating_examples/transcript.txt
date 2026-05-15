@@ -270,4 +270,55 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
   "driver_ctxdsl": "    automata {\n        automaton Driver {\n            controllable {\n                call_uart_init;\n                return_uart_init;\n                call_uart_send;\n                return_uart_send;\n                call_uart_recv;\n                return_uart_recv;\n            }\n\n            states {\n                state Idle initial;\n                state Calling_uart_init;\n                state Calling_uart_send;\n                state Calling_uart_recv;\n            }\n\n            transitions {\n                transition Idle -> Calling_uart_init on label call_uart_init;\n                transition Calling_uart_init -> Idle on label return_uart_init;\n                transition Idle -> Calling_uart_send on label call_uart_send;\n                transition Calling_uart_send -> Idle on label return_uart_send;\n                transition Idle -> Calling_uart_recv on label call_uart_recv;\n                transition Calling_uart_recv -> Idle on label return_uart_recv;\n            }\n        }\n    }\n"
 }
 
+=== Example 8: CMSIS-style struct-member access (--cmsis-stubs) ===
+$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton --cmsis-stubs --include /var/folders/cp/dgzzd8w16l90rnvkvx8532m80000gn/T/tmp.P2Tsc7IqsC
+{
+  "source_filename": "examples/industrial/codesign_uart/motivating_examples/example_8_cmsis_struct_access.c",
+  "target_triple": "x86_64-apple-macosx26.0.0",
+  "functions": [
+    {
+      "name": "uart_send_byte",
+      "return_type": "void",
+      "num_parameters": 1,
+      "num_basic_blocks": 4,
+      "num_instructions": 11,
+      "num_volatile_loads": 2,
+      "num_volatile_stores": 2,
+      "num_inttoptr": 0,
+      "accesses": [
+        {
+          "kind": "read",
+          "register": "STATUS",
+          "field": "tx_busy",
+          "accessor": "(IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 })",
+          "source_line": 4,
+          "flow": "polling_loop"
+        },
+        {
+          "kind": "write",
+          "register": "DATA",
+          "field": "byte",
+          "accessor": "(IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })",
+          "source_line": 9
+        },
+        {
+          "kind": "write",
+          "register": "CTRL",
+          "field": "tx_start",
+          "accessor": "(IR-resolved @AbsoluteAddress(1073807360))",
+          "source_line": 13
+        }
+      ],
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send_byte {\n            controllable {\n                wr_data_byte;\n                wr_ctrl_tx_start;\n            }\n\n            states {\n                state S0 initial;\n                state Loop0;\n                state S1;\n                state S2;\n                state S3;\n            }\n\n            transitions {\n                transition S0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)\n                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)\n                transition Loop0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n                transition S2 -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))\n            }\n        }\n    }\n"
+    }
+  ],
+  "external_globals": [],
+  "struct_types": [
+    "%struct.UART_LITE_Type",
+    "%union.anon",
+    "%union.anon.0",
+    "%union.anon.2"
+  ]
+}
+
 === end of transcript ===

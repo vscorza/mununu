@@ -235,6 +235,34 @@ enum CodesignCommand {
     /// Function bodies are NOT modelled into an automaton yet — that's
     /// slice 2.b.
     ExtractC(CodesignExtractCArgs),
+    /// Emit a CMSIS-DEVICE-style C header for one peripheral from an
+    /// SVD file. Phase L8 — lets `mununu codesign extract-c` consume
+    /// upstream-style firmware C that uses `NRF_TWIM0->FIELD` struct
+    /// member access. The output is one header file's worth of
+    /// content; redirect to disk.
+    EmitCmsisHeader(CodesignEmitCmsisHeaderArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignEmitCmsisHeaderArgs {
+    /// Path to the CMSIS-SVD XML file. One of `--svd` or
+    /// `--register-map` is required.
+    #[arg(long, value_name = "SVD")]
+    svd: Option<PathBuf>,
+    /// Path to a register-map JSON sidecar (the format `mununu
+    /// codesign couple` consumes). Use this when the SVD has
+    /// vendor extensions the importer doesn't yet handle and the
+    /// register map was authored / patched by hand.
+    #[arg(long = "register-map", value_name = "JSON")]
+    register_map: Option<PathBuf>,
+    /// Peripheral name to emit. Default: all peripherals in the
+    /// source (one struct + one macro per peripheral, concatenated).
+    #[arg(long, value_name = "NAME")]
+    peripheral: Option<String>,
+    /// Vendor prefix prepended to peripheral names. E.g.
+    /// `--vendor-prefix NRF_` produces `NRF_TWIM_Type` and `NRF_TWIM0`.
+    #[arg(long = "vendor-prefix", value_name = "PREFIX", default_value = "")]
+    vendor_prefix: String,
 }
 
 #[derive(Args, Debug)]
@@ -276,6 +304,14 @@ struct CodesignExtractCArgs {
     /// application calls in arbitrary order. Disabled by default.
     #[arg(long = "driver-mode")]
     driver_mode: bool,
+    /// Phase L8: include the bundled vendor-neutral CMSIS-minimal
+    /// stubs (`__IO`, `__NOP`, NVIC no-ops, …) in the clang
+    /// invocation. Use together with `--include` pointing at an
+    /// SVD-derived CMSIS header (emit via `mununu codesign
+    /// emit-cmsis-header`) when the C source uses
+    /// `PERIPHERAL->FIELD` struct-member access.
+    #[arg(long = "cmsis-stubs")]
+    cmsis_stubs: bool,
 }
 
 #[derive(Args, Debug)]
@@ -903,6 +939,7 @@ fn handle_contract(command: ContractCommand) -> Result<(), String> {
 
 fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
+        CodesignCommand::EmitCmsisHeader(args) => codesign_emit_cmsis_header(args),
         CodesignCommand::Couple(args) => codesign_couple(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
@@ -945,9 +982,21 @@ fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
         }
     };
 
+    // Phase L8: when `--cmsis-stubs` is set, prepend the bundled
+    // `cmsis-stubs/` directory (vendor-neutral CMSIS shims) to the
+    // include-paths list. The directory ships inside the
+    // mununu-core crate; we resolve it relative to the binary's
+    // workspace root via the CARGO_MANIFEST_DIR-equivalent
+    // environment variable, with a fallback to the conventional
+    // path so this also works for installed binaries.
+    let mut include_paths = args.include_paths;
+    if args.cmsis_stubs {
+        include_paths.insert(0, locate_cmsis_stubs());
+    }
+
     let opts = LlvmExtractOptions {
         clang_path: args.clang,
-        include_paths: args.include_paths,
+        include_paths,
         defines: args.defines,
         extra_clang_args: args.extra_clang_args,
         register_map,
@@ -972,6 +1021,80 @@ fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to serialise extraction: {e}"))?;
     println!("{json}");
     Ok(())
+}
+
+fn codesign_emit_cmsis_header(args: CodesignEmitCmsisHeaderArgs) -> Result<(), String> {
+    use mununu_core::codesign::cmsis_emit::{CmsisEmitOptions, emit_cmsis_header};
+    use mununu_core::codesign::register_map::RegisterMap;
+    use mununu_core::codesign::svd_import::import_svd;
+
+    let owned_maps: Vec<RegisterMap> = match (&args.svd, &args.register_map) {
+        (Some(svd), None) => {
+            let body = std::fs::read_to_string(svd)
+                .map_err(|e| format!("failed to read {}: {e}", svd.display()))?;
+            let import = import_svd(&body).map_err(|e| format!("SVD import failed: {e}"))?;
+            import.maps
+        }
+        (None, Some(rm_path)) => {
+            let body = std::fs::read_to_string(rm_path)
+                .map_err(|e| format!("failed to read {}: {e}", rm_path.display()))?;
+            let rm: RegisterMap = serde_json::from_str(&body)
+                .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+            vec![rm]
+        }
+        (Some(_), Some(_)) => {
+            return Err("specify either --svd or --register-map, not both".to_string());
+        }
+        (None, None) => {
+            return Err("--svd <FILE> or --register-map <JSON> is required".to_string());
+        }
+    };
+    let maps: Vec<&RegisterMap> = match &args.peripheral {
+        Some(name) => owned_maps
+            .iter()
+            .filter(|rm| &rm.peripheral == name)
+            .collect(),
+        None => owned_maps.iter().collect(),
+    };
+    if maps.is_empty() {
+        return Err(match args.peripheral {
+            Some(name) => format!("peripheral `{name}` not found"),
+            None => "no peripherals in input".to_string(),
+        });
+    }
+    let options = CmsisEmitOptions {
+        vendor_prefix: &args.vendor_prefix,
+        struct_type_name: None,
+    };
+    for rm in &maps {
+        print!("{}", emit_cmsis_header(rm, &options));
+        println!();
+    }
+    Ok(())
+}
+
+/// Phase L8: resolve the bundled `cmsis-stubs/` directory's path.
+/// Tries the workspace-relative path first (dev builds running from
+/// source), then a `share/mununu/cmsis-stubs` fallback (installed
+/// binaries). Returns the first existing directory.
+fn locate_cmsis_stubs() -> PathBuf {
+    let candidates: &[PathBuf] = &[
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("mununu-core/cmsis-stubs"),
+        PathBuf::from("crates/mununu-core/cmsis-stubs"),
+        PathBuf::from("../share/mununu/cmsis-stubs"),
+    ];
+    for candidate in candidates {
+        if candidate.is_dir() {
+            return candidate.clone();
+        }
+    }
+    // Fallback: the workspace-relative path even if it doesn't
+    // exist (clang will fail with a clear "include not found" if
+    // so; the user can override via --include).
+    candidates[0].clone()
 }
 
 fn codesign_import_svd(args: CodesignImportSvdArgs) -> Result<(), String> {
