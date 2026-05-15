@@ -142,6 +142,12 @@ pub enum LlvmExtractWarning {
     /// recognised but slice 2 did not fully decompose it. Phase L4
     /// will handle per-field expansion.
     PartialBitfield { function: String, register: String },
+    /// Phase L5: the interprocedural walker hit a recursive call
+    /// (direct or transitive). The recursion is broken at the
+    /// second visit; the callee's accesses are not unrolled. Sound
+    /// over-approximation for safety; liveness verdicts may be
+    /// affected.
+    RecursiveCall { function: String },
 }
 
 impl fmt::Display for LlvmExtractWarning {
@@ -158,6 +164,10 @@ impl fmt::Display for LlvmExtractWarning {
             LlvmExtractWarning::PartialBitfield { function, register } => write!(
                 f,
                 "{function}: bit-field load-modify-store on register {register} not yet decomposed (phase L4)"
+            ),
+            LlvmExtractWarning::RecursiveCall { function } => write!(
+                f,
+                "{function}: recursive call cycle broken \u{2014} callee accesses not unrolled (over-approximation; sound for safety, may affect liveness)"
             ),
         }
     }
@@ -307,11 +317,20 @@ fn summarise(module: &Module, options: &LlvmExtractOptions) -> LlvmExtraction {
 
     let struct_types: Vec<String> = module.struct_types.keys().cloned().collect();
 
+    // Phase L5: build a module-wide function lookup so the
+    // interprocedural walker can resolve `call @callee` instructions
+    // to their definitions.
+    let module_fns: HashMap<&str, &crate::llvm_ir::Function> = module
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+
     let mut warnings: Vec<LlvmExtractWarning> = Vec::new();
     let functions: Vec<LlvmFunctionSummary> = module
         .functions
         .iter()
-        .map(|f| summarise_function(f, options, &mut warnings))
+        .map(|f| summarise_function(f, options, &module_fns, &mut warnings))
         .collect();
 
     LlvmExtraction {
@@ -327,6 +346,7 @@ fn summarise(module: &Module, options: &LlvmExtractOptions) -> LlvmExtraction {
 fn summarise_function(
     f: &crate::llvm_ir::Function,
     options: &LlvmExtractOptions,
+    module_fns: &HashMap<&str, &crate::llvm_ir::Function>,
     warnings: &mut Vec<LlvmExtractWarning>,
 ) -> LlvmFunctionSummary {
     let num_instructions: usize = f.basic_blocks.iter().map(|b| b.instructions.len()).sum();
@@ -350,7 +370,8 @@ fn summarise_function(
         .count();
 
     let (accesses, automaton_ctxdsl) = if let Some(rm) = options.register_map.as_ref() {
-        let accesses = extract_register_accesses(f, rm, warnings);
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let accesses = extract_register_accesses(f, rm, module_fns, &mut visiting, warnings);
         let automaton = if options.synthesize_automaton && !accesses.is_empty() {
             Some(crate::codesign::c_extract::synthesise_automaton_ctxdsl(
                 &f.name, &accesses, rm,
@@ -772,8 +793,20 @@ enum ResolvedAddress {
 fn extract_register_accesses(
     f: &crate::llvm_ir::Function,
     rm: &RegisterMap,
+    module_fns: &HashMap<&str, &crate::llvm_ir::Function>,
+    visiting: &mut std::collections::HashSet<String>,
     warnings: &mut Vec<LlvmExtractWarning>,
 ) -> Vec<RegisterAccess> {
+    // Phase L5: cycle guard for the interprocedural walk. A function
+    // that calls itself (directly or transitively) would otherwise
+    // recurse forever.
+    if !visiting.insert(f.name.clone()) {
+        warnings.push(LlvmExtractWarning::RecursiveCall {
+            function: f.name.clone(),
+        });
+        return Vec::new();
+    }
+
     // Build an SSA-name → producing-instruction lookup over the
     // whole function. The plan below uses it for backwards-tracing
     // (e.g. resolving a store's value through `or → and → load`).
@@ -799,6 +832,20 @@ fn extract_register_accesses(
         // Approximate source-line ordering by basic-block traversal.
         for instr in &bb.instructions {
             current_line = current_line.saturating_add(1);
+            // Phase L5: when we hit a call to a function defined in
+            // the same module, recursively extract its accesses and
+            // splice them into the caller's list at this point.
+            // External calls fall through silently — the verifier
+            // sees no accesses for them (chaotic-stub equivalent).
+            if let Instruction::Call { callee, .. } = instr {
+                let target = callee.trim_start_matches('@');
+                if let Some(callee_fn) = module_fns.get(target) {
+                    let callee_accesses =
+                        extract_register_accesses(callee_fn, rm, module_fns, visiting, warnings);
+                    accesses.extend(callee_accesses);
+                }
+                continue;
+            }
             let (pointer, kind, instr_result) = match instr {
                 Instruction::Load {
                     volatile: true,
@@ -875,6 +922,7 @@ fn extract_register_accesses(
             current_line = current_line.saturating_add(1);
         }
     }
+    visiting.remove(&f.name);
     accesses
 }
 
@@ -1542,6 +1590,122 @@ define void @set_mode() {
         assert_eq!(f.accesses[0].kind, AccessKind::Write);
         assert_eq!(f.accesses[0].register, "CTRL");
         assert_eq!(f.accesses[0].field.as_deref(), Some("tx_mode"));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase L5 tests — interprocedural call-graph walk.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn l5_inlines_callee_accesses_at_the_call_site() {
+        // Example 4 from the plan: a helper function holds the
+        // polling loop, the caller chains DATA write + CTRL write.
+        // The IR has separate `define` blocks for both functions;
+        // phase L5 inlines the callee's accesses at the call site.
+        let ir = r#"%struct.UART_TypeDef = type { i32, i32, i32 }
+@UART = external constant ptr, align 8
+
+define void @uart_wait_idle() {
+1:
+  %2 = load ptr, ptr @UART, align 8
+  %3 = getelementptr inbounds %struct.UART_TypeDef, ptr %2, i32 0, i32 1
+  %4 = load volatile i32, ptr %3, align 4
+  %5 = and i32 %4, 1
+  %6 = icmp ne i32 %5, 0
+  br i1 %6, label %7, label %8
+
+7:
+  br label %1
+
+8:
+  ret void
+}
+
+define void @uart_send(i8 %0) {
+  call void @uart_wait_idle()
+  %2 = load ptr, ptr @UART, align 8
+  %3 = getelementptr inbounds %struct.UART_TypeDef, ptr %2, i32 0, i32 2
+  store volatile i8 %0, ptr %3, align 4
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            synthesize_automaton: true,
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(ir, &opts).unwrap();
+        // Two functions in the module — the caller (uart_send) and
+        // the callee (uart_wait_idle). Each has its own summary.
+        let send = ext
+            .functions
+            .iter()
+            .find(|f| f.name == "uart_send")
+            .expect("uart_send extracted");
+        // After L5 inlining: the polling-loop STATUS read (from
+        // uart_wait_idle) + the DATA write (from uart_send body).
+        assert_eq!(send.accesses.len(), 2, "{:#?}", send.accesses);
+        assert_eq!(send.accesses[0].kind, AccessKind::Read);
+        assert_eq!(send.accesses[0].register, "STATUS");
+        assert_eq!(send.accesses[0].flow, AccessFlow::PollingLoop);
+        assert_eq!(send.accesses[1].kind, AccessKind::Write);
+        assert_eq!(send.accesses[1].register, "DATA");
+    }
+
+    #[test]
+    fn l5_recursive_call_breaks_with_warning_no_infinite_loop() {
+        let ir = r#"define void @loops() {
+  call void @loops()
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(ir, &opts).unwrap();
+        // The walker must not infinite-loop; it must emit a
+        // RecursiveCall warning when it re-enters the same function.
+        assert!(
+            ext.warnings
+                .iter()
+                .any(|w| matches!(w, LlvmExtractWarning::RecursiveCall { function } if function == "loops")),
+            "got warnings: {:?}",
+            ext.warnings
+        );
+    }
+
+    #[test]
+    fn l5_external_call_falls_through_silently() {
+        // Calls to external symbols (not defined in this module) are
+        // not inlined and produce no warning — they're the chaotic-
+        // stub equivalent of "we have no body to walk."
+        let ir = r#"@UART = external constant ptr, align 8
+%struct.UART_TypeDef = type { i32, i32, i32 }
+define void @uart_send() {
+  call void @printf(ptr %0)
+  %2 = load ptr, ptr @UART, align 8
+  %3 = getelementptr inbounds %struct.UART_TypeDef, ptr %2, i32 0, i32 0
+  store volatile i32 1, ptr %3, align 4
+  ret void
+}
+"#;
+        let opts = LlvmExtractOptions {
+            register_map: Some(uart_register_map()),
+            ..Default::default()
+        };
+        let ext = extract_from_ir_text_with_options(ir, &opts).unwrap();
+        let f = &ext.functions[0];
+        // One access — the CTRL write that comes after the printf
+        // call. The external call doesn't produce a recursion or
+        // unknown warning.
+        assert_eq!(f.accesses.len(), 1);
+        assert_eq!(f.accesses[0].register, "CTRL");
+        assert!(
+            !ext.warnings
+                .iter()
+                .any(|w| matches!(w, LlvmExtractWarning::RecursiveCall { .. }))
+        );
     }
 
     #[test]
