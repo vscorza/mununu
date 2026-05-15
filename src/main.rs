@@ -277,6 +277,10 @@ struct CodesignExtractCArgs {
     /// `--register-map`).
     #[arg(long = "synthesize-automaton")]
     synthesize_automaton: bool,
+    /// Phase L7: emit a top-level Driver automaton dispatching to
+    /// each non-ISR entry point. Disabled by default.
+    #[arg(long = "driver-mode")]
+    driver_mode: bool,
 }
 
 #[derive(Args, Debug)]
@@ -722,6 +726,7 @@ fn codesign_extract_c(args: CodesignExtractCArgs) -> Result<(), String> {
         extra_clang_args: args.extra_clang_args,
         register_map,
         synthesize_automaton: args.synthesize_automaton,
+        driver_mode: args.driver_mode,
     };
     let extraction =
         extract_c_via_llvm(&args.file, &opts).map_err(|e| format!("C extraction failed: {e}"))?;
