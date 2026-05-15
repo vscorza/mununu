@@ -1,0 +1,803 @@
+{
+  "peripheral": "TWIM0",
+  "base_address": "0x40003000",
+  "registers": [
+    {
+      "name": "TASKS_STARTRX",
+      "offset": 0,
+      "width_bits": 32,
+      "direction": "WO",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "TASKS_STARTRX",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Start TWI receive sequence",
+          "sv_signal": "nrf_twim0.tasks_startrx",
+          "c_accessor": "NRF_TWIM0->TASKS_STARTRX"
+        }
+      ],
+      "description": "Start TWI receive sequence"
+    },
+    {
+      "name": "TASKS_STARTTX",
+      "offset": 8,
+      "width_bits": 32,
+      "direction": "WO",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "TASKS_STARTTX",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Start TWI transmit sequence",
+          "sv_signal": "nrf_twim0.tasks_starttx",
+          "c_accessor": "NRF_TWIM0->TASKS_STARTTX"
+        }
+      ],
+      "description": "Start TWI transmit sequence"
+    },
+    {
+      "name": "TASKS_STOP",
+      "offset": 20,
+      "width_bits": 32,
+      "direction": "WO",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "TASKS_STOP",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Stop TWI transaction. Must be issued while the TWI master is not suspended.",
+          "sv_signal": "nrf_twim0.tasks_stop",
+          "c_accessor": "NRF_TWIM0->TASKS_STOP"
+        }
+      ],
+      "description": "Stop TWI transaction. Must be issued while the TWI master is not suspended."
+    },
+    {
+      "name": "TASKS_SUSPEND",
+      "offset": 28,
+      "width_bits": 32,
+      "direction": "WO",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "TASKS_SUSPEND",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Suspend TWI transaction",
+          "sv_signal": "nrf_twim0.tasks_suspend",
+          "c_accessor": "NRF_TWIM0->TASKS_SUSPEND"
+        }
+      ],
+      "description": "Suspend TWI transaction"
+    },
+    {
+      "name": "TASKS_RESUME",
+      "offset": 32,
+      "width_bits": 32,
+      "direction": "WO",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "TASKS_RESUME",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Resume TWI transaction",
+          "sv_signal": "nrf_twim0.tasks_resume",
+          "c_accessor": "NRF_TWIM0->TASKS_RESUME"
+        }
+      ],
+      "description": "Resume TWI transaction"
+    },
+    {
+      "name": "EVENTS_STOPPED",
+      "offset": 260,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_STOPPED",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "TWI stopped",
+          "sv_signal": "nrf_twim0.events_stopped",
+          "c_accessor": "NRF_TWIM0->EVENTS_STOPPED"
+        }
+      ],
+      "description": "TWI stopped"
+    },
+    {
+      "name": "EVENTS_ERROR",
+      "offset": 292,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_ERROR",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "TWI error",
+          "sv_signal": "nrf_twim0.events_error",
+          "c_accessor": "NRF_TWIM0->EVENTS_ERROR"
+        }
+      ],
+      "description": "TWI error"
+    },
+    {
+      "name": "EVENTS_SUSPENDED",
+      "offset": 328,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_SUSPENDED",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "SUSPEND task has been issued, TWI traffic is now suspended.",
+          "sv_signal": "nrf_twim0.events_suspended",
+          "c_accessor": "NRF_TWIM0->EVENTS_SUSPENDED"
+        }
+      ],
+      "description": "SUSPEND task has been issued, TWI traffic is now suspended."
+    },
+    {
+      "name": "EVENTS_RXSTARTED",
+      "offset": 332,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_RXSTARTED",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Receive sequence started",
+          "sv_signal": "nrf_twim0.events_rxstarted",
+          "c_accessor": "NRF_TWIM0->EVENTS_RXSTARTED"
+        }
+      ],
+      "description": "Receive sequence started"
+    },
+    {
+      "name": "EVENTS_TXSTARTED",
+      "offset": 336,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_TXSTARTED",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Transmit sequence started",
+          "sv_signal": "nrf_twim0.events_txstarted",
+          "c_accessor": "NRF_TWIM0->EVENTS_TXSTARTED"
+        }
+      ],
+      "description": "Transmit sequence started"
+    },
+    {
+      "name": "EVENTS_LASTRX",
+      "offset": 348,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_LASTRX",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Byte boundary, starting to receive the last byte",
+          "sv_signal": "nrf_twim0.events_lastrx",
+          "c_accessor": "NRF_TWIM0->EVENTS_LASTRX"
+        }
+      ],
+      "description": "Byte boundary, starting to receive the last byte"
+    },
+    {
+      "name": "EVENTS_LASTTX",
+      "offset": 352,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "interrupt_flag",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "EVENTS_LASTTX",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Byte boundary, starting to transmit the last byte",
+          "sv_signal": "nrf_twim0.events_lasttx",
+          "c_accessor": "NRF_TWIM0->EVENTS_LASTTX"
+        }
+      ],
+      "description": "Byte boundary, starting to transmit the last byte"
+    },
+    {
+      "name": "SHORTS",
+      "offset": 512,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "LASTTX_STARTRX",
+          "bits": [
+            7,
+            7
+          ],
+          "description": "Shortcut between event LASTTX and task STARTRX",
+          "sv_signal": "nrf_twim0.shorts.lasttx_startrx",
+          "c_accessor": "NRF_TWIM0->SHORTS.LASTTX_STARTRX"
+        },
+        {
+          "name": "LASTTX_SUSPEND",
+          "bits": [
+            8,
+            8
+          ],
+          "description": "Shortcut between event LASTTX and task SUSPEND",
+          "sv_signal": "nrf_twim0.shorts.lasttx_suspend",
+          "c_accessor": "NRF_TWIM0->SHORTS.LASTTX_SUSPEND"
+        },
+        {
+          "name": "LASTTX_STOP",
+          "bits": [
+            9,
+            9
+          ],
+          "description": "Shortcut between event LASTTX and task STOP",
+          "sv_signal": "nrf_twim0.shorts.lasttx_stop",
+          "c_accessor": "NRF_TWIM0->SHORTS.LASTTX_STOP"
+        },
+        {
+          "name": "LASTRX_STARTTX",
+          "bits": [
+            10,
+            10
+          ],
+          "description": "Shortcut between event LASTRX and task STARTTX",
+          "sv_signal": "nrf_twim0.shorts.lastrx_starttx",
+          "c_accessor": "NRF_TWIM0->SHORTS.LASTRX_STARTTX"
+        },
+        {
+          "name": "LASTRX_SUSPEND",
+          "bits": [
+            11,
+            11
+          ],
+          "description": "Shortcut between event LASTRX and task SUSPEND",
+          "sv_signal": "nrf_twim0.shorts.lastrx_suspend",
+          "c_accessor": "NRF_TWIM0->SHORTS.LASTRX_SUSPEND"
+        },
+        {
+          "name": "LASTRX_STOP",
+          "bits": [
+            12,
+            12
+          ],
+          "description": "Shortcut between event LASTRX and task STOP",
+          "sv_signal": "nrf_twim0.shorts.lastrx_stop",
+          "c_accessor": "NRF_TWIM0->SHORTS.LASTRX_STOP"
+        }
+      ],
+      "description": "Shortcuts between local events and tasks"
+    },
+    {
+      "name": "INTEN",
+      "offset": 768,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "STOPPED",
+          "bits": [
+            1,
+            1
+          ],
+          "description": "Enable or disable interrupt for event STOPPED",
+          "sv_signal": "nrf_twim0.inten.stopped",
+          "c_accessor": "NRF_TWIM0->INTEN.STOPPED"
+        },
+        {
+          "name": "ERROR",
+          "bits": [
+            9,
+            9
+          ],
+          "description": "Enable or disable interrupt for event ERROR",
+          "sv_signal": "nrf_twim0.inten.error",
+          "c_accessor": "NRF_TWIM0->INTEN.ERROR"
+        },
+        {
+          "name": "SUSPENDED",
+          "bits": [
+            18,
+            18
+          ],
+          "description": "Enable or disable interrupt for event SUSPENDED",
+          "sv_signal": "nrf_twim0.inten.suspended",
+          "c_accessor": "NRF_TWIM0->INTEN.SUSPENDED"
+        },
+        {
+          "name": "RXSTARTED",
+          "bits": [
+            19,
+            19
+          ],
+          "description": "Enable or disable interrupt for event RXSTARTED",
+          "sv_signal": "nrf_twim0.inten.rxstarted",
+          "c_accessor": "NRF_TWIM0->INTEN.RXSTARTED"
+        },
+        {
+          "name": "TXSTARTED",
+          "bits": [
+            20,
+            20
+          ],
+          "description": "Enable or disable interrupt for event TXSTARTED",
+          "sv_signal": "nrf_twim0.inten.txstarted",
+          "c_accessor": "NRF_TWIM0->INTEN.TXSTARTED"
+        },
+        {
+          "name": "LASTRX",
+          "bits": [
+            23,
+            23
+          ],
+          "description": "Enable or disable interrupt for event LASTRX",
+          "sv_signal": "nrf_twim0.inten.lastrx",
+          "c_accessor": "NRF_TWIM0->INTEN.LASTRX"
+        },
+        {
+          "name": "LASTTX",
+          "bits": [
+            24,
+            24
+          ],
+          "description": "Enable or disable interrupt for event LASTTX",
+          "sv_signal": "nrf_twim0.inten.lasttx",
+          "c_accessor": "NRF_TWIM0->INTEN.LASTTX"
+        }
+      ],
+      "description": "Enable or disable interrupt"
+    },
+    {
+      "name": "INTENSET",
+      "offset": 772,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "STOPPED",
+          "bits": [
+            1,
+            1
+          ],
+          "description": "Write '1' to enable interrupt for event STOPPED",
+          "sv_signal": "nrf_twim0.intenset.stopped",
+          "c_accessor": "NRF_TWIM0->INTENSET.STOPPED"
+        },
+        {
+          "name": "ERROR",
+          "bits": [
+            9,
+            9
+          ],
+          "description": "Write '1' to enable interrupt for event ERROR",
+          "sv_signal": "nrf_twim0.intenset.error",
+          "c_accessor": "NRF_TWIM0->INTENSET.ERROR"
+        },
+        {
+          "name": "SUSPENDED",
+          "bits": [
+            18,
+            18
+          ],
+          "description": "Write '1' to enable interrupt for event SUSPENDED",
+          "sv_signal": "nrf_twim0.intenset.suspended",
+          "c_accessor": "NRF_TWIM0->INTENSET.SUSPENDED"
+        },
+        {
+          "name": "RXSTARTED",
+          "bits": [
+            19,
+            19
+          ],
+          "description": "Write '1' to enable interrupt for event RXSTARTED",
+          "sv_signal": "nrf_twim0.intenset.rxstarted",
+          "c_accessor": "NRF_TWIM0->INTENSET.RXSTARTED"
+        },
+        {
+          "name": "TXSTARTED",
+          "bits": [
+            20,
+            20
+          ],
+          "description": "Write '1' to enable interrupt for event TXSTARTED",
+          "sv_signal": "nrf_twim0.intenset.txstarted",
+          "c_accessor": "NRF_TWIM0->INTENSET.TXSTARTED"
+        },
+        {
+          "name": "LASTRX",
+          "bits": [
+            23,
+            23
+          ],
+          "description": "Write '1' to enable interrupt for event LASTRX",
+          "sv_signal": "nrf_twim0.intenset.lastrx",
+          "c_accessor": "NRF_TWIM0->INTENSET.LASTRX"
+        },
+        {
+          "name": "LASTTX",
+          "bits": [
+            24,
+            24
+          ],
+          "description": "Write '1' to enable interrupt for event LASTTX",
+          "sv_signal": "nrf_twim0.intenset.lasttx",
+          "c_accessor": "NRF_TWIM0->INTENSET.LASTTX"
+        }
+      ],
+      "description": "Enable interrupt"
+    },
+    {
+      "name": "INTENCLR",
+      "offset": 776,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "STOPPED",
+          "bits": [
+            1,
+            1
+          ],
+          "description": "Write '1' to disable interrupt for event STOPPED",
+          "sv_signal": "nrf_twim0.intenclr.stopped",
+          "c_accessor": "NRF_TWIM0->INTENCLR.STOPPED"
+        },
+        {
+          "name": "ERROR",
+          "bits": [
+            9,
+            9
+          ],
+          "description": "Write '1' to disable interrupt for event ERROR",
+          "sv_signal": "nrf_twim0.intenclr.error",
+          "c_accessor": "NRF_TWIM0->INTENCLR.ERROR"
+        },
+        {
+          "name": "SUSPENDED",
+          "bits": [
+            18,
+            18
+          ],
+          "description": "Write '1' to disable interrupt for event SUSPENDED",
+          "sv_signal": "nrf_twim0.intenclr.suspended",
+          "c_accessor": "NRF_TWIM0->INTENCLR.SUSPENDED"
+        },
+        {
+          "name": "RXSTARTED",
+          "bits": [
+            19,
+            19
+          ],
+          "description": "Write '1' to disable interrupt for event RXSTARTED",
+          "sv_signal": "nrf_twim0.intenclr.rxstarted",
+          "c_accessor": "NRF_TWIM0->INTENCLR.RXSTARTED"
+        },
+        {
+          "name": "TXSTARTED",
+          "bits": [
+            20,
+            20
+          ],
+          "description": "Write '1' to disable interrupt for event TXSTARTED",
+          "sv_signal": "nrf_twim0.intenclr.txstarted",
+          "c_accessor": "NRF_TWIM0->INTENCLR.TXSTARTED"
+        },
+        {
+          "name": "LASTRX",
+          "bits": [
+            23,
+            23
+          ],
+          "description": "Write '1' to disable interrupt for event LASTRX",
+          "sv_signal": "nrf_twim0.intenclr.lastrx",
+          "c_accessor": "NRF_TWIM0->INTENCLR.LASTRX"
+        },
+        {
+          "name": "LASTTX",
+          "bits": [
+            24,
+            24
+          ],
+          "description": "Write '1' to disable interrupt for event LASTTX",
+          "sv_signal": "nrf_twim0.intenclr.lasttx",
+          "c_accessor": "NRF_TWIM0->INTENCLR.LASTTX"
+        }
+      ],
+      "description": "Disable interrupt"
+    },
+    {
+      "name": "ERRORSRC",
+      "offset": 1220,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "status",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "OVERRUN",
+          "bits": [
+            0,
+            0
+          ],
+          "description": "Overrun error",
+          "sv_signal": "nrf_twim0.errorsrc.overrun",
+          "c_accessor": "NRF_TWIM0->ERRORSRC.OVERRUN"
+        },
+        {
+          "name": "ANACK",
+          "bits": [
+            1,
+            1
+          ],
+          "description": "NACK received after sending the address (write '1' to clear)",
+          "sv_signal": "nrf_twim0.errorsrc.anack",
+          "c_accessor": "NRF_TWIM0->ERRORSRC.ANACK"
+        },
+        {
+          "name": "DNACK",
+          "bits": [
+            2,
+            2
+          ],
+          "description": "NACK received after sending a data byte (write '1' to clear)",
+          "sv_signal": "nrf_twim0.errorsrc.dnack",
+          "c_accessor": "NRF_TWIM0->ERRORSRC.DNACK"
+        }
+      ],
+      "description": "Error source"
+    },
+    {
+      "name": "ENABLE",
+      "offset": 1280,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "ENABLE",
+          "bits": [
+            0,
+            3
+          ],
+          "description": "Enable or disable TWIM",
+          "sv_signal": "nrf_twim0.enable",
+          "c_accessor": "NRF_TWIM0->ENABLE"
+        }
+      ],
+      "description": "Enable TWIM"
+    },
+    {
+      "name": "FREQUENCY",
+      "offset": 1316,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "FREQUENCY",
+          "bits": [
+            0,
+            31
+          ],
+          "description": "TWI master clock frequency",
+          "sv_signal": "nrf_twim0.frequency",
+          "c_accessor": "NRF_TWIM0->FREQUENCY"
+        }
+      ],
+      "description": "TWI frequency. Accuracy depends on the HFCLK source selected."
+    },
+    {
+      "name": "ADDRESS",
+      "offset": 1416,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "control",
+      "access_path": "mmio_direct",
+      "fields": [
+        {
+          "name": "ADDRESS",
+          "bits": [
+            0,
+            6
+          ],
+          "description": "Address used in the TWI transfer",
+          "sv_signal": "nrf_twim0.address",
+          "c_accessor": "NRF_TWIM0->ADDRESS"
+        }
+      ],
+      "description": "Address used in the TWI transfer"
+    },
+    {
+      "name": "RXD_PTR",
+      "offset": 1332,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "data",
+      "access_path": "dma",
+      "description": "RXD.PTR (cluster slot, hand-added \u2014 upstream importer skips <cluster>). EasyDMA RX buffer pointer.",
+      "fields": [
+        {
+          "name": "RXD_PTR",
+          "bits": [
+            0,
+            31
+          ],
+          "description": "Receive buffer base address. Must be set before TASKS_STARTRX.",
+          "sv_signal": "nrf_twim0.rxd_ptr",
+          "c_accessor": "NRF_TWIM0->RXD_PTR"
+        }
+      ]
+    },
+    {
+      "name": "RXD_MAXCNT",
+      "offset": 1336,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "data",
+      "access_path": "dma",
+      "description": "RXD.MAXCNT (cluster slot, hand-added). Maximum number of bytes for the RX transfer.",
+      "fields": [
+        {
+          "name": "RXD_MAXCNT",
+          "bits": [
+            0,
+            15
+          ],
+          "description": "Maximum number of receive bytes.",
+          "sv_signal": "nrf_twim0.rxd_maxcnt",
+          "c_accessor": "NRF_TWIM0->RXD_MAXCNT"
+        }
+      ]
+    },
+    {
+      "name": "RXD_AMOUNT",
+      "offset": 1340,
+      "width_bits": 32,
+      "direction": "RO",
+      "visibility_class": "data",
+      "access_path": "dma",
+      "description": "RXD.AMOUNT (cluster slot, hand-added). Number of bytes actually received in the last transfer.",
+      "fields": [
+        {
+          "name": "RXD_AMOUNT",
+          "bits": [
+            0,
+            15
+          ],
+          "description": "Number of bytes received in the previous TWI transaction.",
+          "sv_signal": "nrf_twim0.rxd_amount",
+          "c_accessor": "NRF_TWIM0->RXD_AMOUNT"
+        }
+      ]
+    },
+    {
+      "name": "TXD_PTR",
+      "offset": 1348,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "data",
+      "access_path": "dma",
+      "description": "TXD.PTR (cluster slot, hand-added \u2014 upstream importer skips <cluster>). EasyDMA TX buffer pointer.",
+      "fields": [
+        {
+          "name": "TXD_PTR",
+          "bits": [
+            0,
+            31
+          ],
+          "description": "Transmit buffer base address. Must be set before TASKS_STARTTX.",
+          "sv_signal": "nrf_twim0.txd_ptr",
+          "c_accessor": "NRF_TWIM0->TXD_PTR"
+        }
+      ]
+    },
+    {
+      "name": "TXD_MAXCNT",
+      "offset": 1352,
+      "width_bits": 32,
+      "direction": "RW",
+      "visibility_class": "data",
+      "access_path": "dma",
+      "description": "TXD.MAXCNT (cluster slot, hand-added). Maximum number of bytes for the TX transfer.",
+      "fields": [
+        {
+          "name": "TXD_MAXCNT",
+          "bits": [
+            0,
+            15
+          ],
+          "description": "Maximum number of transmit bytes.",
+          "sv_signal": "nrf_twim0.txd_maxcnt",
+          "c_accessor": "NRF_TWIM0->TXD_MAXCNT"
+        }
+      ]
+    },
+    {
+      "name": "TXD_AMOUNT",
+      "offset": 1356,
+      "width_bits": 32,
+      "direction": "RO",
+      "visibility_class": "data",
+      "access_path": "dma",
+      "description": "TXD.AMOUNT (cluster slot, hand-added). Number of bytes actually transmitted in the last transfer.",
+      "fields": [
+        {
+          "name": "TXD_AMOUNT",
+          "bits": [
+            0,
+            15
+          ],
+          "description": "Number of bytes transmitted in the previous TWI transaction.",
+          "sv_signal": "nrf_twim0.txd_amount",
+          "c_accessor": "NRF_TWIM0->TXD_AMOUNT"
+        }
+      ]
+    }
+  ],
+  "description": "Nordic nRF52840 TWIM0 (I2C Master with EasyDMA), peripheral 0. Imported via `mununu codesign import-svd` from the upstream nrfx SVD at commit 0883a272c34004697dd56dfa44f6e2d0f8705689 (bsp/stable/mdk/nrf52840.svd), BSD-3-Clause. SOUNDNESS: the upstream importer aborts on Nordic's <cluster> vendor-extension (e.g. peripheral ACL), so the importer was run against a hand-sliced SVD containing only the TWIM0 <peripheral> block. The sliced source is checked in at upstream/nrf52840.svd and the slicing transcript is documented in upstream/ATTRIBUTION.md. Per-field sv_signal and c_accessor mappings were post-author authored against the Nordic nRF52840 Product Specification \u00a76.30 (TWIM) and the nrfx_twim.c HAL accessor conventions. The TXD and RXD EasyDMA cluster registers (TXD.PTR/MAXCNT/AMOUNT, RXD.PTR/MAXCNT/AMOUNT) are described inside <cluster> elements in the upstream SVD; the importer skips clusters silently. Those registers were added by hand here with the standard offsets from \u00a76.30 of the nRF52840 Product Specification (0x534/0x544 base for RXD/TXD respectively). The TXD.PTR-before-TASKS_STARTTX ordering relation that the property pack exercises requires these registers to exist as labels."
+}

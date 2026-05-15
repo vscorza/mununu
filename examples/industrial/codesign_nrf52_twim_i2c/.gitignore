@@ -1,0 +1,4 @@
+# mununu writes a per-run trace log to ./logs/ relative to the binary's
+# cwd. validate.sh runs from this directory, so the logs land here.
+# Keep them out of git — the transcript is the canonical evidence record.
+logs/

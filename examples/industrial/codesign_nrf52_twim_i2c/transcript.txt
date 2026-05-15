@@ -1,0 +1,597 @@
+# Nordic nRF52840 TWIM (I2C) codesign flagship — validation transcript
+# regenerate via examples/industrial/codesign_nrf52_twim_i2c/validate.sh
+# transcript is byte-deterministic; re-running validate.sh against the
+# same commit should produce identical output.
+#
+# Upstream: nrfx @ 0883a272c34004697dd56dfa44f6e2d0f8705689 (BSD-3-Clause)
+
+=== 1. emit the coupling fragment from the register-map sidecar ===
+$ mununu codesign couple register_map.json --firmware-member TwimDriver
+    // ----------------------------------------------------------
+    // Coupling fragment emitted by mununu codesign couple
+    // Peripheral: TWIM0
+    // Base address: 0x40003000
+    // Coupling is asynchronous — Document C §C.5 soundness rule.
+    // ----------------------------------------------------------
+
+    alphabet {
+        label wr_tasks_startrx_tasks_startrx;   // wr TASKS_STARTRX.TASKS_STARTRX — Controllable
+        label wr_tasks_starttx_tasks_starttx;   // wr TASKS_STARTTX.TASKS_STARTTX — Controllable
+        label wr_tasks_stop_tasks_stop;   // wr TASKS_STOP.TASKS_STOP — Controllable
+        label wr_tasks_suspend_tasks_suspend;   // wr TASKS_SUSPEND.TASKS_SUSPEND — Controllable
+        label wr_tasks_resume_tasks_resume;   // wr TASKS_RESUME.TASKS_RESUME — Controllable
+        label wr_events_stopped_events_stopped;   // wr EVENTS_STOPPED.EVENTS_STOPPED — Controllable
+        label rd_events_stopped_events_stopped;   // rd EVENTS_STOPPED.EVENTS_STOPPED — Uncontrollable
+        label wr_events_error_events_error;   // wr EVENTS_ERROR.EVENTS_ERROR — Controllable
+        label rd_events_error_events_error;   // rd EVENTS_ERROR.EVENTS_ERROR — Uncontrollable
+        label wr_events_suspended_events_suspended;   // wr EVENTS_SUSPENDED.EVENTS_SUSPENDED — Controllable
+        label rd_events_suspended_events_suspended;   // rd EVENTS_SUSPENDED.EVENTS_SUSPENDED — Uncontrollable
+        label wr_events_rxstarted_events_rxstarted;   // wr EVENTS_RXSTARTED.EVENTS_RXSTARTED — Controllable
+        label rd_events_rxstarted_events_rxstarted;   // rd EVENTS_RXSTARTED.EVENTS_RXSTARTED — Uncontrollable
+        label wr_events_txstarted_events_txstarted;   // wr EVENTS_TXSTARTED.EVENTS_TXSTARTED — Controllable
+        label rd_events_txstarted_events_txstarted;   // rd EVENTS_TXSTARTED.EVENTS_TXSTARTED — Uncontrollable
+        label wr_events_lastrx_events_lastrx;   // wr EVENTS_LASTRX.EVENTS_LASTRX — Controllable
+        label rd_events_lastrx_events_lastrx;   // rd EVENTS_LASTRX.EVENTS_LASTRX — Uncontrollable
+        label wr_events_lasttx_events_lasttx;   // wr EVENTS_LASTTX.EVENTS_LASTTX — Controllable
+        label rd_events_lasttx_events_lasttx;   // rd EVENTS_LASTTX.EVENTS_LASTTX — Uncontrollable
+        label wr_shorts_lasttx_startrx;   // wr SHORTS.LASTTX_STARTRX — Controllable
+        label wr_shorts_lasttx_suspend;   // wr SHORTS.LASTTX_SUSPEND — Controllable
+        label wr_shorts_lasttx_stop;   // wr SHORTS.LASTTX_STOP — Controllable
+        label wr_shorts_lastrx_starttx;   // wr SHORTS.LASTRX_STARTTX — Controllable
+        label wr_shorts_lastrx_suspend;   // wr SHORTS.LASTRX_SUSPEND — Controllable
+        label wr_shorts_lastrx_stop;   // wr SHORTS.LASTRX_STOP — Controllable
+        label rd_shorts_lasttx_startrx;   // rd SHORTS.LASTTX_STARTRX — Uncontrollable
+        label rd_shorts_lasttx_suspend;   // rd SHORTS.LASTTX_SUSPEND — Uncontrollable
+        label rd_shorts_lasttx_stop;   // rd SHORTS.LASTTX_STOP — Uncontrollable
+        label rd_shorts_lastrx_starttx;   // rd SHORTS.LASTRX_STARTTX — Uncontrollable
+        label rd_shorts_lastrx_suspend;   // rd SHORTS.LASTRX_SUSPEND — Uncontrollable
+        label rd_shorts_lastrx_stop;   // rd SHORTS.LASTRX_STOP — Uncontrollable
+        label wr_inten_stopped;   // wr INTEN.STOPPED — Controllable
+        label wr_inten_error;   // wr INTEN.ERROR — Controllable
+        label wr_inten_suspended;   // wr INTEN.SUSPENDED — Controllable
+        label wr_inten_rxstarted;   // wr INTEN.RXSTARTED — Controllable
+        label wr_inten_txstarted;   // wr INTEN.TXSTARTED — Controllable
+        label wr_inten_lastrx;   // wr INTEN.LASTRX — Controllable
+        label wr_inten_lasttx;   // wr INTEN.LASTTX — Controllable
+        label rd_inten_stopped;   // rd INTEN.STOPPED — Uncontrollable
+        label rd_inten_error;   // rd INTEN.ERROR — Uncontrollable
+        label rd_inten_suspended;   // rd INTEN.SUSPENDED — Uncontrollable
+        label rd_inten_rxstarted;   // rd INTEN.RXSTARTED — Uncontrollable
+        label rd_inten_txstarted;   // rd INTEN.TXSTARTED — Uncontrollable
+        label rd_inten_lastrx;   // rd INTEN.LASTRX — Uncontrollable
+        label rd_inten_lasttx;   // rd INTEN.LASTTX — Uncontrollable
+        label wr_intenset_stopped;   // wr INTENSET.STOPPED — Controllable
+        label wr_intenset_error;   // wr INTENSET.ERROR — Controllable
+        label wr_intenset_suspended;   // wr INTENSET.SUSPENDED — Controllable
+        label wr_intenset_rxstarted;   // wr INTENSET.RXSTARTED — Controllable
+        label wr_intenset_txstarted;   // wr INTENSET.TXSTARTED — Controllable
+        label wr_intenset_lastrx;   // wr INTENSET.LASTRX — Controllable
+        label wr_intenset_lasttx;   // wr INTENSET.LASTTX — Controllable
+        label rd_intenset_stopped;   // rd INTENSET.STOPPED — Uncontrollable
+        label rd_intenset_error;   // rd INTENSET.ERROR — Uncontrollable
+        label rd_intenset_suspended;   // rd INTENSET.SUSPENDED — Uncontrollable
+        label rd_intenset_rxstarted;   // rd INTENSET.RXSTARTED — Uncontrollable
+        label rd_intenset_txstarted;   // rd INTENSET.TXSTARTED — Uncontrollable
+        label rd_intenset_lastrx;   // rd INTENSET.LASTRX — Uncontrollable
+        label rd_intenset_lasttx;   // rd INTENSET.LASTTX — Uncontrollable
+        label wr_intenclr_stopped;   // wr INTENCLR.STOPPED — Controllable
+        label wr_intenclr_error;   // wr INTENCLR.ERROR — Controllable
+        label wr_intenclr_suspended;   // wr INTENCLR.SUSPENDED — Controllable
+        label wr_intenclr_rxstarted;   // wr INTENCLR.RXSTARTED — Controllable
+        label wr_intenclr_txstarted;   // wr INTENCLR.TXSTARTED — Controllable
+        label wr_intenclr_lastrx;   // wr INTENCLR.LASTRX — Controllable
+        label wr_intenclr_lasttx;   // wr INTENCLR.LASTTX — Controllable
+        label rd_intenclr_stopped;   // rd INTENCLR.STOPPED — Uncontrollable
+        label rd_intenclr_error;   // rd INTENCLR.ERROR — Uncontrollable
+        label rd_intenclr_suspended;   // rd INTENCLR.SUSPENDED — Uncontrollable
+        label rd_intenclr_rxstarted;   // rd INTENCLR.RXSTARTED — Uncontrollable
+        label rd_intenclr_txstarted;   // rd INTENCLR.TXSTARTED — Uncontrollable
+        label rd_intenclr_lastrx;   // rd INTENCLR.LASTRX — Uncontrollable
+        label rd_intenclr_lasttx;   // rd INTENCLR.LASTTX — Uncontrollable
+        label wr_errorsrc_overrun;   // wr ERRORSRC.OVERRUN — Controllable
+        label wr_errorsrc_anack;   // wr ERRORSRC.ANACK — Controllable
+        label wr_errorsrc_dnack;   // wr ERRORSRC.DNACK — Controllable
+        label rd_errorsrc_overrun;   // rd ERRORSRC.OVERRUN — Uncontrollable
+        label rd_errorsrc_anack;   // rd ERRORSRC.ANACK — Uncontrollable
+        label rd_errorsrc_dnack;   // rd ERRORSRC.DNACK — Uncontrollable
+        label wr_enable_enable;   // wr ENABLE.ENABLE — Controllable
+        label rd_enable_enable;   // rd ENABLE.ENABLE — Uncontrollable
+        label wr_frequency_frequency;   // wr FREQUENCY.FREQUENCY — Controllable
+        label rd_frequency_frequency;   // rd FREQUENCY.FREQUENCY — Uncontrollable
+        label wr_address_address;   // wr ADDRESS.ADDRESS — Controllable
+        label rd_address_address;   // rd ADDRESS.ADDRESS — Uncontrollable
+        label wr_rxd_ptr_rxd_ptr;   // wr RXD_PTR.RXD_PTR — Controllable
+        label rd_rxd_ptr_rxd_ptr;   // rd RXD_PTR.RXD_PTR — Uncontrollable
+        label wr_rxd_maxcnt_rxd_maxcnt;   // wr RXD_MAXCNT.RXD_MAXCNT — Controllable
+        label rd_rxd_maxcnt_rxd_maxcnt;   // rd RXD_MAXCNT.RXD_MAXCNT — Uncontrollable
+        label rd_rxd_amount_rxd_amount;   // rd RXD_AMOUNT.RXD_AMOUNT — Uncontrollable
+        label wr_txd_ptr_txd_ptr;   // wr TXD_PTR.TXD_PTR — Controllable
+        label rd_txd_ptr_txd_ptr;   // rd TXD_PTR.TXD_PTR — Uncontrollable
+        label wr_txd_maxcnt_txd_maxcnt;   // wr TXD_MAXCNT.TXD_MAXCNT — Controllable
+        label rd_txd_maxcnt_txd_maxcnt;   // rd TXD_MAXCNT.TXD_MAXCNT — Uncontrollable
+        label rd_txd_amount_txd_amount;   // rd TXD_AMOUNT.TXD_AMOUNT — Uncontrollable
+    }
+
+    automata {
+        automaton TWIM0 {
+        states {
+            state Idle initial;
+            state Busy_tasks_startrx;
+            state Busy_tasks_starttx;
+            state Busy_tasks_stop;
+            state Busy_tasks_suspend;
+            state Busy_tasks_resume;
+            state Busy_events_stopped;
+            state Busy_events_error;
+            state Busy_events_suspended;
+            state Busy_events_rxstarted;
+            state Busy_events_txstarted;
+            state Busy_events_lastrx;
+            state Busy_events_lasttx;
+            state Busy_shorts;
+            state Busy_inten;
+            state Busy_intenset;
+            state Busy_intenclr;
+            state Busy_errorsrc;
+            state Busy_enable;
+            state Busy_frequency;
+            state Busy_address;
+            state Busy_rxd_ptr;
+            state Busy_rxd_maxcnt;
+            state Busy_rxd_amount;
+            state Busy_txd_ptr;
+            state Busy_txd_maxcnt;
+            state Busy_txd_amount;
+        }
+
+        transitions {
+            transition Idle -> Busy_tasks_startrx on label wr_tasks_startrx_tasks_startrx;
+            transition Busy_tasks_startrx -> Idle on label wr_tasks_startrx_tasks_startrx;
+            // TASKS_STARTRX (WO, control)
+            transition Idle -> Busy_tasks_starttx on label wr_tasks_starttx_tasks_starttx;
+            transition Busy_tasks_starttx -> Idle on label wr_tasks_starttx_tasks_starttx;
+            // TASKS_STARTTX (WO, control)
+            transition Idle -> Busy_tasks_stop on label wr_tasks_stop_tasks_stop;
+            transition Busy_tasks_stop -> Idle on label wr_tasks_stop_tasks_stop;
+            // TASKS_STOP (WO, control)
+            transition Idle -> Busy_tasks_suspend on label wr_tasks_suspend_tasks_suspend;
+            transition Busy_tasks_suspend -> Idle on label wr_tasks_suspend_tasks_suspend;
+            // TASKS_SUSPEND (WO, control)
+            transition Idle -> Busy_tasks_resume on label wr_tasks_resume_tasks_resume;
+            transition Busy_tasks_resume -> Idle on label wr_tasks_resume_tasks_resume;
+            // TASKS_RESUME (WO, control)
+            transition Idle -> Busy_events_stopped on label wr_events_stopped_events_stopped;
+            transition Busy_events_stopped -> Idle on label wr_events_stopped_events_stopped;
+            transition Idle -> Idle on label rd_events_stopped_events_stopped;
+            transition Idle -> Busy_events_stopped on label rd_events_stopped_events_stopped;
+            transition Busy_events_stopped -> Idle on label rd_events_stopped_events_stopped;
+            // EVENTS_STOPPED (RW, interrupt_flag)
+            transition Idle -> Busy_events_error on label wr_events_error_events_error;
+            transition Busy_events_error -> Idle on label wr_events_error_events_error;
+            transition Idle -> Idle on label rd_events_error_events_error;
+            transition Idle -> Busy_events_error on label rd_events_error_events_error;
+            transition Busy_events_error -> Idle on label rd_events_error_events_error;
+            // EVENTS_ERROR (RW, interrupt_flag)
+            transition Idle -> Busy_events_suspended on label wr_events_suspended_events_suspended;
+            transition Busy_events_suspended -> Idle on label wr_events_suspended_events_suspended;
+            transition Idle -> Idle on label rd_events_suspended_events_suspended;
+            transition Idle -> Busy_events_suspended on label rd_events_suspended_events_suspended;
+            transition Busy_events_suspended -> Idle on label rd_events_suspended_events_suspended;
+            // EVENTS_SUSPENDED (RW, interrupt_flag)
+            transition Idle -> Busy_events_rxstarted on label wr_events_rxstarted_events_rxstarted;
+            transition Busy_events_rxstarted -> Idle on label wr_events_rxstarted_events_rxstarted;
+            transition Idle -> Idle on label rd_events_rxstarted_events_rxstarted;
+            transition Idle -> Busy_events_rxstarted on label rd_events_rxstarted_events_rxstarted;
+            transition Busy_events_rxstarted -> Idle on label rd_events_rxstarted_events_rxstarted;
+            // EVENTS_RXSTARTED (RW, interrupt_flag)
+            transition Idle -> Busy_events_txstarted on label wr_events_txstarted_events_txstarted;
+            transition Busy_events_txstarted -> Idle on label wr_events_txstarted_events_txstarted;
+            transition Idle -> Idle on label rd_events_txstarted_events_txstarted;
+            transition Idle -> Busy_events_txstarted on label rd_events_txstarted_events_txstarted;
+            transition Busy_events_txstarted -> Idle on label rd_events_txstarted_events_txstarted;
+            // EVENTS_TXSTARTED (RW, interrupt_flag)
+            transition Idle -> Busy_events_lastrx on label wr_events_lastrx_events_lastrx;
+            transition Busy_events_lastrx -> Idle on label wr_events_lastrx_events_lastrx;
+            transition Idle -> Idle on label rd_events_lastrx_events_lastrx;
+            transition Idle -> Busy_events_lastrx on label rd_events_lastrx_events_lastrx;
+            transition Busy_events_lastrx -> Idle on label rd_events_lastrx_events_lastrx;
+            // EVENTS_LASTRX (RW, interrupt_flag)
+            transition Idle -> Busy_events_lasttx on label wr_events_lasttx_events_lasttx;
+            transition Busy_events_lasttx -> Idle on label wr_events_lasttx_events_lasttx;
+            transition Idle -> Idle on label rd_events_lasttx_events_lasttx;
+            transition Idle -> Busy_events_lasttx on label rd_events_lasttx_events_lasttx;
+            transition Busy_events_lasttx -> Idle on label rd_events_lasttx_events_lasttx;
+            // EVENTS_LASTTX (RW, interrupt_flag)
+            transition Idle -> Busy_shorts on label wr_shorts_lasttx_startrx;
+            transition Busy_shorts -> Idle on label wr_shorts_lasttx_startrx;
+            transition Idle -> Busy_shorts on label wr_shorts_lasttx_suspend;
+            transition Busy_shorts -> Idle on label wr_shorts_lasttx_suspend;
+            transition Idle -> Busy_shorts on label wr_shorts_lasttx_stop;
+            transition Busy_shorts -> Idle on label wr_shorts_lasttx_stop;
+            transition Idle -> Busy_shorts on label wr_shorts_lastrx_starttx;
+            transition Busy_shorts -> Idle on label wr_shorts_lastrx_starttx;
+            transition Idle -> Busy_shorts on label wr_shorts_lastrx_suspend;
+            transition Busy_shorts -> Idle on label wr_shorts_lastrx_suspend;
+            transition Idle -> Busy_shorts on label wr_shorts_lastrx_stop;
+            transition Busy_shorts -> Idle on label wr_shorts_lastrx_stop;
+            transition Idle -> Idle on label rd_shorts_lasttx_startrx;
+            transition Idle -> Busy_shorts on label rd_shorts_lasttx_startrx;
+            transition Busy_shorts -> Idle on label rd_shorts_lasttx_startrx;
+            transition Idle -> Idle on label rd_shorts_lasttx_suspend;
+            transition Idle -> Busy_shorts on label rd_shorts_lasttx_suspend;
+            transition Busy_shorts -> Idle on label rd_shorts_lasttx_suspend;
+            transition Idle -> Idle on label rd_shorts_lasttx_stop;
+            transition Idle -> Busy_shorts on label rd_shorts_lasttx_stop;
+            transition Busy_shorts -> Idle on label rd_shorts_lasttx_stop;
+            transition Idle -> Idle on label rd_shorts_lastrx_starttx;
+            transition Idle -> Busy_shorts on label rd_shorts_lastrx_starttx;
+            transition Busy_shorts -> Idle on label rd_shorts_lastrx_starttx;
+            transition Idle -> Idle on label rd_shorts_lastrx_suspend;
+            transition Idle -> Busy_shorts on label rd_shorts_lastrx_suspend;
+            transition Busy_shorts -> Idle on label rd_shorts_lastrx_suspend;
+            transition Idle -> Idle on label rd_shorts_lastrx_stop;
+            transition Idle -> Busy_shorts on label rd_shorts_lastrx_stop;
+            transition Busy_shorts -> Idle on label rd_shorts_lastrx_stop;
+            // SHORTS (RW, control)
+            transition Idle -> Busy_inten on label wr_inten_stopped;
+            transition Busy_inten -> Idle on label wr_inten_stopped;
+            transition Idle -> Busy_inten on label wr_inten_error;
+            transition Busy_inten -> Idle on label wr_inten_error;
+            transition Idle -> Busy_inten on label wr_inten_suspended;
+            transition Busy_inten -> Idle on label wr_inten_suspended;
+            transition Idle -> Busy_inten on label wr_inten_rxstarted;
+            transition Busy_inten -> Idle on label wr_inten_rxstarted;
+            transition Idle -> Busy_inten on label wr_inten_txstarted;
+            transition Busy_inten -> Idle on label wr_inten_txstarted;
+            transition Idle -> Busy_inten on label wr_inten_lastrx;
+            transition Busy_inten -> Idle on label wr_inten_lastrx;
+            transition Idle -> Busy_inten on label wr_inten_lasttx;
+            transition Busy_inten -> Idle on label wr_inten_lasttx;
+            transition Idle -> Idle on label rd_inten_stopped;
+            transition Idle -> Busy_inten on label rd_inten_stopped;
+            transition Busy_inten -> Idle on label rd_inten_stopped;
+            transition Idle -> Idle on label rd_inten_error;
+            transition Idle -> Busy_inten on label rd_inten_error;
+            transition Busy_inten -> Idle on label rd_inten_error;
+            transition Idle -> Idle on label rd_inten_suspended;
+            transition Idle -> Busy_inten on label rd_inten_suspended;
+            transition Busy_inten -> Idle on label rd_inten_suspended;
+            transition Idle -> Idle on label rd_inten_rxstarted;
+            transition Idle -> Busy_inten on label rd_inten_rxstarted;
+            transition Busy_inten -> Idle on label rd_inten_rxstarted;
+            transition Idle -> Idle on label rd_inten_txstarted;
+            transition Idle -> Busy_inten on label rd_inten_txstarted;
+            transition Busy_inten -> Idle on label rd_inten_txstarted;
+            transition Idle -> Idle on label rd_inten_lastrx;
+            transition Idle -> Busy_inten on label rd_inten_lastrx;
+            transition Busy_inten -> Idle on label rd_inten_lastrx;
+            transition Idle -> Idle on label rd_inten_lasttx;
+            transition Idle -> Busy_inten on label rd_inten_lasttx;
+            transition Busy_inten -> Idle on label rd_inten_lasttx;
+            // INTEN (RW, control)
+            transition Idle -> Busy_intenset on label wr_intenset_stopped;
+            transition Busy_intenset -> Idle on label wr_intenset_stopped;
+            transition Idle -> Busy_intenset on label wr_intenset_error;
+            transition Busy_intenset -> Idle on label wr_intenset_error;
+            transition Idle -> Busy_intenset on label wr_intenset_suspended;
+            transition Busy_intenset -> Idle on label wr_intenset_suspended;
+            transition Idle -> Busy_intenset on label wr_intenset_rxstarted;
+            transition Busy_intenset -> Idle on label wr_intenset_rxstarted;
+            transition Idle -> Busy_intenset on label wr_intenset_txstarted;
+            transition Busy_intenset -> Idle on label wr_intenset_txstarted;
+            transition Idle -> Busy_intenset on label wr_intenset_lastrx;
+            transition Busy_intenset -> Idle on label wr_intenset_lastrx;
+            transition Idle -> Busy_intenset on label wr_intenset_lasttx;
+            transition Busy_intenset -> Idle on label wr_intenset_lasttx;
+            transition Idle -> Idle on label rd_intenset_stopped;
+            transition Idle -> Busy_intenset on label rd_intenset_stopped;
+            transition Busy_intenset -> Idle on label rd_intenset_stopped;
+            transition Idle -> Idle on label rd_intenset_error;
+            transition Idle -> Busy_intenset on label rd_intenset_error;
+            transition Busy_intenset -> Idle on label rd_intenset_error;
+            transition Idle -> Idle on label rd_intenset_suspended;
+            transition Idle -> Busy_intenset on label rd_intenset_suspended;
+            transition Busy_intenset -> Idle on label rd_intenset_suspended;
+            transition Idle -> Idle on label rd_intenset_rxstarted;
+            transition Idle -> Busy_intenset on label rd_intenset_rxstarted;
+            transition Busy_intenset -> Idle on label rd_intenset_rxstarted;
+            transition Idle -> Idle on label rd_intenset_txstarted;
+            transition Idle -> Busy_intenset on label rd_intenset_txstarted;
+            transition Busy_intenset -> Idle on label rd_intenset_txstarted;
+            transition Idle -> Idle on label rd_intenset_lastrx;
+            transition Idle -> Busy_intenset on label rd_intenset_lastrx;
+            transition Busy_intenset -> Idle on label rd_intenset_lastrx;
+            transition Idle -> Idle on label rd_intenset_lasttx;
+            transition Idle -> Busy_intenset on label rd_intenset_lasttx;
+            transition Busy_intenset -> Idle on label rd_intenset_lasttx;
+            // INTENSET (RW, control)
+            transition Idle -> Busy_intenclr on label wr_intenclr_stopped;
+            transition Busy_intenclr -> Idle on label wr_intenclr_stopped;
+            transition Idle -> Busy_intenclr on label wr_intenclr_error;
+            transition Busy_intenclr -> Idle on label wr_intenclr_error;
+            transition Idle -> Busy_intenclr on label wr_intenclr_suspended;
+            transition Busy_intenclr -> Idle on label wr_intenclr_suspended;
+            transition Idle -> Busy_intenclr on label wr_intenclr_rxstarted;
+            transition Busy_intenclr -> Idle on label wr_intenclr_rxstarted;
+            transition Idle -> Busy_intenclr on label wr_intenclr_txstarted;
+            transition Busy_intenclr -> Idle on label wr_intenclr_txstarted;
+            transition Idle -> Busy_intenclr on label wr_intenclr_lastrx;
+            transition Busy_intenclr -> Idle on label wr_intenclr_lastrx;
+            transition Idle -> Busy_intenclr on label wr_intenclr_lasttx;
+            transition Busy_intenclr -> Idle on label wr_intenclr_lasttx;
+            transition Idle -> Idle on label rd_intenclr_stopped;
+            transition Idle -> Busy_intenclr on label rd_intenclr_stopped;
+            transition Busy_intenclr -> Idle on label rd_intenclr_stopped;
+            transition Idle -> Idle on label rd_intenclr_error;
+            transition Idle -> Busy_intenclr on label rd_intenclr_error;
+            transition Busy_intenclr -> Idle on label rd_intenclr_error;
+            transition Idle -> Idle on label rd_intenclr_suspended;
+            transition Idle -> Busy_intenclr on label rd_intenclr_suspended;
+            transition Busy_intenclr -> Idle on label rd_intenclr_suspended;
+            transition Idle -> Idle on label rd_intenclr_rxstarted;
+            transition Idle -> Busy_intenclr on label rd_intenclr_rxstarted;
+            transition Busy_intenclr -> Idle on label rd_intenclr_rxstarted;
+            transition Idle -> Idle on label rd_intenclr_txstarted;
+            transition Idle -> Busy_intenclr on label rd_intenclr_txstarted;
+            transition Busy_intenclr -> Idle on label rd_intenclr_txstarted;
+            transition Idle -> Idle on label rd_intenclr_lastrx;
+            transition Idle -> Busy_intenclr on label rd_intenclr_lastrx;
+            transition Busy_intenclr -> Idle on label rd_intenclr_lastrx;
+            transition Idle -> Idle on label rd_intenclr_lasttx;
+            transition Idle -> Busy_intenclr on label rd_intenclr_lasttx;
+            transition Busy_intenclr -> Idle on label rd_intenclr_lasttx;
+            // INTENCLR (RW, control)
+            transition Idle -> Busy_errorsrc on label wr_errorsrc_overrun;
+            transition Busy_errorsrc -> Idle on label wr_errorsrc_overrun;
+            transition Idle -> Busy_errorsrc on label wr_errorsrc_anack;
+            transition Busy_errorsrc -> Idle on label wr_errorsrc_anack;
+            transition Idle -> Busy_errorsrc on label wr_errorsrc_dnack;
+            transition Busy_errorsrc -> Idle on label wr_errorsrc_dnack;
+            transition Idle -> Idle on label rd_errorsrc_overrun;
+            transition Idle -> Busy_errorsrc on label rd_errorsrc_overrun;
+            transition Busy_errorsrc -> Idle on label rd_errorsrc_overrun;
+            transition Idle -> Idle on label rd_errorsrc_anack;
+            transition Idle -> Busy_errorsrc on label rd_errorsrc_anack;
+            transition Busy_errorsrc -> Idle on label rd_errorsrc_anack;
+            transition Idle -> Idle on label rd_errorsrc_dnack;
+            transition Idle -> Busy_errorsrc on label rd_errorsrc_dnack;
+            transition Busy_errorsrc -> Idle on label rd_errorsrc_dnack;
+            // ERRORSRC (RW, status)
+            transition Idle -> Busy_enable on label wr_enable_enable;
+            transition Busy_enable -> Idle on label wr_enable_enable;
+            transition Idle -> Idle on label rd_enable_enable;
+            transition Idle -> Busy_enable on label rd_enable_enable;
+            transition Busy_enable -> Idle on label rd_enable_enable;
+            // ENABLE (RW, control)
+            transition Idle -> Busy_frequency on label wr_frequency_frequency;
+            transition Busy_frequency -> Idle on label wr_frequency_frequency;
+            transition Idle -> Idle on label rd_frequency_frequency;
+            transition Idle -> Busy_frequency on label rd_frequency_frequency;
+            transition Busy_frequency -> Idle on label rd_frequency_frequency;
+            // FREQUENCY (RW, control)
+            transition Idle -> Busy_address on label wr_address_address;
+            transition Busy_address -> Idle on label wr_address_address;
+            transition Idle -> Idle on label rd_address_address;
+            transition Idle -> Busy_address on label rd_address_address;
+            transition Busy_address -> Idle on label rd_address_address;
+            // ADDRESS (RW, control)
+            transition Idle -> Busy_rxd_ptr on label wr_rxd_ptr_rxd_ptr;
+            transition Busy_rxd_ptr -> Idle on label wr_rxd_ptr_rxd_ptr;
+            transition Idle -> Idle on label rd_rxd_ptr_rxd_ptr;
+            transition Idle -> Busy_rxd_ptr on label rd_rxd_ptr_rxd_ptr;
+            transition Busy_rxd_ptr -> Idle on label rd_rxd_ptr_rxd_ptr;
+            // RXD_PTR (RW, data)
+            // access_path: Dma
+            transition Idle -> Busy_rxd_maxcnt on label wr_rxd_maxcnt_rxd_maxcnt;
+            transition Busy_rxd_maxcnt -> Idle on label wr_rxd_maxcnt_rxd_maxcnt;
+            transition Idle -> Idle on label rd_rxd_maxcnt_rxd_maxcnt;
+            transition Idle -> Busy_rxd_maxcnt on label rd_rxd_maxcnt_rxd_maxcnt;
+            transition Busy_rxd_maxcnt -> Idle on label rd_rxd_maxcnt_rxd_maxcnt;
+            // RXD_MAXCNT (RW, data)
+            // access_path: Dma
+            transition Idle -> Idle on label rd_rxd_amount_rxd_amount;
+            transition Idle -> Busy_rxd_amount on label rd_rxd_amount_rxd_amount;
+            transition Busy_rxd_amount -> Idle on label rd_rxd_amount_rxd_amount;
+            // RXD_AMOUNT (RO, data)
+            // access_path: Dma
+            transition Idle -> Busy_txd_ptr on label wr_txd_ptr_txd_ptr;
+            transition Busy_txd_ptr -> Idle on label wr_txd_ptr_txd_ptr;
+            transition Idle -> Idle on label rd_txd_ptr_txd_ptr;
+            transition Idle -> Busy_txd_ptr on label rd_txd_ptr_txd_ptr;
+            transition Busy_txd_ptr -> Idle on label rd_txd_ptr_txd_ptr;
+            // TXD_PTR (RW, data)
+            // access_path: Dma
+            transition Idle -> Busy_txd_maxcnt on label wr_txd_maxcnt_txd_maxcnt;
+            transition Busy_txd_maxcnt -> Idle on label wr_txd_maxcnt_txd_maxcnt;
+            transition Idle -> Idle on label rd_txd_maxcnt_txd_maxcnt;
+            transition Idle -> Busy_txd_maxcnt on label rd_txd_maxcnt_txd_maxcnt;
+            transition Busy_txd_maxcnt -> Idle on label rd_txd_maxcnt_txd_maxcnt;
+            // TXD_MAXCNT (RW, data)
+            // access_path: Dma
+            transition Idle -> Idle on label rd_txd_amount_txd_amount;
+            transition Idle -> Busy_txd_amount on label rd_txd_amount_txd_amount;
+            transition Busy_txd_amount -> Idle on label rd_txd_amount_txd_amount;
+            // TXD_AMOUNT (RO, data)
+            // access_path: Dma
+        }
+        }
+    }
+
+    composition {
+        asynchronous TWIM0System {
+            members [TWIM0, TwimDriver];
+        }
+    }
+
+=== clean firmware: codesign verify — init_reachable ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula init_reachable
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `init_reachable` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — safety_protocol_respected ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula safety_protocol_respected
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `safety_protocol_respected` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — twim_enable_before_tasks ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula twim_enable_before_tasks
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `twim_enable_before_tasks` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — data_pointer_set_before_tasks ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula data_pointer_set_before_tasks
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `data_pointer_set_before_tasks` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — no_data_after_error ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula no_data_after_error
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `no_data_after_error` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — stop_after_last_byte_with_shorts ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula stop_after_last_byte_with_shorts
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `stop_after_last_byte_with_shorts` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — error_event_cleared_before_retry ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula error_event_cleared_before_retry
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `error_event_cleared_before_retry` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — shorts_only_between_transactions ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula shorts_only_between_transactions
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `shorts_only_between_transactions` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — frequency_only_when_disabled ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula frequency_only_when_disabled
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `frequency_only_when_disabled` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== clean firmware: codesign verify — suspend_resume_ordering ===
+$ mununu codesign verify register_map.json firmware.hand_authored.ctxdsl --formula suspend_resume_ordering
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `suspend_resume_ordering` over `TWIM0System`
+    states satisfying: 101/101
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== buggy firmware: codesign verify — data_pointer_set_before_tasks ===
+$ mununu codesign verify register_map.json firmware_buggy.hand_authored.ctxdsl --formula data_pointer_set_before_tasks
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `data_pointer_set_before_tasks` over `TWIM0System`
+    states satisfying: 6/82
+    initial states satisfying: 0/1
+      initials: Idle|Reset
+    verdict: VIOLATED at initial state(s)
+
+=== buggy firmware: codesign verify — safety_protocol_respected ===
+$ mununu codesign verify register_map.json firmware_buggy.hand_authored.ctxdsl --formula safety_protocol_respected
+codesign verify — peripheral `TWIM0` (base 0x40003000), composition `TWIM0System`
+  composed with firmware member(s): TwimDriver
+
+  formula `safety_protocol_respected` over `TWIM0System`
+    states satisfying: 82/82
+    initial states satisfying: 1/1
+      initials: Idle|Reset
+      satisfying: Idle|Reset
+    verdict: HOLDS
+
+=== buggy firmware: codesign verify — data_pointer_set_before_tasks (JSON) ===
+$ mununu codesign verify register_map.json firmware_buggy.hand_authored.ctxdsl --formula data_pointer_set_before_tasks --json
+{
+  "composition": {
+    "automaton": "TWIM0System",
+    "firmware_members": [
+      "TwimDriver"
+    ],
+    "peripheral_automaton": "TWIM0"
+  },
+  "register_map": {
+    "base_address": "0x40003000",
+    "peripheral": "TWIM0",
+    "registers": 26
+  },
+  "verdict": {
+    "automaton": "TWIM0System",
+    "formula": "data_pointer_set_before_tasks",
+    "initial_satisfying": [],
+    "initial_states": [
+      "Idle|Reset"
+    ],
+    "satisfied": false,
+    "satisfying_states": 6,
+    "total_states": 82
+  }
+}
+
+=== end of transcript ===
