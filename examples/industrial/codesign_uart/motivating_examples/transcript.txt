@@ -36,6 +36,68 @@ $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/mot
   "struct_types": []
 }
 
+=== Example 4: helper function with pointer parameter (phase L5.5 alias tracking) ===
+$ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_4_helper_function_pointer_param.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton
+warning: uart_read_status: could not resolve pointer operand %4 of a volatile load/store; access dropped
+{
+  "source_filename": "examples/industrial/codesign_uart/motivating_examples/example_4_helper_function_pointer_param.c",
+  "target_triple": "x86_64-apple-macosx26.0.0",
+  "functions": [
+    {
+      "name": "uart_send",
+      "return_type": "void",
+      "num_parameters": 1,
+      "num_basic_blocks": 1,
+      "num_instructions": 5,
+      "num_volatile_loads": 0,
+      "num_volatile_stores": 1,
+      "num_inttoptr": 0,
+      "accesses": [
+        {
+          "kind": "read",
+          "register": "STATUS",
+          "field": "tx_busy",
+          "accessor": "(IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 })",
+          "source_line": 5
+        },
+        {
+          "kind": "write",
+          "register": "DATA",
+          "field": "byte",
+          "accessor": "(IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })",
+          "source_line": 5
+        }
+      ],
+      "automaton_ctxdsl": "    automata {\n        automaton Uart_send {\n            controllable {\n                wr_data_byte;\n            }\n\n            states {\n                state S0 initial;\n                state S1;\n                state S2;\n            }\n\n            transitions {\n                transition S0 -> S1 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 })\n                transition S1 -> S2 on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })\n            }\n        }\n    }\n"
+    },
+    {
+      "name": "uart_read_status",
+      "return_type": "void",
+      "num_parameters": 1,
+      "num_basic_blocks": 1,
+      "num_instructions": 6,
+      "num_volatile_loads": 1,
+      "num_volatile_stores": 0,
+      "num_inttoptr": 0
+    }
+  ],
+  "external_globals": [],
+  "struct_types": [
+    "%struct.UART_TypeDef",
+    "%union.anon",
+    "%union.anon.0",
+    "%union.anon.2"
+  ],
+  "warnings": [
+    {
+      "UnresolvedPointer": {
+        "function": "uart_read_status",
+        "ssa": "4"
+      }
+    }
+  ]
+}
+
 === Example 5: ISR + main-thread (annotation-driven asynchronous composition) ===
 $ ./target/debug/mununu codesign extract-c examples/industrial/codesign_uart/motivating_examples/example_5_isr_with_main_thread.c --register-map examples/industrial/codesign_uart/register_map.json --synthesize-automaton
 {

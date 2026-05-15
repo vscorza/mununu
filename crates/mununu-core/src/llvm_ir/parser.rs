@@ -126,9 +126,13 @@ fn regexes() -> &'static Regexes {
             r"^\s*%(\w+)\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+(\S+)\s+(\S+?),\s+(\S+?)\s*$",
         )
         .unwrap(),
-        // call covers both `%r = call ...` and `call ...`
+        // call covers both `%r = call ...` and `call ...`. The
+        // arg-capture is greedy + anchored to a `)` followed by
+        // optional whitespace + optional attributes — that lets us
+        // capture inline `inttoptr (i64 N to ptr)` constexprs as
+        // arguments without truncating at the first inner `)`.
         call: Regex::new(
-            r"^\s*(?:%(\w+)\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:\S+\s+)?(\S+?)\s+@([\w.]+)\((.*?)\)",
+            r"^\s*(?:%(\w+)\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:\S+\s+)?(\S+?)\s+@([\w.]+)\((.*)\)\s*(?:#\d+\s*)?$",
         )
         .unwrap(),
         phi: Regex::new(r"^\s*%(\w+)\s*=\s*phi\s+(\S+)\s+(.+)\s*$").unwrap(),
@@ -516,16 +520,24 @@ fn parse_pointer_operand(text: &str) -> PointerOperand {
     if let Some(rest) = trimmed.strip_prefix('%') {
         return PointerOperand::Ssa(rest.to_string());
     }
+    if let Some(op) = parse_inline_pointer_expr(trimmed) {
+        return op;
+    }
+    PointerOperand::Ssa(trimmed.to_string())
+}
+
+/// Phase L5.5: shared helper for recognising inline-constexpr
+/// pointer expressions — `inttoptr (i64 N to ptr)` and
+/// `getelementptr inbounds (T, ptr inttoptr (i64 N to ptr), i32 0,
+/// i32 K)`. Used by both [`parse_pointer_operand`] (for load/store
+/// pointer fields) and `c_extract_llvm`'s call-argument parser.
+pub fn parse_inline_pointer_expr(text: &str) -> Option<PointerOperand> {
+    let trimmed = text.trim().trim_end_matches(',');
     // Inline `inttoptr (i64 0x40010000 to ptr)` literal.
     if let Some(addr) = parse_inline_inttoptr(trimmed) {
-        return PointerOperand::InlineConstAddr(addr);
+        return Some(PointerOperand::InlineConstAddr(addr));
     }
     // Inline `getelementptr inbounds (T, ptr inttoptr (i64 N to ptr), i32 0, i32 K)`.
-    // Clang emits this when the source's base pointer is a #define
-    // macro that resolves to a literal address — the entire GEP is a
-    // constexpr rather than an SSA instruction. We extract the
-    // (base_addr, field_index) pair so the matcher can route it
-    // through the same path as a non-constexpr GEP.
     if let Some(gep_inner) = trimmed
         .strip_prefix("getelementptr")
         .and_then(|s| s.trim().strip_prefix("inbounds").or(Some(s)))
@@ -533,12 +545,12 @@ fn parse_pointer_operand(text: &str) -> PointerOperand {
         .and_then(|s| s.trim_end_matches(',').strip_suffix(')'))
         && let Some((base_addr, field_index)) = parse_inline_gep_inner(gep_inner)
     {
-        return PointerOperand::InlineGep {
+        return Some(PointerOperand::InlineGep {
             base_addr,
             field_index,
-        };
+        });
     }
-    PointerOperand::Ssa(trimmed.to_string())
+    None
 }
 
 /// Parse an `inttoptr (i64 N to ptr)` inline constexpr to its u64

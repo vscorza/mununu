@@ -16,10 +16,8 @@
 #   - Example 2: example_2_typecast_register_access.c
 #   - Example 3: covered implicitly by firmware.c (CTRL.bit.tx_start
 #     bit-field RMW); no separate file needed.
-#   - Example 4: NOT covered — phase L5.5 (pointer-parameter
-#     aliasing) is queued. A real C file demonstrating Example 4
-#     would extract to zero accesses today; that gap is honestly
-#     documented in docs/design/c-extraction-correctness-scope.md.
+#   - Example 4: example_4_helper_function_pointer_param.c (closed
+#     by phase L5.5 — pointer-parameter alias tracking).
 #   - Example 5: example_5_isr_with_main_thread.c
 #   - Example 6: example_6_multi_entry_driver.c
 #
@@ -72,6 +70,12 @@ run() {
     run "Example 2: type-cast register access — *(volatile uint32_t *)0x40010004 = 1" \
         ./target/debug/mununu codesign extract-c \
             "$DIR/example_2_typecast_register_access.c" \
+            --register-map "$REGISTER_MAP" \
+            --synthesize-automaton
+
+    run "Example 4: helper function with pointer parameter (phase L5.5 alias tracking)" \
+        ./target/debug/mununu codesign extract-c \
+            "$DIR/example_4_helper_function_pointer_param.c" \
             --register-map "$REGISTER_MAP" \
             --synthesize-automaton
 
