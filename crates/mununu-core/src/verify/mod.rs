@@ -35,6 +35,7 @@
 
 pub mod assemble;
 pub mod binding;
+pub mod codesign_shorthand;
 pub mod config;
 pub mod orchestrator;
 pub mod report;
