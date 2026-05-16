@@ -2065,6 +2065,65 @@ pub async fn verify_project_handler(
         })
 }
 
+// ============================================================================
+// Codesign reconcile-labels (Doc C §C.5 hard gate)
+// ============================================================================
+
+/// Request body for `POST /api/v1/codesign/reconcile-labels`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CodesignReconcileLabelsRequest {
+    /// Firmware-side rendezvous labels (the C extraction's alphabet).
+    pub firmware_labels: Vec<String>,
+    /// Peripheral-side rendezvous labels (the SV extraction's
+    /// alphabet — or, today, the alphabet derived from a register
+    /// map by `coupling::register_map_labels`).
+    pub peripheral_labels: Vec<String>,
+}
+
+/// Response body for `POST /api/v1/codesign/reconcile-labels`.
+///
+/// The handler always returns 200 OK with a populated body — the
+/// `mismatch` field distinguishes the two outcomes:
+///   - `mismatch == null`: alphabets agree; `shared` holds the
+///     canonical sorted alphabet.
+///   - `mismatch == { firmware_only, peripheral_only }`: at least one
+///     side has labels the other doesn't. `shared` is empty.
+#[derive(Debug, serde::Serialize)]
+pub struct CodesignReconcileLabelsResponse {
+    /// Shared canonical alphabet (sorted), or empty on mismatch.
+    pub shared: Vec<String>,
+    /// Mismatch report. `None` when the alphabets reconcile exactly.
+    pub mismatch: Option<crate::codesign::reconcile::ReconcileMismatch>,
+}
+
+/// HW/SW codesign label-alphabet reconcile handler (Doc C §C.5).
+///
+/// Hard gate against silent over-approximation: refuses to compose
+/// firmware ‖ peripheral when the two extractions disagree on the
+/// rendezvous-label alphabet. The handler itself returns 200 OK and
+/// reports the mismatch in the body; downstream orchestrators (the
+/// future `verify-project` flow) consume the `mismatch` field and
+/// fail their pipelines on a non-null value.
+pub async fn codesign_reconcile_labels_handler(
+    Json(request): Json<CodesignReconcileLabelsRequest>,
+) -> ApiResult<Json<CodesignReconcileLabelsResponse>> {
+    use crate::codesign::reconcile::{ReconcileError, reconcile_label_alphabets};
+    use std::collections::BTreeSet;
+
+    let firmware: BTreeSet<String> = request.firmware_labels.into_iter().collect();
+    let peripheral: BTreeSet<String> = request.peripheral_labels.into_iter().collect();
+    match reconcile_label_alphabets(&firmware, &peripheral) {
+        Ok(r) => Ok(Json(CodesignReconcileLabelsResponse {
+            shared: r.shared,
+            mismatch: None,
+        })),
+        Err(ReconcileError::Mismatch(m)) => Ok(Json(CodesignReconcileLabelsResponse {
+            shared: Vec::new(),
+            mismatch: Some(m),
+        })),
+    }
+}
+
 #[cfg(test)]
 mod contract_handler_tests {
     use super::*;

@@ -1,0 +1,5 @@
+[
+  "rd_status_tx_busy",
+  "wr_ctrl_tx_start",
+  "wr_data_byte"
+]

@@ -31,6 +31,20 @@ extracted 1 functions; the synthesised automaton fragment for the entry point is
         }
     }
 
+=== Step 1.5: derive firmware-side label list + reconcile against register map ===
+firmware labels (3):
+  - rd_status_tx_busy
+  - wr_ctrl_tx_start
+  - wr_data_byte
+
+=== Step 1.6: reconcile against the register-map alphabet ===
+$ ./target/debug/mununu codesign reconcile-labels examples/industrial/codesign_uart/extract_verify_recipe/firmware_labels.json --peripheral-register-map examples/industrial/codesign_uart/register_map.json
+error: unexpected argument 'examples/industrial/codesign_uart/extract_verify_recipe/firmware_labels.json' found
+
+Usage: mununu codesign reconcile-labels [OPTIONS] --c-extraction <JSON>
+
+For more information, try '--help'.
+
 === Step 2: splice the automaton into verify.template.ctxdsl ===
 wrote spliced CTXDSL to examples/industrial/codesign_uart/extract_verify_recipe/verify.ctxdsl (150 lines)
 

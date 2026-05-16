@@ -35,6 +35,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codesign::coupling::register_map_labels;
+use crate::codesign::register_map::RegisterMap;
+
 /// Successful reconciliation result. The `shared` field is the
 /// (canonical) alphabet on which firmware and peripheral synchronise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +125,24 @@ pub fn reconcile_label_alphabets(
     Ok(ReconciledAlphabet { shared })
 }
 
+/// Derive the peripheral-side rendezvous-label alphabet directly from
+/// a [`RegisterMap`]. Wraps
+/// [`crate::codesign::coupling::register_map_labels`] and projects to
+/// the label names only.
+///
+/// Use this when the SV-side adapter doesn't yet emit the alphabet
+/// directly (deferred to PR 2b's `--register-map` flag on the SV
+/// adapter) — for now the register map *is* the canonical source of
+/// truth for what the peripheral exposes, and the firmware side
+/// (`mununu codesign extract-c --register-map --synthesize-automaton`)
+/// already emits its automaton on these label names.
+pub fn peripheral_labels_from_register_map(rm: &RegisterMap) -> BTreeSet<String> {
+    register_map_labels(rm)
+        .into_iter()
+        .map(|l| l.name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +219,25 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("firmware-only labels: [a, b]"));
         assert!(s.contains("peripheral-only labels: [c]"));
+    }
+
+    #[test]
+    fn peripheral_labels_from_register_map_derive_canonical_alphabet() {
+        // Reuse the real UART-Lite fixture from the codesign_uart example
+        // so the test stays in lockstep with the schema. The fixture
+        // declares CTRL (RW, fields: tx_start, enable), STATUS (RO,
+        // fields: tx_busy, rx_ready, etc.), and DATA (RW). The label
+        // names follow `rendezvous_label_name`'s convention
+        // `wr_<reg>_<field>` / `rd_<reg>_<field>`.
+        let json = include_str!("../../../../examples/industrial/codesign_uart/register_map.json");
+        let rm: RegisterMap = serde_json::from_str(json).expect("valid register-map JSON");
+        let labels = peripheral_labels_from_register_map(&rm);
+        // Firmware writes CTRL.tx_start; the peripheral observes it.
+        assert!(labels.contains("wr_ctrl_tx_start"));
+        assert!(labels.contains("wr_ctrl_enable"));
+        // Firmware reads STATUS.tx_busy.
+        assert!(labels.contains("rd_status_tx_busy"));
+        // STATUS is RO from firmware's perspective → no write label.
+        assert!(!labels.contains("wr_status_tx_busy"));
     }
 }
