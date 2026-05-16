@@ -47,7 +47,7 @@
 //! slice. Calls with an unrecognised adapter return
 //! [`VerifyError::UnknownAdapter`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::adapter::templates::{TemplateRef, TemplateRegistry};
 use crate::adapter::xstate::XStateAdapter;
@@ -104,7 +104,14 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 source: source_err,
             })?;
 
-        let raw_ctxdsl = dispatch_adapter(&source.adapter, &source.id, &content)?;
+        let raw_ctxdsl = dispatch_adapter(
+            &source.adapter,
+            &source.id,
+            &path,
+            &content,
+            &source.options,
+            base_dir,
+        )?;
 
         // Apply per-source renamings from the binding. For Direct
         // strategy the map is absent / empty so this is a no-op.
@@ -231,29 +238,210 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 
 /// Translate a single source file via the adapter named in the config.
 ///
-/// Today's dispatch only knows `"ctxdsl"` (pass-through) and
-/// `"xstate"`. Other adapters return [`VerifyError::UnknownAdapter`];
-/// support is added incrementally in later A2 slices as the
-/// adapter-options plumbing matures.
-fn dispatch_adapter(adapter: &str, source_id: &str, content: &str) -> Result<String, VerifyError> {
+/// Recognised adapter names:
+///
+/// - `"ctxdsl"` — pass-through; `content` is already CTXDSL.
+/// - `"xstate"` — uses [`XStateAdapter`].
+/// - `"sv-rtl"` — uses the SystemVerilog adapter via the existing
+///   `SystemVerilogAdapter::translate` entry point. Options
+///   currently ignored by this layer — the SV adapter has its own
+///   per-source sidecar conventions (`.mununu.json` next to the
+///   `.sv` file).
+/// - `"extraction"` — uses [`ExtractionAdapter`]. Options:
+///   `mode = "fixed" | "vulnerable" | "both"` (default `"both"`).
+/// - `"c-codesign"` — uses [`extract_c_via_llvm`] (LLVM IR via
+///   clang), wraps each function's synthesised `automaton_ctxdsl`
+///   into a `context FwSource { … }` block. Options:
+///   `register_map = <PATH>` (required for `synthesize_automaton`),
+///   `synthesize_automaton = bool` (default `true`),
+///   `cmsis_stubs = bool` (default `true`), `include_paths =
+///   [string]`, `defines = [string]`, `clang = <PATH>`.
+///
+/// Other adapters return [`VerifyError::UnknownAdapter`].
+fn dispatch_adapter(
+    adapter: &str,
+    source_id: &str,
+    file_path: &Path,
+    content: &str,
+    options: &std::collections::BTreeMap<String, toml::Value>,
+    base_dir: &Path,
+) -> Result<String, VerifyError> {
     match adapter {
         "ctxdsl" => Ok(content.to_string()),
         "xstate" => {
-            let options = AdapterOptions::default();
-            match XStateAdapter::translate(content, &options) {
-                Ok(out) => Ok(out.ctxdsl),
-                Err(err) => Err(VerifyError::AdapterTranslationFailed {
+            let opts = AdapterOptions::default();
+            XStateAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
                     source_id: source_id.to_string(),
                     adapter: adapter.to_string(),
                     message: err.to_string(),
-                }),
-            }
+                })
         }
+        "sv-rtl" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "extraction" => {
+            let mode = options
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let opts = AdapterOptions {
+                mode,
+                ..AdapterOptions::default()
+            };
+            crate::adapter::extraction::ExtractionAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "c-codesign" => dispatch_c_codesign(source_id, file_path, options, base_dir),
         other => Err(VerifyError::UnknownAdapter {
             source_id: source_id.to_string(),
             adapter: other.to_string(),
         }),
     }
+}
+
+/// Dispatch the `c-codesign` adapter — runs LLVM-IR extraction via
+/// clang, then wraps the per-function synthesised automaton fragments
+/// into a single `context FwSource { … }` block the verify assembler
+/// can ingest.
+fn dispatch_c_codesign(
+    source_id: &str,
+    file_path: &Path,
+    options: &std::collections::BTreeMap<String, toml::Value>,
+    base_dir: &Path,
+) -> Result<String, VerifyError> {
+    use crate::codesign::c_extract_llvm::{LlvmExtractOptions, extract_c_via_llvm};
+    use crate::codesign::register_map::RegisterMap;
+
+    let mut extract_opts = LlvmExtractOptions::default();
+
+    if let Some(toml::Value::String(s)) = options.get("clang") {
+        extract_opts.clang_path = Some(PathBuf::from(s));
+    }
+    if let Some(toml::Value::Array(arr)) = options.get("include_paths") {
+        extract_opts.include_paths = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| {
+                let p = PathBuf::from(s);
+                if p.is_absolute() { p } else { base_dir.join(p) }
+            })
+            .collect();
+    }
+    if let Some(toml::Value::Array(arr)) = options.get("defines") {
+        extract_opts.defines = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    extract_opts.synthesize_automaton = options
+        .get("synthesize_automaton")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // Register map: load the JSON sidecar referenced by the source's
+    // `register_map` option (set by the codesign-shorthand translator)
+    // so accesses get matched and labelled.
+    if let Some(toml::Value::String(rm_str)) = options.get("register_map") {
+        let rm_path = {
+            let p = PathBuf::from(rm_str);
+            if p.is_absolute() { p } else { base_dir.join(p) }
+        };
+        // Skip non-JSON files (SVD path; the translator records it
+        // verbatim, but the c-codesign adapter only consumes JSON
+        // register-map sidecars today).
+        let is_json = rm_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+        if is_json {
+            let bytes =
+                std::fs::read(&rm_path).map_err(|e| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: "c-codesign".to_string(),
+                    message: format!(
+                        "failed to read register-map sidecar {}: {e}",
+                        rm_path.display()
+                    ),
+                })?;
+            let rm: RegisterMap = serde_json::from_slice(&bytes).map_err(|e| {
+                VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: "c-codesign".to_string(),
+                    message: format!(
+                        "failed to parse register-map sidecar {} as JSON: {e}",
+                        rm_path.display()
+                    ),
+                }
+            })?;
+            extract_opts.register_map = Some(rm);
+        }
+    }
+
+    let extraction = extract_c_via_llvm(file_path, &extract_opts).map_err(|err| {
+        VerifyError::AdapterTranslationFailed {
+            source_id: source_id.to_string(),
+            adapter: "c-codesign".to_string(),
+            message: format!("{err:?}"),
+        }
+    })?;
+
+    // Build the per-source CTXDSL: collect every label every function
+    // touches, declare them in the alphabet, then concatenate all
+    // `automaton_ctxdsl` fragments. Functions without a synthesised
+    // automaton are skipped (they had no register accesses).
+    use crate::codesign::coupling::rendezvous_label_name;
+    use std::collections::BTreeSet;
+
+    let mut labels: BTreeSet<String> = BTreeSet::new();
+    for f in &extraction.functions {
+        for a in &f.accesses {
+            labels.insert(rendezvous_label_name(
+                &a.register,
+                a.field.as_deref(),
+                a.kind,
+            ));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("context FwSource {\n");
+    if !labels.is_empty() {
+        out.push_str("    alphabet {\n");
+        for label in &labels {
+            out.push_str(&format!("        label {label};\n"));
+        }
+        out.push_str("    }\n");
+    }
+    out.push_str("    automata {\n");
+    for f in &extraction.functions {
+        if let Some(frag) = &f.automaton_ctxdsl {
+            // Indent the fragment one level deeper to nest cleanly
+            // inside `automata { ... }`.
+            for line in frag.lines() {
+                out.push_str("        ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
