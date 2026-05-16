@@ -36,3 +36,11 @@
 pub mod assemble;
 pub mod binding;
 pub mod config;
+pub mod orchestrator;
+pub mod report;
+
+pub use orchestrator::verify_project;
+pub use report::{
+    CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, VerifyError,
+    VerifyReport,
+};
