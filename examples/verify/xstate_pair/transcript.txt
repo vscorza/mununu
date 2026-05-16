@@ -1,0 +1,21 @@
+# xstate_pair — verify framework end-to-end transcript
+# Regenerated via examples/verify/xstate_pair/validate.sh
+#
+# Two XState machines composed asynchronously; direct alphabet
+# binding (no renaming); two properties (template-sourced
+# no_deadlock + inline `true`).
+
+=== mununu verify (human-readable) ===
+verify report — project `XStatePair`:
+  composition: asynchronous Pair { members = [Lock, Gate] }
+    - lock (adapter = xstate, automaton = Lock)
+    - gate (adapter = xstate, automaton = Gate)
+    no_deadlock: SATISFIED (4/4 states, 1/1 initial) [template `no_deadlock`, over = Pair]
+    always_true: SATISFIED (4/4 states, 1/1 initial) [inline, over = Pair]
+
+=== mununu verify --json (subset: project + verdict shape) ===
+project = XStatePair
+composition.name = Pair
+composition.semantics = asynchronous
+  property `no_deadlock`: satisfied = True, source = template
+  property `always_true`: satisfied = True, source = inline
