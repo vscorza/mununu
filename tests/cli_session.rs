@@ -381,3 +381,89 @@ members = ["x"]
         .stderr(predicate::str::contains("validation issue"));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// `mununu codesign reconcile-labels` — Doc C §C.5 hard-gate CLI (PR #54).
+// ---------------------------------------------------------------------------
+
+fn write_labels_array(dir: &Path, name: &str, labels: &[&str]) -> Result<PathBuf, Box<dyn Error>> {
+    let path = dir.join(name);
+    let body = serde_json::to_string(labels)?;
+    fs::write(&path, body)?;
+    Ok(path)
+}
+
+#[test]
+fn codesign_reconcile_labels_reports_clean_match() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let fw = write_labels_array(
+        temp.path(),
+        "fw.json",
+        &["rd_status_tx_busy", "wr_ctrl_tx_start"],
+    )?;
+    let p = write_labels_array(
+        temp.path(),
+        "p.json",
+        &["rd_status_tx_busy", "wr_ctrl_tx_start"],
+    )?;
+    assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args([
+            "codesign",
+            "reconcile-labels",
+            fw.to_str().unwrap(),
+            p.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alphabets reconcile"))
+        .stdout(predicate::str::contains("wr_ctrl_tx_start"))
+        .stdout(predicate::str::contains("rd_status_tx_busy"));
+    Ok(())
+}
+
+#[test]
+fn codesign_reconcile_labels_reports_firmware_only_mismatch() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let fw = write_labels_array(
+        temp.path(),
+        "fw.json",
+        &["wr_ctrl_tx_start", "wr_data_byte"],
+    )?;
+    let p = write_labels_array(temp.path(), "p.json", &["wr_ctrl_tx_start"])?;
+    assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args([
+            "codesign",
+            "reconcile-labels",
+            fw.to_str().unwrap(),
+            p.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("label-alphabet mismatch"))
+        .stderr(predicate::str::contains("firmware-only"))
+        .stderr(predicate::str::contains("wr_data_byte"));
+    Ok(())
+}
+
+#[test]
+fn codesign_reconcile_labels_emits_json_on_request() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let fw = write_labels_array(temp.path(), "fw.json", &["wr_a"])?;
+    let p = write_labels_array(temp.path(), "p.json", &["wr_a"])?;
+    let assert = assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args([
+            "codesign",
+            "reconcile-labels",
+            fw.to_str().unwrap(),
+            p.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone())?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(parsed["shared"], serde_json::json!(["wr_a"]));
+    assert_eq!(parsed["mismatch"], serde_json::Value::Null);
+    Ok(())
+}

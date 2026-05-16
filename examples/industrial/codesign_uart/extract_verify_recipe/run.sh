@@ -58,15 +58,39 @@ run() {
     printf '#   firmware.c -> mununu codesign extract-c -> splice -> mununu context eval\n'
 
     printf '\n=== Step 1: extract C firmware to synthesised CTXDSL automaton ===\n'
-    EXTRACT_JSON="$(./target/debug/mununu codesign extract-c \
+    EXTRACT_JSON_PATH="$DIR/extraction.json"
+    ./target/debug/mununu codesign extract-c \
         "$FIRMWARE" \
         --register-map "$REGISTER_MAP" \
         --synthesize-automaton \
-        --cmsis-stubs 2>/dev/null)"
+        --cmsis-stubs > "$EXTRACT_JSON_PATH" 2>/dev/null
+    EXTRACT_JSON="$(cat "$EXTRACT_JSON_PATH")"
     printf 'extracted %d functions; the synthesised automaton fragment for the entry point is:\n\n' \
         "$(printf '%s' "$EXTRACT_JSON" | jq '.functions | length')"
     AUTOMATON="$(printf '%s' "$EXTRACT_JSON" | jq -r '.functions[0].automaton_ctxdsl')"
     printf '%s\n' "$AUTOMATON"
+
+    printf '\n=== Step 1.5: derive firmware-side label list + reconcile against register map ===\n'
+    # The reconcile-labels CLI consumes a plain `["label_1", ...]` array,
+    # so we project the extraction's per-access (kind, register, field)
+    # tuples into rendezvous labels using the same lowercase-and-ASCII-
+    # only sanitisation `coupling::rendezvous_label_name` applies.
+    FW_LABELS_PATH="$DIR/firmware_labels.json"
+    printf '%s' "$EXTRACT_JSON" | jq '[
+        .functions[].accesses[]
+        | (if .kind == "read" then "rd" else "wr" end) as $kind
+        | (.register | ascii_downcase | gsub("[^a-z0-9_]"; "_")) as $reg
+        | (if .field then "_" + (.field | ascii_downcase | gsub("[^a-z0-9_]"; "_")) else "" end) as $field
+        | "\($kind)_\($reg)\($field)"
+    ] | unique' > "$FW_LABELS_PATH"
+    printf 'firmware labels (%d):\n' \
+        "$(jq 'length' "$FW_LABELS_PATH")"
+    jq -r '.[] | "  - " + .' "$FW_LABELS_PATH"
+
+    run "Step 1.6: reconcile against the register-map alphabet" \
+        ./target/debug/mununu codesign reconcile-labels \
+            "$FW_LABELS_PATH" \
+            --peripheral-register-map "$REGISTER_MAP"
 
     printf '\n=== Step 2: splice the automaton into verify.template.ctxdsl ===\n'
     # Python one-shot string replace — handles multiline substitution

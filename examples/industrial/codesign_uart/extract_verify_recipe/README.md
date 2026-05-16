@@ -41,7 +41,14 @@ firmware.c                                       (auto-extracted)
 { "functions": [{ ..., "automaton_ctxdsl": "..." }] }   (JSON; jq extracts
                                                          the automaton block)
      │
-     │   awk/python splices it into the {{AUTOMATON_CTXDSL}} placeholder
+     ├──► (1.5) project per-access (kind, register, field) tuples into a
+     │         `["label_1", ...]` array of rendezvous labels
+     │
+     │   $ mununu codesign reconcile-labels firmware_labels.json \
+     │       --peripheral-register-map ../register_map.json
+     │   (gate; mismatch reports firmware_only / peripheral_only labels)
+     │
+     │   python3 splices `automaton_ctxdsl` into the {{AUTOMATON_CTXDSL}} placeholder
      ▼
 verify.template.ctxdsl  +  hand-authored UartPeripheral + composition + formulas
      │

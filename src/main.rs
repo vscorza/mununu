@@ -264,6 +264,25 @@ enum CodesignCommand {
     ExtractC(CodesignExtractCArgs),
     /// Phase L8: emit a CMSIS-DEVICE-style C header from an SVD.
     EmitCmsisHeader(CodesignEmitCmsisHeaderArgs),
+    /// Reconcile firmware-side and peripheral-side rendezvous-label
+    /// alphabets. Foundation for `verify-project` (gap (3)).
+    ReconcileLabels(CodesignReconcileLabelsArgs),
+}
+
+#[derive(Args, Debug)]
+struct CodesignReconcileLabelsArgs {
+    /// Path to the firmware-side label JSON (a `["label_1", …]` array).
+    #[arg(value_name = "FIRMWARE_JSON")]
+    firmware_labels: PathBuf,
+    /// Path to the peripheral-side label JSON (same shape as FIRMWARE_JSON).
+    #[arg(value_name = "PERIPHERAL_JSON", required = false)]
+    peripheral_labels: Option<PathBuf>,
+    /// Path to a register-map sidecar JSON.
+    #[arg(long = "peripheral-register-map", value_name = "REGISTER_MAP_JSON")]
+    peripheral_register_map: Option<PathBuf>,
+    /// Output format: `human` (default) or `json`.
+    #[arg(long, value_name = "FORMAT", default_value = "human")]
+    format: String,
 }
 
 #[derive(Args, Debug)]
@@ -779,6 +798,131 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
+        CodesignCommand::ReconcileLabels(args) => codesign_reconcile_labels(args),
+    }
+}
+
+fn codesign_reconcile_labels(args: CodesignReconcileLabelsArgs) -> Result<(), String> {
+    use mununu::codesign::reconcile::{
+        ReconcileError, peripheral_labels_from_register_map, reconcile_label_alphabets,
+    };
+    use mununu::codesign::register_map::RegisterMap;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    let load_label_list = |path: &PathBuf, side: &str| -> Result<BTreeSet<String>, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("failed to read {side} labels {}: {e}", path.display()))?;
+        let labels: Vec<String> = serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "failed to parse {side} labels {} as JSON array of strings: {e}",
+                path.display()
+            )
+        })?;
+        Ok(labels.into_iter().collect())
+    };
+
+    let firmware = load_label_list(&args.firmware_labels, "firmware")?;
+
+    let peripheral: BTreeSet<String> = match (
+        &args.peripheral_labels,
+        &args.peripheral_register_map,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "pass exactly one of <PERIPHERAL_JSON> or --peripheral-register-map, not both"
+                    .to_string(),
+            );
+        }
+        (None, None) => {
+            return Err(
+                "missing peripheral source: pass <PERIPHERAL_JSON> as the second positional arg or --peripheral-register-map <JSON>"
+                    .to_string(),
+            );
+        }
+        (Some(p), None) => load_label_list(p, "peripheral")?,
+        (None, Some(rm_path)) => {
+            let bytes = std::fs::read(rm_path)
+                .map_err(|e| format!("failed to read register-map {}: {e}", rm_path.display()))?;
+            let rm: RegisterMap = serde_json::from_slice(&bytes).map_err(|e| {
+                format!(
+                    "failed to parse register-map {} as JSON: {e}",
+                    rm_path.display()
+                )
+            })?;
+            let issues = rm.validate();
+            if !issues.is_empty() {
+                for issue in &issues {
+                    eprintln!("register-map validation: {issue}");
+                }
+                return Err(format!(
+                    "register-map {} has {} validation issue(s) — refusing to proceed",
+                    rm_path.display(),
+                    issues.len()
+                ));
+            }
+            peripheral_labels_from_register_map(&rm)
+        }
+    };
+
+    let result = reconcile_label_alphabets(&firmware, &peripheral);
+
+    match args.format.as_str() {
+        "json" => match &result {
+            Ok(r) => {
+                let payload = serde_json::json!({
+                    "shared": r.shared,
+                    "mismatch": serde_json::Value::Null,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+                Ok(())
+            }
+            Err(ReconcileError::Mismatch(m)) => {
+                let payload = serde_json::json!({
+                    "shared": Vec::<String>::new(),
+                    "mismatch": {
+                        "firmware_only": m.firmware_only,
+                        "peripheral_only": m.peripheral_only,
+                    },
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+                Err("label-alphabet mismatch".to_string())
+            }
+        },
+        "human" => match &result {
+            Ok(r) => {
+                println!("alphabets reconcile ({} shared labels):", r.shared.len());
+                for label in &r.shared {
+                    println!("  - {label}");
+                }
+                Ok(())
+            }
+            Err(ReconcileError::Mismatch(m)) => {
+                eprintln!("error: label-alphabet mismatch");
+                if !m.firmware_only.is_empty() {
+                    eprintln!("  firmware-only ({}):", m.firmware_only.len());
+                    for label in &m.firmware_only {
+                        eprintln!("    - {label}");
+                    }
+                }
+                if !m.peripheral_only.is_empty() {
+                    eprintln!("  peripheral-only ({}):", m.peripheral_only.len());
+                    for label in &m.peripheral_only {
+                        eprintln!("    - {label}");
+                    }
+                }
+                Err("label-alphabet mismatch".to_string())
+            }
+        },
+        other => Err(format!("unknown --format '{other}' (valid: human, json)")),
     }
 }
 
