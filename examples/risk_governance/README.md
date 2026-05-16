@@ -390,7 +390,7 @@ transitions in the offending states. In our case the synthesized
 supervisor will disable `deploy_live` in every composite state where
 `DrawdownMonitor` is in `Halted`. That supervisor is a CLTS in its own
 right, exportable as native CTXDSL or (for compatible adapters) as
-XState / SystemVerilog / GDScript, and it is what the running system
+XState / SystemVerilog, and it is what the running system
 should consult — not the underlying validator FSM in isolation.
 
 The discipline is: the runbook is the *spec*; the synthesized

@@ -1,7 +1,7 @@
 //! Cross-domain property template system.
 //!
 //! Templates define parameterized mu-calculus formula patterns that can be
-//! instantiated with concrete arguments across any domain (game, RTL, agentic,
+//! instantiated with concrete arguments across any domain (RTL, agentic,
 //! software extraction, synthesis). Templates resolve to
 //! `PropertyFormula::MuCalculus(String)` — the emitter and evaluator see no
 //! difference from a hand-written formula.
@@ -40,8 +40,6 @@ use super::ir::{PropertyKind, PropertyRole};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TemplateDomain {
-    /// Game engine state machines (Godot, Unity, etc.)
-    Game,
     /// Register-transfer level hardware (SystemVerilog)
     Rtl,
     /// Agentic AI protocols (MCP, CrewAI, LangGraph, A2A)
@@ -502,9 +500,9 @@ mod tests {
     fn filter_by_domain() {
         let reg = TemplateRegistry::builtin();
         let universal = reg.for_domain(TemplateDomain::Universal);
-        let game = reg.for_domain(TemplateDomain::Game);
-        // All universal templates should appear in game domain results
-        assert!(game.len() >= universal.len());
+        let agentic = reg.for_domain(TemplateDomain::Agentic);
+        // All universal templates should appear in agentic domain results
+        assert!(agentic.len() >= universal.len());
     }
 
     #[test]

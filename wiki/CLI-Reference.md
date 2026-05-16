@@ -62,14 +62,12 @@ mununu context eval examples/counters/counters.ctxdsl \
 
 ```bash
 # Evaluate using a property template (no need to write mu-calculus)
-mununu context eval examples/game/player_fsm.espec.json \
-    --adapter extraction \
-    --template no_deadlock --automaton PlayerState
+mununu context eval examples/agentic/handoff_protocol.ctxdsl \
+    --template no_deadlock --automaton HandoffSupervisor
 
 # Template with arguments
-mununu context eval examples/game/quest_deadlock.espec.json \
-    --adapter extraction \
-    --template reachable --template-arg TARGET=AllComplete --automaton QuestProgress
+mununu context eval examples/agentic/mcp_auth.ctxdsl \
+    --template reachable --template-arg TARGET=SessionClosed --automaton Session
 ```
 
 ```bash
@@ -117,7 +115,7 @@ mununu context synth <CONTEXT> [options]
 | `--adapter <FORMAT>` | Translate from an external format before processing. Supported: `tlsf`, `aiger`, `btor2` (or `btor`), `promela`, `xstate`, `systemverilog` (or `sv`, hand-written parser), `sv-yosys` (or `yosys`, Yosys-driven elaboration), `extraction`, `auto` |
 | `--dump-json <FILE>` | Write a JSON summary of the synthesis result to a file |
 | `--emit-dsl <FILE>` | Write the synthesized controller as a CTXDSL file |
-| `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog`, `gdscript` |
+| `--output-format <FORMAT>` | Output format for the synthesized controller: `ctxdsl` (default), `xstate`, `systemverilog` |
 | `--emit-native <FILE>` | Write the controller in the native format specified by `--output-format` |
 | `--dump-diagnostics <FILE>` | Export diagnostics as a DSL sidecar file |
 | `--print-structure [FILE]` | Print internal context structure to stdout or a file |
@@ -437,7 +435,7 @@ mununu templates [options]
 
 | Flag | Description |
 |------|-------------|
-| `--domain <DOMAIN>` | Filter templates by domain: `game`, `rtl`, `agentic`, `software`, `synthesis` |
+| `--domain <DOMAIN>` | Filter templates by domain: `rtl`, `agentic`, `software`, `synthesis` |
 | `--id <ID>` | Show details of a specific template |
 | `--json` | Output as JSON |
 
@@ -448,7 +446,7 @@ mununu templates [options]
 mununu templates
 
 # Filter by domain
-mununu templates --domain game
+mununu templates --domain rtl
 
 # Show template details
 mununu templates --id reachable
@@ -465,7 +463,6 @@ See [Property Templates](Property-Templates) for the full catalog and usage guid
 
 - [Adapter Formats](Adapter-Formats.md) -- supported external formats
 - [Property Templates](Property-Templates.md) -- parameterized property patterns
-- [Game Engine Integration](Game-Engine-Integration.md) -- game FSM verification
 - [LTL Properties](LTL-Properties.md) -- writing temporal specifications
 - [Controller Synthesis](Controller-Synthesis.md) -- synthesis concepts and examples
 - [Hardware Verification Patterns](Hardware-Verification-Patterns.md) -- example models and properties

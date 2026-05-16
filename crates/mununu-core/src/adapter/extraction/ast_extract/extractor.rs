@@ -187,12 +187,6 @@ fn find_class_nodes<'a>(
                 (None, None) => {}                    // fall through to error
             }
         }
-        SourceLanguage::GDScript => {
-            // GDScript has no class wrapper — the file itself is the "class".
-            // Use the root node as both field and method container.
-            // The class_name is treated as the script name (ignored for matching).
-            return Ok((root, root));
-        }
     }
 
     Err(format!("Class/struct '{}' not found in source", class_name))
@@ -489,10 +483,6 @@ fn extract_fields(
                 .find(|child| child.kind() == "field_declaration_list")
                 .or(Some(*class_node))
         }
-        SourceLanguage::GDScript => {
-            // GDScript: root node is the body (file-level declarations)
-            Some(*class_node)
-        }
     };
 
     let body = match body_node {
@@ -552,7 +542,6 @@ fn extract_fields(
             SourceLanguage::TypeScript => extract_ts_field(parsed, &child),
             SourceLanguage::Python => extract_py_field(parsed, &child),
             SourceLanguage::Rust => extract_rs_field(parsed, &child),
-            SourceLanguage::GDScript => extract_gd_field(parsed, &child),
         };
 
         let name = match name {
@@ -1052,68 +1041,6 @@ fn extract_rs_field(
     (name, type_str, None, Some(parsed.node_line(node)))
 }
 
-/// Extract a field from a GDScript `variable_statement` node.
-///
-/// Handles patterns like:
-/// - `var current_state: State = State.IDLE`
-/// - `var health: int = 100`
-/// - `var is_dead: bool = false`
-fn extract_gd_field(
-    parsed: &ParsedSource,
-    node: &Node,
-) -> (Option<String>, Option<String>, Option<String>, Option<u32>) {
-    // GDScript variable declarations (tree-sitter-gdscript uses "variable_statement")
-    if node.kind() != "variable_statement" {
-        return (None, None, None, None);
-    }
-
-    let text = parsed.node_text(node);
-
-    // Parse "var name: Type = initial" pattern from the text
-    let text = text.trim();
-    if !text.starts_with("var ") {
-        return (None, None, None, None);
-    }
-    let after_var = &text[4..];
-
-    // Extract name (up to : or = or whitespace)
-    let name_end = after_var
-        .find(|c: char| c == ':' || c == '=' || c.is_whitespace())
-        .unwrap_or(after_var.len());
-    let name = after_var[..name_end].trim().to_string();
-    if name.is_empty() {
-        return (None, None, None, None);
-    }
-
-    // Extract type (after : and before =)
-    let type_str = if let Some(colon_pos) = after_var.find(':') {
-        let after_colon = &after_var[colon_pos + 1..];
-        let type_end = after_colon.find('=').unwrap_or(after_colon.len());
-        let t = after_colon[..type_end].trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
-    } else {
-        None
-    };
-
-    // Extract initial value (after =)
-    let initial = if let Some(eq_pos) = after_var.find('=') {
-        let after_eq = after_var[eq_pos + 1..].trim();
-        if after_eq.is_empty() {
-            None
-        } else {
-            Some(after_eq.to_string())
-        }
-    } else {
-        None
-    };
-
-    (Some(name), type_str, initial, Some(parsed.node_line(node)))
-}
-
 /// Extract method behaviors from a class/struct.
 #[allow(clippy::too_many_arguments)]
 fn extract_methods(
@@ -1157,7 +1084,6 @@ fn extract_methods(
             };
 
         // Extract guards and effects from method body.
-        // For GDScript match statements, split into per-case behaviors.
         let body = method_node.child_by_field_name("body");
         if let Some(body_node) = body {
             let case_behaviors = extract_method_behaviors(
@@ -1191,10 +1117,6 @@ fn find_method_nodes<'a>(
             // impl_item has a body field (declaration_list) containing function_items
             class_node.child_by_field_name("body").or(Some(*class_node))
         }
-        SourceLanguage::GDScript => {
-            // GDScript: root node contains top-level function definitions
-            Some(*class_node)
-        }
     };
 
     let body = match body_node {
@@ -1206,7 +1128,6 @@ fn find_method_nodes<'a>(
         SourceLanguage::TypeScript => "method_definition",
         SourceLanguage::Python => "function_definition",
         SourceLanguage::Rust => "function_item",
-        SourceLanguage::GDScript => "function_definition",
     };
 
     let mut cursor = body.walk();
@@ -1245,18 +1166,7 @@ fn unwrap_python_decorator<'a>(node: Node<'a>) -> Node<'a> {
     node
 }
 
-/// Extract method behaviors, splitting match-statement cases into separate behaviors.
-///
-/// For a method like:
-/// ```gdscript
-/// func _physics_process(delta):
-///     match current_state:
-///         State.IDLE: current_state = State.RUNNING
-///         State.RUNNING: current_state = State.IDLE
-/// ```
-/// This produces two MethodBehavior entries:
-///   - `_physics_process` with guard MustEqual("IDLE") + effect Variant("RUNNING")
-///   - `_physics_process` with guard MustEqual("RUNNING") + effect Variant("IDLE")
+/// Extract method behaviors via flat guard/effect extraction.
 #[allow(clippy::too_many_arguments)]
 fn extract_method_behaviors(
     parsed: &ParsedSource,
@@ -1268,99 +1178,15 @@ fn extract_method_behaviors(
     line_end: u32,
     warnings: &mut Vec<String>,
 ) -> Vec<MethodBehavior> {
-    // Check if the method body contains a top-level match statement on a state field.
-    // If so, split into per-case behaviors.
-    type MatchCases = Vec<(Vec<Guard>, Vec<Effect>)>;
-    let mut match_info: Option<(String, MatchCases)> = None;
-
-    let mut cursor = body_node.walk();
-    for child in body_node.children(&mut cursor) {
-        if child.kind() == "match_statement" {
-            if let Some(value_node) = child.child_by_field_name("value") {
-                let match_expr = parsed.node_text(&value_node).trim().to_string();
-                let matched_field = field_names
-                    .iter()
-                    .find(|&&f| {
-                        match_expr == f
-                            || match_expr == format!("self.{f}")
-                            || match_expr == format!("this.{f}")
-                    })
-                    .map(|f| f.to_string());
-
-                if let Some(field) = matched_field {
-                    let mut cases = Vec::new();
-                    if let Some(match_body) = child.child_by_field_name("body") {
-                        let mut mc = match_body.walk();
-                        for section in match_body.children(&mut mc) {
-                            if section.kind() == "pattern_section" {
-                                let mut case_guards = Vec::new();
-                                let mut case_effects = Vec::new();
-                                extract_match_case_guard_and_effects(
-                                    parsed,
-                                    &section,
-                                    &field,
-                                    field_names,
-                                    &mut case_guards,
-                                    &mut case_effects,
-                                );
-                                if !case_guards.is_empty() || !case_effects.is_empty() {
-                                    cases.push((case_guards, case_effects));
-                                }
-                            }
-                        }
-                    }
-                    if !cases.is_empty() {
-                        match_info = Some((field, cases));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some((_field, cases)) = match_info {
-        // Split: one MethodBehavior per effect within each match case.
-        // Each assignment to a state field in a case body is a separate
-        // nondeterministic transition (environment chooses which if-branch fires).
-        let mut behaviors = Vec::new();
-        for (guards, effects) in cases {
-            if effects.is_empty() {
-                // Case with guards but no effects (e.g., pass statement)
-                behaviors.push(MethodBehavior {
-                    name: method_name.to_string(),
-                    guards,
-                    effects: vec![],
-                    controllable,
-                    line_start: Some(line_start),
-                    line_end: Some(line_end),
-                });
-            } else {
-                // One behavior per effect — models nondeterministic choice
-                for effect in effects {
-                    behaviors.push(MethodBehavior {
-                        name: method_name.to_string(),
-                        guards: guards.clone(),
-                        effects: vec![effect],
-                        controllable,
-                        line_start: Some(line_start),
-                        line_end: Some(line_end),
-                    });
-                }
-            }
-        }
-        behaviors
-    } else {
-        // No match statement — use flat guard/effect extraction
-        let (guards, effects) =
-            extract_guards_and_effects(parsed, body_node, field_names, warnings);
-        vec![MethodBehavior {
-            name: method_name.to_string(),
-            guards,
-            effects,
-            controllable,
-            line_start: Some(line_start),
-            line_end: Some(line_end),
-        }]
-    }
+    let (guards, effects) = extract_guards_and_effects(parsed, body_node, field_names, warnings);
+    vec![MethodBehavior {
+        name: method_name.to_string(),
+        guards,
+        effects,
+        controllable,
+        line_start: Some(line_start),
+        line_end: Some(line_end),
+    }]
 }
 
 /// Extract guards (if-checks on state fields) and effects (assignments to
@@ -1410,8 +1236,7 @@ fn extract_guards_and_effects(
                 }
             }
             "expression_statement" => {
-                // TypeScript: `this._field = value;` is wrapped in expression_statement
-                // GDScript: assignments are also wrapped in expression_statement
+                // TypeScript: `this._field = value;` is wrapped in expression_statement.
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     if child.kind() == "assignment_expression" || child.kind() == "assignment" {
@@ -1422,48 +1247,6 @@ fn extract_guards_and_effects(
                         }
                     }
                 }
-            }
-            "match_statement" => {
-                // GDScript match-based FSM pattern:
-                //   match current_state:
-                //       State.IDLE:
-                //           current_state = State.RUNNING
-                //
-                // Tree-sitter-gdscript v6 structure:
-                //   match_statement { value, body: match_body { pattern_section* } }
-                //   pattern_section { _pattern, body }
-                if let Some(value_node) = node.child_by_field_name("value") {
-                    let match_expr = parsed.node_text(&value_node).trim().to_string();
-                    // Check if matched expression is a state field
-                    let matched_field = field_names
-                        .iter()
-                        .find(|&&f| {
-                            match_expr == f
-                                || match_expr == format!("self.{f}")
-                                || match_expr == format!("this.{f}")
-                        })
-                        .map(|f| f.to_string());
-
-                    if let Some(field) = matched_field {
-                        if let Some(body_node_inner) = node.child_by_field_name("body") {
-                            let mut cursor = body_node_inner.walk();
-                            for section in body_node_inner.children(&mut cursor) {
-                                if section.kind() == "pattern_section" {
-                                    extract_match_case_guard_and_effects(
-                                        parsed,
-                                        &section,
-                                        &field,
-                                        field_names,
-                                        &mut guards,
-                                        &mut effects,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                // Don't push children — we already traversed match internals
-                continue;
             }
             // B6: detect `this.<field>.<method>(...)` / `self.<field>.<method>(...)`
             // and resolve via the call-summary library.
@@ -1521,7 +1304,6 @@ fn extract_effect_from_call(
         SourceLanguage::TypeScript => "typescript",
         SourceLanguage::Python => "python",
         SourceLanguage::Rust => "rust",
-        SourceLanguage::GDScript => return None, // not yet supported
     };
     let lib = CallSummaryLibrary::for_language(lang);
     let (effect, _guard) = lib.resolve_unqualified(method_name)?;
@@ -1565,76 +1347,6 @@ fn is_early_exit_body(_parsed: &ParsedSource, if_node: &Node) -> bool {
         }
     }
     false
-}
-
-/// Extract guards and effects from a single GDScript match/case branch.
-///
-/// For a pattern_section like `State.IDLE: ...`, this produces:
-///   - A guard `MustEqual("IDLE")` on the matched field
-///   - Effects from assignments in the case body
-fn extract_match_case_guard_and_effects(
-    parsed: &ParsedSource,
-    section: &Node,
-    matched_field: &str,
-    field_names: &HashSet<&str>,
-    guards: &mut Vec<Guard>,
-    effects: &mut Vec<Effect>,
-) {
-    // Extract pattern value from non-body children of pattern_section.
-    // Text is e.g., "State.IDLE" — normalize to "IDLE" (part after last dot).
-    let mut pattern_value: Option<String> = None;
-    let mut cursor = section.walk();
-    for child in section.children(&mut cursor) {
-        if child.kind() != "body" && child.is_named() {
-            let text = parsed.node_text(&child).trim().to_string();
-            if !text.is_empty() {
-                let variant = text.rsplit('.').next().unwrap_or(&text).to_string();
-                pattern_value = Some(variant);
-                break;
-            }
-        }
-    }
-
-    let variant = match pattern_value {
-        Some(v) => v,
-        None => return,
-    };
-
-    guards.push(Guard {
-        field: matched_field.to_string(),
-        condition: CallGuard::MustEqual(variant),
-    });
-
-    // Extract effects from the case body
-    if let Some(case_body) = section.child_by_field_name("body") {
-        let mut stack = vec![case_body];
-        while let Some(n) = stack.pop() {
-            match n.kind() {
-                "assignment" | "assignment_expression" | "augmented_assignment_expression" => {
-                    if let Some(effect) = extract_effect_from_assignment(parsed, &n, field_names) {
-                        effects.push(effect);
-                    }
-                }
-                "expression_statement" => {
-                    let mut c = n.walk();
-                    for child in n.children(&mut c) {
-                        if child.kind() == "assignment" || child.kind() == "assignment_expression" {
-                            if let Some(effect) =
-                                extract_effect_from_assignment(parsed, &child, field_names)
-                            {
-                                effects.push(effect);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            let mut c = n.walk();
-            for child in n.children(&mut c) {
-                stack.push(child);
-            }
-        }
-    }
 }
 
 /// Invert a guard condition (for early-return pattern detection).
