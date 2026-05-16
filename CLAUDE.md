@@ -545,6 +545,19 @@ This applies to: README examples, wiki case studies, blog posts linked from the 
 
 **Agents must propagate this rule.** Any subagent invocation that performs git operations on a real repo (not an `isolation: "worktree"` clone) inherits this restriction. Subagents may take destructive actions only inside `isolation: "worktree"` agents (the worktree is a throwaway clone).
 
+### Workspace Concurrency
+
+**Do not run multiple Claude Code instances against the same workspace simultaneously.** Each instance maintains its own private conversation context. When two instances are attached to the same workspace (or worse, the same session ID via `--resume`), they race each other on the filesystem: instance A edits a file, instance B (whose snapshot of the conversation pre-dates A's edit) later fires a tool call that overwrites A's change with the older content. The symptom looks like a "reverter" silently rolling back edits — there is no reverter, only stale-context overwrites.
+
+**Why**: An incident in this repo (session `b5bd74c2-…`, May 2026) burned hours of effort when three Claude processes (one user-driven, two background) all resumed the same session and competed on the same `crates/mununu-cli/src/main.rs` and `crates/mununu-core/src/api/handlers.rs` paths. The `file was modified, intentional` system-reminder pattern that fires when an external process modifies a tool-tracked file is *accurate* in this scenario — the "external process" is just another Claude instance — but it produces an impossible-to-debug loop where each instance is convinced the others are wrong.
+
+**How to apply**:
+- Before starting an interactive Claude session in this repo, run `pgrep -fa 'claude.*--resume'` and confirm no other process owns the same session ID. The lockfile at `.claude/scheduled_tasks.lock` names the PID that holds it; check its `etime` via `ps -o pid,etime,command -p <pid>` to spot stale (multi-hour) holders.
+- If a long-running background Claude is intentional (a `/loop`, a `CronCreate`, a `ScheduleWakeup`), do not also open an interactive Claude pane against the same project until that loop ends. The interactive instance has no way to coordinate with the background one and will fight it.
+- A user who must run two instances should split them across **separate worktrees** (`git worktree add ../mununu-worktree-2 <branch>`) or **separate clones** so the filesystems don't overlap. Same session ID + same working directory is the failure mode; either dimension being separate avoids it.
+- For agents: when an `Agent` invocation needs to perform tool calls in the same workspace as the parent (no `isolation: "worktree"`), only one such agent may be in flight at a time. Parallel `Agent` tool calls are safe **only** when each uses `isolation: "worktree"` (throwaway clone) or each touches a disjoint file set the orchestrator pre-partitions.
+- If the symptom appears mid-session (an edit you just applied silently reverts to the pre-edit content, possibly with a `file was modified, intentional` system-reminder), stop editing immediately. Re-applying loses to the racing instance every time. Run `pgrep -fa claude` to confirm the racing instance, surface it to the user, and wait until only one instance remains.
+
 ## Private Files Policy
 
 Sensitive or unpublished materials must live in the **sibling private repo**, not in this repo:
