@@ -33,5 +33,6 @@
 //! [`crate::codesign::project_config`] (when shipped) translates
 //! mechanically into a `VerifyConfig`.
 
+pub mod assemble;
 pub mod binding;
 pub mod config;
