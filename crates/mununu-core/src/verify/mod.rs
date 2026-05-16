@@ -38,6 +38,7 @@ pub mod binding;
 pub mod codesign_shorthand;
 pub mod config;
 pub mod orchestrator;
+pub mod register_map_rewriter;
 pub mod report;
 
 pub use orchestrator::verify_project;

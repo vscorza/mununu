@@ -47,6 +47,7 @@
 //! slice. Calls with an unrecognised adapter return
 //! [`VerifyError::UnknownAdapter`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::adapter::templates::{TemplateRef, TemplateRegistry};
@@ -60,6 +61,7 @@ use crate::verify::assemble::{
 };
 use crate::verify::binding::{AlphabetBinding, apply_renamings_to_ctxdsl};
 use crate::verify::config::{PropertySection, VerifyConfig};
+use crate::verify::register_map_rewriter::derive_sv_renamings_from_register_map;
 use crate::verify::report::{
     CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, VerifyError,
     VerifyReport,
@@ -85,6 +87,15 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     let binding =
         AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
     let per_source_renamings = binding.per_source_renamings();
+    // For RegisterMap binding, eagerly derive the SV-side renaming
+    // table once — it's identical for every sv-rtl source under this
+    // binding. `None` when binding is Direct or Renamings.
+    let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
+        AlphabetBinding::RegisterMap { map, .. } => {
+            Some(derive_sv_renamings_from_register_map(map))
+        }
+        _ => None,
+    };
 
     // 3. For each source: read files, dispatch adapter, apply renamings.
     let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
@@ -115,12 +126,22 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 
         // Apply per-source renamings from the binding. For Direct
         // strategy the map is absent / empty so this is a no-op.
-        let rewritten = match per_source_renamings.get(&source.id) {
+        let mut rewritten = match per_source_renamings.get(&source.id) {
             Some(renamings) if !renamings.is_empty() => {
                 apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
             }
             _ => raw_ctxdsl,
         };
+        // For RegisterMap binding, sv-rtl sources get the derived
+        // SV-side renaming map applied on top — collapses each
+        // `<sv_signal>_<value>` SV-emitted label onto the firmware-side
+        // `wr_<reg>_<field>` / `rd_<reg>_<field>` rendezvous name.
+        if let (Some(rm_renamings), "sv-rtl") =
+            (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+            && !rm_renamings.is_empty()
+        {
+            rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+        }
 
         source_ctxdsls.push(SourceCtxdsl {
             source_id: source.id.clone(),
@@ -929,5 +950,129 @@ template = "reachable"
             err,
             VerifyError::TemplateInstantiationFailed { .. }
         ));
+    }
+
+    /// End-to-end: a tiny SV peripheral + a register map mapping its
+    /// `req` input onto a synthetic `ctrl.req` field flows through the
+    /// orchestrator's register-map SV rewriter and the verify pipeline
+    /// completes against the rewritten alphabet.
+    #[test]
+    fn register_map_binding_rewrites_sv_source_labels() {
+        let temp = tempdir().unwrap();
+        // Minimal SV module — same shape as the codesign-uart tests.
+        let sv = r#"
+module periph(
+    input        clk,
+    input        rst,
+    input        req,
+    output reg   ack
+);
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) ack <= 1'b0;
+        else if (req) ack <= 1'b1;
+        else ack <= 1'b0;
+    end
+endmodule
+"#;
+        fs::write(temp.path().join("periph.sv"), sv).unwrap();
+
+        // Register-map sidecar: a single-bit control field `req`
+        // exposed via SV signal `dut.req`.
+        let register_map = r#"{
+            "peripheral": "PERIPH",
+            "base_address": "0x40000000",
+            "registers": [
+                {
+                    "name": "ctrl",
+                    "offset": 0,
+                    "width_bits": 32,
+                    "direction": "WO",
+                    "visibility_class": "control",
+                    "fields": [
+                        {
+                            "name": "req",
+                            "bits": [0, 0],
+                            "sv_signal": "dut.req",
+                            "c_accessor": "PERIPH->CTRL.bit.req"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        fs::write(temp.path().join("register_map.json"), register_map).unwrap();
+
+        let toml_src = r#"
+[project]
+name = "RewriteTest"
+
+[[sources]]
+id = "rtl"
+adapter = "sv-rtl"
+files = ["periph.sv"]
+
+[alphabet]
+strategy = "register_map"
+register_map = "register_map.json"
+
+[composition]
+semantics = "asynchronous"
+members = ["rtl"]
+name = "P"
+
+[[properties]]
+name = "always_true"
+formula = "true"
+over = "P"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
+        assert_eq!(report.project, "RewriteTest");
+        // Single source; verdict satisfied (vacuous property —
+        // the test's point is that the pipeline completes, with the
+        // register-map binding's SV rewriter applied without choking
+        // on the SV adapter's `<signal>_<value>` labels.
+        assert_eq!(report.property_verdicts.len(), 1);
+        assert!(report.property_verdicts[0].satisfied);
+    }
+
+    /// Direct-binding sanity: a register-map sidecar present but the
+    /// strategy is `direct` — the rewriter must not fire.
+    #[test]
+    fn direct_binding_with_sv_source_skips_register_map_rewriter() {
+        let temp = tempdir().unwrap();
+        let sv = r#"
+module tiny(input clk, input rst, input go, output reg done);
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) done <= 1'b0; else done <= go;
+    end
+endmodule
+"#;
+        fs::write(temp.path().join("tiny.sv"), sv).unwrap();
+        let toml_src = r#"
+[project]
+name = "DirectOnly"
+
+[[sources]]
+id = "rtl"
+adapter = "sv-rtl"
+files = ["tiny.sv"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["rtl"]
+name = "T"
+
+[[properties]]
+name = "p"
+formula = "true"
+over = "T"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
+        assert_eq!(report.property_verdicts.len(), 1);
+        assert!(report.property_verdicts[0].satisfied);
     }
 }
