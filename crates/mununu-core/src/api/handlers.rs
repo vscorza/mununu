@@ -2032,14 +2032,23 @@ pub async fn codesign_verify_handler(
 
 /// Request body for `POST /api/v1/verify`.
 ///
-/// The HTTP variant always receives the config inline. Source files
-/// are read from disk relative to `base_dir`. Inline-content sources
-/// are a future extension (would let the HTTP caller stream the
-/// whole project archive without on-disk paths).
+/// HTTP variant accepts either a pre-parsed `config` JSON object or
+/// raw `config_toml` text — the latter is what the UI sends after a
+/// user drops a verify.toml file. Source files are read from disk
+/// relative to `base_dir`. Inline-content sources (uploading the
+/// whole project archive in the request body) remain a future
+/// extension.
 #[derive(Debug, serde::Deserialize)]
 pub struct VerifyProjectRequest {
-    /// Parsed `verify.toml` payload.
-    pub config: crate::verify::config::VerifyConfig,
+    /// Pre-parsed `verify.toml` payload. Mutually exclusive with
+    /// `config_toml`.
+    #[serde(default)]
+    pub config: Option<crate::verify::config::VerifyConfig>,
+    /// Raw verify.toml text. Parsed via
+    /// [`crate::verify::config::VerifyConfig::from_toml`]. Mutually
+    /// exclusive with `config`.
+    #[serde(default)]
+    pub config_toml: Option<String>,
     /// Directory the source paths in the config resolve against.
     /// Required — the server has no implicit "client working
     /// directory" the way the CLI does.
@@ -2056,8 +2065,28 @@ pub struct VerifyProjectRequest {
 pub async fn verify_project_handler(
     Json(request): Json<VerifyProjectRequest>,
 ) -> ApiResult<Json<crate::verify::report::VerifyReport>> {
+    let config = match (request.config, request.config_toml) {
+        (Some(c), None) => c,
+        (None, Some(toml_text)) => crate::verify::config::VerifyConfig::from_toml(&toml_text)
+            .map_err(|e| ApiError::BadRequest {
+                message: format!("failed to parse config_toml: {e}"),
+                details: None,
+            })?,
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest {
+                message: "supply exactly one of `config` or `config_toml`, not both".to_string(),
+                details: None,
+            });
+        }
+        (None, None) => {
+            return Err(ApiError::BadRequest {
+                message: "missing `config` or `config_toml` in request body".to_string(),
+                details: None,
+            });
+        }
+    };
     let base_dir = std::path::PathBuf::from(&request.base_dir);
-    crate::verify::verify_project(&request.config, &base_dir)
+    crate::verify::verify_project(&config, &base_dir)
         .map(Json)
         .map_err(|e| ApiError::BadRequest {
             message: e.to_string(),
@@ -2328,5 +2357,107 @@ mod compositional_extract_handler_tests {
         assert_eq!(members.len(), 2);
         assert_eq!(members[0], "worker_a");
         assert_eq!(members[1], "worker_b");
+    }
+
+    // ---- verify_project_handler --------------------------------------
+
+    #[tokio::test]
+    async fn verify_project_handler_accepts_config_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Minimal hand-authored CTXDSL source — exercises the
+        // `ctxdsl` adapter pass-through path so the handler test
+        // doesn't depend on clang / yosys / etc.
+        let ctxdsl = r#"
+context Light {
+    alphabet { label tick; }
+    automata {
+        automaton Light {
+            states { state lit initial; state dim; }
+            transitions {
+                transition lit -> dim on label tick;
+                transition dim -> lit on label tick;
+            }
+        }
+    }
+}
+"#;
+        std::fs::write(tmp.path().join("light.ctxdsl"), ctxdsl).unwrap();
+
+        let toml = r#"
+[project]
+name = "ConfigTomlPath"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+name = "Sys"
+
+[[properties]]
+name = "alive"
+formula = "true"
+over = "Sys"
+"#;
+        let request = VerifyProjectRequest {
+            config: None,
+            config_toml: Some(toml.to_string()),
+            base_dir: tmp.path().to_string_lossy().to_string(),
+        };
+        let Json(report) = verify_project_handler(Json(request))
+            .await
+            .expect("verify_project should succeed");
+        assert_eq!(report.project, "ConfigTomlPath");
+        assert_eq!(report.property_verdicts.len(), 1);
+        assert!(report.property_verdicts[0].satisfied);
+    }
+
+    #[tokio::test]
+    async fn verify_project_handler_rejects_both_config_and_config_toml() {
+        let cfg = crate::verify::config::VerifyConfig::from_toml(
+            r#"
+[project]
+name = "X"
+[[sources]]
+id = "x"
+adapter = "ctxdsl"
+files = ["x.ctxdsl"]
+[composition]
+semantics = "asynchronous"
+members = ["x"]
+"#,
+        )
+        .unwrap();
+        let request = VerifyProjectRequest {
+            config: Some(cfg),
+            config_toml: Some("[project]\nname = \"Y\"\n".to_string()),
+            base_dir: ".".to_string(),
+        };
+        let err = verify_project_handler(Json(request)).await.unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("exactly one"), "got: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_project_handler_rejects_missing_config_and_toml() {
+        let request = VerifyProjectRequest {
+            config: None,
+            config_toml: None,
+            base_dir: ".".to_string(),
+        };
+        let err = verify_project_handler(Json(request)).await.unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("missing"), "got: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }
