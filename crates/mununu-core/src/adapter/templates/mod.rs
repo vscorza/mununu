@@ -581,6 +581,8 @@ mod tests {
             "mutual_exclusion_3",
             "bounded_handoff",
             "no_lost_update",
+            "no_delegation_cycle",
+            "eventual_completion",
         ] {
             assert!(
                 reg.get(id).is_some(),
@@ -596,6 +598,8 @@ mod tests {
             "clobber_reachable",
             "bounded_handoff",
             "no_lost_update",
+            "no_delegation_cycle",
+            "eventual_completion",
         ] {
             assert!(
                 agentic_ids.contains(&id),
@@ -671,6 +675,52 @@ mod tests {
         let result = reg.instantiate(&tref).unwrap();
         assert!(result.formula.contains("Req"));
         assert!(result.formula.contains("Ack"));
+        assert_eq!(result.kind, PropertyKind::Liveness);
+    }
+
+    #[test]
+    fn no_delegation_cycle_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "no_delegation_cycle".to_string(),
+            args: [
+                (
+                    "FORWARD".to_string(),
+                    "Manager_Delegated_To_Worker".to_string(),
+                ),
+                (
+                    "BACKWARD".to_string(),
+                    "Worker_Delegating_To_Manager".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("Manager_Delegated_To_Worker"));
+        assert!(result.formula.contains("Worker_Delegating_To_Manager"));
+        // Nested nu Y. inside the response-shaped guard.
+        assert!(result.formula.contains("nu X."));
+        assert!(result.formula.contains("nu Y."));
+        assert_eq!(result.kind, PropertyKind::Safety);
+    }
+
+    #[test]
+    fn eventual_completion_template() {
+        let reg = TemplateRegistry::builtin();
+        let tref = TemplateRef {
+            template: "eventual_completion".to_string(),
+            args: [
+                ("TASK_STARTED".to_string(), "Crew_Dispatched".to_string()),
+                ("TASK_DONE".to_string(), "Crew_Done".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let result = reg.instantiate(&tref).unwrap();
+        assert!(result.formula.contains("Crew_Dispatched"));
+        assert!(result.formula.contains("Crew_Done"));
+        assert!(result.formula.contains("mu Y."));
         assert_eq!(result.kind, PropertyKind::Liveness);
     }
 
