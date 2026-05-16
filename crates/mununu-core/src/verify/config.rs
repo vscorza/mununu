@@ -116,8 +116,9 @@ pub struct SourceSection {
     /// A2.4. Recognised values today (subject to A2 evolution):
     /// `"c-codesign"` (firmware C via `codesign::c_extract_llvm`),
     /// `"sv-rtl"` (custom-SV / yosys frontend), `"ctxdsl"` (raw
-    /// hand-authored automaton), `"xstate"`, `"extraction"`, `"tlsf"`,
-    /// `"aiger"`, `"btor2"`, `"promela"`.
+    /// hand-authored automaton), `"xstate"`, `"crewai"` (CrewAI
+    /// agentic JSON), `"langgraph"` (LangGraph StateGraph JSON),
+    /// `"extraction"`, `"tlsf"`, `"aiger"`, `"btor2"`, `"promela"`.
     pub adapter: String,
     /// Source files to feed the adapter. Order is significant for
     /// adapters that accept multiple files; for single-file adapters

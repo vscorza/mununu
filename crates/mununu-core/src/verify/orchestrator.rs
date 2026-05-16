@@ -247,6 +247,13 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 ///   currently ignored by this layer — the SV adapter has its own
 ///   per-source sidecar conventions (`.mununu.json` next to the
 ///   `.sv` file).
+/// - `"crewai"` — uses [`crate::adapter::crewai::CrewaiAdapter`].
+///   Per-agent automata + sequential supervisor + asynchronous
+///   composition. Options currently ignored.
+/// - `"langgraph"` — uses
+///   [`crate::adapter::langgraph::LangGraphAdapter`]. Nodes → states,
+///   edges → `node_<from>_enter` transitions. Options currently
+///   ignored.
 /// - `"extraction"` — uses [`ExtractionAdapter`]. Options:
 ///   `mode = "fixed" | "vulnerable" | "both"` (default `"both"`).
 /// - `"c-codesign"` — uses [`extract_c_via_llvm`] (LLVM IR via
@@ -281,6 +288,26 @@ fn dispatch_adapter(
         "sv-rtl" => {
             let opts = AdapterOptions::default();
             crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "crewai" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::crewai::CrewaiAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "langgraph" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::langgraph::LangGraphAdapter::translate(content, &opts)
                 .map(|out| out.ctxdsl)
                 .map_err(|err| VerifyError::AdapterTranslationFailed {
                     source_id: source_id.to_string(),

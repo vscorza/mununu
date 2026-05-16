@@ -305,6 +305,12 @@ pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str
     if stem.ends_with(".xstate") {
         return Some("xstate");
     }
+    if stem.ends_with(".crewai") {
+        return Some("crewai");
+    }
+    if stem.ends_with(".langgraph") {
+        return Some("langgraph");
+    }
 
     match path.extension().and_then(|e| e.to_str()) {
         Some("tlsf") => Some("tlsf"),
@@ -312,6 +318,8 @@ pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str
         Some("btor") | Some("btor2") => Some("btor2"),
         Some("pml") | Some("promela") => Some("promela"),
         Some("xstate") => Some("xstate"),
+        Some("crewai") => Some("crewai"),
+        Some("langgraph") => Some("langgraph"),
         Some("sv") | Some("v") => Some("systemverilog"),
         _ => None,
     }
@@ -337,6 +345,15 @@ pub fn auto_translate(
     if xstate::XStateAdapter::detect(content) {
         return xstate::XStateAdapter::translate(content, options);
     }
+    // CrewAI / LangGraph come after XState — XState's `states` + `initial`
+    // shape is distinct from CrewAI's `agents` + `tasks` and LangGraph's
+    // `nodes` + `edges`, so order avoids false positives.
+    if crewai::CrewaiAdapter::detect(content) {
+        return crewai::CrewaiAdapter::translate(content, options);
+    }
+    if langgraph::LangGraphAdapter::detect(content) {
+        return langgraph::LangGraphAdapter::translate(content, options);
+    }
     if systemverilog::SystemVerilogAdapter::detect(content) {
         return systemverilog::SystemVerilogAdapter::translate(content, options);
     }
@@ -346,7 +363,7 @@ pub fn auto_translate(
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), BTOR2 (.btor/.btor2), Promela (.pml), XState (.xstate or .xstate.json), SystemVerilog (.sv/.v via Yosys frontend), Extraction (.espec.json)".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), BTOR2 (.btor/.btor2), Promela (.pml), XState (.xstate or .xstate.json), CrewAI (.crewai.json), LangGraph (.langgraph.json), SystemVerilog (.sv/.v via Yosys frontend), Extraction (.espec.json)".into(),
         location: None,
     })
 }
@@ -393,6 +410,30 @@ mod tests {
         assert_eq!(
             detect_format_by_extension(Path::new("proc.pml")),
             Some("promela")
+        );
+    }
+
+    #[test]
+    fn detects_crewai_compound_extension() {
+        assert_eq!(
+            detect_format_by_extension(Path::new("research_crew.crewai.json")),
+            Some("crewai")
+        );
+        assert_eq!(
+            detect_format_by_extension(Path::new("/abs/path/crew.crewai")),
+            Some("crewai")
+        );
+    }
+
+    #[test]
+    fn detects_langgraph_compound_extension() {
+        assert_eq!(
+            detect_format_by_extension(Path::new("workflow.langgraph.json")),
+            Some("langgraph")
+        );
+        assert_eq!(
+            detect_format_by_extension(Path::new("/abs/path/graph.langgraph")),
+            Some("langgraph")
         );
     }
 
