@@ -432,11 +432,15 @@ pub async fn context_import_handler(
             opts.mode = Some("vulnerable".to_string());
             crate::adapter::extraction::ExtractionAdapter::translate(&request.content, &opts)
         }
+        "crewai" => crate::adapter::crewai::CrewaiAdapter::translate(&request.content, &options),
+        "langgraph" => {
+            crate::adapter::langgraph::LangGraphAdapter::translate(&request.content, &options)
+        }
         "auto" | "" => crate::adapter::auto_translate(&request.content, &options),
         other => {
             return Err(ApiError::BadRequest {
                 message: format!(
-                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction"
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, crewai, langgraph"
                 ),
                 details: None,
             });
@@ -2443,6 +2447,53 @@ members = ["x"]
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn context_import_handler_accepts_crewai_format() {
+        let crew = r#"{
+            "name": "Mini",
+            "agents": [{ "role": "Solo" }],
+            "tasks": [{ "agent": "Solo" }]
+        }"#;
+        let request = ContextImportRequest {
+            content: crew.to_string(),
+            format: "crewai".to_string(),
+            filename: Some("mini.crewai.json".to_string()),
+            sidecar: None,
+            additional_sources: Vec::new(),
+        };
+        let Json(out) = context_import_handler(Json(request))
+            .await
+            .expect("crewai dispatch should succeed");
+        assert!(out.ctxdsl.contains("Agent_Solo"));
+        // CrewAI currently rides the XState SourceFormat variant until
+        // `SourceFormat::Crewai` lands.
+        assert_eq!(out.source_format, "XState");
+    }
+
+    #[tokio::test]
+    async fn context_import_handler_accepts_langgraph_format() {
+        let graph = r#"{
+            "name": "Linear",
+            "entry_point": "a",
+            "nodes": [
+                { "id": "a" },
+                { "id": "b" }
+            ],
+            "edges": [{ "from": "a", "to": "b" }]
+        }"#;
+        let request = ContextImportRequest {
+            content: graph.to_string(),
+            format: "langgraph".to_string(),
+            filename: Some("graph.langgraph.json".to_string()),
+            sidecar: None,
+            additional_sources: Vec::new(),
+        };
+        let Json(out) = context_import_handler(Json(request))
+            .await
+            .expect("langgraph dispatch should succeed");
+        assert!(out.ctxdsl.contains("automaton Linear"));
     }
 
     #[tokio::test]
