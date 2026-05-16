@@ -1,0 +1,20 @@
+# crewai_handoff — verify framework end-to-end transcript
+# Regenerated via examples/verify/crewai_handoff/validate.sh
+#
+# Sequential 2-agent CrewAI crew; native `CrewaiAdapter` dispatch;
+# direct alphabet binding; two properties over the first-emitted
+# `Agent_Researcher` automaton (no_deadlock + bounded_handoff).
+
+=== mununu verify (human-readable) ===
+verify report — project `CrewaiHandoff`:
+  composition: asynchronous ResearcherSlice { members = [Agent_Researcher] }
+    - crew (adapter = crewai, automaton = Agent_Researcher)
+    no_deadlock: SATISFIED (3/3 states, 1/1 initial) [template `no_deadlock`, over = ResearcherSlice]
+    executing_can_complete: SATISFIED (3/3 states, 1/1 initial) [template `bounded_handoff`, over = ResearcherSlice]
+
+=== mununu verify --json (subset: project + verdict shape) ===
+project = CrewaiHandoff
+composition.name = ResearcherSlice
+composition.semantics = asynchronous
+  property `no_deadlock`: satisfied = True, source = template
+  property `executing_can_complete`: satisfied = True, source = template

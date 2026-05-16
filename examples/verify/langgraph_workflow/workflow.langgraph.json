@@ -1,0 +1,16 @@
+{
+  "name": "TicketTriage",
+  "entry_point": "classify",
+  "nodes": [
+    { "id": "classify", "kind": "agent" },
+    { "id": "billing", "kind": "agent" },
+    { "id": "tech", "kind": "agent" },
+    { "id": "done", "kind": "end" }
+  ],
+  "edges": [
+    { "from": "classify", "to": "billing", "condition": "is_billing" },
+    { "from": "classify", "to": "tech", "condition": "is_tech" },
+    { "from": "billing", "to": "done" },
+    { "from": "tech", "to": "done" }
+  ]
+}

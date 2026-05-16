@@ -1,0 +1,20 @@
+{
+  "name": "ResearchAndWrite",
+  "agents": [
+    { "role": "Researcher", "goal": "Find authoritative sources" },
+    { "role": "Writer", "goal": "Produce a readable summary" }
+  ],
+  "tasks": [
+    {
+      "description": "Gather references",
+      "agent": "Researcher",
+      "expected_output": "List of references"
+    },
+    {
+      "description": "Draft the article",
+      "agent": "Writer",
+      "expected_output": "Draft article"
+    }
+  ],
+  "process": "sequential"
+}

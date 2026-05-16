@@ -1,0 +1,47 @@
+# crewai_handoff — verify-framework example for CrewAI agentic flows.
+#
+# A two-agent sequential crew (Researcher hands off to Writer) drives
+# the native `CrewaiAdapter` (one automaton per agent + a sequential
+# supervisor + asynchronous composition). The composition members
+# resolve to the first automaton per source today, so the property
+# verdicts here target `Agent_Researcher` directly — the source's
+# internal CrewAI composition (with all three automata + asynchronous
+# semantics) is still preserved verbatim in the assembled CTXDSL.
+# Full multi-automaton-per-source composition is queued as an
+# orchestrator follow-up; this fixture's intent is to anchor the
+# adapter + dispatch + property-evaluation path end-to-end.
+#
+# Recreate the run:
+#   $ bash examples/verify/crewai_handoff/validate.sh
+#
+# Expected output (byte-deterministic) lives in transcript.txt.
+
+[project]
+name = "CrewaiHandoff"
+
+[[sources]]
+id = "crew"
+adapter = "crewai"
+files = ["crew.crewai.json"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["crew"]
+name = "ResearcherSlice"
+
+[[properties]]
+name = "no_deadlock"
+template = "no_deadlock"
+over = "ResearcherSlice"
+
+[[properties]]
+# bounded_handoff: once the agent enters Executing, it must always be
+# possible to reach Done — a liveness check over the simple
+# Idle->Executing->Done agent automaton.
+name = "executing_can_complete"
+template = "bounded_handoff"
+args = { HANDOFF_TRIGGERED = "Executing", HANDOFF_COMPLETE = "Done" }
+over = "ResearcherSlice"
