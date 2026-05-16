@@ -267,6 +267,16 @@ enum CodesignCommand {
     /// member access. The output is one header file's worth of
     /// content; redirect to disk.
     EmitCmsisHeader(CodesignEmitCmsisHeaderArgs),
+    /// Reconcile firmware and peripheral rendezvous-label alphabets.
+    ///
+    /// Reads two JSON files, each a `[ "label_1", "label_2", … ]`
+    /// array. Returns the canonical shared alphabet when the two sets
+    /// match exactly, or a structured mismatch report otherwise. This
+    /// is the hard gate against alphabet drift between the
+    /// C-extraction's firmware automaton and the SV-extraction's
+    /// peripheral automaton (Doc C §C.5: silent over-approximation
+    /// across a mismatched bus is unsound for safety).
+    ReconcileLabels(CodesignReconcileLabelsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -289,6 +299,22 @@ struct CodesignEmitCmsisHeaderArgs {
     /// `--vendor-prefix NRF_` produces `NRF_TWIM_Type` and `NRF_TWIM0`.
     #[arg(long = "vendor-prefix", value_name = "PREFIX", default_value = "")]
     vendor_prefix: String,
+}
+
+#[derive(Args, Debug)]
+struct CodesignReconcileLabelsArgs {
+    /// Path to the firmware-side label JSON (a `["label_1", …]` array).
+    #[arg(value_name = "FIRMWARE_JSON")]
+    firmware_labels: PathBuf,
+    /// Path to the peripheral-side label JSON (same shape).
+    #[arg(value_name = "PERIPHERAL_JSON")]
+    peripheral_labels: PathBuf,
+    /// Output format. `human` (default): one section per outcome,
+    /// human-readable. `json`: machine-parseable
+    /// `{ "shared": […], "mismatch": null | { "firmware_only": […],
+    /// "peripheral_only": […] } }`.
+    #[arg(long, value_name = "FORMAT", default_value = "human")]
+    format: String,
 }
 
 #[derive(Args, Debug)]
@@ -1039,6 +1065,86 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
         CodesignCommand::Verify(args) => codesign_verify(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
+        CodesignCommand::ReconcileLabels(args) => codesign_reconcile_labels(args),
+    }
+}
+
+fn codesign_reconcile_labels(args: CodesignReconcileLabelsArgs) -> Result<(), String> {
+    use mununu_core::codesign::reconcile::{ReconcileError, reconcile_label_alphabets};
+    use std::collections::BTreeSet;
+
+    let load = |path: &PathBuf, side: &str| -> Result<BTreeSet<String>, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("failed to read {side} labels {}: {e}", path.display()))?;
+        let labels: Vec<String> = serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "failed to parse {side} labels {} as JSON array of strings: {e}",
+                path.display()
+            )
+        })?;
+        Ok(labels.into_iter().collect())
+    };
+
+    let firmware = load(&args.firmware_labels, "firmware")?;
+    let peripheral = load(&args.peripheral_labels, "peripheral")?;
+    let result = reconcile_label_alphabets(&firmware, &peripheral);
+
+    match args.format.as_str() {
+        "json" => match &result {
+            Ok(r) => {
+                let payload = serde_json::json!({
+                    "shared": r.shared,
+                    "mismatch": serde_json::Value::Null,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+                Ok(())
+            }
+            Err(ReconcileError::Mismatch(m)) => {
+                let payload = serde_json::json!({
+                    "shared": Vec::<String>::new(),
+                    "mismatch": {
+                        "firmware_only": m.firmware_only,
+                        "peripheral_only": m.peripheral_only,
+                    },
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| format!("serialize: {e}"))?
+                );
+                Err("label-alphabet mismatch".to_string())
+            }
+        },
+        "human" => match &result {
+            Ok(r) => {
+                println!("alphabets reconcile ({} shared labels):", r.shared.len());
+                for label in &r.shared {
+                    println!("  - {label}");
+                }
+                Ok(())
+            }
+            Err(ReconcileError::Mismatch(m)) => {
+                eprintln!("error: label-alphabet mismatch");
+                if !m.firmware_only.is_empty() {
+                    eprintln!("  firmware-only ({}):", m.firmware_only.len());
+                    for label in &m.firmware_only {
+                        eprintln!("    - {label}");
+                    }
+                }
+                if !m.peripheral_only.is_empty() {
+                    eprintln!("  peripheral-only ({}):", m.peripheral_only.len());
+                    for label in &m.peripheral_only {
+                        eprintln!("    - {label}");
+                    }
+                }
+                Err("label-alphabet mismatch".to_string())
+            }
+        },
+        other => Err(format!("unknown --format '{other}' (valid: human, json)")),
     }
 }
 

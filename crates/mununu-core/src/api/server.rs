@@ -110,6 +110,10 @@ fn create_router() -> Router {
             post(handlers::codesign_verify_handler),
         )
         .route("/api/v1/verify", post(handlers::verify_project_handler))
+        .route(
+            "/api/v1/codesign/reconcile-labels",
+            post(handlers::codesign_reconcile_labels_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
