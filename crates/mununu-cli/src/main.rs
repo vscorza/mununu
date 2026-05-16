@@ -66,6 +66,13 @@ enum Commands {
         #[command(subcommand)]
         command: Box<CodesignCommand>,
     },
+    /// Run the general N-source verification framework against a
+    /// `verify.toml` project config. Each source is dispatched
+    /// through its adapter, alphabet bindings are applied,
+    /// composition is realised, and every declared property is
+    /// evaluated. See `crates/mununu-core/src/verify/` for the
+    /// pipeline.
+    Verify(VerifyArgs),
     /// Start HTTP API server
     Server {
         /// Server address (default: 127.0.0.1:8080)
@@ -118,6 +125,25 @@ struct ContractQueryArgs {
     /// Output as JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args, Debug)]
+struct VerifyArgs {
+    /// Path to the `verify.toml` project config.
+    #[arg(value_name = "VERIFY_TOML")]
+    config: PathBuf,
+    /// Override the base directory used to resolve relative paths in
+    /// the config. Defaults to the config file's parent directory.
+    #[arg(long, value_name = "DIR")]
+    base_dir: Option<PathBuf>,
+    /// Emit the full `VerifyReport` as JSON on stdout instead of the
+    /// human-readable summary table.
+    #[arg(long)]
+    json: bool,
+    /// Exit with a non-zero status if any property is unsatisfied.
+    /// Default: exit 0 regardless of verdicts; the report distinguishes.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -884,6 +910,74 @@ fn init_tracing() {
     }
 }
 
+fn handle_verify(args: VerifyArgs) -> Result<(), String> {
+    use mununu_core::verify::config::VerifyConfig;
+    use mununu_core::verify::report::PropertyFormulaSource;
+    use mununu_core::verify::verify_project;
+
+    let body = std::fs::read_to_string(&args.config)
+        .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
+    let config = VerifyConfig::from_toml(&body)
+        .map_err(|e| format!("failed to parse {} as TOML: {e}", args.config.display()))?;
+
+    let base_dir = args.base_dir.clone().unwrap_or_else(|| {
+        args.config
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+
+    let report = verify_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("verify report — project `{}`:", report.project);
+        println!(
+            "  composition: {} {} {{ members = [{}] }}",
+            report.composition.semantics,
+            report.composition.name,
+            report.composition.members.join(", "),
+        );
+        println!("  sources:");
+        for s in &report.sources {
+            println!(
+                "    - {id} (adapter = {adapter}, automaton = {automaton})",
+                id = s.id,
+                adapter = s.adapter,
+                automaton = s.automaton.as_deref().unwrap_or("(unresolved)"),
+            );
+        }
+        println!("  properties ({}):", report.property_verdicts.len());
+        for v in &report.property_verdicts {
+            let source_str = match &v.formula_source {
+                PropertyFormulaSource::Inline => "inline".to_string(),
+                PropertyFormulaSource::Template { id, .. } => format!("template `{id}`"),
+            };
+            let verdict = if v.satisfied { "SATISFIED" } else { "VIOLATED" };
+            println!(
+                "    {name}: {verdict} ({sat}/{total} states, {init_sat}/{init} initial) [{source}, over = {over}]",
+                name = v.name,
+                verdict = verdict,
+                sat = v.satisfying_states,
+                total = v.total_states,
+                init_sat = v.initial_satisfying.len(),
+                init = v.initial_states.len(),
+                source = source_str,
+                over = v.over,
+            );
+        }
+    }
+
+    if args.strict && report.property_verdicts.iter().any(|v| !v.satisfied) {
+        return Err("one or more properties violated (--strict)".to_string());
+    }
+    Ok(())
+}
+
 fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(*command),
@@ -892,6 +986,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Templates(args) => list_templates(args),
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
+        Commands::Verify(args) => handle_verify(args),
         Commands::Server { addr } => {
             use std::net::SocketAddr;
             let addr: SocketAddr = addr

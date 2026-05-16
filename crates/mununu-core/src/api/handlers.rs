@@ -2043,6 +2043,45 @@ pub async fn codesign_verify_handler(
     }))
 }
 
+// ============================================================================
+// Verify project (general N-source verification framework, A2.5)
+// ============================================================================
+
+/// Request body for `POST /api/v1/verify`.
+///
+/// The HTTP variant always receives the config inline. Source files
+/// are read from disk relative to `base_dir`. Inline-content sources
+/// are a future extension (would let the HTTP caller stream the
+/// whole project archive without on-disk paths).
+#[derive(Debug, serde::Deserialize)]
+pub struct VerifyProjectRequest {
+    /// Parsed `verify.toml` payload.
+    pub config: crate::verify::config::VerifyConfig,
+    /// Directory the source paths in the config resolve against.
+    /// Required — the server has no implicit "client working
+    /// directory" the way the CLI does.
+    pub base_dir: String,
+}
+
+/// HTTP handler for the general verify pipeline. Mirrors
+/// `mununu verify` (CLI). Returns the structured
+/// [`crate::verify::report::VerifyReport`] on success.
+///
+/// All structural errors (config validation, adapter dispatch
+/// failures, parse + realize failures, evaluation failures) come back
+/// as 400 Bad Request with the error message.
+pub async fn verify_project_handler(
+    Json(request): Json<VerifyProjectRequest>,
+) -> ApiResult<Json<crate::verify::report::VerifyReport>> {
+    let base_dir = std::path::PathBuf::from(&request.base_dir);
+    crate::verify::verify_project(&request.config, &base_dir)
+        .map(Json)
+        .map_err(|e| ApiError::BadRequest {
+            message: e.to_string(),
+            details: None,
+        })
+}
+
 #[cfg(test)]
 mod contract_handler_tests {
     use super::*;

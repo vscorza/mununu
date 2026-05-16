@@ -199,3 +199,185 @@ fn context_eval_reports_satisfying_states() -> Result<(), Box<dyn Error>> {
         .stdout(predicate::str::contains("Initial states satisfying: 1/1"));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// `mununu verify` — the general N-source verification CLI (A2.5).
+// ---------------------------------------------------------------------------
+
+fn write_two_source_verify_project(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let light_ctxdsl = r#"
+context Light {
+    alphabet { label tick_light; }
+    automata {
+        automaton Light {
+            states { state green initial; state yellow; state red; }
+            transitions {
+                transition green -> yellow on label tick_light;
+                transition yellow -> red on label tick_light;
+                transition red -> green on label tick_light;
+            }
+        }
+    }
+}
+"#;
+    let gate_ctxdsl = r#"
+context Gate {
+    alphabet { label tick_gate; }
+    automata {
+        automaton Gate {
+            states { state closed initial; state open; }
+            transitions {
+                transition closed -> open on label tick_gate;
+                transition open -> closed on label tick_gate;
+            }
+        }
+    }
+}
+"#;
+    fs::write(dir.join("light.ctxdsl"), light_ctxdsl)?;
+    fs::write(dir.join("gate.ctxdsl"), gate_ctxdsl)?;
+
+    let verify_toml = r#"
+[project]
+name = "Demo"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+
+[[sources]]
+id = "gate"
+adapter = "ctxdsl"
+files = ["gate.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["light", "gate"]
+name = "System"
+
+[[properties]]
+name = "no_deadlock"
+template = "no_deadlock"
+over = "System"
+
+[[properties]]
+name = "always_true"
+formula = "true"
+over = "System"
+"#;
+    let toml_path = dir.join("verify.toml");
+    fs::write(&toml_path, verify_toml)?;
+    Ok(toml_path)
+}
+
+#[test]
+fn verify_reports_satisfied_properties_in_human_format() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let toml_path = write_two_source_verify_project(temp.path())?;
+
+    assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args(["verify", toml_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("verify report — project `Demo`"))
+        .stdout(predicate::str::contains("asynchronous System"))
+        .stdout(predicate::str::contains("light"))
+        .stdout(predicate::str::contains("gate"))
+        .stdout(predicate::str::contains("always_true: SATISFIED"))
+        .stdout(predicate::str::contains("[inline,"));
+    Ok(())
+}
+
+#[test]
+fn verify_json_output_round_trips_through_serde() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let toml_path = write_two_source_verify_project(temp.path())?;
+
+    let output = assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args(["verify", toml_path.to_str().unwrap(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(parsed["project"], "Demo");
+    let sources = parsed["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    let verdicts = parsed["property_verdicts"].as_array().unwrap();
+    assert_eq!(verdicts.len(), 2);
+    // Both properties should be satisfied — `always_true` trivially,
+    // `no_deadlock` because every state has at least one enabled
+    // transition under asynchronous composition.
+    for v in verdicts {
+        assert_eq!(v["satisfied"], true);
+    }
+    Ok(())
+}
+
+#[test]
+fn verify_strict_mode_fails_on_violation() -> Result<(), Box<dyn Error>> {
+    // Pin a property to `false` so it's universally violated; --strict
+    // should then return a non-zero exit code.
+    let temp = tempdir()?;
+    let _ = write_two_source_verify_project(temp.path())?;
+    let bad_toml = r#"
+[project]
+name = "Bad"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+
+[composition]
+semantics = "synchronous"
+members = ["light"]
+name = "Sys"
+
+[[properties]]
+name = "impossible"
+formula = "false"
+over = "Sys"
+"#;
+    let toml_path = temp.path().join("bad_verify.toml");
+    fs::write(&toml_path, bad_toml)?;
+
+    assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args(["verify", toml_path.to_str().unwrap(), "--strict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("impossible: VIOLATED"));
+    Ok(())
+}
+
+#[test]
+fn verify_config_validation_failure_surfaces_clearly() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let bad_toml = r#"
+[project]
+name = "Bad"
+
+[[sources]]
+id = "x"
+adapter = "ctxdsl"
+files = ["doesnt_matter.ctxdsl"]
+
+[composition]
+semantics = "lockstep"   # invalid semantics
+members = ["x"]
+"#;
+    let toml_path = temp.path().join("bad_verify.toml");
+    fs::write(&toml_path, bad_toml)?;
+
+    assert_cmd::cargo::cargo_bin_cmd!("mununu")
+        .args(["verify", toml_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("validation issue"));
+    Ok(())
+}

@@ -55,6 +55,9 @@ enum Commands {
         #[command(subcommand)]
         command: Box<CodesignCommand>,
     },
+    /// General N-source verification framework. See `mununu verify --help`
+    /// in the `mununu-cli` crate for full docs.
+    Verify(VerifyArgs),
     #[cfg(feature = "api")]
     /// Start HTTP API server
     Server {
@@ -112,6 +115,18 @@ enum ContractCommand {
     /// `@mununu_guarantee` annotation and one per resolved corpus
     /// reference.
     Review(ContractReviewArgs),
+}
+
+#[derive(Args, Debug)]
+struct VerifyArgs {
+    #[arg(value_name = "VERIFY_TOML")]
+    config: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    base_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -640,12 +655,77 @@ fn init_tracing() {
     }
 }
 
+fn handle_verify(args: VerifyArgs) -> Result<(), String> {
+    use mununu::verify::config::VerifyConfig;
+    use mununu::verify::report::PropertyFormulaSource;
+    use mununu::verify::verify_project;
+
+    let body = std::fs::read_to_string(&args.config)
+        .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
+    let config = VerifyConfig::from_toml(&body)
+        .map_err(|e| format!("failed to parse {} as TOML: {e}", args.config.display()))?;
+    let base_dir = args.base_dir.clone().unwrap_or_else(|| {
+        args.config
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let report = verify_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("verify report — project `{}`:", report.project);
+        println!(
+            "  composition: {} {} {{ members = [{}] }}",
+            report.composition.semantics,
+            report.composition.name,
+            report.composition.members.join(", "),
+        );
+        for s in &report.sources {
+            println!(
+                "    - {} (adapter = {}, automaton = {})",
+                s.id,
+                s.adapter,
+                s.automaton.as_deref().unwrap_or("(unresolved)"),
+            );
+        }
+        for v in &report.property_verdicts {
+            let src = match &v.formula_source {
+                PropertyFormulaSource::Inline => "inline".to_string(),
+                PropertyFormulaSource::Template { id, .. } => format!("template `{id}`"),
+            };
+            let verdict = if v.satisfied { "SATISFIED" } else { "VIOLATED" };
+            println!(
+                "    {}: {} ({}/{} states, {}/{} initial) [{}, over = {}]",
+                v.name,
+                verdict,
+                v.satisfying_states,
+                v.total_states,
+                v.initial_satisfying.len(),
+                v.initial_states.len(),
+                src,
+                v.over,
+            );
+        }
+    }
+
+    if args.strict && report.property_verdicts.iter().any(|v| !v.satisfied) {
+        return Err("one or more properties violated (--strict)".to_string());
+    }
+    Ok(())
+}
+
 fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(*command),
         Commands::Extraction { command } => handle_extraction(*command),
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
+        Commands::Verify(args) => handle_verify(args),
         #[cfg(feature = "api")]
         Commands::Server { addr } => {
             use std::net::SocketAddr;
