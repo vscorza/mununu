@@ -1,0 +1,27 @@
+# uart_codesign_protocol_spec — verify framework transcript
+# Regenerated via examples/verify/uart_codesign_protocol_spec/validate.sh
+#
+# C firmware (adapter = c-codesign, shells out to clang for LLVM IR
+# extraction) + hand-authored CTXDSL peripheral protocol spec.
+# Direct alphabet binding on the rendezvous-label alphabet derived
+# from the register-map sidecar. Asynchronous composition (Doc C
+# §C.5 — bus arbitration is non-deterministic, synchronous coupling
+# is unsound for racy access).
+
+=== mununu verify (human-readable) ===
+verify report — project `UartCodesignProtocolSpec`:
+  composition: asynchronous UartProtocolSystem { members = [Uart_send_byte, UartPeripheral] }
+    - firmware (adapter = c-codesign, automaton = Uart_send_byte)
+    - peripheral (adapter = ctxdsl, automaton = UartPeripheral)
+    firmware_reaches_sending: VIOLATED (2/5 states, 0/1 initial) [inline, over = Uart_send_byte]
+    peripheral_reaches_transmitting: SATISFIED (3/3 states, 1/1 initial) [inline, over = UartPeripheral]
+    safety_protocol_respected: SATISFIED (6/6 states, 1/1 initial) [inline, over = UartProtocolSystem]
+
+=== verdict shape (from --json output) ===
+project = UartCodesignProtocolSpec
+composition.name = UartProtocolSystem
+composition.semantics = asynchronous
+composition.members = Uart_send_byte, UartPeripheral
+  firmware_reaches_sending: VIOLATED (2/5 states, 0/1 initial) [over = Uart_send_byte]
+  peripheral_reaches_transmitting: SATISFIED (3/3 states, 1/1 initial) [over = UartPeripheral]
+  safety_protocol_respected: SATISFIED (6/6 states, 1/1 initial) [over = UartProtocolSystem]

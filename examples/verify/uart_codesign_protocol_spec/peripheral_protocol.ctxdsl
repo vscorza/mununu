@@ -1,0 +1,61 @@
+// peripheral_protocol.ctxdsl — hand-authored UART peripheral protocol
+// spec. Mirrors `examples/industrial/codesign_uart/extract_verify_recipe/
+// verify.template.ctxdsl`'s UartPeripheral, lifted into a standalone
+// CTXDSL source for the verify-framework example.
+//
+// What's modelled:
+//   - Three states: `Idle` (no byte queued), `Loaded` (byte written to
+//     DATA, waiting for tx_start), `Transmitting` (silicon driving the
+//     line).
+//   - `tick` is an internal silicon event representing the peripheral
+//     making autonomous progress.
+//   - `rd_status_tx_busy`, `wr_data_byte`, `wr_ctrl_tx_start` are the
+//     rendezvous labels shared with the firmware-side source — they
+//     are NOT re-declared here in an `alphabet { … }` block (the
+//     firmware extraction declares them). CTXDSL accepts implicit
+//     label references in `transitions { … on label X; }` as long as
+//     the label is declared somewhere in the realized context.
+//
+// The CRITICAL property this spec captures: there's no outbound
+// `wr_ctrl_tx_start` transition from `Transmitting`. That's the
+// protocol-conformance assertion — the firmware must not write
+// tx_start while the peripheral is busy.
+
+context UartPeripheralSpec {
+    alphabet {
+        // Only the peripheral's own internal event needs declaring
+        // here. The firmware-side `wr_*` / `rd_*` labels are declared
+        // in the firmware source's alphabet block (the c-codesign
+        // dispatcher emits them) and propagate through composition.
+        label tick;
+    }
+
+    automata {
+        automaton UartPeripheral {
+            internal {
+                label tick;
+            }
+
+            states {
+                state Idle initial;
+                state Loaded;
+                state Transmitting;
+            }
+
+            transitions {
+                transition Idle -> Idle on label rd_status_tx_busy;
+                transition Idle -> Loaded on label wr_data_byte;
+                transition Idle -> Idle on label tick;
+
+                transition Loaded -> Loaded on label rd_status_tx_busy;
+                transition Loaded -> Loaded on label wr_data_byte;
+                transition Loaded -> Transmitting on label wr_ctrl_tx_start;
+                transition Loaded -> Loaded on label tick;
+
+                transition Transmitting -> Transmitting on label rd_status_tx_busy;
+                transition Transmitting -> Idle on label tick;
+                // No outbound wr_ctrl_tx_start — protocol-conformance.
+            }
+        }
+    }
+}

@@ -352,6 +352,20 @@ fn dispatch_c_codesign(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    // `cmsis_stubs = true` prepends the bundled `cmsis-stubs/` include
+    // path so firmware C files that `#include "mununu_annotations.h"`
+    // or use the bundled CMSIS shims compile cleanly. Mirrors the
+    // `mununu codesign extract-c --cmsis-stubs` CLI flag.
+    let cmsis_stubs_enabled = options
+        .get("cmsis_stubs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if cmsis_stubs_enabled {
+        extract_opts
+            .include_paths
+            .insert(0, locate_bundled_cmsis_stubs());
+    }
+
     // Register map: load the JSON sidecar referenced by the source's
     // `register_map` option (set by the codesign-shorthand translator)
     // so accesses get matched and labelled.
@@ -427,19 +441,19 @@ fn dispatch_c_codesign(
         }
         out.push_str("    }\n");
     }
-    out.push_str("    automata {\n");
+    // Each function's `automaton_ctxdsl` already includes its own
+    // `automata { automaton X { ... } }` wrapper, so we splice the
+    // fragments in verbatim (no additional `automata { ... }` shell
+    // — that would produce nested `automata { automata { ... } }`).
     for f in &extraction.functions {
         if let Some(frag) = &f.automaton_ctxdsl {
-            // Indent the fragment one level deeper to nest cleanly
-            // inside `automata { ... }`.
             for line in frag.lines() {
-                out.push_str("        ");
+                out.push_str("    ");
                 out.push_str(line);
                 out.push('\n');
             }
         }
     }
-    out.push_str("    }\n");
     out.push_str("}\n");
     Ok(out)
 }
@@ -615,6 +629,26 @@ fn scan_first_automaton(body: &str) -> Option<&str> {
         return None;
     }
     Some(&trimmed[..end])
+}
+
+/// Resolve the bundled `cmsis-stubs/` directory. Tries the
+/// workspace-relative path (dev / source builds) first, then a
+/// `share/mununu/cmsis-stubs` fallback for installed binaries.
+/// Returns the workspace-relative path as a non-existent fallback so
+/// clang surfaces a clear "include not found" if neither candidate
+/// is on disk.
+fn locate_bundled_cmsis_stubs() -> PathBuf {
+    let candidates: &[PathBuf] = &[
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cmsis-stubs"),
+        PathBuf::from("crates/mununu-core/cmsis-stubs"),
+        PathBuf::from("../share/mununu/cmsis-stubs"),
+    ];
+    for candidate in candidates {
+        if candidate.is_dir() {
+            return candidate.clone();
+        }
+    }
+    candidates[0].clone()
 }
 
 fn snippet_around_error(text: &str, _err: &str) -> String {
