@@ -25,9 +25,9 @@ regex = "1.12"
 roxmltree = "0.20"
 
 # TOML parser for the `verify.toml` general verification-project schema
-# (verify::config) and its `mununu.codesign.toml` shorthand. Pulled in
-# unconditionally because the `verify` module is part of the default
-# core surface.
+# (verify::config) and its `mununu.codesign.toml` shorthand
+# (codesign::project_config). Pulled in unconditionally because both
+# schemas are part of the default core surface.
 toml = "0.8"
 
 # Tracing — used unconditionally for structured diagnostics (gap markers,

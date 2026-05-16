@@ -40,6 +40,7 @@ pub mod c_extract_llvm;
 pub mod cmsis_emit;
 pub mod compose;
 pub mod coupling;
+pub mod project_config;
 pub mod reconcile;
 pub mod register_map;
 pub mod svd_import;
