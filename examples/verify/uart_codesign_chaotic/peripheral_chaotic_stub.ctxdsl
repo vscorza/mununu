@@ -1,0 +1,59 @@
+// peripheral_chaotic_stub.ctxdsl — chaotic-stub peripheral for the
+// codesign UART, matching the register map at
+// `../../industrial/codesign_uart/register_map.json`.
+//
+// The chaotic stub is the **soundest possible** peripheral model
+// when the silicon's internal protocol isn't (yet) specified: every
+// register access can succeed at any time, with no constraint on
+// ordering, repetition, or interleaving. Asynchronous composition
+// with the firmware automaton over-approximates the real system —
+// any behaviour the chaotic stub admits, the real silicon can also
+// admit (per chaotic-stub soundness). Safety verdicts transfer:
+// if the composition with the chaotic stub holds, the composition
+// with any well-behaved silicon also holds.
+//
+// Doc C §C.5 — bus arbitration is non-deterministic; asynchronous
+// composition is mandatory. Synchronous coupling under a chaotic
+// stub would over-constrain the silicon and is unsound for racy
+// access.
+//
+// The labels below mirror what
+// `codesign::coupling::register_map_labels(rm)` derives for the
+// register map. Equivalent in shape to
+// `codesign::compose::compose_codesign_ctxdsl`'s emitted coupling
+// fragment, hand-authored here so this CTXDSL source can be
+// consumed verbatim by the verify framework's `ctxdsl` adapter.
+
+context PeripheralChaoticStub {
+    alphabet {
+        // CTRL register (read-write from firmware's perspective)
+        label wr_ctrl_tx_start;
+        label rd_ctrl_tx_start;
+        label wr_ctrl_enable;
+        label rd_ctrl_enable;
+        // STATUS register (read-only)
+        label rd_status_tx_busy;
+        label rd_status_rx_ready;
+        // DATA register (read-write)
+        label wr_data_byte;
+        label rd_data_byte;
+    }
+
+    automata {
+        automaton UART_LITE {
+            states {
+                state Chaotic initial;
+            }
+            transitions {
+                transition Chaotic -> Chaotic on label wr_ctrl_tx_start;
+                transition Chaotic -> Chaotic on label rd_ctrl_tx_start;
+                transition Chaotic -> Chaotic on label wr_ctrl_enable;
+                transition Chaotic -> Chaotic on label rd_ctrl_enable;
+                transition Chaotic -> Chaotic on label rd_status_tx_busy;
+                transition Chaotic -> Chaotic on label rd_status_rx_ready;
+                transition Chaotic -> Chaotic on label wr_data_byte;
+                transition Chaotic -> Chaotic on label rd_data_byte;
+            }
+        }
+    }
+}
