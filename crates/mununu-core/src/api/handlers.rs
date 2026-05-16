@@ -35,7 +35,6 @@ pub async fn templates_handler(
     if let Some(domain_str) = &query.domain {
         use crate::adapter::templates::TemplateDomain;
         let domain = match domain_str.as_str() {
-            "game" => Some(TemplateDomain::Game),
             "rtl" => Some(TemplateDomain::Rtl),
             "agentic" => Some(TemplateDomain::Agentic),
             "software" => Some(TemplateDomain::Software),
@@ -342,22 +341,6 @@ pub async fn context_synthesize_handler(
                 Some(FileContent {
                     name: format!("{}_controller.sv", request.automaton),
                     content: sv,
-                })
-            }
-            Some("gdscript") | Some("gd") => {
-                use crate::adapter::gdscript::emit_controller::{
-                    collect_controllable_labels, controller_to_gdscript,
-                };
-                let controllable = collect_controllable_labels(&synthesis.controller);
-                let gd = controller_to_gdscript(
-                    &synthesis.controller,
-                    &request.automaton,
-                    true,
-                    &controllable,
-                );
-                Some(FileContent {
-                    name: format!("{}_controller.gd", request.automaton),
-                    content: gd,
                 })
             }
             _ => None,
@@ -1208,12 +1191,12 @@ pub async fn extraction_propose_composition_handler(
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest {
             message: "missing required field `language`".to_string(),
-            details: Some("supported values: typescript, python, rust, gdscript".to_string()),
+            details: Some("supported values: typescript, python, rust".to_string()),
         })?;
     let lang =
         parser::SourceLanguage::from_name(lang_name).ok_or_else(|| ApiError::BadRequest {
             message: format!("unknown language: {lang_name}"),
-            details: Some("supported values: typescript, python, rust, gdscript".to_string()),
+            details: Some("supported values: typescript, python, rust".to_string()),
         })?;
 
     let parsed = parser::parse_source(&request.source, lang).map_err(|e| ApiError::BadRequest {

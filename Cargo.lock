@@ -903,7 +903,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tree-sitter",
- "tree-sitter-gdscript",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
@@ -1776,16 +1775,6 @@ dependencies = [
  "regex",
  "regex-syntax",
  "streaming-iterator",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-gdscript"
-version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7a37fe8c0a10c0c39ecd5b2f7db53933f691488f5572409a4d3c0dfeb3f6108"
-dependencies = [
- "cc",
  "tree-sitter-language",
 ]
 

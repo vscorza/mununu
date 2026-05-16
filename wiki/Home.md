@@ -13,7 +13,7 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 - **Synchronous and asynchronous composition** -- combine automata lock-step (shared clock) or interleaved (independent clocks), with hierarchical nesting for cross-domain designs.
 - **Controller synthesis** -- automatically derive a maximally permissive controller that enforces a given property, respecting the controllable/uncontrollable label split.
 - **Counterstrategy generation** -- when a property is unrealizable, Mununu produces diagnostic traces showing how the environment can force a violation.
-- **Format adapters** -- import specifications from XState/Statecharts, SystemVerilog RTL, TLSF, AIGER, and Promela, plus extraction-spec inputs from C / Rust / GDScript / TypeScript. Export synthesized controllers back to XState JSON, SystemVerilog modules, or GDScript.
+- **Format adapters** -- import specifications from XState/Statecharts, SystemVerilog RTL, TLSF, AIGER, and Promela, plus extraction-spec inputs from C / Rust / TypeScript. Export synthesized controllers back to XState JSON or SystemVerilog modules.
 - **Web UI** -- the companion `mununu-ui` frontend connects to the built-in API server for interactive graph visualization, formula evaluation, and synthesis. Supports importing adapter formats directly from the file picker.
 
 ## Table of Contents
@@ -28,8 +28,6 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 | [RTL Verification Pipeline](RTL-Verification-Pipeline) | End-to-end SystemVerilog verification with `.mununu.json` sidecars and SMT discovery |
 | [Agentic Orchestration](Agentic-Orchestration) | Verify multi-agent workflows, MCP tool authorization, and handoff protocols |
 | [Property Templates](Property-Templates) | Parameterized property patterns (no_deadlock, reachable, bounded, etc.) |
-| [Game Engine Integration](Game-Engine-Integration) | Verify game FSMs for softlocks, unreachable content, AI loops |
-| [Godot Adapter](Godot-Adapter) | GDScript extraction and game_fsm domain profile |
 | [CLI Reference](CLI-Reference) | Full command reference with adapter import/export examples |
 | [API Reference](API-Reference) | REST API documentation including the import endpoint |
 | [Controller Modes](Controller-Modes) | Six controller extraction modes (projection, functional, permissive, signature-memory, product-game, parity-game) and when to use each |

@@ -159,7 +159,7 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 | `diagnostics` | `DiagnosticsOptions` | `{}` | Control diagnostic output. |
 | `extract_strategy` | `boolean` | `false` | **Legacy** — equivalent to `controller_mode: "functional"`. When `controller_mode` is set, that takes precedence. |
 | `controller_mode` | `string \| null` | `null` (= `"projection"` or `"functional"` if `extract_strategy=true`) | Controller extraction mode. One of `"projection"`, `"functional"`, `"permissive"`, `"signature-memory"`, `"product-game"`, `"parity-game"`. Case-insensitive; dashes/underscores interchangeable. Unknown values return `400 Bad Request`. See [Controller Modes](Controller-Modes.md) for the full reference. |
-| `output_format` | `string \| null` | `null` | Native controller export format: `"xstate"`, `"systemverilog"`/`"sv"`, or `"gdscript"`/`"gd"`. When set, the response includes a `controller_native` field. |
+| `output_format` | `string \| null` | `null` | Native controller export format: `"xstate"` or `"systemverilog"`/`"sv"`. When set, the response includes a `controller_native` field. |
 
 **DiagnosticsOptions**
 
@@ -599,7 +599,7 @@ List available property templates. Templates provide parameterized mu-calculus f
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `domain` | `string` | No | Filter by domain: `game`, `rtl`, `agentic`, `software`, `synthesis`, `universal` |
+| `domain` | `string` | No | Filter by domain: `rtl`, `agentic`, `software`, `synthesis`, `universal` |
 
 ### Response Body
 
@@ -631,7 +631,7 @@ With `domain` filter, returns a filtered array of `PropertyTemplate` objects.
 
 ```bash
 curl http://localhost:8080/api/v1/templates
-curl http://localhost:8080/api/v1/templates?domain=game
+curl http://localhost:8080/api/v1/templates?domain=rtl
 ```
 
 See [Property Templates](Property-Templates) for the full catalog and usage guide.

@@ -510,7 +510,7 @@ struct SvDiscoverArgs {
 
 #[derive(Args, Debug)]
 struct TemplatesArgs {
-    /// Filter templates by domain (game, rtl, agentic, software, synthesis).
+    /// Filter templates by domain (rtl, agentic, software, synthesis).
     #[arg(long, value_name = "DOMAIN")]
     domain: Option<String>,
     /// Show details of a specific template by ID.
@@ -3792,17 +3792,10 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                     use mununu_core::adapter::systemverilog::emit_controller::controller_to_systemverilog;
                     controller_to_systemverilog(controller, &args.automaton, true)
                 }
-                "gdscript" | "gd" => {
-                    use mununu_core::adapter::gdscript::emit_controller::{
-                        collect_controllable_labels, controller_to_gdscript,
-                    };
-                    let controllable = collect_controllable_labels(controller);
-                    controller_to_gdscript(controller, &args.automaton, true, &controllable)
-                }
                 "ctxdsl" => String::new(), // already handled by --emit-dsl
                 other => {
                     return Err(format!(
-                        "unknown output format '{other}'. Supported: ctxdsl, xstate, systemverilog, gdscript"
+                        "unknown output format '{other}'. Supported: ctxdsl, xstate, systemverilog"
                     ));
                 }
             };
@@ -5678,7 +5671,6 @@ fn list_templates(args: TemplatesArgs) -> Result<(), String> {
 
     // Filter by domain
     let domain_filter: Option<TemplateDomain> = args.domain.as_deref().and_then(|d| match d {
-        "game" => Some(TemplateDomain::Game),
         "rtl" => Some(TemplateDomain::Rtl),
         "agentic" => Some(TemplateDomain::Agentic),
         "software" => Some(TemplateDomain::Software),

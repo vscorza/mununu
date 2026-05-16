@@ -2,7 +2,7 @@
 
 > **Alpha Software** — Mununu is under active development. APIs, syntax, and behavior may change.
 
-Property templates provide parameterized mu-calculus formula patterns that can be instantiated across any domain — game engines, SystemVerilog RTL, MCP/agentic protocols, software extraction, and synthesis benchmarks. Templates hide formal logic behind named patterns with human-readable descriptions.
+Property templates provide parameterized mu-calculus formula patterns that can be instantiated across any domain — SystemVerilog RTL, MCP/agentic protocols, software extraction, and synthesis benchmarks. Templates hide formal logic behind named patterns with human-readable descriptions.
 
 ## Overview
 
@@ -56,7 +56,7 @@ mununu context eval model.espec.json \
 mununu templates
 
 # Filter by domain
-mununu templates --domain game
+mununu templates --domain rtl
 
 # Show template details
 mununu templates --id reachable
@@ -137,7 +137,7 @@ When both `formula` and `template_ref` are present, `formula` takes precedence.
 curl http://localhost:8080/api/v1/templates
 
 # Filter by domain
-curl http://localhost:8080/api/v1/templates?domain=game
+curl http://localhost:8080/api/v1/templates?domain=rtl
 
 # Verify with template
 curl -X POST http://localhost:8080/api/v1/context/verify \
@@ -157,11 +157,11 @@ In the verification tab, check "Use Template" to switch from formula-name input 
 
 Templates include domain-specific hints that appear in the UI parameter inputs:
 
-| Template | Game | RTL | Agentic | Software |
-|----------|------|-----|---------|----------|
-| `reachable($TARGET)` | Idle, GameOver, Victory | state_IDLE, fill_0 | SessionClosed | Released, Disposed |
-| `never($BAD)` | Dead, Softlocked | overflow, error_state | Unauthorized | NullState |
-| `bounded($OVERFLOW)` | inventory_full | fill_5 | — | count_max |
+| Template | RTL | Agentic | Software |
+|----------|-----|---------|----------|
+| `reachable($TARGET)` | state_IDLE, fill_0 | SessionClosed | Released, Disposed |
+| `never($BAD)` | overflow, error_state | Unauthorized | NullState |
+| `bounded($OVERFLOW)` | fill_5 | — | count_max |
 
 ## Adding Custom Templates
 
@@ -185,4 +185,4 @@ Templates are defined in `crates/mununu-core/src/adapter/templates/builtin_templ
 
 Templates are compiled into the binary via `include_str!` from the JSON catalog. The `TemplateRegistry` provides lookup, validation, and instantiation. Template resolution happens at the adapter layer (before the emitter/evaluator), producing standard `PropertyFormula::MuCalculus(String)` values.
 
-See also: [CLI Reference](CLI-Reference), [API Reference](API-Reference), [Game Engine Integration](Game-Engine-Integration)
+See also: [CLI Reference](CLI-Reference), [API Reference](API-Reference)
