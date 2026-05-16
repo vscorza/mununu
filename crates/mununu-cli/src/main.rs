@@ -306,9 +306,20 @@ struct CodesignReconcileLabelsArgs {
     /// Path to the firmware-side label JSON (a `["label_1", …]` array).
     #[arg(value_name = "FIRMWARE_JSON")]
     firmware_labels: PathBuf,
-    /// Path to the peripheral-side label JSON (same shape).
-    #[arg(value_name = "PERIPHERAL_JSON")]
-    peripheral_labels: PathBuf,
+    /// Path to the peripheral-side label JSON (same shape as
+    /// `FIRMWARE_JSON`). Mutually exclusive with
+    /// `--peripheral-register-map` — exactly one peripheral source
+    /// must be supplied.
+    #[arg(value_name = "PERIPHERAL_JSON", required = false)]
+    peripheral_labels: Option<PathBuf>,
+    /// Path to a register-map sidecar JSON. The peripheral-side
+    /// alphabet is derived directly via
+    /// `coupling::register_map_labels` (the same function the
+    /// firmware emitter targets), so passing a register map here
+    /// short-circuits any manual hand-authoring of the peripheral
+    /// labels list. Mutually exclusive with `PERIPHERAL_JSON`.
+    #[arg(long = "peripheral-register-map", value_name = "REGISTER_MAP_JSON")]
+    peripheral_register_map: Option<PathBuf>,
     /// Output format. `human` (default): one section per outcome,
     /// human-readable. `json`: machine-parseable
     /// `{ "shared": […], "mismatch": null | { "firmware_only": […],
@@ -1070,10 +1081,13 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
 }
 
 fn codesign_reconcile_labels(args: CodesignReconcileLabelsArgs) -> Result<(), String> {
-    use mununu_core::codesign::reconcile::{ReconcileError, reconcile_label_alphabets};
+    use mununu_core::codesign::reconcile::{
+        ReconcileError, peripheral_labels_from_register_map, reconcile_label_alphabets,
+    };
+    use mununu_core::codesign::register_map::RegisterMap;
     use std::collections::BTreeSet;
 
-    let load = |path: &PathBuf, side: &str| -> Result<BTreeSet<String>, String> {
+    let load_label_list = |path: &PathBuf, side: &str| -> Result<BTreeSet<String>, String> {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("failed to read {side} labels {}: {e}", path.display()))?;
         let labels: Vec<String> = serde_json::from_slice(&bytes).map_err(|e| {
@@ -1085,8 +1099,49 @@ fn codesign_reconcile_labels(args: CodesignReconcileLabelsArgs) -> Result<(), St
         Ok(labels.into_iter().collect())
     };
 
-    let firmware = load(&args.firmware_labels, "firmware")?;
-    let peripheral = load(&args.peripheral_labels, "peripheral")?;
+    let firmware = load_label_list(&args.firmware_labels, "firmware")?;
+
+    let peripheral: BTreeSet<String> = match (
+        &args.peripheral_labels,
+        &args.peripheral_register_map,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "pass exactly one of <PERIPHERAL_JSON> or --peripheral-register-map, not both"
+                    .to_string(),
+            );
+        }
+        (None, None) => {
+            return Err(
+                "missing peripheral source: pass <PERIPHERAL_JSON> as the second positional arg or --peripheral-register-map <JSON>"
+                    .to_string(),
+            );
+        }
+        (Some(p), None) => load_label_list(p, "peripheral")?,
+        (None, Some(rm_path)) => {
+            let bytes = std::fs::read(rm_path)
+                .map_err(|e| format!("failed to read register-map {}: {e}", rm_path.display()))?;
+            let rm: RegisterMap = serde_json::from_slice(&bytes).map_err(|e| {
+                format!(
+                    "failed to parse register-map {} as JSON: {e}",
+                    rm_path.display()
+                )
+            })?;
+            let issues = rm.validate();
+            if !issues.is_empty() {
+                for issue in &issues {
+                    eprintln!("register-map validation: {issue}");
+                }
+                return Err(format!(
+                    "register-map {} has {} validation issue(s) — refusing to proceed",
+                    rm_path.display(),
+                    issues.len()
+                ));
+            }
+            peripheral_labels_from_register_map(&rm)
+        }
+    };
+
     let result = reconcile_label_alphabets(&firmware, &peripheral);
 
     match args.format.as_str() {
