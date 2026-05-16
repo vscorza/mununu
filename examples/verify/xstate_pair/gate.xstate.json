@@ -1,0 +1,12 @@
+{
+    "id": "Gate",
+    "initial": "closed",
+    "states": {
+        "closed": {
+            "on": { "tick_gate": "open" }
+        },
+        "open": {
+            "on": { "tick_gate": "closed" }
+        }
+    }
+}

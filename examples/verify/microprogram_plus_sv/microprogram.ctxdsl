@@ -1,0 +1,47 @@
+// microprogram.ctxdsl — hand-authored microcode listing for a tiny
+// driver that talks to the handshake_peripheral SV module.
+//
+// The microcode is modelled as a 4-state CTXDSL automaton:
+//   - WaitForReady: initial state, the controller is polling
+//   - AssertReq:    raise req to the peripheral
+//   - PollAck:      wait for the peripheral to enter ACTIVE
+//   - Done:         the handshake completed
+//
+// Labels:
+//   - tick_microcode is the microprogram's internal step event
+//     (silicon clock tick from the microcode's point of view).
+//   - The handshake_peripheral SV adapter emits its own
+//     port-binding labels (`req_T`, `req_F`, etc.) which compose
+//     asynchronously with this microprogram per the verify
+//     framework's direct alphabet binding.
+//
+// The whole point of this example is to demonstrate the framework's
+// adapter-agnosticism: a hand-authored CTXDSL source + an SV-
+// extracted source compose without code changes on the framework
+// side. This is a "framework demonstration" pairing rather than a
+// verification target — the two automata share no labels in this
+// minimal form, so the asynchronous composition is just an
+// interleaving of their independent state spaces.
+
+context Microprogram {
+    alphabet {
+        label tick_microcode;
+    }
+
+    automata {
+        automaton Microprogram {
+            states {
+                state WaitForReady initial;
+                state AssertReq;
+                state PollAck;
+                state Done;
+            }
+            transitions {
+                transition WaitForReady -> AssertReq on label tick_microcode;
+                transition AssertReq -> PollAck on label tick_microcode;
+                transition PollAck -> Done on label tick_microcode;
+                transition Done -> WaitForReady on label tick_microcode;
+            }
+        }
+    }
+}

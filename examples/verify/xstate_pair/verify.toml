@@ -1,0 +1,44 @@
+# xstate_pair — minimal end-to-end example for the verify framework.
+#
+# Two independent XState machines composed asynchronously. Both
+# adapters emit on their own event alphabets; no renaming is needed
+# (`strategy = "direct"`). The composition models a lock + gate where
+# the two sides cycle independently — a vacuous demonstration of the
+# pipeline rather than a real domain problem; meant to anchor the
+# framework's smoke tests.
+#
+# Recreate the run:
+#   $ bash examples/verify/xstate_pair/validate.sh
+#
+# Expected output (byte-deterministic) lives in transcript.txt.
+
+[project]
+name = "XStatePair"
+
+[[sources]]
+id = "lock"
+adapter = "xstate"
+files = ["lock.xstate.json"]
+
+[[sources]]
+id = "gate"
+adapter = "xstate"
+files = ["gate.xstate.json"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["lock", "gate"]
+name = "Pair"
+
+[[properties]]
+name = "no_deadlock"
+template = "no_deadlock"
+over = "Pair"
+
+[[properties]]
+name = "always_true"
+formula = "true"
+over = "Pair"

@@ -1,0 +1,12 @@
+{
+    "id": "Lock",
+    "initial": "locked",
+    "states": {
+        "locked": {
+            "on": { "open_request": "unlocked" }
+        },
+        "unlocked": {
+            "on": { "close_request": "locked" }
+        }
+    }
+}

@@ -1,0 +1,24 @@
+# uart_codesign_chaotic — verify framework transcript
+# Regenerated via examples/verify/uart_codesign_chaotic/validate.sh
+#
+# Canonical chaotic-stub codesign verification: C firmware
+# (adapter = c-codesign) composed asynchronously with a chaotic
+# peripheral stub (matches what codesign::coupling::emit_coupling_fragment
+# would generate from the register map). Doc C §C.5 — asynchronous
+# composition is mandatory for racy access.
+
+=== mununu verify (human-readable) ===
+verify report — project `UartCodesignChaotic`:
+  composition: asynchronous UART_LITESystem { members = [Uart_send_byte, UART_LITE] }
+    - firmware (adapter = c-codesign, automaton = Uart_send_byte)
+    - peripheral (adapter = ctxdsl, automaton = UART_LITE)
+    firmware_reaches_sending: VIOLATED (2/5 states, 0/1 initial) [inline, over = Uart_send_byte]
+    safety_holds_under_chaotic_stub: SATISFIED (5/5 states, 1/1 initial) [inline, over = UART_LITESystem]
+
+=== verdict shape (from --json output) ===
+project = UartCodesignChaotic
+composition.name = UART_LITESystem
+composition.semantics = asynchronous
+composition.members = Uart_send_byte, UART_LITE
+  firmware_reaches_sending: VIOLATED (2/5 states, 0/1 initial) [over = Uart_send_byte]
+  safety_holds_under_chaotic_stub: SATISFIED (5/5 states, 1/1 initial) [over = UART_LITESystem]

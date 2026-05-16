@@ -1,0 +1,78 @@
+# uart_codesign_protocol_spec — C firmware + hand-authored peripheral
+# protocol spec via the general verify framework.
+#
+# The firmware-side source (`firmware`) is the same `firmware.c` the
+# canonical codesign recipe at
+# `examples/industrial/codesign_uart/extract_verify_recipe/` consumes:
+# a `uart_send_byte(byte)` function instrumented with `MUNUNU_STATE()`
+# markers (Polling / Ready / Sending) so the synthesised CTXDSL
+# automaton's state names carry semantic content.
+#
+# The peripheral-side source (`peripheral`) is a HAND-AUTHORED
+# CTXDSL protocol spec that models the UART silicon's intended
+# behaviour: Idle → (write data) → Loaded → (write tx_start) →
+# Transmitting → (tick) → Idle. The critical absence is the lack of
+# any outbound `wr_ctrl_tx_start` transition from `Transmitting` —
+# that's the protocol-conformance assertion (no double-start while
+# busy).
+#
+# Direct alphabet binding: the firmware extraction emits labels via
+# `coupling::rendezvous_label_name(reg, field, kind)` —
+# `wr_ctrl_tx_start`, `wr_data_byte`, `rd_status_tx_busy` — and the
+# peripheral spec uses the same names.
+#
+# Recreate the run (requires `clang` on PATH):
+#   $ bash examples/verify/uart_codesign_protocol_spec/validate.sh
+
+[project]
+name = "UartCodesignProtocolSpec"
+
+[[sources]]
+id = "firmware"
+adapter = "c-codesign"
+files = ["../../industrial/codesign_uart/extract_verify_recipe/firmware.c"]
+
+[sources.options]
+register_map = "../../industrial/codesign_uart/register_map.json"
+cmsis_stubs = true
+synthesize_automaton = true
+
+[[sources]]
+id = "peripheral"
+adapter = "ctxdsl"
+files = ["peripheral_protocol.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["firmware", "peripheral"]
+name = "UartProtocolSystem"
+
+[[properties]]
+# Firmware-side reachability: the extracted firmware automaton reaches
+# its named `Sending` state. Smoke test that the c-codesign extractor
+# produced a connected automaton.
+name = "firmware_reaches_sending"
+formula = "mu X. (Sending || <> X)"
+over = "Uart_send_byte"
+
+[[properties]]
+# Peripheral-side reachability under the full composed system: the
+# peripheral eventually transitions to `Transmitting`. This requires
+# the firmware to drive the full handshake (poll status → write data →
+# write tx_start). Holds only if the synthesised firmware automaton
+# correctly orders its accesses.
+name = "peripheral_reaches_transmitting"
+formula = "mu X. (Transmitting || <> X)"
+over = "UartPeripheral"
+
+[[properties]]
+# Composed-system safety: no reachable state violates the protocol.
+# Vacuous on this finite-state system (there are no labelled "error"
+# states), but the canonical smoke-test formula used elsewhere in
+# the codesign examples.
+name = "safety_protocol_respected"
+formula = "nu X. ([] X)"
+over = "UartProtocolSystem"

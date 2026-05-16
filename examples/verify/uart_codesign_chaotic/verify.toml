@@ -1,0 +1,69 @@
+# uart_codesign_chaotic — C firmware + chaotic-stub peripheral via
+# the general verify framework.
+#
+# Demonstrates the canonical **codesign chaotic-stub verification**
+# pattern (Doc C §C.4 / §C.5) under the general verify framework: a
+# real C firmware (extracted via the `c-codesign` adapter) composed
+# asynchronously with a chaotic-stub peripheral that admits every
+# register access at any time. Verdicts transferable to any
+# well-behaved silicon by the chaotic-stub soundness rule.
+#
+# The peripheral source is a hand-authored CTXDSL chaotic stub
+# matching what `codesign::coupling::emit_coupling_fragment` would
+# generate from the register map; both sides already speak the
+# rendezvous alphabet (the firmware via the c-codesign adapter's
+# `coupling::rendezvous_label_name` call; the peripheral by
+# convention). The `register_map` strategy on `[alphabet]` is
+# declared here as the eventual home for sv-rtl-side label
+# rewriting; today the orchestrator's strategy projection is a
+# no-op because both sources already align (a follow-up wires the
+# strategy to drive SV-side renaming when sv-rtl is paired in).
+#
+# Recreate the run (requires `clang` on PATH):
+#   $ bash examples/verify/uart_codesign_chaotic/validate.sh
+
+[project]
+name = "UartCodesignChaotic"
+
+[[sources]]
+id = "firmware"
+adapter = "c-codesign"
+files = ["../../industrial/codesign_uart/extract_verify_recipe/firmware.c"]
+
+[sources.options]
+register_map = "../../industrial/codesign_uart/register_map.json"
+cmsis_stubs = true
+synthesize_automaton = true
+
+[[sources]]
+id = "peripheral"
+adapter = "ctxdsl"
+files = ["peripheral_chaotic_stub.ctxdsl"]
+
+[alphabet]
+strategy = "register_map"
+register_map = "../../industrial/codesign_uart/register_map.json"
+allow_peripheral_superset = true
+
+[composition]
+semantics = "asynchronous"
+members = ["firmware", "peripheral"]
+name = "UART_LITESystem"
+
+[[properties]]
+# Firmware-side reachability: the extracted automaton reaches its
+# named `Sending` state. Same property as the protocol-spec
+# example; VIOLATED here too (the polling loop can stay in Loop0
+# indefinitely; the chaotic stub doesn't constrain firmware
+# progress).
+name = "firmware_reaches_sending"
+formula = "mu X. (Sending || <> X)"
+over = "Uart_send_byte"
+
+[[properties]]
+# Composed-system safety: vacuous on the chaotic-stub composition
+# (no labelled error state exists). Smoke test that the realiser
+# accepts the chaotic-stub composition.
+name = "safety_holds_under_chaotic_stub"
+formula = "nu X. ([] X)"
+over = "UART_LITESystem"
