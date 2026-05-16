@@ -60,9 +60,27 @@ impl FormatAdapter for CrewaiAdapter {
         let crew = doc.into_crew();
 
         if crew.agents.is_empty() {
+            // Distinguish "JSON parsed but the schema is empty" from
+            // "agents key was an explicit empty array" — both produce
+            // an empty agents vec via serde's default, but the
+            // empty-schema case usually means the caller passed
+            // truncated or wrong content.
+            let bytes = content.len();
+            let looks_empty_object = content.trim().len() <= 4; // "{}" plus whitespace
+            let hint = if looks_empty_object {
+                format!(
+                    " (received {bytes} bytes — looks like an empty object; check the request content reached the server)"
+                )
+            } else if !content.contains("\"agents\"") {
+                format!(
+                    " (received {bytes} bytes with no `agents` key — is this really a CrewAI JSON file?)"
+                )
+            } else {
+                format!(" (received {bytes} bytes — the agents array deserialised as empty)")
+            };
             return Err(AdapterError {
                 kind: AdapterErrorKind::IrConsistencyError,
-                message: "CrewAI document has no agents — nothing to translate.".to_string(),
+                message: format!("CrewAI document has no agents — nothing to translate.{hint}"),
                 location: None,
             });
         }
