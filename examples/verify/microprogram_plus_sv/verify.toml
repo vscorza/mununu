@@ -1,0 +1,60 @@
+# microprogram_plus_sv — hand-authored CTXDSL microcode + real SV
+# peripheral via the general verify framework.
+#
+# The point of this example is to demonstrate the framework's
+# adapter-agnosticism: the orchestrator pairs a `ctxdsl` source
+# (microcode authored by hand) with an `sv-rtl` source (real SV
+# parsed via `SystemVerilogAdapter::translate`) under one
+# `verify.toml`. The two automata have disjoint label alphabets here
+# (the microcode steps on `tick_microcode`; the SV adapter emits
+# port-binding labels for `req` / `ack`), so the asynchronous
+# composition just interleaves their independent state spaces — no
+# rendezvous synchronisation. Direct alphabet binding.
+#
+# Future extension: author a `.mununu.json` sidecar next to the SV
+# file declaring rendezvous labels matching the microprogram's
+# events, switching the binding from `direct` to `renamings` so the
+# two sides actually coordinate.
+
+[project]
+name = "MicroprogramPlusSv"
+
+[[sources]]
+id = "microcode"
+adapter = "ctxdsl"
+files = ["microprogram.ctxdsl"]
+
+[[sources]]
+id = "peripheral"
+adapter = "sv-rtl"
+files = ["handshake_peripheral.sv"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["microcode", "peripheral"]
+name = "Driver"
+
+[[properties]]
+# Microprogram never deadlocks — every state has at least one outgoing
+# transition. Holds because the microcode FSM is a cycle.
+name = "microcode_no_deadlock"
+template = "no_deadlock"
+over = "Microprogram"
+
+[[properties]]
+# Peripheral reachability — the SV adapter's 4-state automaton
+# eventually visits ACTIVE.
+name = "peripheral_reaches_active"
+formula = "mu X. (ACTIVE || <> X)"
+over = "handshake_peripheral"
+
+[[properties]]
+# Composed-system no-deadlock — vacuous on this asynchronous
+# interleaving (each side keeps cycling), but exercises the realiser
+# against the full product state space.
+name = "composed_no_deadlock"
+template = "no_deadlock"
+over = "Driver"
