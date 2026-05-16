@@ -44,6 +44,7 @@ pub mod domain;
 pub mod emit;
 pub mod extraction;
 pub mod ir;
+pub mod langgraph;
 pub mod promela;
 pub mod sidecar;
 pub mod state_enum;
