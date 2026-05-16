@@ -1,0 +1,127 @@
+// =========================================================================
+// verify.template.ctxdsl — recipe template for end-to-end extract+verify.
+// =========================================================================
+//
+// `run.sh` substitutes the placeholder `{{AUTOMATON_CTXDSL}}` with the
+// `automaton_ctxdsl` fragment that `mununu codesign extract-c` synthesises
+// from `firmware.c`. The result is a self-contained `context { ... }` block
+// that `mununu context eval` consumes.
+//
+// What's hand-authored vs auto-extracted:
+//
+//   - The firmware automaton ({{AUTOMATON_CTXDSL}} below) — AUTO-EXTRACTED.
+//   - The peripheral protocol-spec (UartPeripheral) — HAND-AUTHORED, lifted
+//     directly from `../verification_with_peripheral_spec.ctxdsl` (PR #50).
+//   - The composition — HAND-AUTHORED, asynchronous per Doc C §C.5.
+//   - The formulas — HAND-AUTHORED, reference state names produced by the
+//     `MUNUNU_STATE` markers in `firmware.c` (PR #51) and by the peripheral
+//     spec.
+//
+// The shape of this recipe is the canonical mununu codesign workflow:
+//   firmware C → mununu codesign extract-c → splice → mununu context eval.
+
+context UartExtractAndVerify {
+    alphabet {
+        // Same rendezvous labels firmware.c (via the register map) and the
+        // peripheral spec share. The synthesised firmware automaton already
+        // declares its write labels as controllable in its own block, and
+        // uses the read labels in transitions (which mununu accepts as an
+        // implicit alphabet declaration).
+        label rd_status_tx_busy;
+        label wr_data_byte;
+        label wr_ctrl_tx_start;
+        // Internal peripheral event: silicon making autonomous progress.
+        label tick;
+    }
+
+    // -----------------------------------------------------------------------
+    // The placeholder below is replaced by `run.sh` with the
+    // `automaton_ctxdsl` fragment emitted by `mununu codesign extract-c`.
+    //
+    // For this firmware (with MUNUNU_STATE markers) the extracted automaton
+    // is named `Uart_send_byte` and has states `Polling` (initial), `Loop0`,
+    // `Ready`, `Sending`, and `S3` (the terminal state after the last write).
+    // The labels `rd_status_tx_busy`, `wr_data_byte`, `wr_ctrl_tx_start` are
+    // the same rendezvous labels the peripheral spec uses.
+    // -----------------------------------------------------------------------
+{{AUTOMATON_CTXDSL}}
+    // -----------------------------------------------------------------------
+
+    automata {
+        // -----------------------------------------------------------------
+        // Hand-authored protocol-spec peripheral. Same shape as
+        // `../verification_with_peripheral_spec.ctxdsl`'s UartPeripheral:
+        // Idle / Loaded / Transmitting. The CRITICAL absence is the lack
+        // of any outbound `wr_ctrl_tx_start` transition from Transmitting
+        // — that's the protocol-conformance assertion (no double-start
+        // while busy).
+        // -----------------------------------------------------------------
+        automaton UartPeripheral {
+            internal {
+                label tick;
+            }
+
+            states {
+                state Idle initial;
+                state Loaded;
+                state Transmitting;
+            }
+
+            transitions {
+                transition Idle -> Idle on label rd_status_tx_busy;
+                transition Idle -> Loaded on label wr_data_byte;
+                transition Idle -> Idle on label tick;
+
+                transition Loaded -> Loaded on label rd_status_tx_busy;
+                transition Loaded -> Loaded on label wr_data_byte;
+                transition Loaded -> Transmitting on label wr_ctrl_tx_start;
+                transition Loaded -> Loaded on label tick;
+
+                transition Transmitting -> Transmitting on label rd_status_tx_busy;
+                transition Transmitting -> Idle on label tick;
+            }
+        }
+    }
+
+    composition {
+        asynchronous UartProtocolSystem {
+            members [Uart_send_byte, UartPeripheral];
+        }
+    }
+
+    mu_formulas {
+        // -----------------------------------------------------------------
+        // Property 1 — Sending is reachable in the firmware automaton
+        // alone (smoke test: the extractor produced a connected automaton
+        // that reaches its named transmit state).
+        // -----------------------------------------------------------------
+        formula firmware_reaches_sending {
+            over Uart_send_byte;
+            body = mu X. (Sending || <> X);
+        }
+
+        // -----------------------------------------------------------------
+        // Property 2 — In the composed protocol system, the peripheral
+        // eventually reaches Transmitting. This requires the firmware
+        // to drive the full handshake (poll → write data → write
+        // tx_start), which the auto-extracted automaton must do
+        // correctly for the property to hold.
+        // -----------------------------------------------------------------
+        formula peripheral_transmits {
+            over UartPeripheral;
+            body = mu X. (Transmitting || <> X);
+        }
+
+        // -----------------------------------------------------------------
+        // Property 3 — Composed-system safety: every reachable composed
+        // state respects the protocol. Holds vacuously for finite-state
+        // systems whose state space contains no "error" labelled state;
+        // this is the canonical "smoke test" formula used elsewhere in
+        // the codesign examples.
+        // -----------------------------------------------------------------
+        formula safety_protocol_respected {
+            over UartProtocolSystem;
+            body = nu X. ([] X);
+        }
+    }
+}

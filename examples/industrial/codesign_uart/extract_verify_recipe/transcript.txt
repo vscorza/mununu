@@ -1,0 +1,64 @@
+# extract_verify_recipe — end-to-end transcript
+# Regenerated via examples/industrial/codesign_uart/extract_verify_recipe/run.sh
+# Demonstrates the full mununu codesign workflow:
+#   firmware.c -> mununu codesign extract-c -> splice -> mununu context eval
+
+=== Step 1: extract C firmware to synthesised CTXDSL automaton ===
+extracted 1 functions; the synthesised automaton fragment for the entry point is:
+
+    automata {
+        automaton Uart_send_byte {
+            controllable {
+                label wr_data_byte;
+                label wr_ctrl_tx_start;
+            }
+
+            states {
+                state Polling initial;
+                state Loop0;
+                state Ready;
+                state Sending;
+                state S3;
+            }
+
+            transitions {
+                transition Polling -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (enter loop)
+                transition Loop0 -> Loop0 on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (loop iteration)
+                transition Loop0 -> Ready on label rd_status_tx_busy; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 1 }) (exit loop)
+                transition Ready -> Sending on label wr_data_byte; // (IR-resolved @InlineConstexprGep { base_addr: 1073807360, field_index: 2 })
+                transition Sending -> S3 on label wr_ctrl_tx_start; // (IR-resolved @AbsoluteAddress(1073807360))
+            }
+        }
+    }
+
+=== Step 2: splice the automaton into verify.template.ctxdsl ===
+wrote spliced CTXDSL to examples/industrial/codesign_uart/extract_verify_recipe/verify.ctxdsl (150 lines)
+
+=== Step 3a: verify firmware-side reachability (firmware_reaches_sending) ===
+$ ./target/debug/mununu context eval examples/industrial/codesign_uart/extract_verify_recipe/verify.ctxdsl --formula firmware_reaches_sending --automaton Uart_send_byte
+Formula 'firmware_reaches_sending' over automaton 'Uart_send_byte':
+  States satisfying: 2/5
+    Ready, Sending
+  Initial states satisfying: 0/1
+    (none)
+  Guard partitions: enabled
+
+=== Step 3b: verify peripheral-side reachability (peripheral_transmits) ===
+$ ./target/debug/mununu context eval examples/industrial/codesign_uart/extract_verify_recipe/verify.ctxdsl --formula peripheral_transmits --automaton UartPeripheral
+Formula 'peripheral_transmits' over automaton 'UartPeripheral':
+  States satisfying: 3/3
+    Idle, Loaded, Transmitting
+  Initial states satisfying: 1/1
+    Idle
+  Guard partitions: enabled
+
+=== Step 3c: verify composed-system safety (safety_protocol_respected) ===
+$ ./target/debug/mununu context eval examples/industrial/codesign_uart/extract_verify_recipe/verify.ctxdsl --formula safety_protocol_respected --automaton UartProtocolSystem
+Formula 'safety_protocol_respected' over automaton 'UartProtocolSystem':
+  States satisfying: 6/6
+    Idle|Loop0, Idle|Polling, Idle|Ready, Idle|S3, Loaded|Sending, Transmitting|S3
+  Initial states satisfying: 1/1
+    Idle|Polling
+  Guard partitions: enabled
+
+=== end of transcript ===
