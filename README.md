@@ -21,7 +21,8 @@ Mununu is a verification tool for analyzing and synthesizing controllers for rea
 - **Composition** &mdash; Synchronous, asynchronous, and superset composition of CLTS components
 - **Controller synthesis** &mdash; Automatic synthesis of controllers satisfying safety and liveness properties
 - **State abstraction** &mdash; Multi-level variable abstraction (Boolean, integer intervals, symbol sets)
-- **Format adapters** &mdash; Import from TLSF, AIGER, Promela, XState, and SystemVerilog (plus extraction-spec inputs from C / Rust / TypeScript); export controllers to XState JSON or SystemVerilog
+- **Format adapters** &mdash; Import from TLSF, AIGER, Promela, XState, SystemVerilog, **CrewAI** (`.crewai.json`), and **LangGraph** (`.langgraph.json`), plus extraction-spec inputs from C / Rust / TypeScript; export controllers to XState JSON or SystemVerilog
+- **N-source verify framework** &mdash; `mununu verify <verify.toml>` composes any combination of the above sources, picks an alphabet-binding strategy (direct / explicit renamings / register-map-derived), declares a composition shape, and produces a structured `VerifyReport`. See [`wiki/Verify-Project-Flow.md`](wiki/Verify-Project-Flow.md).
 - **REST API** &mdash; Built-in HTTP server for integration with web frontends
 - **Web UI** &mdash; Interactive editor, graph visualization, and verification via [mununu-ui](https://github.com/vscorza/mununu-ui)
 
@@ -74,6 +75,21 @@ The `examples/` directory contains ready-to-use CLTS specifications:
 | [Customer Support Pipeline](examples/agentic/support_pipeline.xstate.json) | XState parallel: triage + budget tracking | 5+2 (parallel) | No tool over budget (safety) |
 | [MCP Tool Authorization](examples/agentic/mcp_auth.ctxdsl) | Session + confirmation gate protocol | 3+4 (async) | Session-required, confirm-before-delete |
 | [Multi-Agent Handoff](examples/agentic/handoff_protocol.ctxdsl) | Supervisor + 2 specialist agents | 4+3+3 (async) | Mutual exclusion, GR(1) liveness |
+
+### Verify Framework (`mununu verify <verify.toml>`)
+
+Each entry under [`examples/verify/`](examples/verify/) ships a `verify.toml`, the referenced source files, a `validate.sh` reproduction script, and a byte-deterministic `transcript.txt`:
+
+| Example | Sources | Binding | What it demonstrates |
+|---------|---------|---------|----------------------|
+| [`xstate_pair/`](examples/verify/xstate_pair/) | XState × 2 | direct | Multiple sources via the same adapter; mixed inline + template properties |
+| [`microprogram_plus_sv/`](examples/verify/microprogram_plus_sv/) | hand-authored CTXDSL + SystemVerilog | direct | Microcode + RTL pairing through the framework |
+| [`uart_codesign_chaotic/`](examples/verify/uart_codesign_chaotic/) | C firmware + chaotic-stub peripheral | register-map | Codesign C+SV with register-map-derived rendezvous labels |
+| [`uart_codesign_protocol_spec/`](examples/verify/uart_codesign_protocol_spec/) | C firmware + hand-authored protocol spec | direct | The "protocol-spec recipe" inside the framework |
+| [`crewai_handoff/`](examples/verify/crewai_handoff/) | CrewAI 2-agent crew | direct | Native CrewAI adapter end-to-end |
+| [`langgraph_workflow/`](examples/verify/langgraph_workflow/) | LangGraph triage workflow | direct | Native LangGraph adapter end-to-end |
+
+Reproduce any of them: `bash examples/verify/<example>/validate.sh`
 
 ## CTXDSL at a Glance
 

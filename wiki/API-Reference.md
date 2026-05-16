@@ -22,6 +22,7 @@ All request and response bodies use `application/json`. CORS is open by default 
 - [POST /api/v1/context/graphs](#post-apiv1contextgraphs)
 - [POST /api/v1/context/verify](#post-apiv1contextverify)
 - [POST /api/v1/context/import](#post-apiv1contextimport)
+- [POST /api/v1/verify](#post-apiv1verify) — general N-source verify framework
 - [GET /api/v1/templates](#get-apiv1templates)
 - [Common Types](#common-types)
 - [Error Responses](#error-responses)
@@ -553,14 +554,16 @@ curl -X POST http://localhost:3000/api/v1/context/verify \
 
 ## POST /api/v1/context/import
 
-Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela) and translate it to CTXDSL.
+Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela, CrewAI, LangGraph) and translate it to CTXDSL.
+
+> Source of truth: [`api::handlers::context_import_handler`](../crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Request Body
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `content` | string | Yes | Raw file content in the source format |
-| `format` | string | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"btor2"` (or `"btor"`), `"promela"`, `"xstate"`, `"systemverilog"` (hand-written parser), `"sv-yosys"` (or `"yosys"`, Yosys-driven elaboration), `"extraction"` |
+| `format` | string | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"btor2"` (or `"btor"`), `"promela"`, `"xstate"`, `"systemverilog"` (hand-written parser), `"sv-yosys"` (or `"yosys"`, Yosys-driven elaboration), `"extraction"`, `"crewai"`, `"langgraph"` |
 | `filename` | string | No | Original filename (used for extension-based detection if format is `"auto"`) |
 | `additional_sources` | array | No | Extra SV source files to compile alongside the primary input (Yosys path only). Each entry: `{name, content}`. |
 
@@ -588,6 +591,48 @@ curl -X POST http://localhost:3000/api/v1/context/import \
 ```
 
 See [Adapter Formats](Adapter-Formats.md) for details on each supported format.
+
+---
+
+## POST /api/v1/verify
+
+Run the general N-source verification framework against a `verify.toml` manifest. Mirrors `mununu verify` (CLI). See [Verify Project Flow](Verify-Project-Flow.md) for the conceptual model.
+
+> Source of truth: [`api::handlers::verify_project_handler`](../crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+Supply exactly one of `config` (pre-parsed) or `config_toml` (raw verify.toml text); the handler 400s on both-set or neither-set.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `config` | object | No | Pre-parsed `VerifyConfig` JSON. Mutually exclusive with `config_toml`. |
+| `config_toml` | string | No | Raw verify.toml text. Parsed server-side via `VerifyConfig::from_toml`. Mutually exclusive with `config`. Convenient for thin clients (UI wizard) that don't bundle a TOML parser. |
+| `base_dir` | string | Yes | Directory the source paths in the config resolve against. Must exist on the server's filesystem. |
+
+### Response Body
+
+`VerifyReport`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `project` | string | Project name from `[project]`. |
+| `sources` | `SourceSummary[]` | Per-source diagnostics (`id`, `adapter`, resolved automaton name). |
+| `composition` | `CompositionInfo` | `semantics`, resolved composition `name`, resolved member names. |
+| `property_verdicts` | `PropertyVerdict[]` | One verdict per `[[properties]]` entry. |
+
+`PropertyVerdict` carries `name`, `formula_source` (`Inline` or `Template { id, args }`), the concrete `formula` text, the `over` target, `satisfied`, state counts, and the initial-state breakdown.
+
+### Example
+
+```bash
+TOML=$(cat examples/verify/crewai_handoff/verify.toml)
+BASE=$(realpath examples/verify/crewai_handoff)
+curl -X POST http://localhost:3000/api/v1/verify \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg toml "$TOML" --arg base "$BASE" \
+        '{config_toml: $toml, base_dir: $base}')"
+```
 
 ---
 
