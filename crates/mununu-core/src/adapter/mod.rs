@@ -42,7 +42,6 @@ pub mod btor2;
 pub mod domain;
 pub mod emit;
 pub mod extraction;
-pub mod gdscript;
 pub mod ir;
 pub mod promela;
 pub mod sidecar;

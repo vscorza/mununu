@@ -181,9 +181,6 @@ mununu context synth machine.xstate --adapter xstate --formula safety --automato
 mununu context synth design.sv --adapter sv --formula safety --automaton FSM \
   --output-format systemverilog --emit-native controller.sv
 
-# Export controller as GDScript for Godot
-mununu context synth game.espec.json --adapter extraction --formula safety --automaton FSM \
-  --output-format gdscript --emit-native controller.gd
 ```
 
 ## Git Identity
@@ -423,16 +420,6 @@ mununu context eval spec.espec.json --adapter extraction --mode fixed --formula 
 **Spec format**: See `tools/extraction_specs/*.espec.json` in the mununu-private repo for examples. The `model_config` section carries declarative automaton definitions with `states`, `transitions` (mode-filtered), `composition`, `properties` (with per-property `over` targets), and `controllers`.
 
 **Property templates**: Properties in `.espec.json`, `.mununu.json`, and XState `__mununu` blocks can use `template_ref` instead of raw `formula` to reference a named property template. Templates are parameterized mu-calculus patterns (e.g., `no_deadlock`, `reachable(TARGET)`, `bounded(OVERFLOW, UNDERFLOW)`). Resolution happens at adapter translation time — the emitter and evaluator see no difference. See `crates/mununu-core/src/adapter/templates/` for the registry and catalog.
-
-### Game Engine Adapters (Godot)
-
-The extraction adapter supports game state machine verification through `.espec.json` specs and GDScript source extraction:
-
-- **GDScript extraction**: Tree-sitter grammar (`tree-sitter-gdscript` v6) extracts enum-based state machines from `.gd` files. The `game_fsm` domain profile in `src/adapter/extraction/ast_extract/domain.rs` configures controllability (player input = uncontrollable, system actions = controllable), asynchronous composition, and `ev_` label prefix.
-- **Game examples**: `examples/game/` contains `.espec.json` files demonstrating softlock detection, quest deadlocks, and NPC AI loops — all using property templates.
-- **CLI**: `mununu context eval game.espec.json --adapter extraction --template no_deadlock --automaton FSM`
-- **CLI templates**: `mununu templates --domain game` lists templates relevant to game verification.
-- **UI workflow**: The `gameengine` workflow in `mununu-ui/src/types/workflow.ts` provides a 5-step pipeline: Load → Extract → Edit Spec → Translate → Verify.
 
 ### TLSF/AIGER Adapter Encoding (Turn-Based Compound Labels)
 

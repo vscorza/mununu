@@ -18,7 +18,7 @@ Mununu can import specifications from external formats and export synthesized co
 | **SystemVerilog via Yosys** | `.sv`, `.v` (with `--adapter sv-yosys`) | Yes | No | Explicit automaton |
 | **Extraction Spec** | `.espec.json` | Yes | No | Explicit automaton |
 
-> The **Extraction Spec** adapter handles `.espec.json` files from the extraction pipeline (source code analysis) and game engine integration. Properties can use `template_ref` to reference [Property Templates](Property-Templates) instead of raw mu-calculus formulas. See [Game Engine Integration](Game-Engine-Integration) for game-specific use cases.
+> The **Extraction Spec** adapter handles `.espec.json` files from the extraction pipeline (source code analysis). Properties can use `template_ref` to reference [Property Templates](Property-Templates) instead of raw mu-calculus formulas.
 >
 > **Agentic orchestration** (CrewAI, LangGraph, A2A) does not have a dedicated native adapter today. Models for these frameworks are authored either as native CTXDSL (`examples/agentic/*.ctxdsl`) or as XState JSON (`examples/agentic/*.xstate.json`) consumed by the XState adapter. See [Agentic Orchestration](Agentic-Orchestration) for patterns and examples.
 

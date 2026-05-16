@@ -82,7 +82,7 @@ pub fn detect_concurrency(parsed: &ParsedSource) -> Vec<DetectedConcurrency> {
         SourceLanguage::TypeScript => {
             scan_typescript(parsed, &mut findings);
         }
-        SourceLanguage::Rust | SourceLanguage::GDScript => {
+        SourceLanguage::Rust => {
             // Out of scope for v0.1.
         }
     }

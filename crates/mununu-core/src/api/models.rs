@@ -625,7 +625,7 @@ pub struct CompositionModeInfo {
 pub struct ProposeCompositionRequest {
     /// Source content to scan.
     pub source: String,
-    /// Source language (`typescript` / `python` / `rust` / `gdscript`).
+    /// Source language (`typescript` / `python` / `rust`).
     /// When omitted, the API requires the caller to specify it — there
     /// is no `source.file` extension to infer from at this endpoint.
     pub language: Option<String>,

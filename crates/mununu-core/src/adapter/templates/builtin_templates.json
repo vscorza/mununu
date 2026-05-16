@@ -11,7 +11,6 @@
       "params": [],
       "formula_pattern": "nu X. (<> true && [] X)",
       "domain_hints": {
-        "game": {},
         "rtl": {},
         "agentic": {},
         "software": {}
@@ -35,7 +34,6 @@
       ],
       "formula_pattern": "mu X. (${TARGET} || <> X)",
       "domain_hints": {
-        "game": { "TARGET": "e.g., Idle, GameOver, Victory" },
         "rtl": { "TARGET": "e.g., state_IDLE, fill_0" },
         "agentic": { "TARGET": "e.g., SessionClosed, Authenticated" },
         "software": { "TARGET": "e.g., Released, Disposed" }
@@ -59,7 +57,6 @@
       ],
       "formula_pattern": "nu X. (!${BAD} && [] X)",
       "domain_hints": {
-        "game": { "BAD": "e.g., Dead, Softlocked" },
         "rtl": { "BAD": "e.g., overflow, error_state" },
         "agentic": { "BAD": "e.g., Unauthorized, DataLeak" },
         "software": { "BAD": "e.g., NullState, Corrupted" }
@@ -83,7 +80,6 @@
       ],
       "formula_pattern": "nu Y. ((mu X. (${TARGET} || <> X)) && [] Y)",
       "domain_hints": {
-        "game": { "TARGET": "e.g., Idle, Patrol (return-to-idle)" },
         "rtl": { "TARGET": "e.g., state_IDLE (reset recovery)" },
         "agentic": { "TARGET": "e.g., Ready (session cleanup)" },
         "software": { "TARGET": "e.g., Available (resource release)" }
@@ -114,7 +110,6 @@
       ],
       "formula_pattern": "nu X. (!${OVERFLOW} && !${UNDERFLOW} && [] X)",
       "domain_hints": {
-        "game": { "OVERFLOW": "e.g., inventory_full", "UNDERFLOW": "e.g., health_0" },
         "rtl": { "OVERFLOW": "e.g., fill_5 (FIFO depth exceeded)", "UNDERFLOW": "e.g., fill_neg1" },
         "software": { "OVERFLOW": "e.g., count_max", "UNDERFLOW": "e.g., count_0" }
       },
@@ -144,8 +139,7 @@
       "formula_pattern": "nu X. ((!${TRIGGER} || mu Y. (${RESPONSE} || <> Y)) && [] X)",
       "domain_hints": {
         "rtl": { "TRIGGER": "e.g., req_active", "RESPONSE": "e.g., ack_active" },
-        "agentic": { "TRIGGER": "e.g., RequestReceived", "RESPONSE": "e.g., ResponseSent" },
-        "game": { "TRIGGER": "e.g., QuestAccepted", "RESPONSE": "e.g., QuestComplete" }
+        "agentic": { "TRIGGER": "e.g., RequestReceived", "RESPONSE": "e.g., ResponseSent" }
       },
       "tags": ["liveness", "response", "handshake"]
     },
@@ -172,7 +166,6 @@
       ],
       "formula_pattern": "nu X. (!(${A} && ${B}) && [] X)",
       "domain_hints": {
-        "game": { "A": "e.g., P1_Acting", "B": "e.g., P2_Acting" },
         "rtl": { "A": "e.g., grant_0", "B": "e.g., grant_1" },
         "agentic": { "A": "e.g., Agent1_Active", "B": "e.g., Agent2_Active" }
       },
@@ -201,7 +194,6 @@
       ],
       "formula_pattern": "nu X. ((!${STATE} || [${LABEL}] false) && [] X)",
       "domain_hints": {
-        "game": { "STATE": "e.g., Dead", "LABEL": "e.g., ev_attack" },
         "software": { "STATE": "e.g., Empty", "LABEL": "e.g., ev_get" },
         "rtl": { "STATE": "e.g., state_IDLE", "LABEL": "e.g., data_out" }
       },
