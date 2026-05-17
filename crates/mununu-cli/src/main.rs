@@ -144,6 +144,15 @@ struct VerifyArgs {
     /// Default: exit 0 regardless of verdicts; the report distinguishes.
     #[arg(long)]
     strict: bool,
+    /// Skip property evaluation and instead emit an introspection
+    /// report: per-automaton alphabet + state names, the composition's
+    /// union alphabet, and every declared per-state predicate. Use
+    /// this before authoring property formulas to discover what
+    /// labels and predicates the realized context actually exposes.
+    /// Mutually exclusive with `--strict` (the report carries no
+    /// verdicts to enforce against).
+    #[arg(long = "print-alphabet")]
+    print_alphabet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -979,7 +988,11 @@ fn init_tracing() {
 fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     use mununu_core::verify::config::VerifyConfig;
     use mununu_core::verify::report::PropertyFormulaSource;
-    use mununu_core::verify::verify_project;
+    use mununu_core::verify::{inspect_project, verify_project};
+
+    if args.print_alphabet && args.strict {
+        return Err("--print-alphabet is incompatible with --strict (the introspection report carries no verdicts)".to_string());
+    }
 
     let body = std::fs::read_to_string(&args.config)
         .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
@@ -992,6 +1005,19 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     });
+
+    if args.print_alphabet {
+        let inspection = inspect_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inspection).map_err(|e| e.to_string())?
+            );
+        } else {
+            print_inspection_human(&inspection);
+        }
+        return Ok(());
+    }
 
     let report = verify_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
 
@@ -1042,6 +1068,73 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
         return Err("one or more properties violated (--strict)".to_string());
     }
     Ok(())
+}
+
+fn print_inspection_human(report: &mununu_core::verify::InspectionReport) {
+    println!("inspect report — project `{}`:", report.project);
+    println!(
+        "  composition: {} {} {{ members = [{}] }}",
+        report.composition.info.semantics,
+        report.composition.info.name,
+        report.composition.info.members.join(", "),
+    );
+    println!("  sources:");
+    for s in &report.sources {
+        println!(
+            "    - {id} (adapter = {adapter}, automaton = {automaton})",
+            id = s.id,
+            adapter = s.adapter,
+            automaton = s.automaton.as_deref().unwrap_or("(unresolved)"),
+        );
+    }
+    println!("  automata ({}):", report.automata.len());
+    for a in &report.automata {
+        let src = a.source_id.as_deref().unwrap_or("-");
+        println!(
+            "    {name} (source = {src}, {n_states} states, {n_init} initial, {n_alpha} labels)",
+            name = a.name,
+            n_states = a.states.len(),
+            n_init = a.initial_states.len(),
+            n_alpha = a.alphabet.len(),
+        );
+        if !a.initial_states.is_empty() {
+            println!("      initial: {}", a.initial_states.join(", "));
+        }
+        if !a.states.is_empty() {
+            println!("      states:  {}", a.states.join(", "));
+        }
+        if !a.alphabet.is_empty() {
+            println!("      labels:  {}", a.alphabet.join(", "));
+        }
+    }
+    println!();
+    println!(
+        "  composition alphabet ({} labels):",
+        report.composition.alphabet.len()
+    );
+    if !report.composition.alphabet.is_empty() {
+        for chunk in report.composition.alphabet.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+    if !report.composition.state_names.is_empty() {
+        println!(
+            "  composition states ({}):",
+            report.composition.state_names.len()
+        );
+        for chunk in report.composition.state_names.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+    if !report.composition.predicate_names.is_empty() {
+        println!(
+            "  declared predicates ({}):",
+            report.composition.predicate_names.len()
+        );
+        for chunk in report.composition.predicate_names.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
 }
 
 fn dispatch(command: Commands) -> Result<(), String> {

@@ -41,7 +41,9 @@ pub mod orchestrator;
 pub mod register_map_rewriter;
 pub mod report;
 
-pub use orchestrator::verify_project;
+pub use orchestrator::{
+    AutomatonInspection, CompositionInspection, InspectionReport, inspect_project, verify_project,
+};
 pub use report::{
     CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, VerifyError,
     VerifyReport,

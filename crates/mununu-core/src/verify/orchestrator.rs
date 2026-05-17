@@ -254,6 +254,264 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 }
 
 // ---------------------------------------------------------------------------
+// Inspection (alphabet + state-predicate introspection — plan Part 6 item 3)
+// ---------------------------------------------------------------------------
+
+/// Per-automaton snapshot produced by [`inspect_project`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutomatonInspection {
+    /// Resolved automaton name (e.g. the CTXDSL identifier after
+    /// adapter dispatch + assembly).
+    pub name: String,
+    /// Source id whose adapter emitted this automaton, when known.
+    pub source_id: Option<String>,
+    /// Alphabet (union of controllable + internal + uncontrollable
+    /// labels) the automaton participates in.
+    pub alphabet: Vec<String>,
+    /// State names declared on this automaton.
+    pub states: Vec<String>,
+    /// Initial-state names.
+    pub initial_states: Vec<String>,
+}
+
+/// Composition-level snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompositionInspection {
+    /// Composition info (semantics, name, resolved members) as it
+    /// appears in [`VerifyReport`].
+    pub info: CompositionInfo,
+    /// Union of every member's alphabet — the labels that can appear
+    /// in property formulas referencing the composition.
+    pub alphabet: Vec<String>,
+    /// Names of the realized composition CLTS's states. Empty when
+    /// the realiser does not eagerly materialise the composed CLTS
+    /// (some compositions are evaluated symbolically).
+    pub state_names: Vec<String>,
+    /// Names of declared per-state predicates the composition
+    /// exposes (from CTXDSL `predicates { … }` blocks). Useful as a
+    /// "what can I write in a mu-calculus formula" list.
+    pub predicate_names: Vec<String>,
+}
+
+/// Report produced by [`inspect_project`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InspectionReport {
+    pub project: String,
+    pub sources: Vec<SourceSummary>,
+    /// One entry per realized automaton (per-source + the composition
+    /// member resolution).
+    pub automata: Vec<AutomatonInspection>,
+    /// Composition-level alphabet + state-predicate listing.
+    pub composition: CompositionInspection,
+}
+
+/// Run the verify pipeline through realize, then return an
+/// introspection report covering each realized automaton's alphabet,
+/// states, and the composition-level alphabet + predicate listing.
+///
+/// **Skips property evaluation entirely** — use this to discover what
+/// labels and state predicates the realized context exposes before
+/// authoring property formulas. Closes plan Part 6 item 3 (and Part
+/// 2 automation gap #2).
+///
+/// Reuses every step of [`verify_project`] up to and including the
+/// realize step.
+pub fn inspect_project(
+    config: &VerifyConfig,
+    base_dir: &Path,
+) -> Result<InspectionReport, VerifyError> {
+    // 1. Validate config.
+    let issues = config.validate();
+    if !issues.is_empty() {
+        return Err(VerifyError::ConfigValidationFailed(issues));
+    }
+
+    // 2. Alphabet binding (same as verify_project).
+    let binding =
+        AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
+    let per_source_renamings = binding.per_source_renamings();
+    let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
+        AlphabetBinding::RegisterMap { map, .. } => {
+            Some(derive_sv_renamings_from_register_map(map))
+        }
+        _ => None,
+    };
+
+    // 3. Per-source dispatch + renaming (same as verify_project).
+    let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
+    let mut source_summaries: Vec<SourceSummary> = Vec::with_capacity(config.sources.len());
+    for source in &config.sources {
+        let primary_file = source
+            .files
+            .first()
+            .expect("validator rejected empty files");
+        let path = resolve_path(base_dir, primary_file);
+        let content =
+            std::fs::read_to_string(&path).map_err(|source_err| VerifyError::SourceReadFailed {
+                path: path.clone(),
+                source: source_err,
+            })?;
+        let raw_ctxdsl = dispatch_adapter(
+            &source.adapter,
+            &source.id,
+            &path,
+            &content,
+            &source.options,
+            base_dir,
+        )?;
+        let mut rewritten = match per_source_renamings.get(&source.id) {
+            Some(renamings) if !renamings.is_empty() => {
+                apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
+            }
+            _ => raw_ctxdsl,
+        };
+        if let (Some(rm_renamings), "sv-rtl") =
+            (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+            && !rm_renamings.is_empty()
+        {
+            rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+        }
+        source_ctxdsls.push(SourceCtxdsl {
+            source_id: source.id.clone(),
+            ctxdsl: rewritten,
+        });
+        source_summaries.push(SourceSummary {
+            id: source.id.clone(),
+            adapter: source.adapter.clone(),
+            automaton: None,
+        });
+    }
+
+    // 4. CompositionSpec.
+    let composition = CompositionSpec {
+        semantics: config.composition.semantics.clone(),
+        members: config.composition.members.clone(),
+        name: config.composition_name(),
+    };
+
+    // 5. NO property resolution — the whole point of inspection is to
+    //    let the user discover what they CAN write in a property
+    //    before authoring it.
+    let resolved_properties: Vec<ResolvedProperty> = Vec::new();
+
+    // 6. Assemble.
+    let assembled = assemble_unified_ctxdsl(
+        &config.project.name,
+        &source_ctxdsls,
+        &composition,
+        &resolved_properties,
+        &AutomatonDiscovery::FirstAutomaton,
+    )
+    .map_err(VerifyError::Assemble)?;
+    let resolved_members =
+        derive_resolved_member_names(&source_ctxdsls, &config.composition.members);
+    for s in &mut source_summaries {
+        s.automaton = resolved_members.get(&s.id).cloned();
+    }
+    let composition_info = CompositionInfo {
+        semantics: composition.semantics.clone(),
+        name: composition.name.clone(),
+        members: composition
+            .members
+            .iter()
+            .filter_map(|id| resolved_members.get(id).cloned())
+            .collect(),
+    };
+
+    // 7. Parse + realize.
+    let (main_text, props_text) = split_main_and_props(&assembled);
+    let main_doc = crate::context_dsl::parse(&main_text).map_err(|e| {
+        VerifyError::AssembledCtxdslParseFailed {
+            message: format!("{e:?}"),
+            snippet: snippet_around_error(&main_text, &format!("{e:?}")),
+        }
+    })?;
+    let sidecar_docs = if let Some(props) = props_text.as_deref() {
+        let sidecar = crate::context_dsl::parse(props).map_err(|e| {
+            VerifyError::AssembledCtxdslParseFailed {
+                message: format!("{e:?}"),
+                snippet: snippet_around_error(props, &format!("{e:?}")),
+            }
+        })?;
+        vec![sidecar]
+    } else {
+        Vec::new()
+    };
+    let realized = crate::context_dsl::realize_context(&main_doc, &sidecar_docs).map_err(|e| {
+        VerifyError::RealizeFailed {
+            message: format!("{e:?}"),
+        }
+    })?;
+
+    // 8. Build the introspection report.
+    let source_by_automaton: BTreeMap<String, String> = resolved_members
+        .iter()
+        .map(|(src, aut)| (aut.clone(), src.clone()))
+        .collect();
+    let mut automata_inspections: Vec<AutomatonInspection> = Vec::new();
+    for clts_name in realized.context.clts_names() {
+        if let Some(clts) = realized.context.clts(&clts_name) {
+            let mut alphabet = clts.alphabet();
+            alphabet.sort();
+            let states: Vec<String> = clts
+                .states()
+                .filter_map(|sid| clts.state_name(sid).map(String::from))
+                .collect();
+            let initial_states: Vec<String> = clts
+                .initial_states()
+                .iter()
+                .filter_map(|sid| clts.state_name(*sid).map(String::from))
+                .collect();
+            automata_inspections.push(AutomatonInspection {
+                name: clts_name.clone(),
+                source_id: source_by_automaton.get(&clts_name).cloned(),
+                alphabet,
+                states,
+                initial_states,
+            });
+        }
+    }
+
+    let composition_alphabet: Vec<String> = {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for a in &automata_inspections {
+            for lab in &a.alphabet {
+                seen.insert(lab.clone());
+            }
+        }
+        seen.into_iter().collect()
+    };
+    let composition_states: Vec<String> = realized
+        .context
+        .clts(&composition_info.name)
+        .map(|c| {
+            c.states()
+                .filter_map(|sid| c.state_name(sid).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let predicate_names: Vec<String> = realized
+        .predicates
+        .values()
+        .flat_map(|preds| preds.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    Ok(InspectionReport {
+        project: config.project.name.clone(),
+        sources: source_summaries,
+        automata: automata_inspections,
+        composition: CompositionInspection {
+            info: composition_info,
+            alphabet: composition_alphabet,
+            state_names: composition_states,
+            predicate_names,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Adapter dispatch
 // ---------------------------------------------------------------------------
 
@@ -793,6 +1051,52 @@ formula = "true"
 over = "System"
 "#;
         VerifyConfig::from_toml(toml_src).unwrap()
+    }
+
+    #[test]
+    fn inspect_project_reports_alphabet_states_and_predicates() {
+        let temp = tempdir().unwrap();
+        let config = build_two_source_config(temp.path());
+        let inspection = inspect_project(&config, temp.path()).expect("inspection succeeded");
+        assert_eq!(inspection.project, "Demo");
+        assert_eq!(inspection.composition.info.name, "System");
+        // Every source's automaton is in the per-automaton list, plus
+        // the composed automaton itself.
+        let names: Vec<_> = inspection
+            .automata
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert!(names.contains(&"Light"));
+        assert!(names.contains(&"Gate"));
+        // Composition alphabet is the union of every member's alphabet.
+        // Light fires `tick_light`; Gate fires `tick_gate`.
+        assert!(
+            inspection
+                .composition
+                .alphabet
+                .iter()
+                .any(|l| l == "tick_light")
+        );
+        assert!(
+            inspection
+                .composition
+                .alphabet
+                .iter()
+                .any(|l| l == "tick_gate")
+        );
+    }
+
+    #[test]
+    fn inspect_project_runs_even_when_no_properties_declared() {
+        // Sanity: `inspect_project` deliberately ignores `[[properties]]`
+        // and never evaluates a formula. A config that would normally
+        // declare properties should still inspect cleanly.
+        let temp = tempdir().unwrap();
+        let mut config = build_two_source_config(temp.path());
+        config.properties.clear();
+        let inspection = inspect_project(&config, temp.path()).expect("inspection succeeded");
+        assert!(!inspection.automata.is_empty());
     }
 
     #[test]
