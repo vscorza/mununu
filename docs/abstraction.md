@@ -39,7 +39,7 @@ Use this doc when:
 This holds for:
 
 - **Firmware drivers** — `c-codesign` adapter. The register-map sidecar carries the structural information (which signals are MMIO, what their direction is).
-- **Restricted microprograms** — a planned `microcode` adapter (see `docs/adapters/microcode.md` when shipped). The `regs` / `mem` / `interrupts` declarations carry the structural information.
+- **Restricted microprograms** — shipped via the [`microcode` adapter](../crates/mununu-core/src/adapter/microcode/) (plan Part 5 + Part 5.5). JSON input; `regs` / `mem` / `interrupts` declarations carry the structural information; ops emit canonical rendezvous labels (`wr_mem_<region>`, `rd_mem_<region>`, `fence_<order>`, `irq_ack_<source>`). See `examples/verify/rv5_2core_mesi_microcode_extracted/` (parity) and `examples/verify/dma_engine_microcode/` (industrial DMA demo).
 - **Word-level arithmetic inside firmware / microcode** — subsumed by the host adapter's register-abstraction infrastructure; no separate extraction path.
 - **Shared memory regions referenced by tracked addresses** — a chaotic-stub generator parameterised by an address list is mechanical.
 
@@ -62,7 +62,7 @@ For each concrete subsystem class, the **minimum** abstraction that keeps the mo
 - **Concrete content.** Arbitrary integer operations on register-resident values.
 - **What to abstract.** Treat each operand as the abstraction class of its source register. Operations have no observable label — they update the abstract value of the destination register. Track status flags (carry / overflow / zero) only when a property reads them.
 - **Primitive.** `AbstractionType::Symbols` for register values. Operations are subsumed by the host source's transition function.
-- **Automated extraction?** Yes via `c-codesign` (LLVM SSA collapses arithmetic). Yes via the planned `microcode` adapter (no transitions emitted for pure computation).
+- **Automated extraction?** Yes via `c-codesign` (LLVM SSA collapses arithmetic). Yes via the [`microcode` adapter](../crates/mununu-core/src/adapter/microcode/) (no transitions emitted for pure computation; explicit `regs` / `mem` declarations + sharing tags drive the alphabet).
 - **Soundness.** Sound iff property does not distinguish values within the same symbol class.
 
 ### Memory (general-address, multi-GB)

@@ -45,6 +45,7 @@ pub mod emit;
 pub mod extraction;
 pub mod ir;
 pub mod langgraph;
+pub mod microcode;
 pub mod promela;
 pub mod sidecar;
 pub mod state_enum;
@@ -311,6 +312,9 @@ pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str
     if stem.ends_with(".langgraph") {
         return Some("langgraph");
     }
+    if stem.ends_with(".microcode") {
+        return Some("microcode");
+    }
 
     match path.extension().and_then(|e| e.to_str()) {
         Some("tlsf") => Some("tlsf"),
@@ -320,6 +324,7 @@ pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str
         Some("xstate") => Some("xstate"),
         Some("crewai") => Some("crewai"),
         Some("langgraph") => Some("langgraph"),
+        Some("microcode") => Some("microcode"),
         Some("sv") | Some("v") => Some("systemverilog"),
         _ => None,
     }
@@ -353,6 +358,12 @@ pub fn auto_translate(
     }
     if langgraph::LangGraphAdapter::detect(content) {
         return langgraph::LangGraphAdapter::translate(content, options);
+    }
+    // Microcode after LangGraph — microcode's `steps` array plus
+    // `regs`/`mem`/`interrupts` resource declarations make it
+    // unambiguous against LangGraph's `nodes` + `edges` shape.
+    if microcode::MicrocodeAdapter::detect(content) {
+        return microcode::MicrocodeAdapter::translate(content, options);
     }
     if systemverilog::SystemVerilogAdapter::detect(content) {
         return systemverilog::SystemVerilogAdapter::translate(content, options);

@@ -436,11 +436,14 @@ pub async fn context_import_handler(
         "langgraph" => {
             crate::adapter::langgraph::LangGraphAdapter::translate(&request.content, &options)
         }
+        "microcode" => {
+            crate::adapter::microcode::MicrocodeAdapter::translate(&request.content, &options)
+        }
         "auto" | "" => crate::adapter::auto_translate(&request.content, &options),
         other => {
             return Err(ApiError::BadRequest {
                 message: format!(
-                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, crewai, langgraph"
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, crewai, langgraph, microcode"
                 ),
                 details: None,
             });

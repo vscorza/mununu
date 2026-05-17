@@ -613,6 +613,16 @@ fn dispatch_adapter(
                     message: err.to_string(),
                 })
         }
+        "microcode" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::microcode::MicrocodeAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
         "extraction" => {
             let mode = options
                 .get("mode")

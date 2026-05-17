@@ -1,0 +1,69 @@
+// l1_cache_core0.ctxdsl — per-core L1 cache for core_0, MESI states
+// for the single tracked cache line containing address X.
+//
+// Per the abstraction recipe (docs/abstraction.md): cache memory
+// content is not tracked, only the MESI state of the tracked line.
+// 4 states (I / S / E / M) per cache, 4×4 = 16 cache-state
+// combinations under composition.
+//
+// Bus transactions are rendezvous labels — every cache + memory
+// automaton declares every bus label in its alphabet and either
+// transitions or self-loops, so the asynchronous composition
+// propagates the transaction to all participants. Per Doc C §C.5,
+// asynchronous composition is the right shape: the bus arbitrates
+// non-deterministically; synchronous one-step rendezvous would
+// over-constrain the silicon.
+//
+// State naming uses the Core0_ prefix so composed-state predicates
+// stay unambiguous against Core1_*, MP_*, and Mem_*.
+
+// Per peripheral_protocol.ctxdsl convention: the rendezvous labels
+// are declared once by the microprogram source (which also marks
+// them controllable). The cache transitions reference them
+// implicitly — CTXDSL accepts label references as long as the label
+// is declared somewhere in the realized context.
+
+context L1Core0 {
+    automata {
+        automaton L1Core0 {
+            states {
+                state Core0_I initial;
+                state Core0_S;
+                state Core0_E;
+                state Core0_M;
+            }
+
+            transitions {
+                // Local read: I -> E (fetched exclusive); E/S/M stay where they are
+                transition Core0_I -> Core0_E on label rd_mem_x_core_0;
+                transition Core0_S -> Core0_S on label rd_mem_x_core_0;
+                transition Core0_E -> Core0_E on label rd_mem_x_core_0;
+                transition Core0_M -> Core0_M on label rd_mem_x_core_0;
+
+                // Local write: any state -> M (issues bus_invalidate as part of the same xact)
+                transition Core0_I -> Core0_M on label wr_mem_x_core_0;
+                transition Core0_S -> Core0_M on label wr_mem_x_core_0;
+                transition Core0_E -> Core0_M on label wr_mem_x_core_0;
+                transition Core0_M -> Core0_M on label wr_mem_x_core_0;
+
+                // Snoop: core_1 writes -> invalidate this line (write-back if M, implicit)
+                transition Core0_I -> Core0_I on label wr_mem_x_core_1;
+                transition Core0_S -> Core0_I on label wr_mem_x_core_1;
+                transition Core0_E -> Core0_I on label wr_mem_x_core_1;
+                transition Core0_M -> Core0_I on label wr_mem_x_core_1;
+
+                // Snoop: core_1 reads -> downgrade to S (write-back if M, implicit)
+                transition Core0_I -> Core0_I on label rd_mem_x_core_1;
+                transition Core0_S -> Core0_S on label rd_mem_x_core_1;
+                transition Core0_E -> Core0_S on label rd_mem_x_core_1;
+                transition Core0_M -> Core0_S on label rd_mem_x_core_1;
+
+                // Fence — cache state unchanged but the label propagates.
+                transition Core0_I -> Core0_I on label fence_rw;
+                transition Core0_S -> Core0_S on label fence_rw;
+                transition Core0_E -> Core0_E on label fence_rw;
+                transition Core0_M -> Core0_M on label fence_rw;
+            }
+        }
+    }
+}

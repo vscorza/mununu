@@ -17,10 +17,15 @@ Mununu can import specifications from external formats and export synthesized co
 | **SystemVerilog** (hand-written parser) | `.sv`, `.v` | Yes | Yes | Explicit automaton |
 | **SystemVerilog via Yosys** | `.sv`, `.v` (with `--adapter sv-yosys`) | Yes | No | Explicit automaton |
 | **Extraction Spec** | `.espec.json` | Yes | No | Explicit automaton |
+| **CrewAI** | `.crewai.json` | Yes | No | Explicit automaton (per-agent + sequential supervisor + asynchronous composition) |
+| **LangGraph** | `.langgraph.json` | Yes | No | Explicit automaton (nodes → states, edges → `node_<from>_enter` transitions) |
+| **Microcode** | `.microcode.json` | Yes | No | Explicit automaton (steps → states, ops → labelled transitions) |
 
 > The **Extraction Spec** adapter handles `.espec.json` files from the extraction pipeline (source code analysis). Properties can use `template_ref` to reference [Property Templates](Property-Templates) instead of raw mu-calculus formulas.
 >
-> **Agentic orchestration** (CrewAI, LangGraph, A2A) does not have a dedicated native adapter today. Models for these frameworks are authored either as native CTXDSL (`examples/agentic/*.ctxdsl`) or as XState JSON (`examples/agentic/*.xstate.json`) consumed by the XState adapter. See [Agentic Orchestration](Agentic-Orchestration) for patterns and examples.
+> The **CrewAI** and **LangGraph** adapters consume each framework's canonical JSON serialisation. See [Agentic Adapters](Agentic-Adapters) for the per-adapter semantics and `examples/verify/crewai_handoff/` and `examples/verify/langgraph_workflow/` for end-to-end fixtures.
+>
+> The **Microcode** adapter consumes a restricted JSON form documented under [Verify Project Flow](Verify-Project-Flow) (plan Part 5 + Part 5.5). One side-effect per step, explicit sequencing, resources declared up front, fences first-class, sharing tags on memory regions. See `examples/verify/rv5_2core_mesi_microcode_extracted/` (parity fixture) and `examples/verify/dma_engine_microcode/` (industrial DMA-engine demo).
 
 ## Pipeline
 

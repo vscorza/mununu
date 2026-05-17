@@ -118,6 +118,7 @@ pub struct SourceSection {
     /// `"sv-rtl"` (custom-SV / yosys frontend), `"ctxdsl"` (raw
     /// hand-authored automaton), `"xstate"`, `"crewai"` (CrewAI
     /// agentic JSON), `"langgraph"` (LangGraph StateGraph JSON),
+    /// `"microcode"` (restricted JSON microcode form — plan Part 5.5),
     /// `"extraction"`, `"tlsf"`, `"aiger"`, `"btor2"`, `"promela"`.
     pub adapter: String,
     /// Source files to feed the adapter. Order is significant for

@@ -1,0 +1,40 @@
+// memory.ctxdsl — minimal memory model for the DMA-engine demo.
+//
+// Tracks two memory regions: a descriptor region (read-only from the
+// DMA's perspective — the host writes it) and a payload region (written
+// by the DMA). Per the abstraction recipe (docs/abstraction.md), only
+// the existence of writes / reads is tracked — actual data values are
+// abstracted away.
+
+context DMAMemory {
+    automata {
+        automaton DMAMemory {
+            states {
+                state Mem_Initial initial;
+                state Mem_DescriptorPresent;
+                state Mem_PayloadWritten;
+            }
+            transitions {
+                // Descriptor read — moves to "descriptor present"
+                // (the host has staged a descriptor and the DMA has
+                // observed it).
+                transition Mem_Initial -> Mem_DescriptorPresent on label rd_mem_descriptor;
+                transition Mem_DescriptorPresent -> Mem_DescriptorPresent on label rd_mem_descriptor;
+                transition Mem_PayloadWritten -> Mem_PayloadWritten on label rd_mem_descriptor;
+
+                // Payload write — commits the DMA transfer.
+                transition Mem_DescriptorPresent -> Mem_PayloadWritten on label wr_mem_payload;
+                transition Mem_PayloadWritten -> Mem_PayloadWritten on label wr_mem_payload;
+                // Allow the DMA to write before reading descriptor — over-
+                // approximation; the property catches the ordering.
+                transition Mem_Initial -> Mem_PayloadWritten on label wr_mem_payload;
+
+                // Fence — global barrier; memory state unchanged but
+                // the label propagates to the composition.
+                transition Mem_Initial -> Mem_Initial on label fence_rw;
+                transition Mem_DescriptorPresent -> Mem_DescriptorPresent on label fence_rw;
+                transition Mem_PayloadWritten -> Mem_PayloadWritten on label fence_rw;
+            }
+        }
+    }
+}

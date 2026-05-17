@@ -1,0 +1,27 @@
+// irq_controller.ctxdsl — minimal interrupt-controller stub.
+//
+// Two states: IRQ_Pending and IRQ_Cleared. The irq_ack_dma_done label
+// (rendezvous with the DMA microcode's irq_ack op) clears the pending
+// bit. Lets the verify property check "every issued irq_ack pairs with
+// a clear" — the safety-equivalent of "no interrupt lost". For a real
+// PLIC, replicate this per source and arbitrate; the shape stays the
+// same.
+
+context DMAIrqController {
+    automata {
+        automaton DMAIrqController {
+            states {
+                state IRQ_Cleared initial;
+                state IRQ_Pending;
+            }
+            transitions {
+                // The hardware (environment) raises the interrupt
+                // before the DMA acks. Modelled as a self-loop +
+                // edge: Cleared → Pending on the same ack label so
+                // the composition can advance.
+                transition IRQ_Pending -> IRQ_Cleared on label irq_ack_dma_done;
+                transition IRQ_Cleared -> IRQ_Cleared on label irq_ack_dma_done;
+            }
+        }
+    }
+}

@@ -1,0 +1,61 @@
+{
+  "name": "DMAChannel",
+  "description": "Minimal DMA-engine microcode: idle → read descriptor → write payload → fence → signal completion → ack interrupt. The industrial-impactful pattern named in plan Part 5.5 — every SoC DMA engine has this shape, and the safety properties (no-lost-update, bounded-handoff, completion-eventually) translate directly across all of them.",
+  "regs": {
+    "desc_ptr": { "width": 64 },
+    "payload_addr": { "width": 64 },
+    "payload_len": { "width": 32 },
+    "status": { "width": 8 }
+  },
+  "mem": {
+    "descriptor": { "kind": "shared", "attr": "device" },
+    "payload": { "kind": "shared", "attr": "cacheable" }
+  },
+  "interrupts": {
+    "dma_done": { "maskable": true }
+  },
+  "steps": [
+    {
+      "id": "DMA_Idle",
+      "ops": [
+        { "op": "write_reg", "reg": "desc_ptr", "value": "0x1000" }
+      ],
+      "next": "DMA_FetchDescriptor"
+    },
+    {
+      "id": "DMA_FetchDescriptor",
+      "ops": [
+        { "op": "read_mem", "region": "descriptor", "into_reg": "payload_addr" }
+      ],
+      "next": "DMA_WritePayload"
+    },
+    {
+      "id": "DMA_WritePayload",
+      "ops": [
+        { "op": "write_mem", "region": "payload", "source_reg": "payload_len" }
+      ],
+      "next": "DMA_FlushBuffer"
+    },
+    {
+      "id": "DMA_FlushBuffer",
+      "ops": [
+        { "op": "fence", "order": "rw" }
+      ],
+      "next": "DMA_SignalCompletion"
+    },
+    {
+      "id": "DMA_SignalCompletion",
+      "ops": [
+        { "op": "write_reg", "reg": "status", "value": "DONE" }
+      ],
+      "next": "DMA_AckInterrupt"
+    },
+    {
+      "id": "DMA_AckInterrupt",
+      "ops": [
+        { "op": "irq_ack", "source": "dma_done" }
+      ],
+      "next": "DMA_Idle"
+    }
+  ]
+}

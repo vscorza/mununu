@@ -2293,6 +2293,48 @@ fn load_with_adapter_mode(
             );
             output.ctxdsl
         }
+        Some("microcode") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::microcode::MicrocodeAdapter::translate(&source, &options)
+                .map_err(|e| format!("Microcode adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated Microcode: {} states, {} properties",
+                output.source_info.state_count, output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("crewai") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::crewai::CrewaiAdapter::translate(&source, &options)
+                .map_err(|e| format!("CrewAI adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated CrewAI: {} states, {} properties",
+                output.source_info.state_count, output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("langgraph") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::langgraph::LangGraphAdapter::translate(&source, &options)
+                .map_err(|e| format!("LangGraph adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated LangGraph: {} states, {} properties",
+                output.source_info.state_count, output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
         Some("auto") => {
             let options = mununu::adapter::AdapterOptions {
                 mode: mode.map(|s| s.to_string()),
@@ -2314,7 +2356,7 @@ fn load_with_adapter_mode(
         }
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, crewai, langgraph, microcode, auto"
             ));
         }
         None => {

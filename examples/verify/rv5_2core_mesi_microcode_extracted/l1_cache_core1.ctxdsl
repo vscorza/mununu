@@ -1,0 +1,49 @@
+// l1_cache_core1.ctxdsl — per-core L1 cache for core_1, mirror image
+// of l1_cache_core0.ctxdsl with the per-core labels swapped.
+//
+// See l1_cache_core0.ctxdsl for the MESI transition rationale.
+
+context L1Core1 {
+    automata {
+        automaton L1Core1 {
+            states {
+                state Core1_I initial;
+                state Core1_S;
+                state Core1_E;
+                state Core1_M;
+            }
+
+            transitions {
+                // Local read: I -> E; others stay
+                transition Core1_I -> Core1_E on label rd_mem_x_core_1;
+                transition Core1_S -> Core1_S on label rd_mem_x_core_1;
+                transition Core1_E -> Core1_E on label rd_mem_x_core_1;
+                transition Core1_M -> Core1_M on label rd_mem_x_core_1;
+
+                // Local write: any -> M
+                transition Core1_I -> Core1_M on label wr_mem_x_core_1;
+                transition Core1_S -> Core1_M on label wr_mem_x_core_1;
+                transition Core1_E -> Core1_M on label wr_mem_x_core_1;
+                transition Core1_M -> Core1_M on label wr_mem_x_core_1;
+
+                // Snoop: core_0 writes -> invalidate
+                transition Core1_I -> Core1_I on label wr_mem_x_core_0;
+                transition Core1_S -> Core1_I on label wr_mem_x_core_0;
+                transition Core1_E -> Core1_I on label wr_mem_x_core_0;
+                transition Core1_M -> Core1_I on label wr_mem_x_core_0;
+
+                // Snoop: core_0 reads -> downgrade
+                transition Core1_I -> Core1_I on label rd_mem_x_core_0;
+                transition Core1_S -> Core1_S on label rd_mem_x_core_0;
+                transition Core1_E -> Core1_S on label rd_mem_x_core_0;
+                transition Core1_M -> Core1_S on label rd_mem_x_core_0;
+
+                // Fence
+                transition Core1_I -> Core1_I on label fence_rw;
+                transition Core1_S -> Core1_S on label fence_rw;
+                transition Core1_E -> Core1_E on label fence_rw;
+                transition Core1_M -> Core1_M on label fence_rw;
+            }
+        }
+    }
+}
