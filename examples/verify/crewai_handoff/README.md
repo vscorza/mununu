@@ -15,19 +15,19 @@ supervisor, all composed asynchronously per
 - **Native CrewAI dispatch.** `[[sources]] adapter = "crewai"` — no
   manual rewrite into XState. The adapter handles the `agents`, `tasks`,
   `process = "sequential"` shape directly.
-- **First-automaton-per-source composition.** The orchestrator's
-  `[composition].members = ["crew"]` resolves to `Agent_Researcher`
-  (the first automaton emitted by the source). The CrewAI source's
-  full internal composition (with all three automata) is preserved
-  verbatim inside the assembled CTXDSL; full multi-automaton-per-source
-  composition is queued as an orchestrator follow-up.
-- **Agentic property templates in action.** Both properties target
-  `Agent_Researcher` directly via the `ResearcherSlice` composition:
-  - `no_deadlock` — every reachable agent state has a successor (the
-    `Done -> Idle` cycle keeps the agent live).
-  - `bounded_handoff(HANDOFF_TRIGGERED = Executing, HANDOFF_COMPLETE
-    = Done)` — once in `Executing`, `Done` is always reachable. Maps
-    directly to the agentic-domain template added in A3.3.
+- **Multi-automaton-per-source composition via wildcard.**
+  `[composition].members = ["crew.*"]` expands to every automaton
+  emitted by the CrewAI source: `Agent_Researcher`, `Agent_Writer`,
+  and the sequential `ResearchAndWriteSupervisor`. The composition
+  reports `members = [Agent_Researcher, Agent_Writer,
+  ResearchAndWriteSupervisor]`. Plan Part 6 item 4.
+- **Per-automaton properties via the `over` field.** Each property
+  targets a specific emitted automaton — the agent-level `reachable`
+  liveness checks run against `Agent_Researcher` and `Agent_Writer`
+  independently; the pipeline-completion check runs against the
+  supervisor. The CrewAI source's internal asynchronous composition
+  is also preserved verbatim in the assembled CTXDSL for future
+  composed-state property authoring.
 
 ## Files
 

@@ -449,7 +449,11 @@ impl VerifyConfig {
             issues.push(ConfigIssue::CompositionNoMembers);
         }
         for m in &self.composition.members {
-            if !seen_source_ids.contains(m) {
+            // Wildcard expansion: `<src>.*` resolves to every automaton
+            // emitted by `<src>`. The validator only enforces source
+            // existence; the assembler does the expansion.
+            let bare = m.strip_suffix(".*").unwrap_or(m.as_str());
+            if !seen_source_ids.contains(bare) {
                 issues.push(ConfigIssue::CompositionUnknownMember { id: m.clone() });
             }
         }

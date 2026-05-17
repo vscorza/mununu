@@ -182,24 +182,51 @@ pub fn assemble_unified_ctxdsl(
     properties: &[ResolvedProperty],
     discovery: &AutomatonDiscovery,
 ) -> Result<String, AssembleError> {
-    // Pull each source's inner body and the first-automaton hint we
-    // need for member-name resolution.
+    // Pull each source's inner body, plus the first-automaton hint
+    // and the full list of automata-per-source for the `<src>.*`
+    // wildcard syntax.
     let mut bodies: Vec<&str> = Vec::with_capacity(sources.len());
     let mut first_automaton_by_source: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut all_automata_by_source: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for s in sources {
         let body =
             extract_context_body(&s.ctxdsl).ok_or_else(|| AssembleError::NoContextBlock {
                 source_id: s.source_id.clone(),
             })?;
-        if let Some(name) = first_automaton_name(body) {
+        let all = all_automaton_names(body);
+        if let Some(name) = all.first() {
             first_automaton_by_source.insert(s.source_id.as_str(), name);
         }
+        all_automata_by_source.insert(s.source_id.as_str(), all);
         bodies.push(body);
     }
 
-    // Resolve composition members → automaton names.
+    // Resolve composition members → automaton names. Supports the
+    // `<source_id>.*` wildcard form: a single member entry expands
+    // to one composition member per automaton the source emits. Bare
+    // member entries keep the legacy single-automaton behaviour.
     let mut resolved_members: Vec<String> = Vec::with_capacity(composition.members.len());
     for m in &composition.members {
+        if let Some(src_id) = m.strip_suffix(".*") {
+            if !sources.iter().any(|s| s.source_id == src_id) {
+                return Err(AssembleError::UnknownMember {
+                    id: src_id.to_string(),
+                });
+            }
+            let names = all_automata_by_source
+                .get(src_id)
+                .cloned()
+                .unwrap_or_default();
+            if names.is_empty() {
+                return Err(AssembleError::NoAutomatonFound {
+                    source_id: src_id.to_string(),
+                });
+            }
+            for n in names {
+                resolved_members.push(n.to_string());
+            }
+            continue;
+        }
         // Source must exist.
         if !sources.iter().any(|s| s.source_id == *m) {
             return Err(AssembleError::UnknownMember { id: m.clone() });
@@ -329,20 +356,59 @@ fn matching_close_brace(text: &str, open_at: usize) -> Option<usize> {
 }
 
 /// Scan a context body for the first `automaton <name> { ... }`
-/// declaration and return `<name>`.
+/// declaration and return `<name>`. Kept for tests and external
+/// callers; assembly itself uses [`all_automaton_names`] directly so
+/// the wildcard expansion sees the full list.
+#[allow(dead_code)]
 fn first_automaton_name(body: &str) -> Option<&str> {
-    let kw = body.find("automaton")?;
-    let after_kw = &body[kw + "automaton".len()..];
-    // Skip whitespace.
-    let trimmed = after_kw.trim_start();
-    // The next token is the name — identifier chars only.
-    let name_end = trimmed
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(trimmed.len());
-    if name_end == 0 {
-        return None;
+    all_automaton_names(body).into_iter().next()
+}
+
+/// Scan a context body for **every** `automaton <name> { ... }`
+/// declaration and return the names in declaration order. Used by
+/// the `<source_id>.*` wildcard composition-member syntax: a single
+/// `members = ["crew.*"]` entry expands to one composition member per
+/// automaton the source emits.
+///
+/// Matches the keyword `automaton` followed by whitespace + an
+/// identifier. Does not look inside string literals or comments — the
+/// CTXDSL grammar's lexical rules make this safe in practice; if a
+/// false positive ever bites we'll tighten the scan.
+pub(crate) fn all_automaton_names(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = body[cursor..].find("automaton") {
+        let kw = cursor + rel;
+        let prev_ok = kw == 0
+            || body
+                .as_bytes()
+                .get(kw - 1)
+                .is_some_and(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        let after_kw = &body[kw + "automaton".len()..];
+        cursor = kw + "automaton".len();
+        if !prev_ok {
+            continue;
+        }
+        // The next non-whitespace char must start an identifier.
+        let trimmed = after_kw.trim_start();
+        let name_end = trimmed
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(trimmed.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = &trimmed[..name_end];
+        // De-dupe; also skip the `automata { ... }` block keyword
+        // (handled by the prev_ok guard above — `automata` is a
+        // longer match that contains `automaton` as a prefix only
+        // when the source contains a literal substring; the body
+        // never does in practice).
+        if !out.contains(&name) {
+            out.push(name);
+        }
+        cursor += name_end;
     }
-    Some(&trimmed[..name_end])
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +469,75 @@ mod tests {
     fn first_automaton_name_finds_identifier_after_keyword() {
         let body = "automata { automaton Toaster { states {} } }";
         assert_eq!(first_automaton_name(body), Some("Toaster"));
+    }
+
+    #[test]
+    fn all_automaton_names_returns_every_declaration_in_order() {
+        let body = "
+            automata {
+                automaton Agent_Researcher { states {} }
+                automaton Agent_Writer { states {} }
+                automaton Supervisor { states {} }
+            }
+        ";
+        assert_eq!(
+            all_automaton_names(body),
+            vec!["Agent_Researcher", "Agent_Writer", "Supervisor"]
+        );
+    }
+
+    #[test]
+    fn all_automaton_names_skips_keyword_prefix_collisions() {
+        // The `automata { … }` block keyword is a longer-prefix match
+        // — `automaton` is not the same as `automata`. Ensure the scan
+        // doesn't catch the `a` in `automata` and start hunting for
+        // an identifier inside the `{ … }` brace pair.
+        let body = "automata { automaton X { states {} } }";
+        assert_eq!(all_automaton_names(body), vec!["X"]);
+    }
+
+    #[test]
+    fn wildcard_member_expands_to_every_source_automaton() {
+        // Composing one source that emits three automata via the
+        // `<src>.*` wildcard form.
+        let s = source(
+            "crew",
+            "context Crew {
+                automata {
+                    automaton Agent_A { states { state s0 initial; } transitions {} }
+                    automaton Agent_B { states { state s0 initial; } transitions {} }
+                    automaton Supervisor { states { state s0 initial; } transitions {} }
+                }
+            }",
+        );
+        let comp = CompositionSpec {
+            semantics: "asynchronous".to_string(),
+            members: vec!["crew.*".to_string()],
+            name: "CrewSystem".to_string(),
+        };
+        let out = assemble_unified_ctxdsl(
+            "Demo",
+            &[s],
+            &comp,
+            &[],
+            &AutomatonDiscovery::FirstAutomaton,
+        )
+        .expect("wildcard assembly succeeded");
+        // All three automata land in the composition members list.
+        assert!(out.contains("members [Agent_A, Agent_B, Supervisor]"));
+    }
+
+    #[test]
+    fn wildcard_member_with_unknown_source_errors() {
+        let comp = CompositionSpec {
+            semantics: "asynchronous".to_string(),
+            members: vec!["ghost.*".to_string()],
+            name: "X".to_string(),
+        };
+        let err =
+            assemble_unified_ctxdsl("Demo", &[], &comp, &[], &AutomatonDiscovery::FirstAutomaton)
+                .unwrap_err();
+        assert!(matches!(err, AssembleError::UnknownMember { id } if id == "ghost"));
     }
 
     // --------------------------------------------------------------

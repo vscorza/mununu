@@ -28,8 +28,9 @@ strip_logs() {
     printf '# Regenerated via examples/verify/crewai_handoff/validate.sh\n'
     printf '#\n'
     printf '# Sequential 2-agent CrewAI crew; native `CrewaiAdapter` dispatch;\n'
-    printf '# direct alphabet binding; two properties over the first-emitted\n'
-    printf '# `Agent_Researcher` automaton (no_deadlock + bounded_handoff).\n\n'
+    printf '# direct alphabet binding; `crew.*` wildcard composition member\n'
+    printf '# (expands to all three emitted automata); per-automaton\n'
+    printf '# `reachable` properties.\n\n'
 
     printf '=== mununu verify (human-readable) ===\n'
     ./target/debug/mununu verify "$DIR/verify.toml" 2>&1 | strip_logs

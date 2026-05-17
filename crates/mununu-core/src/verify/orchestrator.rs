@@ -191,11 +191,20 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     // Backfill SourceSummary.automaton now that we know the
     // composition's resolved members (FirstAutomaton strategy reads
     // them from each source's CTXDSL — re-derive here for the
-    // report).
+    // report). `derive_resolved_member_names` returns the full
+    // expansion list per member entry so `<src>.*` wildcards land
+    // in `composition_info.members` correctly.
     let resolved_members =
         derive_resolved_member_names(&source_ctxdsls, &config.composition.members);
     for s in &mut source_summaries {
-        s.automaton = resolved_members.get(&s.id).cloned();
+        // SourceSummary.automaton holds the *primary* automaton of
+        // the source. For wildcard expansions (`<src>.*`) the user
+        // sees the first automaton; the full list lives in
+        // CompositionInfo.members.
+        s.automaton = resolved_members
+            .iter()
+            .find(|(k, _)| k.trim_end_matches(".*") == s.id)
+            .and_then(|(_, names)| names.first().cloned());
     }
     let composition_info = CompositionInfo {
         semantics: composition.semantics.clone(),
@@ -204,6 +213,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
             .members
             .iter()
             .filter_map(|id| resolved_members.get(id).cloned())
+            .flatten()
             .collect(),
     };
 
@@ -406,7 +416,10 @@ pub fn inspect_project(
     let resolved_members =
         derive_resolved_member_names(&source_ctxdsls, &config.composition.members);
     for s in &mut source_summaries {
-        s.automaton = resolved_members.get(&s.id).cloned();
+        s.automaton = resolved_members
+            .iter()
+            .find(|(k, _)| k.trim_end_matches(".*") == s.id)
+            .and_then(|(_, names)| names.first().cloned());
     }
     let composition_info = CompositionInfo {
         semantics: composition.semantics.clone(),
@@ -415,6 +428,7 @@ pub fn inspect_project(
             .members
             .iter()
             .filter_map(|id| resolved_members.get(id).cloned())
+            .flatten()
             .collect(),
     };
 
@@ -443,10 +457,15 @@ pub fn inspect_project(
         }
     })?;
 
-    // 8. Build the introspection report.
+    // 8. Build the introspection report. Map every emitted automaton
+    // back to its originating source. Wildcards (`<src>.*`) and bare
+    // entries both contribute multiple automaton-to-source mappings.
     let source_by_automaton: BTreeMap<String, String> = resolved_members
         .iter()
-        .map(|(src, aut)| (aut.clone(), src.clone()))
+        .flat_map(|(member_entry, names)| {
+            let src = member_entry.trim_end_matches(".*").to_string();
+            names.iter().map(move |n| (n.clone(), src.clone()))
+        })
         .collect();
     let mut automata_inspections: Vec<AutomatonInspection> = Vec::new();
     for clts_name in realized.context.clts_names() {
@@ -908,33 +927,45 @@ fn split_main_and_props(assembled: &str) -> (String, Option<String>) {
 /// Derive each composition member's resolved automaton name by
 /// running the same `FirstAutomaton` scan the assembler uses. Returns
 /// a `source_id → automaton_name` map.
+/// Resolve each `[composition].members` entry to its expanded list
+/// of automaton names. Supports the `<source_id>.*` wildcard form
+/// (one entry → every automaton the source emits) alongside the
+/// legacy bare-source-id form (one entry → the first automaton).
+///
+/// Returned map is keyed by the **member entry as written in the
+/// config** (so wildcards round-trip), with the value being the
+/// possibly-multiple resolved automaton names in declaration order.
 fn derive_resolved_member_names(
     sources: &[SourceCtxdsl],
     member_ids: &[String],
-) -> std::collections::BTreeMap<String, String> {
+) -> std::collections::BTreeMap<String, Vec<String>> {
     let mut out = std::collections::BTreeMap::new();
     for mid in member_ids {
-        if let Some(src) = sources.iter().find(|s| &s.source_id == mid)
-            && let Some(body) = extract_context_body(&src.ctxdsl)
-            && let Some(name) = scan_first_automaton(body)
-        {
-            out.insert(mid.clone(), name.to_string());
+        let (src_id, expand_all) = match mid.strip_suffix(".*") {
+            Some(id) => (id, true),
+            None => (mid.as_str(), false),
+        };
+        let Some(src) = sources.iter().find(|s| s.source_id == src_id) else {
+            continue;
+        };
+        let Some(body) = extract_context_body(&src.ctxdsl) else {
+            continue;
+        };
+        let names: Vec<String> = crate::verify::assemble::all_automaton_names(body)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if names.is_empty() {
+            continue;
         }
+        let value = if expand_all {
+            names
+        } else {
+            vec![names.into_iter().next().unwrap()]
+        };
+        out.insert(mid.clone(), value);
     }
     out
-}
-
-fn scan_first_automaton(body: &str) -> Option<&str> {
-    let kw = body.find("automaton")?;
-    let after = &body[kw + "automaton".len()..];
-    let trimmed = after.trim_start();
-    let end = trimmed
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(trimmed.len());
-    if end == 0 {
-        return None;
-    }
-    Some(&trimmed[..end])
 }
 
 /// Resolve the bundled `cmsis-stubs/` directory. Tries the
