@@ -1,0 +1,36 @@
+// memory.ctxdsl — shared memory model for the single tracked address X.
+//
+// Per the abstraction recipe (docs/abstraction.md): only tracked
+// addresses are modelled, and per-address state is a small symbol set.
+// Here: two states (Mem_Initial / Mem_Written). The transition fires
+// on whichever core's write reaches the bus.
+//
+// Reads and fences do not change memory state but the labels propagate
+// (rendezvous with the caches and the microprogram).
+
+context SharedMemory {
+    automata {
+        automaton SharedMemory {
+            states {
+                state Mem_Initial initial;
+                state Mem_Written;
+            }
+
+            transitions {
+                // Writes commit a new value to memory.
+                transition Mem_Initial -> Mem_Written on label xact_write_x_core0;
+                transition Mem_Initial -> Mem_Written on label xact_write_x_core1;
+                transition Mem_Written -> Mem_Written on label xact_write_x_core0;
+                transition Mem_Written -> Mem_Written on label xact_write_x_core1;
+
+                // Reads / fence: state unchanged but the label propagates.
+                transition Mem_Initial -> Mem_Initial on label xact_read_x_core0;
+                transition Mem_Initial -> Mem_Initial on label xact_read_x_core1;
+                transition Mem_Written -> Mem_Written on label xact_read_x_core0;
+                transition Mem_Written -> Mem_Written on label xact_read_x_core1;
+                transition Mem_Initial -> Mem_Initial on label fence_rw;
+                transition Mem_Written -> Mem_Written on label fence_rw;
+            }
+        }
+    }
+}
