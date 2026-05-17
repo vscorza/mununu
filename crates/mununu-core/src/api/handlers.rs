@@ -2157,6 +2157,57 @@ pub async fn codesign_reconcile_labels_handler(
     }
 }
 
+/// Request body for `POST /api/v1/codesign/emit-chaotic-stub`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CodesignEmitChaoticStubRequest {
+    /// Parsed register-map JSON sidecar.
+    pub register_map: crate::codesign::register_map::RegisterMap,
+    /// Optional override for the peripheral automaton name. Defaults
+    /// to the uppercased peripheral name from the sidecar. The
+    /// context-block name is always `<AutomatonName>ChaoticStub`.
+    #[serde(default)]
+    pub peripheral_automaton: Option<String>,
+    /// When true, refuse to emit and 400 if the register-map
+    /// validator reports any issue.
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// Response body — just the emitted CTXDSL text.
+#[derive(Debug, serde::Serialize)]
+pub struct CodesignEmitChaoticStubResponse {
+    /// The standalone CTXDSL document with its own `context { … }`
+    /// wrapper, ready to drop into a `verify.toml` as a `ctxdsl`
+    /// source.
+    pub ctxdsl: String,
+    /// Validation warnings surfaced by the register-map validator.
+    /// Empty when the sidecar is well-formed.
+    pub warnings: Vec<String>,
+}
+
+/// Emit a standalone chaotic-stub CTXDSL document from a register map.
+/// Mirrors `mununu codesign emit-chaotic-stub` (CLI).
+pub async fn codesign_emit_chaotic_stub_handler(
+    Json(request): Json<CodesignEmitChaoticStubRequest>,
+) -> ApiResult<Json<CodesignEmitChaoticStubResponse>> {
+    use crate::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
+
+    let issues = request.register_map.validate();
+    let warnings: Vec<String> = issues.iter().map(|i| i.to_string()).collect();
+    if request.strict && !warnings.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: format!("strict mode: {} register-map issue(s)", warnings.len()),
+            details: Some(warnings.join("; ")),
+        });
+    }
+    let opts = CouplingOptions {
+        peripheral_automaton: request.peripheral_automaton.as_deref(),
+        ..Default::default()
+    };
+    let ctxdsl = emit_chaotic_stub_ctxdsl(&request.register_map, &opts);
+    Ok(Json(CodesignEmitChaoticStubResponse { ctxdsl, warnings }))
+}
+
 #[cfg(test)]
 mod contract_handler_tests {
     use super::*;

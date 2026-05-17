@@ -252,6 +252,8 @@ struct ContractGapsArgs {
 enum CodesignCommand {
     /// Emit the coupling CTXDSL fragment for a register-map sidecar.
     Couple(CodesignCoupleArgs),
+    /// Emit a standalone chaotic-stub CTXDSL document from a register-map.
+    EmitChaoticStub(CodesignEmitChaoticStubArgs),
     /// Compose a register-map sidecar with a firmware CTXDSL and
     /// verify a property over the result.
     Verify(CodesignVerifyArgs),
@@ -283,6 +285,18 @@ struct CodesignReconcileLabelsArgs {
     /// Output format: `human` (default) or `json`.
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     format: String,
+}
+
+#[derive(Args, Debug)]
+struct CodesignEmitChaoticStubArgs {
+    #[arg(value_name = "REGISTER_MAP")]
+    register_map: PathBuf,
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
+    #[arg(long, value_name = "NAME")]
+    peripheral_automaton: Option<String>,
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -795,6 +809,7 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::EmitCmsisHeader(args) => codesign_emit_cmsis_header(args),
         CodesignCommand::Couple(args) => codesign_couple(args),
+        CodesignCommand::EmitChaoticStub(args) => codesign_emit_chaotic_stub(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
@@ -1127,6 +1142,42 @@ fn sanitize_filename_legacy(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn codesign_emit_chaotic_stub(args: CodesignEmitChaoticStubArgs) -> Result<(), String> {
+    use mununu::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
+    use mununu::codesign::register_map::RegisterMap;
+
+    let body = std::fs::read_to_string(&args.register_map)
+        .map_err(|e| format!("failed to read {}: {e}", args.register_map.display()))?;
+    let map: RegisterMap = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+
+    let issues = map.validate();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("warning: {issue}");
+        }
+        if args.strict {
+            return Err(format!(
+                "--strict: {} register-map issue(s) — refusing to proceed",
+                issues.len()
+            ));
+        }
+    }
+
+    let opts = CouplingOptions {
+        peripheral_automaton: args.peripheral_automaton.as_deref(),
+        ..Default::default()
+    };
+    let stub = emit_chaotic_stub_ctxdsl(&map, &opts);
+
+    match args.output {
+        Some(path) => std::fs::write(&path, &stub)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+        None => print!("{stub}"),
+    }
+    Ok(())
 }
 
 fn codesign_couple(args: CodesignCoupleArgs) -> Result<(), String> {

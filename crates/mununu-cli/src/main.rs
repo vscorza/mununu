@@ -236,6 +236,16 @@ enum CodesignCommand {
     /// `context <name> { … }` block alongside their firmware
     /// automaton.
     Couple(CodesignCoupleArgs),
+    /// Emit a standalone chaotic-stub CTXDSL document from a register-map
+    /// sidecar.
+    ///
+    /// Generates the one-state-self-loops form: a single `Chaotic`
+    /// state with self-loops on every rendezvous label derived from
+    /// the register map. The output is a complete CTXDSL document
+    /// (with its own `context { … }` wrapper) ready to reference as
+    /// a `ctxdsl` source from a `verify.toml`. Sound for safety,
+    /// optimistic for liveness (Doc C §C.5). See `docs/abstraction.md`.
+    EmitChaoticStub(CodesignEmitChaoticStubArgs),
     /// Compose a register-map sidecar with a firmware CTXDSL and
     /// verify a property over the result.
     ///
@@ -431,6 +441,25 @@ struct CodesignVerifyArgs {
     /// Emit the result as JSON to stdout.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args, Debug)]
+struct CodesignEmitChaoticStubArgs {
+    /// Path to the register-map JSON sidecar.
+    #[arg(value_name = "REGISTER_MAP")]
+    register_map: PathBuf,
+    /// Output path. Defaults to stdout when omitted.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Override the peripheral automaton name (default: uppercased
+    /// peripheral name from the sidecar). The context-block name is
+    /// always `<AutomatonName>ChaoticStub`.
+    #[arg(long, value_name = "NAME")]
+    peripheral_automaton: Option<String>,
+    /// Validate the register-map and exit non-zero if any issue is
+    /// reported, instead of just printing warnings.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1073,6 +1102,7 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::EmitCmsisHeader(args) => codesign_emit_cmsis_header(args),
         CodesignCommand::Couple(args) => codesign_couple(args),
+        CodesignCommand::EmitChaoticStub(args) => codesign_emit_chaotic_stub(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
@@ -1568,6 +1598,42 @@ fn codesign_verify(args: CodesignVerifyArgs) -> Result<(), String> {
         println!("    verdict: HOLDS");
     } else {
         println!("    verdict: VIOLATED at initial state(s)");
+    }
+    Ok(())
+}
+
+fn codesign_emit_chaotic_stub(args: CodesignEmitChaoticStubArgs) -> Result<(), String> {
+    use mununu_core::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
+    use mununu_core::codesign::register_map::RegisterMap;
+
+    let body = std::fs::read_to_string(&args.register_map)
+        .map_err(|e| format!("failed to read {}: {e}", args.register_map.display()))?;
+    let map: RegisterMap = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+
+    let issues = map.validate();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("warning: {issue}");
+        }
+        if args.strict {
+            return Err(format!(
+                "--strict: {} register-map issue(s) — refusing to proceed",
+                issues.len()
+            ));
+        }
+    }
+
+    let opts = CouplingOptions {
+        peripheral_automaton: args.peripheral_automaton.as_deref(),
+        ..Default::default()
+    };
+    let stub = emit_chaotic_stub_ctxdsl(&map, &opts);
+
+    match args.output {
+        Some(path) => std::fs::write(&path, &stub)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+        None => print!("{stub}"),
     }
     Ok(())
 }

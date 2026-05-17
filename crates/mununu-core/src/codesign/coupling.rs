@@ -467,6 +467,104 @@ pub fn emit_coupling_fragment(rm: &RegisterMap, options: &CouplingOptions<'_>) -
     buf
 }
 
+/// Emit a **standalone chaotic-stub CTXDSL document** from a register
+/// map.
+///
+/// This is the simplest possible peripheral model — a single `Chaotic`
+/// state with a self-loop on every rendezvous label derived from the
+/// register map. Over-approximates every concrete peripheral that
+/// honours the register-map alphabet: any sequence of reads / writes
+/// is admitted in any order with no internal protocol constraints.
+///
+/// **Soundness.** Per Doc C §C.5 and `docs/abstraction.md`'s "chaotic
+/// stub" entry, this over-approximation is **sound for safety** (any
+/// real silicon's reachable states are a subset of the stub's) and
+/// **optimistic for liveness** (the stub admits progress the real
+/// silicon may refuse). Use it as the first cut when authoring
+/// `verify.toml` against a peripheral whose internal protocol is not
+/// yet specified.
+///
+/// The returned string is a complete CTXDSL document with its own
+/// `context <Peripheral>ChaoticStub { … }` wrapper. It is ready to
+/// drop into `verify.toml` as a `ctxdsl` source. The unique state
+/// name is `Chaotic`; the automaton name is `<PERIPHERAL>` (uppercase
+/// sanitised). Both can be overridden via [`CouplingOptions`].
+///
+/// The emitted document does **not** include a `controllable { … }`
+/// block — the stub claims ownership of no label. Under composition,
+/// firmware (or microcode) must claim controllability of every write
+/// label it issues; the stub silently observes.
+pub fn emit_chaotic_stub_ctxdsl(rm: &RegisterMap, options: &CouplingOptions<'_>) -> String {
+    let automaton_name = options
+        .peripheral_automaton
+        .map(str::to_string)
+        .unwrap_or_else(|| sanitise_ident(&rm.peripheral).to_ascii_uppercase());
+    let context_name = format!("{automaton_name}ChaoticStub");
+
+    let labels = register_map_labels(rm);
+    let mut buf = String::new();
+
+    // ---------------- header banner --------------------------------
+    let _ = writeln!(
+        buf,
+        "// chaotic-stub CTXDSL emitted by `mununu codesign emit-chaotic-stub`."
+    );
+    let _ = writeln!(buf, "//");
+    let _ = writeln!(buf, "// Peripheral: {}", rm.peripheral);
+    let _ = writeln!(buf, "// Base address: {}", rm.base_address);
+    if let Some(uri) = &rm.contract_uri {
+        let _ = writeln!(buf, "// Contract URI: {uri}");
+    }
+    let _ = writeln!(
+        buf,
+        "// One-state-self-loops form: every rendezvous label is admitted"
+    );
+    let _ = writeln!(
+        buf,
+        "// at any time. Sound for safety, optimistic for liveness (Doc C §C.5)."
+    );
+    let _ = writeln!(buf);
+
+    // ---------------- context wrapper ------------------------------
+    let _ = writeln!(buf, "context {context_name} {{");
+    let _ = writeln!(buf, "    alphabet {{");
+    for l in &labels {
+        let location = match &l.field {
+            Some(f) => format!("{}.{}", l.register, f),
+            None => l.register.clone(),
+        };
+        let _ = writeln!(
+            buf,
+            "        label {};   // {} {}",
+            l.name,
+            l.kind.as_str(),
+            location,
+        );
+    }
+    let _ = writeln!(buf, "    }}");
+    let _ = writeln!(buf);
+
+    let _ = writeln!(buf, "    automata {{");
+    let _ = writeln!(buf, "        automaton {automaton_name} {{");
+    let _ = writeln!(buf, "            states {{");
+    let _ = writeln!(buf, "                state Chaotic initial;");
+    let _ = writeln!(buf, "            }}");
+    let _ = writeln!(buf, "            transitions {{");
+    for l in &labels {
+        let _ = writeln!(
+            buf,
+            "                transition Chaotic -> Chaotic on label {};",
+            l.name,
+        );
+    }
+    let _ = writeln!(buf, "            }}");
+    let _ = writeln!(buf, "        }}");
+    let _ = writeln!(buf, "    }}");
+    let _ = writeln!(buf, "}}");
+
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,5 +915,63 @@ mod tests {
             crate::context_dsl::ast::CompositionKind::Asynchronous
         ));
         assert_eq!(comp.members.len(), 2);
+    }
+
+    // ---- emit_chaotic_stub_ctxdsl --------------------------------
+
+    #[test]
+    fn chaotic_stub_emits_a_self_loop_per_label() {
+        let m = uart_map();
+        let stub = emit_chaotic_stub_ctxdsl(&m, &CouplingOptions::default());
+        let labels = register_map_labels(&m);
+        for l in &labels {
+            let needle = format!("transition Chaotic -> Chaotic on label {};", l.name);
+            assert!(
+                stub.contains(&needle),
+                "expected self-loop on `{}`, got:\n{}",
+                l.name,
+                stub
+            );
+        }
+    }
+
+    #[test]
+    fn chaotic_stub_is_a_complete_context_document() {
+        let m = uart_map();
+        let stub = emit_chaotic_stub_ctxdsl(&m, &CouplingOptions::default());
+        // The chaotic stub is a STANDALONE CTXDSL document — wraps in
+        // its own `context { … }` and parses on its own. The earlier
+        // `emit_peripheral_stub_ctxdsl` emits a fragment intended to
+        // be embedded inside another context; this one does not.
+        assert!(
+            stub.contains("context UART_LITEChaoticStub {"),
+            "expected `context UART_LITEChaoticStub {{`, got:\n{}",
+            stub
+        );
+        assert!(stub.contains("    alphabet {"));
+        assert!(stub.contains("    automata {"));
+        assert!(stub.contains("        automaton UART_LITE {"));
+        // No controllable block — the stub owns no labels.
+        assert!(!stub.contains("controllable {"));
+    }
+
+    #[test]
+    fn chaotic_stub_parses_as_a_standalone_document() {
+        let m = uart_map();
+        let stub = emit_chaotic_stub_ctxdsl(&m, &CouplingOptions::default());
+        let doc = crate::context_dsl::parser::parse(&stub);
+        assert!(doc.is_ok(), "chaotic stub failed to parse: {doc:?}");
+    }
+
+    #[test]
+    fn chaotic_stub_honours_overridden_automaton_name() {
+        let m = uart_map();
+        let opts = CouplingOptions {
+            peripheral_automaton: Some("MyStub"),
+            ..Default::default()
+        };
+        let stub = emit_chaotic_stub_ctxdsl(&m, &opts);
+        assert!(stub.contains("context MyStubChaoticStub {"));
+        assert!(stub.contains("        automaton MyStub {"));
     }
 }
