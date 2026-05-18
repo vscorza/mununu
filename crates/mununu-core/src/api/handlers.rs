@@ -2102,6 +2102,62 @@ pub async fn verify_project_handler(
 }
 
 // ============================================================================
+// Memory-check (B2b)
+// ============================================================================
+
+/// Request body for `POST /api/v1/verify/memory-check`.
+///
+/// Mirrors [`VerifyProjectRequest`] in shape — either `config` or
+/// `config_toml`, never both. The analysis is pure (it inspects only
+/// the parsed config), so no `base_dir` is required.
+#[derive(Debug, serde::Deserialize)]
+pub struct MemoryCheckRequest {
+    /// Pre-parsed `verify.toml` payload. Mutually exclusive with
+    /// `config_toml`.
+    #[serde(default)]
+    pub config: Option<crate::verify::config::VerifyConfig>,
+    /// Raw verify.toml text. Parsed via
+    /// [`crate::verify::config::VerifyConfig::from_toml`]. Mutually
+    /// exclusive with `config`.
+    #[serde(default)]
+    pub config_toml: Option<String>,
+}
+
+/// HTTP handler for `mununu memory check`. Returns the structured
+/// [`crate::verify::memory_check::MemoryCheckReport`].
+///
+/// The handler is advisory — warnings appear in the response body
+/// but never surface as 4xx. Callers (UI / CI) decide whether to
+/// treat warnings as a gate.
+pub async fn memory_check_handler(
+    Json(request): Json<MemoryCheckRequest>,
+) -> ApiResult<Json<crate::verify::memory_check::MemoryCheckReport>> {
+    let config = match (request.config, request.config_toml) {
+        (Some(c), None) => c,
+        (None, Some(toml_text)) => crate::verify::config::VerifyConfig::from_toml(&toml_text)
+            .map_err(|e| ApiError::BadRequest {
+                message: format!("failed to parse config_toml: {e}"),
+                details: None,
+            })?,
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest {
+                message: "supply exactly one of `config` or `config_toml`, not both".to_string(),
+                details: None,
+            });
+        }
+        (None, None) => {
+            return Err(ApiError::BadRequest {
+                message: "missing `config` or `config_toml` in request body".to_string(),
+                details: None,
+            });
+        }
+    };
+    Ok(Json(crate::verify::memory_check::check_memory_postures(
+        &config,
+    )))
+}
+
+// ============================================================================
 // Codesign reconcile-labels (Doc C §C.5 hard gate)
 // ============================================================================
 
@@ -2558,6 +2614,89 @@ members = ["x"]
             base_dir: ".".to_string(),
         };
         let err = verify_project_handler(Json(request)).await.unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("missing"), "got: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    // ---- memory_check_handler -----------------------------------------
+
+    #[tokio::test]
+    async fn memory_check_handler_accepts_config_toml_and_surfaces_warnings() {
+        let toml_text = r#"
+[project]
+name = "MC"
+
+[[sources]]
+id = "mem"
+adapter = "ctxdsl"
+files = ["m.ctxdsl"]
+
+[sources.memory_abstraction]
+kind = "tracked_addresses"
+tracked = ["x"]
+
+[composition]
+semantics = "asynchronous"
+members = ["mem"]
+
+[[properties]]
+name = "p"
+formula = "mem.x.fresh"
+"#;
+        let request = MemoryCheckRequest {
+            config: None,
+            config_toml: Some(toml_text.to_string()),
+        };
+        let Json(report) = memory_check_handler(Json(request))
+            .await
+            .expect("memory check should succeed");
+        assert_eq!(report.postures.len(), 1);
+        assert!(report.warnings.iter().any(|w| matches!(
+            w,
+            crate::verify::memory_check::MemoryCheckWarning::ValueMentionOnTrackedAddressesPosture { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn memory_check_handler_rejects_both_config_and_config_toml() {
+        let cfg = crate::verify::config::VerifyConfig::from_toml(
+            r#"
+[project]
+name = "X"
+[[sources]]
+id = "x"
+adapter = "ctxdsl"
+files = ["x.ctxdsl"]
+[composition]
+semantics = "asynchronous"
+members = ["x"]
+"#,
+        )
+        .unwrap();
+        let request = MemoryCheckRequest {
+            config: Some(cfg),
+            config_toml: Some("ignored".to_string()),
+        };
+        let err = memory_check_handler(Json(request)).await.unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("exactly one"), "got: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_check_handler_rejects_missing_config_and_toml() {
+        let request = MemoryCheckRequest {
+            config: None,
+            config_toml: None,
+        };
+        let err = memory_check_handler(Json(request)).await.unwrap_err();
         match err {
             ApiError::BadRequest { message, .. } => {
                 assert!(message.contains("missing"), "got: {message}");

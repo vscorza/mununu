@@ -111,6 +111,10 @@ fn create_router() -> Router {
         )
         .route("/api/v1/verify", post(handlers::verify_project_handler))
         .route(
+            "/api/v1/verify/memory-check",
+            post(handlers::memory_check_handler),
+        )
+        .route(
             "/api/v1/codesign/reconcile-labels",
             post(handlers::codesign_reconcile_labels_handler),
         )
