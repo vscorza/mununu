@@ -73,6 +73,8 @@ For each concrete subsystem class, the **minimum** abstraction that keeps the mo
 - **Automated extraction?** Yes via a chaotic-stub generator parameterised by the tracked-address list — pending implementation.
 - **Soundness.** Tracked-address restriction is sound for safety properties referencing only tracked addresses. Chaotic stub over untracked addresses is sound for safety, optimistic for liveness.
 
+See the **[Memory soundness matrix](#memory-soundness-matrix)** below for the per-posture × per-property-class breakdown and the declaration shape (`[sources.memory_abstraction]`) that records the choice in `verify.toml`.
+
 ### Pipelines (per CPU core)
 
 - **Concrete content.** N pipeline registers carrying instruction + control fields, hazard logic, forwarding paths.
@@ -121,6 +123,93 @@ For each concrete subsystem class, the **minimum** abstraction that keeps the mo
 - **Automated extraction?** Yes — most mature path mununu has.
 - **Soundness.** Documented inline by the adapter; loop bounding is the main soundness-relevant choice.
 
+## Memory soundness matrix
+
+> Source of truth: [`MemoryAbstractionPosture`](../crates/mununu-core/src/verify/config.rs) (verify-framework declaration), [`docs/design/black-box-modules.md`](design/black-box-modules.md) (chaotic-stub foundations, Doc A §A.4), [`docs/design/hw-sw-codesign-extraction.md`](design/hw-sw-codesign-extraction.md) (HW/SW codesign chaotic-stub formulation, Doc C §C.5) — surface: CLI+API+UI (declared in `verify.toml`, consumed by the orchestrator and surfaced in summaries).
+
+Memory abstraction is the single biggest soundness-relevant choice in any non-trivial verification target. This section defines the four canonical postures, how they interact with fence semantics, and which property classes each posture supports soundly. The choice is recorded in `verify.toml` via the `[sources.memory_abstraction]` block (see [Declaring the posture](#declaring-the-posture-in-verifytoml) below) so reviewers can audit the abstraction without re-reading the CTXDSL.
+
+### The four postures
+
+| `kind` | What is modelled | What is dropped | When to reach for it |
+|---|---|---|---|
+| `chaotic` | Self-loop on every memory label; no per-address state | All address discrimination; all value information; all ordering | Smoke test that the surrounding system terminates / does not deadlock regardless of memory behaviour. Always sound for safety; **never sound for any property that depends on what memory returns**. |
+| `tracked_addresses` | Per-address presence/absence in a small declared set; chaotic over the rest | Per-address *values*; ordering across addresses unless fences enforce it | Safety properties that read **which** address was last touched but not **what value** it holds — e.g. "the watchdog kick happens before the deadline register write". |
+| `tracked_with_values` | Per-tracked-address state from a declared symbol set (`stale`/`fresh`, `initial`/`written_by_X`/…); chaotic over untracked | Concrete numeric values within a symbol class; behaviour of untracked addresses | The default for memory-correctness properties — "did the microprogram's write to X become observable before the load on the other core?". The symbol set is the verifier's choice of equivalence class. |
+| `full_concrete` | Every modelled address carries its concrete integer value | Nothing (within the declared address range) | Only for tiny address ranges (a handful of registers) where the property genuinely depends on numeric values — e.g. a checksum register accumulating a known sequence. State-space cost is exponential in the value width. |
+
+Posture choice is **monotone in expressivity** from `chaotic` to `full_concrete`: each strictly extends what the model can distinguish, at strictly higher state-space cost.
+
+### The three fence semantics
+
+`fence_semantics`, when set on a posture, declares how a microcode `fence` op or an architectural barrier is interpreted in the model. The choice is **independent of `kind`** — any posture can pair with any fence semantics, but some combinations are pointless (chaotic + rvwmo gains nothing).
+
+| `fence_semantics` | What the fence enforces | What it preserves | Soundness caveat |
+|---|---|---|---|
+| `global_barrier` | All pending writes globally ordered before all subsequent reads, across every source | "After fence, every tracked write is observable to every source" | **Strictly stronger than any real architecture**; sound *as a model assumption* but the user must justify the gap to RVWMO / TSO / SC if claims transfer to real hardware. |
+| `release_acquire` | Per-source release-store and acquire-load semantics; happens-before chains via fences | Standard acquire/release reasoning ("if a release-store on core 0 is observed by an acquire-load on core 1, every prior write on core 0 is observable") | Sound for properties expressible in the release/acquire fragment; loses behaviours from non-RA atomics. |
+| `rvwmo` | RISC-V Weak Memory Order, modelled per the [public spec](https://github.com/riscv/riscv-isa-manual) | Whatever the embedded RVWMO encoding preserves | **Not implemented in mununu today.** Declaring `rvwmo` is currently an **aspirational** annotation — the orchestrator does not yet enforce RVWMO semantics. The declaration is honoured by `mununu memory check` (when shipped) as a signal that the user understands the gap; it does not change verdicts. |
+
+### Posture × property class — soundness matrix
+
+The **claim transfer direction** is from model verdict → real system. ✓ = transfer is sound (within the modeled scope of declared tracked addresses). ⚠ = transfer is sound only with caveats spelt out below the table. ✗ = transfer is not sound — the verdict is true of the model but says nothing about the real system.
+
+| Property class | `chaotic` | `tracked_addresses` | `tracked_with_values` | `full_concrete` |
+|---|---|---|---|---|
+| **Safety, no-memory mention** (e.g. "no double-DVFS") | ✓ | ✓ | ✓ | ✓ |
+| **Safety, references tracked memory presence** (e.g. "address X written before Y") | ✗ | ✓ | ✓ | ✓ |
+| **Safety, references tracked memory values** (e.g. "if X contains `fresh`, then …") | ✗ | ✗ | ✓ | ✓ |
+| **Safety, references untracked memory** (any property that reads an address outside `tracked`) | ✗ | ✗ | ✗ | ✗ (use full_concrete only over the *declared* address range) |
+| **Liveness, no-memory mention** (e.g. "every request eventually serviced") | ⚠ | ⚠ | ⚠ | ⚠ |
+| **Liveness, references tracked memory** (e.g. "every write eventually observable") | ✗ | ⚠ | ⚠ | ✓ |
+
+**Caveats.**
+
+- **All liveness rows carry ⚠** because mununu's composition is asynchronous by default and chaotic / over-approximated memory **admits noop loops**. Without an explicit fairness constraint, the model can satisfy "eventually X" only by demonstrating the existence of a fair execution. Liveness verdicts are honest about the model but pessimistic for the real system: a real bus enforces forward progress that the chaotic-stub model does not. Use `tracked_with_values` + `release_acquire` (or `global_barrier`) + a fairness annotation on the bus source before drawing liveness conclusions.
+- **The "references untracked memory" row is uniformly ✗** by construction. Reaching that row means the user named an address that is not in `tracked`. The orchestrator does not detect this today — `mununu memory check` (B2b, pending) will surface the mismatch.
+- **`tracked_addresses` + value-mention property** is the most common authoring mistake: the property formula refers to a per-address value class (`mem.x.fresh`) but the posture does not encode values. The verdict on the model is meaningless. `mununu memory check` will flag this.
+- **`full_concrete` + large value width** is **not** a soundness problem but a tractability one: the state space grows as `(value-domain-size)^(number-of-tracked-addresses)`. Stay under a few thousand combined states unless the verifier has memory budget for millions.
+
+### Posture × fence-semantics — preservation matrix
+
+For a memory-order property (e.g. "if core 0 stores X then fences, the store is visible to core 1's subsequent load"):
+
+| Posture | `global_barrier` | `release_acquire` | `rvwmo` |
+|---|---|---|---|
+| `chaotic` | n/a (chaotic posture has no ordering to enforce) | n/a | n/a |
+| `tracked_addresses` | Ordering enforced on presence-of-write only | Ordering enforced on per-source release/acquire labels | Aspirational; not enforced |
+| `tracked_with_values` | Ordering enforced on value-class transitions across addresses | Per-source acquire/release ordering on value-class transitions | Aspirational; not enforced |
+| `full_concrete` | Strongest possible ordering; equivalent to SC | Per-source acquire/release with concrete values | Aspirational; not enforced |
+
+The honest path for v1 multicore verification: pair `tracked_with_values` with `release_acquire`, and **declare the gap to RVWMO in the `notes` field** of `[sources.memory_abstraction]`. The verdict is sound for what the model encodes; transfer to a real RISC-V system requires either a sound abstraction argument (e.g. "this property is in the SC subset that RVWMO preserves") or an external memory-model checker (Herd / RMEM) integrated as a future adapter.
+
+### Declaring the posture in `verify.toml`
+
+> Source of truth: [`MemoryAbstractionPosture`](../crates/mununu-core/src/verify/config.rs) — surface: CLI+API+UI.
+
+```toml
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory/shared.ctxdsl"]
+
+[sources.memory_abstraction]
+kind             = "tracked_with_values"
+tracked          = ["X", "Y"]
+value_symbol_set = ["stale", "fresh"]
+fence_semantics  = "release_acquire"
+notes            = "Sound for the SC subset; RVWMO gap analysed in design/rvwmo-gap.md."
+```
+
+The block is optional — omitting it is legacy-safe and equivalent to declaring `chaotic` posture. The four validator rules enforced at parse time:
+
+1. `kind` must be one of `chaotic`, `tracked_addresses`, `tracked_with_values`, `full_concrete`.
+2. `fence_semantics`, when set, must be one of `global_barrier`, `release_acquire`, `rvwmo`.
+3. Non-empty `tracked` requires `kind = tracked_addresses` or `tracked_with_values`.
+4. Non-empty `value_symbol_set` requires `kind = tracked_with_values`.
+
+`mununu memory check` (B2b, pending) extends these to property-level cross-checks: every property formula mentioning `<source>.<address>.<value>` must reference a `(<address>, <value>)` pair declared in the source's posture block.
+
 ## Soundness summary (one-line reference)
 
 - **Boolean / interval / symbol-set on a variable** — sound when property doesn't distinguish values within an equivalence class.
@@ -143,7 +232,7 @@ When introducing an abstraction decision — whether in an adapter, a CTXDSL sou
 
 - **Quantify state-space cost** per abstraction choice. That depends on the user's specific model; a follow-up benchmark suite would help, but it does not exist today.
 - **Prescribe one abstraction class as "the right one"** for any subsystem. The right class depends on the property — the recipe above gives the *minimum*; safety-only properties often tolerate coarser abstractions than liveness properties.
-- **Cover memory-model semantics** (RVWMO, TSO, sequential consistency). Mununu does not encode any weak-memory model today; verifying memory-order intent at the architectural level requires either an external checker integrated as an adapter or a heavy abstraction (TSO / SC) that ignores weak orderings.
+- **Cover weak-memory-model semantics** (RVWMO, TSO, sequential consistency) **as an enforcement layer**. The [memory soundness matrix](#memory-soundness-matrix) above documents which fence semantics mununu's orchestrator enforces today (`global_barrier`, `release_acquire`) and which are aspirational (`rvwmo`). Verifying memory-order intent at the architectural level still requires either an external checker integrated as an adapter (Herd / RMEM) or a heavy abstraction (TSO / SC) that ignores weak orderings.
 
 ## See also
 
