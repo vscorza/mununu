@@ -98,60 +98,73 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     };
 
     // 3. For each source: read files, dispatch adapter, apply renamings.
+    // Parameterised sources (`count >= 2`) expand to N instances
+    // named `<id>_0` .. `<id>_<N-1>`. Each instance substitutes
+    // `{instance_id}` in the file content with its full name before
+    // the adapter sees it.
     let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
     let mut source_summaries: Vec<SourceSummary> = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
-        // Read the first source file and pass it to the adapter.
-        // Multi-file sources are a follow-up — most adapters today
-        // take one file. We document the limitation.
         let primary_file = source
             .files
             .first()
             .expect("validator rejected empty files");
         let path = resolve_path(base_dir, primary_file);
-        let content =
+        let raw_content =
             std::fs::read_to_string(&path).map_err(|source_err| VerifyError::SourceReadFailed {
                 path: path.clone(),
                 source: source_err,
             })?;
 
-        let raw_ctxdsl = dispatch_adapter(
-            &source.adapter,
-            &source.id,
-            &path,
-            &content,
-            &source.options,
-            base_dir,
-        )?;
-
-        // Apply per-source renamings from the binding. For Direct
-        // strategy the map is absent / empty so this is a no-op.
-        let mut rewritten = match per_source_renamings.get(&source.id) {
-            Some(renamings) if !renamings.is_empty() => {
-                apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
-            }
-            _ => raw_ctxdsl,
+        let count = source.count.unwrap_or(1).max(1);
+        let instances: Vec<(String, String)> = if count == 1 {
+            vec![(source.id.clone(), raw_content.clone())]
+        } else {
+            (0..count)
+                .map(|i| {
+                    let instance_id = format!("{}_{}", source.id, i);
+                    let substituted = raw_content.replace("{instance_id}", &instance_id);
+                    (instance_id, substituted)
+                })
+                .collect()
         };
-        // For RegisterMap binding, sv-rtl sources get the derived
-        // SV-side renaming map applied on top — collapses each
-        // `<sv_signal>_<value>` SV-emitted label onto the firmware-side
-        // `wr_<reg>_<field>` / `rd_<reg>_<field>` rendezvous name.
-        if let (Some(rm_renamings), "sv-rtl") =
-            (register_map_sv_renamings.as_ref(), source.adapter.as_str())
-            && !rm_renamings.is_empty()
-        {
-            rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
-        }
 
-        source_ctxdsls.push(SourceCtxdsl {
-            source_id: source.id.clone(),
-            ctxdsl: rewritten,
-        });
-        source_summaries.push(SourceSummary {
-            id: source.id.clone(),
-            adapter: source.adapter.clone(),
-            automaton: None, // filled after assembly resolves the member
-        });
+        for (instance_id, content) in instances {
+            let raw_ctxdsl = dispatch_adapter(
+                &source.adapter,
+                &instance_id,
+                &path,
+                &content,
+                &source.options,
+                base_dir,
+            )?;
+
+            // Apply per-source renamings from the binding. The renamings
+            // are keyed on the *original* source id (so users author
+            // them once and they apply to every instance).
+            let mut rewritten = match per_source_renamings.get(&source.id) {
+                Some(renamings) if !renamings.is_empty() => {
+                    apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
+                }
+                _ => raw_ctxdsl,
+            };
+            if let (Some(rm_renamings), "sv-rtl") =
+                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+                && !rm_renamings.is_empty()
+            {
+                rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+            }
+
+            source_ctxdsls.push(SourceCtxdsl {
+                source_id: instance_id.clone(),
+                ctxdsl: rewritten,
+            });
+            source_summaries.push(SourceSummary {
+                id: instance_id,
+                adapter: source.adapter.clone(),
+                automaton: None,
+            });
+        }
     }
 
     // 4. Build CompositionSpec (resolve composition_name default).
@@ -347,7 +360,8 @@ pub fn inspect_project(
         _ => None,
     };
 
-    // 3. Per-source dispatch + renaming (same as verify_project).
+    // 3. Per-source dispatch + renaming + parameterised-instance
+    // expansion (same as verify_project).
     let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
     let mut source_summaries: Vec<SourceSummary> = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
@@ -356,40 +370,54 @@ pub fn inspect_project(
             .first()
             .expect("validator rejected empty files");
         let path = resolve_path(base_dir, primary_file);
-        let content =
+        let raw_content =
             std::fs::read_to_string(&path).map_err(|source_err| VerifyError::SourceReadFailed {
                 path: path.clone(),
                 source: source_err,
             })?;
-        let raw_ctxdsl = dispatch_adapter(
-            &source.adapter,
-            &source.id,
-            &path,
-            &content,
-            &source.options,
-            base_dir,
-        )?;
-        let mut rewritten = match per_source_renamings.get(&source.id) {
-            Some(renamings) if !renamings.is_empty() => {
-                apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
-            }
-            _ => raw_ctxdsl,
+        let count = source.count.unwrap_or(1).max(1);
+        let instances: Vec<(String, String)> = if count == 1 {
+            vec![(source.id.clone(), raw_content.clone())]
+        } else {
+            (0..count)
+                .map(|i| {
+                    let instance_id = format!("{}_{}", source.id, i);
+                    let substituted = raw_content.replace("{instance_id}", &instance_id);
+                    (instance_id, substituted)
+                })
+                .collect()
         };
-        if let (Some(rm_renamings), "sv-rtl") =
-            (register_map_sv_renamings.as_ref(), source.adapter.as_str())
-            && !rm_renamings.is_empty()
-        {
-            rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+        for (instance_id, content) in instances {
+            let raw_ctxdsl = dispatch_adapter(
+                &source.adapter,
+                &instance_id,
+                &path,
+                &content,
+                &source.options,
+                base_dir,
+            )?;
+            let mut rewritten = match per_source_renamings.get(&source.id) {
+                Some(renamings) if !renamings.is_empty() => {
+                    apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
+                }
+                _ => raw_ctxdsl,
+            };
+            if let (Some(rm_renamings), "sv-rtl") =
+                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+                && !rm_renamings.is_empty()
+            {
+                rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+            }
+            source_ctxdsls.push(SourceCtxdsl {
+                source_id: instance_id.clone(),
+                ctxdsl: rewritten,
+            });
+            source_summaries.push(SourceSummary {
+                id: instance_id,
+                adapter: source.adapter.clone(),
+                automaton: None,
+            });
         }
-        source_ctxdsls.push(SourceCtxdsl {
-            source_id: source.id.clone(),
-            ctxdsl: rewritten,
-        });
-        source_summaries.push(SourceSummary {
-            id: source.id.clone(),
-            adapter: source.adapter.clone(),
-            automaton: None,
-        });
     }
 
     // 4. CompositionSpec.
@@ -1138,6 +1166,130 @@ over = "System"
         config.properties.clear();
         let inspection = inspect_project(&config, temp.path()).expect("inspection succeeded");
         assert!(!inspection.automata.is_empty());
+    }
+
+    #[test]
+    fn parameterised_count_expands_into_n_instances() {
+        // Authoring a single `[[sources]]` with `count = 3` and a
+        // file referencing `{instance_id}` expands to three
+        // independent automata under the composition.
+        let temp = tempdir().unwrap();
+        let templated = r#"
+context Worker_{instance_id} {
+    alphabet { label tick_{instance_id}; }
+    automata {
+        automaton Worker_{instance_id} {
+            states { state Idle initial; state Busy; }
+            transitions {
+                transition Idle -> Busy on label tick_{instance_id};
+                transition Busy -> Idle on label tick_{instance_id};
+            }
+        }
+    }
+}
+"#;
+        let _ = write_ctxdsl_source(temp.path(), "worker.ctxdsl", templated);
+        let toml_src = r#"
+[project]
+name = "Parameterised"
+
+[[sources]]
+id = "worker"
+adapter = "ctxdsl"
+files = ["worker.ctxdsl"]
+count = 3
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["worker_0", "worker_1", "worker_2"]
+name = "PoolSystem"
+
+[[properties]]
+name = "alive"
+formula = "true"
+over = "PoolSystem"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
+        assert_eq!(report.sources.len(), 3);
+        let ids: Vec<&str> = report.sources.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"worker_0"));
+        assert!(ids.contains(&"worker_1"));
+        assert!(ids.contains(&"worker_2"));
+        assert_eq!(
+            report.composition.members,
+            vec![
+                "Worker_worker_0".to_string(),
+                "Worker_worker_1".to_string(),
+                "Worker_worker_2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn count_one_is_indistinguishable_from_omitted() {
+        // Backwards-compat: `count = 1` (explicit) matches the
+        // legacy single-instance behaviour. No expansion.
+        let temp = tempdir().unwrap();
+        let _ = write_ctxdsl_source(temp.path(), "light.ctxdsl", SIMPLE_LIGHT_CTXDSL);
+        let toml_src = r#"
+[project]
+name = "Singleton"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+count = 1
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+name = "S"
+
+[[properties]]
+name = "p"
+formula = "true"
+over = "S"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify succeeded");
+        assert_eq!(report.sources.len(), 1);
+        assert_eq!(report.sources[0].id, "light");
+    }
+
+    #[test]
+    fn count_zero_is_a_config_error() {
+        let temp = tempdir().unwrap();
+        let _ = write_ctxdsl_source(temp.path(), "light.ctxdsl", SIMPLE_LIGHT_CTXDSL);
+        let toml_src = r#"
+[project]
+name = "Zero"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+count = 0
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let err = verify_project(&config, temp.path()).unwrap_err();
+        match err {
+            VerifyError::ConfigValidationFailed(issues) => {
+                assert!(issues.iter().any(|i| matches!(
+                    i,
+                    crate::verify::config::ConfigIssue::SourceCountZero { source_id } if source_id == "light"
+                )));
+            }
+            other => panic!("expected ConfigValidationFailed, got {other:?}"),
+        }
     }
 
     #[test]

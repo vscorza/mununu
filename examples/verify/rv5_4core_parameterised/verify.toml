@@ -1,0 +1,60 @@
+# rv5_4core_parameterised — parameterised-instance support demo
+# (plan Part 6 item 6).
+#
+# ONE source declaration with `count = 4` expands to four
+# independent per-core pipeline automata. Without parameterisation
+# the same model would require four duplicated `[[sources]]` blocks
+# plus four near-identical CTXDSL files.
+#
+# The verify orchestrator substitutes `{instance_id}` in the source
+# file with `core_0`, `core_1`, `core_2`, `core_3` per instance, so
+# the emitted automata stay unique.
+#
+# Recreate:
+#   $ bash examples/verify/rv5_4core_parameterised/validate.sh
+
+[project]
+name = "RV5_4Core_Parameterised"
+description = "4 RV5 cores from one parameterised source — count = 4 expansion."
+
+[[sources]]
+id = "core"
+adapter = "ctxdsl"
+files = ["core_pipeline.ctxdsl"]
+count = 4
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+# Each parameterised instance is a separate composition member.
+# The `<id>.*` wildcard form (Part 6 item 4) would also work but is
+# unnecessary here — every source emits exactly one automaton.
+members = ["core_0", "core_1", "core_2", "core_3"]
+name = "RV5_4Core_System"
+
+# Per-core liveness — each core can independently reach Done.
+[[properties]]
+name = "core_0_can_finish"
+template = "reachable"
+args = { TARGET = "Core_core_0_Done" }
+over = "RV5_4Core_System"
+
+[[properties]]
+name = "core_1_can_finish"
+template = "reachable"
+args = { TARGET = "Core_core_1_Done" }
+over = "RV5_4Core_System"
+
+[[properties]]
+name = "core_2_can_finish"
+template = "reachable"
+args = { TARGET = "Core_core_2_Done" }
+over = "RV5_4Core_System"
+
+[[properties]]
+name = "core_3_can_finish"
+template = "reachable"
+args = { TARGET = "Core_core_3_Done" }
+over = "RV5_4Core_System"

@@ -197,6 +197,7 @@ fn build_firmware_source(codesign: &CodesignProjectConfig) -> SourceSection {
         adapter: "c-codesign".to_string(),
         files: codesign.firmware.sources.clone(),
         options,
+        count: None,
     }
 }
 
@@ -216,6 +217,7 @@ fn build_rtl_source(codesign: &CodesignProjectConfig) -> SourceSection {
         adapter: "sv-rtl".to_string(),
         files: codesign.rtl.sources.clone(),
         options,
+        count: None,
     }
 }
 

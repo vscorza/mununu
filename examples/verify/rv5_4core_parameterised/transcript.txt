@@ -1,0 +1,80 @@
+# rv5_4core_parameterised — verify framework end-to-end transcript
+# Regenerated via examples/verify/rv5_4core_parameterised/validate.sh
+#
+# ONE source declaration (`count = 4`) expands to four
+# independent per-core pipeline automata. 3^4 = 81 reachable
+# composed states. Plan Part 6 item 6.
+
+=== mununu verify (human-readable) ===
+verify report — project `RV5_4Core_Parameterised`:
+  composition: asynchronous RV5_4Core_System { members = [Core_core_0, Core_core_1, Core_core_2, Core_core_3] }
+    - core_0 (adapter = ctxdsl, automaton = Core_core_0)
+    - core_1 (adapter = ctxdsl, automaton = Core_core_1)
+    - core_2 (adapter = ctxdsl, automaton = Core_core_2)
+    - core_3 (adapter = ctxdsl, automaton = Core_core_3)
+    core_0_can_finish: SATISFIED (81/81 states, 1/1 initial) [template `reachable`, over = RV5_4Core_System]
+    core_1_can_finish: SATISFIED (81/81 states, 1/1 initial) [template `reachable`, over = RV5_4Core_System]
+    core_2_can_finish: SATISFIED (81/81 states, 1/1 initial) [template `reachable`, over = RV5_4Core_System]
+    core_3_can_finish: SATISFIED (81/81 states, 1/1 initial) [template `reachable`, over = RV5_4Core_System]
+
+=== mununu verify --print-alphabet (introspection) ===
+inspect report — project `RV5_4Core_Parameterised`:
+  composition: asynchronous RV5_4Core_System { members = [Core_core_0, Core_core_1, Core_core_2, Core_core_3] }
+  sources:
+    - core_0 (adapter = ctxdsl, automaton = Core_core_0)
+    - core_1 (adapter = ctxdsl, automaton = Core_core_1)
+    - core_2 (adapter = ctxdsl, automaton = Core_core_2)
+    - core_3 (adapter = ctxdsl, automaton = Core_core_3)
+  automata (5):
+    RV5_4Core_System (source = -, 81 states, 1 initial, 8 labels)
+      initial: Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle
+      states:  Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Working, Core_core_0_Working|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Working|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Working|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Working, Core_core_0_Done|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Working|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Done, Core_core_0_Working|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Working, Core_core_0_Working|Core_core_1_Working|Core_core_2_Working|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Working|Core_core_1_Working|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Done|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Working|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Done|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Working|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Working, Core_core_0_Done|Core_core_1_Working|Core_core_2_Working|Core_core_3_Working, Core_core_0_Done|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Done|Core_core_1_Working|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Done|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Done, Core_core_0_Working|Core_core_1_Working|Core_core_2_Working|Core_core_3_Done, Core_core_0_Working|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Working|Core_core_1_Working|Core_core_2_Done|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Working|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Done|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Working|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Done|Core_core_3_Working, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Working|Core_core_3_Done, Core_core_0_Done|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Done|Core_core_3_Working, Core_core_0_Done|Core_core_1_Done|Core_core_2_Working|Core_core_3_Working, Core_core_0_Done|Core_core_1_Done|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Working|Core_core_2_Done|Core_core_3_Done, Core_core_0_Working|Core_core_1_Done|Core_core_2_Working|Core_core_3_Done, Core_core_0_Working|Core_core_1_Done|Core_core_2_Done|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Done|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Done|Core_core_3_Done, Core_core_0_Done|Core_core_1_Done|Core_core_2_Working|Core_core_3_Done, Core_core_0_Done|Core_core_1_Done|Core_core_2_Done|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Done|Core_core_3_Done, Core_core_0_Done|Core_core_1_Done|Core_core_2_Done|Core_core_3_Done
+      labels:  complete_core_0, complete_core_1, complete_core_2, complete_core_3, dispatch_core_0, dispatch_core_1, dispatch_core_2, dispatch_core_3
+    Core_core_3 (source = core_3, 3 states, 1 initial, 2 labels)
+      initial: Core_core_3_Idle
+      states:  Core_core_3_Done, Core_core_3_Idle, Core_core_3_Working
+      labels:  complete_core_3, dispatch_core_3
+    Core_core_0 (source = core_0, 3 states, 1 initial, 2 labels)
+      initial: Core_core_0_Idle
+      states:  Core_core_0_Done, Core_core_0_Idle, Core_core_0_Working
+      labels:  complete_core_0, dispatch_core_0
+    Core_core_1 (source = core_1, 3 states, 1 initial, 2 labels)
+      initial: Core_core_1_Idle
+      states:  Core_core_1_Done, Core_core_1_Idle, Core_core_1_Working
+      labels:  complete_core_1, dispatch_core_1
+    Core_core_2 (source = core_2, 3 states, 1 initial, 2 labels)
+      initial: Core_core_2_Idle
+      states:  Core_core_2_Done, Core_core_2_Idle, Core_core_2_Working
+      labels:  complete_core_2, dispatch_core_2
+
+  composition alphabet (8 labels):
+    complete_core_0, complete_core_1, complete_core_2, complete_core_3
+    dispatch_core_0, dispatch_core_1, dispatch_core_2, dispatch_core_3
+  composition states (81):
+    Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Idle
+    Core_core_0_Idle|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Idle
+    Core_core_0_Working|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Working
+    Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Working
+    Core_core_0_Done|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Working
+    Core_core_0_Working|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Working|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Idle
+    Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Working|Core_core_3_Working
+    Core_core_0_Idle|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Idle|Core_core_3_Done
+    Core_core_0_Done|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Working, Core_core_0_Done|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Working|Core_core_2_Working|Core_core_3_Idle
+    Core_core_0_Done|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Done, Core_core_0_Working|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Working
+    Core_core_0_Working|Core_core_1_Working|Core_core_2_Working|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Working|Core_core_1_Working|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Done|Core_core_2_Working|Core_core_3_Idle
+    Core_core_0_Idle|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Working|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Done|Core_core_3_Working
+    Core_core_0_Idle|Core_core_1_Done|Core_core_2_Working|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Working|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Idle|Core_core_3_Done
+    Core_core_0_Done|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Working, Core_core_0_Done|Core_core_1_Working|Core_core_2_Working|Core_core_3_Working, Core_core_0_Done|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Working, Core_core_0_Done|Core_core_1_Working|Core_core_2_Done|Core_core_3_Idle
+    Core_core_0_Done|Core_core_1_Done|Core_core_2_Working|Core_core_3_Idle, Core_core_0_Working|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Done, Core_core_0_Working|Core_core_1_Working|Core_core_2_Working|Core_core_3_Done, Core_core_0_Working|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Done
+    Core_core_0_Working|Core_core_1_Working|Core_core_2_Done|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Working|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Done|Core_core_3_Idle, Core_core_0_Idle|Core_core_1_Working|Core_core_2_Done|Core_core_3_Done
+    Core_core_0_Idle|Core_core_1_Done|Core_core_2_Working|Core_core_3_Done, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Done|Core_core_3_Working, Core_core_0_Done|Core_core_1_Idle|Core_core_2_Done|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Working|Core_core_3_Done
+    Core_core_0_Done|Core_core_1_Done|Core_core_2_Idle|Core_core_3_Done, Core_core_0_Done|Core_core_1_Working|Core_core_2_Done|Core_core_3_Working, Core_core_0_Done|Core_core_1_Done|Core_core_2_Working|Core_core_3_Working, Core_core_0_Done|Core_core_1_Done|Core_core_2_Done|Core_core_3_Idle
+    Core_core_0_Working|Core_core_1_Working|Core_core_2_Done|Core_core_3_Done, Core_core_0_Working|Core_core_1_Done|Core_core_2_Working|Core_core_3_Done, Core_core_0_Working|Core_core_1_Done|Core_core_2_Done|Core_core_3_Working, Core_core_0_Idle|Core_core_1_Done|Core_core_2_Done|Core_core_3_Done
+    Core_core_0_Done|Core_core_1_Working|Core_core_2_Done|Core_core_3_Done, Core_core_0_Done|Core_core_1_Done|Core_core_2_Working|Core_core_3_Done, Core_core_0_Done|Core_core_1_Done|Core_core_2_Done|Core_core_3_Working, Core_core_0_Working|Core_core_1_Done|Core_core_2_Done|Core_core_3_Done
+    Core_core_0_Done|Core_core_1_Done|Core_core_2_Done|Core_core_3_Done
+  declared predicates (20):
+    Core_core_0_can_reach_completion, Core_core_0_has_enabled_transition, Core_core_0_is_completion_state, Core_core_0_is_deadlock_state
+    Core_core_1_can_reach_completion, Core_core_1_has_enabled_transition, Core_core_1_is_completion_state, Core_core_1_is_deadlock_state
+    Core_core_2_can_reach_completion, Core_core_2_has_enabled_transition, Core_core_2_is_completion_state, Core_core_2_is_deadlock_state
+    Core_core_3_can_reach_completion, Core_core_3_has_enabled_transition, Core_core_3_is_completion_state, Core_core_3_is_deadlock_state
+    RV5_4Core_System_can_reach_completion, RV5_4Core_System_has_enabled_transition, RV5_4Core_System_is_completion_state, RV5_4Core_System_is_deadlock_state

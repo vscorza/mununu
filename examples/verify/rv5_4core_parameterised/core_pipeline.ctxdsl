@@ -1,0 +1,36 @@
+// core_pipeline.ctxdsl — parameterised per-core pipeline.
+//
+// The `{instance_id}` placeholder is substituted by the verify
+// orchestrator with `<id>_<i>` (e.g. `core_0`, `core_1`, …) for each
+// instance when the `[[sources]]` block declares `count = N`.
+// One source file → N independent automata; the manifest stays tiny.
+//
+// Per-core state: Idle (waiting for work) → Working (executing
+// pipeline stages, abstracted as a single Working state per
+// docs/abstraction.md's pipeline recipe) → Done.
+
+context Core_{instance_id} {
+    alphabet {
+        label dispatch_{instance_id};
+        label complete_{instance_id};
+    }
+
+    automata {
+        automaton Core_{instance_id} {
+            controllable {
+                label dispatch_{instance_id};
+                label complete_{instance_id};
+            }
+            states {
+                state Core_{instance_id}_Idle initial;
+                state Core_{instance_id}_Working;
+                state Core_{instance_id}_Done;
+            }
+            transitions {
+                transition Core_{instance_id}_Idle -> Core_{instance_id}_Working on label dispatch_{instance_id};
+                transition Core_{instance_id}_Working -> Core_{instance_id}_Done on label complete_{instance_id};
+                transition Core_{instance_id}_Done -> Core_{instance_id}_Idle on label dispatch_{instance_id};
+            }
+        }
+    }
+}
