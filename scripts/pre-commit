@@ -14,4 +14,9 @@ make ci
 echo "Testing API module..."
 cargo test --lib api --features api
 
+# Fast (milliseconds) — mirrors the `unused-deps` CI job. Install locally with
+#   cargo install cargo-machete --locked
+echo "Checking for unused dependencies (cargo machete)..."
+cargo machete
+
 echo "All pre-commit checks passed."

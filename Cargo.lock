@@ -843,23 +843,16 @@ name = "mununu"
 version = "0.4.0"
 dependencies = [
  "assert_cmd",
- "axum",
- "bitvec",
  "clap",
  "criterion",
  "itoa",
  "mununu-core",
  "predicates",
  "proptest",
- "regex",
  "serde",
  "serde_json",
- "smallvec",
  "tempfile",
- "thiserror",
  "tokio",
- "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
