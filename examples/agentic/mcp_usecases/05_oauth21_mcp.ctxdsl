@@ -223,8 +223,8 @@ context oauth21_mcp {
         // GF(TokenExpired) -> GF(TokenActive)
         formula token_refresh_liveness {
             over OAuthFlow;
-            body = (! (nu A. (mu B. (TokenExpired || <> B)) && ([] A)))
-                || (nu C. (mu D. (TokenActive || <> D)) && ([] C));
+            body = (! (nu A. ((mu B. (TokenExpired || <> B)) && ([] A))))
+                || (nu C. ((mu D. (TokenActive || <> D)) && ([] C)));
         }
     }
 

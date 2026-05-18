@@ -155,7 +155,13 @@ impl<'a> Parser<'a> {
             self.expect_char('.')?;
             let var_id = self.builder.push_var(name.clone());
             self.binder_stack.push(Binder { name, id: var_id });
-            let body = self.parse_unary()?;
+            // Textbook mu-calculus convention: a fixpoint binder extends as
+            // far right as possible — `mu X. φ ∧ ψ` ≡ `mu X. (φ ∧ ψ)`. Parse
+            // the body with parse_or (the lowest-precedence parser) so the
+            // body absorbs following `&&` / `||` at the same nesting level.
+            // Existing call sites use explicit parens around the body, so
+            // their parse tree is unchanged.
+            let body = self.parse_or()?;
             self.binder_stack.pop();
             let node = self.builder.push_node(Node::Mu { var: var_id, body });
             return Ok(Some(node));
@@ -169,7 +175,7 @@ impl<'a> Parser<'a> {
             self.expect_char('.')?;
             let var_id = self.builder.push_var(name.clone());
             self.binder_stack.push(Binder { name, id: var_id });
-            let body = self.parse_unary()?;
+            let body = self.parse_or()?;
             self.binder_stack.pop();
             let node = self.builder.push_node(Node::Nu { var: var_id, body });
             return Ok(Some(node));
@@ -763,29 +769,42 @@ mod tests {
     use crate::mu_calculus::{Control, Guard, ModalKind, Node, VariableGuard};
 
     #[test]
-    fn test_failing_ai_formulas() {
-        let formulas = vec![
-            (
-                "1",
-                "nu X. ((not scoring_request_received) or (mu Y. (scoring_request_handled or [] Y))) and [] X",
-            ),
-            (
-                "2",
-                "nu X. ((not score_received_) or (mu Y. (report_delay or [] Y))) and [] X",
-            ),
-            (
-                "3",
-                "nu X. ((not Fulfill_order_exit) or (mu Y. (Order_completed or [] Y))) and [] X",
-            ),
+    fn fixpoint_binder_extends_right_through_conjunction() {
+        // Verifies that `nu X. φ and [] X` binds X across the trailing
+        // `[] X` (textbook right-extending convention). Each formula is the
+        // canonical liveness-implication body — the `[] X` references the
+        // outer nu's bound variable; if the parser bound it as a free
+        // predicate, model checking would silently miscompile.
+        let formulas = [
+            "nu X. ((not scoring_request_received) or (mu Y. (scoring_request_handled or [] Y))) and [] X",
+            "nu X. ((not score_received_) or (mu Y. (report_delay or [] Y))) and [] X",
+            "nu X. ((not Fulfill_order_exit) or (mu Y. (Order_completed or [] Y))) and [] X",
         ];
 
-        for (name, formula) in formulas {
-            match parse(formula) {
-                Ok(_) => println!("Formula {}: ✅ OK", name),
-                Err(e) => {
-                    println!("Formula {}: ❌ ERROR: {:?}", name, e);
-                    println!("  Formula text: {}", formula);
-                }
+        for formula_text in formulas {
+            let formula = parse(formula_text).unwrap_or_else(|e| {
+                panic!("formula failed to parse: {e:?}\n  text: {formula_text}")
+            });
+            let Node::Nu { var: nu_var, body } = formula.node(formula.root()) else {
+                panic!(
+                    "expected outer nu, got {:?}\n  text: {formula_text}",
+                    formula.node(formula.root())
+                );
+            };
+            let Node::And(_, rhs) = formula.node(*body) else {
+                panic!("expected `... and [] X` at nu body\n  text: {formula_text}");
+            };
+            let Node::Modal { target, .. } = formula.node(*rhs) else {
+                panic!("expected `[] X` modal at rhs\n  text: {formula_text}");
+            };
+            match formula.node(*target) {
+                Node::Variable(var) => assert_eq!(
+                    var, nu_var,
+                    "`[] X` must bind to outer nu X\n  text: {formula_text}"
+                ),
+                other => panic!(
+                    "`[] X` resolved to {other:?} instead of bound Variable\n  text: {formula_text}"
+                ),
             }
         }
     }

@@ -277,16 +277,16 @@ context bedrock_agentcore {
         // GF(Unbound) -> GF(BoundToA || BoundToB)
         formula gateway_availability {
             over GatewayRouter;
-            body = (! (nu A. (mu B. (Unbound || <> B)) && ([] A)))
-                || (nu C. (mu D. (BoundToA || BoundToB || <> D)) && ([] C));
+            body = (! (nu A. ((mu B. (Unbound || <> B)) && ([] A))))
+                || (nu C. ((mu D. (BoundToA || BoundToB || <> D)) && ([] C)));
         }
 
         // GR(1): IAM token refresh responsiveness.
         // GF(TokenExpired) -> GF(Authenticated)
         formula iam_refresh_liveness {
             over IAMAuth;
-            body = (! (nu A. (mu B. (TokenExpired || <> B)) && ([] A)))
-                || (nu C. (mu D. (Authenticated || <> D)) && ([] C));
+            body = (! (nu A. ((mu B. (TokenExpired || <> B)) && ([] A))))
+                || (nu C. ((mu D. (Authenticated || <> D)) && ([] C)));
         }
 
         // Liveness: Authenticated state is reachable.

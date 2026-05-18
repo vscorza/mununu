@@ -527,7 +527,7 @@ fn build_properties(
         }
     }
 
-    // Justice properties → liveness: nu Y. (mu X. (pred || <> X) && [] Y)
+    // Justice properties → liveness: nu Y. ((mu X. (pred || <> X)) && ([] Y))
     for (i, line) in file.justices().enumerate() {
         let signals = match &line.node {
             Node::Justice { signals } => signals.clone(),

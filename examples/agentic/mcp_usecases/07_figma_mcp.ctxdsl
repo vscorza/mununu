@@ -156,8 +156,8 @@ context figma_mcp {
         // GF(Writing) -> GF(Idle)
         formula write_fairness {
             over DesignAccess;
-            body = (! (nu A. (mu B. (Writing || <> B)) && ([] A)))
-                || (nu C. (mu D. (Idle || <> D)) && ([] C));
+            body = (! (nu A. ((mu B. (Writing || <> B)) && ([] A))))
+                || (nu C. ((mu D. (Idle || <> D)) && ([] C)));
         }
 
         // Liveness: CacheValid is reachable from CacheStale.

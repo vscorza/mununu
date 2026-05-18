@@ -212,26 +212,26 @@ context amba_arbiter_gr1_synthesis {
 
         formula grant0_reachable {
             over bus_system;
-            body = (! (nu X. (mu Y. (Requesting0 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Grant0 || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Requesting0 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Grant0 || <> W)) && ([] Z)));
         }
 
         formula grant1_reachable {
             over bus_system;
-            body = (! (nu X. (mu Y. (Requesting1 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Grant1 || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Requesting1 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Grant1 || <> W)) && ([] Z)));
         }
 
         formula grant2_reachable {
             over bus_system;
-            body = (! (nu X. (mu Y. (Requesting2 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Grant2 || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Requesting2 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Grant2 || <> W)) && ([] Z)));
         }
 
         formula grant3_reachable {
             over bus_system;
-            body = (! (nu X. (mu Y. (Requesting3 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Grant3 || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Requesting3 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Grant3 || <> W)) && ([] Z)));
         }
 
         // GR(1) no starvation: GF(GrantN) → GF(Free)
@@ -240,26 +240,26 @@ context amba_arbiter_gr1_synthesis {
 
         formula no_starvation_0 {
             over bus_system;
-            body = (! (nu X. (mu Y. (Grant0 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Grant0 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Free || <> W)) && ([] Z)));
         }
 
         formula no_starvation_1 {
             over bus_system;
-            body = (! (nu X. (mu Y. (Grant1 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Grant1 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Free || <> W)) && ([] Z)));
         }
 
         formula no_starvation_2 {
             over bus_system;
-            body = (! (nu X. (mu Y. (Grant2 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Grant2 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Free || <> W)) && ([] Z)));
         }
 
         formula no_starvation_3 {
             over bus_system;
-            body = (! (nu X. (mu Y. (Grant3 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Grant3 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Free || <> W)) && ([] Z)));
         }
     }
 

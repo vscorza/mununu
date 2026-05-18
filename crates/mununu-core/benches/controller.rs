@@ -43,8 +43,8 @@ fn build_line_plant(state_count: usize) -> Clts<DefaultStateIdx, DefaultLabelIdx
 /// alternating fixpoint evaluation instead of the trivial `true` formula.
 fn gr1_formula() -> mununu_core::mu_calculus::Formula {
     parser::parse(
-        "((! (nu NuA. (mu MuA. (Req || <> MuA)) && ([] NuA))) \
-          || (nu NuG. (mu MuG. (Grant || <> MuG)) && ([] NuG)))",
+        "((! (nu NuA. ((mu MuA. (Req || <> MuA)) && ([] NuA)))) \
+          || (nu NuG. ((mu MuG. (Grant || <> MuG)) && ([] NuG))))",
     )
     .expect("GR(1) formula parses")
 }

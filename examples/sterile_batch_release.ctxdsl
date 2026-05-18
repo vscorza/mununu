@@ -112,12 +112,12 @@ context sterile_batch_release {
     mu_formulas {
         formula ship_requires_release {
             over pipeline;
-            body = nu Safe. ((! < ( labels = {ship} ) > true) || < ( labels = {qp_sign} ) > true) && Safe;
+            body = nu Safe. (((! < ( labels = {ship} ) > true) || < ( labels = {qp_sign} ) > true) && ([] Safe));
         }
 
         formula completion_leads_to_disposition {
             over pipeline;
-            body = nu Progress. ( [ ( labels = {qc_start} ) ] mu Resolve. ( < ( labels = {qp_sign} ) > true || < ( labels = {quarantine} ) > true || < ( labels = {cancel} ) > true ) && Resolve ) && Progress;
+            body = nu Progress. (([ ( labels = {qc_start} ) ] (mu Resolve. ((< ( labels = {qp_sign} ) > true || < ( labels = {quarantine} ) > true || < ( labels = {cancel} ) > true) || (<> Resolve)))) && ([] Progress));
         }
     }
 

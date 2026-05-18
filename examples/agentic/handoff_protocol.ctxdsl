@@ -173,8 +173,8 @@ context handoff_protocol {
         // GF(Dispatching) -> GF(Idle)
         formula no_orphaned_tasks {
             over handoff_system;
-            body = (! (nu A. (mu B. (Dispatching || <> B)) && ([] A)))
-                || (nu C. (mu D. (Idle || <> D)) && ([] C));
+            body = (! (nu A. ((mu B. (Dispatching || <> B)) && ([] A))))
+                || (nu C. ((mu D. (Idle || <> D)) && ([] C)));
         }
     }
 

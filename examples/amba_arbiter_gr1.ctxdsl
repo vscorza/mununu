@@ -126,32 +126,32 @@ context amba_arbiter_gr1 {
         // Corresponds to GF grant_0 in the GR(1) system justice.
         formula grant0_reachable {
             over bus_system;
-            body = (! (nu X. (mu Y. (Requesting0 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Grant0 || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Requesting0 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Grant0 || <> W)) && ([] Z)));
         }
 
         // Liveness (GF guarantee): Grant1 is reachable — client 1 can be served.
         formula grant1_reachable {
             over bus_system;
-            body = (! (nu X. (mu Y. (Requesting1 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Grant1 || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Requesting1 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Grant1 || <> W)) && ([] Z)));
         }
 
         // GR(1) no starvation for client 0: GF(Grant0) → GF(Free).
         // If the arbiter grants client 0 infinitely often, it also frees the
         // bus infinitely often.
-        // GF(p) = nu X. (mu Y. (p || <> Y)) && ([] X)
+        // GF(p) = nu X. ((mu Y. (p || <> Y)) && ([] X))
         formula no_starvation_0 {
             over bus_system;
-            body = (! (nu X. (mu Y. (Grant0 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Grant0 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Free || <> W)) && ([] Z)));
         }
 
         // GR(1) no starvation for client 1: GF(Grant1) → GF(Free).
         formula no_starvation_1 {
             over bus_system;
-            body = (! (nu X. (mu Y. (Grant1 || <> Y)) && ([] X)))
-                || (nu Z. (mu W. (Free || <> W)) && ([] Z));
+            body = (! (nu X. ((mu Y. (Grant1 || <> Y)) && ([] X))))
+                || (nu Z. ((mu W. (Free || <> W)) && ([] Z)));
         }
     }
 
