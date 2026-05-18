@@ -1,0 +1,106 @@
+// Patched companion to redfish_auth_vulnerable.ctxdsl. The same model
+// shape, with the header_spoof_request short-circuit removed: every
+// authenticated state is now reached via the perform_auth_check
+// transition.
+//
+// Provenance: see redfish_auth_vulnerable.ctxdsl. This is a design-pattern
+// representation of the fix shape (require auth-check before treating a
+// session as authenticated), not extracted from any specific patched
+// firmware build.
+//
+// Same safety formula evaluated here is expected to HOLD.
+
+context cve_2024_54085_redfish_auth_fixed {
+    alphabet {
+        label http_connect;
+        label normal_request;
+        label perform_auth_check;
+        label header_spoof_request;
+        label execute_privileged_op;
+        label session_close;
+        label noop;
+    }
+
+    automata {
+        automaton HttpClient {
+            controllable { }
+            states {
+                state Disconnected initial;
+                state Open;
+            }
+            transitions {
+                transition Disconnected -> Open on label http_connect;
+                transition Disconnected -> Disconnected on label noop;
+
+                transition Open -> Open on label normal_request;
+                transition Open -> Open on label header_spoof_request;
+                transition Open -> Open on label execute_privileged_op;
+                transition Open -> Open on label perform_auth_check;
+                transition Open -> Disconnected on label session_close;
+                transition Open -> Open on label noop;
+            }
+        }
+
+        automaton RedfishAuthHandler {
+            controllable { }
+            states {
+                state Unconnected initial;
+                state Connected;
+                state AuthCheckInProgress;
+                state AuthenticatedViaCheck;
+                state PrivilegedExecLegit;
+                // AuthenticatedViaSpoof and PrivilegedExecUnauth are
+                // declared but have no incoming transitions in the
+                // fixed model — there is no edge that can introduce
+                // them. Keeping the names makes the formula text
+                // diff-clean against the vulnerable file: the property
+                // body is identical, only the transition relation
+                // changes.
+                state AuthenticatedViaSpoof;
+                state PrivilegedExecUnauth;
+            }
+            transitions {
+                transition Unconnected -> Connected on label http_connect;
+                transition Unconnected -> Unconnected on label noop;
+                transition Unconnected -> Unconnected on label normal_request;
+                transition Unconnected -> Unconnected on label header_spoof_request;
+                transition Unconnected -> Unconnected on label perform_auth_check;
+                transition Unconnected -> Unconnected on label execute_privileged_op;
+
+                transition Connected -> AuthCheckInProgress on label normal_request;
+                // FIXED: header_spoof_request no longer transitions to an
+                // authenticated state. The handler treats it as a normal
+                // request that still needs to traverse the challenge.
+                transition Connected -> AuthCheckInProgress on label header_spoof_request;
+                transition Connected -> Unconnected on label session_close;
+                transition Connected -> Connected on label noop;
+
+                transition AuthCheckInProgress -> AuthenticatedViaCheck on label perform_auth_check;
+                transition AuthCheckInProgress -> Unconnected on label session_close;
+                transition AuthCheckInProgress -> AuthCheckInProgress on label noop;
+
+                transition AuthenticatedViaCheck -> PrivilegedExecLegit on label execute_privileged_op;
+                transition AuthenticatedViaCheck -> Unconnected on label session_close;
+                transition AuthenticatedViaCheck -> AuthenticatedViaCheck on label normal_request;
+                transition AuthenticatedViaCheck -> AuthenticatedViaCheck on label noop;
+
+                transition PrivilegedExecLegit -> PrivilegedExecLegit on label execute_privileged_op;
+                transition PrivilegedExecLegit -> Unconnected on label session_close;
+                transition PrivilegedExecLegit -> PrivilegedExecLegit on label noop;
+
+                // Unreachable-state self-loops. No incoming transitions
+                // exist to AuthenticatedViaSpoof or PrivilegedExecUnauth,
+                // so these self-loops are dead code that exist only to
+                // keep every declared state inhabited in the transition
+                // relation. They preserve identity-of-formula between
+                // the vulnerable and fixed variants.
+                transition AuthenticatedViaSpoof -> AuthenticatedViaSpoof on label noop;
+                transition PrivilegedExecUnauth -> PrivilegedExecUnauth on label noop;
+            }
+        }
+    }
+
+    // Composition and mu_formulas blocks live in verify_fixed.toml
+    // (this file is consumed as a verify-framework source, not a
+    // standalone CTXDSL file).
+}

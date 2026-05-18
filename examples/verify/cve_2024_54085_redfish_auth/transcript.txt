@@ -1,0 +1,58 @@
+# cve_2024_54085_redfish_auth — verify-framework transcript
+# Regenerated via examples/verify/cve_2024_54085_redfish_auth/validate.sh
+#
+# Models the Redfish authentication-bypass pattern publicly
+# described in CVE-2024-54085. Two manifests:
+#   verify_vulnerable.toml — safety property fails with lasso
+#   verify_fixed.toml      — safety property holds; bypass unreachable
+#
+# Disclaimer: hand-authored model of the property class. NOT
+# extracted from any specific firmware binary. See README.md.
+
+=== mununu memory check (vulnerable) ===
+memory-check report:
+  declared postures (1):
+    redfish: kind = chaotic, notes = "No shared memory between HttpClient and RedfishAuthHandler in this protocol-level abstraction; properties reference automaton state names only."
+  warnings (0):
+  info (0):
+
+=== mununu verify (vulnerable) ===
+verify report — project `RedfishAuthBypassVulnerable`:
+  composition: asynchronous RedfishSystem { members = [HttpClient, RedfishAuthHandler] }
+  sources:
+    - redfish (adapter = ctxdsl, automaton = HttpClient)
+  properties (3):
+    no_unauthenticated_privileged_exec: VIOLATED (0/7 states, 0/1 initial) [inline, over = RedfishAuthHandler]
+      counterexample (from Unconnected):
+        1. --[http_connect]--> Connected
+        2. --[normal_request]--> AuthCheckInProgress
+        3. --[perform_auth_check]--> AuthenticatedViaCheck
+        4. --[execute_privileged_op]--> PrivilegedExecLegit
+        5. --[execute_privileged_op]--> PrivilegedExecLegit
+        (cycle back to step 4)
+    legit_privileged_path_reachable: SATISFIED (7/7 states, 1/1 initial) [template `reachable`, over = RedfishAuthHandler]
+    bypass_state_reachable: SATISFIED (7/7 states, 1/1 initial) [template `reachable`, over = RedfishAuthHandler]
+
+=== mununu memory check (fixed) ===
+memory-check report:
+  declared postures (1):
+    redfish: kind = chaotic, notes = "Protocol-level model with no shared memory; properties reference automaton state names only."
+  warnings (0):
+  info (0):
+
+=== mununu verify (fixed) ===
+verify report — project `RedfishAuthBypassFixed`:
+  composition: asynchronous RedfishSystem { members = [HttpClient, RedfishAuthHandler] }
+  sources:
+    - redfish (adapter = ctxdsl, automaton = HttpClient)
+  properties (3):
+    no_unauthenticated_privileged_exec: SATISFIED (6/7 states, 1/1 initial) [inline, over = RedfishAuthHandler]
+    legit_privileged_path_reachable: SATISFIED (5/7 states, 1/1 initial) [template `reachable`, over = RedfishAuthHandler]
+    bypass_state_reachable: VIOLATED (1/7 states, 0/1 initial) [template `reachable`, over = RedfishAuthHandler]
+      counterexample (from Unconnected):
+        1. --[http_connect]--> Connected
+        2. --[header_spoof_request]--> AuthCheckInProgress
+        3. --[perform_auth_check]--> AuthenticatedViaCheck
+        4. --[execute_privileged_op]--> PrivilegedExecLegit
+        5. --[execute_privileged_op]--> PrivilegedExecLegit
+        (cycle back to step 4)
