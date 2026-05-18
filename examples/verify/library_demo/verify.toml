@@ -1,0 +1,71 @@
+# library_demo — parameterised CTXDSL library template demo
+# (plan Part 6 item 7).
+#
+# Demonstrates: drop a `mununu library emit <name>` template into a
+# verify project, declare `count = N` on the `[[sources]]` block, and
+# the framework expands one template file into N independent
+# instances. The PLIC template here covers 3 interrupt sources; the
+# watchdog template instantiates twice (one main + one backup).
+#
+# Recreate:
+#   $ bash examples/verify/library_demo/validate.sh
+
+[project]
+name = "LibraryDemo"
+description = "PLIC × 3 + Watchdog × 2 from shipped library templates."
+
+[[sources]]
+id = "plic_src"
+adapter = "ctxdsl"
+files = ["plic.ctxdsl.tpl"]
+count = 3
+
+[[sources]]
+id = "wd"
+adapter = "ctxdsl"
+files = ["watchdog.ctxdsl.tpl"]
+count = 2
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = [
+    "plic_src_0", "plic_src_1", "plic_src_2",
+    "wd_0", "wd_1",
+]
+name = "LibrarySystem"
+
+# Per-source PLIC reachability — each tracked interrupt can fire.
+[[properties]]
+name = "plic_0_can_pend"
+template = "reachable"
+args = { TARGET = "PLIC_plic_src_0_Pending" }
+over = "LibrarySystem"
+
+[[properties]]
+name = "plic_1_can_pend"
+template = "reachable"
+args = { TARGET = "PLIC_plic_src_1_Pending" }
+over = "LibrarySystem"
+
+[[properties]]
+name = "plic_2_can_pend"
+template = "reachable"
+args = { TARGET = "PLIC_plic_src_2_Pending" }
+over = "LibrarySystem"
+
+# Per-watchdog reachability — both watchdogs can timeout (each is
+# independent; environment-driven).
+[[properties]]
+name = "main_watchdog_can_expire"
+template = "reachable"
+args = { TARGET = "Watchdog_wd_0_Expired" }
+over = "LibrarySystem"
+
+[[properties]]
+name = "backup_watchdog_can_expire"
+template = "reachable"
+args = { TARGET = "Watchdog_wd_1_Expired" }
+over = "LibrarySystem"

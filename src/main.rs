@@ -58,6 +58,11 @@ enum Commands {
     /// General N-source verification framework. See `mununu verify --help`
     /// in the `mununu-cli` crate for full docs.
     Verify(VerifyArgs),
+    /// Browse / emit shipped parameterised CTXDSL component templates.
+    Library {
+        #[command(subcommand)]
+        command: Box<LibraryCommand>,
+    },
     #[cfg(feature = "api")]
     /// Start HTTP API server
     Server {
@@ -65,6 +70,24 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommand {
+    /// List every shipped library template.
+    List,
+    /// Emit one template's CTXDSL body.
+    Emit(LibraryEmitArgs),
+}
+
+#[derive(Args, Debug)]
+struct LibraryEmitArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "ID")]
+    instance_id: Option<String>,
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -693,6 +716,40 @@ fn init_tracing() {
     }
 }
 
+fn handle_library(command: LibraryCommand) -> Result<(), String> {
+    use mununu::library;
+
+    match command {
+        LibraryCommand::List => {
+            println!("Shipped parameterised CTXDSL component templates:");
+            println!();
+            for t in library::templates() {
+                println!("  {:<18} — {}", t.name, t.summary);
+            }
+            println!();
+            println!("Emit with: `mununu library emit <NAME> [--instance-id ID] [-o PATH]`");
+            Ok(())
+        }
+        LibraryCommand::Emit(args) => {
+            let t = library::lookup(&args.name).ok_or_else(|| {
+                let names: Vec<&str> = library::templates().iter().map(|t| t.name).collect();
+                format!(
+                    "unknown library template `{}`. Available: {}",
+                    args.name,
+                    names.join(", ")
+                )
+            })?;
+            let body = library::emit(t, args.instance_id.as_deref());
+            match args.output {
+                Some(path) => std::fs::write(&path, &body)
+                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+                None => print!("{body}"),
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     use mununu::verify::config::VerifyConfig;
     use mununu::verify::report::PropertyFormulaSource;
@@ -848,6 +905,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
         Commands::Verify(args) => handle_verify(args),
+        Commands::Library { command } => handle_library(*command),
         #[cfg(feature = "api")]
         Commands::Server { addr } => {
             use std::net::SocketAddr;

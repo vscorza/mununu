@@ -56,6 +56,12 @@ enum Commands {
     },
     /// List available property templates.
     Templates(TemplatesArgs),
+    /// Browse / emit shipped parameterised CTXDSL component templates
+    /// (PLIC, watchdog, tracked-memory).
+    Library {
+        #[command(subcommand)]
+        command: Box<LibraryCommand>,
+    },
     /// Contract assume-guarantee tooling (validate discharge graphs, etc.).
     Contract {
         #[command(subcommand)]
@@ -79,6 +85,30 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommand {
+    /// List every shipped library template + a one-line summary.
+    List,
+    /// Emit one template's CTXDSL body to stdout (or `--output`).
+    Emit(LibraryEmitArgs),
+}
+
+#[derive(Args, Debug)]
+struct LibraryEmitArgs {
+    /// Template name (e.g. `plic`, `watchdog`, `tracked_memory`).
+    #[arg(value_name = "NAME")]
+    name: String,
+    /// Substitute `{instance_id}` with this value before emitting.
+    /// When omitted, the placeholder is preserved verbatim — useful
+    /// when feeding the output to a `[[sources]]` block with
+    /// `count = N` (the verify framework substitutes per instance).
+    #[arg(long, value_name = "ID")]
+    instance_id: Option<String>,
+    /// Output path. Defaults to stdout.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1143,6 +1173,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Extraction { command } => handle_extraction(*command),
         Commands::Sv { command } => handle_sv(*command),
         Commands::Templates(args) => list_templates(args),
+        Commands::Library { command } => handle_library(*command),
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
         Commands::Verify(args) => handle_verify(args),
@@ -5941,6 +5972,40 @@ fn sanitize_identifier_cli(value: &str) -> String {
 // ---------------------------------------------------------------------------
 // Property templates CLI
 // ---------------------------------------------------------------------------
+
+fn handle_library(command: LibraryCommand) -> Result<(), String> {
+    use mununu_core::library;
+
+    match command {
+        LibraryCommand::List => {
+            println!("Shipped parameterised CTXDSL component templates:");
+            println!();
+            for t in library::templates() {
+                println!("  {:<18} — {}", t.name, t.summary);
+            }
+            println!();
+            println!("Emit with: `mununu library emit <NAME> [--instance-id ID] [-o PATH]`");
+            Ok(())
+        }
+        LibraryCommand::Emit(args) => {
+            let t = library::lookup(&args.name).ok_or_else(|| {
+                let names: Vec<&str> = library::templates().iter().map(|t| t.name).collect();
+                format!(
+                    "unknown library template `{}`. Available: {}",
+                    args.name,
+                    names.join(", ")
+                )
+            })?;
+            let body = library::emit(t, args.instance_id.as_deref());
+            match args.output {
+                Some(path) => std::fs::write(&path, &body)
+                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+                None => print!("{body}"),
+            }
+            Ok(())
+        }
+    }
+}
 
 fn list_templates(args: TemplatesArgs) -> Result<(), String> {
     use mununu_core::adapter::templates::{TemplateDomain, TemplateRegistry};
