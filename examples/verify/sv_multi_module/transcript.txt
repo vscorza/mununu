@@ -1,0 +1,12 @@
+# sv_multi_module — verify framework end-to-end transcript
+# Regenerated via examples/verify/sv_multi_module/validate.sh
+#
+# Producer + consumer SV modules composed via the SV adapter's
+# multi-module entry point. Demonstrates the verify framework's
+# multi-file source support (Stream A1 of the adjacent-work plan).
+
+=== mununu verify (human-readable) ===
+verify report — project `SvMultiModule`:
+  composition: asynchronous ProducerConsumerSystem { members = [producer] }
+    - system (adapter = sv-rtl, automaton = producer)
+    system_alive: SATISFIED (4/4 states, 1/1 initial) [inline, over = system]
