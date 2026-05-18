@@ -151,7 +151,61 @@ pub struct SourceSection {
     /// accepts both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// Declarative posture marker for sources that model memory
+    /// regions (chaotic stubs, tracked-memory templates, ad-hoc
+    /// memory CTXDSL). When set, the validator and the `mununu
+    /// memory check` audit (Stream B2b) cross-reference the
+    /// declared posture against property templates to surface
+    /// soundness mismatches (e.g. liveness properties under a
+    /// chaotic stub — Doc C §C.5: optimistic).
+    ///
+    /// Plan Stream B2a / `docs/abstraction.md` memory section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_abstraction: Option<MemoryAbstractionPosture>,
 }
+
+/// Declarative posture marker for memory-modelling sources. Each
+/// field is optional so the user can ship only the constraints they
+/// care about; missing fields default to the legacy "no posture
+/// declared" behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryAbstractionPosture {
+    /// One of `"chaotic"`, `"tracked_addresses"`, `"tracked_with_values"`,
+    /// or `"full_concrete"`. See `docs/abstraction.md` § Memory.
+    pub kind: String,
+    /// Tracked memory region identifiers. Only meaningful for
+    /// `kind = "tracked_addresses"` or `"tracked_with_values"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracked: Vec<String>,
+    /// Symbol set the source uses for per-address state. Only
+    /// meaningful for `kind = "tracked_with_values"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_symbol_set: Vec<String>,
+    /// One of `"global_barrier"` (default), `"release_acquire"`, or
+    /// `"rvwmo"`. The verify framework currently always models
+    /// fences as global barriers; declaring this field lets future
+    /// tooling (Stream B2b's audit) flag weak-memory-sensitive
+    /// property templates with a `WeakMemoryUnmodelled` warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_semantics: Option<String>,
+    /// Free-form note. Surfaced in `mununu memory check` output and
+    /// the `--print-alphabet` introspection report. Useful for
+    /// pointing readers at the docs section that justifies the
+    /// posture choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Valid `MemoryAbstractionPosture.kind` values.
+pub const VALID_MEMORY_ABSTRACTION_KINDS: &[&str] = &[
+    "chaotic",
+    "tracked_addresses",
+    "tracked_with_values",
+    "full_concrete",
+];
+
+/// Valid `MemoryAbstractionPosture.fence_semantics` values.
+pub const VALID_FENCE_SEMANTICS: &[&str] = &["global_barrier", "release_acquire", "rvwmo"];
 
 /// `[alphabet]` block — how labels across sources synchronise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +321,24 @@ pub enum ConfigIssue {
     /// = 1` (or omit the field) for a single instance, `>= 2` for
     /// parameterised expansion.
     SourceCountZero { source_id: String },
+    /// `[[sources]]` entry had a `memory_abstraction.kind` value
+    /// outside the allowed set (`chaotic`, `tracked_addresses`,
+    /// `tracked_with_values`, `full_concrete`).
+    MemoryAbstractionInvalidKind { source_id: String, kind: String },
+    /// `[[sources]]` entry had a `memory_abstraction.fence_semantics`
+    /// value outside the allowed set (`global_barrier`,
+    /// `release_acquire`, `rvwmo`).
+    MemoryAbstractionInvalidFenceSemantics {
+        source_id: String,
+        fence_semantics: String,
+    },
+    /// `memory_abstraction.tracked` is non-empty but
+    /// `kind = "chaotic"` doesn't track individual addresses.
+    MemoryAbstractionTrackedWithoutTracking { source_id: String, kind: String },
+    /// `memory_abstraction.value_symbol_set` is non-empty but
+    /// `kind` is not `tracked_with_values` — symbol sets only
+    /// apply when tracking per-address state.
+    MemoryAbstractionValuesWithoutTracking { source_id: String, kind: String },
     /// `[alphabet].strategy` is not one of `direct` / `renamings` /
     /// `register_map`.
     UnknownAlphabetStrategy(String),
@@ -325,6 +397,27 @@ impl fmt::Display for ConfigIssue {
             ConfigIssue::SourceCountZero { source_id } => write!(
                 f,
                 "[[sources]] `{source_id}` has `count = 0` (use 1 or omit for single-instance; >= 2 for parameterised expansion)"
+            ),
+            ConfigIssue::MemoryAbstractionInvalidKind { source_id, kind } => write!(
+                f,
+                "[[sources]] `{source_id}`: memory_abstraction.kind = `{kind}` is not one of {}",
+                VALID_MEMORY_ABSTRACTION_KINDS.join(" | ")
+            ),
+            ConfigIssue::MemoryAbstractionInvalidFenceSemantics {
+                source_id,
+                fence_semantics,
+            } => write!(
+                f,
+                "[[sources]] `{source_id}`: memory_abstraction.fence_semantics = `{fence_semantics}` is not one of {}",
+                VALID_FENCE_SEMANTICS.join(" | ")
+            ),
+            ConfigIssue::MemoryAbstractionTrackedWithoutTracking { source_id, kind } => write!(
+                f,
+                "[[sources]] `{source_id}`: memory_abstraction.tracked is non-empty but kind = `{kind}` does not track individual addresses (use `tracked_addresses` or `tracked_with_values`)"
+            ),
+            ConfigIssue::MemoryAbstractionValuesWithoutTracking { source_id, kind } => write!(
+                f,
+                "[[sources]] `{source_id}`: memory_abstraction.value_symbol_set is non-empty but kind = `{kind}` does not declare per-address values (use `tracked_with_values`)"
             ),
             ConfigIssue::SourceNoFiles { source_id } => write!(
                 f,
@@ -428,6 +521,43 @@ impl VerifyConfig {
                 issues.push(ConfigIssue::SourceNoFiles {
                     source_id: source.id.clone(),
                 });
+            }
+            // Memory-abstraction posture: validate kind + fence_semantics
+            // against the allowed sets, plus a couple of consistency
+            // checks between fields. Soundness audits (liveness under
+            // chaotic, weak-memory-sensitive templates) are handled
+            // by `mununu memory check` (Stream B2b), not here — this
+            // layer is strictly schema correctness.
+            if let Some(ma) = source.memory_abstraction.as_ref() {
+                if !VALID_MEMORY_ABSTRACTION_KINDS.contains(&ma.kind.as_str()) {
+                    issues.push(ConfigIssue::MemoryAbstractionInvalidKind {
+                        source_id: source.id.clone(),
+                        kind: ma.kind.clone(),
+                    });
+                }
+                if let Some(fs) = ma.fence_semantics.as_deref()
+                    && !VALID_FENCE_SEMANTICS.contains(&fs)
+                {
+                    issues.push(ConfigIssue::MemoryAbstractionInvalidFenceSemantics {
+                        source_id: source.id.clone(),
+                        fence_semantics: fs.to_string(),
+                    });
+                }
+                if !ma.tracked.is_empty()
+                    && ma.kind != "tracked_addresses"
+                    && ma.kind != "tracked_with_values"
+                {
+                    issues.push(ConfigIssue::MemoryAbstractionTrackedWithoutTracking {
+                        source_id: source.id.clone(),
+                        kind: ma.kind.clone(),
+                    });
+                }
+                if !ma.value_symbol_set.is_empty() && ma.kind != "tracked_with_values" {
+                    issues.push(ConfigIssue::MemoryAbstractionValuesWithoutTracking {
+                        source_id: source.id.clone(),
+                        kind: ma.kind.clone(),
+                    });
+                }
             }
             // Parameterisation: `count = N` expands to N instances
             // `<id>_0` .. `<id>_<N-1>`. count == 0 is meaningless;
@@ -1147,5 +1277,143 @@ members = ["a"]
 "#;
         let cfg2 = VerifyConfig::from_toml(toml_src).unwrap();
         assert_eq!(cfg2.composition_name(), "demoSystem");
+    }
+
+    // ---- memory_abstraction posture (Stream B2a) -------------------
+
+    const MEMORY_ABSTRACTION_VALID: &str = r#"
+[project]
+name = "MemAbsValid"
+
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+memory_abstraction = { kind = "tracked_addresses", tracked = ["mem_x", "mem_y"], fence_semantics = "global_barrier", notes = "tracked-only" }
+
+[composition]
+semantics = "asynchronous"
+members = ["memory"]
+"#;
+
+    #[test]
+    fn memory_abstraction_valid_kind_passes() {
+        let cfg = VerifyConfig::from_toml(MEMORY_ABSTRACTION_VALID).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.is_empty(), "got issues: {issues:?}");
+        let ma = cfg.sources[0].memory_abstraction.as_ref().unwrap();
+        assert_eq!(ma.kind, "tracked_addresses");
+        assert_eq!(ma.tracked, vec!["mem_x", "mem_y"]);
+        assert_eq!(ma.fence_semantics.as_deref(), Some("global_barrier"));
+    }
+
+    #[test]
+    fn memory_abstraction_invalid_kind_is_caught() {
+        let toml_src = r#"
+[project]
+name = "Bad"
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+memory_abstraction = { kind = "wat" }
+[composition]
+semantics = "asynchronous"
+members = ["memory"]
+"#;
+        let cfg = VerifyConfig::from_toml(toml_src).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|i| matches!(
+            i,
+            ConfigIssue::MemoryAbstractionInvalidKind { source_id, kind }
+                if source_id == "memory" && kind == "wat"
+        )));
+    }
+
+    #[test]
+    fn memory_abstraction_invalid_fence_semantics_is_caught() {
+        let toml_src = r#"
+[project]
+name = "BadFence"
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+memory_abstraction = { kind = "tracked_addresses", fence_semantics = "vibes" }
+[composition]
+semantics = "asynchronous"
+members = ["memory"]
+"#;
+        let cfg = VerifyConfig::from_toml(toml_src).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|i| matches!(
+            i,
+            ConfigIssue::MemoryAbstractionInvalidFenceSemantics { source_id, .. }
+                if source_id == "memory"
+        )));
+    }
+
+    #[test]
+    fn memory_abstraction_tracked_without_tracking_kind_is_caught() {
+        let toml_src = r#"
+[project]
+name = "MismatchedTracked"
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+memory_abstraction = { kind = "chaotic", tracked = ["mem_x"] }
+[composition]
+semantics = "asynchronous"
+members = ["memory"]
+"#;
+        let cfg = VerifyConfig::from_toml(toml_src).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|i| matches!(
+            i,
+            ConfigIssue::MemoryAbstractionTrackedWithoutTracking { source_id, kind }
+                if source_id == "memory" && kind == "chaotic"
+        )));
+    }
+
+    #[test]
+    fn memory_abstraction_values_without_tracked_with_values_is_caught() {
+        let toml_src = r#"
+[project]
+name = "MismatchedValues"
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+memory_abstraction = { kind = "tracked_addresses", tracked = ["x"], value_symbol_set = ["Initial", "Written"] }
+[composition]
+semantics = "asynchronous"
+members = ["memory"]
+"#;
+        let cfg = VerifyConfig::from_toml(toml_src).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|i| matches!(
+            i,
+            ConfigIssue::MemoryAbstractionValuesWithoutTracking { source_id, kind }
+                if source_id == "memory" && kind == "tracked_addresses"
+        )));
+    }
+
+    #[test]
+    fn memory_abstraction_omitted_is_legacy_safe() {
+        // Sources without memory_abstraction stay valid — backwards-
+        // compatible with every shipped fixture.
+        let cfg = VerifyConfig::from_toml(VALID_DIRECT).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.is_empty(), "got: {issues:?}");
+        assert!(cfg.sources[0].memory_abstraction.is_none());
+    }
+
+    #[test]
+    fn memory_abstraction_round_trips_via_serde() {
+        let cfg = VerifyConfig::from_toml(MEMORY_ABSTRACTION_VALID).unwrap();
+        let toml_text = toml::to_string(&cfg).unwrap();
+        let reparsed = VerifyConfig::from_toml(&toml_text).unwrap();
+        assert_eq!(cfg, reparsed);
     }
 }

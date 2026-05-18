@@ -198,6 +198,7 @@ fn build_firmware_source(codesign: &CodesignProjectConfig) -> SourceSection {
         files: codesign.firmware.sources.clone(),
         options,
         count: None,
+        memory_abstraction: None,
     }
 }
 
@@ -218,6 +219,7 @@ fn build_rtl_source(codesign: &CodesignProjectConfig) -> SourceSection {
         files: codesign.rtl.sources.clone(),
         options,
         count: None,
+        memory_abstraction: None,
     }
 }
 
