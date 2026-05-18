@@ -63,8 +63,8 @@ use crate::verify::binding::{AlphabetBinding, apply_renamings_to_ctxdsl};
 use crate::verify::config::{PropertySection, VerifyConfig};
 use crate::verify::register_map_rewriter::derive_sv_renamings_from_register_map;
 use crate::verify::report::{
-    CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, VerifyError,
-    VerifyReport,
+    CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, TraceStep,
+    TraceTermination, TraceWitness, VerifyError, VerifyReport,
 };
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1012,12 @@ fn evaluate_one_property(
         .collect();
     let satisfied = !initial_states.is_empty() && initial_satisfying.len() == initial_states.len();
 
+    let counterexample = if !satisfied {
+        build_counterexample_witness(clts, &result, TRACE_WITNESS_STEP_CAP)
+    } else {
+        None
+    };
+
     Ok(PropertyVerdict {
         name: name.to_string(),
         formula_source,
@@ -1022,7 +1028,147 @@ fn evaluate_one_property(
         satisfying_states,
         initial_states,
         initial_satisfying,
+        counterexample,
     })
+}
+
+/// Maximum number of steps recorded by [`build_counterexample_witness`].
+/// 20 steps is enough to surface the typical violation in shipped
+/// fixtures (the chaotic codesign trace from `Idle` to `Sending` is
+/// ~6 steps in the worst case) without producing a wall of state
+/// names in the verify report.
+const TRACE_WITNESS_STEP_CAP: usize = 20;
+
+/// Construct a forward-walk witness from a violating initial state.
+///
+/// Picks the first initial state that does not satisfy `result`,
+/// then walks outgoing transitions for up to `max_steps`, preferring
+/// successors that also violate the property. Falls back to any
+/// unvisited successor when no violating successor is available.
+///
+/// Returns `None` when:
+/// - every initial state satisfies the property (caller should not
+///   invoke this), or
+/// - the composition has no initial states.
+fn build_counterexample_witness<S, L>(
+    clts: &crate::clts::Clts<S, L>,
+    satisfaction: &bitvec::vec::BitVec<usize, bitvec::order::Lsb0>,
+    max_steps: usize,
+) -> Option<TraceWitness>
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    use std::collections::HashSet;
+
+    let violating_initial = clts
+        .initial_states()
+        .iter()
+        .copied()
+        .find(|sid| !satisfaction.get(sid.index()).map(|b| *b).unwrap_or(false))?;
+
+    let initial_state = clts.state_name(violating_initial)?.to_string();
+
+    let mut steps: Vec<TraceStep> = Vec::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+    visited.insert(violating_initial.index());
+    let mut current = violating_initial;
+    let mut termination = TraceTermination::Sink;
+    let mut path_states_by_index: Vec<usize> = vec![violating_initial.index()];
+
+    for _ in 0..max_steps {
+        let outgoing = clts.outgoing(current);
+        if outgoing.is_empty() {
+            termination = TraceTermination::Sink;
+            break;
+        }
+
+        // Prefer an unvisited violating successor.
+        let mut pick = outgoing.iter().find(|t| {
+            let idx = t.target().index();
+            !visited.contains(&idx) && !satisfaction.get(idx).map(|b| *b).unwrap_or(true)
+        });
+        // Fallback to any unvisited successor.
+        if pick.is_none() {
+            pick = outgoing
+                .iter()
+                .find(|t| !visited.contains(&t.target().index()));
+        }
+
+        let Some(transition) = pick else {
+            // Every successor visited — close the cycle on the first
+            // outgoing edge.
+            let first = &outgoing[0];
+            let succ_idx = first.target().index();
+            let succ_name = clts
+                .state_name(first.target())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("state_{succ_idx}"));
+            let label = format_transition_label(clts, first);
+            steps.push(TraceStep {
+                label,
+                successor_state: succ_name,
+            });
+            let return_to_step = path_states_by_index
+                .iter()
+                .position(|&i| i == succ_idx)
+                .unwrap_or(0);
+            termination = TraceTermination::Cycle { return_to_step };
+            break;
+        };
+
+        let succ = transition.target();
+        let succ_idx = succ.index();
+        let succ_name = clts
+            .state_name(succ)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("state_{succ_idx}"));
+        let label = format_transition_label(clts, transition);
+        steps.push(TraceStep {
+            label,
+            successor_state: succ_name,
+        });
+        visited.insert(succ_idx);
+        path_states_by_index.push(succ_idx);
+        current = succ;
+    }
+
+    if steps.len() == max_steps && !matches!(termination, TraceTermination::Cycle { .. }) {
+        termination = TraceTermination::LengthLimit;
+    }
+
+    Some(TraceWitness {
+        initial_state,
+        steps,
+        termination,
+    })
+}
+
+/// Render one multi-label transition's label payload as a
+/// comma-joined string (`label_a,label_b`). Falls back to `"?"` when
+/// the label store cannot resolve the ID, which only happens if the
+/// CLTS is malformed.
+fn format_transition_label<S, L>(
+    clts: &crate::clts::Clts<S, L>,
+    transition: &crate::clts::Transition<S, L>,
+) -> String
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    let mut parts: Vec<String> = Vec::new();
+    for lid in transition.labels() {
+        if let Some(payload) = clts.label_payload(*lid) {
+            for sym in payload {
+                parts.push(sym.clone());
+            }
+        }
+    }
+    if parts.is_empty() {
+        "?".to_string()
+    } else {
+        parts.join(",")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,5 +1899,66 @@ over = "T"
         let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
         assert_eq!(report.property_verdicts.len(), 1);
         assert!(report.property_verdicts[0].satisfied);
+    }
+
+    #[test]
+    fn violated_property_emits_counterexample_witness() {
+        // Pin a property to `false` so every initial state violates;
+        // expect the orchestrator to attach a TraceWitness rooted at
+        // a violating initial state.
+        let temp = tempdir().unwrap();
+        let _ = write_ctxdsl_source(temp.path(), "light.ctxdsl", SIMPLE_LIGHT_CTXDSL);
+        let toml_src = r#"
+[project]
+name = "Bad"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+
+[composition]
+semantics = "synchronous"
+members = ["light"]
+name = "Sys"
+
+[[properties]]
+name = "impossible"
+formula = "false"
+over = "Sys"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("pipeline runs");
+        assert_eq!(report.property_verdicts.len(), 1);
+        let v = &report.property_verdicts[0];
+        assert!(!v.satisfied, "expected VIOLATED");
+        let witness = v
+            .counterexample
+            .as_ref()
+            .expect("violated verdicts carry a counterexample");
+        assert!(
+            !witness.initial_state.is_empty(),
+            "initial_state should name a violating initial"
+        );
+        // The walk should produce at least one step or terminate at a sink.
+        match &witness.termination {
+            TraceTermination::Sink
+            | TraceTermination::Cycle { .. }
+            | TraceTermination::LengthLimit => {}
+        }
+    }
+
+    #[test]
+    fn satisfied_property_does_not_emit_counterexample() {
+        let temp = tempdir().unwrap();
+        let config = build_two_source_config(temp.path());
+        let report = verify_project(&config, temp.path()).expect("pipeline runs");
+        for v in &report.property_verdicts {
+            assert!(v.satisfied);
+            assert!(
+                v.counterexample.is_none(),
+                "satisfied verdicts should not carry a counterexample"
+            );
+        }
     }
 }
