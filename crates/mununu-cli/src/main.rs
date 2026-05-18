@@ -212,6 +212,12 @@ struct VerifyArgs {
     /// verdicts to enforce against).
     #[arg(long = "print-alphabet")]
     print_alphabet: bool,
+    /// For every violated property, print the counterexample witness
+    /// attached by the orchestrator (initial state → labelled steps →
+    /// termination). Default off so existing transcripts stay
+    /// byte-stable; opt-in for debugging.
+    #[arg(long = "print-counterexample")]
+    print_counterexample: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1120,6 +1126,29 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
                 source = source_str,
                 over = v.over,
             );
+            if args.print_counterexample
+                && let Some(witness) = v.counterexample.as_ref()
+            {
+                println!("      counterexample (from {}):", witness.initial_state);
+                for (i, step) in witness.steps.iter().enumerate() {
+                    println!(
+                        "        {idx}. --[{label}]--> {state}",
+                        idx = i + 1,
+                        label = step.label,
+                        state = step.successor_state,
+                    );
+                }
+                let term = match &witness.termination {
+                    mununu_core::verify::report::TraceTermination::Sink => "sink".to_string(),
+                    mununu_core::verify::report::TraceTermination::Cycle { return_to_step } => {
+                        format!("cycle back to step {return_to_step}")
+                    }
+                    mununu_core::verify::report::TraceTermination::LengthLimit => {
+                        "length-limit (truncated)".to_string()
+                    }
+                };
+                println!("        ({term})");
+            }
         }
     }
 

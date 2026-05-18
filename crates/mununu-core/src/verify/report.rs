@@ -70,6 +70,60 @@ pub struct PropertyVerdict {
     pub initial_states: Vec<String>,
     /// Subset of `initial_states` that satisfy the formula.
     pub initial_satisfying: Vec<String>,
+    /// Witness path from a violating initial state, when the
+    /// verdict is unsatisfied and a witness can be constructed. The
+    /// orchestrator emits this opportunistically — `None` is also
+    /// emitted for satisfied verdicts and when the walk hits a
+    /// degenerate case (no violating initials, no outgoing
+    /// transitions from violating initials). See [`TraceWitness`]
+    /// for the trace shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterexample: Option<TraceWitness>,
+}
+
+/// A short witness path from a violating initial state to either a
+/// sink, a cycle, or a length-capped step in the composed
+/// automaton. The trace is **not** a counterstrategy — it is a
+/// straightforward forward walk through the composition, biased
+/// toward visiting states that violate the property formula. For
+/// safety properties this surfaces "the system can reach this bad
+/// state via these transitions"; for reachability properties this
+/// surfaces "no path from here reaches the target".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceWitness {
+    /// Initial composed-state name where the trace begins.
+    pub initial_state: String,
+    /// Sequence of transitions taken. `steps[i]` records the label
+    /// fired and the state entered.
+    pub steps: Vec<TraceStep>,
+    /// Why the trace stopped.
+    pub termination: TraceTermination,
+}
+
+/// One transition in a [`TraceWitness`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceStep {
+    /// Label payload of the fired transition. A single CTXDSL
+    /// `transition s -> t on label a, label b;` produces one entry
+    /// joining the labels with `,`.
+    pub label: String,
+    /// Composed-state name entered after firing this transition.
+    pub successor_state: String,
+}
+
+/// Reason a [`TraceWitness`] stopped at a particular step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TraceTermination {
+    /// The composed-state reached has no outgoing transitions.
+    Sink,
+    /// The walk revisited a state already in the trace; the
+    /// `return_to_step` index is the step where the cycle joins
+    /// back. `0` means the cycle closes onto the initial state.
+    Cycle { return_to_step: usize },
+    /// The orchestrator's length cap (currently 20 steps) was
+    /// reached before any other terminator fired.
+    LengthLimit,
 }
 
 /// How a property's formula was sourced.
