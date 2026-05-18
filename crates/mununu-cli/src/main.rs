@@ -4653,6 +4653,40 @@ fn collect_action_info(automaton: &mununu_core::context_dsl::ast::Automaton) -> 
         .collect()
 }
 
+/// Build the Cytoscape compound node that wraps an automaton's states and edges.
+/// Shape is identical for both DSL and unrolled builders; only `id` and `label`
+/// differ at the call site.
+fn build_automaton_compound_node(
+    id: String,
+    label: String,
+    var_names: &[String],
+    action_info: &[String],
+) -> CytoscapeElement {
+    CytoscapeElement {
+        data: CytoscapeData::Node {
+            id,
+            parent: None,
+            label: Some(label),
+            vars: if var_names.is_empty() {
+                None
+            } else {
+                Some(json!(var_names))
+            },
+            actions: if action_info.is_empty() {
+                None
+            } else {
+                Some(json!(action_info))
+            },
+            valuations: None,
+            note: None,
+            isStart: None,
+            isDead: None,
+        },
+        position: None,
+        classes: None,
+    }
+}
+
 /// Classify a label as controllable/internal/uncontrollable from an automaton's
 /// declarations.  Used by both Cytoscape builders for edge `actionType`.
 fn classify_action(
@@ -4939,32 +4973,13 @@ fn dsl_automata_to_cytoscape(
 
         // Create automaton compound node
         let automaton_id = automaton_name.clone();
-        elements.push(CytoscapeElement {
-            data: CytoscapeData::Node {
-                id: automaton_id.clone(),
-                parent: None,
-                label: Some(format!("Automaton {}", automaton_name)),
-                vars: if var_names.is_empty() {
-                    None
-                } else {
-                    Some(json!(var_names))
-                },
-                actions: if action_info.is_empty() {
-                    None
-                } else {
-                    Some(json!(action_info))
-                },
-                valuations: None,
-                note: None,
-                isStart: None,
-                isDead: None,
-            },
-            position: None,
-            classes: None,
-        });
+        elements.push(build_automaton_compound_node(
+            automaton_id.clone(),
+            format!("Automaton {}", automaton_name),
+            &var_names,
+            &action_info,
+        ));
 
-        // Collect states and their positions
-        let mut state_positions: HashMap<String, (f64, f64)> = HashMap::new();
         let mut x_pos = 100.0;
 
         for state_decl in &automaton.states {
@@ -4991,8 +5006,6 @@ fn dsl_automata_to_cytoscape(
                     }
                 })
             };
-
-            state_positions.insert(state_name.clone(), (x_pos, y_offset + 100.0));
 
             let state_valuations = clts
                 .state_id(state_name)
@@ -5262,32 +5275,13 @@ fn unrolled_automata_to_cytoscape(
 
         // Create automaton compound node (with "Unrolled" suffix)
         let automaton_id = format!("{}_unrolled", automaton_name);
-        elements.push(CytoscapeElement {
-            data: CytoscapeData::Node {
-                id: automaton_id.clone(),
-                parent: None,
-                label: Some(format!("Automaton {} (Unrolled)", automaton_name)),
-                vars: if var_names.is_empty() {
-                    None
-                } else {
-                    Some(json!(var_names))
-                },
-                actions: if action_info.is_empty() {
-                    None
-                } else {
-                    Some(json!(action_info))
-                },
-                valuations: None,
-                note: None,
-                isStart: None,
-                isDead: None,
-            },
-            position: None,
-            classes: None,
-        });
+        elements.push(build_automaton_compound_node(
+            automaton_id.clone(),
+            format!("Automaton {} (Unrolled)", automaton_name),
+            &var_names,
+            &action_info,
+        ));
 
-        // Collect states and their positions
-        let mut state_positions: HashMap<String, (f64, f64)> = HashMap::new();
         let mut x_pos = 100.0;
         let mut initial_states = HashSet::new();
 
@@ -5341,8 +5335,6 @@ fn unrolled_automata_to_cytoscape(
                     .collect();
                 Some(var_parts.join(", "))
             };
-
-            state_positions.insert(state_name.clone(), (x_pos, y_offset + 100.0));
 
             elements.extend(build_state_elements(StateElementParams {
                 state_id,
