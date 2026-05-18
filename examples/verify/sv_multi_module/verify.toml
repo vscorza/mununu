@@ -1,0 +1,39 @@
+# sv_multi_module — SystemVerilog multi-module composition under the
+# verify framework (Stream A1 of the adjacent-work plan).
+#
+# Demonstrates: a single `[[sources]]` block with `files = [sidecar,
+# module_1.sv, module_2.sv]` drives the SV adapter's multi-module
+# entry point. The orchestrator reads every file, recognises the
+# multi-module sidecar shape (`mununu_sv_multi_v1` schema), and
+# dispatches via `SystemVerilogAdapter::translate_multi_module_content`.
+#
+# Without multi-file source support, the user would have to either
+# pre-compose the SV blob (lossy) or hand-author a CTXDSL stub.
+
+[project]
+name = "SvMultiModule"
+description = "Producer + consumer composed via the SV adapter's multi-module path."
+
+[[sources]]
+id = "system"
+adapter = "sv-rtl"
+# Primary file is the multi-module sidecar; additional files are the
+# SV sources it references via the `source` field on each module.
+files = [
+    "system.mununu.json",
+    "producer.sv",
+    "consumer.sv",
+]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["system"]
+name = "ProducerConsumerSystem"
+
+[[properties]]
+name = "system_alive"
+formula = "true"
+over = "system"

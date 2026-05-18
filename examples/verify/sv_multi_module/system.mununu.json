@@ -1,0 +1,40 @@
+{
+  "$schema": "mununu_sv_multi_v1",
+  "modules": [
+    {
+      "name": "producer",
+      "source": "producer.sv",
+      "clock_domain": "clk_sys",
+      "signals": [
+        {"name": "state", "abstraction": "enum", "variants": ["IDLE", "PRODUCING", "DONE"]}
+      ],
+      "inputs": [
+        {"name": "enable", "abstraction": "boolean"}
+      ],
+      "controllable": []
+    },
+    {
+      "name": "consumer",
+      "source": "consumer.sv",
+      "clock_domain": "clk_sys",
+      "signals": [
+        {"name": "state", "abstraction": "enum", "variants": ["IDLE", "BUSY", "ACK"]}
+      ],
+      "inputs": [],
+      "controllable": []
+    }
+  ],
+  "connections": [
+    {
+      "from": "producer.valid",
+      "to": "consumer.valid",
+      "abstraction": "boolean",
+      "note": "Producer valid signal drives consumer"
+    }
+  ],
+  "composition": {
+    "mode": "synchronous",
+    "name": "system"
+  },
+  "properties": []
+}

@@ -115,6 +115,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 path: path.clone(),
                 source: source_err,
             })?;
+        let additional_files = read_additional_files(base_dir, source)?;
 
         let count = source.count.unwrap_or(1).max(1);
         let instances: Vec<(String, String)> = if count == 1 {
@@ -135,6 +136,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 &instance_id,
                 &path,
                 &content,
+                &additional_files,
                 &source.options,
                 base_dir,
             )?;
@@ -375,6 +377,7 @@ pub fn inspect_project(
                 path: path.clone(),
                 source: source_err,
             })?;
+        let additional_files = read_additional_files(base_dir, source)?;
         let count = source.count.unwrap_or(1).max(1);
         let instances: Vec<(String, String)> = if count == 1 {
             vec![(source.id.clone(), raw_content.clone())]
@@ -393,6 +396,7 @@ pub fn inspect_project(
                 &instance_id,
                 &path,
                 &content,
+                &additional_files,
                 &source.options,
                 base_dir,
             )?;
@@ -596,12 +600,17 @@ fn dispatch_adapter(
     source_id: &str,
     file_path: &Path,
     content: &str,
+    additional_files: &[(PathBuf, String)],
     options: &std::collections::BTreeMap<String, toml::Value>,
     base_dir: &Path,
 ) -> Result<String, VerifyError> {
     match adapter {
-        "ctxdsl" => Ok(content.to_string()),
+        "ctxdsl" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
+            Ok(content.to_string())
+        }
         "xstate" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             XStateAdapter::translate(content, &opts)
                 .map(|out| out.ctxdsl)
@@ -611,17 +620,9 @@ fn dispatch_adapter(
                     message: err.to_string(),
                 })
         }
-        "sv-rtl" => {
-            let opts = AdapterOptions::default();
-            crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
-                .map(|out| out.ctxdsl)
-                .map_err(|err| VerifyError::AdapterTranslationFailed {
-                    source_id: source_id.to_string(),
-                    adapter: adapter.to_string(),
-                    message: err.to_string(),
-                })
-        }
+        "sv-rtl" => dispatch_sv_rtl(source_id, content, additional_files),
         "crewai" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             crate::adapter::crewai::CrewaiAdapter::translate(content, &opts)
                 .map(|out| out.ctxdsl)
@@ -632,6 +633,7 @@ fn dispatch_adapter(
                 })
         }
         "langgraph" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             crate::adapter::langgraph::LangGraphAdapter::translate(content, &opts)
                 .map(|out| out.ctxdsl)
@@ -642,6 +644,7 @@ fn dispatch_adapter(
                 })
         }
         "microcode" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             crate::adapter::microcode::MicrocodeAdapter::translate(content, &opts)
                 .map(|out| out.ctxdsl)
@@ -652,6 +655,7 @@ fn dispatch_adapter(
                 })
         }
         "extraction" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
             let mode = options
                 .get("mode")
                 .and_then(|v| v.as_str())
@@ -668,11 +672,98 @@ fn dispatch_adapter(
                     message: err.to_string(),
                 })
         }
-        "c-codesign" => dispatch_c_codesign(source_id, file_path, options, base_dir),
+        "c-codesign" => {
+            warn_unused_additional_files(adapter, source_id, additional_files);
+            dispatch_c_codesign(source_id, file_path, options, base_dir)
+        }
         other => Err(VerifyError::UnknownAdapter {
             source_id: source_id.to_string(),
             adapter: other.to_string(),
         }),
+    }
+}
+
+/// Emit a `tracing::warn!` line per dropped additional file when a
+/// single-file adapter is given more than one input. The verify
+/// pipeline accepts the over-specified `files = [...]` list but only
+/// the primary file reaches the adapter; this notice tells the user
+/// the extras were dropped so they don't silently misinterpret the
+/// model.
+///
+/// Today every adapter except `sv-rtl` is single-file; the framework
+/// only honours multi-file on the sv-rtl multi-module path.
+fn warn_unused_additional_files(
+    adapter: &str,
+    source_id: &str,
+    additional_files: &[(PathBuf, String)],
+) {
+    if additional_files.is_empty() {
+        return;
+    }
+    let names: Vec<String> = additional_files
+        .iter()
+        .map(|(p, _)| p.display().to_string())
+        .collect();
+    tracing::warn!(
+        adapter,
+        source_id,
+        dropped = names.join(", ").as_str(),
+        "verify: source's `files = [...]` listed {} additional file(s); adapter `{}` only consumes one — extras dropped: {}",
+        additional_files.len(),
+        adapter,
+        names.join(", "),
+    );
+}
+
+/// Dispatch sv-rtl. When the primary content looks like a
+/// multi-module sidecar (`$schema = "mununu_sv_multi_v1"` or carries
+/// a `"modules"` array), use the SV adapter's multi-module entry
+/// point, sourcing each module's RTL from the additional files. When
+/// it's a single SV source, dispatch the regular `translate` path
+/// (extras dropped with a warning).
+fn dispatch_sv_rtl(
+    source_id: &str,
+    content: &str,
+    additional_files: &[(PathBuf, String)],
+) -> Result<String, VerifyError> {
+    let is_multi_module = content.contains("mununu_sv_multi_v1") || content.contains("\"modules\"");
+    if is_multi_module {
+        // Build the source-name → content map the SV adapter expects.
+        // The sidecar's "modules[*].source" fields reference each
+        // module's RTL by filename; the user lists those files in
+        // [[sources]].files after the sidecar.
+        let mut sources: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (path, body) in additional_files {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                sources.insert(name.to_string(), body.clone());
+            }
+            // Also register the full path string in case the sidecar
+            // references files by relative path rather than basename.
+            if let Some(s) = path.to_str() {
+                sources.insert(s.to_string(), body.clone());
+            }
+        }
+        let opts = AdapterOptions::default();
+        crate::adapter::systemverilog::SystemVerilogAdapter::translate_multi_module_content(
+            content, &sources, &opts,
+        )
+        .map(|out| out.ctxdsl)
+        .map_err(|err| VerifyError::AdapterTranslationFailed {
+            source_id: source_id.to_string(),
+            adapter: "sv-rtl".to_string(),
+            message: err.to_string(),
+        })
+    } else {
+        warn_unused_additional_files("sv-rtl", source_id, additional_files);
+        let opts = AdapterOptions::default();
+        crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
+            .map(|out| out.ctxdsl)
+            .map_err(|err| VerifyError::AdapterTranslationFailed {
+                source_id: source_id.to_string(),
+                adapter: "sv-rtl".to_string(),
+                message: err.to_string(),
+            })
     }
 }
 
@@ -944,6 +1035,27 @@ fn resolve_path(base_dir: &Path, p: &Path) -> std::path::PathBuf {
     } else {
         base_dir.join(p)
     }
+}
+
+/// Read every entry in `source.files[1..]` and return `(path,
+/// content)` pairs ready to hand to [`dispatch_adapter`]. The primary
+/// file at `files[0]` is read separately by the orchestrator. Errors
+/// (missing / unreadable files) propagate as `SourceReadFailed`.
+fn read_additional_files(
+    base_dir: &Path,
+    source: &crate::verify::config::SourceSection,
+) -> Result<Vec<(PathBuf, String)>, VerifyError> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    for f in source.files.iter().skip(1) {
+        let path = resolve_path(base_dir, f);
+        let content =
+            std::fs::read_to_string(&path).map_err(|err| VerifyError::SourceReadFailed {
+                path: path.clone(),
+                source: err,
+            })?;
+        out.push((path, content));
+    }
+    Ok(out)
 }
 
 /// Split the assembler's two-context output into `(main, props)`.
@@ -1289,6 +1401,76 @@ members = ["light"]
                 )));
             }
             other => panic!("expected ConfigValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn additional_files_on_single_file_adapter_warn_but_succeed() {
+        // The xstate adapter only consumes one file. If the user
+        // over-specifies `files = ["a.xstate.json", "extra.xstate.json"]`,
+        // the orchestrator reads both, dispatches only the primary,
+        // and the warn helper logs the dropped extras. The verdict
+        // should still match the primary-file-only result.
+        let temp = tempdir().unwrap();
+        let xstate = r#"{ "id": "primary", "initial": "s0", "states": { "s0": {} } }"#;
+        let extra = r#"{ "id": "extra", "initial": "x0", "states": { "x0": {} } }"#;
+        let _ = write_ctxdsl_source(temp.path(), "primary.xstate.json", xstate);
+        let _ = write_ctxdsl_source(temp.path(), "extra.xstate.json", extra);
+        let toml_src = r#"
+[project]
+name = "MultiFileWarn"
+
+[[sources]]
+id = "x"
+adapter = "xstate"
+files = ["primary.xstate.json", "extra.xstate.json"]
+
+[composition]
+semantics = "asynchronous"
+members = ["x"]
+name = "S"
+
+[[properties]]
+name = "p"
+formula = "true"
+over = "S"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("multi-file dispatch succeeds");
+        assert_eq!(report.sources.len(), 1);
+        // The XState adapter consumed only the primary file — the
+        // automaton in the composition came from `primary.xstate.json`.
+        assert_eq!(report.sources[0].id, "x");
+        assert!(report.property_verdicts[0].satisfied);
+    }
+
+    #[test]
+    fn missing_additional_file_surfaces_as_source_read_failure() {
+        // If the additional file doesn't exist on disk, the
+        // orchestrator surfaces the same `SourceReadFailed` error as
+        // a missing primary file — fail-fast, not silent.
+        let temp = tempdir().unwrap();
+        let _ = write_ctxdsl_source(temp.path(), "light.ctxdsl", SIMPLE_LIGHT_CTXDSL);
+        let toml_src = r#"
+[project]
+name = "MissingExtra"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl", "missing.ctxdsl"]
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let err = verify_project(&config, temp.path()).unwrap_err();
+        match err {
+            VerifyError::SourceReadFailed { path, .. } => {
+                assert!(path.ends_with("missing.ctxdsl"));
+            }
+            other => panic!("expected SourceReadFailed, got {other:?}"),
         }
     }
 
