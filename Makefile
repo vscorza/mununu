@@ -59,8 +59,17 @@ build:
 	$(CARGO) build --release -p mununu-cli
 	$(CARGO) build --release -p mununu-extract
 
+# Prefer cargo-nextest when available (CI's dev image installs it). nextest
+# is faster but does NOT run doctests — invoke them separately so they
+# cannot silently drop. Falling back to `cargo test --workspace` covers
+# both unit and doc tests in one shot.
 test:
-	$(CARGO) test --workspace
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		$(CARGO) nextest run --workspace && \
+		$(CARGO) test --workspace --doc; \
+	else \
+		$(CARGO) test --workspace; \
+	fi
 
 # tier-1 + tier-2: pre-commit gate. Skips #[ignore]'d stress tests by default.
 # Eventually this will be the canonical pre-commit form; for now it is an

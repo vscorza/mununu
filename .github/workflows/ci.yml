@@ -57,6 +57,31 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  unused-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - name: Check for unused dependencies
+        run: cargo machete
+
+  tokei:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tokei
+      - name: Count lines of code
+        run: tokei --output json > tokei.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokei-report
+          path: tokei.json
+
   dependency-check:
     runs-on: ubuntu-latest
     continue-on-error: true
