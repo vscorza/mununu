@@ -355,15 +355,6 @@ fn matching_close_brace(text: &str, open_at: usize) -> Option<usize> {
     None
 }
 
-/// Scan a context body for the first `automaton <name> { ... }`
-/// declaration and return `<name>`. Kept for tests and external
-/// callers; assembly itself uses [`all_automaton_names`] directly so
-/// the wildcard expansion sees the full list.
-#[allow(dead_code)]
-fn first_automaton_name(body: &str) -> Option<&str> {
-    all_automaton_names(body).into_iter().next()
-}
-
 /// Scan a context body for **every** `automaton <name> { ... }`
 /// declaration and return the names in declaration order. Used by
 /// the `<source_id>.*` wildcard composition-member syntax: a single
@@ -468,7 +459,10 @@ mod tests {
     #[test]
     fn first_automaton_name_finds_identifier_after_keyword() {
         let body = "automata { automaton Toaster { states {} } }";
-        assert_eq!(first_automaton_name(body), Some("Toaster"));
+        assert_eq!(
+            all_automaton_names(body).into_iter().next(),
+            Some("Toaster")
+        );
     }
 
     #[test]
