@@ -1349,6 +1349,28 @@ pub enum ControllerMode {
     ParityGame,
 }
 
+impl ControllerMode {
+    /// Parse a controller-mode name with whitespace, dashes, and underscores
+    /// stripped and case folded. Returns the variant on success, or the
+    /// normalized input on failure so callers can format their own errors.
+    pub fn from_normalized_name(name: &str) -> Result<Self, String> {
+        let normalized: String = name
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        match normalized.as_str() {
+            "projection" => Ok(Self::Projection),
+            "functional" => Ok(Self::Functional),
+            "permissive" => Ok(Self::Permissive),
+            "signaturememory" => Ok(Self::SignatureMemory),
+            "productgame" => Ok(Self::ProductGame),
+            "paritygame" => Ok(Self::ParityGame),
+            _ => Err(normalized),
+        }
+    }
+}
+
 /// Extended controller synthesis configuration, combining evaluation, diagnostics, and post-processing knobs.
 #[derive(Debug, Default)]
 pub struct ControllerSynthesisOptions<'a> {

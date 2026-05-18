@@ -163,25 +163,12 @@ fn resolve_controller_mode(
 ) -> Result<crate::context::ControllerMode, ApiError> {
     use crate::context::ControllerMode;
     if let Some(name) = mode {
-        let normalized: String = name
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
-            .flat_map(|c| c.to_lowercase())
-            .collect();
-        return match normalized.as_str() {
-            "projection" => Ok(ControllerMode::Projection),
-            "functional" => Ok(ControllerMode::Functional),
-            "permissive" => Ok(ControllerMode::Permissive),
-            "signaturememory" => Ok(ControllerMode::SignatureMemory),
-            "productgame" => Ok(ControllerMode::ProductGame),
-            "paritygame" => Ok(ControllerMode::ParityGame),
-            other => Err(ApiError::BadRequest {
-                message: format!("Unknown controller_mode '{other}'"),
-                details: Some(
-                    "Valid: projection, functional, permissive, signature-memory, product-game, parity-game".into(),
-                ),
-            }),
-        };
+        return ControllerMode::from_normalized_name(name).map_err(|other| ApiError::BadRequest {
+            message: format!("Unknown controller_mode '{other}'"),
+            details: Some(
+                "Valid: projection, functional, permissive, signature-memory, product-game, parity-game".into(),
+            ),
+        });
     }
     Ok(if extract_strategy {
         ControllerMode::Functional

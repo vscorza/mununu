@@ -1289,12 +1289,6 @@ fn snippet_around_error(text: &str, _err: &str) -> String {
     lines.join("\n")
 }
 
-// Silence unused-import lint for IdStorage: it's brought into scope
-// so that the closure-style generic bounds in
-// `evaluate_one_property` don't need to repeat the constraint.
-#[allow(dead_code)]
-fn _id_storage_marker<S: IdStorage, L: IdStorage>(_: &crate::clts::Clts<S, L>) {}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

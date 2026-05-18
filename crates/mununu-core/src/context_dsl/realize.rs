@@ -676,12 +676,6 @@ impl EnumRegistry {
     fn is_empty(&self) -> bool {
         self.enums.is_empty()
     }
-
-    /// Returns the integer domain size for an enum type, or None if not found.
-    #[allow(dead_code)]
-    fn variant_count(&self, enum_name: &str) -> Option<usize> {
-        self.enums.get(enum_name).map(Vec::len)
-    }
 }
 
 /// Resolves enum variant names in an automaton's expressions to integer literals.
