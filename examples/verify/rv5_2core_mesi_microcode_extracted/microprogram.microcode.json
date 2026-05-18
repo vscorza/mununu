@@ -1,0 +1,36 @@
+{
+  "name": "RV5_2Core_StoreFenceLoad",
+  "description": "Core 0 store + rw-fence + core 1 load — same shape as the hand-authored microprogram in rv5_2core_mesi_microprogram/. Per-core distinction comes from the `tag` field on memory ops, which the microcode adapter folds into the emitted label.",
+  "regs": {
+    "acc": { "width": 32 },
+    "ptr": { "width": 32 }
+  },
+  "mem": {
+    "x": { "kind": "shared", "attr": "cacheable" }
+  },
+  "steps": [
+    {
+      "id": "MP_Init",
+      "ops": [{ "op": "write_mem", "region": "x", "source_reg": "acc", "tag": "core_0" }],
+      "next": "MP_AfterStore"
+    },
+    {
+      "id": "MP_AfterStore",
+      "ops": [{ "op": "fence", "order": "rw" }],
+      "next": "MP_AfterFence"
+    },
+    {
+      "id": "MP_AfterFence",
+      "ops": [{ "op": "read_mem", "region": "x", "into_reg": "acc", "tag": "core_1" }],
+      "next": "MP_AfterLoad"
+    },
+    {
+      "id": "MP_AfterLoad",
+      "ops": []
+    }
+  ],
+  "extra_controllable": [
+    "wr_mem_x_core_1",
+    "rd_mem_x_core_0"
+  ]
+}

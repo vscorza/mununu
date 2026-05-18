@@ -1,0 +1,54 @@
+# dma_engine_microcode — verify framework end-to-end transcript
+# Regenerated via examples/verify/dma_engine_microcode/validate.sh
+#
+# DMA channel microcode (extracted from JSON via the v1 microcode
+# adapter) composed with a tracked-memory automaton and an IRQ
+# controller stub. Industrial-canonical DMA safety properties.
+
+=== mununu verify (human-readable) ===
+verify report — project `DMAEngineMicrocode`:
+  composition: asynchronous DMASystem { members = [DMAChannel, DMAMemory, DMAIrqController] }
+    - dma (adapter = microcode, automaton = DMAChannel)
+    - memory (adapter = ctxdsl, automaton = DMAMemory)
+    - irq (adapter = ctxdsl, automaton = DMAIrqController)
+    descriptor_fetch_leads_to_completion: SATISFIED (6/6 states, 1/1 initial) [template `bounded_handoff`, over = DMAChannel]
+    payload_eventually_written: SATISFIED (9/9 states, 1/1 initial) [template `reachable`, over = DMASystem]
+    interrupt_can_clear: SATISFIED (9/9 states, 1/1 initial) [template `reachable`, over = DMASystem]
+    composed_dma_completes: SATISFIED (9/9 states, 1/1 initial) [template `reachable`, over = DMASystem]
+
+=== mununu verify --print-alphabet (introspection of composed system) ===
+inspect report — project `DMAEngineMicrocode`:
+  composition: asynchronous DMASystem { members = [DMAChannel, DMAMemory, DMAIrqController] }
+  sources:
+    - dma (adapter = microcode, automaton = DMAChannel)
+    - memory (adapter = ctxdsl, automaton = DMAMemory)
+    - irq (adapter = ctxdsl, automaton = DMAIrqController)
+  automata (4):
+    DMAChannel (source = dma, 6 states, 1 initial, 6 labels)
+      initial: DMA_Idle
+      states:  DMA_AckInterrupt, DMA_FetchDescriptor, DMA_FlushBuffer, DMA_Idle, DMA_SignalCompletion, DMA_WritePayload
+      labels:  fence_rw, irq_ack_dma_done, rd_mem_descriptor, wr_mem_payload, wr_reg_desc_ptr, wr_reg_status
+    DMASystem (source = -, 9 states, 1 initial, 6 labels)
+      initial: DMA_Idle|IRQ_Cleared|Mem_Initial
+      states:  DMA_Idle|IRQ_Cleared|Mem_Initial, DMA_FetchDescriptor|IRQ_Cleared|Mem_Initial, DMA_WritePayload|IRQ_Cleared|Mem_DescriptorPresent, DMA_FlushBuffer|IRQ_Cleared|Mem_PayloadWritten, DMA_SignalCompletion|IRQ_Cleared|Mem_PayloadWritten, DMA_AckInterrupt|IRQ_Cleared|Mem_PayloadWritten, DMA_Idle|IRQ_Cleared|Mem_PayloadWritten, DMA_FetchDescriptor|IRQ_Cleared|Mem_PayloadWritten, DMA_WritePayload|IRQ_Cleared|Mem_PayloadWritten
+      labels:  fence_rw, irq_ack_dma_done, rd_mem_descriptor, wr_mem_payload, wr_reg_desc_ptr, wr_reg_status
+    DMAIrqController (source = irq, 2 states, 1 initial, 1 labels)
+      initial: IRQ_Cleared
+      states:  IRQ_Cleared, IRQ_Pending
+      labels:  irq_ack_dma_done
+    DMAMemory (source = memory, 3 states, 1 initial, 3 labels)
+      initial: Mem_Initial
+      states:  Mem_DescriptorPresent, Mem_Initial, Mem_PayloadWritten
+      labels:  fence_rw, rd_mem_descriptor, wr_mem_payload
+
+  composition alphabet (6 labels):
+    fence_rw, irq_ack_dma_done, rd_mem_descriptor, wr_mem_payload
+    wr_reg_desc_ptr, wr_reg_status
+  composition states (9):
+    DMA_Idle|IRQ_Cleared|Mem_Initial, DMA_FetchDescriptor|IRQ_Cleared|Mem_Initial, DMA_WritePayload|IRQ_Cleared|Mem_DescriptorPresent, DMA_FlushBuffer|IRQ_Cleared|Mem_PayloadWritten
+    DMA_SignalCompletion|IRQ_Cleared|Mem_PayloadWritten, DMA_AckInterrupt|IRQ_Cleared|Mem_PayloadWritten, DMA_Idle|IRQ_Cleared|Mem_PayloadWritten, DMA_FetchDescriptor|IRQ_Cleared|Mem_PayloadWritten
+    DMA_WritePayload|IRQ_Cleared|Mem_PayloadWritten
+  declared predicates (10):
+    DMAChannel_has_enabled_transition, DMAChannel_is_deadlock_state, DMAIrqController_can_reach_completion, DMAIrqController_has_enabled_transition
+    DMAIrqController_is_completion_state, DMAIrqController_is_deadlock_state, DMAMemory_has_enabled_transition, DMAMemory_is_deadlock_state
+    DMASystem_has_enabled_transition, DMASystem_is_deadlock_state

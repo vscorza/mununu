@@ -1,0 +1,78 @@
+# rv5_2core_mesi_microprogram — smallest first slice of the
+# multicore RISC-V verification scenario from the plan.
+#
+# Two cores, one tracked cache line, MESI coherence, shared memory,
+# and a 3-step microprogram (core_0 store -> rw-fence -> core_1 load).
+# No PLIC, no watchdog, no pipelines — see the plan for the path to
+# the full system. State space ≈ 4 (MP) × 4 (Core0) × 4 (Core1) × 2
+# (Mem) = 128 cross-product states; the reachable subset is smaller.
+#
+# All adapters: ctxdsl pass-through (hand-authored). Asynchronous
+# composition with rendezvous on shared bus labels.
+#
+# Recreate:
+#   $ bash examples/verify/rv5_2core_mesi_microprogram/validate.sh
+#
+# Properties:
+#   - mesi_coherence_invariant — the cache-coherence safety property:
+#     no two caches in Modified state for the same line at the same
+#     time.
+#   - write_visible_to_memory — every store reaches memory: from MP_Init
+#     the system can reach Mem_Written. Reachability witness.
+#   - microprogram_runs_to_completion — the microprogram can reach
+#     MP_AfterLoad. Liveness reachability over the composition.
+
+[project]
+name = "RV5_2Core_MESI_Microprogram"
+description = "Two-core MESI coherence + 3-step microprogram (store + fence + load)."
+
+[[sources]]
+id = "microprogram"
+adapter = "ctxdsl"
+files = ["microprogram.ctxdsl"]
+
+[[sources]]
+id = "l1_core0"
+adapter = "ctxdsl"
+files = ["l1_cache_core0.ctxdsl"]
+
+[[sources]]
+id = "l1_core1"
+adapter = "ctxdsl"
+files = ["l1_cache_core1.ctxdsl"]
+
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["microprogram", "l1_core0", "l1_core1", "memory"]
+name = "RV5_2Core_System"
+
+[[properties]]
+# Cache coherence invariant: at most one cache can hold the line in
+# Modified state at a time. Uses the mutual_exclusion safety template.
+name = "mesi_coherence_invariant"
+template = "mutual_exclusion"
+args = { A = "Core0_M", B = "Core1_M" }
+over = "RV5_2Core_System"
+
+[[properties]]
+# Reachability witness: a write from core_0 eventually reaches
+# Mem_Written.
+name = "write_visible_to_memory"
+template = "reachable"
+args = { TARGET = "Mem_Written" }
+over = "RV5_2Core_System"
+
+[[properties]]
+# Microprogram liveness: the microprogram can run to completion.
+name = "microprogram_runs_to_completion"
+template = "reachable"
+args = { TARGET = "MP_AfterLoad" }
+over = "RV5_2Core_System"

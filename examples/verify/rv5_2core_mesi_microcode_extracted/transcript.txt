@@ -1,0 +1,27 @@
+# rv5_2core_mesi_microcode_extracted — verify framework end-to-end transcript
+# Regenerated via examples/verify/rv5_2core_mesi_microcode_extracted/validate.sh
+#
+# Same 2-core MESI + 3-step microprogram scenario as the hand-authored
+# rv5_2core_mesi_microprogram/ fixture; here the microprogram is
+# extracted from JSON microcode via the v1 microcode adapter.
+# Verdict equivalence proves the adapter preserves semantics.
+
+=== mununu verify (human-readable) ===
+verify report — project `RV5_2Core_MESI_MicrocodeExtracted`:
+  composition: asynchronous RV5_2Core_System { members = [RV5_2Core_StoreFenceLoad, L1Core0, L1Core1, SharedMemory] }
+    - microprogram (adapter = microcode, automaton = RV5_2Core_StoreFenceLoad)
+    - l1_core0 (adapter = ctxdsl, automaton = L1Core0)
+    - l1_core1 (adapter = ctxdsl, automaton = L1Core1)
+    - memory (adapter = ctxdsl, automaton = SharedMemory)
+    mesi_coherence_invariant: SATISFIED (14/14 states, 1/1 initial) [template `mutual_exclusion`, over = RV5_2Core_System]
+    write_visible_to_memory: SATISFIED (14/14 states, 1/1 initial) [template `reachable`, over = RV5_2Core_System]
+    microprogram_runs_to_completion: SATISFIED (14/14 states, 1/1 initial) [template `reachable`, over = RV5_2Core_System]
+
+=== mununu verify --json (subset: project + verdict shape) ===
+project = RV5_2Core_MESI_MicrocodeExtracted
+composition.name = RV5_2Core_System
+composition.semantics = asynchronous
+composition.members = RV5_2Core_StoreFenceLoad, L1Core0, L1Core1, SharedMemory
+  property `mesi_coherence_invariant`: satisfied = True, source = template, states = 14/14
+  property `write_visible_to_memory`: satisfied = True, source = template, states = 14/14
+  property `microprogram_runs_to_completion`: satisfied = True, source = template, states = 14/14

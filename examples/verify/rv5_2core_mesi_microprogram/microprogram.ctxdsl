@@ -1,0 +1,68 @@
+// microprogram.ctxdsl — the verification target.
+//
+// Three sequential micro-ops:
+//   1. core_0 stores into shared address X
+//   2. global memory fence
+//   3. core_1 loads from shared address X
+//
+// The microprogram is the controller (every emitted label is
+// controllable from its perspective); cache snoops triggered by
+// the bus on behalf of the other core are environment-driven and
+// stay uncontrollable.
+//
+// Labels (all rendezvous with the cache + memory automata):
+//   - xact_write_x_core0  — core_0 issues a write to X
+//   - fence_rw            — global rw-fence
+//   - xact_read_x_core1   — core_1 issues a read from X
+//
+// State names use the MP_ prefix to disambiguate against the cache
+// automata's M / S / E / I states when properties target the
+// composed system.
+
+context Microprogram {
+    alphabet {
+        // Labels actually fired by this microprogram.
+        label xact_write_x_core0;
+        label fence_rw;
+        label xact_read_x_core1;
+        // Bus labels the cache + memory automata also reference. We
+        // declare them here (in the microprogram's alphabet) so the
+        // cache transitions resolve at realize time, even though this
+        // microprogram never fires them itself. The protocol-spec
+        // example uses the same single-declarer convention.
+        label xact_write_x_core1;
+        label xact_read_x_core0;
+    }
+
+    automata {
+        automaton Microprogram {
+            controllable {
+                // Labels actually fired by this microprogram's transitions.
+                label xact_write_x_core0;
+                label fence_rw;
+                label xact_read_x_core1;
+                // Bus labels owned by the microprogram for the framework's
+                // controllability registry, even though this particular
+                // microprogram doesn't fire them. Without this, the
+                // realiser's legacy mode infers them as controllable on
+                // each of the cache automata that *reference* them,
+                // producing a DuplicateControllableAlphabet error.
+                label xact_write_x_core1;
+                label xact_read_x_core0;
+            }
+
+            states {
+                state MP_Init initial;
+                state MP_AfterStore;
+                state MP_AfterFence;
+                state MP_AfterLoad;
+            }
+
+            transitions {
+                transition MP_Init -> MP_AfterStore on label xact_write_x_core0;
+                transition MP_AfterStore -> MP_AfterFence on label fence_rw;
+                transition MP_AfterFence -> MP_AfterLoad on label xact_read_x_core1;
+            }
+        }
+    }
+}

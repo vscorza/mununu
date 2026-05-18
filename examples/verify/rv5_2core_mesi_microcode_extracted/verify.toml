@@ -1,0 +1,62 @@
+# rv5_2core_mesi_microcode_extracted — same scenario as
+# rv5_2core_mesi_microprogram/ but the microprogram is **extracted
+# from a `.microcode.json` source via the v1 microcode adapter**
+# instead of hand-authored CTXDSL.
+#
+# Plan Part 5.5 + Part 6 item 5c: the parity demonstration. Verdict
+# equivalence with the hand-authored sibling confirms the adapter
+# preserves semantics; the hand-authored ~50 lines of CTXDSL collapse
+# to ~25 lines of JSON the user (or upstream tooling) authors.
+#
+# Recreate:
+#   $ bash examples/verify/rv5_2core_mesi_microcode_extracted/validate.sh
+
+[project]
+name = "RV5_2Core_MESI_MicrocodeExtracted"
+description = "2-core MESI + 3-step microprogram extracted from JSON microcode."
+
+[[sources]]
+id = "microprogram"
+adapter = "microcode"
+files = ["microprogram.microcode.json"]
+
+[[sources]]
+id = "l1_core0"
+adapter = "ctxdsl"
+files = ["l1_cache_core0.ctxdsl"]
+
+[[sources]]
+id = "l1_core1"
+adapter = "ctxdsl"
+files = ["l1_cache_core1.ctxdsl"]
+
+[[sources]]
+id = "memory"
+adapter = "ctxdsl"
+files = ["memory.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["microprogram", "l1_core0", "l1_core1", "memory"]
+name = "RV5_2Core_System"
+
+[[properties]]
+name = "mesi_coherence_invariant"
+template = "mutual_exclusion"
+args = { A = "Core0_M", B = "Core1_M" }
+over = "RV5_2Core_System"
+
+[[properties]]
+name = "write_visible_to_memory"
+template = "reachable"
+args = { TARGET = "Mem_Written" }
+over = "RV5_2Core_System"
+
+[[properties]]
+name = "microprogram_runs_to_completion"
+template = "reachable"
+args = { TARGET = "MP_AfterLoad" }
+over = "RV5_2Core_System"

@@ -47,6 +47,7 @@
 //! slice. Calls with an unrecognised adapter return
 //! [`VerifyError::UnknownAdapter`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::adapter::templates::{TemplateRef, TemplateRegistry};
@@ -60,6 +61,7 @@ use crate::verify::assemble::{
 };
 use crate::verify::binding::{AlphabetBinding, apply_renamings_to_ctxdsl};
 use crate::verify::config::{PropertySection, VerifyConfig};
+use crate::verify::register_map_rewriter::derive_sv_renamings_from_register_map;
 use crate::verify::report::{
     CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, VerifyError,
     VerifyReport,
@@ -85,52 +87,84 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     let binding =
         AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
     let per_source_renamings = binding.per_source_renamings();
+    // For RegisterMap binding, eagerly derive the SV-side renaming
+    // table once — it's identical for every sv-rtl source under this
+    // binding. `None` when binding is Direct or Renamings.
+    let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
+        AlphabetBinding::RegisterMap { map, .. } => {
+            Some(derive_sv_renamings_from_register_map(map))
+        }
+        _ => None,
+    };
 
     // 3. For each source: read files, dispatch adapter, apply renamings.
+    // Parameterised sources (`count >= 2`) expand to N instances
+    // named `<id>_0` .. `<id>_<N-1>`. Each instance substitutes
+    // `{instance_id}` in the file content with its full name before
+    // the adapter sees it.
     let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
     let mut source_summaries: Vec<SourceSummary> = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
-        // Read the first source file and pass it to the adapter.
-        // Multi-file sources are a follow-up — most adapters today
-        // take one file. We document the limitation.
         let primary_file = source
             .files
             .first()
             .expect("validator rejected empty files");
         let path = resolve_path(base_dir, primary_file);
-        let content =
+        let raw_content =
             std::fs::read_to_string(&path).map_err(|source_err| VerifyError::SourceReadFailed {
                 path: path.clone(),
                 source: source_err,
             })?;
 
-        let raw_ctxdsl = dispatch_adapter(
-            &source.adapter,
-            &source.id,
-            &path,
-            &content,
-            &source.options,
-            base_dir,
-        )?;
-
-        // Apply per-source renamings from the binding. For Direct
-        // strategy the map is absent / empty so this is a no-op.
-        let rewritten = match per_source_renamings.get(&source.id) {
-            Some(renamings) if !renamings.is_empty() => {
-                apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
-            }
-            _ => raw_ctxdsl,
+        let count = source.count.unwrap_or(1).max(1);
+        let instances: Vec<(String, String)> = if count == 1 {
+            vec![(source.id.clone(), raw_content.clone())]
+        } else {
+            (0..count)
+                .map(|i| {
+                    let instance_id = format!("{}_{}", source.id, i);
+                    let substituted = raw_content.replace("{instance_id}", &instance_id);
+                    (instance_id, substituted)
+                })
+                .collect()
         };
 
-        source_ctxdsls.push(SourceCtxdsl {
-            source_id: source.id.clone(),
-            ctxdsl: rewritten,
-        });
-        source_summaries.push(SourceSummary {
-            id: source.id.clone(),
-            adapter: source.adapter.clone(),
-            automaton: None, // filled after assembly resolves the member
-        });
+        for (instance_id, content) in instances {
+            let raw_ctxdsl = dispatch_adapter(
+                &source.adapter,
+                &instance_id,
+                &path,
+                &content,
+                &source.options,
+                base_dir,
+            )?;
+
+            // Apply per-source renamings from the binding. The renamings
+            // are keyed on the *original* source id (so users author
+            // them once and they apply to every instance).
+            let mut rewritten = match per_source_renamings.get(&source.id) {
+                Some(renamings) if !renamings.is_empty() => {
+                    apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
+                }
+                _ => raw_ctxdsl,
+            };
+            if let (Some(rm_renamings), "sv-rtl") =
+                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+                && !rm_renamings.is_empty()
+            {
+                rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+            }
+
+            source_ctxdsls.push(SourceCtxdsl {
+                source_id: instance_id.clone(),
+                ctxdsl: rewritten,
+            });
+            source_summaries.push(SourceSummary {
+                id: instance_id,
+                adapter: source.adapter.clone(),
+                automaton: None,
+            });
+        }
     }
 
     // 4. Build CompositionSpec (resolve composition_name default).
@@ -170,11 +204,20 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     // Backfill SourceSummary.automaton now that we know the
     // composition's resolved members (FirstAutomaton strategy reads
     // them from each source's CTXDSL — re-derive here for the
-    // report).
+    // report). `derive_resolved_member_names` returns the full
+    // expansion list per member entry so `<src>.*` wildcards land
+    // in `composition_info.members` correctly.
     let resolved_members =
         derive_resolved_member_names(&source_ctxdsls, &config.composition.members);
     for s in &mut source_summaries {
-        s.automaton = resolved_members.get(&s.id).cloned();
+        // SourceSummary.automaton holds the *primary* automaton of
+        // the source. For wildcard expansions (`<src>.*`) the user
+        // sees the first automaton; the full list lives in
+        // CompositionInfo.members.
+        s.automaton = resolved_members
+            .iter()
+            .find(|(k, _)| k.trim_end_matches(".*") == s.id)
+            .and_then(|(_, names)| names.first().cloned());
     }
     let composition_info = CompositionInfo {
         semantics: composition.semantics.clone(),
@@ -183,6 +226,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
             .members
             .iter()
             .filter_map(|id| resolved_members.get(id).cloned())
+            .flatten()
             .collect(),
     };
 
@@ -233,6 +277,288 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 }
 
 // ---------------------------------------------------------------------------
+// Inspection (alphabet + state-predicate introspection — plan Part 6 item 3)
+// ---------------------------------------------------------------------------
+
+/// Per-automaton snapshot produced by [`inspect_project`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutomatonInspection {
+    /// Resolved automaton name (e.g. the CTXDSL identifier after
+    /// adapter dispatch + assembly).
+    pub name: String,
+    /// Source id whose adapter emitted this automaton, when known.
+    pub source_id: Option<String>,
+    /// Alphabet (union of controllable + internal + uncontrollable
+    /// labels) the automaton participates in.
+    pub alphabet: Vec<String>,
+    /// State names declared on this automaton.
+    pub states: Vec<String>,
+    /// Initial-state names.
+    pub initial_states: Vec<String>,
+}
+
+/// Composition-level snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompositionInspection {
+    /// Composition info (semantics, name, resolved members) as it
+    /// appears in [`VerifyReport`].
+    pub info: CompositionInfo,
+    /// Union of every member's alphabet — the labels that can appear
+    /// in property formulas referencing the composition.
+    pub alphabet: Vec<String>,
+    /// Names of the realized composition CLTS's states. Empty when
+    /// the realiser does not eagerly materialise the composed CLTS
+    /// (some compositions are evaluated symbolically).
+    pub state_names: Vec<String>,
+    /// Names of declared per-state predicates the composition
+    /// exposes (from CTXDSL `predicates { … }` blocks). Useful as a
+    /// "what can I write in a mu-calculus formula" list.
+    pub predicate_names: Vec<String>,
+}
+
+/// Report produced by [`inspect_project`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InspectionReport {
+    pub project: String,
+    pub sources: Vec<SourceSummary>,
+    /// One entry per realized automaton (per-source + the composition
+    /// member resolution).
+    pub automata: Vec<AutomatonInspection>,
+    /// Composition-level alphabet + state-predicate listing.
+    pub composition: CompositionInspection,
+}
+
+/// Run the verify pipeline through realize, then return an
+/// introspection report covering each realized automaton's alphabet,
+/// states, and the composition-level alphabet + predicate listing.
+///
+/// **Skips property evaluation entirely** — use this to discover what
+/// labels and state predicates the realized context exposes before
+/// authoring property formulas. Closes plan Part 6 item 3 (and Part
+/// 2 automation gap #2).
+///
+/// Reuses every step of [`verify_project`] up to and including the
+/// realize step.
+pub fn inspect_project(
+    config: &VerifyConfig,
+    base_dir: &Path,
+) -> Result<InspectionReport, VerifyError> {
+    // 1. Validate config.
+    let issues = config.validate();
+    if !issues.is_empty() {
+        return Err(VerifyError::ConfigValidationFailed(issues));
+    }
+
+    // 2. Alphabet binding (same as verify_project).
+    let binding =
+        AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
+    let per_source_renamings = binding.per_source_renamings();
+    let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
+        AlphabetBinding::RegisterMap { map, .. } => {
+            Some(derive_sv_renamings_from_register_map(map))
+        }
+        _ => None,
+    };
+
+    // 3. Per-source dispatch + renaming + parameterised-instance
+    // expansion (same as verify_project).
+    let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
+    let mut source_summaries: Vec<SourceSummary> = Vec::with_capacity(config.sources.len());
+    for source in &config.sources {
+        let primary_file = source
+            .files
+            .first()
+            .expect("validator rejected empty files");
+        let path = resolve_path(base_dir, primary_file);
+        let raw_content =
+            std::fs::read_to_string(&path).map_err(|source_err| VerifyError::SourceReadFailed {
+                path: path.clone(),
+                source: source_err,
+            })?;
+        let count = source.count.unwrap_or(1).max(1);
+        let instances: Vec<(String, String)> = if count == 1 {
+            vec![(source.id.clone(), raw_content.clone())]
+        } else {
+            (0..count)
+                .map(|i| {
+                    let instance_id = format!("{}_{}", source.id, i);
+                    let substituted = raw_content.replace("{instance_id}", &instance_id);
+                    (instance_id, substituted)
+                })
+                .collect()
+        };
+        for (instance_id, content) in instances {
+            let raw_ctxdsl = dispatch_adapter(
+                &source.adapter,
+                &instance_id,
+                &path,
+                &content,
+                &source.options,
+                base_dir,
+            )?;
+            let mut rewritten = match per_source_renamings.get(&source.id) {
+                Some(renamings) if !renamings.is_empty() => {
+                    apply_renamings_to_ctxdsl(&raw_ctxdsl, renamings)
+                }
+                _ => raw_ctxdsl,
+            };
+            if let (Some(rm_renamings), "sv-rtl") =
+                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+                && !rm_renamings.is_empty()
+            {
+                rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
+            }
+            source_ctxdsls.push(SourceCtxdsl {
+                source_id: instance_id.clone(),
+                ctxdsl: rewritten,
+            });
+            source_summaries.push(SourceSummary {
+                id: instance_id,
+                adapter: source.adapter.clone(),
+                automaton: None,
+            });
+        }
+    }
+
+    // 4. CompositionSpec.
+    let composition = CompositionSpec {
+        semantics: config.composition.semantics.clone(),
+        members: config.composition.members.clone(),
+        name: config.composition_name(),
+    };
+
+    // 5. NO property resolution — the whole point of inspection is to
+    //    let the user discover what they CAN write in a property
+    //    before authoring it.
+    let resolved_properties: Vec<ResolvedProperty> = Vec::new();
+
+    // 6. Assemble.
+    let assembled = assemble_unified_ctxdsl(
+        &config.project.name,
+        &source_ctxdsls,
+        &composition,
+        &resolved_properties,
+        &AutomatonDiscovery::FirstAutomaton,
+    )
+    .map_err(VerifyError::Assemble)?;
+    let resolved_members =
+        derive_resolved_member_names(&source_ctxdsls, &config.composition.members);
+    for s in &mut source_summaries {
+        s.automaton = resolved_members
+            .iter()
+            .find(|(k, _)| k.trim_end_matches(".*") == s.id)
+            .and_then(|(_, names)| names.first().cloned());
+    }
+    let composition_info = CompositionInfo {
+        semantics: composition.semantics.clone(),
+        name: composition.name.clone(),
+        members: composition
+            .members
+            .iter()
+            .filter_map(|id| resolved_members.get(id).cloned())
+            .flatten()
+            .collect(),
+    };
+
+    // 7. Parse + realize.
+    let (main_text, props_text) = split_main_and_props(&assembled);
+    let main_doc = crate::context_dsl::parse(&main_text).map_err(|e| {
+        VerifyError::AssembledCtxdslParseFailed {
+            message: format!("{e:?}"),
+            snippet: snippet_around_error(&main_text, &format!("{e:?}")),
+        }
+    })?;
+    let sidecar_docs = if let Some(props) = props_text.as_deref() {
+        let sidecar = crate::context_dsl::parse(props).map_err(|e| {
+            VerifyError::AssembledCtxdslParseFailed {
+                message: format!("{e:?}"),
+                snippet: snippet_around_error(props, &format!("{e:?}")),
+            }
+        })?;
+        vec![sidecar]
+    } else {
+        Vec::new()
+    };
+    let realized = crate::context_dsl::realize_context(&main_doc, &sidecar_docs).map_err(|e| {
+        VerifyError::RealizeFailed {
+            message: format!("{e:?}"),
+        }
+    })?;
+
+    // 8. Build the introspection report. Map every emitted automaton
+    // back to its originating source. Wildcards (`<src>.*`) and bare
+    // entries both contribute multiple automaton-to-source mappings.
+    let source_by_automaton: BTreeMap<String, String> = resolved_members
+        .iter()
+        .flat_map(|(member_entry, names)| {
+            let src = member_entry.trim_end_matches(".*").to_string();
+            names.iter().map(move |n| (n.clone(), src.clone()))
+        })
+        .collect();
+    let mut automata_inspections: Vec<AutomatonInspection> = Vec::new();
+    for clts_name in realized.context.clts_names() {
+        if let Some(clts) = realized.context.clts(&clts_name) {
+            let mut alphabet = clts.alphabet();
+            alphabet.sort();
+            let states: Vec<String> = clts
+                .states()
+                .filter_map(|sid| clts.state_name(sid).map(String::from))
+                .collect();
+            let initial_states: Vec<String> = clts
+                .initial_states()
+                .iter()
+                .filter_map(|sid| clts.state_name(*sid).map(String::from))
+                .collect();
+            automata_inspections.push(AutomatonInspection {
+                name: clts_name.clone(),
+                source_id: source_by_automaton.get(&clts_name).cloned(),
+                alphabet,
+                states,
+                initial_states,
+            });
+        }
+    }
+
+    let composition_alphabet: Vec<String> = {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for a in &automata_inspections {
+            for lab in &a.alphabet {
+                seen.insert(lab.clone());
+            }
+        }
+        seen.into_iter().collect()
+    };
+    let composition_states: Vec<String> = realized
+        .context
+        .clts(&composition_info.name)
+        .map(|c| {
+            c.states()
+                .filter_map(|sid| c.state_name(sid).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let predicate_names: Vec<String> = realized
+        .predicates
+        .values()
+        .flat_map(|preds| preds.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    Ok(InspectionReport {
+        project: config.project.name.clone(),
+        sources: source_summaries,
+        automata: automata_inspections,
+        composition: CompositionInspection {
+            info: composition_info,
+            alphabet: composition_alphabet,
+            state_names: composition_states,
+            predicate_names,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Adapter dispatch
 // ---------------------------------------------------------------------------
 
@@ -247,6 +573,13 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 ///   currently ignored by this layer — the SV adapter has its own
 ///   per-source sidecar conventions (`.mununu.json` next to the
 ///   `.sv` file).
+/// - `"crewai"` — uses [`crate::adapter::crewai::CrewaiAdapter`].
+///   Per-agent automata + sequential supervisor + asynchronous
+///   composition. Options currently ignored.
+/// - `"langgraph"` — uses
+///   [`crate::adapter::langgraph::LangGraphAdapter`]. Nodes → states,
+///   edges → `node_<from>_enter` transitions. Options currently
+///   ignored.
 /// - `"extraction"` — uses [`ExtractionAdapter`]. Options:
 ///   `mode = "fixed" | "vulnerable" | "both"` (default `"both"`).
 /// - `"c-codesign"` — uses [`extract_c_via_llvm`] (LLVM IR via
@@ -281,6 +614,36 @@ fn dispatch_adapter(
         "sv-rtl" => {
             let opts = AdapterOptions::default();
             crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "crewai" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::crewai::CrewaiAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "langgraph" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::langgraph::LangGraphAdapter::translate(content, &opts)
+                .map(|out| out.ctxdsl)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: adapter.to_string(),
+                    message: err.to_string(),
+                })
+        }
+        "microcode" => {
+            let opts = AdapterOptions::default();
+            crate::adapter::microcode::MicrocodeAdapter::translate(content, &opts)
                 .map(|out| out.ctxdsl)
                 .map_err(|err| VerifyError::AdapterTranslationFailed {
                     source_id: source_id.to_string(),
@@ -602,33 +965,45 @@ fn split_main_and_props(assembled: &str) -> (String, Option<String>) {
 /// Derive each composition member's resolved automaton name by
 /// running the same `FirstAutomaton` scan the assembler uses. Returns
 /// a `source_id → automaton_name` map.
+/// Resolve each `[composition].members` entry to its expanded list
+/// of automaton names. Supports the `<source_id>.*` wildcard form
+/// (one entry → every automaton the source emits) alongside the
+/// legacy bare-source-id form (one entry → the first automaton).
+///
+/// Returned map is keyed by the **member entry as written in the
+/// config** (so wildcards round-trip), with the value being the
+/// possibly-multiple resolved automaton names in declaration order.
 fn derive_resolved_member_names(
     sources: &[SourceCtxdsl],
     member_ids: &[String],
-) -> std::collections::BTreeMap<String, String> {
+) -> std::collections::BTreeMap<String, Vec<String>> {
     let mut out = std::collections::BTreeMap::new();
     for mid in member_ids {
-        if let Some(src) = sources.iter().find(|s| &s.source_id == mid)
-            && let Some(body) = extract_context_body(&src.ctxdsl)
-            && let Some(name) = scan_first_automaton(body)
-        {
-            out.insert(mid.clone(), name.to_string());
+        let (src_id, expand_all) = match mid.strip_suffix(".*") {
+            Some(id) => (id, true),
+            None => (mid.as_str(), false),
+        };
+        let Some(src) = sources.iter().find(|s| s.source_id == src_id) else {
+            continue;
+        };
+        let Some(body) = extract_context_body(&src.ctxdsl) else {
+            continue;
+        };
+        let names: Vec<String> = crate::verify::assemble::all_automaton_names(body)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if names.is_empty() {
+            continue;
         }
+        let value = if expand_all {
+            names
+        } else {
+            vec![names.into_iter().next().unwrap()]
+        };
+        out.insert(mid.clone(), value);
     }
     out
-}
-
-fn scan_first_automaton(body: &str) -> Option<&str> {
-    let kw = body.find("automaton")?;
-    let after = &body[kw + "automaton".len()..];
-    let trimmed = after.trim_start();
-    let end = trimmed
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(trimmed.len());
-    if end == 0 {
-        return None;
-    }
-    Some(&trimmed[..end])
 }
 
 /// Resolve the bundled `cmsis-stubs/` directory. Tries the
@@ -745,6 +1120,176 @@ formula = "true"
 over = "System"
 "#;
         VerifyConfig::from_toml(toml_src).unwrap()
+    }
+
+    #[test]
+    fn inspect_project_reports_alphabet_states_and_predicates() {
+        let temp = tempdir().unwrap();
+        let config = build_two_source_config(temp.path());
+        let inspection = inspect_project(&config, temp.path()).expect("inspection succeeded");
+        assert_eq!(inspection.project, "Demo");
+        assert_eq!(inspection.composition.info.name, "System");
+        // Every source's automaton is in the per-automaton list, plus
+        // the composed automaton itself.
+        let names: Vec<_> = inspection
+            .automata
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert!(names.contains(&"Light"));
+        assert!(names.contains(&"Gate"));
+        // Composition alphabet is the union of every member's alphabet.
+        // Light fires `tick_light`; Gate fires `tick_gate`.
+        assert!(
+            inspection
+                .composition
+                .alphabet
+                .iter()
+                .any(|l| l == "tick_light")
+        );
+        assert!(
+            inspection
+                .composition
+                .alphabet
+                .iter()
+                .any(|l| l == "tick_gate")
+        );
+    }
+
+    #[test]
+    fn inspect_project_runs_even_when_no_properties_declared() {
+        // Sanity: `inspect_project` deliberately ignores `[[properties]]`
+        // and never evaluates a formula. A config that would normally
+        // declare properties should still inspect cleanly.
+        let temp = tempdir().unwrap();
+        let mut config = build_two_source_config(temp.path());
+        config.properties.clear();
+        let inspection = inspect_project(&config, temp.path()).expect("inspection succeeded");
+        assert!(!inspection.automata.is_empty());
+    }
+
+    #[test]
+    fn parameterised_count_expands_into_n_instances() {
+        // Authoring a single `[[sources]]` with `count = 3` and a
+        // file referencing `{instance_id}` expands to three
+        // independent automata under the composition.
+        let temp = tempdir().unwrap();
+        let templated = r#"
+context Worker_{instance_id} {
+    alphabet { label tick_{instance_id}; }
+    automata {
+        automaton Worker_{instance_id} {
+            states { state Idle initial; state Busy; }
+            transitions {
+                transition Idle -> Busy on label tick_{instance_id};
+                transition Busy -> Idle on label tick_{instance_id};
+            }
+        }
+    }
+}
+"#;
+        let _ = write_ctxdsl_source(temp.path(), "worker.ctxdsl", templated);
+        let toml_src = r#"
+[project]
+name = "Parameterised"
+
+[[sources]]
+id = "worker"
+adapter = "ctxdsl"
+files = ["worker.ctxdsl"]
+count = 3
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["worker_0", "worker_1", "worker_2"]
+name = "PoolSystem"
+
+[[properties]]
+name = "alive"
+formula = "true"
+over = "PoolSystem"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
+        assert_eq!(report.sources.len(), 3);
+        let ids: Vec<&str> = report.sources.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"worker_0"));
+        assert!(ids.contains(&"worker_1"));
+        assert!(ids.contains(&"worker_2"));
+        assert_eq!(
+            report.composition.members,
+            vec![
+                "Worker_worker_0".to_string(),
+                "Worker_worker_1".to_string(),
+                "Worker_worker_2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn count_one_is_indistinguishable_from_omitted() {
+        // Backwards-compat: `count = 1` (explicit) matches the
+        // legacy single-instance behaviour. No expansion.
+        let temp = tempdir().unwrap();
+        let _ = write_ctxdsl_source(temp.path(), "light.ctxdsl", SIMPLE_LIGHT_CTXDSL);
+        let toml_src = r#"
+[project]
+name = "Singleton"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+count = 1
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+name = "S"
+
+[[properties]]
+name = "p"
+formula = "true"
+over = "S"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify succeeded");
+        assert_eq!(report.sources.len(), 1);
+        assert_eq!(report.sources[0].id, "light");
+    }
+
+    #[test]
+    fn count_zero_is_a_config_error() {
+        let temp = tempdir().unwrap();
+        let _ = write_ctxdsl_source(temp.path(), "light.ctxdsl", SIMPLE_LIGHT_CTXDSL);
+        let toml_src = r#"
+[project]
+name = "Zero"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+count = 0
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let err = verify_project(&config, temp.path()).unwrap_err();
+        match err {
+            VerifyError::ConfigValidationFailed(issues) => {
+                assert!(issues.iter().any(|i| matches!(
+                    i,
+                    crate::verify::config::ConfigIssue::SourceCountZero { source_id } if source_id == "light"
+                )));
+            }
+            other => panic!("expected ConfigValidationFailed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -902,5 +1447,129 @@ template = "reachable"
             err,
             VerifyError::TemplateInstantiationFailed { .. }
         ));
+    }
+
+    /// End-to-end: a tiny SV peripheral + a register map mapping its
+    /// `req` input onto a synthetic `ctrl.req` field flows through the
+    /// orchestrator's register-map SV rewriter and the verify pipeline
+    /// completes against the rewritten alphabet.
+    #[test]
+    fn register_map_binding_rewrites_sv_source_labels() {
+        let temp = tempdir().unwrap();
+        // Minimal SV module — same shape as the codesign-uart tests.
+        let sv = r#"
+module periph(
+    input        clk,
+    input        rst,
+    input        req,
+    output reg   ack
+);
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) ack <= 1'b0;
+        else if (req) ack <= 1'b1;
+        else ack <= 1'b0;
+    end
+endmodule
+"#;
+        fs::write(temp.path().join("periph.sv"), sv).unwrap();
+
+        // Register-map sidecar: a single-bit control field `req`
+        // exposed via SV signal `dut.req`.
+        let register_map = r#"{
+            "peripheral": "PERIPH",
+            "base_address": "0x40000000",
+            "registers": [
+                {
+                    "name": "ctrl",
+                    "offset": 0,
+                    "width_bits": 32,
+                    "direction": "WO",
+                    "visibility_class": "control",
+                    "fields": [
+                        {
+                            "name": "req",
+                            "bits": [0, 0],
+                            "sv_signal": "dut.req",
+                            "c_accessor": "PERIPH->CTRL.bit.req"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        fs::write(temp.path().join("register_map.json"), register_map).unwrap();
+
+        let toml_src = r#"
+[project]
+name = "RewriteTest"
+
+[[sources]]
+id = "rtl"
+adapter = "sv-rtl"
+files = ["periph.sv"]
+
+[alphabet]
+strategy = "register_map"
+register_map = "register_map.json"
+
+[composition]
+semantics = "asynchronous"
+members = ["rtl"]
+name = "P"
+
+[[properties]]
+name = "always_true"
+formula = "true"
+over = "P"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
+        assert_eq!(report.project, "RewriteTest");
+        // Single source; verdict satisfied (vacuous property —
+        // the test's point is that the pipeline completes, with the
+        // register-map binding's SV rewriter applied without choking
+        // on the SV adapter's `<signal>_<value>` labels.
+        assert_eq!(report.property_verdicts.len(), 1);
+        assert!(report.property_verdicts[0].satisfied);
+    }
+
+    /// Direct-binding sanity: a register-map sidecar present but the
+    /// strategy is `direct` — the rewriter must not fire.
+    #[test]
+    fn direct_binding_with_sv_source_skips_register_map_rewriter() {
+        let temp = tempdir().unwrap();
+        let sv = r#"
+module tiny(input clk, input rst, input go, output reg done);
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) done <= 1'b0; else done <= go;
+    end
+endmodule
+"#;
+        fs::write(temp.path().join("tiny.sv"), sv).unwrap();
+        let toml_src = r#"
+[project]
+name = "DirectOnly"
+
+[[sources]]
+id = "rtl"
+adapter = "sv-rtl"
+files = ["tiny.sv"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["rtl"]
+name = "T"
+
+[[properties]]
+name = "p"
+formula = "true"
+over = "T"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
+        assert_eq!(report.property_verdicts.len(), 1);
+        assert!(report.property_verdicts[0].satisfied);
     }
 }

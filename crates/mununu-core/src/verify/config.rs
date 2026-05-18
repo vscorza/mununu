@@ -116,8 +116,10 @@ pub struct SourceSection {
     /// A2.4. Recognised values today (subject to A2 evolution):
     /// `"c-codesign"` (firmware C via `codesign::c_extract_llvm`),
     /// `"sv-rtl"` (custom-SV / yosys frontend), `"ctxdsl"` (raw
-    /// hand-authored automaton), `"xstate"`, `"extraction"`, `"tlsf"`,
-    /// `"aiger"`, `"btor2"`, `"promela"`.
+    /// hand-authored automaton), `"xstate"`, `"crewai"` (CrewAI
+    /// agentic JSON), `"langgraph"` (LangGraph StateGraph JSON),
+    /// `"microcode"` (restricted JSON microcode form — plan Part 5.5),
+    /// `"extraction"`, `"tlsf"`, `"aiger"`, `"btor2"`, `"promela"`.
     pub adapter: String,
     /// Source files to feed the adapter. Order is significant for
     /// adapters that accept multiple files; for single-file adapters
@@ -131,6 +133,24 @@ pub struct SourceSection {
     /// inside the adapter; this layer only catches well-formedness.
     #[serde(default)]
     pub options: BTreeMap<String, toml::Value>,
+    /// Instance count for parameterised expansion. When `>= 2`, the
+    /// orchestrator expands this `[[sources]]` entry into `count`
+    /// virtual sources named `<id>_0`, `<id>_1`, …, `<id>_<count-1>`.
+    /// Each virtual instance's file content has `{instance_id}`
+    /// occurrences substituted with `<id>_<i>` *before* the adapter
+    /// sees the content, so the emitted automaton names and state
+    /// names stay unique per instance.
+    ///
+    /// `None` (or `1`) means "single instance" — no expansion, no
+    /// placeholder substitution, full backwards compatibility with
+    /// existing fixtures.
+    ///
+    /// To reference parameterised instances from `[composition].members`,
+    /// use either the wildcard form `<id>.*` (expands to every
+    /// instance) or a specific instance id `<id>_0`. The validator
+    /// accepts both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
 }
 
 /// `[alphabet]` block — how labels across sources synchronise.
@@ -243,6 +263,10 @@ pub enum ConfigIssue {
     EmptyAdapter { source_id: String },
     /// `[[sources]]` entry had an empty `files` list.
     SourceNoFiles { source_id: String },
+    /// `[[sources]]` entry had `count = 0` — meaningless. Use `count
+    /// = 1` (or omit the field) for a single instance, `>= 2` for
+    /// parameterised expansion.
+    SourceCountZero { source_id: String },
     /// `[alphabet].strategy` is not one of `direct` / `renamings` /
     /// `register_map`.
     UnknownAlphabetStrategy(String),
@@ -298,6 +322,10 @@ impl fmt::Display for ConfigIssue {
             ConfigIssue::EmptyAdapter { source_id } => {
                 write!(f, "[[sources]] `{source_id}` has empty `adapter`")
             }
+            ConfigIssue::SourceCountZero { source_id } => write!(
+                f,
+                "[[sources]] `{source_id}` has `count = 0` (use 1 or omit for single-instance; >= 2 for parameterised expansion)"
+            ),
             ConfigIssue::SourceNoFiles { source_id } => write!(
                 f,
                 "[[sources]] `{source_id}` has empty `files` list; at least one path is required"
@@ -401,6 +429,26 @@ impl VerifyConfig {
                     source_id: source.id.clone(),
                 });
             }
+            // Parameterisation: `count = N` expands to N instances
+            // `<id>_0` .. `<id>_<N-1>`. count == 0 is meaningless;
+            // count == 1 is identical to omitting the field.
+            if let Some(c) = source.count {
+                if c == 0 {
+                    issues.push(ConfigIssue::SourceCountZero {
+                        source_id: source.id.clone(),
+                    });
+                }
+                if c >= 2 {
+                    // Register every expanded instance id as a
+                    // visible source for composition-member checks.
+                    for i in 0..c {
+                        let instance_id = format!("{}_{}", source.id, i);
+                        if !seen_source_ids.insert(instance_id.clone()) {
+                            issues.push(ConfigIssue::DuplicateSourceId(instance_id));
+                        }
+                    }
+                }
+            }
         }
 
         // Alphabet
@@ -448,7 +496,11 @@ impl VerifyConfig {
             issues.push(ConfigIssue::CompositionNoMembers);
         }
         for m in &self.composition.members {
-            if !seen_source_ids.contains(m) {
+            // Wildcard expansion: `<src>.*` resolves to every automaton
+            // emitted by `<src>`. The validator only enforces source
+            // existence; the assembler does the expansion.
+            let bare = m.strip_suffix(".*").unwrap_or(m.as_str());
+            if !seen_source_ids.contains(bare) {
                 issues.push(ConfigIssue::CompositionUnknownMember { id: m.clone() });
             }
         }

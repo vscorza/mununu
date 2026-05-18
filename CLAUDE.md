@@ -12,14 +12,15 @@
 4. [Git Identity](#git-identity) `[RULE]`
 5. [Surface Parity](#surface-parity) `[RULE]`
 6. [Soundness Guarantees](#soundness-guarantees) `[RULE]`
-7. [Documentation Traceability](#documentation-traceability) `[RULE]`
-8. [Claims Integrity](#claims-integrity) `[RULE]`
-9. [Adapter / Emitter Capability Use](#adapter--emitter-capability-use) `[RULE]`
-10. [Git Operations & Destructive Commands](#git-operations--destructive-commands) `[RULE]`
-11. [Code Reuse, Dead Code, Performance, Security](#code-reuse-dead-code-performance-security) `[RULE]`
-12. [Available Agents and Skills](#available-agents-and-skills) `[REFERENCE]`
-13. [Private Files Policy](#private-files-policy) `[RULE]`
-14. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
+7. [Abstraction Guidelines](#abstraction-guidelines) `[RULE]`
+8. [Documentation Traceability](#documentation-traceability) `[RULE]`
+9. [Claims Integrity](#claims-integrity) `[RULE]`
+10. [Adapter / Emitter Capability Use](#adapter--emitter-capability-use) `[RULE]`
+11. [Git Operations & Destructive Commands](#git-operations--destructive-commands) `[RULE]`
+12. [Code Reuse, Dead Code, Performance, Security](#code-reuse-dead-code-performance-security) `[RULE]`
+13. [Available Agents and Skills](#available-agents-and-skills) `[REFERENCE]`
+14. [Private Files Policy](#private-files-policy) `[RULE]`
+15. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
 
 ---
 
@@ -92,6 +93,20 @@ When contributing adapters or modifying the Kripke builder:
 Strategy extraction uses **signature-based selection** from iteration ranks. Both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998); memoryless on the model-checking product = finite-memory on the plant. See [`docs/synthesis.md`](docs/synthesis.md) for `ControllerMode` options, lasso trace format, counterstrategy emission, and the Skolem-paradigm rules for nondeterminism vs. controllability.
 
 Contract-specific soundness (chaotic-stub default, cyclic-discharge handling, codesign rules) is in [`docs/design/black-box-modules.md`](docs/design/black-box-modules.md) and [`docs/design/hw-sw-codesign-extraction.md`](docs/design/hw-sw-codesign-extraction.md).
+
+## Abstraction Guidelines
+
+Every adapter, every CTXDSL source, every sidecar makes an abstraction decision — what to enumerate, what to bucket, what to drop. The Soundness Guarantees section above tells you the three directions (safety + over-approximation = sound, etc.); the **per-subsystem recipe** — which mununu primitive to reach for, when, and what each primitive preserves — lives in [`docs/abstraction.md`](docs/abstraction.md). Read it before authoring a new adapter, a new Kripke-builder rule, or a non-trivial CTXDSL source.
+
+The load-bearing rules at a glance:
+
+- **Pick the *minimum* abstraction that keeps the property decidable.** Coarser is fine when safety is the only concern; finer is required when liveness or order-sensitive properties are in play.
+- **Declare the posture explicitly** — `AbstractionType::Symbols([…])` in a sidecar, a comment block at the top of a hand-authored CTXDSL, or a `mem { x : shared }`-style tag in the microcode discipline.
+- **Add a `// SOUNDNESS:` annotation** at every `eval_expr → None` choice and every adapter decision that drops information. State whether it is over- or under-approximation. `/soundness-check` is the audit skill.
+- **Automated extraction is viable when the abstraction shape is uniform across instances and the source format carries the structural information** (`c-codesign` + register-map; the planned `microcode` adapter; the planned chaotic-stub generator). Everything else — pipelines, caches, buses, PLICs, watchdogs — gets a **parameterised CTXDSL library template**, not an extractor.
+- **Add a regression test** for every abstraction decision that touches an adapter or the Kripke builder. The test must exercise the abstract case and at least one concrete case that maps into the same abstraction class.
+
+For benchmarks of state-space cost per abstraction choice, see `docs/abstraction.md`'s "What this doc deliberately does not do" — they are not yet shipped, and any claim about absolute state-space numbers must be measured per-model.
 
 ## Documentation Traceability
 
@@ -237,8 +252,11 @@ Reference and how-to material — read when the task calls for it, not on every 
 - [`docs/toolchain.md`](docs/toolchain.md) — Rust version pinning and clippy compatibility notes.
 - [`docs/cli-cookbook.md`](docs/cli-cookbook.md) — common `mununu` CLI invocations.
 - [`docs/synthesis.md`](docs/synthesis.md) — `ControllerMode`, signature-based extraction, lasso traces, Skolem-paradigm rules.
+- [`docs/abstraction.md`](docs/abstraction.md) — Per-subsystem abstraction recipe: which mununu primitive to reach for, when, what each preserves, and where automated extraction is viable vs where parameterised templates are the right pattern.
 - [`docs/docker.md`](docs/docker.md) — Dockerfile best practices for Rust services in this project.
-- [`docs/adapters/agentic.md`](docs/adapters/agentic.md) — Agentic AI orchestration via native CTXDSL or XState.
+- [`docs/adapters/agentic.md`](docs/adapters/agentic.md) — Agentic AI orchestration via native CTXDSL, XState, CrewAI, or LangGraph.
+- [`wiki/Verify-Project-Flow.md`](wiki/Verify-Project-Flow.md) — General N-source verify framework: `verify.toml` manifest, alphabet bindings, composition, the orchestrator pipeline, and the example fleet.
+- [`wiki/Agentic-Adapters.md`](wiki/Agentic-Adapters.md) — Native CrewAI + LangGraph adapter details: accepted JSON shapes, translation semantics, the three agentic property templates.
 - [`docs/adapters/extraction.md`](docs/adapters/extraction.md) — `.espec.json` extraction adapter, mode filtering, property templates.
 - [`docs/adapters/tlsf-aiger.md`](docs/adapters/tlsf-aiger.md) — Turn-based compound-label encoding for TLSF and AIGER.
 - [`docs/policies/claims-integrity.md`](docs/policies/claims-integrity.md) — Full claims-integrity policy (10 rules + editorial framing).

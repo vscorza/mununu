@@ -432,11 +432,18 @@ pub async fn context_import_handler(
             opts.mode = Some("vulnerable".to_string());
             crate::adapter::extraction::ExtractionAdapter::translate(&request.content, &opts)
         }
+        "crewai" => crate::adapter::crewai::CrewaiAdapter::translate(&request.content, &options),
+        "langgraph" => {
+            crate::adapter::langgraph::LangGraphAdapter::translate(&request.content, &options)
+        }
+        "microcode" => {
+            crate::adapter::microcode::MicrocodeAdapter::translate(&request.content, &options)
+        }
         "auto" | "" => crate::adapter::auto_translate(&request.content, &options),
         other => {
             return Err(ApiError::BadRequest {
                 message: format!(
-                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction"
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, crewai, langgraph, microcode"
                 ),
                 details: None,
             });
@@ -2032,14 +2039,23 @@ pub async fn codesign_verify_handler(
 
 /// Request body for `POST /api/v1/verify`.
 ///
-/// The HTTP variant always receives the config inline. Source files
-/// are read from disk relative to `base_dir`. Inline-content sources
-/// are a future extension (would let the HTTP caller stream the
-/// whole project archive without on-disk paths).
+/// HTTP variant accepts either a pre-parsed `config` JSON object or
+/// raw `config_toml` text — the latter is what the UI sends after a
+/// user drops a verify.toml file. Source files are read from disk
+/// relative to `base_dir`. Inline-content sources (uploading the
+/// whole project archive in the request body) remain a future
+/// extension.
 #[derive(Debug, serde::Deserialize)]
 pub struct VerifyProjectRequest {
-    /// Parsed `verify.toml` payload.
-    pub config: crate::verify::config::VerifyConfig,
+    /// Pre-parsed `verify.toml` payload. Mutually exclusive with
+    /// `config_toml`.
+    #[serde(default)]
+    pub config: Option<crate::verify::config::VerifyConfig>,
+    /// Raw verify.toml text. Parsed via
+    /// [`crate::verify::config::VerifyConfig::from_toml`]. Mutually
+    /// exclusive with `config`.
+    #[serde(default)]
+    pub config_toml: Option<String>,
     /// Directory the source paths in the config resolve against.
     /// Required — the server has no implicit "client working
     /// directory" the way the CLI does.
@@ -2056,8 +2072,28 @@ pub struct VerifyProjectRequest {
 pub async fn verify_project_handler(
     Json(request): Json<VerifyProjectRequest>,
 ) -> ApiResult<Json<crate::verify::report::VerifyReport>> {
+    let config = match (request.config, request.config_toml) {
+        (Some(c), None) => c,
+        (None, Some(toml_text)) => crate::verify::config::VerifyConfig::from_toml(&toml_text)
+            .map_err(|e| ApiError::BadRequest {
+                message: format!("failed to parse config_toml: {e}"),
+                details: None,
+            })?,
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest {
+                message: "supply exactly one of `config` or `config_toml`, not both".to_string(),
+                details: None,
+            });
+        }
+        (None, None) => {
+            return Err(ApiError::BadRequest {
+                message: "missing `config` or `config_toml` in request body".to_string(),
+                details: None,
+            });
+        }
+    };
     let base_dir = std::path::PathBuf::from(&request.base_dir);
-    crate::verify::verify_project(&request.config, &base_dir)
+    crate::verify::verify_project(&config, &base_dir)
         .map(Json)
         .map_err(|e| ApiError::BadRequest {
             message: e.to_string(),
@@ -2122,6 +2158,57 @@ pub async fn codesign_reconcile_labels_handler(
             mismatch: Some(m),
         })),
     }
+}
+
+/// Request body for `POST /api/v1/codesign/emit-chaotic-stub`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CodesignEmitChaoticStubRequest {
+    /// Parsed register-map JSON sidecar.
+    pub register_map: crate::codesign::register_map::RegisterMap,
+    /// Optional override for the peripheral automaton name. Defaults
+    /// to the uppercased peripheral name from the sidecar. The
+    /// context-block name is always `<AutomatonName>ChaoticStub`.
+    #[serde(default)]
+    pub peripheral_automaton: Option<String>,
+    /// When true, refuse to emit and 400 if the register-map
+    /// validator reports any issue.
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// Response body — just the emitted CTXDSL text.
+#[derive(Debug, serde::Serialize)]
+pub struct CodesignEmitChaoticStubResponse {
+    /// The standalone CTXDSL document with its own `context { … }`
+    /// wrapper, ready to drop into a `verify.toml` as a `ctxdsl`
+    /// source.
+    pub ctxdsl: String,
+    /// Validation warnings surfaced by the register-map validator.
+    /// Empty when the sidecar is well-formed.
+    pub warnings: Vec<String>,
+}
+
+/// Emit a standalone chaotic-stub CTXDSL document from a register map.
+/// Mirrors `mununu codesign emit-chaotic-stub` (CLI).
+pub async fn codesign_emit_chaotic_stub_handler(
+    Json(request): Json<CodesignEmitChaoticStubRequest>,
+) -> ApiResult<Json<CodesignEmitChaoticStubResponse>> {
+    use crate::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
+
+    let issues = request.register_map.validate();
+    let warnings: Vec<String> = issues.iter().map(|i| i.to_string()).collect();
+    if request.strict && !warnings.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: format!("strict mode: {} register-map issue(s)", warnings.len()),
+            details: Some(warnings.join("; ")),
+        });
+    }
+    let opts = CouplingOptions {
+        peripheral_automaton: request.peripheral_automaton.as_deref(),
+        ..Default::default()
+    };
+    let ctxdsl = emit_chaotic_stub_ctxdsl(&request.register_map, &opts);
+    Ok(Json(CodesignEmitChaoticStubResponse { ctxdsl, warnings }))
 }
 
 #[cfg(test)]
@@ -2328,5 +2415,154 @@ mod compositional_extract_handler_tests {
         assert_eq!(members.len(), 2);
         assert_eq!(members[0], "worker_a");
         assert_eq!(members[1], "worker_b");
+    }
+
+    // ---- verify_project_handler --------------------------------------
+
+    #[tokio::test]
+    async fn verify_project_handler_accepts_config_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Minimal hand-authored CTXDSL source — exercises the
+        // `ctxdsl` adapter pass-through path so the handler test
+        // doesn't depend on clang / yosys / etc.
+        let ctxdsl = r#"
+context Light {
+    alphabet { label tick; }
+    automata {
+        automaton Light {
+            states { state lit initial; state dim; }
+            transitions {
+                transition lit -> dim on label tick;
+                transition dim -> lit on label tick;
+            }
+        }
+    }
+}
+"#;
+        std::fs::write(tmp.path().join("light.ctxdsl"), ctxdsl).unwrap();
+
+        let toml = r#"
+[project]
+name = "ConfigTomlPath"
+
+[[sources]]
+id = "light"
+adapter = "ctxdsl"
+files = ["light.ctxdsl"]
+
+[composition]
+semantics = "asynchronous"
+members = ["light"]
+name = "Sys"
+
+[[properties]]
+name = "alive"
+formula = "true"
+over = "Sys"
+"#;
+        let request = VerifyProjectRequest {
+            config: None,
+            config_toml: Some(toml.to_string()),
+            base_dir: tmp.path().to_string_lossy().to_string(),
+        };
+        let Json(report) = verify_project_handler(Json(request))
+            .await
+            .expect("verify_project should succeed");
+        assert_eq!(report.project, "ConfigTomlPath");
+        assert_eq!(report.property_verdicts.len(), 1);
+        assert!(report.property_verdicts[0].satisfied);
+    }
+
+    #[tokio::test]
+    async fn verify_project_handler_rejects_both_config_and_config_toml() {
+        let cfg = crate::verify::config::VerifyConfig::from_toml(
+            r#"
+[project]
+name = "X"
+[[sources]]
+id = "x"
+adapter = "ctxdsl"
+files = ["x.ctxdsl"]
+[composition]
+semantics = "asynchronous"
+members = ["x"]
+"#,
+        )
+        .unwrap();
+        let request = VerifyProjectRequest {
+            config: Some(cfg),
+            config_toml: Some("[project]\nname = \"Y\"\n".to_string()),
+            base_dir: ".".to_string(),
+        };
+        let err = verify_project_handler(Json(request)).await.unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("exactly one"), "got: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_import_handler_accepts_crewai_format() {
+        let crew = r#"{
+            "name": "Mini",
+            "agents": [{ "role": "Solo" }],
+            "tasks": [{ "agent": "Solo" }]
+        }"#;
+        let request = ContextImportRequest {
+            content: crew.to_string(),
+            format: "crewai".to_string(),
+            filename: Some("mini.crewai.json".to_string()),
+            sidecar: None,
+            additional_sources: Vec::new(),
+        };
+        let Json(out) = context_import_handler(Json(request))
+            .await
+            .expect("crewai dispatch should succeed");
+        assert!(out.ctxdsl.contains("Agent_Solo"));
+        // CrewAI currently rides the XState SourceFormat variant until
+        // `SourceFormat::Crewai` lands.
+        assert_eq!(out.source_format, "XState");
+    }
+
+    #[tokio::test]
+    async fn context_import_handler_accepts_langgraph_format() {
+        let graph = r#"{
+            "name": "Linear",
+            "entry_point": "a",
+            "nodes": [
+                { "id": "a" },
+                { "id": "b" }
+            ],
+            "edges": [{ "from": "a", "to": "b" }]
+        }"#;
+        let request = ContextImportRequest {
+            content: graph.to_string(),
+            format: "langgraph".to_string(),
+            filename: Some("graph.langgraph.json".to_string()),
+            sidecar: None,
+            additional_sources: Vec::new(),
+        };
+        let Json(out) = context_import_handler(Json(request))
+            .await
+            .expect("langgraph dispatch should succeed");
+        assert!(out.ctxdsl.contains("automaton Linear"));
+    }
+
+    #[tokio::test]
+    async fn verify_project_handler_rejects_missing_config_and_toml() {
+        let request = VerifyProjectRequest {
+            config: None,
+            config_toml: None,
+            base_dir: ".".to_string(),
+        };
+        let err = verify_project_handler(Json(request)).await.unwrap_err();
+        match err {
+            ApiError::BadRequest { message, .. } => {
+                assert!(message.contains("missing"), "got: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }

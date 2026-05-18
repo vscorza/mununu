@@ -1,0 +1,20 @@
+# langgraph_workflow — verify framework end-to-end transcript
+# Regenerated via examples/verify/langgraph_workflow/validate.sh
+#
+# Conditional-branching LangGraph (classify -> {billing, tech} -> done)
+# via the native `LangGraphAdapter`; direct alphabet binding; two
+# property templates (reachable + mutual_exclusion).
+
+=== mununu verify (human-readable) ===
+verify report — project `LangGraphWorkflow`:
+  composition: asynchronous Triage { members = [TicketTriage] }
+    - wf (adapter = langgraph, automaton = TicketTriage)
+    done_reachable: SATISFIED (4/4 states, 1/1 initial) [template `reachable`, over = Triage]
+    done_excludes_classify: SATISFIED (4/4 states, 1/1 initial) [template `mutual_exclusion`, over = Triage]
+
+=== mununu verify --json (subset: project + verdict shape) ===
+project = LangGraphWorkflow
+composition.name = Triage
+composition.semantics = asynchronous
+  property `done_reachable`: satisfied = True, source = template
+  property `done_excludes_classify`: satisfied = True, source = template

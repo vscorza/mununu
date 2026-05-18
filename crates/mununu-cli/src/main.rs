@@ -56,6 +56,12 @@ enum Commands {
     },
     /// List available property templates.
     Templates(TemplatesArgs),
+    /// Browse / emit shipped parameterised CTXDSL component templates
+    /// (PLIC, watchdog, tracked-memory).
+    Library {
+        #[command(subcommand)]
+        command: Box<LibraryCommand>,
+    },
     /// Contract assume-guarantee tooling (validate discharge graphs, etc.).
     Contract {
         #[command(subcommand)]
@@ -79,6 +85,30 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommand {
+    /// List every shipped library template + a one-line summary.
+    List,
+    /// Emit one template's CTXDSL body to stdout (or `--output`).
+    Emit(LibraryEmitArgs),
+}
+
+#[derive(Args, Debug)]
+struct LibraryEmitArgs {
+    /// Template name (e.g. `plic`, `watchdog`, `tracked_memory`).
+    #[arg(value_name = "NAME")]
+    name: String,
+    /// Substitute `{instance_id}` with this value before emitting.
+    /// When omitted, the placeholder is preserved verbatim — useful
+    /// when feeding the output to a `[[sources]]` block with
+    /// `count = N` (the verify framework substitutes per instance).
+    #[arg(long, value_name = "ID")]
+    instance_id: Option<String>,
+    /// Output path. Defaults to stdout.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -144,6 +174,15 @@ struct VerifyArgs {
     /// Default: exit 0 regardless of verdicts; the report distinguishes.
     #[arg(long)]
     strict: bool,
+    /// Skip property evaluation and instead emit an introspection
+    /// report: per-automaton alphabet + state names, the composition's
+    /// union alphabet, and every declared per-state predicate. Use
+    /// this before authoring property formulas to discover what
+    /// labels and predicates the realized context actually exposes.
+    /// Mutually exclusive with `--strict` (the report carries no
+    /// verdicts to enforce against).
+    #[arg(long = "print-alphabet")]
+    print_alphabet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -236,6 +275,16 @@ enum CodesignCommand {
     /// `context <name> { … }` block alongside their firmware
     /// automaton.
     Couple(CodesignCoupleArgs),
+    /// Emit a standalone chaotic-stub CTXDSL document from a register-map
+    /// sidecar.
+    ///
+    /// Generates the one-state-self-loops form: a single `Chaotic`
+    /// state with self-loops on every rendezvous label derived from
+    /// the register map. The output is a complete CTXDSL document
+    /// (with its own `context { … }` wrapper) ready to reference as
+    /// a `ctxdsl` source from a `verify.toml`. Sound for safety,
+    /// optimistic for liveness (Doc C §C.5). See `docs/abstraction.md`.
+    EmitChaoticStub(CodesignEmitChaoticStubArgs),
     /// Compose a register-map sidecar with a firmware CTXDSL and
     /// verify a property over the result.
     ///
@@ -431,6 +480,25 @@ struct CodesignVerifyArgs {
     /// Emit the result as JSON to stdout.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args, Debug)]
+struct CodesignEmitChaoticStubArgs {
+    /// Path to the register-map JSON sidecar.
+    #[arg(value_name = "REGISTER_MAP")]
+    register_map: PathBuf,
+    /// Output path. Defaults to stdout when omitted.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Override the peripheral automaton name (default: uppercased
+    /// peripheral name from the sidecar). The context-block name is
+    /// always `<AutomatonName>ChaoticStub`.
+    #[arg(long, value_name = "NAME")]
+    peripheral_automaton: Option<String>,
+    /// Validate the register-map and exit non-zero if any issue is
+    /// reported, instead of just printing warnings.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -950,7 +1018,11 @@ fn init_tracing() {
 fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     use mununu_core::verify::config::VerifyConfig;
     use mununu_core::verify::report::PropertyFormulaSource;
-    use mununu_core::verify::verify_project;
+    use mununu_core::verify::{inspect_project, verify_project};
+
+    if args.print_alphabet && args.strict {
+        return Err("--print-alphabet is incompatible with --strict (the introspection report carries no verdicts)".to_string());
+    }
 
     let body = std::fs::read_to_string(&args.config)
         .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
@@ -963,6 +1035,19 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     });
+
+    if args.print_alphabet {
+        let inspection = inspect_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inspection).map_err(|e| e.to_string())?
+            );
+        } else {
+            print_inspection_human(&inspection);
+        }
+        return Ok(());
+    }
 
     let report = verify_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
 
@@ -1015,12 +1100,80 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn print_inspection_human(report: &mununu_core::verify::InspectionReport) {
+    println!("inspect report — project `{}`:", report.project);
+    println!(
+        "  composition: {} {} {{ members = [{}] }}",
+        report.composition.info.semantics,
+        report.composition.info.name,
+        report.composition.info.members.join(", "),
+    );
+    println!("  sources:");
+    for s in &report.sources {
+        println!(
+            "    - {id} (adapter = {adapter}, automaton = {automaton})",
+            id = s.id,
+            adapter = s.adapter,
+            automaton = s.automaton.as_deref().unwrap_or("(unresolved)"),
+        );
+    }
+    println!("  automata ({}):", report.automata.len());
+    for a in &report.automata {
+        let src = a.source_id.as_deref().unwrap_or("-");
+        println!(
+            "    {name} (source = {src}, {n_states} states, {n_init} initial, {n_alpha} labels)",
+            name = a.name,
+            n_states = a.states.len(),
+            n_init = a.initial_states.len(),
+            n_alpha = a.alphabet.len(),
+        );
+        if !a.initial_states.is_empty() {
+            println!("      initial: {}", a.initial_states.join(", "));
+        }
+        if !a.states.is_empty() {
+            println!("      states:  {}", a.states.join(", "));
+        }
+        if !a.alphabet.is_empty() {
+            println!("      labels:  {}", a.alphabet.join(", "));
+        }
+    }
+    println!();
+    println!(
+        "  composition alphabet ({} labels):",
+        report.composition.alphabet.len()
+    );
+    if !report.composition.alphabet.is_empty() {
+        for chunk in report.composition.alphabet.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+    if !report.composition.state_names.is_empty() {
+        println!(
+            "  composition states ({}):",
+            report.composition.state_names.len()
+        );
+        for chunk in report.composition.state_names.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+    if !report.composition.predicate_names.is_empty() {
+        println!(
+            "  declared predicates ({}):",
+            report.composition.predicate_names.len()
+        );
+        for chunk in report.composition.predicate_names.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+}
+
 fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(*command),
         Commands::Extraction { command } => handle_extraction(*command),
         Commands::Sv { command } => handle_sv(*command),
         Commands::Templates(args) => list_templates(args),
+        Commands::Library { command } => handle_library(*command),
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
         Commands::Verify(args) => handle_verify(args),
@@ -1073,6 +1226,7 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::EmitCmsisHeader(args) => codesign_emit_cmsis_header(args),
         CodesignCommand::Couple(args) => codesign_couple(args),
+        CodesignCommand::EmitChaoticStub(args) => codesign_emit_chaotic_stub(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
@@ -1568,6 +1722,42 @@ fn codesign_verify(args: CodesignVerifyArgs) -> Result<(), String> {
         println!("    verdict: HOLDS");
     } else {
         println!("    verdict: VIOLATED at initial state(s)");
+    }
+    Ok(())
+}
+
+fn codesign_emit_chaotic_stub(args: CodesignEmitChaoticStubArgs) -> Result<(), String> {
+    use mununu_core::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
+    use mununu_core::codesign::register_map::RegisterMap;
+
+    let body = std::fs::read_to_string(&args.register_map)
+        .map_err(|e| format!("failed to read {}: {e}", args.register_map.display()))?;
+    let map: RegisterMap = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+
+    let issues = map.validate();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("warning: {issue}");
+        }
+        if args.strict {
+            return Err(format!(
+                "--strict: {} register-map issue(s) — refusing to proceed",
+                issues.len()
+            ));
+        }
+    }
+
+    let opts = CouplingOptions {
+        peripheral_automaton: args.peripheral_automaton.as_deref(),
+        ..Default::default()
+    };
+    let stub = emit_chaotic_stub_ctxdsl(&map, &opts);
+
+    match args.output {
+        Some(path) => std::fs::write(&path, &stub)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+        None => print!("{stub}"),
     }
     Ok(())
 }
@@ -5782,6 +5972,40 @@ fn sanitize_identifier_cli(value: &str) -> String {
 // ---------------------------------------------------------------------------
 // Property templates CLI
 // ---------------------------------------------------------------------------
+
+fn handle_library(command: LibraryCommand) -> Result<(), String> {
+    use mununu_core::library;
+
+    match command {
+        LibraryCommand::List => {
+            println!("Shipped parameterised CTXDSL component templates:");
+            println!();
+            for t in library::templates() {
+                println!("  {:<18} — {}", t.name, t.summary);
+            }
+            println!();
+            println!("Emit with: `mununu library emit <NAME> [--instance-id ID] [-o PATH]`");
+            Ok(())
+        }
+        LibraryCommand::Emit(args) => {
+            let t = library::lookup(&args.name).ok_or_else(|| {
+                let names: Vec<&str> = library::templates().iter().map(|t| t.name).collect();
+                format!(
+                    "unknown library template `{}`. Available: {}",
+                    args.name,
+                    names.join(", ")
+                )
+            })?;
+            let body = library::emit(t, args.instance_id.as_deref());
+            match args.output {
+                Some(path) => std::fs::write(&path, &body)
+                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+                None => print!("{body}"),
+            }
+            Ok(())
+        }
+    }
+}
 
 fn list_templates(args: TemplatesArgs) -> Result<(), String> {
     use mununu_core::adapter::templates::{TemplateDomain, TemplateRegistry};

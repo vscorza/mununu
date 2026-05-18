@@ -1,0 +1,29 @@
+# library_demo — verify framework end-to-end transcript
+# Regenerated via examples/verify/library_demo/validate.sh
+#
+# Two shipped library templates (PLIC, watchdog) instantiated
+# 3× and 2× respectively via count=N. Five independent automata
+# from two source files. Plan Part 6 item 7.
+
+=== mununu library list ===
+Shipped parameterised CTXDSL component templates:
+
+  plic               — RISC-V PLIC interrupt-controller stub (one tracked source × one observer).
+  watchdog           — Watchdog timer (Disabled / Armed / Expired) with kick + clear + expire labels.
+  tracked_memory     — Single-address memory tracker (Initial / Written) with wr / rd / fence labels.
+
+Emit with: `mununu library emit <NAME> [--instance-id ID] [-o PATH]`
+
+=== mununu verify (human-readable) ===
+verify report — project `LibraryDemo`:
+  composition: asynchronous LibrarySystem { members = [PLIC_plic_src_0, PLIC_plic_src_1, PLIC_plic_src_2, Watchdog_wd_0, Watchdog_wd_1] }
+    - plic_src_0 (adapter = ctxdsl, automaton = PLIC_plic_src_0)
+    - plic_src_1 (adapter = ctxdsl, automaton = PLIC_plic_src_1)
+    - plic_src_2 (adapter = ctxdsl, automaton = PLIC_plic_src_2)
+    - wd_0 (adapter = ctxdsl, automaton = Watchdog_wd_0)
+    - wd_1 (adapter = ctxdsl, automaton = Watchdog_wd_1)
+    plic_0_can_pend: SATISFIED (72/72 states, 1/1 initial) [template `reachable`, over = LibrarySystem]
+    plic_1_can_pend: SATISFIED (72/72 states, 1/1 initial) [template `reachable`, over = LibrarySystem]
+    plic_2_can_pend: SATISFIED (72/72 states, 1/1 initial) [template `reachable`, over = LibrarySystem]
+    main_watchdog_can_expire: SATISFIED (72/72 states, 1/1 initial) [template `reachable`, over = LibrarySystem]
+    backup_watchdog_can_expire: SATISFIED (72/72 states, 1/1 initial) [template `reachable`, over = LibrarySystem]

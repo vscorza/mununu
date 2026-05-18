@@ -58,6 +58,11 @@ enum Commands {
     /// General N-source verification framework. See `mununu verify --help`
     /// in the `mununu-cli` crate for full docs.
     Verify(VerifyArgs),
+    /// Browse / emit shipped parameterised CTXDSL component templates.
+    Library {
+        #[command(subcommand)]
+        command: Box<LibraryCommand>,
+    },
     #[cfg(feature = "api")]
     /// Start HTTP API server
     Server {
@@ -65,6 +70,24 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommand {
+    /// List every shipped library template.
+    List,
+    /// Emit one template's CTXDSL body.
+    Emit(LibraryEmitArgs),
+}
+
+#[derive(Args, Debug)]
+struct LibraryEmitArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "ID")]
+    instance_id: Option<String>,
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +150,11 @@ struct VerifyArgs {
     json: bool,
     #[arg(long)]
     strict: bool,
+    /// Skip property evaluation and emit an introspection report:
+    /// per-automaton alphabet + state names, the composition's union
+    /// alphabet, and every declared per-state predicate.
+    #[arg(long = "print-alphabet")]
+    print_alphabet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -252,6 +280,8 @@ struct ContractGapsArgs {
 enum CodesignCommand {
     /// Emit the coupling CTXDSL fragment for a register-map sidecar.
     Couple(CodesignCoupleArgs),
+    /// Emit a standalone chaotic-stub CTXDSL document from a register-map.
+    EmitChaoticStub(CodesignEmitChaoticStubArgs),
     /// Compose a register-map sidecar with a firmware CTXDSL and
     /// verify a property over the result.
     Verify(CodesignVerifyArgs),
@@ -283,6 +313,18 @@ struct CodesignReconcileLabelsArgs {
     /// Output format: `human` (default) or `json`.
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     format: String,
+}
+
+#[derive(Args, Debug)]
+struct CodesignEmitChaoticStubArgs {
+    #[arg(value_name = "REGISTER_MAP")]
+    register_map: PathBuf,
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
+    #[arg(long, value_name = "NAME")]
+    peripheral_automaton: Option<String>,
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -674,10 +716,48 @@ fn init_tracing() {
     }
 }
 
+fn handle_library(command: LibraryCommand) -> Result<(), String> {
+    use mununu::library;
+
+    match command {
+        LibraryCommand::List => {
+            println!("Shipped parameterised CTXDSL component templates:");
+            println!();
+            for t in library::templates() {
+                println!("  {:<18} — {}", t.name, t.summary);
+            }
+            println!();
+            println!("Emit with: `mununu library emit <NAME> [--instance-id ID] [-o PATH]`");
+            Ok(())
+        }
+        LibraryCommand::Emit(args) => {
+            let t = library::lookup(&args.name).ok_or_else(|| {
+                let names: Vec<&str> = library::templates().iter().map(|t| t.name).collect();
+                format!(
+                    "unknown library template `{}`. Available: {}",
+                    args.name,
+                    names.join(", ")
+                )
+            })?;
+            let body = library::emit(t, args.instance_id.as_deref());
+            match args.output {
+                Some(path) => std::fs::write(&path, &body)
+                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+                None => print!("{body}"),
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     use mununu::verify::config::VerifyConfig;
     use mununu::verify::report::PropertyFormulaSource;
-    use mununu::verify::verify_project;
+    use mununu::verify::{inspect_project, verify_project};
+
+    if args.print_alphabet && args.strict {
+        return Err("--print-alphabet is incompatible with --strict".to_string());
+    }
 
     let body = std::fs::read_to_string(&args.config)
         .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
@@ -689,6 +769,20 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     });
+
+    if args.print_alphabet {
+        let inspection = inspect_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inspection).map_err(|e| e.to_string())?
+            );
+        } else {
+            print_inspection_human(&inspection);
+        }
+        return Ok(());
+    }
+
     let report = verify_project(&config, &base_dir).map_err(|e| format!("{e}"))?;
 
     if args.json {
@@ -738,6 +832,72 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn print_inspection_human(report: &mununu::verify::InspectionReport) {
+    println!("inspect report — project `{}`:", report.project);
+    println!(
+        "  composition: {} {} {{ members = [{}] }}",
+        report.composition.info.semantics,
+        report.composition.info.name,
+        report.composition.info.members.join(", "),
+    );
+    println!("  sources:");
+    for s in &report.sources {
+        println!(
+            "    - {} (adapter = {}, automaton = {})",
+            s.id,
+            s.adapter,
+            s.automaton.as_deref().unwrap_or("(unresolved)"),
+        );
+    }
+    println!("  automata ({}):", report.automata.len());
+    for a in &report.automata {
+        let src = a.source_id.as_deref().unwrap_or("-");
+        println!(
+            "    {} (source = {}, {} states, {} initial, {} labels)",
+            a.name,
+            src,
+            a.states.len(),
+            a.initial_states.len(),
+            a.alphabet.len(),
+        );
+        if !a.initial_states.is_empty() {
+            println!("      initial: {}", a.initial_states.join(", "));
+        }
+        if !a.states.is_empty() {
+            println!("      states:  {}", a.states.join(", "));
+        }
+        if !a.alphabet.is_empty() {
+            println!("      labels:  {}", a.alphabet.join(", "));
+        }
+    }
+    println!();
+    println!(
+        "  composition alphabet ({} labels):",
+        report.composition.alphabet.len()
+    );
+    for chunk in report.composition.alphabet.chunks(4) {
+        println!("    {}", chunk.join(", "));
+    }
+    if !report.composition.state_names.is_empty() {
+        println!(
+            "  composition states ({}):",
+            report.composition.state_names.len()
+        );
+        for chunk in report.composition.state_names.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+    if !report.composition.predicate_names.is_empty() {
+        println!(
+            "  declared predicates ({}):",
+            report.composition.predicate_names.len()
+        );
+        for chunk in report.composition.predicate_names.chunks(4) {
+            println!("    {}", chunk.join(", "));
+        }
+    }
+}
+
 fn dispatch(command: Commands) -> Result<(), String> {
     match command {
         Commands::Context { command } => handle_context(*command),
@@ -745,6 +905,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
         Commands::Verify(args) => handle_verify(args),
+        Commands::Library { command } => handle_library(*command),
         #[cfg(feature = "api")]
         Commands::Server { addr } => {
             use std::net::SocketAddr;
@@ -795,6 +956,7 @@ fn handle_codesign(command: CodesignCommand) -> Result<(), String> {
     match command {
         CodesignCommand::EmitCmsisHeader(args) => codesign_emit_cmsis_header(args),
         CodesignCommand::Couple(args) => codesign_couple(args),
+        CodesignCommand::EmitChaoticStub(args) => codesign_emit_chaotic_stub(args),
         CodesignCommand::ImportSvd(args) => codesign_import_svd(args),
         CodesignCommand::ExtractC(args) => codesign_extract_c(args),
         CodesignCommand::Verify(args) => codesign_verify(args),
@@ -1127,6 +1289,42 @@ fn sanitize_filename_legacy(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn codesign_emit_chaotic_stub(args: CodesignEmitChaoticStubArgs) -> Result<(), String> {
+    use mununu::codesign::coupling::{CouplingOptions, emit_chaotic_stub_ctxdsl};
+    use mununu::codesign::register_map::RegisterMap;
+
+    let body = std::fs::read_to_string(&args.register_map)
+        .map_err(|e| format!("failed to read {}: {e}", args.register_map.display()))?;
+    let map: RegisterMap = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse register-map JSON: {e}"))?;
+
+    let issues = map.validate();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("warning: {issue}");
+        }
+        if args.strict {
+            return Err(format!(
+                "--strict: {} register-map issue(s) — refusing to proceed",
+                issues.len()
+            ));
+        }
+    }
+
+    let opts = CouplingOptions {
+        peripheral_automaton: args.peripheral_automaton.as_deref(),
+        ..Default::default()
+    };
+    let stub = emit_chaotic_stub_ctxdsl(&map, &opts);
+
+    match args.output {
+        Some(path) => std::fs::write(&path, &stub)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?,
+        None => print!("{stub}"),
+    }
+    Ok(())
 }
 
 fn codesign_couple(args: CodesignCoupleArgs) -> Result<(), String> {
@@ -2153,6 +2351,48 @@ fn load_with_adapter_mode(
             );
             output.ctxdsl
         }
+        Some("microcode") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::microcode::MicrocodeAdapter::translate(&source, &options)
+                .map_err(|e| format!("Microcode adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated Microcode: {} states, {} properties",
+                output.source_info.state_count, output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("crewai") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::crewai::CrewaiAdapter::translate(&source, &options)
+                .map_err(|e| format!("CrewAI adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated CrewAI: {} states, {} properties",
+                output.source_info.state_count, output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
+        Some("langgraph") => {
+            use mununu::adapter::{AdapterOptions, FormatAdapter};
+            let options = AdapterOptions::default();
+            let output = mununu::adapter::langgraph::LangGraphAdapter::translate(&source, &options)
+                .map_err(|e| format!("LangGraph adapter error: {e}"))?;
+            for w in &output.warnings {
+                eprintln!("adapter warning: {}", w.message);
+            }
+            eprintln!(
+                "Translated LangGraph: {} states, {} properties",
+                output.source_info.state_count, output.source_info.property_count,
+            );
+            output.ctxdsl
+        }
         Some("auto") => {
             let options = mununu::adapter::AdapterOptions {
                 mode: mode.map(|s| s.to_string()),
@@ -2174,7 +2414,7 @@ fn load_with_adapter_mode(
         }
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, crewai, langgraph, microcode, auto"
             ));
         }
         None => {

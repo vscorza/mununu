@@ -1,0 +1,23 @@
+# crewai_handoff — verify framework end-to-end transcript
+# Regenerated via examples/verify/crewai_handoff/validate.sh
+#
+# Sequential 2-agent CrewAI crew; native `CrewaiAdapter` dispatch;
+# direct alphabet binding; `crew.*` wildcard composition member
+# (expands to all three emitted automata); per-automaton
+# `reachable` properties.
+
+=== mununu verify (human-readable) ===
+verify report — project `CrewaiHandoff`:
+  composition: asynchronous ResearchAndWriteSystem { members = [Agent_Researcher, Agent_Writer, ResearchAndWriteSupervisor] }
+    - crew (adapter = crewai, automaton = Agent_Researcher)
+    researcher_can_complete: SATISFIED (3/3 states, 1/1 initial) [template `reachable`, over = Agent_Researcher]
+    writer_can_complete: SATISFIED (3/3 states, 1/1 initial) [template `reachable`, over = Agent_Writer]
+    supervisor_finishes_pipeline: SATISFIED (3/3 states, 1/1 initial) [template `reachable`, over = ResearchAndWriteSupervisor]
+
+=== mununu verify --json (subset: project + verdict shape) ===
+project = CrewaiHandoff
+composition.name = ResearchAndWriteSystem
+composition.semantics = asynchronous
+  property `researcher_can_complete`: satisfied = True, source = template
+  property `writer_can_complete`: satisfied = True, source = template
+  property `supervisor_finishes_pipeline`: satisfied = True, source = template

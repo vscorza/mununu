@@ -114,6 +114,10 @@ fn create_router() -> Router {
             "/api/v1/codesign/reconcile-labels",
             post(handlers::codesign_reconcile_labels_handler),
         )
+        .route(
+            "/api/v1/codesign/emit-chaotic-stub",
+            post(handlers::codesign_emit_chaotic_stub_handler),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

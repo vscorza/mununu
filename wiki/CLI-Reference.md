@@ -286,6 +286,42 @@ mununu context predicates examples/hw/arbiter.ctxdsl --automaton Arbiter
 
 ---
 
+## `mununu verify`
+
+Run the general N-source verification framework against a `verify.toml` manifest. The manifest lists sources (any combination of `ctxdsl`, `xstate`, `crewai`, `langgraph`, `sv-rtl`, `c-codesign`, `extraction`), an alphabet-binding strategy, a composition shape, and properties. See [Verify Project Flow](Verify-Project-Flow.md) for the conceptual model and the `verify.toml` schema.
+
+> Source of truth: [`mununu-cli::handle_verify`](../crates/mununu-cli/src/main.rs) — surface: CLI.
+
+```
+mununu verify <CONFIG> [options]
+```
+
+**Description**: Dispatches each declared source through its adapter, applies the alphabet binding, assembles a unified CTXDSL document, evaluates every declared property via mu-calculus, and emits a structured `VerifyReport`.
+
+**Required arguments**:
+- `<CONFIG>` — path to a `verify.toml` manifest. Relative source paths inside the manifest resolve against the manifest's parent directory.
+
+**Optional flags**:
+- `--json` — emit the report as JSON instead of the default human-readable verdict table
+- `--strict` — exit non-zero on any violated property (default: exit 0 with the report even if some properties fail)
+
+**Examples**:
+
+```bash
+# Default human-readable output
+mununu verify examples/verify/crewai_handoff/verify.toml
+
+# Machine-readable JSON (pipe into jq or store as a CI artifact)
+mununu verify examples/verify/langgraph_workflow/verify.toml --json
+
+# Fail the build when any property doesn't hold
+mununu verify examples/verify/uart_codesign_chaotic/verify.toml --strict
+```
+
+**See also**: every entry in [`examples/verify/`](../examples/verify/) ships a `validate.sh` script that calls `mununu verify` and diffs against a checked-in `transcript.txt` — useful copy-paste starting points.
+
+---
+
 ## `mununu server`
 
 Start the HTTP API server (requires the `api` feature).

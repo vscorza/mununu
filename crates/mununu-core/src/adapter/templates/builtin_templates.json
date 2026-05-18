@@ -337,6 +337,62 @@
         "rtl": { "WRITE_STARTED": "e.g., wr_req", "WRITE_VISIBLE": "e.g., wr_ack" }
       },
       "tags": ["safety", "consistency", "concurrency", "composition", "atomicity"]
+    },
+    {
+      "id": "no_delegation_cycle",
+      "display_name": "No Delegation Cycle",
+      "description": "Once a delegation from one agent to another has fired, the reverse delegation must never fire afterwards. Catches A->B->A handoff cycles (CrewAI hierarchical, LangGraph back-edges) that would loop indefinitely.",
+      "kind": "safety",
+      "role": "guarantee",
+      "domains": ["agentic", "universal"],
+      "params": [
+        {
+          "name": "FORWARD",
+          "description": "Predicate marking the forward delegation (e.g., A delegated to B).",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "BACKWARD",
+          "description": "Predicate marking the reverse delegation (e.g., B delegating back to A).",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. ((!${FORWARD} || nu Y. (!${BACKWARD} && [] Y)) && [] X)",
+      "domain_hints": {
+        "agentic": { "FORWARD": "e.g., Manager_Delegated_To_Worker", "BACKWARD": "e.g., Worker_Delegating_To_Manager" },
+        "software": { "FORWARD": "e.g., Caller_Invoked_Callee", "BACKWARD": "e.g., Callee_Invoking_Caller" }
+      },
+      "tags": ["safety", "delegation", "cycle", "agentic", "hierarchical"]
+    },
+    {
+      "id": "eventual_completion",
+      "display_name": "Eventual Completion",
+      "description": "Every started task / workflow eventually reaches a terminal state. Maps to LangGraph reachability of `END` from any task-start state, or CrewAI's expectation that every dispatched task completes.",
+      "kind": "liveness",
+      "role": "guarantee",
+      "domains": ["agentic", "universal"],
+      "params": [
+        {
+          "name": "TASK_STARTED",
+          "description": "Predicate marking task dispatch / workflow entry.",
+          "param_type": { "type": "predicate" },
+          "required": true
+        },
+        {
+          "name": "TASK_DONE",
+          "description": "Predicate marking task termination (success or terminal failure).",
+          "param_type": { "type": "predicate" },
+          "required": true
+        }
+      ],
+      "formula_pattern": "nu X. ((!${TASK_STARTED} || mu Y. (${TASK_DONE} || <> Y)) && [] X)",
+      "domain_hints": {
+        "agentic": { "TASK_STARTED": "e.g., Crew_Dispatched, Graph_Entered", "TASK_DONE": "e.g., Crew_Done, Graph_End" },
+        "software": { "TASK_STARTED": "e.g., JobQueued", "TASK_DONE": "e.g., JobSettled" }
+      },
+      "tags": ["liveness", "completion", "agentic", "termination", "workflow"]
     }
   ]
 }

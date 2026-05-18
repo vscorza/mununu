@@ -1,0 +1,44 @@
+# langgraph_workflow — verify-framework example for LangGraph sources.
+#
+# A small triage workflow (classify -> {billing, tech} -> done) drives
+# the native `LangGraphAdapter`. Nodes become states; conditional edges
+# become per-condition `node_<from>_<condition>_enter` transitions; the
+# `done` node's `kind = "end"` flips its enter-label to uncontrollable.
+#
+# Recreate the run:
+#   $ bash examples/verify/langgraph_workflow/validate.sh
+#
+# Expected output (byte-deterministic) lives in transcript.txt.
+
+[project]
+name = "LangGraphWorkflow"
+
+[[sources]]
+id = "wf"
+adapter = "langgraph"
+files = ["workflow.langgraph.json"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["wf"]
+name = "Triage"
+
+[[properties]]
+# Liveness: from the `classify` entry state, the `done` terminal is
+# reachable. Maps to LangGraph's expected workflow-completion shape.
+name = "done_reachable"
+template = "reachable"
+args = { TARGET = "done" }
+over = "Triage"
+
+[[properties]]
+# Safety smoke: `done` is never simultaneously `classify` — vacuous on
+# a deterministic per-step encoding, but demonstrates the
+# mutual_exclusion template wires through.
+name = "done_excludes_classify"
+template = "mutual_exclusion"
+args = { A = "done", B = "classify" }
+over = "Triage"

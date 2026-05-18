@@ -1,11 +1,13 @@
 # Agentic Orchestration Examples
 
-Models for verifying multi-agent / tool-orchestration workflows. Two entry points:
+Models for verifying multi-agent / tool-orchestration workflows. Four entry points:
 
 - **Native CTXDSL** — agent / supervisor / authorization gates as composed automata.
 - **XState JSON** — workflows as XState v5 statecharts with a `__mununu` block (controllability + properties), consumed by the XState adapter.
+- **CrewAI JSON** (`.crewai.json`) — sequential / hierarchical crews consumed by the native [`CrewaiAdapter`](../../crates/mununu-core/src/adapter/crewai/). Per-agent automata (`Idle -> Executing -> Done` on `agent_<role>_start` / `agent_<role>_complete`) + sequential supervisor + asynchronous composition.
+- **LangGraph JSON** (`.langgraph.json`) — `StateGraph` workflows consumed by the native [`LangGraphAdapter`](../../crates/mununu-core/src/adapter/langgraph/). Nodes become states; conditional edges become `node_<from>_<condition>_enter` transitions.
 
-Mununu does **not** ship native CrewAI / LangGraph / A2A JSON parsers; rewrite as XState (the Python scripts under `tools/` can help) or hand-author CTXDSL.
+A2A and AutoGen JSON are not yet wired natively; rewrite as XState, CrewAI, or LangGraph, or hand-author CTXDSL. End-to-end verify-framework fixtures for the agentic adapters live under [`examples/verify/crewai_handoff/`](../verify/crewai_handoff/) and [`examples/verify/langgraph_workflow/`](../verify/langgraph_workflow/).
 
 ## Top-level examples
 

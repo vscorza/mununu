@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# validate.sh — end-to-end smoke test for the rv5_2core_mesi_microprogram example.
+#
+# Runs `mununu verify` against verify.toml in this directory and
+# captures the human-readable transcript at transcript.txt. The
+# script is byte-deterministic: re-running against the same commit
+# must reproduce the same output (modulo wall-clock timestamps which
+# are stripped).
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+DIR="examples/verify/rv5_2core_mesi_microprogram"
+TRANSCRIPT="$DIR/transcript.txt"
+
+echo "build: mununu binary (cargo)" 1>&2
+cargo build --quiet --bin mununu
+
+strip_logs() {
+    perl -pe '
+        s/\e\[[0-9;]*m//g;
+        s/^\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+//;
+    ' | grep -v 'Logging initialized'
+}
+
+{
+    printf '# rv5_2core_mesi_microprogram — verify framework end-to-end transcript\n'
+    printf '# Regenerated via examples/verify/rv5_2core_mesi_microprogram/validate.sh\n'
+    printf '#\n'
+    printf '# 2-core MESI coherence + 3-step microprogram (store + fence + load).\n'
+    printf '# All adapters: ctxdsl pass-through. Asynchronous composition.\n'
+    printf '# 14 reachable composed states; cache coherence + reachability\n'
+    printf '# witnesses; the smallest first slice of the multicore RISC-V plan.\n\n'
+
+    printf '=== mununu verify (human-readable) ===\n'
+    ./target/debug/mununu verify "$DIR/verify.toml" 2>&1 | strip_logs
+
+    printf '\n=== mununu verify --json (subset: project + verdict shape) ===\n'
+    ./target/debug/mununu verify "$DIR/verify.toml" --json 2>&1 \
+        | strip_logs \
+        | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+print("project = " + report["project"])
+print("composition.name = " + report["composition"]["name"])
+print("composition.semantics = " + report["composition"]["semantics"])
+print("composition.members = " + ", ".join(report["composition"]["members"]))
+for v in report["property_verdicts"]:
+    src = v["formula_source"]["kind"]
+    sat = v["satisfied"]
+    print("  property `" + v["name"] + "`: satisfied = " + str(sat) + ", source = " + src + ", states = " + str(v["satisfying_states"]) + "/" + str(v["total_states"]))
+'
+} > "$TRANSCRIPT"
+
+printf 'wrote transcript to %s (%d lines)\n' \
+    "$TRANSCRIPT" "$(wc -l < "$TRANSCRIPT" | tr -d ' ')"

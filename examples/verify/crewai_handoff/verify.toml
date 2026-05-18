@@ -1,0 +1,54 @@
+# crewai_handoff — verify-framework example for CrewAI agentic flows.
+#
+# A two-agent sequential crew (Researcher hands off to Writer) drives
+# the native `CrewaiAdapter` (one automaton per agent + a sequential
+# supervisor + asynchronous composition). Uses the `<src>.*` wildcard
+# composition-member form so all three automata participate in the
+# composition (closes Part 6 item 4 of
+# .claude/plans/i-want-you-to-distributed-orbit.md).
+#
+# Recreate the run:
+#   $ bash examples/verify/crewai_handoff/validate.sh
+#
+# Expected output (byte-deterministic) lives in transcript.txt.
+
+[project]
+name = "CrewaiHandoff"
+
+[[sources]]
+id = "crew"
+adapter = "crewai"
+files = ["crew.crewai.json"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+# `crew.*` expands to every automaton the CrewAI adapter emits for
+# this source: per-agent automata plus the sequential supervisor.
+members = ["crew.*"]
+name = "ResearchAndWriteSystem"
+
+# Per-automaton properties (target the underlying agent automaton
+# directly rather than the composition — these are independent
+# liveness checks per agent).
+
+[[properties]]
+name = "researcher_can_complete"
+template = "reachable"
+args = { TARGET = "Done" }
+over = "Agent_Researcher"
+
+[[properties]]
+name = "writer_can_complete"
+template = "reachable"
+args = { TARGET = "Done" }
+over = "Agent_Writer"
+
+[[properties]]
+# Sequential supervisor reaches the final task slot.
+name = "supervisor_finishes_pipeline"
+template = "reachable"
+args = { TARGET = "AfterTask_2" }
+over = "ResearchAndWriteSupervisor"
