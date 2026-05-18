@@ -11,7 +11,7 @@ no row claims Success without a shipped `examples/verify/<id>/` directory.
 
 | # | Pipeline | Candidate | Upstream | Pinned commit | Bug citation | Outcome |
 |---|---|---|---|---|---|---|
-| 1 | D (sv-yosys) | Caliptra RTL boot FSM (RTL-002) | [chipsalliance/caliptra-rtl](https://github.com/chipsalliance/caliptra-rtl) `src/soc_ifc/rtl/soc_ifc_boot_fsm.sv` | `b436906f0b16ae0cfbb160e927499b79800ec9ce` (2023-07-08) | [Issue #150](https://github.com/chipsalliance/caliptra-rtl/issues/150) — CWE-1245, `unique casez` without `default:` | **Failure — systemic blocker** (Finding 1) |
+| 1 | D (sv-yosys) | Caliptra RTL boot FSM (RTL-002) | [chipsalliance/caliptra-rtl](https://github.com/chipsalliance/caliptra-rtl) `src/soc_ifc/rtl/soc_ifc_boot_fsm.sv` | `b436906f0b16ae0cfbb160e927499b79800ec9ce` (2023-07-08) | [Issue #150](https://github.com/chipsalliance/caliptra-rtl/issues/150) — CWE-1245, `unique casez` without `default:` | **Failure — systemic blocker** (Finding 1); **Finding 1 SV-parse blocker resolved 2026-05-18 via sv2v integration (Phase 1)**; retry now blocked by Finding 2 (state-bit cap) + a CLI multi-file gap (see Finding 1 update) |
 | 2 | E (BTOR2) | Pono "data-integrity" FIFO `arbitrated_top_n2_w8_d8_e0.btor2` (smallest variant) | [makaimann/btor-benchmarks](https://github.com/makaimann/btor-benchmarks) | repo `master` 2026-05-18 | Mukherjee/Kroening/Melham (DAC 2016, [arXiv 1606.02347](https://arxiv.org/pdf/1606.02347)); used in Pono CAV 2022 tool paper | **Failure — systemic blocker** (Finding 2) |
 | 3 | A (C-extract) | Zephyr I/O APIC signed-cast register-offset bug | [zephyrproject-rtos/zephyr](https://github.com/zephyrproject-rtos/zephyr) `drivers/interrupt_controller/intc_ioapic.c` | PR [#50337](https://github.com/zephyrproject-rtos/zephyr/pull/50337) — fix is `(char) → (unsigned char)` | [Issue #49803](https://github.com/zephyrproject-rtos/zephyr/issues/49803) — `(char)offset` sign-extends offsets ≥ 0x80; wrong index written to `IOAPIC_IND` | **Failure — semantic mismatch** (Finding 3) |
 | 4 | A (C-extract) | RIOT-OS CC2538 endless-loop on spoofed length byte | [RIOT-OS/RIOT](https://github.com/RIOT-OS/RIOT) `cpu/cc2538/radio/cc2538_rf_radio_ops.c` | pre-fix `1a418ccfedeb…` / fix in PR [#20998](https://github.com/RIOT-OS/RIOT/pull/20998) | [GHSA-m75q-8vj8-wppw](https://github.com/RIOT-OS/RIOT/security/advisories/GHSA-m75q-8vj8-wppw) / [CVE-2024-53980](https://www.cve.org/CVERecord?id=CVE-2024-53980) | **Failure — semantic mismatch** (Finding 3, same shape) |
@@ -71,6 +71,79 @@ options are:
   stage in the sv-yosys driver — engineering work, not in any open plan.
 - Use a Verific-licensed Yosys build — disabled by the mununu driver's
   Verific check.
+
+### Phase 1 update — sv2v integration shipped (2026-05-18)
+
+**Resolution status: SV-parse blocker resolved. Caliptra retry still blocked, but on a different blocker (Finding 2 + a CLI gap).**
+
+Per the [active plan's Phase 1](../../../.claude/plans/create-a-plan-to-enumerated-patterson.md), sv2v ([zachjs/sv2v](https://github.com/zachjs/sv2v) v0.0.13) was integrated into the sv-yosys driver as an optional preprocessing pass. Opt-in via `MUNUNU_USE_SV2V=1` or `YosysOptions.use_sv2v = true`. Implementation lives in [`crates/mununu-core/src/adapter/yosys/mod.rs`](../../crates/mununu-core/src/adapter/yosys/mod.rs) (`locate_sv2v`, `run_sv2v`, `env_flag` helpers; pipe inserted before the Yosys subprocess). Three unit tests cover the integration: module-header `import pkg::*` parses through sv2v + Yosys; cross-file package imports resolve; missing-tool error is clean.
+
+**Caliptra retry under the new pipeline.** Reproduction:
+
+```bash
+mkdir /tmp/caliptra_retry && cd /tmp/caliptra_retry
+cp ~/git_repo/mununu/.claude/reviews/prospector/staging/RTL-002/source/*.sv .
+# Plus minimal SVA-macro stub for caliptra_sva.svh (Yosys is Phase-1-SVA only;
+# concurrent SVA macros expand to no-ops):
+cat > caliptra_sva.svh <<'EOF'
+`define CALIPTRA_ASSERT_KNOWN(ID, SIG, CLK, RST_B)
+`define CALIPTRA_ASSERT_NEVER(ID, EXPR, CLK, RST_B)
+EOF
+# And empty stubs for the un-published address macros + reg pkg:
+cat > caliptra_top_reg_defines.svh <<'EOF'
+`define CALIPTRA_TOP_REG_MBOX_CSR_BASE_ADDR             32'h0
+`define CALIPTRA_TOP_REG_SHA512_ACC_CSR_BASE_ADDR       32'h0
+`define CALIPTRA_TOP_REG_GENERIC_AND_FUSE_REG_BASE_ADDR 32'h0
+EOF
+echo 'package soc_ifc_reg_pkg; endpackage' > soc_ifc_reg_pkg.sv
+
+# Standalone sv2v works end-to-end:
+sv2v -I. soc_ifc_pkg.sv soc_ifc_reg_pkg.sv soc_ifc_boot_fsm_pre_fix.sv > preprocessed.v
+#   → exit 0, 211 lines emitted.
+
+# Through mununu, single-file CLI path:
+MUNUNU_USE_SV2V=1 mununu context eval soc_ifc_boot_fsm_pre_fix.sv \
+    --adapter sv-yosys --formula safety_bad_0 --automaton Circuit
+```
+
+Two next-layer outcomes (both honest):
+
+1. **State-bit cap (Finding 2) bites at 19 bits.** After sv2v + Yosys
+   succeed on the *preprocessed* Verilog (running the pipeline directly on
+   `preprocessed.v`):
+
+   ```
+   Yosys SV adapter error: adapter/yosys: BTOR2 reader failed:
+     BTOR2 design has 19 state bits → 2^19 = 524288 states
+     (max supported: 2^16 = 65536).
+   ```
+
+   The boot FSM module bundles a 3-bit state enum with an 8-bit wait
+   counter and reset-window logic that together exceed the cap by 3 bits.
+   Finding 2's unlock (Phase 3 compose-and-decompose or external-engine
+   handoff) is the gate.
+
+2. **CLI multi-file gap.** The single-file CLI invocation
+   `mununu context eval soc_ifc_boot_fsm_pre_fix.sv` only stages the
+   primary `.sv` into the tempdir; sv2v then cannot resolve the
+   `soc_ifc_pkg::*` import because the sibling package files are not
+   passed. sv2v silently emits zero output and exits 0 in this scenario,
+   which Yosys then reports as "No top module found." The verify
+   framework (`verify.toml`'s `[[sources]] files = [...]`) currently has
+   **no sv-yosys dispatcher path**, only `c-codesign`, `ctxdsl`, `xstate`,
+   `crewai`, `langgraph`, `microcode`, `sv-multi`. Wiring sv-yosys into the
+   verify orchestrator's multi-file path is a small follow-up, scoped
+   outside Phase 1.
+
+**Phase 1 verdict.** SV-parse blocker (Finding 1) is **resolved at the
+adapter level**. Caliptra-RTL #150 end-to-end PoC is **still blocked**, but
+on a different layer — Finding 2 (state-bit cap) plus the CLI multi-file
+gap. Both are addressable by subsequent phases / small follow-ups; Phase 2
+or Phase 3 of the active plan would pick them up.
+
+**Files touched in Phase 1.**
+
+- [`crates/mununu-core/src/adapter/yosys/mod.rs`](../../crates/mununu-core/src/adapter/yosys/mod.rs) — `YosysOptions.use_sv2v`, `locate_sv2v`, `run_sv2v`, `env_flag`; integration in `translate_sv`; 3 new tests.
 
 **Honesty disclosure.** Three mitigation iterations on dependency
 stubbing were performed before the systemic blocker was hit. Stubs created

@@ -114,3 +114,11 @@ Replacing `"sv-yosys"` with `"btor2"` and `$SV` with the contents of `safety_dem
 - **`setundef -zero`** in the Yosys script makes X / undef bits deterministic (bit-blaster does not model X-prop). For X-aware verification, route through a commercial flow; that is out of mununu's roadmap scope.
 - **Verific check** at runtime: the driver refuses to use a yosys binary built with the commercial Verific frontend (license-incompatible). See [`adapter::yosys::verify_no_verific`](../../crates/mununu-core/src/adapter/yosys/mod.rs).
 - **`chformal -lower` property-tracking latches** are real CLTS state — they encode "the assertion has fired in some prior cycle." They appear in state names as anonymous `st<idx>_n<nid>` symbols and are filtered out of `StateSpec.valuations` so user-written formulas don't accidentally reference them.
+
+## Optional sv2v preprocessing (modern SV dialect)
+
+Yosys's built-in parser rejects the SV2009/2012 module-header `import pkg::*;` syntax used by Caliptra-RTL, OpenTitan, ibex, cv32e40p, and similar open-source RTL. The mununu sv-yosys driver can optionally run [zachjs/sv2v](https://github.com/zachjs/sv2v) as a preprocessing pass.
+
+**Opt in** via either `MUNUNU_USE_SV2V=1` (env var) or `YosysOptions.use_sv2v = true` (programmatic). Requires `sv2v` (≥ 0.0.10 recommended) on `$PATH` or in `MUNUNU_SV2V_PATH`. See [`adapter::yosys::run_sv2v`](../../crates/mununu-core/src/adapter/yosys/mod.rs).
+
+**What it does.** Before the Yosys subprocess, the driver invokes `sv2v -I<source-parent-dir> <all-input-sv>`, captures stdout into a temp `preprocessed.sv`, and feeds that single Verilog-2005 file to Yosys. Cross-file package resolution uses sv2v's documented multi-file mode — pass related `.sv` files together via `YosysOptions::additional_sources` so sv2v resolves them in one pass. `\`include` directives are searched relative to the source's parent directory.
