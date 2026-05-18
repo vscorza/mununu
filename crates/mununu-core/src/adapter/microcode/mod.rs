@@ -247,6 +247,11 @@ mod tests {
         // one memory automaton — each ops can declare a `tag` that
         // gets folded into the emitted label, so caches /
         // memories can distinguish writes by issuer.
+        //
+        // Both ops live on non-terminal steps so their labels fire:
+        // translate.rs drops ops declared on terminal steps (no
+        // `next`) with an `ApproximateTranslation` warning, which
+        // would otherwise silently elide the `rd_mem` label.
         let json = r#"
         {
           "name": "tagged",
@@ -256,7 +261,9 @@ mod tests {
               "ops": [{ "op": "write_mem", "region": "x", "tag": "core_0" }],
               "next": "b" },
             { "id": "b",
-              "ops": [{ "op": "read_mem", "region": "x", "tag": "core_1" }] }
+              "ops": [{ "op": "read_mem", "region": "x", "tag": "core_1" }],
+              "next": "halt" },
+            { "id": "halt", "ops": [] }
           ]
         }
         "#;

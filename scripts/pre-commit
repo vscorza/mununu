@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
+# CLAUDE.md contract: "The gate is `make ci` — the same command runs locally,
+# in pre-commit hooks, and in GitHub Actions." Anything else drifts and lets
+# CI-failing commits land. The extra `cargo test --lib api --features api`
+# call mirrors the separate step in .github/workflows/ci.yml.
 set -e
 
-echo "Running pre-commit checks..."
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 
-echo "  [1/4] Checking formatting..."
-cargo fmt --all -- --check
+echo "Running pre-commit checks (make ci)..."
+make ci
 
-echo "  [2/4] Running clippy..."
-cargo clippy --all-targets -- -D warnings
-
-echo "  [3/4] Running tests..."
-cargo test --lib --bins --tests --examples
-
-echo "  [4/4] Testing API module..."
+echo "Testing API module..."
 cargo test --lib api --features api
 
 echo "All pre-commit checks passed."
