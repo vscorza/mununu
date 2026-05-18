@@ -3799,16 +3799,43 @@ fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
-    let (context_doc, mut sidecar_docs, adapter_ctxdsl) = load_context_documents_mode(
-        &args.context,
-        &args.sidecars,
-        args.adapter.as_deref(),
-        args.mode.as_deref(),
-    )?;
+/// Shared preamble result for `context eval` and `context synthesize`.
+///
+/// Both subcommands load documents, optionally print intermediate CTXDSL,
+/// resolve a formula name, and realize the context before diverging.
+/// This struct carries the outputs of that common setup so neither caller
+/// duplicates the logic.
+struct PreparedEvalContext {
+    realized: RealizedContext,
+    formula_name: String,
+}
+
+/// Input parameters for [`prepare_eval_context`].
+///
+/// Groups the fields that are identical across `ContextEvalArgs` and
+/// `ContextSynthesizeArgs` so the helper stays under clippy's argument-count
+/// limit without introducing a builder or unrelated abstraction.
+struct EvalContextParams<'a> {
+    context: &'a Path,
+    sidecars: &'a [PathBuf],
+    adapter: Option<&'a str>,
+    mode: Option<&'a str>,
+    print_ctxdsl_path: Option<&'a Option<PathBuf>>,
+    /// Non-empty only for `context eval`; pass `&[]` for `context synthesize`.
+    stubs: &'a [PathBuf],
+    formula: &'a Option<String>,
+    template: &'a Option<String>,
+    template_args: &'a [String],
+    automaton: &'a str,
+}
+
+/// Execute the shared preamble for `context eval` and `context synthesize`.
+fn prepare_eval_context(p: EvalContextParams<'_>) -> Result<PreparedEvalContext, String> {
+    let (context_doc, mut sidecar_docs, adapter_ctxdsl) =
+        load_context_documents_mode(p.context, p.sidecars, p.adapter, p.mode)?;
 
     // Print intermediate CTXDSL if requested
-    if let Some(output_path) = &args.print_ctxdsl {
+    if let Some(output_path) = p.print_ctxdsl_path {
         if let Some(ctxdsl) = &adapter_ctxdsl {
             print_ctxdsl_output(ctxdsl, output_path.as_ref())?;
         } else {
@@ -3817,10 +3844,10 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
     }
 
     // Load stub files: translate each .espec.json via extraction adapter → CTXDSL → parse as sidecar
-    for stub_path in &args.stubs {
-        let (stub_doc, _) =
-            load_with_adapter_mode(stub_path, Some("extraction"), args.mode.as_deref())
-                .map_err(|e| format!("Failed to load stub '{}': {e}", stub_path.display()))?;
+    // Only context_eval passes stubs; context_synthesize passes an empty slice.
+    for stub_path in p.stubs {
+        let (stub_doc, _) = load_with_adapter_mode(stub_path, Some("extraction"), p.mode)
+            .map_err(|e| format!("Failed to load stub '{}': {e}", stub_path.display()))?;
         eprintln!(
             "Loaded stub: {} ({} automata)",
             stub_path.display(),
@@ -3831,14 +3858,36 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 
     // Resolve formula: either --formula NAME or --template ID [--template-arg K=V]
     let formula_name = resolve_formula_name(
-        &args.formula,
-        &args.template,
-        &args.template_args,
-        &args.automaton,
+        p.formula,
+        p.template,
+        p.template_args,
+        p.automaton,
         &mut sidecar_docs,
     )?;
 
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
+    Ok(PreparedEvalContext {
+        realized,
+        formula_name,
+    })
+}
+
+fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
+    let PreparedEvalContext {
+        realized,
+        formula_name,
+    } = prepare_eval_context(EvalContextParams {
+        context: &args.context,
+        sidecars: &args.sidecars,
+        adapter: args.adapter.as_deref(),
+        mode: args.mode.as_deref(),
+        print_ctxdsl_path: args.print_ctxdsl.as_ref(),
+        stubs: &args.stubs,
+        formula: &args.formula,
+        template: &args.template,
+        template_args: &args.template_args,
+        automaton: &args.automaton,
+    })?;
     let formula = realized
         .formulas
         .get(&formula_name)
@@ -4058,32 +4107,21 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 }
 
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
-    let (context_doc, mut sidecar_docs, adapter_ctxdsl) = load_context_documents_mode(
-        &args.context,
-        &args.sidecars,
-        args.adapter.as_deref(),
-        args.mode.as_deref(),
-    )?;
-
-    // Print intermediate CTXDSL if requested
-    if let Some(output_path) = &args.print_ctxdsl {
-        if let Some(ctxdsl) = &adapter_ctxdsl {
-            print_ctxdsl_output(ctxdsl, output_path.as_ref())?;
-        } else {
-            eprintln!("No adapter translation — CTXDSL is the input file itself");
-        }
-    }
-
-    // Resolve formula: either --formula NAME or --template ID [--template-arg K=V]
-    let formula_name = resolve_formula_name(
-        &args.formula,
-        &args.template,
-        &args.template_args,
-        &args.automaton,
-        &mut sidecar_docs,
-    )?;
-
-    let realized = realize_documents(&context_doc, &sidecar_docs)?;
+    let PreparedEvalContext {
+        realized,
+        formula_name,
+    } = prepare_eval_context(EvalContextParams {
+        context: &args.context,
+        sidecars: &args.sidecars,
+        adapter: args.adapter.as_deref(),
+        mode: args.mode.as_deref(),
+        print_ctxdsl_path: args.print_ctxdsl.as_ref(),
+        stubs: &[], // context_synthesize has no --stub support
+        formula: &args.formula,
+        template: &args.template,
+        template_args: &args.template_args,
+        automaton: &args.automaton,
+    })?;
     let realized_formula = realized
         .formulas
         .get(&formula_name)
