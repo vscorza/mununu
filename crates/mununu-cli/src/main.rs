@@ -79,12 +79,41 @@ enum Commands {
     /// evaluated. See `crates/mununu-core/src/verify/` for the
     /// pipeline.
     Verify(VerifyArgs),
+    /// Memory-soundness tooling — surface declared
+    /// `[sources.memory_abstraction]` postures and flag property
+    /// formulas that reference memory in ways the declared posture
+    /// cannot soundly support. Advisory by default; `--strict`
+    /// converts warnings into a non-zero exit.
+    Memory {
+        #[command(subcommand)]
+        command: Box<MemoryCommand>,
+    },
     /// Start HTTP API server
     Server {
         /// Server address (default: 127.0.0.1:8080)
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    /// Analyse a `verify.toml` for memory-abstraction-posture issues.
+    Check(MemoryCheckArgs),
+}
+
+#[derive(Args, Debug)]
+struct MemoryCheckArgs {
+    /// Path to the `verify.toml` project config.
+    #[arg(value_name = "VERIFY_TOML")]
+    config: PathBuf,
+    /// Emit the report as JSON on stdout instead of the
+    /// human-readable summary.
+    #[arg(long)]
+    json: bool,
+    /// Exit with a non-zero status if any warning is raised.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1100,6 +1129,40 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn handle_memory(command: MemoryCommand) -> Result<(), String> {
+    match command {
+        MemoryCommand::Check(args) => handle_memory_check(args),
+    }
+}
+
+fn handle_memory_check(args: MemoryCheckArgs) -> Result<(), String> {
+    use mununu_core::verify::config::VerifyConfig;
+    use mununu_core::verify::memory_check::check_memory_postures;
+
+    let body = std::fs::read_to_string(&args.config)
+        .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
+    let config = VerifyConfig::from_toml(&body)
+        .map_err(|e| format!("failed to parse {} as TOML: {e}", args.config.display()))?;
+    let report = check_memory_postures(&config);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", report.format_human());
+    }
+
+    if args.strict && report.has_warnings() {
+        return Err(format!(
+            "{} warning(s) raised; --strict requested",
+            report.warnings.len()
+        ));
+    }
+    Ok(())
+}
+
 fn print_inspection_human(report: &mununu_core::verify::InspectionReport) {
     println!("inspect report — project `{}`:", report.project);
     println!(
@@ -1177,6 +1240,7 @@ fn dispatch(command: Commands) -> Result<(), String> {
         Commands::Contract { command } => handle_contract(*command),
         Commands::Codesign { command } => handle_codesign(*command),
         Commands::Verify(args) => handle_verify(args),
+        Commands::Memory { command } => handle_memory(*command),
         Commands::Server { addr } => {
             use std::net::SocketAddr;
             let addr: SocketAddr = addr
