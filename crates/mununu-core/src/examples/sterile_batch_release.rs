@@ -7,8 +7,8 @@ use thiserror::Error;
 
 const PIPELINE_NAME: &str = "pipeline";
 const SHIP_REQUIRES_RELEASE: &str =
-    "nu Safe. ((! < ( labels = {ship} ) > true) || < ( labels = {qp_sign} ) > true) && Safe";
-const COMPLETION_LEADS_TO_DISPOSITION: &str = "nu Progress. ( [ ( labels = {qc_start} ) ] mu Resolve. ( < ( labels = {qp_sign} ) > true || < ( labels = {quarantine} ) > true || < ( labels = {cancel} ) > true ) && Resolve ) && Progress";
+    "nu Safe. (((! < ( labels = {ship} ) > true) || < ( labels = {qp_sign} ) > true) && ([] Safe))";
+const COMPLETION_LEADS_TO_DISPOSITION: &str = "nu Progress. (([ ( labels = {qc_start} ) ] (mu Resolve. ((< ( labels = {qp_sign} ) > true || < ( labels = {quarantine} ) > true || < ( labels = {cancel} ) > true) || (<> Resolve)))) && ([] Progress))";
 
 #[derive(Debug, Error)]
 pub enum SterileError {

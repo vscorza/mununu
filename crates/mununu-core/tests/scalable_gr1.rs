@@ -144,14 +144,14 @@ fn build_env(clts: &Clts<DefaultStateIdx, DefaultLabelIdx>, n_pairs: usize) -> E
 /// Build the GR(1) formula for n pairs using string representation.
 ///
 /// Formula: ∧_{i=0}^{n-1} (¬GF(Req_i) ∨ GF(Grant_i))
-/// = ∧_{i=0}^{n-1} ((! nu NuAi. (mu MuAi. (Req_i || <> MuAi)) && [] NuAi)
-///                  || nu NuGi. (mu MuGi. (Grant_i || <> MuGi)) && [] NuGi)
+/// = ∧_{i=0}^{n-1} ((! (nu NuAi. ((mu MuAi. (Req_i || <> MuAi)) && ([] NuAi))))
+///                  || (nu NuGi. ((mu MuGi. (Grant_i || <> MuGi)) && ([] NuGi))))
 fn build_formula_string(n_pairs: usize) -> String {
     let pair_exprs: Vec<String> = (0..n_pairs)
         .map(|i| {
             format!(
-                "((! (nu NuA{i}. (mu MuA{i}. (Req{i} || <> MuA{i})) && ([] NuA{i})))\
-                 || (nu NuG{i}. (mu MuG{i}. (Grant{i} || <> MuG{i})) && ([] NuG{i})))"
+                "((! (nu NuA{i}. ((mu MuA{i}. (Req{i} || <> MuA{i})) && ([] NuA{i}))))\
+                 || (nu NuG{i}. ((mu MuG{i}. (Grant{i} || <> MuG{i})) && ([] NuG{i}))))"
             )
         })
         .collect();

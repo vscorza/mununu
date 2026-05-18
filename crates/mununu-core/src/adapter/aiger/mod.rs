@@ -310,7 +310,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
 
         if !justice_states.is_empty() {
             let justice_pred = justice_states.join(" || ");
-            // G F (justice_states) encoded as nu Y. (mu X. ((pred) || <> X) && [] Y)
+            // G F (justice_states) encoded as nu Y. ((mu X. ((pred) || <> X)) && ([] Y))
             properties.push(PropertySpec {
                 name: format!("justice_{i}"),
                 kind: PropertyKind::Fairness,
@@ -349,7 +349,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
 
         if !fair_states.is_empty() {
             let fair_pred = fair_states.join(" || ");
-            // G F (fairness_states) encoded as nu Y. (mu X. ((pred) || <> X) && [] Y)
+            // G F (fairness_states) encoded as nu Y. ((mu X. ((pred) || <> X)) && ([] Y))
             properties.push(PropertySpec {
                 name: format!("fairness_{i}"),
                 kind: PropertyKind::Fairness,

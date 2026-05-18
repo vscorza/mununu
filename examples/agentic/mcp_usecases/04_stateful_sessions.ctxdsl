@@ -187,8 +187,8 @@ context stateful_sessions {
         // Encodes the keepalive heartbeat requirement.
         formula keepalive_liveness {
             over SessionLifecycle;
-            body = (! (nu A. (mu B. (Active || <> B)) && ([] A)))
-                || (nu C. (mu D. (Active || <> D)) && ([] C));
+            body = (! (nu A. ((mu B. (Active || <> B)) && ([] A))))
+                || (nu C. ((mu D. (Active || <> D)) && ([] C)));
         }
 
         // Safety: No tool calls from uninitialized state.
