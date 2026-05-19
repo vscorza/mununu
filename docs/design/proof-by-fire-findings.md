@@ -236,7 +236,16 @@ $ MUNUNU_USE_SV2V=1 mununu context eval soc_ifc_boot_fsm_pre_fix.sv \
 Loaded sidecar: soc_ifc_boot_fsm_pre_fix.mununu.json
 ```
 
-(Verdict pending release-build completion — debug build was impractically slow for the 524K × 64 = 33.5M transition enumeration. Update will land in the verdict row of the candidate ledger.)
+**Runtime characterization (new finding).** The cap unblocker works, but the underlying enumeration scale exposes a separate performance gap:
+
+- **Debug build**: ~8+ hours elapsed, no verdict, killed.
+- **Release build**: 22 minutes elapsed, 4.6 GB RSS, still chewing, killed.
+
+The 524K × 64 = 33.5M transition enumeration is impractical for the current explicit-state bit-blaster regardless of build mode at this scale. RSS growth to 4.6 GB suggests an O(states × per-step-allocation) pattern in `make_step_env` (each transition allocates a fresh `Env` HashMap; 33.5M allocations × ~100 entries each accounts for the memory).
+
+This is a separate gap from the input-bit cap — the cap is correctly cleared by the sidecar; the engine just doesn't scale to 33.5M transitions in usable time. The unlock path is engine-level (move from per-transition `Env` allocation to a reusable buffer; cache evaluated nodes that don't depend on the changing input; or compositional decomposition per Phase 3 of the BTOR2 roadmap), **not** another sidecar tweak.
+
+**Phase 1.6 verdict.** Cap-check blocker (Finding 2's input-cap side) **resolved** — the sidecar mechanism now prunes inputs correctly, validated by two unit tests. Caliptra end-to-end retry **exposes a deeper runtime-performance blocker** at the bit-blaster's explicit-enumeration loop. Documented as a new finding; the unlock is non-trivial engine work, scoped outside this plan's READY-pipelines-only constraint.
 
 **Files touched in Phase 1.6.**
 
