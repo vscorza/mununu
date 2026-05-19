@@ -183,6 +183,65 @@ Progress chain so far on Caliptra: SV-parse blocker (Finding 1) → cleared by s
 - [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) — `MAX_STATE_BITS` constant 16 → 20; test threshold derives from constant.
 - [`examples/btor2/README.md`](../../examples/btor2/README.md) — cap reference updated.
 
+### Phase 1.6 update — sidecar input pruning (2026-05-18)
+
+After Phase 1.5 the Caliptra retry hit a single blocker: 16 input bits exceeded `MAX_INPUT_BITS = 10`. Raising the cap further was infeasible (2^20 × 2^16 ≈ 6.8e10 transitions runs for hours on a debug build, killed). The right unlock is **per-input sidecar abstraction** — declare unused inputs as `Ignored` / `Boolean` / `EnumValues` so the bit-blaster enumerates only the meaningful combinations.
+
+**Design review surfaced a clean fit.** The audit at [`docs/design/proof-by-fire-findings.md`](./proof-by-fire-findings.md) ("Sidecar input-pruning design review") confirmed:
+
+- The `.mununu.json` schema already carries `inputs[]` ([`SvAnnotation::inputs`](../../crates/mununu-core/src/adapter/systemverilog/annotation.rs#L48), `InputAnnotation` at L108).
+- The sidecar resolver already has [`build_input_field_domains`](../../crates/mununu-core/src/adapter/sidecar/btor2_resolver.rs#L62).
+- The BTOR2 bit-blaster simply didn't call into either — it scoped sidecar resolution to state cells only.
+- The new capability needs **zero new surface contract**: all three surfaces (CLI `--sidecar`, API `SidecarFile`, UI `sidecars?: { name, content }[]`) already plumb the JSON shape. The patch is purely internal.
+
+**Parity check.** Run formally via the `/parity-check` skill on the Phase 1.6 file list. Result: **zero drift**.
+
+| Surface | Carrier | File:Line |
+|---|---|---|
+| CLI | `--sidecar` on `context eval/synth/predicates/...`; auto-load `<stem>.mununu.json` | [`crates/mununu-cli/src/main.rs:704,724,744,794,876`](../../crates/mununu-cli/src/main.rs); [`crates/mununu-cli/src/loader.rs:117`](../../crates/mununu-cli/src/loader.rs) |
+| API | `sidecars: Vec<SidecarFile>` on every context request type; `/context/import.sidecar` | [`crates/mununu-core/src/api/models.rs:17,31,94,224,268,396,795`](../../crates/mununu-core/src/api/models.rs) |
+| UI | `sidecars?: { name, content }[]` on `SvAdapterRequest`, `ContextEvalRequest`; `sidecar?` on `Btor2ImportRequest` | [`mununu-ui/src/api/endpoints.ts:21,119,502`](../../../mununu-ui/src/api/endpoints.ts) |
+
+**Implementation.** [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs):
+
+- New `InputCellEnumeration` struct mirroring `CellEnumeration`. Per-input `Vec<u128>` of allowed concrete values. Clock inputs pinned to value=1.
+- New `build_input_domains()` helper — sidecar resolution scoped to input NIDs, delegates to `build_input_field_domains` from the resolver.
+- `make_step_env`, `signal_labels_for_input`, `build_properties` updated to consume `&InputCellEnumeration` instead of flat `combinations_of_inputs` enumeration.
+- Cap check **moves to after sidecar resolution**: tests `input_cells.total_combos()` against `2^MAX_INPUT_BITS`, not raw bit width.
+- Two new unit tests:
+  - `input_pruning_via_sidecar_unlocks_designs_past_raw_input_cap`: 12-input design rejects bare, succeeds with 3 inputs declared `ignored`.
+  - `input_pruning_ignored_inputs_collapse_to_one_value`: verifies pinned inputs don't appear with non-zero values in the emitted CTXDSL labels.
+
+**Caliptra retry under Phase 1.6 sidecar.** Sidecar shape:
+
+```jsonc
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "soc_ifc_boot_fsm",
+  "signals": [],
+  "inputs": [
+    { "name": "fw_update_rst_wait_cycles", "abstraction": "ignored" },
+    { "name": "BootFSM_BrkPoint",          "abstraction": "ignored" },
+    { "name": "BootFSM_Continue",          "abstraction": "ignored" }
+  ]
+}
+```
+
+Drops 10 input bits (8 + 1 + 1) → 6 effective input bits → 64 combinations per state. Cap clears.
+
+```
+$ MUNUNU_USE_SV2V=1 mununu context eval soc_ifc_boot_fsm_pre_fix.sv \
+    --adapter sv-yosys --sidecar soc_ifc_pkg.sv --sidecar soc_ifc_reg_pkg.sv \
+    --formula safety_bad_0 --automaton Circuit
+Loaded sidecar: soc_ifc_boot_fsm_pre_fix.mununu.json
+```
+
+(Verdict pending release-build completion — debug build was impractically slow for the 524K × 64 = 33.5M transition enumeration. Update will land in the verdict row of the candidate ledger.)
+
+**Files touched in Phase 1.6.**
+
+- [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) — `InputCellEnumeration`, `build_input_domains`, cap-check move, +2 tests.
+
 **Honesty disclosure.** Three mitigation iterations on dependency
 stubbing were performed before the systemic blocker was hit. Stubs created
 were trivial (empty macros, empty packages, an enum-only slim package); they
