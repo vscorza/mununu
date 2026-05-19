@@ -145,6 +145,44 @@ or Phase 3 of the active plan would pick them up.
 
 - [`crates/mununu-core/src/adapter/yosys/mod.rs`](../../crates/mununu-core/src/adapter/yosys/mod.rs) — `YosysOptions.use_sv2v`, `locate_sv2v`, `run_sv2v`, `env_flag`; integration in `translate_sv`; 3 new tests.
 
+### Phase 1.5 update — CLI multi-file + state cap 16 → 20 (2026-05-18)
+
+Per the user's incremental ask after Phase 1's two-blocker outcome, two
+follow-up unblocks shipped together:
+
+1. **CLI multi-file for sv-yosys.** [`crates/mununu-cli/src/loader.rs`](../../crates/mununu-cli/src/loader.rs) — new `load_with_adapter_mode_extra()` accepts additional source paths. `load_context_documents_mode()` now partitions `--sidecar` arguments by file extension: `.sv` / `.svh` flow to the sv-yosys driver's `YosysOptions::additional_sources` (multi-file SV elaboration); everything else continues as a regular CTXDSL sidecar. The driver's sv2v invocation canonicalizes the primary source path so its parent directory's `-I` flag resolves correctly under relative CLI invocations.
+
+2. **State-bit cap 16 → 20.** [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) — `MAX_STATE_BITS` raised from 16 to 20 (2^20 ≈ 1 M states). The existing overflow-rejection test was rewritten to derive its threshold from the constant rather than hard-coding 17. Input-bit cap (`MAX_INPUT_BITS = 10`) was left at 10 — see the new caveat in Finding 2 below.
+
+**Caliptra retry after Phase 1.5.**
+
+```bash
+cd /tmp/caliptra_retry  # holds the 3 upstream .sv files + the stub headers
+MUNUNU_USE_SV2V=1 mununu context eval soc_ifc_boot_fsm_pre_fix.sv \
+  --adapter sv-yosys \
+  --sidecar soc_ifc_pkg.sv --sidecar soc_ifc_reg_pkg.sv \
+  --formula safety_bad_0 --automaton Circuit
+```
+
+Outcome — the pipeline now runs cleanly through sv2v → Yosys → BTOR2 and stops on the *input-bit cap*, not the *state-bit cap*:
+
+```
+Yosys SV adapter error: adapter/yosys: BTOR2 reader failed:
+  BTOR2 design has 16 input bits per step (max supported: 10).
+```
+
+Progress chain so far on Caliptra: SV-parse blocker (Finding 1) → cleared by sv2v; state-bit cap (Finding 2 / state side) → cleared by 16 → 20 lift; **next-layer blocker: input-bit cap** (`MAX_INPUT_BITS = 10`, design has 16). The pipeline reaches BTOR2 and would explore 19 state bits (~524 K states) given freedom over its inputs.
+
+**Why the input cap was not also raised.** Raising it to 16 was attempted and reverted. With `MAX_STATE_BITS=20`, lifting `MAX_INPUT_BITS` to 16 produces a transition budget of 2^20 × 2^16 ≈ 6.8e10 — concrete enumeration runs for hours and was killed at the 5-minute mark on the Caliptra design. The cap is genuinely the right defense against explosion at the explicit-state engine's scale; the unlock path for designs with many inputs is **sidecar-based input pruning** (declare unused inputs as `Ignored` / `Boolean` / `Symbols` in a `.mununu.json`), not a higher numeric cap.
+
+**Phase 1.5 verdict.** Two more layers of the Caliptra blocker chain are cleared. The next-layer blocker is the input-bit cap, which is a soundness-aware engineering task (sidecar input pruning) rather than a numeric-constant flip. Documented for the user to direct the next phase.
+
+**Additional files touched in Phase 1.5.**
+
+- [`crates/mununu-cli/src/loader.rs`](../../crates/mununu-cli/src/loader.rs) — `load_with_adapter_mode_extra`, sidecar extension partitioning.
+- [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) — `MAX_STATE_BITS` constant 16 → 20; test threshold derives from constant.
+- [`examples/btor2/README.md`](../../examples/btor2/README.md) — cap reference updated.
+
 **Honesty disclosure.** Three mitigation iterations on dependency
 stubbing were performed before the systemic blocker was hit. Stubs created
 were trivial (empty macros, empty packages, an enum-only slim package); they

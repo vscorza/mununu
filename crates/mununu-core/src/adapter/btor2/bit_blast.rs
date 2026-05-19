@@ -29,12 +29,22 @@ use crate::adapter::{
 };
 
 /// Maximum total bits across all state declarations.
-/// 2^16 = 65 K explicit states — at the edge of practicality for the
-/// current explicit-state engine. Anything above is rejected.
-pub const MAX_STATE_BITS: u32 = 16;
+/// 2^20 = ~1 M explicit states — the explicit-state engine's practical
+/// upper bound. Raised from 16 → 20 on 2026-05-18 to admit small
+/// industrial RTL modules (e.g. the Caliptra-RTL boot FSM bundles a
+/// 3-bit state enum with an 8-bit wait counter + reset-window logic
+/// totalling 19 state bits, which the previous cap rejected just past
+/// the boundary). Designs above this still error rather than truncate.
+pub const MAX_STATE_BITS: u32 = 20;
 
 /// Maximum total bits across all input declarations (per-step combinations).
-/// 2^10 = 1024 input combos per state → up to 64 M transitions, also at the edge.
+/// 2^10 = 1024 input combos per state → up to ~1 G transitions at the
+/// raised state cap (MAX_STATE_BITS = 20). Lifting the input cap further
+/// quickly becomes intractable: 2^20 × 2^16 ≈ 6.8e10 transitions takes
+/// hours to enumerate concretely. Designs above this cap must prune
+/// unused inputs via a `.mununu.json` sidecar (see
+/// [`crate::adapter::sidecar`]) declaring `Ignored` / `Boolean` /
+/// `Symbols` abstractions per input.
 pub const MAX_INPUT_BITS: u32 = 10;
 
 /// Bit-vector value. Backed by `u128` — sufficient for any width ≤ 128
@@ -1545,9 +1555,10 @@ mod tests {
 
     #[test]
     fn rejects_state_space_overflow() {
-        // 17 1-bit states → 2^17 > MAX_STATE_BITS=16
+        // `MAX_STATE_BITS + 1` 1-bit states → 2^(N+1) > MAX_STATE_BITS.
         let mut src = "1 sort bitvec 1\n".to_string();
-        for i in 0..17 {
+        let overflow_count = MAX_STATE_BITS as usize + 1;
+        for i in 0..overflow_count {
             src.push_str(&format!("{} state 1 s{}\n", i + 2, i));
         }
         let err = translate(&src, &AdapterOptions::default()).unwrap_err();

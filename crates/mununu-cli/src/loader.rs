@@ -86,6 +86,20 @@ pub(crate) fn load_with_adapter_mode(
     adapter: Option<&str>,
     mode: Option<&str>,
 ) -> Result<(ContextDoc, Option<String>), String> {
+    load_with_adapter_mode_extra(path, adapter, mode, &[])
+}
+
+/// Like [`load_with_adapter_mode`] but accepts a slice of additional
+/// source files. For the `sv-yosys` adapter these are forwarded to
+/// `YosysOptions::additional_sources` so sv2v / Yosys can resolve
+/// cross-file packages, interfaces, and `\`include`-style directives.
+/// Ignored by all other adapters.
+pub(crate) fn load_with_adapter_mode_extra(
+    path: &Path,
+    adapter: Option<&str>,
+    mode: Option<&str>,
+    additional_sv_paths: &[PathBuf],
+) -> Result<(ContextDoc, Option<String>), String> {
     use mununu_core::adapter::{AdapterOptions, FormatAdapter};
 
     let source = fs::read_to_string(path)
@@ -136,8 +150,35 @@ pub(crate) fn load_with_adapter_mode(
             // Sidecars emitted for `(* blackbox *)` modules (Document B
             // task B3) land in the source file's parent directory so the
             // user finds them next to the `.sv` they just ran.
+            //
+            // Multi-file: `additional_sv_paths` (passed in from the CLI
+            // sidecar flag) become extra `.sv` sources for Yosys / sv2v
+            // to resolve cross-file packages and imports. Each entry is
+            // read off disk and shipped as a (filename, content) pair.
+            let mut additional: Vec<(String, String)> =
+                Vec::with_capacity(additional_sv_paths.len());
+            for extra in additional_sv_paths {
+                let content = fs::read_to_string(extra).map_err(|err| {
+                    format!(
+                        "failed to read additional SV source '{}': {err}",
+                        extra.display()
+                    )
+                })?;
+                let name = extra
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "additional SV source '{}' has no usable filename",
+                            extra.display()
+                        )
+                    })?
+                    .to_string();
+                additional.push((name, content));
+            }
             let yopts = mununu_core::adapter::yosys::YosysOptions {
                 primary_source_path: Some(path.to_string_lossy().into_owned()),
+                additional_sources: additional,
                 ..Default::default()
             };
             log_adapter_output_with_dir(
@@ -227,7 +268,7 @@ pub(crate) fn load_with_adapter_mode(
             // Auto-detect by file extension if no adapter specified
             if let Some(fmt) = mununu_core::adapter::detect_format_by_extension(path) {
                 eprintln!("Auto-detected format '{}' from extension", fmt);
-                return load_with_adapter_mode(path, Some(fmt), mode);
+                return load_with_adapter_mode_extra(path, Some(fmt), mode, additional_sv_paths);
             }
             (source, std::collections::HashMap::new())
         }
@@ -263,9 +304,20 @@ pub(crate) fn load_context_documents_mode(
     adapter: Option<&str>,
     mode: Option<&str>,
 ) -> Result<(ContextDoc, Vec<ContextDoc>, Option<String>), String> {
-    let (context_doc, ctxdsl_text) = load_with_adapter_mode(context_path, adapter, mode)?;
-    let mut sidecar_docs = Vec::with_capacity(sidecar_paths.len());
-    for path in sidecar_paths {
+    // Split sidecars: `.sv` / `.svh` go to the sv-yosys adapter as
+    // additional sources (multi-file SV elaboration); everything else is
+    // parsed as a regular CTXDSL sidecar document.
+    let (sv_sources, ctxdsl_sidecars): (Vec<PathBuf>, Vec<PathBuf>) =
+        sidecar_paths.iter().cloned().partition(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("sv") | Some("svh")
+            )
+        });
+    let (context_doc, ctxdsl_text) =
+        load_with_adapter_mode_extra(context_path, adapter, mode, &sv_sources)?;
+    let mut sidecar_docs = Vec::with_capacity(ctxdsl_sidecars.len());
+    for path in &ctxdsl_sidecars {
         sidecar_docs.push(parse_context_file(path)?);
     }
     Ok((context_doc, sidecar_docs, ctxdsl_text))

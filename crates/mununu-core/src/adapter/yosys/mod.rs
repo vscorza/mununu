@@ -129,10 +129,19 @@ pub fn translate_sv(
         // disk, if known. `caliptra_sva.svh` and similar header files
         // live next to the `.sv` the user invoked us on; sv2v can't
         // see them otherwise because mununu staged a per-call tempdir.
+        //
+        // Canonicalize to an absolute path so relative invocations
+        // (e.g. `mununu context eval foo.sv` from the source dir)
+        // resolve to a usable `-I` rather than the empty-parent path.
         let include_dirs: Vec<PathBuf> = yopts
             .primary_source_path
             .as_ref()
-            .and_then(|p| Path::new(p).parent().map(Path::to_path_buf))
+            .and_then(|p| {
+                let abs = Path::new(p)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(p));
+                abs.parent().map(Path::to_path_buf)
+            })
             .into_iter()
             .collect();
         run_sv2v(&sv2v, &sources, &include_dirs, &preprocessed)?;

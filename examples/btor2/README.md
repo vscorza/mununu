@@ -15,7 +15,7 @@ The BTOR2 reader applies four transformations on top of Yosys's elaboration to p
 
 ## The example corpus
 
-Each example demonstrates a different BTOR2 line-type and SV idiom. All four elaborate via the canonical `sv-yosys` driver script and produce models well under the `MAX_STATE_BITS = 16` cap.
+Each example demonstrates a different BTOR2 line-type and SV idiom. All four elaborate via the canonical `sv-yosys` driver script and produce models well under the `MAX_STATE_BITS = 20` cap.
 
 ### `safety_demo.sv` — counter with violatable assertion
 
@@ -108,7 +108,7 @@ Replacing `"sv-yosys"` with `"btor2"` and `$SV` with the contents of `safety_dem
 ## Soundness notes (per CLAUDE.md rules)
 
 - **Bit-blasting is exact** for the operators marked `is_blastable()` in [`adapter::btor2::ast::Op`](../../crates/mununu-core/src/adapter/btor2/ast.rs). No approximation.
-- **State-space rejection over silent truncation:** designs whose total state-bit width exceeds [`MAX_STATE_BITS = 16`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) error out with `StateSpaceOverflow` — the documented escape hatch is compose-and-decompose (Phase 3) before BTOR2 hand-off to an external symbolic engine.
+- **State-space rejection over silent truncation:** designs whose total state-bit width exceeds [`MAX_STATE_BITS = 20`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) error out with `StateSpaceOverflow` — the documented escape hatch is compose-and-decompose (Phase 3) before BTOR2 hand-off to an external symbolic engine.
 - **Implicit clock is sound for posedge-only single-clock designs.** Multi-clock and negedge are explicitly rejected at read time. The "one CLTS transition = one posedge" mapping is exact under that scope.
 - **`async2sync` preserves synchronous structure** for both register cells and `chformal`-lowered assertions. The user-named state cells get one BTOR2 `state` line each (no shadow / previous-clk auxiliaries), and assertion-tracking latches that `chformal -lower` introduces are real synthetic state — they encode the temporal property "the assertion has fired in some prior cycle" — not edge detection.
 - **`setundef -zero`** in the Yosys script makes X / undef bits deterministic (bit-blaster does not model X-prop). For X-aware verification, route through a commercial flow; that is out of mununu's roadmap scope.
