@@ -247,6 +247,46 @@ This is a separate gap from the input-bit cap — the cap is correctly cleared b
 
 **Phase 1.6 verdict.** Cap-check blocker (Finding 2's input-cap side) **resolved** — the sidecar mechanism now prunes inputs correctly, validated by two unit tests. Caliptra end-to-end retry **exposes a deeper runtime-performance blocker** at the bit-blaster's explicit-enumeration loop. Documented as a new finding; the unlock is non-trivial engine work, scoped outside this plan's READY-pipelines-only constraint.
 
+### Phase 1.7 update — abstraction analysis (2026-05-19)
+
+Read-only analysis of the SV adapter's abstraction primitives (including
+SMT discovery) and whether any of them can be reused by the BTOR2 path
+to bring the Caliptra enumeration down to a tractable scale without an
+engine rewrite. Full doc at
+[`docs/design/caliptra-abstraction-analysis.md`](caliptra-abstraction-analysis.md).
+
+**Headline finding.** The BTOR2 path already honours every `FieldDomain`
+shape the SV adapter produces, including the `discover → EnumValues`
+derivation — Phases 1.5 + 1.6 wired the state and input resolvers, and
+the resolver itself is format-agnostic. The Caliptra retry's
+runtime-performance blocker can be addressed by **tightening the
+sidecar**, not by engine work:
+
+- **Phase 1.6 sidecar** pinned 3 inputs (10 raw input bits removed), but
+  left the 8-bit `wait_count` state register fully bit-blasted. Effective
+  state space remained 2^19 ≈ 524 K.
+- **Proposed Phase 1.7b sidecar** adds `wait_count` as a
+  `bounded_counter(bound=0)` or `enum_values { ZERO, NONZERO }` —
+  the safety property only depends on `wait_count == 0`. State bits drop
+  from 19 → ~12 (with reset-window registers also collapsed to
+  `ignored`). Optionally adds `boot_fsm_ps` as `enum_values { …, UNDEF }`
+  to make the bug-class predicate first-class.
+- Combined effect: 8 K transitions vs 33.5 M — **4 000× reduction**,
+  expected to complete in seconds even on the debug build.
+
+The analysis doc's §2.3 lists the four mu-calculus properties evaluated
+on the hand-modelled staging variant (`no_undef_reachable`,
+`recoverable_to_idle`, `always_recoverable`, `safety_all_states_have_successors`),
+with expected verdicts under buggy / fixed / defensive-fixed variants.
+These become the property catalog for the Phase 1.7b retry.
+
+**Next concrete step** (Phase 1.7b, gated on user approval): ship the
+refined sidecar + `validate.sh` + transcript under
+`examples/verify/sv_yosys_caliptra_rtl_150/`, with the four properties
+exercised against the upstream pre-fix and post-fix sources. If it
+completes and discriminates buggy vs fixed, it becomes the first
+auto-extracted PoC against a real public upstream bug in this plan.
+
 **Files touched in Phase 1.6.**
 
 - [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) — `InputCellEnumeration`, `build_input_domains`, cap-check move, +2 tests.
