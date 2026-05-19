@@ -343,15 +343,77 @@ pub fn collect_symbols(file: &Btor2File) -> HashMap<Nid, String> {
     // Pass 2: trace `Op { symbol: Some(NAME) }` aliases (Yosys's `uext _ _ 0 NAME`
     // pattern) back to their underlying state lines and attach the user-
     // visible name. Only overrides synthetic compiler-generated names.
+    //
+    // **Width filter** — only attach a symbol when the Op's result width
+    // matches the target state's width. Without this, narrow combinational
+    // aliases (`uext 1 ... arc_BOOT_X_BOOT_Y`, a single-bit `assign` output)
+    // false-positive onto wide state cells they happen to reference (the
+    // multi-bit state register that drives the combinational chain).
+    // The width-matched alias is the canonical "this NID *is* state S"
+    // shape Yosys emits for SystemVerilog regs that lose their direct
+    // symbol annotation through `flatten` + `async2sync` + `dffunmap`.
     let is_synthetic = |s: &str| s.starts_with('$');
     for line in &file.lines {
         if let Node::Op {
+            sort: op_sort,
             args,
             symbol: Some(name),
             ..
         } = &line.node
             && let Some(state_nid) = trace_to_state(file, args)
         {
+            let op_width = bv_width(file, *op_sort);
+            let state_width = file.lookup(state_nid).and_then(|l| match &l.node {
+                Node::State { sort, .. } => bv_width(file, *sort),
+                _ => None,
+            });
+            if op_width != state_width || op_width.is_none() {
+                continue;
+            }
+            let entry = out.entry(state_nid);
+            match entry {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(name.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if is_synthetic(o.get()) {
+                        o.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: trace `output <signal> <NAME>` lines back to their underlying
+    // state cells. Yosys's `write_btor` retains output-port names through
+    // synthesis (the original `output logic boot_fsm_ps` becomes
+    // `<nid> output <ite-nid> boot_fsm_ps`) but does NOT emit a symbol on
+    // the state-cell line itself when the cell goes through `flatten` +
+    // `async2sync` + `dffunmap`. This pass closes the gap: an output that
+    // 1:1 reflects a state register propagates its user-visible name back
+    // to the state line, so `.mununu.json` sidecar entries keyed on the
+    // SystemVerilog port name match the underlying BTOR2 nid.
+    //
+    // Same width-filter as Pass 2 — a narrow output combinational chain
+    // pointing at a wide state cell is not the same signal. Same override
+    // logic — a state cell that already carries a user-visible symbol on
+    // its `state` line (direct, or via a width-matched Pass 2 alias) is
+    // not overwritten.
+    for line in &file.lines {
+        if let Node::Output {
+            signal,
+            symbol: Some(name),
+        } = &line.node
+            && let Some(state_nid) = trace_to_state(file, &[*signal])
+        {
+            let signal_width = bv_width_of_operand(file, *signal);
+            let state_width = file.lookup(state_nid).and_then(|l| match &l.node {
+                Node::State { sort, .. } => bv_width(file, *sort),
+                _ => None,
+            });
+            if signal_width != state_width || signal_width.is_none() {
+                continue;
+            }
             let entry = out.entry(state_nid);
             match entry {
                 std::collections::hash_map::Entry::Vacant(v) => {
@@ -366,6 +428,24 @@ pub fn collect_symbols(file: &Btor2File) -> HashMap<Nid, String> {
         }
     }
     out
+}
+
+/// Resolve an Operand's bit-vector width by looking up its defining
+/// line and reading the sort. Returns `None` for unresolvable operands
+/// (off-graph references, array sorts).
+fn bv_width_of_operand(file: &Btor2File, op: crate::adapter::btor2::ast::Operand) -> Option<u32> {
+    let line = file.lookup(op.nid())?;
+    let sort_nid = match &line.node {
+        Node::Sort { .. } => return None,
+        Node::Input { sort, .. }
+        | Node::State { sort, .. }
+        | Node::Const { sort, .. }
+        | Node::Op { sort, .. }
+        | Node::Init { sort, .. }
+        | Node::Next { sort, .. } => *sort,
+        _ => return None,
+    };
+    bv_width(file, sort_nid)
 }
 
 /// Walk the operand graph backward from a list of operands, returning

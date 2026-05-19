@@ -511,7 +511,7 @@ fn enumerate_and_blast(
         internal_labels: vec![],
     };
 
-    let properties = build_properties(
+    let mut properties = build_properties(
         file,
         &state_meta,
         &input_meta,
@@ -519,12 +519,54 @@ fn enumerate_and_blast(
         &input_cells,
         &state_names,
     )?;
+    // Append sidecar-declared mu-calculus properties. The custom SV
+    // adapter (which constructs its own SvAnnotation flow) already
+    // honours `SvAnnotation::properties`; this mirrors the same shape
+    // on the BTOR2 / sv-yosys path so a user's `.mununu.json` can
+    // carry hand-authored property formulas alongside abstractions.
+    properties.extend(sidecar_properties(options));
 
     Ok(BlastOutput {
         signals,
         properties,
         automaton,
     })
+}
+
+/// Parse the sidecar's `properties[]` array (if any) into the
+/// adapter-IR `PropertySpec` shape. Malformed entries are logged as
+/// adapter warnings — same permissive policy as `build_cell_domains`.
+fn sidecar_properties(options: &AdapterOptions) -> Vec<PropertySpec> {
+    let Some(json) = &options.sidecar_json else {
+        return vec![];
+    };
+    let annotation =
+        match serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+        {
+            Ok(a) => a,
+            Err(_) => return vec![],
+        };
+    annotation
+        .properties
+        .into_iter()
+        .filter_map(|p| {
+            // Prefer an inline formula; template_ref support is the
+            // custom SV adapter's responsibility (not the BTOR2 path).
+            let body = p.formula?;
+            Some(PropertySpec {
+                name: p.id,
+                kind: PropertyKind::Safety,
+                formula: PropertyFormula::MuCalculus(body),
+                role: match p.role.as_str() {
+                    "assumption" => PropertyRole::Assumption,
+                    "standalone" => PropertyRole::Standalone,
+                    _ => PropertyRole::Guarantee,
+                },
+                over: None,
+                description: p.description,
+            })
+        })
+        .collect()
 }
 
 fn build_properties(
@@ -868,10 +910,22 @@ struct CellEnumeration {
     per_cell: Vec<Vec<u128>>,
     /// Per state cell, cached `per_cell[i].len()` (the radix base).
     radices: Vec<usize>,
+    /// Per state cell, whether `encode` should saturate out-of-range
+    /// values to the nearest in-range value (true for `BoundedCounter`
+    /// abstraction; false otherwise). Saturating maps the design's
+    /// arbitrary concrete writes (e.g. `wait_count = 5`) onto the
+    /// declared abstract counter range (e.g. `bound = 1` → values
+    /// `{0, 1}`, with `5` saturating to `1` = the "non-zero" class).
+    /// This is an over-approximation: a smaller abstract domain
+    /// represents a larger concrete one. Sound for safety; under-
+    /// approximates liveness. See `docs/abstraction.md` for the
+    /// memory-soundness matrix.
+    saturate: Vec<bool>,
 }
 
 impl CellEnumeration {
     fn build(state_meta: &[StateMeta], cell_domains: &CellDomainMap) -> Self {
+        use crate::adapter::domain::AbstractionType;
         let per_cell: Vec<Vec<u128>> = state_meta
             .iter()
             .map(|sm| {
@@ -885,7 +939,20 @@ impl CellEnumeration {
             })
             .collect();
         let radices: Vec<usize> = per_cell.iter().map(|v| v.len().max(1)).collect();
-        CellEnumeration { per_cell, radices }
+        let saturate: Vec<bool> = state_meta
+            .iter()
+            .map(|sm| {
+                cell_domains
+                    .get(&sm.nid)
+                    .map(|(fd, _)| fd.abstraction == AbstractionType::BoundedCounter)
+                    .unwrap_or(false)
+            })
+            .collect();
+        CellEnumeration {
+            per_cell,
+            radices,
+            saturate,
+        }
     }
 
     fn values_for_field_domain(
@@ -953,16 +1020,49 @@ impl CellEnumeration {
     }
 
     /// Encode per-cell concrete values back to a linear combo index.
-    /// Returns `None` if any value is not in its cell's allowed set —
-    /// this happens when the design's transition function lands a state
-    /// outside the sidecar-declared abstraction (e.g., a counter
-    /// exceeding its bound). The caller treats this as out-of-bounds.
+    /// Returns `None` if any value is not in its cell's allowed set
+    /// AND the cell does not declare saturating semantics — this
+    /// happens when the design's transition function lands a state
+    /// outside the sidecar-declared abstraction (e.g., an `EnumValues`
+    /// signal landing outside its variant set). The caller treats
+    /// this as out-of-bounds.
+    ///
+    /// For cells whose `saturate` flag is set (`BoundedCounter`), an
+    /// out-of-range value is clamped to the nearest in-range value:
+    /// `v > max(per_cell)` → `max`; `v < min(per_cell)` → `min`. This
+    /// is the standard saturating-counter semantics — a soundness-
+    /// preserving over-approximation that lets the abstract domain
+    /// stand in for an unbounded concrete domain without dropping
+    /// transitions. The classic use case is `bound = 1` standing in
+    /// for `{0, non-zero}`: the design's `wait_count = 5` write
+    /// saturates to `1` (= the "non-zero" abstract class).
     fn encode(&self, values: &[u128]) -> Option<usize> {
         let mut combo = 0usize;
         let mut multiplier = 1usize;
         for (i, &v) in values.iter().enumerate() {
             let radix = self.radices[i];
-            let idx = self.per_cell[i].iter().position(|x| *x == v)?;
+            let cell_values = &self.per_cell[i];
+            let idx = cell_values.iter().position(|x| *x == v).or_else(|| {
+                if !self.saturate[i] || cell_values.is_empty() {
+                    return None;
+                }
+                // `per_cell` is sorted ascending in `build`. Clamp.
+                let last = *cell_values.last()?;
+                let first = *cell_values.first()?;
+                if v > last {
+                    Some(cell_values.len() - 1)
+                } else if v < first {
+                    Some(0)
+                } else {
+                    // Value sits in a gap within the declared range.
+                    // For `BoundedCounter` the range is contiguous,
+                    // so this branch is unreachable in practice; if
+                    // the abstraction ever gets gappy variants the
+                    // saturation is undefined and we drop the
+                    // transition (under-approx) rather than guess.
+                    None
+                }
+            })?;
             combo = combo.checked_add(idx.checked_mul(multiplier)?)?;
             multiplier = multiplier.checked_mul(radix)?;
         }
