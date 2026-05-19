@@ -68,7 +68,8 @@ pub struct YosysOptions {
     /// Requires `sv2v` (zachjs/sv2v ≥ 0.0.10 recommended) on `$PATH` or
     /// in `MUNUNU_SV2V_PATH`. Defaults to `false` so existing examples
     /// keep their current parse behavior. Opt in via the CLI flag
-    /// `--preprocessor sv2v` or the env var `MUNUNU_USE_SV2V=1`.
+    /// `--preprocessor sv2v` or the API field `use_sv2v: true` on the
+    /// import request.
     pub use_sv2v: bool,
 }
 
@@ -119,10 +120,10 @@ pub fn translate_sv(
     // Optional sv2v preprocessing pass. sv2v translates modern SV
     // constructs Yosys's built-in parser doesn't accept (notably the
     // module-header `import pkg::*;` syntax) into Verilog-2005 that
-    // Yosys handles cleanly. Activated by `YosysOptions::use_sv2v` or
-    // the `MUNUNU_USE_SV2V=1` env var.
-    let use_sv2v = yopts.use_sv2v || env_flag("MUNUNU_USE_SV2V");
-    if use_sv2v {
+    // Yosys handles cleanly. Activated by `YosysOptions::use_sv2v`
+    // (the only switch — wire `--preprocessor sv2v` on the CLI or
+    // `use_sv2v: true` on the API into this field).
+    if yopts.use_sv2v {
         let sv2v = locate_sv2v()?;
         let preprocessed = tmp.path().join("preprocessed.sv");
         // Include-search path: the parent dir of the primary source on
@@ -568,14 +569,6 @@ fn run_sv2v(
     std::fs::write(out, &result.stdout).map_err(io_err)
 }
 
-/// Read a boolean-shaped env var (`1` / `true`, case-insensitive). Matches
-/// the convention used by `MUNUNU_KEEP_YOSYS_TMP`.
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 /// Best-effort check that the located yosys binary was not built with the
 /// commercial Verific frontend. Verific-built yosys binaries print
 /// "verific" in their `-V` banner.
@@ -700,7 +693,7 @@ pub fn translate_sv_multi(
             .collect(),
         skip_verific_check: false,
         primary_source_path: None,
-        use_sv2v: env_flag("MUNUNU_USE_SV2V"),
+        use_sv2v: false,
     };
     translate_sv(primary, options, &yopts)
 }

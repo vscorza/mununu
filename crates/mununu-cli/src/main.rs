@@ -3,7 +3,7 @@ mod render;
 
 use crate::loader::{
     EvalContextParams, PreparedEvalContext, load_context_documents, load_context_documents_mode,
-    prepare_eval_context, print_context_structure, realize_documents,
+    prepare_eval_context, print_context_structure, realize_documents, validate_preprocessor,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mununu_core::clts::{Clts, DefaultLabelIdx, LabelId};
@@ -709,6 +709,13 @@ struct ContextSummarizeArgs {
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     #[arg(long = "mode", value_name = "MODE")]
     mode: Option<String>,
+    /// Optional source-language preprocessor to run before adapter
+    /// translation. Currently supports: `sv2v` (lowers SV2009/2012
+    /// constructs to Verilog-2005 before Yosys; required for modern
+    /// open-source RTL — Caliptra-RTL, OpenTitan, ibex, etc.).
+    /// Only honoured by `--adapter sv-yosys`.
+    #[arg(long = "preprocessor", value_name = "NAME")]
+    preprocessor: Option<String>,
     /// Print the internal structure of the context to stdout or a file.
     #[arg(long = "print-structure", value_name = "FILE")]
     print_structure: Option<Option<PathBuf>>,
@@ -729,6 +736,11 @@ struct ContextPredicatesArgs {
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     #[arg(long = "mode", value_name = "MODE")]
     mode: Option<String>,
+    /// Optional source-language preprocessor to run before adapter
+    /// translation. Currently supports: `sv2v`. Only honoured by
+    /// `--adapter sv-yosys`.
+    #[arg(long = "preprocessor", value_name = "NAME")]
+    preprocessor: Option<String>,
     /// Restrict output to a single automaton.
     #[arg(long = "automaton", value_name = "NAME")]
     automaton: Option<String>,
@@ -749,6 +761,11 @@ struct ContextEvalArgs {
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     #[arg(long = "mode", value_name = "MODE")]
     mode: Option<String>,
+    /// Optional source-language preprocessor to run before adapter
+    /// translation. Currently supports: `sv2v`. Only honoured by
+    /// `--adapter sv-yosys`.
+    #[arg(long = "preprocessor", value_name = "NAME")]
+    preprocessor: Option<String>,
     /// μ-calculus formula to evaluate (by name from the context).
     #[arg(long = "formula", value_name = "NAME", conflicts_with = "template")]
     formula: Option<String>,
@@ -799,6 +816,11 @@ struct ContextSynthesizeArgs {
     /// Mode for extraction adapter: "fixed" or "vulnerable".
     #[arg(long = "mode", value_name = "MODE")]
     mode: Option<String>,
+    /// Optional source-language preprocessor to run before adapter
+    /// translation. Currently supports: `sv2v`. Only honoured by
+    /// `--adapter sv-yosys`.
+    #[arg(long = "preprocessor", value_name = "NAME")]
+    preprocessor: Option<String>,
     /// μ-calculus formula to synthesise (by name from the context).
     #[arg(long = "formula", value_name = "NAME", conflicts_with = "template")]
     formula: Option<String>,
@@ -3252,11 +3274,13 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
 }
 
 fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
+    let preprocessor = validate_preprocessor(args.preprocessor.as_deref())?;
     let (context_doc, sidecar_docs, _) = load_context_documents_mode(
         &args.context,
         &args.sidecars,
         args.adapter.as_deref(),
         args.mode.as_deref(),
+        preprocessor,
     )?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let summary = build_context_summary(&context_doc, &sidecar_docs, &realized);
@@ -3273,11 +3297,13 @@ fn context_summarize(args: ContextSummarizeArgs) -> Result<(), String> {
 }
 
 fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
+    let preprocessor = validate_preprocessor(args.preprocessor.as_deref())?;
     let (context_doc, sidecar_docs, _) = load_context_documents_mode(
         &args.context,
         &args.sidecars,
         args.adapter.as_deref(),
         args.mode.as_deref(),
+        preprocessor,
     )?;
     let realized = realize_documents(&context_doc, &sidecar_docs)?;
     let mut automata: Vec<String> = realized.predicates.keys().cloned().collect();
@@ -3337,6 +3363,7 @@ fn context_predicates(args: ContextPredicatesArgs) -> Result<(), String> {
 }
 
 fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
+    let preprocessor = validate_preprocessor(args.preprocessor.as_deref())?;
     let PreparedEvalContext {
         realized,
         formula_name,
@@ -3345,6 +3372,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         sidecars: &args.sidecars,
         adapter: args.adapter.as_deref(),
         mode: args.mode.as_deref(),
+        preprocessor,
         print_ctxdsl_path: args.print_ctxdsl.as_ref(),
         stubs: &args.stubs,
         formula: &args.formula,
@@ -3571,6 +3599,7 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
 }
 
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
+    let preprocessor = validate_preprocessor(args.preprocessor.as_deref())?;
     let PreparedEvalContext {
         realized,
         formula_name,
@@ -3579,6 +3608,7 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
         sidecars: &args.sidecars,
         adapter: args.adapter.as_deref(),
         mode: args.mode.as_deref(),
+        preprocessor,
         print_ctxdsl_path: args.print_ctxdsl.as_ref(),
         stubs: &[], // context_synthesize has no --stub support
         formula: &args.formula,
