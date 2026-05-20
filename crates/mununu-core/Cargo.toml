@@ -48,13 +48,13 @@ tree-sitter-python = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.23", optional = true }
 
 # SMT solver — z3 for predicate-image discovery and RTL value discovery.
-# Mandatory dependency: every build links Z3 statically via the bundled
-# feature so the `mununu` binary works the same in dev containers and
-# user installs. The historical `--features smt` opt-in was removed
-# in Phase A.4 step 4.2 — the predicate-image algorithm depends on Z3,
-# and the dual-build matrix (with-Z3 / without-Z3) had no users left
-# to justify the maintenance cost.
-z3 = { version = "0.20", features = ["bundled"] }
+# Mandatory dependency since Phase A.4 step 4.2. Uses the system Z3
+# (libz3-dev on Debian / Z3 via homebrew on macOS) by default — the
+# dev-container Dockerfile installs `libz3-dev`. To build with the
+# bundled Z3 source (slower; runner-OOM-prone in CI), enable the
+# `z3/bundled` feature explicitly:
+#   cargo build --features z3/bundled
+z3 = { version = "0.20" }
 
 # Optional / feature-gated:
 #   `test_support`: deterministic CLTS generators (chain/ring/grid/hypercube/...)
