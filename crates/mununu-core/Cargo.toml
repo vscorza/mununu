@@ -47,8 +47,14 @@ tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-python = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.23", optional = true }
 
-# SMT solver (optional — z3 for value discovery in RTL verification)
-z3 = { version = "0.20", optional = true, features = ["bundled"] }
+# SMT solver — z3 for predicate-image discovery and RTL value discovery.
+# Mandatory dependency: every build links Z3 statically via the bundled
+# feature so the `mununu` binary works the same in dev containers and
+# user installs. The historical `--features smt` opt-in was removed
+# in Phase A.4 step 4.2 — the predicate-image algorithm depends on Z3,
+# and the dual-build matrix (with-Z3 / without-Z3) had no users left
+# to justify the maintenance cost.
+z3 = { version = "0.20", features = ["bundled"] }
 
 # Optional / feature-gated:
 #   `test_support`: deterministic CLTS generators (chain/ring/grid/hypercube/...)
@@ -74,7 +80,6 @@ rand_chacha = "0.3"
 default = []
 api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
 ast-extract = ["dep:tree-sitter", "dep:tree-sitter-typescript", "dep:tree-sitter-python", "dep:tree-sitter-rust"]
-smt = ["dep:z3"]
 syntcomp = []
 # Optimization-programme features (see notebook/0000-overview.md). Each is
 # additive and can be enabled per-bench, per-test, or per-CI-tier.

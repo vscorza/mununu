@@ -2676,48 +2676,36 @@ fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
 
     eprintln!("Discovering values for {} signal(s)...", discover_count);
 
-    #[cfg(not(feature = "smt"))]
-    {
-        let _ = (&_module, &annotation); // suppress unused warnings
-        Err(
-            "SMT discovery requires the 'smt' feature. Rebuild with: cargo build --features smt"
-                .to_string(),
-        )
-    }
+    let mut annotation = annotation;
+    let results = mununu_core::adapter::systemverilog::kripke_smt::discover_significant_values(
+        &_module,
+        &annotation,
+    );
 
-    #[cfg(feature = "smt")]
-    {
-        let mut annotation = annotation;
-        let results = mununu_core::adapter::systemverilog::kripke_smt::discover_significant_values(
-            &_module,
-            &annotation,
-        );
-
-        if results.is_empty() {
-            eprintln!("No significant values discovered.");
-        } else {
-            for (signal, discovered) in &results {
-                eprintln!("  {} — {} value(s):", signal, discovered.values.len());
-                for v in &discovered.values {
-                    let from = v.from.as_deref().unwrap_or("unknown");
-                    eprintln!("    {} = {} ({})", v.name, v.value, from);
-                }
+    if results.is_empty() {
+        eprintln!("No significant values discovered.");
+    } else {
+        for (signal, discovered) in &results {
+            eprintln!("  {} — {} value(s):", signal, discovered.values.len());
+            for v in &discovered.values {
+                let from = v.from.as_deref().unwrap_or("unknown");
+                eprintln!("    {} = {} ({})", v.name, v.value, from);
             }
-
-            // Merge into the annotation, preserving user-given names
-            sv_annotation::merge_discovered_values(&mut annotation.discovered_values, results);
         }
 
-        // Write the updated sidecar
-        let output_path = args.output.as_ref().unwrap_or(&sidecar_path);
-        let json = serde_json::to_string_pretty(&annotation)
-            .map_err(|e| format!("Failed to serialize annotation: {e}"))?;
-        fs::write(output_path, json)
-            .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
-        eprintln!("Updated sidecar: {}", output_path.display());
-
-        Ok(())
+        // Merge into the annotation, preserving user-given names
+        sv_annotation::merge_discovered_values(&mut annotation.discovered_values, results);
     }
+
+    // Write the updated sidecar
+    let output_path = args.output.as_ref().unwrap_or(&sidecar_path);
+    let json = serde_json::to_string_pretty(&annotation)
+        .map_err(|e| format!("Failed to serialize annotation: {e}"))?;
+    fs::write(output_path, json)
+        .map_err(|e| format!("Failed to write '{}': {e}", output_path.display()))?;
+    eprintln!("Updated sidecar: {}", output_path.display());
+
+    Ok(())
 }
 
 /// Multi-module discovery: runs cross-module SMT discovery for connected
@@ -2778,15 +2766,6 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
 
     eprintln!("Discovering values for {} target(s)...", discover_count);
 
-    #[cfg(not(feature = "smt"))]
-    {
-        Err(
-            "SMT discovery requires the 'smt' feature. Rebuild with: cargo build --features smt"
-                .to_string(),
-        )
-    }
-
-    #[cfg(feature = "smt")]
     {
         // Parse all sub-modules
         let mut parsed_modules: Vec<(mununu_core::adapter::systemverilog::ast::Module, String)> =

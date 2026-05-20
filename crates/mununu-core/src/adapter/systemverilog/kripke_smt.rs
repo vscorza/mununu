@@ -4,9 +4,9 @@
 //! guard conditions satisfiable. This discovers significant values hidden
 //! behind combinational logic (e.g., `y = x * 4; if (y == 12)` → `x = 3`).
 //!
-//! Requires the `smt` feature flag (`cargo build --features smt`).
+//! Z3 is a mandatory dependency since Phase A.4 step 4.2 — the historical
+//! `--features smt` opt-in was removed.
 
-#[cfg(feature = "smt")]
 pub mod engine {
     use super::super::annotation::{
         DiscoveredValue, DiscoveredValues, SignalAbstraction, SvAnnotation,
@@ -794,11 +794,9 @@ pub mod engine {
     }
 }
 
-#[cfg(feature = "smt")]
 pub use engine::discover_significant_values;
 
 #[cfg(test)]
-#[cfg(feature = "smt")]
 mod tests {
     use super::engine::*;
     use crate::adapter::systemverilog::annotation::*;

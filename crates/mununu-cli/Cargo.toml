@@ -24,4 +24,5 @@ bitvec = "1.0"
 
 [features]
 default = []
-smt = ["mununu-core/smt"]
+# `smt` feature removed in Phase A.4 step 4.2 — Z3 is now mandatory in
+# mununu-core. See its Cargo.toml for the rationale.
