@@ -197,3 +197,4 @@ pub fn resolve_to_field_domain(
 }
 
 pub mod btor2_resolver;
+pub mod predicate_image;
