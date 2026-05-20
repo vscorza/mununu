@@ -193,10 +193,20 @@ pub(crate) fn load_with_adapter_mode_extra(
                 additional.push((name, content));
             }
             let use_sv2v = matches!(preprocessor, Some("sv2v"));
+            // `MUNUNU_YOSYS_SETUNDEF_ANYSEQ=1` opt-in for CWE-1245-class
+            // bug-preserving extraction. See the SOUNDNESS comment in
+            // `adapter::yosys::build_script`. CLI-level flag is
+            // deferred — env-var lets the Caliptra PoF fixture's
+            // `validate.sh` opt in without touching every adapter
+            // call-site.
+            let setundef_anyseq = std::env::var("MUNUNU_YOSYS_SETUNDEF_ANYSEQ")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             let yopts = mununu_core::adapter::yosys::YosysOptions {
                 primary_source_path: Some(path.to_string_lossy().into_owned()),
                 additional_sources: additional,
                 use_sv2v,
+                setundef_anyseq,
                 ..Default::default()
             };
             log_adapter_output_with_dir(

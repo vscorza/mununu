@@ -247,6 +247,56 @@ This is a separate gap from the input-bit cap — the cap is correctly cleared b
 
 **Phase 1.6 verdict.** Cap-check blocker (Finding 2's input-cap side) **resolved** — the sidecar mechanism now prunes inputs correctly, validated by two unit tests. Caliptra end-to-end retry **exposes a deeper runtime-performance blocker** at the bit-blaster's explicit-enumeration loop. Documented as a new finding; the unlock is non-trivial engine work, scoped outside this plan's READY-pipelines-only constraint.
 
+### Phase A.4 update — predicate-image discovery ships; Caliptra verdict-flip blocked by state-bit cap (2026-05-20)
+
+Phase A.4 of the parent pipeline-blocker plan landed the SMT
+predicate-image discovery algorithm end-to-end on the BTOR2 path
+(steps 4.0–4.4; see
+[`.claude/plans/phase-a4-predicate-image.md`](../../.claude/plans/phase-a4-predicate-image.md)
+for the per-step record). The headline algorithm + recall harness
+work as designed against the curated benchmark
+([`examples/verify/bench_predicate_image_a4/`](../../examples/verify/bench_predicate_image_a4/) —
+3/3 BTOR2 fixtures pass recall ≥ 0.92).
+
+**Caliptra verdict-flip — partial.** The PoF criterion stated in the
+A.4 plan ("`no_undef_reachable` initial-state verdict flips 1/1 →
+0/1") is **not yet achieved**. Step 4.6 measured the exact gap:
+
+- `setundef -zero` (Yosys driver default): translation succeeds at
+  4 096 states. Predicate-image on the resulting BTOR2 discovers
+  `boot_fsm_ns ∈ {0..4}` — the synthesis pass silently transforms
+  CWE-1245's unmatched-case sink into a deterministic `→ 0`
+  transition. The bug is masked.
+- `setundef -anyseq` (opt-in via `MUNUNU_YOSYS_SETUNDEF_ANYSEQ=1`):
+  predicate-image discovers `boot_fsm_ns ∈ {0..7}` — the violating
+  encodings 5/6/7 surface. **But** the synthesis pass introduces
+  `$anyseq` cells that explode the bit-blast state count from 19 →
+  56, well past `MAX_STATE_BITS = 20`. Translation refuses.
+
+So the algorithm is correct in isolation, the bug-preserving Yosys
+synthesis is wired up as an opt-in, and the gap is the explicit-state
+engine's enumeration cap — exactly the case the original A.4 plan
+flagged as the A.4a fallback. The next step is
+[`phase-a4b-state-bit-cap-followup.md`](../../.claude/plans/phase-a4b-state-bit-cap-followup.md)
+which catalogs the four unlock paths (sidecar-side workaround;
+compose-and-decompose; Phase B IC3-IA; lift the cap — not viable).
+
+**Honest scope.** Phase A.4 is shipped as **A.4a**: the algorithm,
+recall harness, CLI surface, and the empirical finding are in tree.
+The "first auto-extracted real-upstream-bug verdict" claim stays
+**partially open** in this ledger until A.4b closes one of the
+unlock paths.
+
+**Files touched in Phase A.4.**
+
+- [`crates/mununu-core/src/adapter/sidecar/predicate_image/`](../../crates/mununu-core/src/adapter/sidecar/predicate_image/) — new module (~700 LOC)
+- [`crates/mununu-core/tests/predicate_image_recall.rs`](../../crates/mununu-core/tests/predicate_image_recall.rs) — recall harness
+- [`crates/mununu-cli/src/main.rs`](../../crates/mununu-cli/src/main.rs) — `mununu btor2 discover` subcommand
+- [`crates/mununu-core/src/adapter/yosys/mod.rs`](../../crates/mununu-core/src/adapter/yosys/mod.rs) — `YosysOptions::setundef_anyseq` opt-in
+- [`crates/mununu-cli/src/loader.rs`](../../crates/mununu-cli/src/loader.rs) — `MUNUNU_YOSYS_SETUNDEF_ANYSEQ` env-var
+- [`crates/mununu-core/Cargo.toml`](../../crates/mununu-core/Cargo.toml) + [`crates/mununu-cli/Cargo.toml`](../../crates/mununu-cli/Cargo.toml) — Z3 mandatory
+- [`examples/verify/bench_predicate_image_a4/`](../../examples/verify/bench_predicate_image_a4/) — 10-fixture benchmark
+
 ### Phase A.3 update — auto-partition + predicate binding ship (2026-05-19)
 
 > Predecessor: Phase 1.7 analysis (below).

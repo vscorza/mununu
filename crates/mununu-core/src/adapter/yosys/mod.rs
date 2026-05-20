@@ -71,6 +71,16 @@ pub struct YosysOptions {
     /// `--preprocessor sv2v` or the API field `use_sv2v: true` on the
     /// import request.
     pub use_sv2v: bool,
+    /// When `true`, Yosys's `setundef -anyseq` pass replaces every
+    /// undefined net with a fresh symbolic choice instead of pinning
+    /// it to zero. Preserves CWE-1245-class bug-bearing semantics
+    /// (the unmatched-case path admits any value) at the cost of
+    /// introducing `$anyseq` state cells — the bit-blast state-bit
+    /// count can grow substantially. **Default: `false`** (matches
+    /// historical `setundef -zero` behaviour; small state space; bug
+    /// silently transformed away). See the SOUNDNESS comment in
+    /// [`build_script`] for the trade-off.
+    pub setundef_anyseq: bool,
 }
 
 /// SV-via-Yosys adapter — wraps the BTOR2 path with a Yosys subprocess.
@@ -155,7 +165,13 @@ pub fn translate_sv(
 
     let btor_path = tmp.path().join("design.btor");
     let hier_json_path = tmp.path().join("hier.json");
-    let script = build_script(&sources, yopts.top.as_deref(), &btor_path, &hier_json_path);
+    let script = build_script(
+        &sources,
+        yopts.top.as_deref(),
+        &btor_path,
+        &hier_json_path,
+        yopts.setundef_anyseq,
+    );
 
     let output = Command::new(&yosys)
         .arg("-q")
@@ -642,6 +658,7 @@ fn build_script(
     top: Option<&str>,
     btor_out: &Path,
     hier_json_out: &Path,
+    setundef_anyseq: bool,
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
@@ -657,8 +674,37 @@ fn build_script(
     // the pipeline succeed even when the blackbox body is empty — the
     // blackbox's outputs become uncontrollable free signals, exactly
     // the chaotic-stub semantics Document A §2 prescribes.
+    // SOUNDNESS — `setundef -anyseq` vs `setundef -zero`:
+    //
+    // `setundef` decides how Yosys treats nets that have no assigned
+    // value on some path (an `always_comb` case statement with no
+    // `default:` arm; an `unique casez` with unmatched encodings).
+    //
+    // - `-zero` pins them to 0. Deterministic; state space stays
+    //   small; **silently de-bugs CWE-1245-class defects** because
+    //   the unmatched-case path becomes a deterministic transition
+    //   to 0 instead of an admissible-any-value sink.
+    // - `-anyseq` makes them free symbolic choices each cycle.
+    //   Preserves the bug-bearing semantics, but introduces fresh
+    //   `$anyseq` state cells at each undefined point — the state-
+    //   bit count explodes (≈ 56 bits on the Caliptra fixture
+    //   vs ≈ 19 bits under `-zero`). For designs near the
+    //   `MAX_STATE_BITS` cap, `-anyseq` pushes the design *over*
+    //   the cap and the bit-blaster refuses it.
+    //
+    // mununu defaults to `-zero` (small state space; CWE-1245 hidden
+    // unless re-instated). The Phase A.4 step 4.6 finding documented
+    // this trade-off explicitly. Designs that need the bug-bearing
+    // semantics opt in via `YosysOptions::setundef_anyseq = true`,
+    // accepting the state-space cost; the all-SMT predicate-image
+    // enumerator then surfaces the violating encodings.
+    let setundef_pass = if setundef_anyseq {
+        "setundef -anyseq"
+    } else {
+        "setundef -zero"
+    };
     format!(
-        "{}; {hier}; proc; write_json {}; cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; setundef -zero; write_btor {}",
+        "{}; {hier}; proc; write_json {}; cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         hier_json_out.display(),
         btor_out.display()
@@ -694,6 +740,7 @@ pub fn translate_sv_multi(
         skip_verific_check: false,
         primary_source_path: None,
         use_sv2v: false,
+        setundef_anyseq: false,
     };
     translate_sv(primary, options, &yopts)
 }

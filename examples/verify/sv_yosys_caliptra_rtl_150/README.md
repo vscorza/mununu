@@ -31,6 +31,43 @@ The reduction comes from **two composing mechanisms**:
    and is observable in the bit-blaster's pre-partition state-count
    warning (`2^19 = 524288 explicit states` → post-abstraction 4 096).
 
+## Phase A.4 update (2026-05-20) — verdict-flip blocked by state-bit cap
+
+The Phase A.4 predicate-image discovery algorithm is **complete** and
+**correct**, but the Caliptra `no_undef_reachable` verdict-flip
+criterion is **not yet achieved**. The trade-off measured:
+
+| Yosys `setundef` pass | State bits | Predicate-image finds `boot_fsm_ns ∈` | Verdict |
+|---|---|---|---|
+| `-zero` (default) | 19 → 4 096 states | **{0, 1, 2, 3, 4} only** | 1/1 initial satisfies — CWE-1245 silently masked |
+| `-anyseq` (opt-in via `MUNUNU_YOSYS_SETUNDEF_ANYSEQ=1`) | **56 — over MAX_STATE_BITS=20 cap** | **{0, 1, 2, 3, 4, 5, 6, 7}** (bug encodings surface) | Cannot translate (bit-blaster refuses) |
+
+So the algorithm works in isolation (Step 4.4's `mununu btor2 discover`
+on the `-anyseq`-emitted BTOR2 surfaces the violating encodings), but
+the full `sv-yosys → BTOR2 → bit-blast → eval` pipeline cannot close
+the verdict because the bug-preserving `-anyseq` synthesis pass
+explodes the state space past the explicit-state engine's reach.
+This matches the [Phase A.4 plan's anticipated fallback](../../../.claude/plans/phase-a4-predicate-image.md#proof-by-fire-target-validation-contract):
+the gap is **measured**, not unknown.
+
+**Next-step options** (deferred to the A.4b follow-up plan):
+1. **Lift the bit-blast cap** to absorb the `$anyseq` cells —
+   impractical at 2^56 explicit states.
+2. **Compose-and-decompose** (Phase 3 of the BTOR2 roadmap) to split
+   the design and verify pieces under the cap.
+3. **Phase B (IC3-IA)** — implicit predicate abstraction inside an IC3
+   prover doesn't materialise the state space, so the bit-blast cap
+   doesn't apply.
+4. **Sidecar-side workaround**: use the default `-zero` synthesis but
+   author a sidecar that explicitly declares the bug-bearing branches
+   via `predicates {}` blocks the mu-calculus formula references
+   directly. Cheap but model-specific.
+
+The end-to-end "first auto-extracted real-upstream-bug finding" claim
+in [proof-by-fire-findings.md](../../../docs/design/proof-by-fire-findings.md)
+remains **partially open** — see the Phase A.4 update there for the
+full record.
+
 ## Status
 
 > **Source of truth:** [`validate.sh`](validate.sh) (asserts state-count
