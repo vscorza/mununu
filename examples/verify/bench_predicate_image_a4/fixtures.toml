@@ -212,15 +212,18 @@ adapter = "btor2"
 category = "adversarial"
 bug = false
 note = """
-3-bit register with two `bad` lines that fire at {0b001, 0b110} —
-non-contiguous predicate witnesses chosen so the syntactic seed
-extractor sees both constants but the predicate-image must verify
-they are both reachable. The constraint relation only permits even
-parity transitions so 0b110 is reachable but 0b001 is not (under the
-constraint).
+3-bit register `s` with two `bad` lines at encodings {0b001, 0b110}
+— non-contiguous predicate witnesses. The transition relation
+admits any even-parity step. Single-step reachability from *any*
+current state is what the brute-force enumerator measures, so the
+baseline lists every encoding reachable in one step.
+
+Under single-step semantics: from any current state `c`, the
+encoder can take `step = 0` (stay) or `step = 1` (jump by +6),
+landing at `c` or `c + 6 mod 8`. Every encoding 0..7 is reachable
+from *some* current state. The "1 is unreachable from init" claim
+is a *multi-step* property that the brute-force enumerator does
+not assert (see all_smt.rs SOUNDNESS docs).
 """
 [fixture.significant_values_expected]
-state = [0, 6]
-# 1 is a syntactic-seed candidate (appears in the bad line) but is
-# NOT reachable due to the parity constraint; the predicate-image
-# must NOT surface it. This is the negative-soundness assertion.
+s = [0, 1, 2, 3, 4, 5, 6, 7]
