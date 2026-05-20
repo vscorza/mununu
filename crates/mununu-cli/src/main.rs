@@ -98,6 +98,42 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+    /// BTOR2-direct analysis tools (Phase A.4 predicate-image discovery).
+    Btor2 {
+        #[command(subcommand)]
+        command: Box<Btor2Command>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum Btor2Command {
+    /// Run SMT predicate-image discovery on a BTOR2 file.
+    ///
+    /// For each user-named state cell, enumerate the values reachable
+    /// in one transition step under any current state + input
+    /// combination. Writes the resulting `discovered_values` map to
+    /// the path-adjacent `<stem>.mununu.json` (or `--output` if
+    /// provided), so the existing BTOR2 bit-blast / sidecar resolver
+    /// pipeline picks the abstraction up without further wiring.
+    ///
+    /// See `docs/design/auto-extraction-architecture.md` §2 Stage 4
+    /// for the soundness contract.
+    Discover(Btor2DiscoverArgs),
+}
+
+#[derive(Args, Debug)]
+struct Btor2DiscoverArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// Where to write the updated sidecar. Defaults to
+    /// `<stem>.mununu.json` next to the BTOR2 input.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Maximum number of distinct values to enumerate per state cell.
+    /// Default matches `ImageOptions::default().cap_edges = 4096`.
+    #[arg(long, default_value_t = 4096)]
+    cap_edges: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1298,7 +1334,124 @@ fn dispatch(command: Commands) -> Result<(), String> {
                 .map_err(|e| format!("Server error: {}", e))?;
             Ok(())
         }
+        Commands::Btor2 { command } => handle_btor2(*command),
     }
+}
+
+fn handle_btor2(command: Btor2Command) -> Result<(), String> {
+    match command {
+        Btor2Command::Discover(args) => btor2_discover(args),
+    }
+}
+
+fn btor2_discover(args: Btor2DiscoverArgs) -> Result<(), String> {
+    use mununu_core::adapter::sidecar::predicate_image::{
+        ImageOptions, all_smt::discover_values_for_btor2_file,
+    };
+    use mununu_core::adapter::systemverilog::annotation::{
+        DiscoveredValues, SvAnnotation, merge_discovered_values,
+    };
+
+    if !args.file.exists() {
+        return Err(format!(
+            "BTOR2 input file does not exist: {}",
+            args.file.display()
+        ));
+    }
+    let src = fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
+    let file = mununu_core::adapter::btor2::parser::parse(&src)
+        .map_err(|e| format!("BTOR2 parse error in '{}': {e}", args.file.display()))?;
+
+    let opts = ImageOptions {
+        cap_edges: args.cap_edges,
+        ..ImageOptions::default()
+    };
+
+    eprintln!(
+        "Running predicate-image discovery on {} (cap_edges={})...",
+        args.file.display(),
+        args.cap_edges
+    );
+    let results = discover_values_for_btor2_file(&file, &opts)
+        .map_err(|e| format!("predicate-image discovery failed: {e}"))?;
+
+    if results.is_empty() {
+        eprintln!("No discovered values for any state cell.");
+    } else {
+        for (signal, discovered) in &results {
+            eprintln!("  {} — {} value(s):", signal, discovered.values.len());
+            for v in &discovered.values {
+                let from = v.from.as_deref().unwrap_or("predicate-image");
+                eprintln!("    {} = {} ({})", v.name, v.value, from);
+            }
+        }
+    }
+
+    // Resolve the output sidecar path: explicit `--output`, or
+    // `<stem>.mununu.json` next to the input.
+    let sidecar_path = match &args.output {
+        Some(p) => p.clone(),
+        None => {
+            let stem = args
+                .file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| {
+                    format!("Cannot derive sidecar stem from '{}'", args.file.display())
+                })?;
+            args.file.with_file_name(format!("{stem}.mununu.json"))
+        }
+    };
+
+    // Load existing sidecar if present, else start from a minimal
+    // annotation shape. Either way we merge in the discovered values.
+    let mut annotation: SvAnnotation = if sidecar_path.exists() {
+        let body = fs::read_to_string(&sidecar_path).map_err(|e| {
+            format!(
+                "Failed to read existing sidecar '{}': {e}",
+                sidecar_path.display()
+            )
+        })?;
+        serde_json::from_str(&body).map_err(|e| {
+            format!(
+                "Failed to parse existing sidecar '{}': {e}",
+                sidecar_path.display()
+            )
+        })?
+    } else {
+        SvAnnotation {
+            schema: Some("mununu_sv_annotation_v1".to_string()),
+            module: args
+                .file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("design")
+                .to_string(),
+            source: args
+                .file
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string()),
+            signals: Vec::new(),
+            inputs: Vec::new(),
+            controllable: Vec::new(),
+            properties: Vec::new(),
+            discovered_values: std::collections::HashMap::new(),
+            parameters: std::collections::HashMap::new(),
+        }
+    };
+
+    let results_typed: std::collections::HashMap<String, DiscoveredValues> = results;
+    merge_discovered_values(&mut annotation.discovered_values, results_typed);
+
+    let json = serde_json::to_string_pretty(&annotation)
+        .map_err(|e| format!("Failed to serialise updated sidecar: {e}"))?;
+    fs::write(&sidecar_path, json)
+        .map_err(|e| format!("Failed to write sidecar '{}': {e}", sidecar_path.display()))?;
+    eprintln!("Updated sidecar: {}", sidecar_path.display());
+
+    Ok(())
 }
 
 fn handle_context(command: ContextCommand) -> Result<(), String> {
