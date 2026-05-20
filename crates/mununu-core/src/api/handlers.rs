@@ -1412,75 +1412,51 @@ pub async fn sv_init_handler(
 pub async fn sv_discover_handler(
     Json(request): Json<SvDiscoverRequest>,
 ) -> ApiResult<Json<SvDiscoverResponse>> {
-    // Check if SMT feature is available
-    if !cfg!(feature = "smt") {
-        return Ok(Json(SvDiscoverResponse {
-            success: false,
-            sidecar: request.sidecar.clone(),
-            discoveries: vec![],
-            smt_available: false,
-            warnings: vec![
-                "SMT discovery not available: mununu was built without the 'smt' feature. \
-                 Rebuild with `cargo build --features smt` to enable Z3-based value discovery."
-                    .to_string(),
-            ],
-        }));
-    }
-
     // Parse the SV source
     use crate::adapter::systemverilog::parser;
-    let _module = parser::parse(&request.source.content).map_err(|e| ApiError::BadRequest {
+    let module = parser::parse(&request.source.content).map_err(|e| ApiError::BadRequest {
         message: format!("SV parse error: {e}"),
         details: None,
     })?;
 
     // Parse the sidecar
-    use crate::adapter::systemverilog::annotation::SvAnnotation;
-    let _sidecar: SvAnnotation =
+    use crate::adapter::systemverilog::annotation::{SvAnnotation, merge_discovered_values};
+    use crate::adapter::systemverilog::kripke_smt::engine;
+
+    let mut sidecar: SvAnnotation =
         serde_json::from_str(&request.sidecar).map_err(|e| ApiError::BadRequest {
             message: format!("Failed to parse sidecar JSON: {e}"),
             details: None,
         })?;
 
-    // Run SMT discovery (only when feature is enabled)
-    #[cfg(feature = "smt")]
-    {
-        use crate::adapter::systemverilog::annotation::merge_discovered_values;
-        use crate::adapter::systemverilog::kripke_smt::engine;
+    let results = engine::discover_significant_values(&module, &sidecar);
 
-        let mut sidecar = _sidecar;
-        let results = engine::discover_significant_values(&_module, &sidecar);
+    let discoveries: Vec<SvDiscoveryResult> = results
+        .iter()
+        .map(|(signal, dv)| SvDiscoveryResult {
+            signal: signal.clone(),
+            values_found: dv.values.len(),
+        })
+        .collect();
 
-        let discoveries: Vec<SvDiscoveryResult> = results
-            .iter()
-            .map(|(signal, dv)| SvDiscoveryResult {
-                signal: signal.clone(),
-                values_found: dv.values.len(),
-            })
-            .collect();
+    merge_discovered_values(&mut sidecar.discovered_values, results);
 
-        merge_discovered_values(&mut sidecar.discovered_values, results);
+    let updated_sidecar =
+        serde_json::to_string_pretty(&sidecar).map_err(|e| ApiError::Internal {
+            message: format!("Failed to serialize updated sidecar: {e}"),
+            source: None,
+        })?;
 
-        let updated_sidecar =
-            serde_json::to_string_pretty(&sidecar).map_err(|e| ApiError::Internal {
-                message: format!("Failed to serialize updated sidecar: {e}"),
-                source: None,
-            })?;
-
-        Ok(Json(SvDiscoverResponse {
-            success: true,
-            sidecar: updated_sidecar,
-            discoveries,
-            smt_available: true,
-            warnings: vec![],
-        }))
-    }
-
-    #[cfg(not(feature = "smt"))]
-    {
-        // Stub when smt feature is disabled.
-        unreachable!()
-    }
+    Ok(Json(SvDiscoverResponse {
+        success: true,
+        sidecar: updated_sidecar,
+        discoveries,
+        // Field retained for API back-compat — Z3 is always available
+        // now, so this is always `true`. A breaking removal of the
+        // field is deferred to a future API revision.
+        smt_available: true,
+        warnings: vec![],
+    }))
 }
 
 /// Validate an extraction spec against source code.

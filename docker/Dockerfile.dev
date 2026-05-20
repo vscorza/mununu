@@ -35,13 +35,16 @@
 ARG RUST_VERSION=1.95
 FROM rust:${RUST_VERSION}-slim-bookworm
 
-# Native deps required to build mununu's tree-sitter grammars and OpenSSL
-# bindings. `python3` is used by helper scripts in scripts/. Single
-# layer, --no-install-recommends, lists cleaned in the same RUN.
+# Native deps required to build mununu's tree-sitter grammars + OpenSSL
+# bindings + Z3 (mandatory since Phase A.4 step 4.2 — see
+# `crates/mununu-core/Cargo.toml`). `python3` is used by helper scripts
+# in scripts/. Single layer, --no-install-recommends, lists cleaned in
+# the same RUN.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         libssl-dev \
+        libz3-dev \
         cmake \
         git \
         curl \

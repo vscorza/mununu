@@ -1,0 +1,20 @@
+; cap_overflow.btor — Phase A.4 adversarial: 8-bit counter saturates at 200.
+;
+; State `cnt[7:0]` increments by 1 each step. `bad iff cnt == 200`.
+; Exercises the predicate-image cap (`MAX_VALUES_PER_SIGNAL`) and the
+; Bryant-Kroening under-approximation fallback when Z3 saturates.
+;
+; Expected discovered values (per fixtures.toml): {0,1,2,3,4,5,6,7,8,100,199,200}.
+1 sort bitvec 8
+2 sort bitvec 1
+3 zero 1
+4 one 1
+5 state 1 cnt
+6 init 1 5 3
+7 const 1 11001000
+8 eq 2 5 7
+9 ult 2 5 7
+10 add 1 5 4
+11 ite 1 9 10 5
+12 next 1 5 11
+13 bad 8

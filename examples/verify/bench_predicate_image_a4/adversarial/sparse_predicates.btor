@@ -1,0 +1,26 @@
+; sparse_predicates.btor — Phase A.4 adversarial: predicate-image must
+; *not* surface syntactically-attractive constants that are unreachable
+; under the design's constraint relation.
+;
+; State `s[2:0]` cycled by even-parity transitions only. Two bad signals
+; trigger at s == 0b001 and s == 0b110 respectively. The syntactic
+; seed extractor sees both constants in `bad` operands, but only 0b110
+; is reachable from init (0b000) via parity-preserving steps. The
+; predicate-image must surface {0, 6} as discovered and reject 1.
+1 sort bitvec 3
+2 sort bitvec 1
+3 zero 1
+4 state 1 s
+5 init 1 4 3
+6 input 2 step
+7 one 1
+8 const 1 110          ; 6 in binary
+9 add 1 4 8            ; s + 6 (even-parity-preserving offset)
+10 ite 1 6 9 4         ; step ? s+6 : s
+11 next 1 4 10
+12 const 1 001         ; 1 — would-be-bad encoding
+13 const 1 110         ; 6 — actually-reachable-bad encoding
+14 eq 2 4 12
+15 eq 2 4 13
+16 bad 14              ; never reachable under the parity constraint
+17 bad 15              ; reachable
