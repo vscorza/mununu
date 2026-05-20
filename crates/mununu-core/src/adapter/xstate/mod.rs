@@ -67,6 +67,7 @@ impl FormatAdapter for XStateAdapter {
             },
             state_valuations: Default::default(),
             transition_observations: Default::default(),
+            partition_summary: None,
         })
     }
 }

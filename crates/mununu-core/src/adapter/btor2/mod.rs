@@ -21,6 +21,7 @@
 
 pub mod ast;
 pub mod bit_blast;
+pub mod dep_graph;
 pub mod parser;
 
 use super::{AdapterError, AdapterOptions, AdapterOutput, FormatAdapter};

@@ -29,14 +29,22 @@ A verification project is the tuple `(Sources, AlphabetBinding, Composition, Pro
 
 ```text
 verify.toml --> parse + validate
-              \--> for each source: dispatch_adapter -> AdapterOutput.ctxdsl
-                                  \--> apply_renamings (binding-driven)
-                                  \--> for sv-rtl + register_map binding:
-                                           apply derive_sv_renamings_from_register_map
+              \--> for each source: dispatch_adapter
+                       \--> adapter::partition::classify         (Phase A.3 — auto-COI)
+                                  \--> Dropped signals → Ignored when no sidecar override
+                                  \--> AdapterOutput.partition_summary captures the counts
+                       \--> AdapterOutput.ctxdsl (+ state_valuations side-channel)
+                       \--> apply_renamings (binding-driven)
+                       \--> for sv-rtl + register_map binding:
+                                apply derive_sv_renamings_from_register_map
               \--> assemble_unified_ctxdsl (N source bodies into one context)
               \--> parse + realize
+                       \--> environment_for(automaton) wires CLTS state_valuations
+                                into Environment::abstract_states when numeric (Phase A.3)
               \--> for each property: resolve template, evaluate via mu_calculus
-              \--> VerifyReport
+                       \--> on-demand `signal == const` atoms resolve through
+                            abstract_states + state-valuation binding (Phase A.3)
+              \--> VerifyReport (includes per-source partition_summary)
 ```
 
 ## `verify.toml` schema
@@ -85,6 +93,37 @@ name = "init_reachable"
 formula = "mu X. (Init || <> X)"
 over = "System"
 ```
+
+## Automatic partition (Phase A.3)
+
+> **Source of truth:** [`adapter::partition::classify`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
+
+SV (`sv-rtl`) and BTOR2 sources run an **automatic cone-of-influence
+pass** during their `dispatch_adapter` translation. The pass walks the
+frontend IR's dependency graph from property atoms and marks signals
+outside the cone as `AbstractionType::Ignored`. The composition rule
+with the sidecar:
+
+- A signal explicitly listed in the `.mununu.json`'s `signals[]` /
+  `inputs[]` always wins — the auto-partition never overrides a user
+  declaration.
+- A signal *absent* from the sidecar gets the partition's verdict.
+  Most often `Kept` (in-cone); when `Dropped`, the bit-blaster pins
+  the signal to a single value and emits an `AdapterWarning`.
+
+The per-source `partition_summary` field on `VerifyReport.sources[*]`
+carries the counts (kept / dropped / total) and bit-widths
+(`state_bits_before` / `state_bits_after` on BTOR2) so users can read
+the COI's reduction effect directly out of the report JSON.
+
+Datapath UF substitution (combinational arithmetic collapsed to
+uninterpreted functions per Andraus–Sakallah Reveal 2008) is reserved
+for a follow-up; the `Datapath { uf_symbol }` variant on
+`PartitionClass` is currently never produced.
+
+See also:
+[`docs/abstraction.md` §"Automatic cone-of-influence"](../docs/abstraction.md#automatic-cone-of-influence-phase-a3)
+for the user-facing guidance.
 
 ## Report shape
 

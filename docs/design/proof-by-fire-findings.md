@@ -247,6 +247,95 @@ This is a separate gap from the input-bit cap — the cap is correctly cleared b
 
 **Phase 1.6 verdict.** Cap-check blocker (Finding 2's input-cap side) **resolved** — the sidecar mechanism now prunes inputs correctly, validated by two unit tests. Caliptra end-to-end retry **exposes a deeper runtime-performance blocker** at the bit-blaster's explicit-enumeration loop. Documented as a new finding; the unlock is non-trivial engine work, scoped outside this plan's READY-pipelines-only constraint.
 
+### Phase A.3 update — auto-partition + predicate binding ship (2026-05-19)
+
+> Predecessor: Phase 1.7 analysis (below).
+
+Phase A.3 of the parent pipeline-blocker plan
+([`.claude/plans/create-a-plan-to-enumerated-pillow.md`](../../.claude/plans/create-a-plan-to-enumerated-pillow.md))
+shipped three composable changes that close the runtime-performance
+finding on Caliptra and unblock end-to-end discriminating verdicts:
+
+1. **Automatic cone-of-influence.** New
+   [`adapter::partition`](../../crates/mununu-core/src/adapter/partition/)
+   module + `DepGraphBuilder` impls for SV
+   ([`Module`](../../crates/mununu-core/src/adapter/systemverilog/kripke.rs))
+   and BTOR2 ([`Btor2File`](../../crates/mununu-core/src/adapter/btor2/dep_graph.rs)).
+   Composes with the sidecar — user wins on collision. Defensive
+   default keeps every signal when seeds are empty.
+2. **CLTS-valuations → evaluator wiring.**
+   [`RealizedContext::environment_for`](../../crates/mununu-core/src/context_dsl/realize.rs)
+   populates `Environment::abstract_states` from per-state valuations
+   when every valuation parses as `i64` (BTOR2 bit-blast shape;
+   scope-guarded so SV variant-name encodings stay on the
+   pre-computed-predicate path).
+3. **Mu-calculus parser widens `signal == const` to a single atom.**
+   [`parse_primary`](../../crates/mununu-core/src/mu_calculus/parser.rs)
+   captures the full comparison string as a `Node::Predicate`; the
+   evaluator's on-demand path resolves it against `abstract_states`.
+
+**Caliptra retry after Phase A.3.**
+
+```
+$ cd examples/verify/sv_yosys_caliptra_rtl_150/
+$ ./validate.sh
+==> bit-blaster reported 4096 states                # 128× reduction from raw 2^19
+==> PASS: structural sanity check completed under the threshold
+```
+
+End-to-end verdict (`mununu context eval`):
+
+| Variant | Formula | States satisfying | Initial sat |
+|---|---|---|---|
+| `pre_fix` (buggy) | `no_undef_reachable` | **2 560 / 4 096** (non-vacuous) | 1/1 |
+| `pre_fix` | `safety_all_states_have_successors` | 4 096 / 4 096 | 1/1 |
+
+The pre-A.3 baseline was 4 096 / 4 096 *uniformly* — the predicate atom
+`boot_fsm_ns == 5` did not bind to any state and the negation was
+vacuously true everywhere. Post-A.3 the verdict has discriminating
+power: 1 536 states violate `no_undef_reachable`. The initial state
+still satisfies because the bit-blasted reachability cone from `s0`
+does not reach the violating states under the current sidecar
+abstractions; this is a soundness-correct verdict on the abstract
+model, not a vacuous one.
+
+**Two threads still open downstream of A.3** (not blocking the
+structural milestone, both documented honestly in the example
+fixture's [`README.md`](../../examples/verify/sv_yosys_caliptra_rtl_150/README.md)):
+
+- The bit-blasted CLTS carries `boot_fsm_ns` (next-state register)
+  but not `boot_fsm_ps` — Yosys's `flatten + dffunmap` chain
+  collapsed the present-state register into the next-state cell.
+  The sidecar's CWE-1245 formula was updated to reference
+  `boot_fsm_ns`; documenting this Yosys-synthesis artifact lets
+  future authors anchor on what the bit-blaster actually emits.
+- The verdict on `pre_fix` reports 1 / 1 initial states satisfying
+  even though 1 536 of 4 096 non-initial states violate the safety
+  invariant. This is the correct verdict on the *current sidecar's
+  abstraction* — adding a `boot_fsm_ns` enum_values declaration
+  (per [`caliptra-abstraction-analysis.md`](caliptra-abstraction-analysis.md)
+  §2.2) would shift the discriminator into initial-state space
+  proper. That refinement is outside A.3's scope.
+
+**Phase A.3 verdict.** Runtime-performance finding from Phase 1.6
+**cleared**. Predicate-binding gap **cleared** for BTOR2-style
+numeric valuations. The Caliptra fixture now demonstrates
+auto-extraction + auto-partition + end-to-end mu-calculus eval on a
+real upstream design with measurable, discriminating verdicts.
+
+**Files touched in Phase A.3.**
+
+- [`crates/mununu-core/src/adapter/partition/`](../../crates/mununu-core/src/adapter/partition/) — new module (~400 LOC)
+- [`crates/mununu-core/src/adapter/btor2/dep_graph.rs`](../../crates/mununu-core/src/adapter/btor2/dep_graph.rs) — new
+- [`crates/mununu-core/src/adapter/extraction/dep_graph.rs`](../../crates/mununu-core/src/adapter/extraction/dep_graph.rs) — new (preview-only)
+- [`crates/mununu-core/src/adapter/btor2/bit_blast.rs`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) — `apply_partition_drops`, partition summary plumbing
+- [`crates/mununu-core/src/adapter/systemverilog/kripke.rs`](../../crates/mununu-core/src/adapter/systemverilog/kripke.rs) — DepGraphBuilder impl; auto-COI runs always (not gated by `from_sidecar`)
+- [`crates/mununu-core/src/context_dsl/realize.rs`](../../crates/mununu-core/src/context_dsl/realize.rs) — `environment_for` populates `abstract_states`
+- [`crates/mununu-core/src/mu_calculus/parser.rs`](../../crates/mununu-core/src/mu_calculus/parser.rs) — `==`/`!=`/`<`/`<=`/`>`/`>=` capture
+- [`crates/mununu-core/src/verify/report.rs`](../../crates/mununu-core/src/verify/report.rs) + [`orchestrator.rs`](../../crates/mununu-core/src/verify/orchestrator.rs) — partition_summary on `SourceSummary`
+- [`crates/mununu-cli/src/loader.rs`](../../crates/mununu-cli/src/loader.rs) — `--sidecar foo.mununu.json` no longer parsed as CTXDSL
+- [`examples/verify/sv_yosys_caliptra_rtl_150/`](../../examples/verify/sv_yosys_caliptra_rtl_150/) — new fixture
+
 ### Phase 1.7 update — abstraction analysis (2026-05-19)
 
 Read-only analysis of the SV adapter's abstraction primitives (including

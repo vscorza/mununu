@@ -111,13 +111,29 @@ struct BlastOutput {
     automaton: AutomatonSpec,
     signals: Vec<Signal>,
     properties: Vec<PropertySpec>,
+    /// Phase A.3 step 3.6 — auto-partition telemetry populated by
+    /// `enumerate_and_blast` after the COI pass runs. `None` when
+    /// the partition step was skipped (empty seeds, or a future
+    /// `--no-partition` opt-out).
+    partition_summary: Option<crate::adapter::partition::PartitionSummary>,
 }
 
 /// Top-level entry: convert a parsed BTOR2 file + options to an AdapterIR.
+///
+/// Returns a tuple of (IR, warnings, partition_summary). The third
+/// element is `Some` whenever `enumerate_and_blast` ran the auto-COI
+/// pass; the BTOR2 adapter forwards it onto `AdapterOutput`.
 pub fn to_ir(
     file: &Btor2File,
     options: &AdapterOptions,
-) -> Result<(AdapterIR, Vec<AdapterWarning>), AdapterError> {
+) -> Result<
+    (
+        AdapterIR,
+        Vec<AdapterWarning>,
+        Option<crate::adapter::partition::PartitionSummary>,
+    ),
+    AdapterError,
+> {
     let mut warnings = Vec::new();
 
     // Reject unsupported operators up-front so users get a clear error
@@ -201,6 +217,7 @@ pub fn to_ir(
             controller: None,
         },
         warnings,
+        blasted.partition_summary,
     ))
 }
 
@@ -325,12 +342,45 @@ fn enumerate_and_blast(
         });
     }
 
+    // Phase A.3 step 3.5 — automatic partition (live).
+    //
+    // Compute the partition from the BTOR2 dep-graph and the seed set
+    // extracted from intrinsic `bad` / `constraint` / `justice` / `fair`
+    // lines. The injection into `cell_domains` / `input_domains` happens
+    // **after** the sidecar resolver runs (below), so the user-wins-on-
+    // collision rule is enforced naturally — anything the user listed
+    // appears as a key in those maps; anything they didn't list is
+    // absent, and the partition's `Dropped` verdict is what fills the
+    // gap.
+    //
+    // SOUNDNESS: see `crate::adapter::partition` module docs. Auto-COI
+    // pins a `Dropped` signal to a single value via
+    // `AbstractionType::Ignored`; the abstract model admits more
+    // behaviours than the concrete one (sound for safety + over-
+    // approximation).
+    let partition = {
+        use crate::adapter::partition::{self, PartitionOptions};
+        let seeds = super::dep_graph::extract_property_seeds(file);
+        partition::classify(file, &seeds, &PartitionOptions::default())
+    };
+
     // Phase 1 sub-deliverable 2: when the caller passes a `.mununu.json`
     // sidecar, load it and resolve each named state cell to a
     // [`FieldDomain`]. Cells with a sidecar entry get bounded per the
     // declared abstraction (BoundedCounter, EnumValues, …); cells
     // without an entry fall back to full bit-blast over their width.
-    let cell_domains = build_cell_domains(&state_meta, &symbols, options, warnings)?;
+    let mut cell_domains = build_cell_domains(&state_meta, &symbols, options, warnings)?;
+    // Phase A.3 step 3.5 — apply partition to state cells. Each NID
+    // not already keyed in `cell_domains` (i.e. not user-listed in the
+    // sidecar) AND classified `Dropped` by the partition gets pinned
+    // to `AbstractionType::Ignored` here.
+    apply_partition_drops(
+        &mut cell_domains,
+        state_meta.iter().map(|m| (m.nid, m.symbol.as_str())),
+        &partition,
+        warnings,
+        "state cell",
+    );
     let cells = CellEnumeration::build(&state_meta, &cell_domains);
 
     // Phase 1.6: per-input sidecar resolution. The sidecar already
@@ -341,7 +391,21 @@ fn enumerate_and_blast(
     // an input declared `Ignored` / `Boolean` / `EnumValues` / etc.
     // collapses to a 1-of-N value list and the enumerator sees only
     // the meaningful combinations.
-    let input_domains = build_input_domains(&input_meta, &symbols, options, warnings)?;
+    let mut input_domains = build_input_domains(&input_meta, &symbols, options, warnings)?;
+    // Clock inputs are auto-pinned by the bit-blaster regardless; the
+    // partition's Dropped classification on a clock would be redundant
+    // but harmless. We filter clocks out here only to avoid an
+    // unnecessary "auto-COI dropped 'clk'" warning.
+    apply_partition_drops(
+        &mut input_domains,
+        input_meta
+            .iter()
+            .filter(|m| !m.is_clock)
+            .map(|m| (m.nid, m.symbol.as_str())),
+        &partition,
+        warnings,
+        "input port",
+    );
     let input_cells = InputCellEnumeration::build(&input_meta, &input_domains);
 
     // Effective input-bit cap. The previous cap (`MAX_INPUT_BITS`)
@@ -526,10 +590,29 @@ fn enumerate_and_blast(
     // carry hand-authored property formulas alongside abstractions.
     properties.extend(sidecar_properties(options));
 
+    // Phase A.3 step 3.6 — partition summary. Pair the partition's
+    // per-signal classification with the bit-blaster's known widths
+    // so the user can read `state_bits_before` / `state_bits_after`
+    // as observable evidence of COI's reduction effect.
+    let widths: std::collections::HashMap<String, usize> = state_meta
+        .iter()
+        .map(|m| (m.symbol.clone(), m.width as usize))
+        .chain(
+            input_meta
+                .iter()
+                .map(|m| (m.symbol.clone(), m.width as usize)),
+        )
+        .collect();
+    let partition_summary = Some(crate::adapter::partition::PartitionSummary::from_partition(
+        &partition,
+        Some(&widths),
+    ));
+
     Ok(BlastOutput {
         signals,
         properties,
         automaton,
+        partition_summary,
     })
 }
 
@@ -862,6 +945,70 @@ fn build_cell_domains(
             &state_symbols,
         ),
     )
+}
+
+/// Phase A.3 step 3.5 — inject `AbstractionType::Ignored` for signals
+/// the partition classified `Dropped` *and* the user did not list in
+/// the sidecar.
+///
+/// User-listed signals are identified by membership of their NID in
+/// `domains` (the sidecar resolver only inserts entries for names that
+/// appear in the sidecar's `signals[]` / `inputs[]` arrays). The
+/// partition's verdict is keyed by symbol; we look up the symbol for
+/// each NID via `iter` and skip anonymous signals (no symbol available).
+///
+/// SOUNDNESS: see `crate::adapter::partition` module docs. The injected
+/// `Ignored` domain pins the signal to its initial value; the abstract
+/// model thereby admits more behaviours than the concrete model — sound
+/// for safety + over-approximation.
+fn apply_partition_drops<'a>(
+    domains: &mut CellDomainMap,
+    iter: impl Iterator<Item = (i64, &'a str)>,
+    partition: &crate::adapter::partition::Partition,
+    warnings: &mut Vec<AdapterWarning>,
+    kind: &str,
+) {
+    use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
+    use crate::adapter::partition::PartitionClass;
+
+    for (nid, symbol) in iter {
+        // User wins: an entry already keyed by NID in `domains` means
+        // the sidecar listed this signal — trust the user.
+        if domains.contains_key(&nid) {
+            continue;
+        }
+        match partition.classes.get(symbol) {
+            Some(PartitionClass::Dropped { reason }) => {
+                warnings.push(AdapterWarning {
+                    kind: WarningKind::ApproximateTranslation,
+                    message: format!(
+                        "auto-partition: {kind} '{symbol}' dropped ({reason}); add an explicit sidecar entry to override"
+                    ),
+                    location: None,
+                });
+                domains.insert(
+                    nid,
+                    (
+                        FieldDomain {
+                            name: symbol.to_string(),
+                            abstraction: AbstractionType::Ignored,
+                            bound: None,
+                            lower_bound: None,
+                            variants: None,
+                            initial: AbstractValue::Counter(0),
+                        },
+                        Vec::new(),
+                    ),
+                );
+            }
+            _ => {
+                // Kept (or absent for symbols outside the partition's
+                // signal universe — clocks, anonymous synthesisers).
+                // Leave `domains` untouched; the existing fall-through
+                // (full bit-blast) applies.
+            }
+        }
+    }
 }
 
 /// Recognize clock signals by name (case-insensitive). Single-clock
@@ -1730,7 +1877,7 @@ fn sign_extend(bits: u128, width: u32) -> i128 {
 /// High-level entry: parse + bit-blast + emit.
 pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutput, AdapterError> {
     let file = super::parser::parse(content)?;
-    let (ir, warnings) = to_ir(&file, options)?;
+    let (ir, warnings, partition_summary) = to_ir(&file, options)?;
 
     let state_count = ir.automata.first().map(|a| a.states.len()).unwrap_or(0);
     let signal_count = ir.signals.len();
@@ -1775,6 +1922,7 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
         },
         state_valuations,
         transition_observations: Default::default(),
+        partition_summary,
     })
 }
 
@@ -1921,8 +2069,67 @@ mod tests {
     }
 
     #[test]
+    fn partition_summary_populated_on_adapter_output() {
+        // Phase A.3 step 3.6 — BTOR2 adapter populates
+        // `AdapterOutput.partition_summary` with the right counts and
+        // bit-width totals.
+        //
+        // Fixture: one named state `s_keep` reachable from a `bad` line
+        // (Kept), one named state `s_drop` not reachable (Dropped),
+        // and one named input `trigger` that drives `s_keep` (Kept by
+        // transitive walk). state_bits_before = 1+1 = 2, state_bits_after
+        // = 1 (after dropping s_drop's 1-bit width).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 input 1 trigger
+4 state 1 s_keep
+5 init 1 4 2
+6 next 1 4 3
+7 state 1 s_drop
+8 init 1 7 2
+9 next 1 7 2
+10 bad 4
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        let summary = out
+            .partition_summary
+            .expect("partition_summary must be populated");
+        assert!(
+            summary.dropped_coi >= 1,
+            "expected ≥ 1 dropped signal (s_drop); got {summary:?}"
+        );
+        assert!(
+            summary.kept >= 2,
+            "expected ≥ 2 kept signals; got {summary:?}"
+        );
+        assert_eq!(summary.datapath_uf, 0, "datapath UF disabled in A.3");
+        // Width tracking should be present for BTOR2.
+        let before = summary
+            .state_bits_before
+            .expect("BTOR2 always tracks widths");
+        let after = summary
+            .state_bits_after
+            .expect("BTOR2 always tracks widths");
+        assert!(
+            after <= before,
+            "state_bits_after ({after}) must not exceed state_bits_before ({before})"
+        );
+        assert!(
+            after < before,
+            "expected reduction from dropping s_drop; got before={before} after={after}"
+        );
+    }
+
+    #[test]
     fn constraint_filters_transitions() {
-        // input drives state; constraint = input must be 0.
+        // input drives state; constraint = input must be 0; bad line
+        // pinned to state `q` so auto-COI (Phase A.3) keeps `q` in the
+        // partition. Without that pin, COI would correctly drop `q`
+        // because no property atom referenced it — collapsing the
+        // test's state space below the count required to assert that
+        // *constraint* filtering takes effect.
+        //
         // Without constraint: 2 states × 2 inputs = 4 transitions.
         // With constraint:    2 states × 1 input  = 2 transitions.
         let src = r#"
@@ -1934,6 +2141,7 @@ mod tests {
 6 next 1 3 5
 7 not 1 5
 8 constraint 7
+9 bad 3
 "#;
         let out = translate(src, &AdapterOptions::default()).expect("translate");
         assert_eq!(out.source_info.state_count, 2);

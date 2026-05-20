@@ -59,6 +59,7 @@ impl FormatAdapter for TlsfAdapter {
             },
             state_valuations: Default::default(),
             transition_observations: Default::default(),
+            partition_summary: None,
         })
     }
 }

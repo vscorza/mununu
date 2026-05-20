@@ -238,10 +238,99 @@ impl<'a> Parser<'a> {
             if let Some(var_id) = self.lookup_binder(&identifier) {
                 return Ok(self.builder.push_node(Node::Variable(var_id)));
             }
+            // Phase A.3 follow-up — capture `signal == const`, `signal != const`,
+            // `signal < N`, `signal <= N`, `signal > N`, `signal >= N` as a single
+            // `Node::Predicate(full_expression)`. The evaluator's on-demand path
+            // (`evaluate_expression_on_demand`) parses the full string as a
+            // guard expression and evaluates it against per-state abstract values
+            // populated from the CLTS's `state_valuations` by `RealizedContext::environment_for`.
+            //
+            // Without this widening, `signal == 5` would parse as `Predicate("signal")`
+            // followed by garbage; the evaluator never sees the constant.
+            let mut full = identifier.clone();
+            self.skip_whitespace();
+            if let Some(op_str) = self.try_consume_comparison_op() {
+                full.push(' ');
+                full.push_str(op_str);
+                self.skip_whitespace();
+                if let Some(rhs) = self.parse_comparison_rhs() {
+                    full.push(' ');
+                    full.push_str(&rhs);
+                    return Ok(self.builder.push_node(Node::Predicate(full)));
+                }
+                // No valid RHS — fall back to predicate-only. The leading
+                // identifier already consumed; mark the formula as malformed.
+                return Err(self.error_here(ParseErrorKind::Expected("comparison rhs")));
+            }
             return Ok(self.builder.push_node(Node::Predicate(identifier)));
         }
 
         Err(self.error_here(ParseErrorKind::Expected("formula")))
+    }
+
+    /// Try to consume one of the comparison operators (`==`, `!=`, `<=`, `>=`,
+    /// `<`, `>`) and return its canonical text form. Returns `None` if the
+    /// next characters do not form a comparison operator.
+    fn try_consume_comparison_op(&mut self) -> Option<&'static str> {
+        let two = self
+            .input
+            .get(self.pos..self.pos.saturating_add(2))
+            .unwrap_or("");
+        let canonical = match two {
+            "==" => Some("=="),
+            "!=" => Some("!="),
+            "<=" => Some("<="),
+            ">=" => Some(">="),
+            _ => None,
+        };
+        if let Some(op) = canonical {
+            self.pos += op.len();
+            return Some(op);
+        }
+        let one = self.peek_char()?;
+        let single = match one {
+            '<' => Some("<"),
+            '>' => Some(">"),
+            _ => None,
+        };
+        if let Some(op) = single {
+            // Cheap reject of cases like `>` inside diamonds — the parser
+            // never reaches parse_primary with a leading identifier when the
+            // surrounding modality is being consumed, so it's safe to treat
+            // a bare `<` / `>` here as comparison.
+            self.consume_char();
+            return Some(op);
+        }
+        None
+    }
+
+    /// Parse the right-hand side of a comparison: an integer literal, a
+    /// boolean literal, or an identifier. Returns `None` if none of these
+    /// match.
+    fn parse_comparison_rhs(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        // Integer (possibly signed)
+        let start = self.pos;
+        if matches!(self.peek_char(), Some('-' | '+')) {
+            self.consume_char();
+        }
+        let mut has_digit = false;
+        while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
+            self.consume_char();
+            has_digit = true;
+        }
+        if has_digit {
+            return Some(self.input[start..self.pos].to_string());
+        }
+        // Reset (no number consumed) and try identifier or boolean literal.
+        self.pos = start;
+        if self.consume_keyword("true") {
+            return Some("true".to_string());
+        }
+        if self.consume_keyword("false") {
+            return Some("false".to_string());
+        }
+        self.parse_identifier()
     }
 
     /// Parses a modal guard up to the provided closing delimiter.

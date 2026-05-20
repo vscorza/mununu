@@ -32,6 +32,70 @@ Use this doc when:
 | Domain profiles | Bias AST extractor to one of `software` / `rtl` / `agentic` / `synthesis` / `universal` | `mununu-extract --domain`; `extraction/ast_extract/domain.rs` | Profile chooses defaults but does not enforce soundness — must be declared per-extraction | Shipped |
 | Mode filtering | One spec → multiple abstraction levels (e.g. `fixed` vs `vulnerable`) | `.espec.json` `mode` field | Per-mode posture declared inline | Shipped |
 
+## Automatic cone-of-influence (Phase A.3)
+
+> Source of truth: [`adapter/partition/mod.rs`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
+
+mununu's BTOR2 and SystemVerilog adapters now run an **automatic
+cone-of-influence pass** during translation. The pass walks the
+frontend IR's signal dependency graph from the seed atoms extracted
+from the property formulas (intrinsic `bad`/`constraint`/`justice`
+lines on BTOR2, atoms in `@mununu` property comments on SV), keeps
+every transitively-reachable state cell and input, and pins everything
+else to [`AbstractionType::Ignored`](../crates/mununu-core/src/adapter/domain.rs).
+
+**User wins on collision.** Auto-COI only acts on signals the sidecar
+does **not** mention. If a signal appears in
+`.mununu.json`'s `signals[]` or `inputs[]` with any explicit
+declaration, that declaration wins regardless of the auto-COI verdict.
+The two layers compose:
+
+1. The sidecar carries user-curated abstractions (`Boolean`,
+   `BoundedCounter`, `EnumValues`, `Ignored`, `Discover`).
+2. Auto-COI fills the gap for signals the user did not list, dropping
+   them to `Ignored` when they are outside the property's reach.
+
+**Soundness.** Cone-of-influence dropping is an over-approximation —
+the abstract model admits *more* behaviours than the concrete model
+(pinned signals are equivalent to havoc on their value). For safety
+properties this is sound; for liveness see the soundness summary at
+the bottom of this doc.
+
+**Defensive default for unbindable seeds.** If the adapter cannot
+extract any property atoms (e.g., a BTOR2 file whose `bad` line traces
+only through anonymous compiler-synthesised state cells), the
+partition keeps every signal rather than drop everything silently.
+This avoids accidental under-approximation when the property
+structure is opaque to the partition's syntactic scan.
+
+**Observability.** Every adapter populates
+[`AdapterOutput.partition_summary`](../crates/mununu-core/src/adapter/mod.rs)
+with the counts and bit-widths. The verify orchestrator threads this
+through `SourceSummary.partition_summary` in `VerifyReport`; CLI
+warnings surface each `Dropped` signal (`"auto-partition: state cell
+'X' dropped (outside-cone-of-influence); add an explicit sidecar entry
+to override"`).
+
+**Opt-out.** `PartitionOptions::disabled = true` returns every signal
+as `Kept` — useful for regression triage but not exposed on the CLI
+today.
+
+**Predicate binding for `signal == const` atoms.** Phase A.3 also
+wires per-state valuations from the BTOR2 bit-blaster into the
+mu-calculus evaluator's `Environment::abstract_states` channel and
+extends the parser to capture `signal == constant` (also `!=`, `<`,
+`<=`, `>`, `>=`) as a single predicate atom. Formulas of the shape
+`nu X. ((!(state == 5)) && [] X)` now discriminate over the model
+instead of returning vacuous verdicts. Scope-guarded to BTOR2-style
+numeric valuations to keep the SV adapter's variant-string predicate
+path unchanged.
+
+**Datapath UF substitution** (combinational arithmetic collapsed to
+uninterpreted functions) is reserved for the follow-up plan
+[`phase-a3-followup-datapath-uf.md`](../../.claude/plans/phase-a3-followup-datapath-uf.md);
+the `Datapath { uf_symbol }` variant is reserved in
+`PartitionClass` but never produced today.
+
 ## The rule of thumb for automated extraction vs hand-authoring
 
 > **Automated extraction is viable for a subsystem when the abstraction shape is** *uniform across instances* **and the source format carries enough structural information for an adapter to instantiate it mechanically.**

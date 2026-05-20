@@ -1,6 +1,18 @@
 # Caliptra-RTL #150 — Abstraction Analysis
 
-> **Status: analysis doc.** Phase 1.7 of the [pipeline-blocker plan](../../.claude/plans/create-a-plan-to-enumerated-patterson.md).
+> **Status: superseded by Phase A.3 (2026-05-19).** The runtime-performance
+> blocker this doc analyses was cleared by the auto-partition + predicate-
+> binding shipment documented in
+> [`proof-by-fire-findings.md`](proof-by-fire-findings.md#phase-a3-update--auto-partition--predicate-binding-ship-2026-05-19).
+> The runnable end-to-end fixture lives at
+> [`examples/verify/sv_yosys_caliptra_rtl_150/`](../../examples/verify/sv_yosys_caliptra_rtl_150/).
+> The §2.2 signal × abstraction matrix and §2.3 property catalog below
+> remain the canonical reference for *which* signals to keep / drop
+> and which mu-calculus properties to evaluate; only the §3 "Recommended
+> actions" list is now historical.
+>
+> Original status: analysis doc, Phase 1.7 of the
+> [pipeline-blocker plan](../../.claude/plans/create-a-plan-to-enumerated-patterson.md).
 > Read-only audit; the actions section recommends concrete next steps but
 > does not perform them. Companion to
 > [`proof-by-fire-findings.md`](proof-by-fire-findings.md) — this doc

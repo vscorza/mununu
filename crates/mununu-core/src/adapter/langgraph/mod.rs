@@ -83,6 +83,7 @@ impl FormatAdapter for LangGraphAdapter {
             sidecars: Vec::new(),
             state_valuations: Default::default(),
             transition_observations: Default::default(),
+            partition_summary: None,
         })
     }
 }

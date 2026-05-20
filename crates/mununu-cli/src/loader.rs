@@ -329,16 +329,40 @@ pub(crate) fn load_context_documents_mode(
     mode: Option<&str>,
     preprocessor: Option<&str>,
 ) -> Result<(ContextDoc, Vec<ContextDoc>, Option<String>), String> {
-    // Split sidecars: `.sv` / `.svh` go to the sv-yosys adapter as
-    // additional sources (multi-file SV elaboration); everything else is
-    // parsed as a regular CTXDSL sidecar document.
-    let (sv_sources, ctxdsl_sidecars): (Vec<PathBuf>, Vec<PathBuf>) =
-        sidecar_paths.iter().cloned().partition(|p| {
-            matches!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("sv") | Some("svh")
-            )
-        });
+    // Sidecar argument routing.
+    //
+    // - `.sv` / `.svh`: additional sources for the sv-yosys adapter
+    //   (multi-file SV elaboration).
+    // - `.mununu.json` (the abstraction sidecar): a no-op at the CLI
+    //   level. The adapter auto-loads the file from the primary
+    //   source's directory via path adjacency (see
+    //   [`load_btor_sidecar`]); the user-passed path is informational
+    //   and must not be parsed as a CTXDSL document.
+    // - everything else: a CTXDSL sidecar document.
+    let mut sv_sources: Vec<PathBuf> = Vec::new();
+    let mut ctxdsl_sidecars: Vec<PathBuf> = Vec::new();
+    let mut ignored_mununu_json: Vec<PathBuf> = Vec::new();
+    for p in sidecar_paths.iter().cloned() {
+        let ext = p.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("sv") | Some("svh")) {
+            sv_sources.push(p);
+        } else if p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with(".mununu.json"))
+        {
+            ignored_mununu_json.push(p);
+        } else {
+            ctxdsl_sidecars.push(p);
+        }
+    }
+    for p in &ignored_mununu_json {
+        eprintln!(
+            "note: --sidecar {} is auto-loaded by the adapter via path adjacency; \
+             the explicit flag is informational only",
+            p.display()
+        );
+    }
     let (context_doc, ctxdsl_text) =
         load_with_adapter_mode_extra(context_path, adapter, mode, &sv_sources, preprocessor)?;
     let mut sidecar_docs = Vec::with_capacity(ctxdsl_sidecars.len());
