@@ -1,0 +1,226 @@
+# Phase A.4 predicate-image discovery benchmark — fixture manifest.
+#
+# Each entry names a real or synthetic fixture against which the
+# `predicate_image` SMT enumeration is measured. `significant_values_expected`
+# is the hand-curated baseline the recall harness in step 4.3 compares
+# against; `recall = (discovered ∩ expected) / |expected|`.
+#
+# Conventions:
+# - `path`     : repo-relative path to the *primary* source file (SV / BTOR2).
+# - `adapter`  : adapter to use — "sv-yosys" or "btor2".
+# - `category` : "real-upstream-bug" | "synthetic-cwe" | "negative" | "external" | "adversarial".
+# - `bug`      : true if the fixture is expected to violate at least one of its
+#                declared properties; false for fix variants and negative cases.
+# - `significant_values_expected.<signal>` : list of integers we expect the
+#                predicate-image to discover for that signal.
+# - `note`     : human-readable description.
+#
+# This manifest is consumed by:
+# - The recall harness integration test (`crates/mununu-core/tests/predicate_image_recall.rs`)
+#   landing in step 4.3.
+# - The README in this directory.
+
+# ---------------------------------------------------------------------------
+# Group A — real upstream bugs (headline proof-by-fire)
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+id = "caliptra_pre_fix"
+path = "examples/verify/sv_yosys_caliptra_rtl_150/source/soc_ifc_boot_fsm_pre_fix.sv"
+adapter = "sv-yosys"
+category = "real-upstream-bug"
+bug = true
+note = """
+Upstream chipsalliance/caliptra-rtl#150 — `unique casez (boot_fsm_ps)`
+over a 3-bit state enum (5 defined arms; 3 unmatched encodings 5/6/7
+admitted as absorbing sinks under default-less casez). Property
+`no_undef_reachable` must flip from `Initial states satisfying: 1/1`
+(Phase A.3) to `0/1` (Phase A.4 done criterion).
+"""
+[fixture.significant_values_expected]
+boot_fsm_ns = [0, 1, 2, 3, 4, 5, 6, 7]
+
+[[fixture]]
+id = "caliptra_post_fix"
+path = "examples/verify/sv_yosys_caliptra_rtl_150/source/soc_ifc_boot_fsm_post_fix.sv"
+adapter = "sv-yosys"
+category = "real-upstream-bug"
+bug = false
+note = """
+Upstream-applied fix variant of caliptra-rtl#150. Discriminator pair —
+the predicate-image should still discover all 8 encodings (the
+abstraction does not eliminate the unreached states; the *reachability*
+from `s0` is what changes between variants). `no_undef_reachable`
+should report Initial-state SAT on this variant.
+"""
+[fixture.significant_values_expected]
+boot_fsm_ns = [0, 1, 2, 3, 4, 5, 6, 7]
+
+# ---------------------------------------------------------------------------
+# Group B — synthetic CWE patterns (in-tree)
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+id = "safety_demo_btor"
+path = "examples/btor2/safety_demo.btor"
+adapter = "btor2"
+category = "synthetic-cwe"
+bug = true
+note = """
+Smallest possible BTOR2 sanity case. 2-bit counter `cnt` with a
+`bad iff cnt == 3` property. Bit-blast space is 16 states.
+"""
+[fixture.significant_values_expected]
+cnt = [0, 1, 2, 3]
+
+[[fixture]]
+id = "cwe1245_fsm_bug"
+path = "examples/systemverilog/cwe1245_fsm_bug.sv"
+adapter = "sv-yosys"
+category = "synthetic-cwe"
+bug = true
+note = """
+Mini-Caliptra: 3-bit one-hot enum {IDLE=001, READING=010, WRITING=100}
+with no `default:` arm in the case statement. The unmatched encodings
+{0, 3, 5, 6, 7} (= 2^3 \\ enum) become absorbing sinks under
+default-less case.
+"""
+[fixture.significant_values_expected]
+state = [0, 1, 2, 3, 4, 5, 6, 7]
+
+[[fixture]]
+id = "cwe1260_addr_overlap_bug"
+path = "examples/systemverilog/cwe1260_addr_overlap_bug.sv"
+adapter = "sv-yosys"
+category = "synthetic-cwe"
+bug = true
+note = """
+2-bit state enum {IDLE=0, UART_ACCESS=1, AES_ACCESS=2} — encoding 3
+is unreachable in the enum but representable in the 2-bit register.
+CWE-1260 (address overlap) is the *property* under test; the
+predicate-image should still surface all 4 encoding values.
+"""
+[fixture.significant_values_expected]
+state = [0, 1, 2, 3]
+
+# ---------------------------------------------------------------------------
+# Group C — negative cases (in-tree; property should HOLD)
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+id = "handshake"
+path = "examples/systemverilog/handshake.sv"
+adapter = "sv-yosys"
+category = "negative"
+bug = false
+note = """
+2-bit state enum {IDLE=0, WAIT_ACK=1, ACTIVE=2, DONE=3} — fully
+populated 4-encoding state register. Property: `ack` is asserted iff
+`state == ACTIVE`. Negative case — predicate-image should discover
+the full set with no surprise encodings.
+"""
+[fixture.significant_values_expected]
+state = [0, 1, 2, 3]
+
+[[fixture]]
+id = "traffic_light"
+path = "examples/btor2/traffic_light.sv"
+adapter = "sv-yosys"
+category = "negative"
+bug = false
+note = """
+2-bit state enum {RED=0, GREEN=1, YELLOW=2}. Encoding 3 is
+representable but unreached by the always_ff cycle. Smoke test for
+the case where the predicate-image must NOT spuriously surface an
+unreachable value as discovered.
+"""
+[fixture.significant_values_expected]
+state = [0, 1, 2]
+
+[[fixture]]
+id = "fair_arbiter"
+path = "examples/btor2/fair_arbiter.sv"
+adapter = "sv-yosys"
+category = "negative"
+bug = false
+note = """
+Multi-requester arbiter. State register tracks the current grantee;
+`grant` outputs are derived combinationally. Liveness property
+(eventual grant) is the natural target; predicate-image discovers
+the grantee enum.
+"""
+[fixture.significant_values_expected]
+# Two-requester variant — grantee is a single bit (next-grantee
+# selection). Expected to discover both values; the recall harness
+# normalises across the requester-count parameter when applicable.
+state = [0, 1]
+
+# ---------------------------------------------------------------------------
+# Group D — external benchmark (Pono / makaimann)
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+id = "pono_arbitrated_top_n2_w2_d2"
+path = "examples/verify/bench_predicate_image_a4/external/arbitrated_top_n2_w2_d2_e0.btor2"
+adapter = "btor2"
+category = "external"
+bug = true
+fetch_url = "https://raw.githubusercontent.com/makaimann/btor-benchmarks/master/data-integrity/unsafe/btor2/arbitrated_top_n2_w2_d2_e0.btor2"
+note = """
+Smallest viable variant of the Pono data-integrity FIFO family (per
+docs/design/proof-by-fire-findings.md Finding 2). The `n2_w8_d8`
+variant cited in the original finding has 176 state bits — well above
+mununu's `MAX_STATE_BITS=20` cap. The `n2_w2_d2` variant (2 arbiters,
+2-bit data, depth-2 FIFOs) should fit. **Fixture not yet downloaded
+into the repo** — fetch URL above is the canonical source; the
+benchmark-bench README documents the download procedure.
+"""
+[fixture.significant_values_expected]
+# Pono benchmarks don't declare semantic signal names — the BTOR2
+# emitter from Mukherjee/Kroening/Melham uses Yosys-style synthetic
+# names. The expected baseline here is left empty until Step 4.0
+# completes the download + manual inspection. Recall harness skips
+# fixtures with an empty expected map (won't count against pass/fail).
+
+# ---------------------------------------------------------------------------
+# Group E — hand-authored adversarial cases
+# ---------------------------------------------------------------------------
+
+[[fixture]]
+id = "adversarial_cap_overflow"
+path = "examples/verify/bench_predicate_image_a4/adversarial/cap_overflow.btor"
+adapter = "btor2"
+category = "adversarial"
+bug = true
+note = """
+8-bit counter with a saturating `bad` signal at value 200 — the
+property cone reaches a value well beyond the typical 16-value sidecar
+budget. Exercises the predicate-image's `MAX_VALUES_PER_SIGNAL` cap
+and the Bryant-Kroening under-approximation fallback (#10) when Z3
+saturates.
+"""
+[fixture.significant_values_expected]
+cnt = [0, 1, 2, 3, 4, 5, 6, 7, 8, 100, 199, 200]
+# 200 is the bad-signal trigger; the predicate-image must discover
+# it. The interior values are sampled to confirm reachability across
+# the range.
+
+[[fixture]]
+id = "adversarial_sparse_predicates"
+path = "examples/verify/bench_predicate_image_a4/adversarial/sparse_predicates.btor"
+adapter = "btor2"
+category = "adversarial"
+bug = false
+note = """
+3-bit register with two `bad` lines that fire at {0b001, 0b110} —
+non-contiguous predicate witnesses chosen so the syntactic seed
+extractor sees both constants but the predicate-image must verify
+they are both reachable. The constraint relation only permits even
+parity transitions so 0b110 is reachable but 0b001 is not (under the
+constraint).
+"""
+[fixture.significant_values_expected]
+state = [0, 6]
+# 1 is a syntactic-seed candidate (appears in the bad line) but is
+# NOT reachable due to the parity constraint; the predicate-image
+# must NOT surface it. This is the negative-soundness assertion.
