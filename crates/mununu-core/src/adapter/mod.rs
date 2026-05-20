@@ -46,6 +46,7 @@ pub mod extraction;
 pub mod ir;
 pub mod langgraph;
 pub mod microcode;
+pub mod partition;
 pub mod promela;
 pub mod sidecar;
 pub mod state_enum;
@@ -180,6 +181,14 @@ pub struct AdapterOutput {
     /// rendering counterexamples and counterstrategies so the user
     /// sees Mealy output values per cycle.
     pub transition_observations: std::collections::HashMap<String, Vec<TransitionObservation>>,
+    /// Auto-partition telemetry (Phase A.3 step 3.6) — populated by
+    /// adapters that run `crate::adapter::partition::classify` during
+    /// translation. Surfaced in CLI / API summaries so users can see
+    /// how many signals the cone-of-influence pass dropped without
+    /// re-deriving the count from warnings. `None` when the adapter
+    /// did not run the partition (e.g. agentic / xstate paths).
+    #[doc(hidden)]
+    pub partition_summary: Option<partition::PartitionSummary>,
 }
 
 /// A single per-transition observation row, emitted by adapters that

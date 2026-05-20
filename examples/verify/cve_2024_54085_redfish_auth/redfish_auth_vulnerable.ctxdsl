@@ -1,0 +1,146 @@
+// Hand-authored CTXDSL model of the Redfish authentication-bypass pattern
+// publicly described in CVE-2024-54085 (AMI MegaRAC SPx, CISA KEV added
+// 2025-06-25).
+//
+// Provenance: modeled from the public CVE / NVD disclosure text and the
+// vendor advisory's description of the bypass shape. NOT extracted from
+// AMI MegaRAC firmware binaries; no source recovery was performed.
+// Per docs/policies/claims-integrity.md Rule 1, this is a design-pattern
+// demonstration of the property class, not a finding about a specific
+// build of AMI MegaRAC.
+//
+// Mode: VULNERABLE. A header-spoof transition lets a session reach a
+// privileged-execution state without traversing the authentication-check
+// transition. The companion file redfish_auth_fixed.ctxdsl removes that
+// transition; the same property is satisfied there.
+//
+// Pattern shape (single composed FSM encodes joint state):
+//   (session-position) × (audit: was perform_auth_check ever observed?)
+//
+//   Unconnected           -- initial; no session, no check seen
+//   Connected             -- session up; no check yet
+//   AuthCheckInProgress   -- challenge issued; awaiting response
+//   AuthenticatedViaCheck -- legitimate path; check observed
+//   AuthenticatedViaSpoof -- VULNERABLE shortcut; check NOT observed
+//   PrivilegedExecLegit   -- privileged op from the legit path
+//   PrivilegedExecUnauth  -- privileged op from the spoof path (the
+//                            target state the safety property forbids)
+//
+// SOUNDNESS: over-approximation. The model collapses HTTP-request content
+// to abstract event labels (header_spoof_request stands in for "a
+// specially crafted Redfish request that bypasses the auth header check"
+// per the disclosure). It admits more behaviour than the real handler.
+// For the safety property "no privileged execution without auth-check",
+// over-approximation is sound: if the abstract model has the bypass,
+// any concrete refinement that does not introduce a new auth-check on the
+// spoofed path still has it. Per docs/abstraction.md, this is the standard
+// safety + over-approximation = SOUND direction.
+
+context cve_2024_54085_redfish_auth_vulnerable {
+    alphabet {
+        label http_connect;
+        label normal_request;
+        label perform_auth_check;
+        label header_spoof_request;   // VULNERABLE pathway
+        label execute_privileged_op;
+        label session_close;
+        label noop;
+    }
+
+    automata {
+        // HttpClient — offers connect / request / spoof / privileged-op
+        // events asynchronously. No state-name properties reference this
+        // FSM; it exists to make the composition non-trivial and
+        // to mirror the verify-framework idiom of composing a driver
+        // with a stateful peer.
+        automaton HttpClient {
+            controllable { }
+            states {
+                state Disconnected initial;
+                state Open;
+            }
+            transitions {
+                transition Disconnected -> Open on label http_connect;
+                transition Disconnected -> Disconnected on label noop;
+
+                transition Open -> Open on label normal_request;
+                transition Open -> Open on label header_spoof_request;
+                transition Open -> Open on label execute_privileged_op;
+                transition Open -> Open on label perform_auth_check;
+                transition Open -> Disconnected on label session_close;
+                transition Open -> Open on label noop;
+            }
+        }
+
+        // RedfishAuthHandler — single FSM encoding the joint
+        // (auth-state × audit) cross-product, after the
+        // MappingAndRouter pattern from cve_2026_25536_transport_*. The
+        // safety property references a single state name on this
+        // FSM, which keeps the formula transparent to reviewers.
+        automaton RedfishAuthHandler {
+            controllable { }
+            states {
+                state Unconnected initial;
+                state Connected;
+                state AuthCheckInProgress;
+                state AuthenticatedViaCheck;
+                state AuthenticatedViaSpoof;
+                state PrivilegedExecLegit;
+                state PrivilegedExecUnauth;
+            }
+            transitions {
+                // --- Connection establishment ---
+                transition Unconnected -> Connected on label http_connect;
+                transition Unconnected -> Unconnected on label noop;
+                transition Unconnected -> Unconnected on label normal_request;
+                transition Unconnected -> Unconnected on label header_spoof_request;
+                transition Unconnected -> Unconnected on label perform_auth_check;
+                transition Unconnected -> Unconnected on label execute_privileged_op;
+
+                // --- From Connected ---
+                // Normal request kicks off the auth challenge.
+                transition Connected -> AuthCheckInProgress on label normal_request;
+                // VULNERABLE: a crafted request transits straight to an
+                // authenticated state without going through
+                // AuthCheckInProgress / perform_auth_check.
+                transition Connected -> AuthenticatedViaSpoof on label header_spoof_request;
+                transition Connected -> Unconnected on label session_close;
+                transition Connected -> Connected on label noop;
+
+                // --- Auth challenge in progress ---
+                transition AuthCheckInProgress -> AuthenticatedViaCheck on label perform_auth_check;
+                transition AuthCheckInProgress -> Unconnected on label session_close;
+                transition AuthCheckInProgress -> AuthCheckInProgress on label noop;
+
+                // --- Authenticated (legit path) ---
+                transition AuthenticatedViaCheck -> PrivilegedExecLegit on label execute_privileged_op;
+                transition AuthenticatedViaCheck -> Unconnected on label session_close;
+                transition AuthenticatedViaCheck -> AuthenticatedViaCheck on label normal_request;
+                transition AuthenticatedViaCheck -> AuthenticatedViaCheck on label noop;
+
+                // --- Authenticated (spoof path) ---
+                // This branch is the bug: the handler treats the session
+                // as authenticated even though perform_auth_check never
+                // fired, so the next privileged-op label lands in
+                // PrivilegedExecUnauth.
+                transition AuthenticatedViaSpoof -> PrivilegedExecUnauth on label execute_privileged_op;
+                transition AuthenticatedViaSpoof -> Unconnected on label session_close;
+                transition AuthenticatedViaSpoof -> AuthenticatedViaSpoof on label normal_request;
+                transition AuthenticatedViaSpoof -> AuthenticatedViaSpoof on label noop;
+
+                // --- Privileged execution (terminal-ish; can chain or close) ---
+                transition PrivilegedExecLegit -> PrivilegedExecLegit on label execute_privileged_op;
+                transition PrivilegedExecLegit -> Unconnected on label session_close;
+                transition PrivilegedExecLegit -> PrivilegedExecLegit on label noop;
+
+                transition PrivilegedExecUnauth -> PrivilegedExecUnauth on label execute_privileged_op;
+                transition PrivilegedExecUnauth -> Unconnected on label session_close;
+                transition PrivilegedExecUnauth -> PrivilegedExecUnauth on label noop;
+            }
+        }
+    }
+
+    // Composition and mu_formulas blocks live in verify_vulnerable.toml
+    // (this file is consumed as a verify-framework source, not a
+    // standalone CTXDSL file).
+}

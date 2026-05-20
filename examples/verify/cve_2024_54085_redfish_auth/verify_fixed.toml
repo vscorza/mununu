@@ -1,0 +1,48 @@
+# verify_fixed.toml — fixed variant of the Redfish auth-bypass pattern.
+#
+# Same property as verify_vulnerable.toml; expected to HOLD on the
+# patched model.
+
+[project]
+name = "RedfishAuthBypassFixed"
+description = "Hand-authored CTXDSL model of the patched Redfish auth handler (companion to verify_vulnerable.toml). Property no_unauthenticated_privileged_exec is expected to HOLD; bypass_state_reachable is expected to FAIL."
+
+[[sources]]
+id = "redfish"
+adapter = "ctxdsl"
+files = ["redfish_auth_fixed.ctxdsl"]
+
+[sources.memory_abstraction]
+kind  = "chaotic"
+notes = "Protocol-level model with no shared memory; properties reference automaton state names only."
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+members = ["redfish.*"]
+name    = "RedfishSystem"
+
+# Same safety property as the vulnerable manifest; expected HOLDS here.
+[[properties]]
+name = "no_unauthenticated_privileged_exec"
+formula = "nu X. ((!PrivilegedExecUnauth) && ([] X))"
+over = "RedfishAuthHandler"
+
+# Legit path still reachable on the patched model.
+[[properties]]
+name = "legit_privileged_path_reachable"
+template = "reachable"
+args = { TARGET = "PrivilegedExecLegit" }
+over = "RedfishAuthHandler"
+
+# Bypass state is structurally present (declared, with a self-loop) but
+# has no incoming transitions in the fixed model. Expected: FAILS
+# (unreachable from the initial state). The pair {safety HOLDS, bypass
+# UNREACHABLE} is the load-bearing before/after evidence.
+[[properties]]
+name = "bypass_state_reachable"
+template = "reachable"
+args = { TARGET = "PrivilegedExecUnauth" }
+over = "RedfishAuthHandler"

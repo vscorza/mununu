@@ -20,6 +20,7 @@
 
 pub mod ast;
 pub mod ast_extract;
+pub mod dep_graph;
 pub mod validate;
 
 use super::ir::*;
@@ -78,6 +79,53 @@ impl FormatAdapter for ExtractionAdapter {
         }
 
         let mut warnings = Vec::new();
+
+        // Phase A.3 step 3.4 — extraction-side auto-partition preview.
+        //
+        // The trait impl in `dep_graph` exposes the spec's
+        // `state_fields[]` as the per-field signal set and uses
+        // `methods[].guards/effects` references as dep edges.
+        // For specs that have at least one declared field, run the
+        // partition and surface any `Dropped` field as a preview
+        // warning. Specs that use only `model_config.automata[]`
+        // (no `state_fields`) have nothing per-field to prune and
+        // the partition is a silent no-op.
+        //
+        // SOUNDNESS: see `dep_graph` module-level docs for the
+        // indirect-reference caveat — the dep edges built from
+        // `guards` / `effects` may under-represent the true data
+        // flow when the upstream `mununu-extract` tool could not
+        // resolve a pointer write to a concrete field name. A
+        // standing AdapterWarning surfaces this risk whenever the
+        // spec declares any fields.
+        if !spec.state_fields.is_empty() {
+            use crate::adapter::partition::{self, PartitionClass, PartitionOptions};
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "auto-partition (preview, step 3.4): extraction adapter's dep graph is derived from `methods[].guards/effects`; \
+                     indirect pointer writes (`*p = x` and equivalents) may be missing — see phase-a3-followup-indirect-references.md. \
+                     Spec declares {} state field(s).",
+                    spec.state_fields.len()
+                ),
+                location: None,
+            });
+            let seeds = dep_graph::extract_property_seeds(&spec);
+            let preview = partition::classify(&spec, &seeds, &PartitionOptions::default());
+            for (name, class) in &preview.classes {
+                if let PartitionClass::Dropped { reason } = class {
+                    warnings.push(AdapterWarning {
+                        kind: WarningKind::ApproximateTranslation,
+                        message: format!(
+                            "auto-partition (preview, step 3.4): extraction field '{name}' would be dropped as {reason} — \
+                             step 3.5 will make this take effect on the sidecar resolver"
+                        ),
+                        location: None,
+                    });
+                }
+            }
+        }
+
         let ir = to_ir(&spec, mode, options, &mut warnings)?;
 
         let result = super::emit::emit(&ir).map_err(|e| AdapterError {
@@ -105,6 +153,7 @@ impl FormatAdapter for ExtractionAdapter {
             },
             state_valuations: Default::default(),
             transition_observations: Default::default(),
+            partition_summary: None,
         })
     }
 }

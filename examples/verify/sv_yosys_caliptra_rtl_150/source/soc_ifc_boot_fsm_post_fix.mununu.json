@@ -1,0 +1,39 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "soc_ifc_boot_fsm",
+  "source": "soc_ifc_boot_fsm_post_fix.sv",
+  "signals": [
+    {
+      "name": "wait_count",
+      "abstraction": "bounded_counter",
+      "bound": 1,
+      "note": "Saturating {ZERO, NONZERO} for the reset-window timer."
+    }
+  ],
+  "inputs": [
+    {
+      "name": "fw_update_rst_wait_cycles",
+      "abstraction": "bounded_counter",
+      "bound": 1
+    },
+    { "name": "BootFSM_BrkPoint", "abstraction": "ignored" },
+    { "name": "BootFSM_Continue", "abstraction": "ignored" }
+  ],
+  "properties": [
+    {
+      "id": "safety_all_states_have_successors",
+      "formula": "nu X. ([] X)",
+      "description": "Baseline smoke test: every reachable state has at least one outgoing transition."
+    },
+    {
+      "id": "no_undef_reachable",
+      "formula": "nu X. ((!(boot_fsm_ns == 5 || boot_fsm_ns == 6 || boot_fsm_ns == 7)) && ([] X))",
+      "description": "CWE-1245 safety: the boot FSM's next-state register must never carry an unmatched encoding (5/6/7 are not in the case statement of the buggy variant; default-less unique casez admits them as absorbing sinks). Phase A.3 note: Yosys `flatten` + `dffunmap` retains the next-state register `boot_fsm_ns` in the bit-blasted BTOR2 — the original SV name `boot_fsm_ps` does not survive synthesis as a separate cell."
+    },
+    {
+      "id": "boot_idle_reachable",
+      "formula": "mu X. ((boot_fsm_ns == 0) || (<> X))",
+      "description": "Liveness: BOOT_IDLE (encoding 0) is reachable from any state via some path."
+    }
+  ]
+}

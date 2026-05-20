@@ -131,7 +131,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
         };
 
         for (instance_id, content) in instances {
-            let raw_ctxdsl = dispatch_adapter(
+            let (raw_ctxdsl, partition_summary) = dispatch_adapter(
                 &source.adapter,
                 &instance_id,
                 &path,
@@ -165,6 +165,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 id: instance_id,
                 adapter: source.adapter.clone(),
                 automaton: None,
+                partition_summary,
             });
         }
     }
@@ -391,7 +392,7 @@ pub fn inspect_project(
                 .collect()
         };
         for (instance_id, content) in instances {
-            let raw_ctxdsl = dispatch_adapter(
+            let (raw_ctxdsl, partition_summary) = dispatch_adapter(
                 &source.adapter,
                 &instance_id,
                 &path,
@@ -420,6 +421,7 @@ pub fn inspect_project(
                 id: instance_id,
                 adapter: source.adapter.clone(),
                 automaton: None,
+                partition_summary,
             });
         }
     }
@@ -595,6 +597,11 @@ pub fn inspect_project(
 ///   [string]`, `defines = [string]`, `clang = <PATH>`.
 ///
 /// Other adapters return [`VerifyError::UnknownAdapter`].
+/// Phase A.3 step 3.6 — adapter dispatch returns both the CTXDSL text
+/// **and** the partition summary the adapter populated on its
+/// `AdapterOutput`. The orchestrator threads the summary onto the
+/// source's `SourceSummary` so the `VerifyReport` surfaces COI
+/// telemetry per source.
 fn dispatch_adapter(
     adapter: &str,
     source_id: &str,
@@ -603,56 +610,49 @@ fn dispatch_adapter(
     additional_files: &[(PathBuf, String)],
     options: &std::collections::BTreeMap<String, toml::Value>,
     base_dir: &Path,
-) -> Result<String, VerifyError> {
+) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
+    let to_pair = |out: crate::adapter::AdapterOutput| (out.ctxdsl, out.partition_summary);
+    let err_for = |adapter: &str, source_id: &str, err: crate::adapter::AdapterError| {
+        VerifyError::AdapterTranslationFailed {
+            source_id: source_id.to_string(),
+            adapter: adapter.to_string(),
+            message: err.to_string(),
+        }
+    };
+
     match adapter {
         "ctxdsl" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
-            Ok(content.to_string())
+            Ok((content.to_string(), None))
         }
         "xstate" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             XStateAdapter::translate(content, &opts)
-                .map(|out| out.ctxdsl)
-                .map_err(|err| VerifyError::AdapterTranslationFailed {
-                    source_id: source_id.to_string(),
-                    adapter: adapter.to_string(),
-                    message: err.to_string(),
-                })
+                .map(to_pair)
+                .map_err(|err| err_for(adapter, source_id, err))
         }
         "sv-rtl" => dispatch_sv_rtl(source_id, content, additional_files),
         "crewai" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             crate::adapter::crewai::CrewaiAdapter::translate(content, &opts)
-                .map(|out| out.ctxdsl)
-                .map_err(|err| VerifyError::AdapterTranslationFailed {
-                    source_id: source_id.to_string(),
-                    adapter: adapter.to_string(),
-                    message: err.to_string(),
-                })
+                .map(to_pair)
+                .map_err(|err| err_for(adapter, source_id, err))
         }
         "langgraph" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             crate::adapter::langgraph::LangGraphAdapter::translate(content, &opts)
-                .map(|out| out.ctxdsl)
-                .map_err(|err| VerifyError::AdapterTranslationFailed {
-                    source_id: source_id.to_string(),
-                    adapter: adapter.to_string(),
-                    message: err.to_string(),
-                })
+                .map(to_pair)
+                .map_err(|err| err_for(adapter, source_id, err))
         }
         "microcode" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
             crate::adapter::microcode::MicrocodeAdapter::translate(content, &opts)
-                .map(|out| out.ctxdsl)
-                .map_err(|err| VerifyError::AdapterTranslationFailed {
-                    source_id: source_id.to_string(),
-                    adapter: adapter.to_string(),
-                    message: err.to_string(),
-                })
+                .map(to_pair)
+                .map_err(|err| err_for(adapter, source_id, err))
         }
         "extraction" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
@@ -665,16 +665,13 @@ fn dispatch_adapter(
                 ..AdapterOptions::default()
             };
             crate::adapter::extraction::ExtractionAdapter::translate(content, &opts)
-                .map(|out| out.ctxdsl)
-                .map_err(|err| VerifyError::AdapterTranslationFailed {
-                    source_id: source_id.to_string(),
-                    adapter: adapter.to_string(),
-                    message: err.to_string(),
-                })
+                .map(to_pair)
+                .map_err(|err| err_for(adapter, source_id, err))
         }
         "c-codesign" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             dispatch_c_codesign(source_id, file_path, options, base_dir)
+                .map(|ctxdsl| (ctxdsl, None))
         }
         other => Err(VerifyError::UnknownAdapter {
             source_id: source_id.to_string(),
@@ -725,7 +722,7 @@ fn dispatch_sv_rtl(
     source_id: &str,
     content: &str,
     additional_files: &[(PathBuf, String)],
-) -> Result<String, VerifyError> {
+) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
     let is_multi_module = content.contains("mununu_sv_multi_v1") || content.contains("\"modules\"");
     if is_multi_module {
         // Build the source-name → content map the SV adapter expects.
@@ -748,7 +745,7 @@ fn dispatch_sv_rtl(
         crate::adapter::systemverilog::SystemVerilogAdapter::translate_multi_module_content(
             content, &sources, &opts,
         )
-        .map(|out| out.ctxdsl)
+        .map(|out| (out.ctxdsl, out.partition_summary))
         .map_err(|err| VerifyError::AdapterTranslationFailed {
             source_id: source_id.to_string(),
             adapter: "sv-rtl".to_string(),
@@ -758,7 +755,7 @@ fn dispatch_sv_rtl(
         warn_unused_additional_files("sv-rtl", source_id, additional_files);
         let opts = AdapterOptions::default();
         crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
-            .map(|out| out.ctxdsl)
+            .map(|out| (out.ctxdsl, out.partition_summary))
             .map_err(|err| VerifyError::AdapterTranslationFailed {
                 source_id: source_id.to_string(),
                 adapter: "sv-rtl".to_string(),

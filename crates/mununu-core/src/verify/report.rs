@@ -33,6 +33,12 @@ pub struct SourceSummary {
     /// Resolved automaton name used in the composition (post
     /// `AutomatonDiscovery`).
     pub automaton: Option<String>,
+    /// Auto-partition telemetry (Phase A.3 step 3.6) — present for
+    /// adapters that ran the cone-of-influence pass during translation
+    /// (currently SV / BTOR2; extraction is preview-only). `None` for
+    /// adapters that did not run the partition (xstate, ctxdsl, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_summary: Option<crate::adapter::partition::PartitionSummary>,
 }
 
 /// Composition shape used for evaluation.

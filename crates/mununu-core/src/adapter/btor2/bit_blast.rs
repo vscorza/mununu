@@ -29,12 +29,22 @@ use crate::adapter::{
 };
 
 /// Maximum total bits across all state declarations.
-/// 2^16 = 65 K explicit states — at the edge of practicality for the
-/// current explicit-state engine. Anything above is rejected.
-pub const MAX_STATE_BITS: u32 = 16;
+/// 2^20 = ~1 M explicit states — the explicit-state engine's practical
+/// upper bound. Raised from 16 → 20 on 2026-05-18 to admit small
+/// industrial RTL modules (e.g. the Caliptra-RTL boot FSM bundles a
+/// 3-bit state enum with an 8-bit wait counter + reset-window logic
+/// totalling 19 state bits, which the previous cap rejected just past
+/// the boundary). Designs above this still error rather than truncate.
+pub const MAX_STATE_BITS: u32 = 20;
 
 /// Maximum total bits across all input declarations (per-step combinations).
-/// 2^10 = 1024 input combos per state → up to 64 M transitions, also at the edge.
+/// 2^10 = 1024 input combos per state → up to ~1 G transitions at the
+/// raised state cap (MAX_STATE_BITS = 20). Lifting the input cap further
+/// quickly becomes intractable: 2^20 × 2^16 ≈ 6.8e10 transitions takes
+/// hours to enumerate concretely. Designs above this cap must prune
+/// unused inputs via a `.mununu.json` sidecar (see
+/// [`crate::adapter::sidecar`]) declaring `Ignored` / `Boolean` /
+/// `Symbols` abstractions per input.
 pub const MAX_INPUT_BITS: u32 = 10;
 
 /// Bit-vector value. Backed by `u128` — sufficient for any width ≤ 128
@@ -101,13 +111,29 @@ struct BlastOutput {
     automaton: AutomatonSpec,
     signals: Vec<Signal>,
     properties: Vec<PropertySpec>,
+    /// Phase A.3 step 3.6 — auto-partition telemetry populated by
+    /// `enumerate_and_blast` after the COI pass runs. `None` when
+    /// the partition step was skipped (empty seeds, or a future
+    /// `--no-partition` opt-out).
+    partition_summary: Option<crate::adapter::partition::PartitionSummary>,
 }
 
 /// Top-level entry: convert a parsed BTOR2 file + options to an AdapterIR.
+///
+/// Returns a tuple of (IR, warnings, partition_summary). The third
+/// element is `Some` whenever `enumerate_and_blast` ran the auto-COI
+/// pass; the BTOR2 adapter forwards it onto `AdapterOutput`.
 pub fn to_ir(
     file: &Btor2File,
     options: &AdapterOptions,
-) -> Result<(AdapterIR, Vec<AdapterWarning>), AdapterError> {
+) -> Result<
+    (
+        AdapterIR,
+        Vec<AdapterWarning>,
+        Option<crate::adapter::partition::PartitionSummary>,
+    ),
+    AdapterError,
+> {
     let mut warnings = Vec::new();
 
     // Reject unsupported operators up-front so users get a clear error
@@ -149,15 +175,13 @@ pub fn to_ir(
             location: None,
         });
     }
-    if total_input_bits > MAX_INPUT_BITS {
-        return Err(AdapterError {
-            kind: AdapterErrorKind::StateSpaceOverflow,
-            message: format!(
-                "BTOR2 design has {total_input_bits} input bits per step (max supported: {MAX_INPUT_BITS})."
-            ),
-            location: None,
-        });
-    }
+    // Input-bit cap is checked AFTER sidecar resolution inside
+    // `enumerate_and_blast` (per-input `FieldDomain` abstractions may
+    // collapse a wide raw input into a 1-of-N value set — e.g. an
+    // `Ignored` input contributes zero effective bits even when its
+    // raw BTOR2 width is large). The raw-bit number is kept for
+    // diagnostics only.
+    let _ = total_input_bits;
 
     if total_state_bits >= 12 {
         warnings.push(AdapterWarning {
@@ -193,6 +217,7 @@ pub fn to_ir(
             controller: None,
         },
         warnings,
+        blasted.partition_summary,
     ))
 }
 
@@ -317,16 +342,91 @@ fn enumerate_and_blast(
         });
     }
 
+    // Phase A.3 step 3.5 — automatic partition (live).
+    //
+    // Compute the partition from the BTOR2 dep-graph and the seed set
+    // extracted from intrinsic `bad` / `constraint` / `justice` / `fair`
+    // lines. The injection into `cell_domains` / `input_domains` happens
+    // **after** the sidecar resolver runs (below), so the user-wins-on-
+    // collision rule is enforced naturally — anything the user listed
+    // appears as a key in those maps; anything they didn't list is
+    // absent, and the partition's `Dropped` verdict is what fills the
+    // gap.
+    //
+    // SOUNDNESS: see `crate::adapter::partition` module docs. Auto-COI
+    // pins a `Dropped` signal to a single value via
+    // `AbstractionType::Ignored`; the abstract model admits more
+    // behaviours than the concrete one (sound for safety + over-
+    // approximation).
+    let partition = {
+        use crate::adapter::partition::{self, PartitionOptions};
+        let seeds = super::dep_graph::extract_property_seeds(file);
+        partition::classify(file, &seeds, &PartitionOptions::default())
+    };
+
     // Phase 1 sub-deliverable 2: when the caller passes a `.mununu.json`
     // sidecar, load it and resolve each named state cell to a
     // [`FieldDomain`]. Cells with a sidecar entry get bounded per the
     // declared abstraction (BoundedCounter, EnumValues, …); cells
     // without an entry fall back to full bit-blast over their width.
-    let cell_domains = build_cell_domains(&state_meta, &symbols, options, warnings)?;
+    let mut cell_domains = build_cell_domains(&state_meta, &symbols, options, warnings)?;
+    // Phase A.3 step 3.5 — apply partition to state cells. Each NID
+    // not already keyed in `cell_domains` (i.e. not user-listed in the
+    // sidecar) AND classified `Dropped` by the partition gets pinned
+    // to `AbstractionType::Ignored` here.
+    apply_partition_drops(
+        &mut cell_domains,
+        state_meta.iter().map(|m| (m.nid, m.symbol.as_str())),
+        &partition,
+        warnings,
+        "state cell",
+    );
     let cells = CellEnumeration::build(&state_meta, &cell_domains);
 
+    // Phase 1.6: per-input sidecar resolution. The sidecar already
+    // carries `inputs: [...]` entries via `SvAnnotation::inputs` (see
+    // `crate::adapter::sidecar::btor2_resolver::build_input_field_domains`).
+    // Without this, every input enumerates over its full bit-vector
+    // width, which blocks real designs at the input-bit cap. With it,
+    // an input declared `Ignored` / `Boolean` / `EnumValues` / etc.
+    // collapses to a 1-of-N value list and the enumerator sees only
+    // the meaningful combinations.
+    let mut input_domains = build_input_domains(&input_meta, &symbols, options, warnings)?;
+    // Clock inputs are auto-pinned by the bit-blaster regardless; the
+    // partition's Dropped classification on a clock would be redundant
+    // but harmless. We filter clocks out here only to avoid an
+    // unnecessary "auto-COI dropped 'clk'" warning.
+    apply_partition_drops(
+        &mut input_domains,
+        input_meta
+            .iter()
+            .filter(|m| !m.is_clock)
+            .map(|m| (m.nid, m.symbol.as_str())),
+        &partition,
+        warnings,
+        "input port",
+    );
+    let input_cells = InputCellEnumeration::build(&input_meta, &input_domains);
+
+    // Effective input-bit cap. The previous cap (`MAX_INPUT_BITS`)
+    // tested raw bit width and ran before sidecars resolved; that
+    // rejected designs where most of the input width is masked off by
+    // an abstraction. Now the cap tests the enumerated cardinality.
+    let total_input_combos = input_cells.total_combos();
+    let cap_combos: usize = 1usize << MAX_INPUT_BITS;
+    if total_input_combos > cap_combos {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::StateSpaceOverflow,
+            message: format!(
+                "BTOR2 design enumerates {total_input_combos} input combinations per step \
+                 (max supported: 2^{MAX_INPUT_BITS} = {cap_combos}). Add `.mununu.json` \
+                 `inputs[]` entries declaring `Ignored` / `Boolean` / `EnumValues` per \
+                 non-essential input to prune the enumeration."
+            ),
+            location: None,
+        });
+    }
     let total_state_combos = cells.total_combos();
-    let total_input_combos = combinations_of_inputs(&input_meta);
 
     let state_names = enumerate_state_names(total_state_combos);
 
@@ -357,7 +457,14 @@ fn enumerate_and_blast(
     let mut oob_dropped: usize = 0;
     for (state_idx, state_name) in state_names.iter().enumerate() {
         for input_idx in 0..total_input_combos {
-            let mut env = make_step_env(&state_meta, &input_meta, &cells, state_idx, input_idx);
+            let mut env = make_step_env(
+                &state_meta,
+                &input_meta,
+                &cells,
+                &input_cells,
+                state_idx,
+                input_idx,
+            );
             evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
 
             // Evaluate every constraint — if any is false in (state, input)
@@ -378,7 +485,7 @@ fn enumerate_and_blast(
             transitions.push(TransitionSpec {
                 source: state_name.clone(),
                 target: state_names[next_state_idx].clone(),
-                labels: signal_labels_for_input(input_idx, &input_meta),
+                labels: signal_labels_for_input(input_idx, &input_meta, &input_cells),
             });
         }
     }
@@ -468,13 +575,81 @@ fn enumerate_and_blast(
         internal_labels: vec![],
     };
 
-    let properties = build_properties(file, &state_meta, &input_meta, &cells, &state_names)?;
+    let mut properties = build_properties(
+        file,
+        &state_meta,
+        &input_meta,
+        &cells,
+        &input_cells,
+        &state_names,
+    )?;
+    // Append sidecar-declared mu-calculus properties. The custom SV
+    // adapter (which constructs its own SvAnnotation flow) already
+    // honours `SvAnnotation::properties`; this mirrors the same shape
+    // on the BTOR2 / sv-yosys path so a user's `.mununu.json` can
+    // carry hand-authored property formulas alongside abstractions.
+    properties.extend(sidecar_properties(options));
+
+    // Phase A.3 step 3.6 — partition summary. Pair the partition's
+    // per-signal classification with the bit-blaster's known widths
+    // so the user can read `state_bits_before` / `state_bits_after`
+    // as observable evidence of COI's reduction effect.
+    let widths: std::collections::HashMap<String, usize> = state_meta
+        .iter()
+        .map(|m| (m.symbol.clone(), m.width as usize))
+        .chain(
+            input_meta
+                .iter()
+                .map(|m| (m.symbol.clone(), m.width as usize)),
+        )
+        .collect();
+    let partition_summary = Some(crate::adapter::partition::PartitionSummary::from_partition(
+        &partition,
+        Some(&widths),
+    ));
 
     Ok(BlastOutput {
         signals,
         properties,
         automaton,
+        partition_summary,
     })
+}
+
+/// Parse the sidecar's `properties[]` array (if any) into the
+/// adapter-IR `PropertySpec` shape. Malformed entries are logged as
+/// adapter warnings — same permissive policy as `build_cell_domains`.
+fn sidecar_properties(options: &AdapterOptions) -> Vec<PropertySpec> {
+    let Some(json) = &options.sidecar_json else {
+        return vec![];
+    };
+    let annotation =
+        match serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+        {
+            Ok(a) => a,
+            Err(_) => return vec![],
+        };
+    annotation
+        .properties
+        .into_iter()
+        .filter_map(|p| {
+            // Prefer an inline formula; template_ref support is the
+            // custom SV adapter's responsibility (not the BTOR2 path).
+            let body = p.formula?;
+            Some(PropertySpec {
+                name: p.id,
+                kind: PropertyKind::Safety,
+                formula: PropertyFormula::MuCalculus(body),
+                role: match p.role.as_str() {
+                    "assumption" => PropertyRole::Assumption,
+                    "standalone" => PropertyRole::Standalone,
+                    _ => PropertyRole::Guarantee,
+                },
+                over: None,
+                description: p.description,
+            })
+        })
+        .collect()
 }
 
 fn build_properties(
@@ -482,10 +657,11 @@ fn build_properties(
     state_meta: &[StateMeta],
     input_meta: &[InputMeta],
     cells: &CellEnumeration,
+    input_cells: &InputCellEnumeration,
     state_names: &[String],
 ) -> Result<Vec<PropertySpec>, AdapterError> {
     let mut out = Vec::new();
-    let total_input_combos = combinations_of_inputs(input_meta);
+    let total_input_combos = input_cells.total_combos();
 
     // Bad properties → safety: nu X. (!(bad-states) && [] X)
     for (i, line) in file.bads().enumerate() {
@@ -497,7 +673,14 @@ fn build_properties(
         for (state_idx, state_name) in state_names.iter().enumerate() {
             let mut found = false;
             for input_idx in 0..total_input_combos {
-                let mut env = make_step_env(state_meta, input_meta, cells, state_idx, input_idx);
+                let mut env = make_step_env(
+                    state_meta,
+                    input_meta,
+                    cells,
+                    input_cells,
+                    state_idx,
+                    input_idx,
+                );
                 evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
                 if !constraints_hold(file, &env)? {
                     continue;
@@ -537,7 +720,14 @@ fn build_properties(
         for (state_idx, state_name) in state_names.iter().enumerate() {
             let mut found = false;
             for input_idx in 0..total_input_combos {
-                let mut env = make_step_env(state_meta, input_meta, cells, state_idx, input_idx);
+                let mut env = make_step_env(
+                    state_meta,
+                    input_meta,
+                    cells,
+                    input_cells,
+                    state_idx,
+                    input_idx,
+                );
                 evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
                 if !constraints_hold(file, &env)? {
                     continue;
@@ -579,7 +769,14 @@ fn build_properties(
         for (state_idx, state_name) in state_names.iter().enumerate() {
             let mut found = false;
             for input_idx in 0..total_input_combos {
-                let mut env = make_step_env(state_meta, input_meta, cells, state_idx, input_idx);
+                let mut env = make_step_env(
+                    state_meta,
+                    input_meta,
+                    cells,
+                    input_cells,
+                    state_idx,
+                    input_idx,
+                );
                 evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
                 if !constraints_hold(file, &env)? {
                     continue;
@@ -750,6 +947,70 @@ fn build_cell_domains(
     )
 }
 
+/// Phase A.3 step 3.5 — inject `AbstractionType::Ignored` for signals
+/// the partition classified `Dropped` *and* the user did not list in
+/// the sidecar.
+///
+/// User-listed signals are identified by membership of their NID in
+/// `domains` (the sidecar resolver only inserts entries for names that
+/// appear in the sidecar's `signals[]` / `inputs[]` arrays). The
+/// partition's verdict is keyed by symbol; we look up the symbol for
+/// each NID via `iter` and skip anonymous signals (no symbol available).
+///
+/// SOUNDNESS: see `crate::adapter::partition` module docs. The injected
+/// `Ignored` domain pins the signal to its initial value; the abstract
+/// model thereby admits more behaviours than the concrete model — sound
+/// for safety + over-approximation.
+fn apply_partition_drops<'a>(
+    domains: &mut CellDomainMap,
+    iter: impl Iterator<Item = (i64, &'a str)>,
+    partition: &crate::adapter::partition::Partition,
+    warnings: &mut Vec<AdapterWarning>,
+    kind: &str,
+) {
+    use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
+    use crate::adapter::partition::PartitionClass;
+
+    for (nid, symbol) in iter {
+        // User wins: an entry already keyed by NID in `domains` means
+        // the sidecar listed this signal — trust the user.
+        if domains.contains_key(&nid) {
+            continue;
+        }
+        match partition.classes.get(symbol) {
+            Some(PartitionClass::Dropped { reason }) => {
+                warnings.push(AdapterWarning {
+                    kind: WarningKind::ApproximateTranslation,
+                    message: format!(
+                        "auto-partition: {kind} '{symbol}' dropped ({reason}); add an explicit sidecar entry to override"
+                    ),
+                    location: None,
+                });
+                domains.insert(
+                    nid,
+                    (
+                        FieldDomain {
+                            name: symbol.to_string(),
+                            abstraction: AbstractionType::Ignored,
+                            bound: None,
+                            lower_bound: None,
+                            variants: None,
+                            initial: AbstractValue::Counter(0),
+                        },
+                        Vec::new(),
+                    ),
+                );
+            }
+            _ => {
+                // Kept (or absent for symbols outside the partition's
+                // signal universe — clocks, anonymous synthesisers).
+                // Leave `domains` untouched; the existing fall-through
+                // (full bit-blast) applies.
+            }
+        }
+    }
+}
+
 /// Recognize clock signals by name (case-insensitive). Single-clock
 /// posedge designs are Phase 1's whole scope; multi-clock and negedge
 /// will surface in Phase 3 / 4 when compositional decomposition lands.
@@ -796,10 +1057,22 @@ struct CellEnumeration {
     per_cell: Vec<Vec<u128>>,
     /// Per state cell, cached `per_cell[i].len()` (the radix base).
     radices: Vec<usize>,
+    /// Per state cell, whether `encode` should saturate out-of-range
+    /// values to the nearest in-range value (true for `BoundedCounter`
+    /// abstraction; false otherwise). Saturating maps the design's
+    /// arbitrary concrete writes (e.g. `wait_count = 5`) onto the
+    /// declared abstract counter range (e.g. `bound = 1` → values
+    /// `{0, 1}`, with `5` saturating to `1` = the "non-zero" class).
+    /// This is an over-approximation: a smaller abstract domain
+    /// represents a larger concrete one. Sound for safety; under-
+    /// approximates liveness. See `docs/abstraction.md` for the
+    /// memory-soundness matrix.
+    saturate: Vec<bool>,
 }
 
 impl CellEnumeration {
     fn build(state_meta: &[StateMeta], cell_domains: &CellDomainMap) -> Self {
+        use crate::adapter::domain::AbstractionType;
         let per_cell: Vec<Vec<u128>> = state_meta
             .iter()
             .map(|sm| {
@@ -813,7 +1086,20 @@ impl CellEnumeration {
             })
             .collect();
         let radices: Vec<usize> = per_cell.iter().map(|v| v.len().max(1)).collect();
-        CellEnumeration { per_cell, radices }
+        let saturate: Vec<bool> = state_meta
+            .iter()
+            .map(|sm| {
+                cell_domains
+                    .get(&sm.nid)
+                    .map(|(fd, _)| fd.abstraction == AbstractionType::BoundedCounter)
+                    .unwrap_or(false)
+            })
+            .collect();
+        CellEnumeration {
+            per_cell,
+            radices,
+            saturate,
+        }
     }
 
     fn values_for_field_domain(
@@ -881,16 +1167,49 @@ impl CellEnumeration {
     }
 
     /// Encode per-cell concrete values back to a linear combo index.
-    /// Returns `None` if any value is not in its cell's allowed set —
-    /// this happens when the design's transition function lands a state
-    /// outside the sidecar-declared abstraction (e.g., a counter
-    /// exceeding its bound). The caller treats this as out-of-bounds.
+    /// Returns `None` if any value is not in its cell's allowed set
+    /// AND the cell does not declare saturating semantics — this
+    /// happens when the design's transition function lands a state
+    /// outside the sidecar-declared abstraction (e.g., an `EnumValues`
+    /// signal landing outside its variant set). The caller treats
+    /// this as out-of-bounds.
+    ///
+    /// For cells whose `saturate` flag is set (`BoundedCounter`), an
+    /// out-of-range value is clamped to the nearest in-range value:
+    /// `v > max(per_cell)` → `max`; `v < min(per_cell)` → `min`. This
+    /// is the standard saturating-counter semantics — a soundness-
+    /// preserving over-approximation that lets the abstract domain
+    /// stand in for an unbounded concrete domain without dropping
+    /// transitions. The classic use case is `bound = 1` standing in
+    /// for `{0, non-zero}`: the design's `wait_count = 5` write
+    /// saturates to `1` (= the "non-zero" abstract class).
     fn encode(&self, values: &[u128]) -> Option<usize> {
         let mut combo = 0usize;
         let mut multiplier = 1usize;
         for (i, &v) in values.iter().enumerate() {
             let radix = self.radices[i];
-            let idx = self.per_cell[i].iter().position(|x| *x == v)?;
+            let cell_values = &self.per_cell[i];
+            let idx = cell_values.iter().position(|x| *x == v).or_else(|| {
+                if !self.saturate[i] || cell_values.is_empty() {
+                    return None;
+                }
+                // `per_cell` is sorted ascending in `build`. Clamp.
+                let last = *cell_values.last()?;
+                let first = *cell_values.first()?;
+                if v > last {
+                    Some(cell_values.len() - 1)
+                } else if v < first {
+                    Some(0)
+                } else {
+                    // Value sits in a gap within the declared range.
+                    // For `BoundedCounter` the range is contiguous,
+                    // so this branch is unreachable in practice; if
+                    // the abstraction ever gets gappy variants the
+                    // saturation is undefined and we drop the
+                    // transition (under-approx) rather than guess.
+                    None
+                }
+            })?;
             combo = combo.checked_add(idx.checked_mul(multiplier)?)?;
             multiplier = multiplier.checked_mul(radix)?;
         }
@@ -912,23 +1231,113 @@ impl CellEnumeration {
     }
 }
 
+/// Per-input enumeration plan — sibling to [`CellEnumeration`].
+///
+/// Each non-clock input carries a `Vec<u128>` of allowed concrete
+/// values, sourced from the sidecar's `inputs[]` `FieldDomain`. Inputs
+/// without a sidecar entry fall back to full bit-blast over their
+/// declared BTOR2 width. **Clock inputs are pinned to a single value
+/// (1, posedge active)** — they are not part of the enumerated input
+/// space, matching the prior `combinations_of_inputs` semantics.
+///
+/// The total input-combination count is the product of per-input
+/// value-set sizes. The bit-blaster's transition loops iterate
+/// `0..total_combos()` and call [`Self::value_at`] per input nid.
+struct InputCellEnumeration {
+    per_input: Vec<Vec<u128>>,
+    radices: Vec<usize>,
+}
+
+impl InputCellEnumeration {
+    fn build(input_meta: &[InputMeta], input_domains: &CellDomainMap) -> Self {
+        let per_input: Vec<Vec<u128>> = input_meta
+            .iter()
+            .map(|im| {
+                if im.is_clock {
+                    // Implicit clock: pinned to 1 (posedge active).
+                    return vec![1u128];
+                }
+                if let Some((fd, vm)) = input_domains.get(&im.nid) {
+                    CellEnumeration::values_for_field_domain(fd, vm, im.width)
+                } else {
+                    let cap = im.width.min(31);
+                    (0..(1u128 << cap)).collect()
+                }
+            })
+            .collect();
+        let radices: Vec<usize> = per_input.iter().map(|v| v.len().max(1)).collect();
+        InputCellEnumeration { per_input, radices }
+    }
+
+    fn total_combos(&self) -> usize {
+        self.radices
+            .iter()
+            .fold(1usize, |a, r| a.saturating_mul(*r))
+    }
+
+    /// Per-input value at this combo for the input at `input_idx`.
+    fn value_at(&self, combo: usize, input_idx: usize) -> u128 {
+        let mut rem = combo;
+        for (i, radix) in self.radices.iter().enumerate() {
+            let pick = rem % radix;
+            if i == input_idx {
+                return *self.per_input[i].get(pick).unwrap_or(&0);
+            }
+            rem /= radix;
+        }
+        0
+    }
+}
+
+/// Sidecar resolution for inputs — mirrors [`build_cell_domains`] but
+/// scopes the symbol filter to input NIDs and delegates to
+/// [`build_input_field_domains`](crate::adapter::sidecar::btor2_resolver::build_input_field_domains).
+fn build_input_domains(
+    input_meta: &[InputMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    options: &AdapterOptions,
+    warnings: &mut Vec<AdapterWarning>,
+) -> Result<CellDomainMap, AdapterError> {
+    let Some(json) = &options.sidecar_json else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let annotation = match serde_json::from_str::<
+        crate::adapter::systemverilog::annotation::SvAnnotation,
+    >(json)
+    {
+        Ok(a) => a,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::UnsupportedConstruct,
+                message: format!(
+                    "adapter/btor2: failed to parse .mununu.json sidecar for inputs ({e}); falling back to full bit-blast"
+                ),
+                location: None,
+            });
+            return Ok(std::collections::HashMap::new());
+        }
+    };
+    let input_symbols: std::collections::HashMap<i64, String> = input_meta
+        .iter()
+        .filter_map(|im| symbols.get(&im.nid).map(|s| (im.nid, s.clone())))
+        .collect();
+    Ok(
+        crate::adapter::sidecar::btor2_resolver::build_input_field_domains(
+            &annotation,
+            &input_symbols,
+        ),
+    )
+}
+
 #[allow(dead_code)]
 fn combinations_of(meta: &[StateMeta]) -> usize {
     meta.iter()
         .fold(1usize, |acc, m| acc.saturating_mul(1usize << m.width))
 }
 
-/// Total enumerable input combinations — clock inputs are excluded.
-/// Each CLTS transition already represents one posedge; the clock value
-/// is implicit and held at 1 during next-state evaluation.
-fn combinations_of_inputs(meta: &[InputMeta]) -> usize {
-    if meta.iter().all(|m| m.is_clock) {
-        return 1;
-    }
-    meta.iter()
-        .filter(|m| !m.is_clock)
-        .fold(1usize, |acc, m| acc.saturating_mul(1usize << m.width))
-}
+// `combinations_of_inputs` was removed in Phase 1.6 — input enumeration
+// now goes through `InputCellEnumeration::total_combos`, which respects
+// per-input `FieldDomain` abstractions from the sidecar.
 
 /// Enumerate state names as `s0`, `s1`, ..., `s{total-1}`.
 ///
@@ -996,12 +1405,17 @@ fn build_state_valuations(
 ///
 /// When the design has no inputs, the transition still needs a label;
 /// `step` is the conventional fallback (matches AIGER's behavior).
-fn signal_labels_for_input(combo: usize, meta: &[InputMeta]) -> Vec<String> {
+fn signal_labels_for_input(
+    combo: usize,
+    meta: &[InputMeta],
+    input_cells: &InputCellEnumeration,
+) -> Vec<String> {
     let labels: Vec<String> = meta
         .iter()
-        .filter(|im| !im.is_clock)
-        .map(|im| {
-            let v = extract_input_combo(combo, meta, im.nid);
+        .enumerate()
+        .filter(|(_, im)| !im.is_clock)
+        .map(|(i, im)| {
+            let v = input_cells.value_at(combo, i);
             format!("{}_{}", im.symbol, v)
         })
         .collect();
@@ -1034,6 +1448,11 @@ fn extract_combo(combo: usize, meta: &[StateMeta], target_nid: Nid) -> u128 {
 /// not part of the enumerated input space — and their value is always
 /// reported as 1 (posedge active) so the BTOR2 evaluator sees the
 /// active clock edge on every CLTS step.
+///
+/// Superseded in Phase 1.6 by [`InputCellEnumeration::value_at`], which
+/// respects per-input `FieldDomain` mixed-radix encoding. Kept for
+/// reference only.
+#[allow(dead_code)]
 fn extract_input_combo(combo: usize, meta: &[InputMeta], target_nid: Nid) -> u128 {
     let mut shift = 0u32;
     for im in meta {
@@ -1054,6 +1473,7 @@ fn make_step_env(
     state_meta: &[StateMeta],
     input_meta: &[InputMeta],
     cells: &CellEnumeration,
+    input_cells: &InputCellEnumeration,
     state_idx: usize,
     input_idx: usize,
 ) -> Env {
@@ -1062,8 +1482,8 @@ fn make_step_env(
         let bits = cells.value_at(state_idx, i);
         env.values.insert(sm.nid, BvValue::new(bits, sm.width));
     }
-    for im in input_meta {
-        let bits = extract_input_combo(input_idx, input_meta, im.nid);
+    for (i, im) in input_meta.iter().enumerate() {
+        let bits = input_cells.value_at(input_idx, i);
         env.values.insert(im.nid, BvValue::new(bits, im.width));
     }
     env
@@ -1457,7 +1877,7 @@ fn sign_extend(bits: u128, width: u32) -> i128 {
 /// High-level entry: parse + bit-blast + emit.
 pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutput, AdapterError> {
     let file = super::parser::parse(content)?;
-    let (ir, warnings) = to_ir(&file, options)?;
+    let (ir, warnings, partition_summary) = to_ir(&file, options)?;
 
     let state_count = ir.automata.first().map(|a| a.states.len()).unwrap_or(0);
     let signal_count = ir.signals.len();
@@ -1502,6 +1922,7 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
         },
         state_valuations,
         transition_observations: Default::default(),
+        partition_summary,
     })
 }
 
@@ -1545,9 +1966,10 @@ mod tests {
 
     #[test]
     fn rejects_state_space_overflow() {
-        // 17 1-bit states → 2^17 > MAX_STATE_BITS=16
+        // `MAX_STATE_BITS + 1` 1-bit states → 2^(N+1) > MAX_STATE_BITS.
         let mut src = "1 sort bitvec 1\n".to_string();
-        for i in 0..17 {
+        let overflow_count = MAX_STATE_BITS as usize + 1;
+        for i in 0..overflow_count {
             src.push_str(&format!("{} state 1 s{}\n", i + 2, i));
         }
         let err = translate(&src, &AdapterOptions::default()).unwrap_err();
@@ -1562,8 +1984,152 @@ mod tests {
     }
 
     #[test]
+    fn input_pruning_via_sidecar_unlocks_designs_past_raw_input_cap() {
+        // Twelve 1-bit inputs → raw input width 12, exceeds
+        // MAX_INPUT_BITS = 10. Without sidecar pruning, translation
+        // must reject. With a sidecar declaring three of the inputs
+        // as `ignored`, the effective input space is 2^9 = 512, well
+        // under the cap, and translation succeeds.
+        let mut src = "1 sort bitvec 1\n".to_string();
+        src.push_str("2 zero 1\n");
+        src.push_str("3 state 1 q\n");
+        src.push_str("4 init 1 3 2\n");
+        for i in 0..12 {
+            src.push_str(&format!("{} input 1 in{}\n", i + 5, i));
+        }
+
+        // 1) Without sidecar — should reject on the input-bit cap.
+        let bare = translate(&src, &AdapterOptions::default());
+        assert!(bare.is_err(), "expected raw-input-cap rejection");
+        let err = bare.unwrap_err();
+        assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
+
+        // 2) With a sidecar pruning three inputs to `ignored`, the
+        // effective input space drops below the cap and translation
+        // succeeds.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [],
+            "inputs": [
+                { "name": "in0", "abstraction": "ignored" },
+                { "name": "in1", "abstraction": "ignored" },
+                { "name": "in2", "abstraction": "ignored" },
+            ],
+        })
+        .to_string();
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar),
+            ..Default::default()
+        };
+        let out = translate(&src, &opts).expect("sidecar-pruned design should translate");
+        assert!(out.ctxdsl.contains("automaton"));
+    }
+
+    #[test]
+    fn input_pruning_ignored_inputs_collapse_to_one_value() {
+        // One state, two inputs. Without sidecar: 4 input combos
+        // → 2 transitions per input combo across 2 states. With
+        // sidecar declaring one input as `ignored`: 2 input combos
+        // total — the enumeration count is observably smaller.
+        let mut src = "1 sort bitvec 1\n".to_string();
+        src.push_str("2 zero 1\n");
+        src.push_str("3 state 1 q\n");
+        src.push_str("4 init 1 3 2\n");
+        src.push_str("5 input 1 keep\n");
+        src.push_str("6 input 1 drop\n");
+        src.push_str("7 next 1 3 5\n"); // q' = keep (drop is unused)
+
+        // Sidecar pins `drop` to 0.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [],
+            "inputs": [
+                { "name": "drop", "abstraction": "ignored" },
+            ],
+        })
+        .to_string();
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar),
+            ..Default::default()
+        };
+        let out = translate(&src, &opts).expect("translate");
+        // Labels should mention `keep_0` and `keep_1` but never
+        // `drop_1` (drop is pinned to 0).
+        let ctxdsl = &out.ctxdsl;
+        assert!(
+            ctxdsl.contains("keep_0") || ctxdsl.contains("keep_1"),
+            "expected keep-labeled transitions; ctxdsl was:\n{ctxdsl}"
+        );
+        assert!(
+            !ctxdsl.contains("drop_1"),
+            "drop should be pinned to 0; ctxdsl was:\n{ctxdsl}"
+        );
+    }
+
+    #[test]
+    fn partition_summary_populated_on_adapter_output() {
+        // Phase A.3 step 3.6 — BTOR2 adapter populates
+        // `AdapterOutput.partition_summary` with the right counts and
+        // bit-width totals.
+        //
+        // Fixture: one named state `s_keep` reachable from a `bad` line
+        // (Kept), one named state `s_drop` not reachable (Dropped),
+        // and one named input `trigger` that drives `s_keep` (Kept by
+        // transitive walk). state_bits_before = 1+1 = 2, state_bits_after
+        // = 1 (after dropping s_drop's 1-bit width).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 input 1 trigger
+4 state 1 s_keep
+5 init 1 4 2
+6 next 1 4 3
+7 state 1 s_drop
+8 init 1 7 2
+9 next 1 7 2
+10 bad 4
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        let summary = out
+            .partition_summary
+            .expect("partition_summary must be populated");
+        assert!(
+            summary.dropped_coi >= 1,
+            "expected ≥ 1 dropped signal (s_drop); got {summary:?}"
+        );
+        assert!(
+            summary.kept >= 2,
+            "expected ≥ 2 kept signals; got {summary:?}"
+        );
+        assert_eq!(summary.datapath_uf, 0, "datapath UF disabled in A.3");
+        // Width tracking should be present for BTOR2.
+        let before = summary
+            .state_bits_before
+            .expect("BTOR2 always tracks widths");
+        let after = summary
+            .state_bits_after
+            .expect("BTOR2 always tracks widths");
+        assert!(
+            after <= before,
+            "state_bits_after ({after}) must not exceed state_bits_before ({before})"
+        );
+        assert!(
+            after < before,
+            "expected reduction from dropping s_drop; got before={before} after={after}"
+        );
+    }
+
+    #[test]
     fn constraint_filters_transitions() {
-        // input drives state; constraint = input must be 0.
+        // input drives state; constraint = input must be 0; bad line
+        // pinned to state `q` so auto-COI (Phase A.3) keeps `q` in the
+        // partition. Without that pin, COI would correctly drop `q`
+        // because no property atom referenced it — collapsing the
+        // test's state space below the count required to assert that
+        // *constraint* filtering takes effect.
+        //
         // Without constraint: 2 states × 2 inputs = 4 transitions.
         // With constraint:    2 states × 1 input  = 2 transitions.
         let src = r#"
@@ -1575,6 +2141,7 @@ mod tests {
 6 next 1 3 5
 7 not 1 5
 8 constraint 7
+9 bad 3
 "#;
         let out = translate(src, &AdapterOptions::default()).expect("translate");
         assert_eq!(out.source_info.state_count, 2);

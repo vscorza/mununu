@@ -59,6 +59,18 @@ pub struct YosysOptions {
     /// at `/tmp/.../work.sv`. The user expects the path of the file
     /// they actually invoked mununu on.
     pub primary_source_path: Option<String>,
+    /// Run `sv2v` as a preprocessing pass before Yosys. Unblocks Yosys's
+    /// built-in parser for modern SystemVerilog constructs it doesn't
+    /// accept — most notably the SV2009/2012 module-header import
+    /// syntax `module M import pkg::*; (ports);` used by Caliptra-RTL,
+    /// OpenTitan, ibex, cv32e40p, and similar open-source RTL.
+    ///
+    /// Requires `sv2v` (zachjs/sv2v ≥ 0.0.10 recommended) on `$PATH` or
+    /// in `MUNUNU_SV2V_PATH`. Defaults to `false` so existing examples
+    /// keep their current parse behavior. Opt in via the CLI flag
+    /// `--preprocessor sv2v` or the API field `use_sv2v: true` on the
+    /// import request.
+    pub use_sv2v: bool,
 }
 
 /// SV-via-Yosys adapter — wraps the BTOR2 path with a Yosys subprocess.
@@ -103,6 +115,42 @@ pub fn translate_sv(
         }
         write_file(&p, src)?;
         sources.push(p);
+    }
+
+    // Optional sv2v preprocessing pass. sv2v translates modern SV
+    // constructs Yosys's built-in parser doesn't accept (notably the
+    // module-header `import pkg::*;` syntax) into Verilog-2005 that
+    // Yosys handles cleanly. Activated by `YosysOptions::use_sv2v`
+    // (the only switch — wire `--preprocessor sv2v` on the CLI or
+    // `use_sv2v: true` on the API into this field).
+    if yopts.use_sv2v {
+        let sv2v = locate_sv2v()?;
+        let preprocessed = tmp.path().join("preprocessed.sv");
+        // Include-search path: the parent dir of the primary source on
+        // disk, if known. `caliptra_sva.svh` and similar header files
+        // live next to the `.sv` the user invoked us on; sv2v can't
+        // see them otherwise because mununu staged a per-call tempdir.
+        //
+        // Canonicalize to an absolute path so relative invocations
+        // (e.g. `mununu context eval foo.sv` from the source dir)
+        // resolve to a usable `-I` rather than the empty-parent path.
+        let include_dirs: Vec<PathBuf> = yopts
+            .primary_source_path
+            .as_ref()
+            .and_then(|p| {
+                let abs = Path::new(p)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(p));
+                abs.parent().map(Path::to_path_buf)
+            })
+            .into_iter()
+            .collect();
+        run_sv2v(&sv2v, &sources, &include_dirs, &preprocessed)?;
+        // Replace the original .sv inputs with the single combined
+        // Verilog-2005 file. sv2v resolves cross-file packages,
+        // interfaces, and parameters in one pass, so feeding the
+        // combined output to Yosys is the documented correct usage.
+        sources = vec![preprocessed];
     }
 
     let btor_path = tmp.path().join("design.btor");
@@ -462,6 +510,65 @@ fn locate_yosys() -> Result<PathBuf, AdapterError> {
     })
 }
 
+/// Find a usable sv2v binary. Mirrors `locate_yosys` — check
+/// `MUNUNU_SV2V_PATH` first, then fall back to the bare `sv2v` on
+/// `$PATH`. zachjs/sv2v's `--version` flag is a stable smoke test.
+fn locate_sv2v() -> Result<PathBuf, AdapterError> {
+    if let Ok(path) = std::env::var("MUNUNU_SV2V_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(out) = Command::new("sv2v").arg("--version").output()
+        && out.status.success()
+    {
+        return Ok(PathBuf::from("sv2v"));
+    }
+    Err(AdapterError {
+        kind: AdapterErrorKind::UnsupportedConstruct,
+        message: "adapter/yosys: sv2v binary not found in $PATH (set MUNUNU_SV2V_PATH or install zachjs/sv2v ≥ 0.0.10). Required by --preprocessor sv2v / MUNUNU_USE_SV2V=1."
+            .into(),
+        location: None,
+    })
+}
+
+/// Run sv2v over `sources`, capture stdout into `out`. sv2v's documented
+/// multi-file mode resolves cross-file packages/interfaces in one pass
+/// and emits a single combined Verilog-2005 stream on stdout.
+///
+/// `include_dirs` forwards `-I` flags so `\`include` directives in the
+/// `.sv` sources (e.g. `\`include "caliptra_sva.svh"`) resolve. Without
+/// these, sv2v errors on missing headers because mununu stages a per-call
+/// tempdir away from the original source directory.
+fn run_sv2v(
+    sv2v: &Path,
+    sources: &[PathBuf],
+    include_dirs: &[PathBuf],
+    out: &Path,
+) -> Result<(), AdapterError> {
+    let mut cmd = Command::new(sv2v);
+    for dir in include_dirs {
+        cmd.arg(format!("-I{}", dir.display()));
+    }
+    cmd.args(sources);
+    let result = cmd.output().map_err(|e| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: format!("adapter/yosys: failed to spawn sv2v: {e}"),
+        location: None,
+    })?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/yosys: sv2v (preprocessor) exited with status {} \nstdout:\n{stdout}\nstderr:\n{stderr}",
+                result.status
+            ),
+            location: None,
+        });
+    }
+    std::fs::write(out, &result.stdout).map_err(io_err)
+}
+
 /// Best-effort check that the located yosys binary was not built with the
 /// commercial Verific frontend. Verific-built yosys binaries print
 /// "verific" in their `-V` banner.
@@ -586,6 +693,7 @@ pub fn translate_sv_multi(
             .collect(),
         skip_verific_check: false,
         primary_source_path: None,
+        use_sv2v: false,
     };
     translate_sv(primary, options, &yopts)
 }
@@ -972,5 +1080,147 @@ endmodule
         assert_eq!(gap_sidecars.len(), 1);
         assert_eq!(gap_sidecars[0].filename, "vendor_ip.gap_report.json");
         assert!(gap_sidecars[0].content.contains("output_sequencing"));
+    }
+
+    // ----- sv2v preprocessor integration -----------------------------
+
+    /// Probe whether `sv2v` is on PATH. Mirrors `yosys_available()`.
+    fn sv2v_available() -> bool {
+        Command::new("sv2v")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn sv2v_preprocesses_module_header_import_then_yosys_succeeds() {
+        if !yosys_available() || !sv2v_available() {
+            eprintln!("skipping: yosys or sv2v not on PATH");
+            return;
+        }
+        // SV2009/2012 module-header `import pkg::*;` — Yosys 0.59's built-in
+        // parser does NOT accept this. sv2v rewrites it to Verilog-2005
+        // that Yosys handles. This is the construct that blocked the
+        // Caliptra-RTL #150 retry in proof-by-fire Finding 1.
+        let sv = r#"
+package my_pkg;
+    typedef enum logic [1:0] {
+        S_IDLE = 2'b00,
+        S_RUN  = 2'b01,
+        S_DONE = 2'b10
+    } state_e;
+endpackage
+
+module dut
+    import my_pkg::*;
+    (input wire clk, input wire start, output state_e ps);
+    state_e ns;
+    always @(posedge clk) ps <= ns;
+    always_comb begin
+        ns = ps;
+        case (ps)
+            S_IDLE: if (start) ns = S_RUN;
+            S_RUN:  ns = S_DONE;
+            S_DONE: ns = S_IDLE;
+            default: ns = S_IDLE;
+        endcase
+    end
+endmodule
+"#;
+        let opts = AdapterOptions::default();
+        let yopts = YosysOptions {
+            top: Some("dut".into()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let out = translate_sv(sv, &opts, &yopts).expect("sv2v + yosys translate");
+        assert!(
+            out.source_info.state_count >= 3,
+            "expected ≥3 reachable states for the 3-state FSM, got {}",
+            out.source_info.state_count
+        );
+    }
+
+    #[test]
+    fn sv2v_multi_file_cross_package_imports() {
+        if !yosys_available() || !sv2v_available() {
+            eprintln!("skipping: yosys or sv2v not on PATH");
+            return;
+        }
+        // Cross-file: the module in primary.sv imports a package
+        // declared in additional.sv. sv2v's documented multi-file mode
+        // resolves the import in one pass before Yosys sees the
+        // combined output.
+        let primary = r#"
+module top
+    import shared_pkg::*;
+    (input wire clk, output logic flag);
+    state_e ps;
+    always @(posedge clk) ps <= S_ON;
+    assign flag = (ps == S_ON);
+endmodule
+"#;
+        let additional = r#"
+package shared_pkg;
+    typedef enum logic { S_OFF = 1'b0, S_ON = 1'b1 } state_e;
+endpackage
+"#;
+        let opts = AdapterOptions::default();
+        let yopts = YosysOptions {
+            top: Some("top".into()),
+            additional_sources: vec![("shared_pkg.sv".into(), additional.into())],
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let out = translate_sv(primary, &opts, &yopts).expect("sv2v multi-file translate");
+        // Reachability: at least 1 state. The actual count depends on
+        // Yosys's flatten + chformal; we assert non-empty.
+        assert!(
+            out.source_info.state_count >= 1,
+            "got state_count = {}",
+            out.source_info.state_count
+        );
+    }
+
+    #[test]
+    fn sv2v_missing_tool_errors_cleanly() {
+        // Point MUNUNU_SV2V_PATH at a definitely-missing file to make
+        // locate_sv2v's first branch (env-var lookup) take a path that
+        // exists in code but yields a binary that won't run. The driver
+        // surfaces the failure during the sv2v subprocess spawn.
+        if !yosys_available() {
+            eprintln!("skipping: yosys not on PATH");
+            return;
+        }
+        // Save/restore the env var so we don't pollute other tests.
+        let prev = std::env::var("MUNUNU_SV2V_PATH").ok();
+        // SAFETY: tests in this binary run on one thread by default for
+        // YosysOptions-mutating cases; if parallelism is enabled this
+        // test should be ignored. Per cargo test default we're fine.
+        unsafe {
+            std::env::set_var("MUNUNU_SV2V_PATH", "/definitely/not/a/real/sv2v/binary");
+        }
+        let sv = "module empty; endmodule\n";
+        let opts = AdapterOptions::default();
+        let yopts = YosysOptions {
+            top: Some("empty".into()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let res = translate_sv(sv, &opts, &yopts);
+        // Restore env first so panic in assert below doesn't leak it.
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("MUNUNU_SV2V_PATH", p),
+                None => std::env::remove_var("MUNUNU_SV2V_PATH"),
+            }
+        }
+        let err = res.expect_err("expected sv2v spawn failure when binary path is bogus");
+        assert!(
+            err.message.contains("sv2v"),
+            "error should name sv2v; got: {}",
+            err.message
+        );
     }
 }

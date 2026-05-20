@@ -86,6 +86,36 @@ pub(crate) fn load_with_adapter_mode(
     adapter: Option<&str>,
     mode: Option<&str>,
 ) -> Result<(ContextDoc, Option<String>), String> {
+    load_with_adapter_mode_extra(path, adapter, mode, &[], None)
+}
+
+/// Optional source-language preprocessor for SV-shaped adapters.
+/// Currently only `sv2v` is recognised (returns `Some("sv2v")` →
+/// caller sets `YosysOptions::use_sv2v`). Anything else returns a
+/// user-visible error so a typo doesn't silently disable the
+/// requested preprocessor.
+pub(crate) fn validate_preprocessor(name: Option<&str>) -> Result<Option<&str>, String> {
+    match name {
+        None => Ok(None),
+        Some("sv2v") => Ok(Some("sv2v")),
+        Some(other) => Err(format!("unknown preprocessor '{other}'. Supported: sv2v")),
+    }
+}
+
+/// Like [`load_with_adapter_mode`] but accepts a slice of additional
+/// source files and an optional preprocessor name. For the `sv-yosys`
+/// adapter the additional sources are forwarded to
+/// `YosysOptions::additional_sources` so sv2v / Yosys can resolve
+/// cross-file packages, interfaces, and `\`include`-style directives;
+/// the preprocessor name (`Some("sv2v")`) toggles
+/// `YosysOptions::use_sv2v`. Ignored by all other adapters.
+pub(crate) fn load_with_adapter_mode_extra(
+    path: &Path,
+    adapter: Option<&str>,
+    mode: Option<&str>,
+    additional_sv_paths: &[PathBuf],
+    preprocessor: Option<&str>,
+) -> Result<(ContextDoc, Option<String>), String> {
     use mununu_core::adapter::{AdapterOptions, FormatAdapter};
 
     let source = fs::read_to_string(path)
@@ -136,8 +166,37 @@ pub(crate) fn load_with_adapter_mode(
             // Sidecars emitted for `(* blackbox *)` modules (Document B
             // task B3) land in the source file's parent directory so the
             // user finds them next to the `.sv` they just ran.
+            //
+            // Multi-file: `additional_sv_paths` (passed in from the CLI
+            // sidecar flag) become extra `.sv` sources for Yosys / sv2v
+            // to resolve cross-file packages and imports. Each entry is
+            // read off disk and shipped as a (filename, content) pair.
+            let mut additional: Vec<(String, String)> =
+                Vec::with_capacity(additional_sv_paths.len());
+            for extra in additional_sv_paths {
+                let content = fs::read_to_string(extra).map_err(|err| {
+                    format!(
+                        "failed to read additional SV source '{}': {err}",
+                        extra.display()
+                    )
+                })?;
+                let name = extra
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "additional SV source '{}' has no usable filename",
+                            extra.display()
+                        )
+                    })?
+                    .to_string();
+                additional.push((name, content));
+            }
+            let use_sv2v = matches!(preprocessor, Some("sv2v"));
             let yopts = mununu_core::adapter::yosys::YosysOptions {
                 primary_source_path: Some(path.to_string_lossy().into_owned()),
+                additional_sources: additional,
+                use_sv2v,
                 ..Default::default()
             };
             log_adapter_output_with_dir(
@@ -227,7 +286,13 @@ pub(crate) fn load_with_adapter_mode(
             // Auto-detect by file extension if no adapter specified
             if let Some(fmt) = mununu_core::adapter::detect_format_by_extension(path) {
                 eprintln!("Auto-detected format '{}' from extension", fmt);
-                return load_with_adapter_mode(path, Some(fmt), mode);
+                return load_with_adapter_mode_extra(
+                    path,
+                    Some(fmt),
+                    mode,
+                    additional_sv_paths,
+                    preprocessor,
+                );
             }
             (source, std::collections::HashMap::new())
         }
@@ -254,7 +319,7 @@ pub(crate) fn load_context_documents(
     sidecar_paths: &[PathBuf],
     adapter: Option<&str>,
 ) -> Result<(ContextDoc, Vec<ContextDoc>, Option<String>), String> {
-    load_context_documents_mode(context_path, sidecar_paths, adapter, None)
+    load_context_documents_mode(context_path, sidecar_paths, adapter, None, None)
 }
 
 pub(crate) fn load_context_documents_mode(
@@ -262,10 +327,46 @@ pub(crate) fn load_context_documents_mode(
     sidecar_paths: &[PathBuf],
     adapter: Option<&str>,
     mode: Option<&str>,
+    preprocessor: Option<&str>,
 ) -> Result<(ContextDoc, Vec<ContextDoc>, Option<String>), String> {
-    let (context_doc, ctxdsl_text) = load_with_adapter_mode(context_path, adapter, mode)?;
-    let mut sidecar_docs = Vec::with_capacity(sidecar_paths.len());
-    for path in sidecar_paths {
+    // Sidecar argument routing.
+    //
+    // - `.sv` / `.svh`: additional sources for the sv-yosys adapter
+    //   (multi-file SV elaboration).
+    // - `.mununu.json` (the abstraction sidecar): a no-op at the CLI
+    //   level. The adapter auto-loads the file from the primary
+    //   source's directory via path adjacency (see
+    //   [`load_btor_sidecar`]); the user-passed path is informational
+    //   and must not be parsed as a CTXDSL document.
+    // - everything else: a CTXDSL sidecar document.
+    let mut sv_sources: Vec<PathBuf> = Vec::new();
+    let mut ctxdsl_sidecars: Vec<PathBuf> = Vec::new();
+    let mut ignored_mununu_json: Vec<PathBuf> = Vec::new();
+    for p in sidecar_paths.iter().cloned() {
+        let ext = p.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("sv") | Some("svh")) {
+            sv_sources.push(p);
+        } else if p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with(".mununu.json"))
+        {
+            ignored_mununu_json.push(p);
+        } else {
+            ctxdsl_sidecars.push(p);
+        }
+    }
+    for p in &ignored_mununu_json {
+        eprintln!(
+            "note: --sidecar {} is auto-loaded by the adapter via path adjacency; \
+             the explicit flag is informational only",
+            p.display()
+        );
+    }
+    let (context_doc, ctxdsl_text) =
+        load_with_adapter_mode_extra(context_path, adapter, mode, &sv_sources, preprocessor)?;
+    let mut sidecar_docs = Vec::with_capacity(ctxdsl_sidecars.len());
+    for path in &ctxdsl_sidecars {
         sidecar_docs.push(parse_context_file(path)?);
     }
     Ok((context_doc, sidecar_docs, ctxdsl_text))
@@ -355,6 +456,7 @@ pub(crate) struct EvalContextParams<'a> {
     pub(crate) sidecars: &'a [PathBuf],
     pub(crate) adapter: Option<&'a str>,
     pub(crate) mode: Option<&'a str>,
+    pub(crate) preprocessor: Option<&'a str>,
     pub(crate) print_ctxdsl_path: Option<&'a Option<PathBuf>>,
     /// Non-empty only for `context eval`; pass `&[]` for `context synthesize`.
     pub(crate) stubs: &'a [PathBuf],
@@ -369,7 +471,7 @@ pub(crate) fn prepare_eval_context(
     p: EvalContextParams<'_>,
 ) -> Result<PreparedEvalContext, String> {
     let (context_doc, mut sidecar_docs, adapter_ctxdsl) =
-        load_context_documents_mode(p.context, p.sidecars, p.adapter, p.mode)?;
+        load_context_documents_mode(p.context, p.sidecars, p.adapter, p.mode, p.preprocessor)?;
 
     // Print intermediate CTXDSL if requested
     if let Some(output_path) = p.print_ctxdsl_path {

@@ -23,6 +23,29 @@ use super::{
 use ast::{Module, MununuPropertyKind, PortDirection};
 use std::collections::HashSet;
 
+/// Phase A.3 step 3.6 — recompute the partition for telemetry only.
+/// Mirrors what `build_kripke_with_config` does internally; we
+/// duplicate the computation here to avoid threading a return value
+/// through every Kripke-builder call site. Returns `None` when the
+/// partition was effectively skipped (no property seeds).
+///
+/// Width tracking is `None` for the SV adapter — register widths are
+/// available via `extract_registers` but plumbing them here for a
+/// recomputed second pass is not worth the cycles. Adapters that
+/// natively track bit widths (BTOR2) populate `state_bits_before/after`.
+fn partition_summary_for_sv(
+    module: &Module,
+    config: &annotation::MergedConfig,
+) -> Option<crate::adapter::partition::PartitionSummary> {
+    use crate::adapter::partition::{self, PartitionOptions, PartitionSummary};
+    let seeds = kripke::collect_property_signals_from_config(config);
+    if seeds.is_empty() {
+        return None;
+    }
+    let partition = partition::classify(module, &seeds, &PartitionOptions::default());
+    Some(PartitionSummary::from_partition(&partition, None))
+}
+
 /// SystemVerilog adapter implementing [`FormatAdapter`].
 pub struct SystemVerilogAdapter;
 
@@ -109,6 +132,13 @@ impl SystemVerilogAdapter {
 
         let property_count = ir.properties.len();
 
+        // Phase A.3 step 3.6 — recompute the partition for telemetry.
+        // The first-pass partition runs inside `build_kripke_with_config`
+        // and informs which registers were dropped; we re-run here on
+        // the same inputs to surface a `PartitionSummary` without
+        // threading it through every Kripke-builder call site.
+        let partition_summary = partition_summary_for_sv(&module, &config);
+
         Ok(AdapterOutput {
             sidecars: Vec::new(),
             ctxdsl: result.ctxdsl,
@@ -122,6 +152,7 @@ impl SystemVerilogAdapter {
             },
             state_valuations,
             transition_observations: Default::default(),
+            partition_summary,
         })
     }
 
@@ -411,6 +442,7 @@ impl SystemVerilogAdapter {
             },
             state_valuations: all_state_valuations,
             transition_observations: Default::default(),
+            partition_summary: None,
         })
     }
 }
@@ -705,6 +737,11 @@ impl FormatAdapter for SystemVerilogAdapter {
 
         let mut warnings = Vec::new();
         warnings.append(&mut parse_warnings);
+        // Build a minimal MergedConfig from the inline annotations so
+        // the partition summary mirrors what build_kripke internally
+        // computes. Mirrors the path inside translate_with_path.
+        let config = annotation::merge_config(None, &module);
+        let partition_summary = partition_summary_for_sv(&module, &config);
         let ir = to_ir(&module, options, &mut warnings)?;
 
         let state_valuations = crate::adapter::emit::extract_state_valuations(&ir);
@@ -730,6 +767,7 @@ impl FormatAdapter for SystemVerilogAdapter {
             },
             state_valuations,
             transition_observations: Default::default(),
+            partition_summary,
         })
     }
 }

@@ -329,8 +329,74 @@ impl RealizedContext {
                 }
             }
         }
+
+        // Phase A.3 follow-up — wire CLTS per-state valuations into the
+        // evaluator's `abstract_states` channel so formula atoms of the
+        // shape `signal == constant` (emitted by the BTOR2 bit-blaster
+        // via `build_state_valuations`) bind to actual integer values
+        // rather than fall through to the SOUNDNESS under-approx
+        // "predicate-not-found → empty bitset" path. Without this the
+        // round-trip from `mununu sv-yosys → CTXDSL → realize → eval`
+        // returned vacuous verdicts on Caliptra-class designs.
+        //
+        // **Narrow scope.** Wiring is gated on `clts_valuations_are_numeric()`
+        // — every valuation string across every state must parse as an
+        // i64. This restricts the fix to the BTOR2 bit-blaster's
+        // decimal-encoded valuations and **excludes** the SV adapter's
+        // semantic state-name encoding (`state_S_IDLE_overlap_F` /
+        // variant strings like `"T"` / `"F"`), which uses pre-computed
+        // predicate bitsets registered above and would otherwise be
+        // changed by the `Maybe → include` semantics of
+        // `evaluate_expression_on_demand`. A broader binding rule
+        // (e.g. routing variant-name comparisons too) is a separate
+        // follow-up.
+        if clts.has_valuations() && clts_valuations_are_numeric(clts) {
+            let mut abstract_states = Vec::with_capacity(state_count);
+            for state_id in clts.states() {
+                let location = clts.state_name(state_id).unwrap_or("").to_string();
+                let mut abs = crate::abstraction::state::AbstractState::new(location);
+                if let Some(vals) = clts.state_valuation(state_id) {
+                    for (var, display) in vals {
+                        if let Ok(n) = display.parse::<i64>() {
+                            abs.set_variable(
+                                var.clone(),
+                                crate::abstraction::value::AbstractValue::IntConstant(n),
+                            );
+                        }
+                    }
+                }
+                abstract_states.push(abs);
+            }
+            env = env.with_abstract_states(abstract_states);
+        }
+
         env
     }
+}
+
+/// Return `true` when every valuation string on every CLTS state
+/// parses as an `i64`. The scope guard for the Phase A.3 follow-up
+/// abstract-states wiring above — only the BTOR2 bit-blaster's
+/// decimal-encoded valuations qualify, so semantic SV-adapter
+/// encodings (variant names like `T`/`F`/`IDLE`) are left to the
+/// existing pre-computed-predicate path.
+fn clts_valuations_are_numeric<S, L>(clts: &crate::clts::Clts<S, L>) -> bool
+where
+    S: crate::clts::IdStorage,
+    L: crate::clts::IdStorage,
+{
+    let mut any_value = false;
+    for state_id in clts.states() {
+        if let Some(vals) = clts.state_valuation(state_id) {
+            for v in vals.values() {
+                any_value = true;
+                if v.parse::<i64>().is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+    any_value
 }
 
 fn fallback_bits(state_count: usize, metadata: Option<&PredicateMetadata>) -> BitVec<usize, Lsb0> {

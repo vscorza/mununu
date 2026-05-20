@@ -89,6 +89,7 @@ impl FormatAdapter for AigerAdapter {
             },
             state_valuations: Default::default(),
             transition_observations: Default::default(),
+            partition_summary: None,
         })
     }
 }

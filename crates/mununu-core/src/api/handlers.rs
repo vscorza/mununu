@@ -363,6 +363,12 @@ pub async fn context_import_handler(
         "sv-yosys" | "yosys" => {
             // Yosys-driven SV elaboration via child process. Parity with the
             // CLI `--adapter sv-yosys` flag.
+            //
+            // `use_sv2v` is the API-side mirror of the CLI's
+            // `--preprocessor sv2v` flag. When set, the driver runs sv2v
+            // as a preprocessing pass before invoking Yosys, lowering
+            // modern SystemVerilog constructs (notably module-header
+            // `import pkg::*;`) to Verilog-2005 that Yosys handles.
             let yopts = if !request.additional_sources.is_empty() {
                 let mut additional = std::collections::HashMap::new();
                 for src in &request.additional_sources {
@@ -370,10 +376,14 @@ pub async fn context_import_handler(
                 }
                 crate::adapter::yosys::YosysOptions {
                     additional_sources: additional.into_iter().collect(),
+                    use_sv2v: request.use_sv2v,
                     ..Default::default()
                 }
             } else {
-                crate::adapter::yosys::YosysOptions::default()
+                crate::adapter::yosys::YosysOptions {
+                    use_sv2v: request.use_sv2v,
+                    ..Default::default()
+                }
             };
             crate::adapter::yosys::translate_sv(&request.content, &options, &yopts)
         }
@@ -2559,6 +2569,7 @@ members = ["x"]
             filename: Some("mini.crewai.json".to_string()),
             sidecar: None,
             additional_sources: Vec::new(),
+            use_sv2v: false,
         };
         let Json(out) = context_import_handler(Json(request))
             .await
@@ -2586,6 +2597,7 @@ members = ["x"]
             filename: Some("graph.langgraph.json".to_string()),
             sidecar: None,
             additional_sources: Vec::new(),
+            use_sv2v: false,
         };
         let Json(out) = context_import_handler(Json(request))
             .await

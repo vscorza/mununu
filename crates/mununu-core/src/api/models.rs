@@ -225,6 +225,15 @@ pub struct ContextImportRequest {
     /// Additional source files (for multi-module SV compositions).
     #[serde(default)]
     pub additional_sources: Vec<FileContent>,
+    /// When `format == "sv-yosys"`, opt in to the `sv2v` preprocessor pass
+    /// before Yosys elaboration. Required for modern open-source SV
+    /// dialects (SV2009/2012 module-header `import pkg::*;` etc.) that
+    /// Yosys's built-in `read_verilog -sv` parser does not accept.
+    /// Requires `sv2v` (zachjs/sv2v) on `$PATH` or in `MUNUNU_SV2V_PATH`.
+    /// Mirrors the CLI's `--preprocessor sv2v` flag. Ignored by all
+    /// other formats.
+    #[serde(default)]
+    pub use_sv2v: bool,
 }
 
 fn default_import_format() -> String {

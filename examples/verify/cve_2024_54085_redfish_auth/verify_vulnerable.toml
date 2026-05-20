@@ -1,0 +1,76 @@
+# verify_vulnerable.toml — vulnerable variant of the Redfish auth-bypass
+# pattern publicly described in CVE-2024-54085.
+#
+# Companion: verify_fixed.toml runs the same property against the
+# patched model and is expected to satisfy it.
+#
+# Recreate:
+#   $ bash examples/verify/cve_2024_54085_redfish_auth/validate.sh
+
+[project]
+name = "RedfishAuthBypassVulnerable"
+description = "Hand-authored CTXDSL model of CVE-2024-54085 (vulnerable variant). Property no_unauthenticated_privileged_exec is expected to FAIL with a counterexample lasso witnessing the header-spoof shortcut."
+
+[[sources]]
+id = "redfish"
+adapter = "ctxdsl"
+files = ["redfish_auth_vulnerable.ctxdsl"]
+
+# Protocol-level model — no shared memory between sources. Declaring
+# the chaotic posture explicitly documents the choice for reviewers
+# rather than relying on the legacy-safe omission default. Per
+# docs/abstraction.md memory soundness matrix, `chaotic` is sound for
+# safety properties that do not mention memory; our properties only
+# reference state names on RedfishAuthHandler, so this is correct.
+[sources.memory_abstraction]
+kind  = "chaotic"
+notes = "No shared memory between HttpClient and RedfishAuthHandler in this protocol-level abstraction; properties reference automaton state names only."
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "asynchronous"
+# `redfish.*` expands to every automaton the CTXDSL source emits
+# (HttpClient + RedfishAuthHandler).
+members = ["redfish.*"]
+name    = "RedfishSystem"
+
+# --- Safety property (the load-bearing one) ---
+#
+# "Privileged execution must never be reachable from the spoof path."
+# Equivalently: every privileged-op the handler accepts must have been
+# preceded, in the same session, by a perform_auth_check transition.
+#
+# Expected on this VULNERABLE manifest: FAILS. The verify framework
+# emits a counterexample lasso witnessing the bypass — the lasso runs
+# http_connect → header_spoof_request → execute_privileged_op and
+# lands in `PrivilegedExecUnauth` without traversing
+# AuthCheckInProgress.
+[[properties]]
+name = "no_unauthenticated_privileged_exec"
+formula = "nu X. ((!PrivilegedExecUnauth) && ([] X))"
+over = "RedfishAuthHandler"
+
+# --- Sanity: legit path still works ---
+#
+# Reachability of `PrivilegedExecLegit` rules out a vacuous safety
+# verdict (a model that satisfies the safety formula by being unable
+# to reach any privileged state). Expected: HOLDS.
+[[properties]]
+name = "legit_privileged_path_reachable"
+template = "reachable"
+args = { TARGET = "PrivilegedExecLegit" }
+over = "RedfishAuthHandler"
+
+# --- Witness reachability of the bug ---
+#
+# Confirms the bypass state is reachable on the vulnerable model.
+# Expected: HOLDS. The verify framework reports the safety property
+# above as violated; this property holds. The pair makes the bug
+# unambiguous.
+[[properties]]
+name = "bypass_state_reachable"
+template = "reachable"
+args = { TARGET = "PrivilegedExecUnauth" }
+over = "RedfishAuthHandler"

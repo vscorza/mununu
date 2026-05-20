@@ -16,7 +16,7 @@ use crate::adapter::domain::{AbstractState, AbstractValue, AbstractionType, Fiel
 use crate::adapter::ir::*;
 use crate::adapter::state_enum;
 use crate::adapter::{AdapterError, AdapterErrorKind, AdapterWarning, WarningKind};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Reserved valuation key marking the out-of-bounds (OOB) sink state.
 ///
@@ -161,20 +161,46 @@ pub fn build_kripke_with_config(
         }
     }
 
-    // Step 2: Cone-of-influence reduction (inline path only)
-    // When a sidecar is used, the user explicitly controls preservation via
-    // `preserve: true/false` — COI auto-exclusion is not applied.
-    if !config.from_sidecar {
+    // Step 2: Cone-of-influence reduction (Phase A.3 step 3.5).
+    //
+    // Auto-COI runs whether or not a sidecar is in use. The composition
+    // rule with the sidecar is: **user wins on collision**. A register
+    // with an explicit entry in `config.signal_domains` is never
+    // auto-dropped — the user already signalled intent by mentioning
+    // it. Registers without a sidecar entry are subject to auto-COI;
+    // those classified `Dropped` by the partition collapse to
+    // `AbstractionType::Ignored`.
+    //
+    // SOUNDNESS: dropping a register to `Ignored` over-approximates —
+    // the abstract model admits all behaviours of the concrete model.
+    // Per `crate::adapter::partition`, this is safe for safety
+    // properties; liveness posture is documented in
+    // `crate::adapter::partition` module docs.
+    {
         let property_signals = collect_property_signals_from_config(config);
         if !property_signals.is_empty() {
-            let deps = build_dependency_graph(module);
-            let relevant = compute_cone_of_influence(&property_signals, &deps);
+            use crate::adapter::partition::{self, PartitionClass, PartitionOptions};
+            let partition =
+                partition::classify(module, &property_signals, &PartitionOptions::default());
             for reg in &mut registers {
-                let is_relevant = relevant.contains(&reg.name)
-                    || property_signals
-                        .iter()
-                        .any(|tok| tok.starts_with(&reg.name));
-                if reg.domain.abstraction != AbstractionType::Ignored && !is_relevant {
+                // Preserve the legacy prefix-match fallback so that
+                // structured names (e.g. a register surfaced as
+                // `reg[3:0]` in the formula) are still kept.
+                let is_relevant_by_prefix = property_signals
+                    .iter()
+                    .any(|tok| tok.starts_with(&reg.name));
+                let dropped_by_coi = matches!(
+                    partition.classes.get(&reg.name),
+                    Some(PartitionClass::Dropped { .. })
+                );
+                // User-wins-on-collision: an explicit sidecar entry
+                // for this register name overrides the auto-COI verdict.
+                let user_explicit = config.signal_domains.contains_key(&reg.name);
+                if reg.domain.abstraction != AbstractionType::Ignored
+                    && dropped_by_coi
+                    && !is_relevant_by_prefix
+                    && !user_explicit
+                {
                     warnings.push(AdapterWarning {
                         kind: WarningKind::ApproximateTranslation,
                         message: format!(
@@ -838,7 +864,7 @@ fn build_input_domains_from_config(
 }
 
 /// Collect property signals from config properties (for COI).
-fn collect_property_signals_from_config(
+pub(super) fn collect_property_signals_from_config(
     config: &super::annotation::MergedConfig,
 ) -> HashSet<String> {
     let mut signals = HashSet::new();
@@ -1087,6 +1113,46 @@ fn collect_identifiers_from_formula(formula: &str, out: &mut HashSet<String>) {
     }
 }
 
+// SOUNDNESS: the SV `DepGraphBuilder` impl below is an
+// over-approximation by construction — every assignment target gets the
+// union of (a) RHS identifiers and (b) any enclosing `if` / `case`
+// condition's identifiers as dependencies. Spurious edges reduce
+// precision but preserve soundness for safety properties; missing
+// edges would be unsound. See `crate::adapter::partition::dep_graph`.
+impl crate::adapter::partition::DepGraphBuilder for Module {
+    fn build(&self) -> HashMap<String, HashSet<String>> {
+        build_dependency_graph(self)
+    }
+
+    fn state_cells(&self) -> HashSet<String> {
+        let port_names: HashSet<&str> = self.ports.iter().map(|p| p.name.as_str()).collect();
+        let mut out = HashSet::new();
+        for decl in &self.declarations {
+            match decl {
+                Declaration::Enum {
+                    var_name: Some(var),
+                    ..
+                } => {
+                    out.insert(var.clone());
+                }
+                Declaration::Logic { name, .. } if !port_names.contains(name.as_str()) => {
+                    out.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn input_ports(&self) -> HashSet<String> {
+        self.ports
+            .iter()
+            .filter(|p| matches!(p.direction, super::ast::PortDirection::Input))
+            .map(|p| p.name.clone())
+            .collect()
+    }
+}
+
 /// Build a dependency graph: for each signal, which other signals does it depend on?
 pub fn build_dependency_graph(module: &Module) -> HashMap<String, HashSet<String>> {
     let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
@@ -1243,33 +1309,12 @@ fn collect_expr_idents(expr: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-/// Compute cone-of-influence: BFS backward from property signals through dependency graph.
-fn compute_cone_of_influence(
-    seeds: &HashSet<String>,
-    deps: &HashMap<String, HashSet<String>>,
-) -> HashSet<String> {
-    // Build reverse dependency map: if A depends on B, then B influences A
-    // We want: starting from property signals, what registers are needed?
-    // But we need the forward closure: property signals + anything they depend on
-
-    let mut relevant = HashSet::new();
-    let mut queue: VecDeque<String> = seeds.iter().cloned().collect();
-
-    while let Some(signal) = queue.pop_front() {
-        if relevant.insert(signal.clone()) {
-            // This signal depends on other signals
-            if let Some(signal_deps) = deps.get(&signal) {
-                for dep in signal_deps {
-                    if !relevant.contains(dep) {
-                        queue.push_back(dep.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    relevant
-}
+// The standalone `compute_cone_of_influence` previously lived here.
+// It has been replaced by `crate::adapter::partition::coi::cone_of_influence`,
+// which implements the same BFS algorithm against the
+// adapter-agnostic `DepGraphBuilder` trait. Call-sites inside this
+// file now go through `partition::classify`; the lifted function is
+// covered by tests under `crate::adapter::partition::coi::tests`.
 
 // ---------------------------------------------------------------------------
 // Combinational logic evaluation
@@ -2488,7 +2533,10 @@ mod tests {
             s
         });
 
-        let relevant = compute_cone_of_influence(&seeds, &deps);
+        // After Phase A.3 step 3.2: COI logic lifted to the shared
+        // `partition::coi` module. The behaviour is identical; the
+        // test exercises the same algorithm via its new home.
+        let relevant = crate::adapter::partition::coi::cone_of_influence(&seeds, &deps);
         assert!(relevant.contains("state"));
         assert!(relevant.contains("req"));
         assert!(!relevant.contains("data"));
