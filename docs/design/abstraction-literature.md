@@ -789,11 +789,480 @@ measurement.
 
 ---
 
+---
+
+# KMTS & 3-valued mu-calculus (entries 19–24)
+
+> **Section context.** The original 18-paper catalog above was assembled for
+> the pillow-plan / `auto-extraction-architecture.md` framing, which centred
+> on Phase A's explicit-state CLTS pipeline. The KMTS pivot
+> ([`native-sv-abstraction.md`](native-sv-abstraction.md)) re-centres the
+> abstraction story on **Kripke Modal Transition Systems with 3-valued
+> mu-calculus** — the only abstraction framework that is uniformly sound
+> for the full mu-calculus (including alternating fixpoints, including
+> liveness). The six entries that follow are the load-bearing KMTS
+> citations referenced by [`kmts-theory.md`](kmts-theory.md) and the §6 of
+> the architecture doc.
+
+## 19. Larsen & Thomsen, *A Modal Process Logic* (LICS 1988)
+
+**Theoretical core.** Original *modal transition systems* (MTS): triples
+`(S, R_must, R_may)` over an action alphabet with `R_must ⊆ R_may`. The
+intuition is *under-specification*: a must-edge is a transition every
+implementation must exhibit; a may-edge is a transition every
+implementation may exhibit. The paper introduces the refinement preorder
+that lets one MTS be a more concrete specification of another, with the
+asymmetry (may shrinks; must grows) that makes it the right notion for
+"abstract less informatively."
+
+**Pseudocode.** (Definitional, not algorithmic.)
+
+```text
+M = (S, R_must, R_may) over action alphabet Act, with R_must ⊆ R_may
+
+M_2 ≼ M_1 (M_2 refines M_1) iff there exists ≼ ⊆ M_2.S × M_1.S such that
+  for all (s_2, s_1) ∈ ≼:
+    (a) every may-step of s_1 is matched by a may-step of s_2 (accommodation)
+    (b) every must-step of s_2 is matched by a must-step of s_1 (preservation)
+```
+
+**mununu-shaped Rust sketch.**
+
+```rust
+// crates/mununu-core/src/clts/mod.rs (EXTENSION; post-R.1)
+enum TransitionModality { Sharp, MayOnly }   // standard KMTS: must ⊆ may
+struct Transition {
+    ...existing fields...
+    modality: TransitionModality,             // default Sharp on construction
+}
+```
+
+**Map to mununu.** Foundational. The `TransitionModality` enum on
+`Transition` is the direct implementation of the may/must distinction;
+the `Sharp` variant corresponds to `R_must ∩ R_may` (both required and
+admitted), `MayOnly` to `R_may \ R_must`. R.1 ships this.
+
+---
+
+## 20. Dams, Gerth, Grumberg, *Abstract Interpretation of Reactive Systems* (TOPLAS 1997, Vol. 19 No. 2)
+
+**Theoretical core.** Foundational abstract-interpretation framework
+for branching-time temporal logic. Introduces the *mixed transition
+system* generalisation that *drops* the `R_must ⊆ R_may` invariant of
+Larsen–Thomsen — admitting `must`-without-`may` for
+under-approximation-only abstractions. The Galois-connection setup,
+the preservation properties of abstract interpretation on
+branching-time formulas, and the soundness proof for the modal-mu
+fragment under either over- or under-approximation are all defined
+here. Mononu's standard-KMTS shape (the `Sharp + MayOnly` two-variant
+enum) is the restricted form of this framework — predicate-image
+construction guarantees the invariant by definition, so the
+mixed-system generalisation is not needed for the BTOR2 lifter.
+
+**Pseudocode.** (Framework definition; no single algorithm.)
+
+**mununu-shaped Rust sketch.** (See #19; the same `TransitionModality`
+enum, but consciously *omitting* a third `MustOnly` variant — the
+mixed-system extension is deferred work, not currently needed.)
+
+**Map to mununu.** Theoretical justification for the two-variant
+choice in §6.3 of the architecture doc. Cited in
+[`kmts-theory.md`](kmts-theory.md) §2.3 as the generalisation we do not
+adopt; structurally excluded from the data model by the predicate-image
+construction.
+
+---
+
+## 21. Bruns & Godefroid, *Generalized Model Checking: Reasoning about Partial State Spaces* (CONCUR 2000)
+
+**Theoretical core.** The 3-valued mu-calculus semantics. Verdicts
+in `{T, F, ⊥}` with `⊥` ("unknown") as the third value of Kleene's
+strong 3-valued logic. The modal operators read both relations: `[a]φ`
+is `T` iff every may-`a`-successor satisfies `φ` as `T`; `F` iff some
+must-`a`-successor has `F`. The preservation theorem: a `T`/`F`
+verdict on the abstract transfers to the concrete *for the full
+mu-calculus including alternating fixpoints*; only `⊥` requires
+refinement. This is the result that makes KMTS the right framework
+for *any* sound mu-calculus abstraction — not just for safety, not
+just for liveness, but for both under a single abstract model.
+
+**Pseudocode.**
+
+```text
+⟦[a]φ⟧_M(s) = T   iff   for every s' with (s, a, s') ∈ R_may : ⟦φ⟧_M(s') = T
+              F   iff   exists s' with (s, a, s') ∈ R_must : ⟦φ⟧_M(s') = F
+              ⊥   otherwise
+
+⟦⟨a⟩φ⟧_M(s) = T   iff   exists s' with (s, a, s') ∈ R_must : ⟦φ⟧_M(s') = T
+              F   iff   for every s' with (s, a, s') ∈ R_may : ⟦φ⟧_M(s') = F
+              ⊥   otherwise
+
+Fixpoints: Kleene iteration over the *information order*
+  ⊥ ⊑_i F,  ⊥ ⊑_i T,  F and T incomparable
+```
+
+**mununu-shaped Rust sketch.**
+
+```rust
+// crates/mununu-core/src/mu_calculus/truth_domain.rs (NEW; post-R.3)
+trait TruthDomain {
+    type Element: Clone + Eq;
+    fn truth_top(&self) -> Self::Element;
+    fn truth_join(&self, a: &Self::Element, b: &Self::Element) -> Self::Element;
+    fn info_bot(&self)  -> Self::Element;   // false in Bool, KleeneBot in Kleene
+    fn info_join(&self, a: &Self::Element, b: &Self::Element) -> Self::Element;
+    fn box_modality(&self, may: &[Self::Element], must: &[Self::Element]) -> Self::Element;
+    fn diamond_modality(&self, may: &[Self::Element], must: &[Self::Element]) -> Self::Element;
+    // (truth_bot, truth_meet, truth_negate, info_leq elided for brevity)
+}
+struct KleeneDomain;   // 3-valued instantiation; truth-order ≠ info-order
+```
+
+**Map to mununu.** §6.2 of the architecture doc adopts these semantics
+verbatim. R.3 ships `KleeneDomain`; the dual-lattice trait shape
+(§6.4 of the architecture doc) is the operational consequence of the
+distinction between truth-order operations (formula semantics) and
+information-order operations (fixpoint convergence) the Bruns–Godefroid
+result requires.
+
+---
+
+## 22. Huth, Jagadeesan, Schmidt, *Modal Transition Systems: A Foundation for Three-Valued Program Analysis* (TACAS 2001)
+
+**Theoretical core.** The KMTS definition itself: a 5-tuple `(S, S_0,
+R_must, R_may, L)` with `L: S × AP → {T, F, ⊥}` — Larsen–Thomsen MTS
+extended with 3-valued state labelling. Proves that 3-valued mu-calculus
+model checking on KMTSes is sound, complete (relative to the lattice's
+expressiveness), and *decidable for finite KMTSes*. The compositional
+case: composition is pointwise on may and must (per-axis conjunction on
+synchronisation); refinement is congruential under composition. This is
+the result that makes the §7 "structural free lunch" of the architecture
+doc a theorem, not a hope.
+
+**Pseudocode.**
+
+```text
+KMTS M = (S, S_0, R_must, R_may, L)
+L: S × AP → {T, F, ⊥}     (with L(s, p) = T iff p holds on every concretisation of s,
+                            L(s, p) = F iff p fails on every concretisation,
+                            L(s, p) = ⊥ otherwise)
+
+Composition M_1 ∥ M_2 over Sync ⊆ Act:
+  for each capability c ∈ {must, may}:
+    synchronising step: ((s_1, s_2), a, (s_1', s_2')) ∈ R_c iff
+        a ∈ Sync ∧ (s_1, a, s_1') ∈ M_1.R_c ∧ (s_2, a, s_2') ∈ M_2.R_c
+    interleaving step:  ((s_1, s_2), a, (s_1', s_2)) ∈ R_c iff
+        a ∉ Sync ∧ (s_1, a, s_1') ∈ M_1.R_c    (symmetric for right side)
+```
+
+**mununu-shaped Rust sketch.**
+
+```rust
+// crates/mununu-core/src/composition/mod.rs (EXTENSION; post-R.1)
+fn merge_modality(left: TransitionModality, right: TransitionModality) -> TransitionModality {
+    // per-axis conjunction: has_may(L) ∧ has_may(R) ; has_must(L) ∧ has_must(R)
+    match (left, right) {
+        (Sharp,   Sharp)   => Sharp,
+        (Sharp,   MayOnly) | (MayOnly, Sharp) => MayOnly,
+        (MayOnly, MayOnly) => MayOnly,
+    }
+}
+```
+
+**Map to mununu.** §6.5 of the architecture doc derives the modality-merge
+table from this paper's per-axis conjunction rule. R.1 ships the merge;
+the audit of the `composition/mod.rs` shared-label rendezvous is the
+operational corollary.
+
+---
+
+## 23. Godefroid & Jagadeesan, *Automatic Abstraction Using Generalized Model Checking* (TACAS 2003)
+
+**Theoretical core.** The CEGAR-style refinement loop for KMTS — how
+to respond to `⊥` verdicts by extracting refinement predicates from
+spurious abstract counterexamples. Key insight: a `⊥` verdict admits
+an abstract counterexample that may or may not concretise; the
+spuriousness check decides which, and if spurious, the SMT UNSAT core
+identifies which predicate to add. Generalises CEGAR from the 2-valued
+setting (where refinement triggers on a spurious abstract `F` verdict)
+to the 3-valued setting (where refinement triggers on `⊥`).
+
+**Pseudocode.**
+
+```text
+input : KMTS M_0, property φ
+output: verdict in {T, F} or ⊥ at refinement cap
+
+M := M_0
+for round in 1..K:
+    verdict, cex := evaluate_3valued(M, φ)
+    if verdict ∈ {T, F}: return verdict
+    spurious := discharge_concretely(cex)
+    if SAT: return F                       # cex is real
+    core := unsat_core(spurious)
+    new_predicates := extract_interpolant(core)
+    M := M.with_predicates(M.predicates ∪ new_predicates)
+return ⊥                                    # cap reached or stalled
+```
+
+**mununu-shaped Rust sketch.**
+
+```rust
+// crates/mununu-core/src/adapter/btor2/kmts_lift.rs::refine (NEW; post-R.5)
+pub fn refine(
+    mut model: Kmts,
+    formula: &Formula,
+    max_rounds: u32,
+) -> (KleeneVerdict, Option<AbstractCounterexample>) {
+    for _round in 0..max_rounds {
+        let (verdict, cex) = evaluate_kleene(&model, formula);
+        if matches!(verdict, KleeneT | KleeneF) { return (verdict, cex); }
+        match discharge_concrete(&cex) {
+            ConcreteWitness(_) => return (KleeneF, Some(cex)),
+            UnsatProof(core) => {
+                let new_preds = interpolate(&core);
+                if new_preds.is_empty() { break; }   // stall
+                model = model.with_predicates(new_preds);
+            }
+        }
+    }
+    (KleeneBot, None)
+}
+```
+
+**Map to mununu.** §4 of [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md)
+adopts this algorithm. R.5 ships the refinement loop;
+R.5b extends it with two-axis (predicate + UF) refinement per the
+architecture doc §6.10.
+
+---
+
+## 24. Larsen, Nyman, Wąsowski, *Modal I/O Automata for Interface and Product Line Theories* (FoSSaCS 2007)
+
+**Theoretical core.** Compositional theory of KMTSes with input/output
+asymmetry. Proves that modal refinement is *congruential* under
+parallel composition: `M_1 ≼ M_1' ⇒ M_1 ∥ M_2 ≼ M_1' ∥ M_2`. The
+operational consequence for mununu: refining one module's KMTS (e.g.
+via CEGAR predicate addition) refines the composed KMTS *without
+re-composing* — the per-module refinement step is local. This is the
+result that closes the §7 architecture-doc claim that compositional
+KMTS is the "structural free lunch": composition is sound, refinement
+is local, no AGR machinery needed.
+
+**Pseudocode.** (Theorem statement, not algorithmic.)
+
+```text
+Theorem (Larsen–Nyman–Wąsowski 2007, congruence of refinement under ∥):
+  If M_2 ≼ M_1 then for every modal I/O automaton N over a compatible alphabet:
+    M_2 ∥ N ≼ M_1 ∥ N
+```
+
+**mununu-shaped Rust sketch.** None — this is a meta-theoretic property
+that holds automatically for the modality-merge implementation
+(#22 sketch). The mununu test suite asserts the property empirically
+on hand-built KMTS pairs.
+
+**Map to mununu.** §5.2 of [`kmts-theory.md`](kmts-theory.md) and §7
+of the architecture doc cite this paper for the local-refinement
+property. Operational meaning: the §6.10 CEGAR loop's per-module
+refinement is sound under composition without needing a global proof
+obligation.
+
+---
+
+# Assume-Guarantee Reasoning (entries 25–28)
+
+> **Section context.** AGR is the classical compositional-verification
+> framework: rather than verifying a global property over a composed
+> system directly, decompose it into per-module obligations
+> (*assumptions* about the environment, *guarantees* about the module)
+> and discharge them with a circular proof rule. KMTS composition
+> (#22, #24) makes AGR *unnecessary* for mu-calculus verification —
+> the §7 "structural free lunch" replaces the AGR ladder. The four
+> entries below are catalogued for two reasons: (a) they are the
+> foundational citations any compositional-verification literature
+> review must include; (b) the optional sidecar `assumptions: Vec<MuFormula>`
+> field (§7.3 of the architecture doc) is a degenerate AGR — environment
+> over-approximation as user-supplied assertions — that retains the AGR
+> *interface* without the AGR *discharge cost*. Future product-line or
+> contract-oriented work on mununu may revisit these.
+
+## 25. Pnueli, *In Transition from Global to Modular Temporal Reasoning about Programs* (in *Logics and Models of Concurrent Systems*, ed. Apt, NATO ASI Series 1985)
+
+**Theoretical core.** The original assume-guarantee framework. To
+verify that a composed system `M_1 ∥ M_2` satisfies a global property
+`φ`, decompose `φ` into per-module obligations of the form
+`A_i ⇒ G_i` — module `i`'s guarantee `G_i` holds under assumption `A_i`
+about its environment. The composition is sound if every assumption is
+discharged by the other modules' guarantees. The asymmetry (module
+guarantees its outputs assuming inputs behave) is what makes the
+decomposition tractable.
+
+**Pseudocode.**
+
+```text
+input : modules M_1, …, M_n; global property φ
+output: verdict via per-module obligations
+
+decompose: φ ≡ (A_1 ⇒ G_1) ∧ … ∧ (A_n ⇒ G_n)   (user-supplied or synthesised)
+for each i:
+    verify M_i ⊨ (A_i ⇒ G_i)                    (local model check)
+discharge: for each i, A_i must follow from {G_j : j ≠ i}
+if all discharges succeed: M_1 ∥ … ∥ M_n ⊨ φ
+```
+
+**mununu-shaped Rust sketch.**
+
+```rust
+// (No direct mununu landing — superseded by KMTS composition.)
+// The optional sidecar `assumptions: Vec<MuFormula>` field (§7.3 of the
+// architecture doc) is the degenerate-AGR interface: environment
+// over-approximation as user-supplied entry assertions, *without* the
+// circular discharge. The lifter treats assumptions as `must`-true on
+// entry; soundness is by environment over-approximation, not by AGR
+// discharge.
+struct ModuleAnnotation {
+    ...existing fields...
+    assumptions: Vec<MuFormula>,   // post-S.3 schema
+}
+```
+
+**Map to mununu.** §7.3 of the architecture doc. The classical AGR
+framework is not adopted — KMTS composition's structural soundness
+replaces it. The `assumptions` sidecar field provides the AGR
+*interface* (declare environment behaviour) without the AGR
+*discharge engine*.
+
+---
+
+## 26. McMillan, *Verification of an Implementation of Tomasulo's Algorithm by Compositional Model Checking* (CAV 1998)
+
+**Theoretical core.** Circular AGR with inductive invariants. To break
+the chicken-and-egg circularity of "module A assumes module B's
+behaviour; module B assumes module A's behaviour," McMillan proves
+both assumptions *simultaneously* by induction on time: at each time
+step, both assumptions hold if they held at all previous steps. The
+inductive proof rule is sound under reasonable conditions on the
+temporal operators involved. Demonstrated on the Tomasulo out-of-order
+execution algorithm — a non-trivial industrial application.
+
+**Pseudocode.**
+
+```text
+input : modules M_1, M_2; mutual assumptions A_1, A_2 about each other
+output: verdict on whether A_1, A_2 hold jointly
+
+base case (t = 0): show A_1(0) and A_2(0) hold initially
+inductive step:    assuming A_1(t), A_2(t) hold for all t ≤ T,
+                   show M_1 ⊨ A_2(T+1) and M_2 ⊨ A_1(T+1)
+if both inductive steps succeed: A_1, A_2 hold for all time
+```
+
+**mununu-shaped Rust sketch.** None — circular AGR is genuinely new
+machinery that mununu does not have. The §7 of the architecture doc
+explicitly argues that the KMTS framework's compositional soundness
+makes this *not* necessary; if a future use case demands circular AGR
+(e.g. modelling a multi-IP SoC where each IP makes assumptions about
+its neighbours), the relevant data structure would be a pair of
+mutually-recursive `(assumption, guarantee)` KMTSes per module, with
+a discharge engine that iterates the inductive proof.
+
+**Map to mununu.** Deferred per §11 of the architecture doc. Cited
+here as the canonical circular-AGR reference; not adopted.
+
+---
+
+## 27. Cobleigh, Giannakopoulou, Păsăreanu, *Learning Assumptions for Compositional Verification* (TACAS 2003)
+
+**Theoretical core.** Automatic *learning* of AGR assumptions via
+Angluin's L* algorithm for regular-language inference. Rather than
+hand-authoring the per-module assumption `A_i`, treat it as a regular
+language over the module's interface alphabet and have the model
+checker iteratively refine it through membership and equivalence
+queries. Demonstrated on industrial JPL software with significant
+reduction in human-authoring effort. Particularly relevant when the
+right assumption is non-obvious (e.g. emerges from the protocol's
+deadlock-freedom requirement).
+
+**Pseudocode.**
+
+```text
+input : module M, property φ, interface alphabet Σ
+output: learned assumption A such that M ⊨ (A ⇒ φ)
+
+A := L*_learner.initial_hypothesis()
+loop:
+    if M ⊨ (A ⇒ φ): return A
+    cex := find_counterexample(M, A ⇒ φ)
+    if cex.violates_φ_on_real_runs(M):       # not just a spurious A-violation
+        return UNSAT                          # property fails on M
+    refine A with the witness from cex
+```
+
+**mununu-shaped Rust sketch.** None — L* learning is out of scope.
+The architecture doc's §11 deferred section lists it explicitly. A
+mununu implementation would be a new module
+`crates/mununu-core/src/verify/assumption_learning.rs` consuming a
+KMTS, a property, and an alphabet; emitting a learned assumption
+formula.
+
+**Map to mununu.** Deferred per §11. The user-supplied
+`assumptions: Vec<MuFormula>` sidecar field (#25 sketch) is the manual
+counterpart: when the user knows the right assumption, sidecar entry
+suffices; L* would synthesise it automatically. Trigger condition for
+adopting: a fixture where the right assumption is genuinely non-obvious.
+
+---
+
+## 28. Cimatti & Tonetta, *A Property-Based Proof System for Contract-Based Design* (FMCAD 2012; full system: OCRA tool, NFM 2013)
+
+**Theoretical core.** *Contract-based design*: each component carries
+a contract `(assumption, guarantee)` pair, refinement of contracts is
+structural, and system-level properties are verified via a hierarchical
+discharge that decomposes along the contract structure. OCRA (Othello
+Contracts Refinement Analysis) is the tool implementation. Most
+sophisticated of the AGR-family papers — adds compositional contract
+refinement on top of the McMillan-style circular discharge. Useful
+reference for product-line and modular SoC verification.
+
+**Pseudocode.**
+
+```text
+input : component hierarchy H with per-component contracts {(A_i, G_i)}
+output: verdict on whether system contract is satisfied
+
+for each component C_i in H:
+    verify M_i ⊨ (A_i ⇒ G_i)                  (per-component check)
+for each parent-child relation C_i ⊏ C_j in H:
+    verify contract refinement: A_i ⊨ A_j' ∧ G_j' ⊨ G_i
+                                (where the primed contract is C_j's at C_i's interface)
+if all checks pass: system contract holds
+```
+
+**mununu-shaped Rust sketch.** None — contract-based design is out
+of scope. The natural mununu landing would be a per-source contract
+declaration in `verify.toml` and a discharge engine in
+`crates/mununu-core/src/verify/contract.rs`; both deferred.
+
+**Map to mununu.** Deferred per §11. Cited as the most-developed
+AGR-family tool for contract-style modular verification; revisit if a
+multi-IP-SoC use case surfaces where contract refinement is the right
+proof structure.
+
+---
+
 ## Cross-reference matrix
 
 This matrix is the contract between this doc and
 [`auto-extraction-architecture.md`](auto-extraction-architecture.md) §2 (stage
-mapping) and §5 (current-vs-proposed comparison).
+mapping) and §5 (current-vs-proposed comparison). Entries 1–18 cover
+the original pillow-plan / explicit-state pipeline. Entries 19–28 (the
+KMTS + AGR sections appended in the D.0 deliverable of
+[`you-are-a-formal-vast-lake.md`](../../.claude/plans/you-are-a-formal-vast-lake.md))
+cover the KMTS pivot's literature anchors and lift verbatim into
+[`native-sv-abstraction.md`](native-sv-abstraction.md),
+[`kmts-theory.md`](kmts-theory.md), and
+[`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md).
 
 | # | Paper | mununu stage | Existing module touched | New module introduced | Phase |
 |---|---|---|---|---|---|
@@ -815,8 +1284,20 @@ mapping) and §5 (current-vs-proposed comparison).
 | 16 | rIC3 arXiv 2025 | Decision-gate baseline | n/a | n/a | A (gate) |
 | 17 | rtl2µspec MICRO 2021 | Validation / template taxonomy | [`builtin_templates.json`](../../crates/mununu-core/src/adapter/templates/builtin_templates.json) | n/a | A (template doc) |
 | 18 | Caliptra 2.0/2.1 spec | Empirical target | [`/tmp/caliptra_retry/`](file:///tmp/caliptra_retry/) | n/a | A.4–A.5 fixtures |
+| 19 | Larsen–Thomsen 1988 — MTS | KMTS data model | [`clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) (`Transition`) | `TransitionModality` enum addition | R.1 |
+| 20 | Dams–Gerth–Grumberg 1997 — Mixed TS | KMTS data model (theoretical) | [`clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) | n/a (mixed-system extension consciously omitted) | R.1 (cite) |
+| 21 | Bruns–Godefroid CONCUR 2000 — 3-valued mu-calculus | KMTS evaluator | [`mu_calculus/evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) | `mu_calculus/truth_domain.rs` (`TruthDomain` trait + `KleeneDomain` instantiation) | R.3 |
+| 22 | Huth–Jagadeesan–Schmidt TACAS 2001 — KMTS | KMTS evaluator + composition | [`composition/mod.rs`](../../crates/mununu-core/src/composition/mod.rs), [`clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) | `state_3valued_predicates`, `TransitionModality` merge in `composition` | R.1, R.3 |
+| 23 | Godefroid–Jagadeesan TACAS 2003 — CEGAR for KMTS | KMTS lifter refinement | n/a (new) | `adapter/btor2/kmts_lift.rs::refine` | R.5 |
+| 24 | Larsen–Nyman–Wąsowski FoSSaCS 2007 — Modal I/O automata | Compositional KMTS soundness | [`composition/mod.rs`](../../crates/mununu-core/src/composition/mod.rs) | n/a (theorem; no algorithmic code) | R.1 (cite) |
+| 25 | Pnueli 1985 — AGR | Optional sidecar assumptions | n/a | `SvAnnotation.assumptions: Vec<MuFormula>` | S.3 |
+| 26 | McMillan CAV 1998 — Circular AGR | Deferred | n/a | n/a | deferred (§11) |
+| 27 | Cobleigh–Giannakopoulou–Păsăreanu TACAS 2003 — L* AGR | Deferred | n/a | `verify/assumption_learning.rs` (hypothetical) | deferred (§11) |
+| 28 | Cimatti–Tonetta FMCAD 2012 — OCRA contracts | Deferred | n/a | `verify/contract.rs` (hypothetical) | deferred (§11) |
 
 ### Reading order if you only have time for three
+
+For the original pillow-plan (explicit-state / Phase A) framing:
 
 1. **AVR NFM 2019 (#6)** — closest published comparator to mununu; sets
    the publication-positioning baseline.
@@ -825,6 +1306,20 @@ mapping) and §5 (current-vs-proposed comparison).
 3. **Andraus–Sakallah Reveal LPAR 2008 (#9)** — closest formalisation of
    the `wait_count`-collapse pattern that the Caliptra abstraction
    analysis hand-derived; parent of Stage 2.
+
+For the **KMTS pivot** framing (`native-sv-abstraction.md` + R.0–R.5):
+
+1. **Bruns–Godefroid CONCUR 2000 (#21)** — the 3-valued mu-calculus
+   preservation theorem; the load-bearing soundness argument that the
+   entire KMTS pipeline rests on. Read this first.
+2. **Huth–Jagadeesan–Schmidt TACAS 2001 (#22)** — KMTS definition +
+   compositional model checking. The structural-free-lunch result is
+   here, with the per-axis composition rule that mununu's modality
+   merge implements verbatim.
+3. **Godefroid–Jagadeesan TACAS 2003 (#23)** — CEGAR for KMTS. The
+   `KleeneBot → refinement` loop's algorithmic core; §4 of
+   [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md)
+   adopts this directly.
 
 ### Out of Phase A scope (cite, do not adopt)
 
@@ -835,3 +1330,16 @@ mapping) and §5 (current-vs-proposed comparison).
   syntactic seeds first.
 - Indexed predicates (#13) — gated on the Stage 4 SMT-theory selector
   (`Theory::BvUfArray`).
+
+### Out of KMTS-pivot scope (cite, do not adopt)
+
+- Circular AGR (#26), L*-learning AGR (#27), OCRA contracts (#28) —
+  classical compositional-verification machinery superseded by KMTS
+  composition (§7 of the architecture doc). Cited as the foundational
+  AGR references; not adopted because KMTS makes them unnecessary for
+  mu-calculus verification. The optional sidecar `assumptions: Vec<MuFormula>`
+  field (#25 sketch) is the degenerate-AGR interface mununu *does* offer.
+- Mixed transition systems (#20) — the `R_must ⊆ R_may`-violating
+  generalisation. Cited as theoretical context; mununu's standard-KMTS
+  shape excludes it by construction (the predicate-image construction
+  guarantees the invariant).

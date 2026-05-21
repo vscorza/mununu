@@ -1,27 +1,111 @@
 # Abstraction guidelines for mununu
 
-> Source of truth: [`crates/mununu-core/src/clts/`](../crates/mununu-core/src/clts/) (state-variable + per-state predicate primitives), [`crates/mununu-core/src/adapter/systemverilog/`](../crates/mununu-core/src/adapter/systemverilog/) (signal-level abstraction sidecar), [`crates/mununu-core/src/mu_calculus/`](../crates/mununu-core/src/mu_calculus/) (`hide` + bisimulation minimization at evaluation time) — surface: CLI+API+UI.
+> Source of truth: [`crates/mununu-core/src/clts/`](../crates/mununu-core/src/clts/) (state-variable + per-state predicate primitives + `TransitionModality` post-R.1), [`crates/mununu-core/src/adapter/btor2/`](../crates/mununu-core/src/adapter/btor2/) (BTOR2 → KMTS lifter, post-R.2), [`crates/mununu-core/src/adapter/systemverilog/`](../crates/mununu-core/src/adapter/systemverilog/) (legacy native-SV adapter; scheduled for removal in S.2b), [`crates/mununu-core/src/mu_calculus/`](../crates/mununu-core/src/mu_calculus/) (`TruthDomain` trait + `KleeneDomain` instantiation, post-R.3) — surface: CLI+API+UI.
 
 ## Why this doc exists
 
-Mununu's verdicts are correct **for the model**. Whether they transfer to the real system depends entirely on the abstraction the user (or adapter) picks. The [`Soundness Guarantees`](../CLAUDE.md#soundness-guarantees) section of CLAUDE.md states the three soundness directions; this doc gives the **per-subsystem recipe** — *which* mununu primitive to reach for, *when*, and what each primitive preserves.
+Mununu's verdicts are correct **for the model**. Whether they transfer to the real system depends entirely on the abstraction the user (or adapter) picks. The [`Soundness Guarantees`](../CLAUDE.md#soundness-guarantees) section of CLAUDE.md states the soundness directions; this doc gives the **per-subsystem recipe** — *which* mununu primitive to reach for, *when*, and what each primitive preserves.
 
 Use this doc when:
 
-- You are authoring an adapter and have to decide how to encode a multi-bit register or a memory region.
+- You are authoring an adapter and have to decide how to encode a multi-bit register, a memory region, or a wide-arithmetic operator.
 - You are hand-writing a CTXDSL source for a peripheral, microprogram, cache, bus, or protocol spec.
 - You are reviewing a `// SOUNDNESS:` annotation and want a checklist.
-- You are deciding whether an automated extraction is feasible for a new subsystem class or whether the user must hand-author it.
+- You are deciding whether automated extraction is feasible for a new subsystem class or whether the user must hand-author it.
 
-## The abstraction toolbox mununu already ships
+## The canonical recipe — KMTS predicates
+
+> **Status (2026-05-21).** The KMTS pipeline is the **canonical recipe** for SystemVerilog and BTOR2 extraction. Other adapters (XState, microcode, agentic, hand-written CTXDSL) continue to use the legacy primitives (§"Legacy primitives" below) and produce Sharp-everywhere KMTSes vacuously. Architecture: [`docs/design/native-sv-abstraction.md`](design/native-sv-abstraction.md). Theory: [`docs/design/kmts-theory.md`](design/kmts-theory.md). Practical recipe: [`docs/design/predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md).
+
+The canonical recipe has four moving parts: a **predicate set** that partitions the abstract state space, a **modality** that captures the may/must distinction on each transition, a **3-valued evaluator** that returns `KleeneT / KleeneF / KleeneBot`, and a **CEGAR refinement loop** that responds to `KleeneBot` verdicts by adding predicates.
+
+### The four primitives at a glance
+
+| Primitive | What it is | Where it lands | Source of truth (post-R.x) |
+|---|---|---|---|
+| **Predicate set** `P` | Finite set of Boolean expressions over module signals; each defines one bit of the abstract state | Sidecar `predicates: Vec<MuFormula>` per module; auto-derived from property atoms, COI register-equality, and typedef enums | [`predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md) §2 |
+| **`TransitionModality`** | `Sharp` (in both `may` and `must`) or `MayOnly` (over-approximation, no must-witness) | [`Transition::modality`](../crates/mununu-core/src/clts/mod.rs) per transition; default `Sharp` for legacy adapters | [`kmts-theory.md`](design/kmts-theory.md) §2.2; post-R.1 |
+| **`Tristate`** | `KleeneT` / `KleeneF` / `KleeneBot` per `(state, predicate)` | Optional [`state_3valued_predicates`](../crates/mununu-core/src/clts/mod.rs) on `Clts`; `None` for legacy adapters | [`kmts-theory.md`](design/kmts-theory.md) §2.5; post-R.1 |
+| **CEGAR refinement** | On `KleeneBot` verdict, lift abstract counterexample, SMT-discharge, IC3-IA-style interpolation, add predicates | New `adapter/btor2/kmts_lift.rs::refine`; bounded by `cegar_max_rounds` (default 16) | [`predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md) §4; post-R.5 |
+
+### Soundness in one paragraph
+
+KMTS abstraction is **uniformly sound for the full mu-calculus including liveness** (Bruns–Godefroid CONCUR 2000): a `KleeneT` verdict on the abstract transfers to `true` on the concrete; a `KleeneF` verdict transfers to `false`; only `KleeneBot` requires refinement. The asymmetry between `may` (over-approximation, used for `KleeneT` claims on `[a]φ` and `KleeneF` claims on `⟨a⟩φ`) and `must` (under-approximation, used for `KleeneF` claims on `[a]φ` and `KleeneT` claims on `⟨a⟩φ`) is what makes safety, reachability, and liveness all soundly decidable under a single abstract model. The pre-KMTS 2-valued abstraction (the "legacy primitives" section below) is sound only for safety / pure greatest fixpoints under over-approximation, not for the full mu-calculus.
+
+### When the canonical recipe applies
+
+- **SystemVerilog** (post-S.2b — the native parser is deleted): the sv2v → Yosys-no-flatten → BTOR2-per-module → KMTS lifter pipeline is the only path. Adopt predicates instead of `BoundedCounter` / `Enum` / `BitBlast` / `Discover` per the migration table below.
+- **BTOR2**: the KMTS lifter consumes BTOR2 directly. Same predicate primitives apply.
+- **C-codesign**: the lifter's predicate-image is BV-only today; richer theories (arrays for memories) deferred. Use the legacy `c-codesign` adapter for current C extraction work; KMTS for C is gated on a memory-cell abstraction roadmap item.
+
+### When to stay on the legacy primitives
+
+XState, microcode, agentic adapters, and hand-written CTXDSL sources continue to produce **Sharp-everywhere KMTSes** — every transition is `Sharp`, every predicate valuation is two-valued, no `KleeneBot` ever appears in the verdict. These adapters use the legacy `AbstractionType::*` primitives (Boolean / Symbols / Ignored / per-state predicates / multi-label transitions / rich modal guards) without change. The `KleeneDomain` evaluator on such a CLTS returns verdicts in `{KleeneT, KleeneF}` only, identical to today's 2-valued `{true, false}` semantics. The `BoolDomain` monomorphisation of the evaluator computes the same verdicts more cheaply and is the default for Sharp-only adapters.
+
+### Migration table — legacy `AbstractionType::*` → KMTS predicates
+
+This table is the operational recipe for porting an existing sidecar to the post-S.3 schema. The S.1 / S.3 auto-migration tool applies it mechanically; this table is what the tool implements.
+
+| Legacy variant | KMTS replacement | Rationale |
+|---|---|---|
+| `Boolean` | One predicate: `{ name: "<reg>_high", formula: "<reg> != 0" }` | A Boolean abstraction is one bit of the predicate cube. |
+| `BitBlast { width }` (cap 4) | `width` predicates: `{ name: "<reg>_bit<i>", formula: "<reg>[<i>] == 1" }` for `i in 0..width` | One predicate per bit; the predicate-image computation reconstructs the cube on demand. |
+| `BoundedCounter { bound: N }` | `N + 1` predicates: `{ name: "<reg>_eq<i>", formula: "<reg> == <i>" }` for `i in 0..=N` | The bounded counter's domain becomes the predicate set; CEGAR refines via IC3-IA interpolation if `>= N` matters. |
+| `Enum { variants: [V_1, …, V_n] }` | `n` predicates: `{ name: "is_<V_i>", formula: "<reg> == <V_i>" }` | Typedef enums seed predicates directly; the lifter pulls variant info from BTOR2 metadata. |
+| `Discover` (default for the native SV adapter) | Replaced by predicate seeding from the property's atomic propositions + COI register-equality (auto-derived). User-supplied predicates extend the auto-derived set. | The constants-discovery step (`kripke_smt::discover_significant_values`) becomes the predicate-image computation in `kmts_lift.rs`. |
+| `Ignored` | Unchanged: `signals: [{ name: "<reg>", preserve: false }]`. Outside the COI is also dropped automatically by `adapter::partition`. | Cone-of-influence pruning is orthogonal to KMTS; same primitive. |
+
+## Automatic cone-of-influence (Phase A.3 — orthogonal to KMTS)
+
+> Source of truth: [`adapter/partition/mod.rs`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
+
+mununu's BTOR2 and SystemVerilog adapters run an **automatic cone-of-influence pass** during translation. The pass walks the frontend IR's signal dependency graph from the seed atoms extracted from the property formulas (intrinsic `bad`/`constraint`/`justice` lines on BTOR2, atoms in `@mununu` property comments on SV), keeps every transitively-reachable state cell and input, and pins everything else to [`AbstractionType::Ignored`](../crates/mununu-core/src/adapter/domain.rs).
+
+COI is **exact** (per [`docs/design/native-sv-abstraction.md`](design/native-sv-abstraction.md) §5): the cone's behaviour projected onto the property's atomic-proposition set is bisimilar to the full system's, so COI is sound *and complete* for the full mu-calculus over Σ_φ — including liveness, including alternating fixpoints. No approximation. R.4 ships property-clustered COI (Jaccard-similarity grouping of property cones) as an extension.
+
+**User wins on collision.** Auto-COI only acts on signals the sidecar does **not** mention. If a signal appears in `.mununu.json`'s `signals[]`, `inputs[]`, or `predicates[]` with any explicit declaration, that declaration wins regardless of the auto-COI verdict. The three layers compose:
+
+1. The sidecar carries user-curated abstractions (`predicates: Vec<MuFormula>` post-S.3; legacy `Boolean`/`Symbols`/`Ignored` pre-S.3).
+2. The auto-derived predicate set (property APs + COI register-equality + typedef enums) extends the user-curated set for the canonical KMTS recipe.
+3. Auto-COI fills the gap for signals neither layer mentions, dropping them to `Ignored` when they are outside the property's reach.
+
+**Soundness.** COI dropping is exact, not over-approximation. Sound for everything.
+
+**Defensive default for unbindable seeds.** If the adapter cannot extract any property atoms (e.g., a BTOR2 file whose `bad` line traces only through anonymous compiler-synthesised state cells), the partition keeps every signal rather than drop everything silently. This avoids accidental under-approximation when the property structure is opaque to the partition's syntactic scan.
+
+**Observability.** Every adapter populates [`AdapterOutput.partition_summary`](../crates/mununu-core/src/adapter/mod.rs) with the counts and bit-widths. The verify orchestrator threads this through `SourceSummary.partition_summary` in `VerifyReport`; CLI warnings surface each `Dropped` signal (`"auto-partition: state cell 'X' dropped (outside-cone-of-influence); add an explicit sidecar entry to override"`).
+
+**Opt-out.** `PartitionOptions::disabled = true` returns every signal as `Kept` — useful for regression triage but not exposed on the CLI today.
+
+## Uninterpreted-function abstraction for wide arithmetic
+
+> Source of truth: KMTS lifter post-R.5b; recipe in [`predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md) §3b + §6.10 of the architecture doc.
+
+Predicate abstraction abstracts the **state space**; UF abstraction abstracts the **operations**. The two axes are orthogonal and the canonical KMTS recipe uses both: wide-arithmetic cells (`$mul` / `$div` / `$mod` / `$pow` unconditionally; `$add` / `$sub` for width > 32 bits) are wrapped as uninterpreted functions with functional consistency as the only axiom. This drops predicate-image SMT queries from QF_BV (slow on multipliers) into EUF + linear bitvector (much faster).
+
+**Soundness asymmetry.** UF abstraction is a **may-side-only over-approximation**. May-mode predicate-image queries (`R_may`) use the UF-abstracted relation — sound because UF only adds may-behaviour. Must-mode queries (`R_must`) use concrete operators — UF is unsound here because a "∀s, ∃s' under UF" witness does not transfer to "∀s, ∃s' under concrete." The lifter enforces this by switching the UF wrapper off for must-mode queries.
+
+**User overrides.** Sidecar `uf_wrap: Vec<String>` forces specific cell instances into UF mode; `uf_unwrap: Vec<String>` forces concretisation. Default policy applies otherwise.
+
+**CEGAR refinement on two axes.** When a `KleeneBot` verdict's spuriousness check returns UNSAT, the unsat core distinguishes:
+- Bitvector constants → state-distinguishability gap → add predicates.
+- UF instance terms → operator-behaviour gap → either selectively concretise the UF instance or add a learned-lemma axiom (`a * 0 = 0`, etc.).
+
+One interpolation query, two refinement decisions, partitioned by symbol kind.
+
+## Legacy abstraction primitives (still used by non-RTL adapters)
+
+> Source of truth: [`crates/mununu-core/src/adapter/domain.rs`](../crates/mununu-core/src/adapter/domain.rs) — surface: CLI+API+UI.
+
+The pre-KMTS primitives remain canonical for adapters that do not need predicate abstraction (XState, microcode, agentic, hand-written CTXDSL). These adapters produce Sharp-everywhere KMTSes with two-valued AP labellings; the KleeneDomain evaluator reduces to 2-valued semantics on them.
 
 | Primitive | What it abstracts | Surface where exposed | Soundness | Status |
 |---|---|---|---|---|
-| `AbstractionType::Boolean` | Multi-bit signal → `{ low, high }` | SV sidecar `domain.abstraction`; CTXDSL `boolean` variables | Sound iff property does not distinguish values within the same equivalence class | Shipped |
-| `AbstractionType::Interval { min, max }` | Signal → finite set of integer intervals | SV sidecar | Same as above | Shipped |
-| `AbstractionType::Symbols(Vec<String>)` | Signal → named representative values + "other" | SV sidecar; CTXDSL enum types | Same as above | Shipped |
-| `AbstractionType::Ignored` | Drop signal from state space | SV sidecar | Sound for safety (model permits every concrete value); under-approximates liveness | Shipped |
-| Per-state predicate (`state_variable_bitset`) | Lift state name → mu-calculus predicate | `clts/mod.rs:1173`; CTXDSL `predicates { … }` | Exact (no abstraction loss) | Shipped |
+| `AbstractionType::Boolean` | Multi-bit signal → `{ low, high }` | CTXDSL `boolean` variables; legacy SV sidecar `domain.abstraction` (pre-S.3) | Sound iff property does not distinguish values within the same equivalence class | Shipped |
+| `AbstractionType::Interval { min, max }` | Signal → finite set of integer intervals | Legacy SV sidecar (pre-S.3) | Same as above | Shipped |
+| `AbstractionType::Symbols(Vec<String>)` | Signal → named representative values + "other" | CTXDSL enum types; legacy SV sidecar (pre-S.3) | Same as above | Shipped |
+| `AbstractionType::Ignored` | Drop signal from state space | Any sidecar; preserved across S.3 | Sound for safety (model permits every concrete value); under-approximates liveness | Shipped |
+| Per-state predicate (`state_variable_bitset`) | Lift state name → mu-calculus predicate | [`clts/mod.rs`](../crates/mununu-core/src/clts/mod.rs); CTXDSL `predicates { … }` | Exact (no abstraction loss) | Shipped |
 | Per-state structured valuation | Hand-write display metadata on state | CTXDSL `state S { valuations { … } }`; `ContextDoc.state_valuations` | Exact (display-only by default; formal when paired with predicates) | Shipped |
 | Multi-label transitions | Collapse parallel edges → one transition w/ N labels | CTXDSL `transition s -> t on label a, label b;`; `SmallVec<[LabelId; 4]>` | Exact | Shipped |
 | Rich modal guards | One `[…]` / `<…>` combining labels + current/next predicates + controllability class + step bound | CTXDSL `[(labels = {a}, req_next = {active}, ctrl = controllable)] φ`; `Guard` struct | Exact | Shipped, under-used |
@@ -32,69 +116,18 @@ Use this doc when:
 | Domain profiles | Bias AST extractor to one of `software` / `rtl` / `agentic` / `synthesis` / `universal` | `mununu-extract --domain`; `extraction/ast_extract/domain.rs` | Profile chooses defaults but does not enforce soundness — must be declared per-extraction | Shipped |
 | Mode filtering | One spec → multiple abstraction levels (e.g. `fixed` vs `vulnerable`) | `.espec.json` `mode` field | Per-mode posture declared inline | Shipped |
 
-## Automatic cone-of-influence (Phase A.3)
+### Variants scheduled for removal in S.0 / S.1
 
-> Source of truth: [`adapter/partition/mod.rs`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
+The KMTS pivot's simplification phase removes the SV-specific synthesis-tuned variants. They are listed here to signal "do not start new use cases" for these primitives; the migration table above maps each to its KMTS replacement.
 
-mununu's BTOR2 and SystemVerilog adapters now run an **automatic
-cone-of-influence pass** during translation. The pass walks the
-frontend IR's signal dependency graph from the seed atoms extracted
-from the property formulas (intrinsic `bad`/`constraint`/`justice`
-lines on BTOR2, atoms in `@mununu` property comments on SV), keeps
-every transitively-reachable state cell and input, and pins everything
-else to [`AbstractionType::Ignored`](../crates/mununu-core/src/adapter/domain.rs).
+| Variant | Removal phase | Replacement |
+|---|---|---|
+| `AbstractionType::BitBlast { width }` | S.0 | Per-bit predicates |
+| `SignalAbstraction::Enum { variants, value_map? }` | S.1 | One predicate per variant |
+| `SignalAbstraction::BoundedCounter { bound }` | S.1 | One predicate per value in `0..=bound` |
+| `SignalAbstraction::Discover` | S.1 | Auto-derived predicates from property APs + COI |
 
-**User wins on collision.** Auto-COI only acts on signals the sidecar
-does **not** mention. If a signal appears in
-`.mununu.json`'s `signals[]` or `inputs[]` with any explicit
-declaration, that declaration wins regardless of the auto-COI verdict.
-The two layers compose:
-
-1. The sidecar carries user-curated abstractions (`Boolean`,
-   `BoundedCounter`, `EnumValues`, `Ignored`, `Discover`).
-2. Auto-COI fills the gap for signals the user did not list, dropping
-   them to `Ignored` when they are outside the property's reach.
-
-**Soundness.** Cone-of-influence dropping is an over-approximation —
-the abstract model admits *more* behaviours than the concrete model
-(pinned signals are equivalent to havoc on their value). For safety
-properties this is sound; for liveness see the soundness summary at
-the bottom of this doc.
-
-**Defensive default for unbindable seeds.** If the adapter cannot
-extract any property atoms (e.g., a BTOR2 file whose `bad` line traces
-only through anonymous compiler-synthesised state cells), the
-partition keeps every signal rather than drop everything silently.
-This avoids accidental under-approximation when the property
-structure is opaque to the partition's syntactic scan.
-
-**Observability.** Every adapter populates
-[`AdapterOutput.partition_summary`](../crates/mununu-core/src/adapter/mod.rs)
-with the counts and bit-widths. The verify orchestrator threads this
-through `SourceSummary.partition_summary` in `VerifyReport`; CLI
-warnings surface each `Dropped` signal (`"auto-partition: state cell
-'X' dropped (outside-cone-of-influence); add an explicit sidecar entry
-to override"`).
-
-**Opt-out.** `PartitionOptions::disabled = true` returns every signal
-as `Kept` — useful for regression triage but not exposed on the CLI
-today.
-
-**Predicate binding for `signal == const` atoms.** Phase A.3 also
-wires per-state valuations from the BTOR2 bit-blaster into the
-mu-calculus evaluator's `Environment::abstract_states` channel and
-extends the parser to capture `signal == constant` (also `!=`, `<`,
-`<=`, `>`, `>=`) as a single predicate atom. Formulas of the shape
-`nu X. ((!(state == 5)) && [] X)` now discriminate over the model
-instead of returning vacuous verdicts. Scope-guarded to BTOR2-style
-numeric valuations to keep the SV adapter's variant-string predicate
-path unchanged.
-
-**Datapath UF substitution** (combinational arithmetic collapsed to
-uninterpreted functions) is reserved for the follow-up plan
-[`phase-a3-followup-datapath-uf.md`](../../.claude/plans/phase-a3-followup-datapath-uf.md);
-the `Datapath { uf_symbol }` variant is reserved in
-`PartitionClass` but never produced today.
+XState, microcode, agentic adapters do not use these SV-specific variants and are unaffected.
 
 ## The rule of thumb for automated extraction vs hand-authoring
 
@@ -102,6 +135,7 @@ the `Datapath { uf_symbol }` variant is reserved in
 
 This holds for:
 
+- **SystemVerilog / BTOR2** — the KMTS pipeline. sv2v elaborates SV-2017 to a Verilog-2005 subset; Yosys-no-flatten preserves hierarchy; BTOR2-per-module retains word-level types; the lifter seeds predicates from property APs + COI + typedef enums.
 - **Firmware drivers** — `c-codesign` adapter. The register-map sidecar carries the structural information (which signals are MMIO, what their direction is).
 - **Restricted microprograms** — shipped via the [`microcode` adapter](../crates/mununu-core/src/adapter/microcode/) (plan Part 5 + Part 5.5). JSON input; `regs` / `mem` / `interrupts` declarations carry the structural information; ops emit canonical rendezvous labels (`wr_mem_<region>`, `rd_mem_<region>`, `fence_<order>`, `irq_ack_<source>`). See `examples/verify/rv5_2core_mesi_microcode_extracted/` (parity) and `examples/verify/dma_engine_microcode/` (industrial DMA demo).
 - **Word-level arithmetic inside firmware / microcode** — subsumed by the host adapter's register-abstraction infrastructure; no separate extraction path.
@@ -119,22 +153,22 @@ This distinction matters because it tells you where the next investment goes: "b
 
 ## Per-subsystem recipe
 
-For each concrete subsystem class, the **minimum** abstraction that keeps the model tractable plus the primitive that supplies it.
+For each concrete subsystem class, the **minimum** abstraction that keeps the model tractable plus the primitive that supplies it. Recipes use the canonical KMTS primitives where the adapter is the KMTS lifter; the legacy primitives where the adapter is XState / microcode / agentic / hand-written CTXDSL.
 
 ### Word operations (32/64-bit arithmetic, shifts, comparisons)
 
 - **Concrete content.** Arbitrary integer operations on register-resident values.
-- **What to abstract.** Treat each operand as the abstraction class of its source register. Operations have no observable label — they update the abstract value of the destination register. Track status flags (carry / overflow / zero) only when a property reads them.
-- **Primitive.** `AbstractionType::Symbols` for register values. Operations are subsumed by the host source's transition function.
-- **Automated extraction?** Yes via `c-codesign` (LLVM SSA collapses arithmetic). Yes via the [`microcode` adapter](../crates/mununu-core/src/adapter/microcode/) (no transitions emitted for pure computation; explicit `regs` / `mem` declarations + sharing tags drive the alphabet).
-- **Soundness.** Sound iff property does not distinguish values within the same symbol class.
+- **What to abstract.** For RTL: wrap wide-arithmetic operators (`$mul`, `$div`, `$mod`, `$pow` unconditionally; `$add` / `$sub` for width > 32) with UF symbols per §UF above; the predicate-image computation populates may/must relations under the UF abstraction (may) and concrete operators (must). For non-RTL: treat each operand as the abstraction class of its source register; operations have no observable label.
+- **Primitive.** **KMTS path:** UF wrapping + predicates on the operand registers. **Legacy path:** `AbstractionType::Symbols` for register values.
+- **Automated extraction?** Yes — the KMTS lifter handles arithmetic via UF. Yes via `c-codesign` (LLVM SSA collapses arithmetic). Yes via the [`microcode` adapter](../crates/mununu-core/src/adapter/microcode/).
+- **Soundness.** Sound iff property does not distinguish values within the same predicate cube. UF over-approximation may produce more `KleeneBot` verdicts on wide arithmetic; CEGAR refines via UF concretisation or learned-lemma addition.
 
 ### Memory (general-address, multi-GB)
 
 - **Concrete content.** Byte-addressable RAM, infinitely many possible values per byte.
 - **What to abstract.** Only tracked addresses (declared in microcode `mem { … }` or referenced by the cache's tracked-line set) are modelled. Per-address state is a small symbol set: `{ initial, written_by_<src>, observed_by_<sink> }` for provenance-tracking properties; `{ stale, fresh }` otherwise.
-- **Primitive.** `AbstractionType::Symbols` per address. Chaotic stub on the untracked-address majority.
-- **Automated extraction?** Yes via a chaotic-stub generator parameterised by the tracked-address list — pending implementation.
+- **Primitive.** **KMTS path:** one predicate per tracked-address value class. Memory cells in BTOR2 (`$mem`/`$mem_v2`) are currently deferred (§11 of the architecture doc); when the lifter learns array theory, predicates over array selects become the primitive. **Legacy path:** `AbstractionType::Symbols` per address; chaotic stub on the untracked-address majority.
+- **Automated extraction?** Yes via a chaotic-stub generator parameterised by the tracked-address list — pending implementation. Memory-cell KMTS abstraction deferred.
 - **Soundness.** Tracked-address restriction is sound for safety properties referencing only tracked addresses. Chaotic stub over untracked addresses is sound for safety, optimistic for liveness.
 
 See the **[Memory soundness matrix](#memory-soundness-matrix)** below for the per-posture × per-property-class breakdown and the declaration shape (`[sources.memory_abstraction]`) that records the choice in `verify.toml`.
@@ -142,16 +176,16 @@ See the **[Memory soundness matrix](#memory-soundness-matrix)** below for the pe
 ### Pipelines (per CPU core)
 
 - **Concrete content.** N pipeline registers carrying instruction + control fields, hazard logic, forwarding paths.
-- **What to abstract.** Per-stage occupancy as Boolean `{ empty, busy }`. Forwarding encoded as multi-label transitions. Branch flush encoded via rich modal guards. No cycle-accurate timing.
-- **Primitive.** `AbstractionType::Boolean` for occupancy; multi-label transitions; rich modal guards.
+- **What to abstract.** Per-stage occupancy as one predicate per stage (`stage_i_busy`). Forwarding encoded as multi-label transitions. Branch flush encoded via rich modal guards. No cycle-accurate timing.
+- **Primitive.** **KMTS path:** one predicate per stage; multi-label transitions; rich modal guards. **Legacy path:** `AbstractionType::Boolean` for occupancy.
 - **Automated extraction?** No — the abstraction is semantic. Library template feasible.
 - **Soundness.** Sound iff the property does not require cycle-accurate timing. Document `// SOUNDNESS: pipeline occupancy is Boolean-abstracted; cycle-level hazards are not modelled.` inline.
 
 ### Caches (per core, per line)
 
 - **Concrete content.** Cache memory (KB to MB), tag array, coherence state bits per line.
-- **What to abstract.** Memory content not tracked. Tracked lines = small hand-picked set (1-4 typically). Per-line state = symbol set of the coherence protocol's states (e.g. `{ I, S, E, M }` for MESI).
-- **Primitive.** `AbstractionType::Symbols` per line; per-state predicate to lift `M_lineX` into a mu-calculus-usable predicate.
+- **What to abstract.** Memory content not tracked. Tracked lines = small hand-picked set (1-4 typically). Per-line state = one predicate per protocol-state variant (e.g. `is_M_lineX`, `is_E_lineX`, `is_S_lineX`, `is_I_lineX` for MESI).
+- **Primitive.** **KMTS path:** predicates per (line, state) pair. **Legacy path:** `AbstractionType::Symbols` per line; per-state predicate to lift `M_lineX` into a mu-calculus-usable predicate.
 - **Automated extraction?** Partial — library template parameterised by `<N>` cores × `<M>` lines.
 - **Soundness.** Sound iff the property references only tracked lines and the protocol's symbol set is exhaustive.
 
@@ -166,8 +200,8 @@ See the **[Memory soundness matrix](#memory-soundness-matrix)** below for the pe
 ### Interrupt controllers (PLIC / NVIC)
 
 - **Concrete content.** Per-source pending + priority + enable; arbiter; per-hart claim/complete.
-- **What to abstract.** Pending state Boolean per tracked source. Priority either dropped or symbolic (`{high, low}`). Claim/complete as discrete events.
-- **Primitive.** `AbstractionType::Boolean` per source; per-state predicates.
+- **What to abstract.** Pending state Boolean per tracked source (one predicate `is_pending_src_i`). Priority either dropped or symbolic (one predicate per priority class). Claim/complete as discrete events.
+- **Primitive.** **KMTS path:** predicates per source. **Legacy path:** `AbstractionType::Boolean` per source; per-state predicates.
 - **Automated extraction?** Partial — library template feasible.
 - **Soundness.** Same as caches.
 
@@ -175,8 +209,8 @@ See the **[Memory soundness matrix](#memory-soundness-matrix)** below for the pe
 
 - **Concrete content.** Subsystem-specific.
 - **What to abstract.** A small CLTS automaton (3-10 states) modelling only the interaction with bus / interrupt interfaces. Internal state not visible at those interfaces is dropped.
-- **Primitive.** Hand-authored CTXDSL; `sv-rtl` when RTL exists.
-- **Automated extraction?** No for the general case.
+- **Primitive.** Hand-authored CTXDSL; KMTS lifter if RTL exists.
+- **Automated extraction?** No for the general case via hand-written CTXDSL; yes via the KMTS lifter from RTL.
 - **Soundness.** Sound iff the externally-visible abstraction matches the actual interaction protocol.
 
 ### Firmware drivers
@@ -191,7 +225,7 @@ See the **[Memory soundness matrix](#memory-soundness-matrix)** below for the pe
 
 > Source of truth: [`MemoryAbstractionPosture`](../crates/mununu-core/src/verify/config.rs) (verify-framework declaration), [`docs/design/black-box-modules.md`](design/black-box-modules.md) (chaotic-stub foundations, Doc A §A.4), [`docs/design/hw-sw-codesign-extraction.md`](design/hw-sw-codesign-extraction.md) (HW/SW codesign chaotic-stub formulation, Doc C §C.5) — surface: CLI+API+UI (declared in `verify.toml`, consumed by the orchestrator and surfaced in summaries).
 
-Memory abstraction is the single biggest soundness-relevant choice in any non-trivial verification target. This section defines the four canonical postures, how they interact with fence semantics, and which property classes each posture supports soundly. The choice is recorded in `verify.toml` via the `[sources.memory_abstraction]` block (see [Declaring the posture](#declaring-the-posture-in-verifytoml) below) so reviewers can audit the abstraction without re-reading the CTXDSL.
+Memory abstraction is the single biggest soundness-relevant choice in any non-trivial verification target. The matrix is unchanged by the KMTS pivot — the four canonical postures interact with the canonical KMTS recipe through the predicate set (per-address predicates of the form `mem.x.fresh = (mem[x] == fresh)`) rather than through legacy `Symbols` abstractions, but the soundness story per posture is identical.
 
 ### The four postures
 
@@ -276,6 +310,15 @@ The block is optional — omitting it is legacy-safe and equivalent to declaring
 
 ## Soundness summary (one-line reference)
 
+**Canonical KMTS recipe:**
+
+- **KMTS abstraction with 3-valued mu-calculus** — uniformly sound for the full mu-calculus including liveness. `KleeneT` and `KleeneF` verdicts transfer to the concrete; `KleeneBot` requires refinement.
+- **Composition** — pointwise meet on the capability lattice (per-axis conjunction); sound for both may and must without an AGR discharge step.
+- **UF abstraction on wide arithmetic** — may-side-only over-approximation; must-mode queries use concrete operators.
+- **CEGAR refinement** — bounded (default 16 rounds); on cap-hit, `KleeneBot` is retained with a soundness-tagged warning.
+
+**Legacy primitives (Sharp-everywhere KMTSes):**
+
 - **Boolean / interval / symbol-set on a variable** — sound when property doesn't distinguish values within an equivalence class.
 - **Ignored variables** — sound for safety; model permits every concrete value.
 - **Chaotic stub** — over-approximation; sound for safety, optimistic for liveness (Doc C §C.5 for the codesign formulation).
@@ -287,21 +330,27 @@ The block is optional — omitting it is legacy-safe and equivalent to declaring
 
 When introducing an abstraction decision — whether in an adapter, a CTXDSL source, or a sidecar — follow this checklist:
 
-1. **Declare the abstraction posture explicitly.** Either inline (`AbstractionType::Symbols(["zero", "non_zero"])` in a sidecar; `mem { x : shared }` in microcode) or in a comment block at the top of a hand-authored CTXDSL file.
-2. **Add a `// SOUNDNESS:` annotation** at every `eval_expr → None` choice and every adapter decision that drops information. State whether it is over-approximation or under-approximation and why it is sound for the relevant property class. CLAUDE.md § Soundness Guarantees is the enforcement point; `/soundness-check` is the audit skill.
-3. **Add a regression test** for the abstraction decision when adding a new adapter or modifying the Kripke builder. The test must exercise both the abstracted case and at least one concrete case that maps into the same abstraction class, asserting the verdict agrees.
+1. **Declare the abstraction posture explicitly.** For the KMTS recipe: list predicates in the sidecar (`predicates: Vec<MuFormula>`) and any UF wrapping overrides (`uf_wrap`, `uf_unwrap`). For legacy adapters: inline (`AbstractionType::Symbols(["zero", "non_zero"])`; `mem { x : shared }` in microcode) or in a comment block at the top of a hand-authored CTXDSL file.
+2. **Add a `// SOUNDNESS:` annotation** at every `eval_expr → None` choice and every adapter decision that drops information. State whether it is over-approximation or under-approximation and why it is sound for the relevant property class. KMTS-aware adapters additionally annotate every `KleeneBot` fallback at the spuriousness-check and refinement-cap boundaries. CLAUDE.md § Soundness Guarantees is the enforcement point; `/soundness-check` is the audit skill.
+3. **Add a regression test** for the abstraction decision when adding a new adapter or modifying the Kripke builder. The test must exercise both the abstracted case and at least one concrete case that maps into the same abstraction class, asserting the verdict agrees. For KMTS adapters, the test must also cover one fixture where the initial predicate set returns `KleeneBot` and CEGAR refinement demotes it to `KleeneT` / `KleeneF`.
 4. **Document the choice in the user-facing wiki page** for the affected adapter or workflow. If the abstraction is non-obvious (e.g. "the chaotic-stub peripheral over-approximates every register access"), state the soundness consequence inline.
 
 ## What this doc deliberately does not do
 
-- **Quantify state-space cost** per abstraction choice. That depends on the user's specific model; a follow-up benchmark suite would help, but it does not exist today.
+- **Quantify state-space cost** per abstraction choice. That depends on the user's specific model; a follow-up benchmark suite would help, but it does not exist today. The KMTS recipe's `2^|P|` upper bound on abstract states is a worst case; reachable abstract state counts are typically much smaller.
 - **Prescribe one abstraction class as "the right one"** for any subsystem. The right class depends on the property — the recipe above gives the *minimum*; safety-only properties often tolerate coarser abstractions than liveness properties.
 - **Cover weak-memory-model semantics** (RVWMO, TSO, sequential consistency) **as an enforcement layer**. The [memory soundness matrix](#memory-soundness-matrix) above documents which fence semantics mununu's orchestrator enforces today (`global_barrier`, `release_acquire`) and which are aspirational (`rvwmo`). Verifying memory-order intent at the architectural level still requires either an external checker integrated as an adapter (Herd / RMEM) or a heavy abstraction (TSO / SC) that ignores weak orderings.
+- **Cover 3-valued controller synthesis.** Synthesis is de-prioritised under the KMTS pivot. The synthesiser runs on the `BoolDomain`-projected KMTS (Sharp-only transitions) and hard-errors when fed a KMTS with `MayOnly` transitions. Revisit if synthesis is re-prioritised; until then, the recipe is "if you want synthesis, stay on Sharp-everywhere adapters (XState, microcode, agentic, hand-written CTXDSL)."
 
 ## See also
 
 - [Soundness Guarantees](../CLAUDE.md#soundness-guarantees) — the load-bearing rules.
+- [`docs/design/native-sv-abstraction.md`](design/native-sv-abstraction.md) — the KMTS architecture, the simplification phases (§9), the validation milestones (§10).
+- [`docs/design/kmts-theory.md`](design/kmts-theory.md) — KMTS definition, 3-valued mu-calculus semantics, preservation theorem.
+- [`docs/design/predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md) — predicate seeding, may/must image computation, CEGAR refinement, operational debugging.
+- [`docs/design/abstraction-literature.md`](design/abstraction-literature.md) — 28-paper catalog (entries 19–24 KMTS, 25–28 AGR).
 - [`docs/policies/claims-integrity.md`](policies/claims-integrity.md) — full claims-integrity policy with the abstraction-soundness procedure.
 - [`docs/adapters/extraction.md`](adapters/extraction.md) — `.espec.json` extraction adapter, mode filtering, property templates.
-- [`docs/synthesis.md`](synthesis.md) — `ControllerMode`, signature-based extraction, Skolem-paradigm rules.
+- [`docs/synthesis.md`](synthesis.md) — `ControllerMode`, signature-based extraction, Skolem-paradigm rules (operates on Sharp-everywhere KMTSes only post-R.3).
 - [`wiki/Verify-Project-Flow.md`](../wiki/Verify-Project-Flow.md) — the verify framework that consumes all of the above.
+- [`wiki/Composition.md`](../wiki/Composition.md) — composition semantics including the KMTS modality merge.

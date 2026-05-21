@@ -30,22 +30,75 @@ A verification project is the tuple `(Sources, AlphabetBinding, Composition, Pro
 ```text
 verify.toml --> parse + validate
               \--> for each source: dispatch_adapter
-                       \--> adapter::partition::classify         (Phase A.3 — auto-COI)
+                       \--> SystemVerilog path (post-R.0; singular pipeline post-S.2b):
+                                sv2v --top <top> *.sv > elaborated.v
+                                yosys read_verilog ... hierarchy -check ... NO flatten
+                                       submod -name <m>; write_btor <m>.btor    (per submodule)
+                                btor2 → KMTS lifter (kmts_lift.rs)
+                                       \--> predicate seeding from property APs + COI + typedef enums
+                                       \--> may-mode predicate-image (UF-abstracted operators)
+                                       \--> must-mode predicate-image (concrete operators)
+                                       \--> emits Clts with TransitionModality { Sharp | MayOnly }
+                                            and state_3valued_predicates : Tristate
+                       \--> other adapters (XState, microcode, agentic, ctxdsl):
+                                produce Sharp-everywhere KMTSes (legacy 2-valued semantics)
+                       \--> adapter::partition::classify         (Phase A.3 — auto-COI; orthogonal to KMTS)
                                   \--> Dropped signals → Ignored when no sidecar override
                                   \--> AdapterOutput.partition_summary captures the counts
-                       \--> AdapterOutput.ctxdsl (+ state_valuations side-channel)
+                       \--> AdapterOutput.ctxdsl (+ state_valuations + state_3valued_predicates side-channels)
                        \--> apply_renamings (binding-driven)
-                       \--> for sv-rtl + register_map binding:
-                                apply derive_sv_renamings_from_register_map
               \--> assemble_unified_ctxdsl (N source bodies into one context)
               \--> parse + realize
                        \--> environment_for(automaton) wires CLTS state_valuations
                                 into Environment::abstract_states when numeric (Phase A.3)
               \--> for each property: resolve template, evaluate via mu_calculus
+                       \--> TruthDomain choice: BoolDomain (default; 2-valued) or KleeneDomain (3-valued)
                        \--> on-demand `signal == const` atoms resolve through
                             abstract_states + state-valuation binding (Phase A.3)
-              \--> VerifyReport (includes per-source partition_summary)
+                       \--> on KleeneBot verdict: CEGAR refinement loop (post-R.5; bounded at 16 rounds)
+              \--> VerifyReport (per-source partition_summary; per-property 3-valued verdict + refinement trace)
 ```
+
+## KMTS pipeline highlights (post-R.0 / R.1 / R.2 / R.3)
+
+> **Source of truth:** [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) (architecture), [`docs/design/kmts-theory.md`](../docs/design/kmts-theory.md) (theory), [`docs/design/predicate-abstraction-recipe.md`](../docs/design/predicate-abstraction-recipe.md) (practical recipe).
+
+The KMTS pivot replaces the SystemVerilog extraction story end-to-end while leaving non-RTL adapters (XState, microcode, agentic, ctxdsl) unchanged. The four moving parts:
+
+- **Frontend: sv2v + Yosys-no-flatten + BTOR2-per-module.** sv2v normalises SV-2017 to a Verilog-2005 subset (preserves hierarchy and signal names); Yosys runs `read_verilog; hierarchy -check; proc; opt -fast -purge -keepdc` **without `flatten`** then emits one BTOR2 per submodule via `submod -name <m>; write_btor`. Top-module netlist drives composition.
+- **KMTS data model.** Each `Transition` carries a `TransitionModality` (`Sharp` for must ∧ may; `MayOnly` for over-approximation). Each `Clts` optionally carries `state_3valued_predicates: BTreeMap<(StateId, PredId), Tristate>` where `Tristate ∈ { KleeneT, KleeneF, KleeneBot }`. Legacy adapters produce `Sharp` everywhere with `None` for the 3-valued field — vacuous KMTS, identical to today's 2-valued behaviour.
+- **3-valued evaluator.** The `TruthDomain` trait surfaces both the truth lattice (formula semantics) and the information lattice (fixpoint convergence). `BoolDomain` instantiates the 2-valued specialisation; `KleeneDomain` instantiates the 3-valued one. Verdicts are `KleeneT` / `KleeneF` / `KleeneBot`; `KleeneBot` triggers CEGAR.
+- **CEGAR refinement.** On `KleeneBot`, the lifter lifts the abstract counterexample, SMT-discharges it for spuriousness, and on UNSAT extracts predicate refinements via IC3-IA-style interpolation. Bounded by `cegar_max_rounds` (default 16). Two-axis refinement: predicate addition vs. UF instance concretisation, partitioned by unsat-core symbol kind.
+
+**Singular-pipeline commitment.** By the end of S.2b, the legacy native-SV adapter (the hand-rolled recursive-descent parser + explicit cross-product enumerator) is deleted. There is no `--engine native-sv` escape hatch. SV verification has exactly one pipeline. See [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) §9 (simplification phases) and §10 (validation milestones M.0–M.6 against industrially realistic OpenTitan / ibex / Caliptra fixtures).
+
+## Automatic partition (Phase A.3)
+
+> **Source of truth:** [`adapter::partition::classify`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
+
+SV (`sv-rtl`) and BTOR2 sources run an **automatic cone-of-influence
+pass** during their `dispatch_adapter` translation. The pass walks the
+frontend IR's dependency graph from property atoms and marks signals
+outside the cone as `AbstractionType::Ignored`. The composition rule
+with the sidecar:
+
+- A signal explicitly listed in the `.mununu.json`'s `signals[]` /
+  `inputs[]` / `predicates[]` always wins — the auto-partition never
+  overrides a user declaration.
+- A signal *absent* from the sidecar gets the partition's verdict.
+  Most often `Kept` (in-cone); when `Dropped`, the bit-blaster pins
+  the signal to a single value and emits an `AdapterWarning`.
+
+The per-source `partition_summary` field on `VerifyReport.sources[*]`
+carries the counts (kept / dropped / total) and bit-widths
+(`state_bits_before` / `state_bits_after` on BTOR2) so users can read
+the COI's reduction effect directly out of the report JSON.
+
+COI is **exact** (bisimilar on the property's atomic-proposition set), not over-approximation — sound and complete for the full mu-calculus. Independent of the KMTS pivot.
+
+See also:
+[`docs/abstraction.md` §"Automatic cone-of-influence"](../docs/abstraction.md#automatic-cone-of-influence-phase-a3-orthogonal-to-kmts)
+for the user-facing guidance.
 
 ## `verify.toml` schema
 
@@ -94,37 +147,6 @@ formula = "mu X. (Init || <> X)"
 over = "System"
 ```
 
-## Automatic partition (Phase A.3)
-
-> **Source of truth:** [`adapter::partition::classify`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
-
-SV (`sv-rtl`) and BTOR2 sources run an **automatic cone-of-influence
-pass** during their `dispatch_adapter` translation. The pass walks the
-frontend IR's dependency graph from property atoms and marks signals
-outside the cone as `AbstractionType::Ignored`. The composition rule
-with the sidecar:
-
-- A signal explicitly listed in the `.mununu.json`'s `signals[]` /
-  `inputs[]` always wins — the auto-partition never overrides a user
-  declaration.
-- A signal *absent* from the sidecar gets the partition's verdict.
-  Most often `Kept` (in-cone); when `Dropped`, the bit-blaster pins
-  the signal to a single value and emits an `AdapterWarning`.
-
-The per-source `partition_summary` field on `VerifyReport.sources[*]`
-carries the counts (kept / dropped / total) and bit-widths
-(`state_bits_before` / `state_bits_after` on BTOR2) so users can read
-the COI's reduction effect directly out of the report JSON.
-
-Datapath UF substitution (combinational arithmetic collapsed to
-uninterpreted functions per Andraus–Sakallah Reveal 2008) is reserved
-for a follow-up; the `Datapath { uf_symbol }` variant on
-`PartitionClass` is currently never produced.
-
-See also:
-[`docs/abstraction.md` §"Automatic cone-of-influence"](../docs/abstraction.md#automatic-cone-of-influence-phase-a3)
-for the user-facing guidance.
-
 ## Report shape
 
 > **Source of truth:** [`verify::report::VerifyReport`](../crates/mununu-core/src/verify/report.rs) — surface: CLI+API+UI.
@@ -142,13 +164,20 @@ pub struct PropertyVerdict {
     pub formula_source: PropertyFormulaSource, // Inline | Template { id, args }
     pub formula: String,                       // concrete mu-calculus text
     pub over: String,
-    pub satisfied: bool,
+    pub verdict: KleeneVerdict,                // KleeneT | KleeneF | KleeneBot (post-R.3)
+    pub satisfied: bool,                       // true iff KleeneT (preserved for 2-valued clients)
     pub total_states: usize,
-    pub satisfying_states: usize,
+    pub satisfying_states: usize,              // for KleeneT/KleeneF; not meaningful for KleeneBot
+    pub bot_states: usize,                     // count of KleeneBot states (post-R.3; 0 for BoolDomain)
     pub initial_states: Vec<String>,
     pub initial_satisfying: Vec<String>,
+    pub refinement_trace: Option<RefinementTrace>, // populated when CEGAR ran (post-R.5)
 }
+
+pub enum KleeneVerdict { KleeneT, KleeneF, KleeneBot }
 ```
+
+For BoolDomain (legacy adapters, Sharp-everywhere KMTSes), `verdict` is always `KleeneT` or `KleeneF` and `bot_states` is always `0`. For KleeneDomain (KMTS lifter output with `MayOnly` transitions), `KleeneBot` is possible; when CEGAR refinement closes it, `refinement_trace` is `Some(_)` with per-round predicate / UF additions.
 
 ## CLI
 

@@ -209,3 +209,53 @@ The full example is in `tutorial/examples/04_cross_domain.ctxdsl`.
 - **Skip labels are only needed for synchronous composition.** In asynchronous mode, members are not required to step, so self-loop skip labels are unnecessary.
 - **Hierarchical composition is order-sensitive.** Inner compositions must be declared before the outer composition that references them.
 - **Formulas can target any level.** You can write mu-calculus properties over individual automata, inner compositions, or the outermost system -- just set the `over` field accordingly.
+
+## KMTS Composition — Modality Merge (post-R.1)
+
+> **Source of truth:** [`composition::compose`](../crates/mununu-core/src/composition/mod.rs), [`Transition::modality`](../crates/mununu-core/src/clts/mod.rs) — surface: CLI+API+UI.
+
+The synchronous / asynchronous / superset semantics above apply unchanged to Kripke Modal Transition Systems (KMTSes — see [`docs/design/kmts-theory.md`](../docs/design/kmts-theory.md)). What KMTS composition *adds* is **per-axis modality merging**: each transition carries a `TransitionModality` (`Sharp` for both may and must, `MayOnly` for over-approximation only), and the composition operator merges modalities pointwise on each axis.
+
+### Modality merge rule
+
+Each KMTS transition has two independent capabilities: `may` (the transition is admitted by the abstraction) and `must` (a concrete witness for the transition exists). Standard KMTS enforces `must ⊆ may`, so the valid capability sets are `{may}` (= `MayOnly`) and `{may, must}` (= `Sharp`). A composed transition has capability `c` iff **both** sides have a transition with capability `c` on the synchronizing label:
+
+```text
+has_may (left ⊗ right) = has_may (left) ∧ has_may (right)
+has_must(left ⊗ right) = has_must(left) ∧ has_must(right)
+```
+
+Set-intersection on each axis, independently. The merge table is a corollary:
+
+| `left.modality` | `right.modality` | `composed.modality` |
+|---|---|---|
+| `Sharp` | `Sharp` | `Sharp` (both have may; both have must) |
+| `Sharp` | `MayOnly` | `MayOnly` (both have may; only one has must → composed has may but not must) |
+| `MayOnly` | `MayOnly` | `MayOnly` (both have may; neither has must) |
+
+Three cases, not six — the standard-KMTS invariant `must ⊆ may` eliminates a hypothetical `MustOnly` variant.
+
+### Why this is the structural free lunch
+
+Composition is purely structural (no SMT at compose time); refinement is congruential (Larsen–Larsen–Wąsowski FoSSaCS 2007 — refining one module's KMTS refines the composed KMTS without recomposition). The compositional verification problem reduces to the per-module abstraction problem, **without** an assume-guarantee discharge step.
+
+### What this preserves and what it doesn't
+
+**Preserves:** Per-module abstraction; cross-module verdict soundness *under per-module abstractions*; liveness reasoning under fairness; all CTLS-observable behaviour for Sharp-everywhere KMTSes (the legacy case is a structural special case).
+
+**Does not preserve:** *Tightness* — the composed KMTS may have more `KleeneBot` verdicts than a monolithic predicate abstraction of the flattened system. The architecture doc [§7.2 worked counterexample](../docs/design/native-sv-abstraction.md#§7-compositional-kmts-the-structural-free-lunch) walks through a producer/consumer pair where the composed KMTS returns `KleeneBot` on a safety property because the per-module predicate sets lack a cross-module port-equality predicate; adding `data_eq_on_handshake = (valid ⇒ producer.data_out == consumer.data_in)` to the multi-module sidecar closes the gap.
+
+The KMTS lifter auto-emits canonical port-equality predicates for every declared multi-module connection (`from: "producer.data_out", to: "consumer.data_in"` → `data_eq_on_handshake`). Authors only need to add predicates manually for arbitrated buses, stateful intermediates, and cross-domain CDC bridges.
+
+### How this affects the existing examples
+
+For Sharp-everywhere KMTSes (the case the existing examples above all describe — XState, microcode, ctxdsl, agentic adapters all produce `Sharp` transitions exclusively), the modality merge is `Sharp ⊗ Sharp = Sharp` on every composed transition. The 3-valued evaluator (`KleeneDomain`) reduces to the 2-valued one (`BoolDomain`) on a Sharp-everywhere KMTS: `KleeneBot` never appears in the verdict. So the existing producer-consumer and sensor-network examples are unchanged — the new modality machinery is *additive*, not a behavioural change for adapters that don't produce `MayOnly` transitions.
+
+The KMTS lifter (SV / BTOR2 path, post-R.2) is the adapter that produces `MayOnly` transitions, because predicate abstraction creates over-approximation edges that no concrete witness backs. See [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) §6 for the design and [`docs/design/predicate-abstraction-recipe.md`](../docs/design/predicate-abstraction-recipe.md) §3 for the predicate-image computation that decides which transitions are `Sharp` vs `MayOnly`.
+
+## See Also
+
+- [Verify Project Flow](Verify-Project-Flow) — composition's place in the verify pipeline; the KMTS pipeline highlights.
+- [`docs/design/kmts-theory.md`](../docs/design/kmts-theory.md) — KMTS theory, refinement preorder, 3-valued mu-calculus semantics, preservation theorem.
+- [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) §6.5 (composition modality merge) + §7 (compositional KMTS).
+- [`docs/abstraction.md`](../docs/abstraction.md) — the canonical KMTS recipe and the legacy primitives.
