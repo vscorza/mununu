@@ -661,6 +661,19 @@ enum SvCommand {
     /// want to inspect or further-process the sv2v output. Same
     /// sv2v invocation as the Yosys path's `--preprocessor sv2v`.
     Preprocess(SvPreprocessArgs),
+    /// Emit one BTOR2 per submodule (R.0b — KMTS pipeline frontend).
+    ///
+    /// Runs Yosys with `hierarchy -check` (no `flatten`) and emits one
+    /// BTOR2 per submodule reachable from the top. The per-submodule
+    /// BTOR2 files feed the R.2 KMTS lifter; the top-module netlist
+    /// drives composition (see docs/design/native-sv-abstraction.md
+    /// §3 + §4).
+    ///
+    /// Output: writes `<output-dir>/<module>.btor2` per submodule.
+    /// Defaults to writing into the same directory as the input file
+    /// when --output-dir is omitted. Also prints the per-submodule
+    /// state-count / property-count summary to stdout.
+    EmitBtor2PerModule(SvEmitBtor2PerModuleArgs),
 }
 
 #[derive(Args, Debug)]
@@ -717,6 +730,38 @@ struct SvPreprocessArgs {
     /// <first-stem>.elab.v next to the first input file.
     #[arg(long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct SvEmitBtor2PerModuleArgs {
+    /// Primary SystemVerilog source file (.sv) containing the top
+    /// module or the multi-module design.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    /// Additional SV source files providing submodules or packages.
+    /// Repeatable; each is read alongside the primary input.
+    #[arg(long = "source", value_name = "FILE")]
+    sources: Vec<PathBuf>,
+    /// Explicit top-module name. When omitted, Yosys's
+    /// `hierarchy -auto-top` picks the root.
+    #[arg(long = "top", value_name = "NAME")]
+    top: Option<String>,
+    /// Output directory for the per-submodule BTOR2 files. Defaults
+    /// to the directory of the primary input.
+    #[arg(long = "output-dir", value_name = "DIR")]
+    output_dir: Option<PathBuf>,
+    /// Run sv2v as a preprocessor pass before Yosys. Required for
+    /// SV-2017 constructs Yosys's built-in parser cannot accept (most
+    /// notably the module-header `import pkg::*;` form). Same
+    /// behaviour as the legacy `--preprocessor sv2v` flag on the
+    /// single-BTOR2 path.
+    #[arg(long = "preprocess-sv2v")]
+    preprocess_sv2v: bool,
+    /// Use Yosys's `setundef -anyseq` instead of the default
+    /// `setundef -zero`. Preserves CWE-1245-class semantics at the
+    /// cost of introducing `$anyseq` state cells.
+    #[arg(long = "setundef-anyseq")]
+    setundef_anyseq: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2460,7 +2505,72 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         }
         SvCommand::Discover(args) => sv_discover(args),
         SvCommand::Preprocess(args) => sv_preprocess(args),
+        SvCommand::EmitBtor2PerModule(args) => sv_emit_btor2_per_module(args),
     }
+}
+
+fn sv_emit_btor2_per_module(args: SvEmitBtor2PerModuleArgs) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::fs;
+
+    let primary_content = fs::read_to_string(&args.file).map_err(|e| {
+        format!(
+            "Failed to read primary source '{}': {e}",
+            args.file.display()
+        )
+    })?;
+    let mut additional: HashMap<String, String> = HashMap::new();
+    for src in &args.sources {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid additional source path: {}", src.display()))?;
+        let body = fs::read_to_string(src)
+            .map_err(|e| format!("Failed to read additional source '{}': {e}", src.display()))?;
+        additional.insert(name.to_string(), body);
+    }
+    let output_dir = args.output_dir.clone().unwrap_or_else(|| {
+        args.file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    });
+
+    let yopts = mununu_core::adapter::yosys::YosysOptions {
+        top: args.top.clone(),
+        additional_sources: additional.into_iter().collect(),
+        primary_source_path: Some(args.file.display().to_string()),
+        use_sv2v: args.preprocess_sv2v,
+        setundef_anyseq: args.setundef_anyseq,
+        per_module_btor: true,
+        per_module_output_dir: Some(output_dir.clone()),
+        ..Default::default()
+    };
+    let opts = mununu_core::adapter::AdapterOptions::default();
+    let outputs =
+        mununu_core::adapter::yosys::translate_sv_per_module(&primary_content, &opts, &yopts)
+            .map_err(|e| format!("sv emit-btor2-per-module: {e}"))?;
+
+    println!(
+        "Emitted {} BTOR2 file(s) to {}",
+        outputs.len(),
+        output_dir.display()
+    );
+    for per_module in &outputs {
+        let path_display = per_module
+            .btor2_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(transient)".to_string());
+        println!(
+            "  {} -> {} (state_count={}, property_count={})",
+            per_module.module_name,
+            path_display,
+            per_module.output.source_info.state_count,
+            per_module.output.source_info.property_count,
+        );
+    }
+    Ok(())
 }
 
 fn sv_preprocess(args: SvPreprocessArgs) -> Result<(), String> {

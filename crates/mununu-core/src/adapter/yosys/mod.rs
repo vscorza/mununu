@@ -81,6 +81,28 @@ pub struct YosysOptions {
     /// silently transformed away). See the SOUNDNESS comment in
     /// [`build_script`] for the trade-off.
     pub setundef_anyseq: bool,
+    /// When `true`, the per-submodule BTOR2 emission path is engaged
+    /// (R.0b — KMTS pivot). Each submodule reachable from the top is
+    /// emitted as its own BTOR2 file by running Yosys once per
+    /// submodule with `hierarchy -top <m>` (no `flatten`). The R.2
+    /// KMTS lifter consumes the per-submodule outputs; the top-level
+    /// netlist drives composition (per
+    /// [`docs/design/native-sv-abstraction.md`](../../docs/design/native-sv-abstraction.md)
+    /// §3 and §4).
+    ///
+    /// This is *independent* of the legacy single-BTOR2 path: callers
+    /// that set this opt out of the existing `translate_sv` and use
+    /// [`translate_sv_per_module`] instead.
+    pub per_module_btor: bool,
+    /// When set, the per-submodule BTOR2 files are persisted to this
+    /// directory (one `<module_name>.btor2` per submodule) for
+    /// downstream consumption / inspection. The directory is created
+    /// if missing. When `None` (default), the per-submodule files live
+    /// in a transient per-call tempdir and are dropped after the
+    /// per-module translation completes — the [`AdapterOutput`]s still
+    /// carry the CLTS, sidecars, and partition summaries the BTOR2
+    /// adapter produced.
+    pub per_module_output_dir: Option<PathBuf>,
 }
 
 /// SV-via-Yosys adapter — wraps the BTOR2 path with a Yosys subprocess.
@@ -276,6 +298,356 @@ pub fn translate_sv(
     }
 
     Ok(out)
+}
+
+/// One submodule's translated output, as returned by
+/// [`translate_sv_per_module`]. The `btor2_path` is `Some(..)` when
+/// `yopts.per_module_output_dir` was set (the BTOR2 file persists);
+/// `None` when the per-call tempdir is in use.
+#[derive(Debug, Clone)]
+pub struct PerModuleOutput {
+    pub module_name: String,
+    pub btor2_path: Option<PathBuf>,
+    pub output: AdapterOutput,
+}
+
+/// Translate a SystemVerilog design into one [`AdapterOutput`] *per
+/// submodule*, with Yosys's `hierarchy -check` preserving module
+/// boundaries and no `flatten` pass running anywhere on the path. This
+/// is the R.0b KMTS-pipeline frontend: each submodule reachable from
+/// the top is emitted as a separate BTOR2 file, then read back through
+/// the existing BTOR2 adapter to produce a per-submodule
+/// `AdapterOutput`.
+///
+/// Strategy: two-pass invocation of Yosys.
+///
+/// 1. **Discovery pass.** Run Yosys with the user's `read_verilog`
+///    sources + `hierarchy -check -top <top>` + `proc` + `write_json`.
+///    This produces a hierarchy snapshot from which the submodule list
+///    is enumerated. The pass runs even when there is only one module
+///    in the design (returning a singleton list).
+/// 2. **Per-module emission pass.** For each submodule, run Yosys
+///    again, this time with `hierarchy -check -top <m>` (no
+///    `flatten`), then the same `async2sync; chformal -lower;
+///    dffunmap; setundef …; write_btor` tail as the legacy
+///    single-BTOR2 path. Each per-module BTOR2 is fed through the
+///    BTOR2 adapter to produce an `AdapterOutput`.
+///
+/// The cost (~N Yosys invocations for an N-submodule design) is
+/// acceptable for the small multi-module fixtures the M.0–M.4
+/// validation milestones target. A single-invocation variant using
+/// Yosys `select` is feasible in principle but introduces select-scope
+/// subtleties that the two-pass shape avoids.
+pub fn translate_sv_per_module(
+    content: &str,
+    options: &AdapterOptions,
+    yopts: &YosysOptions,
+) -> Result<Vec<PerModuleOutput>, AdapterError> {
+    let yosys = locate_yosys()?;
+    if !yopts.skip_verific_check {
+        verify_no_verific(&yosys)?;
+    }
+
+    let tmp = TempDir::new("mununu-yosys-per-module")?;
+    let primary = tmp.path().join("work.sv");
+    write_file(&primary, content)?;
+
+    let mut sources = vec![primary.clone()];
+    for (name, src) in &yopts.additional_sources {
+        let p = tmp.path().join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
+        write_file(&p, src)?;
+        sources.push(p);
+    }
+
+    // Optional sv2v preprocessing. Same shape as `translate_sv`.
+    if yopts.use_sv2v {
+        let preprocessed = tmp.path().join("preprocessed.sv");
+        let include_dirs: Vec<PathBuf> = yopts
+            .primary_source_path
+            .as_ref()
+            .and_then(|p| {
+                let abs = Path::new(p)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(p));
+                abs.parent().map(Path::to_path_buf)
+            })
+            .into_iter()
+            .collect();
+        preprocess_sv(&sources, &include_dirs, &preprocessed)?;
+        sources = vec![preprocessed];
+    }
+
+    // Pass 1 — discovery. Use `hierarchy -auto-top` when the caller did
+    // not provide one (matches the legacy build_script).
+    let hier_json_path = tmp.path().join("hier.json");
+    let discovery_script = build_discovery_script(&sources, yopts.top.as_deref(), &hier_json_path);
+    run_yosys(&yosys, &discovery_script)?;
+
+    let hier_body = std::fs::read_to_string(&hier_json_path).map_err(|e| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: format!(
+            "adapter/yosys: per-module discovery pass succeeded but hierarchy snapshot {} is unreadable ({e})",
+            hier_json_path.display()
+        ),
+        location: None,
+    })?;
+    let submodules = enumerate_submodules(&hier_body, yopts.top.as_deref());
+    if submodules.is_empty() {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: "adapter/yosys: per-module emission found no non-blackbox modules in the hierarchy snapshot".into(),
+            location: None,
+        });
+    }
+
+    // Per-module port directions: parse the discovery snapshot once;
+    // every submodule's directions live in the same JSON document.
+    let top_directions_per_module =
+        parse_port_directions_per_module(&hier_body, yopts.top.as_deref());
+
+    // Choose output directory for the per-submodule BTOR2 files.
+    let out_dir = match &yopts.per_module_output_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(io_err)?;
+            dir.clone()
+        }
+        None => tmp.path().to_path_buf(),
+    };
+    let persist = yopts.per_module_output_dir.is_some();
+
+    // Pass 2 — per-submodule emission. For each module, run Yosys with
+    // `hierarchy -top <m>` (no flatten) and emit `<m>.btor2`. Feed each
+    // BTOR2 through the existing BTOR2 adapter.
+    let mut outputs = Vec::with_capacity(submodules.len());
+    for module_name in &submodules {
+        let btor_path = out_dir.join(format!("{module_name}.btor2"));
+        let script =
+            build_per_module_script(&sources, module_name, &btor_path, yopts.setundef_anyseq);
+        run_yosys(&yosys, &script)?;
+
+        let btor = std::fs::read_to_string(&btor_path).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/yosys: per-module pass for '{module_name}' produced no BTOR2 at {} ({e})",
+                btor_path.display()
+            ),
+            location: None,
+        })?;
+
+        // Per-module port-direction context (Document B task B1 — same
+        // mechanism as `translate_sv`, scoped to each submodule's
+        // boundary).
+        let btor_options = match top_directions_per_module.get(module_name) {
+            Some(directions) if !directions.is_empty() => crate::adapter::AdapterOptions {
+                port_directions: directions.clone(),
+                ..options.clone()
+            },
+            _ => options.clone(),
+        };
+
+        let mut out =
+            super::btor2::Btor2Adapter::translate(&btor, &btor_options).map_err(|mut e| {
+                e.message = format!(
+                    "adapter/yosys: per-module BTOR2 reader failed for '{module_name}': {}",
+                    e.message
+                );
+                e
+            })?;
+        out.source_info = SourceInfo {
+            format: SourceFormat::SystemVerilog,
+            ..out.source_info
+        };
+
+        outputs.push(PerModuleOutput {
+            module_name: module_name.clone(),
+            btor2_path: if persist { Some(btor_path) } else { None },
+            output: out,
+        });
+    }
+
+    Ok(outputs)
+}
+
+/// Yosys discovery-pass script: read sources, set up hierarchy,
+/// elaborate processes, dump hierarchy snapshot. Stops before
+/// `flatten` / `async2sync` because the per-module emission pass
+/// repeats those steps with a different top.
+fn build_discovery_script(sources: &[PathBuf], top: Option<&str>, hier_json_out: &Path) -> String {
+    let read_cmds: Vec<String> = sources
+        .iter()
+        .map(|p| format!("read_verilog -formal -sv {}", p.display()))
+        .collect();
+    let hier = match top {
+        Some(t) => format!("hierarchy -check -top {t}"),
+        None => "hierarchy -check -auto-top".to_string(),
+    };
+    format!(
+        "{}; {hier}; proc; write_json {}",
+        read_cmds.join("; "),
+        hier_json_out.display()
+    )
+}
+
+/// Per-submodule emission script. Runs the same chain as `build_script`
+/// but with `<m>` as the top — no `flatten`, no `cutpoint -blackbox`
+/// (each submodule is treated as a self-contained design here). The
+/// BTOR2 emitted carries only `<m>`'s state cells and transitions.
+fn build_per_module_script(
+    sources: &[PathBuf],
+    module: &str,
+    btor_out: &Path,
+    setundef_anyseq: bool,
+) -> String {
+    let read_cmds: Vec<String> = sources
+        .iter()
+        .map(|p| format!("read_verilog -formal -sv {}", p.display()))
+        .collect();
+    let setundef_pass = if setundef_anyseq {
+        "setundef -anyseq"
+    } else {
+        "setundef -zero"
+    };
+    format!(
+        "{}; hierarchy -check -top {module}; proc; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        read_cmds.join("; "),
+        btor_out.display()
+    )
+}
+
+/// Spawn Yosys with the given script. Captures stdout/stderr into the
+/// `AdapterError` message on failure.
+fn run_yosys(yosys: &Path, script: &str) -> Result<(), AdapterError> {
+    let output = Command::new(yosys)
+        .arg("-q")
+        .arg("-p")
+        .arg(script)
+        .output()
+        .map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!("adapter/yosys: failed to spawn yosys: {e}"),
+            location: None,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/yosys: yosys exited with status {} (script: {script})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            ),
+            location: None,
+        });
+    }
+    Ok(())
+}
+
+/// Enumerate submodule names from a Yosys `write_json` hierarchy
+/// snapshot. Returns module names in deterministic (sorted) order,
+/// excluding the top module and any module flagged `(* blackbox *)`
+/// (blackbox bodies are not extractable to BTOR2).
+///
+/// When `explicit_top` is provided, it is excluded from the result.
+/// When `explicit_top` is `None`, the function attempts to discover
+/// the top via the `(* top *)` attribute and excludes it. If no top
+/// is identifiable, every non-blackbox module is returned (the caller
+/// can decide what to do).
+pub fn enumerate_submodules(hier_json: &str, explicit_top: Option<&str>) -> Vec<String> {
+    let root: serde_json::Value = match serde_json::from_str(hier_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let modules = match root.get("modules").and_then(|m| m.as_object()) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    // Determine which name to exclude as the top.
+    let auto_top: Option<String> = modules.iter().find_map(|(name, body)| {
+        let is_top = body
+            .get("attributes")
+            .and_then(|a| a.get("top"))
+            .map(|v| v.as_str().is_some_and(|s| s.ends_with('1')))
+            .unwrap_or(false);
+        if is_top { Some(name.clone()) } else { None }
+    });
+    let top_name = explicit_top.map(str::to_string).or(auto_top);
+
+    let mut out: Vec<String> = modules
+        .iter()
+        .filter(|(name, body)| {
+            if Some(name.as_str()) == top_name.as_deref() {
+                return false;
+            }
+            let is_bb = body
+                .get("attributes")
+                .and_then(|a| a.get("blackbox"))
+                .map(|v| v.as_str().is_some_and(|s| s.ends_with('1')))
+                .unwrap_or(false);
+            !is_bb
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    out.sort();
+
+    // If there are no non-top non-blackbox modules, fall back to
+    // emitting just the top — designs with a single module (the
+    // typical hand-written fixture) still produce one BTOR2 file.
+    if out.is_empty()
+        && let Some(top) = top_name
+        && modules.contains_key(&top)
+    {
+        out.push(top);
+    }
+
+    out
+}
+
+/// Parse port directions for *every* module in the hierarchy snapshot.
+/// Used by [`translate_sv_per_module`] to pass each submodule's
+/// boundary direction map into the BTOR2 adapter (Document B task B1
+/// extension to multi-module).
+fn parse_port_directions_per_module(
+    hier_json: &str,
+    _explicit_top: Option<&str>,
+) -> HashMap<String, HashMap<String, crate::controllability::BoundaryDirection>> {
+    use crate::controllability::BoundaryDirection;
+
+    let root: serde_json::Value = match serde_json::from_str(hier_json) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let modules = match root.get("modules").and_then(|m| m.as_object()) {
+        Some(m) => m,
+        None => return HashMap::new(),
+    };
+
+    let mut all = HashMap::new();
+    for (module_name, body) in modules {
+        let port_map = match body.get("ports").and_then(|p| p.as_object()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let mut per_module = HashMap::new();
+        for (name, info) in port_map {
+            let direction_str = info
+                .get("direction")
+                .and_then(|d| d.as_str())
+                .unwrap_or("input");
+            let direction = match direction_str {
+                "input" => BoundaryDirection::Input,
+                "output" => BoundaryDirection::Output,
+                "inout" => BoundaryDirection::Inout,
+                _ => BoundaryDirection::Internal,
+            };
+            per_module.insert(name.clone(), direction);
+        }
+        all.insert(module_name.clone(), per_module);
+    }
+    all
 }
 
 /// Parse the yosys `write_json` output and extract any modules with the
@@ -763,10 +1135,7 @@ pub fn translate_sv_multi(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        skip_verific_check: false,
-        primary_source_path: None,
-        use_sv2v: false,
-        setundef_anyseq: false,
+        ..Default::default()
     };
     translate_sv(primary, options, &yopts)
 }
