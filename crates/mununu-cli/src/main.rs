@@ -648,6 +648,19 @@ enum SvCommand {
     /// and uses z3 to find concrete values that make guard conditions
     /// satisfiable. Updates the sidecar's discovered_values section.
     Discover(SvDiscoverArgs),
+    /// Preprocess SystemVerilog through sv2v into Verilog-2005.
+    ///
+    /// Standalone wrapper over the sv2v binary (zachjs/sv2v). Elaborates
+    /// SV-2017 constructs (generates, interfaces, structs, always_ff,
+    /// parameterized modules, …) into a Verilog-2005 subset, preserving
+    /// module hierarchy and signal names. Output goes to --output or
+    /// <stem>.elab.v next to the input.
+    ///
+    /// Used by the KMTS pipeline (R.0a) as the frontend normaliser
+    /// before Yosys-no-flatten. Also exposed standalone for users who
+    /// want to inspect or further-process the sv2v output. Same
+    /// sv2v invocation as the Yosys path's `--preprocessor sv2v`.
+    Preprocess(SvPreprocessArgs),
 }
 
 #[derive(Args, Debug)]
@@ -686,6 +699,24 @@ struct SvDiscoverArgs {
     /// Run discovery on a multi-module sidecar (cross-module + per-module).
     #[arg(long)]
     multi: bool,
+}
+
+#[derive(Args, Debug)]
+struct SvPreprocessArgs {
+    /// Path(s) to the SystemVerilog source file(s) (.sv). At least one
+    /// required. Multiple files are passed to sv2v in one invocation
+    /// (sv2v resolves cross-file packages, interfaces, and parameter
+    /// references in a single pass).
+    #[arg(value_name = "FILE", num_args = 1..)]
+    files: Vec<PathBuf>,
+    /// Include directory for `\`include` resolution. Repeatable;
+    /// forwarded to sv2v as `-I <dir>`.
+    #[arg(short = 'I', long = "include-dir", value_name = "DIR")]
+    include_dirs: Vec<PathBuf>,
+    /// Output path for the elaborated Verilog-2005. Defaults to
+    /// <first-stem>.elab.v next to the first input file.
+    #[arg(long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -2428,7 +2459,33 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
             }
         }
         SvCommand::Discover(args) => sv_discover(args),
+        SvCommand::Preprocess(args) => sv_preprocess(args),
     }
+}
+
+fn sv_preprocess(args: SvPreprocessArgs) -> Result<(), String> {
+    if args.files.is_empty() {
+        return Err("sv preprocess: at least one .sv input file required".to_string());
+    }
+    let output_path = args.output.unwrap_or_else(|| {
+        let first = &args.files[0];
+        let stem = first
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("module");
+        first.with_file_name(format!("{stem}.elab.v"))
+    });
+    let sv2v =
+        mununu_core::adapter::yosys::preprocess_sv(&args.files, &args.include_dirs, &output_path)
+            .map_err(|e| format!("sv preprocess: {e}"))?;
+    println!(
+        "sv2v ({}) -> {} (inputs: {})",
+        sv2v.display(),
+        output_path.display(),
+        args.files.len()
+    );
+    Ok(())
 }
 
 fn sv_init(args: SvInitArgs) -> Result<(), String> {

@@ -526,6 +526,32 @@ fn locate_yosys() -> Result<PathBuf, AdapterError> {
     })
 }
 
+/// Preprocess one or more SystemVerilog sources through `sv2v` and
+/// write the elaborated Verilog-2005 output to `out`. Public entry
+/// point for R.0a's standalone `mununu sv preprocess` CLI subcommand
+/// and for any future caller that needs sv2v output without
+/// invoking Yosys.
+///
+/// `include_dirs` forwards `-I` flags so `\`include` directives in the
+/// `.sv` sources resolve. Returns the absolute path of `sv2v` that
+/// was used (for diagnostics) on success; `AdapterError` if the
+/// binary is missing or the subprocess fails.
+///
+/// This wraps the same `locate_sv2v` + `run_sv2v` helpers the Yosys
+/// `--preprocessor sv2v` path uses, exposed here as a single public
+/// function. Soundness invariant: identical sv2v invocation on both
+/// paths means any future change to one path lands on the other for
+/// free.
+pub fn preprocess_sv(
+    sources: &[PathBuf],
+    include_dirs: &[PathBuf],
+    out: &Path,
+) -> Result<PathBuf, AdapterError> {
+    let sv2v = locate_sv2v()?;
+    run_sv2v(&sv2v, sources, include_dirs, out)?;
+    Ok(sv2v)
+}
+
 /// Find a usable sv2v binary. Mirrors `locate_yosys` — check
 /// `MUNUNU_SV2V_PATH` first, then fall back to the bare `sv2v` on
 /// `$PATH`. zachjs/sv2v's `--version` flag is a stable smoke test.
