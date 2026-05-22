@@ -50,6 +50,7 @@ pub mod partition;
 pub mod promela;
 pub mod sidecar;
 pub mod state_enum;
+pub mod sv_pipeline_compare;
 pub mod systemverilog;
 pub mod templates;
 pub mod tlsf;

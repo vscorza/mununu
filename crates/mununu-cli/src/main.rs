@@ -674,6 +674,17 @@ enum SvCommand {
     /// when --output-dir is omitted. Also prints the per-submodule
     /// state-count / property-count summary to stdout.
     EmitBtor2PerModule(SvEmitBtor2PerModuleArgs),
+    /// Compare the native + KMTS pipelines on one fixture (R.0c).
+    ///
+    /// Runs both extraction paths on the same SystemVerilog source,
+    /// records per-pipeline shape (state count, property count,
+    /// per-submodule breakdown), runs the SVA-elision gate via sv2v,
+    /// and prints a JSON record. Used to seed
+    /// `crates/mununu-core/tests/data/kmts_pipeline_baseline.json` and
+    /// `sva_elision_gate.json`; the integration test
+    /// `sv_compare_pipelines` consumes those files as the regression
+    /// baseline that gates S.0–S.2b.
+    ComparePipelines(SvComparePipelinesArgs),
 }
 
 #[derive(Args, Debug)]
@@ -762,6 +773,23 @@ struct SvEmitBtor2PerModuleArgs {
     /// cost of introducing `$anyseq` state cells.
     #[arg(long = "setundef-anyseq")]
     setundef_anyseq: bool,
+}
+
+#[derive(Args, Debug)]
+struct SvComparePipelinesArgs {
+    /// Primary SystemVerilog source file (.sv). The native arm reads
+    /// only this file; the KMTS arm reads it plus any --source entries.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    /// Additional SV source files for the KMTS arm's multi-file
+    /// composition. Repeatable.
+    #[arg(long = "source", value_name = "FILE")]
+    sources: Vec<PathBuf>,
+    /// Explicit top-module name. When omitted, the KMTS arm uses
+    /// `hierarchy -auto-top`; the native arm uses the first declared
+    /// module in the file.
+    #[arg(long = "top", value_name = "NAME")]
+    top: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2506,7 +2534,36 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Discover(args) => sv_discover(args),
         SvCommand::Preprocess(args) => sv_preprocess(args),
         SvCommand::EmitBtor2PerModule(args) => sv_emit_btor2_per_module(args),
+        SvCommand::ComparePipelines(args) => sv_compare_pipelines(args),
     }
+}
+
+fn sv_compare_pipelines(args: SvComparePipelinesArgs) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::fs;
+
+    let content = fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read '{}': {e}", args.file.display()))?;
+    let mut additional: HashMap<String, String> = HashMap::new();
+    for src in &args.sources {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid additional source path: {}", src.display()))?;
+        let body = fs::read_to_string(src)
+            .map_err(|e| format!("Failed to read additional source '{}': {e}", src.display()))?;
+        additional.insert(name.to_string(), body);
+    }
+    let record = mununu_core::adapter::sv_pipeline_compare::compare_pipelines(
+        &content,
+        &args.file,
+        &additional,
+        args.top.as_deref(),
+    );
+    let json = serde_json::to_string_pretty(&record)
+        .map_err(|e| format!("Failed to serialise comparison record: {e}"))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn sv_emit_btor2_per_module(args: SvEmitBtor2PerModuleArgs) -> Result<(), String> {
