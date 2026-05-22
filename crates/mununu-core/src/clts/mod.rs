@@ -257,16 +257,164 @@ pub enum LabelControllability {
     Uncontrollable,
 }
 
+/// R.1 — Kleene tristate value for 3-valued state-predicate labellings
+/// and 3-valued mu-calculus verdicts. Per the KMTS architecture
+/// (`docs/design/native-sv-abstraction.md` §6.3, `docs/design/kmts-theory.md` §2):
+///
+/// - `KleeneT` — the predicate / formula evaluates to *true* on
+///   every concretisation of this abstract state.
+/// - `KleeneF` — the predicate / formula evaluates to *false* on
+///   every concretisation.
+/// - `KleeneBot` — concretisations disagree; the abstraction is
+///   too coarse to give a definite answer here. Refinement
+///   (CEGAR, R.5) demotes `KleeneBot` to `KleeneT` or `KleeneF`.
+///
+/// The prefix avoids collision with Rust's `bool` (`True`/`False`)
+/// mental model and makes match arms unambiguous across the
+/// thousands of touch-points this enum will see in the evaluator.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum Tristate {
+    KleeneT,
+    KleeneF,
+    KleeneBot,
+}
+
+impl Tristate {
+    /// Lift a 2-valued Boolean into the tristate domain. A
+    /// Sharp-everywhere KMTS only ever produces `KleeneT` /
+    /// `KleeneF` values; this helper is how legacy 2-valued
+    /// adapters seed the 3-valued labelling vacuously when running
+    /// through a `KleeneDomain` evaluator.
+    pub fn from_bool(b: bool) -> Self {
+        if b {
+            Tristate::KleeneT
+        } else {
+            Tristate::KleeneF
+        }
+    }
+
+    /// Convenience for the common interpretation: `KleeneT` is the
+    /// only "definite truth" verdict. `KleeneF` and `KleeneBot`
+    /// both return `false`.
+    pub fn is_true(self) -> bool {
+        matches!(self, Tristate::KleeneT)
+    }
+
+    /// Whether this verdict is definite (not `KleeneBot`).
+    pub fn is_definite(self) -> bool {
+        !matches!(self, Tristate::KleeneBot)
+    }
+}
+
+/// R.1 — KMTS transition modality (`docs/design/native-sv-abstraction.md` §6.3).
+/// Standard KMTS enforces the invariant `R_must ⊆ R_may`; a transition
+/// is either in *both* relations (`Sharp`) or in *only* may (`MayOnly`).
+/// The mixed-transition-system generalisation of Dams–Gerth–Grumberg
+/// TOPLAS 1997 would allow a `MustOnly` variant, but the BTOR2 lifter
+/// produces sound predicate-image transitions that always satisfy the
+/// inclusion invariant by construction, so the standard-KMTS shape
+/// (two variants, not three) is what mununu's data model carries.
+///
+/// **Strict additivity:** every existing adapter produces `Sharp`
+/// transitions (the default); only KMTS-aware adapters (the future
+/// `adapter/btor2/kmts_lift.rs` shipping in R.2) produce `MayOnly`
+/// edges. The `BoolDomain` evaluator (R.1) treats every transition
+/// as Sharp regardless of this field; the `KleeneDomain` evaluator
+/// (R.3) reads it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum TransitionModality {
+    /// In both `may` and `must` relations: an existential witness
+    /// for the transition has been verified (concrete-operator
+    /// SMT query or syntactic guarantee), and the over-approximation
+    /// admits it.
+    Sharp,
+    /// In `may` only: the over-approximation admits the transition
+    /// (an existential SMT query under the UF-abstracted relation
+    /// found a witness), but no must-witness backs it.
+    MayOnly,
+}
+
+impl Default for TransitionModality {
+    /// Existing adapters and hand-written CTXDSL produce
+    /// Sharp-everywhere KMTSes. New adapters opt into `MayOnly`
+    /// explicitly via the modality-aware builder method.
+    fn default() -> Self {
+        TransitionModality::Sharp
+    }
+}
+
+impl TransitionModality {
+    /// Per-axis conjunction merge for parallel composition
+    /// (Larsen–Larsen–Wąsowski FoSSaCS 2007;
+    /// `docs/design/native-sv-abstraction.md` §6.5;
+    /// `docs/design/kmts-theory.md` §5.1).
+    ///
+    /// A composed transition has each capability iff *both* sides
+    /// have a transition with that capability on the synchronizing
+    /// label:
+    ///
+    /// ```text
+    /// has_may (left ⊗ right) = has_may (left)  ∧ has_may (right)
+    /// has_must(left ⊗ right) = has_must(left) ∧ has_must(right)
+    /// ```
+    ///
+    /// The 3-case merge table is the corollary (standard-KMTS
+    /// invariant rules out the would-be `MustOnly` rows):
+    ///
+    /// ```text
+    /// Sharp   ⊗ Sharp   = Sharp     (both have may; both have must)
+    /// Sharp   ⊗ MayOnly = MayOnly   (both have may; only left has must)
+    /// MayOnly ⊗ MayOnly = MayOnly   (both have may; neither has must)
+    /// ```
+    ///
+    /// This is the **silent-soundness-bug fix** flagged in the
+    /// architecture doc §6.5 R.1 audit: a composed transition
+    /// incorrectly marked `Sharp` when only one side has `must`
+    /// would give the evaluator a fabricated must-witness, making
+    /// `KleeneF` verdicts unsound.
+    pub fn merge(self, other: TransitionModality) -> TransitionModality {
+        use TransitionModality::*;
+        match (self, other) {
+            (Sharp, Sharp) => Sharp,
+            _ => MayOnly, // any side without must produces a may-only composed edge
+        }
+    }
+
+    /// Whether this transition is in the `may` relation. Every
+    /// well-formed modality has `may` capability under the
+    /// standard-KMTS invariant.
+    pub fn has_may(self) -> bool {
+        true
+    }
+
+    /// Whether this transition is in the `must` relation.
+    pub fn has_must(self) -> bool {
+        matches!(self, TransitionModality::Sharp)
+    }
+}
+
 /// Transition entry stored in adjacency lists.
 ///
 /// The labels are staged in a `SmallVec` so the hot path stays stack-allocated
 /// for the common case of one or two labels per edge. This keeps the
 /// optimisation local to `clts` without leaking the `SmallVec` dependency to
 /// callers.
+///
+/// R.1 — Every transition carries a [`TransitionModality`] for KMTS
+/// composition + 3-valued evaluation. Existing 2-valued CLTSes
+/// produce `Sharp` everywhere (the default); KMTS-aware adapters
+/// produce `MayOnly` for over-approximation edges. The `BoolDomain`
+/// evaluator ignores this field and treats every transition as
+/// Sharp; the `KleeneDomain` evaluator (R.3) reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition<S: IdStorage, L: IdStorage> {
     target: StateId<S>,
     labels: SmallVec<[LabelId<L>; 4]>,
+    modality: TransitionModality,
 }
 
 impl<S: IdStorage, L: IdStorage> Transition<S, L> {
@@ -278,6 +426,13 @@ impl<S: IdStorage, L: IdStorage> Transition<S, L> {
     /// Returns the labels associated with this transition.
     pub fn labels(&self) -> &[LabelId<L>] {
         &self.labels
+    }
+
+    /// R.1 — Returns the KMTS modality of this transition. Sharp by
+    /// default for existing (2-valued) CLTSes; `MayOnly` for
+    /// KMTS-aware adapters that produce over-approximation edges.
+    pub fn modality(&self) -> TransitionModality {
+        self.modality
     }
 
     /// Checks if this transition is controllable based on its labels.
@@ -932,6 +1087,18 @@ pub struct Clts<S: IdStorage = DefaultStateIdx, L: IdStorage = DefaultLabelIdx> 
     /// (SV Kripke, extraction). Enables structured predicate matching that avoids
     /// the underscore-delimiter ambiguity of state name parsing.
     state_valuations: Vec<Option<BTreeMap<String, String>>>,
+    /// R.1 — 3-valued AP labellings per state (`docs/design/native-sv-abstraction.md` §6.3).
+    /// Outer `Option` distinguishes "no 3-valued labelling configured"
+    /// (the legacy 2-valued path; the `BoolDomain` evaluator uses
+    /// `state_variables` / `state_valuations` directly) from "3-valued
+    /// labelling populated by a KMTS-aware adapter" (each entry maps
+    /// `(state_id, predicate_name)` to a [`Tristate`] verdict).
+    ///
+    /// Adapters that do not produce 3-valued labellings leave this as
+    /// `None`; the `KleeneDomain` evaluator (R.3) falls back to the
+    /// 2-valued state-variable bitsets in that case, yielding verdicts
+    /// in `{KleeneT, KleeneF}` only (never `KleeneBot`).
+    state_3valued_predicates: Option<BTreeMap<(StateId<S>, String), Tristate>>,
     // Pool of state sets.
     state_set_pool: Arc<StateSetPoolInner>,
     /// Explicit controllability classification for each label ID.
@@ -1191,6 +1358,30 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
     /// Returns `true` if any state has a structured valuation attached.
     pub fn has_valuations(&self) -> bool {
         self.state_valuations.iter().any(|v| v.is_some())
+    }
+
+    /// R.1 — Returns the 3-valued labelling of `predicate` at `state`,
+    /// if a KMTS-aware adapter has populated the
+    /// [`Clts::state_3valued_predicates`] map. Returns `None` when no
+    /// 3-valued labelling was configured (the legacy 2-valued path)
+    /// or when this particular `(state, predicate)` pair is missing
+    /// (the `KleeneDomain` evaluator interprets that as
+    /// `Tristate::KleeneBot` — the abstraction is too coarse here).
+    pub fn state_3valued_predicate(&self, state: StateId<S>, predicate: &str) -> Option<Tristate> {
+        self.state_3valued_predicates
+            .as_ref()
+            .and_then(|m| m.get(&(state, predicate.to_string())))
+            .copied()
+    }
+
+    /// R.1 — Returns `true` if any 3-valued predicate labelling has
+    /// been populated. `KleeneDomain` callers can branch on this to
+    /// fall back to the 2-valued `state_variables` path when the
+    /// CLTS came from a legacy adapter.
+    pub fn has_3valued_predicates(&self) -> bool {
+        self.state_3valued_predicates
+            .as_ref()
+            .is_some_and(|m| !m.is_empty())
     }
 
     /// Borrows a reusable state-set bit vector sized to this CLTS instance.
@@ -1476,6 +1667,11 @@ pub struct CltsBuilder<S: IdStorage = DefaultStateIdx, L: IdStorage = DefaultLab
     state_variables: Vec<VariableSetId>,
     /// Structured variable-value pairs per state, index-aligned.
     state_valuations: Vec<Option<BTreeMap<String, String>>>,
+    /// R.1 — staged 3-valued predicate labellings; lifted into the
+    /// built [`Clts::state_3valued_predicates`] field unchanged.
+    /// `None` is the default; KMTS-aware adapters populate via
+    /// [`CltsBuilder::with_3valued_predicate`].
+    state_3valued_predicates: Option<BTreeMap<(StateId<S>, String), Tristate>>,
     // EXP-0004: capacity-hint fields removed. Vec::push handles growth
     // by amortized doubling; explicit pre-sizing goes through
     // `reserve_states` / `reserve_transitions`.
@@ -1489,6 +1685,10 @@ struct TransitionSpec<S: IdStorage, L: IdStorage> {
     from: StateId<S>,
     to: StateId<S>,
     labels: SmallVec<[LabelId<L>; 4]>,
+    /// R.1 — KMTS modality. `Sharp` by default for the legacy
+    /// 2-valued path; `MayOnly` for KMTS-aware adapters that opt
+    /// in via [`CltsBuilder::transition_ids_with_modality`].
+    modality: TransitionModality,
 }
 
 impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
@@ -1754,6 +1954,28 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
         self
     }
 
+    /// R.1 — Attaches a 3-valued labelling for `(state, predicate)`
+    /// to the staged CLTS. Used by KMTS-aware adapters (R.2+ BTOR2
+    /// lifter) when an abstract state's predicate verdict is
+    /// `KleeneT` / `KleeneF` (sharp) or `KleeneBot` (uncertain).
+    ///
+    /// Repeated calls on the same `(state, predicate)` pair
+    /// overwrite the previous value — adapters layering refinement
+    /// steps should write the *final* verdict for each pair before
+    /// `build()`.
+    pub fn with_3valued_predicate(
+        &mut self,
+        state: StateId<S>,
+        predicate: impl Into<String>,
+        verdict: Tristate,
+    ) -> &mut Self {
+        let map = self
+            .state_3valued_predicates
+            .get_or_insert_with(BTreeMap::new);
+        map.insert((state, predicate.into()), verdict);
+        self
+    }
+
     /// Adds a transition between two named states with the provided labels.
     /// Transition controllability is derived from label controllability.
     pub fn transition<Str: AsRef<str>>(
@@ -1778,11 +2000,31 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
     /// Transitions are staged and later copied into adjacency lists when
     /// [`CltsBuilder::build`] is called.
     /// Transition controllability is derived from label controllability.
+    ///
+    /// R.1 — The transition is created with `TransitionModality::Sharp`
+    /// (the default; both `may` and `must` capabilities). KMTS-aware
+    /// callers that need to mark a transition as `MayOnly` use
+    /// [`CltsBuilder::transition_ids_with_modality`] instead.
     pub fn transition_ids(
         &mut self,
         from: StateId<S>,
         labels: &[LabelId<L>],
         to: StateId<S>,
+    ) -> &mut Self {
+        self.transition_ids_with_modality(from, labels, to, TransitionModality::Sharp)
+    }
+
+    /// R.1 — Like [`CltsBuilder::transition_ids`] but takes an
+    /// explicit [`TransitionModality`] so KMTS-aware adapters (the
+    /// future R.2 BTOR2 lifter) can mark over-approximation edges
+    /// as `MayOnly`. Default-modality (Sharp) callers use the
+    /// shorter [`CltsBuilder::transition_ids`].
+    pub fn transition_ids_with_modality(
+        &mut self,
+        from: StateId<S>,
+        labels: &[LabelId<L>],
+        to: StateId<S>,
+        modality: TransitionModality,
     ) -> &mut Self {
         debug_assert!(from.index() < self.state_variables.len());
         debug_assert!(to.index() < self.state_variables.len());
@@ -1791,6 +2033,7 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             from,
             to,
             labels: small_vec,
+            modality,
         });
         self
     }
@@ -1893,10 +2136,12 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             outgoing[spec.from.index()].push(Transition {
                 target: spec.to,
                 labels: spec.labels.clone(),
+                modality: spec.modality,
             });
             incoming[spec.to.index()].push(Transition {
                 target: spec.from,
                 labels: spec.labels.clone(),
+                modality: spec.modality,
             });
         }
 
@@ -1990,6 +2235,11 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             variables: variable_store,
             state_variables: self.state_variables,
             state_valuations: self.state_valuations,
+            // R.1 — 3-valued predicate labellings are populated only
+            // by KMTS-aware adapters (R.2+); legacy builders leave
+            // this `None`, and the `KleeneDomain` evaluator falls
+            // back to the 2-valued state_variables in that case.
+            state_3valued_predicates: self.state_3valued_predicates,
             state_set_pool,
             label_controllability,
             uncontrollable_alphabet,
@@ -2012,6 +2262,7 @@ impl<S: IdStorage, L: IdStorage> Default for CltsBuilder<S, L> {
             variables: VariableStoreBuilder::default(),
             state_variables: Vec::with_capacity(DEFAULT_STATE_RESERVE),
             state_valuations: Vec::with_capacity(DEFAULT_STATE_RESERVE),
+            state_3valued_predicates: None,
             label_controllability: HashMap::new(),
         }
     }
@@ -2369,6 +2620,172 @@ mod tests {
     use super::*;
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    // ---- R.1 — TransitionModality merge truth table ----
+    //
+    // The 3-case square the architecture doc §6.5 enumerates as the
+    // corollary of the per-axis-conjunction rule
+    // `has_may(L⊗R)=has_may(L)∧has_may(R); has_must(L⊗R)=has_must(L)∧has_must(R)`.
+    // Standard-KMTS's `must ⊆ may` invariant eliminates the
+    // hypothetical `MustOnly` rows; that is why the table is 3 cases,
+    // not 6.
+
+    #[test]
+    fn modality_merge_sharp_and_sharp_is_sharp() {
+        assert_eq!(
+            TransitionModality::Sharp.merge(TransitionModality::Sharp),
+            TransitionModality::Sharp,
+            "both sides have may AND must; composed has both"
+        );
+    }
+
+    #[test]
+    fn modality_merge_sharp_and_mayonly_is_mayonly() {
+        // Sharp ⊗ MayOnly: both have may, only left has must,
+        // therefore the composed has may but not must.
+        assert_eq!(
+            TransitionModality::Sharp.merge(TransitionModality::MayOnly),
+            TransitionModality::MayOnly,
+        );
+        // Symmetric: MayOnly ⊗ Sharp.
+        assert_eq!(
+            TransitionModality::MayOnly.merge(TransitionModality::Sharp),
+            TransitionModality::MayOnly,
+        );
+    }
+
+    #[test]
+    fn modality_merge_mayonly_and_mayonly_is_mayonly() {
+        // Both have may; neither has must.
+        assert_eq!(
+            TransitionModality::MayOnly.merge(TransitionModality::MayOnly),
+            TransitionModality::MayOnly,
+        );
+    }
+
+    #[test]
+    fn modality_merge_is_commutative() {
+        for a in [TransitionModality::Sharp, TransitionModality::MayOnly] {
+            for b in [TransitionModality::Sharp, TransitionModality::MayOnly] {
+                assert_eq!(
+                    a.merge(b),
+                    b.merge(a),
+                    "merge must be commutative for KMTS composition; counter-example: {a:?} ⊗ {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modality_merge_is_idempotent_per_value() {
+        for m in [TransitionModality::Sharp, TransitionModality::MayOnly] {
+            assert_eq!(
+                m.merge(m),
+                m,
+                "self-merge must be the identity; counter-example: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_default_modality_is_sharp() -> TestResult {
+        // Strict additivity invariant: every transition built via
+        // `transition_ids` (the legacy entry point) emerges as Sharp.
+        // KMTS-aware adapters opt into MayOnly via
+        // `transition_ids_with_modality`.
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let lbl = builder.labels().intern(["a"])?;
+        let s0 = builder.state_id_or_insert("s0").expect("s0 inserted");
+        let s1 = builder.state_id_or_insert("s1").expect("s1 inserted");
+        builder.transition_ids(s0, &[lbl], s1);
+        let clts = builder.build()?;
+        let trans = clts.outgoing(s0);
+        assert_eq!(trans.len(), 1);
+        assert_eq!(
+            trans[0].modality(),
+            TransitionModality::Sharp,
+            "legacy transition_ids must default to Sharp"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transition_ids_with_modality_preserves_chosen_modality() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let lbl = builder.labels().intern(["a"])?;
+        let s0 = builder.state_id_or_insert("s0").expect("s0 inserted");
+        let s1 = builder.state_id_or_insert("s1").expect("s1 inserted");
+        builder.transition_ids_with_modality(s0, &[lbl], s1, TransitionModality::MayOnly);
+        let clts = builder.build()?;
+        let trans = clts.outgoing(s0);
+        assert_eq!(trans.len(), 1);
+        assert_eq!(trans[0].modality(), TransitionModality::MayOnly);
+        Ok(())
+    }
+
+    #[test]
+    fn state_3valued_predicate_round_trips() -> TestResult {
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        let s0 = builder.state_id_or_insert("s0").expect("s0 inserted");
+        builder
+            .with_3valued_predicate(s0, "p", Tristate::KleeneT)
+            .with_3valued_predicate(s0, "q", Tristate::KleeneBot);
+        let clts = builder.build()?;
+        assert_eq!(
+            clts.state_3valued_predicate(s0, "p"),
+            Some(Tristate::KleeneT)
+        );
+        assert_eq!(
+            clts.state_3valued_predicate(s0, "q"),
+            Some(Tristate::KleeneBot)
+        );
+        assert_eq!(clts.state_3valued_predicate(s0, "absent"), None);
+        assert!(clts.has_3valued_predicates());
+        Ok(())
+    }
+
+    #[test]
+    fn state_3valued_predicate_absent_by_default() -> TestResult {
+        // Strict additivity: legacy adapters that never call
+        // `with_3valued_predicate` leave the field at `None`. The
+        // KleeneDomain evaluator (R.3) treats that as the cue to fall
+        // back to the 2-valued state_variables bitset.
+        let mut builder = Clts::builder();
+        builder.state("s0").initial("s0");
+        let clts = builder.build()?;
+        assert!(!clts.has_3valued_predicates());
+        assert_eq!(
+            clts.state_3valued_predicate(clts.state_id("s0")?, "p"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tristate_helpers() {
+        assert_eq!(Tristate::from_bool(true), Tristate::KleeneT);
+        assert_eq!(Tristate::from_bool(false), Tristate::KleeneF);
+        assert!(Tristate::KleeneT.is_true());
+        assert!(!Tristate::KleeneF.is_true());
+        assert!(!Tristate::KleeneBot.is_true());
+        assert!(Tristate::KleeneT.is_definite());
+        assert!(Tristate::KleeneF.is_definite());
+        assert!(!Tristate::KleeneBot.is_definite());
+    }
+
+    #[test]
+    fn transition_modality_has_may_invariant() {
+        // The standard-KMTS invariant `must ⊆ may` means every
+        // representable transition has may.
+        assert!(TransitionModality::Sharp.has_may());
+        assert!(TransitionModality::MayOnly.has_may());
+        // Only Sharp has must.
+        assert!(TransitionModality::Sharp.has_must());
+        assert!(!TransitionModality::MayOnly.has_must());
+    }
 
     #[test]
     fn builds_single_state_clts() -> TestResult {

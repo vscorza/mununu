@@ -518,6 +518,10 @@ pub fn compose(
                     !labels_have_intersection(left_labels.as_ref(), right_labels.as_ref());
                 let union_labels_set = arena.union_labels(&left_labels, &right_labels);
 
+                // R.1 — KMTS modality merge per §6.5. Synchronising
+                // steps use the pointwise meet `lt ⊗ rt`; interleaving
+                // steps preserve the single contributing side's modality.
+                let sync_modality = lt.modality().merge(rt.modality());
                 match options.semantics {
                     CompositionSemantics::Synchronous => {
                         let union_target = enqueue_state(
@@ -540,6 +544,7 @@ pub fn compose(
                             union_target,
                             Rc::clone(&union_labels_set),
                             has_uncontrollable,
+                            sync_modality,
                         ));
                         matched = true;
                     }
@@ -565,6 +570,7 @@ pub fn compose(
                                 left_target,
                                 Rc::clone(&left_labels),
                                 lt.is_uncontrollable(left),
+                                lt.modality(),
                             ));
 
                             if right_perm_targets.insert(rt.target()) {
@@ -584,6 +590,7 @@ pub fn compose(
                                     right_target,
                                     Rc::clone(&right_labels),
                                     rt.is_uncontrollable(right),
+                                    rt.modality(),
                                 ));
                             }
                             matched = true;
@@ -608,6 +615,7 @@ pub fn compose(
                                 union_target,
                                 Rc::clone(&union_labels_set),
                                 has_uncontrollable,
+                                sync_modality,
                             ));
                             matched = true;
                         }
@@ -635,6 +643,7 @@ pub fn compose(
                             union_target,
                             Rc::clone(&union_labels_set),
                             has_uncontrollable,
+                            sync_modality,
                         ));
                         if shared_actual_empty {
                             let left_target = left_perm_state.unwrap_or_else(|| {
@@ -657,6 +666,7 @@ pub fn compose(
                                 left_target,
                                 Rc::clone(&left_labels),
                                 lt.is_uncontrollable(left),
+                                lt.modality(),
                             ));
 
                             if right_perm_targets.insert(rt.target()) {
@@ -676,6 +686,7 @@ pub fn compose(
                                     right_target,
                                     Rc::clone(&right_labels),
                                     rt.is_uncontrollable(right),
+                                    rt.modality(),
                                 ));
                             }
                         }
@@ -708,6 +719,7 @@ pub fn compose(
                     left_target,
                     Rc::clone(&left_labels),
                     lt.is_uncontrollable(left),
+                    lt.modality(),
                 ));
             }
         }
@@ -737,6 +749,7 @@ pub fn compose(
                         right_target,
                         Rc::clone(&right_labels),
                         rt.is_uncontrollable(right),
+                        rt.modality(),
                     ));
                 }
             }
@@ -750,12 +763,14 @@ pub fn compose(
             a.target.index(),
             a.labels.as_slice(),
             a.has_uncontrollable_labels,
+            a.modality,
         )
             .cmp(&(
                 b.source.index(),
                 b.target.index(),
                 b.labels.as_slice(),
                 b.has_uncontrollable_labels,
+                b.modality,
             ))
     });
 
@@ -768,7 +783,12 @@ pub fn compose(
         if key.has_uncontrollable_labels {
             builder.set_label_controllability(label_id, LabelControllability::Uncontrollable);
         }
-        builder.transition_ids(key.source, &[label_id], key.target);
+        // R.1 — Use modality-aware transition builder. For
+        // Sharp-everywhere KMTSes (every legacy adapter today), the
+        // modality is always Sharp and this is identical to
+        // `transition_ids`. KMTS-aware adapters propagate `MayOnly`
+        // through composition per §6.5's per-axis-conjunction merge.
+        builder.transition_ids_with_modality(key.source, &[label_id], key.target, key.modality);
     }
 
     builder.build()
@@ -777,6 +797,7 @@ pub fn compose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clts::TransitionModality;
     use std::collections::{BTreeSet, HashMap};
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -1062,6 +1083,144 @@ mod tests {
         assert!(composed.state_id("s0|t0").is_ok());
         assert!(composed.state_id("s1|t1").is_err());
 
+        Ok(())
+    }
+
+    // ---- R.1 — KMTS modality merge end-to-end via compose() ----
+    //
+    // The 3×3 corollary table from `docs/design/native-sv-abstraction.md` §6.5,
+    // exercised at the composition level rather than the standalone-method
+    // level (which is covered by the unit tests in `clts/mod.rs::tests`).
+
+    /// Helper: build a single-transition CLTS s0 -a-> s1 with the
+    /// given modality. The label is marked `Uncontrollable` so that
+    /// the composition operator's SCT-style validation does not
+    /// reject the test on "controllable actions shared between
+    /// automata" (the default classification, `Controllable`, is
+    /// the rejected case when both sides share the same label name).
+    fn one_edge_with_modality(
+        label: &str,
+        modality: TransitionModality,
+    ) -> TestResult<Clts<DefaultStateIdx, DefaultLabelIdx>> {
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let id = builder.labels().intern([label])?;
+        builder.set_label_controllability(id, LabelControllability::Uncontrollable);
+        let s0 = builder.state_id_or_insert("s0").expect("s0 inserted");
+        let s1 = builder.state_id_or_insert("s1").expect("s1 inserted");
+        builder.transition_ids_with_modality(s0, &[id], s1, modality);
+        builder.build().map_err(|e| e.into())
+    }
+
+    /// Helper: pull the modality of the unique outgoing transition
+    /// from `state` in the composed CLTS.
+    fn first_outgoing_modality(
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+        state: &str,
+    ) -> TestResult<TransitionModality> {
+        let sid = clts.state_id(state)?;
+        let trans = clts.outgoing(sid);
+        assert_eq!(
+            trans.len(),
+            1,
+            "expected exactly one outgoing transition from {state}; got {}",
+            trans.len()
+        );
+        Ok(trans[0].modality())
+    }
+
+    #[test]
+    fn compose_synchronizing_sharp_and_sharp_yields_sharp() -> TestResult {
+        // Both sides have may AND must on label "a"; composed has both.
+        let left = one_edge_with_modality("a", TransitionModality::Sharp)?;
+        let right = one_edge_with_modality("a", TransitionModality::Sharp)?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        assert_eq!(
+            first_outgoing_modality(&composed, "s0|s0")?,
+            TransitionModality::Sharp,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_synchronizing_sharp_and_mayonly_yields_mayonly() -> TestResult {
+        // Both have may; only left has must; composed has may but not must.
+        let left = one_edge_with_modality("a", TransitionModality::Sharp)?;
+        let right = one_edge_with_modality("a", TransitionModality::MayOnly)?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        assert_eq!(
+            first_outgoing_modality(&composed, "s0|s0")?,
+            TransitionModality::MayOnly,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_synchronizing_mayonly_and_sharp_yields_mayonly() -> TestResult {
+        // Symmetric of the previous case — merge is commutative.
+        let left = one_edge_with_modality("a", TransitionModality::MayOnly)?;
+        let right = one_edge_with_modality("a", TransitionModality::Sharp)?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        assert_eq!(
+            first_outgoing_modality(&composed, "s0|s0")?,
+            TransitionModality::MayOnly,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_synchronizing_mayonly_and_mayonly_yields_mayonly() -> TestResult {
+        // Both have may; neither has must.
+        let left = one_edge_with_modality("a", TransitionModality::MayOnly)?;
+        let right = one_edge_with_modality("a", TransitionModality::MayOnly)?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        assert_eq!(
+            first_outgoing_modality(&composed, "s0|s0")?,
+            TransitionModality::MayOnly,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_async_interleaving_preserves_single_side_modality() -> TestResult {
+        // Interleaving step: only one side moves; that side's
+        // modality survives unchanged on the composed transition.
+        let left = one_edge_with_modality("a", TransitionModality::Sharp)?;
+        let right = one_edge_with_modality("b", TransitionModality::MayOnly)?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Asynchronous),
+        )?;
+        // The composed CLTS has two interleaving paths from s0|s0:
+        //   s0|s0 -a-> s1|s0  (modality from left = Sharp)
+        //   s0|s0 -b-> s0|s1  (modality from right = MayOnly)
+        let sid = composed.state_id("s0|s0")?;
+        let trans = composed.outgoing(sid);
+        assert_eq!(trans.len(), 2, "expected two interleaving outgoing edges");
+        let mut modalities: Vec<_> = trans.iter().map(|t| t.modality()).collect();
+        modalities.sort();
+        assert_eq!(
+            modalities,
+            vec![TransitionModality::Sharp, TransitionModality::MayOnly],
+            "left's Sharp and right's MayOnly must both survive on their respective interleaving edges"
+        );
         Ok(())
     }
 }

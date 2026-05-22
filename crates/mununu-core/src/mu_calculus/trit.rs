@@ -51,6 +51,36 @@ pub enum Trit {
     Unknown,
 }
 
+impl From<crate::clts::Tristate> for Trit {
+    /// R.1 — bridge between the CLTS-layer 3-valued state-AP
+    /// labelling ([`crate::clts::Tristate`], variants prefixed
+    /// `Kleene*`) and the evaluator-layer 3-valued formula verdict
+    /// ([`Trit`], variants matching the literature's
+    /// `True`/`False`/`Unknown`). Both enums encode the same
+    /// algebraic domain; the parallel naming reflects the layer
+    /// split (data model vs evaluator output) introduced when the
+    /// KMTS state-labelling field landed in `clts/mod.rs` (the
+    /// `mu_calculus` module already had `Trit` for verdict output).
+    /// Conversion is lossless and total.
+    fn from(t: crate::clts::Tristate) -> Self {
+        match t {
+            crate::clts::Tristate::KleeneT => Trit::True,
+            crate::clts::Tristate::KleeneF => Trit::False,
+            crate::clts::Tristate::KleeneBot => Trit::Unknown,
+        }
+    }
+}
+
+impl From<Trit> for crate::clts::Tristate {
+    fn from(t: Trit) -> Self {
+        match t {
+            Trit::True => crate::clts::Tristate::KleeneT,
+            Trit::False => crate::clts::Tristate::KleeneF,
+            Trit::Unknown => crate::clts::Tristate::KleeneBot,
+        }
+    }
+}
+
 /// A three-valued set: pair of bitsets `(must_true, may_true)` with invariant
 /// `must_true ⊆ may_true`.
 #[derive(Debug, Clone)]
