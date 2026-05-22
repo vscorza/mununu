@@ -254,10 +254,100 @@ fn trit_modal_dense_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+/// R-A3 — measure trit evaluator on a μ-fixpoint whose body contains
+/// a loop-invariant modal-heavy subterm. Per the §Phase 6 §6.7 anchor
+/// for R-A3, the pass-bar is:
+///
+/// - invariant fixture: time scales **sub-linearly** with K (fixpoint
+///   iteration count) for the invariant subexpression. K ≥ 8
+///   demonstrates the gain.
+/// - non-invariant negative control: no regression.
+///
+/// The fixture choice matters for K. `build_eval_fixture` builds a
+/// wrap-around cycle where `μX. (one_state_predicate ∨ ◇X)` reachability
+/// would converge in O(|S|) iterations; the chosen formulas use a
+/// property whose convergence depth is proportional to state count.
+///
+/// **invariant fixture**: `μX. (modal5_invariant ∧ (active ∨ ⟨tick⟩X))`
+/// where `modal5_invariant = [tick][sync][ack]⟨tick⟩⟨sync⟩safe_pred` —
+/// 5 modal operators, **no reference to X**. The hoist target: a future
+/// R-A3 implementation should detect this subterm has empty free-var
+/// intersection with X and evaluate it once outside the fixpoint loop.
+///
+/// **non-invariant control**: same shape but the 5-modal subterm
+/// references X — not hoistable. The hoist analysis must correctly
+/// classify this and keep evaluating per-iteration.
+const TRIT_INVARIANT_HOIST_FORMULA: &str = "mu X. (([ ( labels = {tick} ) ] ([ ( labels = {sync} ) ] \
+     ([ ( labels = {ack} ) ] (< ( labels = {tick} ) > \
+     (< ( labels = {sync} ) > safe_pred))))) \
+     and (active or < ( labels = {tick} ) > X))";
+
+const TRIT_NO_INVARIANT_FORMULA: &str = "mu X. (([ ( labels = {tick} ) ] ([ ( labels = {sync} ) ] \
+     ([ ( labels = {ack} ) ] (< ( labels = {tick} ) > \
+     (< ( labels = {sync} ) > X))))) \
+     and (active or < ( labels = {tick} ) > X))";
+
+fn trit_invariant_hoist_benchmarks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("trit_fixpoint_invariant_subterm");
+    let options = EvaluationOptions::default();
+
+    let invariant = parser::parse(TRIT_INVARIANT_HOIST_FORMULA).expect("invariant formula parses");
+    let no_invariant = parser::parse(TRIT_NO_INVARIANT_FORMULA).expect("control formula parses");
+
+    // Larger scales here — R-A3's value scales with K (fixpoint iteration
+    // count), which grows with state count under the cycle topology.
+    for &(state_count, fanout) in &[(128usize, 3usize), (512usize, 4usize), (2048usize, 4usize)] {
+        let clts = build_eval_fixture(state_count, fanout);
+        let env = build_environment(&clts);
+        group.throughput(Throughput::Elements(state_count as u64));
+
+        // invariant: subterm doesn't reference X — hoistable.
+        {
+            let f = invariant.clone();
+            let opts = options.clone();
+            let clts_ref = &clts;
+            let env_ref = &env;
+            group.bench_function(
+                BenchmarkId::new("invariant", format!("states_{state_count}_fanout_{fanout}")),
+                move |b| {
+                    b.iter(|| {
+                        let result = evaluate_tri_with_options(&f, clts_ref, env_ref, &opts)
+                            .expect("trit eval succeeded");
+                        black_box(result);
+                    });
+                },
+            );
+        }
+        // non-invariant control: subterm references X — not hoistable.
+        {
+            let f = no_invariant.clone();
+            let opts = options.clone();
+            let clts_ref = &clts;
+            let env_ref = &env;
+            group.bench_function(
+                BenchmarkId::new(
+                    "no_invariant",
+                    format!("states_{state_count}_fanout_{fanout}"),
+                ),
+                move |b| {
+                    b.iter(|| {
+                        let result = evaluate_tri_with_options(&f, clts_ref, env_ref, &opts)
+                            .expect("trit eval succeeded");
+                        black_box(result);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     mu_calculus_benchmarks,
     trit_subexpr_sharing_benchmarks,
-    trit_modal_dense_benchmarks
+    trit_modal_dense_benchmarks,
+    trit_invariant_hoist_benchmarks
 );
 criterion_main!(benches);
