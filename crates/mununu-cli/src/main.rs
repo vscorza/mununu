@@ -119,6 +119,16 @@ enum Btor2Command {
     /// See `docs/design/auto-extraction-architecture.md` §2 Stage 4
     /// for the soundness contract.
     Discover(Btor2DiscoverArgs),
+    /// Lift a BTOR2 source into the KMTS-aware shape (R.2).
+    ///
+    /// Runs the existing 2-valued BTOR2 adapter and post-hoc
+    /// enriches the output with per-state 3-valued AP labellings
+    /// derived from the bit-blaster's `state_valuations`. Prints a
+    /// summary JSON: number of predicates synthesised, total
+    /// `(state, predicate)` labellings, per-automaton state count.
+    /// Used by the R.2 fixture sweep to validate the lifter shape
+    /// stays consistent across runs.
+    LiftKmts(Btor2LiftKmtsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -134,6 +144,19 @@ struct Btor2DiscoverArgs {
     /// Default matches `ImageOptions::default().cap_edges = 4096`.
     #[arg(long, default_value_t = 4096)]
     cap_edges: usize,
+}
+
+#[derive(Args, Debug)]
+struct Btor2LiftKmtsArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// Cap on the number of predicates the lifter synthesises.
+    /// Each `(register, value)` pair in the bit-blaster's state
+    /// valuations becomes one predicate; `None` (the default)
+    /// means no cap.
+    #[arg(long, value_name = "N")]
+    max_predicates: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1442,9 +1465,38 @@ fn dispatch(command: Commands) -> Result<(), String> {
     }
 }
 
+fn btor2_lift_kmts(args: Btor2LiftKmtsArgs) -> Result<(), String> {
+    use mununu_core::adapter::AdapterOptions;
+    use mununu_core::adapter::btor2::{KmtsLiftOptions, lift_btor2_to_kmts};
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let opts = AdapterOptions::default();
+    let lift_opts = KmtsLiftOptions {
+        max_predicates: args.max_predicates,
+        ..Default::default()
+    };
+    let result = lift_btor2_to_kmts(&content, &opts, &lift_opts)
+        .map_err(|e| format!("btor2 lift-kmts: {}", e.message))?;
+
+    let summary = serde_json::json!({
+        "fixture": args.file.display().to_string(),
+        "predicates_synthesised": result.predicates.len(),
+        "labelling_count": result.labelling_count(),
+        "automata": result.predicate_labellings.keys().collect::<Vec<_>>(),
+        "predicate_names": result.predicates.iter().map(|p| &p.name).collect::<Vec<_>>(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    Ok(())
+}
+
 fn handle_btor2(command: Btor2Command) -> Result<(), String> {
     match command {
         Btor2Command::Discover(args) => btor2_discover(args),
+        Btor2Command::LiftKmts(args) => btor2_lift_kmts(args),
     }
 }
 

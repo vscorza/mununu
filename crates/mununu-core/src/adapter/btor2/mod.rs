@@ -22,7 +22,10 @@
 pub mod ast;
 pub mod bit_blast;
 pub mod dep_graph;
+pub mod kmts_lift;
 pub mod parser;
+
+pub use kmts_lift::{KmtsLiftOptions, KmtsLiftResult, LiftedPredicate, lift_btor2_to_kmts};
 
 use super::{AdapterError, AdapterOptions, AdapterOutput, FormatAdapter};
 
