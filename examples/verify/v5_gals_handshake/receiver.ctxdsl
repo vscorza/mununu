@@ -1,0 +1,33 @@
+// receiver.ctxdsl — Responder side of the 4-phase async handshake.
+// Mirrors the Sender's protocol shape — the Sender drives req_*
+// events, the Receiver drives ack_* events; both synchronize on all
+// four labels because each event is observable to both sides on the
+// shared channel.
+//
+// References the bus labels declared in `sender.ctxdsl`'s
+// `controllable {…}` block — no re-declaration here (the realiser's
+// legacy mode would otherwise flag duplicate-controllability per the
+// v0_mesi convention).
+
+context Receiver {
+    automata {
+        automaton Receiver {
+            states {
+                state Receiver_Idle initial;
+                state Receiver_ReqSeen;
+                state Receiver_AckUp;
+                state Receiver_AckDown;
+            }
+            transitions {
+                // Phase 1: Receiver observes request assertion.
+                transition Receiver_Idle    -> Receiver_ReqSeen on label req_rise;
+                // Phase 2: Receiver asserts ack (accepts the request).
+                transition Receiver_ReqSeen -> Receiver_AckUp   on label ack_rise;
+                // Phase 3: Receiver observes request deassertion.
+                transition Receiver_AckUp   -> Receiver_AckDown on label req_fall;
+                // Phase 4: Receiver deasserts ack → back to Idle.
+                transition Receiver_AckDown -> Receiver_Idle    on label ack_fall;
+            }
+        }
+    }
+}

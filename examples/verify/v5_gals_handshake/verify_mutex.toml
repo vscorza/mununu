@@ -1,0 +1,62 @@
+# v5_gals_handshake/verify_mutex.toml — 3-input mutex sub-fixture for
+# V.5. Companion to verify.toml (the 4-phase handshake). The two
+# sub-fixtures don't compose with each other — they are independent
+# demonstrations within the GALS / async-handshake domain (§7 of
+# `docs/design/industrial-value-and-validation-domains.md`).
+#
+# Recreate:
+#   $ bash examples/verify/v5_gals_handshake/validate.sh
+#   (validate.sh runs both verify.toml and verify_mutex.toml)
+#
+# Properties:
+#   - `mutex_pairwise_exclusion` — at most one of {G0, G1, G2} holds
+#     in any reachable state. The 3-way generalisation of the V.0
+#     coherence safety property; the load-bearing safety check for
+#     any arbitration mechanism.
+#   - `mutex_no_deadlock` — every reachable state has an enabled
+#     transition. For the arbiter alone this is trivially true
+#     (every state has either grant_c* or release_c* enabled).
+#
+# What V.5b does NOT validate:
+#
+# - **Bounded overtaking fairness** (`νY. μZ. (granted ∨ ⟨τ⟩Z within
+#   K) ∧ [−]Y`) per the §Phase 7 V.5 spec. mununu's existing
+#   template library does not include a bounded-overtaking template;
+#   adding one is a follow-up. The current arbiter is fairness-
+#   agnostic (any pending request can be deferred indefinitely).
+# - **Per-client request modelling.** The arbiter is verified in
+#   isolation. Composing it with three client automata would extend
+#   the state space (4 × 2^3 = 32 states) but does not change the
+#   safety verdict. The composition variant lands when bounded-
+#   overtaking fairness is added.
+
+[project]
+name = "V5_GALS_3Input_Mutex"
+description = "V.5 3-input mutex arbiter — mutual exclusion safety. GALS / async domain (second half of V.5)."
+
+[[sources]]
+id = "Mutex3"
+adapter = "ctxdsl"
+files = ["mutex_3input.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+# Single-source "composition" — the arbiter stands alone; no
+# external clients in the minimal sub-fixture.
+semantics = "asynchronous"
+members = ["Mutex3"]
+name = "MutexSystem"
+
+[[properties]]
+# 3-way mutual exclusion: G0, G1, G2 are pairwise disjoint.
+name = "mutex_pairwise_exclusion"
+template = "mutual_exclusion_3"
+args = { A = "Mutex_G0", B = "Mutex_G1", C = "Mutex_G2" }
+over = "MutexSystem"
+
+[[properties]]
+name = "mutex_no_deadlock"
+template = "no_deadlock"
+over = "MutexSystem"

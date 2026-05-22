@@ -1,0 +1,37 @@
+// mutex_3input.ctxdsl — 3-input mutual-exclusion arbiter for the V.5
+// GALS-domain demo. Companion to sender.ctxdsl + receiver.ctxdsl;
+// runs under a separate `verify_mutex.toml` because it does not
+// compose with the 4-phase handshake (distinct sub-fixtures).
+//
+// Single arbiter, four states: Free + Granted{0,1,2}. The
+// `grant_cN` events are environment-controlled (a client requests
+// and the arbiter grants); `release_cN` returns to Free. The state
+// predicate `Mutex_Gn` is the load-bearing handle for the
+// mutual_exclusion_3 safety check.
+
+context Mutex3 {
+    automata {
+        automaton Mutex3 {
+            states {
+                state Mutex_Free initial;
+                state Mutex_G0;
+                state Mutex_G1;
+                state Mutex_G2;
+            }
+            transitions {
+                // Grant phase: from Free, the arbiter can grant to any
+                // one client. Nondeterministic choice — the verifier
+                // explores all three branches.
+                transition Mutex_Free -> Mutex_G0 on label grant_c0;
+                transition Mutex_Free -> Mutex_G1 on label grant_c1;
+                transition Mutex_Free -> Mutex_G2 on label grant_c2;
+
+                // Release phase: each granted client must eventually
+                // release for the mutex to be reusable.
+                transition Mutex_G0 -> Mutex_Free on label release_c0;
+                transition Mutex_G1 -> Mutex_Free on label release_c1;
+                transition Mutex_G2 -> Mutex_Free on label release_c2;
+            }
+        }
+    }
+}

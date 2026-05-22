@@ -1,0 +1,47 @@
+# v5_gals_handshake — V.5 GALS-domain demo transcript
+# Regenerated via examples/verify/v5_gals_handshake/validate.sh
+#
+# Two sub-fixtures (verify.toml + verify_mutex.toml) — both halves of the
+# §Phase 7 V.5 spec:
+#   verify.toml       : 4-phase REQ/ACK handshake (Sender + Receiver, sync compose)
+#   verify_mutex.toml : 3-input mutex arbiter (mutual exclusion safety)
+#
+# Sharp-everywhere semantics; expected verdicts (all SATISFIED):
+#   verify.toml       : deadlock_freedom, request_eventually_acked, recurrence_to_idle
+#   verify_mutex.toml : mutex_pairwise_exclusion, mutex_no_deadlock
+#
+# §Phase 7 V.5 done-criterion: all five verdicts true on the singular
+# pipeline; CADP cross-check is a manual follow-up.
+
+=== verify.toml — 4-phase handshake — human-readable ===
+verify report — project `V5_GALS_4Phase_Handshake`:
+  composition: synchronous FourPhaseChannel { members = [Sender, Receiver] }
+    - Sender (adapter = ctxdsl, automaton = Sender)
+    - Receiver (adapter = ctxdsl, automaton = Receiver)
+    deadlock_freedom: SATISFIED (4/4 states, 1/1 initial) [template `no_deadlock`, over = FourPhaseChannel]
+    request_eventually_acked: SATISFIED (4/4 states, 1/1 initial) [template `response`, over = FourPhaseChannel]
+    recurrence_to_idle: SATISFIED (4/4 states, 1/1 initial) [template `always_eventually`, over = FourPhaseChannel]
+
+=== verify.toml — JSON verdict shape ===
+project = V5_GALS_4Phase_Handshake
+composition.name = FourPhaseChannel
+composition.semantics = synchronous
+composition.members = Sender, Receiver
+property[deadlock_freedom] satisfied = True
+property[request_eventually_acked] satisfied = True
+property[recurrence_to_idle] satisfied = True
+
+=== verify_mutex.toml — 3-input mutex — human-readable ===
+verify report — project `V5_GALS_3Input_Mutex`:
+  composition: asynchronous MutexSystem { members = [Mutex3] }
+    - Mutex3 (adapter = ctxdsl, automaton = Mutex3)
+    mutex_pairwise_exclusion: SATISFIED (4/4 states, 1/1 initial) [template `mutual_exclusion_3`, over = MutexSystem]
+    mutex_no_deadlock: SATISFIED (4/4 states, 1/1 initial) [template `no_deadlock`, over = MutexSystem]
+
+=== verify_mutex.toml — JSON verdict shape ===
+project = V5_GALS_3Input_Mutex
+composition.name = MutexSystem
+composition.semantics = asynchronous
+composition.members = Mutex3
+property[mutex_pairwise_exclusion] satisfied = True
+property[mutex_no_deadlock] satisfied = True

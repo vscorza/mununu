@@ -1,0 +1,43 @@
+// sender.ctxdsl — Initiator side of a 4-phase async handshake for the
+// V.5 GALS-domain demo. Controlling doc:
+// `docs/design/industrial-value-and-validation-domains.md` §7.
+//
+// 4-phase REQ/ACK protocol shape (CHP-style, no data payload for the
+// V.5 minimal demo — the conformance + liveness verdicts do not need
+// data tracking):
+//
+//   Idle ──req_rise──▶ ReqUp ──ack_rise──▶ AckUp ──req_fall──▶ ReqDown ──ack_fall──▶ Idle
+//
+// All four channel events are sync-rendezvous labels declared in this
+// `controllable {…}` block (the Sender owns label registration; the
+// Receiver references them without redeclaration, per the v0_mesi
+// convention).
+
+context Sender {
+    automata {
+        automaton Sender {
+            controllable {
+                label req_rise;
+                label req_fall;
+                label ack_rise;
+                label ack_fall;
+            }
+            states {
+                state Sender_Idle initial;
+                state Sender_ReqUp;
+                state Sender_AckUp;
+                state Sender_ReqDown;
+            }
+            transitions {
+                // Phase 1: Sender asserts request.
+                transition Sender_Idle    -> Sender_ReqUp   on label req_rise;
+                // Phase 2: Sender observes ack assertion.
+                transition Sender_ReqUp   -> Sender_AckUp   on label ack_rise;
+                // Phase 3: Sender deasserts request.
+                transition Sender_AckUp   -> Sender_ReqDown on label req_fall;
+                // Phase 4: Sender observes ack deassertion → back to Idle.
+                transition Sender_ReqDown -> Sender_Idle    on label ack_fall;
+            }
+        }
+    }
+}

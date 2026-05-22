@@ -1,0 +1,95 @@
+# v5_gals_handshake — V.5 of the §Phase 7 domain-validation track in
+# `.claude/plans/you-are-a-formal-vast-lake.md` (controlling doc:
+# `docs/design/industrial-value-and-validation-domains.md` §7, the
+# GALS / async-handshake domain).
+#
+# CHP-style 4-phase REQ/ACK handshake: a Sender drives the request
+# edges, a Receiver drives the ack edges, both synchronize on all four
+# channel events. Per-side automata are 4-state cycles; synchronous
+# composition reduces the 16-state cross-product to the 4 reachable
+# (Sender_phase, Receiver_phase) pairs of the lock-stepped protocol.
+#
+# **Sharp-everywhere semantics** — V.5's 4-phase fixture does not need
+# the R.4.5 GKMTS hyper-must arbiter abstraction (that comes in V.5b
+# below, the mutex sub-fixture). The 2-valued evaluator (BoolDomain)
+# suffices and the KleeneDomain produces identical verdicts per the
+# R.3 baseline invariant.
+#
+# Recreate:
+#   $ bash examples/verify/v5_gals_handshake/validate.sh
+#
+# Properties:
+#   - `deadlock_freedom` — every reachable composed state has an
+#     enabled outgoing transition. Standard safety check.
+#   - `request_eventually_acked` — every req_rise (Sender_ReqUp) is
+#     eventually followed by Sender_AckUp. The response-template
+#     instantiation of the 4-phase protocol's handshake-completion
+#     guarantee.
+#   - `recurrence_to_idle` — the protocol returns to (Sender_Idle ∧
+#     Receiver_Idle) infinitely often. Encodes the cyclic-handshake
+#     liveness witness. SHOULD hold without fairness because the
+#     model is deterministic (every reachable state has exactly one
+#     enabled transition).
+#
+# CADP cross-check: deferred. The CADP-comparable property shape is
+# the response template; the equivalent MCL formula is `[ true* ]
+# < req_rise > true ⇒ < true* . ack_rise > true` — the V.5
+# done-criterion in §Phase 7 §10.1 asks for verdict-polarity match
+# against CADP on the same fixture, which is a manual follow-up.
+
+[project]
+name = "V5_GALS_4Phase_Handshake"
+description = "V.5 minimal 4-phase async handshake (Sender + Receiver, sync composition). GALS / async domain."
+
+[[sources]]
+id = "Sender"
+adapter = "ctxdsl"
+files = ["sender.ctxdsl"]
+
+[[sources]]
+id = "Receiver"
+adapter = "ctxdsl"
+files = ["receiver.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+# **Synchronous** composition: both sides advance together on every
+# channel event (4-phase rendezvous discipline). This is the
+# load-bearing distinction vs the V.0 cache fixture's async
+# composition — the GALS domain's defining shape is handshake
+# rendezvous between adjacent components.
+semantics = "synchronous"
+members = ["Sender", "Receiver"]
+name = "FourPhaseChannel"
+
+[[properties]]
+# Deadlock freedom — `nu X. (<> true && [] X)`. Every reachable
+# composed state has some enabled transition.
+name = "deadlock_freedom"
+template = "no_deadlock"
+over = "FourPhaseChannel"
+
+[[properties]]
+# 4-phase handshake completion: every Sender_ReqUp state is
+# eventually followed by Sender_AckUp. The response-template
+# instantiation matches the protocol's handshake-completion
+# guarantee. CADP's equivalent MCL is the action-based variant
+# (`< req_rise > true ⇒ < true* . ack_rise > true`); the predicate-
+# based variant via the response template gives a polarity-
+# equivalent verdict because the 4-phase channel is deterministic.
+name = "request_eventually_acked"
+template = "response"
+args = { TRIGGER = "Sender_ReqUp", RESPONSE = "Sender_AckUp" }
+over = "FourPhaseChannel"
+
+[[properties]]
+# Recurrence to Idle: the protocol returns to Sender_Idle infinitely
+# often. Encodes the "every handshake completes and the channel is
+# ready for the next" liveness witness. For the deterministic V.5
+# protocol this holds without explicit fairness.
+name = "recurrence_to_idle"
+template = "always_eventually"
+args = { TARGET = "Sender_Idle" }
+over = "FourPhaseChannel"
