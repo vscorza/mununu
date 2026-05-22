@@ -171,9 +171,93 @@ fn trit_subexpr_sharing_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+/// R-A2 — measure trit evaluator on modal-dense formulas. Per the
+/// §Phase 6 §6.7 anchor for R-A2, the pass-bar is:
+///
+/// - modal-dense fixture: ≥ 15% faster post-fusion
+/// - alternation-depth-1: no regression > 5%
+///
+/// The "fusion" is folding the two `modal_bits_from_target` calls
+/// (one for must, one for may) in `eval_node_tri::Node::Modal`
+/// (evaluator.rs:2080–2086) into a single transition walk. This
+/// bench measures the baseline before any fusion attempt so we can
+/// decide via measurement whether modal walks are a large enough
+/// fraction of trit-eval time to make a 50% modal-walk saving clear
+/// the 15% total-time bar.
+///
+/// Modal-dense fixture: 6 modal operators, mix of `[]` and `<>`,
+/// alternation depth 2 to stress fixpoint iteration too. Picked from
+/// the same `build_eval_fixture` shape so cross-bench comparisons are
+/// straightforward.
+const TRIT_MODAL_DENSE_FORMULA: &str = "nu Z. ((mu Y. (active or < ( labels = {tick} ) > Y)) and \
+                                        [ ( labels = {sync} ) ] ([ ( labels = {ack} ) ] safe_pred) and \
+                                        [ ( labels = {tick} ) ] (< ( labels = {ack} ) > active) and \
+                                        [ ( labels = {sync} ) ] Z)";
+
+const TRIT_ALT_DEPTH_1_FORMULA: &str =
+    // No alternation, one modal. The bench's negative-control: a
+    // change to `eval_node_tri::Node::Modal` must not regress this.
+    "(safe_pred and < ( labels = {tick} ) > active)";
+
+fn trit_modal_dense_benchmarks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("trit_eval_modal_dense");
+    let options = EvaluationOptions::default();
+
+    let dense = parser::parse(TRIT_MODAL_DENSE_FORMULA).expect("modal-dense formula parses");
+    let alt1 = parser::parse(TRIT_ALT_DEPTH_1_FORMULA).expect("alt-depth-1 formula parses");
+
+    for &(state_count, fanout) in &[(64usize, 3usize), (512usize, 4usize), (2048usize, 4usize)] {
+        let clts = build_eval_fixture(state_count, fanout);
+        let env = build_environment(&clts);
+        group.throughput(Throughput::Elements(state_count as u64));
+
+        // Dense: 6 modals + νμ alternation. The must/may modal walk
+        // duplication this bench is sized to detect.
+        {
+            let f = dense.clone();
+            let opts = options.clone();
+            let clts_ref = &clts;
+            let env_ref = &env;
+            group.bench_function(
+                BenchmarkId::new("dense", format!("states_{state_count}_fanout_{fanout}")),
+                move |b| {
+                    b.iter(|| {
+                        let result = evaluate_tri_with_options(&f, clts_ref, env_ref, &opts)
+                            .expect("trit eval succeeded");
+                        black_box(result);
+                    });
+                },
+            );
+        }
+        // Alt-depth-1: one modal, no fixpoint. Regression detector.
+        {
+            let f = alt1.clone();
+            let opts = options.clone();
+            let clts_ref = &clts;
+            let env_ref = &env;
+            group.bench_function(
+                BenchmarkId::new(
+                    "alt_depth_1",
+                    format!("states_{state_count}_fanout_{fanout}"),
+                ),
+                move |b| {
+                    b.iter(|| {
+                        let result = evaluate_tri_with_options(&f, clts_ref, env_ref, &opts)
+                            .expect("trit eval succeeded");
+                        black_box(result);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     mu_calculus_benchmarks,
-    trit_subexpr_sharing_benchmarks
+    trit_subexpr_sharing_benchmarks,
+    trit_modal_dense_benchmarks
 );
 criterion_main!(benches);

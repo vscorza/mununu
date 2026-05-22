@@ -2078,11 +2078,22 @@ where
                 guard,
                 target,
             } => {
+                // R-A2 attempt 1 (clone elision): the previous shape cloned
+                // `target_tri.must_true()` / `.may_true()` before passing them
+                // to `modal_bits_from_target`, which already accepts `&BitVec`.
+                // The clones were defensive against borrow-checker problems
+                // that do not actually arise: `target_tri` outlives both calls
+                // and `modal_bits_from_target` only needs an immutable view of
+                // the bitset. Cloning a BitVec at |S|=2048 is ~256 bytes per
+                // clone × 2 clones × every modal node × every fixpoint
+                // iteration; dropping the clones is the cheapest possible
+                // R-A2 fusion attempt (see §Phase 6 §6.7 R-A2 anchor; if this
+                // does not clear the 15% pass-bar, the heavier modal-walk
+                // fusion is the next attempt).
                 let target_tri = self.eval_node_tri(*target, bindings)?;
-                let must_target = target_tri.must_true().clone();
-                let may_target = target_tri.may_true().clone();
-                let must_bits = self.modal_bits_from_target(*kind, guard, &must_target)?;
-                let may_bits = self.modal_bits_from_target(*kind, guard, &may_target)?;
+                let must_bits =
+                    self.modal_bits_from_target(*kind, guard, target_tri.must_true())?;
+                let may_bits = self.modal_bits_from_target(*kind, guard, target_tri.may_true())?;
                 Ok(super::trit::TritSet::from_parts(must_bits, may_bits))
             }
             Node::Mu { var, body } => {
