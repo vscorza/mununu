@@ -260,16 +260,20 @@ fn r3_kleene_matches_bool_on_sharp_only_fixtures() {
         let committed_lines: Vec<&str> = committed.lines().collect();
         let snapshot_lines: Vec<&str> = snapshot.lines().collect();
         let mut first_diff = None;
-        for (i, (a, b)) in committed_lines.iter().zip(snapshot_lines.iter()).enumerate() {
+        for (i, (a, b)) in committed_lines
+            .iter()
+            .zip(snapshot_lines.iter())
+            .enumerate()
+        {
             if a != b {
                 first_diff = Some((i + 1, *a, *b));
                 break;
             }
         }
         let diff_msg = match first_diff {
-            Some((line, expected, got)) => format!(
-                "first diff at line {line}:\n  expected: {expected}\n  got:      {got}"
-            ),
+            Some((line, expected, got)) => {
+                format!("first diff at line {line}:\n  expected: {expected}\n  got:      {got}")
+            }
             None => format!(
                 "line counts differ: baseline={}, current={}",
                 committed_lines.len(),

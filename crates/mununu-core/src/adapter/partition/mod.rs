@@ -295,6 +295,99 @@ pub fn classify<B: DepGraphBuilder>(
     }
 }
 
+/// R.4 — Per-cluster partition record produced by
+/// [`classify_clustered`]. Each cluster carries its constituent
+/// property names (so the verify orchestrator can attribute verdicts
+/// back to the originating property) and the `Partition` computed
+/// from the cluster's union seed set.
+#[derive(Debug, Clone)]
+pub struct ClusterPartition {
+    /// Property names merged into this cluster (cf. the input
+    /// `properties` vector to [`classify_clustered`]). One-element
+    /// when the property is singleton-clustered.
+    pub members: Vec<String>,
+    /// COI-based partition computed from the union of the cluster
+    /// members' cone signal sets. Shape matches the non-clustered
+    /// [`classify`] output.
+    pub partition: Partition,
+}
+
+/// R.4 — Property-clustered COI per
+/// `docs/design/native-sv-abstraction.md` §5 and the KMTS roadmap
+/// (§10.1 R.4, `.claude/plans/you-are-a-formal-vast-lake.md`).
+///
+/// Given N properties (each with its own seed atom set), this
+/// function:
+///
+/// 1. Clusters them by Jaccard similarity on their cone signal sets
+///    via [`coi::cluster_properties_by_jaccard`] with the supplied
+///    `similarity_floor`.
+/// 2. Runs [`classify`] **once per cluster** with the cluster's
+///    `seed_union` as the seed set.
+/// 3. Returns one [`ClusterPartition`] per cluster, preserving the
+///    cluster order produced by the Jaccard pass.
+///
+/// **Why per-cluster?** A single joint COI over all properties' atoms
+/// keeps every signal any property mentions, even when one
+/// pathologically-wide-fanin property pulls in signals every other
+/// property could safely drop. Per-property COI maximises reduction
+/// but loses fixpoint-cache reuse across related properties. Clustering
+/// is the middle ground — properties that *do* share most of their
+/// cone share one partition (and thus the same verified abstraction);
+/// properties whose cones are largely disjoint get their own. Wins
+/// the Caliptra-fixture ≥10× reduction goal called out in §10.1 R.4.
+///
+/// **Soundness.** Each cluster's [`Partition`] is independently sound
+/// for the properties in *that* cluster (cone-of-influence is exact
+/// on the property's atomic-proposition set under
+/// over-approximation). Verifying a property against its cluster's
+/// abstraction is the same correctness contract as verifying it
+/// against the joint COI; the *only* difference is that signals
+/// outside this cluster's cone get pinned to a single value, which
+/// adds behaviours rather than removing them. Safety verdicts on the
+/// cluster-abstracted model transfer to the concrete; liveness picks
+/// up the same caveat as joint COI (see module docs).
+///
+/// **Singleton-cluster fallback.** When `properties.is_empty()` the
+/// function returns an empty vector. When every property
+/// scores below the floor against every existing cluster, every
+/// property gets its own singleton cluster — equivalent to per-property
+/// COI. When the floor is `0.0` the result is one cluster with all
+/// properties — equivalent to joint COI. The middle range is where
+/// R.4 earns its keep.
+pub fn classify_clustered<B: DepGraphBuilder>(
+    builder: &B,
+    properties: &[(String, std::collections::HashSet<String>)],
+    opts: &PartitionOptions,
+    similarity_floor: f64,
+) -> Vec<ClusterPartition> {
+    if properties.is_empty() {
+        return Vec::new();
+    }
+
+    // Build the dep-graph once and reuse for both the clustering pass
+    // (which calls into `cone_of_influence`) and the per-cluster
+    // `classify` walks.
+    let deps = builder.build();
+    let clusters = coi::cluster_properties_by_jaccard(properties, &deps, similarity_floor);
+
+    let mut out = Vec::with_capacity(clusters.len());
+    for cluster in clusters {
+        // The cluster's seed_union *is* the cone (already a fixpoint
+        // of the COI walk under these deps), so reusing it as the
+        // input atom set to `classify` is idempotent — the inner COI
+        // walk returns the same set, just keyed back through the
+        // `Partition` API for the standard `Kept` / `Dropped`
+        // accounting that `PartitionSummary` consumes downstream.
+        let partition = classify(builder, &cluster.seed_union, opts);
+        out.push(ClusterPartition {
+            members: cluster.members,
+            partition,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +473,118 @@ mod tests {
         for cls in p.classes.values() {
             assert!(matches!(cls, PartitionClass::Kept));
         }
+    }
+
+    #[test]
+    fn classify_clustered_empty_input_returns_empty() {
+        let builder = StubBuilder {
+            deps: HashMap::new(),
+            states: names(&["a"]),
+            inputs: names(&[]),
+        };
+        let result = classify_clustered(&builder, &[], &PartitionOptions::default(), 0.5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn classify_clustered_merges_overlapping_properties() {
+        // P1 and P2 both cone to the same fsm_state subgraph; with
+        // floor 0.5 they cluster together and get one partition.
+        let mut deps = HashMap::new();
+        deps.insert("fsm_state".to_string(), names(&["clk", "rst"]));
+        deps.insert("counter".to_string(), names(&["tick"]));
+        let builder = StubBuilder {
+            deps,
+            states: names(&["fsm_state", "counter"]),
+            inputs: names(&["clk", "rst", "tick"]),
+        };
+        let properties = vec![
+            ("P1".to_string(), names(&["fsm_state"])),
+            ("P2".to_string(), names(&["fsm_state"])),
+        ];
+        let result = classify_clustered(&builder, &properties, &PartitionOptions::default(), 0.5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].members, vec!["P1", "P2"]);
+        // The cluster's partition keeps fsm_state's cone, drops counter / tick.
+        assert!(matches!(
+            result[0].partition.classes.get("fsm_state"),
+            Some(PartitionClass::Kept)
+        ));
+        assert!(matches!(
+            result[0].partition.classes.get("counter"),
+            Some(PartitionClass::Dropped { .. })
+        ));
+        assert!(matches!(
+            result[0].partition.classes.get("tick"),
+            Some(PartitionClass::Dropped { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_clustered_separates_disjoint_properties() {
+        let mut deps = HashMap::new();
+        deps.insert("fsm_state".to_string(), names(&["clk", "rst"]));
+        deps.insert("counter".to_string(), names(&["tick"]));
+        let builder = StubBuilder {
+            deps,
+            states: names(&["fsm_state", "counter"]),
+            inputs: names(&["clk", "rst", "tick"]),
+        };
+        let properties = vec![
+            ("P1".to_string(), names(&["fsm_state"])),
+            ("P2".to_string(), names(&["counter"])),
+        ];
+        let result = classify_clustered(&builder, &properties, &PartitionOptions::default(), 0.5);
+        assert_eq!(result.len(), 2);
+        // Cluster 0: P1; keeps fsm_state, drops counter.
+        assert_eq!(result[0].members, vec!["P1"]);
+        assert!(matches!(
+            result[0].partition.classes.get("fsm_state"),
+            Some(PartitionClass::Kept)
+        ));
+        assert!(matches!(
+            result[0].partition.classes.get("counter"),
+            Some(PartitionClass::Dropped { .. })
+        ));
+        // Cluster 1: P2; keeps counter, drops fsm_state.
+        assert_eq!(result[1].members, vec!["P2"]);
+        assert!(matches!(
+            result[1].partition.classes.get("counter"),
+            Some(PartitionClass::Kept)
+        ));
+        assert!(matches!(
+            result[1].partition.classes.get("fsm_state"),
+            Some(PartitionClass::Dropped { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_clustered_floor_zero_collapses_to_joint_coi() {
+        let mut deps = HashMap::new();
+        deps.insert("fsm_state".to_string(), names(&["clk"]));
+        deps.insert("counter".to_string(), names(&["tick"]));
+        let builder = StubBuilder {
+            deps,
+            states: names(&["fsm_state", "counter"]),
+            inputs: names(&["clk", "tick"]),
+        };
+        let properties = vec![
+            ("P1".to_string(), names(&["fsm_state"])),
+            ("P2".to_string(), names(&["counter"])),
+        ];
+        // floor 0.0 ⇒ both properties join the first cluster.
+        let result = classify_clustered(&builder, &properties, &PartitionOptions::default(), 0.0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].members, vec!["P1", "P2"]);
+        // Joint COI keeps both subgraphs.
+        assert!(matches!(
+            result[0].partition.classes.get("fsm_state"),
+            Some(PartitionClass::Kept)
+        ));
+        assert!(matches!(
+            result[0].partition.classes.get("counter"),
+            Some(PartitionClass::Kept)
+        ));
     }
 
     #[test]
