@@ -221,6 +221,174 @@ impl TruthDomain for BoolDomain {
     }
 }
 
+/// R.3 — 3-valued (Kleene) instantiation of [`TruthDomain`]. The
+/// formula evaluator uses this domain to produce verdicts in
+/// `{ KleeneT, KleeneF, KleeneBot }` over KMTS-aware CLTSes that
+/// carry [`crate::clts::TransitionModality::MayOnly`] transitions
+/// and/or `KleeneBot` state-predicate labellings.
+///
+/// **Soundness contract** (Bruns–Godefroid CONCUR 2000, preservation
+/// theorem; restated in `docs/design/native-sv-abstraction.md` §6.2):
+/// for any property φ and abstract KMTS `M_α` of concrete `M`,
+///
+/// - `KleeneDomain ⊨ φ @ s = KleeneT` ⇒ `M ⊨ φ @ s = true`
+/// - `KleeneDomain ⊨ φ @ s = KleeneF` ⇒ `M ⊨ φ @ s = false`
+/// - `KleeneDomain ⊨ φ @ s = KleeneBot` ⇒ `M ⊨ φ @ s` is
+///   either `true` or `false`; the abstraction is too coarse to decide
+///   and CEGAR (R.5) refines.
+///
+/// **Sharp-only collapse.** When every transition is
+/// [`crate::clts::TransitionModality::Sharp`] and every state-AP is
+/// in `{ KleeneT, KleeneF }` (the data shape every legacy adapter
+/// produces post-R.1), `KleeneDomain` verdicts contain no `KleeneBot`
+/// and project to exactly the same Booleans `BoolDomain` would emit.
+/// The verdict-baseline regression test (R.3 done-criterion) enforces
+/// this property over the existing test suite.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KleeneDomain;
+
+impl TruthDomain for KleeneDomain {
+    type Element = Tristate;
+
+    fn truth_bot(&self) -> Tristate {
+        Tristate::KleeneF
+    }
+    fn truth_top(&self) -> Tristate {
+        Tristate::KleeneT
+    }
+
+    fn truth_join(&self, a: &Tristate, b: &Tristate) -> Tristate {
+        // Kleene strong disjunction:
+        //   T ∨ x = T, F ∨ x = x, ⊥ ∨ ⊥ = ⊥, ⊥ ∨ F = ⊥.
+        // The "definitely true wins" rule keeps `T` absorbing; the
+        // "definitely false is the identity" rule keeps `F` neutral.
+        match (a, b) {
+            (Tristate::KleeneT, _) | (_, Tristate::KleeneT) => Tristate::KleeneT,
+            (Tristate::KleeneBot, _) | (_, Tristate::KleeneBot) => Tristate::KleeneBot,
+            _ => Tristate::KleeneF,
+        }
+    }
+
+    fn truth_meet(&self, a: &Tristate, b: &Tristate) -> Tristate {
+        // Kleene strong conjunction (dual of join):
+        //   F ∧ x = F, T ∧ x = x, ⊥ ∧ ⊥ = ⊥, ⊥ ∧ T = ⊥.
+        match (a, b) {
+            (Tristate::KleeneF, _) | (_, Tristate::KleeneF) => Tristate::KleeneF,
+            (Tristate::KleeneBot, _) | (_, Tristate::KleeneBot) => Tristate::KleeneBot,
+            _ => Tristate::KleeneT,
+        }
+    }
+
+    fn truth_negate(&self, a: &Tristate) -> Tristate {
+        // Kleene negation: T ↔ F, ⊥ fixed (we have no evidence either way,
+        // so the negation also has no evidence).
+        match a {
+            Tristate::KleeneT => Tristate::KleeneF,
+            Tristate::KleeneF => Tristate::KleeneT,
+            Tristate::KleeneBot => Tristate::KleeneBot,
+        }
+    }
+
+    fn info_bot(&self) -> Tristate {
+        // The information-order least element is `KleeneBot` — "least
+        // defined." Fixpoint iteration starts here for least fixpoints
+        // (`Mu`) and ascends toward more-defined values.
+        Tristate::KleeneBot
+    }
+
+    fn info_join(&self, a: &Tristate, b: &Tristate) -> Tristate {
+        // Information join: combine two values toward more-definedness.
+        //   ⊥ ⊔_i x = x  (the more-defined value wins)
+        //   T ⊔_i T = T, F ⊔_i F = F  (agreement)
+        //   T ⊔_i F  is structurally inconsistent — two definite-and-
+        //   disagreeing values for the same fixpoint cell indicates a
+        //   bug in the modal-operator code. We debug_assert and fall
+        //   back to KleeneBot (the safe "we don't know" value), which
+        //   preserves liveness soundness if the assertion is compiled
+        //   out in release.
+        match (a, b) {
+            (Tristate::KleeneBot, x) | (x, Tristate::KleeneBot) => *x,
+            (Tristate::KleeneT, Tristate::KleeneT) => Tristate::KleeneT,
+            (Tristate::KleeneF, Tristate::KleeneF) => Tristate::KleeneF,
+            _ => {
+                debug_assert!(
+                    false,
+                    "info_join of two definite-and-disagreeing values \
+                     ({a:?} ⊔_i {b:?}) — fixpoint iteration is producing \
+                     inconsistent updates, likely a modal-operator bug"
+                );
+                Tristate::KleeneBot
+            }
+        }
+    }
+
+    fn info_leq(&self, a: &Tristate, b: &Tristate) -> bool {
+        // `a ⊑_i b` iff `b` is at least as defined as `a`.
+        //   ⊥ ⊑_i ⊥, ⊥ ⊑_i T, ⊥ ⊑_i F   (⊥ is below everything)
+        //   T ⊑_i T, F ⊑_i F             (reflexive on definite values)
+        //   T ⊑_i F is false; F ⊑_i T is false (definite values are
+        //   incomparable to each other).
+        match (a, b) {
+            (Tristate::KleeneBot, _) => true,
+            (x, y) if x == y => true,
+            _ => false,
+        }
+    }
+
+    fn box_modality(&self, may: &[Tristate], must: &[Tristate]) -> Tristate {
+        // `[a]φ` per `docs/design/native-sv-abstraction.md` §6.2:
+        //   - `KleeneT` iff every may-successor has `KleeneT`.
+        //   - `KleeneF` iff some must-successor has `KleeneF`.
+        //   - `KleeneBot` otherwise.
+        //
+        // The asymmetry: we need EVERY may-successor (over-approx) to be T
+        // to conclude T (sound — even the abstract behaviours can't refute),
+        // but we only need ONE must-successor (under-approx) to be F to
+        // conclude F (sound — the must-witness is a concrete counterexample).
+        //
+        // Convention: empty may-list ⇒ vacuous T (no successors means no
+        // way to falsify the universal). Matches BoolDomain.
+        if must.iter().any(|v| matches!(v, Tristate::KleeneF)) {
+            Tristate::KleeneF
+        } else if may.iter().all(|v| matches!(v, Tristate::KleeneT)) {
+            Tristate::KleeneT
+        } else {
+            Tristate::KleeneBot
+        }
+    }
+
+    fn diamond_modality(&self, may: &[Tristate], must: &[Tristate]) -> Tristate {
+        // `⟨a⟩φ` per §6.2 (dual of box_modality):
+        //   - `KleeneT` iff some must-successor has `KleeneT`.
+        //   - `KleeneF` iff every may-successor has `KleeneF`.
+        //   - `KleeneBot` otherwise.
+        //
+        // Convention: empty may-list ⇒ vacuous F (no successors means
+        // there cannot exist one satisfying φ). Matches BoolDomain.
+        if must.iter().any(|v| matches!(v, Tristate::KleeneT)) {
+            Tristate::KleeneT
+        } else if may.iter().all(|v| matches!(v, Tristate::KleeneF)) {
+            Tristate::KleeneF
+        } else {
+            Tristate::KleeneBot
+        }
+    }
+
+    fn lift_bool(&self, b: bool) -> Tristate {
+        // Sharp-only adapters' 2-valued bitsets lift losslessly into
+        // {KleeneT, KleeneF}; KleeneBot is never produced here.
+        Tristate::from_bool(b)
+    }
+
+    fn lift_tristate(&self, t: Tristate) -> Tristate {
+        t
+    }
+
+    fn is_unknown(&self, _state: &StateId<impl IdStorage>, value: &Tristate) -> bool {
+        matches!(value, Tristate::KleeneBot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +458,148 @@ mod tests {
         let d = BoolDomain;
         assert!(d.lift_bool(true));
         assert!(!d.lift_bool(false));
+    }
+
+    // ---- R.3 KleeneDomain tests ----
+
+    #[test]
+    fn kleene_truth_join_is_strong_disjunction() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // T absorbs everything
+        assert_eq!(d.truth_join(&KleeneT, &KleeneT), KleeneT);
+        assert_eq!(d.truth_join(&KleeneT, &KleeneF), KleeneT);
+        assert_eq!(d.truth_join(&KleeneT, &KleeneBot), KleeneT);
+        assert_eq!(d.truth_join(&KleeneBot, &KleeneT), KleeneT);
+        // F is identity for join when the other arg is not T
+        assert_eq!(d.truth_join(&KleeneF, &KleeneF), KleeneF);
+        // ⊥ ∨ F = ⊥ (we might still see a true witness later)
+        assert_eq!(d.truth_join(&KleeneBot, &KleeneF), KleeneBot);
+        assert_eq!(d.truth_join(&KleeneF, &KleeneBot), KleeneBot);
+        assert_eq!(d.truth_join(&KleeneBot, &KleeneBot), KleeneBot);
+    }
+
+    #[test]
+    fn kleene_truth_meet_is_strong_conjunction() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // F absorbs everything
+        assert_eq!(d.truth_meet(&KleeneF, &KleeneT), KleeneF);
+        assert_eq!(d.truth_meet(&KleeneF, &KleeneBot), KleeneF);
+        assert_eq!(d.truth_meet(&KleeneBot, &KleeneF), KleeneF);
+        // T is identity for meet
+        assert_eq!(d.truth_meet(&KleeneT, &KleeneT), KleeneT);
+        // ⊥ ∧ T = ⊥ (we might still see a false witness later)
+        assert_eq!(d.truth_meet(&KleeneT, &KleeneBot), KleeneBot);
+        assert_eq!(d.truth_meet(&KleeneBot, &KleeneT), KleeneBot);
+        assert_eq!(d.truth_meet(&KleeneBot, &KleeneBot), KleeneBot);
+    }
+
+    #[test]
+    fn kleene_negate_preserves_bot() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        assert_eq!(d.truth_negate(&KleeneT), KleeneF);
+        assert_eq!(d.truth_negate(&KleeneF), KleeneT);
+        assert_eq!(d.truth_negate(&KleeneBot), KleeneBot);
+        // Double-negation round-trips.
+        for v in [KleeneT, KleeneF, KleeneBot] {
+            assert_eq!(d.truth_negate(&d.truth_negate(&v)), v);
+        }
+    }
+
+    #[test]
+    fn kleene_info_lattice_has_bot_below_definite_values() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        assert_eq!(d.info_bot(), KleeneBot);
+        // ⊥ ⊑ everything
+        assert!(d.info_leq(&KleeneBot, &KleeneBot));
+        assert!(d.info_leq(&KleeneBot, &KleeneT));
+        assert!(d.info_leq(&KleeneBot, &KleeneF));
+        // Reflexive on definite values
+        assert!(d.info_leq(&KleeneT, &KleeneT));
+        assert!(d.info_leq(&KleeneF, &KleeneF));
+        // Definite values are incomparable to each other in info-order
+        assert!(!d.info_leq(&KleeneT, &KleeneF));
+        assert!(!d.info_leq(&KleeneF, &KleeneT));
+        // Definite values cannot be approximated by ⊥ (would lose information)
+        assert!(!d.info_leq(&KleeneT, &KleeneBot));
+        assert!(!d.info_leq(&KleeneF, &KleeneBot));
+    }
+
+    #[test]
+    fn kleene_info_join_promotes_definedness() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // ⊥ ⊔_i x = x
+        assert_eq!(d.info_join(&KleeneBot, &KleeneT), KleeneT);
+        assert_eq!(d.info_join(&KleeneT, &KleeneBot), KleeneT);
+        assert_eq!(d.info_join(&KleeneBot, &KleeneF), KleeneF);
+        assert_eq!(d.info_join(&KleeneF, &KleeneBot), KleeneF);
+        assert_eq!(d.info_join(&KleeneBot, &KleeneBot), KleeneBot);
+        // Agreement on definite values
+        assert_eq!(d.info_join(&KleeneT, &KleeneT), KleeneT);
+        assert_eq!(d.info_join(&KleeneF, &KleeneF), KleeneF);
+    }
+
+    #[test]
+    fn kleene_box_modality_asymmetric_per_spec_6_2() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // KleeneT iff every may-successor is T
+        assert_eq!(d.box_modality(&[KleeneT, KleeneT], &[KleeneT]), KleeneT);
+        // KleeneF iff some must-successor is F
+        assert_eq!(d.box_modality(&[KleeneT, KleeneF], &[KleeneF]), KleeneF);
+        // Mixed: a may-successor is ⊥, no must-successor is F → ⊥
+        assert_eq!(d.box_modality(&[KleeneT, KleeneBot], &[KleeneT]), KleeneBot);
+        // Empty successor lists ⇒ vacuous T (matches BoolDomain convention)
+        assert_eq!(d.box_modality(&[], &[]), KleeneT);
+        // A must-F outweighs all-may-T (Sharp invariant violated here in
+        // input — non-Sharp KMTSes where some-must but not all-may could
+        // appear; the F verdict is correct because the must-edge is a
+        // concrete counterexample regardless of may saturation).
+        assert_eq!(d.box_modality(&[KleeneT, KleeneT], &[KleeneF]), KleeneF);
+    }
+
+    #[test]
+    fn kleene_diamond_modality_asymmetric_per_spec_6_2() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // KleeneT iff some must-successor is T
+        assert_eq!(d.diamond_modality(&[KleeneT], &[KleeneT]), KleeneT);
+        // KleeneF iff every may-successor is F
+        assert_eq!(d.diamond_modality(&[KleeneF, KleeneF], &[]), KleeneF);
+        // Mixed: a may-successor is ⊥, no must-T → ⊥
+        assert_eq!(
+            d.diamond_modality(&[KleeneF, KleeneBot], &[KleeneF]),
+            KleeneBot
+        );
+        // Empty lists ⇒ vacuous F
+        assert_eq!(d.diamond_modality(&[], &[]), KleeneF);
+        // A must-T witness overrides a may-F majority.
+        assert_eq!(d.diamond_modality(&[KleeneF, KleeneT], &[KleeneT]), KleeneT);
+    }
+
+    #[test]
+    fn kleene_lift_round_trips() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        assert_eq!(d.lift_bool(true), KleeneT);
+        assert_eq!(d.lift_bool(false), KleeneF);
+        for v in [KleeneT, KleeneF, KleeneBot] {
+            assert_eq!(d.lift_tristate(v), v);
+        }
+    }
+
+    #[test]
+    fn kleene_is_unknown_only_for_bot() {
+        let d = KleeneDomain;
+        use crate::clts::StateId;
+        use Tristate::*;
+        let id: StateId<u32> = StateId::from_index(0).expect("index 0 fits u32");
+        assert!(d.is_unknown(&id, &KleeneBot));
+        assert!(!d.is_unknown(&id, &KleeneT));
+        assert!(!d.is_unknown(&id, &KleeneF));
     }
 }

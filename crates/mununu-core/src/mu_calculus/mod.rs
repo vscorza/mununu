@@ -23,7 +23,7 @@ pub use evaluator::{
 };
 pub use simplify::simplify;
 pub use trit::{Trit, TritSet};
-pub use truth_domain::{BoolDomain, TruthDomain};
+pub use truth_domain::{BoolDomain, KleeneDomain, TruthDomain};
 
 /// Classification of a μ-calculus formula by its fixpoint structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
