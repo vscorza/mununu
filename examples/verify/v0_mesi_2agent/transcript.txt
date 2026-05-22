@@ -1,0 +1,25 @@
+# v0_mesi_2agent — V.0 minimal MESI demo transcript
+# Regenerated via examples/verify/v0_mesi_2agent/validate.sh
+#
+# 2 L1 caches, 1 tracked line, free environment driving.
+# Sharp-everywhere semantics; verdicts must be:
+#   - mesi_coherence_invariant  : satisfied = true
+#   - deadlock_freedom          : satisfied = true
+#
+# §Phase 7 V.0 done-criterion: both verdicts true on the singular pipeline.
+
+=== mununu verify (human-readable) ===
+verify report — project `V0_MESI_2Agent`:
+  composition: asynchronous MesiSystem { members = [L1Core0, L1Core1] }
+    - L1Core0 (adapter = ctxdsl, automaton = L1Core0)
+    - L1Core1 (adapter = ctxdsl, automaton = L1Core1)
+    mesi_coherence_invariant: SATISFIED (8/8 states, 1/1 initial) [template `mutual_exclusion`, over = MesiSystem]
+    deadlock_freedom: SATISFIED (8/8 states, 1/1 initial) [template `no_deadlock`, over = MesiSystem]
+
+=== mununu verify --json (verdict shape) ===
+project = V0_MESI_2Agent
+composition.name = MesiSystem
+composition.semantics = asynchronous
+composition.members = L1Core0, L1Core1
+property[mesi_coherence_invariant] satisfied = True
+property[deadlock_freedom] satisfied = True

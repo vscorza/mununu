@@ -1,0 +1,40 @@
+// l1_core1.ctxdsl — Core 1's L1 cache for the V.0 MESI demo.
+// Mirror-symmetric to l1_core0.ctxdsl.
+
+context L1Core1 {
+    automata {
+        automaton L1Core1 {
+            states {
+                state Core1_I initial;
+                state Core1_S;
+                state Core1_E;
+                state Core1_M;
+            }
+            transitions {
+                // Local read.
+                transition Core1_I -> Core1_E on label xact_read_x_core1;
+                transition Core1_S -> Core1_S on label xact_read_x_core1;
+                transition Core1_E -> Core1_E on label xact_read_x_core1;
+                transition Core1_M -> Core1_M on label xact_read_x_core1;
+
+                // Local write.
+                transition Core1_I -> Core1_M on label xact_write_x_core1;
+                transition Core1_S -> Core1_M on label xact_write_x_core1;
+                transition Core1_E -> Core1_M on label xact_write_x_core1;
+                transition Core1_M -> Core1_M on label xact_write_x_core1;
+
+                // Snoop core0 write: invalidate.
+                transition Core1_I -> Core1_I on label xact_write_x_core0;
+                transition Core1_S -> Core1_I on label xact_write_x_core0;
+                transition Core1_E -> Core1_I on label xact_write_x_core0;
+                transition Core1_M -> Core1_I on label xact_write_x_core0;
+
+                // Snoop core0 read: downgrade to S.
+                transition Core1_I -> Core1_I on label xact_read_x_core0;
+                transition Core1_S -> Core1_S on label xact_read_x_core0;
+                transition Core1_E -> Core1_S on label xact_read_x_core0;
+                transition Core1_M -> Core1_S on label xact_read_x_core0;
+            }
+        }
+    }
+}

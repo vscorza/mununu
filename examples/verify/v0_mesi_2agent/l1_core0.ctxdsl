@@ -1,0 +1,59 @@
+// l1_core0.ctxdsl — Core 0's L1 cache for the V.0 MESI demo.
+// See `v0_mesi_2agent/verify.toml` for the verification project
+// and `docs/design/industrial-value-and-validation-domains.md` §3
+// for the domain framing.
+//
+// Per-cache MESI states for one tracked line. Bus events are
+// rendezvous labels: `xact_*_core0` are this cache's local-driven
+// transactions; `xact_*_core1` are snoops it reacts to.
+
+context L1Core0 {
+    automata {
+        automaton L1Core0 {
+            // Per the rv5_2core_mesi_microprogram convention: one
+            // automaton owns shared bus labels in its `controllable`
+            // block so the realiser's legacy mode does not infer
+            // duplicate controllability across the two caches. V.0
+            // has no microprogram coordinator, so L1Core0 takes the
+            // owner role; L1Core1 references the same labels without
+            // re-declaring them.
+            controllable {
+                label xact_read_x_core0;
+                label xact_write_x_core0;
+                label xact_read_x_core1;
+                label xact_write_x_core1;
+            }
+            states {
+                state Core0_I initial;
+                state Core0_S;
+                state Core0_E;
+                state Core0_M;
+            }
+            transitions {
+                // Local read (BusRd): I->E on miss, S/E/M idempotent.
+                transition Core0_I -> Core0_E on label xact_read_x_core0;
+                transition Core0_S -> Core0_S on label xact_read_x_core0;
+                transition Core0_E -> Core0_E on label xact_read_x_core0;
+                transition Core0_M -> Core0_M on label xact_read_x_core0;
+
+                // Local write (BusRdX): * -> M.
+                transition Core0_I -> Core0_M on label xact_write_x_core0;
+                transition Core0_S -> Core0_M on label xact_write_x_core0;
+                transition Core0_E -> Core0_M on label xact_write_x_core0;
+                transition Core0_M -> Core0_M on label xact_write_x_core0;
+
+                // Snoop core1 write: invalidate this line.
+                transition Core0_I -> Core0_I on label xact_write_x_core1;
+                transition Core0_S -> Core0_I on label xact_write_x_core1;
+                transition Core0_E -> Core0_I on label xact_write_x_core1;
+                transition Core0_M -> Core0_I on label xact_write_x_core1;
+
+                // Snoop core1 read: downgrade to S (write-back if M, implicit).
+                transition Core0_I -> Core0_I on label xact_read_x_core1;
+                transition Core0_S -> Core0_S on label xact_read_x_core1;
+                transition Core0_E -> Core0_S on label xact_read_x_core1;
+                transition Core0_M -> Core0_S on label xact_read_x_core1;
+            }
+        }
+    }
+}

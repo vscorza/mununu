@@ -1,0 +1,71 @@
+# v0_mesi_2agent — V.0 of the §Phase 7 domain-validation track in
+# `.claude/plans/you-are-a-formal-vast-lake.md` (controlling doc:
+# `docs/design/industrial-value-and-validation-domains.md` §3, the
+# parameterised cache coherence domain).
+#
+# Two L1 caches over one tracked line, MESI states, free environment
+# driving (any bus event from any reachable state). 4 × 4 = 16 product
+# states (reachable subset smaller). Sharp-everywhere semantics —
+# no MayOnly or MustHyperOnly transitions; the 2-valued evaluator
+# (BoolDomain) suffices and KleeneDomain produces identical verdicts
+# per the R.3 baseline invariant.
+#
+# V.0 ships **pre-R.5** (R.4.5 + R.5.0 + R.5 + R.5b are not required
+# for the safety + deadlock-freedom verdicts on this fixture). V.4
+# extends to N agents post-R.5b.
+#
+# Recreate:
+#   $ bash examples/verify/v0_mesi_2agent/validate.sh
+#
+# Properties:
+#   - `mesi_coherence_invariant` — the load-bearing safety property
+#     for any coherence protocol: at most one cache in M state at a
+#     time. Verdict must be `true`. A `false` verdict would mean the
+#     protocol allows two M copies, breaking the invariant.
+#   - `deadlock_freedom` — every reachable state has at least one
+#     enabled transition. Verdict must be `true`. A `false` verdict
+#     would mean the protocol can enter a state where no bus event
+#     is enabled — coherence livelock / softlock.
+
+[project]
+name = "V0_MESI_2Agent"
+description = "V.0 minimal MESI demo — 2 L1 caches, 1 tracked line, free environment. Safety + deadlock-freedom."
+
+[[sources]]
+id = "L1Core0"
+adapter = "ctxdsl"
+files = ["l1_core0.ctxdsl"]
+
+[[sources]]
+id = "L1Core1"
+adapter = "ctxdsl"
+files = ["l1_core1.ctxdsl"]
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+# Asynchronous composition with rendezvous on the shared bus labels —
+# every `xact_*` label is in both caches' alphabets, so each
+# transaction propagates to both participants. Doc C §C.5: async
+# is the right shape for bus-arbitrated SoCs; synchronous one-step
+# rendezvous would over-constrain the silicon.
+semantics = "asynchronous"
+members = ["L1Core0", "L1Core1"]
+name = "MesiSystem"
+
+[[properties]]
+# Safety: at most one cache in Modified state on the tracked line.
+# Standard 2-way mutual exclusion via the built-in template.
+name = "mesi_coherence_invariant"
+template = "mutual_exclusion"
+args = { A = "Core0_M", B = "Core1_M" }
+over = "MesiSystem"
+
+[[properties]]
+# Deadlock freedom: every reachable composed state has an enabled
+# outgoing transition. Formula pattern (from the builtin template):
+# `nu X. (<> true && [] X)`.
+name = "deadlock_freedom"
+template = "no_deadlock"
+over = "MesiSystem"
