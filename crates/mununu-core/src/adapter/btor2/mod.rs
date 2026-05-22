@@ -25,7 +25,10 @@ pub mod dep_graph;
 pub mod kmts_lift;
 pub mod parser;
 
-pub use kmts_lift::{KmtsLiftOptions, KmtsLiftResult, LiftedPredicate, lift_btor2_to_kmts};
+pub use kmts_lift::{
+    KmtsLiftOptions, KmtsLiftResult, LiftedPredicate, PredicateCubeLiftOptions,
+    PredicateCubeLiftResult, PredicateSpec, lift_btor2_to_kmts, predicate_cube_lift,
+};
 
 use super::{AdapterError, AdapterOptions, AdapterOutput, FormatAdapter};
 
