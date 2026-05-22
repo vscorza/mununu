@@ -102,11 +102,100 @@ pub trait TruthDomain {
     /// `T`; `F` iff some must-successor has `F`; else `⊥` (in
     /// `KleeneDomain`) or trivially `T`/`F` (in `BoolDomain`,
     /// where the may/must distinction collapses).
+    ///
+    /// **Sharp / single-target must.** Each entry of `must` is the φ
+    /// value at one must-successor's single target. For R.1 / R.3
+    /// (standard KMTS, no `MustHyperOnly`) this is the only modal
+    /// path the evaluator takes.
     fn box_modality(&self, may: &[Self::Element], must: &[Self::Element]) -> Self::Element;
     /// `⟨a⟩φ` — existential modality. `T` iff some must-successor
     /// has `T`; `F` iff every may-successor has `F`; else `⊥` /
     /// trivial.
     fn diamond_modality(&self, may: &[Self::Element], must: &[Self::Element]) -> Self::Element;
+
+    /// R.4.5 — `[a]φ` over a GKMTS that may carry `MustHyperOnly`
+    /// transitions (per Shoham–Grumberg LMCS 2007 §3;
+    /// `docs/design/native-sv-abstraction.md` §6.11;
+    /// `docs/design/kmts-theory.md` §3.5).
+    ///
+    /// `must_edges` is **outer-per-must-edge, inner-per-hyper-target**:
+    /// `must_edges[i]` is the slice of φ values at the targets of the
+    /// i-th must-edge. For a single-target (Sharp / single-must) edge,
+    /// `must_edges[i].len() == 1`; for a hyper-must edge the inner
+    /// slice has one entry per hyper-target.
+    ///
+    /// **Hyper-must semantics for the box false-check** (the load-bearing
+    /// rule): a hyper-must edge `s →ᴴ T` contributes a false witness
+    /// to `[a]φ` iff **every** `t ∈ T` has `φ(t) = false`. Because the
+    /// refinement realizes the must-edge by hitting any one `t`, a
+    /// single non-false target is enough to escape the false-witness.
+    ///
+    /// **Per-edge reduction is truth-order JOIN (∨), not meet.** In
+    /// 2-valued logic, `∨` over targets is `false` iff *all* targets
+    /// are `false` — which is exactly the condition for the hyper-must
+    /// edge to witness `[a]φ = false`. In Kleene 3-valued logic the
+    /// same identity holds: `false ∨ false = false`, `false ∨ t = ⊥`
+    /// for `t ∈ {⊥, true}`. So the per-edge join lifts the
+    /// "all targets false" check into a single value that the flat
+    /// [`Self::box_modality`] can consume on its `must` slice
+    /// (which it checks for `false` membership).
+    ///
+    /// (The asymmetry vs [`Self::diamond_modality_hyper`] — which
+    /// uses meet — is real: diamond's true-witness requires *every*
+    /// target to be true, hence `∧`; box's false-witness requires
+    /// *every* target to be false, hence `∨` over the polarity-flipped
+    /// values — equivalently, just `∨` over the original values since
+    /// `false ∨ false = false`.)
+    ///
+    /// **Default implementation** delegates to [`Self::box_modality`]
+    /// after the per-edge join reduction. Empty hyper-target sets are
+    /// skipped (an unrealizable must-edge cannot contribute a witness).
+    /// Both `BoolDomain` and `KleeneDomain` inherit this default —
+    /// the semantics are correct under either truth domain's `truth_join`.
+    fn box_modality_hyper(
+        &self,
+        may: &[Self::Element],
+        must_edges: &[&[Self::Element]],
+    ) -> Self::Element {
+        let must_per_edge: Vec<Self::Element> = must_edges
+            .iter()
+            .filter_map(|edge_targets| {
+                let mut iter = edge_targets.iter();
+                let first = iter.next()?.clone();
+                Some(iter.fold(first, |acc, t| self.truth_join(&acc, t)))
+            })
+            .collect();
+        self.box_modality(may, &must_per_edge)
+    }
+
+    /// R.4.5 — `⟨a⟩φ` over a GKMTS.
+    ///
+    /// **Hyper-must semantics for the diamond true-witness:** a
+    /// hyper-must edge `s →ᴴ T` contributes a true witness to `⟨a⟩φ`
+    /// iff **every** `t ∈ T` has `φ(t) = true`. Per-edge reduction is
+    /// truth-order MEET (∧) — the conjunction is `true` iff all targets
+    /// are `true`, which is the condition for the must-witness to
+    /// guarantee φ regardless of which `t` the refinement picks.
+    ///
+    /// **Default implementation** delegates to [`Self::diamond_modality`]
+    /// after the per-edge meet reduction. Empty hyper-target sets are
+    /// skipped. Both `BoolDomain` and `KleeneDomain` inherit this
+    /// default.
+    fn diamond_modality_hyper(
+        &self,
+        may: &[Self::Element],
+        must_edges: &[&[Self::Element]],
+    ) -> Self::Element {
+        let must_per_edge: Vec<Self::Element> = must_edges
+            .iter()
+            .filter_map(|edge_targets| {
+                let mut iter = edge_targets.iter();
+                let first = iter.next()?.clone();
+                Some(iter.fold(first, |acc, t| self.truth_meet(&acc, t)))
+            })
+            .collect();
+        self.diamond_modality(may, &must_per_edge)
+    }
 
     // ---- Bridges to mununu's CLTS layer ----
     //
@@ -336,21 +425,31 @@ impl TruthDomain for KleeneDomain {
     }
 
     fn box_modality(&self, may: &[Tristate], must: &[Tristate]) -> Tristate {
-        // `[a]φ` per `docs/design/native-sv-abstraction.md` §6.2:
-        //   - `KleeneT` iff every may-successor has `KleeneT`.
-        //   - `KleeneF` iff some must-successor has `KleeneF`.
-        //   - `KleeneBot` otherwise.
+        // `[a]φ` per `docs/design/native-sv-abstraction.md` §6.2 +
+        // §6.11 (R.4.5 hyper-must extension):
+        //   - `KleeneT` iff every may-successor is T AND no must-edge
+        //     contributes a non-definite (KleeneBot) per-edge value.
+        //     The second clause matters only for hyper-must inputs
+        //     (R.4.5 +) where the per-edge JOIN over hyper-targets
+        //     can be KleeneBot; for Sharp-only inputs the must slice
+        //     contains only definite values, so the second clause is
+        //     vacuously true and the semantics collapses to the
+        //     §6.2 Sharp form.
+        //   - `KleeneF` iff some must-edge is definitely F (all its
+        //     hyper-targets false, equivalently per-edge JOIN is F).
+        //   - `KleeneBot` otherwise — covers both "some may-successor
+        //     undefined" and "some must-edge undefined" cases.
         //
-        // The asymmetry: we need EVERY may-successor (over-approx) to be T
-        // to conclude T (sound — even the abstract behaviours can't refute),
-        // but we only need ONE must-successor (under-approx) to be F to
-        // conclude F (sound — the must-witness is a concrete counterexample).
+        // The asymmetry: every may (over-approx) must be T to
+        // conclude T (sound); a single must witness suffices for F.
         //
-        // Convention: empty may-list ⇒ vacuous T (no successors means no
-        // way to falsify the universal). Matches BoolDomain.
+        // Convention: empty may-list ⇒ vacuous T (no successors means
+        // no way to falsify the universal). Matches BoolDomain.
         if must.iter().any(|v| matches!(v, Tristate::KleeneF)) {
             Tristate::KleeneF
-        } else if may.iter().all(|v| matches!(v, Tristate::KleeneT)) {
+        } else if may.iter().all(|v| matches!(v, Tristate::KleeneT))
+            && must.iter().all(|v| matches!(v, Tristate::KleeneT))
+        {
             Tristate::KleeneT
         } else {
             Tristate::KleeneBot
@@ -358,16 +457,19 @@ impl TruthDomain for KleeneDomain {
     }
 
     fn diamond_modality(&self, may: &[Tristate], must: &[Tristate]) -> Tristate {
-        // `⟨a⟩φ` per §6.2 (dual of box_modality):
-        //   - `KleeneT` iff some must-successor has `KleeneT`.
-        //   - `KleeneF` iff every may-successor has `KleeneF`.
+        // `⟨a⟩φ` per §6.2 + §6.11 (dual of box_modality):
+        //   - `KleeneT` iff some must-edge is definitely T (all its
+        //     hyper-targets true, equivalently per-edge MEET is T).
+        //   - `KleeneF` iff every may-successor is F AND no must-edge
+        //     contributes a non-definite (KleeneBot) per-edge value.
         //   - `KleeneBot` otherwise.
         //
-        // Convention: empty may-list ⇒ vacuous F (no successors means
-        // there cannot exist one satisfying φ). Matches BoolDomain.
+        // Convention: empty may-list ⇒ vacuous F. Matches BoolDomain.
         if must.iter().any(|v| matches!(v, Tristate::KleeneT)) {
             Tristate::KleeneT
-        } else if may.iter().all(|v| matches!(v, Tristate::KleeneF)) {
+        } else if may.iter().all(|v| matches!(v, Tristate::KleeneF))
+            && must.iter().all(|v| matches!(v, Tristate::KleeneF))
+        {
             Tristate::KleeneF
         } else {
             Tristate::KleeneBot
@@ -601,5 +703,138 @@ mod tests {
         assert!(d.is_unknown(&id, &KleeneBot));
         assert!(!d.is_unknown(&id, &KleeneT));
         assert!(!d.is_unknown(&id, &KleeneF));
+    }
+
+    // ---- R.4.5 — hyper-must modal-operator tests ----
+    //
+    // Per `docs/design/native-sv-abstraction.md` §6.11 / Shoham–
+    // Grumberg LMCS 2007 §3, a `MustHyperOnly` edge `s →ᴴ T`
+    // contributes:
+    //   - to `[a]φ = F` iff EVERY t ∈ T has φ(t) = F (refinement can
+    //     pick any t; if any one is non-F then a refinement exists
+    //     where the must-edge does not witness false)
+    //   - to `⟨a⟩φ = T` iff EVERY t ∈ T has φ(t) = T (refinement can
+    //     pick any t; must-edge witnesses true only if every choice
+    //     yields true)
+    //
+    // The per-edge reduction in the default trait impls is JOIN for
+    // box (so the "all targets F" check becomes "per-edge value is F"
+    // for the flat box_modality) and MEET for diamond (symmetric).
+
+    #[test]
+    fn bool_domain_hyper_modality_is_sharp_only_per_documentation() {
+        // BoolDomain documents that it treats every transition as Sharp
+        // (the may/must distinction collapses). When the trait default
+        // `box_modality_hyper` delegates to BoolDomain's flat
+        // `box_modality`, the `must` slice is IGNORED — so BoolDomain
+        // cannot distinguish hyper-must false witnesses from a Sharp
+        // must over a single target.
+        //
+        // This test pins that documented limitation rather than
+        // pretending BoolDomain handles hyper-must: any hyper-must
+        // input through BoolDomain's hyper-modality methods reduces
+        // to its flat counterpart on the may slice alone.
+        let d = BoolDomain;
+        let must_edges: &[&[bool]] = &[&[false, false]];
+        // may all true → flat box returns true; the hyper-must false
+        // witness is dropped (BoolDomain's documented Sharp-only collapse).
+        assert!(d.box_modality_hyper(&[true, true], must_edges));
+        // diamond inherits the same collapse — may all false, must
+        // slice ignored → returns false.
+        let must_t: &[&[bool]] = &[&[true, true]];
+        assert!(!d.diamond_modality_hyper(&[false], must_t));
+        // Callers that need real hyper-must semantics on 2-valued
+        // inputs must use KleeneDomain with `lift_bool` (which then
+        // applies the §6.2 + §6.11 semantics correctly).
+    }
+
+    #[test]
+    fn kleene_box_hyper_all_targets_false_yields_false() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // hyper-must edge with both targets F → contributes false witness
+        let must_edges: &[&[Tristate]] = &[&[KleeneF, KleeneF]];
+        assert_eq!(
+            d.box_modality_hyper(&[KleeneT, KleeneT], must_edges),
+            KleeneF
+        );
+    }
+
+    #[test]
+    fn kleene_box_hyper_one_true_target_blocks_false() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // hyper-must edge with one F and one T target → join is T → no false witness from this edge
+        let must_edges: &[&[Tristate]] = &[&[KleeneF, KleeneT]];
+        // may all T → box returns T (no false witness anywhere)
+        assert_eq!(
+            d.box_modality_hyper(&[KleeneT, KleeneT], must_edges),
+            KleeneT
+        );
+    }
+
+    #[test]
+    fn kleene_box_hyper_one_bot_target_keeps_bot() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // hyper-must with one F and one ⊥ → join is ⊥ (not a definite false witness)
+        let must_edges: &[&[Tristate]] = &[&[KleeneF, KleeneBot]];
+        // may all T → no definite false-witness, but ⊥ means we cannot conclude T either
+        assert_eq!(
+            d.box_modality_hyper(&[KleeneT, KleeneT], must_edges),
+            KleeneBot
+        );
+    }
+
+    #[test]
+    fn kleene_diamond_hyper_all_targets_true_yields_true() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // hyper-must with both targets T → must-witness is solid → diamond T
+        let must_edges: &[&[Tristate]] = &[&[KleeneT, KleeneT]];
+        assert_eq!(d.diamond_modality_hyper(&[KleeneF], must_edges), KleeneT);
+    }
+
+    #[test]
+    fn kleene_diamond_hyper_one_false_target_blocks_true() {
+        let d = KleeneDomain;
+        use Tristate::*;
+        // hyper-must with one T and one F → meet is F → no true witness from this edge
+        // and may all F → diamond returns F (every may-successor false)
+        let must_edges: &[&[Tristate]] = &[&[KleeneT, KleeneF]];
+        assert_eq!(d.diamond_modality_hyper(&[KleeneF], must_edges), KleeneF);
+    }
+
+    #[test]
+    fn hyper_modality_empty_target_skips_edge() {
+        // Per the trait docs, an empty hyper-target set is skipped
+        // (an unrealizable must-edge cannot contribute a witness).
+        let d = KleeneDomain;
+        use Tristate::*;
+        let must_edges: &[&[Tristate]] = &[&[], &[KleeneT, KleeneT]];
+        // First edge skipped; second edge witnesses true.
+        assert_eq!(d.diamond_modality_hyper(&[KleeneF], must_edges), KleeneT);
+    }
+
+    #[test]
+    fn hyper_modality_single_target_matches_flat() {
+        // R.4.5 invariant: a hyper-must with one target must produce
+        // the same result as the flat box_modality / diamond_modality
+        // with that single target — Sharp is the singleton-target
+        // degeneracy of MustHyperOnly.
+        let d = KleeneDomain;
+        use Tristate::*;
+        let must_flat = vec![KleeneF];
+        let must_hyper: &[&[Tristate]] = &[&[KleeneF]];
+        assert_eq!(
+            d.box_modality(&[KleeneT], &must_flat),
+            d.box_modality_hyper(&[KleeneT], must_hyper),
+        );
+        let must_flat_t = vec![KleeneT];
+        let must_hyper_t: &[&[Tristate]] = &[&[KleeneT]];
+        assert_eq!(
+            d.diamond_modality(&[KleeneF], &must_flat_t),
+            d.diamond_modality_hyper(&[KleeneF], must_hyper_t),
+        );
     }
 }

@@ -308,50 +308,80 @@ impl Tristate {
     }
 }
 
-/// R.1 — KMTS transition modality (`docs/design/native-sv-abstraction.md` §6.3).
-/// Standard KMTS enforces the invariant `R_must ⊆ R_may`; a transition
-/// is either in *both* relations (`Sharp`) or in *only* may (`MayOnly`).
-/// The mixed-transition-system generalisation of Dams–Gerth–Grumberg
-/// TOPLAS 1997 would allow a `MustOnly` variant, but the BTOR2 lifter
-/// produces sound predicate-image transitions that always satisfy the
-/// inclusion invariant by construction, so the standard-KMTS shape
-/// (two variants, not three) is what mununu's data model carries.
+/// R.1 + R.4.5 — KMTS transition modality
+/// (`docs/design/native-sv-abstraction.md` §6.3 + §6.11).
 ///
-/// **Strict additivity:** every existing adapter produces `Sharp`
-/// transitions (the default); only KMTS-aware adapters (the future
-/// `adapter/btor2/kmts_lift.rs` shipping in R.2) produce `MayOnly`
-/// edges. The `BoolDomain` evaluator (R.1) treats every transition
-/// as Sharp regardless of this field; the `KleeneDomain` evaluator
-/// (R.3) reads it.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub enum TransitionModality {
-    /// In both `may` and `must` relations: an existential witness
-    /// for the transition has been verified (concrete-operator
-    /// SMT query or syntactic guarantee), and the over-approximation
-    /// admits it.
+/// **Standard KMTS (R.1; Larsen–Thomsen 1988):** every transition is
+/// either in *both* may and must relations (`Sharp`) or in *only* may
+/// (`MayOnly`). The mixed-transition-system generalisation of
+/// Dams–Gerth–Grumberg TOPLAS 1997 would allow a "must without may"
+/// variant; mununu does not produce one (the predicate-image lifter
+/// at R.2/R.2.5 always satisfies `must ⊆ may`).
+///
+/// **Generalized KMTS (R.4.5; Shoham–Grumberg LMCS 2007):** to make
+/// refinement *monotone* on alternating fixpoints, a must-transition
+/// targets a **set** of abstract states (a hyper-target) rather than
+/// a single state. A refinement realizes the must-transition by
+/// hitting *some* element of the target set — the additional
+/// freedom is what defeats the over-commitment that plain-KMTS
+/// must-transitions suffer under refinement. `Sharp` is the
+/// singleton-target degeneracy of `MustHyperOnly`; we keep it as a
+/// separate variant so the common case stays cheap and the data
+/// model carries the may/must split structurally.
+///
+/// **Strict additivity:** every existing adapter and the R.2 lifter
+/// produce `Sharp` (or `MayOnly` under UF abstraction) transitions —
+/// `MustHyperOnly` is reserved for the R.5/R.5b CEGAR + UF-abstraction
+/// path that the R.4.5 ↔ R.5.0 ↔ R.5 ↔ R.5b sequence delivers. The
+/// `BoolDomain` evaluator (R.1) treats every transition as Sharp;
+/// the `KleeneDomain` evaluator (R.3) reads `MayOnly`; the
+/// `KleeneDomain` R.4.5 widening also reads `MustHyperOnly`.
+///
+/// **Memory note:** the hyper-target set is `Box<SmallVec<…>>` so
+/// `Sharp` and `MayOnly` stay 9 bytes (discriminant + pointer slot,
+/// unused for the unit variants). At the cost of one indirection for
+/// the rare `MustHyperOnly` case we avoid inflating every Sharp /
+/// MayOnly transition by ~32 bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TransitionModality<S: IdStorage> {
+    /// In both `may` and `must` relations with a singleton must-target
+    /// (the transition's `target` field). Equivalent under GKMTS to
+    /// `MustHyperOnly` with `targets = SmallVec::from([target])`; we
+    /// keep it as a separate variant for the cheap default case.
     Sharp,
     /// In `may` only: the over-approximation admits the transition
     /// (an existential SMT query under the UF-abstracted relation
     /// found a witness), but no must-witness backs it.
     MayOnly,
+    /// R.4.5 — In both `may` and `must` relations with a **hyper-target**
+    /// set: every concrete refinement of the source state has a
+    /// must-successor in some element of the target set. The
+    /// transition's `target` field still carries the "principal"
+    /// target (the first element of `targets` by convention), so
+    /// existing single-target adjacency-list queries continue to work
+    /// for Sharp / MayOnly behaviour; consumers that respect the
+    /// hyper-must semantics read the full `targets` set.
+    ///
+    /// The Box keeps the enum size at 9 bytes; only the rare
+    /// `MustHyperOnly` case pays for the SmallVec allocation.
+    MustHyperOnly(Box<smallvec::SmallVec<[StateId<S>; 4]>>),
 }
 
-impl Default for TransitionModality {
+impl<S: IdStorage> Default for TransitionModality<S> {
     /// Existing adapters and hand-written CTXDSL produce
-    /// Sharp-everywhere KMTSes. New adapters opt into `MayOnly`
-    /// explicitly via the modality-aware builder method.
+    /// Sharp-everywhere KMTSes. New adapters opt into `MayOnly` /
+    /// `MustHyperOnly` explicitly via the modality-aware builder.
     fn default() -> Self {
         TransitionModality::Sharp
     }
 }
 
-impl TransitionModality {
+impl<S: IdStorage> TransitionModality<S> {
     /// Per-axis conjunction merge for parallel composition
-    /// (Larsen–Larsen–Wąsowski FoSSaCS 2007;
-    /// `docs/design/native-sv-abstraction.md` §6.5;
-    /// `docs/design/kmts-theory.md` §5.1).
+    /// (Larsen–Larsen–Wąsowski FoSSaCS 2007 — standard KMTS;
+    /// Shoham–Grumberg LMCS 2007 §3 — GKMTS hyper-must extension;
+    /// `docs/design/native-sv-abstraction.md` §6.5 + §6.11;
+    /// `docs/design/kmts-theory.md` §5).
     ///
     /// A composed transition has each capability iff *both* sides
     /// have a transition with that capability on the synchronizing
@@ -362,38 +392,92 @@ impl TransitionModality {
     /// has_must(left ⊗ right) = has_must(left) ∧ has_must(right)
     /// ```
     ///
-    /// The 3-case merge table is the corollary (standard-KMTS
-    /// invariant rules out the would-be `MustOnly` rows):
+    /// The 3×3 merge table (post-R.4.5):
     ///
     /// ```text
-    /// Sharp   ⊗ Sharp   = Sharp     (both have may; both have must)
-    /// Sharp   ⊗ MayOnly = MayOnly   (both have may; only left has must)
-    /// MayOnly ⊗ MayOnly = MayOnly   (both have may; neither has must)
+    ///                Sharp          MayOnly  MustHyperOnly
+    /// Sharp          Sharp          MayOnly  MustHyperOnly*
+    /// MayOnly        MayOnly        MayOnly  MayOnly
+    /// MustHyperOnly  MustHyperOnly* MayOnly  MustHyperOnly†
+    ///
+    /// * The composed MustHyperOnly's target set is the Cartesian
+    ///   product of the two sides' must-target sets, constructed by
+    ///   the composition layer at product-state-build time.
+    ///   `Sharp` participates as a singleton-target hyper-must.
+    /// † Cartesian product of both hyper-target sets.
     /// ```
     ///
+    /// Because the target-set Cartesian product requires access to
+    /// the product-state index (which lives at the composition layer),
+    /// this method returns a **placeholder** `MustHyperOnly` with an
+    /// empty target set — the composition layer is responsible for
+    /// computing the actual targets via [`Self::is_must`] and the
+    /// `merge_with_hyper_targets` helper. For Sharp / MayOnly merges
+    /// the result is exact.
+    ///
     /// This is the **silent-soundness-bug fix** flagged in the
-    /// architecture doc §6.5 R.1 audit: a composed transition
-    /// incorrectly marked `Sharp` when only one side has `must`
-    /// would give the evaluator a fabricated must-witness, making
-    /// `KleeneF` verdicts unsound.
-    pub fn merge(self, other: TransitionModality) -> TransitionModality {
-        use TransitionModality::*;
-        match (self, other) {
-            (Sharp, Sharp) => Sharp,
-            _ => MayOnly, // any side without must produces a may-only composed edge
+    /// architecture doc §6.5 R.1 audit, extended in R.4.5 to handle
+    /// hyper-must monotonicity per §6.11.
+    pub fn merge(&self, other: &TransitionModality<S>) -> TransitionModality<S> {
+        // Capability conjunction: composed transition has must iff both sides
+        // have must (Sharp or MustHyperOnly each carry must capability).
+        let lhs_must = self.is_must();
+        let rhs_must = other.is_must();
+        let lhs_hyper = matches!(self, TransitionModality::MustHyperOnly(_));
+        let rhs_hyper = matches!(other, TransitionModality::MustHyperOnly(_));
+        match (lhs_must, rhs_must) {
+            (true, true) => {
+                if lhs_hyper || rhs_hyper {
+                    // Composition layer computes the Cartesian product.
+                    TransitionModality::MustHyperOnly(Box::default())
+                } else {
+                    TransitionModality::Sharp
+                }
+            }
+            _ => TransitionModality::MayOnly,
         }
     }
 
     /// Whether this transition is in the `may` relation. Every
     /// well-formed modality has `may` capability under the
-    /// standard-KMTS invariant.
-    pub fn has_may(self) -> bool {
+    /// standard-KMTS invariant `must ⊆ may`.
+    pub fn has_may(&self) -> bool {
         true
     }
 
-    /// Whether this transition is in the `must` relation.
-    pub fn has_must(self) -> bool {
-        matches!(self, TransitionModality::Sharp)
+    /// Whether this transition is in the `must` relation. True for
+    /// `Sharp` (singleton must-target) and `MustHyperOnly` (hyper
+    /// must-target set); false for `MayOnly`.
+    pub fn has_must(&self) -> bool {
+        matches!(
+            self,
+            TransitionModality::Sharp | TransitionModality::MustHyperOnly(_)
+        )
+    }
+
+    /// Convenience alias for `has_must()` used by the composition
+    /// merge logic.
+    pub fn is_must(&self) -> bool {
+        self.has_must()
+    }
+
+    /// R.4.5 — The hyper-must target set, if this is a `MustHyperOnly`
+    /// transition. `None` for `Sharp` (whose must-target is the
+    /// transition's `target` field — singleton) and `MayOnly` (no
+    /// must capability).
+    pub fn hyper_targets(&self) -> Option<&[StateId<S>]> {
+        match self {
+            TransitionModality::MustHyperOnly(targets) => Some(targets.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// R.4.5 — Construct a `MustHyperOnly` from an explicit target
+    /// set. Used by the R.5 CEGAR loop and the R.5b UF-abstraction
+    /// path when the predicate-image SMT query returns multiple
+    /// admissible successors per source predicate cube.
+    pub fn must_hyper(targets: smallvec::SmallVec<[StateId<S>; 4]>) -> Self {
+        TransitionModality::MustHyperOnly(Box::new(targets))
     }
 }
 
@@ -414,7 +498,7 @@ impl TransitionModality {
 pub struct Transition<S: IdStorage, L: IdStorage> {
     target: StateId<S>,
     labels: SmallVec<[LabelId<L>; 4]>,
-    modality: TransitionModality,
+    modality: TransitionModality<S>,
 }
 
 impl<S: IdStorage, L: IdStorage> Transition<S, L> {
@@ -431,8 +515,8 @@ impl<S: IdStorage, L: IdStorage> Transition<S, L> {
     /// R.1 — Returns the KMTS modality of this transition. Sharp by
     /// default for existing (2-valued) CLTSes; `MayOnly` for
     /// KMTS-aware adapters that produce over-approximation edges.
-    pub fn modality(&self) -> TransitionModality {
-        self.modality
+    pub fn modality(&self) -> &TransitionModality<S> {
+        &self.modality
     }
 
     /// Checks if this transition is controllable based on its labels.
@@ -1688,7 +1772,9 @@ struct TransitionSpec<S: IdStorage, L: IdStorage> {
     /// R.1 — KMTS modality. `Sharp` by default for the legacy
     /// 2-valued path; `MayOnly` for KMTS-aware adapters that opt
     /// in via [`CltsBuilder::transition_ids_with_modality`].
-    modality: TransitionModality,
+    /// R.4.5 adds `MustHyperOnly` for GKMTS-aware adapters that
+    /// produce hyper-must transitions (R.5 / R.5b paths).
+    modality: TransitionModality<S>,
 }
 
 impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
@@ -2024,7 +2110,7 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
         from: StateId<S>,
         labels: &[LabelId<L>],
         to: StateId<S>,
-        modality: TransitionModality,
+        modality: TransitionModality<S>,
     ) -> &mut Self {
         debug_assert!(from.index() < self.state_variables.len());
         debug_assert!(to.index() < self.state_variables.len());
@@ -2136,12 +2222,12 @@ impl<S: IdStorage, L: IdStorage> CltsBuilder<S, L> {
             outgoing[spec.from.index()].push(Transition {
                 target: spec.to,
                 labels: spec.labels.clone(),
-                modality: spec.modality,
+                modality: spec.modality.clone(),
             });
             incoming[spec.to.index()].push(Transition {
                 target: spec.from,
                 labels: spec.labels.clone(),
-                modality: spec.modality,
+                modality: spec.modality.clone(),
             });
         }
 
@@ -2632,8 +2718,9 @@ mod tests {
 
     #[test]
     fn modality_merge_sharp_and_sharp_is_sharp() {
+        let sharp: TransitionModality<DefaultStateIdx> = TransitionModality::Sharp;
         assert_eq!(
-            TransitionModality::Sharp.merge(TransitionModality::Sharp),
+            sharp.merge(&sharp),
             TransitionModality::Sharp,
             "both sides have may AND must; composed has both"
         );
@@ -2643,30 +2730,26 @@ mod tests {
     fn modality_merge_sharp_and_mayonly_is_mayonly() {
         // Sharp ⊗ MayOnly: both have may, only left has must,
         // therefore the composed has may but not must.
-        assert_eq!(
-            TransitionModality::Sharp.merge(TransitionModality::MayOnly),
-            TransitionModality::MayOnly,
-        );
+        let sharp: TransitionModality<DefaultStateIdx> = TransitionModality::Sharp;
+        let mayonly: TransitionModality<DefaultStateIdx> = TransitionModality::MayOnly;
+        assert_eq!(sharp.merge(&mayonly), TransitionModality::MayOnly);
         // Symmetric: MayOnly ⊗ Sharp.
-        assert_eq!(
-            TransitionModality::MayOnly.merge(TransitionModality::Sharp),
-            TransitionModality::MayOnly,
-        );
+        assert_eq!(mayonly.merge(&sharp), TransitionModality::MayOnly);
     }
 
     #[test]
     fn modality_merge_mayonly_and_mayonly_is_mayonly() {
         // Both have may; neither has must.
-        assert_eq!(
-            TransitionModality::MayOnly.merge(TransitionModality::MayOnly),
-            TransitionModality::MayOnly,
-        );
+        let mayonly: TransitionModality<DefaultStateIdx> = TransitionModality::MayOnly;
+        assert_eq!(mayonly.merge(&mayonly), TransitionModality::MayOnly);
     }
 
     #[test]
     fn modality_merge_is_commutative() {
-        for a in [TransitionModality::Sharp, TransitionModality::MayOnly] {
-            for b in [TransitionModality::Sharp, TransitionModality::MayOnly] {
+        let candidates: Vec<TransitionModality<DefaultStateIdx>> =
+            vec![TransitionModality::Sharp, TransitionModality::MayOnly];
+        for a in &candidates {
+            for b in &candidates {
                 assert_eq!(
                     a.merge(b),
                     b.merge(a),
@@ -2678,10 +2761,12 @@ mod tests {
 
     #[test]
     fn modality_merge_is_idempotent_per_value() {
-        for m in [TransitionModality::Sharp, TransitionModality::MayOnly] {
+        let candidates: Vec<TransitionModality<DefaultStateIdx>> =
+            vec![TransitionModality::Sharp, TransitionModality::MayOnly];
+        for m in &candidates {
             assert_eq!(
                 m.merge(m),
-                m,
+                m.clone(),
                 "self-merge must be the identity; counter-example: {m:?}"
             );
         }
@@ -2704,7 +2789,7 @@ mod tests {
         assert_eq!(trans.len(), 1);
         assert_eq!(
             trans[0].modality(),
-            TransitionModality::Sharp,
+            &TransitionModality::<DefaultStateIdx>::Sharp,
             "legacy transition_ids must default to Sharp"
         );
         Ok(())
@@ -2721,7 +2806,10 @@ mod tests {
         let clts = builder.build()?;
         let trans = clts.outgoing(s0);
         assert_eq!(trans.len(), 1);
-        assert_eq!(trans[0].modality(), TransitionModality::MayOnly);
+        assert_eq!(
+            trans[0].modality(),
+            &TransitionModality::<DefaultStateIdx>::MayOnly
+        );
         Ok(())
     }
 
@@ -2780,11 +2868,22 @@ mod tests {
     fn transition_modality_has_may_invariant() {
         // The standard-KMTS invariant `must ⊆ may` means every
         // representable transition has may.
-        assert!(TransitionModality::Sharp.has_may());
-        assert!(TransitionModality::MayOnly.has_may());
-        // Only Sharp has must.
-        assert!(TransitionModality::Sharp.has_must());
-        assert!(!TransitionModality::MayOnly.has_must());
+        let sharp: TransitionModality<DefaultStateIdx> = TransitionModality::Sharp;
+        let mayonly: TransitionModality<DefaultStateIdx> = TransitionModality::MayOnly;
+        assert!(sharp.has_may());
+        assert!(mayonly.has_may());
+        // Sharp has must (singleton-target); MayOnly does not.
+        assert!(sharp.has_must());
+        assert!(!mayonly.has_must());
+        // R.4.5 — MustHyperOnly also has must (hyper-target set).
+        let hyper: TransitionModality<DefaultStateIdx> =
+            TransitionModality::must_hyper(smallvec::smallvec![
+                StateId::from_index(0).expect("idx 0 fits"),
+                StateId::from_index(1).expect("idx 1 fits"),
+            ]);
+        assert!(hyper.has_may());
+        assert!(hyper.has_must());
+        assert_eq!(hyper.hyper_targets().map(|t| t.len()), Some(2));
     }
 
     #[test]
