@@ -3,7 +3,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use std::hint::black_box;
 
 use mununu_core::clts::{Clts, DefaultLabelIdx, DefaultStateIdx};
-use mununu_core::mu_calculus::{Environment, EvaluationOptions, evaluate_with_options, parser};
+use mununu_core::mu_calculus::{
+    Environment, EvaluationOptions, evaluate_tri_with_options, evaluate_with_options, parser,
+};
 
 const FIXPOINT_FORMULA: &str = "nu Goal. mu Safe. ([ ( labels = {tick}, ctrl = controllable ) ] (Safe and < ( labels = {sync}, req_next = {active} ) > Goal) and safe_pred)";
 
@@ -94,5 +96,84 @@ fn mu_calculus_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, mu_calculus_benchmarks);
+/// R-A1 — measure 3-valued (trit) evaluator performance with and
+/// without sub-expression sharing. Per the §Phase 6 §6.7 anchor for
+/// R-A1, the pass-bar is:
+///
+/// - shared-subexpr fixture: ≥ 30% faster post-memoisation
+/// - no-shared fixture:      ≤ 5% regression
+///
+/// Both formulas use `evaluate_tri_with_options` (the KleeneDomain
+/// path); same CLTS + environment as the 2-valued bench above so
+/// fixture-size effects are comparable.
+const TRIT_SHARED_SUBEXPR_FORMULA: &str =
+    // (safe_pred ∧ <tick> active) appears 3 times — pure memo win.
+    "((safe_pred and < ( labels = {tick} ) > active) or \
+      (safe_pred and < ( labels = {tick} ) > active) or \
+      (safe_pred and < ( labels = {tick} ) > active))";
+
+const TRIT_NO_SHARED_FORMULA: &str =
+    // Three structurally distinct conjuncts; no shared subterm.
+    "((safe_pred and < ( labels = {tick} ) > active) or \
+      (inactive and [ ( labels = {sync} ) ] safe_pred) or \
+      (active and [ ( labels = {ack} ) ] inactive))";
+
+fn trit_subexpr_sharing_benchmarks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("trit_eval_shared_subexpr");
+    let options = EvaluationOptions::default();
+
+    let shared = parser::parse(TRIT_SHARED_SUBEXPR_FORMULA).expect("shared formula parses");
+    let no_shared = parser::parse(TRIT_NO_SHARED_FORMULA).expect("no-shared formula parses");
+
+    // M.1 / M.2 KMTS-shape proxies — 64 / 512 states with moderate fanout.
+    for &(state_count, fanout) in &[(64usize, 3usize), (512usize, 4usize)] {
+        let clts = build_eval_fixture(state_count, fanout);
+        let env = build_environment(&clts);
+        group.throughput(Throughput::Elements(state_count as u64));
+
+        // shared: pre-memo would re-evaluate the same subtree 3×;
+        // post-memo evaluates once and reuses.
+        {
+            let f = shared.clone();
+            let opts = options.clone();
+            let clts_ref = &clts;
+            let env_ref = &env;
+            group.bench_function(
+                BenchmarkId::new("shared", format!("states_{state_count}_fanout_{fanout}")),
+                move |b| {
+                    b.iter(|| {
+                        let result = evaluate_tri_with_options(&f, clts_ref, env_ref, &opts)
+                            .expect("trit eval succeeded");
+                        black_box(result);
+                    });
+                },
+            );
+        }
+        // no_shared: memo cost without payoff — must not regress > 5%.
+        {
+            let f = no_shared.clone();
+            let opts = options.clone();
+            let clts_ref = &clts;
+            let env_ref = &env;
+            group.bench_function(
+                BenchmarkId::new("no_shared", format!("states_{state_count}_fanout_{fanout}")),
+                move |b| {
+                    b.iter(|| {
+                        let result = evaluate_tri_with_options(&f, clts_ref, env_ref, &opts)
+                            .expect("trit eval succeeded");
+                        black_box(result);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    mu_calculus_benchmarks,
+    trit_subexpr_sharing_benchmarks
+);
 criterion_main!(benches);
