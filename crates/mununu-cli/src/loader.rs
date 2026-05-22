@@ -202,11 +202,20 @@ pub(crate) fn load_with_adapter_mode_extra(
             let setundef_anyseq = std::env::var("MUNUNU_YOSYS_SETUNDEF_ANYSEQ")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+            // R-Y1 (§Phase 8) — `MUNUNU_YOSYS_SETUNDEF_ANYCONST=1`
+            // opt-in for the intermediate init policy: one nondeterministic
+            // constant input per undef bit (no per-cycle state cells).
+            // Strictly between -zero (masks bugs) and -anyseq (state
+            // explosion). Precedence: ANYSEQ wins if both are set.
+            let setundef_anyconst = std::env::var("MUNUNU_YOSYS_SETUNDEF_ANYCONST")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             let yopts = mununu_core::adapter::yosys::YosysOptions {
                 primary_source_path: Some(path.to_string_lossy().into_owned()),
                 additional_sources: additional,
                 use_sv2v,
                 setundef_anyseq,
+                setundef_anyconst,
                 ..Default::default()
             };
             log_adapter_output_with_dir(

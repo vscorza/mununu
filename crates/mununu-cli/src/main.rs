@@ -796,6 +796,16 @@ struct SvEmitBtor2PerModuleArgs {
     /// cost of introducing `$anyseq` state cells.
     #[arg(long = "setundef-anyseq")]
     setundef_anyseq: bool,
+    /// R-Y1 (§Phase 8) — Use Yosys's `setundef -anyconst` instead of
+    /// the default `setundef -zero`. Adds one nondeterministic
+    /// **constant input** per undef bit (NOT per-cycle state cells).
+    /// Preserves CWE-1245-class bug-bearing semantics at zero extra
+    /// state-cell cost — the intermediate between `-zero` (masks
+    /// bugs) and `-anyseq` (state-space explosion). When both
+    /// `--setundef-anyseq` and `--setundef-anyconst` are passed,
+    /// `--setundef-anyseq` wins (strictly more permissive).
+    #[arg(long = "setundef-anyconst")]
+    setundef_anyconst: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2651,6 +2661,7 @@ fn sv_emit_btor2_per_module(args: SvEmitBtor2PerModuleArgs) -> Result<(), String
         primary_source_path: Some(args.file.display().to_string()),
         use_sv2v: args.preprocess_sv2v,
         setundef_anyseq: args.setundef_anyseq,
+        setundef_anyconst: args.setundef_anyconst,
         per_module_btor: true,
         per_module_output_dir: Some(output_dir.clone()),
         ..Default::default()

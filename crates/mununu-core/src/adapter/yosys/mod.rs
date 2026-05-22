@@ -80,7 +80,37 @@ pub struct YosysOptions {
     /// historical `setundef -zero` behaviour; small state space; bug
     /// silently transformed away). See the SOUNDNESS comment in
     /// [`build_script`] for the trade-off.
+    ///
+    /// **Precedence**: when both `setundef_anyseq` and
+    /// [`Self::setundef_anyconst`] are `true`, `setundef_anyseq`
+    /// wins (it is the strictly more permissive policy).
     pub setundef_anyseq: bool,
+    /// R-Y1 (§Phase 8) — When `true`, Yosys's `setundef -anyconst`
+    /// pass replaces every undefined net with a single nondeterministic
+    /// constant input (NOT a per-cycle state cell). The solver chooses
+    /// any concrete value at init; the value is then fixed for the
+    /// entire run. Strictly between `-zero` (deterministic; masks
+    /// bugs) and `-anyseq` (per-cycle havoc; state-space explosion):
+    /// adds `|undef_bits|` constant *inputs* without inflating the
+    /// per-cycle state count.
+    ///
+    /// **The intermediate the Caliptra CWE-1245 fixture has been
+    /// waiting for.** Under `-zero` the bug encodings `{5, 6, 7}` of
+    /// `boot_fsm_ns` are unreachable from the deterministic 0-init;
+    /// under `-anyseq` they appear but the state-bit count exceeds
+    /// `MAX_STATE_BITS = 20`. Under `-anyconst` the solver picks an
+    /// init in `{0..7}` and the run proceeds with that init held
+    /// constant; the bug-bearing encodings become reachable without
+    /// per-cycle havoc inflation.
+    ///
+    /// **Default: `false`** (preserves the historical `-zero`
+    /// behaviour; existing fixtures' verdicts unchanged). Opt in
+    /// via the API field or the CLI flag once R.0a / R.0b expose
+    /// it.
+    ///
+    /// **Precedence**: when both this and `setundef_anyseq` are
+    /// `true`, `setundef_anyseq` wins (strictly more permissive).
+    pub setundef_anyconst: bool,
     /// When `true`, the per-submodule BTOR2 emission path is engaged
     /// (R.0b — KMTS pivot). Each submodule reachable from the top is
     /// emitted as its own BTOR2 file by running Yosys once per
@@ -193,6 +223,7 @@ pub fn translate_sv(
         &btor_path,
         &hier_json_path,
         yopts.setundef_anyseq,
+        yopts.setundef_anyconst,
     );
 
     let output = Command::new(&yosys)
@@ -424,8 +455,13 @@ pub fn translate_sv_per_module(
     let mut outputs = Vec::with_capacity(submodules.len());
     for module_name in &submodules {
         let btor_path = out_dir.join(format!("{module_name}.btor2"));
-        let script =
-            build_per_module_script(&sources, module_name, &btor_path, yopts.setundef_anyseq);
+        let script = build_per_module_script(
+            &sources,
+            module_name,
+            &btor_path,
+            yopts.setundef_anyseq,
+            yopts.setundef_anyconst,
+        );
         run_yosys(&yosys, &script)?;
 
         let btor = std::fs::read_to_string(&btor_path).map_err(|e| AdapterError {
@@ -508,21 +544,42 @@ fn build_per_module_script(
     module: &str,
     btor_out: &Path,
     setundef_anyseq: bool,
+    setundef_anyconst: bool,
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
         .map(|p| format!("read_verilog -formal -sv {}", p.display()))
         .collect();
-    let setundef_pass = if setundef_anyseq {
-        "setundef -anyseq"
-    } else {
-        "setundef -zero"
-    };
+    let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
     format!(
         "{}; hierarchy -check -top {module}; proc; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         btor_out.display()
     )
+}
+
+/// R-Y1 (§Phase 8) — Three-way precedence for the Yosys `setundef`
+/// pass selection. `anyseq` wins over `anyconst` (strictly more
+/// permissive); `anyconst` wins over the default `zero`.
+///
+/// Trade-off table per §Phase 8 §8.1:
+///
+/// ```text
+///                  | extra state cells       | bug-bearing semantics
+/// -----------------+-------------------------+--------------------------
+/// `setundef -zero` | 0                       | NO (silently masks CWE-1245-class)
+/// `-anyconst`      | 0 (constant inputs)     | YES (init nondeterminism)
+/// `-anyseq`        | N per cycle per undef   | YES (per-cycle nondeterminism)
+/// ```
+///
+/// **Default**: `-zero` (preserves historical behaviour; existing
+/// fixtures' verdicts unchanged).
+fn select_setundef_pass(anyseq: bool, anyconst: bool) -> &'static str {
+    match (anyseq, anyconst) {
+        (true, _) => "setundef -anyseq",
+        (false, true) => "setundef -anyconst",
+        (false, false) => "setundef -zero",
+    }
 }
 
 /// Spawn Yosys with the given script. Captures stdout/stderr into the
@@ -1077,6 +1134,7 @@ fn build_script(
     btor_out: &Path,
     hier_json_out: &Path,
     setundef_anyseq: bool,
+    setundef_anyconst: bool,
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
@@ -1092,35 +1150,44 @@ fn build_script(
     // the pipeline succeed even when the blackbox body is empty — the
     // blackbox's outputs become uncontrollable free signals, exactly
     // the chaotic-stub semantics Document A §2 prescribes.
-    // SOUNDNESS — `setundef -anyseq` vs `setundef -zero`:
+    // SOUNDNESS — `setundef` three-way trade-off (R-Y1, §Phase 8 §8.1):
     //
     // `setundef` decides how Yosys treats nets that have no assigned
     // value on some path (an `always_comb` case statement with no
     // `default:` arm; an `unique casez` with unmatched encodings).
     //
-    // - `-zero` pins them to 0. Deterministic; state space stays
-    //   small; **silently de-bugs CWE-1245-class defects** because
-    //   the unmatched-case path becomes a deterministic transition
-    //   to 0 instead of an admissible-any-value sink.
+    // - `-zero` (default) pins them to 0. Deterministic; state space
+    //   stays small; **silently de-bugs CWE-1245-class defects**
+    //   because the unmatched-case path becomes a deterministic
+    //   transition to 0 instead of an admissible-any-value sink.
+    //
+    // - `-anyconst` introduces one nondeterministic *constant input*
+    //   per undef bit (NOT per-cycle state cells). Solver picks any
+    //   concrete value at init; value is then fixed for the run.
+    //   Preserves CWE-1245-class bug-bearing semantics at zero
+    //   extra state-cell cost — for a 3-bit FSM register this is 3
+    //   constant inputs ≡ 8 init choices, vs `-anyseq`'s 2^56
+    //   inflation on the Caliptra fixture. This is **the
+    //   intermediate the Caliptra CWE-1245 fixture has been
+    //   waiting for.** Opt in via `YosysOptions::setundef_anyconst`.
+    //
     // - `-anyseq` makes them free symbolic choices each cycle.
     //   Preserves the bug-bearing semantics, but introduces fresh
-    //   `$anyseq` state cells at each undefined point — the state-
-    //   bit count explodes (≈ 56 bits on the Caliptra fixture
+    //   `$anyseq` state cells at each undefined point — the
+    //   state-bit count explodes (≈ 56 bits on the Caliptra fixture
     //   vs ≈ 19 bits under `-zero`). For designs near the
     //   `MAX_STATE_BITS` cap, `-anyseq` pushes the design *over*
-    //   the cap and the bit-blaster refuses it.
+    //   the cap and the bit-blaster refuses it. Opt in via
+    //   `YosysOptions::setundef_anyseq`.
     //
-    // mununu defaults to `-zero` (small state space; CWE-1245 hidden
-    // unless re-instated). The Phase A.4 step 4.6 finding documented
-    // this trade-off explicitly. Designs that need the bug-bearing
-    // semantics opt in via `YosysOptions::setundef_anyseq = true`,
-    // accepting the state-space cost; the all-SMT predicate-image
-    // enumerator then surfaces the violating encodings.
-    let setundef_pass = if setundef_anyseq {
-        "setundef -anyseq"
-    } else {
-        "setundef -zero"
-    };
+    // Precedence when multiple flags are set: `-anyseq` wins over
+    // `-anyconst` (strictly more permissive); `-anyconst` wins over
+    // the default `-zero`. mununu defaults to `-zero` (small state
+    // space; CWE-1245 hidden unless re-instated). The Phase A.4
+    // step 4.6 + §Phase 8 §8.2 documented this trade-off explicitly.
+    // Per-signal granularity (anyconst only on selected registers)
+    // is R-Y2 (§Phase 8 §8.1), shipping post-R-Y1.
+    let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
     format!(
         "{}; {hier}; proc; write_json {}; cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
@@ -1218,6 +1285,66 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    // ----- R-Y1 (§Phase 8): setundef 3-way precedence ----------------
+
+    #[test]
+    fn select_setundef_pass_defaults_to_zero() {
+        assert_eq!(select_setundef_pass(false, false), "setundef -zero");
+    }
+
+    #[test]
+    fn select_setundef_pass_anyconst_wins_over_zero() {
+        assert_eq!(select_setundef_pass(false, true), "setundef -anyconst");
+    }
+
+    #[test]
+    fn select_setundef_pass_anyseq_wins_over_anyconst() {
+        // Precedence: anyseq is strictly more permissive than anyconst.
+        // When both flags are set, anyseq must win so the caller gets
+        // the most-bug-bearing semantics (zero false-negatives at the
+        // cost of state-space).
+        assert_eq!(select_setundef_pass(true, true), "setundef -anyseq");
+    }
+
+    #[test]
+    fn select_setundef_pass_anyseq_wins_when_alone() {
+        assert_eq!(select_setundef_pass(true, false), "setundef -anyseq");
+    }
+
+    #[test]
+    fn yosys_options_default_has_setundef_anyconst_false() {
+        // R-Y1 strict additivity: the new field must default to false
+        // so existing fixtures' verdicts are unchanged.
+        let opts = YosysOptions::default();
+        assert!(!opts.setundef_anyconst);
+        assert!(!opts.setundef_anyseq);
+    }
+
+    #[test]
+    fn build_per_module_script_emits_anyconst_when_flagged() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/foo.sv")];
+        let btor = PathBuf::from("/tmp/out.btor");
+
+        let zero_script = build_per_module_script(&sources, "top", &btor, false, false);
+        assert!(zero_script.contains("setundef -zero"));
+        assert!(!zero_script.contains("setundef -anyconst"));
+        assert!(!zero_script.contains("setundef -anyseq"));
+
+        let anyconst_script = build_per_module_script(&sources, "top", &btor, false, true);
+        assert!(anyconst_script.contains("setundef -anyconst"));
+        assert!(!anyconst_script.contains("setundef -zero"));
+
+        let anyseq_script = build_per_module_script(&sources, "top", &btor, true, false);
+        assert!(anyseq_script.contains("setundef -anyseq"));
+        assert!(!anyseq_script.contains("setundef -anyconst"));
+
+        // Precedence: both flags set → anyseq wins
+        let both_script = build_per_module_script(&sources, "top", &btor, true, true);
+        assert!(both_script.contains("setundef -anyseq"));
+        assert!(!both_script.contains("setundef -anyconst"));
     }
 
     // ----- Hierarchy JSON parser tests (yosys-free) ------------------
