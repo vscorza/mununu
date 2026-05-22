@@ -21,10 +21,14 @@
 
 pub mod ast;
 pub mod bit_blast;
+pub mod cegar;
 pub mod dep_graph;
 pub mod kmts_lift;
 pub mod parser;
 
+pub use cegar::{
+    CegarIteration, CegarOptions, CegarTermination, CegarTrace, PredicateSource, cegar_refine_loop,
+};
 pub use kmts_lift::{
     KmtsLiftOptions, KmtsLiftResult, LiftedPredicate, PredicateCubeLiftOptions,
     PredicateCubeLiftResult, PredicateSpec, lift_btor2_to_kmts, predicate_cube_lift,
