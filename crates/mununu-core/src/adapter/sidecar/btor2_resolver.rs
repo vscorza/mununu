@@ -77,6 +77,7 @@ pub fn build_input_field_domains(
                 variants: inp.variants.clone(),
                 value_map: inp.value_map.clone(),
                 combinational: false,
+                init_policy: inp.init_policy,
                 note: None,
             };
             let resolved = super::resolve_to_field_domain(&sig_view, annotation);
@@ -131,6 +132,7 @@ mod tests {
             variants: None,
             value_map: None,
             combinational: false,
+            init_policy: crate::adapter::systemverilog::annotation::InitPolicy::Inherit,
             note: None,
         });
 
@@ -155,6 +157,7 @@ mod tests {
             variants: None,
             value_map: None,
             combinational: false,
+            init_policy: crate::adapter::systemverilog::annotation::InitPolicy::Inherit,
             note: None,
         });
         let symbols: HashMap<i64, String> = HashMap::new();
@@ -174,6 +177,7 @@ mod tests {
             variants: None,
             value_map: None,
             combinational: false,
+            init_policy: crate::adapter::systemverilog::annotation::InitPolicy::Inherit,
             note: None,
         });
         ann.discovered_values.insert(

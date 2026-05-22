@@ -111,6 +111,22 @@ pub struct YosysOptions {
     /// **Precedence**: when both this and `setundef_anyseq` are
     /// `true`, `setundef_anyseq` wins (strictly more permissive).
     pub setundef_anyconst: bool,
+    /// R-Y2 (§Phase 8 §8.1) — Per-signal init-policy overrides:
+    /// `(signal_name, InitPolicy)` pairs. The Yosys script-builder
+    /// emits `setattr -set <attr> <val> w:<signal>` for each entry
+    /// between `hierarchy` and `proc`, giving surgical control over
+    /// individual signals. **Per-signal overrides take precedence
+    /// over the global `setundef_*` flags for the signals listed**
+    /// — e.g. set `setundef_anyconst = false` globally but list
+    /// `("boot_fsm_ns", InitPolicy::Anyconst)` in this vector to
+    /// apply anyconst only to that one signal (the Caliptra fixture
+    /// pattern; closes §Phase 8 §8.2's load-bearing fix).
+    ///
+    /// **Default**: empty vec (no overrides; global policy applies
+    /// to all signals). Populated by `crates/mununu-cli/src/loader.rs`
+    /// from the sidecar's `SvAnnotation::init_policy_overrides()` —
+    /// see that helper for the deterministic ordering.
+    pub init_policy_overrides: InitPolicyOverrides,
     /// When `true`, the per-submodule BTOR2 emission path is engaged
     /// (R.0b — KMTS pivot). Each submodule reachable from the top is
     /// emitted as its own BTOR2 file by running Yosys once per
@@ -224,6 +240,7 @@ pub fn translate_sv(
         &hier_json_path,
         yopts.setundef_anyseq,
         yopts.setundef_anyconst,
+        &yopts.init_policy_overrides,
     );
 
     let output = Command::new(&yosys)
@@ -461,6 +478,7 @@ pub fn translate_sv_per_module(
             &btor_path,
             yopts.setundef_anyseq,
             yopts.setundef_anyconst,
+            &yopts.init_policy_overrides,
         );
         run_yosys(&yosys, &script)?;
 
@@ -545,14 +563,16 @@ fn build_per_module_script(
     btor_out: &Path,
     setundef_anyseq: bool,
     setundef_anyconst: bool,
+    init_policy_overrides: &InitPolicyOverrides,
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
         .map(|p| format!("read_verilog -formal -sv {}", p.display()))
         .collect();
     let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
+    let per_signal = emit_init_policy_setattrs(init_policy_overrides);
     format!(
-        "{}; hierarchy -check -top {module}; proc; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        "{}; hierarchy -check -top {module}; {per_signal}proc; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         btor_out.display()
     )
@@ -1089,45 +1109,77 @@ fn verify_no_verific(yosys: &Path) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Build the Yosys script to elaborate `sources` into a BTOR2 file.
+// `build_script` (defined further below) elaborates `sources` into a
+// BTOR2 file. The pipeline is intentionally **non-pruning** —
+// verification benefits
+// from observing every register, even those without an external output.
+// `prep` and `opt -fast` are explicitly avoided because they strip cells
+// not feeding outputs / asserts and would silently produce an empty BTOR2
+// for SV without assertions.
+//
+// Components of `build_script` (defined further below), in order:
+//
+//  1. `read_verilog -formal -sv` — parse, enabling SVA / formal constructs.
+//  2. `hierarchy -top X` — select the design's root.
+//  3. `proc` — lower always-blocks to RTL netlist.
+//  4. `write_json <hier>` — **before flatten** — capture the elaborated
+//     hierarchy (modules, ports with directions, attributes) so the
+//     driver can detect `(* blackbox *)` modules and auto-emit
+//     `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars
+//     (Document B task B2 + B3). Without this snapshot, `flatten`
+//     erases module boundaries before the driver gets a chance to see
+//     them.
+//  5. `flatten` — inline submodule instances.
+//  6. `async2sync` — convert async-reset / async-set cells to plain
+//     synchronous DFFs while **preserving the synchronous structure**
+//     (the clock is implicit in BTOR2's `state` semantics, not exposed
+//     as edge-detect combinational logic). This lets `chformal -lower`
+//     translate the assertions cleanly without introducing the `value +
+//     shadow + previous-clk` triple-state-cell encoding that
+//     `clk2fflogic` would. The previous (`clk2fflogic`-based) script
+//     produced ~3 state cells per user FF group; this script produces
+//     1, matching mununu's "each CLTS transition = one clock edge"
+//     semantics natively.
+//  7. `chformal -lower` — translate SVA `assert` / `assume` / `cover` into
+//     BTOR2 `bad` / `constraint` / fair / `justice` signals. No-op if no
+//     SVA is present in the design.
+//  8. `dffunmap` — unmap SDFF (synchronous-reset) cells to plain DFF +
+//     explicit reset logic (write_btor only accepts plain DFF).
+//  9. `setundef -zero` — replace any remaining X / undef bits with 0
+//     (deterministic; bit-blaster does not model X-prop).
+// 10. `write_btor` — emit the BTOR2.
+
+/// R-Y2 (§Phase 8 §8.1) — Per-signal init-policy override list.
 ///
-/// The pipeline is intentionally **non-pruning** — verification benefits
-/// from observing every register, even those without an external output.
-/// `prep` and `opt -fast` are explicitly avoided because they strip cells
-/// not feeding outputs / asserts and would silently produce an empty BTOR2
-/// for SV without assertions.
-///
-/// Components, in order:
-///
-/// 1. `read_verilog -formal -sv` — parse, enabling SVA / formal constructs.
-/// 2. `hierarchy -top X` — select the design's root.
-/// 3. `proc` — lower always-blocks to RTL netlist.
-/// 4. `write_json <hier>` — **before flatten** — capture the elaborated
-///    hierarchy (modules, ports with directions, attributes) so the
-///    driver can detect `(* blackbox *)` modules and auto-emit
-///    `BlackBoxInterface.json` + `GapMarkerReport.json` sidecars
-///    (Document B task B2 + B3). Without this snapshot, `flatten`
-///    erases module boundaries before the driver gets a chance to see
-///    them.
-/// 5. `flatten` — inline submodule instances.
-/// 6. `async2sync` — convert async-reset / async-set cells to plain
-///    synchronous DFFs while **preserving the synchronous structure**
-///    (the clock is implicit in BTOR2's `state` semantics, not exposed
-///    as edge-detect combinational logic). This lets `chformal -lower`
-///    translate the assertions cleanly without introducing the `value +
-///    shadow + previous-clk` triple-state-cell encoding that
-///    `clk2fflogic` would. The previous (`clk2fflogic`-based) script
-///    produced ~3 state cells per user FF group; this script produces
-///    1, matching mununu's "each CLTS transition = one clock edge"
-///    semantics natively.
-/// 7. `chformal -lower` — translate SVA `assert` / `assume` / `cover` into
-///    BTOR2 `bad` / `constraint` / fair / `justice` signals. No-op if no
-///    SVA is present in the design.
-/// 8. `dffunmap` — unmap SDFF (synchronous-reset) cells to plain DFF +
-///    explicit reset logic (write_btor only accepts plain DFF).
-/// 9. `setundef -zero` — replace any remaining X / undef bits with 0
-///    (deterministic; bit-blaster does not model X-prop).
-/// 10. `write_btor` — emit the BTOR2.
+/// Each pair is `(signal_name, InitPolicy)`. The Yosys script-builder
+/// emits `setattr -mod -set <attr> <val> w:<signal>` for each entry
+/// between `read_verilog` and `proc`, giving surgical control over
+/// individual signals (e.g. anyconst on `boot_fsm_ns` while other
+/// undefs stay zero on the Caliptra fixture).
+pub type InitPolicyOverrides = Vec<(
+    String,
+    crate::adapter::systemverilog::annotation::InitPolicy,
+)>;
+
+/// R-Y2 — Emit one Yosys `setattr` command per init-policy override.
+/// Returns an empty string when overrides is empty (no-op insertion
+/// preserves the legacy script shape).
+fn emit_init_policy_setattrs(overrides: &InitPolicyOverrides) -> String {
+    let mut commands: Vec<String> = Vec::new();
+    for (name, policy) in overrides {
+        if let Some((attr, val)) = policy.yosys_attribute() {
+            commands.push(format!("setattr -set {attr} {val} w:{name}"));
+        }
+    }
+    if commands.is_empty() {
+        String::new()
+    } else {
+        // Trailing semicolon so the caller can concatenate without
+        // worrying about whether overrides are present.
+        format!("{}; ", commands.join("; "))
+    }
+}
+
 fn build_script(
     sources: &[PathBuf],
     top: Option<&str>,
@@ -1135,6 +1187,7 @@ fn build_script(
     hier_json_out: &Path,
     setundef_anyseq: bool,
     setundef_anyconst: bool,
+    init_policy_overrides: &InitPolicyOverrides,
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
@@ -1188,8 +1241,9 @@ fn build_script(
     // Per-signal granularity (anyconst only on selected registers)
     // is R-Y2 (§Phase 8 §8.1), shipping post-R-Y1.
     let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
+    let per_signal = emit_init_policy_setattrs(init_policy_overrides);
     format!(
-        "{}; {hier}; proc; write_json {}; cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        "{}; {hier}; {per_signal}proc; write_json {}; cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         hier_json_out.display(),
         btor_out.display()
@@ -1327,24 +1381,90 @@ mod tests {
         use std::path::PathBuf;
         let sources = vec![PathBuf::from("/tmp/foo.sv")];
         let btor = PathBuf::from("/tmp/out.btor");
+        let no_overrides: InitPolicyOverrides = Vec::new();
 
-        let zero_script = build_per_module_script(&sources, "top", &btor, false, false);
+        let zero_script =
+            build_per_module_script(&sources, "top", &btor, false, false, &no_overrides);
         assert!(zero_script.contains("setundef -zero"));
         assert!(!zero_script.contains("setundef -anyconst"));
         assert!(!zero_script.contains("setundef -anyseq"));
 
-        let anyconst_script = build_per_module_script(&sources, "top", &btor, false, true);
+        let anyconst_script =
+            build_per_module_script(&sources, "top", &btor, false, true, &no_overrides);
         assert!(anyconst_script.contains("setundef -anyconst"));
         assert!(!anyconst_script.contains("setundef -zero"));
 
-        let anyseq_script = build_per_module_script(&sources, "top", &btor, true, false);
+        let anyseq_script =
+            build_per_module_script(&sources, "top", &btor, true, false, &no_overrides);
         assert!(anyseq_script.contains("setundef -anyseq"));
         assert!(!anyseq_script.contains("setundef -anyconst"));
 
         // Precedence: both flags set → anyseq wins
-        let both_script = build_per_module_script(&sources, "top", &btor, true, true);
+        let both_script =
+            build_per_module_script(&sources, "top", &btor, true, true, &no_overrides);
         assert!(both_script.contains("setundef -anyseq"));
         assert!(!both_script.contains("setundef -anyconst"));
+    }
+
+    // ---- R-Y2 (§Phase 8 §8.1): per-signal init policy ----
+
+    #[test]
+    fn emit_init_policy_setattrs_empty_returns_empty_string() {
+        let empty: InitPolicyOverrides = Vec::new();
+        assert!(emit_init_policy_setattrs(&empty).is_empty());
+    }
+
+    #[test]
+    fn emit_init_policy_setattrs_skips_inherit() {
+        use crate::adapter::systemverilog::annotation::InitPolicy;
+        let overrides: InitPolicyOverrides = vec![("ignored".to_string(), InitPolicy::Inherit)];
+        // Inherit yields no attribute → emitted string is empty.
+        assert!(emit_init_policy_setattrs(&overrides).is_empty());
+    }
+
+    #[test]
+    fn emit_init_policy_setattrs_anyconst_per_signal() {
+        use crate::adapter::systemverilog::annotation::InitPolicy;
+        let overrides: InitPolicyOverrides = vec![
+            ("boot_fsm_ns".to_string(), InitPolicy::Anyconst),
+            ("other_reg".to_string(), InitPolicy::Zero),
+        ];
+        let cmds = emit_init_policy_setattrs(&overrides);
+        assert!(cmds.contains("setattr -set anyconst 1 w:boot_fsm_ns"));
+        assert!(cmds.contains("setattr -set init 0 w:other_reg"));
+        // Trailing semicolon-space so caller can concatenate.
+        assert!(cmds.ends_with("; "));
+    }
+
+    #[test]
+    fn build_per_module_script_includes_per_signal_setattrs() {
+        use crate::adapter::systemverilog::annotation::InitPolicy;
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/foo.sv")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let overrides: InitPolicyOverrides =
+            vec![("boot_fsm_ns".to_string(), InitPolicy::Anyconst)];
+        // Global policy stays default (-zero); per-signal anyconst
+        // applies only to boot_fsm_ns.
+        let script = build_per_module_script(&sources, "top", &btor, false, false, &overrides);
+        assert!(
+            script.contains("setattr -set anyconst 1 w:boot_fsm_ns"),
+            "per-signal setattr missing from script: {script}"
+        );
+        assert!(
+            script.contains("setundef -zero"),
+            "global -zero policy should still apply: {script}"
+        );
+        // Per-signal setattr comes between hierarchy and proc.
+        let hier_pos = script.find("hierarchy").expect("hierarchy command present");
+        let setattr_pos = script
+            .find("setattr -set anyconst")
+            .expect("setattr present");
+        let proc_pos = script.find("; proc;").expect("proc command present");
+        assert!(
+            hier_pos < setattr_pos && setattr_pos < proc_pos,
+            "setattr must appear between hierarchy and proc; ordering = hier@{hier_pos} setattr@{setattr_pos} proc@{proc_pos}"
+        );
     }
 
     // ----- Hierarchy JSON parser tests (yosys-free) ------------------

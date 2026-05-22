@@ -683,6 +683,7 @@ fn build_per_module_annotation(
                 variants: conn.variants.clone(),
                 value_map: conn.value_map.clone(),
                 label_name: shared_label,
+                init_policy: annotation::InitPolicy::Inherit,
             });
         }
     }

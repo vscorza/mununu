@@ -8,6 +8,12 @@
       "abstraction": "bounded_counter",
       "bound": 1,
       "note": "Saturating {ZERO, NONZERO} for the reset-window timer."
+    },
+    {
+      "name": "boot_fsm_ns",
+      "abstraction": "discover",
+      "init_policy": "anyconst",
+      "note": "R-Y2 (§Phase 8): per-signal anyconst on the bug-bearing FSM register so the CWE-1245 encodings {5,6,7} are reachable from init without the global -anyseq cap-explosion. Other undefs stay at -zero per the global YosysOptions default."
     }
   ],
   "inputs": [

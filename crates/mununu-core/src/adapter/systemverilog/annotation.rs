@@ -98,9 +98,52 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "is_false")]
     pub combinational: bool,
 
+    /// R-Y2 (§Phase 8 §8.1) — per-signal init policy override. When
+    /// not `Inherit`, this signal's undef bits are treated per the
+    /// chosen policy (zero / anyconst / anyseq) regardless of the
+    /// global `YosysOptions::setundef_*` flags. The Yosys script-
+    /// builder emits `setattr -mod -set <attr> <val> w:<name>`
+    /// between `read_verilog` and `proc` to apply the override.
+    /// **Default `Inherit`** — strict additivity; legacy sidecars
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "is_inherit_init_policy")]
+    pub init_policy: InitPolicy,
+
     /// Human-readable note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// R-Y2 — serde skip-helper: skip serialising `init_policy` when it
+/// is the default `Inherit`. Keeps existing sidecars round-trip stable.
+fn is_inherit_init_policy(p: &InitPolicy) -> bool {
+    matches!(p, InitPolicy::Inherit)
+}
+
+impl SvAnnotation {
+    /// R-Y2 (§Phase 8 §8.1) — Collect per-signal init-policy overrides
+    /// from the sidecar's `signals` + `inputs` declarations. Returns
+    /// `(signal_name, InitPolicy)` pairs for every signal whose policy
+    /// is not `Inherit`. The Yosys script-builder consumes this to
+    /// emit `setattr -mod -set <attr> <val> w:<signal>` commands.
+    ///
+    /// Order is deterministic (signals first, in declaration order,
+    /// then inputs in declaration order) so the emitted script is
+    /// stable across runs.
+    pub fn init_policy_overrides(&self) -> Vec<(String, InitPolicy)> {
+        let mut out: Vec<(String, InitPolicy)> = Vec::new();
+        for sig in &self.signals {
+            if !matches!(sig.init_policy, InitPolicy::Inherit) {
+                out.push((sig.name.clone(), sig.init_policy));
+            }
+        }
+        for inp in &self.inputs {
+            if !matches!(inp.init_policy, InitPolicy::Inherit) {
+                out.push((inp.name.clone(), inp.init_policy));
+            }
+        }
+        out
+    }
 }
 
 /// Annotation for an input port.
@@ -135,6 +178,14 @@ pub struct InputAnnotation {
     /// between driving and receiving modules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_name: Option<String>,
+
+    /// R-Y2 (§Phase 8 §8.1) — per-input init policy override. Same
+    /// semantics as `SignalAnnotation::init_policy`; used when an
+    /// input port is the under-constrained constant the property
+    /// depends on (e.g. fuse / strap bits in the Caliptra context).
+    /// **Default `Inherit`** — strict additivity.
+    #[serde(default, skip_serializing_if = "is_inherit_init_policy")]
+    pub init_policy: InitPolicy,
 }
 
 /// Abstraction strategy for a signal.
@@ -161,6 +212,63 @@ pub enum SignalAbstraction {
 pub struct ValueMapEntry {
     pub name: String,
     pub value: i64,
+}
+
+/// R-Y2 (§Phase 8 §8.1) — Per-signal init policy. Selects which
+/// Yosys `setundef`-style treatment applies to *this signal* in
+/// isolation, overriding the global `setundef_zero` / `setundef_anyseq`
+/// / `setundef_anyconst` policy from `YosysOptions`.
+///
+/// The Yosys mechanism is the `(* anyconst *)` net attribute applied
+/// per signal via the `setattr -mod -set anyconst 1 w:<signal>`
+/// script command between `read_verilog` and `proc` passes. This
+/// gives surgical control — `anyconst` only on the bug-relevant
+/// register (e.g. `boot_fsm_ns` in the Caliptra fixture) while
+/// other undefs stay `zero`.
+///
+/// **Default**: `Inherit` — apply the global policy from
+/// `YosysOptions`. Explicit per-signal opt-in is the load-bearing
+/// case for the Caliptra anchor per §Phase 8 §8.2.
+///
+/// **Strict additivity**: legacy sidecars without this field
+/// continue to load (default `Inherit`); existing fixtures'
+/// verdicts unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitPolicy {
+    /// Defer to the global `YosysOptions::setundef_*` flags. This
+    /// is the legacy behaviour and the load-preserving default for
+    /// sidecars that pre-date R-Y2.
+    #[default]
+    Inherit,
+    /// Override: pin this signal's undefined bits to 0. Cheapest;
+    /// matches the global `setundef -zero` semantics for this
+    /// signal alone.
+    Zero,
+    /// Override: this signal's undefined bits become one
+    /// nondeterministic constant input each. Solver picks any
+    /// concrete value at init; value stays fixed for the run. The
+    /// Caliptra anchor uses this on `boot_fsm_ns` (3 bits → 8 init
+    /// choices) while other undefs stay `zero`.
+    Anyconst,
+    /// Override: this signal's undefined bits become free symbolic
+    /// choices each cycle. Per-signal `$anyseq` cells; small
+    /// per-signal cost.
+    Anyseq,
+}
+
+impl InitPolicy {
+    /// Returns the Yosys per-signal attribute name + value pair,
+    /// or `None` for `Inherit` (the global policy applies).
+    /// Used by the Yosys script-builder to emit `setattr` commands.
+    pub fn yosys_attribute(self) -> Option<(&'static str, u32)> {
+        match self {
+            InitPolicy::Inherit => None,
+            InitPolicy::Zero => Some(("init", 0)), // emitted as `setattr -set init 0`
+            InitPolicy::Anyconst => Some(("anyconst", 1)),
+            InitPolicy::Anyseq => Some(("anyseq", 1)),
+        }
+    }
 }
 
 /// A property to verify.
@@ -669,6 +777,7 @@ fn resolve_input_domain(
         variants: inp.variants.clone(),
         value_map: inp.value_map.clone(),
         combinational: false,
+        init_policy: inp.init_policy,
         note: None,
     };
     resolve_signal_domain(&sig, ann)
@@ -894,6 +1003,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     variants: Some(variants.clone()),
                     value_map: None,
                     combinational: false,
+                    init_policy: InitPolicy::Inherit,
                     note: Some("auto-detected typedef enum".to_string()),
                 });
             }
@@ -912,6 +1022,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     variants: None,
                     value_map: None,
                     combinational: false,
+                    init_policy: InitPolicy::Inherit,
                     note: Some(note.to_string()),
                 });
             }
@@ -944,6 +1055,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     variants: None,
                     value_map: None,
                     combinational: true,
+                    init_policy: InitPolicy::Inherit,
                     note: Some(note.to_string()),
                 });
             }
@@ -1019,6 +1131,7 @@ pub fn build_input_annotations(module: &super::ast::Module) -> Vec<InputAnnotati
                 variants: None,
                 value_map: None,
                 label_name: None,
+                init_policy: InitPolicy::Inherit,
             }
         })
         .collect()
@@ -1208,6 +1321,110 @@ pub fn generate_multi_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- R-Y2 (§Phase 8 §8.1) — per-signal init policy ----
+
+    #[test]
+    fn init_policy_defaults_to_inherit() {
+        assert!(matches!(InitPolicy::default(), InitPolicy::Inherit));
+    }
+
+    #[test]
+    fn init_policy_yosys_attribute_inherit_is_none() {
+        assert!(InitPolicy::Inherit.yosys_attribute().is_none());
+    }
+
+    #[test]
+    fn init_policy_yosys_attribute_anyconst() {
+        assert_eq!(
+            InitPolicy::Anyconst.yosys_attribute(),
+            Some(("anyconst", 1))
+        );
+    }
+
+    #[test]
+    fn init_policy_yosys_attribute_anyseq() {
+        assert_eq!(InitPolicy::Anyseq.yosys_attribute(), Some(("anyseq", 1)));
+    }
+
+    #[test]
+    fn init_policy_yosys_attribute_zero() {
+        assert_eq!(InitPolicy::Zero.yosys_attribute(), Some(("init", 0)));
+    }
+
+    #[test]
+    fn legacy_sidecar_without_init_policy_loads_with_inherit() {
+        // R-Y2 strict additivity: a sidecar that pre-dates R-Y2
+        // (no init_policy fields) must deserialise cleanly with
+        // init_policy = Inherit on every signal/input.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "legacy",
+            "signals": [
+                { "name": "reg_a", "abstraction": "boolean" }
+            ],
+            "inputs": [
+                { "name": "in_b", "abstraction": "boolean" }
+            ]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("legacy sidecar parses");
+        assert_eq!(ann.signals.len(), 1);
+        assert!(matches!(ann.signals[0].init_policy, InitPolicy::Inherit));
+        assert_eq!(ann.inputs.len(), 1);
+        assert!(matches!(ann.inputs[0].init_policy, InitPolicy::Inherit));
+        // init_policy_overrides() should return empty for an
+        // all-inherit sidecar.
+        assert!(ann.init_policy_overrides().is_empty());
+    }
+
+    #[test]
+    fn sidecar_with_anyconst_override_round_trips() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "caliptra",
+            "signals": [
+                {
+                    "name": "boot_fsm_ns",
+                    "abstraction": "boolean",
+                    "init_policy": "anyconst"
+                },
+                { "name": "other_reg", "abstraction": "boolean" }
+            ]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parses");
+        assert!(matches!(ann.signals[0].init_policy, InitPolicy::Anyconst));
+        assert!(matches!(ann.signals[1].init_policy, InitPolicy::Inherit));
+        let overrides = ann.init_policy_overrides();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].0, "boot_fsm_ns");
+        assert!(matches!(overrides[0].1, InitPolicy::Anyconst));
+    }
+
+    #[test]
+    fn init_policy_overrides_orders_signals_then_inputs() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [
+                { "name": "sig_a", "abstraction": "boolean", "init_policy": "anyconst" },
+                { "name": "sig_b", "abstraction": "boolean" },
+                { "name": "sig_c", "abstraction": "boolean", "init_policy": "anyseq" }
+            ],
+            "inputs": [
+                { "name": "in_x", "abstraction": "boolean", "init_policy": "zero" },
+                { "name": "in_y", "abstraction": "boolean" }
+            ]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parses");
+        let overrides = ann.init_policy_overrides();
+        // signals first (in declaration order, skipping Inherit), then inputs.
+        let names: Vec<&str> = overrides.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["sig_a", "sig_c", "in_x"]);
+        // policies preserved
+        assert!(matches!(overrides[0].1, InitPolicy::Anyconst));
+        assert!(matches!(overrides[1].1, InitPolicy::Anyseq));
+        assert!(matches!(overrides[2].1, InitPolicy::Zero));
+    }
 
     #[test]
     fn parse_minimal_sidecar() {

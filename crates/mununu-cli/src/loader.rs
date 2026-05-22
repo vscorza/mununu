@@ -210,12 +210,45 @@ pub(crate) fn load_with_adapter_mode_extra(
             let setundef_anyconst = std::env::var("MUNUNU_YOSYS_SETUNDEF_ANYCONST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+            // R-Y2 (§Phase 8 §8.1) — load the SV sidecar if it exists
+            // and extract per-signal init-policy overrides. The
+            // overrides are surgical (per-signal anyconst on declared
+            // signals only, keeping every other undef at zero), which
+            // is the load-bearing Caliptra unblock per §Phase 8 §8.2.
+            // Silently skips if no sidecar exists or the schema does
+            // not parse — non-blocking for fixtures that pre-date R-Y2.
+            let init_policy_overrides: mununu_core::adapter::yosys::InitPolicyOverrides = {
+                let mut overrides = Vec::new();
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    let candidate = path.with_file_name(format!("{stem}.mununu.json"));
+                    if candidate.exists()
+                        && let Ok(content) = fs::read_to_string(&candidate)
+                        && let Ok(ann) = serde_json::from_str::<
+                            mununu_core::adapter::systemverilog::annotation::SvAnnotation,
+                        >(&content)
+                    {
+                        overrides = ann.init_policy_overrides();
+                        if !overrides.is_empty() {
+                            eprintln!(
+                                "R-Y2: applying per-signal init-policy overrides from sidecar: {}",
+                                overrides
+                                    .iter()
+                                    .map(|(n, p)| format!("{n}={p:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                    }
+                }
+                overrides
+            };
             let yopts = mununu_core::adapter::yosys::YosysOptions {
                 primary_source_path: Some(path.to_string_lossy().into_owned()),
                 additional_sources: additional,
                 use_sv2v,
                 setundef_anyseq,
                 setundef_anyconst,
+                init_policy_overrides,
                 ..Default::default()
             };
             log_adapter_output_with_dir(
