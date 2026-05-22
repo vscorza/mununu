@@ -492,9 +492,17 @@ fn build_discovery_script(sources: &[PathBuf], top: Option<&str>, hier_json_out:
 }
 
 /// Per-submodule emission script. Runs the same chain as `build_script`
-/// but with `<m>` as the top — no `flatten`, no `cutpoint -blackbox`
-/// (each submodule is treated as a self-contained design here). The
-/// BTOR2 emitted carries only `<m>`'s state cells and transitions.
+/// but with `<m>` as the top — *each submodule is treated as a
+/// self-contained design here*. Internal `flatten` is applied within
+/// each submodule's scope because BTOR2 has no notion of sub-module
+/// references: any `$paramod` parametrised cells the submodule
+/// instantiates must be inlined into the emitted BTOR2.
+///
+/// The "no flatten" rule of the KMTS-pipeline frontend applies at the
+/// *discovery* boundary (so per-submodule enumeration sees real module
+/// boundaries) and at *cross-submodule composition* (driven by the
+/// top-level netlist, not by Yosys). Within a single submodule's BTOR2,
+/// flatten is the correct call.
 fn build_per_module_script(
     sources: &[PathBuf],
     module: &str,
@@ -511,7 +519,7 @@ fn build_per_module_script(
         "setundef -zero"
     };
     format!(
-        "{}; hierarchy -check -top {module}; proc; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        "{}; hierarchy -check -top {module}; proc; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         btor_out.display()
     )
@@ -587,7 +595,19 @@ pub fn enumerate_submodules(hier_json: &str, explicit_top: Option<&str>) -> Vec<
                 .and_then(|a| a.get("blackbox"))
                 .map(|v| v.as_str().is_some_and(|s| s.ends_with('1')))
                 .unwrap_or(false);
-            !is_bb
+            if is_bb {
+                return false;
+            }
+            // Yosys mangles parameterised module instances as
+            // `$paramod$<hash>\<original_name>`. These represent a
+            // specific parameter elaboration of a generic module and
+            // cannot be re-elaborated as `hierarchy -top` from the
+            // original source — the parameter context is lost outside
+            // the instantiating scope. Skip them; the parent wrapper's
+            // BTOR2 already contains the elaborated logic (Yosys's
+            // `write_btor` inlines parameterised cells because BTOR2
+            // has no notion of sub-module references).
+            !name.starts_with("$paramod")
         })
         .map(|(name, _)| name.clone())
         .collect();
