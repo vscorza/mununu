@@ -11,6 +11,7 @@ pub mod invert;
 mod memo;
 pub mod nnf;
 pub mod parity_game;
+pub mod parity_game_3v;
 pub mod parser;
 pub mod simplify;
 pub mod trit;
@@ -20,6 +21,10 @@ pub use evaluator::{
     Environment, EvalResult, EvaluationError, EvaluationOptions, Signature, WitnessMap, evaluate,
     evaluate_tri, evaluate_tri_with_options, evaluate_with_options,
     evaluate_with_options_and_automaton, evaluate_with_witnesses,
+};
+pub use parity_game_3v::{
+    FailureSubgame, GameEvaluation, Position3v, clts_has_non_sharp_transitions, evaluate_3v_game,
+    evaluate_3v_game_with_options,
 };
 pub use simplify::simplify;
 pub use trit::{Trit, TritSet};
