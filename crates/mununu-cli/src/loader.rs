@@ -253,18 +253,44 @@ pub(crate) fn load_with_adapter_mode_extra(
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             );
-                            // Re-serialise so the BTOR2 lifter sees the
-                            // widened variants + value_map. Falls back
-                            // to the raw content if serialisation fails
-                            // (would only happen on schema drift).
+                        }
+                        // R-S7 (§Phase 9 §9.1) — property-syntactic
+                        // seeding. Bridges the gap when R-S5 didn't
+                        // fire (no typedef on the signal) but a
+                        // property formula references discriminator
+                        // values like `count_3` or `mode_7`. Strictly
+                        // additive — only injects values not already
+                        // in the signal's value_map.
+                        let seeded = ann.apply_property_syntactic_seeding();
+                        if !seeded.is_empty() {
+                            eprintln!(
+                                "R-S7: seeding discriminators from property formulas: {}",
+                                seeded
+                                    .iter()
+                                    .map(|(s, vs)| format!(
+                                        "{s}=[{}]",
+                                        vs.iter()
+                                            .map(|v| v.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                        if !widened.is_empty() || !seeded.is_empty() {
+                            // Re-serialise so the BTOR2 lifter sees
+                            // the widened+seeded variants + value_map.
+                            // Falls back to the raw content if
+                            // serialisation fails (would only happen
+                            // on schema drift).
                             if let Ok(json) = serde_json::to_string_pretty(&ann) {
-                                // R-S5 debug aid: optionally dump the
-                                // widened JSON for inspection. Set
-                                // MUNUNU_R_S5_DUMP_PATH=/path/to/dump.json
-                                // to enable.
+                                // Debug aid (shared with R-S5):
+                                // MUNUNU_R_S5_DUMP_PATH=/path dumps the
+                                // post-widening JSON for inspection.
                                 if let Ok(dump_path) = std::env::var("MUNUNU_R_S5_DUMP_PATH") {
                                     let _ = std::fs::write(&dump_path, &json);
-                                    eprintln!("R-S5: dumped widened sidecar to {dump_path}");
+                                    eprintln!("R-S5/R-S7: dumped widened sidecar to {dump_path}");
                                 }
                                 widened_sidecar_json = Some(json);
                             }

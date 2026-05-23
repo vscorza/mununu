@@ -224,6 +224,151 @@ impl SvAnnotation {
         }
         applied
     }
+
+    /// R-S7 (§Phase 9 §9.1) — property-syntactic seeding. Walks every
+    /// property formula in the sidecar, collects predicate names of
+    /// the shape `<signal>_<integer-suffix>` where `<signal>` is a
+    /// declared signal in the sidecar, and adds the integer values as
+    /// abstraction discriminators for that signal (synthetic variant
+    /// name `<signal>_<n>` mirroring R-S5's UNMATCHED_<n> convention).
+    ///
+    /// **Bridges the gap between handwritten formulas and the
+    /// abstraction set.** When the user writes a property referencing
+    /// `count_3` or `mode_7` but the signal has no typedef for R-S5
+    /// to widen against, R-S7 picks up the values from the formula
+    /// text and ensures the abstraction layer keeps transitions to
+    /// those specific values.
+    ///
+    /// Strictly additive — only inserts values not already in the
+    /// signal's value_map. Signals with explicit `bit_blast` /
+    /// `boolean` / `ignored` abstractions are skipped (those don't
+    /// take per-value discriminators). Signals without any seeded
+    /// values from the property text are untouched.
+    ///
+    /// Returns `(signal_name, [seeded_values])` for each signal
+    /// widened, for caller logging.
+    pub fn apply_property_syntactic_seeding(&mut self) -> Vec<(String, Vec<i64>)> {
+        let mut harvest: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
+            std::collections::BTreeMap::new();
+        let signal_names: std::collections::HashSet<String> =
+            self.signals.iter().map(|s| s.name.clone()).collect();
+
+        for prop in &self.properties {
+            let Some(formula_text) = prop.formula.as_deref() else {
+                continue;
+            };
+            let Ok(formula) = crate::mu_calculus::parser::parse(formula_text) else {
+                continue;
+            };
+            for node in formula.nodes() {
+                let preds_in_node: Vec<String> = match node {
+                    crate::mu_calculus::Node::Predicate(name) => vec![name.clone()],
+                    crate::mu_calculus::Node::Modal { guard, .. } => guard
+                        .current
+                        .required
+                        .iter()
+                        .chain(guard.current.forbidden.iter())
+                        .chain(guard.next.required.iter())
+                        .chain(guard.next.forbidden.iter())
+                        .cloned()
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for pred in preds_in_node {
+                    let Some((sig, value)) = split_signal_integer_suffix(&pred, &signal_names)
+                    else {
+                        continue;
+                    };
+                    harvest.entry(sig).or_default().insert(value);
+                }
+            }
+        }
+
+        let mut applied = Vec::new();
+        for sig in &mut self.signals {
+            let Some(seeds) = harvest.get(&sig.name) else {
+                continue;
+            };
+            let widenable = matches!(
+                sig.abstraction,
+                SignalAbstraction::Discover | SignalAbstraction::Enum
+            );
+            if !widenable {
+                continue;
+            }
+            let mut value_map = sig.value_map.clone().unwrap_or_default();
+            let existing_values: std::collections::HashSet<i64> =
+                value_map.iter().map(|e| e.value).collect();
+            let mut added_now = Vec::new();
+            for &v in seeds {
+                if existing_values.contains(&v) {
+                    continue;
+                }
+                let variant = format!("{}_{}", sig.name, v);
+                value_map.push(ValueMapEntry {
+                    name: variant,
+                    value: v,
+                });
+                added_now.push(v);
+            }
+            if added_now.is_empty() {
+                continue;
+            }
+            // Refresh the variants list to mirror value_map order.
+            let mut variants = sig.variants.clone().unwrap_or_default();
+            for &v in &added_now {
+                variants.push(format!("{}_{}", sig.name, v));
+            }
+            sig.abstraction = SignalAbstraction::Enum;
+            sig.variants = Some(variants);
+            sig.value_map = Some(value_map);
+            applied.push((sig.name.clone(), added_now));
+        }
+        applied
+    }
+}
+
+/// R-S7 helper — split a predicate-name string of the shape
+/// `<signal>_<integer-suffix>` into `(signal, value)`. Uses the
+/// declared-signals set to disambiguate (e.g. `boot_fsm_ns_5` against
+/// declared `boot_fsm_ns` → splits at the last `_` boundary that
+/// matches a declared signal name).
+///
+/// Returns `None` when the predicate name does not parse this way —
+/// e.g. typedef-derived variants like `boot_fsm_ns_BOOT_IDLE` (non-
+/// numeric suffix), or names where no prefix matches a declared
+/// signal.
+fn split_signal_integer_suffix(
+    predicate: &str,
+    signal_names: &std::collections::HashSet<String>,
+) -> Option<(String, i64)> {
+    // Try every underscore split position; prefer the longest prefix
+    // that matches a declared signal (handles signal names containing
+    // underscores like `boot_fsm_ns`).
+    let bytes = predicate.as_bytes();
+    let mut best: Option<(String, i64)> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'_' {
+            continue;
+        }
+        let prefix = &predicate[..i];
+        let suffix = &predicate[i + 1..];
+        if !signal_names.contains(prefix) {
+            continue;
+        }
+        let Ok(value) = suffix.parse::<i64>() else {
+            continue;
+        };
+        // Prefer the longest matching prefix.
+        if best
+            .as_ref()
+            .map(|(p, _)| prefix.len() > p.len())
+            .unwrap_or(true)
+        {
+            best = Some((prefix.to_string(), value));
+        }
+    }
+    best
 }
 
 /// Annotation for an input port.
@@ -1999,6 +2144,166 @@ mod tests {
         let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
         assert_eq!(applied.len(), 1);
         assert_eq!(ann.signals[0].variants.as_ref().unwrap().len(), 8);
+    }
+
+    // ---- R-S7 (§Phase 9 §9.1) — property-syntactic predicate seeding ----
+
+    #[test]
+    fn r_s7_split_signal_integer_suffix_basic() {
+        let signals: std::collections::HashSet<String> =
+            ["count".to_string(), "boot_fsm_ns".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            split_signal_integer_suffix("count_5", &signals),
+            Some(("count".to_string(), 5))
+        );
+        assert_eq!(
+            split_signal_integer_suffix("boot_fsm_ns_7", &signals),
+            Some(("boot_fsm_ns".to_string(), 7))
+        );
+        // Longest-prefix-match wins
+        assert_eq!(
+            split_signal_integer_suffix("boot_fsm_ns_42", &signals),
+            Some(("boot_fsm_ns".to_string(), 42))
+        );
+        // Non-numeric suffix returns None (typedef variants handled by R-S5)
+        assert_eq!(
+            split_signal_integer_suffix("boot_fsm_ns_BOOT_IDLE", &signals),
+            None
+        );
+        // Unknown prefix returns None
+        assert_eq!(split_signal_integer_suffix("unknown_5", &signals), None);
+    }
+
+    #[test]
+    fn r_s7_seeds_integer_predicates_from_formula() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(SignalAnnotation {
+            name: "count".into(),
+            preserve: true,
+            abstraction: SignalAbstraction::Discover,
+            bound: None,
+            variants: None,
+            value_map: None,
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: None,
+            note: None,
+        });
+        ann.properties.push(PropertyAnnotation {
+            id: "p".into(),
+            formula: Some("nu X. ((!count_3) && ([] X))".into()),
+            description: None,
+            role: "guarantee".into(),
+            template_ref: None,
+        });
+        let applied = ann.apply_property_syntactic_seeding();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, "count");
+        assert_eq!(applied[0].1, vec![3]);
+        let sig = &ann.signals[0];
+        assert_eq!(sig.abstraction, SignalAbstraction::Enum);
+        let vm = sig.value_map.as_ref().unwrap();
+        assert_eq!(vm.len(), 1);
+        assert_eq!(vm[0].name, "count_3");
+        assert_eq!(vm[0].value, 3);
+    }
+
+    #[test]
+    fn r_s7_skips_signals_with_explicit_value_map() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(SignalAnnotation {
+            name: "count".into(),
+            preserve: true,
+            abstraction: SignalAbstraction::Enum,
+            bound: None,
+            variants: Some(vec!["ZERO".into(), "ONE".into()]),
+            value_map: Some(vec![
+                ValueMapEntry {
+                    name: "ZERO".into(),
+                    value: 0,
+                },
+                ValueMapEntry {
+                    name: "ONE".into(),
+                    value: 1,
+                },
+            ]),
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: None,
+            note: None,
+        });
+        ann.properties.push(PropertyAnnotation {
+            id: "p".into(),
+            formula: Some("nu X. ((!count_3) && ([] X))".into()),
+            description: None,
+            role: "guarantee".into(),
+            template_ref: None,
+        });
+        let applied = ann.apply_property_syntactic_seeding();
+        // count_3 is new (3 isn't in {0, 1}), so it gets added —
+        // additive, never overwrites existing.
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].1, vec![3]);
+        assert_eq!(ann.signals[0].value_map.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn r_s7_skips_non_widenable_abstractions() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(SignalAnnotation {
+            name: "flag".into(),
+            preserve: true,
+            abstraction: SignalAbstraction::Boolean,
+            bound: None,
+            variants: None,
+            value_map: None,
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: None,
+            note: None,
+        });
+        ann.properties.push(PropertyAnnotation {
+            id: "p".into(),
+            formula: Some("nu X. ((!flag_3) && ([] X))".into()),
+            description: None,
+            role: "guarantee".into(),
+            template_ref: None,
+        });
+        let applied = ann.apply_property_syntactic_seeding();
+        // Boolean abstraction can't take per-value discriminators; skipped.
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn r_s7_dedupes_existing_value_map_entries() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(SignalAnnotation {
+            name: "count".into(),
+            preserve: true,
+            abstraction: SignalAbstraction::Enum,
+            bound: None,
+            variants: Some(vec!["count_3".into()]),
+            value_map: Some(vec![ValueMapEntry {
+                name: "count_3".into(),
+                value: 3,
+            }]),
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: None,
+            note: None,
+        });
+        ann.properties.push(PropertyAnnotation {
+            id: "p".into(),
+            formula: Some("nu X. ((!count_3) && ([] X))".into()),
+            description: None,
+            role: "guarantee".into(),
+            template_ref: None,
+        });
+        let applied = ann.apply_property_syntactic_seeding();
+        // count_3 already in value_map → no-op.
+        assert!(applied.is_empty());
     }
 
     #[test]
