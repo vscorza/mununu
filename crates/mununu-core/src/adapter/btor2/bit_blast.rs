@@ -430,13 +430,68 @@ fn enumerate_and_blast(
 
     let state_names = enumerate_state_names(total_state_combos);
 
-    // Initial state derived from `init` lines (defaulting state to 0 where
-    // no init is declared — matches BTOR2 convention).
-    let init_state_idx = {
+    // Initial state(s) derived from `init` lines.
+    //
+    // Path 3 / Option A (§Phase 8 §8.2 residual closure): when a state
+    // cell has NO `Node::Init` line (which is how Yosys's
+    // `(* anyconst *)` attribute survives lowering to BTOR2), its
+    // initial value is **nondeterministic** — under R-Y2 + R-S5, every
+    // value in the cell's declared abstraction is an admissible init
+    // sample. The bit-blaster used to silently default such cells to
+    // zero, producing a single abstract initial state that hid the
+    // anyconst nondeterminism from the verdict (the residual the Path 3
+    // design note flagged on the Caliptra fixture).
+    //
+    // Stage 1: detect nondeterministic cells (no `Init` line in the
+    // BTOR2 file).
+    // Stage 2: enumerate the cartesian product of {deterministic init
+    // value for each cell WITH init} × {all admissible values for each
+    // cell WITHOUT init}, encode each combination as a state index.
+    //
+    // To bound state explosion when many anyconst cells coexist, the
+    // cartesian product is capped at `MAX_INITIAL_STATES = 256`. On
+    // cap exceedance, fall back to the legacy single-init behaviour
+    // and emit a soundness warning so the user can narrow the
+    // abstraction set or limit the per-signal init policy.
+    const MAX_INITIAL_STATES: usize = 256;
+    // Path 3 — restrict the nondeterministic-init set to the cells
+    // the user EXPLICITLY marked `init_policy: anyconst` via R-Y2
+    // sidecar. Yosys emits many cells without `Init` lines (reset
+    // synchronizers, FSM intermediates, undef bits under
+    // `setundef -anyseq/-anyconst` global policy); enumerating all
+    // of them as initial blows up immediately. Surgical anyconst
+    // declarations are the user's signal of intent.
+    let anyconst_symbols = sidecar_anyconst_symbols(options);
+    let nondet_init_nids =
+        nondeterministic_init_cells(file, &state_meta, &symbols, &anyconst_symbols);
+    let init_state_indices: Vec<usize> = {
         let mut init_env = make_initial_env(file, &state_meta, &input_meta, true);
         evaluate_pure(file, &mut init_env, /*honor_init=*/ true)?;
-        encode_state(&init_env, &state_meta, &cells).unwrap_or(0)
+        let combos = enumerate_initial_combos(&init_env, &state_meta, &cells, &nondet_init_nids);
+        if combos.len() > MAX_INITIAL_STATES {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "anyconst-driven initial state set has {n} entries (cap {cap}); \
+                     falling back to single-init state — verdict at init is unsound \
+                     for the nondeterministic init samples beyond the first.",
+                    n = combos.len(),
+                    cap = MAX_INITIAL_STATES
+                ),
+                location: None,
+            });
+            let single = encode_state(&init_env, &state_meta, &cells).unwrap_or(0);
+            vec![single]
+        } else if combos.is_empty() {
+            // Fallback to legacy: no nondet cells, single init state.
+            let single = encode_state(&init_env, &state_meta, &cells).unwrap_or(0);
+            vec![single]
+        } else {
+            combos
+        }
     };
+    let init_state_set: std::collections::HashSet<usize> =
+        init_state_indices.iter().copied().collect();
 
     // Build transitions by walking every (state, input) combination.
     // Each transition carries one label per input signal (`signal_value`)
@@ -549,7 +604,7 @@ fn enumerate_and_blast(
             let vals = build_state_valuations(i, &state_meta, &cells, &cell_domains);
             StateSpec {
                 name: n.clone(),
-                is_initial: i == init_state_idx,
+                is_initial: init_state_set.contains(&i),
                 valuations: if vals.is_empty() { None } else { Some(vals) },
             }
         })
@@ -1489,6 +1544,148 @@ fn make_step_env(
     env
 }
 
+/// Path 3 / Option A (§Phase 8 §8.2 residual closure) — return the
+/// NIDs of state cells the user EXPLICITLY marked `init_policy: anyconst`
+/// in the sidecar.
+///
+/// Restricted to user-declared anyconst (not every BTOR2 cell without
+/// an `Init` line) because Yosys emits many cells without init lines
+/// for non-anyconst reasons (reset synchronizers, undef bits under
+/// the global `setundef` policy, FSM intermediates). Enumerating all
+/// of them as initial blows up immediately; the explicit per-signal
+/// anyconst declaration is the user's signal of intent.
+///
+/// `anyconst_symbols` is the set of signal names from the sidecar's
+/// `signals[].init_policy == anyconst` entries (see
+/// [`sidecar_anyconst_symbols`]). Empty set ⇒ no Path 3 enumeration;
+/// falls back to the legacy single-init behaviour.
+fn nondeterministic_init_cells(
+    file: &Btor2File,
+    state_meta: &[StateMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    anyconst_symbols: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<Nid> {
+    if anyconst_symbols.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let mut has_init: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::Init { state, .. } = &line.node {
+            has_init.insert(*state);
+        }
+    }
+    state_meta
+        .iter()
+        .filter(|sm| !has_init.contains(&sm.nid))
+        .filter(|sm| {
+            symbols
+                .get(&sm.nid)
+                .map(|name| anyconst_symbols.contains(name))
+                .unwrap_or(false)
+        })
+        .map(|sm| sm.nid)
+        .collect()
+}
+
+/// Path 3 — collect the set of signal names declared with
+/// `init_policy: anyconst` in the sidecar. Used by
+/// [`nondeterministic_init_cells`] to restrict init enumeration to
+/// user-declared anyconst cells (avoiding the state explosion on
+/// every Yosys-emitted cell-without-init).
+fn sidecar_anyconst_symbols(options: &AdapterOptions) -> std::collections::HashSet<String> {
+    let Some(json) = &options.sidecar_json else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return std::collections::HashSet::new();
+    };
+    ann.init_policy_overrides()
+        .into_iter()
+        .filter(|(_, p)| {
+            matches!(
+                p,
+                crate::adapter::systemverilog::annotation::InitPolicy::Anyconst
+            )
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Path 3 / Option A — enumerate the cartesian product of admissible
+/// initial-state combinations. Cells WITH an init line contribute
+/// their single pinned value (from the already-evaluated `init_env`);
+/// cells WITHOUT an init line contribute every value in their
+/// `CellEnumeration` per-cell admissible set.
+///
+/// Returns an empty vec when there are no nondeterministic cells —
+/// signals the caller to use the legacy single-init path. Cells
+/// whose pinned init value isn't in their declared abstraction are
+/// silently dropped (cannot encode); a deterministic init outside
+/// the abstraction was already a soundness issue pre-Path 3.
+fn enumerate_initial_combos(
+    init_env: &Env,
+    state_meta: &[StateMeta],
+    cells: &CellEnumeration,
+    nondet_nids: &std::collections::HashSet<Nid>,
+) -> Vec<usize> {
+    if nondet_nids.is_empty() {
+        return Vec::new();
+    }
+    // Build per-cell admissible-init-value lists.
+    let per_cell_init: Vec<Vec<u128>> = state_meta
+        .iter()
+        .enumerate()
+        .map(|(i, sm)| {
+            if nondet_nids.contains(&sm.nid) {
+                // Anyconst-style: every value in the declared abstraction.
+                cells.per_cell[i].clone()
+            } else {
+                // Deterministic: use the pinned init value.
+                let bits = init_env
+                    .values
+                    .get(&sm.nid)
+                    .copied()
+                    .unwrap_or(BvValue::zero(sm.width))
+                    .bits;
+                vec![bits]
+            }
+        })
+        .collect();
+    // Cartesian product → encode each combination.
+    let mut combos: Vec<usize> = Vec::new();
+    let mut current: Vec<u128> = vec![0; per_cell_init.len()];
+    cartesian_collect_combos(&per_cell_init, 0, &mut current, &mut combos, cells);
+    combos.sort_unstable();
+    combos.dedup();
+    combos
+}
+
+/// Recursive helper for `enumerate_initial_combos` — fills the
+/// `combos` vec with every encoding of every value-vector in the
+/// cartesian product of `per_cell_init`. Encodings that fall outside
+/// the cell domain are silently dropped (cannot happen under R-S5's
+/// invariant that the typedef-derived abstraction set is complete).
+fn cartesian_collect_combos(
+    per_cell: &[Vec<u128>],
+    depth: usize,
+    current: &mut Vec<u128>,
+    out: &mut Vec<usize>,
+    cells: &CellEnumeration,
+) {
+    if depth == per_cell.len() {
+        if let Some(idx) = cells.encode(current) {
+            out.push(idx);
+        }
+        return;
+    }
+    for &v in &per_cell[depth] {
+        current[depth] = v;
+        cartesian_collect_combos(per_cell, depth + 1, current, out, cells);
+    }
+}
+
 /// Build the initial environment used to compute init values.
 /// `with_inputs_zero=true` zeroes inputs (init usually doesn't depend on them).
 fn make_initial_env(
@@ -2147,5 +2344,123 @@ mod tests {
         assert_eq!(out.source_info.state_count, 2);
         // Transitions encoded in CTXDSL — we just check the run completed.
         assert!(out.ctxdsl.contains("automaton"));
+    }
+
+    // ---- Path 3 / Option A (§Phase 8 §8.2 residual) — anyconst-init enumeration ----
+
+    #[test]
+    fn path3_baseline_single_init_when_all_cells_have_init_lines() {
+        // 1-bit state q with explicit init 0; q' = q (latch). Single
+        // init state — Path 3 fallback path returns the deterministic
+        // index. Validates the legacy behaviour stays untouched when
+        // there are no anyconst cells.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        // Two abstract states (q=0, q=1); only q=0 is initial.
+        assert_eq!(out.source_info.state_count, 2);
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(initial_count, 1, "exactly one initial-state declaration");
+    }
+
+    #[test]
+    fn path3_no_anyconst_sidecar_means_legacy_single_init_even_for_uninit_cells() {
+        // 2-bit state q with NO init line, NO sidecar. The `bad` line
+        // pins q into the property cone so auto-COI doesn't drop it.
+        // Path 3 is surgical — without sidecar anyconst, q defaults
+        // to zero (legacy single-init).
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 next 1 4 4
+6 eq 1 4 3
+7 bad 6
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        assert_eq!(out.source_info.state_count, 4);
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(
+            initial_count, 1,
+            "no sidecar anyconst declaration ⇒ legacy single-init"
+        );
+    }
+
+    #[test]
+    fn path3_anyconst_sidecar_enumerates_all_admissible_init_values() {
+        // 2-bit state q with NO init line + bad q==3 (so partition
+        // keeps q). Sidecar declares anyconst on q → all 4 admissible
+        // values become initial states.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 next 1 4 4
+6 eq 1 4 3
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {"name": "q", "abstraction": "bit_blast", "init_policy": "anyconst"}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        assert_eq!(out.source_info.state_count, 4);
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(
+            initial_count, 4,
+            "sidecar-declared anyconst ⇒ every admissible init value is initial"
+        );
+    }
+
+    #[test]
+    fn path3_mixed_some_deterministic_some_anyconst_init() {
+        // Two state cells: q1 (init 0), q2 (no init). Sidecar declares
+        // anyconst on q2 only. The `bad` line keeps both in the cone.
+        // Expected initial states: {(q1=0, q2=0), (q1=0, q2=1)} = 2.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 ones 1
+4 state 1 q1
+5 state 1 q2
+6 init 1 4 2
+7 next 1 4 4
+8 next 1 5 5
+9 eq 1 4 3
+10 bad 9
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {"name": "q1", "abstraction": "bit_blast"},
+                {"name": "q2", "abstraction": "bit_blast", "init_policy": "anyconst"}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        assert_eq!(out.source_info.state_count, 4);
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(
+            initial_count, 2,
+            "cartesian product collapses on the pinned cell"
+        );
     }
 }
