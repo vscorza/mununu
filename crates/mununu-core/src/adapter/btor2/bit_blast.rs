@@ -464,6 +464,56 @@ fn enumerate_and_blast(
     let anyconst_symbols = sidecar_anyconst_symbols(options);
     let nondet_init_nids =
         nondeterministic_init_cells(file, &state_meta, &symbols, &anyconst_symbols);
+
+    // SOUNDNESS (§Phase 8 §8.2 — Path 3 follow-up): warn when state
+    // cells silently default to zero. A cell without an `Init` line in
+    // the BTOR2 source AND without a sidecar `init_policy: anyconst`
+    // declaration is being deterministically pinned to zero by the
+    // legacy init path. This is sound iff Yosys ran with
+    // `setundef -zero` (the default) which explicitly zeroes undef
+    // bits. Under `setundef -anyseq/-anyconst` (R-Y1 global flag or
+    // R-Y2 per-signal attribute on a different cell) the cell's
+    // initial value is nondeterministic, and defaulting to zero hides
+    // a class of reset samples from the verdict.
+    //
+    // We cannot tell from BTOR2 alone which policy was used (Yosys
+    // does not annotate the `state` lines with provenance), so this
+    // warning is conservative: it fires whenever the situation
+    // exists, and the user decides whether their flow makes it safe.
+    let uncovered_uninit_signals: Vec<String> =
+        uncovered_uninit_cells(file, &state_meta, &symbols, &anyconst_symbols);
+    if !uncovered_uninit_signals.is_empty() {
+        // Cap the listed names so the warning stays readable on large designs.
+        let shown: Vec<&str> = uncovered_uninit_signals
+            .iter()
+            .take(5)
+            .map(String::as_str)
+            .collect();
+        let suffix = if uncovered_uninit_signals.len() > shown.len() {
+            format!(
+                " (and {} more)",
+                uncovered_uninit_signals.len() - shown.len()
+            )
+        } else {
+            String::new()
+        };
+        warnings.push(AdapterWarning {
+            kind: WarningKind::ApproximateTranslation,
+            message: format!(
+                "{n} state cell(s) without explicit `Init` line default to zero: \
+                 {names}{suffix}. SOUND only if upstream Yosys ran with \
+                 `setundef -zero` (the default). Under `setundef -anyseq/-anyconst` \
+                 these cells' initial values are nondeterministic; declare them in \
+                 the sidecar with `init_policy: anyconst` so Path 3 (§Phase 8 §8.2) \
+                 enumerates their admissible initial values.",
+                n = uncovered_uninit_signals.len(),
+                names = shown.join(", "),
+                suffix = suffix
+            ),
+            location: None,
+        });
+    }
+
     let init_state_indices: Vec<usize> = {
         let mut init_env = make_initial_env(file, &state_meta, &input_meta, true);
         evaluate_pure(file, &mut init_env, /*honor_init=*/ true)?;
@@ -1587,6 +1637,48 @@ fn nondeterministic_init_cells(
         .collect()
 }
 
+/// Soundness companion to [`nondeterministic_init_cells`] — return
+/// the signal names of state cells that have NO `Init` line AND are
+/// NOT in `anyconst_symbols`. These cells silently default to zero
+/// in the legacy init path; the caller emits a SOUNDNESS warning so
+/// the user knows whether their upstream `setundef` policy makes
+/// that safe (sound under `-zero`; unsound under `-anyseq/-anyconst`).
+///
+/// Cells without a recoverable symbol name (Yosys synthetic state
+/// cells without user-visible names) are silently skipped — they
+/// don't appear in the user-facing warning either way, and Yosys
+/// almost always emits Init lines for synthetic intermediate cells
+/// it created itself.
+fn uncovered_uninit_cells(
+    file: &Btor2File,
+    state_meta: &[StateMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    anyconst_symbols: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut has_init: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::Init { state, .. } = &line.node {
+            has_init.insert(*state);
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for sm in state_meta {
+        if has_init.contains(&sm.nid) {
+            continue;
+        }
+        let Some(name) = symbols.get(&sm.nid) else {
+            continue;
+        };
+        if anyconst_symbols.contains(name) {
+            continue;
+        }
+        out.push(name.clone());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Path 3 — collect the set of signal names declared with
 /// `init_policy: anyconst` in the sidecar. Used by
 /// [`nondeterministic_init_cells`] to restrict init enumeration to
@@ -2366,6 +2458,93 @@ mod tests {
         assert_eq!(out.source_info.state_count, 2);
         let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
         assert_eq!(initial_count, 1, "exactly one initial-state declaration");
+    }
+
+    #[test]
+    fn path3_uninit_cell_without_anyconst_emits_soundness_warning() {
+        // 2-bit state q with NO init line and NO sidecar anyconst
+        // declaration — the cell defaults to zero. Sound only under
+        // `setundef -zero`; unsound under any nondeterministic policy.
+        // The translator must emit a soundness warning naming the
+        // uncovered cell.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 next 1 4 4
+6 eq 1 4 3
+7 bad 6
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        let soundness_warning = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("default to zero"))
+            .expect("expected SOUNDNESS warning for uninit cell");
+        assert!(
+            soundness_warning.message.contains("q"),
+            "warning should name the uncovered cell: {}",
+            soundness_warning.message
+        );
+        assert!(
+            soundness_warning.message.contains("init_policy: anyconst"),
+            "warning should point at the remediation"
+        );
+    }
+
+    #[test]
+    fn path3_uninit_cell_with_anyconst_emits_no_soundness_warning() {
+        // Same fixture as above, but `q` is declared anyconst in the
+        // sidecar — the soundness concern is resolved by Path 3
+        // enumeration, no warning emitted.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 next 1 4 4
+6 eq 1 4 3
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {"name": "q", "abstraction": "bit_blast", "init_policy": "anyconst"}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.message.contains("default to zero")),
+            "no soundness warning expected when cell is covered by anyconst sidecar"
+        );
+    }
+
+    #[test]
+    fn path3_init_line_present_emits_no_soundness_warning() {
+        // Baseline: cell has an explicit Init line — no warning needed
+        // because the init value is determined, not defaulted.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.message.contains("default to zero")),
+            "no soundness warning when cell has explicit init"
+        );
     }
 
     #[test]
