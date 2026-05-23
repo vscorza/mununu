@@ -109,6 +109,21 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "is_inherit_init_policy")]
     pub init_policy: InitPolicy,
 
+    /// R-S5 (§Phase 9 §9.1) — SV typedef name (e.g. `boot_fsm_state_e`)
+    /// this signal is declared with. When set AND the signal's
+    /// `abstraction` is `Discover` or `Enum` with empty `variants` /
+    /// `value_map`, the loader walks SV source for the typedef
+    /// declaration via [`super::typedef_extract::extract_typedef_enums`]
+    /// and auto-fills the variant list + value map. Includes the
+    /// `UNMATCHED_<n>` synthetic variants for encodings the typedef's
+    /// bit-width admits but doesn't enumerate, which is the load-bearing
+    /// CWE-1245 detection mechanism on the Caliptra fixture (the bug
+    /// fires precisely on the unmatched encodings).
+    ///
+    /// Default `None` — opt-in per-signal; existing sidecars unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+
     /// Human-readable note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -143,6 +158,71 @@ impl SvAnnotation {
             }
         }
         out
+    }
+
+    /// R-S5 (§Phase 9 §9.1) — auto-fill `variants` + `value_map` on
+    /// signals that declare a `type_name` and whose abstraction is
+    /// `Discover` or `Enum` with empty variant info. The `typedefs`
+    /// map is the output of
+    /// [`super::typedef_extract::extract_typedef_enums`] over every
+    /// SV source file the loader has access to (primary + sidecars).
+    ///
+    /// **Closes the §Phase 8 §8.2 abstraction-clipping bottleneck
+    /// without manual sidecar editing.** When the typedef admits more
+    /// encodings than its named variants (e.g. `boot_fsm_state_e`:
+    /// width 3, 5 named variants, 3 unmatched encodings `{5,6,7}`),
+    /// the auto-widening emits the named variants AND the synthetic
+    /// `UNMATCHED_<n>` variants so the abstraction layer keeps
+    /// transitions to the unmatched encodings in the abstract relation.
+    /// On the Caliptra fixture this is exactly the manual Path 1
+    /// widening reproduced automatically.
+    ///
+    /// Returns the list of `(signal_name, type_name, variant_count)`
+    /// triples that were widened, for caller logging. Signals without
+    /// a `type_name`, with `Ignored` / `Boolean` abstraction, or whose
+    /// `type_name` doesn't appear in `typedefs` are silently skipped
+    /// (additive — no behavior change for legacy sidecars).
+    pub fn apply_type_driven_widening(
+        &mut self,
+        typedefs: &std::collections::HashMap<String, super::typedef_extract::TypedefEnum>,
+    ) -> Vec<(String, String, usize)> {
+        let mut applied = Vec::new();
+        for sig in &mut self.signals {
+            let Some(type_name) = sig.type_name.as_deref() else {
+                continue;
+            };
+            let Some(td) = typedefs.get(type_name) else {
+                continue;
+            };
+            // Only widen when the abstraction strategy can take a
+            // variant list AND it isn't already supplied. Discover and
+            // Enum-with-empty-variants are the targets; explicit
+            // user-supplied variants are NEVER overwritten.
+            let target_strategy = matches!(
+                sig.abstraction,
+                SignalAbstraction::Discover | SignalAbstraction::Enum
+            );
+            let variants_empty = sig.variants.as_ref().map(|v| v.is_empty()).unwrap_or(true);
+            if !target_strategy || !variants_empty {
+                continue;
+            }
+            // Apply the type-driven widening. Variants include the
+            // synthetic UNMATCHED_<n> entries; value_map binds each
+            // variant name to its numeric encoding.
+            let all = td.all_encodings();
+            sig.abstraction = SignalAbstraction::Enum;
+            sig.variants = Some(all.iter().map(|(n, _)| n.clone()).collect());
+            sig.value_map = Some(
+                all.iter()
+                    .map(|(n, v)| ValueMapEntry {
+                        name: n.clone(),
+                        value: *v as i64,
+                    })
+                    .collect(),
+            );
+            applied.push((sig.name.clone(), type_name.to_string(), all.len()));
+        }
+        applied
     }
 }
 
@@ -778,6 +858,7 @@ fn resolve_input_domain(
         value_map: inp.value_map.clone(),
         combinational: false,
         init_policy: inp.init_policy,
+        type_name: None,
         note: None,
     };
     resolve_signal_domain(&sig, ann)
@@ -1004,6 +1085,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
+                    type_name: None,
                     note: Some("auto-detected typedef enum".to_string()),
                 });
             }
@@ -1023,6 +1105,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
+                    type_name: None,
                     note: Some(note.to_string()),
                 });
             }
@@ -1056,6 +1139,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: true,
                     init_policy: InitPolicy::Inherit,
+                    type_name: None,
                     note: Some(note.to_string()),
                 });
             }
@@ -1758,5 +1842,182 @@ mod tests {
         assert_eq!(conn.variants.as_ref().unwrap().len(), 3);
         assert_eq!(conn.value_map.as_ref().unwrap().len(), 3);
         assert_eq!(conn.note.as_deref(), Some("Memory command bus"));
+    }
+
+    // ---- R-S5 (§Phase 9 §9.1) — type-driven valuation auto-widening ----
+
+    fn caliptra_typedefs()
+    -> std::collections::HashMap<String, super::super::typedef_extract::TypedefEnum> {
+        super::super::typedef_extract::extract_typedef_enums(
+            r#"typedef enum logic [2:0] {
+                BOOT_IDLE   = 3'b000,
+                BOOT_FUSE   = 3'b001,
+                BOOT_FW_RST = 3'b010,
+                BOOT_WAIT   = 3'b011,
+                BOOT_DONE   = 3'b100
+            } boot_fsm_state_e;"#,
+        )
+    }
+
+    fn empty_sv_annotation() -> SvAnnotation {
+        SvAnnotation {
+            schema: Some("mununu_sv_annotation_v1".into()),
+            module: "test".into(),
+            source: None,
+            signals: vec![],
+            inputs: vec![],
+            controllable: vec![],
+            properties: vec![],
+            discovered_values: HashMap::new(),
+            parameters: HashMap::new(),
+        }
+    }
+
+    fn signal_with_type(
+        name: &str,
+        type_name: &str,
+        abstraction: SignalAbstraction,
+    ) -> SignalAnnotation {
+        SignalAnnotation {
+            name: name.into(),
+            preserve: true,
+            abstraction,
+            bound: None,
+            variants: None,
+            value_map: None,
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: Some(type_name.into()),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn r_s5_widens_discover_with_named_and_unmatched_variants() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_with_type(
+            "boot_fsm_ns",
+            "boot_fsm_state_e",
+            SignalAbstraction::Discover,
+        ));
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+
+        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            applied[0],
+            ("boot_fsm_ns".into(), "boot_fsm_state_e".into(), 8)
+        );
+
+        let sig = &ann.signals[0];
+        assert_eq!(sig.abstraction, SignalAbstraction::Enum);
+        let variants = sig.variants.as_ref().unwrap();
+        // 5 named + 3 unmatched, sorted by encoding value
+        assert_eq!(variants.len(), 8);
+        assert_eq!(variants[0], "BOOT_IDLE");
+        assert_eq!(variants[4], "BOOT_DONE");
+        assert_eq!(variants[5], "UNMATCHED_5");
+        assert_eq!(variants[7], "UNMATCHED_7");
+
+        let vm = sig.value_map.as_ref().unwrap();
+        assert_eq!(vm.len(), 8);
+        assert_eq!(vm[0].value, 0);
+        assert_eq!(vm[7].value, 7);
+    }
+
+    #[test]
+    fn r_s5_skips_signals_without_type_name() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(SignalAnnotation {
+            name: "wait_count".into(),
+            preserve: true,
+            abstraction: SignalAbstraction::Discover,
+            bound: None,
+            variants: None,
+            value_map: None,
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: None,
+            note: None,
+        });
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+        assert!(applied.is_empty());
+        assert_eq!(ann.signals[0].abstraction, SignalAbstraction::Discover);
+    }
+
+    #[test]
+    fn r_s5_skips_signals_with_unknown_type() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_with_type(
+            "unknown_signal",
+            "no_such_type_t",
+            SignalAbstraction::Discover,
+        ));
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn r_s5_skips_signals_with_explicit_variants() {
+        let mut ann = empty_sv_annotation();
+        let mut sig = signal_with_type("boot_fsm_ns", "boot_fsm_state_e", SignalAbstraction::Enum);
+        sig.variants = Some(vec!["E0".into(), "E1".into()]);
+        sig.value_map = Some(vec![
+            ValueMapEntry {
+                name: "E0".into(),
+                value: 0,
+            },
+            ValueMapEntry {
+                name: "E1".into(),
+                value: 1,
+            },
+        ]);
+        ann.signals.push(sig);
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+        // User-supplied variants are NEVER overwritten.
+        assert!(applied.is_empty());
+        assert_eq!(ann.signals[0].variants.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn r_s5_skips_signals_with_non_widenable_abstraction() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_with_type(
+            "some_flag",
+            "boot_fsm_state_e",
+            SignalAbstraction::Boolean,
+        ));
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn r_s5_widens_enum_with_empty_variants() {
+        let mut ann = empty_sv_annotation();
+        let sig = signal_with_type("boot_fsm_ns", "boot_fsm_state_e", SignalAbstraction::Enum);
+        // variants and value_map are None — treated as empty, eligible for widening
+        ann.signals.push(sig);
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+        assert_eq!(applied.len(), 1);
+        assert_eq!(ann.signals[0].variants.as_ref().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn r_s5_deterministic_order_signals_in_declaration_order() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_with_type(
+            "sig_b",
+            "boot_fsm_state_e",
+            SignalAbstraction::Discover,
+        ));
+        ann.signals.push(signal_with_type(
+            "sig_a",
+            "boot_fsm_state_e",
+            SignalAbstraction::Discover,
+        ));
+        let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
+        assert_eq!(applied.len(), 2);
+        // Reported in sidecar declaration order, not alphabetical
+        assert_eq!(applied[0].0, "sig_b");
+        assert_eq!(applied[1].0, "sig_a");
     }
 }

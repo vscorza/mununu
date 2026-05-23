@@ -210,23 +210,65 @@ pub(crate) fn load_with_adapter_mode_extra(
             let setundef_anyconst = std::env::var("MUNUNU_YOSYS_SETUNDEF_ANYCONST")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            // R-Y2 (§Phase 8 §8.1) — load the SV sidecar if it exists
-            // and extract per-signal init-policy overrides. The
-            // overrides are surgical (per-signal anyconst on declared
-            // signals only, keeping every other undef at zero), which
-            // is the load-bearing Caliptra unblock per §Phase 8 §8.2.
-            // Silently skips if no sidecar exists or the schema does
-            // not parse — non-blocking for fixtures that pre-date R-Y2.
+            // R-Y2 (§Phase 8 §8.1) + R-S5 (§Phase 9 §9.1) — load the
+            // SV sidecar if it exists, apply type-driven widening from
+            // typedef enums in the SV source (R-S5), then extract
+            // per-signal init-policy overrides (R-Y2). Widened
+            // annotation is also serialised back into the JSON the
+            // BTOR2 lifter consumes so the auto-widened `variants` +
+            // `value_map` flow into the abstraction set. Silently
+            // skips when no sidecar exists or the schema does not
+            // parse — non-blocking for fixtures that pre-date R-Y2/
+            // R-S5.
+            let mut widened_sidecar_json: Option<String> = None;
             let init_policy_overrides: mununu_core::adapter::yosys::InitPolicyOverrides = {
                 let mut overrides = Vec::new();
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     let candidate = path.with_file_name(format!("{stem}.mununu.json"));
                     if candidate.exists()
                         && let Ok(content) = fs::read_to_string(&candidate)
-                        && let Ok(ann) = serde_json::from_str::<
+                        && let Ok(mut ann) = serde_json::from_str::<
                             mununu_core::adapter::systemverilog::annotation::SvAnnotation,
                         >(&content)
                     {
+                        // R-S5 — build typedef map from primary +
+                        // additional SV sources, then auto-widen any
+                        // signal that declares a `type_name`.
+                        let mut typedefs = std::collections::HashMap::new();
+                        typedefs.extend(
+                            mununu_core::adapter::systemverilog::typedef_extract::extract_typedef_enums(&source),
+                        );
+                        for (_, content) in &additional {
+                            typedefs.extend(
+                                mununu_core::adapter::systemverilog::typedef_extract::extract_typedef_enums(content),
+                            );
+                        }
+                        let widened = ann.apply_type_driven_widening(&typedefs);
+                        if !widened.is_empty() {
+                            eprintln!(
+                                "R-S5: applying type-driven widening from SV typedefs: {}",
+                                widened
+                                    .iter()
+                                    .map(|(s, t, n)| format!("{s}:{t}({n} variants)"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            // Re-serialise so the BTOR2 lifter sees the
+                            // widened variants + value_map. Falls back
+                            // to the raw content if serialisation fails
+                            // (would only happen on schema drift).
+                            if let Ok(json) = serde_json::to_string_pretty(&ann) {
+                                // R-S5 debug aid: optionally dump the
+                                // widened JSON for inspection. Set
+                                // MUNUNU_R_S5_DUMP_PATH=/path/to/dump.json
+                                // to enable.
+                                if let Ok(dump_path) = std::env::var("MUNUNU_R_S5_DUMP_PATH") {
+                                    let _ = std::fs::write(&dump_path, &json);
+                                    eprintln!("R-S5: dumped widened sidecar to {dump_path}");
+                                }
+                                widened_sidecar_json = Some(json);
+                            }
+                        }
                         overrides = ann.init_policy_overrides();
                         if !overrides.is_empty() {
                             eprintln!(
@@ -251,13 +293,20 @@ pub(crate) fn load_with_adapter_mode_extra(
                 init_policy_overrides,
                 ..Default::default()
             };
+            // R-S5: if R-S5 widened the sidecar in-place, propagate
+            // the widened JSON down to the BTOR2 lifter so it sees
+            // the auto-extracted variants + value_map. Otherwise fall
+            // back to the raw on-disk sidecar via the standard loader.
+            let btor_opts = if let Some(json) = widened_sidecar_json {
+                let mut o = options_default.clone();
+                o.sidecar_json = Some(json);
+                o
+            } else {
+                load_btor_sidecar(&options_default)
+            };
             log_adapter_output_with_dir(
-                mununu_core::adapter::yosys::translate_sv(
-                    &source,
-                    &load_btor_sidecar(&options_default),
-                    &yopts,
-                )
-                .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
+                mununu_core::adapter::yosys::translate_sv(&source, &btor_opts, &yopts)
+                    .map_err(|e| format!("Yosys SV adapter error: {e}"))?,
                 path.parent(),
             )
         }

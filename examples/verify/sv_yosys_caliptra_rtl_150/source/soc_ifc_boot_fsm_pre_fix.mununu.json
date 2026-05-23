@@ -13,7 +13,8 @@
       "name": "boot_fsm_ns",
       "abstraction": "discover",
       "init_policy": "anyconst",
-      "note": "R-Y2 (§Phase 8): per-signal anyconst on the bug-bearing FSM register so the CWE-1245 encodings {5,6,7} are reachable from init without the global -anyseq cap-explosion. Other undefs stay at -zero per the global YosysOptions default."
+      "type_name": "boot_fsm_state_e",
+      "note": "R-S5 + R-Y2 (§Phase 9 §9.1 + §Phase 8): `type_name: boot_fsm_state_e` triggers auto-widening from the SV typedef in soc_ifc_pkg.sv — emits the 5 named variants (BOOT_IDLE..BOOT_DONE) plus 3 synthetic `UNMATCHED_5/6/7` variants for the encodings the type's 3-bit width admits but the case statement doesn't enumerate. Per-signal anyconst init makes the bug-bearing encodings reachable from initialisation. Auto-reproduces the manual Path 1 widening without sidecar editing."
     }
   ],
   "inputs": [
@@ -33,13 +34,13 @@
     },
     {
       "id": "no_undef_reachable",
-      "formula": "nu X. ((!(boot_fsm_ns == 5 || boot_fsm_ns == 6 || boot_fsm_ns == 7)) && ([] X))",
-      "description": "CWE-1245 safety: the boot FSM's next-state register must never carry an unmatched encoding (5/6/7 are not in the case statement of the buggy variant; default-less unique casez admits them as absorbing sinks). Phase A.3 note: Yosys `flatten` + `dffunmap` retains the next-state register `boot_fsm_ns` in the bit-blasted BTOR2 — the original SV name `boot_fsm_ps` does not survive synthesis as a separate cell."
+      "formula": "nu X. ((!(boot_fsm_ns_UNMATCHED_5 || boot_fsm_ns_UNMATCHED_6 || boot_fsm_ns_UNMATCHED_7)) && ([] X))",
+      "description": "CWE-1245 safety: the boot FSM's next-state register must never carry an unmatched encoding (5/6/7 are admissible by the 3-bit type but not enumerated in the default-less unique casez). R-S5 (§Phase 9 §9.1) auto-extracts the 8 encodings from the boot_fsm_state_e typedef in soc_ifc_pkg.sv; the unmatched encodings get the synthetic `UNMATCHED_<n>` variant name. Predicate naming follows the `<signal>_<variant>` convention (cwe1245_fsm_bug.mununu.json precedent), so the predicates are `boot_fsm_ns_UNMATCHED_5` etc (note the triple underscore from `boot_fsm_ns` + `_` separator + `UNMATCHED_5`)."
     },
     {
       "id": "boot_idle_reachable",
-      "formula": "mu X. ((boot_fsm_ns == 0) || (<> X))",
-      "description": "Liveness: BOOT_IDLE (encoding 0) is reachable from any state via some path."
+      "formula": "mu X. (boot_fsm_ns_BOOT_IDLE || (<> X))",
+      "description": "Liveness: BOOT_IDLE (named variant from the typedef) is reachable from any state via some path. R-S5 emits the typedef variant names directly so `boot_fsm_ns_BOOT_IDLE` is the predicate."
     }
   ]
 }

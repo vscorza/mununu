@@ -14,6 +14,7 @@ pub mod fsm;
 pub mod kripke;
 pub mod kripke_smt;
 pub mod parser;
+pub mod typedef_extract;
 
 use super::ir::*;
 use super::{
