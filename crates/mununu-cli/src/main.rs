@@ -3934,6 +3934,31 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         .collect();
     initial_satisfying.sort();
 
+    // Counterexample-style output: when some initial states violate
+    // the property, surface them by name AND by structured valuation
+    // (`signal = value` pairs from the BTOR2 lifter's cross-product
+    // enumeration). Lets the engineer read "init state s_init_5 has
+    // boot_fsm_ns = UNMATCHED_5" directly from the verdict instead of
+    // mentally decoding state IDs against the cell domains. Empty
+    // when every initial state satisfies, or when no state carries a
+    // structured valuation (most CTXDSL-only fixtures).
+    let initial_violating: Vec<(String, Option<BTreeMap<String, String>>)> = eval_clts
+        .initial_states()
+        .iter()
+        .filter_map(|state_id| {
+            let satisfies = result
+                .get(state_id.index())
+                .map(|bit| *bit)
+                .unwrap_or(false);
+            if satisfies {
+                return None;
+            }
+            let name = eval_clts.state_name(*state_id)?.to_string();
+            let valuation = eval_clts.state_valuation(*state_id).cloned();
+            Some((name, valuation))
+        })
+        .collect();
+
     // GAP-009: vacuous-property warning. Surfaced by the 2026-05-04
     // compositional validations on MCP-001 / MCP-005, where per-instance
     // automata collapsed to 1 state and verdicts numerically matched the
@@ -3967,6 +3992,31 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
         println!("    (none)");
     } else {
         println!("    {}", initial_satisfying.join(", "));
+    }
+
+    // Counterexample-style output: surface violating initial states
+    // with their structured valuations (when the adapter produced
+    // them). For Caliptra-shape fixtures this prints lines like
+    // `s_init_5  boot_fsm_ns = UNMATCHED_5, wait_count = ZERO` which
+    // directly identifies the bug-bearing reset samples — closes the
+    // diagnosability gap the §6.7 measurement-driven discipline + the
+    // Substack-article roadmap section both flagged.
+    if !initial_violating.is_empty() {
+        println!(
+            "  Initial states violating: {}/{}",
+            initial_violating.len(),
+            initial_states.len()
+        );
+        for (name, valuation) in &initial_violating {
+            match valuation {
+                Some(vals) if !vals.is_empty() => {
+                    let pairs: Vec<String> =
+                        vals.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+                    println!("    {name}  ({})", pairs.join(", "));
+                }
+                _ => println!("    {name}"),
+            }
+        }
     }
     println!(
         "  Guard partitions: {}",
