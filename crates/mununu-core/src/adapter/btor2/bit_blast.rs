@@ -381,6 +381,19 @@ fn enumerate_and_blast(
         warnings,
         "state cell",
     );
+
+    // R-S2a (§Phase 9 §9.1) — BTOR2 init-line seeding. For every
+    // state cell with an `Init` line in the BTOR2 source AND a
+    // sidecar-declared abstraction that takes per-value discriminators
+    // (`EnumValues` with a value_map), inject the init value as an
+    // additional discriminator if not already present. Bridges the
+    // gap when R-S5 / R-S3 / R-S7 don't cover the init value of a
+    // sidecar-declared signal (rare on typedef-typed Caliptra-style
+    // designs; common on hand-written non-typedef RTL where the
+    // reset value is the only "interesting" value before any input
+    // arrives). Strictly additive — never replaces existing entries.
+    apply_btor2_init_seeding(file, &state_meta, &symbols, &mut cell_domains);
+
     let cells = CellEnumeration::build(&state_meta, &cell_domains);
 
     // Phase 1.6: per-input sidecar resolution. The sidecar already
@@ -1609,6 +1622,126 @@ fn make_step_env(
 /// `signals[].init_policy == anyconst` entries (see
 /// [`sidecar_anyconst_symbols`]). Empty set ⇒ no Path 3 enumeration;
 /// falls back to the legacy single-init behaviour.
+/// R-S2a (§Phase 9 §9.1) — BTOR2 init-line seeding. Walks every
+/// `Node::Init { state, value }` line in the BTOR2 file; for each
+/// state cell with a sidecar-declared `EnumValues` abstraction whose
+/// value_map does NOT already contain the resolved init value, adds
+/// a synthetic discriminator `(<signal>_<value>, value)` to the
+/// cell's value_map AND appends `<signal>_<value>` to its variants
+/// list.
+///
+/// Resolves the init value by reading the `value` operand's NID and
+/// looking up its constant value (`Node::Const` / `Node::Op::Zero` /
+/// `Node::Op::One` / `Node::Op::Ones`). Init lines whose value is a
+/// non-constant expression are silently skipped — those require the
+/// full `evaluate_pure` pass which runs later for the init-state
+/// computation; rare in practice (Yosys typically emits constant
+/// init values).
+///
+/// Bridges the gap when R-S5 / R-S3 / R-S7 don't cover the signal's
+/// init value. Strictly additive — never replaces existing entries.
+fn apply_btor2_init_seeding(
+    file: &Btor2File,
+    state_meta: &[StateMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    cell_domains: &mut CellDomainMap,
+) {
+    // Build a NID → state_meta index for fast lookup of widths.
+    let nid_to_width: std::collections::HashMap<Nid, u32> =
+        state_meta.iter().map(|sm| (sm.nid, sm.width)).collect();
+
+    for line in &file.lines {
+        let Node::Init { state, value, .. } = &line.node else {
+            continue;
+        };
+        // Only seed cells that have a sidecar entry. Cells without
+        // one fall back to full bit-blast over their width — init
+        // value is already admissible.
+        let Some((fd, value_map)) = cell_domains.get_mut(state) else {
+            continue;
+        };
+        // Only widen `EnumValues` abstractions; `BoundedCounter` and
+        // friends use a different value-set construction that does
+        // not benefit from per-value variant names.
+        if !matches!(
+            fd.abstraction,
+            crate::adapter::domain::AbstractionType::EnumValues
+        ) {
+            continue;
+        }
+        // Resolve the init value's constant via the value operand's NID.
+        let Some(init_value) = resolve_btor2_constant(file, value.nid()) else {
+            continue;
+        };
+        // Mask to the cell's bit-width.
+        let Some(width) = nid_to_width.get(state) else {
+            continue;
+        };
+        let masked = if *width >= 64 {
+            init_value
+        } else {
+            init_value & ((1u64 << *width) - 1)
+        };
+        let masked_signed = masked as i64;
+        // Skip if init value already in value_map.
+        if value_map.iter().any(|(_, v)| *v == masked_signed) {
+            continue;
+        }
+        // Augment: append new (name, value) to value_map AND name to variants.
+        let signal_name = symbols
+            .get(state)
+            .cloned()
+            .unwrap_or_else(|| format!("nid_{state}"));
+        let variant_name = format!("{}_{}", signal_name, masked_signed);
+        value_map.push((variant_name.clone(), masked_signed));
+        match &mut fd.variants {
+            Some(v) => v.push(variant_name),
+            None => fd.variants = Some(vec![variant_name]),
+        }
+    }
+}
+
+/// R-S2a helper — resolve a BTOR2 NID to its constant `u64` value if
+/// it's one of the simple constant nodes mununu's bit-blaster
+/// recognises: `Node::Const { value: Binary/Decimal/Hex }`, or one
+/// of the `Op::Zero` / `Op::One` / `Op::Ones` shortcuts that Yosys
+/// emits frequently for init lines.
+///
+/// Returns `None` for any non-constant NID (operations on other
+/// signals, references to inputs, etc.).
+fn resolve_btor2_constant(file: &Btor2File, nid: Nid) -> Option<u64> {
+    for line in &file.lines {
+        if line.nid != nid {
+            continue;
+        }
+        let Node::Const { value, sort } = &line.node else {
+            return None;
+        };
+        let width = parser::bv_width(file, *sort)?;
+        let mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        return match value {
+            ConstValue::Zero => Some(0),
+            ConstValue::One => Some(1 & mask),
+            ConstValue::Ones => Some(mask),
+            ConstValue::Bin(s) => u64::from_str_radix(s, 2).ok().map(|v| v & mask),
+            ConstValue::Dec(n) => {
+                let raw = if *n < 0 {
+                    (mask.wrapping_sub((-*n) as u64).wrapping_add(1)) & mask
+                } else {
+                    (*n as u64) & mask
+                };
+                Some(raw)
+            }
+            ConstValue::Hex(s) => u64::from_str_radix(s, 16).ok().map(|v| v & mask),
+        };
+    }
+    None
+}
+
 fn nondeterministic_init_cells(
     file: &Btor2File,
     state_meta: &[StateMeta],
@@ -2545,6 +2678,130 @@ mod tests {
                 .any(|w| w.message.contains("default to zero")),
             "no soundness warning when cell has explicit init"
         );
+    }
+
+    // ---- R-S2a (§Phase 9 §9.1) — BTOR2 init-line seeding ----
+
+    #[test]
+    fn r_s2a_seeds_init_value_when_sidecar_enum_lacks_it() {
+        // 2-bit state q with init=3. Sidecar declares q as enum
+        // with only variant {Q_0: 0}. R-S2a should auto-add
+        // {q_3: 3} so the formula can reference q_3.
+        let src = r#"
+1 sort bitvec 2
+2 constd 1 3
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {
+                    "name": "q",
+                    "abstraction": "enum",
+                    "variants": ["Q_0"],
+                    "value_map": [{"name": "Q_0", "value": 0}]
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // After R-S2a seeding, the abstraction set has {0, 3} → 2 states.
+        assert_eq!(out.source_info.state_count, 2);
+    }
+
+    #[test]
+    fn r_s2a_no_op_when_init_value_already_in_value_map() {
+        // Same fixture as above but value_map already includes 3.
+        // R-S2a should skip (additive, dedupes).
+        let src = r#"
+1 sort bitvec 2
+2 constd 1 3
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {
+                    "name": "q",
+                    "abstraction": "enum",
+                    "variants": ["Q_0", "Q_3"],
+                    "value_map": [
+                        {"name": "Q_0", "value": 0},
+                        {"name": "Q_3", "value": 3}
+                    ]
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // value_map has 2 entries (0, 3) → 2 states; R-S2a no-op.
+        assert_eq!(out.source_info.state_count, 2);
+    }
+
+    #[test]
+    fn r_s2a_skips_signals_without_sidecar_entry() {
+        // q has init=1 but no sidecar entry. R-S2a should skip
+        // (cells without sidecar use full bit-blast — init already
+        // in the admissible set).
+        let src = r#"
+1 sort bitvec 2
+2 one 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        // No sidecar → full bit-blast over 2 bits = 4 states.
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        assert_eq!(out.source_info.state_count, 4);
+    }
+
+    #[test]
+    fn r_s2a_skips_non_enum_abstractions() {
+        // q has init=1 and sidecar bounded_counter abstraction.
+        // R-S2a only widens EnumValues; bounded_counter handles its
+        // value set via the (lo, hi) bound and doesn't take per-value
+        // variant names.
+        let src = r#"
+1 sort bitvec 4
+2 one 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {"name": "q", "abstraction": "bounded_counter", "bound": 2}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // bounded_counter [0, 2] = 3 states; R-S2a no-op.
+        assert_eq!(out.source_info.state_count, 3);
     }
 
     #[test]
