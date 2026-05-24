@@ -162,7 +162,10 @@ fn find_typedef_enum_blocks(source: &str) -> Vec<TypedefEnum> {
 /// positions stay roughly aligned for error messages. Naive scanner —
 /// does NOT account for `//` or `/*` inside string literals (rare in
 /// typedef contexts).
-fn strip_all_comments(source: &str) -> String {
+///
+/// Visibility: `pub(super)` so R-S3's `case_literal_extract` module
+/// reuses this helper rather than duplicating the byte-walk.
+pub(super) fn strip_all_comments(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
@@ -236,7 +239,10 @@ fn parse_variant_body(body: &str) -> Vec<(String, u64)> {
 ///
 /// Underscores within numeric literals are stripped (SV allows
 /// `8'b1010_0101` for readability).
-fn parse_sv_literal(s: &str) -> Option<u64> {
+///
+/// Visibility: `pub(super)` so R-S3's `case_literal_extract` module
+/// reuses this parser rather than duplicating the radix-handling.
+pub(super) fn parse_sv_literal(s: &str) -> Option<u64> {
     let s = s.trim().replace('_', "");
     // Split on apostrophe to find base specifier
     if let Some(apos_idx) = s.find('\'') {

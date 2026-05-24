@@ -9,6 +9,7 @@
 
 pub mod annotation;
 pub mod ast;
+pub mod case_literal_extract;
 pub mod emit_controller;
 pub mod fsm;
 pub mod kripke;

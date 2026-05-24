@@ -326,6 +326,79 @@ impl SvAnnotation {
         }
         applied
     }
+
+    /// R-S3 (§Phase 9 §9.1) — case-literal seeding. Takes a
+    /// `signal_name → [literal values]` map (produced by
+    /// [`super::case_literal_extract::extract_case_literals`] over
+    /// every SV source the loader has access to) and, for each
+    /// sidecar-declared signal that appears in the map AND has a
+    /// widenable abstraction, adds the literals as discriminators
+    /// (synthetic variant name `<signal>_<n>`, mirroring R-S5's
+    /// UNMATCHED_<n> and R-S7's `<signal>_<n>` conventions).
+    ///
+    /// Bridges the gap when R-S5's typedef widening can't fire (no
+    /// typedef on the signal) AND the property doesn't reference the
+    /// case labels directly (R-S7 no-op). Captures the
+    /// designer-intended distinctions from `case (signal)` blocks in
+    /// the RTL.
+    ///
+    /// Strictly additive — never overwrites existing variants /
+    /// value_map entries. Signals with Boolean / BitBlast / Ignored
+    /// abstractions are skipped (no per-value discriminators).
+    /// Signals whose name does not appear in the case-literal map
+    /// are untouched.
+    ///
+    /// Returns `(signal_name, [seeded_values])` for each signal
+    /// widened, for caller logging.
+    pub fn apply_case_literal_seeding(
+        &mut self,
+        literals: &HashMap<String, Vec<u64>>,
+    ) -> Vec<(String, Vec<i64>)> {
+        let mut applied = Vec::new();
+        for sig in &mut self.signals {
+            let Some(seeds) = literals.get(&sig.name) else {
+                continue;
+            };
+            if seeds.is_empty() {
+                continue;
+            }
+            let widenable = matches!(
+                sig.abstraction,
+                SignalAbstraction::Discover | SignalAbstraction::Enum
+            );
+            if !widenable {
+                continue;
+            }
+            let mut value_map = sig.value_map.clone().unwrap_or_default();
+            let existing_values: std::collections::HashSet<i64> =
+                value_map.iter().map(|e| e.value).collect();
+            let mut added_now = Vec::new();
+            for &v in seeds {
+                let v_signed = v as i64;
+                if existing_values.contains(&v_signed) {
+                    continue;
+                }
+                let variant = format!("{}_{}", sig.name, v_signed);
+                value_map.push(ValueMapEntry {
+                    name: variant,
+                    value: v_signed,
+                });
+                added_now.push(v_signed);
+            }
+            if added_now.is_empty() {
+                continue;
+            }
+            let mut variants = sig.variants.clone().unwrap_or_default();
+            for &v in &added_now {
+                variants.push(format!("{}_{}", sig.name, v));
+            }
+            sig.abstraction = SignalAbstraction::Enum;
+            sig.variants = Some(variants);
+            sig.value_map = Some(value_map);
+            applied.push((sig.name.clone(), added_now));
+        }
+        applied
+    }
 }
 
 /// R-S7 helper — split a predicate-name string of the shape
@@ -2303,6 +2376,93 @@ mod tests {
         });
         let applied = ann.apply_property_syntactic_seeding();
         // count_3 already in value_map → no-op.
+        assert!(applied.is_empty());
+    }
+
+    // ---- R-S3 (§Phase 9 §9.1) — case-literal seeding ----
+
+    fn signal_discover(name: &str) -> SignalAnnotation {
+        SignalAnnotation {
+            name: name.into(),
+            preserve: true,
+            abstraction: SignalAbstraction::Discover,
+            bound: None,
+            variants: None,
+            value_map: None,
+            combinational: false,
+            init_policy: InitPolicy::Inherit,
+            type_name: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn r_s3_seeds_discriminators_from_case_literals() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_discover("opcode"));
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![1, 2, 5]);
+        let applied = ann.apply_case_literal_seeding(&literals);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, "opcode");
+        assert_eq!(applied[0].1, vec![1, 2, 5]);
+        let sig = &ann.signals[0];
+        assert_eq!(sig.abstraction, SignalAbstraction::Enum);
+        let vm = sig.value_map.as_ref().unwrap();
+        assert_eq!(vm.len(), 3);
+        assert_eq!(vm[0].name, "opcode_1");
+        assert_eq!(vm[2].name, "opcode_5");
+    }
+
+    #[test]
+    fn r_s3_skips_signals_not_in_case_literal_map() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_discover("unused_signal"));
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![1]);
+        let applied = ann.apply_case_literal_seeding(&literals);
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn r_s3_dedupes_against_existing_value_map() {
+        let mut ann = empty_sv_annotation();
+        let mut sig = signal_discover("opcode");
+        sig.abstraction = SignalAbstraction::Enum;
+        sig.value_map = Some(vec![ValueMapEntry {
+            name: "opcode_1".into(),
+            value: 1,
+        }]);
+        sig.variants = Some(vec!["opcode_1".into()]);
+        ann.signals.push(sig);
+        let mut literals = HashMap::new();
+        // 1 already in value_map; 2 and 5 are new.
+        literals.insert("opcode".to_string(), vec![1, 2, 5]);
+        let applied = ann.apply_case_literal_seeding(&literals);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].1, vec![2, 5]);
+        assert_eq!(ann.signals[0].value_map.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn r_s3_skips_non_widenable_abstractions() {
+        let mut ann = empty_sv_annotation();
+        let mut sig = signal_discover("flag");
+        sig.abstraction = SignalAbstraction::Boolean;
+        ann.signals.push(sig);
+        let mut literals = HashMap::new();
+        literals.insert("flag".to_string(), vec![3]);
+        let applied = ann.apply_case_literal_seeding(&literals);
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn r_s3_no_op_when_literals_empty() {
+        let mut ann = empty_sv_annotation();
+        ann.signals.push(signal_discover("opcode"));
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![]);
+        let applied = ann.apply_case_literal_seeding(&literals);
         assert!(applied.is_empty());
     }
 

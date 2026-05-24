@@ -254,6 +254,56 @@ pub(crate) fn load_with_adapter_mode_extra(
                                     .join(", ")
                             );
                         }
+                        // R-S3 (§Phase 9 §9.1) — case-literal
+                        // seeding. Scan the primary SV source +
+                        // additional sidecar SV files for
+                        // `case (signal) <LITERAL>: …` blocks; harvest
+                        // the numeric labels per switched-on signal.
+                        // Complements R-S5 (which handles typedef-
+                        // typed signals) and R-S7 (which handles
+                        // property-referenced predicates) by
+                        // capturing designer-intended distinctions
+                        // expressed directly in case-statement
+                        // labels — typically the case for hand-
+                        // written non-typedef FSMs and decoders.
+                        let mut case_literals = std::collections::HashMap::new();
+                        for (name, value) in
+                            std::iter::once((String::from("__primary__"), source.clone()))
+                                .chain(additional.iter().map(|(n, c)| (n.clone(), c.clone())))
+                        {
+                            let _ = name;
+                            for (sig, lits) in
+                                mununu_core::adapter::systemverilog::case_literal_extract::extract_case_literals(&value)
+                            {
+                                case_literals
+                                    .entry(sig)
+                                    .or_insert_with(Vec::new)
+                                    .extend(lits);
+                            }
+                        }
+                        // Dedupe per signal (multiple SV files may
+                        // reference the same signal).
+                        for v in case_literals.values_mut() {
+                            v.sort_unstable();
+                            v.dedup();
+                        }
+                        let case_seeded = ann.apply_case_literal_seeding(&case_literals);
+                        if !case_seeded.is_empty() {
+                            eprintln!(
+                                "R-S3: seeding discriminators from case-statement labels: {}",
+                                case_seeded
+                                    .iter()
+                                    .map(|(s, vs)| format!(
+                                        "{s}=[{}]",
+                                        vs.iter()
+                                            .map(|v| v.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
                         // R-S7 (§Phase 9 §9.1) — property-syntactic
                         // seeding. Bridges the gap when R-S5 didn't
                         // fire (no typedef on the signal) but a
@@ -278,7 +328,7 @@ pub(crate) fn load_with_adapter_mode_extra(
                                     .join(", ")
                             );
                         }
-                        if !widened.is_empty() || !seeded.is_empty() {
+                        if !widened.is_empty() || !seeded.is_empty() || !case_seeded.is_empty() {
                             // Re-serialise so the BTOR2 lifter sees
                             // the widened+seeded variants + value_map.
                             // Falls back to the raw content if
