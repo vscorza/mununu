@@ -109,6 +109,26 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "is_inherit_init_policy")]
     pub init_policy: InitPolicy,
 
+    /// R-S4 (§Phase 9 §9.1) — opt-in equivalence-class seeding. When
+    /// `true` AND R-S3's `extract_case_literals` finds case-statement
+    /// labels for this signal, R-S4 populates the signal's
+    /// `discovered_values` with the labels as named representatives
+    /// plus a single `OTHER` catch-all variant (state-space:
+    /// `N + 1` instead of `2^width`). R-S3 is then skipped for this
+    /// signal to avoid double-emission of per-literal discriminators.
+    ///
+    /// Trades verdict precision (the catch-all collapses all unmatched
+    /// values into one abstract state) for state-space efficiency
+    /// (manageable abstraction sizes on wide signals). Useful for
+    /// parametric constants — opcodes, address-decoder bits,
+    /// agent-IDs in coherence protocols — where each named literal
+    /// matters individually but the unmatched values can be treated
+    /// uniformly.
+    ///
+    /// Default `false` — preserves R-S3's individual-literal behaviour.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub equivalence_classes: bool,
+
     /// R-S5 (§Phase 9 §9.1) — SV typedef name (e.g. `boot_fsm_state_e`)
     /// this signal is declared with. When set AND the signal's
     /// `abstraction` is `Discover` or `Enum` with empty `variants` /
@@ -362,6 +382,12 @@ impl SvAnnotation {
             if seeds.is_empty() {
                 continue;
             }
+            // R-S4 opt-in skips R-S3 for this signal (R-S4 emits the
+            // literals as a catch-all-based Discover abstraction; if
+            // R-S3 also fired we'd double-emit discriminators).
+            if sig.equivalence_classes {
+                continue;
+            }
             let widenable = matches!(
                 sig.abstraction,
                 SignalAbstraction::Discover | SignalAbstraction::Enum
@@ -395,6 +421,86 @@ impl SvAnnotation {
             sig.abstraction = SignalAbstraction::Enum;
             sig.variants = Some(variants);
             sig.value_map = Some(value_map);
+            applied.push((sig.name.clone(), added_now));
+        }
+        applied
+    }
+
+    /// R-S4 (§Phase 9 §9.1) — equivalence-class seeding. For each
+    /// signal with `equivalence_classes: true` AND a case-literals
+    /// entry in `literals`, populates the signal's
+    /// `self.discovered_values` with the literals as named
+    /// representatives plus a single `OTHER` catch-all variant.
+    /// Sets the signal's abstraction to `Discover` so the existing
+    /// sidecar resolver picks up the discovered_values + catch_all
+    /// (the `Discover` arm of `resolve_to_field_domain` already
+    /// handles the catch-all variant — R-S4 leverages that
+    /// infrastructure without introducing a new abstraction
+    /// primitive).
+    ///
+    /// **State-space tradeoff:** R-S4 collapses all unmatched
+    /// values into one abstract state (`OTHER`), giving `N + 1`
+    /// states for a signal with `N` case labels — vs `2^width`
+    /// under full bit-blast OR `N` under R-S3's per-literal
+    /// emission (which lacks the catch-all). Sound for the named
+    /// values; over-approximates the unmatched values into one
+    /// representative state.
+    ///
+    /// Mutually exclusive with R-S3 per signal: R-S3 skips signals
+    /// where `equivalence_classes: true` (the loader runs both
+    /// methods; R-S4 fires first for opt-in signals; R-S3 then
+    /// covers the rest). Strictly additive — if the user already
+    /// declared `discovered_values` for the signal, R-S4 augments
+    /// it (adds new literals, dedups against existing values, keeps
+    /// the existing catch_all name).
+    ///
+    /// Returns `(signal_name, [seeded_values])` for each signal
+    /// widened, for caller logging.
+    pub fn apply_equivalence_class_seeding(
+        &mut self,
+        literals: &HashMap<String, Vec<u64>>,
+    ) -> Vec<(String, Vec<i64>)> {
+        let mut applied = Vec::new();
+        for sig in &mut self.signals {
+            if !sig.equivalence_classes {
+                continue;
+            }
+            let Some(seeds) = literals.get(&sig.name) else {
+                continue;
+            };
+            if seeds.is_empty() {
+                continue;
+            }
+            // Fetch or create the discovered_values entry.
+            let entry = self
+                .discovered_values
+                .entry(sig.name.clone())
+                .or_insert_with(|| DiscoveredValues {
+                    values: Vec::new(),
+                    catch_all: "OTHER".to_string(),
+                });
+            let existing_values: std::collections::HashSet<i64> =
+                entry.values.iter().map(|v| v.value).collect();
+            let mut added_now = Vec::new();
+            for &v in seeds {
+                let v_signed = v as i64;
+                if existing_values.contains(&v_signed) {
+                    continue;
+                }
+                let variant = format!("{}_{}", sig.name, v_signed);
+                entry.values.push(DiscoveredValue {
+                    name: variant,
+                    value: v_signed,
+                    from: Some("R-S4: case-literal equivalence class".to_string()),
+                });
+                added_now.push(v_signed);
+            }
+            if added_now.is_empty() {
+                continue;
+            }
+            // Force abstraction to Discover so the sidecar resolver's
+            // Discover arm picks up the discovered_values + catch_all.
+            sig.abstraction = SignalAbstraction::Discover;
             applied.push((sig.name.clone(), added_now));
         }
         applied
@@ -1076,6 +1182,7 @@ fn resolve_input_domain(
         value_map: inp.value_map.clone(),
         combinational: false,
         init_policy: inp.init_policy,
+        equivalence_classes: false,
         type_name: None,
         note: None,
     };
@@ -1303,6 +1410,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
+                    equivalence_classes: false,
                     type_name: None,
                     note: Some("auto-detected typedef enum".to_string()),
                 });
@@ -1323,6 +1431,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
+                    equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
                 });
@@ -1357,6 +1466,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: true,
                     init_policy: InitPolicy::Inherit,
+                    equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
                 });
@@ -2105,6 +2215,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: Some(type_name.into()),
             note: None,
         }
@@ -2154,6 +2265,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -2261,6 +2373,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -2304,6 +2417,7 @@ mod tests {
             ]),
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -2334,6 +2448,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -2364,6 +2479,7 @@ mod tests {
             }]),
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -2391,6 +2507,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         }
@@ -2464,6 +2581,97 @@ mod tests {
         literals.insert("opcode".to_string(), vec![]);
         let applied = ann.apply_case_literal_seeding(&literals);
         assert!(applied.is_empty());
+    }
+
+    // ---- R-S4 (§Phase 9 §9.1) — equivalence-class seeding ----
+
+    #[test]
+    fn r_s4_seeds_discovered_values_with_catch_all_for_opt_in_signals() {
+        let mut ann = empty_sv_annotation();
+        let mut sig = signal_discover("opcode");
+        sig.equivalence_classes = true;
+        ann.signals.push(sig);
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![1, 2, 5]);
+        let applied = ann.apply_equivalence_class_seeding(&literals);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, "opcode");
+        assert_eq!(applied[0].1, vec![1, 2, 5]);
+        let entry = ann.discovered_values.get("opcode").unwrap();
+        assert_eq!(entry.values.len(), 3);
+        assert_eq!(entry.catch_all, "OTHER");
+        // Provenance is set so future contributors know where the
+        // values came from (e.g. for sidecar inspection / round-trip).
+        assert!(
+            entry.values[0]
+                .from
+                .as_deref()
+                .unwrap_or("")
+                .contains("R-S4")
+        );
+        // Abstraction forced to Discover so the sidecar resolver
+        // picks up the discovered_values + catch_all.
+        assert_eq!(ann.signals[0].abstraction, SignalAbstraction::Discover);
+    }
+
+    #[test]
+    fn r_s4_skips_signals_without_opt_in() {
+        let mut ann = empty_sv_annotation();
+        // Default `equivalence_classes: false`.
+        ann.signals.push(signal_discover("opcode"));
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![1, 2, 5]);
+        let applied = ann.apply_equivalence_class_seeding(&literals);
+        assert!(applied.is_empty());
+        assert!(ann.discovered_values.is_empty());
+    }
+
+    #[test]
+    fn r_s4_dedupes_against_existing_discovered_values() {
+        let mut ann = empty_sv_annotation();
+        let mut sig = signal_discover("opcode");
+        sig.equivalence_classes = true;
+        ann.signals.push(sig);
+        ann.discovered_values.insert(
+            "opcode".to_string(),
+            DiscoveredValues {
+                values: vec![DiscoveredValue {
+                    name: "opcode_1".into(),
+                    value: 1,
+                    from: None,
+                }],
+                catch_all: "OTHER".into(),
+            },
+        );
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![1, 2, 5]);
+        let applied = ann.apply_equivalence_class_seeding(&literals);
+        // 1 already in discovered_values; 2 and 5 are new.
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].1, vec![2, 5]);
+        assert_eq!(ann.discovered_values.get("opcode").unwrap().values.len(), 3);
+    }
+
+    #[test]
+    fn r_s3_skips_signals_with_equivalence_classes_opt_in() {
+        let mut ann = empty_sv_annotation();
+        let mut sig = signal_discover("opcode");
+        sig.equivalence_classes = true;
+        ann.signals.push(sig);
+        let mut literals = HashMap::new();
+        literals.insert("opcode".to_string(), vec![1, 2, 5]);
+        // R-S3 should skip — R-S4 handles this signal exclusively.
+        let r_s3_applied = ann.apply_case_literal_seeding(&literals);
+        assert!(r_s3_applied.is_empty());
+        assert_eq!(
+            ann.signals[0].abstraction,
+            SignalAbstraction::Discover,
+            "R-S3 should not have promoted to Enum"
+        );
+        // R-S4 then fires.
+        let r_s4_applied = ann.apply_equivalence_class_seeding(&literals);
+        assert_eq!(r_s4_applied.len(), 1);
+        assert_eq!(ann.discovered_values.get("opcode").unwrap().values.len(), 3);
     }
 
     #[test]

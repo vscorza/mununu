@@ -78,6 +78,7 @@ pub fn build_input_field_domains(
                 value_map: inp.value_map.clone(),
                 combinational: false,
                 init_policy: inp.init_policy,
+                equivalence_classes: false,
                 type_name: None,
                 note: None,
             };
@@ -134,6 +135,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: crate::adapter::systemverilog::annotation::InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -160,6 +162,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: crate::adapter::systemverilog::annotation::InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });
@@ -181,6 +184,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: crate::adapter::systemverilog::annotation::InitPolicy::Inherit,
+            equivalence_classes: false,
             type_name: None,
             note: None,
         });

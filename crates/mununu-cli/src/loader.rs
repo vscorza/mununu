@@ -287,6 +287,29 @@ pub(crate) fn load_with_adapter_mode_extra(
                             v.sort_unstable();
                             v.dedup();
                         }
+                        // R-S4 (§Phase 9 §9.1) — equivalence-class
+                        // seeding. Runs BEFORE R-S3 (apply_case_literal_seeding)
+                        // so signals declaring `equivalence_classes: true`
+                        // get their case literals + OTHER catch-all populated
+                        // into discovered_values; R-S3 then skips those
+                        // signals (mutually exclusive per signal).
+                        let class_seeded = ann.apply_equivalence_class_seeding(&case_literals);
+                        if !class_seeded.is_empty() {
+                            eprintln!(
+                                "R-S4: equivalence-class seeding (discriminators + OTHER catch-all): {}",
+                                class_seeded
+                                    .iter()
+                                    .map(|(s, vs)| format!(
+                                        "{s}=[{}]+OTHER",
+                                        vs.iter()
+                                            .map(|v| v.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
                         let case_seeded = ann.apply_case_literal_seeding(&case_literals);
                         if !case_seeded.is_empty() {
                             eprintln!(
@@ -328,7 +351,11 @@ pub(crate) fn load_with_adapter_mode_extra(
                                     .join(", ")
                             );
                         }
-                        if !widened.is_empty() || !seeded.is_empty() || !case_seeded.is_empty() {
+                        if !widened.is_empty()
+                            || !seeded.is_empty()
+                            || !case_seeded.is_empty()
+                            || !class_seeded.is_empty()
+                        {
                             // Re-serialise so the BTOR2 lifter sees
                             // the widened+seeded variants + value_map.
                             // Falls back to the raw content if
