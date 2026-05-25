@@ -1,0 +1,54 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "uart_tx",
+  "source": "uart_tx.sv",
+  "signals": [
+    {
+      "name": "bit_cnt_q",
+      "abstraction": "bounded_counter",
+      "bound": 11,
+      "note": "M.1: 4-bit counter [0..11] tracking remaining UART frame bits (0 = idle, 10/11 = start of word transmission depending on parity_enable). Bounded at 11 — the max value the design writes (parity_enable=1)."
+    },
+    {
+      "name": "baud_div_q",
+      "abstraction": "bounded_counter",
+      "bound": 15,
+      "note": "M.1: 4-bit baud-rate divider counter [0..15]. Increments on tick_baud_x16; rollover at 16 generates tick_baud_q (the per-bit baud strobe)."
+    },
+    {
+      "name": "sreg_q",
+      "abstraction": "ignored",
+      "note": "M.1: 11-bit shift register holding the frame data. Pinned to reset value (11'h7ff) so the abstract state space stays within the bit-blast cap (2^20). The properties we verify reference `idle` and bit_cnt_q only — sreg_q's value is irrelevant to those. Discover-based widening would push total state bits past 20 (4+4+11+1+1 = 21 > 20); the user can promote sreg_q to bit_blast or discover after R.2.5 predicate-cube lift ships (which doesn't have the MAX_STATE_BITS cap)."
+    },
+    {
+      "name": "tx_q",
+      "abstraction": "boolean",
+      "note": "M.1: 1-bit serial output register. Boolean abstraction."
+    },
+    {
+      "name": "tick_baud_q",
+      "abstraction": "boolean",
+      "note": "M.1: per-bit baud strobe (true for one clock cycle every 16 tick_baud_x16 pulses)."
+    }
+  ],
+  "inputs": [
+    { "name": "tx_enable", "abstraction": "boolean" },
+    { "name": "tick_baud_x16", "abstraction": "boolean" },
+    { "name": "parity_enable", "abstraction": "boolean" },
+    { "name": "wr", "abstraction": "boolean" },
+    { "name": "wr_parity", "abstraction": "boolean" },
+    { "name": "wr_data", "abstraction": "ignored", "note": "M.1: 8-bit payload byte; not relevant to the FSM-state safety property. Ignored to keep the input space tractable." }
+  ],
+  "properties": [
+    {
+      "id": "idle_reachable_from_every_state",
+      "formula": "nu X. ((<> idle) && [] X)",
+      "description": "M.1 reachability safety: from every reachable state, the UART can eventually re-enter idle (`bit_cnt_q == 0` while `tx_enable`). Exercises the KMTS lifter on a counter-driven FSM-style design without typedef enums; the verdict's polarity matches what an engineer would expect for a well-formed UART transmitter."
+    },
+    {
+      "id": "idle_when_disabled",
+      "formula": "nu X. ((!tx_enable -> idle_after_step) && [] X)",
+      "description": "M.1 safety: when `tx_enable` is low, the transmitter reports `idle` on the next cycle (because `bit_cnt_d = 4'h0` in the always_comb). Exercises temporal-modal evaluation."
+    }
+  ]
+}

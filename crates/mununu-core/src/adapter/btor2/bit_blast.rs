@@ -185,7 +185,24 @@ pub fn to_ir(
     let states: Vec<&Line> = file.states().collect();
     let inputs: Vec<&Line> = file.inputs().collect();
 
-    let total_state_bits = sum_widths(file, &states)?;
+    // M.1 (§Phase 11 priority 2) — abstraction-aware bit accounting.
+    // Cells declared `Ignored` in the sidecar contribute zero bits
+    // to the state-space cap check (they collapse to a single
+    // pinned value at lift time). Discovered while attempting M.1
+    // on OpenTitan `uart_tx.sv`: an 11-bit shift register the
+    // property doesn't reference would otherwise push the design
+    // past `MAX_STATE_BITS = 20` despite the user's intent to
+    // ignore it.
+    //
+    // The pre-existing `sum_widths` runs over raw BTOR2 widths
+    // because cell_domains isn't populated yet at this point. We
+    // run a lightweight sidecar pre-scan here to subtract Ignored
+    // cells' widths before checking the cap. Strict additivity:
+    // when no sidecar is provided OR no cells are Ignored, the
+    // accounting is identical to the legacy behaviour.
+    let raw_state_bits = sum_widths(file, &states)?;
+    let total_state_bits =
+        raw_state_bits.saturating_sub(sidecar_ignored_state_bits(file, &states, options));
     let total_input_bits = sum_widths(file, &inputs)?;
 
     if total_state_bits > MAX_STATE_BITS {
@@ -283,6 +300,59 @@ fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
         })?;
     }
     Ok(total)
+}
+
+/// M.1 (§Phase 11) — sum the raw bit-widths of state cells whose
+/// sidecar entry declares `abstraction: ignored`. Subtracted from
+/// the cap-check total so wide registers the user explicitly opted
+/// to ignore don't push the design past `MAX_STATE_BITS`.
+///
+/// Returns 0 when no sidecar is provided, the sidecar fails to
+/// parse, or no cells are declared Ignored. Strict additivity:
+/// legacy behaviour is preserved when this helper returns 0.
+fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &AdapterOptions) -> u32 {
+    let Some(json) = &options.sidecar_json else {
+        return 0;
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return 0;
+    };
+    let symbols = parser::collect_symbols(file);
+    let ignored_names: std::collections::HashSet<&str> = ann
+        .signals
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.abstraction,
+                crate::adapter::systemverilog::annotation::SignalAbstraction::Ignored
+            )
+        })
+        .map(|s| s.name.as_str())
+        .collect();
+    if ignored_names.is_empty() {
+        return 0;
+    }
+    let mut sum: u32 = 0;
+    for line in states {
+        let name = match symbols.get(&line.nid) {
+            Some(n) => n.as_str(),
+            None => continue,
+        };
+        if !ignored_names.contains(name) {
+            continue;
+        }
+        let sort_nid = match &line.node {
+            Node::State { sort, .. } => *sort,
+            _ => continue,
+        };
+        let Some(width) = parser::bv_width(file, sort_nid) else {
+            continue;
+        };
+        sum = sum.saturating_add(width);
+    }
+    sum
 }
 
 /// §Phase 10 §10.2 stage 1 — metadata for one memory state cell
