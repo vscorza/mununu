@@ -475,6 +475,128 @@ fn trace_to_state(file: &Btor2File, args: &[crate::adapter::btor2::ast::Operand]
     None
 }
 
+/// M.1 Path B (§Phase 11) — find the nearest `State` NID reachable
+/// backward from any node carrying `symbol`. Used by the sidecar
+/// resolvers in [`super::bit_blast`] to map user-facing register
+/// names (`sreg_q`) onto BTOR2 state cells even when Yosys's
+/// `flatten` + `async2sync` + `dffunmap` chain has stripped the
+/// symbol from the `state` line itself.
+///
+/// Resolution order, in declining preference:
+/// 1. A `State { symbol: Some(s) }` line where `s == symbol` —
+///    distance 0 (a direct hit).
+/// 2. Any `Op { symbol: Some(s), args }` line where `s == symbol` —
+///    BFS backward from `args` to the nearest `State`; distance
+///    counts Op hops. Yosys's `uext _ <state-nid> 0 NAME` pattern
+///    (the "alias" shape) lands here at distance 2.
+/// 3. Any `Output { symbol: Some(s), signal }` line where
+///    `s == symbol` — BFS backward from `signal` to the nearest
+///    `State`.
+///
+/// **No width filter.** Pass 2 / Pass 3 in [`collect_symbols`] apply
+/// a width filter to avoid spurious matches between narrow
+/// combinational chains and wide state cells; this resolver
+/// intentionally does *not*, because the user has explicitly named
+/// the driver they care about via the sidecar's `drives` field.
+/// Combinational chains (`idle = bit_cnt_q == 0` — a 1-bit output
+/// driven by a 4-bit state) are exactly what `drives` is for.
+///
+/// **Ambiguity handling.** When multiple distinct `State` NIDs are
+/// reachable at the same minimum distance from candidates carrying
+/// the same symbol, returns `None` so the user can disambiguate by
+/// declaring a more specific `drives` value. Multiple candidates
+/// reaching the *same* state are deduplicated — only distinct state
+/// NIDs trigger the ambiguity guard.
+pub fn resolve_state_by_symbol(file: &Btor2File, symbol: &str) -> Option<Nid> {
+    let mut best: Option<(Nid, usize)> = None;
+    let mut tied: bool = false;
+
+    let consider =
+        |state_nid: Nid, distance: usize, best: &mut Option<(Nid, usize)>, tied: &mut bool| {
+            match *best {
+                None => {
+                    *best = Some((state_nid, distance));
+                    *tied = false;
+                }
+                Some((cur_nid, cur_dist)) => {
+                    if distance < cur_dist {
+                        *best = Some((state_nid, distance));
+                        *tied = false;
+                    } else if distance == cur_dist && cur_nid != state_nid {
+                        *tied = true;
+                    }
+                }
+            }
+        };
+
+    for line in &file.lines {
+        match &line.node {
+            Node::State {
+                symbol: Some(s), ..
+            } if s == symbol => {
+                consider(line.nid, 0, &mut best, &mut tied);
+            }
+            Node::Op {
+                symbol: Some(s),
+                args,
+                ..
+            } if s == symbol => {
+                if let Some((state_nid, distance)) = bfs_nearest_state(file, args) {
+                    consider(state_nid, distance, &mut best, &mut tied);
+                }
+            }
+            Node::Output {
+                symbol: Some(s),
+                signal,
+            } if s == symbol => {
+                if let Some((state_nid, distance)) =
+                    bfs_nearest_state(file, std::slice::from_ref(signal))
+                {
+                    consider(state_nid, distance, &mut best, &mut tied);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if tied {
+        return None;
+    }
+    best.map(|(nid, _)| nid)
+}
+
+/// BFS backward from a set of starting operands until a `State` node
+/// is reached. Returns `(state_nid, distance)` where `distance`
+/// counts Op hops (starting at 1 for direct operands of the seed).
+/// `None` when no state is reachable within the operand graph
+/// closure of the seeds.
+fn bfs_nearest_state(
+    file: &Btor2File,
+    seeds: &[crate::adapter::btor2::ast::Operand],
+) -> Option<(Nid, usize)> {
+    use std::collections::{HashSet, VecDeque};
+    let mut queue: VecDeque<(Nid, usize)> = seeds.iter().map(|o| (o.nid(), 1)).collect();
+    let mut seen: HashSet<Nid> = HashSet::new();
+    while let Some((nid, depth)) = queue.pop_front() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::State { .. } => return Some((line.nid, depth)),
+            Node::Op { args, .. } => {
+                for o in args {
+                    queue.push_back((o.nid(), depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Resolve the bit-vector width of a sort node. Returns `None` if the
 /// referenced node is an array sort or unresolvable.
 pub fn bv_width(file: &Btor2File, sort_nid: Nid) -> Option<u32> {
@@ -572,5 +694,88 @@ mod tests {
         } else {
             panic!("expected Justice node");
         }
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_direct_state_match() {
+        // 14 state 12 sreg_q  — the symbol lives directly on the state line.
+        let src = "1 sort bitvec 4\n2 const 1 0000\n3 state 1 sreg_q\n4 init 1 3 2\n";
+        let file = parse(src).expect("parse");
+        assert_eq!(resolve_state_by_symbol(&file, "sreg_q"), Some(3));
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_op_alias_match() {
+        // 14 state 12  (no symbol)
+        // 15 ite 12 ... 14 ...
+        // 47 uext 12 15 0 bit_cnt_q   (Op alias carrying user-visible name)
+        // The resolver walks from NID 47's operand (15) → state 14.
+        let src = "1 sort bitvec 1\n2 sort bitvec 4\n3 const 2 0000\n4 input 1 rst_n\n\
+                   5 state 2\n6 ite 2 4 5 3\n7 uext 2 6 0 bit_cnt_q\n";
+        let file = parse(src).expect("parse");
+        // Without `bit_cnt_q` on the state line, direct symbol lookup is empty:
+        let symbols = collect_symbols(&file);
+        // collect_symbols may or may not attach bit_cnt_q via Pass 2 (it should — width filter passes);
+        // but resolve_state_by_symbol must work regardless.
+        assert_eq!(resolve_state_by_symbol(&file, "bit_cnt_q"), Some(5));
+        // Sanity: symbols may or may not contain it via Pass 2 — the resolver is independent.
+        let _ = symbols;
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_output_alias_match() {
+        // 21 ite 1 4 20 11    (combinational using state 20 + const)
+        // 22 output 21 tx     (output port symbol attached)
+        let src = "1 sort bitvec 1\n2 input 1 rst_n\n3 const 1 1\n4 state 1\n\
+                   5 ite 1 2 4 3\n6 output 5 tx\n";
+        let file = parse(src).expect("parse");
+        assert_eq!(resolve_state_by_symbol(&file, "tx"), Some(4));
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_prefers_nearest() {
+        // Two Op aliases both name "bit_cnt_q" — one direct (distance 2),
+        // one through several Op hops (next-value combinational chain).
+        // The resolver must pick the nearest.
+        let src = "1 sort bitvec 1\n2 sort bitvec 4\n3 const 2 0000\n4 input 1 rst_n\n\
+                   5 state 2\n6 ite 2 4 5 3\n\
+                   7 ite 2 4 6 3\n8 ite 2 4 7 3\n9 ite 2 4 8 3\n\
+                   10 uext 2 6 0 bit_cnt_q\n11 uext 2 9 0 bit_cnt_d\n";
+        let file = parse(src).expect("parse");
+        // Both bit_cnt_q (via 10→6→5: 2 hops) and bit_cnt_d (via 11→9→8→7→6→5: 5 hops)
+        // reach state 5. The resolver picks the nearer one for bit_cnt_q.
+        assert_eq!(resolve_state_by_symbol(&file, "bit_cnt_q"), Some(5));
+        // bit_cnt_d also reaches state 5 — fine, but its distance is longer.
+        assert_eq!(resolve_state_by_symbol(&file, "bit_cnt_d"), Some(5));
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_ambiguous_returns_none() {
+        // Two distinct states both share the same minimum distance under
+        // the same symbol — the resolver returns None to flag ambiguity.
+        let src = "1 sort bitvec 1\n2 input 1 rst_n\n3 const 1 1\n\
+                   4 state 1\n5 state 1\n\
+                   6 ite 1 2 4 3\n7 ite 1 2 5 3\n\
+                   8 uext 1 6 0 shared\n9 uext 1 7 0 shared\n";
+        let file = parse(src).expect("parse");
+        assert_eq!(resolve_state_by_symbol(&file, "shared"), None);
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_no_match_returns_none() {
+        let src = "1 sort bitvec 1\n2 state 1 only_state\n";
+        let file = parse(src).expect("parse");
+        assert_eq!(resolve_state_by_symbol(&file, "absent"), None);
+    }
+
+    #[test]
+    fn resolve_state_by_symbol_direct_beats_op_alias() {
+        // A direct state symbol (distance 0) wins over an Op alias (distance ≥ 1)
+        // even though both name the same symbol.
+        let src = "1 sort bitvec 1\n2 input 1 rst_n\n3 const 1 1\n\
+                   4 state 1 winner\n5 state 1\n\
+                   6 ite 1 2 5 3\n7 uext 1 6 0 winner\n";
+        let file = parse(src).expect("parse");
+        assert_eq!(resolve_state_by_symbol(&file, "winner"), Some(4));
     }
 }

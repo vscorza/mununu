@@ -293,6 +293,34 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "is_false")]
     pub equivalence_classes: bool,
 
+    /// M.1 Path B (§Phase 11) — identify a BTOR2 state cell by a
+    /// named output / wire that it drives, instead of by the cell's
+    /// own (possibly stripped) symbol. When set, the BTOR2 resolver
+    /// walks the operand graph backward from any node carrying the
+    /// `drives` symbol and resolves the sidecar entry to the nearest
+    /// reachable `State` NID.
+    ///
+    /// Useful on designs where Yosys's `flatten` + `async2sync` +
+    /// `dffunmap` chain strips the original register names from the
+    /// `state` lines and only attaches them to derived `output` /
+    /// `Op` lines (the OpenTitan `uart_tx.sv` case discovered during
+    /// the M.1 attempt — see
+    /// `.claude/plans/milestones/M-1-blocker-2026-05-25.md`).
+    ///
+    /// Resolution: the resolver searches BTOR2 for nodes carrying the
+    /// `drives` symbol when set, falling back to `name` when `drives`
+    /// is `None`; it then BFS-walks the operand graph backward to
+    /// the nearest reachable `State` NID. When the chosen symbol
+    /// resolves to multiple distinct state cells at the same minimum
+    /// distance (ambiguous combinational chain), the resolver returns
+    /// no match — the user must disambiguate by picking a closer
+    /// driver name.
+    ///
+    /// Default `None` — preserves the existing direct-name-only
+    /// resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drives: Option<String>,
+
     /// R-S5 (§Phase 9 §9.1) — SV typedef name (e.g. `boot_fsm_state_e`)
     /// this signal is declared with. When set AND the signal's
     /// `abstraction` is `Discover` or `Enum` with empty `variants` /
@@ -1347,6 +1375,7 @@ fn resolve_input_domain(
         combinational: false,
         init_policy: inp.init_policy,
         bounded_init: None,
+        drives: None,
         equivalence_classes: false,
         type_name: None,
         note: None,
@@ -1576,6 +1605,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
                     bounded_init: None,
+                    drives: None,
                     equivalence_classes: false,
                     type_name: None,
                     note: Some("auto-detected typedef enum".to_string()),
@@ -1598,6 +1628,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
                     bounded_init: None,
+                    drives: None,
                     equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
@@ -1634,6 +1665,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     combinational: true,
                     init_policy: InitPolicy::Inherit,
                     bounded_init: None,
+                    drives: None,
                     equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
@@ -2388,6 +2420,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: Some(type_name.into()),
             note: None,
@@ -2439,6 +2472,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2548,6 +2582,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2593,6 +2628,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2625,6 +2661,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2657,6 +2694,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2686,6 +2724,7 @@ mod tests {
             combinational: false,
             init_policy: InitPolicy::Inherit,
             bounded_init: None,
+            drives: None,
             equivalence_classes: false,
             type_name: None,
             note: None,

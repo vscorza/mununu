@@ -310,6 +310,13 @@ fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
 /// Returns 0 when no sidecar is provided, the sidecar fails to
 /// parse, or no cells are declared Ignored. Strict additivity:
 /// legacy behaviour is preserved when this helper returns 0.
+///
+/// **M.1 Path B (§Phase 11):** resolves each ignored signal via the
+/// `drives` override (falling back to the sidecar `name`) using
+/// [`parser::resolve_state_by_symbol`], so sidecar entries match
+/// state cells even when Yosys strips the original register symbol
+/// from the `state` line and only attaches it via an Op-alias or
+/// `output` port symbol.
 fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &AdapterOptions) -> u32 {
     let Some(json) = &options.sidecar_json else {
         return 0;
@@ -319,8 +326,9 @@ fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &Adap
     else {
         return 0;
     };
-    let symbols = parser::collect_symbols(file);
-    let ignored_names: std::collections::HashSet<&str> = ann
+    // Map each Ignored sidecar signal → its resolved BTOR2 state NID
+    // (drives override > sidecar name; BFS-nearest-state).
+    let ignored_nids: std::collections::HashSet<Nid> = ann
         .signals
         .iter()
         .filter(|s| {
@@ -329,18 +337,17 @@ fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &Adap
                 crate::adapter::systemverilog::annotation::SignalAbstraction::Ignored
             )
         })
-        .map(|s| s.name.as_str())
+        .filter_map(|s| {
+            let target = s.drives.as_deref().unwrap_or(s.name.as_str());
+            parser::resolve_state_by_symbol(file, target)
+        })
         .collect();
-    if ignored_names.is_empty() {
+    if ignored_nids.is_empty() {
         return 0;
     }
     let mut sum: u32 = 0;
     for line in states {
-        let name = match symbols.get(&line.nid) {
-            Some(n) => n.as_str(),
-            None => continue,
-        };
-        if !ignored_names.contains(name) {
+        if !ignored_nids.contains(&line.nid) {
             continue;
         }
         let sort_nid = match &line.node {
@@ -353,6 +360,45 @@ fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &Adap
         sum = sum.saturating_add(width);
     }
     sum
+}
+
+/// M.1 Path B (§Phase 11) — build an augmented NID→sidecar-name map
+/// for the four downstream helpers that today look up sidecar names
+/// via `symbols.get(nid)`. For each sidecar signal entry, resolve
+/// its driver (`drives` override > sidecar `name`) via
+/// [`parser::resolve_state_by_symbol`]; when that finds a state NID,
+/// override the entry in the map with the sidecar's `name` (so the
+/// downstream consumers see the user's name regardless of which
+/// symbol Yosys happens to have attached to the state cell).
+///
+/// **Strict additivity.** Cells with no sidecar entry retain
+/// whatever Yosys-attached symbol was already in `base_symbols`.
+/// Cells whose sidecar entry resolves to the same NID Yosys already
+/// named identically see no change. Only cells where the sidecar's
+/// `drives` (or `name`, when `drives` is None) resolves the cell to
+/// a sidecar entry whose `name` differs from Yosys's symbol — that
+/// is the Path B-shaped overlap — get their entry rewritten.
+fn enrich_symbols_with_sidecar_drives(
+    file: &Btor2File,
+    base_symbols: &std::collections::HashMap<Nid, String>,
+    options: &AdapterOptions,
+) -> std::collections::HashMap<Nid, String> {
+    let mut out = base_symbols.clone();
+    let Some(json) = &options.sidecar_json else {
+        return out;
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return out;
+    };
+    for sig in &ann.signals {
+        let target = sig.drives.as_deref().unwrap_or(sig.name.as_str());
+        if let Some(state_nid) = parser::resolve_state_by_symbol(file, target) {
+            out.insert(state_nid, sig.name.clone());
+        }
+    }
+    out
 }
 
 /// §Phase 10 §10.2 stage 1 — metadata for one memory state cell
@@ -531,7 +577,13 @@ fn enumerate_and_blast(
     options: &AdapterOptions,
     warnings: &mut Vec<AdapterWarning>,
 ) -> Result<BlastOutput, AdapterError> {
-    let symbols = parser::collect_symbols(file);
+    // M.1 Path B (§Phase 11) — start from Yosys's collect_symbols
+    // output, then let the sidecar override per-NID names for
+    // entries whose `drives` (or fallback `name`) resolves to a
+    // state cell whose Yosys symbol is some other alias (`sreg_d`,
+    // `bit_cnt_d`, etc.). Strict additivity: no override fires
+    // when the sidecar's name already matches Yosys's symbol.
+    let symbols = enrich_symbols_with_sidecar_drives(file, &parser::collect_symbols(file), options);
 
     // Per-state-line metadata.
     let state_meta: Vec<StateMeta> = states

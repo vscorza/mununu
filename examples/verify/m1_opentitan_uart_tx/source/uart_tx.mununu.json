@@ -5,9 +5,10 @@
   "signals": [
     {
       "name": "bit_cnt_q",
+      "drives": "bit_cnt_q",
       "abstraction": "bounded_counter",
       "bound": 11,
-      "note": "M.1: 4-bit counter [0..11] tracking remaining UART frame bits (0 = idle, 10/11 = start of word transmission depending on parity_enable). Bounded at 11 — the max value the design writes (parity_enable=1)."
+      "note": "M.1 Path B (§Phase 11): Yosys's flatten + async2sync chain strips the symbol from the state line. The `bit_cnt_q` name appears on a uext alias (NID 47) but Pass 2 attached `bit_cnt_d` first due to line order. `drives: bit_cnt_q` tells mununu's resolver to BFS backward from any node carrying that symbol — picking up the underlying state cell directly. 4-bit counter [0..11] tracking remaining UART frame bits (0 = idle, 10/11 = start of word transmission depending on parity_enable). Bounded at 11 — the max value the design writes (parity_enable=1)."
     },
     {
       "name": "baud_div_q",
@@ -17,13 +18,15 @@
     },
     {
       "name": "sreg_q",
+      "drives": "sreg_q",
       "abstraction": "ignored",
-      "note": "M.1: 11-bit shift register holding the frame data. Pinned to reset value (11'h7ff) so the abstract state space stays within the bit-blast cap (2^20). The properties we verify reference `idle` and bit_cnt_q only — sreg_q's value is irrelevant to those. Discover-based widening would push total state bits past 20 (4+4+11+1+1 = 21 > 20); the user can promote sreg_q to bit_blast or discover after R.2.5 predicate-cube lift ships (which doesn't have the MAX_STATE_BITS cap)."
+      "note": "M.1 Path B (§Phase 11): same Yosys-symbol-stripping issue as bit_cnt_q. `drives: sreg_q` routes the resolver to the 11-bit shift-register state cell (NID 53 in current BTOR2) via the uext alias on NID 71. 11-bit shift register holding the frame data. Pinned to reset value (11'h7ff) so the abstract state space stays within the bit-blast cap (2^20). The properties we verify reference `idle` and bit_cnt_q only — sreg_q's value is irrelevant to those. Discover-based widening would push total state bits past 20 (4+4+11+1+1 = 21 > 20); the user can promote sreg_q to bit_blast or discover after R.2.5 predicate-cube lift ships (which doesn't have the MAX_STATE_BITS cap)."
     },
     {
       "name": "tx_q",
+      "drives": "tx",
       "abstraction": "boolean",
-      "note": "M.1: 1-bit serial output register. Boolean abstraction."
+      "note": "M.1 Path B (§Phase 11): the state cell is anonymous in BTOR2; the symbol `tx` only appears as the output port name. `drives: tx` routes the resolver via the output→state alias (1-hop ITE in NID 21). 1-bit serial output register. Boolean abstraction."
     },
     {
       "name": "tick_baud_q",
