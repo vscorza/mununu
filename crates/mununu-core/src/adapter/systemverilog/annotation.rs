@@ -83,6 +83,111 @@ pub struct SvAnnotation {
     /// Default `None` — preserves the cycle-0 init behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_sequence: Option<ResetSequence>,
+
+    /// §Phase 10 §10.2 stage 2 — Memory-cell annotations. For each
+    /// `$mem` / `$mem_v2` BTOR2 cell the user wants to abstract,
+    /// declare its address-width, data-width, and abstraction strategy
+    /// (UF / bit-blast / havoc / bounded-bit-blast). Optional
+    /// `selected_addresses` restricts UF mode to a finite set of
+    /// addresses kept concrete; the rest fall under the
+    /// abstraction's catch-all behaviour.
+    ///
+    /// Default empty — preserves the legacy behaviour (the BTOR2
+    /// lifter today silently treats `$mem` cells as regular state
+    /// cells, which produces the cap explosion on any non-trivial
+    /// memory). §Phase 10 §10.2 stage 1 (the lifter extension) is
+    /// the consumer of this field; until that lands, declarations
+    /// here are accepted by the schema but have no effect on the
+    /// abstract model. See §Phase 10 §10.1 fixture-selection
+    /// measurement record for the precondition fixture analysis
+    /// (ibex `ibex_register_file_ff.sv` selected as the first
+    /// fixture).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<MemoryAnnotation>,
+}
+
+/// §Phase 10 §10.2 stage 2 — Memory-cell annotation.
+///
+/// Declares an abstraction strategy for a single `$mem` / `$mem_v2`
+/// cell in the BTOR2 source. The BTOR2 cell is named after the SV
+/// signal that declared the array; e.g. an SV `logic [31:0] rf_reg
+/// [0:31]` produces a BTOR2 array cell named `rf_reg` with
+/// address-width 5 and data-width 32.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAnnotation {
+    /// Memory-cell name (matches the BTOR2 `$mem` symbol — typically
+    /// the SV array signal's name).
+    pub name: String,
+
+    /// Number of bits in the address. For a `[0:N-1]` array, this is
+    /// `ceil(log2(N))`. The lifter validates this matches the BTOR2
+    /// cell's actual address width.
+    pub address_width: u32,
+
+    /// Number of bits per memory word. For a `[W-1:0]` data type,
+    /// this is `W`. The lifter validates this matches the BTOR2
+    /// cell's data-port width.
+    pub data_width: u32,
+
+    /// Abstraction strategy.
+    pub abstraction: MemoryAbstraction,
+
+    /// Optional: addresses kept concrete under UF mode. The lifter
+    /// enforces SMT predicate-image queries on these specific
+    /// addresses; addresses outside this set fall under the catch-all
+    /// behaviour (havoc reads, no-op writes for soundness).
+    /// Default `None` (or empty) means "every address is symbolic
+    /// under the chosen abstraction".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_addresses: Option<Vec<u64>>,
+}
+
+/// §Phase 10 §10.2 stage 2 — Memory abstraction strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAbstraction {
+    /// UF (uninterpreted-function) abstraction over Z3 array theory.
+    /// Reads/writes treated as EUF terms with the standard array
+    /// axioms (`read(write(a, i, v), j) = if i==j then v else read(a, j)`).
+    /// Sound for safety + liveness (under-approximation of address
+    /// resolution); may produce `KleeneBot` verdicts that R.5 CEGAR
+    /// refines by selecting specific addresses (via `selected_addresses`).
+    /// **Default abstraction for any declared memory** because it's
+    /// the most general while staying sound; falls back to other
+    /// modes when explicitly requested.
+    Uf,
+
+    /// Full bit-blast over the memory's `address_width × data_width`
+    /// state space. Exact; only viable when `address_width + data_width`
+    /// fits within `MAX_STATE_BITS` after combining with other state
+    /// cells (typically ≤ 6 + 6 = 12 bits in practice). Useful for
+    /// small register files or tiny accumulators where the user wants
+    /// exact verdicts and the state space is manageable.
+    BitBlast,
+
+    /// Havoc on all reads, no-op on writes. Reads return any
+    /// admissible value of the data-width; writes are silently
+    /// dropped. Sound for safety (over-approximation of read
+    /// behaviour, so any property violation in the concrete is
+    /// still detected); **unsound for liveness** (the concrete may
+    /// reach a state the abstract cannot).
+    Havoc,
+
+    /// Bounded bit-blast: full bit-blast over a small subset of
+    /// addresses (declared in `selected_addresses`), havoc on the
+    /// rest. Hybrid between `BitBlast` and `Havoc` — the user picks
+    /// which addresses are worth the exact verdict and accepts havoc
+    /// reads on the rest. Sound for safety; unsound for liveness on
+    /// the havoc'd addresses.
+    BoundedBitBlast,
+}
+
+impl Default for MemoryAbstraction {
+    /// UF is the default — most general + sound for safety AND
+    /// liveness modulo CEGAR refinement on KleeneBot verdicts.
+    fn default() -> Self {
+        Self::Uf
+    }
 }
 
 /// R-Y6 (§Phase 8) — declaration of a reset-hold sequence for the
@@ -1657,6 +1762,7 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         discovered_values: HashMap::new(),
         parameters: HashMap::new(),
         reset_sequence: None,
+        memories: Vec::new(),
     }
 }
 
@@ -2263,6 +2369,7 @@ mod tests {
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
             reset_sequence: None,
+            memories: Vec::new(),
         }
     }
 
@@ -2764,5 +2871,124 @@ mod tests {
         // Reported in sidecar declaration order, not alphabetical
         assert_eq!(applied[0].0, "sig_b");
         assert_eq!(applied[1].0, "sig_a");
+    }
+
+    // ---- §Phase 10 §10.2 stage 2 — Memory schema extension ----
+
+    #[test]
+    fn phase10_memory_abstraction_defaults_to_uf() {
+        assert_eq!(MemoryAbstraction::default(), MemoryAbstraction::Uf);
+    }
+
+    #[test]
+    fn phase10_memory_annotation_round_trips_through_json() {
+        let json = r#"{
+            "name": "rf_reg",
+            "address_width": 5,
+            "data_width": 32,
+            "abstraction": "uf",
+            "selected_addresses": [0, 1, 5, 31]
+        }"#;
+        let mem: MemoryAnnotation = serde_json::from_str(json).expect("parse");
+        assert_eq!(mem.name, "rf_reg");
+        assert_eq!(mem.address_width, 5);
+        assert_eq!(mem.data_width, 32);
+        assert_eq!(mem.abstraction, MemoryAbstraction::Uf);
+        assert_eq!(
+            mem.selected_addresses.as_deref(),
+            Some(&[0u64, 1, 5, 31][..])
+        );
+        let back = serde_json::to_string(&mem).expect("serialize");
+        let again: MemoryAnnotation = serde_json::from_str(&back).expect("re-parse");
+        assert_eq!(again.name, mem.name);
+        assert_eq!(again.address_width, mem.address_width);
+        assert_eq!(again.abstraction, mem.abstraction);
+    }
+
+    #[test]
+    fn phase10_memory_annotation_omits_selected_addresses_when_none() {
+        let mem = MemoryAnnotation {
+            name: "rf_reg".into(),
+            address_width: 5,
+            data_width: 32,
+            abstraction: MemoryAbstraction::Uf,
+            selected_addresses: None,
+        };
+        let json = serde_json::to_string(&mem).expect("serialize");
+        assert!(
+            !json.contains("selected_addresses"),
+            "selected_addresses None should be omitted from JSON; got {json}"
+        );
+    }
+
+    #[test]
+    fn phase10_memory_abstraction_all_variants_parse() {
+        for (s, variant) in [
+            ("uf", MemoryAbstraction::Uf),
+            ("bit_blast", MemoryAbstraction::BitBlast),
+            ("havoc", MemoryAbstraction::Havoc),
+            ("bounded_bit_blast", MemoryAbstraction::BoundedBitBlast),
+        ] {
+            let json =
+                format!(r#"{{"name":"m","address_width":4,"data_width":8,"abstraction":"{s}"}}"#);
+            let mem: MemoryAnnotation =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {s}: {e}"));
+            assert_eq!(mem.abstraction, variant, "variant {s} round-trips");
+        }
+    }
+
+    #[test]
+    fn phase10_sv_annotation_with_memories_field_loads() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "ibex_register_file_ff",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 5,
+                    "data_width": 32,
+                    "abstraction": "uf",
+                    "selected_addresses": [0, 1, 5, 31]
+                }
+            ]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        assert_eq!(ann.memories.len(), 1);
+        assert_eq!(ann.memories[0].name, "rf_reg");
+        assert_eq!(ann.memories[0].abstraction, MemoryAbstraction::Uf);
+    }
+
+    #[test]
+    fn phase10_legacy_sidecar_without_memories_field_loads_with_empty_vec() {
+        // Strict additivity: existing fixtures' sidecars continue to work.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "legacy"
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse legacy");
+        assert!(ann.memories.is_empty());
+    }
+
+    #[test]
+    fn phase10_empty_memories_omitted_on_serialize() {
+        // skip_serializing_if = "Vec::is_empty" → field omitted when empty
+        let ann = SvAnnotation {
+            schema: Some("mununu_sv_annotation_v1".into()),
+            module: "test".into(),
+            source: None,
+            signals: vec![],
+            inputs: vec![],
+            controllable: vec![],
+            properties: vec![],
+            discovered_values: HashMap::new(),
+            parameters: HashMap::new(),
+            reset_sequence: None,
+            memories: Vec::new(),
+        };
+        let json = serde_json::to_string(&ann).expect("serialize");
+        assert!(
+            !json.contains("memories"),
+            "empty memories should be omitted from JSON; got {json}"
+        );
     }
 }

@@ -109,6 +109,7 @@ mod tests {
             discovered_values: std::collections::HashMap::new(),
             parameters: std::collections::HashMap::new(),
             reset_sequence: None,
+            memories: Vec::new(),
         }
     }
 
