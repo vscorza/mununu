@@ -136,16 +136,41 @@ pub fn to_ir(
 > {
     let mut warnings = Vec::new();
 
+    // §Phase 10 §10.2 stage 1 — detect array-typed state cells
+    // (BTOR2 `state` lines whose sort is `Sort::Array`) and validate
+    // them against the sidecar's `memories: [...]` declarations.
+    // The detection runs BEFORE the is_blastable check so that
+    // memory-bearing fixtures get an actionable error pointing at
+    // the sidecar template they need to add, instead of a generic
+    // "operator not supported" error from the downstream
+    // Read/Write check.
+    let memory_cells = detect_btor2_memories(file);
+    if !memory_cells.is_empty() {
+        validate_sidecar_memories(file, &memory_cells, options)?;
+    }
+
     // Reject unsupported operators up-front so users get a clear error
     // pointing to the BTOR2 line, not a confusing run-time panic.
+    // §Phase 10 §10.2 stage 1 nuance: Read/Write operators on
+    // memory cells will still trip this check until stage 3 (UF)
+    // or stage 4 (bounded bit-blast) ships. The error message
+    // includes the §Phase 10 hint so the user knows to wait for
+    // (or contribute) the stage 3/4 implementation.
     for line in &file.lines {
         if let Node::Op { op, .. } = &line.node
             && !op.is_blastable()
         {
+            let phase10_hint = if matches!(op, Op::Read | Op::Write) {
+                " (§Phase 10 §10.2 stage 1 has detected memory cells in this BTOR2 \
+                 and validated the sidecar; the actual lift will succeed once \
+                 stage 3 (UF mode) or stage 4 (bounded bit-blast) ships.)"
+            } else {
+                ""
+            };
             return Err(AdapterError {
                 kind: AdapterErrorKind::UnsupportedConstruct,
                 message: format!(
-                    "BTOR2 operator '{op:?}' at NID {} is not supported by the Phase 1 bit-blaster. \
+                    "BTOR2 operator '{op:?}' at NID {} is not supported by the Phase 1 bit-blaster.{phase10_hint} \
                      Hand the BTOR2 to an external symbolic engine (Phase 3 hand-off) instead.",
                     line.nid
                 ),
@@ -228,6 +253,18 @@ fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
             Node::Input { sort, .. } | Node::State { sort, .. } => *sort,
             _ => continue,
         };
+        // §Phase 10 §10.2 stage 1: skip array-sorted state cells in
+        // the bit-width accounting. Memory abstraction (UF / Havoc /
+        // bounded bit-blast) handles them separately via the
+        // sidecar's `memories` declarations. Stage 1 today still
+        // errors at the Read/Write op check (the actual lift fails),
+        // but the state-bit accounting must not double-error here.
+        if matches!(
+            sort_of_arc(file, sort_nid),
+            Some(crate::adapter::btor2::ast::Sort::Array { .. })
+        ) {
+            continue;
+        }
         let width = parser::bv_width(file, sort_nid).ok_or_else(|| AdapterError {
             kind: AdapterErrorKind::UnsupportedConstruct,
             message: format!(
@@ -246,6 +283,175 @@ fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
         })?;
     }
     Ok(total)
+}
+
+/// §Phase 10 §10.2 stage 1 — metadata for one memory state cell
+/// detected in the BTOR2 source. The `name` is the user-visible
+/// symbol (from `parser::collect_symbols`), used to cross-reference
+/// against the sidecar's `memories[]` declarations.
+#[derive(Debug, Clone)]
+struct MemoryCellMeta {
+    /// BTOR2 NID of the `state` line; reserved for the §Phase 10
+    /// §10.2 stage 3+ lifter to look up the cell during predicate-image
+    /// queries. Currently unused in stage 1 (schema/validate-only).
+    #[allow(dead_code)]
+    nid: Nid,
+    name: String,
+    address_width: u32,
+    data_width: u32,
+    source_line: usize,
+}
+
+/// §Phase 10 §10.2 stage 1 — walk the BTOR2 file for `state` lines
+/// whose sort is `Sort::Array`, resolve their address/data widths
+/// via the array sort's index/element references, and return one
+/// [`MemoryCellMeta`] per detected memory.
+///
+/// Returns an empty vec when no array state cells exist (the common
+/// case for FSM-only fixtures). Memory cells without a resolvable
+/// symbol get a synthetic `nid_<n>` name so the sidecar validator
+/// can still emit an actionable error pointing at the BTOR2 line.
+fn detect_btor2_memories(file: &Btor2File) -> Vec<MemoryCellMeta> {
+    let symbols = parser::collect_symbols(file);
+    let mut out = Vec::new();
+    for line in &file.lines {
+        let Node::State { sort, .. } = &line.node else {
+            continue;
+        };
+        let Some(crate::adapter::btor2::ast::Sort::Array { index, element }) =
+            sort_of_arc(file, *sort)
+        else {
+            continue;
+        };
+        let Some(address_width) = parser::bv_width(file, index) else {
+            continue;
+        };
+        let Some(data_width) = parser::bv_width(file, element) else {
+            continue;
+        };
+        let name = symbols
+            .get(&line.nid)
+            .cloned()
+            .unwrap_or_else(|| format!("nid_{}", line.nid));
+        out.push(MemoryCellMeta {
+            nid: line.nid,
+            name,
+            address_width,
+            data_width,
+            source_line: line.source_line,
+        });
+    }
+    out
+}
+
+/// §Phase 10 §10.2 stage 1 — validate detected memory cells against
+/// the sidecar's `memories[]` declarations. Returns Ok when every
+/// detected memory has a matching sidecar entry with matching
+/// `address_width` + `data_width`. Returns an actionable error
+/// otherwise — the error message includes a copy-paste-ready sidecar
+/// template the user can drop into their `.mununu.json` to declare
+/// the missing memories.
+///
+/// When the sidecar JSON is absent OR the schema fails to parse, the
+/// error still fires (memory cells exist in the BTOR2 and we have
+/// no declarations to validate against). The user sees the same
+/// template; this is the right outcome — silent acceptance of
+/// undeclared memories would let the downstream lift produce
+/// unsound verdicts.
+fn validate_sidecar_memories(
+    _file: &Btor2File,
+    memory_cells: &[MemoryCellMeta],
+    options: &AdapterOptions,
+) -> Result<(), AdapterError> {
+    use crate::adapter::systemverilog::annotation::SvAnnotation;
+
+    // Try to parse sidecar; missing/unparseable JSON ⇒ no declarations.
+    let declared: std::collections::HashMap<String, (u32, u32)> = options
+        .sidecar_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<SvAnnotation>(json).ok())
+        .map(|ann| {
+            ann.memories
+                .into_iter()
+                .map(|m| (m.name, (m.address_width, m.data_width)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut missing: Vec<&MemoryCellMeta> = Vec::new();
+    let mut mismatched: Vec<(&MemoryCellMeta, u32, u32)> = Vec::new();
+
+    for cell in memory_cells {
+        match declared.get(&cell.name) {
+            None => missing.push(cell),
+            Some(&(declared_aw, declared_dw)) => {
+                if declared_aw != cell.address_width || declared_dw != cell.data_width {
+                    mismatched.push((cell, declared_aw, declared_dw));
+                }
+            }
+        }
+    }
+
+    if missing.is_empty() && mismatched.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = String::from(
+        "§Phase 10 §10.2 stage 1 — the BTOR2 source contains memory cells that need \
+         sidecar declarations before lifting can proceed. Add the following entries to your \
+         `.mununu.json` sidecar's `memories` field:\n\n",
+    );
+    message.push_str("  \"memories\": [\n");
+    for cell in &missing {
+        message.push_str(&format!(
+            "    {{\"name\":\"{}\", \"address_width\":{}, \"data_width\":{}, \"abstraction\":\"havoc\"}},\n",
+            cell.name, cell.address_width, cell.data_width
+        ));
+    }
+    for (cell, declared_aw, declared_dw) in &mismatched {
+        message.push_str(&format!(
+            "    // mismatch on `{}`: BTOR2 has address_width={}, data_width={}; \
+             sidecar declared address_width={}, data_width={}. Fix:\n",
+            cell.name, cell.address_width, cell.data_width, declared_aw, declared_dw
+        ));
+        message.push_str(&format!(
+            "    {{\"name\":\"{}\", \"address_width\":{}, \"data_width\":{}, \"abstraction\":\"havoc\"}},\n",
+            cell.name, cell.address_width, cell.data_width
+        ));
+    }
+    message.push_str("  ]\n\n");
+    message.push_str(
+        "Currently supported abstractions: `havoc` (over-approximation; sound for safety, \
+         unsound for liveness). UF mode (stage 3) and bounded bit-blast (stage 4) are queued \
+         — track the §Phase 10 plan for shipping status.",
+    );
+
+    let first_line = missing
+        .first()
+        .map(|c| c.source_line)
+        .or_else(|| mismatched.first().map(|(c, _, _)| c.source_line))
+        .unwrap_or(0);
+
+    Err(AdapterError {
+        kind: AdapterErrorKind::UnsupportedConstruct,
+        message,
+        location: Some(SourceLocation {
+            line: first_line,
+            column: 0,
+        }),
+    })
+}
+
+/// §Phase 10 §10.2 stage 1 helper — resolve a sort NID to its `Sort`.
+fn sort_of_arc(file: &Btor2File, sort_nid: Nid) -> Option<crate::adapter::btor2::ast::Sort> {
+    for line in &file.lines {
+        if line.nid == sort_nid
+            && let Node::Sort { sort } = &line.node
+        {
+            return Some(sort.clone());
+        }
+    }
+    None
 }
 
 fn enumerate_and_blast(
@@ -3119,6 +3325,154 @@ mod tests {
     }
 
     // ---- R-Y3 (§Phase 8) — BTOR2 init smart defaults for unsidecared cells ----
+
+    // ---- §Phase 10 §10.2 stage 1 — BTOR2 $mem lifter extension ----
+
+    /// BTOR2 fixture with one array state cell (5-bit address × 8-bit data).
+    /// Has Write + Next + Read ops on the array; mirrors what Yosys
+    /// emits for a small `logic [7:0] m [0:31]` SV declaration.
+    const PHASE10_FIXTURE_WITH_MEMORY: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 8
+4 sort array 2 3
+5 state 4 rf_reg
+6 input 1 we
+7 input 2 addr
+8 input 3 wdata
+9 ite 4 6 5 5
+10 next 4 5 9
+11 read 3 5 7
+12 zero 3
+13 eq 1 11 12
+14 bad 13
+"#;
+
+    #[test]
+    fn phase10_stage1_no_sidecar_emits_actionable_template_error() {
+        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &AdapterOptions::default())
+            .expect_err("should error on undeclared memory");
+        assert!(
+            err.message.contains("§Phase 10"),
+            "error should cite §Phase 10: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("rf_reg"),
+            "error should name the undeclared memory cell: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("\"address_width\":5"),
+            "error template should include the BTOR2-derived address_width: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("\"data_width\":8"),
+            "error template should include the BTOR2-derived data_width: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("\"abstraction\":\"havoc\""),
+            "error template should suggest havoc as the stage-1 default: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn phase10_stage1_sidecar_consistent_passes_to_op_check() {
+        // With a consistent sidecar declaration, validation passes —
+        // but the lift then errors at the Read/Write op check (stage 3+
+        // territory). The error message includes the §Phase 10 hint.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 5,
+                    "data_width": 8,
+                    "abstraction": "havoc"
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect_err("stage 1 still errors at Read/Write op check");
+        assert!(
+            err.message.contains("§Phase 10"),
+            "op-check error should include the §Phase 10 hint: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("stage 3") || err.message.contains("stage 4"),
+            "op-check hint should point at stages 3/4: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn phase10_stage1_sidecar_mismatched_dimensions_errors() {
+        // Sidecar declares wrong dimensions; validation should flag
+        // the mismatch and emit a corrective template.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 6,  // wrong (BTOR2 says 5)
+                    "data_width": 16,    // wrong (BTOR2 says 8)
+                    "abstraction": "havoc"
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect_err("should error on dimension mismatch");
+        assert!(
+            err.message.contains("mismatch"),
+            "error should flag mismatch: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains("BTOR2 has address_width=5, data_width=8"),
+            "error should show the BTOR2-detected dimensions: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains("sidecar declared address_width=6, data_width=16"),
+            "error should show the sidecar-declared dimensions: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn phase10_stage1_no_memory_cells_no_op() {
+        // Fixture without any array state cells: validation runs but
+        // emits no error; existing behaviour preserved.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        assert!(
+            out.warnings
+                .iter()
+                .all(|w| !w.message.contains("§Phase 10"))
+        );
+    }
 
     // ---- R-Y6 (§Phase 8) — reset-sequence-aware init ----
 
