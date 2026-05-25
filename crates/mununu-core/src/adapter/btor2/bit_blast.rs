@@ -556,6 +556,19 @@ fn enumerate_and_blast(
     let init_state_indices: Vec<usize> = {
         let mut init_env = make_initial_env(file, &state_meta, &input_meta, true);
         evaluate_pure(file, &mut init_env, /*honor_init=*/ true)?;
+        // R-Y6 (§Phase 8) — reset-sequence-aware init. When the
+        // sidecar declares `reset_sequence: {...}`, run K cycles of
+        // reset-asserted simulation before enumerating initial states.
+        // The state after the K-cycle hold becomes the effective
+        // initial state. No-op when the sidecar lacks the field.
+        apply_reset_sequence(
+            file,
+            &mut init_env,
+            &state_meta,
+            &input_meta,
+            &symbols,
+            options,
+        )?;
         // R-Y4 — bounded-init overrides from the sidecar.
         let bounded_init_overrides = sidecar_bounded_init_overrides(options, &state_meta, &symbols);
         let combos = enumerate_initial_combos(
@@ -2050,6 +2063,85 @@ fn enumerate_initial_combos(
     combos
 }
 
+/// R-Y6 (§Phase 8) — apply the sidecar-declared reset-hold sequence
+/// to the init env. Pins the named input signal to its asserted value
+/// and runs `hold_cycles` cycles of `evaluate_pure` + `apply_next`,
+/// mutating `init_env` to reflect the state AFTER the reset hold.
+///
+/// No-op when:
+/// - The sidecar JSON is absent / unparseable.
+/// - No `reset_sequence` field is declared in the SvAnnotation.
+/// - `hold_cycles == 0`.
+/// - The named reset input does not resolve to a BTOR2 input symbol
+///   (silently skipped to keep the precondition behaviour additive).
+///
+/// SOUNDNESS: this is an exact transformation of the init env per the
+/// design's own reset semantics — the K-cycle hold is what the
+/// downstream verification engine would do anyway if it could
+/// observe time before cycle 0. No abstraction tradeoff; the init
+/// state set after R-Y6 represents "what the design's state is after
+/// the reset hold settles", which is the intended initial state for
+/// most real designs with multi-stage reset synchronisers (e.g.
+/// OpenTitan's `prim_reset_sync`).
+fn apply_reset_sequence(
+    file: &Btor2File,
+    init_env: &mut Env,
+    state_meta: &[StateMeta],
+    input_meta: &[InputMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    options: &AdapterOptions,
+) -> Result<(), AdapterError> {
+    let Some(json) = &options.sidecar_json else {
+        return Ok(());
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return Ok(());
+    };
+    let Some(seq) = ann.reset_sequence.as_ref() else {
+        return Ok(());
+    };
+    if seq.hold_cycles == 0 {
+        return Ok(());
+    }
+    // Resolve reset input name to BTOR2 input NID + width.
+    let reset_nid_width: Option<(Nid, u32)> = input_meta
+        .iter()
+        .filter_map(|im| {
+            symbols.get(&im.nid).and_then(|name| {
+                if name == &seq.reset_input {
+                    Some((im.nid, im.width))
+                } else {
+                    None
+                }
+            })
+        })
+        .next();
+    let Some((reset_nid, width)) = reset_nid_width else {
+        // Silently skip — the reset_input name didn't match any BTOR2
+        // input. Additive: leaves init_env unchanged.
+        return Ok(());
+    };
+    let mask = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    let asserted_bv = BvValue::new(seq.asserted_value as u128 & mask, width);
+    for _ in 0..seq.hold_cycles {
+        // Pin the reset input to its asserted value.
+        init_env.values.insert(reset_nid, asserted_bv);
+        // Re-evaluate pure expressions (constants, propagation through
+        // combinational logic) — honor_init=false because we're past
+        // cycle 0 now.
+        evaluate_pure(file, init_env, /*honor_init=*/ false)?;
+        // Advance state cells via their next-state functions.
+        apply_next(file, init_env, state_meta)?;
+    }
+    Ok(())
+}
+
 /// R-Y4 (§Phase 8) — collect per-signal bounded-init overrides from
 /// the sidecar. For each `signals[]` entry with both
 /// `init_policy: anyconst` AND a non-empty `bounded_init: [...]`,
@@ -3027,6 +3119,150 @@ mod tests {
     }
 
     // ---- R-Y3 (§Phase 8) — BTOR2 init smart defaults for unsidecared cells ----
+
+    // ---- R-Y6 (§Phase 8) — reset-sequence-aware init ----
+
+    #[test]
+    fn r_y6_no_sidecar_no_op() {
+        // Counter that increments every cycle; init=0. Without R-Y6
+        // sequence, init state is 0.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 input 1 rst_n
+9 ones 1
+10 eq 1 3 9
+11 bad 10
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        // Single init state (q=0), exactly 1 "initial" marker.
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(initial_count, 1);
+    }
+
+    #[test]
+    fn r_y6_with_sidecar_advances_init_state_by_k_cycles() {
+        // Counter q increments every cycle UNLESS rst_n=0 (active-low
+        // reset) which holds q at 0. R-Y6 with hold_cycles=2,
+        // asserted_value=0 → q held at 0 for 2 cycles, then init is
+        // computed from the post-reset state (still 0; counter never
+        // increments while rst_n=0).
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 input 1 rst_n
+8 ite 1 7 6 2
+9 next 1 3 8
+10 ones 1
+11 eq 1 3 10
+12 bad 11
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "reset_sequence": {
+                "reset_input": "rst_n",
+                "asserted_value": 0,
+                "hold_cycles": 2
+            }
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // Single init state — q still 0 after 2 reset cycles.
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(initial_count, 1);
+    }
+
+    #[test]
+    fn r_y6_runs_design_logic_for_k_cycles_without_reset() {
+        // Counter q increments every cycle unconditionally (no reset
+        // logic in the next-state function). R-Y6 still pins the
+        // declared "reset" input but the design ignores it. After
+        // hold_cycles=3 cycles, q should be at value 3.
+        let src = r#"
+1 sort bitvec 3
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 input 1 rst_n
+9 ones 1
+10 eq 1 3 9
+11 bad 10
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "reset_sequence": {
+                "reset_input": "rst_n",
+                "asserted_value": 0,
+                "hold_cycles": 3
+            }
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // q advances from 0 → 1 → 2 → 3 over the 3 reset cycles.
+        // The bad signal `eq 1 3 9` (=q==7) is not satisfied at q=3,
+        // so init state q=3 satisfies. The CTXDSL has a `q = 3`
+        // valuation block on the initial state.
+        assert!(
+            out.ctxdsl.contains("q = 3"),
+            "expected init valuation q = 3 after 3-cycle reset hold; got:\n{}",
+            out.ctxdsl
+        );
+    }
+
+    #[test]
+    fn r_y6_unknown_reset_input_is_silent_no_op() {
+        // Sidecar names a reset signal that doesn't exist in the
+        // BTOR2. R-Y6 silently skips (additive); init state computed
+        // normally.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 ones 1
+9 eq 1 3 8
+10 bad 9
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "reset_sequence": {
+                "reset_input": "nonexistent_reset",
+                "asserted_value": 0,
+                "hold_cycles": 3
+            }
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // Without applicable reset signal, init state is cycle 0 (q=0).
+        assert!(out.ctxdsl.contains("q = 0"));
+    }
 
     // ---- R-Y4 (§Phase 8) — bounded-havoc init value sets ----
 

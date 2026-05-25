@@ -722,6 +722,7 @@ fn build_per_module_annotation(
         properties: vec![], // Properties come from the multi-module level
         discovered_values,
         parameters: entry.parameters.clone(),
+        reset_sequence: None,
     }
 }
 

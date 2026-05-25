@@ -108,6 +108,7 @@ mod tests {
             properties: vec![],
             discovered_values: std::collections::HashMap::new(),
             parameters: std::collections::HashMap::new(),
+            reset_sequence: None,
         }
     }
 

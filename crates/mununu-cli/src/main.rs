@@ -1605,6 +1605,7 @@ fn btor2_discover(args: Btor2DiscoverArgs) -> Result<(), String> {
             properties: Vec::new(),
             discovered_values: std::collections::HashMap::new(),
             parameters: std::collections::HashMap::new(),
+            reset_sequence: None,
         }
     };
 
@@ -2773,6 +2774,7 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
             .iter()
             .map(|p| (p.name.clone(), p.default_value))
             .collect(),
+        reset_sequence: None,
     };
 
     let json =
@@ -3250,6 +3252,7 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
                 properties: vec![],
                 discovered_values: module_entry.discovered_values.clone(),
                 parameters: module_entry.parameters.clone(),
+                reset_sequence: None,
             };
 
             let results =

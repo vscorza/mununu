@@ -63,6 +63,44 @@ pub struct SvAnnotation {
     /// Module parameter overrides (e.g., `{"DEPTH": 4}`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub parameters: HashMap<String, i64>,
+
+    /// R-Y6 (§Phase 8) — reset-sequence-aware init. When set, the
+    /// BTOR2 bit-blaster runs `hold_cycles` cycles of "reset asserted"
+    /// simulation before enumerating initial states. The named input
+    /// is pinned to `asserted_value` for those cycles; design logic
+    /// propagates the reset through synchronizers and reset-domain
+    /// flip-flops. The state after the K-cycle hold becomes the
+    /// effective initial state (instead of the cycle-0 BTOR2 init
+    /// values).
+    ///
+    /// Useful for designs where the reset signal passes through a
+    /// multi-stage synchronizer before the main reset takes effect
+    /// (OpenTitan `prim_reset_sync` is the canonical example: 2-cycle
+    /// hold ensures the synchronizer settles before any verification
+    /// cycle runs). Caliptra's `soc_ifc_boot_fsm` does not need this
+    /// — the reset path is single-cycle.
+    ///
+    /// Default `None` — preserves the cycle-0 init behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_sequence: Option<ResetSequence>,
+}
+
+/// R-Y6 (§Phase 8) — declaration of a reset-hold sequence for the
+/// bit-blaster's init-state computation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetSequence {
+    /// Name of the BTOR2 input signal to pin during the hold cycles
+    /// (typically `rst_ni` for active-low or `rst` for active-high).
+    pub reset_input: String,
+    /// The value to pin the reset input to during the hold. Use 0 for
+    /// active-low reset (rst_ni asserted = 0) and 1 for active-high
+    /// reset. Masked to the input's bit-width.
+    pub asserted_value: u64,
+    /// How many clock cycles to hold the reset asserted before
+    /// enumerating initial states. Typical values: 1 (single-cycle
+    /// reset domain), 2 (one synchronizer stage), 3 (two synchronizer
+    /// stages). Must be > 0; 0 is equivalent to omitting the field.
+    pub hold_cycles: u32,
 }
 
 /// Annotation for a register or internal signal.
@@ -1618,6 +1656,7 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         }],
         discovered_values: HashMap::new(),
         parameters: HashMap::new(),
+        reset_sequence: None,
     }
 }
 
@@ -2223,6 +2262,7 @@ mod tests {
             properties: vec![],
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
+            reset_sequence: None,
         }
     }
 
