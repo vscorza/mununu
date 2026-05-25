@@ -103,6 +103,26 @@ pub struct AdapterOptions {
     /// default (the right call for BTOR2 inputs that originated as
     /// cut points from `cutpoint -blackbox`).
     pub port_directions: HashMap<String, crate::controllability::BoundaryDirection>,
+
+    /// R-Y3 (§Phase 8) — opt-in BTOR2 init-line smart defaults for
+    /// state cells without sidecar entries. When true, each
+    /// unsidecared cell with a BTOR2 `Init` line is pinned to its
+    /// init value (1-state abstraction) instead of falling back to
+    /// full bit-blast (`2^width`). Cells without init lines retain
+    /// full bit-blast.
+    ///
+    /// SOUNDNESS: under-approximation. Sound for liveness ("the
+    /// reset state is reachable in the real design"); unsound for
+    /// safety ("property violations that require deviation from the
+    /// init value are silently masked"). Surfaced as an adapter
+    /// warning naming the affected cells.
+    ///
+    /// The CLI also honours the env var
+    /// `MUNUNU_BTOR2_SMART_INIT_DEFAULTS=1` as a fallback so existing
+    /// `validate.sh` scripts can opt in without touching every
+    /// AdapterOptions construction site. Default `false` — preserves
+    /// legacy full-bit-blast behaviour for unsidecared cells.
+    pub smart_init_defaults: bool,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.

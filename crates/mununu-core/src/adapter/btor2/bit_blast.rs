@@ -382,6 +382,32 @@ fn enumerate_and_blast(
         "state cell",
     );
 
+    // R-Y3 (§Phase 8) — BTOR2 init-line smart defaults for cells
+    // WITHOUT sidecar entries. Opt-in via `MUNUNU_BTOR2_SMART_INIT_DEFAULTS=1`.
+    // Default OFF — full bit-blast remains the cap-safe legacy
+    // behaviour. When enabled, each state cell with NO sidecar entry
+    // AND a BTOR2 `Init` line gets a synthetic `EnumValues` entry
+    // pinning it to its init value (1-state abstraction instead of
+    // `2^width`).
+    //
+    // SOUNDNESS: collapsing an unsidecared cell to its init value is
+    // an **under-approximation** of the design — sound for liveness
+    // ("if reset state alone reaches the property, the property is
+    // reachable in the real design too"), **unsound for safety**
+    // ("property violations that depend on the cell deviating from
+    // its init value are silently masked"). The opt-in surfaces this
+    // tradeoff explicitly; users enable it when they want to ignore
+    // cells they haven't bothered to declare AND accept the
+    // soundness implication. Mirrors R-Y1's env-var pattern.
+    apply_btor2_init_smart_defaults(
+        file,
+        &state_meta,
+        &symbols,
+        &mut cell_domains,
+        warnings,
+        options,
+    );
+
     // R-S2a (§Phase 9 §9.1) — BTOR2 init-line seeding. For every
     // state cell with an `Init` line in the BTOR2 source AND a
     // sidecar-declared abstraction that takes per-value discriminators
@@ -1640,6 +1666,122 @@ fn make_step_env(
 ///
 /// Bridges the gap when R-S5 / R-S3 / R-S7 don't cover the signal's
 /// init value. Strictly additive — never replaces existing entries.
+/// R-Y3 (§Phase 8) — BTOR2 init-line smart defaults for cells
+/// WITHOUT sidecar entries. Opt-in via `MUNUNU_BTOR2_SMART_INIT_DEFAULTS=1`.
+///
+/// For each state cell with NO entry in `cell_domains` AND a BTOR2
+/// `Init` line resolvable to a constant, inserts a synthetic
+/// `EnumValues` `FieldDomain` pinning the cell to its init value.
+/// The synthetic variant name is `<signal>_<init_value>`.
+///
+/// Effect: `CellEnumeration::build` sees the cell as if the user had
+/// declared `{abstraction: enum, variants: [<signal>_<init>],
+/// value_map: [{<signal>_<init>: <init>}]}` in the sidecar. State
+/// space for that cell collapses from `2^width` (full bit-blast) to 1.
+///
+/// SOUNDNESS: see the call-site comment in `enumerate_and_blast`.
+/// Under-approximation; sound for liveness, unsound for safety. Emits
+/// an adapter warning naming the affected cells so users see what
+/// was pinned.
+///
+/// No-op when the env var is unset OR when the design has no
+/// unsidecared init-line cells.
+fn apply_btor2_init_smart_defaults(
+    file: &Btor2File,
+    state_meta: &[StateMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+    cell_domains: &mut CellDomainMap,
+    warnings: &mut Vec<AdapterWarning>,
+    options: &AdapterOptions,
+) {
+    let enabled = options.smart_init_defaults
+        || std::env::var("MUNUNU_BTOR2_SMART_INIT_DEFAULTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
+
+    // Build a NID → width lookup.
+    let nid_to_width: std::collections::HashMap<Nid, u32> =
+        state_meta.iter().map(|sm| (sm.nid, sm.width)).collect();
+
+    // Walk Init lines; build (state_nid, init_value) pairs.
+    let mut pinned: Vec<(Nid, u64)> = Vec::new();
+    for line in &file.lines {
+        let Node::Init { state, value, .. } = &line.node else {
+            continue;
+        };
+        // Only consider cells without sidecar entries.
+        if cell_domains.contains_key(state) {
+            continue;
+        }
+        let Some(init_value) = resolve_btor2_constant(file, value.nid()) else {
+            continue;
+        };
+        let Some(width) = nid_to_width.get(state) else {
+            continue;
+        };
+        let masked = if *width >= 64 {
+            init_value
+        } else {
+            init_value & ((1u64 << *width) - 1)
+        };
+        pinned.push((*state, masked));
+    }
+
+    if pinned.is_empty() {
+        return;
+    }
+
+    // Inject synthetic sidecar entries.
+    let mut pinned_names: Vec<String> = Vec::new();
+    for (nid, val) in &pinned {
+        let signal_name = symbols
+            .get(nid)
+            .cloned()
+            .unwrap_or_else(|| format!("nid_{nid}"));
+        let variant_name = format!("{}_{}", signal_name, *val);
+        let fd = FieldDomain {
+            name: signal_name.clone(),
+            abstraction: AbstractionType::EnumValues,
+            bound: None,
+            lower_bound: None,
+            variants: Some(vec![variant_name.clone()]),
+            initial: AbstractValue::Variant(variant_name.clone()),
+        };
+        let value_map = vec![(variant_name, *val as i64)];
+        cell_domains.insert(*nid, (fd, value_map));
+        pinned_names.push(signal_name);
+    }
+    pinned_names.sort();
+    pinned_names.dedup();
+
+    let shown: Vec<&str> = pinned_names.iter().take(5).map(String::as_str).collect();
+    let suffix = if pinned_names.len() > shown.len() {
+        format!(" (and {} more)", pinned_names.len() - shown.len())
+    } else {
+        String::new()
+    };
+    warnings.push(AdapterWarning {
+        kind: WarningKind::ApproximateTranslation,
+        message: format!(
+            "R-Y3: pinned {n} unsidecared state cell(s) to their BTOR2 init values \
+             (smart-init-defaults policy enabled): {names}{suffix}. SOUNDNESS: \
+             under-approximation — sound for liveness, unsound for safety. \
+             Property violations that require these cells to deviate from their \
+             init values are silently masked. Disable via unsetting \
+             MUNUNU_BTOR2_SMART_INIT_DEFAULTS or declare the affected signals in \
+             the sidecar to override the pinning.",
+            n = pinned_names.len(),
+            names = shown.join(", "),
+            suffix = suffix
+        ),
+        location: None,
+    });
+}
+
 fn apply_btor2_init_seeding(
     file: &Btor2File,
     state_meta: &[StateMeta],
@@ -2802,6 +2944,112 @@ mod tests {
         let out = translate(src, &opts).expect("translate");
         // bounded_counter [0, 2] = 3 states; R-S2a no-op.
         assert_eq!(out.source_info.state_count, 3);
+    }
+
+    // ---- R-Y3 (§Phase 8) — BTOR2 init smart defaults for unsidecared cells ----
+
+    #[test]
+    fn r_y3_default_off_preserves_full_bit_blast() {
+        // 2-bit state q with init=1; NO sidecar entry. Default
+        // R-Y3 off → full bit-blast = 4 states.
+        let src = r#"
+1 sort bitvec 2
+2 one 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        assert_eq!(out.source_info.state_count, 4);
+    }
+
+    #[test]
+    fn r_y3_enabled_pins_unsidecared_cell_to_init_value() {
+        // Same fixture; R-Y3 ON → q pinned to init=1, single state.
+        let src = r#"
+1 sort bitvec 2
+2 one 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        let opts = AdapterOptions {
+            smart_init_defaults: true,
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // q pinned to init=1 → 1 state.
+        assert_eq!(out.source_info.state_count, 1);
+        // Warning fires naming the affected cell.
+        let warning = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("R-Y3"))
+            .expect("R-Y3 warning expected");
+        assert!(
+            warning.message.contains("q"),
+            "warning should name the pinned cell: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("unsound for safety"),
+            "warning should surface the soundness tradeoff"
+        );
+    }
+
+    #[test]
+    fn r_y3_skips_sidecared_cells() {
+        // q has init=1 AND sidecar entry. R-Y3 should NOT override
+        // the sidecar declaration (only fills in for cells WITHOUT one).
+        let src = r#"
+1 sort bitvec 4
+2 one 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+6 eq 1 3 2
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {"name": "q", "abstraction": "bounded_counter", "bound": 2}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            smart_init_defaults: true,
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // Sidecar wins: bounded_counter [0, 2] = 3 states; R-Y3 no-op.
+        assert_eq!(out.source_info.state_count, 3);
+    }
+
+    #[test]
+    fn r_y3_skips_cells_without_init_line() {
+        // q has NO init line AND no sidecar. R-Y3 skips (nothing to
+        // pin to); falls back to full bit-blast.
+        let src = r#"
+1 sort bitvec 2
+2 state 1 q
+3 next 1 2 2
+4 zero 1
+5 eq 1 2 4
+6 bad 5
+"#;
+        let opts = AdapterOptions {
+            smart_init_defaults: true,
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // Full bit-blast (no init to pin to) = 4 states.
+        assert_eq!(out.source_info.state_count, 4);
     }
 
     #[test]
