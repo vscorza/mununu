@@ -556,7 +556,15 @@ fn enumerate_and_blast(
     let init_state_indices: Vec<usize> = {
         let mut init_env = make_initial_env(file, &state_meta, &input_meta, true);
         evaluate_pure(file, &mut init_env, /*honor_init=*/ true)?;
-        let combos = enumerate_initial_combos(&init_env, &state_meta, &cells, &nondet_init_nids);
+        // R-Y4 — bounded-init overrides from the sidecar.
+        let bounded_init_overrides = sidecar_bounded_init_overrides(options, &state_meta, &symbols);
+        let combos = enumerate_initial_combos(
+            &init_env,
+            &state_meta,
+            &cells,
+            &nondet_init_nids,
+            &bounded_init_overrides,
+        );
         if combos.len() > MAX_INITIAL_STATES {
             warnings.push(AdapterWarning {
                 kind: WarningKind::ApproximateTranslation,
@@ -1996,6 +2004,7 @@ fn enumerate_initial_combos(
     state_meta: &[StateMeta],
     cells: &CellEnumeration,
     nondet_nids: &std::collections::HashSet<Nid>,
+    bounded_init_overrides: &std::collections::HashMap<Nid, Vec<u128>>,
 ) -> Vec<usize> {
     if nondet_nids.is_empty() {
         return Vec::new();
@@ -2006,8 +2015,20 @@ fn enumerate_initial_combos(
         .enumerate()
         .map(|(i, sm)| {
             if nondet_nids.contains(&sm.nid) {
-                // Anyconst-style: every value in the declared abstraction.
-                cells.per_cell[i].clone()
+                // R-Y4 (§Phase 8) — if the sidecar declared
+                // `bounded_init: [...]` for this signal, restrict
+                // the per-cell init set to those values. The
+                // bounded-init values must already be in the cell's
+                // abstract admissible set (`cells.per_cell[i]`);
+                // out-of-set values are silently dropped by the
+                // cartesian-product encoder (cells.encode returns
+                // None for unrepresentable combinations).
+                if let Some(bounded) = bounded_init_overrides.get(&sm.nid) {
+                    bounded.clone()
+                } else {
+                    // Anyconst-style: every value in the declared abstraction.
+                    cells.per_cell[i].clone()
+                }
             } else {
                 // Deterministic: use the pinned init value.
                 let bits = init_env
@@ -2027,6 +2048,65 @@ fn enumerate_initial_combos(
     combos.sort_unstable();
     combos.dedup();
     combos
+}
+
+/// R-Y4 (§Phase 8) — collect per-signal bounded-init overrides from
+/// the sidecar. For each `signals[]` entry with both
+/// `init_policy: anyconst` AND a non-empty `bounded_init: [...]`,
+/// returns `(NID, [values])` keyed by the BTOR2 state-cell NID.
+///
+/// Values are masked to the cell's bit-width to avoid surprising
+/// encode failures on values that span more bits than the cell admits.
+/// Cells whose symbol does not resolve to a state-meta entry are
+/// silently skipped (defensive — typically can't happen if the
+/// sidecar names match the SV source).
+fn sidecar_bounded_init_overrides(
+    options: &AdapterOptions,
+    state_meta: &[StateMeta],
+    symbols: &std::collections::HashMap<i64, String>,
+) -> std::collections::HashMap<Nid, Vec<u128>> {
+    let Some(json) = &options.sidecar_json else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return std::collections::HashMap::new();
+    };
+    let name_to_nid_width: std::collections::HashMap<&str, (Nid, u32)> = state_meta
+        .iter()
+        .filter_map(|sm| {
+            symbols
+                .get(&sm.nid)
+                .map(|n| (n.as_str(), (sm.nid, sm.width)))
+        })
+        .collect();
+    let mut out = std::collections::HashMap::new();
+    for sig in &ann.signals {
+        if !matches!(
+            sig.init_policy,
+            crate::adapter::systemverilog::annotation::InitPolicy::Anyconst
+        ) {
+            continue;
+        }
+        let Some(bounded) = sig.bounded_init.as_ref() else {
+            continue;
+        };
+        if bounded.is_empty() {
+            continue;
+        }
+        let Some((nid, width)) = name_to_nid_width.get(sig.name.as_str()) else {
+            continue;
+        };
+        let mask = if *width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << *width) - 1
+        };
+        let values: Vec<u128> = bounded.iter().map(|v| (*v as u128) & mask).collect();
+        out.insert(*nid, values);
+    }
+    out
 }
 
 /// Recursive helper for `enumerate_initial_combos` — fills the
@@ -2947,6 +3027,123 @@ mod tests {
     }
 
     // ---- R-Y3 (§Phase 8) — BTOR2 init smart defaults for unsidecared cells ----
+
+    // ---- R-Y4 (§Phase 8) — bounded-havoc init value sets ----
+
+    #[test]
+    fn r_y4_bounded_init_restricts_path3_enumeration() {
+        // 2-bit state q with anyconst init policy + bounded_init: [0, 2].
+        // Path 3 should enumerate exactly 2 init states (q=0, q=2)
+        // instead of all 4 admissible values.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 next 1 4 4
+6 eq 1 4 3
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {
+                    "name": "q",
+                    "abstraction": "bit_blast",
+                    "init_policy": "anyconst",
+                    "bounded_init": [0, 2]
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // 4 abstract states; 2 are initial (the bounded set).
+        assert_eq!(out.source_info.state_count, 4);
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(
+            initial_count, 2,
+            "bounded_init restricts enumeration to {{0, 2}} = 2 init states"
+        );
+    }
+
+    #[test]
+    fn r_y4_empty_bounded_init_falls_back_to_full_anyconst() {
+        // bounded_init: [] should be treated as "no bounding" — Path 3
+        // enumerates the full admissible set per the anyconst policy.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 next 1 4 4
+6 eq 1 4 3
+7 bad 6
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {
+                    "name": "q",
+                    "abstraction": "bit_blast",
+                    "init_policy": "anyconst",
+                    "bounded_init": []
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(
+            initial_count, 4,
+            "empty bounded_init → full anyconst enumeration"
+        );
+    }
+
+    #[test]
+    fn r_y4_no_op_when_init_policy_not_anyconst() {
+        // bounded_init declared but init_policy not anyconst — Path 3
+        // does not fire (no nondet_init_nids); bounded_init is
+        // collected but ignored. Legacy single-init runs.
+        let src = r#"
+1 sort bitvec 2
+2 zero 1
+3 ones 1
+4 state 1 q
+5 init 1 4 2
+6 next 1 4 4
+7 eq 1 4 3
+8 bad 7
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {
+                    "name": "q",
+                    "abstraction": "bit_blast",
+                    "bounded_init": [1, 2]
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        let initial_count = out.ctxdsl.lines().filter(|l| l.contains("initial")).count();
+        assert_eq!(
+            initial_count, 1,
+            "no anyconst → no Path 3 enumeration → legacy single-init"
+        );
+    }
 
     #[test]
     fn r_y3_default_off_preserves_full_bit_blast() {

@@ -109,6 +109,27 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "is_inherit_init_policy")]
     pub init_policy: InitPolicy,
 
+    /// R-Y4 (§Phase 8) — bounded-havoc init value set. When set AND
+    /// `init_policy == Anyconst`, Path 3's per-anyconst-value
+    /// initial-state enumeration restricts the admissible init
+    /// values for this signal to the listed values (instead of
+    /// enumerating every value in the cell's abstract admissible
+    /// set). Useful when the hardware spec documents a restricted
+    /// reset-sample range (e.g. "reset value is one of 0..4" on a
+    /// 3-bit register that admits 0..7) or when the user wants to
+    /// focus the verifier on specific bug-relevant init samples.
+    ///
+    /// Strictly additive: when empty/None OR when `init_policy` is
+    /// not `Anyconst`, Path 3's existing enumeration runs unchanged.
+    /// Values outside the cell's abstract admissible set (e.g.
+    /// outside the typedef's UNMATCHED-extended set after R-S5
+    /// widening) are silently skipped by the cartesian product
+    /// (cells.encode returns None for unrepresentable combinations).
+    ///
+    /// Default `None` — preserves Path 3's full-enumeration behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_init: Option<Vec<i64>>,
+
     /// R-S4 (§Phase 9 §9.1) — opt-in equivalence-class seeding. When
     /// `true` AND R-S3's `extract_case_literals` finds case-statement
     /// labels for this signal, R-S4 populates the signal's
@@ -1182,6 +1203,7 @@ fn resolve_input_domain(
         value_map: inp.value_map.clone(),
         combinational: false,
         init_policy: inp.init_policy,
+        bounded_init: None,
         equivalence_classes: false,
         type_name: None,
         note: None,
@@ -1410,6 +1432,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
+                    bounded_init: None,
                     equivalence_classes: false,
                     type_name: None,
                     note: Some("auto-detected typedef enum".to_string()),
@@ -1431,6 +1454,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: false,
                     init_policy: InitPolicy::Inherit,
+                    bounded_init: None,
                     equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
@@ -1466,6 +1490,7 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     value_map: None,
                     combinational: true,
                     init_policy: InitPolicy::Inherit,
+                    bounded_init: None,
                     equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
@@ -2215,6 +2240,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: Some(type_name.into()),
             note: None,
@@ -2265,6 +2291,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2373,6 +2400,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2417,6 +2445,7 @@ mod tests {
             ]),
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2448,6 +2477,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2479,6 +2509,7 @@ mod tests {
             }]),
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
@@ -2507,6 +2538,7 @@ mod tests {
             value_map: None,
             combinational: false,
             init_policy: InitPolicy::Inherit,
+            bounded_init: None,
             equivalence_classes: false,
             type_name: None,
             note: None,
