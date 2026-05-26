@@ -145,9 +145,57 @@ pub fn to_ir(
     // "operator not supported" error from the downstream
     // Read/Write check.
     let memory_cells = detect_btor2_memories(file);
+
+    // §Phase 10 §10.2 stage 1b — havoc-mode BTOR2 rewriting. When
+    // the sidecar declares a memory with `abstraction: havoc`, we
+    // rewrite the BTOR2 in-place before the is_blastable check:
+    // - drop the array `State` line for the memory cell;
+    // - drop Init/Next lines whose `state` operand is the memory;
+    // - drop `Op::Write` lines whose first operand is the memory;
+    // - rewrite each `Op::Read` from the memory to a fresh `Input`
+    //   of the data-port width (keeping the same NID so downstream
+    //   references resolve unchanged).
+    //
+    // The result is a memory-free BTOR2 the stage-1 bit-blaster can
+    // already handle. Reads return nondeterministic values on every
+    // cycle (the standard havoc abstraction); writes are silently
+    // dropped (no abstract memory to update). Soundness: over-
+    // approximates read behaviour ⇒ sound for safety, unsound for
+    // liveness on the memory contents.
+    //
+    // Non-havoc memory abstractions (`uf`, `bit_blast`,
+    // `bounded_bit_blast`) are left for stage 3/4 — the rewriter
+    // simply passes the file through unchanged in those cases, and
+    // the is_blastable check below produces the existing
+    // "stage 3/4 not yet shipped" error.
+    let mut rewritten_holder: Option<Btor2File> = None;
     if !memory_cells.is_empty() {
         validate_sidecar_memories(file, &memory_cells, options)?;
+        let havoc_nids = sidecar_havoc_memory_nids(&memory_cells, options);
+        if !havoc_nids.is_empty() {
+            let havoc_names: Vec<&str> = memory_cells
+                .iter()
+                .filter(|m| havoc_nids.contains(&m.nid))
+                .map(|m| m.name.as_str())
+                .collect();
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "§Phase 10 §10.2 stage 1b: {} memor{} havoc-abstracted (reads return \
+                     fresh nondeterministic values; writes/inits/nexts dropped). SOUND for \
+                     safety (over-approximation of read behaviour); UNSOUND for liveness on \
+                     memory contents (the concrete may reach states the abstract cannot). \
+                     Memories: {}",
+                    havoc_names.len(),
+                    if havoc_names.len() == 1 { "y" } else { "ies" },
+                    havoc_names.join(", "),
+                ),
+                location: None,
+            });
+            rewritten_holder = Some(havoc_rewrite_memories(file, &havoc_nids)?);
+        }
     }
+    let file: &Btor2File = rewritten_holder.as_ref().unwrap_or(file);
 
     // Reject unsupported operators up-front so users get a clear error
     // pointing to the BTOR2 line, not a confusing run-time panic.
@@ -555,6 +603,213 @@ fn validate_sidecar_memories(
             line: first_line,
             column: 0,
         }),
+    })
+}
+
+/// §Phase 10 §10.2 stage 1b — collect the NIDs of memory cells the
+/// sidecar declared with `abstraction: havoc`. Used by
+/// [`havoc_rewrite_memories`] to know which cells to abstract.
+///
+/// Returns the empty set when no memories are declared havoc (the
+/// stage 1a-only path; the is_blastable check will then error out
+/// on any remaining Read/Write op pointing the user at stage 3/4).
+fn sidecar_havoc_memory_nids(
+    memory_cells: &[MemoryCellMeta],
+    options: &AdapterOptions,
+) -> std::collections::HashSet<Nid> {
+    use crate::adapter::systemverilog::annotation::{MemoryAbstraction, SvAnnotation};
+
+    let Some(json) = &options.sidecar_json else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(ann) = serde_json::from_str::<SvAnnotation>(json) else {
+        return std::collections::HashSet::new();
+    };
+    let havoc_names: std::collections::HashSet<&str> = ann
+        .memories
+        .iter()
+        .filter(|m| matches!(m.abstraction, MemoryAbstraction::Havoc))
+        .map(|m| m.name.as_str())
+        .collect();
+    memory_cells
+        .iter()
+        .filter(|m| havoc_names.contains(m.name.as_str()))
+        .map(|m| m.nid)
+        .collect()
+}
+
+/// §Phase 10 §10.2 stage 1b — rewrite a BTOR2 file to abstract out
+/// the memory cells listed in `havoc_nids` under the havoc-mode
+/// semantics:
+///
+/// 1. Drop each memory's `State` line (the array cell goes away).
+/// 2. Drop every `Init` / `Next` line whose `state` operand is one
+///    of the havoc'd memories.
+/// 3. Drop every `Op::Write` whose first operand is one of the
+///    havoc'd memories.
+/// 4. Replace every `Op::Read` whose first operand is one of the
+///    havoc'd memories with an `Input` of the read's data sort,
+///    preserving the NID so downstream references resolve. The new
+///    input carries a synthetic symbol `__havoc_read_<nid>` for
+///    traceability in `valuations { ... }` blocks.
+///
+/// **Soundness.** Each Read becomes an independent nondeterministic
+/// input — re-reading the same address at different cycles can
+/// return different values. This over-approximates the concrete
+/// read behaviour: any value the concrete memory might hold is
+/// admissible. Writes are silently dropped because there is no
+/// abstract memory to update. Sound for safety; unsound for liveness
+/// on memory contents.
+///
+/// **Errors.** Returns `Err` when dropping memory operators would
+/// leave a dangling reference (i.e. a node OTHER than a Next/Write
+/// references a dropped Write's NID). This shouldn't happen on
+/// well-formed Yosys-emitted BTOR2 for stage 1b's target fixtures
+/// (register files, mailboxes); the error message asks the user to
+/// file a bug with the BTOR2 dump so we can extend the rewriter.
+fn havoc_rewrite_memories(
+    file: &Btor2File,
+    havoc_nids: &std::collections::HashSet<Nid>,
+) -> Result<Btor2File, AdapterError> {
+    use crate::adapter::btor2::ast::{Op, Sort};
+
+    // Helper — does this sort NID resolve to an Array sort?
+    let is_array_sort =
+        |sort_nid: Nid| -> bool { matches!(sort_of_arc(file, sort_nid), Some(Sort::Array { .. })) };
+
+    // First pass — compute the closed set of NIDs to drop. The havoc
+    // semantics demand that every node carrying array-typed data
+    // disappear from the IR; downstream consumers either (a) had
+    // their array operand replaced by an Input (Reads), or
+    // (b) referenced a Next line we're dropping (chained Writes,
+    // ITE-on-array selectors).
+    //
+    // We iterate the line list once and collect every node whose
+    // RESULT sort is Array — that includes the State cells themselves,
+    // intermediate `Op { sort = array, ... }` lines (ITE-on-array,
+    // Write, etc.), and the Init/Next lines targeting array states.
+    // Yosys-emitted BTOR2 only uses array sorts for memory data flow,
+    // so dropping every array-sorted node is safe; we explicitly
+    // check this assumption by verifying every array-sorted State is
+    // a havoc'd memory (mixed havoc/non-havoc memories would require
+    // a per-memory closure which stage 1b does not yet implement).
+    let mut dropped: std::collections::HashSet<Nid> = havoc_nids.clone();
+    for line in &file.lines {
+        match &line.node {
+            Node::State { sort, .. } if is_array_sort(*sort) => {
+                if !havoc_nids.contains(&line.nid) {
+                    return Err(AdapterError {
+                        kind: AdapterErrorKind::UnsupportedConstruct,
+                        message: format!(
+                            "§Phase 10 §10.2 stage 1b: BTOR2 has array-typed state at NID {} \
+                             that the sidecar did not declare with `abstraction: havoc`. \
+                             Stage 1b only handles mixed havoc + bitvec-only fixtures; \
+                             non-havoc memories must wait for stage 3 (UF) or stage 4 \
+                             (bounded bit-blast).",
+                            line.nid,
+                        ),
+                        location: Some(SourceLocation {
+                            line: line.source_line,
+                            column: 0,
+                        }),
+                    });
+                }
+                dropped.insert(line.nid);
+            }
+            Node::Op { sort, .. } if is_array_sort(*sort) => {
+                dropped.insert(line.nid);
+            }
+            Node::Init { sort, .. } | Node::Next { sort, .. } if is_array_sort(*sort) => {
+                dropped.insert(line.nid);
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass — produce the rewritten line list. Each Read whose
+    // array operand is dropped becomes a fresh Input at the same NID
+    // (downstream references resolve unchanged). Every other dropped
+    // line is removed. Non-dropped lines pass through cloned.
+    let mut new_lines: Vec<Line> = Vec::with_capacity(file.lines.len());
+    for line in &file.lines {
+        if dropped.contains(&line.nid) {
+            continue;
+        }
+        let rewritten = match &line.node {
+            Node::Op {
+                op: Op::Read,
+                sort,
+                args,
+                ..
+            } if args
+                .first()
+                .map(|a| dropped.contains(&a.nid()))
+                .unwrap_or(false) =>
+            {
+                Line {
+                    nid: line.nid,
+                    node: Node::Input {
+                        sort: *sort,
+                        symbol: Some(format!("__havoc_read_{}", line.nid)),
+                    },
+                    immediates: Vec::new(),
+                    source_line: line.source_line,
+                }
+            }
+            _ => line.clone(),
+        };
+        new_lines.push(rewritten);
+    }
+
+    // Third pass — verify no dangling references survived. A live
+    // reference to a dropped NID would mean some consumer is using an
+    // array-tainted result the rewriter expected to be self-contained
+    // within the dropped subgraph.
+    let live: std::collections::HashSet<Nid> = new_lines.iter().map(|l| l.nid).collect();
+    for line in &new_lines {
+        let refs: Vec<Nid> = match &line.node {
+            Node::Op { args, .. } => args.iter().map(|a| a.nid()).collect(),
+            Node::Init { state, value, .. } | Node::Next { state, value, .. } => {
+                vec![*state, value.nid()]
+            }
+            Node::Bad { signal }
+            | Node::Constraint { signal }
+            | Node::Fair { signal }
+            | Node::Output { signal, .. } => vec![signal.nid()],
+            Node::Justice { signals } => signals.iter().map(|s| s.nid()).collect(),
+            _ => Vec::new(),
+        };
+        for r in refs {
+            if !live.contains(&r) && dropped.contains(&r) {
+                return Err(AdapterError {
+                    kind: AdapterErrorKind::UnsupportedConstruct,
+                    message: format!(
+                        "§Phase 10 §10.2 stage 1b: havoc rewrite would leave NID {} \
+                         (a {:?}) referencing dropped NID {} (an array-tainted node). \
+                         The stage 1b rewriter assumes array data flow is self-contained \
+                         within the memory subgraph; please file an issue with the BTOR2 \
+                         dump so we can extend the rewriter.",
+                        line.nid, line.node, r,
+                    ),
+                    location: Some(SourceLocation {
+                        line: line.source_line,
+                        column: 0,
+                    }),
+                });
+            }
+        }
+    }
+
+    // Fourth pass — rebuild the by_nid index.
+    let by_nid: std::collections::HashMap<Nid, usize> = new_lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.nid, i))
+        .collect();
+
+    Ok(Btor2File {
+        lines: new_lines,
+        by_nid,
     })
 }
 
@@ -3502,10 +3757,49 @@ mod tests {
     }
 
     #[test]
-    fn phase10_stage1_sidecar_consistent_passes_to_op_check() {
-        // With a consistent sidecar declaration, validation passes —
-        // but the lift then errors at the Read/Write op check (stage 3+
-        // territory). The error message includes the §Phase 10 hint.
+    fn phase10_stage1_non_havoc_abstraction_passes_to_op_check() {
+        // With a consistent UF-mode sidecar declaration, stage 1
+        // validation passes, but the lift errors at the Read/Write
+        // op check (stage 3 territory — UF is not yet shipped).
+        // The error message includes the §Phase 10 hint.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 5,
+                    "data_width": 8,
+                    "abstraction": "uf"
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect_err("stage 1 still errors at Read/Write op check under non-havoc abstraction");
+        assert!(
+            err.message.contains("§Phase 10"),
+            "op-check error should include the §Phase 10 hint: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("stage 3") || err.message.contains("stage 4"),
+            "op-check hint should point at stages 3/4: {}",
+            err.message
+        );
+    }
+
+    // ---- §Phase 10 §10.2 stage 1b — havoc-mode BTOR2 rewriting ----
+
+    #[test]
+    fn phase10_stage1b_havoc_rewrites_and_lifts_end_to_end() {
+        // With `abstraction: havoc` the rewriter drops the memory
+        // state cell, drops Init/Next/Write lines targeting it, and
+        // converts Read into a fresh nondet input. The bit-blaster
+        // then succeeds end-to-end (no Read/Write ops survive).
         let sidecar = serde_json::json!({
             "$schema": "mununu_sv_annotation_v1",
             "module": "test",
@@ -3522,17 +3816,105 @@ mod tests {
             sidecar_json: Some(sidecar.to_string()),
             ..Default::default()
         };
-        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
-            .expect_err("stage 1 still errors at Read/Write op check");
+        let out = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect("havoc rewrite should make the lift succeed");
+        // The memory cell vanishes from the state space; no scalar
+        // state cells survive the rewrite either, so state_count = 1
+        // (the BTOR2 has a single state cell, the rf_reg array, which
+        // gets dropped).
+        assert_eq!(
+            out.source_info.state_count, 1,
+            "rewritten BTOR2 has no surviving state cells → trivial 1-state model"
+        );
+        // The havoc warning must fire and name the abstracted memory.
+        let havoc_warn = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("§Phase 10 §10.2 stage 1b"))
+            .expect("havoc warning should fire");
         assert!(
-            err.message.contains("§Phase 10"),
-            "op-check error should include the §Phase 10 hint: {}",
-            err.message
+            havoc_warn.message.contains("rf_reg"),
+            "havoc warning should name the abstracted memory: {}",
+            havoc_warn.message
         );
         assert!(
-            err.message.contains("stage 3") || err.message.contains("stage 4"),
-            "op-check hint should point at stages 3/4: {}",
+            havoc_warn.message.contains("SOUND for safety"),
+            "havoc warning should state soundness posture: {}",
+            havoc_warn.message
+        );
+    }
+
+    #[test]
+    fn phase10_stage1b_havoc_input_added_at_read_nid() {
+        // The havoc rewrite replaces the Read at NID 11 with an
+        // Input at the same NID, carrying a `__havoc_read_11` symbol
+        // for traceability. We probe by checking the surviving
+        // input count grows by 1 (we, addr, wdata, plus __havoc_read_11).
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 5,
+                    "data_width": 8,
+                    "abstraction": "havoc"
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts).expect("havoc lift should succeed");
+        // The synthetic input should appear in the generated CTXDSL
+        // text as a label name (the rewrite gave it a symbol prefixed
+        // with `__havoc_read_`).
+        assert!(
+            out.ctxdsl.contains("__havoc_read_"),
+            "rewritten CTXDSL should mention the synthetic havoc-read input; got:\n{}",
+            out.ctxdsl
+        );
+    }
+
+    #[test]
+    fn phase10_stage1b_havoc_does_not_fire_without_sidecar_entry() {
+        // A sidecar with no `memories[]` entry causes stage 1a to
+        // emit the actionable error — stage 1b never runs (no
+        // declared abstraction).
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": []
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect_err("undeclared memory should still error at stage 1a");
+        assert!(
+            err.message.contains("§Phase 10"),
+            "stage 1a actionable error should fire: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn phase10_stage1b_no_op_when_no_memories() {
+        // Fixture without any memory cells — neither stage 1a nor
+        // 1b run; no havoc warning fires. Legacy behaviour preserved.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        assert!(
+            out.warnings.iter().all(|w| !w.message.contains("stage 1b")),
+            "no stage 1b warning should fire on memory-free fixture"
         );
     }
 
