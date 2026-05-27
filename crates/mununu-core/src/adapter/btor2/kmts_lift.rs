@@ -349,6 +349,13 @@ pub struct PredicateCubeLiftResult {
     /// debt; consumers that need verdicts on the cube space must wait
     /// for that integration.
     pub predicate_image_pending: bool,
+    /// R.5b follow-up — Adapter warnings the lift emitted (e.g. UF
+    /// wrapping naming). Replaces the prior tracing::warn!-only
+    /// surface so callers (e.g. cegar.rs) can fold lift warnings
+    /// into their own reporting (CegarTrace, CLI verdict-with-
+    /// warnings, etc.). Empty for fixtures that triggered no
+    /// warning-worthy abstraction decisions.
+    pub warnings: Vec<crate::adapter::AdapterWarning>,
 }
 
 /// R.2.5 — Lift one BTOR2 source through the predicate-cube path.
@@ -389,27 +396,31 @@ pub fn predicate_cube_lift(
     let known_registers: std::collections::HashSet<String> = symbols.values().cloned().collect();
 
     // R.5b lifter consumer wiring — resolve sidecar `uf_wrap` /
-    // `uf_unwrap` declarations to the set of BTOR2 Op NIDs the
+    // `uf_unwrap` declarations + the default policy (Op::Mul always;
+    // Op::Add/Sub when width > 32) to the set of BTOR2 Op NIDs the
     // simulate-one-step pass should treat as uninterpreted (returns
     // BvValue::zero on evaluation). Empty set ⇒ no UF wrapping;
     // simulate_one_step is used directly with no behaviour change.
     let uf_wrapped_nids = crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, options);
+    let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
     if !uf_wrapped_nids.is_empty() {
-        // Surface the wrapping via tracing — the predicate-image
-        // result doesn't currently carry an AdapterWarning channel,
-        // so the user-visible signal goes through the CLI's tracing
-        // initialization. Per `docs/design/native-sv-abstraction.md`
-        // §6.10: sound may-side over-approximation for the
-        // wrapped cells; downstream cube successors may shift toward
-        // KleeneBot when wrapped Op outputs propagate through Next.
-        tracing::warn!(
-            uf_wrapped_count = uf_wrapped_nids.len(),
+        // R.5b AdapterWarning channel — surface the UF wrapping via
+        // both tracing (log-stream visibility) and the structured
+        // warnings vec (for callers like cegar.rs to fold into their
+        // own reporting).
+        let message = format!(
             "R.5b predicate-image: {} Op(s) UF-wrapped (substituted to zero in simulate-one-step). \
              SOUND for safety (may-side over-approximation per §6.10); the wrapped cells' downstream \
              cube successors may shift toward KleeneBot. To remove a wrapping, list the cell in the \
              sidecar's `uf_unwrap` field.",
             uf_wrapped_nids.len()
         );
+        tracing::warn!(uf_wrapped_count = uf_wrapped_nids.len(), "{}", message);
+        warnings.push(crate::adapter::AdapterWarning {
+            kind: crate::adapter::WarningKind::ApproximateTranslation,
+            message,
+            location: None,
+        });
     }
 
     for pred in &predicates {
@@ -645,6 +656,10 @@ pub fn predicate_cube_lift(
         // `max_input_bits > 0` and at least one predicate exists;
         // R.5 / R.5b will additionally populate must-edges via SMT.
         predicate_image_pending,
+        // R.5b AdapterWarning channel — UF wrapping naming + other
+        // lift-time abstraction decisions surface here for caller
+        // reporting.
+        warnings,
     })
 }
 
@@ -1317,6 +1332,72 @@ mod tests {
         assert_eq!(
             uf_edges, no_uf_edges,
             "edge count must match between UF and no-UF runs (same input space, same cube count)"
+        );
+    }
+
+    #[test]
+    fn r5b_predicate_cube_lift_surfaces_uf_wrap_warning_to_caller() {
+        // R.5b AdapterWarning channel test — when UF wrapping fires,
+        // the result.warnings vec must carry an entry naming the
+        // wrapping. Mirror of the tracing::warn! surface but
+        // structured for caller consumption (e.g. cegar.rs folding
+        // into CegarTrace).
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_1".into(),
+            register: "cnt".into(),
+            value: 1,
+        }];
+        let uf_sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "uf_wrap": ["wide_add"]
+        });
+        let uf_opts = AdapterOptions {
+            sidecar_json: Some(uf_sidecar.to_string()),
+            ..Default::default()
+        };
+        let result = predicate_cube_lift(
+            preds,
+            R5B_CONSUMER_FIXTURE,
+            &uf_opts,
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("ok");
+        assert!(
+            !result.warnings.is_empty(),
+            "UF wrapping must surface as at least one AdapterWarning on the result"
+        );
+        let has_uf_warning = result.warnings.iter().any(|w| {
+            matches!(w.kind, crate::adapter::WarningKind::ApproximateTranslation)
+                && w.message.contains("UF-wrapped")
+        });
+        assert!(
+            has_uf_warning,
+            "warnings must include an UF-wrapping naming entry; got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn r5b_predicate_cube_lift_no_warning_when_no_wrapping() {
+        // Fixture with NO Op::Mul + no wide add → no UF wrapping →
+        // no warning surfaces.
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let result = predicate_cube_lift(
+            preds,
+            COUNTER_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("ok");
+        assert!(
+            result.warnings.is_empty(),
+            "warnings must be empty when no UF wrapping fires; got: {:?}",
+            result.warnings
         );
     }
 }
