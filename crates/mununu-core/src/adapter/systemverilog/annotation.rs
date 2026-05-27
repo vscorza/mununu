@@ -104,6 +104,45 @@ pub struct SvAnnotation {
     /// fixture).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memories: Vec<MemoryAnnotation>,
+
+    /// R.5b — Cell-instance names to **force-wrap** as uninterpreted
+    /// functions in the BTOR2 lifter. Each name in the list is matched
+    /// against BTOR2 cell-instance symbols (the same name space the
+    /// `signals[]` array's per-signal `name` field targets) — when a
+    /// match is found, the cell's output is treated as a fresh
+    /// nondeterministic input rather than evaluated through its
+    /// arithmetic. Sound may-side over-approximation per
+    /// `docs/design/native-sv-abstraction.md` §6.10: UF only ADDS
+    /// admissible may-behaviour beyond the concrete relation, so any
+    /// concrete violation the design admits is preserved by the
+    /// abstract. Useful for wide multipliers / dividers / hashes that
+    /// blow up SMT predicate-image queries when evaluated concretely.
+    ///
+    /// Default empty — preserves the legacy behaviour (every cell
+    /// evaluated concretely). R.5b's BTOR2 lifter integration (the
+    /// consumer of this field; tracked under §Phase 11 §11.1 slot 1.e)
+    /// reads this list when the design has cells that match the
+    /// default UF wrapping policy (`$mul`/`$div`/`$mod`/`$pow` always;
+    /// `$add`/`$sub` for width > 32); user-supplied entries here
+    /// extend or override the default policy. Until R.5b's lifter
+    /// integration ships, declarations here are accepted by the
+    /// schema but have no effect on the abstract model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uf_wrap: Vec<String>,
+
+    /// R.5b — Cell-instance names to **force-concretize** even if
+    /// the default UF wrapping policy would have wrapped them. The
+    /// inverse of [`Self::uf_wrap`]: an entry here disables UF
+    /// abstraction for the named cell, falling back to concrete
+    /// arithmetic evaluation. Useful when the user knows a specific
+    /// multiplier / divider / hash is small enough to evaluate
+    /// concretely + wants exact verdicts on it rather than the
+    /// `KleeneBot` -refined-later cycle UF wrapping would produce.
+    ///
+    /// Default empty. R.5b lifter integration consumes this field
+    /// (queued); until then, schema-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uf_unwrap: Vec<String>,
 }
 
 /// §Phase 10 §10.2 stage 2 — Memory-cell annotation.
@@ -1795,6 +1834,8 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         parameters: HashMap::new(),
         reset_sequence: None,
         memories: Vec::new(),
+        uf_wrap: Vec::new(),
+        uf_unwrap: Vec::new(),
     }
 }
 
@@ -2402,6 +2443,8 @@ mod tests {
             parameters: HashMap::new(),
             reset_sequence: None,
             memories: Vec::new(),
+            uf_wrap: Vec::new(),
+            uf_unwrap: Vec::new(),
         }
     }
 
@@ -3023,11 +3066,81 @@ mod tests {
             parameters: HashMap::new(),
             reset_sequence: None,
             memories: Vec::new(),
+            uf_wrap: Vec::new(),
+            uf_unwrap: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
             !json.contains("memories"),
             "empty memories should be omitted from JSON; got {json}"
+        );
+    }
+
+    // ---- R.5b — uf_wrap + uf_unwrap sidecar API surface ----
+
+    #[test]
+    fn r5b_uf_wrap_uf_unwrap_round_trip_through_json() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "uf_wrap": ["wide_mul_inst", "sha_round_compress"],
+            "uf_unwrap": ["small_mul_inst"]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse uf_wrap fields");
+        assert_eq!(ann.uf_wrap, vec!["wide_mul_inst", "sha_round_compress"]);
+        assert_eq!(ann.uf_unwrap, vec!["small_mul_inst"]);
+
+        let back = serde_json::to_string(&ann).expect("serialize");
+        let again: SvAnnotation = serde_json::from_str(&back).expect("re-parse");
+        assert_eq!(again.uf_wrap, ann.uf_wrap);
+        assert_eq!(again.uf_unwrap, ann.uf_unwrap);
+    }
+
+    #[test]
+    fn r5b_legacy_sidecar_without_uf_fields_loads_with_empty_vecs() {
+        // Strict additivity: existing fixtures' sidecars continue to work
+        // without uf_wrap / uf_unwrap declarations.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "legacy"
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse legacy");
+        assert!(
+            ann.uf_wrap.is_empty(),
+            "legacy sidecar must default uf_wrap to empty"
+        );
+        assert!(
+            ann.uf_unwrap.is_empty(),
+            "legacy sidecar must default uf_unwrap to empty"
+        );
+    }
+
+    #[test]
+    fn r5b_empty_uf_fields_omitted_on_serialize() {
+        // skip_serializing_if = "Vec::is_empty" → fields omitted when empty.
+        let ann = SvAnnotation {
+            schema: Some("mununu_sv_annotation_v1".into()),
+            module: "test".into(),
+            source: None,
+            signals: vec![],
+            inputs: vec![],
+            controllable: vec![],
+            properties: vec![],
+            discovered_values: HashMap::new(),
+            parameters: HashMap::new(),
+            reset_sequence: None,
+            memories: Vec::new(),
+            uf_wrap: Vec::new(),
+            uf_unwrap: Vec::new(),
+        };
+        let json = serde_json::to_string(&ann).expect("serialize");
+        assert!(
+            !json.contains("uf_wrap"),
+            "empty uf_wrap must be omitted from JSON; got {json}"
+        );
+        assert!(
+            !json.contains("uf_unwrap"),
+            "empty uf_unwrap must be omitted from JSON; got {json}"
         );
     }
 }
