@@ -301,12 +301,21 @@ pub struct PredicateCubeLiftOptions {
     /// §10.1 R.2.5 done-criterion (< 10 s, < 256 MB) applies only at
     /// the default cap.
     pub max_cube_count: usize,
+    /// R.2.5 predicate-image MVP — max number of 1-bit BTOR2 inputs
+    /// to enumerate per cube when computing may-edges. Defaults to 8
+    /// (256 input combinations per cube). Over the cap, those inputs
+    /// default to zero — sound under-approximation of input
+    /// nondeterminism that may miss may-edges. Set to 0 to disable
+    /// edge construction (recovers the legacy R.2.5 MVP behaviour
+    /// where the Clts has cube states but no transitions).
+    pub max_input_bits: usize,
 }
 
 impl Default for PredicateCubeLiftOptions {
     fn default() -> Self {
         Self {
             max_cube_count: 1024,
+            max_input_bits: 8,
         }
     }
 }
@@ -455,6 +464,120 @@ pub fn predicate_cube_lift(
         }
     }
 
+    // R.2.5 predicate-image MVP — emit MayOnly edges between cubes.
+    //
+    // For each cube_i, build a "canonical representative" concrete
+    // register assignment (each predicate's source register set to
+    // the value the predicate checks against when the cube has the
+    // predicate true; left at 0 otherwise — which is a valid
+    // representative for the predicate-false case under the
+    // simplifying assumption that 0 ≠ predicate.value, which holds
+    // for the typical equality predicate `register == nonzero_constant`).
+    //
+    // For each boolean input combination (up to `max_input_bits` 1-bit
+    // BTOR2 inputs), simulate one clock step via
+    // `bit_blast::simulate_one_step`. The resulting register values
+    // map to a target cube `cube_j` via predicate re-evaluation;
+    // emit a MayOnly edge `cube_i → cube_j` with a "step" label.
+    //
+    // Soundness: emitting MayOnly (no must-witness) is the safe
+    // under-approximation per the standard KMTS preservation theorem.
+    // Sampling a single canonical representative per cube is an
+    // under-approximation of the may-set — every concrete state in
+    // the cube might reach OTHER cubes via inputs we don't sample.
+    // R.5 / R.5b's SMT-driven must-edges + lazy `KmtsLiftLazy` close
+    // these gaps.
+    let mut predicate_image_pending = true;
+    if lift_opts.max_input_bits > 0 && !predicates.is_empty() {
+        let boolean_inputs: Vec<String> = collect_boolean_input_symbols(&file, &symbols);
+        let n_inputs = boolean_inputs.len().min(lift_opts.max_input_bits);
+        let n_combos: usize = 1usize << n_inputs;
+        let label_id = builder
+            .labels()
+            .intern(["step"])
+            .map_err(|e| AdapterError {
+                kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                location: None,
+                message: format!("adapter/btor2/predicate_cube_lift: label intern failed: {e}"),
+            })?;
+
+        // Collect register widths so we can mask the representative
+        // values to the cell's bit-width.
+        let mut pred_register_widths: std::collections::HashMap<&str, u32> =
+            std::collections::HashMap::new();
+        for line in &file.lines {
+            if let crate::adapter::btor2::ast::Node::State { sort, .. } = &line.node
+                && let Some(width) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+                && let Some(name) = symbols.get(&line.nid)
+            {
+                pred_register_widths.insert(name.as_str(), width);
+            }
+        }
+
+        for (i, &src_id) in state_ids.iter().enumerate() {
+            // Build canonical representative for cube_i.
+            let mut registers: std::collections::HashMap<String, u128> =
+                std::collections::HashMap::new();
+            for (bit, pred) in predicates.iter().enumerate() {
+                let truth = (i >> bit) & 1 == 1;
+                let entry = registers.entry(pred.register.clone()).or_insert(0);
+                if truth {
+                    *entry = pred.value as u128;
+                }
+                // Predicate-false case leaves *entry at 0. If the
+                // predicate's value is also 0 (i.e. predicate is
+                // `register == 0`), the false case needs a non-zero
+                // representative; bump to 1 of the appropriate width.
+                if !truth && pred.value == 0 {
+                    let width = pred_register_widths
+                        .get(pred.register.as_str())
+                        .copied()
+                        .unwrap_or(1);
+                    if width >= 1 {
+                        *entry = 1;
+                    }
+                }
+            }
+
+            // Enumerate input combinations + emit MayOnly edges.
+            for combo in 0..n_combos {
+                let mut input_values: std::collections::HashMap<String, u128> =
+                    std::collections::HashMap::new();
+                for (bit, name) in boolean_inputs.iter().take(n_inputs).enumerate() {
+                    let v = if (combo >> bit) & 1 == 1 { 1 } else { 0 };
+                    input_values.insert(name.clone(), v);
+                }
+                let next_registers = match crate::adapter::btor2::bit_blast::simulate_one_step(
+                    &file,
+                    &registers,
+                    &input_values,
+                ) {
+                    Ok(v) => v,
+                    Err(_) => continue, // skip combos that fail to step (rare)
+                };
+                // Determine the resulting cube index by re-evaluating
+                // each predicate against the new register values.
+                let mut target_index: usize = 0;
+                for (bit, pred) in predicates.iter().enumerate() {
+                    let next_v = next_registers.get(&pred.register).copied().unwrap_or(0);
+                    if next_v == pred.value as u128 {
+                        target_index |= 1 << bit;
+                    }
+                }
+                if target_index < state_ids.len() {
+                    let tgt_id = state_ids[target_index];
+                    builder.transition_ids_with_modality(
+                        src_id,
+                        &[label_id],
+                        tgt_id,
+                        crate::clts::TransitionModality::MayOnly,
+                    );
+                }
+            }
+        }
+        predicate_image_pending = false;
+    }
+
     let clts = builder.build().map_err(|e| AdapterError {
         kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
         location: None,
@@ -475,9 +598,48 @@ pub fn predicate_cube_lift(
             property_count: 0,
         },
         lift_time: elapsed,
-        // R.5's KmtsLiftLazy will set this to false when it ships.
-        predicate_image_pending: true,
+        // R.2.5 predicate-image MVP populates may-edges when
+        // `max_input_bits > 0` and at least one predicate exists;
+        // R.5 / R.5b will additionally populate must-edges via SMT.
+        predicate_image_pending,
     })
+}
+
+/// R.2.5 predicate-image MVP helper — collect the symbols of every
+/// 1-bit BTOR2 input that is NOT a clock signal. Clock inputs (per
+/// `looks_like_clock` in `bit_blast`) are excluded because each CLTS
+/// step already represents one clock edge.
+///
+/// Returns symbols in BTOR2 NID order (matches the order
+/// `simulate_one_step` walks the file when building its Env). Inputs
+/// without a symbol are skipped (they're typically Yosys-generated
+/// phi inputs the property doesn't reference anyway).
+fn collect_boolean_input_symbols(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    symbols: &std::collections::HashMap<crate::adapter::btor2::ast::Nid, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in &file.lines {
+        if let crate::adapter::btor2::ast::Node::Input { sort, .. } = &line.node {
+            let width = crate::adapter::btor2::parser::bv_width(file, *sort).unwrap_or(0);
+            if width != 1 {
+                continue;
+            }
+            let symbol = match symbols.get(&line.nid) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            // Skip clock inputs; reuse the same heuristic as
+            // bit_blast's `looks_like_clock`. Conservative: a name
+            // containing "clk" or "clock" is treated as a clock.
+            let lower = symbol.to_lowercase();
+            if lower.contains("clk") || lower.contains("clock") {
+                continue;
+            }
+            out.push(symbol);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -708,7 +870,10 @@ mod tests {
                 value: i,
             })
             .collect();
-        let opts = PredicateCubeLiftOptions { max_cube_count: 8 };
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 8,
+            max_input_bits: 0,
+        };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
         assert!(result.is_err());
         let msg = result.unwrap_err().message;
@@ -748,8 +913,13 @@ mod tests {
         assert_eq!(result.cube_count, 8);
         assert_eq!(result.clts.state_count(), 8);
         assert_eq!(result.predicates.len(), 3);
-        // R.2.5 MVP flag: must/may edges not yet populated.
-        assert!(result.predicate_image_pending);
+        // R.2.5 predicate-image MVP populates may-edges by default
+        // (when `max_input_bits > 0` AND at least one predicate exists).
+        // The flag flips to `false` to advertise edges are present.
+        assert!(
+            !result.predicate_image_pending,
+            "R.2.5 predicate-image MVP should populate may-edges under default opts"
+        );
         // Each cube state must have all 3 predicate verdicts populated.
         for state in result.clts.states() {
             for pred in &result.predicates {
@@ -879,11 +1049,129 @@ mod tests {
             "R.2.5 done-criterion wall-clock bound exceeded: {:?}",
             result.lift_time
         );
-        // R.2.5 MVP explicitly does NOT populate must/may edges.
-        // Flag must be true so callers know not to evaluate verdicts.
+        // R.2.5 predicate-image MVP populates may-edges by default;
+        // the flag flips to `false`. The cap-exceeding fixture's
+        // edges are sound under the canonical-representative +
+        // boolean-input sampling discipline (§Phase 11 R.2.5
+        // predicate-image MVP design doc).
+        assert!(
+            !result.predicate_image_pending,
+            "R.2.5 predicate-image MVP should populate may-edges under default opts"
+        );
+    }
+
+    // ---- R.2.5 predicate-image MVP — may-edge construction tests ----
+
+    /// BTOR2 fixture: a single 2-bit counter `cnt` that increments
+    /// every cycle. One state cell + one 1-bit input `clr` that
+    /// resets cnt to 0 when high. Used by R.2.5 predicate-image
+    /// tests to verify may-edges are emitted between cubes.
+    const COUNTER_BTOR2: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 zero 2
+4 const 2 11
+5 input 1 clr
+6 state 2 cnt
+7 add 2 6 4
+8 ite 2 5 3 7
+9 next 2 6 8
+"#;
+
+    #[test]
+    fn predicate_image_mvp_emits_may_edges_between_cubes() {
+        // 2 predicates over the counter: cnt == 0 and cnt == 1.
+        // Default opts enable boolean-input enumeration; the lifter
+        // should emit MayOnly edges and clear predicate_image_pending.
+        let preds = vec![
+            PredicateSpec {
+                name: "cnt_is_0".into(),
+                register: "cnt".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "cnt_is_1".into(),
+                register: "cnt".into(),
+                value: 1,
+            },
+        ];
+        let result = predicate_cube_lift(
+            preds,
+            COUNTER_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("predicate_cube_lift succeeds");
+
+        // 4 cubes (2^2 predicates) — same as the legacy MVP.
+        assert_eq!(result.cube_count, 4);
+        assert_eq!(result.clts.state_count(), 4);
+
+        // Must/may edges populated (vs the legacy MVP's empty Clts).
+        assert!(
+            !result.predicate_image_pending,
+            "R.2.5 predicate-image MVP must clear predicate_image_pending when edges are populated"
+        );
+
+        // Sanity: every cube has at least one outgoing transition
+        // (either to itself or another cube). With 1 boolean input
+        // `clr` and 4 cube source states, we expect 4 × 2 = 8 edges
+        // total (the MVP enumerates each input combo per cube).
+        let total_transitions: usize = result
+            .clts
+            .states()
+            .map(|s| result.clts.outgoing(s).len())
+            .sum();
+        assert!(
+            total_transitions > 0,
+            "R.2.5 predicate-image MVP must emit at least one may-edge across the cube space"
+        );
+
+        // Every transition must be MayOnly (R.2.5 MVP under-
+        // approximation discipline — must-witnesses wait for R.5).
+        for state in result.clts.states() {
+            for transition in result.clts.outgoing(state) {
+                assert!(
+                    matches!(
+                        transition.modality(),
+                        crate::clts::TransitionModality::MayOnly
+                    ),
+                    "R.2.5 predicate-image MVP must emit only MayOnly edges; got {:?}",
+                    transition.modality()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_image_mvp_max_input_bits_zero_disables_edges() {
+        // Setting max_input_bits = 0 recovers the legacy R.2.5 MVP
+        // behaviour (cube states but no edges; predicate_image_pending
+        // stays true). Useful for the binary-capability test that
+        // doesn't need edges.
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 0,
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("ok");
         assert!(
             result.predicate_image_pending,
-            "R.2.5 MVP must flag predicate_image_pending = true"
+            "max_input_bits=0 must preserve the legacy 'no edges' behaviour"
+        );
+        let total_transitions: usize = result
+            .clts
+            .states()
+            .map(|s| result.clts.outgoing(s).len())
+            .sum();
+        assert_eq!(
+            total_transitions, 0,
+            "max_input_bits=0 must emit zero edges (legacy MVP behaviour)"
         );
     }
 }

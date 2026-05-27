@@ -118,6 +118,99 @@ struct BlastOutput {
     partition_summary: Option<crate::adapter::partition::PartitionSummary>,
 }
 
+/// R.2.5 predicate-image MVP — simulate one clock step of the BTOR2
+/// design.
+///
+/// **Inputs.**
+/// - `file`: parsed BTOR2.
+/// - `register_values`: map from state-cell symbol to its current
+///   value (as a `u128` masked to the cell's width). Cells absent
+///   from the map default to zero.
+/// - `input_values`: map from input symbol to its value for this
+///   step. Inputs absent from the map default to zero (mirrors the
+///   `setundef -zero` discipline the upstream Yosys script enforces).
+///
+/// **Output.** Map from state-cell symbol to its NEXT value after
+/// the step. Cells without a `Next` line in the BTOR2 retain their
+/// `register_values` entry (BTOR2 convention).
+///
+/// **Semantics.** Internally runs `evaluate_pure(file, env, honor_init=false)`
+/// to compute every NID's value from the current state + inputs,
+/// then `apply_next(...)` to commit the new state values. Returns
+/// the post-step state values keyed by symbol for downstream
+/// consumption (e.g. R.2.5's predicate-image edge construction).
+///
+/// **Error cases.** Returns `Err` only when `evaluate_pure` or
+/// `apply_next` fails — typically on malformed BTOR2 with dangling
+/// references (already validated at parse time, so this path is
+/// rarely hit in practice).
+pub fn simulate_one_step(
+    file: &Btor2File,
+    register_values: &std::collections::HashMap<String, u128>,
+    input_values: &std::collections::HashMap<String, u128>,
+) -> Result<std::collections::HashMap<String, u128>, AdapterError> {
+    // Resolve symbols → NIDs for every state + input.
+    let symbols = parser::collect_symbols(file);
+    let mut symbol_to_state_nid: std::collections::HashMap<String, (Nid, u32)> =
+        std::collections::HashMap::new();
+    let mut symbol_to_input_nid: std::collections::HashMap<String, (Nid, u32)> =
+        std::collections::HashMap::new();
+    let mut state_meta: Vec<StateMeta> = Vec::new();
+
+    for line in &file.lines {
+        match &line.node {
+            Node::State { sort, .. } => {
+                let width = parser::bv_width(file, *sort).unwrap_or(0);
+                let symbol = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("st_n{}", line.nid));
+                symbol_to_state_nid.insert(symbol.clone(), (line.nid, width));
+                state_meta.push(StateMeta {
+                    nid: line.nid,
+                    width,
+                    symbol,
+                });
+            }
+            Node::Input { sort, .. } => {
+                let width = parser::bv_width(file, *sort).unwrap_or(0);
+                let symbol = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("in_n{}", line.nid));
+                symbol_to_input_nid.insert(symbol, (line.nid, width));
+            }
+            _ => {}
+        }
+    }
+
+    // Seed the Env with the given register + input values (cells
+    // without an entry default to zero per the `setundef -zero`
+    // convention).
+    let mut env = Env::default();
+    for sm in &state_meta {
+        let bits = register_values.get(&sm.symbol).copied().unwrap_or(0);
+        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
+    }
+    for (symbol, &(nid, width)) in &symbol_to_input_nid {
+        let bits = input_values.get(symbol).copied().unwrap_or(0);
+        env.values.insert(nid, BvValue::new(bits, width));
+    }
+
+    // Step the design: evaluate all derived NIDs, then commit
+    // `next` updates to the state cells.
+    evaluate_pure(file, &mut env, false)?;
+    apply_next(file, &mut env, &state_meta)?;
+
+    // Extract post-step state values keyed by symbol.
+    let mut out: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+    for sm in &state_meta {
+        let bits = env.values.get(&sm.nid).map(|v| v.bits).unwrap_or(0);
+        out.insert(sm.symbol.clone(), bits);
+    }
+    Ok(out)
+}
+
 /// Top-level entry: convert a parsed BTOR2 file + options to an AdapterIR.
 ///
 /// Returns a tuple of (IR, warnings, partition_summary). The third

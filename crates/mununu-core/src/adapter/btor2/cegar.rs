@@ -230,6 +230,11 @@ pub fn cegar_refine_loop(
     let mut iterations: Vec<CegarIteration> = Vec::new();
     let lift_opts = PredicateCubeLiftOptions {
         max_cube_count: cegar_opts.max_cube_count,
+        // R.2.5 predicate-image MVP — enable boolean-input enumeration
+        // so the lifted Clts has meaningful may-edges for the CEGAR
+        // loop to refine. 8 bits = 256 combinations per cube, matches
+        // the lift opts' default.
+        max_input_bits: 8,
     };
 
     for iteration in 0..=cegar_opts.max_iterations {
