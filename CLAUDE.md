@@ -55,6 +55,22 @@ For CI-exact reproduction inside the pinned dev container, see [`docs/dev-contai
 
 The `security-audit` CI job runs `cargo audit`. The `dependency-check` job is non-blocking.
 
+### Pre-commit hook serialisation
+
+**Rule.** When a pre-commit hook (or any `make ci` / `cargo nextest run --workspace` invocation) is running, do not launch additional cargo-heavy commands in parallel. This includes: `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `cargo run`, `cargo doc`, `cargo bench`, and `make ci`. Wait for the running hook to finish first.
+
+**Why.** macOS schedules pre-commit hooks at lowered priority (`STAT=SN`) when launched in the background. Concurrent foreground cargo invocations starve the hook's `cargo nextest`, stretching its wall-clock from minutes to hours per the 2026-05-27 R.2.5 incident where 36 / 1853 tests took 1h 32min wall-clock under contention from competing cargo runs. Test execution itself is sub-millisecond per area; the wall-clock cost is entirely scheduling.
+
+**How to comply.**
+
+- Before kicking off any commit that runs the pre-commit hook (any `git commit` without `--no-verify` — see below for the exception), check that no other cargo / make-ci process is already running.
+- While a commit is in flight (in-foreground or background-detached via `nohup`), do not start new cargo invocations. Wait for the sentinel file or process exit to confirm the hook finished.
+- Do not chain commits back-to-back. Land commit N's hook (verify via `git log` showing the new HEAD) before launching commit N+1.
+- Diagnostic timing runs (e.g. `cargo test -p mununu-core --lib <module>` to spot-check correctness) must wait for the active hook to finish. If diagnosis cannot wait, kill the hook first (rare; default to waiting).
+- Skipping the hook with `--no-verify` requires explicit per-commit user authorisation, per [Git Operations & Destructive Commands](#git-operations--destructive-commands).
+
+**Propagation to subagents.** Any subagent that issues `git commit` or runs `cargo nextest` inherits this constraint. Subagents are encouraged to check for active hook processes before launching their own cargo work; if they cannot wait, they must surface the conflict to the main agent rather than racing.
+
 ## Git Identity
 
 All commits in this repository must use:
