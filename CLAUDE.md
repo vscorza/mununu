@@ -94,17 +94,31 @@ The `/parity-check` skill verifies this automatically. PRs that drift the three 
 
 ## Soundness Guarantees
 
-Mununu is a model checker that exhaustively verifies finite-state models. Its verdicts are correct **for the model**. Whether they transfer to the real system depends on the abstraction:
+Mununu is a model checker that exhaustively verifies finite-state models. Its verdicts are correct **for the model**. Whether they transfer to the real system depends on the abstraction *and* on the alternation structure of the property.
 
-- **Safety + over-approximation → SOUND.** If the model says safe, the real system is safe (within the modeled scope). Extra behaviors can only add violations, not hide them.
+### 2-valued abstraction (legacy primitives, hand-written CTXDSL, XState, microcode, agentic, …)
+
+When the abstract model carries no may/must distinction (every transition is treated as definite), only the corners of the lattice are sound:
+
+- **Safety + over-approximation → SOUND.** If the model says safe, the real system is safe (within the modeled scope). Extra behaviours can only add violations, not hide them.
 - **Liveness + over-approximation → UNSOUND.** The model may show spurious progress from noop loops, havoc branches, or async interleaving without fairness.
-- **Safety + under-approximation → UNSOUND.** The model may miss violations from behaviors it doesn't capture.
+- **Safety + under-approximation → UNSOUND.** The model may miss violations from behaviours it doesn't capture.
+- **Liveness + under-approximation → SOUND** but trivially weak (fewer paths only).
 
-When contributing adapters or modifying the Kripke builder:
+Properties with **alternating fixpoints** (νμ-style; GR(1) response patterns; nested obligations) collapse under plain over- or under-approximation — the outer ν needs a *may*-style upper bound while the inner μ needs a *must*-style lower bound, and a single direction cannot supply both. For these properties, use the KMTS path below.
 
-- Document every `eval_expr → None` choice as over-approx or under-approx using `// SOUNDNESS:` comments.
+### KMTS + Kleene 3-valued domain (canonical recipe for SystemVerilog/BTOR2; available to other adapters that opt in)
+
+The KMTS pipeline tracks **may** and **must** edges separately and evaluates the full modal-mu calculus over a 3-valued (`KleeneT` / `KleeneF` / `KleeneBot`) domain. Bruns–Godefroid (CONCUR 2000) gives the soundness theorem: definite verdicts (`KleeneT`, `KleeneF`) transfer to the concrete system at **every alternation depth**, including νμ. A `KleeneBot` verdict triggers a CEGAR refinement step (R.5) that splits one abstract predicate and reruns.
+
+Use the KMTS path whenever the property has a μ inside a ν (or a ν inside a μ), or when you need a sound liveness verdict on an over-approximating abstraction. See [`docs/abstraction.md`](docs/abstraction.md) §"The canonical recipe — KMTS predicates" and [`docs/design/kmts-theory.md`](docs/design/kmts-theory.md) for the theory and the per-adapter migration table.
+
+### Discipline for contributors
+
+- Document every `eval_expr → None` choice as over-approx or under-approx using a `// SOUNDNESS:` comment; `/soundness-check` flags undeclared sites.
 - Never mix directions within a single model without documenting it.
 - Add a soundness regression test for any new abstraction decision.
+- When emitting a CLTS for a property with alternating fixpoints, prefer the KMTS path (`Transition::modality`, `state_3valued_predicates`) over the legacy primitives. Legacy adapters produce `Sharp`-everywhere KMTSes vacuously, which only carry the 2-valued guarantees above.
 
 Strategy extraction uses **signature-based selection** from iteration ranks. Both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998); memoryless on the model-checking product = finite-memory on the plant. See [`docs/synthesis.md`](docs/synthesis.md) for `ControllerMode` options, lasso trace format, counterstrategy emission, and the Skolem-paradigm rules for nondeterminism vs. controllability.
 

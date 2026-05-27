@@ -14,7 +14,9 @@ Three modes control how synthesis extracts a strategy from the winning region:
 
 The **signature** of a state is its tuple of iteration ranks per fixpoint variable (outermost first). For mu-variables, smaller rank = closer to goal. The functional strategy picks the most progressive move; the permissive supervisor enables all non-regressive moves.
 
-The winning-region / realizability verdict is always correct for **all** mu-calculus formulas (any alternation depth). Counterstrategies are also positional — both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998). Memoryless on the model-checking product = finite-memory on the plant; the memory is the iteration-rank signature from fixpoint evaluation.
+The winning-region / realizability verdict is always correct **for the model** at any alternation depth — the fixpoint engine evaluates the full modal-mu calculus exactly. Counterstrategies are also positional — both players have memoryless winning strategies (positional determinacy of parity games, Zielonka 1998). Memoryless on the model-checking product = finite-memory on the plant; the memory is the iteration-rank signature from fixpoint evaluation.
+
+**Transfer to the concrete system depends on the abstraction.** For pure-safety (ν, depth-1) properties, an over-approximating 2-valued model is enough; sound verdicts transfer. For properties with alternating fixpoints (νμ in GR(1), nested obligations), the 2-valued model is *not* enough — see [`CLAUDE.md` → Soundness Guarantees](../CLAUDE.md#soundness-guarantees) and [`docs/abstraction.md`](abstraction.md). Use the KMTS + Kleene 3-valued path: definite (`KleeneT` / `KleeneF`) verdicts transfer at every alternation depth; `KleeneBot` triggers CEGAR refinement (R.5).
 
 ## Lasso traces
 
