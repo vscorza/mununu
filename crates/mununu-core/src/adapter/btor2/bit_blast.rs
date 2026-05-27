@@ -211,6 +211,130 @@ pub fn simulate_one_step(
     Ok(out)
 }
 
+/// R.5b lifter integration MVP — variant of [`simulate_one_step`]
+/// that substitutes a UF zero-value for each Op NID in
+/// `uf_wrapped_nids` during the per-step evaluation. Use
+/// [`collect_uf_wrapped_nids`] to derive the NID set from a
+/// sidecar's `uf_wrap` / `uf_unwrap` declarations.
+///
+/// The wrapped Ops' results propagate through downstream evaluations
+/// (they're inserted into `env` like any other Op result), so any
+/// computation that transitively reads a wrapped Op sees the
+/// UF-stand-in. Sound may-side over-approximation per the schema
+/// docs on `SvAnnotation::uf_wrap`.
+pub fn simulate_one_step_with_uf(
+    file: &Btor2File,
+    register_values: &std::collections::HashMap<String, u128>,
+    input_values: &std::collections::HashMap<String, u128>,
+    uf_wrapped_nids: &std::collections::HashSet<Nid>,
+) -> Result<std::collections::HashMap<String, u128>, AdapterError> {
+    // Symbol-resolution mirror of simulate_one_step.
+    let symbols = parser::collect_symbols(file);
+    let mut symbol_to_input_nid: std::collections::HashMap<String, (Nid, u32)> =
+        std::collections::HashMap::new();
+    let mut state_meta: Vec<StateMeta> = Vec::new();
+
+    for line in &file.lines {
+        match &line.node {
+            Node::State { sort, .. } => {
+                let width = parser::bv_width(file, *sort).unwrap_or(0);
+                let symbol = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("st_n{}", line.nid));
+                state_meta.push(StateMeta {
+                    nid: line.nid,
+                    width,
+                    symbol,
+                });
+            }
+            Node::Input { sort, .. } => {
+                let width = parser::bv_width(file, *sort).unwrap_or(0);
+                let symbol = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("in_n{}", line.nid));
+                symbol_to_input_nid.insert(symbol, (line.nid, width));
+            }
+            _ => {}
+        }
+    }
+
+    let mut env = Env::default();
+    for sm in &state_meta {
+        let bits = register_values.get(&sm.symbol).copied().unwrap_or(0);
+        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
+    }
+    for (symbol, &(nid, width)) in &symbol_to_input_nid {
+        let bits = input_values.get(symbol).copied().unwrap_or(0);
+        env.values.insert(nid, BvValue::new(bits, width));
+    }
+
+    evaluate_pure_with_uf(file, &mut env, false, Some(uf_wrapped_nids))?;
+    apply_next(file, &mut env, &state_meta)?;
+
+    let mut out: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+    for sm in &state_meta {
+        let bits = env.values.get(&sm.nid).map(|v| v.bits).unwrap_or(0);
+        out.insert(sm.symbol.clone(), bits);
+    }
+    Ok(out)
+}
+
+/// R.5b lifter integration MVP — collect the BTOR2 Op NIDs that
+/// should be substituted with UF zero-values during evaluation, per
+/// the sidecar's `uf_wrap` (force-wrap) and `uf_unwrap`
+/// (force-concretize) declarations.
+///
+/// Algorithm:
+/// 1. Walk every `Node::Op` line that carries a symbol via the
+///    Yosys `uext _ _ 0 NAME` alias pattern (the `symbol` field on
+///    `Node::Op`).
+/// 2. For each such Op, if its symbol appears in `uf_wrap` AND NOT
+///    in `uf_unwrap`, add the Op's NID to the returned set.
+///
+/// **MVP scope.** Only honors explicit `uf_wrap` declarations; does
+/// NOT yet apply the default policy (`$mul` / `$div` / `$mod` /
+/// `$pow` always; `$add` / `$sub` for width > 32) — that's a
+/// follow-up.
+///
+/// **Returns** an empty set when the sidecar JSON is absent, fails
+/// to parse, or declares an empty `uf_wrap` list.
+pub fn collect_uf_wrapped_nids(
+    file: &Btor2File,
+    options: &AdapterOptions,
+) -> std::collections::HashSet<Nid> {
+    use crate::adapter::systemverilog::annotation::SvAnnotation;
+
+    let Some(json) = &options.sidecar_json else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(ann) = serde_json::from_str::<SvAnnotation>(json) else {
+        return std::collections::HashSet::new();
+    };
+    if ann.uf_wrap.is_empty() {
+        return std::collections::HashSet::new();
+    }
+
+    let wrap_set: std::collections::HashSet<&str> =
+        ann.uf_wrap.iter().map(|s| s.as_str()).collect();
+    let unwrap_set: std::collections::HashSet<&str> =
+        ann.uf_unwrap.iter().map(|s| s.as_str()).collect();
+
+    let mut out = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::Op {
+            symbol: Some(name), ..
+        } = &line.node
+            && wrap_set.contains(name.as_str())
+            && !unwrap_set.contains(name.as_str())
+        {
+            out.insert(line.nid);
+        }
+    }
+    out
+}
+
 /// Top-level entry: convert a parsed BTOR2 file + options to an AdapterIR.
 ///
 /// Returns a tuple of (IR, warnings, partition_summary). The third
@@ -2961,6 +3085,35 @@ fn read_operand(env: &Env, op: Operand) -> Option<BvValue> {
 /// during step (transition) evaluation it must be `false` so `init` lines
 /// do not stomp the current state value passed in via `make_step_env`.
 fn evaluate_pure(file: &Btor2File, env: &mut Env, honor_init: bool) -> Result<(), AdapterError> {
+    evaluate_pure_with_uf(file, env, honor_init, None)
+}
+
+/// R.5b lifter integration MVP — variant of [`evaluate_pure`] that
+/// substitutes `BvValue::zero(width)` for every Op NID in
+/// `uf_wrapped_nids`, skipping the actual arithmetic evaluation. The
+/// substituted value propagates through downstream Op evaluations
+/// (since they read the env), so any computation that transitively
+/// depends on a wrapped Op sees the UF-stand-in.
+///
+/// `None` for `uf_wrapped_nids` reproduces `evaluate_pure` exactly
+/// (no UF substitution). `Some(empty)` is also a no-op.
+///
+/// **Soundness note (R.5b MVP).** Substituting a single deterministic
+/// value (zero) is technically an under-approximation of the full
+/// may-side UF semantics ("the wrapped Op's output could be ANY
+/// admissible value"). The full may-side under sampling requires
+/// enumerating multiple representative values per wrapped Op +
+/// generating multiple may-edges per cube. The R.5b MVP ships the
+/// zero-substitute first because it's the smallest observable
+/// behaviour change (a verdict shift relative to concrete arithmetic
+/// is detectable end-to-end); the multi-value enumeration follow-up
+/// is queued.
+fn evaluate_pure_with_uf(
+    file: &Btor2File,
+    env: &mut Env,
+    honor_init: bool,
+    uf_wrapped_nids: Option<&std::collections::HashSet<Nid>>,
+) -> Result<(), AdapterError> {
     for line in &file.lines {
         match &line.node {
             Node::Sort { .. } | Node::Input { .. } | Node::State { .. } => {
@@ -3011,6 +3164,15 @@ fn evaluate_pure(file: &Btor2File, env: &mut Env, honor_init: bool) -> Result<()
             Node::Op { sort, op, args, .. } => {
                 let width = parser::bv_width(file, *sort)
                     .ok_or_else(|| constancy_err(line, "operator references non-bitvec sort"))?;
+                // R.5b lifter integration MVP — when this Op's NID is
+                // in the UF-wrapped set, substitute zero instead of
+                // evaluating the arithmetic. Downstream Ops that read
+                // env see the substituted value, propagating UF
+                // semantics through the dependency chain.
+                if uf_wrapped_nids.is_some_and(|s| s.contains(&line.nid)) {
+                    env.values.insert(line.nid, BvValue::zero(width));
+                    continue;
+                }
                 let result =
                     eval_op(*op, &line.immediates, args, width, env).map_err(|e| AdapterError {
                         kind: AdapterErrorKind::IrConsistencyError,
@@ -4529,6 +4691,107 @@ mod tests {
         assert_eq!(
             initial_count, 2,
             "cartesian product collapses on the pinned cell"
+        );
+    }
+
+    // ---- R.5b lifter integration MVP — UF wrapping tests ----
+
+    /// BTOR2 fixture for R.5b: 2-bit register `cnt` that gets
+    /// `mul_inst` (a wide-arithmetic Op aliased via Yosys's `uext`
+    /// pattern) as its next-value. With `uf_wrap = ["mul_inst"]`,
+    /// the wrapped Op's result is forced to 0 → cnt's next-value
+    /// is always 0 → cnt stays at its init value.
+    ///
+    /// All sort refs use NID 1 (the only `sort bitvec 2` line);
+    /// `const 1 11` denotes "constant of sort 1 with binary value 11"
+    /// = 3 in decimal.
+    const R5B_UF_FIXTURE: &str = r#"
+1 sort bitvec 2
+2 zero 1
+3 const 1 11
+4 state 1 cnt
+5 init 1 4 2
+6 add 1 4 3
+7 uext 1 6 0 mul_inst
+8 next 1 4 7
+"#;
+
+    #[test]
+    fn r5b_collect_uf_wrapped_nids_empty_without_sidecar() {
+        let file = crate::adapter::btor2::parser::parse(R5B_UF_FIXTURE).expect("parse");
+        let opts = AdapterOptions::default();
+        let nids = collect_uf_wrapped_nids(&file, &opts);
+        assert!(
+            nids.is_empty(),
+            "without a sidecar, no UF wrapping should fire"
+        );
+    }
+
+    #[test]
+    fn r5b_collect_uf_wrapped_nids_finds_named_op() {
+        // Sidecar uf_wrap = ["mul_inst"] — the helper must find the
+        // Op NID 7 (the uext alias carrying that symbol).
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "uf_wrap": ["mul_inst"]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let file = crate::adapter::btor2::parser::parse(R5B_UF_FIXTURE).expect("parse");
+        let nids = collect_uf_wrapped_nids(&file, &opts);
+        assert_eq!(nids.len(), 1, "must find exactly one wrapped Op");
+        assert!(nids.contains(&7), "must contain the mul_inst Op NID (7)");
+    }
+
+    #[test]
+    fn r5b_uf_unwrap_overrides_uf_wrap() {
+        // Both wrap + unwrap declared on the same symbol → unwrap wins.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "uf_wrap": ["mul_inst"],
+            "uf_unwrap": ["mul_inst"]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let file = crate::adapter::btor2::parser::parse(R5B_UF_FIXTURE).expect("parse");
+        let nids = collect_uf_wrapped_nids(&file, &opts);
+        assert!(
+            nids.is_empty(),
+            "uf_unwrap must override uf_wrap when both list the same name"
+        );
+    }
+
+    #[test]
+    fn r5b_simulate_one_step_with_uf_substitutes_zero_for_wrapped_op() {
+        // Without UF wrap: cnt = 0 → simulate_one_step → next cnt = add(0, 3) = 3.
+        // With UF wrap on mul_inst (the uext alias of add): next cnt = 0.
+        let file = crate::adapter::btor2::parser::parse(R5B_UF_FIXTURE).expect("parse");
+        let mut regs = std::collections::HashMap::new();
+        regs.insert("cnt".to_string(), 0u128);
+        let inputs = std::collections::HashMap::new();
+
+        // No UF wrap: next cnt = 3.
+        let no_uf = simulate_one_step(&file, &regs, &inputs).expect("step ok");
+        assert_eq!(
+            no_uf.get("cnt").copied(),
+            Some(3),
+            "without UF wrap, cnt should advance to add(0, 3) = 3"
+        );
+
+        // UF wrap on NID 7 (mul_inst): next cnt = 0 (the wrapped Op returns 0).
+        let mut wrapped = std::collections::HashSet::new();
+        wrapped.insert(7i64);
+        let with_uf = simulate_one_step_with_uf(&file, &regs, &inputs, &wrapped).expect("step ok");
+        assert_eq!(
+            with_uf.get("cnt").copied(),
+            Some(0),
+            "with UF wrap on mul_inst, cnt should stay at 0 (UF substitutes zero)"
         );
     }
 }
