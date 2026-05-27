@@ -1,0 +1,27 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "csrng_main_sm",
+  "source": "csrng_main_sm.sv",
+  "inputs": [
+    { "name": "enable_i", "abstraction": "boolean" },
+    { "name": "acmd_avail_i", "abstraction": "boolean" },
+    {
+      "name": "acmd_i",
+      "abstraction": "ignored",
+      "note": "M.2 — 3-bit acmd_e enum input (INS/RES/GEN/UPD/UNI). The idle-reachability property doesn't depend on which command type is dispatched — the FSM's path back to MainSmIdle is taken from every command-completion + every disable-while-running. Pinning to reset (3'h0 = invalid command → default branch routes to MainSmIdle) drops 3 input bits."
+    },
+    { "name": "acmd_eop_i", "abstraction": "boolean" },
+    { "name": "flag0_i", "abstraction": "ignored", "note": "M.2 — flag bit for INS-with-flag0 differentiation; not relevant to idle-reachability." },
+    { "name": "cmd_entropy_avail_i", "abstraction": "boolean" },
+    { "name": "cmd_rdy_i", "abstraction": "boolean" },
+    { "name": "cmd_complete_i", "abstraction": "boolean" },
+    { "name": "local_escalate_i", "abstraction": "boolean" }
+  ],
+  "properties": [
+    {
+      "id": "error_never_reached",
+      "formula": "nu X. ((!main_sm_err_o) && [] X)",
+      "description": "M.2 safety: `main_sm_err_o` is never asserted. `main_sm_err_o` is the 1-bit output equal to `state_q == MainSmError`. The FSM enters MainSmError only when `local_escalate_i` asserts; without that input, every reachable state from MainSmIdle stays in the 7 non-Error sparse FSM states. Expected verdict: `KleeneT` (or BoolDomain `true`) over the 7 non-Error states + initial state. Exercises R.3 KleeneDomain evaluator end-to-end on a real OpenTitan crypto-control FSM — §10.3 M.2 done-criterion (non-vacuous verdict on industrial fixture)."
+    }
+  ]
+}

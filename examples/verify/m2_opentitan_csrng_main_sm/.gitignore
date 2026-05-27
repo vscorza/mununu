@@ -1,0 +1,6 @@
+build/
+source/logs/
+source/csrng_main_sm.btor
+source/*.elab.v
+source/sv2v.err
+source/yosys.log
