@@ -23,14 +23,21 @@
 //!    refinement predicate via [`PredicateSource::Manual`].
 //!
 //! **What this MVP does NOT do** (flagged via the `predicate_source`
-//! variant — `WeakestPrecondition` / `CraigInterpolation` return
-//! empty predicate sets):
+//! variant and the `lazy_lift_pending` / `approximant_reuse_enabled`
+//! flags on `CegarTrace`):
 //!
-//! - **No WP computation.** The `WeakestPrecondition` source is a
-//!   placeholder; selecting it short-circuits to "no refinement
-//!   suggestion" and the loop terminates at cap-hit.
-//! - **No Craig interpolation.** Same as WP — the
-//!   `CraigInterpolation` source short-circuits.
+//! - **WP is a heuristic, not full weakest-precondition.** The
+//!   `WeakestPrecondition` source ships an MVP that emits
+//!   separating predicates over state registers not yet in the
+//!   predicate set, capped at 2 per call. It does NOT perform
+//!   symbolic back-substitution along the classifying transition;
+//!   that's queued as an R.5 follow-up. The name "WP" describes
+//!   the API contract (an alternative to `Manual` and
+//!   `CraigInterpolation`), not the formal weakest-precondition
+//!   construction.
+//! - **No Craig interpolation.** The `CraigInterpolation` source
+//!   short-circuits to empty (requires Z3 with interpolation
+//!   support; queued).
 //! - **No lazy KMTS construction.** Each iteration re-runs
 //!   `predicate_cube_lift` over the full predicate set; `KmtsLiftLazy`
 //!   is a R.5 follow-up.
@@ -42,7 +49,7 @@
 //!   non-amortised re-check.
 //!
 //! Consumers that need the full CEGAR fidelity must wait for R.5
-//! follow-ups. The `predicate_source` enum's stubbed variants + the
+//! follow-ups. The `predicate_source` enum's variants + the
 //! `lazy_lift_pending` / `approximant_reuse_enabled = false` flags
 //! on `CegarTrace` are the explicit handshakes between R.5 MVP and
 //! the future load-bearing implementation.
@@ -66,20 +73,38 @@ pub type ManualPredicateCallback =
 /// R.5 — Predicate-discovery source the CEGAR loop consults when it
 /// encounters a `KleeneBot` verdict and needs to add predicates.
 ///
-/// **MVP**: only [`PredicateSource::Manual`] is wired. The
-/// `WeakestPrecondition` and `CraigInterpolation` variants are
-/// declared so the API surface is complete, but their MVP behaviour
-/// is "return empty predicate set" — selecting either short-circuits
-/// the refinement loop into bounded-cap termination.
+/// **MVP shipping state**:
+/// - [`PredicateSource::Manual`] — fully wired (user-supplied callback).
+/// - [`PredicateSource::WeakestPrecondition`] — heuristic MVP shipped;
+///   emits separating predicates over state registers not yet in the
+///   predicate set, capped at 2 per call. See
+///   [`weakest_precondition_predicates`] for the semantics.
+/// - [`PredicateSource::CraigInterpolation`] — placeholder; returns
+///   empty. Requires Z3 with interpolation support; queued as a
+///   follow-up.
 pub enum PredicateSource {
     /// Caller supplies a closure that returns predicates to add at
     /// each iteration. The closure receives the current failure
     /// subgame + the active predicate set so the caller can choose
-    /// per-iteration. This is the MVP's working refinement path.
+    /// per-iteration. The working refinement path with full
+    /// caller-side control over predicate selection.
     Manual(Arc<ManualPredicateCallback>),
-    /// **R.5 follow-up.** Compute the weakest precondition along the
-    /// offending may-but-not-must transition. MVP behaviour: returns
-    /// empty (no refinement); loop terminates at cap.
+    /// R.5 WP MVP — emit separating predicates over state registers
+    /// reachable from the failure subgame's classifying transitions
+    /// that are NOT yet in the predicate set. Bounded at 2 proposals
+    /// per call; the CEGAR loop iterates and the helper picks up the
+    /// next uncovered register on the following pass. Returns empty
+    /// when every state register is covered OR when the BTOR2 file
+    /// fails to parse, at which point the loop terminates with
+    /// `PredicateSourceExhausted`.
+    ///
+    /// The name "WP" describes the API contract (an alternative to
+    /// `Manual` and `CraigInterpolation`); the mechanism is "any
+    /// uncovered state register" rather than formal weakest-
+    /// precondition back-substitution. The full WP construction
+    /// (symbolic back-substitution along the classifying transition's
+    /// next-state function, bounded by the transition's
+    /// cone-of-influence) is queued as a follow-up.
     WeakestPrecondition,
     /// **R.5 follow-up.** Compute a Craig interpolant between the
     /// concrete-relation states the may-edge admits and excludes.
@@ -319,8 +344,18 @@ pub fn cegar_refine_loop(
             .expect("KleeneBot implies failure_subgame is Some (R.5.0 invariant)");
         let new_predicates = match &cegar_opts.predicate_source {
             PredicateSource::Manual(callback) => callback(subgame, &current_predicates),
-            PredicateSource::WeakestPrecondition | PredicateSource::CraigInterpolation => {
-                // MVP: these sources are not yet implemented.
+            PredicateSource::WeakestPrecondition => {
+                // R.5 WP MVP — emit separating predicates over state
+                // registers reachable from the failure subgame's
+                // classifying transitions that are NOT yet in the
+                // predicate set. See
+                // `.claude/plans/r5-wp-predicate-discovery-design-2026-05-27.md`.
+                weakest_precondition_predicates(subgame, &current_predicates, btor2_content)
+            }
+            PredicateSource::CraigInterpolation => {
+                // MVP: Craig interpolation requires Z3 with
+                // interpolation support and is queued as a separate
+                // R.5 follow-up.
                 Vec::new()
             }
         };
@@ -373,6 +408,102 @@ fn eval_err_to_adapter_err(e: EvaluationError) -> AdapterError {
         location: None,
         message: format!("adapter/btor2/cegar: evaluator error: {e:?}"),
     }
+}
+
+/// R.5 WP MVP — emit separating predicates from the failure
+/// subgame's classifying transitions over state registers that are
+/// NOT yet in the predicate set.
+///
+/// **Heuristic (MVP).** Walk the BTOR2 file's `Node::State` lines;
+/// for each state cell whose symbol is not already covered by
+/// `current_predicates`, propose two predicates:
+/// `<register> == 0` and `<register> == 1`. The CEGAR loop appends
+/// these to the predicate set for the next iteration; the lift's
+/// state cube grows and the next evaluation can distinguish behaviours
+/// the original cube collapsed.
+///
+/// **What this MVP does NOT do** (R.5 follow-ups):
+/// - No actual weakest-precondition formula computation (no
+///   symbolic back-substitution along the classifying transition).
+///   The name "WP" is aspirational for the API surface; the
+///   mechanism here is "any uncovered register".
+/// - No cone-of-influence bound — predicates may be proposed for
+///   registers irrelevant to the classifying transition's
+///   dependency cone. Bounded-iteration cap (16 by default)
+///   prevents runaway.
+/// - No value-set extraction from BTOR2 constants — only
+///   `value == 0` and `value == 1` are proposed. Wider registers
+///   with literal comparisons against (say) 4 or 5 won't be
+///   covered until the value-extraction follow-up ships.
+///
+/// **Capping.** Returns at most 2 predicates per call to keep the
+/// per-iteration growth bounded; the CEGAR loop iterates and the
+/// helper picks up the next uncovered register on the following
+/// pass.
+///
+/// **Empty-result termination.** Returns empty Vec when every state
+/// register is already covered, OR when the BTOR2 file fails to
+/// parse — the CEGAR loop then terminates with
+/// `CegarTermination::PredicateSourceExhausted`.
+fn weakest_precondition_predicates(
+    subgame: &FailureSubgame,
+    current_predicates: &[PredicateSpec],
+    btor2_content: &str,
+) -> Vec<PredicateSpec> {
+    // The subgame's classifying_transitions is the trigger for WP —
+    // we only propose predicates when there's an actual KleeneBot
+    // verdict from a may-but-not-must edge to refine.
+    if subgame.classifying_transitions.is_empty() {
+        return Vec::new();
+    }
+
+    let file = match crate::adapter::btor2::parser::parse(btor2_content) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    let covered: std::collections::HashSet<&str> = current_predicates
+        .iter()
+        .map(|p| p.register.as_str())
+        .collect();
+
+    // Walk state cells; propose 2 predicates per uncovered register,
+    // capped at 2 total (per the doc-comment's bounded-growth policy).
+    let mut seen_proposals: std::collections::HashSet<(String, u64)> =
+        std::collections::HashSet::new();
+    let mut out: Vec<PredicateSpec> = Vec::new();
+
+    for line in &file.lines {
+        if !matches!(line.node, crate::adapter::btor2::ast::Node::State { .. }) {
+            continue;
+        }
+        let symbol = match symbols.get(&line.nid) {
+            Some(s) => s.as_str(),
+            None => continue, // skip anonymous state cells
+        };
+        if covered.contains(symbol) {
+            continue;
+        }
+        for v in [0u64, 1u64] {
+            let proposal = (symbol.to_string(), v);
+            if seen_proposals.contains(&proposal) {
+                continue;
+            }
+            seen_proposals.insert(proposal.clone());
+            out.push(PredicateSpec {
+                name: format!("wp_{symbol}_eq_{v}"),
+                register: symbol.to_string(),
+                value: v,
+            });
+            if out.len() >= 2 {
+                break;
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -554,5 +685,100 @@ mod tests {
         // R.5 follow-ups flip these to false / true respectively.
         assert!(trace.lazy_lift_pending);
         assert!(!trace.approximant_reuse_enabled);
+    }
+
+    // ---- R.5 WP predicate-discovery MVP — helper-level tests ----
+
+    #[test]
+    fn wp_returns_empty_when_no_classifying_transitions() {
+        // FailureSubgame with empty classifying_transitions means
+        // there's nothing for WP to refine — must return empty Vec.
+        let empty_subgame = FailureSubgame {
+            positions: Vec::new(),
+            classifying_transitions: Vec::new(),
+            root: None,
+            subgame_extraction_complete: false,
+        };
+        let preds = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let out = weakest_precondition_predicates(&empty_subgame, &preds, SMALL_BTOR2);
+        assert!(out.is_empty(), "WP must return empty when subgame is empty");
+    }
+
+    #[test]
+    fn wp_proposes_predicates_for_uncovered_state_register() {
+        // SMALL_BTOR2 has reg_a + reg_b. Cover reg_a only; WP must
+        // propose predicates over reg_b (the uncovered register).
+        let subgame = FailureSubgame {
+            positions: Vec::new(),
+            classifying_transitions: vec![(0, 0)],
+            root: None,
+            subgame_extraction_complete: false,
+        };
+        let preds = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let out = weakest_precondition_predicates(&subgame, &preds, SMALL_BTOR2);
+        assert!(
+            !out.is_empty(),
+            "WP must propose at least one predicate when an uncovered register exists"
+        );
+        // Every proposal targets reg_b (the only uncovered register).
+        for p in &out {
+            assert_eq!(p.register, "reg_b", "WP must target the uncovered register");
+        }
+        // Cap at 2 predicates per call (per the helper's bounded-growth policy).
+        assert!(out.len() <= 2, "WP must cap at 2 predicates per call");
+    }
+
+    #[test]
+    fn wp_returns_empty_when_every_register_is_covered() {
+        // All registers in SMALL_BTOR2 are already covered by the
+        // current predicate set — WP has nothing more to propose.
+        let subgame = FailureSubgame {
+            positions: Vec::new(),
+            classifying_transitions: vec![(0, 0)],
+            root: None,
+            subgame_extraction_complete: false,
+        };
+        let preds = vec![
+            PredicateSpec {
+                name: "p_a".into(),
+                register: "reg_a".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "p_b".into(),
+                register: "reg_b".into(),
+                value: 0,
+            },
+        ];
+        let out = weakest_precondition_predicates(&subgame, &preds, SMALL_BTOR2);
+        assert!(
+            out.is_empty(),
+            "WP must return empty when every state register is already covered"
+        );
+    }
+
+    #[test]
+    fn wp_returns_empty_on_malformed_btor2() {
+        // BTOR2 parse failure → WP must short-circuit to empty Vec
+        // (the loop then terminates with PredicateSourceExhausted).
+        let subgame = FailureSubgame {
+            positions: Vec::new(),
+            classifying_transitions: vec![(0, 0)],
+            root: None,
+            subgame_extraction_complete: false,
+        };
+        let out = weakest_precondition_predicates(&subgame, &[], "this is not valid BTOR2 syntax");
+        assert!(
+            out.is_empty(),
+            "WP must return empty on BTOR2 parse failure rather than panicking"
+        );
     }
 }
