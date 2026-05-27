@@ -479,6 +479,28 @@ impl<S: IdStorage> TransitionModality<S> {
     pub fn must_hyper(targets: smallvec::SmallVec<[StateId<S>; 4]>) -> Self {
         TransitionModality::MustHyperOnly(Box::new(targets))
     }
+
+    /// R.4.5 close-out — Return the modality's effective must-target
+    /// set, given a fallback singleton target. Used by the composition
+    /// layer to compute the Cartesian-product hyper-target set on the
+    /// synchronizing path:
+    ///
+    /// - `Sharp` → `[fallback]` (single must-target stored externally
+    ///   on `Transition::target`).
+    /// - `MustHyperOnly(targets)` → a clone of the explicit hyper-
+    ///   target slice.
+    /// - `MayOnly` → empty (no must capability).
+    ///
+    /// The fallback parameter exists so the caller doesn't need to
+    /// branch on `Sharp` themselves — pass the transition's principal
+    /// `target()` and the helper returns the right shape.
+    pub fn must_target_set(&self, fallback: StateId<S>) -> smallvec::SmallVec<[StateId<S>; 4]> {
+        match self {
+            TransitionModality::Sharp => smallvec::smallvec![fallback],
+            TransitionModality::MustHyperOnly(targets) => (**targets).clone(),
+            TransitionModality::MayOnly => smallvec::SmallVec::new(),
+        }
+    }
 }
 
 /// Transition entry stored in adjacency lists.

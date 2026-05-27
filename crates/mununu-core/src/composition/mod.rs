@@ -15,7 +15,7 @@ mod transition;
 
 use crate::clts::{
     Clts, CltsBuilder, CltsResult, DefaultLabelIdx, DefaultStateIdx, LabelControllability, StateId,
-    Transition,
+    Transition, TransitionModality,
 };
 use crate::composition::controllability::ControllabilityChecker;
 use crate::composition::transition::TransitionKeyBuilder;
@@ -521,6 +521,17 @@ pub fn compose(
                 // R.1 — KMTS modality merge per §6.5. Synchronising
                 // steps use the pointwise meet `lt ⊗ rt`; interleaving
                 // steps preserve the single contributing side's modality.
+                //
+                // R.4.5 close-out — `merge` returns a placeholder
+                // `MustHyperOnly(empty)` whenever the synchronizing
+                // pair includes a hyper-must; the composition layer
+                // populates the actual hyper-target set as the
+                // Cartesian product of both sides' must-target sets
+                // (each `(l_target, r_target)` projected through
+                // `enqueue_state`). The principal target (the first
+                // element by convention) matches the existing
+                // `enqueue_state(lt.target(), rt.target())` call so
+                // single-target queries keep working.
                 let sync_modality = lt.modality().merge(rt.modality());
                 match options.semantics {
                     CompositionSemantics::Synchronous => {
@@ -539,12 +550,53 @@ pub fn compose(
                             ControllabilityChecker::composed_has_uncontrollable_labels(
                                 lt, rt, left, right,
                             );
+
+                        // R.4.5 close-out — populate the Cartesian-
+                        // product hyper-target set when the merged
+                        // modality is the placeholder `MustHyperOnly(empty)`.
+                        // For `Sharp` / `MayOnly` results the merge
+                        // already produced the final shape; no work.
+                        let final_modality =
+                            if matches!(sync_modality, TransitionModality::MustHyperOnly(_)) {
+                                let lt_targets = lt.modality().must_target_set(lt.target());
+                                let rt_targets = rt.modality().must_target_set(rt.target());
+                                // Cartesian product; the principal target
+                                // (union_target) goes first to preserve
+                                // the §clts MustHyperOnly convention that
+                                // `targets[0] == transition.target()`.
+                                let mut product: smallvec::SmallVec<[StateId<DefaultStateIdx>; 4]> =
+                                    smallvec::smallvec![union_target];
+                                for &l_tgt in &lt_targets {
+                                    for &r_tgt in &rt_targets {
+                                        if l_tgt == lt.target() && r_tgt == rt.target() {
+                                            // Already added as principal.
+                                            continue;
+                                        }
+                                        let product_id = enqueue_state(
+                                            &mut product_builder,
+                                            &arena,
+                                            &mut builder,
+                                            left,
+                                            right,
+                                            l_tgt,
+                                            r_tgt,
+                                            &mut queue,
+                                            &mut discovered,
+                                        );
+                                        product.push(product_id);
+                                    }
+                                }
+                                TransitionModality::must_hyper(product)
+                            } else {
+                                sync_modality
+                            };
+
                         pending_transitions.insert(TransitionKeyBuilder::create_key(
                             composed_id,
                             union_target,
                             Rc::clone(&union_labels_set),
                             has_uncontrollable,
-                            sync_modality,
+                            final_modality,
                         ));
                         matched = true;
                     }
@@ -1207,12 +1259,11 @@ mod tests {
     //
     // For interleaving steps (async; only one side moves), the contributing
     // side's modality survives unchanged on the composed edge — no merge
-    // happens. These tests target the interleaving path because the
-    // synchronizing path's hyper-target Cartesian product requires the
-    // composition layer to construct product StateIds, which the current
-    // R.4.5 implementation handles by emitting a placeholder MustHyperOnly
-    // with an empty target set (R.5 will populate the Cartesian product
-    // when CEGAR actually generates hyper-must transitions from BTOR2).
+    // happens. The R.4.5 close-out (2026-05-27) populates the Cartesian
+    // product directly in the synchronizing path (verified by
+    // `compose_synchronizing_hyper_must_populates_cartesian_product` and
+    // `compose_synchronizing_sharp_and_hyper_must_promotes_to_hyper`);
+    // the interleaving path's hyper-must preservation is verified below.
 
     #[test]
     fn compose_async_interleaving_preserves_hyper_must_modality() -> TestResult {
@@ -1275,6 +1326,166 @@ mod tests {
     }
 
     #[test]
+    fn compose_synchronizing_hyper_must_populates_cartesian_product() -> TestResult {
+        // R.4.5 close-out — when both sides are `MustHyperOnly`,
+        // the composed transition's hyper-target set must be the
+        // Cartesian product of the two sides' must-target sets,
+        // projected through `enqueue_state` to product StateIds.
+        //
+        // Build:
+        //   left:  s0 -a-> hyper{s1, s2}
+        //   right: t0 -a-> hyper{u1, u2}
+        // Expected composed transition from "s0|t0" on "a" with
+        // modality MustHyperOnly whose target set = {
+        //   s1|u1, s1|u2, s2|u1, s2|u2 } (4 product states).
+        // The principal target (carried on the transition's `target`
+        // field) is the (lt.target(), rt.target()) pair — by
+        // convention `targets[0]`.
+        let mut left_builder = Clts::builder();
+        left_builder
+            .state("s0")
+            .state("s1")
+            .state("s2")
+            .initial("s0");
+        let l_lbl = left_builder.labels().intern(["a"])?;
+        left_builder.set_label_controllability(l_lbl, LabelControllability::Uncontrollable);
+        let l_s0 = left_builder.state_id_or_insert("s0").expect("s0 inserted");
+        let l_s1 = left_builder.state_id_or_insert("s1").expect("s1 inserted");
+        let l_s2 = left_builder.state_id_or_insert("s2").expect("s2 inserted");
+        let l_targets: smallvec::SmallVec<[StateId<DefaultStateIdx>; 4]> =
+            smallvec::smallvec![l_s1, l_s2];
+        left_builder.transition_ids_with_modality(
+            l_s0,
+            &[l_lbl],
+            l_s1,
+            TransitionModality::must_hyper(l_targets),
+        );
+        let left = left_builder.build()?;
+
+        let mut right_builder = Clts::builder();
+        right_builder
+            .state("t0")
+            .state("u1")
+            .state("u2")
+            .initial("t0");
+        let r_lbl = right_builder.labels().intern(["a"])?;
+        right_builder.set_label_controllability(r_lbl, LabelControllability::Uncontrollable);
+        let r_t0 = right_builder.state_id_or_insert("t0").expect("t0 inserted");
+        let r_u1 = right_builder.state_id_or_insert("u1").expect("u1 inserted");
+        let r_u2 = right_builder.state_id_or_insert("u2").expect("u2 inserted");
+        let r_targets: smallvec::SmallVec<[StateId<DefaultStateIdx>; 4]> =
+            smallvec::smallvec![r_u1, r_u2];
+        right_builder.transition_ids_with_modality(
+            r_t0,
+            &[r_lbl],
+            r_u1,
+            TransitionModality::must_hyper(r_targets),
+        );
+        let right = right_builder.build()?;
+
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        let sid = composed.state_id("s0|t0")?;
+        let trans = composed.outgoing(sid);
+        assert_eq!(
+            trans.len(),
+            1,
+            "synchronizing on shared label 'a' should produce one composed transition"
+        );
+        let modality = trans[0].modality();
+        let hyper = match modality {
+            TransitionModality::MustHyperOnly(targets) => &**targets,
+            other => panic!("expected MustHyperOnly composed modality, got {other:?}"),
+        };
+        assert_eq!(
+            hyper.len(),
+            4,
+            "Cartesian product of left {{s1, s2}} × right {{u1, u2}} must have 4 elements; got {}",
+            hyper.len()
+        );
+        // Principal target must be the first element by convention.
+        assert_eq!(
+            trans[0].target(),
+            hyper[0],
+            "principal target must match hyper_targets[0] per the §clts convention"
+        );
+        // Every product target must be reachable as a real composed state.
+        let target_names: Vec<String> = hyper
+            .iter()
+            .map(|&id| composed.state_name(id).unwrap_or("<unknown>").to_string())
+            .collect();
+        let expected: std::collections::HashSet<&str> =
+            ["s1|u1", "s1|u2", "s2|u1", "s2|u2"].into_iter().collect();
+        let actual: std::collections::HashSet<&str> =
+            target_names.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            actual, expected,
+            "Cartesian product targets must match {{s1|u1, s1|u2, s2|u1, s2|u2}}; got {target_names:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_synchronizing_sharp_and_hyper_must_promotes_to_hyper() -> TestResult {
+        // R.4.5 close-out — Sharp ⊗ MustHyperOnly promotes the
+        // composed modality to MustHyperOnly. The left side's
+        // singleton must-target contributes a single dimension to
+        // the Cartesian product; the right side's hyper-target set
+        // contributes the rest. Result has |left_must| × |right_hyper|
+        // = 1 × 2 = 2 product targets.
+        let left = one_edge_with_modality("a", TransitionModality::Sharp)?;
+
+        let mut right_builder = Clts::builder();
+        right_builder
+            .state("t0")
+            .state("u1")
+            .state("u2")
+            .initial("t0");
+        let r_lbl = right_builder.labels().intern(["a"])?;
+        right_builder.set_label_controllability(r_lbl, LabelControllability::Uncontrollable);
+        let r_t0 = right_builder.state_id_or_insert("t0").expect("t0 inserted");
+        let r_u1 = right_builder.state_id_or_insert("u1").expect("u1 inserted");
+        let r_u2 = right_builder.state_id_or_insert("u2").expect("u2 inserted");
+        let r_targets: smallvec::SmallVec<[StateId<DefaultStateIdx>; 4]> =
+            smallvec::smallvec![r_u1, r_u2];
+        right_builder.transition_ids_with_modality(
+            r_t0,
+            &[r_lbl],
+            r_u1,
+            TransitionModality::must_hyper(r_targets),
+        );
+        let right = right_builder.build()?;
+
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        let sid = composed.state_id("s0|t0")?;
+        let trans = composed.outgoing(sid);
+        assert_eq!(
+            trans.len(),
+            1,
+            "synchronizing on shared label 'a' should produce one composed transition"
+        );
+        let hyper = match trans[0].modality() {
+            TransitionModality::MustHyperOnly(targets) => &**targets,
+            other => panic!(
+                "expected MustHyperOnly composed modality (Sharp ⊗ MustHyperOnly promotes), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            hyper.len(),
+            2,
+            "Cartesian product of {{s1}} × {{u1, u2}} must have 2 elements"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn compose_3way_matrix_capabilities_match_truth_table() -> TestResult {
         // The 3×3 capability-conjunction merge table from
         // `clts/mod.rs::TransitionModality::merge` is verified here at
@@ -1282,10 +1493,13 @@ mod tests {
         // produce a composed transition whose modality is the merge
         // of the two side's modalities.
         //
-        // Note: the hyper-target Cartesian product the synchronizing
-        // case produces lives in the R.5 implementation; here we only
-        // verify the KIND of the composed modality (Sharp / MayOnly /
-        // MustHyperOnly) matches the table, not the target-set contents.
+        // Note: this test covers Sharp / MayOnly merges only — the
+        // hyper-target Cartesian product the synchronizing case
+        // produces under R.4.5 close-out is verified by
+        // `compose_synchronizing_hyper_must_populates_cartesian_product`
+        // and `compose_synchronizing_sharp_and_hyper_must_promotes_to_hyper`
+        // above. Here we only verify the KIND of the composed
+        // modality (Sharp / MayOnly) matches the table.
         type ModalityCheck = fn(&TransitionModality<DefaultStateIdx>) -> bool;
         let is_sharp: ModalityCheck = |m| matches!(m, TransitionModality::Sharp);
         let is_mayonly: ModalityCheck = |m| matches!(m, TransitionModality::MayOnly);
