@@ -2751,6 +2751,34 @@ fn resolve_btor2_constant(file: &Btor2File, nid: Nid) -> Option<u64> {
     None
 }
 
+/// R.5 WP literal extraction — collect every distinct constant value
+/// appearing in the BTOR2 file's `Node::Const` lines. Used by the
+/// CEGAR loop's `weakest_precondition_predicates` heuristic to
+/// propose richer separating predicates (e.g. `register == 5`
+/// alongside `register == 0` / `register == 1`).
+///
+/// Returns a sorted, deduped Vec. Const widths are masked to their
+/// declared sort widths before deduplication (so `4'b0000` and
+/// `8'b00000000` both contribute `0`). Const values that fail to
+/// parse (malformed bin/hex literals) are silently skipped.
+///
+/// **Why "all consts" and not "consts compared against a register".**
+/// The full WP picture would walk every `Op::Eq` / `Op::Neq` whose
+/// operand is a register-output and extract the comparison constant.
+/// That cone walk is queued as a separate R.5 follow-up; this
+/// helper is the simpler "every literal somewhere in the design"
+/// MVP. Per-iteration cap on CEGAR refinement (default 2 predicates)
+/// bounds the runaway risk.
+pub fn collect_btor2_constants(file: &Btor2File) -> Vec<u64> {
+    let mut out: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for line in &file.lines {
+        if let Some(v) = resolve_btor2_constant(file, line.nid) {
+            out.insert(v);
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn nondeterministic_init_cells(
     file: &Btor2File,
     state_meta: &[StateMeta],
