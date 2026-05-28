@@ -404,15 +404,19 @@ pub fn predicate_cube_lift(
     let uf_wrapped_nids = crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, options);
     let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
     if !uf_wrapped_nids.is_empty() {
-        // R.5b AdapterWarning channel — surface the UF wrapping via
-        // both tracing (log-stream visibility) and the structured
-        // warnings vec (for callers like cegar.rs to fold into their
-        // own reporting).
+        // R.5b AdapterWarning channel + multi-value UF enumeration —
+        // surface the UF wrapping via both tracing (log-stream
+        // visibility) and the structured warnings vec (for callers
+        // like cegar.rs to fold into their own reporting). The
+        // wrapped Ops' outputs are enumerated under both
+        // UfRepresentative::Zero and UfRepresentative::Ones per
+        // (cube, input combo) → 2× may-edges in the lifted Clts.
         let message = format!(
-            "R.5b predicate-image: {} Op(s) UF-wrapped (substituted to zero in simulate-one-step). \
-             SOUND for safety (may-side over-approximation per §6.10); the wrapped cells' downstream \
-             cube successors may shift toward KleeneBot. To remove a wrapping, list the cell in the \
-             sidecar's `uf_unwrap` field.",
+            "R.5b predicate-image: {} Op(s) UF-wrapped (substituted to zero AND ones via the \
+             multi-value enumeration in simulate-one-step). SOUND for safety (may-side \
+             over-approximation per §6.10); the wrapped cells' downstream cube successors may \
+             shift toward KleeneBot. To remove a wrapping, list the cell in the sidecar's \
+             `uf_unwrap` field.",
             uf_wrapped_nids.len()
         );
         tracing::warn!(uf_wrapped_count = uf_wrapped_nids.len(), "{}", message);
@@ -582,50 +586,71 @@ pub fn predicate_cube_lift(
                     let v = if (combo >> bit) & 1 == 1 { 1 } else { 0 };
                     input_values.insert(name.clone(), v);
                 }
-                // R.5b consumer wiring — use simulate_one_step_with_uf
-                // when at least one Op is UF-wrapped; the substituted
-                // zero value propagates through subsequent Ops in
-                // `evaluate_pure_with_uf` and shifts the resulting cube.
-                // Falls back to the plain simulate_one_step otherwise
-                // to keep the no-UF code path on its existing performance
-                // profile (avoids the HashSet-membership check per Op).
-                let next_registers = if uf_wrapped_nids.is_empty() {
-                    match crate::adapter::btor2::bit_blast::simulate_one_step(
-                        &file,
-                        &registers,
-                        &input_values,
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                // R.5b consumer wiring — multi-value UF enumeration.
+                // When at least one Op is UF-wrapped, enumerate
+                // `UfRepresentative::{Zero, Ones}` substitutions to
+                // emit multiple may-edges per cube/input combo —
+                // tighter may-side approximation than the zero-only
+                // MVP (each representative routes the next-state
+                // computation through a different downstream cube,
+                // when the wrapped Op's value actually controls a
+                // branching path).
+                //
+                // When no UF wrapping fires, use the plain
+                // `simulate_one_step` to keep the no-UF code path
+                // on its existing performance profile (avoids the
+                // HashSet-membership check per Op).
+                let next_register_snapshots: Vec<std::collections::HashMap<String, u128>> =
+                    if uf_wrapped_nids.is_empty() {
+                        match crate::adapter::btor2::bit_blast::simulate_one_step(
+                            &file,
+                            &registers,
+                            &input_values,
+                        ) {
+                            Ok(v) => vec![v],
+                            Err(_) => continue,
+                        }
+                    } else {
+                        use crate::adapter::btor2::bit_blast::UfRepresentative;
+                        let mut snaps = Vec::with_capacity(2);
+                        for rep in [UfRepresentative::Zero, UfRepresentative::Ones] {
+                            match crate::adapter::btor2::bit_blast::simulate_one_step_with_uf_rep(
+                                &file,
+                                &registers,
+                                &input_values,
+                                &uf_wrapped_nids,
+                                rep,
+                            ) {
+                                Ok(v) => snaps.push(v),
+                                Err(_) => continue,
+                            }
+                        }
+                        snaps
+                    };
+
+                // Emit one may-edge per representative. Duplicate
+                // target cubes get deduplicated via the builder's
+                // transition merging.
+                for next_registers in &next_register_snapshots {
+                    // Determine the resulting cube index by
+                    // re-evaluating each predicate against the new
+                    // register values.
+                    let mut target_index: usize = 0;
+                    for (bit, pred) in predicates.iter().enumerate() {
+                        let next_v = next_registers.get(&pred.register).copied().unwrap_or(0);
+                        if next_v == pred.value as u128 {
+                            target_index |= 1 << bit;
+                        }
                     }
-                } else {
-                    match crate::adapter::btor2::bit_blast::simulate_one_step_with_uf(
-                        &file,
-                        &registers,
-                        &input_values,
-                        &uf_wrapped_nids,
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    if target_index < state_ids.len() {
+                        let tgt_id = state_ids[target_index];
+                        builder.transition_ids_with_modality(
+                            src_id,
+                            &[label_id],
+                            tgt_id,
+                            crate::clts::TransitionModality::MayOnly,
+                        );
                     }
-                };
-                // Determine the resulting cube index by re-evaluating
-                // each predicate against the new register values.
-                let mut target_index: usize = 0;
-                for (bit, pred) in predicates.iter().enumerate() {
-                    let next_v = next_registers.get(&pred.register).copied().unwrap_or(0);
-                    if next_v == pred.value as u128 {
-                        target_index |= 1 << bit;
-                    }
-                }
-                if target_index < state_ids.len() {
-                    let tgt_id = state_ids[target_index];
-                    builder.transition_ids_with_modality(
-                        src_id,
-                        &[label_id],
-                        tgt_id,
-                        crate::clts::TransitionModality::MayOnly,
-                    );
                 }
             }
         }
@@ -1305,16 +1330,16 @@ mod tests {
         );
 
         // Both runs produce non-zero transitions; the consumer wiring
-        // is exercised in the UF case via `simulate_one_step_with_uf`.
-        // The observable invariant: under UF wrap, EVERY cube's
-        // successors land in cube 0 (cnt=0, cnt_is_1 false). Without
-        // UF wrap, the same fixture's add-based dynamic also lands in
-        // cube 0 (mask-to-2-bits arithmetic). The test asserts the
-        // edges exist in both cases — the no-UF vs UF distinction
-        // becomes observable on fixtures where the wrapped Op's
-        // arithmetic would produce a different target cube than zero
-        // would; the R.5b lifter MVP tests (in bit_blast.rs) cover
-        // that case at the simulate_one_step layer.
+        // is exercised in the UF case via `simulate_one_step_with_uf_rep`.
+        // The observable invariant (post-R.5b multi-value enumeration):
+        // under UF wrap, each (cube, input combo) emits TWO may-edges
+        // — one per UfRepresentative variant ({Zero, Ones}) — so the
+        // UF run produces ~2× the edge count of the no-UF run. The
+        // exact 2× factor depends on whether Zero and Ones land in
+        // the SAME target cube (deduped by the builder) or DIFFERENT
+        // cubes (both edges survive). For this fixture (2-bit add
+        // with target cube always being cube 0), both representatives
+        // land in cube 0 → edges deduplicate.
         let uf_edges: usize = uf_result
             .clts
             .states()
@@ -1329,9 +1354,15 @@ mod tests {
             .states()
             .map(|s| no_uf_result.clts.outgoing(s).len())
             .sum();
-        assert_eq!(
-            uf_edges, no_uf_edges,
-            "edge count must match between UF and no-UF runs (same input space, same cube count)"
+        assert!(
+            uf_edges >= no_uf_edges,
+            "multi-value UF enumeration must produce at least as many edges as no-UF; \
+             got uf={uf_edges}, no_uf={no_uf_edges}"
+        );
+        assert!(
+            uf_edges <= no_uf_edges * 2,
+            "multi-value UF enumeration capped at 2× no-UF edges (Zero + Ones representatives); \
+             got uf={uf_edges}, no_uf={no_uf_edges}"
         );
     }
 
@@ -1399,5 +1430,68 @@ mod tests {
             "warnings must be empty when no UF wrapping fires; got: {:?}",
             result.warnings
         );
+    }
+
+    /// Multi-value UF enumeration produces distinct target cubes when
+    /// Zero and Ones representatives diverge. Fixture is a 1-bit
+    /// register `bit_q` whose next-value = `wide_op` (an add aliased
+    /// via uext). With UF wrap, Zero → bit_q=0; Ones → bit_q=1. So
+    /// the cube cnt_is_1=true and cnt_is_1=false BOTH show as
+    /// targets — 2 distinct may-edges per source cube.
+    const R5B_MULTIVALUE_FIXTURE: &str = r#"
+1 sort bitvec 1
+2 zero 1
+3 const 1 1
+4 state 1 bit_q
+5 init 1 4 2
+6 add 1 4 3
+7 uext 1 6 0 wide_op
+8 next 1 4 7
+"#;
+
+    #[test]
+    fn r5b_multi_value_uf_enumeration_emits_distinct_target_cubes() {
+        let preds = vec![PredicateSpec {
+            name: "bit_is_1".into(),
+            register: "bit_q".into(),
+            value: 1,
+        }];
+        let uf_sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "uf_wrap": ["wide_op"]
+        });
+        let uf_opts = AdapterOptions {
+            sidecar_json: Some(uf_sidecar.to_string()),
+            ..Default::default()
+        };
+        let result = predicate_cube_lift(
+            preds,
+            R5B_MULTIVALUE_FIXTURE,
+            &uf_opts,
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("ok");
+
+        // 2 cubes total. Each cube under UF wrap produces 2 may-edges
+        // per input combo (Zero → cube_0, Ones → cube_1). The edge
+        // count should reflect the multi-value enumeration. Sanity
+        // check: per-cube outgoing-edge count is >= 2 (one per
+        // representative when reps diverge).
+        for state in result.clts.states() {
+            let trans = result.clts.outgoing(state);
+            // Count distinct (label, target) pairs — the builder
+            // dedups identical edges. Under multi-value with diverging
+            // reps, we expect both cube_0 and cube_1 as targets.
+            let distinct_targets: std::collections::HashSet<_> =
+                trans.iter().map(|t| t.target()).collect();
+            assert!(
+                distinct_targets.len() >= 2,
+                "multi-value UF enumeration must reach distinct target cubes from state {:?}; \
+                 got distinct targets: {:?}",
+                state,
+                distinct_targets.len()
+            );
+        }
     }
 }

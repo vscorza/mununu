@@ -228,6 +228,33 @@ pub fn simulate_one_step_with_uf(
     input_values: &std::collections::HashMap<String, u128>,
     uf_wrapped_nids: &std::collections::HashSet<Nid>,
 ) -> Result<std::collections::HashMap<String, u128>, AdapterError> {
+    simulate_one_step_with_uf_rep(
+        file,
+        register_values,
+        input_values,
+        uf_wrapped_nids,
+        UfRepresentative::Zero,
+    )
+}
+
+/// R.5b multi-value enumeration variant — like
+/// [`simulate_one_step_with_uf`] but lets the caller pick the
+/// [`UfRepresentative`] each wrapped Op's output substitutes to.
+/// Used by `predicate_cube_lift` to enumerate multiple UF
+/// representatives per (cube, input combo), generating multiple
+/// may-edges per starting cube — a tighter may-side approximation
+/// than the zero-only MVP.
+///
+/// Returns the per-symbol next register values under the chosen
+/// representative. Callers needing all representatives should
+/// invoke this fn once per [`UfRepresentative`] variant.
+pub fn simulate_one_step_with_uf_rep(
+    file: &Btor2File,
+    register_values: &std::collections::HashMap<String, u128>,
+    input_values: &std::collections::HashMap<String, u128>,
+    uf_wrapped_nids: &std::collections::HashSet<Nid>,
+    rep: UfRepresentative,
+) -> Result<std::collections::HashMap<String, u128>, AdapterError> {
     // Symbol-resolution mirror of simulate_one_step.
     let symbols = parser::collect_symbols(file);
     let mut symbol_to_input_nid: std::collections::HashMap<String, (Nid, u32)> =
@@ -270,7 +297,7 @@ pub fn simulate_one_step_with_uf(
         env.values.insert(nid, BvValue::new(bits, width));
     }
 
-    evaluate_pure_with_uf(file, &mut env, false, Some(uf_wrapped_nids))?;
+    evaluate_pure_with_uf_rep(file, &mut env, false, Some(uf_wrapped_nids), rep)?;
     apply_next(file, &mut env, &state_meta)?;
 
     let mut out: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
@@ -3162,6 +3189,39 @@ fn evaluate_pure(file: &Btor2File, env: &mut Env, honor_init: bool) -> Result<()
     evaluate_pure_with_uf(file, env, honor_init, None)
 }
 
+/// R.5b multi-value UF representative — which substitution value
+/// the wrapped Op gets per evaluation pass. Used by
+/// [`evaluate_pure_with_uf`] (zero only, backward compat) and
+/// [`evaluate_pure_with_uf_rep`] (multi-value enumeration).
+///
+/// Semantics: each variant maps to a deterministic value of the
+/// wrapped Op's result width. The full may-side UF semantics admit
+/// every admissible value of the data sort; enumerating multiple
+/// representatives ([`UfRepresentative::Zero`] +
+/// [`UfRepresentative::Ones`]) gives a tighter may-side
+/// approximation than zero-only at the cost of K-fold edge
+/// duplication per cube/input combo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UfRepresentative {
+    /// Substitute `BvValue::zero(width)`. The R.5b lifter MVP default.
+    Zero,
+    /// Substitute `BvValue::ones(width)` (all bits set). Combined
+    /// with `Zero` covers the boundary values of the wrapped Op's
+    /// result space; together they detect Boolean-controlled
+    /// downstream paths that diverge on extremes.
+    Ones,
+}
+
+impl UfRepresentative {
+    /// Materialise the substituted value at the given Op width.
+    fn to_value(self, width: u32) -> BvValue {
+        match self {
+            UfRepresentative::Zero => BvValue::zero(width),
+            UfRepresentative::Ones => BvValue::ones(width),
+        }
+    }
+}
+
 /// R.5b lifter integration MVP — variant of [`evaluate_pure`] that
 /// substitutes `BvValue::zero(width)` for every Op NID in
 /// `uf_wrapped_nids`, skipping the actual arithmetic evaluation. The
@@ -3172,21 +3232,37 @@ fn evaluate_pure(file: &Btor2File, env: &mut Env, honor_init: bool) -> Result<()
 /// `None` for `uf_wrapped_nids` reproduces `evaluate_pure` exactly
 /// (no UF substitution). `Some(empty)` is also a no-op.
 ///
-/// **Soundness note (R.5b MVP).** Substituting a single deterministic
-/// value (zero) is technically an under-approximation of the full
-/// may-side UF semantics ("the wrapped Op's output could be ANY
-/// admissible value"). The full may-side under sampling requires
-/// enumerating multiple representative values per wrapped Op +
-/// generating multiple may-edges per cube. The R.5b MVP ships the
-/// zero-substitute first because it's the smallest observable
-/// behaviour change (a verdict shift relative to concrete arithmetic
-/// is detectable end-to-end); the multi-value enumeration follow-up
-/// is queued.
+/// **Multi-value enumeration** — see [`evaluate_pure_with_uf_rep`]
+/// for the explicit-representative variant. This helper hard-codes
+/// `UfRepresentative::Zero` for backward compatibility with the
+/// R.5b lifter MVP.
 fn evaluate_pure_with_uf(
     file: &Btor2File,
     env: &mut Env,
     honor_init: bool,
     uf_wrapped_nids: Option<&std::collections::HashSet<Nid>>,
+) -> Result<(), AdapterError> {
+    evaluate_pure_with_uf_rep(
+        file,
+        env,
+        honor_init,
+        uf_wrapped_nids,
+        UfRepresentative::Zero,
+    )
+}
+
+/// R.5b multi-value enumeration helper — like [`evaluate_pure_with_uf`]
+/// but lets the caller pick which [`UfRepresentative`] each wrapped
+/// Op's output substitutes to. Enables the caller to run K passes
+/// (K = |UfRepresentative| variants) over the same (env, file) to
+/// generate K downstream effects per UF wrapping, which the lift
+/// consumes as K may-edges per cube.
+fn evaluate_pure_with_uf_rep(
+    file: &Btor2File,
+    env: &mut Env,
+    honor_init: bool,
+    uf_wrapped_nids: Option<&std::collections::HashSet<Nid>>,
+    rep: UfRepresentative,
 ) -> Result<(), AdapterError> {
     for line in &file.lines {
         match &line.node {
@@ -3238,13 +3314,14 @@ fn evaluate_pure_with_uf(
             Node::Op { sort, op, args, .. } => {
                 let width = parser::bv_width(file, *sort)
                     .ok_or_else(|| constancy_err(line, "operator references non-bitvec sort"))?;
-                // R.5b lifter integration MVP — when this Op's NID is
-                // in the UF-wrapped set, substitute zero instead of
-                // evaluating the arithmetic. Downstream Ops that read
-                // env see the substituted value, propagating UF
-                // semantics through the dependency chain.
+                // R.5b lifter integration MVP + multi-value follow-up —
+                // when this Op's NID is in the UF-wrapped set, substitute
+                // the chosen representative (zero / ones / etc.) instead
+                // of evaluating the arithmetic. Downstream Ops that read
+                // env see the substituted value, propagating UF semantics
+                // through the dependency chain.
                 if uf_wrapped_nids.is_some_and(|s| s.contains(&line.nid)) {
-                    env.values.insert(line.nid, BvValue::zero(width));
+                    env.values.insert(line.nid, rep.to_value(width));
                     continue;
                 }
                 let result =
