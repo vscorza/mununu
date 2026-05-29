@@ -15,8 +15,24 @@ use crate::clts::{Clts, IdStorage, LabelId, StateId, Transition};
 // Type alias to reduce complexity in function signatures
 type TransitionGroupMap<'a, S, L> = HashMap<String, Vec<(&'a Transition<S, L>, usize)>>;
 
+/// R.5 CEGAR auto-capture sub-item 1.1 — callback type the
+/// evaluator invokes once per fixpoint variable, at the iteration
+/// that converged (the iterate's final value before return).
+///
+/// Signature: `(FormulaVarId, &EvalResult)`. The callback receives
+/// the variable's index + a borrow of the converged bitset; the
+/// caller (typically a CEGAR loop) is expected to clone the
+/// bitset if it wants to persist the value. The callback's return
+/// type is `()` — errors must be handled within the closure.
+///
+/// Wrapped in `Arc<dyn Fn ... + Send + Sync>` so the option type
+/// remains `Clone` (the existing `EvaluationOptions: Clone` bound)
+/// without forcing the closure to be `Copy`.
+pub type FixpointConvergenceCallback =
+    dyn Fn(crate::mu_calculus::FormulaVarId, &EvalResult) + Send + Sync;
+
 /// Options that control μ-calculus evaluation behaviour.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EvaluationOptions {
     /// Enable memoisation of visited sub-formulas (skips storing results when fixpoint
     /// bindings are active to avoid stale entries).
@@ -37,6 +53,37 @@ pub struct EvaluationOptions {
     /// so this lands as a strict-additive opt-in feature
     /// (`None` ⇒ unchanged behaviour).
     pub prior_approximants: Option<std::collections::HashMap<usize, (usize, EvalResult)>>,
+    /// R.5 CEGAR auto-capture sub-item 1.1 — callback fired once
+    /// per fixpoint variable at the iteration that converged.
+    /// Receives the variable's index + a borrow of the converged
+    /// bitset. Used by CEGAR loops to capture the per-iteration
+    /// approximants for `prior_approximants`-style reuse on the
+    /// next iteration.
+    ///
+    /// `None` ⇒ no callback (the default; preserves the pre-1.1
+    /// behaviour exactly). When set, the callback fires once per
+    /// fixpoint var per outer evaluator invocation. Nested
+    /// fixpoints fire once at each containing fixpoint's
+    /// convergence (i.e. K fires for K-deep nesting on a single
+    /// evaluation).
+    pub on_fixpoint_convergence: Option<std::sync::Arc<FixpointConvergenceCallback>>,
+}
+
+impl std::fmt::Debug for EvaluationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvaluationOptions")
+            .field("use_memoisation", &self.use_memoisation)
+            .field("use_partitions", &self.use_partitions)
+            .field(
+                "prior_approximants_count",
+                &self.prior_approximants.as_ref().map(|m| m.len()),
+            )
+            .field(
+                "on_fixpoint_convergence",
+                &self.on_fixpoint_convergence.as_ref().map(|_| "<closure>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for EvaluationOptions {
@@ -45,6 +92,7 @@ impl Default for EvaluationOptions {
             use_memoisation: true,
             use_partitions: true,
             prior_approximants: None,
+            on_fixpoint_convergence: None,
         }
     }
 }
@@ -1794,6 +1842,15 @@ where
             }
 
             if next_set == current_set {
+                // R.5 CEGAR auto-capture sub-item 1.1 — fire the
+                // convergence callback (when present) before
+                // returning the iterate. The callback receives the
+                // fixpoint var's index + a borrow of the converged
+                // iterate; consumers (CEGAR loops) clone the
+                // bitset if they want to persist it across calls.
+                if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
+                    cb(var, &next_set);
+                }
                 return self.clone_bitvec(&next_set);
             }
 
@@ -2641,6 +2698,89 @@ mod tests {
     }
 
     #[test]
+    fn r5_cegar_auto_capture_callback_fires_on_convergence() -> TestResult {
+        // R.5 CEGAR auto-capture sub-item 1.1 — the
+        // on_fixpoint_convergence callback must fire exactly once
+        // per fixpoint variable when its iterate converges. For
+        // `nu X. <true> X` there is one outer fixpoint var, so
+        // exactly one callback invocation.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let cb = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, _result: &EvalResult| {
+                calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        let opts = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb),
+            ..Default::default()
+        };
+        let _ = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "on_fixpoint_convergence must fire exactly once per fixpoint var on a single-fixpoint formula"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_cegar_auto_capture_callback_receives_converged_iterate() -> TestResult {
+        // R.5 CEGAR auto-capture sub-item 1.1 — the callback's
+        // second argument is the converged iterate; it must match
+        // the formula's final verdict (since the outer formula IS
+        // the fixpoint we're capturing).
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<EvalResult>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let cb = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, result: &EvalResult| {
+                *captured_clone.lock().unwrap() = Some(result.clone());
+            },
+        );
+
+        let opts = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb),
+            ..Default::default()
+        };
+        let verdict = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        let captured_iterate = captured.lock().unwrap().clone().expect("callback fired");
+        assert_eq!(
+            verdict, captured_iterate,
+            "callback-captured iterate must match the formula's final verdict for a single-fixpoint formula"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_cegar_auto_capture_callback_absent_preserves_baseline_verdict() -> TestResult {
+        // R.5 CEGAR auto-capture sub-item 1.1 — when the callback
+        // is absent (default), the evaluator's verdict is
+        // identical to the pre-1.1 baseline. This is the
+        // strict-additive guarantee.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+        let baseline = evaluate(&formula, &clts, &env)?;
+        let with_opts =
+            evaluate_with_options(&formula, &clts, &env, &EvaluationOptions::default())?;
+        assert_eq!(
+            baseline, with_opts,
+            "default EvaluationOptions must produce baseline verdict (no callback fires)"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn variable_binding_in_formula() -> TestResult {
         // Test variable evaluation with bindings in fixpoint
         let clts = build_simple_clts();
@@ -2915,6 +3055,7 @@ mod tests {
             use_memoisation: false,
             use_partitions: false,
             prior_approximants: None,
+            on_fixpoint_convergence: None,
         };
         let no_cache_result = evaluate_with_options(&formula, &clts, &env, &custom_opts)?;
 
