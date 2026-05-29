@@ -57,6 +57,7 @@
 use std::sync::Arc;
 
 use crate::adapter::AdapterOptions;
+use crate::adapter::btor2::ast::Nid;
 use crate::adapter::btor2::{PredicateCubeLiftOptions, PredicateSpec, predicate_cube_lift};
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::mu_calculus::{
@@ -480,13 +481,101 @@ fn weakest_precondition_predicates(
         }
     }
 
+    // R.5 WP cone-of-influence bound — restrict proposals to state
+    // cells that the predicate-set's registers transitively depend
+    // on via the BTOR2 next-state graph. Without this bound, WP
+    // would propose predicates over registers irrelevant to the
+    // classifying transition's behavior (wasting CEGAR iterations
+    // on splits that can't change the verdict).
+    //
+    // Algorithm: for each register named in `current_predicates`,
+    // find its BTOR2 state NID via the symbol table + walk its
+    // next-line operand graph backward, collecting every reachable
+    // State NID. The union of those NIDs (translated back to
+    // symbols) is the COI. Empty COI ⇒ no restriction, fall back
+    // to "any uncovered register".
+    let coi_symbols: std::collections::HashSet<&str> = {
+        let mut name_to_nid: std::collections::HashMap<&str, Nid> =
+            std::collections::HashMap::new();
+        for (nid, name) in &symbols {
+            name_to_nid.insert(name.as_str(), *nid);
+        }
+        let mut reachable_nids: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+        for pred in current_predicates {
+            let Some(&seed_nid) = name_to_nid.get(pred.register.as_str()) else {
+                continue;
+            };
+            let Some(next_value) =
+                crate::adapter::btor2::parser::find_next_value_operand(&file, seed_nid)
+            else {
+                // No `Next` line → the state's COI is just itself.
+                reachable_nids.insert(seed_nid);
+                continue;
+            };
+            let from_this = crate::adapter::btor2::parser::collect_reachable_states_from(
+                &file,
+                std::slice::from_ref(&next_value),
+            );
+            // Include the seed state itself + everything its next-value
+            // depends on.
+            reachable_nids.insert(seed_nid);
+            reachable_nids.extend(from_this);
+        }
+        let mut out: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for nid in &reachable_nids {
+            if let Some(name) = symbols.get(nid) {
+                out.insert(name.as_str());
+            }
+        }
+        out
+    };
+    // Empty COI ⇒ fall back to "any uncovered state cell".
+    let coi_active = !coi_symbols.is_empty();
+
     // Walk state cells; propose up to 2 predicates per uncovered
     // register (per the doc-comment's bounded-growth policy).
+    //
+    // R.5 WP COI bound — try the COI-restricted walk first; if it
+    // yields no proposals (the COI was too narrow to admit any
+    // uncovered register), fall back to the unrestricted walk. The
+    // fallback ensures the helper preserves its prior-MVP "always
+    // returns at least one proposal when some register is uncovered"
+    // contract.
+    let mut out = walk_state_cells_proposing(
+        &file,
+        &symbols,
+        &covered,
+        &candidate_values,
+        current_predicates,
+        if coi_active { Some(&coi_symbols) } else { None },
+    );
+    if out.is_empty() && coi_active {
+        out = walk_state_cells_proposing(
+            &file,
+            &symbols,
+            &covered,
+            &candidate_values,
+            current_predicates,
+            None,
+        );
+    }
+    out
+}
+
+/// R.5 WP helper — walk state cells in the BTOR2, proposing
+/// predicates over each uncovered register (cap at 2 total per
+/// invocation per the bounded-growth policy). When `coi_filter` is
+/// `Some`, only registers in that set are eligible.
+fn walk_state_cells_proposing(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    symbols: &std::collections::HashMap<Nid, String>,
+    covered: &std::collections::HashSet<&str>,
+    candidate_values: &[u64],
+    current_predicates: &[PredicateSpec],
+    coi_filter: Option<&std::collections::HashSet<&str>>,
+) -> Vec<PredicateSpec> {
     let mut seen_proposals: std::collections::HashSet<(String, u64)> =
         std::collections::HashSet::new();
-    // Also skip candidate values that already appear in current
-    // predicates for the same register (avoid duplicate work the
-    // dedup mechanism in the lift would discard anyway).
     let existing_register_value_pairs: std::collections::HashSet<(&str, u64)> = current_predicates
         .iter()
         .map(|p| (p.register.as_str(), p.value))
@@ -499,12 +588,17 @@ fn weakest_precondition_predicates(
         }
         let symbol = match symbols.get(&line.nid) {
             Some(s) => s.as_str(),
-            None => continue, // skip anonymous state cells
+            None => continue,
         };
         if covered.contains(symbol) {
             continue;
         }
-        for &v in &candidate_values {
+        if let Some(coi) = coi_filter
+            && !coi.contains(symbol)
+        {
+            continue;
+        }
+        for &v in candidate_values {
             if existing_register_value_pairs.contains(&(symbol, v)) {
                 continue;
             }
@@ -904,6 +998,109 @@ mod tests {
         assert!(
             consts.contains(&5),
             "collect_btor2_constants must include 5 (the `const 1 0101` literal); got {consts:?}"
+        );
+    }
+
+    // ---- R.5 WP cone-of-influence bound tests ----
+
+    /// BTOR2 fixture with two connected state cells where `cnt_a`
+    /// (the cone-controlling register, covered by the initial
+    /// predicate) has a next-value computation that reads `cnt_b`.
+    /// Under the WP cone-of-influence walk (backwards from
+    /// cnt_a's next-value), `cnt_b` enters the cone — so WP must
+    /// propose predicates for `cnt_b` even though only `cnt_a`
+    /// is in the current predicate set.
+    const WP_COI_FIXTURE: &str = r#"
+1 sort bitvec 2
+2 zero 1
+3 const 1 11
+4 state 1 cnt_a
+5 state 1 cnt_b
+6 add 1 4 5
+7 next 1 4 6
+8 add 1 5 3
+9 next 1 5 8
+"#;
+
+    #[test]
+    fn wp_coi_includes_register_in_cone_of_covered_predicate() {
+        // Coverage: cnt_a is covered → COI walks from cnt_a's next
+        // (NID 7 → operand NID 6 → operand cnt_a (4) + cnt_b (5)).
+        // So COI = {cnt_a, cnt_b}. The only uncovered cell in COI
+        // is cnt_b → WP proposes for cnt_b.
+        let subgame = FailureSubgame {
+            positions: Vec::new(),
+            classifying_transitions: vec![(0, 0)],
+            root: None,
+            subgame_extraction_complete: false,
+        };
+        let preds = vec![PredicateSpec {
+            name: "p_a".into(),
+            register: "cnt_a".into(),
+            value: 0,
+        }];
+        let out = weakest_precondition_predicates(&subgame, &preds, WP_COI_FIXTURE);
+        assert!(
+            !out.is_empty(),
+            "WP must propose for cnt_b (in cnt_a's cone)"
+        );
+        assert!(
+            out.iter().all(|p| p.register == "cnt_b"),
+            "WP COI must restrict to cnt_b (the in-cone uncovered register); got: {:?}",
+            out.iter().map(|p| p.register.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wp_coi_falls_back_when_cone_excludes_all_uncovered() {
+        // Fixture where the covered register's cone DOES NOT
+        // include the uncovered register — independent chains.
+        // SMALL_BTOR2 has reg_a + reg_b both with next = const 0.
+        // Neither's cone includes the other → COI = {reg_a only}
+        // (when reg_a is covered). reg_b is OUTSIDE the COI ⇒
+        // strict-COI path returns empty ⇒ fallback fires ⇒ reg_b
+        // gets proposed under the unrestricted walk.
+        let subgame = FailureSubgame {
+            positions: Vec::new(),
+            classifying_transitions: vec![(0, 0)],
+            root: None,
+            subgame_extraction_complete: false,
+        };
+        let preds = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let out = weakest_precondition_predicates(&subgame, &preds, SMALL_BTOR2);
+        assert!(
+            !out.is_empty(),
+            "WP must fall back when COI excludes every uncovered register"
+        );
+        assert!(
+            out.iter().all(|p| p.register == "reg_b"),
+            "fallback must propose for reg_b (the only uncovered register); got: {:?}",
+            out.iter().map(|p| p.register.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collect_reachable_states_from_walks_through_op_chains() {
+        // Direct check on the parser helper: from cnt_a's next-value
+        // (NID 6 = `add 1 4 5`), reachable states are cnt_a (4) + cnt_b (5).
+        let file = crate::adapter::btor2::parser::parse(WP_COI_FIXTURE).expect("parse");
+        let next_op =
+            crate::adapter::btor2::parser::find_next_value_operand(&file, 4).expect("cnt_a Next");
+        let reachable = crate::adapter::btor2::parser::collect_reachable_states_from(
+            &file,
+            std::slice::from_ref(&next_op),
+        );
+        assert!(
+            reachable.contains(&4),
+            "cnt_a (NID 4) must be reachable from its own next-value computation; got {reachable:?}"
+        );
+        assert!(
+            reachable.contains(&5),
+            "cnt_b (NID 5) must be reachable from cnt_a's next-value (cnt_a += cnt_b); got {reachable:?}"
         );
     }
 }

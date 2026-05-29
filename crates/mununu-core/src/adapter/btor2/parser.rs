@@ -597,6 +597,71 @@ fn bfs_nearest_state(
     None
 }
 
+/// R.5 WP cone-of-influence helper — collect every `Node::State`
+/// NID reachable backward through the operand graph from `seeds`.
+/// Used by the CEGAR loop's `weakest_precondition_predicates` to
+/// restrict its proposals to state cells the classifying transition
+/// actually depends on (instead of "any uncovered register").
+///
+/// The walk stops at non-Op leaves (Input, Const, Sort) and collects
+/// every State encountered. Cycles are handled by a `seen` set;
+/// off-graph references (NIDs the file doesn't define) are skipped.
+///
+/// Returns an empty set when no States are reachable. The caller
+/// should treat an empty COI as "no restriction" and fall back to
+/// the unconstrained predicate proposal path.
+pub fn collect_reachable_states_from(
+    file: &Btor2File,
+    seeds: &[crate::adapter::btor2::ast::Operand],
+) -> std::collections::HashSet<Nid> {
+    use std::collections::{HashSet, VecDeque};
+    let mut queue: VecDeque<Nid> = seeds.iter().map(|o| o.nid()).collect();
+    let mut seen: HashSet<Nid> = HashSet::new();
+    let mut states: HashSet<Nid> = HashSet::new();
+    while let Some(nid) = queue.pop_front() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::State { .. } => {
+                states.insert(line.nid);
+            }
+            Node::Op { args, .. } => {
+                for o in args {
+                    queue.push_back(o.nid());
+                }
+            }
+            _ => {}
+        }
+    }
+    states
+}
+
+/// R.5 WP cone-of-influence helper — find the `next` operand for a
+/// given state cell NID, if one exists in the file. The returned
+/// operand is the seed for [`collect_reachable_states_from`] when
+/// computing the cone-of-influence for that state's evolution.
+///
+/// Returns `None` for state cells without a `Next` line (BTOR2
+/// convention: such states retain their init value forever, so the
+/// cone is just the state itself).
+pub fn find_next_value_operand(
+    file: &Btor2File,
+    state_nid: Nid,
+) -> Option<crate::adapter::btor2::ast::Operand> {
+    for line in &file.lines {
+        if let Node::Next { state, value, .. } = &line.node
+            && *state == state_nid
+        {
+            return Some(*value);
+        }
+    }
+    None
+}
+
 /// Resolve the bit-vector width of a sort node. Returns `None` if the
 /// referenced node is an array sort or unresolvable.
 pub fn bv_width(file: &Btor2File, sort_nid: Nid) -> Option<u32> {
