@@ -320,6 +320,96 @@ impl Default for PredicateCubeLiftOptions {
     }
 }
 
+/// R.5 lazy KMTS sub-item 2.1 — a single may-edge from
+/// [`KmtsLiftLazy::expand_cube`]. The target cube is identified by
+/// its 0-based index in the lifter's cube space; the label is the
+/// transition's BTOR2-level label name (`"step"` for the R.2.5
+/// MVP's single-label edges; future variants may carry more
+/// distinguished labels per input combination).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LazyExpansionEdge {
+    /// Label name on the may-edge. Matches the labels the eager
+    /// `predicate_cube_lift` would emit for the same edge.
+    pub label: String,
+    /// 0-based cube index of the edge's target.
+    pub target_cube: usize,
+}
+
+/// R.5 lazy KMTS sub-item 2.1 — trait for on-demand predicate-cube
+/// expansion. The eager [`predicate_cube_lift`] materializes every
+/// cube + every may-edge before returning; the lazy trait lets the
+/// caller (typically R.5's CEGAR loop) drive expansion as the
+/// failure-subgame walk explores cubes, so memory grows only with
+/// the reachable cube set rather than `2^|P|`.
+///
+/// **Sub-item 2.1 scope.** This commit ships the trait + a
+/// [`NullLazyLift`] stub impl that returns empty edges for every
+/// cube (caller treats every cube as terminal). Sub-item 2.2 adds
+/// an eager-wrapping impl that backs the lazy API with the
+/// existing `predicate_cube_lift` results; sub-item 2.3 adds the
+/// truly-lazy impl that computes cube successors on demand via
+/// `simulate_one_step_with_uf_rep`. Sub-items 2.4 + 2.5 plumb the
+/// trait into the CEGAR loop + add benchmark coverage.
+///
+/// **Per-method contracts**:
+/// - [`Self::cube_count`] returns the total cube count
+///   (`2^|predicates|` at the MVP).
+/// - [`Self::expand_cube`] returns the may-edges out of the given
+///   cube. Implementations may cache; repeat calls on the same
+///   cube index must return the same set (sound under
+///   determinism).
+/// - [`Self::predicates`] returns the predicate set the handle was
+///   built with; immutable across the handle's lifetime.
+pub trait KmtsLiftLazy {
+    /// Total number of cubes in the abstract state space.
+    /// Equals `2^|predicates|` at the R.2.5 MVP.
+    fn cube_count(&self) -> usize;
+
+    /// Expand a single cube's may-edges. Caller drives exploration;
+    /// implementations may memoize. Returns an empty `Vec` for
+    /// cubes with no admissible successors (the cube is terminal).
+    ///
+    /// Out-of-range `cube_index` (>= `cube_count()`) returns an
+    /// empty `Vec` — implementations should not panic.
+    fn expand_cube(&mut self, cube_index: usize) -> Vec<LazyExpansionEdge>;
+
+    /// The predicate set the handle was built with.
+    fn predicates(&self) -> &[PredicateSpec];
+}
+
+/// R.5 lazy KMTS sub-item 2.1 — stub implementation of
+/// [`KmtsLiftLazy`] that always returns empty edges. Useful for
+/// testing the trait shape compiles + for callers that want a
+/// cube-state-only abstraction with no dynamics (the legacy R.2.5
+/// MVP behaviour pre-may-edge-construction).
+#[derive(Debug, Clone)]
+pub struct NullLazyLift {
+    /// Predicates the handle was built with. Stored for
+    /// [`KmtsLiftLazy::predicates`] return.
+    pub predicates: Vec<PredicateSpec>,
+}
+
+impl NullLazyLift {
+    /// Build a `NullLazyLift` with the given predicate set.
+    pub fn new(predicates: Vec<PredicateSpec>) -> Self {
+        Self { predicates }
+    }
+}
+
+impl KmtsLiftLazy for NullLazyLift {
+    fn cube_count(&self) -> usize {
+        1usize << self.predicates.len()
+    }
+
+    fn expand_cube(&mut self, _cube_index: usize) -> Vec<LazyExpansionEdge> {
+        Vec::new()
+    }
+
+    fn predicates(&self) -> &[PredicateSpec] {
+        &self.predicates
+    }
+}
+
 /// R.2.5 — Result of lifting one BTOR2 source through the predicate-
 /// cube path. Carries a `Clts` whose state count is bounded by 2^|P|
 /// (NOT 2^|Registers|), plus the predicate set and timing
@@ -1493,5 +1583,105 @@ mod tests {
                 distinct_targets.len()
             );
         }
+    }
+
+    #[test]
+    fn r5_lazy_kmts_null_lift_cube_count_matches_two_to_p() {
+        let preds = vec![
+            PredicateSpec {
+                name: "p0".to_string(),
+                register: "reg_a".to_string(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "p1".to_string(),
+                register: "reg_a".to_string(),
+                value: 1,
+            },
+            PredicateSpec {
+                name: "p2".to_string(),
+                register: "reg_b".to_string(),
+                value: 0,
+            },
+        ];
+        let null_lift = NullLazyLift::new(preds.clone());
+        assert_eq!(
+            null_lift.cube_count(),
+            1usize << preds.len(),
+            "NullLazyLift::cube_count must equal 2^|P|"
+        );
+    }
+
+    #[test]
+    fn r5_lazy_kmts_null_lift_expand_cube_returns_empty() {
+        let preds = vec![PredicateSpec {
+            name: "p0".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let mut null_lift = NullLazyLift::new(preds);
+        for cube in 0..null_lift.cube_count() {
+            let edges = null_lift.expand_cube(cube);
+            assert!(
+                edges.is_empty(),
+                "NullLazyLift must return no may-edges for cube {cube}; got {edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r5_lazy_kmts_null_lift_expand_cube_out_of_range_returns_empty() {
+        let preds = vec![PredicateSpec {
+            name: "p0".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let mut null_lift = NullLazyLift::new(preds);
+        let out_of_range = null_lift.cube_count() + 5;
+        let edges = null_lift.expand_cube(out_of_range);
+        assert!(
+            edges.is_empty(),
+            "expand_cube on out-of-range index must return empty (no panic); got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn r5_lazy_kmts_null_lift_predicates_round_trip() {
+        let preds = vec![
+            PredicateSpec {
+                name: "p_alpha".to_string(),
+                register: "reg_a".to_string(),
+                value: 42,
+            },
+            PredicateSpec {
+                name: "p_beta".to_string(),
+                register: "reg_b".to_string(),
+                value: 7,
+            },
+        ];
+        let null_lift = NullLazyLift::new(preds.clone());
+        assert_eq!(
+            null_lift.predicates(),
+            preds.as_slice(),
+            "NullLazyLift::predicates must round-trip the constructor input"
+        );
+    }
+
+    #[test]
+    fn r5_lazy_kmts_lazy_expansion_edge_equality() {
+        let a = LazyExpansionEdge {
+            label: "step".to_string(),
+            target_cube: 3,
+        };
+        let b = LazyExpansionEdge {
+            label: "step".to_string(),
+            target_cube: 3,
+        };
+        let c = LazyExpansionEdge {
+            label: "step".to_string(),
+            target_cube: 4,
+        };
+        assert_eq!(a, b, "edges with identical fields must be equal");
+        assert_ne!(a, c, "edges with different target_cube must differ");
     }
 }
