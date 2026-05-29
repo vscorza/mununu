@@ -23,6 +23,20 @@ pub struct EvaluationOptions {
     pub use_memoisation: bool,
     /// Enable guard-based symbolic partitions for current/next-state variable checks.
     pub use_partitions: bool,
+    /// R.5 approximant reuse — prior fixpoint approximants keyed by
+    /// `(formula-var-id, state-count)`. When the evaluator enters a
+    /// fixpoint var X for the first time AND `prior_approximants`
+    /// has an entry for X under the current state count, the iterate
+    /// is seeded from the prior value (instead of empty for μ-LFP /
+    /// full for ν-GFP). When the state count differs (CEGAR
+    /// refinement changed the cube space), the entry is ignored —
+    /// the cube-refinement mapping is a follow-up.
+    ///
+    /// **MVP scope.** The API surface ships here; the actual
+    /// reuse-during-fixpoint-init logic ships in a separate commit
+    /// so this lands as a strict-additive opt-in feature
+    /// (`None` ⇒ unchanged behaviour).
+    pub prior_approximants: Option<std::collections::HashMap<usize, (usize, EvalResult)>>,
 }
 
 impl Default for EvaluationOptions {
@@ -30,6 +44,7 @@ impl Default for EvaluationOptions {
         Self {
             use_memoisation: true,
             use_partitions: true,
+            prior_approximants: None,
         }
     }
 }
@@ -1730,9 +1745,29 @@ where
         kind: FixpointKind,
         bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        let mut current_set = match kind {
-            FixpointKind::Least => self.alloc_bitvec(false)?, // ∅
-            FixpointKind::Greatest => self.alloc_bitvec(true)?, // States
+        // R.5 approximant reuse — when a prior approximant exists
+        // for this fixpoint var under the current state count, seed
+        // the iterate with it instead of starting from bottom/top.
+        // The cube-refinement mapping (using a prior approximant
+        // from a coarser cube space on a refined one) is queued as
+        // a follow-up; the MVP requires exact state-count match,
+        // which only fires when CEGAR re-runs without refinement
+        // (verdict-cache pattern) or when iteration 2+ over the
+        // same predicate set re-evaluates the same formula.
+        let state_count = self.env.state_count();
+        let seed: Option<BitVec<usize, Lsb0>> = self
+            .options
+            .prior_approximants
+            .as_ref()
+            .and_then(|m| m.get(&var.index()))
+            .filter(|(prior_state_count, _)| *prior_state_count == state_count)
+            .map(|(_, prior_iterate)| prior_iterate.clone());
+        let mut current_set = match seed {
+            Some(prior) => self.clone_bitvec(&prior)?,
+            None => match kind {
+                FixpointKind::Least => self.alloc_bitvec(false)?, // ∅
+                FixpointKind::Greatest => self.alloc_bitvec(true)?, // States
+            },
         };
         let mut iteration: usize = 0;
 
@@ -2538,6 +2573,74 @@ mod tests {
     }
 
     #[test]
+    fn r5_approximant_reuse_seed_with_matching_state_count_runs_clean() -> TestResult {
+        // R.5 approximant reuse API surface — pass a prior approximant
+        // for the formula's outer fixpoint var; verify the evaluator
+        // accepts the option without panic AND the verdict matches a
+        // run without the option. The MVP's reuse semantics: if the
+        // prior approximant is ALREADY a fixed point, the iterate
+        // returns immediately; otherwise it converges from the seed.
+        // For a small fixture both paths converge to the same result.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        // Baseline: evaluate without prior approximants.
+        let baseline = evaluate(&formula, &clts, &env)?;
+
+        // Seeded: pass a prior approximant matching the baseline.
+        // var id 0 (the outer nu X), state count matches.
+        let mut priors: std::collections::HashMap<usize, (usize, EvalResult)> =
+            std::collections::HashMap::new();
+        priors.insert(0, (clts.state_count(), baseline.clone()));
+        let opts = EvaluationOptions {
+            prior_approximants: Some(priors),
+            ..Default::default()
+        };
+        let seeded = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        assert_eq!(
+            baseline, seeded,
+            "R.5 approximant reuse must produce identical verdict to baseline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_approximant_reuse_ignored_on_state_count_mismatch() -> TestResult {
+        // R.5 approximant reuse — prior approximant under a DIFFERENT
+        // state count must be ignored (the cube refinement mapping
+        // is a follow-up). The evaluator falls back to the default
+        // empty/full seed.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+        let baseline = evaluate(&formula, &clts, &env)?;
+
+        // Bogus prior approximant with mismatched state count.
+        let mut priors: std::collections::HashMap<usize, (usize, EvalResult)> =
+            std::collections::HashMap::new();
+        // Use an invalid state_count (clts.state_count() + 999) so
+        // the mismatch path fires.
+        priors.insert(
+            0,
+            (
+                clts.state_count() + 999,
+                bitvec::vec::BitVec::repeat(false, clts.state_count()),
+            ),
+        );
+        let opts = EvaluationOptions {
+            prior_approximants: Some(priors),
+            ..Default::default()
+        };
+        let with_mismatched = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        assert_eq!(
+            baseline, with_mismatched,
+            "mismatched state count must be ignored, falling back to baseline behaviour"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn variable_binding_in_formula() -> TestResult {
         // Test variable evaluation with bindings in fixpoint
         let clts = build_simple_clts();
@@ -2811,6 +2914,7 @@ mod tests {
         let custom_opts = EvaluationOptions {
             use_memoisation: false,
             use_partitions: false,
+            prior_approximants: None,
         };
         let no_cache_result = evaluate_with_options(&formula, &clts, &env, &custom_opts)?;
 
