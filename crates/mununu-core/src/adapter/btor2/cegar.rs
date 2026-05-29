@@ -54,15 +54,16 @@
 //! on `CegarTrace` are the explicit handshakes between R.5 MVP and
 //! the future load-bearing implementation.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::adapter::AdapterOptions;
 use crate::adapter::btor2::ast::Nid;
 use crate::adapter::btor2::{PredicateCubeLiftOptions, PredicateSpec, predicate_cube_lift};
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::mu_calculus::{
-    Environment, EvaluationError, FailureSubgame, Formula, GameEvaluation, Trit, TritSet,
-    evaluate_3v_game,
+    Environment, EvalResult, EvaluationError, EvaluationOptions, FailureSubgame, Formula,
+    GameEvaluation, Trit, TritSet, evaluate_3v_game, evaluate_3v_game_with_options,
 };
 
 /// R.5 — Type alias for the manual predicate-discovery callback.
@@ -136,6 +137,21 @@ pub struct CegarOptions {
     /// Hard cap on cube count for the underlying `predicate_cube_lift`
     /// at each iteration. Default 1024 (per R.2.5).
     pub max_cube_count: usize,
+    /// R.5 CEGAR auto-capture sub-item 1.2 — when true, the loop wires
+    /// an [`EvaluationOptions::on_fixpoint_convergence`] callback at
+    /// each iteration's `evaluate_3v_game_with_options` call to capture
+    /// converged per-fixpoint-var approximants into
+    /// [`CegarIteration::approximants_at_end`].
+    ///
+    /// `false` (default) ⇒ `approximants_at_end` is always `None`;
+    /// behaviour identical to the pre-1.2 loop.
+    /// `true` ⇒ each iteration's `approximants_at_end` is `Some(map)`
+    /// (possibly empty if the formula has no fixpoints).
+    ///
+    /// Sub-item 1.3 will add a sibling flag that consumes the
+    /// captured approximants as `prior_approximants` seeds on the
+    /// next iteration; this sub-item only ships the capture side.
+    pub capture_approximants: bool,
 }
 
 impl Default for CegarOptions {
@@ -144,6 +160,7 @@ impl Default for CegarOptions {
             max_iterations: 16,
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
+            capture_approximants: false,
         }
     }
 }
@@ -170,6 +187,22 @@ pub struct CegarIteration {
     /// size as a proxy for game-position evaluations; R.5 follow-up
     /// will replace this with a precise per-position counter.
     pub game_position_evaluations: usize,
+    /// R.5 CEGAR auto-capture sub-item 1.2 — per-fixpoint-var
+    /// converged approximants from THIS iteration's evaluator run.
+    ///
+    /// Keyed by `FormulaVarId::index()` (the same shape
+    /// `EvaluationOptions::prior_approximants` consumes). Value is the
+    /// converged iterate as an [`EvalResult`] bitset.
+    ///
+    /// `None` ⇒ caller did not enable auto-capture for this run
+    /// (default; sub-item 1.3 wires the loop to feed these forward).
+    /// `Some(map)` ⇒ map contains exactly the fixpoint vars the
+    /// evaluator visited during convergence. Outer fixpoints capture
+    /// at the outer convergence, inner fixpoints capture once per
+    /// their own convergence (matches sub-item 1.1's nested-fixpoint
+    /// semantics — K fires for K-deep nesting on a single
+    /// evaluation).
+    pub approximants_at_end: Option<HashMap<usize, EvalResult>>,
 }
 
 /// R.5 — Termination reason for the CEGAR loop.
@@ -289,9 +322,35 @@ pub fn cegar_refine_loop(
             });
         }
 
-        // 2. Evaluate.
-        let game_eval: GameEvaluation =
-            evaluate_3v_game(formula, &lift_result.clts, env).map_err(eval_err_to_adapter_err)?;
+        // 2. Evaluate. When `capture_approximants` is set, wire an
+        //    `on_fixpoint_convergence` callback into the evaluator
+        //    options so the converged per-fixpoint-var iterates are
+        //    captured into `approximants_at_end`. Default (callback
+        //    not set) preserves the pre-1.2 behaviour exactly.
+        let captured: Option<Arc<Mutex<HashMap<usize, EvalResult>>>> =
+            if cegar_opts.capture_approximants {
+                Some(Arc::new(Mutex::new(HashMap::new())))
+            } else {
+                None
+            };
+        let game_eval: GameEvaluation = if let Some(capture_handle) = &captured {
+            let mut eval_opts = EvaluationOptions::default();
+            let sink: Arc<Mutex<HashMap<usize, EvalResult>>> = Arc::clone(capture_handle);
+            eval_opts.on_fixpoint_convergence = Some(Arc::new(move |var, iterate| {
+                if let Ok(mut guard) = sink.lock() {
+                    guard.insert(var.index(), iterate.clone());
+                }
+            }));
+            evaluate_3v_game_with_options(formula, &lift_result.clts, env, &eval_opts)
+                .map_err(eval_err_to_adapter_err)?
+        } else {
+            evaluate_3v_game(formula, &lift_result.clts, env).map_err(eval_err_to_adapter_err)?
+        };
+        let approximants_at_end: Option<HashMap<usize, EvalResult>> = captured.map(|h| {
+            Arc::try_unwrap(h)
+                .map(|m| m.into_inner().unwrap_or_default())
+                .unwrap_or_else(|arc| arc.lock().map(|g| g.clone()).unwrap_or_default())
+        });
         let game_position_evaluations = estimate_position_evaluations(&lift_result.clts, formula);
 
         // 3. Check convergence.
@@ -307,6 +366,7 @@ pub fn cegar_refine_loop(
                 failure_subgame: None,
                 predicates_added: Vec::new(),
                 game_position_evaluations,
+                approximants_at_end,
             });
             return Ok(CegarTrace {
                 iterations,
@@ -327,6 +387,7 @@ pub fn cegar_refine_loop(
                 failure_subgame: game_eval.failure_subgame,
                 predicates_added: Vec::new(),
                 game_position_evaluations,
+                approximants_at_end,
             });
             return Ok(CegarTrace {
                 iterations,
@@ -369,6 +430,7 @@ pub fn cegar_refine_loop(
             failure_subgame: game_eval.failure_subgame,
             predicates_added: new_predicates.clone(),
             game_position_evaluations,
+            approximants_at_end,
         });
 
         if added_count == 0 {
@@ -655,6 +717,7 @@ mod tests {
             max_iterations: 16,
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
+            capture_approximants: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -709,6 +772,7 @@ mod tests {
             max_iterations: 3,
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
+            capture_approximants: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -761,6 +825,7 @@ mod tests {
             max_iterations: 16,
             predicate_source: PredicateSource::Manual(cb),
             max_cube_count: 1024,
+            capture_approximants: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1101,6 +1166,100 @@ mod tests {
         assert!(
             reachable.contains(&5),
             "cnt_b (NID 5) must be reachable from cnt_a's next-value (cnt_a += cnt_b); got {reachable:?}"
+        );
+    }
+
+    #[test]
+    fn r5_cegar_auto_capture_records_per_iteration_approximants() {
+        // R.5 sub-item 1.2 — when `capture_approximants` is set, each
+        // iteration's `approximants_at_end` field is `Some(map)`
+        // containing one entry per converged fixpoint var. Backward
+        // compat: with the flag unset, the field stays `None`.
+        //
+        // Fixture: `nu X. < true > X` over the SMALL_BTOR2 1-predicate
+        // lift (2 cubes). One outer fixpoint ⇒ exactly one entry in
+        // the captured map.
+        let formula = parser::parse("nu X. < true > X").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+
+        // Run 1: capture disabled (default) ⇒ approximants_at_end None.
+        let opts_off = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+        };
+        let trace_off = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial.clone(),
+            &env,
+            &AdapterOptions::default(),
+            &opts_off,
+        )
+        .expect("cegar succeeds with capture off");
+        for iter in &trace_off.iterations {
+            assert!(
+                iter.approximants_at_end.is_none(),
+                "capture_approximants=false MUST leave approximants_at_end None; got Some on iteration {}",
+                iter.iteration
+            );
+        }
+
+        // Run 2: capture enabled ⇒ approximants_at_end Some, with one
+        // entry for the single fixpoint var.
+        let opts_on = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: true,
+        };
+        let trace_on = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &opts_on,
+        )
+        .expect("cegar succeeds with capture on");
+        assert!(
+            !trace_on.iterations.is_empty(),
+            "trace must record at least one iteration"
+        );
+        for iter in &trace_on.iterations {
+            let approximants = iter.approximants_at_end.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "capture_approximants=true MUST populate approximants_at_end on iteration {}",
+                    iter.iteration
+                )
+            });
+            assert_eq!(
+                approximants.len(),
+                1,
+                "single-fixpoint formula MUST capture exactly one approximant; got {} on iteration {}",
+                approximants.len(),
+                iter.iteration
+            );
+            // The captured iterate must be a bitset over the lift's
+            // state count (= 2 cubes for this fixture).
+            let iterate = approximants.values().next().expect("one entry");
+            assert_eq!(
+                iterate.len(),
+                env.state_count(),
+                "captured iterate's bitset length MUST equal the lift's state count"
+            );
+        }
+
+        // Backward-compat sanity: verdicts agree across the two runs.
+        assert_eq!(
+            trace_off.terminated_with, trace_on.terminated_with,
+            "capture toggle MUST NOT change termination state"
         );
     }
 }

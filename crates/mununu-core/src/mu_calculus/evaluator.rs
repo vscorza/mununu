@@ -2220,6 +2220,21 @@ where
             next_bindings.insert(var, current.clone());
             let next = self.eval_node_tri(body, &next_bindings)?;
             if current.eq_set(&next) {
+                // R.5 CEGAR auto-capture sub-item 1.2 — fire the
+                // convergence callback (when present) before
+                // returning. Mirrors the 2-valued `eval_fixpoint`
+                // path. The callback's `EvalResult` argument is the
+                // definitely-true (KleeneT) bit-set extracted via
+                // `TritSet::must_true`; KleeneBot positions are
+                // collapsed to false in this projection. This is the
+                // shape CEGAR consumers want — the definite-truth
+                // approximant is the one `prior_approximants` can
+                // safely seed on the next iteration (KleeneBot
+                // positions need re-evaluation post-refinement so
+                // they MUST NOT be seeded as true).
+                if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
+                    cb(var, next.must_true());
+                }
                 return Ok(next);
             }
             current = next;
