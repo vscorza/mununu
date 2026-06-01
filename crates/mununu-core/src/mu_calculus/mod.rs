@@ -18,9 +18,10 @@ pub mod trit;
 pub mod truth_domain;
 
 pub use evaluator::{
-    Environment, EvalResult, EvaluationError, EvaluationOptions, Signature, WitnessMap, evaluate,
-    evaluate_tri, evaluate_tri_with_options, evaluate_with_options,
-    evaluate_with_options_and_automaton, evaluate_with_witnesses,
+    ApproximantView, Environment, EvalResult, EvaluationError, EvaluationOptions,
+    FixpointConvergenceCallback, Signature, WitnessMap, evaluate, evaluate_tri,
+    evaluate_tri_with_options, evaluate_with_options, evaluate_with_options_and_automaton,
+    evaluate_with_witnesses,
 };
 pub use parity_game_3v::{
     FailureSubgame, GameEvaluation, Position3v, clts_has_non_sharp_transitions, evaluate_3v_game,

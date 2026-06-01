@@ -62,8 +62,8 @@ use crate::adapter::btor2::ast::Nid;
 use crate::adapter::btor2::{PredicateCubeLiftOptions, PredicateSpec, predicate_cube_lift};
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::mu_calculus::{
-    Environment, EvalResult, EvaluationError, EvaluationOptions, FailureSubgame, Formula,
-    GameEvaluation, Trit, TritSet, evaluate_3v_game, evaluate_3v_game_with_options,
+    ApproximantView, Environment, EvalResult, EvaluationError, EvaluationOptions, FailureSubgame,
+    Formula, GameEvaluation, Trit, TritSet, evaluate_3v_game, evaluate_3v_game_with_options,
 };
 
 /// R.5 — Type alias for the manual predicate-discovery callback.
@@ -187,12 +187,15 @@ pub struct CegarIteration {
     /// size as a proxy for game-position evaluations; R.5 follow-up
     /// will replace this with a precise per-position counter.
     pub game_position_evaluations: usize,
-    /// R.5 CEGAR auto-capture sub-item 1.2 — per-fixpoint-var
-    /// converged approximants from THIS iteration's evaluator run.
+    /// R.5 CEGAR auto-capture sub-item 1.2 + B.1.a (2026-06-01) —
+    /// per-fixpoint-var converged approximants from THIS iteration's
+    /// evaluator run.
     ///
     /// Keyed by `FormulaVarId::index()` (the same shape
-    /// `EvaluationOptions::prior_approximants` consumes). Value is the
-    /// converged iterate as an [`EvalResult`] bitset.
+    /// `EvaluationOptions::prior_approximants` consumes). Value is
+    /// the converged iterate as a [`StoredApproximant`] carrying
+    /// both `must_true` and `may_true` bit-sets per the B.1.a
+    /// widening.
     ///
     /// `None` ⇒ caller did not enable auto-capture for this run
     /// (default; sub-item 1.3 wires the loop to feed these forward).
@@ -202,7 +205,23 @@ pub struct CegarIteration {
     /// their own convergence (matches sub-item 1.1's nested-fixpoint
     /// semantics — K fires for K-deep nesting on a single
     /// evaluation).
-    pub approximants_at_end: Option<HashMap<usize, EvalResult>>,
+    pub approximants_at_end: Option<HashMap<usize, StoredApproximant>>,
+}
+
+/// R.5 B.1.a (2026-06-01) — persistent storage for a captured
+/// fixpoint approximant. Mirrors the `ApproximantView` shape but
+/// owns its bit-sets so it can outlive the evaluator's iterate.
+///
+/// Sub-item 1.4 will read `must_true` for the "safe to seed as
+/// definite-true" upper bound + `may_true` for the cube-refinement
+/// mapping's parent-to-children copy (children inherit the
+/// parent's upper-bound bit-set including KleeneBot positions).
+#[derive(Debug, Clone)]
+pub struct StoredApproximant {
+    /// Definite-true bit-set (KleeneT positions).
+    pub must_true: EvalResult,
+    /// May-true bit-set (KleeneT ∪ KleeneBot positions).
+    pub may_true: EvalResult,
 }
 
 /// R.5 — Termination reason for the CEGAR loop.
@@ -327,7 +346,12 @@ pub fn cegar_refine_loop(
         //    options so the converged per-fixpoint-var iterates are
         //    captured into `approximants_at_end`. Default (callback
         //    not set) preserves the pre-1.2 behaviour exactly.
-        let captured: Option<Arc<Mutex<HashMap<usize, EvalResult>>>> =
+        //
+        //    **B.1.a (2026-06-01)**: the captured value is a
+        //    `StoredApproximant` carrying BOTH `must_true` and
+        //    `may_true` bit-sets, not just the must-set. Sub-item
+        //    1.4 needs `may_true` for the cube-refinement mapping.
+        let captured: Option<Arc<Mutex<HashMap<usize, StoredApproximant>>>> =
             if cegar_opts.capture_approximants {
                 Some(Arc::new(Mutex::new(HashMap::new())))
             } else {
@@ -335,18 +359,31 @@ pub fn cegar_refine_loop(
             };
         let game_eval: GameEvaluation = if let Some(capture_handle) = &captured {
             let mut eval_opts = EvaluationOptions::default();
-            let sink: Arc<Mutex<HashMap<usize, EvalResult>>> = Arc::clone(capture_handle);
-            eval_opts.on_fixpoint_convergence = Some(Arc::new(move |var, iterate| {
-                if let Ok(mut guard) = sink.lock() {
-                    guard.insert(var.index(), iterate.clone());
-                }
-            }));
+            let sink: Arc<Mutex<HashMap<usize, StoredApproximant>>> = Arc::clone(capture_handle);
+            eval_opts.on_fixpoint_convergence =
+                Some(Arc::new(move |var, view: &ApproximantView<'_>| {
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.insert(
+                            var.index(),
+                            StoredApproximant {
+                                must_true: view.must_true().clone(),
+                                may_true: view.may_true().clone(),
+                            },
+                        );
+                    }
+                }));
             evaluate_3v_game_with_options(formula, &lift_result.clts, env, &eval_opts)
                 .map_err(eval_err_to_adapter_err)?
         } else {
             evaluate_3v_game(formula, &lift_result.clts, env).map_err(eval_err_to_adapter_err)?
         };
-        let approximants_at_end: Option<HashMap<usize, EvalResult>> = captured.map(|h| {
+        let approximants_at_end: Option<HashMap<usize, StoredApproximant>> = captured.map(|h| {
+            // B.6.a invariant: by this point `eval_opts` has been
+            // dropped (the `if let` arm above ended), so the
+            // callback closure holding the sink-side Arc is dropped
+            // too. `try_unwrap` succeeds on the fast path; the
+            // lock+clone fallback handles future refactors that
+            // hold the closure longer.
             Arc::try_unwrap(h)
                 .map(|m| m.into_inner().unwrap_or_default())
                 .unwrap_or_else(|arc| arc.lock().map(|g| g.clone()).unwrap_or_default())
@@ -1246,13 +1283,28 @@ mod tests {
                 approximants.len(),
                 iter.iteration
             );
-            // The captured iterate must be a bitset over the lift's
-            // state count (= 2 cubes for this fixture).
+            // B.1.a (2026-06-01): the captured iterate is a
+            // `StoredApproximant` carrying must + may bit-sets.
+            // Both must equal the lift's state count.
             let iterate = approximants.values().next().expect("one entry");
             assert_eq!(
-                iterate.len(),
+                iterate.must_true.len(),
                 env.state_count(),
-                "captured iterate's bitset length MUST equal the lift's state count"
+                "captured must_true bitset length MUST equal the lift's state count"
+            );
+            assert_eq!(
+                iterate.may_true.len(),
+                env.state_count(),
+                "captured may_true bitset length MUST equal the lift's state count"
+            );
+            // Invariant: must_true ⊆ may_true. Verified by checking
+            // that `must_true & !may_true` is empty.
+            let mut diff = iterate.must_true.clone();
+            diff &= !iterate.may_true.clone();
+            assert!(
+                diff.not_any(),
+                "must_true ⊆ may_true invariant violated for fixpoint var on iteration {}",
+                iter.iteration
             );
         }
 

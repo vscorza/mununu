@@ -15,21 +15,82 @@ use crate::clts::{Clts, IdStorage, LabelId, StateId, Transition};
 // Type alias to reduce complexity in function signatures
 type TransitionGroupMap<'a, S, L> = HashMap<String, Vec<(&'a Transition<S, L>, usize)>>;
 
+/// R.5 CEGAR auto-capture sub-item 1.1 / B.1.a (2026-06-01) —
+/// view over a converged fixpoint iterate that exposes BOTH the
+/// definite-true (`must_true`) AND the may-true (`may_true`)
+/// bit-sets. The B.1.a decision widened the original
+/// `&EvalResult` callback argument to this struct so sub-item 1.4
+/// (cube-refinement mapping) can read the KleeneBot bit-set
+/// (= `may_true & !must_true`) on the parent's converged
+/// approximant and seed each child cube correctly.
+///
+/// Invariant: `must_true ⊆ may_true` (the standard 3-valued
+/// information-order constraint). For 2-valued evaluations, `must`
+/// and `may` are identical (no KleeneBot positions exist).
+///
+/// The two bit-sets are borrowed from the evaluator's converged
+/// iterate; callers that need to persist them must clone.
+pub struct ApproximantView<'a> {
+    must_true: &'a EvalResult,
+    may_true: &'a EvalResult,
+}
+
+impl<'a> ApproximantView<'a> {
+    /// Construct a view from explicit must/may bit-sets. The
+    /// caller is responsible for the `must ⊆ may` invariant.
+    pub fn new(must_true: &'a EvalResult, may_true: &'a EvalResult) -> Self {
+        Self {
+            must_true,
+            may_true,
+        }
+    }
+
+    /// Definite-true bit-set (KleeneT positions). For 2-valued
+    /// evaluations this is the full iterate.
+    pub fn must_true(&self) -> &EvalResult {
+        self.must_true
+    }
+
+    /// May-true bit-set (KleeneT ∪ KleeneBot positions). For
+    /// 2-valued evaluations this is identical to `must_true`.
+    pub fn may_true(&self) -> &EvalResult {
+        self.may_true
+    }
+
+    /// Indefinite bit-set (KleeneBot positions = `may_true &
+    /// !must_true`). Always empty for 2-valued evaluations.
+    /// Allocates a fresh `EvalResult`; callers that need it
+    /// repeatedly should cache.
+    pub fn indefinite(&self) -> EvalResult {
+        let mut bits = self.may_true.clone();
+        bits &= !self.must_true.clone();
+        bits
+    }
+}
+
 /// R.5 CEGAR auto-capture sub-item 1.1 — callback type the
 /// evaluator invokes once per fixpoint variable, at the iteration
 /// that converged (the iterate's final value before return).
 ///
-/// Signature: `(FormulaVarId, &EvalResult)`. The callback receives
-/// the variable's index + a borrow of the converged bitset; the
-/// caller (typically a CEGAR loop) is expected to clone the
-/// bitset if it wants to persist the value. The callback's return
-/// type is `()` — errors must be handled within the closure.
+/// **B.1.a widening (2026-06-01)**: the second argument changed
+/// from `&EvalResult` to `&ApproximantView<'_>`. Consumers that
+/// only need the definite-true bit-set call `view.must_true()`;
+/// consumers that need the KleeneBot bit-set (e.g. sub-item 1.4's
+/// cube-refinement mapping) call `view.indefinite()` or read
+/// `may_true()` directly.
+///
+/// Signature: `(FormulaVarId, &ApproximantView<'_>)`. The
+/// callback receives the variable's index + a borrow of the view;
+/// the caller (typically a CEGAR loop) is expected to clone the
+/// underlying bit-sets if it wants to persist them. The callback's
+/// return type is `()` — errors must be handled within the
+/// closure.
 ///
 /// Wrapped in `Arc<dyn Fn ... + Send + Sync>` so the option type
 /// remains `Clone` (the existing `EvaluationOptions: Clone` bound)
 /// without forcing the closure to be `Copy`.
 pub type FixpointConvergenceCallback =
-    dyn Fn(crate::mu_calculus::FormulaVarId, &EvalResult) + Send + Sync;
+    dyn Fn(crate::mu_calculus::FormulaVarId, &ApproximantView<'_>) + Send + Sync;
 
 /// Options that control μ-calculus evaluation behaviour.
 #[derive(Clone)]
@@ -1844,12 +1905,17 @@ where
             if next_set == current_set {
                 // R.5 CEGAR auto-capture sub-item 1.1 — fire the
                 // convergence callback (when present) before
-                // returning the iterate. The callback receives the
-                // fixpoint var's index + a borrow of the converged
-                // iterate; consumers (CEGAR loops) clone the
-                // bitset if they want to persist it across calls.
+                // returning the iterate. **B.1.a (2026-06-01)**:
+                // the view's `must_true` and `may_true` both
+                // borrow `next_set` because the 2-valued path has
+                // no KleeneBot positions (must ≡ may by
+                // construction). Consumers needing the indefinite
+                // bit-set get an empty BitVec from
+                // `view.indefinite()`, which is correct for the
+                // 2-valued case.
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
-                    cb(var, &next_set);
+                    let view = ApproximantView::new(&next_set, &next_set);
+                    cb(var, &view);
                 }
                 return self.clone_bitvec(&next_set);
             }
@@ -2220,20 +2286,18 @@ where
             next_bindings.insert(var, current.clone());
             let next = self.eval_node_tri(body, &next_bindings)?;
             if current.eq_set(&next) {
-                // R.5 CEGAR auto-capture sub-item 1.2 — fire the
-                // convergence callback (when present) before
-                // returning. Mirrors the 2-valued `eval_fixpoint`
-                // path. The callback's `EvalResult` argument is the
-                // definitely-true (KleeneT) bit-set extracted via
-                // `TritSet::must_true`; KleeneBot positions are
-                // collapsed to false in this projection. This is the
-                // shape CEGAR consumers want — the definite-truth
-                // approximant is the one `prior_approximants` can
-                // safely seed on the next iteration (KleeneBot
-                // positions need re-evaluation post-refinement so
-                // they MUST NOT be seeded as true).
+                // R.5 CEGAR auto-capture sub-item 1.2 + B.1.a
+                // (2026-06-01) — fire the convergence callback
+                // (when present) before returning. The view
+                // exposes BOTH `must_true` (KleeneT positions, the
+                // definite-truth bit-set safe to seed) AND
+                // `may_true` (KleeneT ∪ KleeneBot positions, the
+                // upper-bound bit-set sub-item 1.4 uses for the
+                // cube-refinement mapping). KleeneBot positions
+                // are `may_true & !must_true`.
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
-                    cb(var, next.must_true());
+                    let view = ApproximantView::new(next.must_true(), next.may_true());
+                    cb(var, &view);
                 }
                 return Ok(next);
             }
@@ -2726,7 +2790,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_clone = calls.clone();
         let cb = std::sync::Arc::new(
-            move |_var: crate::mu_calculus::FormulaVarId, _result: &EvalResult| {
+            move |_var: crate::mu_calculus::FormulaVarId, _view: &ApproximantView<'_>| {
                 calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         );
@@ -2750,6 +2814,10 @@ mod tests {
         // second argument is the converged iterate; it must match
         // the formula's final verdict (since the outer formula IS
         // the fixpoint we're capturing).
+        //
+        // **B.1.a (2026-06-01)**: the callback receives an
+        // `ApproximantView`. For the 2-valued path, `must_true`
+        // and `may_true` are identical to the converged iterate.
         let clts = build_simple_clts();
         let env = Environment::new(clts.state_count());
         let formula = parser::parse("nu X. < true > X")?;
@@ -2758,8 +2826,8 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_clone = captured.clone();
         let cb = std::sync::Arc::new(
-            move |_var: crate::mu_calculus::FormulaVarId, result: &EvalResult| {
-                *captured_clone.lock().unwrap() = Some(result.clone());
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *captured_clone.lock().unwrap() = Some(view.must_true().clone());
             },
         );
 
@@ -2772,6 +2840,42 @@ mod tests {
         assert_eq!(
             verdict, captured_iterate,
             "callback-captured iterate must match the formula's final verdict for a single-fixpoint formula"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_cegar_auto_capture_b1a_view_exposes_must_and_may_bitsets() -> TestResult {
+        // R.5 B.1.a (2026-06-01) — the widened view must expose
+        // both `must_true` and `may_true` for 2-valued evaluations,
+        // and for the 2v path they must be identical (no KleeneBot
+        // positions arise in 2-valued semantics). Sub-item 1.4 will
+        // depend on `view.may_true()` returning the parent's full
+        // upper-bound bit-set so the cube-refinement mapping can
+        // seed children correctly.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<(EvalResult, EvalResult)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let cb = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *captured_clone.lock().unwrap() =
+                    Some((view.must_true().clone(), view.may_true().clone()));
+            },
+        );
+
+        let opts = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb),
+            ..Default::default()
+        };
+        let _ = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        let (must, may) = captured.lock().unwrap().clone().expect("callback fired");
+        assert_eq!(
+            must, may,
+            "2-valued evaluations must produce must_true ≡ may_true (no KleeneBot positions)"
         );
         Ok(())
     }
