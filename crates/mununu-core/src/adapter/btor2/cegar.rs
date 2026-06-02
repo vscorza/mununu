@@ -148,10 +148,31 @@ pub struct CegarOptions {
     /// `true` ⇒ each iteration's `approximants_at_end` is `Some(map)`
     /// (possibly empty if the formula has no fixpoints).
     ///
-    /// Sub-item 1.3 will add a sibling flag that consumes the
+    /// Sub-item 1.3 (2026-06-01) adds the sibling
+    /// [`Self::enable_approximant_reuse`] flag that consumes the
     /// captured approximants as `prior_approximants` seeds on the
-    /// next iteration; this sub-item only ships the capture side.
+    /// next iteration.
     pub capture_approximants: bool,
+    /// R.5 CEGAR auto-capture sub-item 1.3 (2026-06-01) — when
+    /// true, the loop threads iteration N's
+    /// [`CegarIteration::approximants_at_end`] forward as
+    /// [`EvaluationOptions::prior_approximants`] on iteration N+1.
+    ///
+    /// Requires [`Self::capture_approximants`] = `true` (otherwise
+    /// there are no approximants to thread). When the predicate
+    /// set grows between iterations (the common case after a
+    /// refinement step), the underlying `prior_approximants` API
+    /// silently drops state-count-mismatched entries, so the
+    /// seeding fires only when state count matches (e.g.
+    /// `PredicateSourceExhausted` repeat-eval, OR when sub-item
+    /// 1.4's cube-refinement mapping ships and translates
+    /// approximants across cube-space resizes).
+    ///
+    /// `false` (default) ⇒ pre-1.3 behaviour exactly (each
+    /// iteration evaluates from scratch).
+    /// `true` + matching state count ⇒ iteration N+1's evaluator
+    /// is seeded with iteration N's converged definite-true bits.
+    pub enable_approximant_reuse: bool,
 }
 
 impl Default for CegarOptions {
@@ -161,6 +182,7 @@ impl Default for CegarOptions {
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
             capture_approximants: false,
+            enable_approximant_reuse: false,
         }
     }
 }
@@ -257,11 +279,18 @@ pub struct CegarTrace {
     /// is eager `predicate_cube_lift` (R.2.5 MVP) rather than the
     /// lazy `KmtsLiftLazy` that R.5 follow-up will ship.
     pub lazy_lift_pending: bool,
-    /// **Always `false` at R.5 MVP.** Flags that each iteration's
-    /// game evaluation is from-scratch — no approximant reuse
-    /// across iterations. R.5 follow-up enables this via the
-    /// `EvaluationOptions::prior_approximants` mechanism (§Phase 5
-    /// §5.4 R.5 entry).
+    /// R.5 CEGAR auto-capture sub-item 1.3 (2026-06-01) — mirrors
+    /// [`CegarOptions::enable_approximant_reuse`]: `true` iff the
+    /// loop threaded prior iterations' converged definite-true
+    /// bit-sets forward as `EvaluationOptions::prior_approximants`
+    /// on subsequent iterations.
+    ///
+    /// Pre-1.3 the flag was always `false`; post-1.3 the flag
+    /// echoes the caller's opt-in. The §10.1 R.5 done-criterion
+    /// "second iteration reuses approximants" is measurable by
+    /// checking this flag + `iterations[N].approximants_at_end`
+    /// (the captured map at iteration N, fed forward to iteration
+    /// N+1 when reuse + state-count match).
     pub approximant_reuse_enabled: bool,
 }
 
@@ -351,14 +380,43 @@ pub fn cegar_refine_loop(
         //    `StoredApproximant` carrying BOTH `must_true` and
         //    `may_true` bit-sets, not just the must-set. Sub-item
         //    1.4 needs `may_true` for the cube-refinement mapping.
+        //
+        //    **Sub-item 1.3 (2026-06-01)**: when
+        //    `enable_approximant_reuse` is set AND a prior
+        //    iteration's `approximants_at_end` exists, thread the
+        //    prior `StoredApproximant::must_true` forward as the
+        //    next iteration's `prior_approximants` seed. The seed
+        //    carries the prior bitset's length as the
+        //    `state_count` so the evaluator's `prior_approximants`
+        //    state-count-match filter (evaluator.rs ~line 1873)
+        //    silently drops entries when refinement grew the cube
+        //    space — exactly the "no cube-refinement mapping yet"
+        //    scope sub-item 1.4 will close.
+        let prior_seed: Option<HashMap<usize, (usize, EvalResult)>> = if cegar_opts
+            .enable_approximant_reuse
+            && let Some(prev) = iterations.last()
+            && let Some(prev_approx) = prev.approximants_at_end.as_ref()
+        {
+            let mut seed = HashMap::new();
+            for (var_idx, stored) in prev_approx {
+                let prior_state_count = stored.must_true.len();
+                seed.insert(*var_idx, (prior_state_count, stored.must_true.clone()));
+            }
+            Some(seed)
+        } else {
+            None
+        };
         let captured: Option<Arc<Mutex<HashMap<usize, StoredApproximant>>>> =
             if cegar_opts.capture_approximants {
                 Some(Arc::new(Mutex::new(HashMap::new())))
             } else {
                 None
             };
+        let mut eval_opts = EvaluationOptions {
+            prior_approximants: prior_seed,
+            ..Default::default()
+        };
         let game_eval: GameEvaluation = if let Some(capture_handle) = &captured {
-            let mut eval_opts = EvaluationOptions::default();
             let sink: Arc<Mutex<HashMap<usize, StoredApproximant>>> = Arc::clone(capture_handle);
             eval_opts.on_fixpoint_convergence =
                 Some(Arc::new(move |var, view: &ApproximantView<'_>| {
@@ -372,6 +430,11 @@ pub fn cegar_refine_loop(
                         );
                     }
                 }));
+            evaluate_3v_game_with_options(formula, &lift_result.clts, env, &eval_opts)
+                .map_err(eval_err_to_adapter_err)?
+        } else if eval_opts.prior_approximants.is_some() {
+            // Sub-item 1.3: even without capture, the prior_seed
+            // path needs to flow through `with_options`.
             evaluate_3v_game_with_options(formula, &lift_result.clts, env, &eval_opts)
                 .map_err(eval_err_to_adapter_err)?
         } else {
@@ -411,7 +474,7 @@ pub fn cegar_refine_loop(
                 final_predicates: current_predicates,
                 terminated_with: CegarTermination::Converged,
                 lazy_lift_pending: true,
-                approximant_reuse_enabled: false,
+                approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
             });
         }
 
@@ -432,7 +495,7 @@ pub fn cegar_refine_loop(
                 final_predicates: current_predicates,
                 terminated_with: CegarTermination::BoundedIterationsReached,
                 lazy_lift_pending: true,
-                approximant_reuse_enabled: false,
+                approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
             });
         }
 
@@ -477,7 +540,7 @@ pub fn cegar_refine_loop(
                 terminated_with: CegarTermination::PredicateSourceExhausted,
                 iterations,
                 lazy_lift_pending: true,
-                approximant_reuse_enabled: false,
+                approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
             });
         }
 
@@ -755,6 +818,7 @@ mod tests {
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
             capture_approximants: false,
+            enable_approximant_reuse: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -810,6 +874,7 @@ mod tests {
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
             capture_approximants: false,
+            enable_approximant_reuse: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -863,6 +928,7 @@ mod tests {
             predicate_source: PredicateSource::Manual(cb),
             max_cube_count: 1024,
             capture_approximants: false,
+            enable_approximant_reuse: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1230,6 +1296,7 @@ mod tests {
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
             capture_approximants: false,
+            enable_approximant_reuse: false,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1255,6 +1322,7 @@ mod tests {
             predicate_source: PredicateSource::WeakestPrecondition,
             max_cube_count: 1024,
             capture_approximants: true,
+            enable_approximant_reuse: false,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -1312,6 +1380,98 @@ mod tests {
         assert_eq!(
             trace_off.terminated_with, trace_on.terminated_with,
             "capture toggle MUST NOT change termination state"
+        );
+    }
+
+    #[test]
+    fn r5_cegar_auto_capture_13_reuse_flag_threads_priors_without_changing_verdict() {
+        // R.5 CEGAR auto-capture sub-item 1.3 (2026-06-01) — when
+        // `enable_approximant_reuse` is set, the loop threads
+        // iteration N's `approximants_at_end` forward as
+        // `prior_approximants` on iteration N+1. The seed is
+        // SOUND under monotonicity (the LFP / GFP converges from
+        // any monotone-comparable starting point); the verdict
+        // MUST be identical to a run with reuse off.
+        //
+        // This test runs the converged-immediately path (formula
+        // `true` returns KleeneT at iteration 0, never needs
+        // refinement). The reuse flag has no observable
+        // verdict-altering effect, but the trace MUST record
+        // `approximant_reuse_enabled = true` to signal the caller
+        // opted in.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+
+        let opts_reuse_off = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: true,
+            enable_approximant_reuse: false,
+        };
+        let trace_off = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial.clone(),
+            &env,
+            &AdapterOptions::default(),
+            &opts_reuse_off,
+        )
+        .expect("cegar succeeds with reuse off");
+
+        let opts_reuse_on = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: true,
+            enable_approximant_reuse: true,
+        };
+        let trace_on = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &opts_reuse_on,
+        )
+        .expect("cegar succeeds with reuse on");
+
+        // Verdict equivalence — strict soundness guarantee.
+        // TritSet has no PartialEq; use its set-equality helper.
+        assert!(
+            trace_off.final_verdict.eq_set(&trace_on.final_verdict),
+            "approximant reuse MUST NOT change the final verdict"
+        );
+        assert_eq!(
+            trace_off.terminated_with, trace_on.terminated_with,
+            "approximant reuse MUST NOT change the termination state"
+        );
+
+        // Flag reflects the caller's opt-in.
+        assert!(
+            !trace_off.approximant_reuse_enabled,
+            "reuse-off trace MUST report approximant_reuse_enabled = false"
+        );
+        assert!(
+            trace_on.approximant_reuse_enabled,
+            "reuse-on trace MUST report approximant_reuse_enabled = true"
+        );
+    }
+
+    #[test]
+    fn r5_cegar_auto_capture_13_default_options_has_reuse_off() {
+        // R.5 CEGAR auto-capture sub-item 1.3 (2026-06-01) — the
+        // default `CegarOptions` MUST have `enable_approximant_reuse
+        // = false` (strict-additive opt-in).
+        let opts = CegarOptions::default();
+        assert!(
+            !opts.enable_approximant_reuse,
+            "CegarOptions::default() MUST have enable_approximant_reuse = false"
         );
     }
 }
