@@ -15,14 +15,38 @@ use crate::clts::{Clts, IdStorage, LabelId, StateId, Transition};
 // Type alias to reduce complexity in function signatures
 type TransitionGroupMap<'a, S, L> = HashMap<String, Vec<(&'a Transition<S, L>, usize)>>;
 
-/// R.5 CEGAR auto-capture sub-item 1.1 / B.1.a (2026-06-01) —
-/// view over a converged fixpoint iterate that exposes BOTH the
-/// definite-true (`must_true`) AND the may-true (`may_true`)
-/// bit-sets. The B.1.a decision widened the original
-/// `&EvalResult` callback argument to this struct so sub-item 1.4
-/// (cube-refinement mapping) can read the KleeneBot bit-set
-/// (= `may_true & !must_true`) on the parent's converged
-/// approximant and seed each child cube correctly.
+/// R.5 sub-item 1.4.a (2026-06-01) — fixpoint polarity tag on
+/// `ApproximantView` + `StoredApproximant`. Determines which
+/// bit-set the cube-refinement mapping uses as the seed:
+/// `Least` (μ-LFP) → seed with `must_true` (sound lower bound on
+/// the LFP); `Greatest` (ν-GFP) → seed with `may_true` (sound
+/// upper bound on the GFP). The polarity flows from the
+/// evaluator's `FixpointKind` at capture time so the CEGAR loop
+/// doesn't need to re-derive it from the formula AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixpointPolarity {
+    /// μ — least fixpoint. Iterate starts from ⊥ (empty set) and
+    /// grows monotonically. A sound seed is any subset of the
+    /// LFP — `must_true` from a prior iteration (KleeneT
+    /// positions) satisfies this.
+    Least,
+    /// ν — greatest fixpoint. Iterate starts from ⊤ (full set)
+    /// and shrinks monotonically. A sound seed is any superset
+    /// of the GFP — `may_true` from a prior iteration
+    /// (KleeneT ∪ KleeneBot positions) satisfies this.
+    Greatest,
+}
+
+/// R.5 CEGAR auto-capture sub-item 1.1 / B.1.a (2026-06-01) /
+/// sub-item 1.4.a (2026-06-01) — view over a converged fixpoint
+/// iterate that exposes the definite-true (`must_true`), may-true
+/// (`may_true`), and the fixpoint polarity. The B.1.a decision
+/// widened the original `&EvalResult` callback argument to this
+/// struct so sub-item 1.4 (cube-refinement mapping) can read the
+/// KleeneBot bit-set (= `may_true & !must_true`) on the parent's
+/// converged approximant and seed each child cube correctly. The
+/// 1.4.a addition of `polarity` lets the cube-refinement mapping
+/// pick the polarity-appropriate bit-set for the child seed.
 ///
 /// Invariant: `must_true ⊆ may_true` (the standard 3-valued
 /// information-order constraint). For 2-valued evaluations, `must`
@@ -33,15 +57,22 @@ type TransitionGroupMap<'a, S, L> = HashMap<String, Vec<(&'a Transition<S, L>, u
 pub struct ApproximantView<'a> {
     must_true: &'a EvalResult,
     may_true: &'a EvalResult,
+    polarity: FixpointPolarity,
 }
 
 impl<'a> ApproximantView<'a> {
-    /// Construct a view from explicit must/may bit-sets. The
-    /// caller is responsible for the `must ⊆ may` invariant.
-    pub fn new(must_true: &'a EvalResult, may_true: &'a EvalResult) -> Self {
+    /// Construct a view from explicit must/may bit-sets and
+    /// polarity. The caller is responsible for the
+    /// `must ⊆ may` invariant.
+    pub fn new(
+        must_true: &'a EvalResult,
+        may_true: &'a EvalResult,
+        polarity: FixpointPolarity,
+    ) -> Self {
         Self {
             must_true,
             may_true,
+            polarity,
         }
     }
 
@@ -65,6 +96,15 @@ impl<'a> ApproximantView<'a> {
         let mut bits = self.may_true.clone();
         bits &= !self.must_true.clone();
         bits
+    }
+
+    /// Fixpoint polarity of the variable that converged.
+    /// `Least` for μ-LFP, `Greatest` for ν-GFP. Sub-item 1.4's
+    /// cube-refinement mapping reads this to decide whether to
+    /// seed children with `must_true` (μ — lower bound on LFP)
+    /// or `may_true` (ν — upper bound on GFP).
+    pub fn polarity(&self) -> FixpointPolarity {
+        self.polarity
     }
 }
 
@@ -1913,8 +1953,12 @@ where
                 // bit-set get an empty BitVec from
                 // `view.indefinite()`, which is correct for the
                 // 2-valued case.
+                // **Sub-item 1.4.a (2026-06-01)**: polarity flows
+                // from `FixpointKind` so the cube-refinement
+                // mapping can pick the polarity-appropriate seed.
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
-                    let view = ApproximantView::new(&next_set, &next_set);
+                    let polarity = fixpoint_kind_to_polarity(kind);
+                    let view = ApproximantView::new(&next_set, &next_set, polarity);
                     cb(var, &view);
                 }
                 return self.clone_bitvec(&next_set);
@@ -2275,11 +2319,52 @@ where
         kind: FixpointKind,
         bindings: &HashMap<FormulaVarId, super::trit::TritSet>,
     ) -> Result<super::trit::TritSet, EvaluationError> {
-        let mut current = match kind {
-            FixpointKind::Least => super::trit::TritSet::all_false(self.env.state_count()),
-            FixpointKind::Greatest => {
-                super::trit::TritSet::all_true(self.env.state_count(), &self.oob_bits)
-            }
+        // R.5 sub-item 1.4.a (2026-06-01) — honor
+        // `prior_approximants` on the 3v path. Until 1.4.a, the
+        // 3v fixpoint loop silently ignored the seed even when
+        // the CEGAR loop (sub-item 1.3) plumbed it through —
+        // a no-op reuse on the path the CEGAR loop actually
+        // runs. The polarity-appropriate seed construction is:
+        // - μ-LFP: (must = prior, may = prior) — treat unset
+        //   positions as KleeneF (definite-false). Sound because
+        //   the prior must-set is a subset of the LFP and
+        //   iteration grows monotonically toward the LFP.
+        // - ν-GFP: (must = prior, may = all_true) — treat unset
+        //   positions as KleeneBot (definite-true OR indefinite).
+        //   Sound because the prior must-set is a subset of the
+        //   GFP.must AND all_true is a superset of the GFP.may;
+        //   iteration shrinks monotonically toward the GFP.
+        //
+        // The state-count match filter (same as the 2v path)
+        // silently drops stale entries when refinement grew the
+        // cube space — sub-item 1.4.b's cube-refinement mapping
+        // handles that case at the CEGAR loop level by translating
+        // the prior bit-set to the refined cube space BEFORE
+        // passing it as the seed.
+        let state_count = self.env.state_count();
+        let tri_seed: Option<super::trit::TritSet> = self
+            .options
+            .prior_approximants
+            .as_ref()
+            .and_then(|m| m.get(&var.index()))
+            .filter(|(prior_state_count, _)| *prior_state_count == state_count)
+            .map(|(_, prior_must)| match kind {
+                FixpointKind::Least => {
+                    super::trit::TritSet::from_parts(prior_must.clone(), prior_must.clone())
+                }
+                FixpointKind::Greatest => super::trit::TritSet::from_parts(
+                    prior_must.clone(),
+                    BitVec::repeat(true, state_count),
+                ),
+            });
+        let mut current = match tri_seed {
+            Some(seed) => seed,
+            None => match kind {
+                FixpointKind::Least => super::trit::TritSet::all_false(self.env.state_count()),
+                FixpointKind::Greatest => {
+                    super::trit::TritSet::all_true(self.env.state_count(), &self.oob_bits)
+                }
+            },
         };
         loop {
             let mut next_bindings = bindings.clone();
@@ -2287,16 +2372,19 @@ where
             let next = self.eval_node_tri(body, &next_bindings)?;
             if current.eq_set(&next) {
                 // R.5 CEGAR auto-capture sub-item 1.2 + B.1.a
-                // (2026-06-01) — fire the convergence callback
-                // (when present) before returning. The view
-                // exposes BOTH `must_true` (KleeneT positions, the
-                // definite-truth bit-set safe to seed) AND
-                // `may_true` (KleeneT ∪ KleeneBot positions, the
-                // upper-bound bit-set sub-item 1.4 uses for the
-                // cube-refinement mapping). KleeneBot positions
-                // are `may_true & !must_true`.
+                // (2026-06-01) + sub-item 1.4.a (2026-06-01) —
+                // fire the convergence callback (when present)
+                // before returning. The view exposes BOTH
+                // `must_true` (KleeneT positions, the
+                // definite-truth bit-set safe to seed as a μ
+                // lower bound) AND `may_true` (KleeneT ∪
+                // KleeneBot positions, the upper-bound bit-set
+                // safe to seed as a ν upper bound) AND the
+                // fixpoint polarity so consumers can pick the
+                // polarity-appropriate seed.
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
-                    let view = ApproximantView::new(next.must_true(), next.may_true());
+                    let polarity = fixpoint_kind_to_polarity(kind);
+                    let view = ApproximantView::new(next.must_true(), next.may_true(), polarity);
                     cb(var, &view);
                 }
                 return Ok(next);
@@ -2306,9 +2394,22 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FixpointKind {
     Least,
     Greatest,
+}
+
+/// R.5 sub-item 1.4.a (2026-06-01) — map the internal
+/// `FixpointKind` to the public `FixpointPolarity` exposed via
+/// `ApproximantView::polarity`. Kept as a tiny private helper so
+/// the public API stays stable even if `FixpointKind` grows new
+/// variants (e.g. Bekić-style nested fixpoints).
+fn fixpoint_kind_to_polarity(kind: FixpointKind) -> FixpointPolarity {
+    match kind {
+        FixpointKind::Least => FixpointPolarity::Least,
+        FixpointKind::Greatest => FixpointPolarity::Greatest,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2876,6 +2977,127 @@ mod tests {
         assert_eq!(
             must, may,
             "2-valued evaluations must produce must_true ≡ may_true (no KleeneBot positions)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_subitem_14a_view_polarity_reports_nu_for_greatest_fixpoint() -> TestResult {
+        // R.5 sub-item 1.4.a (2026-06-01) — the widened view
+        // exposes the fixpoint polarity. For `nu X. ...`, the
+        // captured view's polarity must be `Greatest`.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<FixpointPolarity>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let cb = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *captured_clone.lock().unwrap() = Some(view.polarity());
+            },
+        );
+        let opts = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb),
+            ..Default::default()
+        };
+        let _ = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        assert_eq!(
+            captured.lock().unwrap().clone(),
+            Some(FixpointPolarity::Greatest),
+            "nu X. ... must produce view.polarity() == Greatest"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_subitem_14a_view_polarity_reports_mu_for_least_fixpoint() -> TestResult {
+        // R.5 sub-item 1.4.a (2026-06-01) — mirror of the nu test
+        // for mu. `mu X. ... < tick > X` ensures the callback fires
+        // (the body grows the iterate from the empty set).
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("mu X. < labels = {tick} > X")?;
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<FixpointPolarity>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let cb = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *captured_clone.lock().unwrap() = Some(view.polarity());
+            },
+        );
+        let opts = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb),
+            ..Default::default()
+        };
+        let _ = evaluate_with_options(&formula, &clts, &env, &opts)?;
+        assert_eq!(
+            captured.lock().unwrap().clone(),
+            Some(FixpointPolarity::Least),
+            "mu X. ... must produce view.polarity() == Least"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_subitem_14a_eval_fixpoint_tri_honors_prior_approximants() -> TestResult {
+        // R.5 sub-item 1.4.a (2026-06-01) — the 3v fixpoint loop
+        // (eval_fixpoint_tri) now honors `prior_approximants`.
+        // Before 1.4.a it silently ignored the seed even when the
+        // CEGAR loop plumbed it through, making sub-item 1.3's
+        // reuse a no-op on the path that matters.
+        //
+        // Test approach: evaluate the same formula twice via
+        // `evaluate_tri_with_options` — once from scratch (no
+        // seed), once with `prior_approximants` set to a
+        // hand-chosen bit-set + assert the verdict is identical
+        // (soundness — the seed must not change the verdict). The
+        // seed exercises the 1.4.a code path; the verdict
+        // equality is the strict-additive guarantee.
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        let baseline =
+            evaluate_tri_with_options(&formula, &clts, &env, &EvaluationOptions::default())?;
+
+        // Seed with a singleton bit-set matching baseline's must.
+        // Pick the var index from a capture run.
+        let captured_var: std::sync::Arc<std::sync::Mutex<Option<usize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_var_clone = captured_var.clone();
+        let cb = std::sync::Arc::new(
+            move |var: crate::mu_calculus::FormulaVarId, _view: &ApproximantView<'_>| {
+                *captured_var_clone.lock().unwrap() = Some(var.index());
+            },
+        );
+        let _ = evaluate_tri_with_options(
+            &formula,
+            &clts,
+            &env,
+            &EvaluationOptions {
+                on_fixpoint_convergence: Some(cb),
+                ..Default::default()
+            },
+        )?;
+        let var_idx = captured_var.lock().unwrap().expect("callback fired");
+
+        let mut priors = std::collections::HashMap::new();
+        priors.insert(var_idx, (env.state_count(), baseline.must_true().clone()));
+        let seeded = evaluate_tri_with_options(
+            &formula,
+            &clts,
+            &env,
+            &EvaluationOptions {
+                prior_approximants: Some(priors),
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            baseline.eq_set(&seeded),
+            "1.4.a seed honored on 3v path MUST produce verdict identical to from-scratch eval"
         );
         Ok(())
     }

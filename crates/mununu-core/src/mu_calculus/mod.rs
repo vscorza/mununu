@@ -19,7 +19,7 @@ pub mod truth_domain;
 
 pub use evaluator::{
     ApproximantView, Environment, EvalResult, EvaluationError, EvaluationOptions,
-    FixpointConvergenceCallback, Signature, WitnessMap, evaluate, evaluate_tri,
+    FixpointConvergenceCallback, FixpointPolarity, Signature, WitnessMap, evaluate, evaluate_tri,
     evaluate_tri_with_options, evaluate_with_options, evaluate_with_options_and_automaton,
     evaluate_with_witnesses,
 };

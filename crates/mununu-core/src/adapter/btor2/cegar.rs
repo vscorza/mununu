@@ -63,7 +63,8 @@ use crate::adapter::btor2::{PredicateCubeLiftOptions, PredicateSpec, predicate_c
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::mu_calculus::{
     ApproximantView, Environment, EvalResult, EvaluationError, EvaluationOptions, FailureSubgame,
-    Formula, GameEvaluation, Trit, TritSet, evaluate_3v_game, evaluate_3v_game_with_options,
+    FixpointPolarity, Formula, GameEvaluation, Trit, TritSet, evaluate_3v_game,
+    evaluate_3v_game_with_options,
 };
 
 /// R.5 — Type alias for the manual predicate-discovery callback.
@@ -230,20 +231,25 @@ pub struct CegarIteration {
     pub approximants_at_end: Option<HashMap<usize, StoredApproximant>>,
 }
 
-/// R.5 B.1.a (2026-06-01) — persistent storage for a captured
-/// fixpoint approximant. Mirrors the `ApproximantView` shape but
-/// owns its bit-sets so it can outlive the evaluator's iterate.
+/// R.5 B.1.a (2026-06-01) + sub-item 1.4.a (2026-06-01) —
+/// persistent storage for a captured fixpoint approximant.
+/// Mirrors the `ApproximantView` shape but owns its bit-sets so
+/// it can outlive the evaluator's iterate.
 ///
-/// Sub-item 1.4 will read `must_true` for the "safe to seed as
-/// definite-true" upper bound + `may_true` for the cube-refinement
-/// mapping's parent-to-children copy (children inherit the
-/// parent's upper-bound bit-set including KleeneBot positions).
+/// Sub-item 1.4 reads `must_true` (for the μ lower-bound seed) +
+/// `may_true` (for the ν upper-bound seed) + `polarity` (to pick
+/// which one) for the cube-refinement mapping's parent-to-children
+/// copy.
 #[derive(Debug, Clone)]
 pub struct StoredApproximant {
-    /// Definite-true bit-set (KleeneT positions).
+    /// Definite-true bit-set (KleeneT positions). Sound μ-LFP
+    /// lower-bound seed.
     pub must_true: EvalResult,
-    /// May-true bit-set (KleeneT ∪ KleeneBot positions).
+    /// May-true bit-set (KleeneT ∪ KleeneBot positions). Sound
+    /// ν-GFP upper-bound seed.
     pub may_true: EvalResult,
+    /// Fixpoint polarity of the captured variable.
+    pub polarity: FixpointPolarity,
 }
 
 /// R.5 — Termination reason for the CEGAR loop.
@@ -426,6 +432,7 @@ pub fn cegar_refine_loop(
                             StoredApproximant {
                                 must_true: view.must_true().clone(),
                                 may_true: view.may_true().clone(),
+                                polarity: view.polarity(),
                             },
                         );
                     }
