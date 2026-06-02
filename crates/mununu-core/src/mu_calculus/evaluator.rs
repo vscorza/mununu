@@ -58,21 +58,24 @@ pub struct ApproximantView<'a> {
     must_true: &'a EvalResult,
     may_true: &'a EvalResult,
     polarity: FixpointPolarity,
+    iteration_count: usize,
 }
 
 impl<'a> ApproximantView<'a> {
-    /// Construct a view from explicit must/may bit-sets and
-    /// polarity. The caller is responsible for the
-    /// `must ⊆ may` invariant.
+    /// Construct a view from explicit must/may bit-sets,
+    /// polarity, and iteration count. The caller is responsible
+    /// for the `must ⊆ may` invariant.
     pub fn new(
         must_true: &'a EvalResult,
         may_true: &'a EvalResult,
         polarity: FixpointPolarity,
+        iteration_count: usize,
     ) -> Self {
         Self {
             must_true,
             may_true,
             polarity,
+            iteration_count,
         }
     }
 
@@ -105,6 +108,25 @@ impl<'a> ApproximantView<'a> {
     /// or `may_true` (ν — upper bound on GFP).
     pub fn polarity(&self) -> FixpointPolarity {
         self.polarity
+    }
+
+    /// R.5 sub-item 1.5 (2026-06-01) — number of body-iteration
+    /// rounds the fixpoint loop ran before converging (the count
+    /// of times `current ← body(current)` was applied + 1 for the
+    /// final convergence check). The load-bearing metric for the
+    /// §10.1 R.5 done-criterion "second iteration reuses
+    /// approximants" — comparing iteration counts on a from-
+    /// scratch run vs a seeded run is the measurable reuse-
+    /// savings signal.
+    ///
+    /// On a single-fixpoint formula seeded with the converged
+    /// iterate, this should be `1` (the first iteration's body
+    /// evaluation equals the seed, triggering immediate
+    /// convergence). On a from-scratch run, this is bounded by
+    /// state_count + 1 (Tarski-Knaster) but typically much
+    /// smaller.
+    pub fn iteration_count(&self) -> usize {
+        self.iteration_count
     }
 }
 
@@ -1988,9 +2010,12 @@ where
                 // **Sub-item 1.4.a (2026-06-01)**: polarity flows
                 // from `FixpointKind` so the cube-refinement
                 // mapping can pick the polarity-appropriate seed.
+                // **Sub-item 1.5 (2026-06-01)**: pass the
+                // iteration count so reuse-savings benches can
+                // measure the seeded-vs-from-scratch delta.
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
                     let polarity = fixpoint_kind_to_polarity(kind);
-                    let view = ApproximantView::new(&next_set, &next_set, polarity);
+                    let view = ApproximantView::new(&next_set, &next_set, polarity, iteration);
                     cb(var, &view);
                 }
                 return self.clone_bitvec(&next_set);
@@ -2403,25 +2428,37 @@ where
                 }
             },
         };
+        // **Sub-item 1.5 (2026-06-01)**: track body-iteration
+        // count so the callback can expose it to consumers
+        // measuring reuse savings. Mirrors the 2v path's
+        // existing `iteration` counter.
+        let mut iteration: usize = 0;
         loop {
+            iteration += 1;
             let mut next_bindings = bindings.clone();
             next_bindings.insert(var, current.clone());
             let next = self.eval_node_tri(body, &next_bindings)?;
             if current.eq_set(&next) {
                 // R.5 CEGAR auto-capture sub-item 1.2 + B.1.a
-                // (2026-06-01) + sub-item 1.4.a (2026-06-01) —
-                // fire the convergence callback (when present)
-                // before returning. The view exposes BOTH
-                // `must_true` (KleeneT positions, the
-                // definite-truth bit-set safe to seed as a μ
-                // lower bound) AND `may_true` (KleeneT ∪
-                // KleeneBot positions, the upper-bound bit-set
-                // safe to seed as a ν upper bound) AND the
-                // fixpoint polarity so consumers can pick the
-                // polarity-appropriate seed.
+                // (2026-06-01) + sub-item 1.4.a (2026-06-01) +
+                // sub-item 1.5 (2026-06-01) — fire the
+                // convergence callback (when present) before
+                // returning. The view exposes BOTH `must_true`
+                // (KleeneT positions, the definite-truth bit-set
+                // safe to seed as a μ lower bound) AND `may_true`
+                // (KleeneT ∪ KleeneBot positions, the upper-bound
+                // bit-set safe to seed as a ν upper bound) AND
+                // the fixpoint polarity so consumers can pick the
+                // polarity-appropriate seed AND the iteration
+                // count for reuse-savings benches.
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
                     let polarity = fixpoint_kind_to_polarity(kind);
-                    let view = ApproximantView::new(next.must_true(), next.may_true(), polarity);
+                    let view = ApproximantView::new(
+                        next.must_true(),
+                        next.may_true(),
+                        polarity,
+                        iteration,
+                    );
                     cb(var, &view);
                 }
                 return Ok(next);
@@ -3157,6 +3194,138 @@ mod tests {
         assert!(
             baseline.eq_set(&seeded),
             "1.4.a seed honored on 3v path MUST produce verdict identical to from-scratch eval"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_subitem_15_reuse_savings_iteration_count_strictly_less_when_seeded() -> TestResult {
+        // R.5 sub-item 1.5 (2026-06-01) — measurable reuse-
+        // savings demonstration. On a μ formula that takes ≥ 2
+        // body-iterations to converge from scratch, seeding the
+        // evaluator with the converged iterate makes it converge
+        // in EXACTLY 1 body-iteration (the seed equals the fixed
+        // point, so the first body-evaluation returns the seed
+        // unchanged, triggering convergence). The strict-less-
+        // than assertion is the load-bearing reuse-savings
+        // signal for the §10.1 R.5 done-criterion.
+        //
+        // Fixture: `mu X. (goal || < labels = {tick} > X)` over
+        // a 3-state chain s0 -tick-> s1 -tick-> s2 with `goal`
+        // registered as a predicate true only at s2. From
+        // scratch: iter 1 grows ∅ → {s2}; iter 2 → {s1, s2};
+        // iter 3 → {s0, s1, s2}; iter 4 converges (no growth).
+        // With baseline-equal seed, iter 1 returns the seed
+        // unchanged → converges at iteration 1.
+        let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        builder.state("s0").initial("s0");
+        builder.state("s1");
+        builder.state("s2");
+        let tick = builder.labels().intern(["tick"]).unwrap();
+        let s0 = builder.state_id_or_insert("s0").unwrap();
+        let s1 = builder.state_id_or_insert("s1").unwrap();
+        let s2 = builder.state_id_or_insert("s2").unwrap();
+        builder.transition_ids(s0, &[tick], s1);
+        builder.transition_ids(s1, &[tick], s2);
+        let clts = builder.build().expect("fixture CLTS builds");
+
+        let mut goal_bits = BitVec::<usize, Lsb0>::repeat(false, clts.state_count());
+        goal_bits.set(s2.index(), true);
+        let env = Environment::new(clts.state_count()).with_predicate("goal", goal_bits);
+        let formula = parser::parse("mu X. (goal || < labels = {tick} > X)")?;
+
+        // Capture from-scratch iteration count via callback.
+        let from_scratch_iters: std::sync::Arc<std::sync::Mutex<Option<usize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let fs_clone = from_scratch_iters.clone();
+        let cb_fs = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *fs_clone.lock().unwrap() = Some(view.iteration_count());
+            },
+        );
+        let opts_fs = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb_fs),
+            ..Default::default()
+        };
+        let baseline = evaluate_tri_with_options(&formula, &clts, &env, &opts_fs)?;
+        let iters_fs = from_scratch_iters.lock().unwrap().expect("callback fired");
+
+        // Now seed with the baseline + capture the seeded
+        // iteration count.
+        let seeded_iters: std::sync::Arc<std::sync::Mutex<Option<usize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seed_clone = seeded_iters.clone();
+        let cb_seed = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *seed_clone.lock().unwrap() = Some(view.iteration_count());
+            },
+        );
+        let mut priors = std::collections::HashMap::new();
+        // var index 0 = the outer mu X.
+        priors.insert(
+            0,
+            PriorApproximant {
+                state_count: env.state_count(),
+                must_true: baseline.must_true().clone(),
+                may_true: baseline.may_true().clone(),
+            },
+        );
+        let opts_seed = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb_seed),
+            prior_approximants: Some(priors),
+            ..Default::default()
+        };
+        let seeded = evaluate_tri_with_options(&formula, &clts, &env, &opts_seed)?;
+        let iters_seed = seeded_iters.lock().unwrap().expect("callback fired");
+
+        // Strict soundness: same verdict.
+        assert!(
+            baseline.eq_set(&seeded),
+            "reuse must not change the verdict (seeded vs from-scratch)"
+        );
+        // Load-bearing reuse-savings signal: seeded must take
+        // strictly fewer iterations than from-scratch.
+        assert!(
+            iters_seed < iters_fs,
+            "reuse savings: seeded iter count ({iters_seed}) MUST be strictly less than \
+             from-scratch iter count ({iters_fs})"
+        );
+        // Seeded should converge in exactly 1 iteration on a
+        // baseline-equal seed (body returns the seed unchanged).
+        assert_eq!(
+            iters_seed, 1,
+            "baseline-equal seed MUST converge in exactly 1 body-iteration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r5_subitem_15_iteration_count_exposed_via_view() -> TestResult {
+        // R.5 sub-item 1.5 (2026-06-01) — basic visibility test:
+        // the iteration count is exposed via the widened
+        // `ApproximantView` and is at least 1 (the convergence-
+        // check iteration always runs).
+        let clts = build_simple_clts();
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("nu X. < true > X")?;
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<usize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let cb = std::sync::Arc::new(
+            move |_var: crate::mu_calculus::FormulaVarId, view: &ApproximantView<'_>| {
+                *captured_clone.lock().unwrap() = Some(view.iteration_count());
+            },
+        );
+        let opts = EvaluationOptions {
+            on_fixpoint_convergence: Some(cb),
+            ..Default::default()
+        };
+        let _ = evaluate_tri_with_options(&formula, &clts, &env, &opts)?;
+        let count = captured.lock().unwrap().expect("callback fired");
+        assert!(
+            count >= 1,
+            "iteration_count MUST be at least 1 (the convergence-check iteration always runs); got {count}"
         );
         Ok(())
     }
