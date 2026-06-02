@@ -108,6 +108,32 @@ impl<'a> ApproximantView<'a> {
     }
 }
 
+/// R.5 sub-item 1.4.b (2026-06-01) — entry value for the
+/// `EvaluationOptions::prior_approximants` map. Carries both
+/// `must_true` and `may_true` bit-sets so the 3v fixpoint loop
+/// can construct a tight TritSet seed for ν vars (which need
+/// `may ⊇ GFP.may` for sound convergence to the GFP, not just
+/// `must ⊆ GFP.must` as the pre-1.4.b API exposed).
+///
+/// For 2v consumers (eval_fixpoint via evaluate_with_options),
+/// only `must_true` is read; `may_true` is ignored. The 2v
+/// existing tests that wrap their iterates as
+/// `PriorApproximant { must_true: X, may_true: X, state_count }`
+/// preserve their pre-1.4.b semantics exactly.
+#[derive(Debug, Clone)]
+pub struct PriorApproximant {
+    /// State count of the lift that produced this approximant.
+    /// The evaluator silently drops entries whose `state_count`
+    /// does not match the current `Environment::state_count`.
+    pub state_count: usize,
+    /// Definite-true bit-set (KleeneT positions). Sound μ-LFP
+    /// lower-bound seed; sound ν-GFP must component.
+    pub must_true: EvalResult,
+    /// May-true bit-set (KleeneT ∪ KleeneBot positions). Sound
+    /// ν-GFP upper-bound seed; ignored by the 2v path.
+    pub may_true: EvalResult,
+}
+
 /// R.5 CEGAR auto-capture sub-item 1.1 — callback type the
 /// evaluator invokes once per fixpoint variable, at the iteration
 /// that converged (the iterate's final value before return).
@@ -153,7 +179,11 @@ pub struct EvaluationOptions {
     /// reuse-during-fixpoint-init logic ships in a separate commit
     /// so this lands as a strict-additive opt-in feature
     /// (`None` ⇒ unchanged behaviour).
-    pub prior_approximants: Option<std::collections::HashMap<usize, (usize, EvalResult)>>,
+    /// **B.1.b widening (2026-06-01)**: the value type changed
+    /// from `(usize, EvalResult)` to `PriorApproximant` so the
+    /// 3v fixpoint loop can construct a tight TritSet seed for
+    /// ν vars (which need the may bit-set too).
+    pub prior_approximants: Option<std::collections::HashMap<usize, PriorApproximant>>,
     /// R.5 CEGAR auto-capture sub-item 1.1 — callback fired once
     /// per fixpoint variable at the iteration that converged.
     /// Receives the variable's index + a borrow of the converged
@@ -1904,13 +1934,15 @@ where
         // (verdict-cache pattern) or when iteration 2+ over the
         // same predicate set re-evaluates the same formula.
         let state_count = self.env.state_count();
+        // 2v path: only `must_true` is read; `may_true` is ignored
+        // (the 2v fixpoint loop has no must/may distinction).
         let seed: Option<BitVec<usize, Lsb0>> = self
             .options
             .prior_approximants
             .as_ref()
             .and_then(|m| m.get(&var.index()))
-            .filter(|(prior_state_count, _)| *prior_state_count == state_count)
-            .map(|(_, prior_iterate)| prior_iterate.clone());
+            .filter(|pa| pa.state_count == state_count)
+            .map(|pa| pa.must_true.clone());
         let mut current_set = match seed {
             Some(prior) => self.clone_bitvec(&prior)?,
             None => match kind {
@@ -2342,21 +2374,26 @@ where
         // the prior bit-set to the refined cube space BEFORE
         // passing it as the seed.
         let state_count = self.env.state_count();
+        // 3v path (sub-item 1.4.b widening): consume both
+        // `must_true` AND `may_true` from `PriorApproximant`.
+        // The TritSet seed is `(must, may)` regardless of
+        // polarity — must positions claimed as KleeneT, may-but-
+        // not-must positions claimed as KleeneBot, rest as
+        // KleeneF.
+        //
+        // Soundness:
+        // - μ-LFP: must ⊆ LFP.must (sound subset, iteration
+        //   grows monotonically to LFP per Tarski).
+        // - ν-GFP: must ⊆ GFP.must (sound subset) AND may ⊇
+        //   GFP.may (sound superset, iteration shrinks
+        //   monotonically to GFP per Tarski).
         let tri_seed: Option<super::trit::TritSet> = self
             .options
             .prior_approximants
             .as_ref()
             .and_then(|m| m.get(&var.index()))
-            .filter(|(prior_state_count, _)| *prior_state_count == state_count)
-            .map(|(_, prior_must)| match kind {
-                FixpointKind::Least => {
-                    super::trit::TritSet::from_parts(prior_must.clone(), prior_must.clone())
-                }
-                FixpointKind::Greatest => super::trit::TritSet::from_parts(
-                    prior_must.clone(),
-                    BitVec::repeat(true, state_count),
-                ),
-            });
+            .filter(|pa| pa.state_count == state_count)
+            .map(|pa| super::trit::TritSet::from_parts(pa.must_true.clone(), pa.may_true.clone()));
         let mut current = match tri_seed {
             Some(seed) => seed,
             None => match kind {
@@ -2827,9 +2864,20 @@ mod tests {
 
         // Seeded: pass a prior approximant matching the baseline.
         // var id 0 (the outer nu X), state count matches.
-        let mut priors: std::collections::HashMap<usize, (usize, EvalResult)> =
+        // **Sub-item 1.4.b widening (2026-06-01)**: the API now
+        // takes `PriorApproximant` carrying both must_true and
+        // may_true. For 2-valued evaluations, must = may = the
+        // converged iterate.
+        let mut priors: std::collections::HashMap<usize, PriorApproximant> =
             std::collections::HashMap::new();
-        priors.insert(0, (clts.state_count(), baseline.clone()));
+        priors.insert(
+            0,
+            PriorApproximant {
+                state_count: clts.state_count(),
+                must_true: baseline.clone(),
+                may_true: baseline.clone(),
+            },
+        );
         let opts = EvaluationOptions {
             prior_approximants: Some(priors),
             ..Default::default()
@@ -2854,16 +2902,18 @@ mod tests {
         let baseline = evaluate(&formula, &clts, &env)?;
 
         // Bogus prior approximant with mismatched state count.
-        let mut priors: std::collections::HashMap<usize, (usize, EvalResult)> =
+        // **Sub-item 1.4.b widening (2026-06-01)**: API now takes
+        // `PriorApproximant`. Use an invalid state_count so the
+        // mismatch path fires.
+        let mut priors: std::collections::HashMap<usize, PriorApproximant> =
             std::collections::HashMap::new();
-        // Use an invalid state_count (clts.state_count() + 999) so
-        // the mismatch path fires.
         priors.insert(
             0,
-            (
-                clts.state_count() + 999,
-                bitvec::vec::BitVec::repeat(false, clts.state_count()),
-            ),
+            PriorApproximant {
+                state_count: clts.state_count() + 999,
+                must_true: bitvec::vec::BitVec::repeat(false, clts.state_count()),
+                may_true: bitvec::vec::BitVec::repeat(false, clts.state_count()),
+            },
         );
         let opts = EvaluationOptions {
             prior_approximants: Some(priors),
@@ -3084,8 +3134,17 @@ mod tests {
         )?;
         let var_idx = captured_var.lock().unwrap().expect("callback fired");
 
+        // **Sub-item 1.4.b widening (2026-06-01)**: pass both
+        // must AND may bit-sets via PriorApproximant.
         let mut priors = std::collections::HashMap::new();
-        priors.insert(var_idx, (env.state_count(), baseline.must_true().clone()));
+        priors.insert(
+            var_idx,
+            PriorApproximant {
+                state_count: env.state_count(),
+                must_true: baseline.must_true().clone(),
+                may_true: baseline.may_true().clone(),
+            },
+        );
         let seeded = evaluate_tri_with_options(
             &formula,
             &clts,
