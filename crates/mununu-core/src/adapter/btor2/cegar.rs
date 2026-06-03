@@ -126,7 +126,14 @@ impl std::fmt::Debug for PredicateSource {
 }
 
 /// R.5 — Configuration for the CEGAR loop.
-#[derive(Debug)]
+///
+/// Manual `Debug` impl (B.6.b, 2026-06-03): boolean fields are
+/// printed only when they DIFFER from the default value to
+/// reduce log clutter. `capture_approximants: false`,
+/// `enable_approximant_reuse: false`, and `smart_uf_cap: true`
+/// are the defaults and don't appear unless overridden. The
+/// load-bearing fields (`max_iterations`, `predicate_source`,
+/// `max_cube_count`) are always shown.
 pub struct CegarOptions {
     /// Maximum number of refinement iterations before the loop
     /// terminates with `BoundedIterationsReached`. Default 16 per
@@ -197,6 +204,29 @@ pub struct CegarOptions {
 /// most fixtures; users who want longer runs can disable the
 /// smart cap.
 pub const SMART_UF_MAX_ITERATIONS: usize = 4;
+
+/// R.5 B.6.b (2026-06-03) — manual `Debug` impl that hides
+/// boolean fields at their defaults to reduce log clutter.
+/// See struct doc for the contract.
+impl std::fmt::Debug for CegarOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ds = f.debug_struct("CegarOptions");
+        ds.field("max_iterations", &self.max_iterations);
+        ds.field("predicate_source", &self.predicate_source);
+        ds.field("max_cube_count", &self.max_cube_count);
+        if self.capture_approximants {
+            ds.field("capture_approximants", &true);
+        }
+        if self.enable_approximant_reuse {
+            ds.field("enable_approximant_reuse", &true);
+        }
+        if !self.smart_uf_cap {
+            // smart_uf_cap default is TRUE; only print when DISABLED.
+            ds.field("smart_uf_cap", &false);
+        }
+        ds.finish()
+    }
+}
 
 impl Default for CegarOptions {
     fn default() -> Self {
@@ -2211,6 +2241,150 @@ mod tests {
             !trace.warnings.iter().any(|w| w.message.contains("B.4.a")),
             "B.4.a warning MUST NOT fire when lift has no UF wrap; got: {:?}",
             trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_b6c_capture_records_approximants_when_verdict_contains_kleenebot() {
+        // R.5 B.6.c (2026-06-03) — close the test gap in sub-item
+        // 1.2's coverage. The pre-existing
+        // `r5_cegar_auto_capture_records_per_iteration_approximants`
+        // test only exercises the converged-`true`-verdict case.
+        // This test exercises the case where the verdict contains
+        // KleeneBot cells — proving capture works even when the
+        // game evaluator returns indefinite positions.
+        //
+        // Fixture: `nu X. < step > X` over SMALL_BTOR2_WITH_INPUT.
+        // The lift produces MayOnly transitions on the "step"
+        // label (the input enables R.2.5's may-edge sampling); for
+        // a ν formula over a CLTS with may-but-not-must
+        // transitions, the diamond modality produces KleeneBot at
+        // some cubes. The capture machinery MUST still populate
+        // `approximants_at_end` correctly — both must_true (the
+        // KleeneT-only positions) and may_true (the KleeneT ∪
+        // KleeneBot positions) bit-sets reflect the converged
+        // 3-valued iterate.
+        let formula = parser::parse("nu X. < true > X").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: true,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2_WITH_INPUT,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        assert!(
+            !trace.iterations.is_empty(),
+            "trace must record at least one iteration"
+        );
+        // For every iteration, the captured approximants_at_end
+        // MUST be Some(map) since capture_approximants=true.
+        for iter in &trace.iterations {
+            let approximants = iter.approximants_at_end.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "capture_approximants=true MUST populate approximants_at_end on iteration {}; \
+                     verdict at this iteration: {:?}",
+                    iter.iteration, iter.verdict
+                )
+            });
+            // The ν formula `nu X. <true> X` has exactly one
+            // fixpoint var (the outer ν), so the captured map has
+            // exactly one entry.
+            assert_eq!(
+                approximants.len(),
+                1,
+                "single-fixpoint formula MUST capture exactly one approximant on iteration {}",
+                iter.iteration
+            );
+            // The captured iterate's `must ⊆ may` invariant MUST
+            // hold even when KleeneBot positions are present
+            // (which is the whole point of this test vs the
+            // sub-item 1.2 test that uses `true` formula).
+            let stored = approximants.values().next().expect("one entry");
+            let mut diff = stored.must_true.clone();
+            diff &= !stored.may_true.clone();
+            assert!(
+                diff.not_any(),
+                "must_true ⊆ may_true invariant MUST hold on iteration {} even with KleeneBot \
+                 cells present in the verdict",
+                iter.iteration
+            );
+        }
+    }
+
+    #[test]
+    fn r5_b6b_default_options_debug_omits_default_booleans() {
+        // R.5 B.6.b (2026-06-03) — manual Debug impl hides
+        // boolean fields at their defaults. Verify the rendered
+        // string for `CegarOptions::default()` does NOT contain
+        // the three default-valued boolean field names.
+        let opts = CegarOptions::default();
+        let debug_str = format!("{opts:?}");
+        // The three boolean fields at defaults MUST NOT appear.
+        assert!(
+            !debug_str.contains("capture_approximants"),
+            "Default Debug output MUST hide `capture_approximants: false`; got: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("enable_approximant_reuse"),
+            "Default Debug output MUST hide `enable_approximant_reuse: false`; got: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("smart_uf_cap"),
+            "Default Debug output MUST hide `smart_uf_cap: true`; got: {debug_str}"
+        );
+        // The load-bearing fields MUST appear.
+        assert!(
+            debug_str.contains("max_iterations"),
+            "Default Debug output MUST include `max_iterations`; got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("predicate_source"),
+            "Default Debug output MUST include `predicate_source`; got: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn r5_b6b_non_default_booleans_appear_in_debug() {
+        // R.5 B.6.b (2026-06-03) — when boolean fields are
+        // explicitly overridden away from their defaults, they
+        // MUST appear in the Debug output.
+        let opts = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: true,     // non-default
+            enable_approximant_reuse: true, // non-default
+            smart_uf_cap: false,            // non-default
+        };
+        let debug_str = format!("{opts:?}");
+        assert!(
+            debug_str.contains("capture_approximants"),
+            "Debug output MUST include `capture_approximants: true` when overridden; got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("enable_approximant_reuse"),
+            "Debug output MUST include `enable_approximant_reuse: true` when overridden; got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("smart_uf_cap"),
+            "Debug output MUST include `smart_uf_cap: false` when overridden; got: {debug_str}"
         );
     }
 }
