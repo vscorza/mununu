@@ -24,8 +24,8 @@ pub use evaluator::{
     evaluate_with_options_and_automaton, evaluate_with_witnesses,
 };
 pub use parity_game_3v::{
-    FailureSubgame, GameEvaluation, Position3v, clts_has_non_sharp_transitions, evaluate_3v_game,
-    evaluate_3v_game_with_options,
+    FailureSubgame, GameEvaluation, Position3v, clts_has_hyper_must_transitions,
+    clts_has_non_sharp_transitions, evaluate_3v_game, evaluate_3v_game_with_options,
 };
 pub use simplify::simplify;
 pub use trit::{Trit, TritSet};

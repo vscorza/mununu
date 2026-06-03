@@ -298,6 +298,18 @@ pub struct CegarTrace {
     /// (the captured map at iteration N, fed forward to iteration
     /// N+1 when reuse + state-count match).
     pub approximant_reuse_enabled: bool,
+    /// R.5 B.3.b (2026-06-01) — soundness / advisory warnings
+    /// produced during the CEGAR run. Each warning is structured
+    /// (`AdapterWarning { kind, message, location }`) so consumers
+    /// can route by kind. The B.3.b warning fires when the input
+    /// formula has alternation depth ≥ 2 AND the initial lift's
+    /// CLTS has no `MustHyperOnly` (hyper-must) transitions —
+    /// per Shoham–Grumberg LMCS 2007, refining standard KMTS on
+    /// alternating fixpoints is non-monotone, so verdicts may
+    /// regress across iterations.
+    ///
+    /// Default `Vec::new()` — empty when no advisories fire.
+    pub warnings: Vec<crate::adapter::AdapterWarning>,
 }
 
 /// R.5 MVP — Run the CEGAR refinement loop on a BTOR2 fixture +
@@ -341,6 +353,7 @@ pub fn cegar_refine_loop(
 ) -> Result<CegarTrace, AdapterError> {
     let mut current_predicates = initial_predicates;
     let mut iterations: Vec<CegarIteration> = Vec::new();
+    let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
     let lift_opts = PredicateCubeLiftOptions {
         max_cube_count: cegar_opts.max_cube_count,
         // R.2.5 predicate-image MVP — enable boolean-input enumeration
@@ -358,6 +371,37 @@ pub fn cegar_refine_loop(
             adapter_options,
             &lift_opts,
         )?;
+
+        // R.5 B.3.b (2026-06-01) — soundness warning. After the
+        // FIRST lift, check whether the input formula has
+        // alternation depth ≥ 2 AND the lift's CLTS has no
+        // `MustHyperOnly` (hyper-must) transitions. Per
+        // Shoham–Grumberg LMCS 2007, refining standard KMTS
+        // (Sharp + MayOnly only) on alternating fixpoints is
+        // **non-monotone** — verdicts may regress across CEGAR
+        // iterations. Until R.2.5b's must-edge work emits
+        // hyper-must transitions natively (paired B.3.c), this
+        // gap is documented as a soundness-tagged warning so the
+        // caller can flag νμ verdicts under refinement.
+        if iteration == 0
+            && formula.alternation_depth() >= 2
+            && !crate::mu_calculus::clts_has_hyper_must_transitions(&lift_result.clts)
+        {
+            warnings.push(crate::adapter::AdapterWarning {
+                kind: crate::adapter::WarningKind::ApproximateTranslation,
+                location: None,
+                message: format!(
+                    "adapter/btor2/cegar (B.3.b): formula has alternation depth {} but the \
+                     lifted CLTS has no MustHyperOnly (hyper-must) transitions. Refining \
+                     standard KMTS (Sharp + MayOnly only) on alternating fixpoints is \
+                     non-monotone per Shoham–Grumberg LMCS 2007 — verdicts may regress \
+                     across CEGAR iterations. Until R.2.5b's SMT-driven must-edge work + \
+                     paired B.3.c hyper-must extension ship, treat refined νμ verdicts as \
+                     soundness-tagged.",
+                    formula.alternation_depth()
+                ),
+            });
+        }
 
         // The env passed in must match the lift's state count for
         // `evaluate_3v_game` to succeed. The MVP requires the caller
@@ -522,6 +566,7 @@ pub fn cegar_refine_loop(
                 terminated_with: CegarTermination::Converged,
                 lazy_lift_pending: true,
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
+                warnings: warnings.clone(),
             });
         }
 
@@ -543,6 +588,7 @@ pub fn cegar_refine_loop(
                 terminated_with: CegarTermination::BoundedIterationsReached,
                 lazy_lift_pending: true,
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
+                warnings: warnings.clone(),
             });
         }
 
@@ -588,6 +634,7 @@ pub fn cegar_refine_loop(
                 iterations,
                 lazy_lift_pending: true,
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
+                warnings: warnings.clone(),
             });
         }
 
@@ -1789,5 +1836,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn r5_b3b_warning_fires_on_alt_depth_2_formula_without_hyper_must() {
+        // R.5 B.3.b (2026-06-01) — when the input formula has
+        // alternation depth ≥ 2 AND the lifted CLTS has no
+        // MustHyperOnly transitions, the CEGAR loop emits an
+        // AdapterWarning per Shoham–Grumberg LMCS 2007's
+        // standard-KMTS non-monotonicity result.
+        //
+        // Fixture: `nu X. mu Y. (predicate || < tick > X)` is
+        // depth-2 (nu around mu). The lift produces a standard
+        // KMTS (Sharp + MayOnly only) — no MustHyperOnly.
+        let formula = parser::parse("nu X. mu Y. (true || < true > X)").expect("formula parses");
+        assert_eq!(formula.alternation_depth(), 2);
+
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        // The B.3.b warning MUST fire — formula is alt-depth 2,
+        // the lift has no hyper-must transitions.
+        assert!(
+            trace
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("B.3.b") && w.message.contains("alternation depth")),
+            "expected a B.3.b warning naming alternation depth; got warnings: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_b3b_warning_absent_on_alt_depth_1_formula() {
+        // R.5 B.3.b (2026-06-01) — for an alternation-depth-1
+        // formula (pure ν or pure μ, no μ-inside-ν or ν-inside-μ),
+        // the warning MUST NOT fire even if the lift is standard
+        // KMTS. Safety + liveness without alternation are sound
+        // under standard KMTS refinement.
+        let formula = parser::parse("nu X. < true > X").expect("formula parses");
+        assert_eq!(formula.alternation_depth(), 1);
+
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        // No B.3.b warning — alt-depth = 1.
+        assert!(
+            !trace.warnings.iter().any(|w| w.message.contains("B.3.b")),
+            "B.3.b warning MUST NOT fire on alt-depth-1 formula; got warnings: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_b3b_warning_default_trace_has_empty_warnings_vec() {
+        // R.5 B.3.b (2026-06-01) — backward-compat sanity: when
+        // no advisories fire, `warnings` is the empty Vec.
+        // Strict-additive: callers that don't read `warnings`
+        // see no behaviour change.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions::default();
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        assert!(
+            trace.warnings.is_empty(),
+            "default `true` formula MUST produce no warnings; got: {:?}",
+            trace.warnings
+        );
     }
 }

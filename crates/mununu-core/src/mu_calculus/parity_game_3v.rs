@@ -233,6 +233,28 @@ where
     false
 }
 
+/// R.5 B.3.b (2026-06-01) — does the CLTS contain at least one
+/// `MustHyperOnly` transition? Used by the CEGAR loop's B.3.b
+/// soundness check: refining a standard KMTS (Sharp + MayOnly
+/// only) on a formula with alternation depth ≥ 2 is **non-
+/// monotone** per Shoham–Grumberg LMCS 2007, so when this
+/// predicate returns false AND the formula has alt-depth ≥ 2,
+/// CEGAR emits an `AdapterWarning` documenting the soundness gap.
+pub fn clts_has_hyper_must_transitions<S, L>(clts: &Clts<S, L>) -> bool
+where
+    S: IdStorage,
+    L: IdStorage,
+{
+    for state in clts.states() {
+        for transition in clts.outgoing(state) {
+            if matches!(transition.modality(), TransitionModality::MustHyperOnly(_)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // The MVP only operates on the DefaultStateIdx / DefaultLabelIdx
 // monomorphisation in tests; the public API is generic over S, L
 // per the existing evaluator family's conventions.
@@ -382,5 +404,47 @@ mod tests {
         let mayonly = build_mayonly_kmts();
         assert!(!clts_has_non_sharp_transitions(&sharp));
         assert!(clts_has_non_sharp_transitions(&mayonly));
+    }
+
+    #[test]
+    fn r5_b3b_clts_has_hyper_must_transitions_returns_false_on_sharp_only() {
+        // R.5 B.3.b (2026-06-01) — pure Sharp lift has no
+        // hyper-must.
+        let sharp = build_sharp_only_2state_clts();
+        assert!(!clts_has_hyper_must_transitions(&sharp));
+    }
+
+    #[test]
+    fn r5_b3b_clts_has_hyper_must_transitions_returns_false_on_mayonly_only() {
+        // R.5 B.3.b (2026-06-01) — a CLTS with MayOnly but no
+        // MustHyperOnly should still return false (the predicate
+        // is specifically about hyper-must, not "any non-sharp").
+        let mayonly = build_mayonly_kmts();
+        assert!(!clts_has_hyper_must_transitions(&mayonly));
+    }
+
+    #[test]
+    fn r5_b3b_clts_has_hyper_must_transitions_returns_true_when_hyper_must_present() {
+        // R.5 B.3.b (2026-06-01) — when a MustHyperOnly
+        // transition is present, the predicate fires.
+        let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        builder.state("s0").state("s1").state("s2").initial("s0");
+        let lbl = builder.labels().intern(["a"]).expect("intern a");
+        builder.set_label_controllability(lbl, LabelControllability::Uncontrollable);
+        let s0 = builder.state_id_or_insert("s0").expect("s0");
+        let s1 = builder.state_id_or_insert("s1").expect("s1");
+        let s2 = builder.state_id_or_insert("s2").expect("s2");
+        // MustHyperOnly s0 -a-> {s1, s2}
+        builder.transition_ids_with_modality(
+            s0,
+            &[lbl],
+            s1,
+            TransitionModality::MustHyperOnly(Box::new(smallvec::smallvec![s1, s2])),
+        );
+        // Sharp self-loops on s1, s2 for well-formedness.
+        builder.transition_ids(s1, &[lbl], s1);
+        builder.transition_ids(s2, &[lbl], s2);
+        let clts = builder.build().expect("build");
+        assert!(clts_has_hyper_must_transitions(&clts));
     }
 }
