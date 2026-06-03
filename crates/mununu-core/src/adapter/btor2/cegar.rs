@@ -174,7 +174,29 @@ pub struct CegarOptions {
     /// `true` + matching state count ⇒ iteration N+1's evaluator
     /// is seeded with iteration N's converged definite-true bits.
     pub enable_approximant_reuse: bool,
+    /// R.5 B.4.a (2026-06-01) — smart `max_iterations` cap default.
+    /// When `true` (default) AND the predicate source is
+    /// [`PredicateSource::WeakestPrecondition`] AND the first
+    /// lift emits a UF-wrap warning, the effective iteration cap
+    /// drops to [`SMART_UF_MAX_ITERATIONS`] (4) instead of the
+    /// configured `max_iterations`. Surfaces cap-hit fast on
+    /// UF-spurious cases where WP cannot construct a closing
+    /// predicate without selective UF concretization (which
+    /// requires R-F3 SMT lemma cache access — not shipped).
+    ///
+    /// Set to `false` to use `max_iterations` literally even on
+    /// UF-wrapped lifts (useful when the caller has measured the
+    /// fixture and knows WP will converge given more iterations).
+    pub smart_uf_cap: bool,
 }
+
+/// R.5 B.4.a (2026-06-01) — effective `max_iterations` cap when
+/// [`CegarOptions::smart_uf_cap`] fires (WP source + UF-wrap
+/// warning in the first lift). 4 iterations is enough to confirm
+/// "WP cannot close this verdict because of UF spuriousness" on
+/// most fixtures; users who want longer runs can disable the
+/// smart cap.
+pub const SMART_UF_MAX_ITERATIONS: usize = 4;
 
 impl Default for CegarOptions {
     fn default() -> Self {
@@ -184,6 +206,7 @@ impl Default for CegarOptions {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: true,
         }
     }
 }
@@ -354,6 +377,15 @@ pub fn cegar_refine_loop(
     let mut current_predicates = initial_predicates;
     let mut iterations: Vec<CegarIteration> = Vec::new();
     let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
+    // R.5 B.4.a (2026-06-01) — effective iteration cap. Starts as
+    // `cegar_opts.max_iterations`; iteration 0's UF-wrap detection
+    // may lower it to `SMART_UF_MAX_ITERATIONS` when the smart
+    // cap is enabled + the predicate source is WP + the lift
+    // emits a UF-wrap warning. The loop's `for` header iterates
+    // to the original `max_iterations` but the cap-hit check
+    // uses `effective_max_iterations` so early termination on
+    // UF-spurious cases is structurally guaranteed.
+    let mut effective_max_iterations = cegar_opts.max_iterations;
     let lift_opts = PredicateCubeLiftOptions {
         max_cube_count: cegar_opts.max_cube_count,
         // R.2.5 predicate-image MVP — enable boolean-input enumeration
@@ -401,6 +433,46 @@ pub fn cegar_refine_loop(
                     formula.alternation_depth()
                 ),
             });
+        }
+
+        // R.5 B.4.a (2026-06-01) — smart `max_iterations` cap.
+        // When the predicate source is WP AND the first lift
+        // emits a UF-wrap warning AND `smart_uf_cap` is on
+        // (default), drop the effective iteration cap to
+        // `SMART_UF_MAX_ITERATIONS` (4). Surfaces cap-hit fast
+        // on UF-spurious cases where WP cannot construct a
+        // closing predicate without selective UF concretization
+        // (which requires R-F3 SMT lemma cache access — not
+        // shipped). Emit an explanatory warning so callers know
+        // why the cap was reduced.
+        if iteration == 0
+            && cegar_opts.smart_uf_cap
+            && matches!(
+                cegar_opts.predicate_source,
+                PredicateSource::WeakestPrecondition
+            )
+            && lift_result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("UF-wrapped"))
+        {
+            let smart_cap = cegar_opts.max_iterations.min(SMART_UF_MAX_ITERATIONS);
+            if smart_cap < cegar_opts.max_iterations {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: crate::adapter::WarningKind::ApproximateTranslation,
+                    location: None,
+                    message: format!(
+                        "adapter/btor2/cegar (B.4.a): smart_uf_cap reduced max_iterations from \
+                         {} to {} because the lift emitted a UF-wrap warning AND the predicate \
+                         source is WeakestPrecondition. WP heuristics cannot construct closing \
+                         predicates for UF-spurious KleeneBot cells (that needs selective UF \
+                         concretization gated on R-F3 SMT lemma cache, not shipped). To use \
+                         {} iterations literally, set `CegarOptions::smart_uf_cap = false`.",
+                        cegar_opts.max_iterations, smart_cap, cegar_opts.max_iterations
+                    ),
+                });
+                effective_max_iterations = smart_cap;
+            }
         }
 
         // The env passed in must match the lift's state count for
@@ -571,7 +643,10 @@ pub fn cegar_refine_loop(
         }
 
         // 4. Bounded refinement cap-hit check.
-        if iteration == cegar_opts.max_iterations {
+        // R.5 B.4.a (2026-06-01) — uses `effective_max_iterations`
+        // (possibly reduced by the smart UF cap at iter 0)
+        // instead of `cegar_opts.max_iterations` directly.
+        if iteration == effective_max_iterations {
             iterations.push(CegarIteration {
                 iteration,
                 predicates_at_start: current_predicates.clone(),
@@ -966,6 +1041,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1022,6 +1098,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1076,6 +1153,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1444,6 +1522,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1470,6 +1549,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: true,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -1560,6 +1640,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: true,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1577,6 +1658,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: true,
             enable_approximant_reuse: true,
+            smart_uf_cap: false,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -1775,6 +1857,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: true,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let env_iter0 = Environment::new(2);
         let result_off = cegar_refine_loop(
@@ -1795,6 +1878,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: true,
             enable_approximant_reuse: true,
+            smart_uf_cap: false,
         };
         let result_on = cegar_refine_loop(
             &formula,
@@ -1864,6 +1948,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1909,6 +1994,7 @@ mod tests {
             max_cube_count: 1024,
             capture_approximants: false,
             enable_approximant_reuse: false,
+            smart_uf_cap: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1954,6 +2040,176 @@ mod tests {
         assert!(
             trace.warnings.is_empty(),
             "default `true` formula MUST produce no warnings; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    // R.5 B.4.a (2026-06-01) — BTOR2 fixture with a `mul`
+    // operator. The R.5b default UF policy wraps `Op::Mul`
+    // unconditionally, so this fixture's lift will emit a
+    // UF-wrap warning that the B.4.a smart cap then keys off.
+    const SMALL_BTOR2_WITH_MUL: &str = "\
+1 sort bitvec 1
+2 state 1 reg_a
+3 input 1 in_a
+4 zero 1
+5 mul 1 2 3
+6 init 1 2 4
+7 next 1 2 5
+";
+
+    #[test]
+    fn r5_b4a_smart_uf_cap_default_is_true() {
+        // R.5 B.4.a (2026-06-01) — backward-compat sanity: the
+        // default `CegarOptions` MUST have `smart_uf_cap = true`
+        // (the smart cap is opt-OUT, not opt-in).
+        let opts = CegarOptions::default();
+        assert!(
+            opts.smart_uf_cap,
+            "CegarOptions::default() MUST have smart_uf_cap = true"
+        );
+    }
+
+    #[test]
+    fn r5_b4a_warning_fires_when_wp_source_meets_uf_wrapped_lift() {
+        // R.5 B.4.a (2026-06-01) — when the predicate source is
+        // WP AND the first lift emits a UF-wrap warning AND the
+        // smart cap is on (default), the loop emits an
+        // explanatory warning + reduces the effective iteration
+        // cap from `max_iterations` (16) to `SMART_UF_MAX_ITERATIONS`
+        // (4).
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions::default(); // smart_uf_cap=true, max_iterations=16
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2_WITH_MUL,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        // The B.4.a warning MUST fire — the lift wraps the
+        // `mul` Op, the source is WP, smart_uf_cap is the
+        // default true.
+        assert!(
+            trace.warnings.iter().any(|w| w.message.contains("B.4.a")
+                && w.message.contains("smart_uf_cap")
+                && w.message.contains("UF-wrap")),
+            "expected a B.4.a warning naming smart_uf_cap + UF-wrap; got warnings: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_b4a_no_warning_when_smart_uf_cap_disabled() {
+        // R.5 B.4.a (2026-06-01) — when the user explicitly
+        // disables the smart cap, the warning MUST NOT fire
+        // even on the same UF-wrapped fixture. The literal
+        // `max_iterations` is used.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false, // opt out
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2_WITH_MUL,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        assert!(
+            !trace.warnings.iter().any(|w| w.message.contains("B.4.a")),
+            "B.4.a warning MUST NOT fire when smart_uf_cap=false; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_b4a_no_warning_when_source_is_not_wp() {
+        // R.5 B.4.a (2026-06-01) — when the predicate source is
+        // not WP (e.g. Manual), the smart cap MUST NOT fire even
+        // on a UF-wrapped lift. WP is the only source where the
+        // smart cap applies (because WP is the source that
+        // cannot construct closing predicates for UF-spurious
+        // cases without R-F3 SMT lemma cache).
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let manual_cb: Arc<ManualPredicateCallback> = Arc::new(|_, _| Vec::new());
+        let cegar_opts = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::Manual(manual_cb),
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: true, // on; should still not fire because source ≠ WP
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2_WITH_MUL,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        assert!(
+            !trace.warnings.iter().any(|w| w.message.contains("B.4.a")),
+            "B.4.a warning MUST NOT fire when source is Manual (not WP); got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_b4a_no_warning_when_lift_has_no_uf_wrap() {
+        // R.5 B.4.a (2026-06-01) — on a fixture WITHOUT a UF-
+        // wrapped Op (the existing SMALL_BTOR2), the smart cap
+        // MUST NOT fire even with WP source + smart_uf_cap=true.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions::default();
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2, // no mul → no UF wrap
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        assert!(
+            !trace.warnings.iter().any(|w| w.message.contains("B.4.a")),
+            "B.4.a warning MUST NOT fire when lift has no UF wrap; got: {:?}",
             trace.warnings
         );
     }
