@@ -40,6 +40,7 @@
 pub mod aiger;
 pub mod btor2;
 pub mod crewai;
+pub mod cvc5;
 pub mod domain;
 pub mod emit;
 pub mod extraction;
