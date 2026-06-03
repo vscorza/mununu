@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Pre-push hook (2026-06-03) — full-workspace safety net before push.
+#
+# The pre-commit hook (scripts/pre-commit) is per-crate scoped for
+# speed. Pre-push runs the full `make ci` so cross-crate drift gets
+# caught locally before it hits GitHub. CI is the final gate; this
+# is the local mirror.
+#
+# Cost: ~30–60 min wall-clock on this hardware (1900+ tests). Run
+# once per push (batched commits → one pre-push), not once per
+# commit, so the amortized cost is lower than running it on every
+# commit.
+#
+# To bypass (rare; e.g. emergency hotfix), use `git push --no-verify`.
+# The user must authorize the bypass per CLAUDE.md's Git Operations
+# section.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "Pre-push: running full-workspace make ci..."
+make ci
+
+echo "Pre-push: testing API module..."
+cargo test --lib api --features api
+
+echo "Pre-push: checking for unused dependencies (cargo machete)..."
+cargo machete
+
+echo "All pre-push checks passed."
