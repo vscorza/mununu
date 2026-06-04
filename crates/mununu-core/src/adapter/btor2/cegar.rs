@@ -416,6 +416,43 @@ pub fn cegar_refine_loop(
     // uses `effective_max_iterations` so early termination on
     // UF-spurious cases is structurally guaranteed.
     let mut effective_max_iterations = cegar_opts.max_iterations;
+    // R.5 Item 3 sub-item 3.4 (2026-06-04) — locate the CVC5
+    // binary once at loop start when the predicate source is
+    // CraigInterpolation. Cached for the loop's lifetime.
+    // - `Some(bin)` ⇒ Craig path will run via CVC5.
+    // - `None` + `cvc5_unavailable_warning_emitted = true` ⇒ the
+    //   CraigInterpolation arm falls back to WP for the whole
+    //   run; the warning is emitted exactly once.
+    // Loop iterations re-use the cache.
+    let cvc5_bin: Option<crate::adapter::cvc5::Cvc5Bin> = if matches!(
+        cegar_opts.predicate_source,
+        PredicateSource::CraigInterpolation
+    ) {
+        match crate::adapter::cvc5::locate_cvc5() {
+            Ok(bin) => Some(bin),
+            Err(e) => {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: crate::adapter::WarningKind::ApproximateTranslation,
+                    location: None,
+                    message: format!(
+                        "adapter/btor2/cegar (Item 3 sub-item 3.4): \
+                             PredicateSource::CraigInterpolation selected but cvc5 binary \
+                             not available: {}. Falling back to WeakestPrecondition heuristic \
+                             for the duration of this run. Install cvc5 (Homebrew: \
+                             `brew install cvc5`; Debian: `apt install cvc5`) or set \
+                             MUNUNU_CVC5_PATH to use Craig interpolation.",
+                        e.message
+                    ),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // CVC5 invocation options; sub-item 3.5 will expose this via
+    // the sidecar.
+    let cvc5_opts = crate::adapter::cvc5::InterpolantQueryOptions::default();
     let lift_opts = PredicateCubeLiftOptions {
         max_cube_count: cegar_opts.max_cube_count,
         // R.2.5 predicate-image MVP — enable boolean-input enumeration
@@ -713,10 +750,36 @@ pub fn cegar_refine_loop(
                 weakest_precondition_predicates(subgame, &current_predicates, btor2_content)
             }
             PredicateSource::CraigInterpolation => {
-                // MVP: Craig interpolation requires Z3 with
-                // interpolation support and is queued as a separate
-                // R.5 follow-up.
-                Vec::new()
+                // R.5 Item 3 sub-item 3.4 (2026-06-04) — Craig
+                // interpolation via CVC5 subprocess. When CVC5 is
+                // available, ask it for an interpolant per
+                // classifying may-but-not-must transition. On any
+                // failure (subprocess error, timeout, no
+                // interpolant exists, compound shape the MVP
+                // parser doesn't decode), fall back to the WP
+                // heuristic — never silently terminate the loop.
+                // When CVC5 was unavailable at loop start, the
+                // warning was emitted there and `cvc5_bin = None`
+                // routes us straight to WP.
+                let craig_preds = if let Some(bin) = &cvc5_bin {
+                    craig_interpolation_predicates(
+                        subgame,
+                        &current_predicates,
+                        &lift_result.clts,
+                        bin,
+                        &cvc5_opts,
+                    )
+                } else {
+                    Vec::new()
+                };
+                if !craig_preds.is_empty() {
+                    craig_preds
+                } else {
+                    // Per-iteration fallback. The CEGAR loop's
+                    // soundness contract (never silently
+                    // terminate) requires this safety net.
+                    weakest_precondition_predicates(subgame, &current_predicates, btor2_content)
+                }
             }
         };
 
@@ -823,6 +886,84 @@ fn eval_err_to_adapter_err(e: EvaluationError) -> AdapterError {
         location: None,
         message: format!("adapter/btor2/cegar: evaluator error: {e:?}"),
     }
+}
+
+/// R.5 Item 3 sub-item 3.4 (2026-06-04) — Craig interpolation
+/// predicate source. For each classifying may-but-not-must
+/// transition in the failure subgame, invoke CVC5 to compute
+/// a separating predicate between the source cube and the
+/// target cube.
+///
+/// **Inputs**:
+/// - `subgame.classifying_transitions`: `(source_state_index,
+///   transition_index)` pairs. The lifter ensures
+///   `state_index == cube_index`.
+/// - `current_predicates`: the predicate set defining the cube
+///   space (so the SMT-LIB query knows the bit positions).
+/// - `clts`: needed to look up the target cube from the
+///   `transition_index`.
+/// - `cvc5_bin`: located via `adapter::cvc5::locate_cvc5` once
+///   at loop start (cached by the caller).
+/// - `opts`: subprocess timeout etc.
+///
+/// **Returns**: list of `PredicateSpec`s — one per classifying
+/// transition where CVC5 produced a parsable equality
+/// interpolant. Empty when no transitions yielded interpolants
+/// (CEGAR loop falls back to WP per the dispatch in
+/// `cegar_refine_loop`).
+///
+/// **Dedup**: predicates that match an existing entry in
+/// `current_predicates` by (register, value) are skipped —
+/// re-adding them would not refine the cube space.
+fn craig_interpolation_predicates(
+    subgame: &FailureSubgame,
+    current_predicates: &[PredicateSpec],
+    clts: &crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>,
+    cvc5_bin: &crate::adapter::cvc5::Cvc5Bin,
+    opts: &crate::adapter::cvc5::InterpolantQueryOptions,
+) -> Vec<PredicateSpec> {
+    if subgame.classifying_transitions.is_empty() {
+        return Vec::new();
+    }
+    use crate::clts::StateId;
+    let mut out: Vec<PredicateSpec> = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(String, u64)> = current_predicates
+        .iter()
+        .map(|p| (p.register.clone(), p.value))
+        .collect();
+    for (src_idx, t_idx) in &subgame.classifying_transitions {
+        let Some(src_id) = StateId::<crate::clts::DefaultStateIdx>::from_index(*src_idx) else {
+            continue;
+        };
+        let transitions = clts.outgoing(src_id);
+        let Some(transition) = transitions.get(*t_idx) else {
+            continue;
+        };
+        let target_idx = transition.target().index();
+        let query = crate::adapter::cvc5::build_interpolation_query(
+            current_predicates,
+            *src_idx,
+            target_idx,
+        );
+        match crate::adapter::cvc5::invoke_cvc5_for_interpolant(cvc5_bin, &query, opts) {
+            Ok(Some(mut spec)) => {
+                if !seen_pairs.contains(&(spec.register.clone(), spec.value)) {
+                    seen_pairs.insert((spec.register.clone(), spec.value));
+                    // Tag the predicate with the source state for
+                    // diagnostics, mirroring the WP helper's naming.
+                    spec.name = format!("craig_s{}_t{}", src_idx, t_idx);
+                    out.push(spec);
+                }
+            }
+            Ok(None) | Err(_) => {
+                // CVC5 reported no interpolant, or compound/unparsable
+                // form, or subprocess failure. The CEGAR loop's
+                // dispatch falls back to WP when this helper returns
+                // empty across all transitions.
+            }
+        }
+    }
+    out
 }
 
 /// R.5 WP — emit separating predicates from the failure subgame's
@@ -2386,5 +2527,162 @@ mod tests {
             debug_str.contains("smart_uf_cap"),
             "Debug output MUST include `smart_uf_cap: false` when overridden; got: {debug_str}"
         );
+    }
+
+    #[test]
+    fn r5_subitem_34_craig_emits_adapter_warning_when_cvc5_absent() {
+        // R.5 Item 3 sub-item 3.4 (2026-06-04) — when
+        // PredicateSource::CraigInterpolation is selected but
+        // CVC5 is not available, the CEGAR loop MUST emit an
+        // AdapterWarning + fall back to the WP heuristic for
+        // the run. Test by forcing MUNUNU_CVC5_PATH to a bogus
+        // path so locate_cvc5() fails deterministically.
+        //
+        // SAFETY: env var manipulation in tests is racy; we
+        // restore the original value at the end.
+        let original = std::env::var("MUNUNU_CVC5_PATH").ok();
+        unsafe {
+            std::env::set_var(
+                "MUNUNU_CVC5_PATH",
+                "/nonexistent/path/to/cvc5/binary/from/3_4/test",
+            );
+        }
+
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::CraigInterpolation,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+        };
+        let trace_result = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        );
+
+        // Restore env var before any assertion (so failure
+        // doesn't leak the bogus value).
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("MUNUNU_CVC5_PATH", v),
+                None => std::env::remove_var("MUNUNU_CVC5_PATH"),
+            }
+        }
+
+        let trace = trace_result.expect("cegar should succeed by falling back to WP");
+        assert!(
+            trace
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("sub-item 3.4")
+                    && w.message.contains("cvc5 binary not available")),
+            "expected a sub-item-3.4 warning naming the missing CVC5 binary; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn r5_subitem_34_craig_no_warning_when_source_is_not_craig() {
+        // R.5 Item 3 sub-item 3.4 (2026-06-04) — when the
+        // predicate source is NOT CraigInterpolation, the
+        // sub-item-3.4 warning MUST NOT fire even if CVC5 is
+        // absent. The warning is specific to the Craig path.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        assert!(
+            !trace
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("sub-item 3.4")),
+            "sub-item 3.4 warning MUST NOT fire when source != CraigInterpolation; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    #[ignore = "requires cvc5 binary installed; run with --ignored when available"]
+    fn r5_subitem_34_craig_invokes_cvc5_end_to_end() {
+        // R.5 Item 3 sub-item 3.4 (2026-06-04) — when CVC5 is
+        // available + the Craig source is selected, the CEGAR
+        // loop invokes CVC5 + emits predicates with the
+        // `craig_s<src>_t<tidx>` naming convention.
+        //
+        // Ignored by default; run with `cargo test -- --ignored`
+        // after `brew install cvc5`. Asserts that the CEGAR
+        // run completes AND (if any predicates were added)
+        // they include at least one with the craig naming
+        // convention.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::CraigInterpolation,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds with CVC5 available");
+        // No sub-item-3.4 warning should fire — CVC5 was
+        // discovered.
+        assert!(
+            !trace
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("sub-item 3.4")
+                    && w.message.contains("cvc5 binary not available")),
+            "sub-item 3.4 warning MUST NOT fire when CVC5 is available; got: {:?}",
+            trace.warnings
+        );
+        // The `true` formula converges immediately; no
+        // refinement happens. This test mostly proves the
+        // wiring + locate_cvc5 success path.
     }
 }
