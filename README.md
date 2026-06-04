@@ -192,6 +192,10 @@ cargo test
 cargo build --release --features api
 ```
 
+### Optional external tools
+
+Several mununu pipelines invoke external tools via subprocess. **All are optional** — mununu functions without them and emits a structured warning when an invoked pipeline requires a missing tool. The currently-supported external tools are sv2v (SystemVerilog normalisation), Yosys (SV → BTOR2), SymbiYosys (verification oracle), and CVC5 (Craig interpolation for the R.5 CEGAR loop). See [`docs/external-tools.md`](docs/external-tools.md) for per-platform install instructions and discovery env vars.
+
 ## Web UI
 
 The companion [mununu-ui](https://github.com/vscorza/mununu-ui) project provides:
