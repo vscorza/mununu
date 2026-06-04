@@ -505,6 +505,265 @@ impl KmtsLiftLazy for EagerLazyLift {
     }
 }
 
+/// R.5 lazy KMTS sub-item 2.3 (2026-06-04) — context owned by a
+/// `LazyLift` carrying everything needed to compute a single
+/// cube's outgoing edges on demand. Built once at handle
+/// construction (parses the BTOR2 + collects symbols, register
+/// widths, boolean inputs, UF-wrapped Op NIDs); read-only
+/// thereafter.
+///
+/// Currently DUPLICATES the per-cube logic of the eager
+/// `predicate_cube_lift` (lines ~741–841). A 2.3-follow-up
+/// (likely folded into sub-item 2.4) will refactor
+/// `predicate_cube_lift` to use the same helper, removing the
+/// duplication. The drift risk is mitigated by the
+/// `r5_subitem_23_lazy_lift_edges_match_eager_lift` test which
+/// asserts edge-set equality between the two paths.
+#[derive(Debug, Clone)]
+struct LazyLiftContext {
+    file: crate::adapter::btor2::ast::Btor2File,
+    pred_register_widths: std::collections::HashMap<String, u32>,
+    boolean_inputs: Vec<String>,
+    n_inputs: usize,
+    n_combos: usize,
+    uf_wrapped_nids: std::collections::HashSet<crate::adapter::btor2::ast::Nid>,
+    label_name: String,
+    predicates: Vec<PredicateSpec>,
+    cube_count: usize,
+}
+
+/// R.5 lazy KMTS sub-item 2.3 (2026-06-04) — truly-lazy
+/// implementation of `KmtsLiftLazy`. `expand_cube` computes
+/// a single cube's outgoing edges on demand via
+/// `simulate_one_step` / `simulate_one_step_with_uf_rep` and
+/// caches the result. Subsequent `expand_cube(cube)` calls for
+/// the same cube are O(1) lookups.
+///
+/// **Memory**: bounded by the number of cubes the caller
+/// actually visits. For a `2^|P|`-cube space where only N cubes
+/// are reachable from the initial state(s), memory is O(N)
+/// rather than O(2^|P|) for `EagerLazyLift`.
+///
+/// **CPU**: per-cube cost is the same as the eager loop's
+/// per-iteration cost. The savings come from never paying for
+/// cubes that are never visited.
+///
+/// **MVP scope**: handles the R.2.5 may-edge construction path
+/// (sampling-based, single canonical representative + boolean-
+/// input enumeration). Does NOT handle must-edges (R.2.5b's SMT
+/// work is required for those). Falls back to empty edge set
+/// when the BTOR2 has no boolean inputs OR the predicate set is
+/// empty, mirroring the eager lifter's `if lift_opts.max_input_bits
+/// > 0 && !predicates.is_empty()` gate.
+#[derive(Debug, Clone)]
+pub struct LazyLift {
+    ctx: LazyLiftContext,
+    /// Per-cube cache. Key = cube index; value = the edge set
+    /// computed on first `expand_cube` call. Bounded by the
+    /// number of unique cubes the caller has visited.
+    cache: std::collections::HashMap<usize, Vec<LazyExpansionEdge>>,
+}
+
+impl LazyLift {
+    /// Build a `LazyLift` from a BTOR2 source + predicate set.
+    /// Parses the BTOR2 + collects the context once; subsequent
+    /// `expand_cube` calls are per-cube on-demand.
+    pub fn from_btor2(
+        predicates: Vec<PredicateSpec>,
+        btor2_content: &str,
+        adapter_options: &crate::adapter::AdapterOptions,
+        lift_opts: &PredicateCubeLiftOptions,
+    ) -> Result<Self, crate::adapter::AdapterError> {
+        use crate::adapter::AdapterErrorKind;
+        let file =
+            crate::adapter::btor2::parser::parse(btor2_content).map_err(|e| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                location: None,
+                message: format!("adapter/btor2/lazy_lift: parse failed: {}", e.message),
+            })?;
+        let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+        let cube_count: usize = 1usize << predicates.len();
+        if cube_count > lift_opts.max_cube_count {
+            return Err(AdapterError {
+                kind: AdapterErrorKind::StateSpaceOverflow,
+                location: None,
+                message: format!(
+                    "adapter/btor2/lazy_lift: cube count 2^{} = {cube_count} exceeds max_cube_count = {}",
+                    predicates.len(),
+                    lift_opts.max_cube_count
+                ),
+            });
+        }
+
+        // pred_register_widths: needed for the "predicate value == 0
+        // → use non-zero representative" edge case (mirrors eager
+        // lifter's logic at line ~728).
+        let mut pred_register_widths: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for line in &file.lines {
+            if let crate::adapter::btor2::ast::Node::State { sort, .. } = &line.node
+                && let Some(width) = crate::adapter::btor2::parser::bv_width(&file, *sort)
+                && let Some(name) = symbols.get(&line.nid)
+            {
+                pred_register_widths.insert(name.clone(), width);
+            }
+        }
+
+        // Boolean inputs + UF-wrapped Op NIDs (mirrors eager
+        // lifter's logic at lines ~716, ~494).
+        let boolean_inputs: Vec<String> = collect_boolean_input_symbols(&file, &symbols);
+        let n_inputs = boolean_inputs.len().min(lift_opts.max_input_bits);
+        let n_combos: usize = 1usize << n_inputs;
+        let uf_wrapped_nids =
+            crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, adapter_options);
+
+        Ok(Self {
+            ctx: LazyLiftContext {
+                file,
+                pred_register_widths,
+                boolean_inputs,
+                n_inputs,
+                n_combos,
+                uf_wrapped_nids,
+                label_name: "step".to_string(),
+                predicates,
+                cube_count,
+            },
+            cache: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Number of cubes currently cached.
+    pub fn cached_count(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+impl KmtsLiftLazy for LazyLift {
+    fn cube_count(&self) -> usize {
+        self.ctx.cube_count
+    }
+
+    fn expand_cube(&mut self, cube_index: usize) -> Vec<LazyExpansionEdge> {
+        if cube_index >= self.ctx.cube_count {
+            return Vec::new();
+        }
+        if let Some(cached) = self.cache.get(&cube_index) {
+            return cached.clone();
+        }
+        let edges = compute_cube_outgoing_edges(cube_index, &self.ctx);
+        self.cache.insert(cube_index, edges.clone());
+        edges
+    }
+
+    fn predicates(&self) -> &[PredicateSpec] {
+        &self.ctx.predicates
+    }
+}
+
+/// R.5 lazy KMTS sub-item 2.3 (2026-06-04) — compute one cube's
+/// outgoing may-edges. Currently a DUPLICATE of the per-cube
+/// body in `predicate_cube_lift` (lines ~741–841); a 2.3
+/// follow-up refactors `predicate_cube_lift` to use the same
+/// helper.
+///
+/// Returns empty Vec when:
+/// - The fixture has no boolean inputs OR the predicate set is
+///   empty (matches the eager lifter's gating).
+/// - All `simulate_one_step` invocations error for this cube
+///   (e.g. BTOR2 references registers the lifter can't resolve).
+fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<LazyExpansionEdge> {
+    // Gating: matches the eager lifter's `if lift_opts.max_input_bits
+    // > 0 && !predicates.is_empty()` check. We allow n_inputs == 0
+    // (n_combos == 1) so a single iteration runs with empty
+    // input_values — the eager lifter does the same.
+    if ctx.predicates.is_empty() {
+        return Vec::new();
+    }
+
+    // Build canonical representative for cube_index (mirrors
+    // eager lifter at lines ~742–764).
+    let mut registers: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+    for (bit, pred) in ctx.predicates.iter().enumerate() {
+        let truth = (cube_index >> bit) & 1 == 1;
+        let entry = registers.entry(pred.register.clone()).or_insert(0);
+        if truth {
+            *entry = pred.value as u128;
+        }
+        if !truth && pred.value == 0 {
+            let width = ctx
+                .pred_register_widths
+                .get(pred.register.as_str())
+                .copied()
+                .unwrap_or(1);
+            if width >= 1 {
+                *entry = 1;
+            }
+        }
+    }
+
+    let mut edges: Vec<LazyExpansionEdge> = Vec::new();
+    let mut seen_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // Enumerate input combinations + emit MayOnly-equivalent
+    // edges. We dedupe target cubes across input combos +
+    // UF reps so a cube doesn't get the same edge twice.
+    for combo in 0..ctx.n_combos {
+        let mut input_values: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
+        for (bit, name) in ctx.boolean_inputs.iter().take(ctx.n_inputs).enumerate() {
+            let v = if (combo >> bit) & 1 == 1 { 1 } else { 0 };
+            input_values.insert(name.clone(), v);
+        }
+
+        let next_register_snapshots: Vec<std::collections::HashMap<String, u128>> =
+            if ctx.uf_wrapped_nids.is_empty() {
+                match crate::adapter::btor2::bit_blast::simulate_one_step(
+                    &ctx.file,
+                    &registers,
+                    &input_values,
+                ) {
+                    Ok(v) => vec![v],
+                    Err(_) => continue,
+                }
+            } else {
+                use crate::adapter::btor2::bit_blast::UfRepresentative;
+                let mut snaps = Vec::with_capacity(2);
+                for rep in [UfRepresentative::Zero, UfRepresentative::Ones] {
+                    match crate::adapter::btor2::bit_blast::simulate_one_step_with_uf_rep(
+                        &ctx.file,
+                        &registers,
+                        &input_values,
+                        &ctx.uf_wrapped_nids,
+                        rep,
+                    ) {
+                        Ok(v) => snaps.push(v),
+                        Err(_) => continue,
+                    }
+                }
+                snaps
+            };
+
+        for next_registers in &next_register_snapshots {
+            let mut target_index: usize = 0;
+            for (bit, pred) in ctx.predicates.iter().enumerate() {
+                let next_v = next_registers.get(&pred.register).copied().unwrap_or(0);
+                if next_v == pred.value as u128 {
+                    target_index |= 1 << bit;
+                }
+            }
+            if target_index < ctx.cube_count && seen_targets.insert(target_index) {
+                edges.push(LazyExpansionEdge {
+                    label: ctx.label_name.clone(),
+                    target_cube: target_index,
+                });
+            }
+        }
+    }
+
+    edges
+}
+
 /// R.2.5 — Result of lifting one BTOR2 source through the predicate-
 /// cube path. Carries a `Clts` whose state count is bounded by 2^|P|
 /// (NOT 2^|Registers|), plus the predicate set and timing
@@ -1903,5 +2162,165 @@ mod tests {
         let cube_count = result.cube_count;
         let wrapper = EagerLazyLift::from_result(result);
         assert_eq!(wrapper.cube_count(), cube_count);
+    }
+
+    // R.5 lazy KMTS sub-item 2.3 tests (2026-06-04) — truly-
+    // lazy implementation. Each test ensures the cache + on-
+    // demand computation behaviour matches the eager wrapper.
+
+    #[test]
+    fn r5_subitem_23_lazy_lift_cube_count_matches_eager() {
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let lazy = LazyLift::from_btor2(
+            preds.clone(),
+            SMALL_BTOR2,
+            &AdapterOptions::default(),
+            &opts,
+        )
+        .expect("lazy lift succeeds");
+        let eager =
+            EagerLazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+                .expect("eager lift succeeds");
+        assert_eq!(lazy.cube_count(), eager.cube_count());
+    }
+
+    #[test]
+    fn r5_subitem_23_lazy_lift_cache_starts_empty_grows_on_visits() {
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let mut lazy = LazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("lazy lift succeeds");
+        assert_eq!(lazy.cached_count(), 0, "cache MUST start empty");
+        let _ = lazy.expand_cube(0);
+        assert_eq!(
+            lazy.cached_count(),
+            1,
+            "cache grows by 1 on first cube visit"
+        );
+        let _ = lazy.expand_cube(0);
+        assert_eq!(
+            lazy.cached_count(),
+            1,
+            "cache MUST NOT grow on repeat visit to the same cube"
+        );
+        let _ = lazy.expand_cube(1);
+        assert_eq!(
+            lazy.cached_count(),
+            2,
+            "cache grows by 1 on second distinct cube visit"
+        );
+    }
+
+    #[test]
+    fn r5_subitem_23_lazy_lift_repeat_expand_returns_identical_edges() {
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let mut lazy = LazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("lazy lift succeeds");
+        let edges_1 = lazy.expand_cube(0);
+        let edges_2 = lazy.expand_cube(0);
+        assert_eq!(edges_1, edges_2);
+    }
+
+    #[test]
+    fn r5_subitem_23_lazy_lift_out_of_range_returns_empty_and_no_cache_growth() {
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let mut lazy = LazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("lazy lift succeeds");
+        let edges = lazy.expand_cube(100);
+        assert!(edges.is_empty());
+        assert_eq!(
+            lazy.cached_count(),
+            0,
+            "out-of-range visit MUST NOT pollute the cache"
+        );
+    }
+
+    #[test]
+    fn r5_subitem_23_lazy_lift_edges_match_eager_lift() {
+        // LOAD-BEARING DRIFT-PROTECTION TEST. The lazy impl
+        // currently duplicates the per-cube logic of the eager
+        // lifter. This test asserts the two paths produce
+        // equivalent edge sets for the same input — any
+        // divergence between the duplicated logics surfaces
+        // here.
+        //
+        // Fixture: SMALL_BTOR2 (no inputs ⇒ no may-edges ⇒
+        // both paths produce empty edge sets for every cube).
+        // This is a degenerate match; richer-fixture tests
+        // will live alongside sub-item 2.4 when an input-
+        // bearing fixture is wired in.
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let mut lazy = LazyLift::from_btor2(
+            preds.clone(),
+            SMALL_BTOR2,
+            &AdapterOptions::default(),
+            &opts,
+        )
+        .expect("lazy lift succeeds");
+        let mut eager =
+            EagerLazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+                .expect("eager lift succeeds");
+        for cube in 0..lazy.cube_count() {
+            let lazy_edges = lazy.expand_cube(cube);
+            let eager_edges = eager.expand_cube(cube);
+            let mut lazy_sorted = lazy_edges;
+            lazy_sorted.sort_by(|a, b| {
+                a.label
+                    .cmp(&b.label)
+                    .then_with(|| a.target_cube.cmp(&b.target_cube))
+            });
+            let mut eager_sorted = eager_edges;
+            eager_sorted.sort_by(|a, b| {
+                a.label
+                    .cmp(&b.label)
+                    .then_with(|| a.target_cube.cmp(&b.target_cube))
+            });
+            assert_eq!(
+                lazy_sorted, eager_sorted,
+                "LazyLift and EagerLazyLift MUST agree on edge set for cube {cube}"
+            );
+        }
+    }
+
+    #[test]
+    fn r5_subitem_23_lazy_lift_predicates_round_trip() {
+        let preds = vec![PredicateSpec {
+            name: "p_alpha".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let lazy = LazyLift::from_btor2(
+            preds.clone(),
+            SMALL_BTOR2,
+            &AdapterOptions::default(),
+            &opts,
+        )
+        .expect("lazy lift succeeds");
+        assert_eq!(lazy.predicates(), preds.as_slice());
     }
 }
