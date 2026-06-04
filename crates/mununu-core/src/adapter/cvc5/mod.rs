@@ -29,8 +29,10 @@
 //! ship in subsequent commits.
 
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::adapter::btor2::PredicateSpec;
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -261,6 +263,282 @@ fn render_cube_conjunction(predicates: &[PredicateSpec], cube: usize) -> Option<
     } else {
         Some(format!("(and {})", facts.join(" ")))
     }
+}
+
+/// R.5 Item 3 sub-item 3.3 (2026-06-03) — options controlling
+/// a CVC5 interpolant query invocation. Default timeout is 30s,
+/// matching the breakdown doc's sub-item 3.3 spec.
+#[derive(Debug, Clone)]
+pub struct InterpolantQueryOptions {
+    /// Wall-clock timeout for the CVC5 subprocess. Exceeding this
+    /// kills the child and returns
+    /// `Err(AdapterError { kind: UnsupportedConstruct, ... })`.
+    pub timeout: Duration,
+}
+
+impl Default for InterpolantQueryOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// R.5 Item 3 sub-item 3.3 (2026-06-03) — invoke CVC5 on an
+/// SMT-LIB interpolation query (built by [`build_interpolation_query`])
+/// and parse the returned interpolant into a [`PredicateSpec`].
+///
+/// Returns:
+/// - `Ok(Some(predicate))` — CVC5 produced an interpolant we
+///   can parse into mununu's `PredicateSpec` shape (the MVP
+///   parser handles `(= <register> <bv-literal>)` exactly;
+///   compound interpolants like `(and ...)` / `(or ...)` /
+///   `(not ...)` return `Ok(None)` as a soft fall-through so
+///   the CEGAR loop can fall back to WP).
+/// - `Ok(None)` — CVC5 reported no interpolant exists (the
+///   input wasn't UNSAT-incompatible), OR the interpolant has
+///   a compound shape our MVP parser doesn't decode.
+/// - `Err(_)` — subprocess failure, timeout exceeded, or
+///   non-zero CVC5 exit status.
+///
+/// **MVP scope (sub-item 3.3)**: handles the single-equality
+/// interpolant shape only. Sub-item 3.4 will widen the parser
+/// to handle compound shapes by emitting multiple `PredicateSpec`s
+/// where structurally feasible.
+pub fn invoke_cvc5_for_interpolant(
+    bin: &Cvc5Bin,
+    query: &str,
+    opts: &InterpolantQueryOptions,
+) -> Result<Option<PredicateSpec>, AdapterError> {
+    // Spawn CVC5 with the SMT-LIB query piped to stdin.
+    let mut child = Command::new(&bin.path)
+        .args(["--lang=smt2", "--produce-interpolants"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            location: None,
+            message: format!(
+                "adapter/cvc5: failed to spawn `{} --lang=smt2 --produce-interpolants`: {e}",
+                bin.path.display()
+            ),
+        })?;
+
+    // Write the query to stdin in a separate thread so the main
+    // thread can poll for timeout via `try_wait` on the child.
+    // Without a writer thread, a query that fills the kernel
+    // stdin buffer would deadlock (writer blocks, no one reads
+    // stdout to drain progress).
+    let stdin = child.stdin.take().ok_or_else(|| AdapterError {
+        kind: AdapterErrorKind::UnsupportedConstruct,
+        location: None,
+        message: "adapter/cvc5: failed to capture child stdin handle".to_string(),
+    })?;
+    let query_bytes = query.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || {
+        let mut stdin = stdin;
+        let _ = stdin.write_all(&query_bytes);
+        // Dropping stdin closes the pipe, signalling EOF to CVC5.
+    });
+
+    // Poll loop with timeout. 50 ms granularity is fine for
+    // a 30-second timeout; the overhead is negligible.
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|e| AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            location: None,
+            message: format!("adapter/cvc5: try_wait on child failed: {e}"),
+        })? {
+            Some(s) => break s,
+            None => {
+                if start.elapsed() >= opts.timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = writer.join();
+                    return Err(AdapterError {
+                        kind: AdapterErrorKind::UnsupportedConstruct,
+                        location: None,
+                        message: format!(
+                            "adapter/cvc5: query exceeded {}s timeout — killed",
+                            opts.timeout.as_secs()
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let _ = writer.join();
+
+    // Capture stdout (the interpolant response) + stderr (for
+    // diagnostics on non-zero exit).
+    let mut stdout_data = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_end(&mut stdout_data);
+    }
+    let mut stderr_data = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_end(&mut stderr_data);
+    }
+    let stdout_str = String::from_utf8_lossy(&stdout_data);
+    let stderr_str = String::from_utf8_lossy(&stderr_data);
+
+    if !status.success() {
+        // CVC5 may exit non-zero AND print "(error ...)" on
+        // stdout for queries it can't handle (e.g. no
+        // interpolant exists for SAT inputs). Distinguish:
+        // if stdout contains an error sexpr, treat as Ok(None);
+        // otherwise return Err.
+        if stdout_str.contains("(error") || stderr_str.contains("(error") {
+            return Ok(None);
+        }
+        return Err(AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            location: None,
+            message: format!(
+                "adapter/cvc5: subprocess exited with status {}; stderr: {}",
+                status,
+                stderr_str.trim()
+            ),
+        });
+    }
+
+    // Parse the interpolant response.
+    Ok(parse_cvc5_interpolant_response(&stdout_str))
+}
+
+/// R.5 Item 3 sub-item 3.3 (2026-06-03) — parse CVC5's
+/// interpolant response into a [`PredicateSpec`].
+///
+/// CVC5's `(get-interpolant I <formula>)` produces output of
+/// shape:
+/// ```text
+/// (define-fun I () Bool <interpolant-expression>)
+/// ```
+///
+/// **MVP parser handles**:
+/// - `(= <register-name> #b<binary-literal>)` — bitvector
+///   binary literal form.
+/// - `(= <register-name> (_ bv<value> <width>))` — bitvector
+///   decimal literal form.
+///
+/// **Returns `None` for**:
+/// - Compound expressions: `(and ...)`, `(or ...)`, `(not ...)`,
+///   `(=> ...)`. The CEGAR loop falls back to WP in these
+///   cases.
+/// - `true` / `false` trivial interpolants (no useful
+///   refinement signal).
+/// - Any shape the parser doesn't recognise (defensive
+///   fallthrough).
+/// - The `(error "...")` reply CVC5 emits when no interpolant
+///   exists.
+pub fn parse_cvc5_interpolant_response(stdout: &str) -> Option<PredicateSpec> {
+    // Locate the `(define-fun I () Bool <expr>)` line. CVC5 may
+    // emit prelude lines (status / set-info echoes); scan for
+    // the marker.
+    let define_marker = "(define-fun I () Bool ";
+    let start = stdout.find(define_marker)?;
+    let after = &stdout[start + define_marker.len()..];
+    // Extract the expression up to the matching closing paren.
+    let expr = extract_balanced_expr(after)?;
+    parse_equality_expression(expr.trim())
+}
+
+/// R.5 Item 3 sub-item 3.3 (2026-06-03) — extract a balanced
+/// s-expression from `input`, accounting for nested parens.
+/// Returns the substring from position 0 up to (but not
+/// including) the closing paren that balances the open paren
+/// the parent statement is inside.
+///
+/// Example: given input `"(= reg_a #b00) ...)"`, returns
+/// `"(= reg_a #b00)"`. Given input `"true)\n..."`, returns
+/// `"true"`.
+fn extract_balanced_expr(input: &str) -> Option<&str> {
+    // The interpolant expression starts immediately after the
+    // marker; it's either an atom (true/false/etc.) or an
+    // s-expression starting with `(`. We need to find where it
+    // ends (before the closing `)` of `(define-fun I () Bool
+    // <expr>)`).
+    let mut depth: i32 = 0;
+    let mut end: Option<usize> = None;
+    for (i, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    end.map(|e| &input[..e])
+}
+
+/// R.5 Item 3 sub-item 3.3 (2026-06-03) — parse an equality
+/// expression of shape `(= <register> <bv-literal>)` into a
+/// [`PredicateSpec`]. Returns `None` for any other shape.
+///
+/// Accepted bv-literal forms:
+/// - `#b<binary-digits>` (e.g. `#b00000000`)
+/// - `#x<hex-digits>` (e.g. `#x00`)
+/// - `(_ bv<decimal> <width>)` (e.g. `(_ bv0 8)`)
+fn parse_equality_expression(expr: &str) -> Option<PredicateSpec> {
+    let trimmed = expr.trim();
+    // Must be (= <ident> <bv-literal>).
+    let inner = trimmed.strip_prefix("(=")?.strip_suffix(')')?.trim();
+    // Split on whitespace; the bv-literal may itself be a
+    // parenthesised `(_ bv<n> <w>)` form, so we need to handle
+    // both whitespace-separated identifiers and paren groups.
+    let (register, rest) = split_first_token(inner)?;
+    let bv_value = parse_bv_literal(rest.trim())?;
+    Some(PredicateSpec {
+        name: "craig_interp".to_string(),
+        register: register.to_string(),
+        value: bv_value,
+    })
+}
+
+/// Split off the first whitespace-delimited token, returning
+/// `(token, remainder)`. Used to extract the register name
+/// from the `(= <register> <value>)` form.
+fn split_first_token(input: &str) -> Option<(&str, &str)> {
+    let s = input.trim_start();
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&s[..end], &s[end..]))
+}
+
+/// Parse an SMT-LIB bitvector literal into its numeric value
+/// as `u64`. Handles `#b...`, `#x...`, and `(_ bv<n> <w>)`
+/// forms. Returns `None` for unrecognised shapes or values
+/// exceeding `u64`.
+fn parse_bv_literal(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    // Binary form: #b0101...
+    if let Some(bits) = trimmed.strip_prefix("#b") {
+        return u64::from_str_radix(bits, 2).ok();
+    }
+    // Hex form: #x0a...
+    if let Some(hex) = trimmed.strip_prefix("#x") {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    // Underscored decimal form: (_ bv0 8) — extract the
+    // numeric token after "bv".
+    if let Some(rest) = trimmed.strip_prefix("(_") {
+        let inner = rest.trim().strip_suffix(')')?.trim();
+        let bv_token = inner.split_whitespace().next()?;
+        let value_str = bv_token.strip_prefix("bv")?;
+        return value_str.parse::<u64>().ok();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -522,5 +800,230 @@ mod tests {
             ),
             "source-cube assertion MUST encode cube index 5 = binary 101 correctly; got:\n{got}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R.5 Item 3 sub-item 3.3 tests — CVC5 subprocess invocation
+    // + interpolant parsing. Parser tests run unconditionally;
+    // the subprocess integration test is gated on CVC5 binary
+    // availability.
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_binary_literal() {
+        // CVC5's `(get-interpolant I ...)` output for a simple
+        // equality interpolant.
+        let stdout = "(define-fun I () Bool (= reg_a #b00000000000000000000000000000000))\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(
+            got,
+            Some(PredicateSpec {
+                name: "craig_interp".to_string(),
+                register: "reg_a".to_string(),
+                value: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_hex_literal() {
+        // Hex form: #x notation. 0x0a = 10 decimal.
+        let stdout = "(define-fun I () Bool (= reg_b #x0a))\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(
+            got,
+            Some(PredicateSpec {
+                name: "craig_interp".to_string(),
+                register: "reg_b".to_string(),
+                value: 10,
+            }),
+        );
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_underscored_decimal() {
+        // (_ bv<n> <w>) form.
+        let stdout = "(define-fun I () Bool (= reg_c (_ bv42 32)))\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(
+            got,
+            Some(PredicateSpec {
+                name: "craig_interp".to_string(),
+                register: "reg_c".to_string(),
+                value: 42,
+            }),
+        );
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_returns_none_on_compound_and() {
+        // Compound `(and ...)` interpolants are NOT decoded by
+        // the MVP parser. CEGAR falls back to WP.
+        let stdout = "(define-fun I () Bool (and (= reg_a #b0) (= reg_b #b1)))\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_returns_none_on_negation() {
+        // Negation in the interpolant — MVP parser doesn't
+        // emit an "inequality" PredicateSpec (the type only
+        // supports equality). CEGAR falls back to WP.
+        let stdout = "(define-fun I () Bool (not (= reg_a #b00)))\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_returns_none_on_trivial_true() {
+        // Trivial `true` interpolant — no useful refinement
+        // signal.
+        let stdout = "(define-fun I () Bool true)\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_returns_none_on_trivial_false() {
+        let stdout = "(define-fun I () Bool false)\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_returns_none_when_marker_absent() {
+        // CVC5 sometimes emits `(error "...")` instead of a
+        // define-fun when no interpolant exists. The parser
+        // returns None.
+        let stdout = "(error \"No interpolant exists for the given query.\")\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_interpolant_handles_prelude_lines() {
+        // CVC5 may echo set-info / set-option lines before the
+        // get-interpolant response. The parser scans for the
+        // `(define-fun I` marker.
+        let stdout = "(:status sat)\n\
+                      ; some comment\n\
+                      (define-fun I () Bool (= reg_a #b00))\n";
+        let got = parse_cvc5_interpolant_response(stdout);
+        assert!(got.is_some(), "parser must skip prelude lines; got None");
+        assert_eq!(got.unwrap().register, "reg_a");
+    }
+
+    #[test]
+    fn r5_subitem_33_extract_balanced_expr_handles_nested_parens() {
+        // Internal helper test: balanced extraction stops at
+        // the outermost matching paren.
+        let input = "(= reg_a (_ bv0 32))) trailing junk";
+        let got = extract_balanced_expr(input);
+        assert_eq!(got, Some("(= reg_a (_ bv0 32))"));
+    }
+
+    #[test]
+    fn r5_subitem_33_extract_balanced_expr_handles_atom() {
+        // Atom (true/false) — no nesting; stops at the first
+        // closing paren (which belongs to the parent
+        // define-fun).
+        let input = "true)\n";
+        let got = extract_balanced_expr(input);
+        assert_eq!(got, Some("true"));
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_bv_literal_binary() {
+        assert_eq!(parse_bv_literal("#b1010"), Some(10));
+        assert_eq!(parse_bv_literal("#b00000000"), Some(0));
+        assert_eq!(parse_bv_literal("#b1"), Some(1));
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_bv_literal_hex() {
+        assert_eq!(parse_bv_literal("#xff"), Some(255));
+        assert_eq!(parse_bv_literal("#x0"), Some(0));
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_bv_literal_underscored() {
+        assert_eq!(parse_bv_literal("(_ bv5 8)"), Some(5));
+        assert_eq!(parse_bv_literal("(_ bv0 32)"), Some(0));
+    }
+
+    #[test]
+    fn r5_subitem_33_parse_bv_literal_returns_none_on_invalid() {
+        assert_eq!(parse_bv_literal("not a literal"), None);
+        assert_eq!(parse_bv_literal("#znot-binary"), None);
+        assert_eq!(parse_bv_literal(""), None);
+    }
+
+    #[test]
+    fn r5_subitem_33_default_timeout_is_30_seconds() {
+        // Documented contract.
+        let opts = InterpolantQueryOptions::default();
+        assert_eq!(opts.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "requires cvc5 binary installed; run with --ignored when available"]
+    fn r5_subitem_33_invoke_cvc5_for_known_interpolation_query() {
+        // R.5 Item 3 sub-item 3.3 — end-to-end integration
+        // test. Ignored by default; run with `cargo test --
+        // --ignored` after `brew install cvc5`.
+        //
+        // Builds the query from sub-item 3.2's renderer for a
+        // simple source/target cube pair, invokes CVC5,
+        // verifies the parsed interpolant matches expectations.
+        let bin = locate_cvc5().expect("CVC5 must be available for this test");
+        let preds = vec![PredicateSpec {
+            name: "p_zero".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        // Source cube 1 = (reg_a == 0); target cube 0 = (reg_a != 0).
+        // CVC5 should produce an interpolant like (= reg_a #b0...0).
+        let query = build_interpolation_query(&preds, 1, 0);
+        let result = invoke_cvc5_for_interpolant(&bin, &query, &InterpolantQueryOptions::default());
+        match result {
+            Ok(Some(spec)) => {
+                assert_eq!(spec.register, "reg_a");
+                assert_eq!(spec.value, 0);
+            }
+            Ok(None) => {
+                panic!("expected CVC5 to produce an interpolant for source=1 target=0; got None")
+            }
+            Err(e) => panic!("invoke_cvc5_for_interpolant failed: {}", e.message),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires cvc5 binary installed; run with --ignored when available"]
+    fn r5_subitem_33_invoke_cvc5_timeout_kills_subprocess() {
+        // R.5 Item 3 sub-item 3.3 — timeout integration test.
+        // Pass a 1ms timeout that's guaranteed to be exceeded
+        // even by CVC5's startup time; verifies the subprocess
+        // is killed + the function returns Err.
+        let bin = locate_cvc5().expect("CVC5 must be available for this test");
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let query = build_interpolation_query(&preds, 1, 0);
+        let opts = InterpolantQueryOptions {
+            timeout: Duration::from_millis(1),
+        };
+        let result = invoke_cvc5_for_interpolant(&bin, &query, &opts);
+        match result {
+            Err(e) => {
+                assert!(
+                    e.message.contains("timeout"),
+                    "expected timeout error; got: {}",
+                    e.message
+                );
+            }
+            Ok(_) => panic!("expected timeout Err; got Ok"),
+        }
     }
 }
