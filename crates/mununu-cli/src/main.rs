@@ -129,6 +129,65 @@ enum Btor2Command {
     /// Used by the R.2 fixture sweep to validate the lifter shape
     /// stays consistent across runs.
     LiftKmts(Btor2LiftKmtsArgs),
+    /// R.5 Item 3 sub-item 3.5 (2026-06-04) — Run the R.5 CEGAR
+    /// refinement loop on a BTOR2 fixture + μ-calculus formula.
+    ///
+    /// Selects a predicate-discovery source (`wp` heuristic by
+    /// default, or `craig` for Craig interpolation via the
+    /// CVC5 subprocess). When `craig` is selected but the CVC5
+    /// binary isn't found at runtime, the loop emits a structured
+    /// warning + falls back to the `wp` heuristic automatically.
+    /// See `docs/external-tools.md` for CVC5 install instructions.
+    Cegar(Btor2CegarArgs),
+}
+
+/// R.5 Item 3 sub-item 3.5 (2026-06-04) — predicate-source
+/// selector for `mununu btor2 cegar`. Mirrors the values of
+/// [`mununu_core::adapter::btor2::cegar::PredicateSource`] but
+/// omits the `Manual` variant (callback-only; not selectable
+/// from the CLI).
+#[derive(Clone, Debug, Copy, clap::ValueEnum)]
+enum PredicateSourceArg {
+    /// Weakest-precondition heuristic (default). No external deps.
+    Wp,
+    /// Craig interpolation via CVC5 subprocess. Requires CVC5 ≥ 1.0
+    /// installed locally; falls back to `wp` with a warning when
+    /// the binary is absent.
+    Craig,
+}
+
+#[derive(Args, Debug)]
+struct Btor2CegarArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// μ-calculus formula to evaluate over the lifted KMTS.
+    /// Example: `'nu X. < step > X'` for a simple liveness
+    /// formula. Wrap in single quotes to avoid shell expansion.
+    #[arg(long, value_name = "FORMULA")]
+    formula: String,
+    /// Initial predicate set as `name:register=value` triples.
+    /// May be repeated. At least one is required to bootstrap
+    /// the cube space.
+    /// Example: `--predicate "p_idle:state=0" --predicate "p_busy:state=1"`.
+    #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
+    predicates: Vec<String>,
+    /// Predicate-discovery source for the CEGAR loop.
+    #[arg(long, value_enum, default_value_t = PredicateSourceArg::Wp)]
+    predicate_source: PredicateSourceArg,
+    /// Explicit CVC5 binary path (overrides `MUNUNU_CVC5_PATH`
+    /// env var + `$PATH` discovery). Only consulted when
+    /// `--predicate-source craig`.
+    #[arg(long, value_name = "PATH")]
+    cvc5_path: Option<PathBuf>,
+    /// Maximum number of CEGAR refinement iterations before
+    /// terminating with `BoundedIterationsReached`. Default 16.
+    #[arg(long, default_value_t = 16)]
+    max_iterations: usize,
+    /// Emit the trace summary as JSON on stdout instead of the
+    /// human-readable format.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1507,7 +1566,135 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
     match command {
         Btor2Command::Discover(args) => btor2_discover(args),
         Btor2Command::LiftKmts(args) => btor2_lift_kmts(args),
+        Btor2Command::Cegar(args) => btor2_cegar(args),
     }
+}
+
+/// R.5 Item 3 sub-item 3.5 (2026-06-04) — CEGAR refinement
+/// loop CLI handler.
+///
+/// Parses the user-supplied formula + initial predicate set,
+/// builds a [`CegarOptions`] with the selected predicate source,
+/// and invokes [`cegar_refine_loop`] on the BTOR2 fixture.
+/// Prints a human-readable or JSON summary of the resulting
+/// [`CegarTrace`].
+fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
+    use mununu_core::adapter::AdapterOptions;
+    use mununu_core::adapter::btor2::PredicateSpec;
+    use mununu_core::adapter::btor2::cegar::{CegarOptions, PredicateSource, cegar_refine_loop};
+    use mununu_core::mu_calculus::{Environment, parser as mu_parser};
+
+    if !args.file.exists() {
+        return Err(format!(
+            "BTOR2 input file does not exist: {}",
+            args.file.display()
+        ));
+    }
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+
+    // Honor --cvc5-path via env var (the locate_cvc5 helper
+    // reads MUNUNU_CVC5_PATH first). SAFETY: env vars are
+    // process-global; this is fine for the CLI handler which
+    // is single-threaded + runs once per invocation.
+    if let Some(p) = &args.cvc5_path {
+        unsafe {
+            std::env::set_var("MUNUNU_CVC5_PATH", p);
+        }
+    }
+
+    // Parse initial predicates from `NAME:REGISTER=VALUE` triples.
+    let mut initial_predicates: Vec<PredicateSpec> = Vec::with_capacity(args.predicates.len());
+    for raw in &args.predicates {
+        let (name, rest) = raw.split_once(':').ok_or_else(|| {
+            format!("predicate spec '{raw}' missing ':' separator (expected NAME:REGISTER=VALUE)")
+        })?;
+        let (register, value_str) = rest.split_once('=').ok_or_else(|| {
+            format!("predicate spec '{raw}' missing '=' separator (expected NAME:REGISTER=VALUE)")
+        })?;
+        let value: u64 = value_str
+            .parse()
+            .map_err(|e| format!("predicate spec '{raw}' has non-numeric value: {e}"))?;
+        initial_predicates.push(PredicateSpec {
+            name: name.to_string(),
+            register: register.to_string(),
+            value,
+        });
+    }
+    if initial_predicates.is_empty() {
+        return Err(
+            "at least one --predicate NAME:REGISTER=VALUE is required to bootstrap the cube space"
+                .into(),
+        );
+    }
+
+    // Parse the μ-calculus formula.
+    let formula =
+        mu_parser::parse(&args.formula).map_err(|e| format!("formula parse error: {e:?}"))?;
+
+    // Build the environment with state_count = 2^|predicates|.
+    let cube_count = 1usize << initial_predicates.len();
+    let env = Environment::new(cube_count);
+
+    // Map the CLI's PredicateSourceArg to the core's PredicateSource.
+    let predicate_source = match args.predicate_source {
+        PredicateSourceArg::Wp => PredicateSource::WeakestPrecondition,
+        PredicateSourceArg::Craig => PredicateSource::CraigInterpolation,
+    };
+
+    let cegar_opts = CegarOptions {
+        max_iterations: args.max_iterations,
+        predicate_source,
+        max_cube_count: 1024,
+        capture_approximants: false,
+        enable_approximant_reuse: false,
+        smart_uf_cap: true,
+    };
+
+    let trace = cegar_refine_loop(
+        &formula,
+        &content,
+        initial_predicates,
+        &env,
+        &AdapterOptions::default(),
+        &cegar_opts,
+    )
+    .map_err(|e| format!("cegar refine loop: {}", e.message))?;
+
+    if args.json {
+        let summary = serde_json::json!({
+            "fixture": args.file.display().to_string(),
+            "formula": args.formula,
+            "predicate_source": format!("{:?}", args.predicate_source),
+            "iterations": trace.iterations.len(),
+            "terminated_with": format!("{:?}", trace.terminated_with),
+            "final_predicate_count": trace.final_predicates.len(),
+            "approximant_reuse_enabled": trace.approximant_reuse_enabled,
+            "lazy_lift_pending": trace.lazy_lift_pending,
+            "warnings": trace.warnings.iter().map(|w| w.message.clone()).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .map_err(|e| format!("serialize summary: {e}"))?
+        );
+    } else {
+        println!("CEGAR refinement loop completed");
+        println!("  fixture:           {}", args.file.display());
+        println!("  formula:           {}", args.formula);
+        println!("  predicate_source:  {:?}", args.predicate_source);
+        println!("  iterations:        {}", trace.iterations.len());
+        println!("  terminated_with:   {:?}", trace.terminated_with);
+        println!("  final predicates:  {}", trace.final_predicates.len());
+        if !trace.warnings.is_empty() {
+            println!("  warnings:");
+            for w in &trace.warnings {
+                println!("    - {}", w.message);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn btor2_discover(args: Btor2DiscoverArgs) -> Result<(), String> {
