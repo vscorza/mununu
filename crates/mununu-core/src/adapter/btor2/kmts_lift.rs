@@ -661,6 +661,136 @@ impl KmtsLiftLazy for LazyLift {
     }
 }
 
+/// R.5 lazy KMTS sub-item 2.4 (2026-06-04) — materialize a
+/// fully-formed `PredicateCubeLiftResult` from a `LazyLift` by
+/// visiting every cube in 0..cube_count and emitting one
+/// `Transition::MayOnly` per `LazyExpansionEdge`. Identity result
+/// with `predicate_cube_lift` (sub-item 2.3's
+/// `r5_subitem_23_lazy_lift_edges_match_eager_lift` test
+/// asserts the per-cube edge sets agree).
+///
+/// **Purpose**: bridge for the CEGAR loop's `LiftStrategy::Lazy`
+/// path (sub-item 2.4) — until the evaluator gains lazy-handle
+/// support, the loop still needs a full `Clts` to call
+/// `evaluate_3v_game_with_options`. This helper visits every
+/// cube (defeating the laziness payoff for the CEGAR run) but
+/// exercises the `LazyLift` machinery end-to-end, surfacing
+/// any drift between the lazy + eager per-cube paths as a
+/// verdict-equality test failure.
+///
+/// **Memory caveat**: visiting every cube populates the
+/// `LazyLift`'s cache fully (cached_count() == cube_count()
+/// after this call). The lazy memory savings only fire when
+/// the caller visits a strict subset of cubes — which is what
+/// sub-item 2.5's bench fixture will exercise standalone (not
+/// via the CEGAR loop).
+pub fn materialize_clts_from_lazy(
+    lazy: &mut LazyLift,
+    btor2_source_info_format: SourceFormat,
+) -> Result<PredicateCubeLiftResult, AdapterError> {
+    use crate::adapter::AdapterErrorKind;
+    use crate::clts::TransitionModality;
+
+    let start = Instant::now();
+    let cube_count = lazy.cube_count();
+    let predicates = lazy.predicates().to_vec();
+
+    // Build the Clts shape. Mirrors `predicate_cube_lift`'s
+    // builder pattern (lines ~563–594 in this file).
+    let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+    let mut state_ids = Vec::with_capacity(cube_count);
+    for i in 0..cube_count {
+        let name = format!("cube_{i}");
+        let id = builder
+            .state_id_or_insert(&name)
+            .ok_or_else(|| AdapterError {
+                kind: AdapterErrorKind::StateSpaceOverflow,
+                location: None,
+                message: format!(
+                    "adapter/btor2/materialize_clts_from_lazy: state id overflow at cube {i} / {cube_count}"
+                ),
+            })?;
+        state_ids.push(id);
+    }
+    if let Some(initial) = state_ids.first() {
+        builder.initial_state_id(*initial);
+    }
+
+    // Populate state_3valued_predicates per cube (same bit-pattern
+    // convention as predicate_cube_lift line ~587).
+    for (i, &state_id) in state_ids.iter().enumerate() {
+        for (bit, pred) in predicates.iter().enumerate() {
+            let verdict = if (i >> bit) & 1 == 1 {
+                Tristate::KleeneT
+            } else {
+                Tristate::KleeneF
+            };
+            builder.with_3valued_predicate(state_id, &pred.name, verdict);
+        }
+    }
+
+    // Intern the label store with the "step" label once, then
+    // visit every cube + emit a MayOnly edge per
+    // LazyExpansionEdge. The lazy helper dedupes target cubes
+    // per source so we don't emit duplicate edges.
+    let label_id = builder
+        .labels()
+        .intern(["step"])
+        .map_err(|e| AdapterError {
+            kind: AdapterErrorKind::IrConsistencyError,
+            location: None,
+            message: format!("adapter/btor2/materialize_clts_from_lazy: label intern failed: {e}"),
+        })?;
+    for i in 0..cube_count {
+        let src_id = state_ids[i];
+        for edge in lazy.expand_cube(i) {
+            if edge.target_cube < state_ids.len() {
+                let tgt_id = state_ids[edge.target_cube];
+                builder.transition_ids_with_modality(
+                    src_id,
+                    &[label_id],
+                    tgt_id,
+                    TransitionModality::MayOnly,
+                );
+            }
+        }
+    }
+
+    let clts = builder.build().map_err(|e| AdapterError {
+        kind: AdapterErrorKind::IrConsistencyError,
+        location: None,
+        message: format!("adapter/btor2/materialize_clts_from_lazy: builder.build failed: {e}"),
+    })?;
+
+    Ok(PredicateCubeLiftResult {
+        clts,
+        predicates,
+        cube_count,
+        source_info: SourceInfo {
+            format: btor2_source_info_format,
+            title: None,
+            // Approximated; the precise `signal_count`
+            // requires re-parsing the BTOR2 which we've
+            // already done inside LazyLift. For sub-item 2.4
+            // MVP, surface 0 (the caller doesn't use this
+            // field for the Lazy path's CEGAR verdict).
+            signal_count: 0,
+            state_count: cube_count,
+            property_count: 0,
+        },
+        lift_time: start.elapsed(),
+        // Same caveat as predicate_cube_lift — may-edges are
+        // populated but must-edges are not.
+        predicate_image_pending: false,
+        // Warnings are surfaced by predicate_cube_lift's UF-
+        // wrap path; the lazy path doesn't have its own UF
+        // warning channel yet, so this is empty. Sub-item 2.4
+        // follow-up can plumb the warning through LazyLift if
+        // a real fixture demonstrates the gap.
+        warnings: Vec::new(),
+    })
+}
+
 /// R.5 lazy KMTS sub-item 2.3 (2026-06-04) — compute one cube's
 /// outgoing may-edges. Currently a DUPLICATE of the per-cube
 /// body in `predicate_cube_lift` (lines ~741–841); a 2.3

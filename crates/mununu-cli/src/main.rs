@@ -1581,7 +1581,9 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
 fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     use mununu_core::adapter::AdapterOptions;
     use mununu_core::adapter::btor2::PredicateSpec;
-    use mununu_core::adapter::btor2::cegar::{CegarOptions, PredicateSource, cegar_refine_loop};
+    use mununu_core::adapter::btor2::cegar::{
+        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
+    };
     use mununu_core::mu_calculus::{Environment, parser as mu_parser};
 
     if !args.file.exists() {
@@ -1649,6 +1651,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         capture_approximants: false,
         enable_approximant_reuse: false,
         smart_uf_cap: true,
+        lift_strategy: LiftStrategy::Eager,
     };
 
     let trace = cegar_refine_loop(

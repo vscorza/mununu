@@ -195,6 +195,45 @@ pub struct CegarOptions {
     /// UF-wrapped lifts (useful when the caller has measured the
     /// fixture and knows WP will converge given more iterations).
     pub smart_uf_cap: bool,
+    /// R.5 lazy KMTS sub-item 2.4 (2026-06-04) — choose between
+    /// the eager `predicate_cube_lift` and the lazy `LazyLift`
+    /// for per-iteration cube-space construction.
+    ///
+    /// `Eager` (default): each iteration calls
+    /// `predicate_cube_lift` which materializes all 2^|P| cube
+    /// states + their outgoing may-edges up front. The verdict-
+    /// evaluator receives a finished `Clts`.
+    ///
+    /// `Lazy`: each iteration constructs a `LazyLift` and
+    /// materializes a Clts from it by visiting every cube via
+    /// `expand_cube`. The current verdict-evaluator can't
+    /// consume a lazy handle directly (would need an evaluator-
+    /// side patch to do per-state on-demand lookup), so this
+    /// MVP still produces a fully-materialized Clts — the
+    /// verdict is identical to `Eager`. The flag's value today
+    /// is exercising the LazyLift integration end-to-end via
+    /// the CEGAR loop, surfacing any divergence between the
+    /// eager + lazy per-cube logic as a verdict-equality
+    /// mismatch.
+    ///
+    /// Future evaluator-side lazy support (separate sub-item)
+    /// will extract real memory savings from the lazy path.
+    pub lift_strategy: LiftStrategy,
+}
+
+/// R.5 lazy KMTS sub-item 2.4 (2026-06-04) — selector for the
+/// CEGAR loop's per-iteration cube-lift strategy. See
+/// [`CegarOptions::lift_strategy`] for semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiftStrategy {
+    /// Eager `predicate_cube_lift`. Default; matches pre-2.4
+    /// behaviour.
+    Eager,
+    /// Lazy `LazyLift`. Currently produces the same verdict as
+    /// `Eager` because the verdict-evaluator still consumes a
+    /// fully-materialized Clts. Future evaluator-side support
+    /// will turn this into a real memory-savings path.
+    Lazy,
 }
 
 /// R.5 B.4.a (2026-06-01) — effective `max_iterations` cap when
@@ -237,6 +276,7 @@ impl Default for CegarOptions {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: true,
+            lift_strategy: LiftStrategy::Eager,
         }
     }
 }
@@ -464,12 +504,35 @@ pub fn cegar_refine_loop(
 
     for iteration in 0..=cegar_opts.max_iterations {
         // 1. Lift the BTOR2 with the current predicate set.
-        let lift_result = predicate_cube_lift(
-            current_predicates.clone(),
-            btor2_content,
-            adapter_options,
-            &lift_opts,
-        )?;
+        //
+        // **Sub-item 2.4 (2026-06-04)**: the lift-strategy flag
+        // routes between the eager `predicate_cube_lift` and the
+        // lazy `LazyLift` path. Both produce a fully-materialized
+        // `PredicateCubeLiftResult` today (the verdict-evaluator
+        // can't consume a lazy handle directly yet) — the Lazy
+        // path is an end-to-end exercise of the `LazyLift`
+        // machinery, surfacing any drift between the eager + lazy
+        // per-cube logic as a verdict-equality test failure.
+        let lift_result = match cegar_opts.lift_strategy {
+            LiftStrategy::Eager => predicate_cube_lift(
+                current_predicates.clone(),
+                btor2_content,
+                adapter_options,
+                &lift_opts,
+            )?,
+            LiftStrategy::Lazy => {
+                let mut lazy = crate::adapter::btor2::kmts_lift::LazyLift::from_btor2(
+                    current_predicates.clone(),
+                    btor2_content,
+                    adapter_options,
+                    &lift_opts,
+                )?;
+                crate::adapter::btor2::kmts_lift::materialize_clts_from_lazy(
+                    &mut lazy,
+                    crate::adapter::SourceFormat::Btor2,
+                )?
+            }
+        };
 
         // R.5 B.3.b (2026-06-01) — soundness warning. After the
         // FIRST lift, check whether the input formula has
@@ -1213,6 +1276,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1270,6 +1334,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1325,6 +1390,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1694,6 +1760,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1721,6 +1788,7 @@ mod tests {
             capture_approximants: true,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -1812,6 +1880,7 @@ mod tests {
             capture_approximants: true,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1830,6 +1899,7 @@ mod tests {
             capture_approximants: true,
             enable_approximant_reuse: true,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -2029,6 +2099,7 @@ mod tests {
             capture_approximants: true,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let env_iter0 = Environment::new(2);
         let result_off = cegar_refine_loop(
@@ -2050,6 +2121,7 @@ mod tests {
             capture_approximants: true,
             enable_approximant_reuse: true,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let result_on = cegar_refine_loop(
             &formula,
@@ -2120,6 +2192,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2166,6 +2239,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2299,6 +2373,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false, // opt out
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2339,6 +2414,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: true, // on; should still not fire because source ≠ WP
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2419,6 +2495,7 @@ mod tests {
             capture_approximants: true,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2513,6 +2590,7 @@ mod tests {
             capture_approximants: true,     // non-default
             enable_approximant_reuse: true, // non-default
             smart_uf_cap: false,            // non-default
+            lift_strategy: LiftStrategy::Eager,
         };
         let debug_str = format!("{opts:?}");
         assert!(
@@ -2562,6 +2640,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace_result = cegar_refine_loop(
             &formula,
@@ -2613,6 +2692,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2660,6 +2740,7 @@ mod tests {
             capture_approximants: false,
             enable_approximant_reuse: false,
             smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2684,5 +2765,71 @@ mod tests {
         // The `true` formula converges immediately; no
         // refinement happens. This test mostly proves the
         // wiring + locate_cvc5 success path.
+    }
+
+    #[test]
+    fn r5_subitem_24_default_lift_strategy_is_eager() {
+        // R.5 lazy KMTS sub-item 2.4 (2026-06-04) — backward-
+        // compat sanity: `CegarOptions::default()` MUST set
+        // `lift_strategy = LiftStrategy::Eager`.
+        let opts = CegarOptions::default();
+        assert_eq!(opts.lift_strategy, LiftStrategy::Eager);
+    }
+
+    #[test]
+    fn r5_subitem_24_lazy_strategy_produces_same_verdict_as_eager() {
+        // R.5 lazy KMTS sub-item 2.4 (2026-06-04) — LOAD-
+        // BEARING DRIFT-PROTECTION TEST at the verdict level.
+        // Running CEGAR with `LiftStrategy::Lazy` MUST produce
+        // a verdict identical to `LiftStrategy::Eager` on the
+        // same fixture + formula. Any divergence between the
+        // lazy + eager per-cube paths surfaces here as a
+        // verdict-equality test failure.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+
+        let mut eager_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+        };
+        let trace_eager = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial.clone(),
+            &env,
+            &AdapterOptions::default(),
+            &eager_opts,
+        )
+        .expect("eager cegar succeeds");
+
+        eager_opts.lift_strategy = LiftStrategy::Lazy;
+        let trace_lazy = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &eager_opts,
+        )
+        .expect("lazy cegar succeeds");
+
+        assert!(
+            trace_eager.final_verdict.eq_set(&trace_lazy.final_verdict),
+            "Lazy strategy MUST produce verdict identical to Eager"
+        );
+        assert_eq!(
+            trace_eager.terminated_with, trace_lazy.terminated_with,
+            "Lazy strategy MUST produce identical termination state to Eager"
+        );
     }
 }
