@@ -30,8 +30,9 @@ pub use cegar::{
     CegarIteration, CegarOptions, CegarTermination, CegarTrace, PredicateSource, cegar_refine_loop,
 };
 pub use kmts_lift::{
-    KmtsLiftOptions, KmtsLiftResult, LiftedPredicate, PredicateCubeLiftOptions,
-    PredicateCubeLiftResult, PredicateSpec, lift_btor2_to_kmts, predicate_cube_lift,
+    EagerLazyLift, KmtsLiftLazy, KmtsLiftOptions, KmtsLiftResult, LazyExpansionEdge, LazyLift,
+    LiftedPredicate, NullLazyLift, PredicateCubeLiftOptions, PredicateCubeLiftResult,
+    PredicateSpec, lift_btor2_to_kmts, materialize_clts_from_lazy, predicate_cube_lift,
 };
 
 use super::{AdapterError, AdapterOptions, AdapterOutput, FormatAdapter};
