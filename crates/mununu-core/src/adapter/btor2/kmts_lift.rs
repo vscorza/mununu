@@ -410,6 +410,101 @@ impl KmtsLiftLazy for NullLazyLift {
     }
 }
 
+/// R.5 lazy KMTS sub-item 2.2 (2026-06-04) — eager wrapper that
+/// satisfies [`KmtsLiftLazy`] by holding a fully-materialized
+/// [`PredicateCubeLiftResult`]. All cube + edge work happens at
+/// handle construction (via the eager [`predicate_cube_lift`]);
+/// [`KmtsLiftLazy::expand_cube`] just walks the pre-computed
+/// `Clts::outgoing` for the requested cube.
+///
+/// **Purpose**: drop-in adapter for callers wanting the lazy API
+/// without the lazy performance characteristics yet. Sub-item
+/// 2.3 ships the truly-lazy implementation; until then, this
+/// wrapper lets the CEGAR loop's R.5 follow-up (sub-item 2.4)
+/// migrate to the trait surface incrementally.
+///
+/// **Memory**: O(2^|P|) cubes × per-cube outgoing transitions —
+/// exactly the eager lift's footprint. The lazy savings come
+/// from sub-item 2.3.
+#[derive(Debug, Clone)]
+pub struct EagerLazyLift {
+    result: PredicateCubeLiftResult,
+}
+
+impl EagerLazyLift {
+    /// Wrap a pre-computed `PredicateCubeLiftResult`. Use when
+    /// the caller has already invoked `predicate_cube_lift` (e.g.
+    /// the CEGAR loop's iteration 0).
+    pub fn from_result(result: PredicateCubeLiftResult) -> Self {
+        Self { result }
+    }
+
+    /// Construct an `EagerLazyLift` directly from a BTOR2 source.
+    /// Invokes `predicate_cube_lift` internally; propagates any
+    /// adapter errors.
+    pub fn from_btor2(
+        predicates: Vec<PredicateSpec>,
+        btor2_content: &str,
+        adapter_options: &crate::adapter::AdapterOptions,
+        lift_opts: &PredicateCubeLiftOptions,
+    ) -> Result<Self, crate::adapter::AdapterError> {
+        let result = predicate_cube_lift(predicates, btor2_content, adapter_options, lift_opts)?;
+        Ok(Self::from_result(result))
+    }
+
+    /// Access the underlying lift result (Clts + metadata).
+    /// Useful when consumers need both the lazy-trait shape AND
+    /// the result's auxiliary fields (warnings, lift_time, etc.).
+    pub fn result(&self) -> &PredicateCubeLiftResult {
+        &self.result
+    }
+}
+
+impl KmtsLiftLazy for EagerLazyLift {
+    fn cube_count(&self) -> usize {
+        self.result.cube_count
+    }
+
+    fn expand_cube(&mut self, cube_index: usize) -> Vec<LazyExpansionEdge> {
+        // Out-of-range: per the trait contract, return empty
+        // rather than panicking.
+        if cube_index >= self.cube_count() {
+            return Vec::new();
+        }
+        use crate::clts::StateId;
+        let Some(src) = StateId::<DefaultStateIdx>::from_index(cube_index) else {
+            return Vec::new();
+        };
+        self.result
+            .clts
+            .outgoing(src)
+            .iter()
+            .map(|t| {
+                // Resolve each label-id to its first symbol via
+                // `Clts::label_payload`. The R.2.5 lifter emits
+                // single-symbol single-label transitions
+                // (`["step"]`); future multi-symbol cases would
+                // need a stable join convention here.
+                let label_name = t
+                    .labels()
+                    .first()
+                    .and_then(|lid| self.result.clts.label_payload(*lid))
+                    .and_then(|symbols| symbols.first())
+                    .cloned()
+                    .unwrap_or_else(|| "?unknown_label".to_string());
+                LazyExpansionEdge {
+                    label: label_name,
+                    target_cube: t.target().index(),
+                }
+            })
+            .collect()
+    }
+
+    fn predicates(&self) -> &[PredicateSpec] {
+        &self.result.predicates
+    }
+}
+
 /// R.2.5 — Result of lifting one BTOR2 source through the predicate-
 /// cube path. Carries a `Clts` whose state count is bounded by 2^|P|
 /// (NOT 2^|Registers|), plus the predicate set and timing
@@ -1683,5 +1778,130 @@ mod tests {
         };
         assert_eq!(a, b, "edges with identical fields must be equal");
         assert_ne!(a, c, "edges with different target_cube must differ");
+    }
+
+    // R.5 lazy KMTS sub-item 2.2 tests (2026-06-04) — eager
+    // wrapper backed by predicate_cube_lift. The wrapper must
+    // be a strict drop-in for the lazy trait: cube_count +
+    // expand_cube produce results identical to walking the
+    // underlying Clts directly.
+
+    #[test]
+    fn r5_subitem_22_eager_wrapper_cube_count_matches_lift() {
+        // 1 predicate ⇒ 2 cubes. The wrapper's cube_count MUST
+        // equal the lift's cube_count.
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let wrapper =
+            EagerLazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+                .expect("lift succeeds");
+        assert_eq!(wrapper.cube_count(), 2);
+        // The trait-level cube_count MUST equal the
+        // result-level cube_count.
+        assert_eq!(wrapper.cube_count(), wrapper.result().cube_count);
+    }
+
+    #[test]
+    fn r5_subitem_22_eager_wrapper_expand_cube_matches_clts_outgoing() {
+        // For every cube index in range, the wrapper's
+        // expand_cube() output MUST be derivable from the
+        // underlying Clts's outgoing transitions (one
+        // LazyExpansionEdge per transition).
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let mut wrapper =
+            EagerLazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+                .expect("lift succeeds");
+        use crate::clts::StateId;
+        for cube in 0..wrapper.cube_count() {
+            let edges = wrapper.expand_cube(cube);
+            // Count outgoing transitions directly from the Clts
+            // for this cube — must match the wrapper's edge
+            // count.
+            let src_id = StateId::<DefaultStateIdx>::from_index(cube).expect("valid cube");
+            let direct_count = wrapper.result().clts.outgoing(src_id).len();
+            assert_eq!(
+                edges.len(),
+                direct_count,
+                "expand_cube({cube}) edge count must match Clts::outgoing count"
+            );
+        }
+    }
+
+    #[test]
+    fn r5_subitem_22_eager_wrapper_expand_cube_out_of_range_returns_empty() {
+        // Out-of-range cube_index ⇒ empty Vec, no panic. The
+        // trait contract.
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let mut wrapper =
+            EagerLazyLift::from_btor2(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+                .expect("lift succeeds");
+        let oob = wrapper.cube_count() + 100;
+        let edges = wrapper.expand_cube(oob);
+        assert!(
+            edges.is_empty(),
+            "expand_cube({oob}) on out-of-range must return empty"
+        );
+    }
+
+    #[test]
+    fn r5_subitem_22_eager_wrapper_predicates_round_trip() {
+        // The wrapper's predicates() MUST return the same set
+        // the lift was given.
+        let preds = vec![
+            PredicateSpec {
+                name: "p0".to_string(),
+                register: "reg_a".to_string(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "p1".to_string(),
+                register: "reg_b".to_string(),
+                value: 0,
+            },
+        ];
+        let opts = PredicateCubeLiftOptions::default();
+        let wrapper = EagerLazyLift::from_btor2(
+            preds.clone(),
+            SMALL_BTOR2,
+            &AdapterOptions::default(),
+            &opts,
+        )
+        .expect("lift succeeds");
+        assert_eq!(
+            wrapper.predicates(),
+            preds.as_slice(),
+            "predicates() must round-trip the lift input"
+        );
+    }
+
+    #[test]
+    fn r5_subitem_22_eager_wrapper_from_result_constructor_works() {
+        // The alternative `from_result` constructor must accept
+        // an already-computed PredicateCubeLiftResult.
+        let preds = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "reg_a".to_string(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions::default();
+        let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("lift succeeds");
+        let cube_count = result.cube_count;
+        let wrapper = EagerLazyLift::from_result(result);
+        assert_eq!(wrapper.cube_count(), cube_count);
     }
 }
