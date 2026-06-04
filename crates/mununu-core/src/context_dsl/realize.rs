@@ -811,6 +811,7 @@ fn resolve_enum_variants(automaton: &Automaton, registry: &EnumRegistry) -> Auto
                     expr: resolve_expr(&a.expr, registry),
                 })
                 .collect(),
+            modality: t.modality,
         })
         .collect();
 
@@ -1094,6 +1095,7 @@ fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Auto
                     expr: subst_expr(&a.expr, param_name, value),
                 })
                 .collect(),
+            modality: t.modality,
         })
         .collect();
 
@@ -2472,6 +2474,7 @@ fn expand_state_selectors(automaton: &Automaton) -> Result<Automaton, Realizatio
                     additional_labels: transition.additional_labels.clone(),
                     guard: transition.guard.clone(),
                     effects: transition.effects.clone(),
+                    modality: transition.modality,
                 });
             }
         }

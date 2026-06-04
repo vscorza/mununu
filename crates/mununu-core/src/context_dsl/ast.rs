@@ -164,6 +164,42 @@ pub enum StateIndexSpec {
     Expr(Expr),
 }
 
+/// R.5 Item K sub-item K.1 (2026-06-04) — CTXDSL-level modality
+/// annotation on a transition declaration. Maps to
+/// [`crate::clts::TransitionModality`] at the realize step (K.2).
+///
+/// Syntax: `transition s -> t on label a [<modality>];` where
+/// `<modality>` is one of `may`, `must`, or `sharp`. The
+/// attribute is OPTIONAL — transitions without it default to
+/// `Sharp`, matching the pre-K.1 grammar exactly (backward
+/// compatibility for every existing CTXDSL fixture).
+///
+/// **K.1 MVP scope.** Each modality variant maps to a single-
+/// target transition. The `Must` variant maps to
+/// [`crate::clts::TransitionModality::MustHyperOnly`] with a
+/// singleton target at the realize step. A K.1 follow-up
+/// (likely K.1b) will add multi-target hyper-must syntax
+/// (`transition s -> [t1, t2, t3] on a [must];`) for true GKMTS
+/// hyper-must edges.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionModalitySpec {
+    /// Default; matches pre-K.1 grammar. Realizes to
+    /// `TransitionModality::Sharp`.
+    #[default]
+    Sharp,
+    /// `[may]` attribute. Realizes to
+    /// `TransitionModality::MayOnly`. Used by KMTS-aware
+    /// adapters (or hand-authored CTXDSL) to express "this
+    /// transition is in the over-approximation but not the
+    /// under-approximation."
+    MayOnly,
+    /// `[must]` attribute. Realizes to
+    /// `TransitionModality::MustHyperOnly` with a singleton
+    /// target set. The multi-target hyper-must syntax is a K.1
+    /// follow-up.
+    MustOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransitionDecl {
     pub source: StateSelector,
@@ -172,6 +208,11 @@ pub struct TransitionDecl {
     pub additional_labels: Vec<TransitionLabel>,
     pub guard: Option<Expr>,
     pub effects: Vec<Assignment>,
+    /// R.5 Item K sub-item K.1 (2026-06-04) — modality
+    /// attribute. Defaults to `Sharp` when the source CTXDSL
+    /// omits the `[may]` / `[must]` / `[sharp]` attribute on
+    /// the transition, preserving pre-K.1 behaviour.
+    pub modality: TransitionModalitySpec,
 }
 
 #[derive(Debug, Clone)]

@@ -820,6 +820,13 @@ impl<'a> Parser<'a> {
             self.expect_symbol(Symbol::RBrace)?;
         }
 
+        // R.5 Item K sub-item K.1 (2026-06-04) — optional
+        // `[may]` / `[must]` / `[sharp]` modality attribute.
+        // Defaults to Sharp when absent. The attribute is
+        // accepted at the trailing position (after effects,
+        // before semicolon) to minimise grammar disruption.
+        let modality = self.parse_optional_transition_modality()?;
+
         self.expect_symbol(Symbol::Semicolon)?;
 
         Ok(TransitionDecl {
@@ -829,7 +836,38 @@ impl<'a> Parser<'a> {
             additional_labels,
             guard,
             effects,
+            modality,
         })
+    }
+
+    /// R.5 Item K sub-item K.1 (2026-06-04) — parse the
+    /// optional modality attribute `[may]` / `[must]` /
+    /// `[sharp]` on a transition declaration.
+    ///
+    /// Returns `TransitionModalitySpec::Sharp` when no
+    /// attribute is present (the default; matches pre-K.1
+    /// grammar). Errors on an unknown attribute name with a
+    /// diagnostic listing the accepted values.
+    fn parse_optional_transition_modality(
+        &mut self,
+    ) -> Result<crate::context_dsl::ast::TransitionModalitySpec, ParseError> {
+        use crate::context_dsl::ast::TransitionModalitySpec;
+        if !self.match_symbol(Symbol::LBracket) {
+            return Ok(TransitionModalitySpec::Sharp);
+        }
+        let span = self.peek().span;
+        let modality_text = self.expect_ident()?;
+        self.expect_symbol(Symbol::RBracket)?;
+        match modality_text.name.as_str() {
+            "may" => Ok(TransitionModalitySpec::MayOnly),
+            "must" => Ok(TransitionModalitySpec::MustOnly),
+            "sharp" => Ok(TransitionModalitySpec::Sharp),
+            other => Err(ParseError::UnexpectedToken {
+                found: crate::context_dsl::token::TokenKind::Identifier(other.to_string()),
+                expected: "`may`, `must`, or `sharp` modality attribute",
+                span,
+            }),
+        }
     }
 
     fn parse_state_selector(&mut self, allow_group: bool) -> Result<StateSelector, ParseError> {
@@ -2072,5 +2110,133 @@ context comp_order {
             vec!["A", "B", "C"],
             "members should be canonicalised"
         );
+    }
+
+    // R.5 Item K sub-item K.1 (2026-06-04) — CTXDSL parser
+    // + AST surface for `[may]` / `[must]` / `[sharp]` modality
+    // attributes on transitions.
+
+    use crate::context_dsl::ast::TransitionModalitySpec;
+
+    fn first_transition(src: &str) -> super::TransitionDecl {
+        let doc = parse_ok(src);
+        doc.automata
+            .first()
+            .expect("at least one automaton")
+            .transitions
+            .first()
+            .cloned()
+            .expect("at least one transition")
+    }
+
+    #[test]
+    fn r5_subitem_k1_transition_without_modality_defaults_to_sharp() {
+        // Backward-compat sanity: pre-K.1 grammar (no attribute)
+        // parses with `modality = Sharp`.
+        let src = r"
+context k1_default {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, TransitionModalitySpec::Sharp);
+    }
+
+    #[test]
+    fn r5_subitem_k1_transition_parses_may_attribute() {
+        let src = r"
+context k1_may {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon [may]; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, TransitionModalitySpec::MayOnly);
+    }
+
+    #[test]
+    fn r5_subitem_k1_transition_parses_must_attribute() {
+        let src = r"
+context k1_must {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon [must]; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, TransitionModalitySpec::MustOnly);
+    }
+
+    #[test]
+    fn r5_subitem_k1_transition_parses_explicit_sharp_attribute() {
+        // `[sharp]` parses but is equivalent to no-attribute
+        // default. Useful when the author wants to be explicit.
+        let src = r"
+context k1_sharp {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon [sharp]; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, TransitionModalitySpec::Sharp);
+    }
+
+    #[test]
+    fn r5_subitem_k1_transition_rejects_unknown_modality_attribute() {
+        let src = r"
+context k1_bogus {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon [bogus]; }
+        }
+    }
+}
+";
+        let err = parse(src).expect_err("unknown attribute must error");
+        match err {
+            ParseError::UnexpectedToken { expected, .. } => {
+                assert!(
+                    expected.contains("may") && expected.contains("must"),
+                    "diagnostic must name valid attributes; got: {expected}"
+                );
+            }
+            other => panic!("unexpected error kind: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn r5_subitem_k1_modality_attribute_after_effects_block() {
+        // The attribute is accepted at the trailing position
+        // (after `effects { ... }`). Verifies grammar position
+        // doesn't conflict with effects parsing.
+        let src = r"
+context k1_post_effects {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon effects { } [may]; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, TransitionModalitySpec::MayOnly);
     }
 }

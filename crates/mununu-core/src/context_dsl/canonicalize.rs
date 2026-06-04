@@ -339,6 +339,8 @@ mod tests {
                             span: Span::new(0, 0, 0, 0),
                         },
                     }],
+
+                    modality: TransitionModalitySpec::Sharp,
                 },
                 TransitionDecl {
                     source: StateSelector::Named(StateRef::Simple(ident("A"))),
@@ -356,6 +358,8 @@ mod tests {
                             span: Span::new(0, 0, 0, 0),
                         },
                     }],
+
+                    modality: TransitionModalitySpec::Sharp,
                 },
             ],
             predicates: Vec::new(),
@@ -560,6 +564,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -588,6 +594,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -626,6 +634,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -702,6 +712,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         auto.transitions.push(TransitionDecl {
@@ -717,6 +729,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         // Verify initial order (alpha[10] before alpha[5])
@@ -763,6 +777,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -798,6 +814,8 @@ mod tests {
             ],
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -879,6 +897,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         auto.transitions.push(TransitionDecl {
@@ -900,6 +920,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         // Verify initial order (alpha[arr[10]] before alpha[arr[5]])
@@ -966,6 +988,8 @@ mod tests {
                 span: Span::new(0, 0, 0, 0),
             }),
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -1003,6 +1027,8 @@ mod tests {
                 span: Span::new(0, 0, 0, 0),
             }),
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         canonicalize_automaton(&mut auto);
@@ -1093,6 +1119,8 @@ mod tests {
                     span: Span::new(0, 0, 0, 0),
                 }),
                 effects: Vec::new(),
+
+                modality: TransitionModalitySpec::Sharp,
             });
         }
 
@@ -1166,6 +1194,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         auto.transitions.push(TransitionDecl {
@@ -1184,6 +1214,8 @@ mod tests {
             additional_labels: Vec::new(),
             guard: None,
             effects: Vec::new(),
+
+            modality: TransitionModalitySpec::Sharp,
         });
 
         // Verify initial order (alpha[(10)] before alpha[(5)])
@@ -1391,6 +1423,8 @@ mod tests {
                     },
                 },
             ],
+
+            modality: TransitionModalitySpec::Sharp,
         };
         auto.transitions.push(test_transition);
 
