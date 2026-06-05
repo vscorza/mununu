@@ -9,6 +9,7 @@ use crate::abstraction::unrolling::{
 };
 use crate::clts::{
     Clts, CltsBuilder, CltsError, DefaultLabelIdx, DefaultStateIdx, LabelControllability, LabelId,
+    TransitionModality,
 };
 use crate::composition::{CompositionOptions, CompositionSemantics};
 use crate::context::{Context, ContextBuilder, ContextError};
@@ -19,7 +20,7 @@ use bitvec::prelude::{BitVec, Lsb0};
 use super::ast::{
     AlphabetEntry, Automaton, CompositionKind, ContextDoc, Expr, ExprKind, FormulaExpr,
     FormulaTargets, Meta, PredicateDecl, PredicateTarget, StateDecl, StateRef, StateSelector,
-    TransitionDecl, TransitionLabel, UnaryOp,
+    TransitionDecl, TransitionLabel, TransitionModalitySpec, UnaryOp,
 };
 use super::runtime::ResolvedControllerOptions;
 use super::state_matching::StateNameMatcher;
@@ -2672,8 +2673,29 @@ fn build_automaton(
             );
             builder.set_label_controllability(*label_id, controllability);
         }
+        // R.5 Item K sub-item K.2 (2026-06-05) — thread the CTXDSL
+        // `[may]` / `[must]` / `[sharp]` modality attribute into the CLTS
+        // `TransitionModality`. Pre-K.2 callers (and every existing
+        // fixture without a modality attribute) carry
+        // `TransitionModalitySpec::Sharp` from K.1's default and realize
+        // to `TransitionModality::Sharp` here, preserving behaviour
+        // byte-for-byte. `[must]` realizes to a singleton hyper-must
+        // (target = {to_id}); multi-target hyper-must syntax is queued
+        // as K.1b.
         // All transitions are always enabled after unrolling (guards resolved at build time)
-        builder.transition(source, &label_ids, target);
+        if let (Some(from_id), Some(to_id)) = (
+            builder.state_id_or_insert(source),
+            builder.state_id_or_insert(target),
+        ) {
+            let modality = match transition.modality {
+                TransitionModalitySpec::Sharp => TransitionModality::Sharp,
+                TransitionModalitySpec::MayOnly => TransitionModality::MayOnly,
+                TransitionModalitySpec::MustOnly => {
+                    TransitionModality::must_hyper(smallvec::smallvec![to_id])
+                }
+            };
+            builder.transition_ids_with_modality(from_id, &label_ids, to_id, modality);
+        }
         Ok::<(), RealizationError>(())
     })?;
 
@@ -2932,6 +2954,16 @@ fn build_clts_from_unrolled(
         );
         builder.set_label_controllability(label_id, controllability);
 
+        // R.5 Item K sub-item K.2 (2026-06-05) — SOUNDNESS: the
+        // unrolled-path (parametric automata with `var`-driven guards)
+        // currently strips the `TransitionDecl::modality` attribute on
+        // the AST → `OriginalTransition` conversion at
+        // `convert_transitions_for_unrolling`, so transitions here
+        // default to `TransitionModality::Sharp`. Hand-authored
+        // parametric automata declaring `[may]` / `[must]` realize as
+        // `Sharp` until K.2b threads modality through
+        // `OriginalTransition` / `UnrolledTransition`. The K.1 default
+        // (`Sharp`) keeps every existing parametric fixture unchanged.
         // Add transition without guard (all transitions in unrolled CLTS are always enabled)
         builder.transition(&from_name, &[label_id], &to_name);
     }
@@ -4075,5 +4107,176 @@ context test_structural {
                 clts.state_name(state_id).unwrap_or("unknown")
             );
         }
+    }
+
+    /// R.5 Item K sub-item K.2 — every transition without a modality
+    /// attribute realizes to `TransitionModality::Sharp`, preserving
+    /// pre-K.1 behaviour byte-for-byte.
+    ///
+    /// Tests use the bare-`on epsilon` form rather than
+    /// `on label <name> [<modality>]` because of a parser ambiguity:
+    /// after `label <name>` the parser eagerly consumes `[…]` as an
+    /// indexed-label expression (`name[index]`), which then bypasses
+    /// the modality-attribute slot at the trailing position. The
+    /// epsilon form sidesteps the ambiguity. Resolving the
+    /// labelled-form ambiguity is queued as K.1c (likely: peek ahead
+    /// past `[…]` to disambiguate index-expression from modality-
+    /// attribute, or require modality attributes only at the trailing
+    /// position after a wrapping `effects { }` block).
+    #[test]
+    fn r5_subitem_k2_default_transition_realizes_to_sharp() {
+        let doc = parse(
+            r#"
+context default_modality {
+    automata {
+        automaton M {
+            states { state s0 initial; state s1; }
+            transitions {
+                transition s0 -> s1 on epsilon;
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        let s0 = clts
+            .initial_states()
+            .iter()
+            .copied()
+            .next()
+            .expect("initial state exists");
+        let outgoing = clts.outgoing(s0);
+        assert_eq!(outgoing.len(), 1, "exactly one outgoing transition");
+        assert!(
+            matches!(outgoing[0].modality(), TransitionModality::Sharp),
+            "default transition realizes to Sharp, got {:?}",
+            outgoing[0].modality()
+        );
+    }
+
+    /// R.5 Item K sub-item K.2 — the CTXDSL `[may]` attribute realizes
+    /// to `TransitionModality::MayOnly` on the resulting CLTS edge.
+    #[test]
+    fn r5_subitem_k2_may_attribute_realizes_to_may_only() {
+        let doc = parse(
+            r#"
+context may_only_modality {
+    automata {
+        automaton M {
+            states { state s0 initial; state s1; }
+            transitions {
+                transition s0 -> s1 on epsilon [may];
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        let s0 = clts
+            .initial_states()
+            .iter()
+            .copied()
+            .next()
+            .expect("initial state exists");
+        let outgoing = clts.outgoing(s0);
+        assert_eq!(outgoing.len(), 1, "exactly one outgoing transition");
+        assert!(
+            matches!(outgoing[0].modality(), TransitionModality::MayOnly),
+            "[may] realizes to MayOnly, got {:?}",
+            outgoing[0].modality()
+        );
+    }
+
+    /// R.5 Item K sub-item K.2 — the CTXDSL `[must]` attribute realizes
+    /// to a singleton-hyper-target `TransitionModality::MustHyperOnly`.
+    /// Multi-target hyper-must syntax (`s -> [t1, t2] on a [must];`)
+    /// is queued as the K.1b follow-up.
+    #[test]
+    fn r5_subitem_k2_must_attribute_realizes_to_singleton_hyper_must() {
+        let doc = parse(
+            r#"
+context must_only_modality {
+    automata {
+        automaton M {
+            states { state s0 initial; state s1; }
+            transitions {
+                transition s0 -> s1 on epsilon [must];
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        let s0 = clts
+            .initial_states()
+            .iter()
+            .copied()
+            .next()
+            .expect("initial state exists");
+        let outgoing = clts.outgoing(s0);
+        assert_eq!(outgoing.len(), 1, "exactly one outgoing transition");
+        let targets = outgoing[0]
+            .modality()
+            .hyper_targets()
+            .expect("[must] realizes to MustHyperOnly");
+        assert_eq!(
+            targets.len(),
+            1,
+            "K.2 ships singleton hyper-must; multi-target is K.1b"
+        );
+        let target_state_name = clts
+            .state_name(targets[0])
+            .expect("hyper-target state has a name");
+        assert_eq!(
+            target_state_name, "s1",
+            "hyper-must targets the declared transition target"
+        );
+    }
+
+    /// R.5 Item K sub-item K.2 — the explicit `[sharp]` attribute
+    /// realizes to `TransitionModality::Sharp` (equivalent to no
+    /// attribute), confirming the explicit-equivalent path lands on
+    /// the same CLTS modality as the default.
+    #[test]
+    fn r5_subitem_k2_explicit_sharp_attribute_realizes_to_sharp() {
+        let doc = parse(
+            r#"
+context sharp_modality {
+    automata {
+        automaton M {
+            states { state s0 initial; state s1; }
+            transitions {
+                transition s0 -> s1 on epsilon [sharp];
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        let s0 = clts
+            .initial_states()
+            .iter()
+            .copied()
+            .next()
+            .expect("initial state exists");
+        let outgoing = clts.outgoing(s0);
+        assert_eq!(outgoing.len(), 1, "exactly one outgoing transition");
+        assert!(
+            matches!(outgoing[0].modality(), TransitionModality::Sharp),
+            "[sharp] realizes to Sharp, got {:?}",
+            outgoing[0].modality()
+        );
     }
 }
