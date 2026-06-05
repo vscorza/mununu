@@ -1,0 +1,49 @@
+// R.5 Item K sub-item K.4 (2026-06-05) — minimal hand-authored CTXDSL
+// fixture exercising the K.1-shipped `[may]` / `[must]` modality
+// attribute through the K.2-shipped realize step + the K.3-shipped
+// emitter + the K.4-shipped CLI surface (per-automaton modality
+// breakdown in `mununu context summarize`).
+//
+// Run end-to-end:
+//
+//     cargo run -p mununu-cli -- context summarize examples/k4_modality_demo.ctxdsl
+//
+// Expected text output includes a `[modality: sharp=N, may_only=M,
+// must_hyper_only=K]` suffix on the `KmtsDemo` automaton; the JSON
+// output carries the same data under `automata[].modality_breakdown`.
+//
+// Soundness note (K.1c parser ambiguity): the labelled-transition form
+// `on label <name> [may]` triggers a parser ambiguity (`[…]` is read as
+// an indexed-label expression rather than a modality attribute). Until
+// K.1c lands, the unambiguous forms below are required:
+//   - `on epsilon [<modality>]`                         (bare epsilon)
+//   - `on label <name> effects { } [<modality>]`        (wrapping effects block)
+//
+// This fixture uses the `epsilon` form. The `effects { }` form round-
+// trips identically through the emitter (per K.3).
+
+context k4_modality_demo {
+    alphabet {
+        label tick;
+    }
+    automata {
+        automaton KmtsDemo {
+            states {
+                state idle initial;
+                state working;
+                state done;
+            }
+            transitions {
+                // Sharp (default; no attribute, matches pre-K.1 grammar)
+                transition idle -> working on label tick;
+                // MayOnly: over-approximation edge (in the abstract
+                // model; may or may not be realized in concrete instances)
+                transition working -> done on epsilon [may];
+                // MustOnly: under-approximation edge (guaranteed in
+                // every concrete instance; realizes as a singleton
+                // hyper-must per K.2)
+                transition done -> idle on epsilon [must];
+            }
+        }
+    }
+}

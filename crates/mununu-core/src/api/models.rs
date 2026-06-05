@@ -383,6 +383,14 @@ pub enum GraphElementData {
         guard: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         effect: Option<String>,
+        /// R.5 Item K sub-item K.4 (2026-06-05) — CTXDSL transition
+        /// modality, rendered as `"sharp"` / `"may_only"` /
+        /// `"must_hyper_only"`. Absent on edges that don't come from
+        /// a CLTS transition (start-arrows, controller bridges).
+        /// Default (Sharp) is also serialized as `None` to keep
+        /// pre-K.4 JSON byte-for-byte compatible for the dominant case.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modality: Option<String>,
     },
 }
 
@@ -529,6 +537,7 @@ mod tests {
             action_type: Some("controllable".to_string()),
             guard: Some("x > 0".to_string()),
             effect: Some("x := x + 1".to_string()),
+            modality: None,
         };
         let json = serde_json::to_string(&edge).unwrap();
         let deserialized: GraphElementData = serde_json::from_str(&json).unwrap();

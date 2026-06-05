@@ -8,6 +8,7 @@ use crate::loader::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mununu_core::clts::{Clts, DefaultLabelIdx, LabelId};
 use mununu_core::context::{ControllerSynthesis, ControllerSynthesisOptions, DiagnosticsOptions};
+use mununu_core::context_dsl::ast::TransitionModalitySpec;
 use mununu_core::context_dsl::{ContextDoc, RealizedContext, parse as parse_context_doc};
 use mununu_core::mu_calculus::EvaluationOptions;
 use render::graph::{
@@ -3754,11 +3755,34 @@ fn prepare_output_dir(path: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Default)]
+struct ModalityBreakdown {
+    sharp: usize,
+    may_only: usize,
+    must_hyper_only: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct AutomatonSummaryOutput {
     name: String,
     state_count: usize,
     transition_count: usize,
+    /// R.5 Item K sub-item K.4 (2026-06-05) — per-automaton KMTS
+    /// modality breakdown sourced from the CTXDSL AST. Sharp is the
+    /// pre-K.4 default; non-zero `may_only` / `must_hyper_only`
+    /// indicates the automaton declares KMTS-shaped transitions via
+    /// the K.1 attribute syntax. Serialized verbatim into the
+    /// `context summarize --format json` output.
+    #[serde(skip_serializing_if = "modality_breakdown_is_sharp_only")]
+    modality_breakdown: ModalityBreakdown,
+}
+
+/// R.5 Item K sub-item K.4 — serde skip predicate. Keeps pre-K.4
+/// JSON byte-for-byte compatible: when an automaton only carries
+/// Sharp transitions (the dominant case), the `modality_breakdown`
+/// field is omitted entirely.
+fn modality_breakdown_is_sharp_only(b: &ModalityBreakdown) -> bool {
+    b.may_only == 0 && b.must_hyper_only == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -3779,12 +3803,21 @@ fn build_context_summary(
     let mut automata_map: BTreeMap<String, AutomatonSummaryOutput> = BTreeMap::new();
     for doc in std::iter::once(context_doc).chain(sidecar_docs.iter()) {
         for automaton in &doc.automata {
+            let mut breakdown = ModalityBreakdown::default();
+            for t in &automaton.transitions {
+                match t.modality {
+                    TransitionModalitySpec::Sharp => breakdown.sharp += 1,
+                    TransitionModalitySpec::MayOnly => breakdown.may_only += 1,
+                    TransitionModalitySpec::MustOnly => breakdown.must_hyper_only += 1,
+                }
+            }
             automata_map
                 .entry(automaton.name.name.clone())
                 .or_insert_with(|| AutomatonSummaryOutput {
                     name: automaton.name.name.clone(),
                     state_count: automaton.states.len(),
                     transition_count: automaton.transitions.len(),
+                    modality_breakdown: breakdown,
                 });
         }
     }
@@ -3838,9 +3871,23 @@ fn context_merge(args: ContextMergeArgs) -> Result<(), String> {
         println!("    (none)");
     } else {
         for automaton in &summary.automata {
+            let breakdown = &automaton.modality_breakdown;
+            let modality_suffix = if modality_breakdown_is_sharp_only(breakdown) {
+                String::new()
+            } else {
+                // R.5 Item K sub-item K.4 (2026-06-05) — surface KMTS
+                // modality breakdown when the automaton declares non-Sharp
+                // transitions via the K.1 attribute syntax. Pre-K.4
+                // automata (Sharp-only) print the original output
+                // byte-for-byte.
+                format!(
+                    " [modality: sharp={}, may_only={}, must_hyper_only={}]",
+                    breakdown.sharp, breakdown.may_only, breakdown.must_hyper_only
+                )
+            };
             println!(
-                "    - {} (states: {}, transitions: {})",
-                automaton.name, automaton.state_count, automaton.transition_count
+                "    - {} (states: {}, transitions: {}){}",
+                automaton.name, automaton.state_count, automaton.transition_count, modality_suffix
             );
         }
     }

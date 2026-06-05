@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, HashSet};
 use crate::abstraction::unrolling::{
     Effect, OriginalState, OriginalTransition, UnrollingOptions, VariableDecl, unroll_states,
 };
-use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx};
+use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, TransitionModality};
 use crate::context_dsl::ast::{
-    BinaryOp, Expr, ExprKind, StateRef, StateSelector, TransitionLabel, TypeName, UnaryOp,
+    BinaryOp, Expr, ExprKind, StateRef, StateSelector, TransitionLabel, TransitionModalitySpec,
+    TypeName, UnaryOp,
 };
 use crate::context_dsl::{ContextDoc, RealizedContext};
 
@@ -28,6 +29,30 @@ fn valuation_for_state(
     let sid = clts.state_id(state_name).ok()?;
     let v = clts.state_valuation(sid)?;
     if v.is_empty() { None } else { Some(v.clone()) }
+}
+
+/// R.5 Item K sub-item K.4 (2026-06-05) — render a CLTS-level
+/// [`TransitionModality`] as the API-edge `modality` string. `Sharp`
+/// (the dominant case) returns `None` so the field serializes as
+/// absent, keeping pre-K.4 JSON byte-for-byte compatible.
+fn modality_to_api_string(modality: &TransitionModality<DefaultStateIdx>) -> Option<String> {
+    match modality {
+        TransitionModality::Sharp => None,
+        TransitionModality::MayOnly => Some("may_only".to_string()),
+        TransitionModality::MustHyperOnly(_) => Some("must_hyper_only".to_string()),
+    }
+}
+
+/// R.5 Item K sub-item K.4 (2026-06-05) — render a CTXDSL-AST
+/// [`TransitionModalitySpec`] as the API-edge `modality` string. Used by
+/// the DSL-direct rendering path (no realize step). `Sharp` returns
+/// `None` for the same backward-compat reason as [`modality_to_api_string`].
+fn modality_spec_to_api_string(modality: TransitionModalitySpec) -> Option<String> {
+    match modality {
+        TransitionModalitySpec::Sharp => None,
+        TransitionModalitySpec::MayOnly => Some("may_only".to_string()),
+        TransitionModalitySpec::MustOnly => Some("must_hyper_only".to_string()),
+    }
 }
 
 /// Generate graphs from context based on request parameters.
@@ -260,6 +285,9 @@ pub fn counterstrategy_to_graph_elements(
         target_name: String,
         label_text: Option<String>,
         action_type: &'static str,
+        /// R.5 Item K sub-item K.4 — preserved through the counterstrategy
+        /// edge-keep pass so KMTS modality survives to the API JSON.
+        modality: Option<String>,
     }
     let mut kept_edges: Vec<KeptEdge> = Vec::new();
 
@@ -334,6 +362,7 @@ pub fn counterstrategy_to_graph_elements(
                 } else {
                     "controllable"
                 },
+                modality: modality_to_api_string(transition.modality()),
             });
         }
     }
@@ -446,6 +475,7 @@ pub fn counterstrategy_to_graph_elements(
                     action_type: Some("start-arrow".to_string()),
                     guard: None,
                     effect: None,
+                    modality: None,
                 },
                 position: None,
                 classes: None,
@@ -472,6 +502,7 @@ pub fn counterstrategy_to_graph_elements(
                 action_type: Some(edge.action_type.to_string()),
                 guard: None,
                 effect: None,
+                modality: edge.modality.clone(),
             },
             position: None,
             classes: None,
@@ -578,6 +609,7 @@ fn clts_to_graph_elements_with_labels(
                     action_type: Some("start-arrow".to_string()),
                     guard: None,
                     effect: None,
+                    modality: None,
                 },
                 position: None,
                 classes: None,
@@ -644,6 +676,7 @@ fn clts_to_graph_elements_with_labels(
                     action_type: Some(action_type.to_string()),
                     guard: None,
                     effect: None,
+                    modality: modality_to_api_string(transition.modality()),
                 },
                 position: None,
                 classes: None,
@@ -807,6 +840,7 @@ fn dsl_automata_to_graph_elements(
                         action_type: Some("start-arrow".to_string()),
                         guard: None,
                         effect: None,
+                        modality: None,
                     },
                     position: None,
                     classes: None,
@@ -913,6 +947,7 @@ fn dsl_automata_to_graph_elements(
                     } else {
                         Some(effect_str)
                     },
+                    modality: modality_spec_to_api_string(transition.modality),
                 },
                 position: None,
                 classes: None,
@@ -1209,6 +1244,7 @@ fn unrolled_automata_to_graph_elements(
                         action_type: Some("start-arrow".to_string()),
                         guard: None,
                         effect: None,
+                        modality: None,
                     },
                     position: None,
                     classes: None,
@@ -1251,6 +1287,13 @@ fn unrolled_automata_to_graph_elements(
                     action_type: Some(action_type.to_string()),
                     guard: None,
                     effect: None,
+                    // R.5 Item K sub-item K.4 (2026-06-05) — unrolled-path
+                    // strips modality at AST → OriginalTransition conversion
+                    // per the K.2b SOUNDNESS comment in
+                    // `context_dsl::realize::build_clts_from_unrolled`.
+                    // Defaults to None until K.2b ships modality threading
+                    // through the unrolling pipeline.
+                    modality: None,
                 },
                 position: None,
                 classes: None,
@@ -1389,5 +1432,130 @@ fn extract_literal_value(expr: &Expr, ty: &TypeName) -> Option<String> {
         }
         ExprKind::Group(inner) => extract_literal_value(inner, ty),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::GraphElementData;
+    use crate::context_dsl::parse;
+    use crate::context_dsl::realize::realize;
+
+    /// R.5 Item K sub-item K.4 — the API graph builder threads the
+    /// CLTS-level `TransitionModality` into the `modality` field on
+    /// the emitted edge JSON. Sharp transitions serialize without the
+    /// field (backward-compat); MayOnly + MustHyperOnly serialize as
+    /// `"may_only"` / `"must_hyper_only"`.
+    #[test]
+    fn r5_subitem_k4_clts_graph_carries_kmts_modality_on_edges() {
+        let dsl = r#"
+context k4_graph_modality_test {
+    automata {
+        automaton M {
+            states { state s0 initial; state s1; state s2; }
+            transitions {
+                transition s0 -> s1 on epsilon;
+                transition s1 -> s2 on epsilon [may];
+                transition s2 -> s0 on epsilon [must];
+            }
+        }
+    }
+}
+"#;
+        let doc = parse(dsl).expect("context parses");
+        let realized = realize(&doc, &[]).expect("context realizes");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        let elements =
+            clts_to_graph_elements_with_labels(clts, "M", None).expect("graph elements build");
+
+        // 4 nodes (compound + 3 states) + entry node + entry edge + 3
+        // transition edges = 9 elements. Don't assert exact count
+        // (graph layout is implementation-detail); instead probe each
+        // transition's modality field via a helper.
+        let mut sharp_modalities: Vec<Option<String>> = Vec::new();
+        let mut may_modalities: Vec<Option<String>> = Vec::new();
+        let mut must_modalities: Vec<Option<String>> = Vec::new();
+        for element in &elements {
+            if let GraphElementData::Edge {
+                source,
+                target,
+                modality,
+                ..
+            } = &element.data
+            {
+                // Skip start-arrow (source contains "entry").
+                if source.contains("entry") {
+                    continue;
+                }
+                if source.ends_with("s0") && target.ends_with("s1") {
+                    sharp_modalities.push(modality.clone());
+                } else if source.ends_with("s1") && target.ends_with("s2") {
+                    may_modalities.push(modality.clone());
+                } else if source.ends_with("s2") && target.ends_with("s0") {
+                    must_modalities.push(modality.clone());
+                }
+            }
+        }
+        assert_eq!(
+            sharp_modalities,
+            vec![None],
+            "Sharp transition serializes without modality field"
+        );
+        assert_eq!(
+            may_modalities,
+            vec![Some("may_only".to_string())],
+            "MayOnly transition serializes as `may_only`"
+        );
+        assert_eq!(
+            must_modalities,
+            vec![Some("must_hyper_only".to_string())],
+            "MustHyperOnly transition serializes as `must_hyper_only`"
+        );
+    }
+
+    /// R.5 Item K sub-item K.4 — `modality_to_api_string` matches the
+    /// helper used by every CLTS-aware Edge construction site. Sharp
+    /// returns None (serde-skipped → field absent in JSON output).
+    #[test]
+    fn r5_subitem_k4_modality_to_api_string_helper() {
+        use crate::clts::TransitionModality;
+        use smallvec::smallvec;
+        let sharp: TransitionModality<DefaultStateIdx> = TransitionModality::Sharp;
+        let may_only: TransitionModality<DefaultStateIdx> = TransitionModality::MayOnly;
+        // singleton-hyper-must target — the only shape K.2 emits today.
+        let dummy_state_id = crate::clts::Clts::<DefaultStateIdx, DefaultLabelIdx>::builder()
+            .state("dummy")
+            .state_id_or_insert("dummy")
+            .expect("can allocate state id");
+        let must_hyper: TransitionModality<DefaultStateIdx> =
+            TransitionModality::must_hyper(smallvec![dummy_state_id]);
+
+        assert_eq!(modality_to_api_string(&sharp), None);
+        assert_eq!(modality_to_api_string(&may_only), Some("may_only".into()));
+        assert_eq!(
+            modality_to_api_string(&must_hyper),
+            Some("must_hyper_only".into())
+        );
+    }
+
+    /// R.5 Item K sub-item K.4 — `modality_spec_to_api_string` matches
+    /// the helper used by the DSL-direct rendering path. Same JSON
+    /// shape as `modality_to_api_string` so the UI client sees a
+    /// uniform field regardless of which builder produced the edge.
+    #[test]
+    fn r5_subitem_k4_modality_spec_to_api_string_helper() {
+        assert_eq!(
+            modality_spec_to_api_string(TransitionModalitySpec::Sharp),
+            None
+        );
+        assert_eq!(
+            modality_spec_to_api_string(TransitionModalitySpec::MayOnly),
+            Some("may_only".into())
+        );
+        assert_eq!(
+            modality_spec_to_api_string(TransitionModalitySpec::MustOnly),
+            Some("must_hyper_only".into())
+        );
     }
 }
