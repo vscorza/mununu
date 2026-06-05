@@ -133,6 +133,7 @@ pub fn to_ir(
             source,
             target,
             labels,
+            modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
         });
     }
 

@@ -5,6 +5,7 @@
 //! controllability. Each adapter translates its format-specific AST into
 //! the IR, and the shared emitter converts the IR into CTXDSL text.
 
+use crate::context_dsl::ast::TransitionModalitySpec;
 use crate::ltl::LtlFormula;
 
 /// A reactive system specification in the shared intermediate representation.
@@ -144,6 +145,16 @@ pub struct StateSpec {
 }
 
 /// A transition in an explicit automaton.
+///
+/// R.5 Item K sub-item K.3 (2026-06-05) — carries the CTXDSL-level
+/// modality attribute (`[may]` / `[must]` / `[sharp]`). Adapters
+/// producing KMTS-shaped output (the R.2.5 predicate-cube lift, the
+/// R.5b UF abstraction lifter, and hand-authored CTXDSL via the
+/// realize round-trip) set this field; legacy 2-valued adapters leave
+/// it at the `Sharp` default. The CTXDSL emitter (`adapter::emit`)
+/// reads this field to emit the `[may]` / `[must]` suffix; the
+/// default `Sharp` emits no suffix (preserving pre-K.3 output
+/// byte-for-byte).
 #[derive(Debug, Clone)]
 pub struct TransitionSpec {
     /// Source state name.
@@ -152,6 +163,11 @@ pub struct TransitionSpec {
     pub target: String,
     /// Labels on this transition.
     pub labels: Vec<String>,
+    /// R.5 Item K sub-item K.3 (2026-06-05) — modality attribute.
+    /// Defaults to `Sharp` for adapters that produce only 2-valued
+    /// (CLTS) output. KMTS-aware adapters set this to `MayOnly` or
+    /// `MustOnly` per the source's modality declaration.
+    pub modality: TransitionModalitySpec,
 }
 
 /// Composition directive.

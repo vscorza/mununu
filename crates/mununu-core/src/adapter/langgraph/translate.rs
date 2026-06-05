@@ -85,6 +85,7 @@ pub fn to_ir(
             source: from,
             target: to,
             labels: vec![label],
+            modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
         });
     }
 

@@ -184,6 +184,7 @@ fn build_automaton_from_region(
                 source: t.source.clone(),
                 target: t.target.clone(),
                 labels,
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             }
         })
         .collect();
@@ -303,32 +304,38 @@ fn create_bool_variable_automaton(name: &str, initial: bool) -> AutomatonSpec {
                 source: false_state.clone(),
                 target: true_state.clone(),
                 labels: vec![set_true.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             },
             TransitionSpec {
                 source: true_state.clone(),
                 target: true_state.clone(),
                 labels: vec![set_true.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             },
             TransitionSpec {
                 source: true_state.clone(),
                 target: false_state.clone(),
                 labels: vec![set_false.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             },
             TransitionSpec {
                 source: false_state.clone(),
                 target: false_state.clone(),
                 labels: vec![set_false.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             },
             // test transitions (self-loops)
             TransitionSpec {
                 source: true_state.clone(),
                 target: true_state.clone(),
                 labels: vec![test_true.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             },
             TransitionSpec {
                 source: false_state.clone(),
                 target: false_state.clone(),
                 labels: vec![test_false.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             },
         ],
         controllable_labels: vec![set_true, set_false, test_true, test_false],
@@ -360,6 +367,7 @@ fn create_int_variable_automaton(name: &str, lo: i64, hi: i64, initial: i64) -> 
                 source: format!("{name}_{src}"),
                 target: format!("{name}_{v}"),
                 labels: vec![label.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             });
         }
     }
@@ -372,6 +380,7 @@ fn create_int_variable_automaton(name: &str, lo: i64, hi: i64, initial: i64) -> 
             source: format!("{name}_{v}"),
             target: format!("{name}_{v}"),
             labels: vec![label],
+            modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
         });
     }
 

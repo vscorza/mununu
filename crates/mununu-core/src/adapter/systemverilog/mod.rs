@@ -895,6 +895,7 @@ fn to_ir(
                 source: t.source.clone(),
                 target: t.target.clone(),
                 labels: vec![t.label.clone()],
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
             }
         })
         .collect();
