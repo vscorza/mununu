@@ -728,6 +728,7 @@ impl KmtsLiftLazy for LazyLift {
 pub fn materialize_clts_from_lazy(
     lazy: &mut LazyLift,
     btor2_source_info_format: SourceFormat,
+    must_edge_inference: MustEdgeInference,
 ) -> Result<PredicateCubeLiftResult, AdapterError> {
     use crate::adapter::AdapterErrorKind;
     use crate::clts::TransitionModality;
@@ -735,6 +736,14 @@ pub fn materialize_clts_from_lazy(
     let start = Instant::now();
     let cube_count = lazy.cube_count();
     let predicates = lazy.predicates().to_vec();
+    let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
+    let mut sharp_edges_promoted: usize = 0;
+    let mut hyper_must_edges_emitted: usize = 0;
+    // R.2.5b session-1 follow-up — collect per-source target sets
+    // for the SamplingConfluence post-pass, same shape as the
+    // eager predicate_cube_lift path.
+    let mut sampled_targets_per_source: Vec<std::collections::BTreeSet<usize>> =
+        vec![std::collections::BTreeSet::new(); cube_count];
 
     // Build the Clts shape. Mirrors `predicate_cube_lift`'s
     // builder pattern (lines ~563–594 in this file).
@@ -793,7 +802,53 @@ pub fn materialize_clts_from_lazy(
                     tgt_id,
                     TransitionModality::MayOnly,
                 );
+                sampled_targets_per_source[i].insert(edge.target_cube);
             }
+        }
+    }
+
+    // R.2.5b session-1 follow-up (2026-06-06) — SamplingConfluence
+    // post-pass for the lazy materialiser. Same logic as the eager
+    // predicate_cube_lift path: single-target convergence promotes
+    // to Sharp; multi-target convergence emits a MustHyperOnly
+    // edge. SOUNDNESS: sampling-derived; SMT-backed proof is
+    // queued for R.2.5b session 2.
+    if matches!(must_edge_inference, MustEdgeInference::SamplingConfluence) {
+        for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
+            if targets.is_empty() {
+                continue;
+            }
+            let src_id = state_ids[src_idx];
+            let target_ids: smallvec::SmallVec<[crate::clts::StateId<DefaultStateIdx>; 4]> =
+                targets.iter().map(|&i| state_ids[i]).collect();
+            if target_ids.len() == 1 {
+                builder.transition_ids_with_modality(
+                    src_id,
+                    &[label_id],
+                    target_ids[0],
+                    TransitionModality::Sharp,
+                );
+                sharp_edges_promoted += 1;
+            } else {
+                builder.transition_ids_with_modality(
+                    src_id,
+                    &[label_id],
+                    target_ids[0],
+                    TransitionModality::must_hyper(target_ids.clone()),
+                );
+                hyper_must_edges_emitted += 1;
+            }
+        }
+        if sharp_edges_promoted > 0 || hyper_must_edges_emitted > 0 {
+            warnings.push(crate::adapter::AdapterWarning {
+                kind: crate::adapter::WarningKind::ApproximateTranslation,
+                message: format!(
+                    "[R.2.5b-sampling-must] materialize_clts_from_lazy: SamplingConfluence post-pass promoted {} edge(s) to Sharp and emitted {} MustHyperOnly edge(s). SOUNDNESS: sampling-derived; SMT-backed must-edge proof is queued for an R.2.5b follow-up session.",
+                    sharp_edges_promoted,
+                    hyper_must_edges_emitted
+                ),
+                location: None,
+            });
         }
     }
 
@@ -821,20 +876,15 @@ pub fn materialize_clts_from_lazy(
         },
         lift_time: start.elapsed(),
         // Same caveat as predicate_cube_lift — may-edges are
-        // populated but must-edges are not.
+        // populated; must-edges arrive via the SamplingConfluence
+        // post-pass when opted in.
         predicate_image_pending: false,
-        // Warnings are surfaced by predicate_cube_lift's UF-
-        // wrap path; the lazy path doesn't have its own UF
-        // warning channel yet, so this is empty. Sub-item 2.4
-        // follow-up can plumb the warning through LazyLift if
-        // a real fixture demonstrates the gap.
-        warnings: Vec::new(),
-        // R.2.5b — the lazy materialiser path does not yet run
-        // the SamplingConfluence post-pass. Plumbing the
-        // post-pass through LazyLift is a follow-up to R.2.5b
-        // session 1.
-        sharp_edges_promoted: 0,
-        hyper_must_edges_emitted: 0,
+        // Warnings include UF-wrap (currently absent from lazy
+        // path) + the R.2.5b SamplingConfluence soundness warning
+        // when the post-pass fires.
+        warnings,
+        sharp_edges_promoted,
+        hyper_must_edges_emitted,
     })
 }
 
@@ -2087,6 +2137,87 @@ mod tests {
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
         assert_eq!(result.sharp_edges_promoted, 0);
+        assert_eq!(result.hyper_must_edges_emitted, 0);
+    }
+
+    /// R.2.5b session-1 follow-up — Lazy materialiser threads
+    /// `MustEdgeInference::SamplingConfluence` end-to-end. Same
+    /// fixture as the eager path's test; produces at least one
+    /// Sharp / MustHyperOnly edge + the `[R.2.5b-sampling-must]`
+    /// warning.
+    #[test]
+    fn r5_2_5b_lazy_materialiser_honors_sampling_confluence() {
+        let preds = vec![
+            PredicateSpec {
+                name: "cnt_is_0".into(),
+                register: "cnt".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "cnt_is_1".into(),
+                register: "cnt".into(),
+                value: 1,
+            },
+        ];
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::SamplingConfluence,
+        };
+        let mut lazy =
+            LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+                .expect("LazyLift::from_btor2 succeeds");
+        let result = materialize_clts_from_lazy(
+            &mut lazy,
+            crate::adapter::SourceFormat::Btor2,
+            MustEdgeInference::SamplingConfluence,
+        )
+        .expect("materialize_clts_from_lazy succeeds");
+
+        let total_promoted = result.sharp_edges_promoted + result.hyper_must_edges_emitted;
+        assert!(
+            total_promoted > 0,
+            "lazy materialiser SamplingConfluence must emit at least one Sharp or MustHyperOnly edge; got sharp={}, hyper={}",
+            result.sharp_edges_promoted,
+            result.hyper_must_edges_emitted
+        );
+        let any_warning = result.warnings.iter().any(|w| {
+            w.message.contains("R.2.5b-sampling-must")
+                && matches!(w.kind, crate::adapter::WarningKind::ApproximateTranslation)
+        });
+        assert!(
+            any_warning,
+            "lazy materialiser SamplingConfluence must emit the soundness warning"
+        );
+    }
+
+    /// R.2.5b session-1 follow-up — Lazy materialiser with
+    /// `MustEdgeInference::Off` (the default) produces zero
+    /// promotions, matching the pre-R.2.5b behaviour.
+    #[test]
+    fn r5_2_5b_lazy_materialiser_off_preserves_legacy_behaviour() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let mut lazy = LazyLift::from_btor2(
+            preds,
+            COUNTER_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("LazyLift::from_btor2 succeeds");
+        let result = materialize_clts_from_lazy(
+            &mut lazy,
+            crate::adapter::SourceFormat::Btor2,
+            MustEdgeInference::Off,
+        )
+        .expect("materialize_clts_from_lazy succeeds");
+        assert_eq!(
+            result.sharp_edges_promoted, 0,
+            "Off must yield zero promotions"
+        );
         assert_eq!(result.hyper_must_edges_emitted, 0);
     }
 

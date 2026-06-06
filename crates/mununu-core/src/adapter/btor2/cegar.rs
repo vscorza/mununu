@@ -560,6 +560,7 @@ pub fn cegar_refine_loop(
                 crate::adapter::btor2::kmts_lift::materialize_clts_from_lazy(
                     &mut lazy,
                     crate::adapter::SourceFormat::Btor2,
+                    cegar_opts.must_edge_inference,
                 )?
             }
         };
