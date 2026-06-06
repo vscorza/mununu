@@ -19,26 +19,31 @@
 //!    the may-but-not-must edges reachable from the indefinite
 //!    states.
 //!
-//! **What this MVP does NOT do** (explicitly flagged via
-//! [`FailureSubgame::subgame_extraction_complete`] = false):
+//! **R.5.0 sub-item 4.5 update (2026-06-06)**: the verdict path
+//! still delegates to `evaluate_tri` (preserves cell-by-cell
+//! verdict-equivalence with the production cheap-path evaluator);
+//! the failure-subgame path is now the **precise** extraction
+//! shipped by sub-items 4.1–4.4 (build → solve → extract). The
+//! `subgame_extraction_complete` flag is now `true` whenever a
+//! subgame is emitted.
 //!
-//! - No Zielonka recursion. The evaluator delegates to the existing
-//!   fixpoint trit evaluator and post-hoc reconstructs the failure
-//!   subgame from `KleeneBot` states + the CLTS's `MayOnly`
-//!   transitions reachable from them.
-//! - No precise tracking of which transition *caused* each
-//!   `KleeneBot` position. The MVP returns the over-approximation
-//!   "all reachable MayOnly transitions are candidate classifiers";
-//!   R.5's full implementation will refine this to the actually-
-//!   responsible transition per the Shoham–Grumberg subgame
-//!   construction.
-//! - No `(state, subformula)` position-level granularity. The MVP
-//!   returns root-level positions (one per state). R.5's full
-//!   implementation will enumerate per-subformula positions.
+//! **What this composition does NOT do** (queued):
 //!
-//! Consumers that need the full failure-subgame fidelity must wait
-//! for R.5. The `subgame_extraction_complete` flag is the explicit
-//! handshake between R.5.0 and the future R.5.
+//! - No swap of the verdict source. Verdicts still come from
+//!   `evaluate_tri`. Sub-item 4.6's bench / soundness audit
+//!   compares the Zielonka-based verdict path (sub-items 4.2 + 4.3)
+//!   against `evaluate_tri` across the R.3 fixture sweep; if
+//!   verdict-equivalence holds, a future sub-item may swap the
+//!   verdict source too.
+//! - No `(state, subformula)` position-level granularity in the
+//!   evaluator's output shape. The `Position3v` struct exposed at
+//!   this surface still uses root-level positions; sub-items 4.1's
+//!   `Game3v::Position` carries the full per-subformula info but
+//!   the consumer-facing `Position3v` type stays root-level for
+//!   API stability. Future consumers can call
+//!   `parity_game_3v_build::build_game` + `parity_game_3v_solve3v::
+//!   solve_3v` + `parity_game_3v_subgame::extract_failure_subgame`
+//!   directly for full granularity.
 
 use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, IdStorage, StateId, TransitionModality};
 use crate::mu_calculus::trit::{Trit, TritSet};
@@ -67,9 +72,10 @@ pub struct Position3v {
 /// construction (precise per-subformula positions + per-transition
 /// classification of which edge caused each indefinite resolution).
 ///
-/// The [`subgame_extraction_complete`] flag is always `false` at
-/// R.5.0; R.5 sets it to `true` once the Zielonka-extended solver
-/// + precise transition tracking land.
+/// **R.5.0 sub-item 4.5 update (2026-06-06)**: the
+/// `subgame_extraction_complete` flag is now `true` whenever a
+/// subgame is emitted (the precise extraction from sub-items 4.1–
+/// 4.4 is wired into `evaluate_3v_game_with_options`).
 #[derive(Debug, Clone)]
 pub struct FailureSubgame {
     /// `(state, root_formula_node)` positions whose verdict is
@@ -155,8 +161,11 @@ where
     // 1. Delegate to the cheap-path fixpoint trit evaluator for the
     //    verdict computation. This guarantees the R.5.0 verdict-
     //    equivalence invariant — on Sharp-only inputs, `evaluate_tri`
-    //    and `evaluate_3v_game` are identity (R.5.0 just wraps the
-    //    output with failure-subgame metadata).
+    //    and `evaluate_3v_game` are identity. R.5.0 sub-item 4.5
+    //    (2026-06-06): the verdict source is still `evaluate_tri`
+    //    (preserved for safety + cell-by-cell verdict-equivalence);
+    //    only the failure-subgame extraction is upgraded to the
+    //    precise variant.
     let verdicts = evaluate_tri_with_options(formula, clts, env, options)?;
 
     // 2. Identify KleeneBot positions at the root formula. If none,
@@ -175,42 +184,129 @@ where
         });
     }
 
-    // 3. Construct the MVP failure subgame.
+    // 3. R.5.0 sub-item 4.5 (2026-06-06) — Build the parity game +
+    //    leaf oracle, solve 3-valued, extract the PRECISE failure
+    //    subgame (replaces the pre-4.5 over-approximation that
+    //    listed every reachable MayOnly transition).
     //
-    // R.5.0 over-approximation: enumerate all MayOnly transitions
-    // whose source is in the indefinite-states set. R.5 will replace
-    // this with the precise per-position classifying set from the
-    // Shoham–Grumberg subgame construction.
+    //    Per-position classification: a MayOnly transition is
+    //    classifying iff its removal from the over-approximation
+    //    game changes at least one position's verdict (sub-item
+    //    4.4). The subgame returned here carries
+    //    `subgame_extraction_complete = true` (precise) instead of
+    //    the MVP's `false`.
+    let game = crate::mu_calculus::parity_game_3v_build::build_game(formula, clts);
+    let leaf_winners = build_leaf_oracle_from_env(&game, formula, env);
+    let solution3v = crate::mu_calculus::parity_game_3v_solve3v::solve_3v(&game, &leaf_winners);
+    let precise = crate::mu_calculus::parity_game_3v_subgame::extract_failure_subgame(
+        &game,
+        &leaf_winners,
+        &solution3v,
+    );
+
+    // 4. Translate the precise subgame into the existing
+    //    `FailureSubgame` shape. `classifying_transitions` is the
+    //    union over each precise classifying edge (PositionId pair)
+    //    of the corresponding `(source_state, transition_index)`
+    //    CLTS transition. R.5 CEGAR consumes this list for its
+    //    predicate-splitting heuristic.
+    let positions_translated: Vec<Position3v> = precise
+        .positions
+        .iter()
+        .map(|pid| {
+            let pos = &game.positions[pid.0];
+            Position3v {
+                state: pos.state,
+                node: pos.node,
+            }
+        })
+        .collect();
     let mut classifying_transitions: Vec<(usize, usize)> = Vec::new();
-    for &state_idx in &indefinite_states {
-        let Some(source_id) = StateId::<S>::from_index(state_idx) else {
+    for (src, tgt) in &precise.classifying_edges {
+        let src_pos = &game.positions[src.0];
+        let tgt_pos = &game.positions[tgt.0];
+        let Some(source_id) = StateId::<S>::from_index(src_pos.state) else {
             continue;
         };
+        // Find the CLTS transition index whose target matches the
+        // game edge's target state. The (state, transition_idx)
+        // pair uniquely identifies the CLTS transition.
         for (t_idx, transition) in clts.outgoing(source_id).iter().enumerate() {
-            if matches!(transition.modality(), TransitionModality::MayOnly) {
-                classifying_transitions.push((state_idx, t_idx));
+            if transition.target().index() == tgt_pos.state
+                && matches!(transition.modality(), TransitionModality::MayOnly)
+                && !classifying_transitions.contains(&(src_pos.state, t_idx))
+            {
+                classifying_transitions.push((src_pos.state, t_idx));
             }
         }
     }
-
-    let positions: Vec<Position3v> = indefinite_states
-        .iter()
-        .map(|&state| Position3v {
-            state,
-            node: formula.root(),
-        })
-        .collect();
-    let root = positions.first().copied();
+    let root = positions_translated.first().copied();
 
     Ok(GameEvaluation {
         verdicts,
         failure_subgame: Some(FailureSubgame {
-            positions,
+            positions: positions_translated,
             classifying_transitions,
             root,
-            subgame_extraction_complete: false,
+            // R.5.0 sub-item 4.5 (2026-06-06): true now (was false
+            // in the MVP). The classifying-transitions list comes
+            // from sub-item 4.4's precise per-edge differential
+            // evaluation, not the MVP over-approximation.
+            subgame_extraction_complete: true,
         }),
     })
+}
+
+/// R.5.0 sub-item 4.5 (2026-06-06) — Build the leaf-winner oracle
+/// for [`crate::mu_calculus::parity_game_3v_solve::solve_2v`] from a
+/// CLTS + Environment.
+///
+/// For each game position whose formula node is `True` /
+/// `False` / `Predicate(_)`, assigns the corresponding winner:
+/// - `True` → Eve (Existential).
+/// - `False` → Adam (Universal).
+/// - `Predicate(name)` → Eve iff the environment's per-state
+///   predicate bitset has bit `state` set; else Adam. An unknown
+///   predicate (not registered in the environment) is treated as
+///   Adam (matches the `evaluate_tri` SOUNDNESS under-approximation
+///   at `predicate_bits`'s fallback).
+fn build_leaf_oracle_from_env(
+    game: &crate::mu_calculus::parity_game_3v_build::Game3v,
+    formula: &Formula,
+    env: &Environment,
+) -> std::collections::HashMap<
+    crate::mu_calculus::parity_game_3v_build::PositionId,
+    crate::mu_calculus::parity_game_3v_build::Player,
+> {
+    use crate::mu_calculus::Node;
+    use crate::mu_calculus::parity_game_3v_build::{Player, PositionId};
+    use std::collections::HashMap;
+
+    let mut result: HashMap<PositionId, Player> = HashMap::new();
+    for (pid_idx, pos) in game.positions.iter().enumerate() {
+        let pid = PositionId(pid_idx);
+        let node = formula.node(pos.node);
+        let winner = match node {
+            Node::True => Some(Player::Existential),
+            Node::False => Some(Player::Universal),
+            Node::Predicate(name) => {
+                let truth = env
+                    .predicate(name.as_str())
+                    .and_then(|bits| bits.get(pos.state).map(|b| *b))
+                    .unwrap_or(false);
+                Some(if truth {
+                    Player::Existential
+                } else {
+                    Player::Universal
+                })
+            }
+            _ => None,
+        };
+        if let Some(w) = winner {
+            result.insert(pid, w);
+        }
+    }
+    result
 }
 
 /// R.5.0 — Convenience predicate: does the CLTS contain at least one
@@ -380,9 +476,13 @@ mod tests {
                 !subgame.classifying_transitions.is_empty(),
                 "MayOnly edge must appear in classifying_transitions on this fixture"
             );
+            // R.5.0 sub-item 4.5 (2026-06-06) — flag is now `true`
+            // (precise extraction via sub-item 4.4 per-edge
+            // differential). Pre-4.5 this was `false` (over-
+            // approximation).
             assert!(
-                !subgame.subgame_extraction_complete,
-                "R.5.0 MVP flag must be false until R.5 ships the Shoham–Grumberg construction"
+                subgame.subgame_extraction_complete,
+                "R.5.0 4.5: subgame_extraction_complete=true since sub-item 4.4's precise extractor is wired"
             );
             // The classifying transition must originate from a
             // KleeneBot state.
