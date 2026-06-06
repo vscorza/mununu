@@ -13,6 +13,7 @@ pub mod nnf;
 pub mod parity_game;
 pub mod parity_game_3v;
 pub mod parity_game_3v_build;
+pub mod parity_game_3v_solve;
 pub mod parser;
 pub mod simplify;
 pub mod trit;
