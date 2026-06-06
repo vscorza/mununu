@@ -500,6 +500,11 @@ pub fn cegar_refine_loop(
         // loop to refine. 8 bits = 256 combinations per cube, matches
         // the lift opts' default.
         max_input_bits: 8,
+        // R.2.5b (2026-06-06): default the new lifter option to
+        // pre-R.2.5b behaviour (MayOnly only). The CEGAR loop opts
+        // into SamplingConfluence via the CegarOptions follow-up
+        // once a real fixture surfaces a Diamond-must-edge demand.
+        must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
     };
 
     for iteration in 0..=cegar_opts.max_iterations {

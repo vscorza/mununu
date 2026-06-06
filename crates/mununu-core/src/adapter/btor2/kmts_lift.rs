@@ -309,6 +309,11 @@ pub struct PredicateCubeLiftOptions {
     /// edge construction (recovers the legacy R.2.5 MVP behaviour
     /// where the Clts has cube states but no transitions).
     pub max_input_bits: usize,
+    /// R.2.5b sub-item (2026-06-06) — must-edge inference policy.
+    /// Defaults to [`MustEdgeInference::Off`], which preserves the
+    /// pre-R.2.5b behaviour of emitting only `MayOnly` edges.
+    /// See [`MustEdgeInference`] for the post-pass semantics.
+    pub must_edge_inference: MustEdgeInference,
 }
 
 impl Default for PredicateCubeLiftOptions {
@@ -316,8 +321,44 @@ impl Default for PredicateCubeLiftOptions {
         Self {
             max_cube_count: 1024,
             max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::Off,
         }
     }
+}
+
+/// R.2.5b (2026-06-06) — Policy for inferring `must`-side
+/// transitions (`Sharp`, `MustHyperOnly`) from the R.2.5 sampling-
+/// based predicate-image MVP. Paired with the B.3.b/B.3.c phase-
+/// boundary decision (2026-06-01): R.5.0 ships the soundness-warning
+/// for alt-depth-≥-2 formulas on Sharp-only KMTSes (already in
+/// main); R.2.5b's lifter post-pass opportunistically emits
+/// `Sharp` and `MustHyperOnly` edges when the sampling-based
+/// predicate-image converges on a single target cube (Sharp) or a
+/// non-singleton target set (hyper-must) for every sampled (input,
+/// UF-representative) pair.
+///
+/// **SOUNDNESS**: sampling-based inference. A single-target
+/// convergence under sampling proves the must-edge ONLY when the
+/// canonical representative is a sound proxy for every concrete
+/// state in the cube. R.2.5b's follow-up session will replace the
+/// sampling pass with an SMT-backed must-edge query (∀ concrete
+/// state in source cube ⟹ ∃ input ⟹ next-state in target cube)
+/// using Z3 array theory. Until the SMT swap lands, the inferred
+/// must-edges carry a `// SOUNDNESS:` annotation + an
+/// `AdapterWarning` on the lift result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MustEdgeInference {
+    /// Pre-R.2.5b default. The post-pass is disabled; the lift
+    /// emits only `MayOnly` edges. Use when callers require strict
+    /// soundness (no sampling-derived must claims).
+    Off,
+    /// R.2.5b session-1. Post-pass: for each (source-cube, label)
+    /// pair, collect target cubes across all sampled (input,
+    /// UF-rep) pairs. If exactly one target appears, promote the
+    /// MayOnly edge to `Sharp`. If multiple targets appear, emit
+    /// a `MustHyperOnly { targets }` edge alongside the existing
+    /// MayOnly edges. SOUNDNESS: sampling-derived, not SMT-proved.
+    SamplingConfluence,
 }
 
 /// R.5 lazy KMTS sub-item 2.1 — a single may-edge from
@@ -788,6 +829,12 @@ pub fn materialize_clts_from_lazy(
         // follow-up can plumb the warning through LazyLift if
         // a real fixture demonstrates the gap.
         warnings: Vec::new(),
+        // R.2.5b — the lazy materialiser path does not yet run
+        // the SamplingConfluence post-pass. Plumbing the
+        // post-pass through LazyLift is a follow-up to R.2.5b
+        // session 1.
+        sharp_edges_promoted: 0,
+        hyper_must_edges_emitted: 0,
     })
 }
 
@@ -930,6 +977,16 @@ pub struct PredicateCubeLiftResult {
     /// warnings, etc.). Empty for fixtures that triggered no
     /// warning-worthy abstraction decisions.
     pub warnings: Vec<crate::adapter::AdapterWarning>,
+    /// R.2.5b (2026-06-06) — Number of `MayOnly` edges promoted to
+    /// `Sharp` by the [`MustEdgeInference::SamplingConfluence`]
+    /// post-pass. Zero when `must_edge_inference` is `Off` (the
+    /// default) or when no single-target convergence was detected.
+    pub sharp_edges_promoted: usize,
+    /// R.2.5b (2026-06-06) — Number of `MustHyperOnly` edges
+    /// emitted by the SamplingConfluence post-pass. Zero when
+    /// `must_edge_inference` is `Off` or when no multi-target
+    /// confluence was detected.
+    pub hyper_must_edges_emitted: usize,
 }
 
 /// R.2.5 — Lift one BTOR2 source through the predicate-cube path.
@@ -1100,8 +1157,17 @@ pub fn predicate_cube_lift(
     // the cube might reach OTHER cubes via inputs we don't sample.
     // R.5 / R.5b's SMT-driven must-edges + lazy `KmtsLiftLazy` close
     // these gaps.
+    // R.2.5b (2026-06-06) — collect target-cube sets per source cube
+    // for the SamplingConfluence post-pass. Indexed by source cube
+    // index; each entry is the set of target cube indices reached
+    // across all (input, UF-rep) samples for that source.
+    let mut sharp_edges_promoted: usize = 0;
+    let mut hyper_must_edges_emitted: usize = 0;
+
     let mut predicate_image_pending = true;
     if lift_opts.max_input_bits > 0 && !predicates.is_empty() {
+        let mut sampled_targets_per_source: Vec<std::collections::BTreeSet<usize>> =
+            vec![std::collections::BTreeSet::new(); state_ids.len()];
         let boolean_inputs: Vec<String> = collect_boolean_input_symbols(&file, &symbols);
         let n_inputs = boolean_inputs.len().min(lift_opts.max_input_bits);
         let n_combos: usize = 1usize << n_inputs;
@@ -1224,11 +1290,85 @@ pub fn predicate_cube_lift(
                             tgt_id,
                             crate::clts::TransitionModality::MayOnly,
                         );
+                        // R.2.5b — record sampled target for the
+                        // post-pass.
+                        sampled_targets_per_source[i].insert(target_index);
                     }
                 }
             }
         }
         predicate_image_pending = false;
+
+        // R.2.5b (2026-06-06) — SamplingConfluence post-pass.
+        // For each source cube, inspect the sampled target set:
+        // - Exactly 1 target ⇒ promote to `Sharp` (single
+        //   confluent successor; sampling-derived must-singleton).
+        // - More than 1 target ⇒ emit `MustHyperOnly` with the set
+        //   as the hyper-target collection (sampling-derived
+        //   must-hyper).
+        //
+        // SOUNDNESS: sampling-based, not SMT-proved. The canonical-
+        // representative assumption (the per-cube canonical
+        // register values cover every concrete state in the cube)
+        // is sound for predicate-true cubes (the register is
+        // uniquely fixed) but is an OVER-approximation for
+        // predicate-false cubes (registers may take many values).
+        // The R.2.5b follow-up session will replace this with
+        // a Z3-array-theory query proving must-edges.
+        if matches!(
+            lift_opts.must_edge_inference,
+            MustEdgeInference::SamplingConfluence
+        ) {
+            for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
+                if targets.is_empty() {
+                    continue;
+                }
+                let src_id = state_ids[src_idx];
+                let target_ids: smallvec::SmallVec<[crate::clts::StateId<DefaultStateIdx>; 4]> =
+                    targets.iter().map(|&i| state_ids[i]).collect();
+                if target_ids.len() == 1 {
+                    // Single confluent target: promote MayOnly →
+                    // Sharp. The downstream parity-game-3v_build
+                    // coalesces same-target edges with Sharp
+                    // dominating (per Item K's edge-modality merge
+                    // rule), so this Sharp transition supersedes
+                    // the previously-emitted MayOnly to the same
+                    // target.
+                    builder.transition_ids_with_modality(
+                        src_id,
+                        &[label_id],
+                        target_ids[0],
+                        crate::clts::TransitionModality::Sharp,
+                    );
+                    sharp_edges_promoted += 1;
+                } else {
+                    // Multi-target: emit MustHyperOnly with the
+                    // full target set. The transition's `target`
+                    // (StateId field) is the first element by K.2
+                    // convention; the remaining targets are
+                    // accessible via `modality().hyper_targets()`.
+                    builder.transition_ids_with_modality(
+                        src_id,
+                        &[label_id],
+                        target_ids[0],
+                        crate::clts::TransitionModality::must_hyper(target_ids.clone()),
+                    );
+                    hyper_must_edges_emitted += 1;
+                }
+            }
+            // SOUNDNESS warning: the inference is sampling-derived.
+            if sharp_edges_promoted > 0 || hyper_must_edges_emitted > 0 {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: crate::adapter::WarningKind::ApproximateTranslation,
+                    message: format!(
+                        "[R.2.5b-sampling-must] predicate_cube_lift: SamplingConfluence post-pass promoted {} edge(s) to Sharp and emitted {} MustHyperOnly edge(s). SOUNDNESS: sampling-derived; SMT-backed must-edge proof is queued for an R.2.5b follow-up session. Verdicts depending on these must-edges should be treated as candidate until the SMT swap lands.",
+                        sharp_edges_promoted,
+                        hyper_must_edges_emitted
+                    ),
+                    location: None,
+                });
+            }
+        }
     }
 
     let clts = builder.build().map_err(|e| AdapterError {
@@ -1259,6 +1399,8 @@ pub fn predicate_cube_lift(
         // lift-time abstraction decisions surface here for caller
         // reporting.
         warnings,
+        sharp_edges_promoted,
+        hyper_must_edges_emitted,
     })
 }
 
@@ -1530,6 +1672,7 @@ mod tests {
         let opts = PredicateCubeLiftOptions {
             max_cube_count: 8,
             max_input_bits: 0,
+            must_edge_inference: MustEdgeInference::Off,
         };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
         assert!(result.is_err());
@@ -1814,6 +1957,7 @@ mod tests {
         let opts = PredicateCubeLiftOptions {
             max_cube_count: 1024,
             max_input_bits: 0,
+            must_edge_inference: MustEdgeInference::Off,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("ok");
@@ -1830,6 +1974,120 @@ mod tests {
             total_transitions, 0,
             "max_input_bits=0 must emit zero edges (legacy MVP behaviour)"
         );
+    }
+
+    // ---- R.2.5b — SamplingConfluence post-pass tests ----
+
+    /// R.2.5b — Default `MustEdgeInference::Off` preserves the
+    /// pre-R.2.5b behaviour: only MayOnly edges, zero promotions.
+    #[test]
+    fn r5_2_5b_default_inference_off_preserves_legacy_behaviour() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let result = predicate_cube_lift(
+            preds,
+            COUNTER_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("predicate_cube_lift succeeds");
+        assert_eq!(result.sharp_edges_promoted, 0, "no promotions when Off");
+        assert_eq!(result.hyper_must_edges_emitted, 0, "no hyper-must when Off");
+    }
+
+    /// R.2.5b — `SamplingConfluence` post-pass emits Sharp and / or
+    /// MustHyperOnly edges + records telemetry counts. The counter
+    /// fixture has a single boolean input `clr`; for each source
+    /// cube, the post-pass collects targets across both `clr=0` and
+    /// `clr=1` samples. Cubes whose two samples agree get a Sharp
+    /// promotion; cubes whose samples diverge get a MustHyperOnly.
+    #[test]
+    fn r5_2_5b_sampling_confluence_emits_sharp_and_hyper_must() {
+        let preds = vec![
+            PredicateSpec {
+                name: "cnt_is_0".into(),
+                register: "cnt".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "cnt_is_1".into(),
+                register: "cnt".into(),
+                value: 1,
+            },
+        ];
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::SamplingConfluence,
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("predicate_cube_lift succeeds");
+        let total_promoted = result.sharp_edges_promoted + result.hyper_must_edges_emitted;
+        assert!(
+            total_promoted > 0,
+            "SamplingConfluence must emit at least one Sharp or MustHyperOnly edge on the counter fixture; got sharp={}, hyper={}",
+            result.sharp_edges_promoted,
+            result.hyper_must_edges_emitted
+        );
+
+        // SOUNDNESS warning is emitted alongside the promotions.
+        let any_sampling_warning = result.warnings.iter().any(|w| {
+            w.message.contains("R.2.5b-sampling-must")
+                && matches!(w.kind, crate::adapter::WarningKind::ApproximateTranslation)
+        });
+        assert!(
+            any_sampling_warning,
+            "SamplingConfluence must emit the soundness warning; got warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    /// R.2.5b — Disabling `max_input_bits` (= 0) skips the may-edge
+    /// loop entirely; no promotions happen even when
+    /// SamplingConfluence is enabled, because there are no sampled
+    /// edges to promote.
+    #[test]
+    fn r5_2_5b_sampling_confluence_noop_when_max_input_bits_zero() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 0,
+            must_edge_inference: MustEdgeInference::SamplingConfluence,
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("predicate_cube_lift succeeds");
+        assert_eq!(
+            result.sharp_edges_promoted, 0,
+            "no promotions when max_input_bits=0"
+        );
+        assert_eq!(
+            result.hyper_must_edges_emitted, 0,
+            "no hyper-must when max_input_bits=0"
+        );
+    }
+
+    /// R.2.5b — Empty predicate set: the may-edge loop is skipped
+    /// (gated on `!predicates.is_empty()`); SamplingConfluence's
+    /// post-pass has nothing to operate on.
+    #[test]
+    fn r5_2_5b_sampling_confluence_noop_when_predicates_empty() {
+        let preds: Vec<PredicateSpec> = vec![];
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::SamplingConfluence,
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("predicate_cube_lift succeeds");
+        assert_eq!(result.sharp_edges_promoted, 0);
+        assert_eq!(result.hyper_must_edges_emitted, 0);
     }
 
     // ---- R.5b consumer wiring — predicate_cube_lift honors uf_wrap ----
