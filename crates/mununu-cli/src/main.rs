@@ -157,6 +157,25 @@ enum PredicateSourceArg {
     Craig,
 }
 
+/// R.2.5b session-1 follow-up (2026-06-06) — must-edge inference
+/// selector for `mununu btor2 cegar`. Mirrors the values of
+/// [`mununu_core::adapter::btor2::kmts_lift::MustEdgeInference`].
+#[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
+enum MustEdgeInferenceArg {
+    /// Pre-R.2.5b behaviour (default). Only MayOnly edges emitted;
+    /// no must / hyper-must inference.
+    #[default]
+    Off,
+    /// Sampling-derived must-edge inference. The lifter's post-pass
+    /// promotes MayOnly → Sharp when all sampled paths agree on
+    /// a single target cube, and emits MustHyperOnly with the
+    /// target set when paths diverge. SOUNDNESS: sampling-based;
+    /// SMT-backed proof is queued for R.2.5b session 2. Verdicts
+    /// depending on the inferred must-edges carry an
+    /// `[R.2.5b-sampling-must]` AdapterWarning.
+    SamplingConfluence,
+}
+
 #[derive(Args, Debug)]
 struct Btor2CegarArgs {
     /// Path to the BTOR2 input file.
@@ -185,6 +204,15 @@ struct Btor2CegarArgs {
     /// terminating with `BoundedIterationsReached`. Default 16.
     #[arg(long, default_value_t = 16)]
     max_iterations: usize,
+    /// R.2.5b session-1 follow-up (2026-06-06) — must-edge
+    /// inference policy for the per-iteration `predicate_cube_lift`.
+    /// Defaults to `off`. Set to `sampling-confluence` to opt the
+    /// lifter into sampling-derived Sharp / MustHyperOnly edge
+    /// emission. The lift result then includes an
+    /// `[R.2.5b-sampling-must]` AdapterWarning whenever the
+    /// post-pass fires.
+    #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
+    must_edge_inference: MustEdgeInferenceArg,
     /// Emit the trace summary as JSON on stdout instead of the
     /// human-readable format.
     #[arg(long)]
@@ -1645,6 +1673,15 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         PredicateSourceArg::Craig => PredicateSource::CraigInterpolation,
     };
 
+    // R.2.5b session-1 follow-up — map CLI MustEdgeInferenceArg to
+    // the core MustEdgeInference enum.
+    let must_edge_inference = match args.must_edge_inference {
+        MustEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+        MustEdgeInferenceArg::SamplingConfluence => {
+            mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SamplingConfluence
+        }
+    };
+
     let cegar_opts = CegarOptions {
         max_iterations: args.max_iterations,
         predicate_source,
@@ -1653,8 +1690,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         enable_approximant_reuse: false,
         smart_uf_cap: true,
         lift_strategy: LiftStrategy::Eager,
-
-        must_edge_inference: mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+        must_edge_inference,
     };
 
     let trace = cegar_refine_loop(
