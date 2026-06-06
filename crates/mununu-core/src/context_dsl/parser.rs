@@ -961,7 +961,19 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Label) => {
                 self.advance();
                 let name = self.expect_ident()?;
-                let index = if self.match_symbol(Symbol::LBracket) {
+                // R.5 Item K sub-item K.1c (2026-06-06) — when the
+                // next token sequence is `[ident]` AND `ident` is
+                // a modality keyword (`may` / `must` / `sharp`),
+                // do NOT consume the bracket as an index
+                // expression — leave it for the trailing modality
+                // attribute parser. This resolves the K.1
+                // ambiguity that previously forced authors to
+                // wrap the modality in `effects { } [may]` or use
+                // the bare `on epsilon [may]` form.
+                let index = if self.check_symbol(Symbol::LBracket)
+                    && !self.next_bracket_is_modality_attribute()
+                {
+                    self.match_symbol(Symbol::LBracket);
                     let expr = self.parse_expr()?;
                     self.expect_symbol(Symbol::RBracket)?;
                     Some(expr)
@@ -980,6 +992,37 @@ impl<'a> Parser<'a> {
                 span: self.peek().span,
             }),
         }
+    }
+
+    /// R.5 Item K sub-item K.1c (2026-06-06) — peek-ahead for the
+    /// modality-attribute form `[<ident>]` where `<ident>` is
+    /// `may` / `must` / `sharp`. Returns `true` iff the current
+    /// token is `[` AND the next is an identifier with one of
+    /// the modality-attribute names AND the token after that is
+    /// `]`. Does NOT consume any tokens.
+    ///
+    /// Used by `parse_transition_label` to disambiguate the
+    /// `on label name [may]` syntax from the indexed-label
+    /// expression `on label name [index]` (where `index` is an
+    /// integer or identifier).
+    fn next_bracket_is_modality_attribute(&self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::Symbol(Symbol::LBracket)) {
+            return false;
+        }
+        // Peek tokens at pos + 1 and pos + 2.
+        let Some(ident_token) = self.tokens.get(self.pos + 1) else {
+            return false;
+        };
+        let Some(rbracket_token) = self.tokens.get(self.pos + 2) else {
+            return false;
+        };
+        let TokenKind::Identifier(name) = &ident_token.kind else {
+            return false;
+        };
+        if !matches!(name.as_str(), "may" | "must" | "sharp") {
+            return false;
+        }
+        matches!(rbracket_token.kind, TokenKind::Symbol(Symbol::RBracket))
     }
 
     fn parse_mu_formulas_section(&mut self) -> Result<Vec<MuFormula>, ParseError> {
@@ -2349,5 +2392,101 @@ context k1b_singleton_brackets {
         let t = first_transition(src);
         assert_eq!(t.modality, super::TransitionModalitySpec::MustOnly);
         assert!(t.additional_targets.is_empty());
+    }
+
+    /// R.5 Item K sub-item K.1c (2026-06-06) — parser
+    /// disambiguates `[may]` / `[must]` / `[sharp]` as a modality
+    /// attribute (NOT a labelled-index expression) when it appears
+    /// directly after `label <name>`. Pre-K.1c this form was
+    /// ambiguous and the parser would consume `[may]` as
+    /// `label_name[may]` (an indexed label expression) — forcing
+    /// authors to use the `on epsilon [may]` or
+    /// `on label name effects { } [may]` workaround.
+    #[test]
+    fn r5_subitem_k1c_label_followed_by_modality_attribute_parses_correctly() {
+        let src = r"
+context k1c_label_modality {
+    automata {
+        automaton A {
+            alphabet { label tick; }
+            states { state S initial; state T; }
+            transitions {
+                transition S -> T on label tick [may];
+            }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, super::TransitionModalitySpec::MayOnly);
+        // The label is `tick`, NOT a label-with-index.
+        match &t.label {
+            super::TransitionLabel::Named { name, index } => {
+                assert_eq!(name.name, "tick");
+                assert!(
+                    index.is_none(),
+                    "K.1c disambiguation: `[may]` after `label name` is a modality, not an index"
+                );
+            }
+            other => panic!("expected Named label, got {other:?}"),
+        }
+    }
+
+    /// R.5 Item K sub-item K.1c — `[must]` after `label name`
+    /// also disambiguates as modality.
+    #[test]
+    fn r5_subitem_k1c_label_followed_by_must_attribute_parses_correctly() {
+        let src = r"
+context k1c_label_must {
+    automata {
+        automaton A {
+            alphabet { label tick; }
+            states { state S initial; state T; }
+            transitions {
+                transition S -> T on label tick [must];
+            }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, super::TransitionModalitySpec::MustOnly);
+    }
+
+    /// R.5 Item K sub-item K.1c — indexed-label syntax
+    /// `label name[<integer>]` continues to parse as a label with
+    /// an integer index, NOT as a modality attribute. The
+    /// disambiguation only fires for the 3 modality keywords.
+    #[test]
+    fn r5_subitem_k1c_integer_index_after_label_still_parses_as_index() {
+        let src = r"
+context k1c_integer_index {
+    alphabet { label channel; }
+    automata {
+        automaton A {
+            alphabet { label channel; }
+            states { state S initial; state T; }
+            transitions {
+                transition S -> T on label channel[3];
+            }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        // `[3]` is consumed as the label's index expression
+        // (K.1c does NOT disambiguate integer indices).
+        match &t.label {
+            super::TransitionLabel::Named { name, index } => {
+                assert_eq!(name.name, "channel");
+                assert!(
+                    index.is_some(),
+                    "integer index `[3]` should still parse as an index expression"
+                );
+            }
+            other => panic!("expected Named label, got {other:?}"),
+        }
+        // Modality defaults to Sharp (no attribute).
+        assert_eq!(t.modality, super::TransitionModalitySpec::Sharp);
     }
 }
