@@ -213,6 +213,19 @@ pub struct TransitionDecl {
     /// omits the `[may]` / `[must]` / `[sharp]` attribute on
     /// the transition, preserving pre-K.1 behaviour.
     pub modality: TransitionModalitySpec,
+    /// R.5 Item K sub-item K.1b (2026-06-06) — additional
+    /// hyper-must target states for the multi-target
+    /// `transition s -> [t1, t2, t3] on a [must];` syntax.
+    /// The primary `target` is the first hyper-target (`t1`);
+    /// this field carries `[t2, t3, ...]`. Default `Vec::new()`
+    /// — matches pre-K.1b grammar (singleton hyper-must when
+    /// `modality == MustOnly`).
+    ///
+    /// Only load-bearing for `modality == MustOnly`; ignored by
+    /// realize when modality is `Sharp` or `MayOnly`. The
+    /// emitter writes the bracketed-list syntax iff
+    /// `!additional_targets.is_empty()`.
+    pub additional_targets: Vec<StateSelector>,
 }
 
 #[derive(Debug, Clone)]

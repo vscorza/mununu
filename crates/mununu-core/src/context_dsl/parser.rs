@@ -797,7 +797,18 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Transition)?;
         let source = self.parse_state_selector(true)?;
         self.expect_symbol(Symbol::Arrow)?;
-        let target = self.parse_state_selector(true)?;
+        // R.5 Item K sub-item K.1b (2026-06-06) — accept either a
+        // single target (`-> t`) OR a bracketed-list of
+        // hyper-targets (`-> [t1, t2, t3]`). The list form is the
+        // multi-target hyper-must syntax; the parser stores `t1` as
+        // `target` and the rest in `additional_targets`. The
+        // bracketed syntax is independent of the trailing modality
+        // attribute — pairing with `[must]` produces a multi-target
+        // `MustHyperOnly` at realize; pairing with `[may]` or no
+        // attribute is currently accepted but ignored by realize
+        // (singleton may-edge to `t1` only). Realize emits a
+        // warning when the additional_targets are dropped this way.
+        let (target, additional_targets) = self.parse_transition_target()?;
         self.expect_keyword(Keyword::On)?;
         let label = self.parse_transition_label()?;
         let mut additional_labels = Vec::new();
@@ -837,7 +848,36 @@ impl<'a> Parser<'a> {
             guard,
             effects,
             modality,
+            additional_targets,
         })
+    }
+
+    /// R.5 Item K sub-item K.1b (2026-06-06) — parse the
+    /// transition's target slot. Accepts:
+    ///
+    /// - Single target: `s -> t`. Returns `(t, vec![])`.
+    /// - Hyper-target list: `s -> [t1, t2, t3]`. Returns
+    ///   `(t1, vec![t2, t3])`. The list must be non-empty;
+    ///   `s -> []` errors. Group selectors (`s -> @group`)
+    ///   are not allowed inside the bracketed list (the list
+    ///   form is reserved for explicit per-state hyper-targets
+    ///   per the K.1b syntax spec).
+    fn parse_transition_target(
+        &mut self,
+    ) -> Result<(StateSelector, Vec<StateSelector>), ParseError> {
+        if self.match_symbol(Symbol::LBracket) {
+            let mut targets = Vec::new();
+            targets.push(self.parse_state_selector(false)?);
+            while self.match_symbol(Symbol::Comma) {
+                targets.push(self.parse_state_selector(false)?);
+            }
+            self.expect_symbol(Symbol::RBracket)?;
+            let primary = targets.remove(0);
+            Ok((primary, targets))
+        } else {
+            let single = self.parse_state_selector(true)?;
+            Ok((single, Vec::new()))
+        }
     }
 
     /// R.5 Item K sub-item K.1 (2026-06-04) — parse the
@@ -2238,5 +2278,76 @@ context k1_post_effects {
 ";
         let t = first_transition(src);
         assert_eq!(t.modality, TransitionModalitySpec::MayOnly);
+    }
+
+    /// R.5 Item K sub-item K.1b (2026-06-06) — bracketed-list
+    /// target syntax `transition s -> [t1, t2, t3] on a [must];`
+    /// stores `t1` in `target` and `[t2, t3]` in
+    /// `additional_targets`.
+    #[test]
+    fn r5_subitem_k1b_multi_target_hyper_must_parses_correctly() {
+        let src = r"
+context k1b_multi_target {
+    automata {
+        automaton A {
+            states { state S initial; state T1; state T2; state T3; }
+            transitions {
+                transition S -> [T1, T2, T3] on epsilon [must];
+            }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, super::TransitionModalitySpec::MustOnly);
+        assert_eq!(t.additional_targets.len(), 2);
+        // Primary target is T1; additional are T2, T3.
+        let target_names: Vec<String> = std::iter::once(&t.target)
+            .chain(t.additional_targets.iter())
+            .map(|sel| match sel {
+                super::StateSelector::Named(super::StateRef::Simple(ident)) => ident.name.clone(),
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(target_names, vec!["T1", "T2", "T3"]);
+    }
+
+    /// R.5 Item K sub-item K.1b — single-target form (no brackets)
+    /// continues to parse with `additional_targets.is_empty()`.
+    #[test]
+    fn r5_subitem_k1b_single_target_form_leaves_additional_empty() {
+        let src = r"
+context k1b_single_target {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> T on epsilon [must]; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, super::TransitionModalitySpec::MustOnly);
+        assert!(t.additional_targets.is_empty());
+    }
+
+    /// R.5 Item K sub-item K.1b — bracketed list with a single
+    /// element parses correctly and leaves `additional_targets`
+    /// empty (degenerate but legal).
+    #[test]
+    fn r5_subitem_k1b_singleton_bracketed_list_is_legal() {
+        let src = r"
+context k1b_singleton_brackets {
+    automata {
+        automaton A {
+            states { state S initial; state T; }
+            transitions { transition S -> [T] on epsilon [must]; }
+        }
+    }
+}
+";
+        let t = first_transition(src);
+        assert_eq!(t.modality, super::TransitionModalitySpec::MustOnly);
+        assert!(t.additional_targets.is_empty());
     }
 }

@@ -813,6 +813,7 @@ fn resolve_enum_variants(automaton: &Automaton, registry: &EnumRegistry) -> Auto
                 })
                 .collect(),
             modality: t.modality,
+            additional_targets: t.additional_targets.clone(),
         })
         .collect();
 
@@ -1097,6 +1098,7 @@ fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Auto
                 })
                 .collect(),
             modality: t.modality,
+            additional_targets: t.additional_targets.clone(),
         })
         .collect();
 
@@ -2476,6 +2478,7 @@ fn expand_state_selectors(automaton: &Automaton) -> Result<Automaton, Realizatio
                     guard: transition.guard.clone(),
                     effects: transition.effects.clone(),
                     modality: transition.modality,
+                    additional_targets: transition.additional_targets.clone(),
                 });
             }
         }
@@ -2679,9 +2682,12 @@ fn build_automaton(
         // fixture without a modality attribute) carry
         // `TransitionModalitySpec::Sharp` from K.1's default and realize
         // to `TransitionModality::Sharp` here, preserving behaviour
-        // byte-for-byte. `[must]` realizes to a singleton hyper-must
-        // (target = {to_id}); multi-target hyper-must syntax is queued
-        // as K.1b.
+        // byte-for-byte. `[must]` with no additional_targets
+        // realizes to a singleton hyper-must (target = {to_id});
+        // R.5 Item K sub-item K.1b (2026-06-06) extends this to
+        // multi-target hyper-must when the CTXDSL syntax
+        // `transition s -> [t1, t2, t3] on a [must];` populates
+        // `additional_targets`.
         // All transitions are always enabled after unrolling (guards resolved at build time)
         if let (Some(from_id), Some(to_id)) = (
             builder.state_id_or_insert(source),
@@ -2691,7 +2697,20 @@ fn build_automaton(
                 TransitionModalitySpec::Sharp => TransitionModality::Sharp,
                 TransitionModalitySpec::MayOnly => TransitionModality::MayOnly,
                 TransitionModalitySpec::MustOnly => {
-                    TransitionModality::must_hyper(smallvec::smallvec![to_id])
+                    // R.5 Item K sub-item K.1b — build the
+                    // hyper-target set from the primary target +
+                    // any additional_targets declared via the
+                    // bracketed-list syntax.
+                    let mut hyper_targets: smallvec::SmallVec<
+                        [crate::clts::StateId<DefaultStateIdx>; 4],
+                    > = smallvec::smallvec![to_id];
+                    for additional in &transition.additional_targets {
+                        let additional_name = state_selector_name(additional)?;
+                        if let Some(extra_id) = builder.state_id_or_insert(additional_name) {
+                            hyper_targets.push(extra_id);
+                        }
+                    }
+                    TransitionModality::must_hyper(hyper_targets)
                 }
             };
             builder.transition_ids_with_modality(from_id, &label_ids, to_id, modality);
@@ -4278,5 +4297,53 @@ context sharp_modality {
             "[sharp] realizes to Sharp, got {:?}",
             outgoing[0].modality()
         );
+    }
+
+    /// R.5 Item K sub-item K.1b (2026-06-06) — the multi-target
+    /// bracketed-list syntax `transition s -> [t1, t2, t3] on a
+    /// [must];` realizes to a `MustHyperOnly` whose target set
+    /// has 3 elements (the primary + 2 additional).
+    #[test]
+    fn r5_subitem_k1b_multi_target_realizes_to_hyper_must_with_full_set() {
+        let doc = parse(
+            r#"
+context k1b_multi_realize {
+    automata {
+        automaton M {
+            states { state s0 initial; state t1; state t2; state t3; }
+            transitions {
+                transition s0 -> [t1, t2, t3] on epsilon [must];
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        let s0 = clts
+            .initial_states()
+            .iter()
+            .copied()
+            .next()
+            .expect("initial state exists");
+        let outgoing = clts.outgoing(s0);
+        assert_eq!(outgoing.len(), 1, "one outgoing transition (hyper-must)");
+        let targets = outgoing[0]
+            .modality()
+            .hyper_targets()
+            .expect("[must] with additional_targets realizes to MustHyperOnly");
+        assert_eq!(
+            targets.len(),
+            3,
+            "K.1b: hyper-target set has 3 elements (primary + 2 additional)"
+        );
+        // The target states' names match t1, t2, t3 in order.
+        let target_names: Vec<&str> = targets
+            .iter()
+            .map(|&id| clts.state_name(id).unwrap_or("?"))
+            .collect();
+        assert_eq!(target_names, vec!["t1", "t2", "t3"]);
     }
 }

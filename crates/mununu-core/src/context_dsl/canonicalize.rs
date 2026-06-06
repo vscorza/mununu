@@ -341,6 +341,8 @@ mod tests {
                     }],
 
                     modality: TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
                 TransitionDecl {
                     source: StateSelector::Named(StateRef::Simple(ident("A"))),
@@ -360,6 +362,8 @@ mod tests {
                     }],
 
                     modality: TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
             ],
             predicates: Vec::new(),
@@ -566,6 +570,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -596,6 +602,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -636,6 +644,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -714,6 +724,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         auto.transitions.push(TransitionDecl {
@@ -731,6 +743,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         // Verify initial order (alpha[10] before alpha[5])
@@ -779,6 +793,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -816,6 +832,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -899,6 +917,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         auto.transitions.push(TransitionDecl {
@@ -922,6 +942,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         // Verify initial order (alpha[arr[10]] before alpha[arr[5]])
@@ -990,6 +1012,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -1029,6 +1053,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
@@ -1121,6 +1147,8 @@ mod tests {
                 effects: Vec::new(),
 
                 modality: TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
 
@@ -1196,6 +1224,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         auto.transitions.push(TransitionDecl {
@@ -1216,6 +1246,8 @@ mod tests {
             effects: Vec::new(),
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         // Verify initial order (alpha[(10)] before alpha[(5)])
@@ -1425,6 +1457,8 @@ mod tests {
             ],
 
             modality: TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         };
         auto.transitions.push(test_transition);
 
