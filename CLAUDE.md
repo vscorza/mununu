@@ -186,6 +186,34 @@ The path must be a real file in this workspace. Line numbers are optional but re
 
 **Renames and removals.** The same commit that renames or removes a symbol must update every documentation anchor that points at it. `/parity-check` confirms a *feature* is wired across surfaces; `/docs-traceability` confirms a *doc page* still points at code that exists. Both must pass for a change to ship.
 
+### Documentation Cadence Guideline
+
+**Rule.** When more than **10 commits** have landed on `main` since the last commit touching `docs/`, `wiki/`, `README.md`, or `examples/`, the contributor's next commit should either:
+
+1. Include a `docs/` or `wiki/` delta capturing accumulated changes, OR
+2. Run `/docs-traceability` and record the verdict (no drift detected) in the commit message or a `.claude/reviews/docs-traceability/` note.
+
+**Why.** The per-commit discipline already documents inline changes (commit messages, module `//!` docs, `// SOUNDNESS:` annotations). But user-facing docs (`docs/abstraction.md`, the wiki, example READMEs) drift in batches — a stretch of feature commits without wiki touches accumulates surface that authors of CTXDSL / API / UI consumers can't discover. The cadence rule turns that drift into a visible signal.
+
+**How to check.**
+
+```bash
+make docs-audit                       # default threshold = 10 commits
+make docs-audit DOCS_THRESHOLD=20     # custom threshold
+```
+
+`scripts/docs-audit.sh` (the underlying script) reports:
+- The commit count since the last docs/wiki touch.
+- Whether the threshold has been exceeded.
+- A categorised breakdown of which code areas (CTXDSL syntax, API surface, CLI surface, composition, formula operators, adapters) saw recent commits — narrowing the search space for the actual wiki / docs update.
+- A cross-repo reminder when `api/models.rs` was touched (mununu-ui's `src/api/types.ts` may need a matching type update).
+
+**Cadence enforcement.** The check is **advisory**, not blocking — exit code 1 on threshold breach surfaces the warning but does not fail CI or hooks. The expectation is that contributors invoke `make docs-audit` periodically (e.g. before a multi-commit push, or at the close of a multi-session R-track sub-item arc).
+
+**Cross-repo doc sync (mununu ↔ mununu-ui).** When `api/models.rs` field shapes change, `mununu-ui/src/api/types.ts` typically needs a matching update. There is no automated typegen between the two repos today; the audit script flags this as a manual reminder. Future work: an OpenAPI-driven typegen pipeline would make this drift detectable mechanically.
+
+**Surface-of-truth anchors take precedence.** When the cadence rule fires, the contributor's first move is `/docs-traceability` (anchor-by-anchor verification of the existing docs) — that surfaces the most actionable drift. Adding new doc sections to cover new code is a secondary follow-up.
+
 ## Claims Integrity
 
 Every public claim about mununu's ability to find bugs, verify properties, or improve security of external systems must be backed by reproducible evidence against real implementations. This applies to README examples, wiki case studies, blog posts linked from the repo, conference papers, and any material that references real-world systems.

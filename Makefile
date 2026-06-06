@@ -119,6 +119,22 @@ verify:
 
 ci: lint test
 
+# Advisory documentation cadence check. Reports whether more than
+# THRESHOLD commits (default 10) have landed since the last touch of
+# docs/, wiki/, README.md, or examples/. When triggered, lists the
+# code areas whose recent commits warrant a wiki / docs review and
+# recommends invoking the /docs-traceability skill. See CLAUDE.md
+# §Documentation Cadence Guideline for the contributor protocol.
+#
+# Usage:
+#   make docs-audit                       # default threshold = 10
+#   make docs-audit DOCS_THRESHOLD=20     # custom threshold
+#
+# This target does NOT block commits/pushes; exit code 1 on threshold
+# breach is advisory only.
+docs-audit:
+	@scripts/docs-audit.sh $(DOCS_THRESHOLD)
+
 clean:
 	$(CARGO) clean
 
