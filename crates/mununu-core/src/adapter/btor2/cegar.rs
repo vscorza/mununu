@@ -219,6 +219,20 @@ pub struct CegarOptions {
     /// Future evaluator-side lazy support (separate sub-item)
     /// will extract real memory savings from the lazy path.
     pub lift_strategy: LiftStrategy,
+    /// R.2.5b session-1 follow-up (2026-06-06) — per-iteration
+    /// must-edge inference policy passed to `predicate_cube_lift`.
+    /// Defaults to [`crate::adapter::btor2::kmts_lift::MustEdgeInference::Off`]
+    /// (pre-R.2.5b behaviour, MayOnly only).
+    ///
+    /// Set to `MustEdgeInference::SamplingConfluence` to opt the
+    /// CEGAR loop into sampling-derived must / hyper-must edges.
+    /// SOUNDNESS: the inferred must-edges are sampling-derived
+    /// (canonical-representative assumption). R.5 CEGAR verdicts
+    /// that depend on them carry the lifter's
+    /// `[R.2.5b-sampling-must]` `AdapterWarning` per iteration.
+    /// R.2.5b session 2 (SMT-backed must-edge query via Z3 array
+    /// theory) replaces the sampling pass with a sound proof.
+    pub must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference,
 }
 
 /// R.5 lazy KMTS sub-item 2.4 (2026-06-04) — selector for the
@@ -263,6 +277,14 @@ impl std::fmt::Debug for CegarOptions {
             // smart_uf_cap default is TRUE; only print when DISABLED.
             ds.field("smart_uf_cap", &false);
         }
+        if !matches!(
+            self.must_edge_inference,
+            crate::adapter::btor2::kmts_lift::MustEdgeInference::Off
+        ) {
+            // must_edge_inference default is Off; only print when
+            // overridden.
+            ds.field("must_edge_inference", &self.must_edge_inference);
+        }
         ds.finish()
     }
 }
@@ -277,6 +299,7 @@ impl Default for CegarOptions {
             enable_approximant_reuse: false,
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         }
     }
 }
@@ -500,11 +523,13 @@ pub fn cegar_refine_loop(
         // loop to refine. 8 bits = 256 combinations per cube, matches
         // the lift opts' default.
         max_input_bits: 8,
-        // R.2.5b (2026-06-06): default the new lifter option to
-        // pre-R.2.5b behaviour (MayOnly only). The CEGAR loop opts
-        // into SamplingConfluence via the CegarOptions follow-up
-        // once a real fixture surfaces a Diamond-must-edge demand.
-        must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+        // R.2.5b session-1 follow-up (2026-06-06): forward the
+        // CEGAR-level must-edge inference policy to the lifter. When
+        // the user has opted into `SamplingConfluence`, each
+        // iteration's lift emits sampling-derived Sharp / MustHyperOnly
+        // edges + a [R.2.5b-sampling-must] AdapterWarning that
+        // propagates through the CegarTrace to the verdict surface.
+        must_edge_inference: cegar_opts.must_edge_inference,
     };
 
     for iteration in 0..=cegar_opts.max_iterations {
@@ -1282,6 +1307,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1340,6 +1367,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1396,6 +1425,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1766,6 +1797,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1794,6 +1827,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -1886,6 +1921,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1905,6 +1942,8 @@ mod tests {
             enable_approximant_reuse: true,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -2105,6 +2144,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let env_iter0 = Environment::new(2);
         let result_off = cegar_refine_loop(
@@ -2127,6 +2168,8 @@ mod tests {
             enable_approximant_reuse: true,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let result_on = cegar_refine_loop(
             &formula,
@@ -2198,6 +2241,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2245,6 +2290,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2379,6 +2426,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false, // opt out
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2420,6 +2469,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: true, // on; should still not fire because source ≠ WP
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2501,6 +2552,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2596,6 +2649,8 @@ mod tests {
             enable_approximant_reuse: true, // non-default
             smart_uf_cap: false,            // non-default
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let debug_str = format!("{opts:?}");
         assert!(
@@ -2646,6 +2701,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace_result = cegar_refine_loop(
             &formula,
@@ -2698,6 +2755,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2746,6 +2805,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2806,6 +2867,8 @@ mod tests {
             enable_approximant_reuse: false,
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
+
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         };
         let trace_eager = cegar_refine_loop(
             &formula,

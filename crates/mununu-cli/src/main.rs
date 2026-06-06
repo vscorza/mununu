@@ -1653,6 +1653,8 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         enable_approximant_reuse: false,
         smart_uf_cap: true,
         lift_strategy: LiftStrategy::Eager,
+
+        must_edge_inference: mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
     };
 
     let trace = cegar_refine_loop(
