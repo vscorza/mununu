@@ -57,6 +57,8 @@
 //! - No CEGAR / failure-subgame interaction (sub-items 4.4 / 4.5).
 //! - No benchmark (sub-item 4.6).
 
+#[cfg(test)]
+use crate::mu_calculus::parity_game_3v_build::EdgeModality;
 use crate::mu_calculus::parity_game_3v_build::{Game3v, Player, Position, PositionId};
 use std::collections::{BTreeSet, HashMap};
 
@@ -101,29 +103,29 @@ impl Solution {
 /// matches [`super::evaluate_tri`]'s 2-valued projection at `state`
 /// — Eve wins iff the formula holds at the state.
 pub fn solve_2v(game: &Game3v, leaf_winners: &HashMap<PositionId, Player>) -> Solution {
-    // R.5.0 sub-item 4.2 — Pre-resolve every leaf to its truth-
-    // oracle winner. Zielonka recurses only on non-leaf positions;
-    // leaves act as external "known-winner" successors that the
-    // attractor reads via the resolved-winners map.
+    // R.5.0 sub-item 4.2 — Pre-resolve every position that the
+    // caller's truth oracle has explicitly classified. Zielonka
+    // recurses on the remaining positions (including non-leaves
+    // and any positions made stuck via edge filtering — those are
+    // resolved by the propagation pass's "owner stuck loses"
+    // rule, not by pre-resolution).
+    //
+    // R.5.0 sub-item 4.3 (2026-06-06) — Only oracle-classified
+    // positions get pre-resolution. A non-leaf that becomes stuck
+    // via `solve_3v`'s edge-filter (under-approximation) is NOT in
+    // leaf_winners and must be resolved via propagation, so its
+    // owner's no-move loss is honoured (instead of defaulting to
+    // an arbitrary winner).
     let mut winners: HashMap<PositionId, Player> = HashMap::with_capacity(game.positions.len());
-    for pid_idx in 0..game.positions.len() {
-        let pid = PositionId(pid_idx);
-        if game.successors[pid_idx].is_empty() {
-            let w = leaf_winners
-                .get(&pid)
-                .copied()
-                // Defensive default: a leaf with no entry in
-                // `leaf_winners` is treated as Adam-winning (False
-                // / unresolved predicate). The integration in 4.5
-                // will guarantee every leaf has an oracle entry.
-                .unwrap_or(Player::Universal);
-            winners.insert(pid, w);
+    for (pid, w) in leaf_winners {
+        if pid.0 < game.positions.len() {
+            winners.insert(*pid, *w);
         }
     }
 
     let mut active: BTreeSet<PositionId> = (0..game.positions.len())
         .map(PositionId)
-        .filter(|pid| !game.successors[pid.0].is_empty())
+        .filter(|pid| !winners.contains_key(pid))
         .collect();
 
     // R.5.0 sub-item 4.2 — Propagate winners from pre-resolved
@@ -717,9 +719,17 @@ mod tests {
         for (i, p) in positions.iter().enumerate() {
             index.insert((p.state, p.node), PositionId(i));
         }
+        // R.5.0 sub-item 4.3 — All hand-built game edges default to
+        // Sharp modality (the test pre-dates 4.3's modality
+        // tracking; vanilla 2v solving uses Sharp regardless).
+        let edge_modalities: Vec<Vec<EdgeModality>> = successors
+            .iter()
+            .map(|s| vec![EdgeModality::Sharp; s.len()])
+            .collect();
         let game = Game3v {
             positions,
             successors,
+            edge_modalities,
             index,
         };
         // Leaf assignment: p2 → Adam, p3 → Eve.

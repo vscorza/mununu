@@ -41,9 +41,45 @@
 //! production evaluator. This module ships the **foundation** the
 //! solver will consume.
 
-use crate::clts::{Clts, IdStorage};
+use crate::clts::{Clts, IdStorage, TransitionModality};
 use crate::mu_calculus::{Formula, FormulaVarId, ModalKind, Node, NodeId};
 use std::collections::HashMap;
+
+/// R.5.0 sub-item 4.3 (2026-06-06) — Modality of a single game edge.
+/// Edges derived from CLTS modal transitions inherit the transition's
+/// modality; non-modal edges (Or, And, Variable, fixpoint unfold)
+/// are always `Sharp`. The 3-valued solver (sub-item 4.3) reads this
+/// to distinguish the over-approximation (may-edges, includes
+/// `MayOnly`) from the under-approximation (must-edges, includes
+/// `MustHyperOnly`); positions whose verdict depends on `MayOnly` /
+/// `MustHyperOnly` edges receive a `KleeneBot` indefinite verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EdgeModality {
+    /// Edge is in both may-relation and must-relation (KMTS
+    /// `Sharp`) — every solver run includes it.
+    Sharp,
+    /// Edge is in may-relation only (KMTS `MayOnly`) — over-
+    /// approximation includes it, under-approximation excludes
+    /// it.
+    MayOnly,
+    /// Edge is in must-relation only (KMTS `MustHyperOnly`) —
+    /// hypertransitions in the GKMTS sense. R.5.0 sub-item 4.3
+    /// MVP treats these as Sharp for solving purposes (the
+    /// hyper-target set has cardinality 1 in K.2's encoding, so
+    /// the simplification is exact); the multi-target case
+    /// ships with K.1b's syntax extension.
+    MustHyperOnly,
+}
+
+impl EdgeModality {
+    fn from_clts<S: IdStorage>(modality: &TransitionModality<S>) -> Self {
+        match modality {
+            TransitionModality::Sharp => EdgeModality::Sharp,
+            TransitionModality::MayOnly => EdgeModality::MayOnly,
+            TransitionModality::MustHyperOnly(_) => EdgeModality::MustHyperOnly,
+        }
+    }
+}
 
 /// R.5.0 sub-item 4.1 — Position owner in the 3-valued parity game.
 ///
@@ -98,6 +134,14 @@ pub struct Game3v {
     /// means the position is a leaf (`True` / `False` / `Predicate`)
     /// — its truth value is evaluated externally by the solver.
     pub successors: Vec<Vec<PositionId>>,
+    /// R.5.0 sub-item 4.3 — Per-edge modality, parallel to
+    /// `successors`: `edge_modalities[pid.0][i]` is the
+    /// [`EdgeModality`] for the i-th successor of position `pid`.
+    /// `Sharp` for all non-modal edges; for modal-position
+    /// successors, inherits the underlying CLTS transition's
+    /// modality. The 3-valued solver (sub-item 4.3) reads this to
+    /// distinguish over-approximation from under-approximation.
+    pub edge_modalities: Vec<Vec<EdgeModality>>,
     /// Lookup from `(state, node)` to `PositionId`. Useful for the
     /// solver's reverse lookups when computing predecessors.
     pub index: HashMap<(usize, NodeId), PositionId>,
@@ -186,18 +230,21 @@ where
         }
     }
 
-    // Build successors per position.
+    // Build successors + per-edge modalities per position.
     let mut successors: Vec<Vec<PositionId>> = vec![Vec::new(); positions.len()];
+    let mut edge_modalities: Vec<Vec<EdgeModality>> = vec![Vec::new(); positions.len()];
     for pid in 0..positions.len() {
         let pos = &positions[pid];
         let node = formula.node(pos.node);
-        let succs = compute_successors(node, pos.state, clts, &index, &var_binding);
+        let (succs, mods) = compute_successors(node, pos.state, clts, &index, &var_binding);
         successors[pid] = succs;
+        edge_modalities[pid] = mods;
     }
 
     Game3v {
         positions,
         successors,
+        edge_modalities,
         index,
     }
 }
@@ -276,7 +323,7 @@ fn compute_successors<S, L>(
     clts: &Clts<S, L>,
     index: &HashMap<(usize, NodeId), PositionId>,
     var_binding: &HashMap<FormulaVarId, NodeId>,
-) -> Vec<PositionId>
+) -> (Vec<PositionId>, Vec<EdgeModality>)
 where
     S: IdStorage,
     L: IdStorage,
@@ -284,37 +331,38 @@ where
     match node {
         // Leaf positions: no moves. Truth value is read by the
         // solver from the CLTS (Predicate) or constant (True/False).
-        Node::True | Node::False | Node::Predicate(_) => Vec::new(),
+        Node::True | Node::False | Node::Predicate(_) => (Vec::new(), Vec::new()),
 
         // Variable lookup: move to the position at the binding
         // fixpoint node. This creates the cycle the parity game
         // scores via the fixpoint's priority.
         Node::Variable(var) => {
             let Some(binding_node) = var_binding.get(var) else {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             };
-            index
-                .get(&(state, *binding_node))
-                .copied()
-                .map(|pid| vec![pid])
-                .unwrap_or_default()
+            match index.get(&(state, *binding_node)).copied() {
+                Some(pid) => (vec![pid], vec![EdgeModality::Sharp]),
+                None => (Vec::new(), Vec::new()),
+            }
         }
 
-        Node::Not(inner) => index
-            .get(&(state, *inner))
-            .copied()
-            .map(|pid| vec![pid])
-            .unwrap_or_default(),
+        Node::Not(inner) => match index.get(&(state, *inner)).copied() {
+            Some(pid) => (vec![pid], vec![EdgeModality::Sharp]),
+            None => (Vec::new(), Vec::new()),
+        },
 
         Node::And(l, r) | Node::Or(l, r) => {
             let mut out = Vec::with_capacity(2);
+            let mut mods = Vec::with_capacity(2);
             if let Some(&pid) = index.get(&(state, *l)) {
                 out.push(pid);
+                mods.push(EdgeModality::Sharp);
             }
             if let Some(&pid) = index.get(&(state, *r)) {
                 out.push(pid);
+                mods.push(EdgeModality::Sharp);
             }
-            out
+            (out, mods)
         }
 
         Node::Modal { target, .. } => {
@@ -326,29 +374,48 @@ where
             // job is to prune to those that satisfy the guard.
             // sub-item 4.3 ships the guard-aware pruning.
             //
-            // For Sharp-only inputs, this also matches the existing
+            // For Sharp-only inputs, this matches the existing
             // evaluate_tri semantics (which considers every outgoing
-            // transition).
+            // transition). For KMTS-shaped inputs, the per-edge
+            // modality is inherited from the CLTS transition so the
+            // 3-valued solver (sub-item 4.3) can distinguish over-
+            // and under-approximation.
             let Some(source_id) = crate::clts::StateId::<S>::from_index(state) else {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             };
             let mut out = Vec::new();
+            let mut mods = Vec::new();
             for transition in clts.outgoing(source_id) {
                 let succ_state = transition.target().index();
-                if let Some(&pid) = index.get(&(succ_state, *target))
-                    && !out.contains(&pid)
-                {
+                let Some(&pid) = index.get(&(succ_state, *target)) else {
+                    continue;
+                };
+                // De-duplicate by (target position). Two CLTS
+                // transitions with the same target are coalesced
+                // into a single game edge; their modalities are
+                // merged with `Sharp` dominating (a Sharp + MayOnly
+                // pair contributes a Sharp edge).
+                let edge_mod = EdgeModality::from_clts(transition.modality());
+                if let Some(existing_idx) = out.iter().position(|p| *p == pid) {
+                    // Merge: Sharp absorbs MayOnly / MustHyperOnly.
+                    if mods[existing_idx] != EdgeModality::Sharp && edge_mod == EdgeModality::Sharp
+                    {
+                        mods[existing_idx] = EdgeModality::Sharp;
+                    }
+                } else {
                     out.push(pid);
+                    mods.push(edge_mod);
                 }
             }
-            out
+            (out, mods)
         }
 
-        Node::Mu { body, .. } | Node::Nu { body, .. } => index
-            .get(&(state, *body))
-            .copied()
-            .map(|pid| vec![pid])
-            .unwrap_or_default(),
+        Node::Mu { body, .. } | Node::Nu { body, .. } => {
+            match index.get(&(state, *body)).copied() {
+                Some(pid) => (vec![pid], vec![EdgeModality::Sharp]),
+                None => (Vec::new(), Vec::new()),
+            }
+        }
     }
 }
 
