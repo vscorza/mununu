@@ -36,6 +36,7 @@ DOC_PATHS=(
     "docs/"
     "wiki/"
     "README.md"
+    "CLAUDE.md"  # project instructions count as docs-discipline touches
     "examples/"  # catches examples/*/README.md and example fixtures docs
 )
 
