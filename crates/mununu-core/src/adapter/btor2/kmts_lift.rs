@@ -314,6 +314,20 @@ pub struct PredicateCubeLiftOptions {
     /// pre-R.2.5b behaviour of emitting only `MayOnly` edges.
     /// See [`MustEdgeInference`] for the post-pass semantics.
     pub must_edge_inference: MustEdgeInference,
+    /// R-Y7 (2026-06-07) — symbolic-init via predicate cubes.
+    /// Map of `register_name → set of valid initial values` for
+    /// under-constrained constants. When non-empty, the lifter
+    /// expands the initial-state set to ALL cubes admissible
+    /// under the R-S8 encoder's
+    /// [`crate::adapter::btor2::r_s8_encoder::hyper_must_initial_cubes`]
+    /// instead of the pre-R-Y7 single-initial-cube default.
+    /// One mechanism (the predicate cube space) handles both
+    /// init nondeterminism and state-space abstraction per Phase
+    /// 8 §8.1 R-Y7 spec.
+    ///
+    /// Default empty preserves the pre-R-Y7 single-initial-cube
+    /// behaviour exactly.
+    pub config_values: std::collections::HashMap<String, Vec<u64>>,
 }
 
 impl Default for PredicateCubeLiftOptions {
@@ -322,6 +336,7 @@ impl Default for PredicateCubeLiftOptions {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::Off,
+            config_values: std::collections::HashMap::new(),
         }
     }
 }
@@ -1166,9 +1181,34 @@ pub fn predicate_cube_lift(
             })?;
         state_ids.push(id);
     }
-    // Mark cube_0 (all-predicates-false) as initial. A future iteration
-    // can pick the cube matching the BTOR2 `init` values.
-    if let Some(initial) = state_ids.first() {
+    // R-Y7 (2026-06-07) — initial-state set selection:
+    // - When `lift_opts.config_values` is non-empty, expand the
+    //   initial-state set to all cubes admissible under the
+    //   R-S8 encoder. Each cube whose predicate evaluation is
+    //   consistent with some valid value for every constrained
+    //   register becomes an initial state.
+    // - Otherwise (pre-R-Y7 default): single initial cube
+    //   (cube_0, all-predicates-false). A future iteration can
+    //   pick the cube matching the BTOR2 `init` values.
+    if !lift_opts.config_values.is_empty() {
+        let admissible_cubes = crate::adapter::btor2::r_s8_encoder::hyper_must_initial_cubes(
+            &predicates,
+            &lift_opts.config_values,
+        );
+        for cube_idx in &admissible_cubes {
+            if let Some(state_id) = state_ids.get(*cube_idx) {
+                builder.initial_state_id(*state_id);
+            }
+        }
+        if admissible_cubes.is_empty()
+            && let Some(initial) = state_ids.first()
+        {
+            // Defensive: if no cube is admissible, fall back to
+            // cube_0 to avoid producing a Clts with no initial
+            // states (which would error at evaluator time).
+            builder.initial_state_id(*initial);
+        }
+    } else if let Some(initial) = state_ids.first() {
         builder.initial_state_id(*initial);
     }
 
@@ -1723,6 +1763,7 @@ mod tests {
             max_cube_count: 8,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::Off,
+            config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
         assert!(result.is_err());
@@ -2008,6 +2049,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::Off,
+            config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("ok");
@@ -2072,6 +2114,8 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+
+            config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -2110,6 +2154,8 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+
+            config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -2133,6 +2179,8 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+
+            config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -2163,6 +2211,8 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+
+            config_values: std::collections::HashMap::new(),
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -2188,6 +2238,109 @@ mod tests {
         assert!(
             any_warning,
             "lazy materialiser SamplingConfluence must emit the soundness warning"
+        );
+    }
+
+    /// R-Y7 (2026-06-07) — Default `config_values` (empty) → the
+    /// lifted Clts has a single initial state (cube_0), matching
+    /// pre-R-Y7 behaviour exactly.
+    #[test]
+    fn r_y7_empty_config_values_preserves_legacy_single_initial_state() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let result = predicate_cube_lift(
+            preds,
+            COUNTER_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("predicate_cube_lift succeeds");
+        assert_eq!(
+            result.clts.initial_states().len(),
+            1,
+            "pre-R-Y7 default: single initial state"
+        );
+    }
+
+    /// R-Y7 — Non-empty `config_values` expands the initial-state
+    /// set per the R-S8 encoder. For a register with multiple
+    /// valid values, multiple cubes become admissible initial
+    /// states.
+    #[test]
+    fn r_y7_config_values_expands_initial_state_set() {
+        // 2 predicates over the counter: cnt == 0 and cnt == 1.
+        // config_values: cnt is in {0, 1} → both predicate-true
+        // cubes are admissible (cube 1 = pred_0 true; cube 2 =
+        // pred_1 true). The over-approximation in R-S8 also
+        // admits cube 0 (both predicates false; could be other
+        // valid value) and cube 3 (both predicates true;
+        // inconsistent but not filtered).
+        let preds = vec![
+            PredicateSpec {
+                name: "cnt_is_0".into(),
+                register: "cnt".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "cnt_is_1".into(),
+                register: "cnt".into(),
+                value: 1,
+            },
+        ];
+        let mut config_values: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        config_values.insert("cnt".to_string(), vec![0, 1]);
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 0,
+            must_edge_inference: MustEdgeInference::Off,
+            config_values,
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("predicate_cube_lift succeeds");
+        let initial_count = result.clts.initial_states().len();
+        assert!(
+            initial_count > 1,
+            "R-Y7: config_values must expand initial-state set beyond singleton; got {initial_count}"
+        );
+        assert_eq!(
+            initial_count, 4,
+            "R-Y7: with both predicate values valid + over-approximation, all 4 cubes admissible"
+        );
+    }
+
+    /// R-Y7 — When `config_values` excludes the predicate's
+    /// value, the cube where that predicate is TRUE is NOT
+    /// admissible (per R-S8's load-bearing rule).
+    #[test]
+    fn r_y7_invalid_predicate_value_excludes_initial_cube() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_7".into(),
+            register: "cnt".into(),
+            value: 7,
+        }];
+        let mut config_values: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        // Valid values are 0, 1, 2 — predicate's value 7 is NOT valid.
+        config_values.insert("cnt".to_string(), vec![0, 1, 2]);
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 0,
+            must_edge_inference: MustEdgeInference::Off,
+            config_values,
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
+            .expect("predicate_cube_lift succeeds");
+        let initial_count = result.clts.initial_states().len();
+        // Cube 0 (predicate false): admissible (cnt holds 0, 1,
+        // or 2). Cube 1 (predicate true → cnt == 7): NOT
+        // admissible. → 1 initial state.
+        assert_eq!(
+            initial_count, 1,
+            "R-Y7: predicate-value-not-valid cube excluded from initial set"
         );
     }
 

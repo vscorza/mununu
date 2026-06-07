@@ -530,6 +530,13 @@ pub fn cegar_refine_loop(
         // edges + a [R.2.5b-sampling-must] AdapterWarning that
         // propagates through the CegarTrace to the verdict surface.
         must_edge_inference: cegar_opts.must_edge_inference,
+        // R-Y7 (2026-06-07) — symbolic-init via predicate cubes.
+        // CEGAR's pre-R-Y7 default is empty (single initial
+        // cube). A future CegarOptions follow-up surfaces a
+        // config_values field; until then, callers wanting R-Y7
+        // semantics call predicate_cube_lift directly with a
+        // populated config_values map.
+        config_values: std::collections::HashMap::new(),
     };
 
     for iteration in 0..=cegar_opts.max_iterations {
