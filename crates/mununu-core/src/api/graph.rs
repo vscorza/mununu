@@ -1058,7 +1058,7 @@ fn unrolled_automata_to_graph_elements(
                     // API graph builder operates on AST transitions
                     // post-canonicalization; modality is carried
                     // through via the existing TransitionDecl field.
-                    modality: transition.modality,
+                    modality: t.modality,
                 })
             })
             .collect();
