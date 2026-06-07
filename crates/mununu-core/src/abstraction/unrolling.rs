@@ -8,6 +8,7 @@ use super::expression::{Expr, GuardExpr, GuardResult};
 use super::heuristics::{HeuristicConfig, StateSpaceStats, VariableContext, select_abstract_type};
 use super::state::AbstractState;
 use super::value::AbstractValue;
+use crate::context_dsl::ast::TransitionModalitySpec;
 use crate::guard::parse_guard;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -19,6 +20,13 @@ pub struct OriginalTransition {
     pub label: String,
     pub guard: Option<String>,
     pub effects: Vec<Effect>,
+    /// R.5 Item K sub-item K.2b (2026-06-06) — CTXDSL modality
+    /// attribute (`[may]` / `[must]` / `[sharp]`) on the transition.
+    /// Threaded through the unrolling pipeline so the unrolled
+    /// CLTS edge inherits the source's modality. Defaults to
+    /// `Sharp` for pre-K.2b adapters that don't populate this
+    /// field (matches the K.1 default).
+    pub modality: TransitionModalitySpec,
 }
 
 /// Represents an effect (variable assignment) in a transition.
@@ -56,6 +64,11 @@ pub struct UnrolledTransition {
     pub from: AbstractState,
     pub to: AbstractState,
     pub label: String,
+    /// R.5 Item K sub-item K.2b (2026-06-06) — modality inherited
+    /// from the source [`OriginalTransition`]. `build_clts_from_unrolled`
+    /// reads this to emit the right `TransitionModality` on the
+    /// resulting CLTS edge.
+    pub modality: TransitionModalitySpec,
 }
 
 /// Building context for state unrolling with thresholds and limits.
@@ -649,6 +662,10 @@ impl UnrollingPipeline {
                             from: state.clone(),
                             to: target_state,
                             label: transition.label.clone(),
+                            // R.5 Item K sub-item K.2b (2026-06-06)
+                            // — inherit modality from the source
+                            // OriginalTransition.
+                            modality: transition.modality,
                         });
 
                         // Add target to worklist if new
@@ -1356,6 +1373,7 @@ mod tests {
                 target: "x".to_string(),
                 value_expr: "x + 1".to_string(),
             }],
+            modality: TransitionModalitySpec::Sharp,
         }];
         let variables = vec![VariableDecl {
             name: "x".to_string(),

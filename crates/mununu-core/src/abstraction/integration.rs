@@ -80,6 +80,11 @@ impl JsonToUnrollingConverter {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    // R.5 Item K sub-item K.2b (2026-06-06) — JSON-
+                    // sourced transitions default to Sharp; modality
+                    // is not yet plumbed through the JSON schema
+                    // (queued for a separate JSON-schema follow-up).
+                    modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
                 })
             })
             .collect()

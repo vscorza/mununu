@@ -1054,6 +1054,11 @@ fn unrolled_automata_to_graph_elements(
                         Some(guard_str)
                     },
                     effects,
+                    // R.5 Item K sub-item K.2b (2026-06-06) — the
+                    // API graph builder operates on AST transitions
+                    // post-canonicalization; modality is carried
+                    // through via the existing TransitionDecl field.
+                    modality: transition.modality,
                 })
             })
             .collect();

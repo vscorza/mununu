@@ -2877,6 +2877,11 @@ fn convert_transitions_for_unrolling(
             label,
             guard,
             effects,
+            // R.5 Item K sub-item K.2b (2026-06-06) — propagate
+            // the AST TransitionDecl's modality into the
+            // OriginalTransition so the unrolled CLTS edge
+            // inherits it via build_clts_from_unrolled.
+            modality: transition.modality,
         });
     }
     Ok(result)
@@ -2973,18 +2978,33 @@ fn build_clts_from_unrolled(
         );
         builder.set_label_controllability(label_id, controllability);
 
-        // R.5 Item K sub-item K.2 (2026-06-05) — SOUNDNESS: the
-        // unrolled-path (parametric automata with `var`-driven guards)
-        // currently strips the `TransitionDecl::modality` attribute on
-        // the AST → `OriginalTransition` conversion at
-        // `convert_transitions_for_unrolling`, so transitions here
-        // default to `TransitionModality::Sharp`. Hand-authored
-        // parametric automata declaring `[may]` / `[must]` realize as
-        // `Sharp` until K.2b threads modality through
-        // `OriginalTransition` / `UnrolledTransition`. The K.1 default
-        // (`Sharp`) keeps every existing parametric fixture unchanged.
-        // Add transition without guard (all transitions in unrolled CLTS are always enabled)
-        builder.transition(&from_name, &[label_id], &to_name);
+        // R.5 Item K sub-item K.2b (2026-06-06) — the unrolled
+        // path now inherits the modality from the source
+        // `OriginalTransition` (threaded through
+        // `convert_transitions_for_unrolling` per K.2b). Parametric
+        // automata declaring `[may]` / `[must]` realize correctly;
+        // the K.2 SOUNDNESS gap is closed.
+        //
+        // K.2b MVP scope: `MustOnly` realizes to a singleton
+        // hyper-must (target = {to_id}). The multi-target
+        // hyper-must syntax (K.1b's `additional_targets`) is NOT
+        // yet threaded through `OriginalTransition` — the
+        // bracketed-list target form on parametric automata is a
+        // K.2b follow-up. Singleton MustOnly + parametric
+        // unrolling is the common case and is covered here.
+        if let (Some(from_id), Some(to_id)) = (
+            builder.state_id_or_insert(&from_name),
+            builder.state_id_or_insert(&to_name),
+        ) {
+            let modality = match transition.modality {
+                TransitionModalitySpec::Sharp => TransitionModality::Sharp,
+                TransitionModalitySpec::MayOnly => TransitionModality::MayOnly,
+                TransitionModalitySpec::MustOnly => {
+                    TransitionModality::must_hyper(smallvec::smallvec![to_id])
+                }
+            };
+            builder.transition_ids_with_modality(from_id, &[label_id], to_id, modality);
+        }
     }
 
     builder
@@ -4296,6 +4316,54 @@ context sharp_modality {
             matches!(outgoing[0].modality(), TransitionModality::Sharp),
             "[sharp] realizes to Sharp, got {:?}",
             outgoing[0].modality()
+        );
+    }
+
+    /// R.5 Item K sub-item K.2b (2026-06-06) — the unrolled-path
+    /// (parametric automata with `var`-driven guards) now honors
+    /// the CTXDSL modality attribute. Pre-K.2b, parametric
+    /// automata declaring `[may]` / `[must]` would realize to
+    /// `Sharp` because the unrolling pipeline stripped the
+    /// modality.
+    #[test]
+    fn r5_subitem_k2b_unrolled_path_honors_may_modality() {
+        // K.2b: trigger the unrolled-path by declaring a `var`;
+        // the modality attribute must propagate through unrolling
+        // to the resulting CLTS edge.
+        let doc = parse(
+            r#"
+context k2b_unrolled_may {
+    automata {
+        automaton M {
+            variables {
+                var counter: i64 = 0;
+            }
+            states {
+                state s0 initial;
+                state s1;
+            }
+            transitions {
+                transition s0 -> s1 on epsilon [may];
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        // The unrolled CLTS has states keyed by the variable
+        // bindings; find any state with at least one outgoing
+        // transition and assert its modality is MayOnly.
+        let found_may = clts.states().any(|state| {
+            clts.outgoing(state)
+                .iter()
+                .any(|t| matches!(t.modality(), TransitionModality::MayOnly))
+        });
+        assert!(
+            found_may,
+            "K.2b: unrolled-path parametric automaton must propagate `[may]` to CLTS edge"
         );
     }
 
