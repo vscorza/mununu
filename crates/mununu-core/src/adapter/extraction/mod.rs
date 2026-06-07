@@ -332,6 +332,8 @@ fn build_automaton(
             target: t.to.clone(),
             labels: vec![t.label.clone()],
             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         })
         .collect();
 

@@ -57,12 +57,16 @@ fn fixture_ir() -> AdapterIR {
                     target: "s1".to_string(),
                     labels: vec!["wr_en".to_string()],
                     modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
                 TransitionSpec {
                     source: "s1".to_string(),
                     target: "s2".to_string(),
                     labels: vec!["wr_en".to_string()],
                     modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
             ],
         }],

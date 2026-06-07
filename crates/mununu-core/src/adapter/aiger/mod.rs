@@ -191,6 +191,8 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
                 target: state_names[next_state_idx].clone(),
                 labels: vec![input_label.clone()],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
     }

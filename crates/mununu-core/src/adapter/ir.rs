@@ -168,6 +168,19 @@ pub struct TransitionSpec {
     /// (CLTS) output. KMTS-aware adapters set this to `MayOnly` or
     /// `MustOnly` per the source's modality declaration.
     pub modality: TransitionModalitySpec,
+    /// R.5 Item K sub-item K.1b (2026-06-07) — additional
+    /// hyper-must target state names for the multi-target
+    /// `transition s -> [t1, t2, t3] on a [must];` CTXDSL syntax.
+    /// The primary `target` is the first hyper-target (`t1`);
+    /// this field carries `[t2, t3, ...]` as state-name strings.
+    /// Default `Vec::new()` — matches pre-K.1b emission
+    /// behaviour (single-target syntax) byte-for-byte.
+    ///
+    /// Only load-bearing for `modality == MustOnly`; ignored by
+    /// `emit::emit_explicit` when modality is `Sharp` or
+    /// `MayOnly`. The emitter writes the bracketed-list
+    /// `[t1, t2, t3]` form iff `!additional_targets.is_empty()`.
+    pub additional_targets: Vec<String>,
 }
 
 /// Composition directive.

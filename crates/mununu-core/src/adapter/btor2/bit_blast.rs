@@ -1525,6 +1525,8 @@ fn enumerate_and_blast(
                 target: state_names[next_state_idx].clone(),
                 labels: signal_labels_for_input(input_idx, &input_meta, &input_cells),
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
     }

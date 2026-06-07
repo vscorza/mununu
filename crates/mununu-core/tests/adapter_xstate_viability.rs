@@ -62,18 +62,24 @@ fn viability_simple_automaton_eval_synth() {
                     target: "Yellow".to_string(),
                     labels: vec!["timer".to_string()],
                     modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
                 TransitionSpec {
                     source: "Yellow".to_string(),
                     target: "Red".to_string(),
                     labels: vec!["timer".to_string()],
                     modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
                 TransitionSpec {
                     source: "Red".to_string(),
                     target: "Green".to_string(),
                     labels: vec!["timer".to_string()],
                     modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
             ],
             controllable_labels: vec!["timer".to_string()],
@@ -178,12 +184,16 @@ fn viability_synchronous_composition() {
                         target: "On".to_string(),
                         labels: vec!["toggle".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "On".to_string(),
                         target: "Off".to_string(),
                         labels: vec!["toggle".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                 ],
                 controllable_labels: vec!["toggle".to_string()],
@@ -215,18 +225,24 @@ fn viability_synchronous_composition() {
                         target: "Active".to_string(),
                         labels: vec!["toggle".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "Active".to_string(),
                         target: "Done".to_string(),
                         labels: vec!["step".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "Done".to_string(),
                         target: "Idle".to_string(),
                         labels: vec!["toggle".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                 ],
                 controllable_labels: vec!["step".to_string()],
@@ -343,6 +359,8 @@ fn viability_variable_automaton_guard_sync() {
                         target: "Working".to_string(),
                         labels: vec!["start".to_string(), "set_counter_0".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     // Working -> Working: increment (test that counter is 0, set to 1)
                     TransitionSpec {
@@ -354,6 +372,8 @@ fn viability_variable_automaton_guard_sync() {
                             "set_counter_1".to_string(),
                         ],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     // Working -> Working: increment (test that counter is 1, set to 2)
                     TransitionSpec {
@@ -365,6 +385,8 @@ fn viability_variable_automaton_guard_sync() {
                             "set_counter_2".to_string(),
                         ],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     // Working -> Done: finish when counter is 2
                     TransitionSpec {
@@ -372,6 +394,8 @@ fn viability_variable_automaton_guard_sync() {
                         target: "Done".to_string(),
                         labels: vec!["finish".to_string(), "test_counter_2".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     // Done -> Idle: reset
                     TransitionSpec {
@@ -379,6 +403,8 @@ fn viability_variable_automaton_guard_sync() {
                         target: "Idle".to_string(),
                         labels: vec!["reset".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                 ],
                 controllable_labels: vec![
@@ -416,54 +442,72 @@ fn viability_variable_automaton_guard_sync() {
                         target: "counter_0".to_string(),
                         labels: vec!["set_counter_0".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_1".to_string(),
                         target: "counter_0".to_string(),
                         labels: vec!["set_counter_0".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_2".to_string(),
                         target: "counter_0".to_string(),
                         labels: vec!["set_counter_0".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_0".to_string(),
                         target: "counter_1".to_string(),
                         labels: vec!["set_counter_1".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_1".to_string(),
                         target: "counter_1".to_string(),
                         labels: vec!["set_counter_1".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_2".to_string(),
                         target: "counter_1".to_string(),
                         labels: vec!["set_counter_1".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_0".to_string(),
                         target: "counter_2".to_string(),
                         labels: vec!["set_counter_2".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_1".to_string(),
                         target: "counter_2".to_string(),
                         labels: vec!["set_counter_2".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_2".to_string(),
                         target: "counter_2".to_string(),
                         labels: vec!["set_counter_2".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     // test transitions: self-loops (guard checks)
                     TransitionSpec {
@@ -471,18 +515,24 @@ fn viability_variable_automaton_guard_sync() {
                         target: "counter_0".to_string(),
                         labels: vec!["test_counter_0".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_1".to_string(),
                         target: "counter_1".to_string(),
                         labels: vec!["test_counter_1".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "counter_2".to_string(),
                         target: "counter_2".to_string(),
                         labels: vec!["test_counter_2".to_string()],
                         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                 ],
                 controllable_labels: vec![

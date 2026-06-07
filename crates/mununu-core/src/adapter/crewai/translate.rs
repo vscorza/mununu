@@ -76,18 +76,24 @@ pub fn to_ir(crew: &Crew, warnings: &mut Vec<AdapterWarning>) -> AdapterIR {
                     target: "Executing".to_string(),
                     labels: vec![start.clone()],
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
                 TransitionSpec {
                     source: "Executing".to_string(),
                     target: "Done".to_string(),
                     labels: vec![complete.clone()],
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
                 TransitionSpec {
                     source: "Done".to_string(),
                     target: "Idle".to_string(),
                     labels: vec![start.clone()],
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 },
             ],
             controllable_labels,
@@ -171,6 +177,8 @@ fn build_sequential_supervisor(crew: &Crew, crew_name: &str) -> Option<Automaton
             target: tgt,
             labels: vec![complete],
             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
     }
 

@@ -660,6 +660,11 @@ pub(crate) fn unrolled_automata_to_cytoscape(
                         Some(guard_str)
                     },
                     effects,
+                    // R.5 Item K sub-item K.2b (2026-06-07) —
+                    // propagate the AST TransitionDecl modality so
+                    // the unrolled-CLTS path emits the right
+                    // CLTS edge modality.
+                    modality: t.modality,
                 })
             })
             .collect();

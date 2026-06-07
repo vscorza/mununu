@@ -152,6 +152,8 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
                     target: dst,
                     labels,
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 }
             })
             .collect();
@@ -331,6 +333,8 @@ fn create_variable_automaton(
                 target: state_name.clone(),
                 labels: vec![label],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
 
@@ -341,6 +345,8 @@ fn create_variable_automaton(
             target: state_name.clone(),
             labels: vec![test_label],
             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
     }
 
@@ -383,6 +389,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
                 format!("recv_{}", chan.name),
             ],
             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
     } else {
         // Buffered channel: occupancy-level states
@@ -402,6 +410,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
                 target: format!("{}_{}", chan.name, k + 1),
                 labels: vec![format!("send_{}", chan.name)],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
 
@@ -412,6 +422,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
                 target: format!("{}_{}", chan.name, k - 1),
                 labels: vec![format!("recv_{}", chan.name)],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
 
@@ -422,6 +434,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
             target: format!("{}_0", chan.name),
             labels: vec![format!("test_{}_empty", chan.name)],
             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         // test_ch_nempty: self-loop on ch_1..ch_N
@@ -431,6 +445,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
                 target: format!("{}_{}", chan.name, k),
                 labels: vec![format!("test_{}_nempty", chan.name)],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
 
@@ -440,6 +456,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
             target: format!("{}_{}", chan.name, chan.capacity),
             labels: vec![format!("test_{}_full", chan.name)],
             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+            additional_targets: Vec::new(),
         });
 
         // test_ch_nfull: self-loop on ch_0..ch_{N-1}
@@ -449,6 +467,8 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
                 target: format!("{}_{}", chan.name, k),
                 labels: vec![format!("test_{}_nfull", chan.name)],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             });
         }
     }

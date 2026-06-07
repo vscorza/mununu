@@ -896,6 +896,8 @@ fn to_ir(
                 target: t.target.clone(),
                 labels: vec![t.label.clone()],
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                additional_targets: Vec::new(),
             }
         })
         .collect();

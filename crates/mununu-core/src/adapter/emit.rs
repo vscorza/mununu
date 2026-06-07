@@ -575,10 +575,29 @@ fn emit_explicit(ir: &AdapterIR) -> Result<String, AdapterError> {
             // preserved byte-for-byte). `[sharp]` is never emitted —
             // the empty / no-suffix form is the canonical one.
             let modality_suffix = transition_modality_suffix(t.modality);
+            // R.5 Item K sub-item K.1b (2026-06-07) — when the
+            // TransitionSpec carries `additional_targets`, emit the
+            // bracketed-list `[t1, t2, t3]` target form. Otherwise
+            // emit the legacy single-target form. The
+            // `additional_targets` field is only load-bearing when
+            // `modality == MustOnly` (multi-target hyper-must);
+            // `Sharp` / `MayOnly` ignore additional targets at the
+            // realize step, but the emitter unconditionally honors
+            // the IR shape to preserve round-trip fidelity.
+            let target_text = if t.additional_targets.is_empty() {
+                sanitize(&t.target)
+            } else {
+                let mut parts = Vec::with_capacity(1 + t.additional_targets.len());
+                parts.push(sanitize(&t.target));
+                for tgt in &t.additional_targets {
+                    parts.push(sanitize(tgt));
+                }
+                format!("[{}]", parts.join(", "))
+            };
             w.write_line(&format!(
                 "transition {} -> {} on {}{};",
                 sanitize(&t.source),
-                sanitize(&t.target),
+                target_text,
                 label_str,
                 modality_suffix,
             ));
@@ -1143,12 +1162,16 @@ mod tests {
                         target: "critical".into(),
                         labels: vec!["enter".into()],
                         modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                     TransitionSpec {
                         source: "critical".into(),
                         target: "idle".into(),
                         labels: vec!["exit".into()],
                         modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                        additional_targets: Vec::new(),
                     },
                 ],
                 controllable_labels: vec!["enter".into()],
@@ -1298,6 +1321,8 @@ context k3_roundtrip {
                     target: "s1".into(),
                     labels: vec![label.into()],
                     modality,
+
+                    additional_targets: Vec::new(),
                 }],
                 controllable_labels: vec![],
                 internal_labels: vec![],
@@ -1306,5 +1331,93 @@ context k3_roundtrip {
             properties: vec![],
             controller: None,
         }
+    }
+
+    /// R.5 Item K sub-item K.1b (2026-06-07) — the CTXDSL emitter
+    /// writes the bracketed-list `[t1, t2, t3]` target form when
+    /// `TransitionSpec::additional_targets` is non-empty.
+    #[test]
+    fn r5_subitem_k1b_emitter_writes_bracketed_list_for_multi_target() {
+        let ir = AdapterIR {
+            metadata: Metadata {
+                title: "k1b_multi_target".into(),
+                source_format: SourceFormat::Promela,
+                description: None,
+                game_semantics: None,
+                known_status: None,
+            },
+            signals: vec![],
+            automata: vec![AutomatonSpec {
+                name: "P0".into(),
+                states: vec![
+                    StateSpec {
+                        name: "s0".into(),
+                        is_initial: true,
+                        valuations: None,
+                    },
+                    StateSpec {
+                        name: "t1".into(),
+                        is_initial: false,
+                        valuations: None,
+                    },
+                    StateSpec {
+                        name: "t2".into(),
+                        is_initial: false,
+                        valuations: None,
+                    },
+                    StateSpec {
+                        name: "t3".into(),
+                        is_initial: false,
+                        valuations: None,
+                    },
+                ],
+                transitions: vec![TransitionSpec {
+                    source: "s0".into(),
+                    target: "t1".into(),
+                    labels: vec!["go".into()],
+                    modality: crate::context_dsl::ast::TransitionModalitySpec::MustOnly,
+                    additional_targets: vec!["t2".into(), "t3".into()],
+                }],
+                controllable_labels: vec![],
+                internal_labels: vec![],
+            }],
+            compositions: vec![],
+            properties: vec![],
+            controller: None,
+        };
+        let result = emit(&ir).expect("emit succeeds");
+        // Bracketed-list form with all three targets in order +
+        // the `[must]` modality suffix.
+        assert!(
+            result
+                .ctxdsl
+                .contains("transition s0 -> [t1, t2, t3] on label go [must];"),
+            "K.1b emitter must write bracketed-list form for multi-target hyper-must; got:\n{}",
+            result.ctxdsl
+        );
+    }
+
+    /// R.5 Item K sub-item K.1b — single-target form (empty
+    /// `additional_targets`) preserves pre-K.1b emission
+    /// byte-for-byte (no brackets).
+    #[test]
+    fn r5_subitem_k1b_emitter_preserves_single_target_form_when_no_additional() {
+        let ir = single_transition_ir(
+            crate::context_dsl::ast::TransitionModalitySpec::MustOnly,
+            "tick",
+        );
+        let result = emit(&ir).expect("emit succeeds");
+        // No brackets in target — single-target form.
+        assert!(
+            result
+                .ctxdsl
+                .contains("transition s0 -> s1 on label tick [must];"),
+            "K.1b: empty additional_targets preserves single-target syntax; got:\n{}",
+            result.ctxdsl
+        );
+        assert!(
+            !result.ctxdsl.contains("-> ["),
+            "K.1b: no bracketed-list form when additional_targets empty"
+        );
     }
 }

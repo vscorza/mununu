@@ -365,6 +365,8 @@ pub fn build_kripke_with_config(
                             target: oob_name.clone(),
                             labels,
                             modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                            additional_targets: Vec::new(),
                         });
                     }
                     oob_inserted = true;
@@ -376,6 +378,8 @@ pub fn build_kripke_with_config(
                     target: oob_name.clone(),
                     labels,
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 });
 
                 for ovf in overflows {
@@ -400,6 +404,8 @@ pub fn build_kripke_with_config(
                     target: tgt_name.clone(),
                     labels,
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+                    additional_targets: Vec::new(),
                 });
             }
         }
