@@ -426,6 +426,29 @@ pub struct CegarTrace {
     ///
     /// Default `Vec::new()` — empty when no advisories fire.
     pub warnings: Vec<crate::adapter::AdapterWarning>,
+    /// R-Y5 (2026-06-08) — register names that the failure
+    /// subgame identifies as load-bearing for `KleeneBot`
+    /// verdicts. Downstream consumers (e.g. a Yosys re-run
+    /// wrapper, a user reviewing the trace) can use this list
+    /// to drive init-policy promotion: promoting these
+    /// registers to `anyconst` (R-Y2) or declaring them in the
+    /// sidecar's `config_values` (R-Y7) often closes the
+    /// indefinite verdict.
+    ///
+    /// **R-Y5 MVP scope**: identification only. The actual
+    /// re-run with promoted init policy requires regenerating
+    /// BTOR2 with different Yosys passes — outside the CEGAR
+    /// loop's current scope. Future R-Y5 follow-up adds the
+    /// re-run wrapper.
+    ///
+    /// Deduplicated across all iterations of the loop. Empty
+    /// when:
+    /// - The verdict converged without ever producing a
+    ///   `KleeneBot` cell.
+    /// - No failure subgame was emitted (verdict was definite).
+    /// - No classifying transition's source predicate maps to
+    ///   a register in the BTOR2 source.
+    pub init_refinement_candidates: Vec<String>,
 }
 
 /// R.5 MVP — Run the CEGAR refinement loop on a BTOR2 fixture +
@@ -470,6 +493,14 @@ pub fn cegar_refine_loop(
     let mut current_predicates = initial_predicates;
     let mut iterations: Vec<CegarIteration> = Vec::new();
     let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
+    // R-Y5 (2026-06-08) — register names load-bearing for
+    // `KleeneBot` verdicts across iterations. Populated at the
+    // failure-subgame consumption point; surfaced in the final
+    // CegarTrace for downstream init-policy promotion drivers
+    // (e.g. a future Yosys re-run wrapper). Uses BTreeSet for
+    // deterministic ordering in the trace output.
+    let mut init_refinement_candidates: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     // R.5 B.4.a (2026-06-01) — effective iteration cap. Starts as
     // `cegar_opts.max_iterations`; iteration 0's UF-wrap detection
     // may lower it to `SMART_UF_MAX_ITERATIONS` when the smart
@@ -792,6 +823,24 @@ pub fn cegar_refine_loop(
         let has_kleenebot = (0..game_eval.verdicts.len())
             .any(|s| matches!(game_eval.verdicts.verdict_at(s), Trit::Unknown));
 
+        // R-Y5 (2026-06-08) — identification pass: when a failure
+        // subgame is present, every register named in the current
+        // predicate set is a candidate for init-policy promotion.
+        // The MVP's coarse heuristic ("any register in any
+        // current predicate") is an over-approximation; future
+        // R-Y5 follow-up refines by per-classifying-transition
+        // analysis (only the predicates whose truth values DIFFER
+        // between source + target of a classifying may-edge are
+        // load-bearing). Coarse is acceptable for the MVP because
+        // downstream consumers (Yosys re-run wrapper, user trace
+        // review) treat the list as a CANDIDATE set, not an
+        // authoritative one.
+        if game_eval.failure_subgame.is_some() {
+            for pred in &current_predicates {
+                init_refinement_candidates.insert(pred.register.clone());
+            }
+        }
+
         if !has_kleenebot {
             // Converged. Record final iteration + return.
             iterations.push(CegarIteration {
@@ -811,6 +860,7 @@ pub fn cegar_refine_loop(
                 lazy_lift_pending: true,
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
                 warnings: warnings.clone(),
+                init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
             });
         }
 
@@ -836,6 +886,7 @@ pub fn cegar_refine_loop(
                 lazy_lift_pending: true,
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
                 warnings: warnings.clone(),
+                init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
             });
         }
 
@@ -908,6 +959,7 @@ pub fn cegar_refine_loop(
                 lazy_lift_pending: true,
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
                 warnings: warnings.clone(),
+                init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
             });
         }
 
@@ -2614,6 +2666,121 @@ mod tests {
                 iter.iteration
             );
         }
+    }
+
+    /// R-Y5 (2026-06-08) — the trace's
+    /// `init_refinement_candidates` field is empty when no
+    /// failure subgame is emitted, and is populated
+    /// (containing the registers from the active predicate
+    /// set) when at least one iteration's failure_subgame is
+    /// Some. This structural invariant decouples R-Y5 from
+    /// the specifics of which fixture happens to produce
+    /// KleeneBot via evaluate_tri's projection (a function
+    /// of the CLTS state-3valued-predicate labelling, which
+    /// the R.2.5 MVP does not populate).
+    ///
+    /// The structural invariant is tested by inspecting the
+    /// per-iteration `failure_subgame` field: if ANY iteration
+    /// has Some, the trace's candidates MUST include all
+    /// registers from `final_predicates` (the MVP's coarse
+    /// over-approximation collects every register from the
+    /// predicate set whenever a subgame fires).
+    #[test]
+    fn r_y5_init_refinement_candidates_invariant() {
+        let formula = parser::parse("nu X. < true > X").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 2,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2_WITH_INPUT,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        let any_subgame = trace
+            .iterations
+            .iter()
+            .any(|iter| iter.failure_subgame.is_some());
+        if any_subgame {
+            // R-Y5 invariant: when a subgame fires at any
+            // iteration, every register from the final
+            // predicate set is a candidate (MVP coarse over-
+            // approximation).
+            for pred in &trace.final_predicates {
+                assert!(
+                    trace.init_refinement_candidates.contains(&pred.register),
+                    "R-Y5: register {:?} must appear in init_refinement_candidates \
+                     when a failure subgame fires; got: {:?}",
+                    pred.register,
+                    trace.init_refinement_candidates
+                );
+            }
+        } else {
+            // R-Y5 invariant: no subgame → candidates empty.
+            assert!(
+                trace.init_refinement_candidates.is_empty(),
+                "R-Y5: no failure subgame → init_refinement_candidates must be empty; \
+                 got: {:?}",
+                trace.init_refinement_candidates
+            );
+        }
+    }
+
+    /// R-Y5 — when the verdict converges without any
+    /// failure subgame, `init_refinement_candidates` stays
+    /// empty (no init promotion needed).
+    #[test]
+    fn r_y5_init_refinement_candidates_empty_on_converged_verdict() {
+        // Trivial-true formula → definite verdict at every
+        // cube → no failure subgame ever.
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 4,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2_WITH_INPUT,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        assert!(
+            trace.init_refinement_candidates.is_empty(),
+            "R-Y5: no KleeneBot → no init refinement candidates; got: {:?}",
+            trace.init_refinement_candidates
+        );
     }
 
     #[test]
