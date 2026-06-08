@@ -63,16 +63,19 @@ The `security-audit` CI job runs `cargo audit`. The `dependency-check` job is no
 cargo check --workspace --all-features --tests
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --check
+cargo test --workspace --all-features --doc    # <-- doctests too (revised 2026-06-08)
 ```
 
 **Why.** Per-crate `cargo check` (the typical hook-light pattern under [Pre-commit hook serialisation](#pre-commit-hook-serialisation)) does NOT compile:
 - the **legacy root-level bin** at `src/main.rs` (gated on `--features cli`, separate from the workspace `crates/mununu-cli/src/main.rs`).
 - crates that depend on the touched type through workspace edges.
 - test crates that construct the type in fixtures.
+- **doctests** inside `///` examples that construct the type literally. `cargo check --tests` does NOT compile doctests — they have a separate compilation phase that only `cargo test --doc` (or `make ci`) runs. Doctest gaps surface only at CI.
 
-Two recent incidents exposed the gap:
+Three recent incidents exposed the gap:
 - `3923822` (K.2b): added `modality` to `OriginalTransition`; the api-feature build at `crates/mununu-core/src/api/graph.rs` had a variable-name typo CI caught (fix `04beae6`).
 - `cfee81d` (K.1b-unrolled): added `additional_targets` to `OriginalTransition`; the legacy root bin's `src/main.rs:3738` site was missed; user surfaced the CI failure (fix `04f01f9`).
+- `cfee81d` (K.1b-unrolled, second-order): the doctests in `crates/mununu-core/src/abstraction/unrolling.rs:911,945` constructed `OriginalTransition` literals without the new field; `c3ecb38` + `04f01f9` + `832f552` all ran CI red because the pre-push check (revised at `c3ecb38`) did not include doctests (fix `4a07df7`).
 
 **Scope.** Trigger this check whenever the diff touches a `pub` field of any of the load-bearing struct types listed above. For commits that don't touch IR / sidecar / CegarOptions shape (e.g. parser-internal changes, doc edits), the lighter per-crate pattern in the next section is sufficient.
 
