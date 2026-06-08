@@ -889,6 +889,7 @@ pub fn check_conflicts(
 ///         label: "finish".to_string(),
 ///         guard: Some("count >= 3".to_string()),
 ///         effects: vec![],
+///         modality: Default::default(),
 ///     },
 /// ];
 ///
@@ -925,6 +926,7 @@ pub fn check_conflicts(
 ///                 value_expr: "count + 1".to_string(),
 ///             },
 ///         ],
+///         modality: Default::default(),
 ///     },
 /// ];
 ///
