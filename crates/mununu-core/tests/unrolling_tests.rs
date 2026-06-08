@@ -18,6 +18,8 @@ fn test_simple_unrolling_no_variables() {
         effects: vec![],
 
         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+        additional_targets: Vec::new(),
     }];
     let variables = vec![];
     let options = UnrollingOptions::default();
@@ -51,6 +53,8 @@ fn test_unrolling_with_bool_variable() {
         }],
 
         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+        additional_targets: Vec::new(),
     }];
     let variables = vec![VariableDecl {
         name: "approved".to_string(),
@@ -82,6 +86,8 @@ fn test_unrolling_with_integer_variable() {
         }],
 
         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+        additional_targets: Vec::new(),
     }];
     let variables = vec![VariableDecl {
         name: "count".to_string(),
@@ -124,6 +130,8 @@ fn test_unrolling_with_guard() {
         effects: vec![],
 
         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+        additional_targets: Vec::new(),
     }];
     let variables = vec![VariableDecl {
         name: "count".to_string(),
@@ -184,6 +192,8 @@ fn test_unrolling_state_limit() {
         }],
 
         modality: mununu_core::context_dsl::ast::TransitionModalitySpec::Sharp,
+
+        additional_targets: Vec::new(),
     }];
     let variables = vec![VariableDecl {
         name: "x".to_string(),

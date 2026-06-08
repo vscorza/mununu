@@ -27,6 +27,27 @@ pub struct OriginalTransition {
     /// `Sharp` for pre-K.2b adapters that don't populate this
     /// field (matches the K.1 default).
     pub modality: TransitionModalitySpec,
+    /// R.5 Item K sub-item K.1b-unrolled (2026-06-08) — additional
+    /// hyper-must target state names from the multi-target CTXDSL
+    /// syntax `transition s -> [t1, t2, t3] on a [must];`. Carries
+    /// `[t2, t3, ...]`; the primary target is the `to` field. Only
+    /// load-bearing when `modality == MustOnly`. Defaults to
+    /// `Vec::new()` (singleton hyper-must, matches K.2b behaviour
+    /// exactly).
+    ///
+    /// Note: per-state-variable substitution in the unrolling loop
+    /// applies to the primary `to` field via the unroller's
+    /// existing state-name resolution; the additional targets here
+    /// are used as-is. This works because the CTXDSL parser stores
+    /// `additional_targets` as `StateSelector`s, which are pre-
+    /// unrolling identifiers; the unroller expands the location
+    /// portion of state names but preserves the variable-bindings
+    /// suffix. For the K.1b-unrolled MVP, callers populate
+    /// `additional_targets` with the LOCATION names (matching
+    /// `from` / `to` shape); per-variable expansion of additional
+    /// targets is a future follow-up if a real fixture demonstrates
+    /// the need.
+    pub additional_targets: Vec<String>,
 }
 
 /// Represents an effect (variable assignment) in a transition.
@@ -69,6 +90,16 @@ pub struct UnrolledTransition {
     /// reads this to emit the right `TransitionModality` on the
     /// resulting CLTS edge.
     pub modality: TransitionModalitySpec,
+    /// R.5 Item K sub-item K.1b-unrolled (2026-06-08) — additional
+    /// hyper-must target state NAMES (post-unrolling). The
+    /// unrolling loop substitutes the primary `to` per
+    /// variable-binding combination; additional targets are
+    /// carried verbatim as location-portion names. Only
+    /// load-bearing when `modality == MustOnly` and
+    /// `additional_targets` is non-empty; otherwise
+    /// `build_clts_from_unrolled` emits a singleton hyper-must
+    /// or non-hyper edge per K.2b.
+    pub additional_targets: Vec<String>,
 }
 
 /// Building context for state unrolling with thresholds and limits.
@@ -666,6 +697,10 @@ impl UnrollingPipeline {
                             // — inherit modality from the source
                             // OriginalTransition.
                             modality: transition.modality,
+                            // R.5 Item K sub-item K.1b-unrolled
+                            // (2026-06-08) — propagate additional
+                            // hyper-must target names verbatim.
+                            additional_targets: transition.additional_targets.clone(),
                         });
 
                         // Add target to worklist if new
@@ -1376,6 +1411,7 @@ mod tests {
                 value_expr: "x + 1".to_string(),
             }],
             modality: TransitionModalitySpec::Sharp,
+            additional_targets: Vec::new(),
         }];
         let variables = vec![VariableDecl {
             name: "x".to_string(),

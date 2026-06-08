@@ -85,6 +85,11 @@ impl JsonToUnrollingConverter {
                     // is not yet plumbed through the JSON schema
                     // (queued for a separate JSON-schema follow-up).
                     modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+                    // R.5 Item K sub-item K.1b-unrolled — JSON
+                    // schema doesn't carry multi-target hyper-must;
+                    // defaults to empty (singleton hyper-must when
+                    // modality is MustOnly).
+                    additional_targets: Vec::new(),
                 })
             })
             .collect()

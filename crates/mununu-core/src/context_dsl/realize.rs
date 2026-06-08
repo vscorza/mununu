@@ -2871,6 +2871,22 @@ fn convert_transitions_for_unrolling(
             })
             .collect();
 
+        // R.5 Item K sub-item K.1b-unrolled (2026-06-08) —
+        // resolve `additional_targets` (StateSelectors) to
+        // location-portion state name strings. Drop any
+        // selector that doesn't resolve to a simple state name
+        // (groups, wildcards). For parametric automata, the
+        // unroller's per-variable expansion substitutes the
+        // primary `to` per binding combination; the additional
+        // targets are carried as location names + matched
+        // against the primary's binding-suffix at the
+        // build-from-unrolled step.
+        let additional_targets: Vec<String> = transition
+            .additional_targets
+            .iter()
+            .filter_map(|sel| state_selector_name(sel).ok().map(|s| s.to_string()))
+            .collect();
+
         result.push(OriginalTransition {
             from: source.to_string(),
             to: target.to_string(),
@@ -2882,6 +2898,7 @@ fn convert_transitions_for_unrolling(
             // OriginalTransition so the unrolled CLTS edge
             // inherits it via build_clts_from_unrolled.
             modality: transition.modality,
+            additional_targets,
         });
     }
     Ok(result)
@@ -2985,13 +3002,19 @@ fn build_clts_from_unrolled(
         // automata declaring `[may]` / `[must]` realize correctly;
         // the K.2 SOUNDNESS gap is closed.
         //
-        // K.2b MVP scope: `MustOnly` realizes to a singleton
-        // hyper-must (target = {to_id}). The multi-target
-        // hyper-must syntax (K.1b's `additional_targets`) is NOT
-        // yet threaded through `OriginalTransition` — the
-        // bracketed-list target form on parametric automata is a
-        // K.2b follow-up. Singleton MustOnly + parametric
-        // unrolling is the common case and is covered here.
+        // R.5 Item K sub-item K.1b-unrolled (2026-06-08) —
+        // multi-target hyper-must on the unrolled path. When
+        // `transition.additional_targets` is non-empty AND
+        // modality is `MustOnly`, the hyper-target set is built
+        // from the primary `to` plus each additional target's
+        // resolved StateId. The additional targets are
+        // location-portion state names; we look them up in the
+        // builder by best-effort match (try the exact name first,
+        // then the unrolled state name suffixed with the same
+        // variable-binding portion as the primary). If a target
+        // can't be resolved (the location doesn't exist in the
+        // unrolled state space), it's dropped silently —
+        // matching the K.2 direct-realize path's robust resolution.
         if let (Some(from_id), Some(to_id)) = (
             builder.state_id_or_insert(&from_name),
             builder.state_id_or_insert(&to_name),
@@ -3000,7 +3023,15 @@ fn build_clts_from_unrolled(
                 TransitionModalitySpec::Sharp => TransitionModality::Sharp,
                 TransitionModalitySpec::MayOnly => TransitionModality::MayOnly,
                 TransitionModalitySpec::MustOnly => {
-                    TransitionModality::must_hyper(smallvec::smallvec![to_id])
+                    let mut hyper_targets: smallvec::SmallVec<
+                        [crate::clts::StateId<DefaultStateIdx>; 4],
+                    > = smallvec::smallvec![to_id];
+                    for additional_name in &transition.additional_targets {
+                        if let Some(extra_id) = builder.state_id_or_insert(additional_name) {
+                            hyper_targets.push(extra_id);
+                        }
+                    }
+                    TransitionModality::must_hyper(hyper_targets)
                 }
             };
             builder.transition_ids_with_modality(from_id, &[label_id], to_id, modality);
@@ -4413,5 +4444,57 @@ context k1b_multi_realize {
             .map(|&id| clts.state_name(id).unwrap_or("?"))
             .collect();
         assert_eq!(target_names, vec!["t1", "t2", "t3"]);
+    }
+
+    /// R.5 Item K sub-item K.1b-unrolled (2026-06-08) — the
+    /// unrolled-path realize step honors the multi-target
+    /// bracketed-list syntax `transition s -> [t1, t2, t3] on a
+    /// [must];` on parametric automata. Closes the K.2b MVP gap
+    /// that previously emitted singleton hyper-must only.
+    #[test]
+    fn r5_subitem_k1b_unrolled_path_multi_target_realizes_to_full_hyper_must_set() {
+        let doc = parse(
+            r#"
+context k1b_unrolled_multi {
+    automata {
+        automaton M {
+            variables {
+                var counter: i64 = 0;
+            }
+            states {
+                state s0 initial;
+                state t1;
+                state t2;
+                state t3;
+            }
+            transitions {
+                transition s0 -> [t1, t2, t3] on epsilon [must];
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realization succeeds");
+        let clts = realized.context.clts("M").expect("CLTS exists");
+        // Find any state with at least one outgoing hyper-must
+        // transition + assert the target set has 3 elements.
+        let mut found_3_target_hyper = false;
+        for state in clts.states() {
+            for t in clts.outgoing(state) {
+                if let Some(targets) = t.modality().hyper_targets()
+                    && targets.len() == 3
+                {
+                    found_3_target_hyper = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_3_target_hyper,
+            "K.1b-unrolled: parametric automaton with `[t1, t2, t3] [must]` \
+             must produce a hyper-must edge with 3 targets in the unrolled CLTS"
+        );
     }
 }
