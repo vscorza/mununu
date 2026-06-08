@@ -530,13 +530,17 @@ pub fn cegar_refine_loop(
         // edges + a [R.2.5b-sampling-must] AdapterWarning that
         // propagates through the CegarTrace to the verdict surface.
         must_edge_inference: cegar_opts.must_edge_inference,
-        // R-Y7 (2026-06-07) — symbolic-init via predicate cubes.
-        // CEGAR's pre-R-Y7 default is empty (single initial
-        // cube). A future CegarOptions follow-up surfaces a
-        // config_values field; until then, callers wanting R-Y7
-        // semantics call predicate_cube_lift directly with a
-        // populated config_values map.
-        config_values: std::collections::HashMap::new(),
+        // R-Y7 (2026-06-07) + R-S8 session 2 (2026-06-08) —
+        // symbolic-init via predicate cubes. Read the
+        // `signals[].config_values` map from the sidecar JSON
+        // (when present in `adapter_options.sidecar_json`) via
+        // the R-S8 encoder's `sidecar_config_values` bridge.
+        // Empty when no sidecar OR no signal declares
+        // `config_values` → preserves the pre-R-Y7 single-
+        // initial-cube behaviour. Non-empty → the predicate-cube
+        // lift expands the initial-state set per R-S8's
+        // hyper-must initial semantics.
+        config_values: crate::adapter::btor2::r_s8_encoder::sidecar_config_values(adapter_options),
     };
 
     for iteration in 0..=cegar_opts.max_iterations {

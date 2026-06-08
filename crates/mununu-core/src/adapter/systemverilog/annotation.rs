@@ -332,6 +332,30 @@ pub struct SignalAnnotation {
     #[serde(default, skip_serializing_if = "is_false")]
     pub equivalence_classes: bool,
 
+    /// R-S8 session 2 (§Phase 9 §9.1) — under-constrained constant's
+    /// admissible value set. When set, the predicate-cube lift path
+    /// (R.2.5 + R-Y7) treats this signal as a config bit / parameter
+    /// whose value can be ANY of the listed values across concrete
+    /// instances; the lifter expands the initial-state set to all
+    /// cubes whose predicate evaluation is consistent with some
+    /// valid value (per the [`crate::adapter::btor2::r_s8_encoder`]
+    /// helper). The GKMTS evaluator then treats this as a
+    /// hyper-must initial set ("some cube in this set is the actual
+    /// start"); refinement narrows on demand.
+    ///
+    /// Distinct from [`Self::bounded_init`] (R-Y4): `bounded_init`
+    /// is the BIT-BLAST path's per-anyconst-value initial-state
+    /// enumeration (`init_policy: Anyconst` only); `config_values`
+    /// is the PREDICATE-CUBE path's hyper-must initial-state
+    /// admission. Both fields may coexist on the same signal — the
+    /// bit-blast path reads `bounded_init`; the cube path reads
+    /// `config_values`.
+    ///
+    /// Default `None` — preserves the cube path's single-initial-
+    /// cube behaviour exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_values: Option<Vec<u64>>,
+
     /// M.1 Path B (§Phase 11) — identify a BTOR2 state cell by a
     /// named output / wire that it drives, instead of by the cell's
     /// own (possibly stripped) symbol. When set, the BTOR2 resolver
@@ -1418,6 +1442,8 @@ fn resolve_input_domain(
         equivalence_classes: false,
         type_name: None,
         note: None,
+
+        config_values: None,
     };
     resolve_signal_domain(&sig, ann)
 }
@@ -1648,6 +1674,8 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     equivalence_classes: false,
                     type_name: None,
                     note: Some("auto-detected typedef enum".to_string()),
+
+                    config_values: None,
                 });
             }
             Declaration::Logic { name, width } if !port_names.contains(name.as_str()) => {
@@ -1671,6 +1699,8 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
+
+                    config_values: None,
                 });
             }
             _ => {}
@@ -1708,6 +1738,8 @@ pub fn build_signal_annotations(module: &super::ast::Module) -> Vec<SignalAnnota
                     equivalence_classes: false,
                     type_name: None,
                     note: Some(note.to_string()),
+
+                    config_values: None,
                 });
             }
         }
@@ -2467,6 +2499,7 @@ mod tests {
             equivalence_classes: false,
             type_name: Some(type_name.into()),
             note: None,
+            config_values: None,
         }
     }
 
@@ -2519,6 +2552,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         let applied = ann.apply_type_driven_widening(&caliptra_typedefs());
         assert!(applied.is_empty());
@@ -2629,6 +2664,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         ann.properties.push(PropertyAnnotation {
             id: "p".into(),
@@ -2675,6 +2712,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         ann.properties.push(PropertyAnnotation {
             id: "p".into(),
@@ -2708,6 +2747,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         ann.properties.push(PropertyAnnotation {
             id: "p".into(),
@@ -2741,6 +2782,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         ann.properties.push(PropertyAnnotation {
             id: "p".into(),
@@ -2771,6 +2814,7 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+            config_values: None,
         }
     }
 

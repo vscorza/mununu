@@ -83,6 +83,8 @@ pub fn build_input_field_domains(
                 equivalence_classes: false,
                 type_name: None,
                 note: None,
+
+                config_values: None,
             };
             let resolved = super::resolve_to_field_domain(&sig_view, annotation);
             out.insert(nid, resolved);
@@ -146,6 +148,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
 
         let mut symbols = HashMap::new();
@@ -175,6 +179,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         let symbols: HashMap<i64, String> = HashMap::new();
 
@@ -199,6 +205,8 @@ mod tests {
             equivalence_classes: false,
             type_name: None,
             note: None,
+
+            config_values: None,
         });
         ann.discovered_values.insert(
             "ptr".to_string(),

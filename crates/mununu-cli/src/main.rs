@@ -213,6 +213,21 @@ struct Btor2CegarArgs {
     /// post-pass fires.
     #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
     must_edge_inference: MustEdgeInferenceArg,
+    /// R-S8 session 2 (2026-06-08) — under-constrained constant's
+    /// admissible value set. Format: `REGISTER=v1,v2,v3`. May be
+    /// repeated. Bridges to the R-Y7 symbolic-init path by
+    /// expanding the predicate-cube lifter's initial-state set
+    /// to all cubes admissible under the listed values.
+    /// Example: `--config-values 'boot_fsm=0,1,2'
+    /// --config-values 'mode=0,1'`.
+    ///
+    /// When a sidecar declares `signals[].config_values`, the
+    /// sidecar value takes precedence for that register (the CLI
+    /// flag's values are merged in; sidecar values override CLI
+    /// values per the resolver's last-write-wins for the same
+    /// key).
+    #[arg(long = "config-values", value_name = "REG=v1,v2,...")]
+    config_values: Vec<String>,
     /// Emit the trace summary as JSON on stdout instead of the
     /// human-readable format.
     #[arg(long)]
@@ -1602,13 +1617,62 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — CEGAR refinement
 /// loop CLI handler.
 ///
+/// R-S8 session 2 (2026-06-08) — parse the `--config-values
+/// REG=v1,v2,v3` CLI flag(s) and build an `AdapterOptions` whose
+/// `sidecar_json` declares one `signals[]` entry per flag entry
+/// with the listed `config_values`. The CEGAR loop reads this via
+/// `r_s8_encoder::sidecar_config_values` and threads it through
+/// the predicate-cube lift's `config_values`.
+///
+/// Returns an `AdapterOptions::default()` when the flag is absent.
+/// Errors on malformed entries (missing `=`, non-numeric values).
+fn build_adapter_options_with_config_values(
+    config_values_args: &[String],
+) -> Result<mununu_core::adapter::AdapterOptions, String> {
+    use mununu_core::adapter::AdapterOptions;
+    if config_values_args.is_empty() {
+        return Ok(AdapterOptions::default());
+    }
+    let mut signals = Vec::with_capacity(config_values_args.len());
+    for entry in config_values_args {
+        let (reg, values_str) = entry.split_once('=').ok_or_else(|| {
+            format!("invalid --config-values entry {entry:?}: expected REG=v1,v2,v3 format")
+        })?;
+        let values: Vec<u64> = values_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid value {s:?} in --config-values: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.is_empty() {
+            return Err(format!(
+                "--config-values {entry:?}: at least one value required"
+            ));
+        }
+        signals.push(serde_json::json!({
+            "name": reg,
+            "config_values": values,
+        }));
+    }
+    let synthetic = serde_json::json!({
+        "module": "cli-cegar",
+        "source": "cli-cegar.btor2",
+        "signals": signals,
+    });
+    Ok(AdapterOptions {
+        sidecar_json: Some(synthetic.to_string()),
+        ..AdapterOptions::default()
+    })
+}
+
 /// Parses the user-supplied formula + initial predicate set,
 /// builds a [`CegarOptions`] with the selected predicate source,
 /// and invokes [`cegar_refine_loop`] on the BTOR2 fixture.
 /// Prints a human-readable or JSON summary of the resulting
 /// [`CegarTrace`].
 fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
-    use mununu_core::adapter::AdapterOptions;
     use mununu_core::adapter::btor2::PredicateSpec;
     use mununu_core::adapter::btor2::cegar::{
         CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
@@ -1693,12 +1757,21 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         must_edge_inference,
     };
 
+    // R-S8 session 2 (2026-06-08) — parse the `--config-values`
+    // CLI flag(s) into a synthetic sidecar JSON that exercises the
+    // shipped `sidecar_config_values` resolver bridge end-to-end.
+    // Format: `REG=v1,v2,v3`. Builds an `SvAnnotation` with one
+    // signal per flag entry; the CEGAR loop reads `sidecar_json`
+    // via the bridge and threads `config_values` into the
+    // predicate-cube lift.
+    let adapter_options = build_adapter_options_with_config_values(&args.config_values)?;
+
     let trace = cegar_refine_loop(
         &formula,
         &content,
         initial_predicates,
         &env,
-        &AdapterOptions::default(),
+        &adapter_options,
         &cegar_opts,
     )
     .map_err(|e| format!("cegar refine loop: {}", e.message))?;

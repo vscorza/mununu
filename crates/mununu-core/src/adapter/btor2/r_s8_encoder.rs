@@ -32,8 +32,54 @@
 //! - No CTXDSL emitter for hyper-must transitions (gated on K.1b
 //!   emitter wiring, queued).
 
+use crate::adapter::AdapterOptions;
 use crate::adapter::btor2::kmts_lift::PredicateSpec;
 use std::collections::HashMap;
+
+/// R-S8 session 2 (2026-06-08) — sidecar resolver bridge: extract the
+/// `signals[].config_values` map from a parsed `AdapterOptions` and
+/// return it in the `HashMap<String, Vec<u64>>` shape that
+/// [`hyper_must_initial_cubes`] + `PredicateCubeLiftOptions::config_values`
+/// consume.
+///
+/// Returns an empty map when:
+/// - The sidecar JSON is absent (`AdapterOptions::sidecar_json` is None).
+/// - The sidecar JSON fails to parse as an `SvAnnotation` (matches the
+///   defensive-skip pattern used by `sidecar_anyconst_symbols` in
+///   `bit_blast.rs`).
+/// - No signal declares `config_values`.
+///
+/// Each entry is `(register_name → valid value set)`. Signals with
+/// `config_values: None` are omitted; signals with an empty Vec
+/// (`config_values: Some(vec![])`) are also omitted (no valid value
+/// means the register is unsatisfiable, which the encoder rejects
+/// downstream).
+///
+/// This is the predicate-cube path's analogue of
+/// `bit_blast::sidecar_anyconst_symbols` — both walk the same
+/// `SvAnnotation` shape but populate different fields for different
+/// abstraction layers (bit-blast vs predicate-cube).
+pub fn sidecar_config_values(options: &AdapterOptions) -> HashMap<String, Vec<u64>> {
+    let Some(json) = &options.sidecar_json else {
+        return HashMap::new();
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return HashMap::new();
+    };
+    let mut result = HashMap::new();
+    for signal in &ann.signals {
+        let Some(values) = &signal.config_values else {
+            continue;
+        };
+        if values.is_empty() {
+            continue;
+        }
+        result.insert(signal.name.clone(), values.clone());
+    }
+    result
+}
 
 /// R-S8 — Compute the set of cube indices whose predicate-bit
 /// pattern is consistent with the per-register value-set
@@ -248,6 +294,88 @@ mod tests {
         // satisfiability filter is a separate sub-item).
         // For now, just assert the result is non-empty.
         assert!(!result.is_empty());
+    }
+
+    /// R-S8 session 2 — `sidecar_config_values` returns an empty
+    /// map when the sidecar JSON is absent.
+    #[test]
+    fn r_s8_session2_sidecar_config_values_absent_sidecar_returns_empty() {
+        let opts = AdapterOptions::default();
+        let result = sidecar_config_values(&opts);
+        assert!(result.is_empty());
+    }
+
+    /// R-S8 session 2 — Malformed sidecar JSON returns empty
+    /// (defensive-skip pattern matches `bit_blast::sidecar_anyconst_symbols`).
+    #[test]
+    fn r_s8_session2_sidecar_config_values_malformed_json_returns_empty() {
+        let opts = AdapterOptions {
+            sidecar_json: Some("this is not json".to_string()),
+            ..AdapterOptions::default()
+        };
+        let result = sidecar_config_values(&opts);
+        assert!(result.is_empty());
+    }
+
+    /// R-S8 session 2 — Sidecar with no signals declaring
+    /// `config_values` returns empty.
+    #[test]
+    fn r_s8_session2_sidecar_no_config_values_signal_returns_empty() {
+        let json = r#"{
+            "module": "test",
+            "source": "test.sv",
+            "signals": [
+                {"name": "r1"},
+                {"name": "r2"}
+            ]
+        }"#;
+        let opts = AdapterOptions {
+            sidecar_json: Some(json.to_string()),
+            ..AdapterOptions::default()
+        };
+        let result = sidecar_config_values(&opts);
+        assert!(result.is_empty(), "no config_values declared → empty map");
+    }
+
+    /// R-S8 session 2 — Sidecar with declared `config_values`
+    /// returns the corresponding `register → values` map.
+    #[test]
+    fn r_s8_session2_sidecar_with_config_values_returns_populated_map() {
+        let json = r#"{
+            "module": "test",
+            "source": "test.sv",
+            "signals": [
+                {"name": "boot_fsm_ns", "config_values": [0, 1, 2, 3]},
+                {"name": "unrelated"}
+            ]
+        }"#;
+        let opts = AdapterOptions {
+            sidecar_json: Some(json.to_string()),
+            ..AdapterOptions::default()
+        };
+        let result = sidecar_config_values(&opts);
+        assert_eq!(result.len(), 1, "exactly one signal declared config_values");
+        assert_eq!(result.get("boot_fsm_ns"), Some(&vec![0u64, 1, 2, 3]));
+    }
+
+    /// R-S8 session 2 — Empty `config_values` vec is treated as
+    /// "no constraint" (skipped), not as "register has no valid
+    /// value" (which would make the cube space empty downstream).
+    #[test]
+    fn r_s8_session2_sidecar_empty_config_values_vec_is_skipped() {
+        let json = r#"{
+            "module": "test",
+            "source": "test.sv",
+            "signals": [
+                {"name": "r1", "config_values": []}
+            ]
+        }"#;
+        let opts = AdapterOptions {
+            sidecar_json: Some(json.to_string()),
+            ..AdapterOptions::default()
+        };
+        let result = sidecar_config_values(&opts);
+        assert!(result.is_empty(), "empty config_values vec skipped");
     }
 
     /// R-S8 — All cubes admitted when valid_values covers all
