@@ -23,6 +23,38 @@ set -e
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+# Test-runner selection — see the Makefile `test:` target for the full
+# rationale. Short version: on macOS, nextest's one-process-per-test model
+# pays a synchronous Gatekeeper security assessment on the first exec of
+# every freshly-built (unsigned) test binary (~1–3 s wall, ~0 s CPU,
+# parked in kernel state `U`). Paid thousands of times and starved under
+# the backgrounded hook's lowered priority, it wedges for hours (the
+# 2026-05-27 R.2.5 incident and the 2026-06-07 recurrence). `cargo test`
+# pays the tax once per test-binary (tests run as threads in one process)
+# — ~25× faster locally. So: macOS → cargo test; Linux (CI) → nextest.
+# Override with MUNUNU_TEST_RUNNER=nextest|cargo.
+case "${MUNUNU_TEST_RUNNER:-}" in
+    nextest|cargo) TEST_RUNNER="$MUNUNU_TEST_RUNNER" ;;
+    *)
+        if [ "$(uname -s)" = "Darwin" ]; then
+            TEST_RUNNER=cargo
+        elif command -v cargo-nextest >/dev/null 2>&1; then
+            TEST_RUNNER=nextest
+        else
+            TEST_RUNNER=cargo
+        fi
+        ;;
+esac
+
+# Run the test suite for a single package using the selected runner.
+run_pkg_tests() {
+    if [ "$TEST_RUNNER" = "nextest" ]; then
+        cargo nextest run -p "$1"
+    else
+        cargo test -p "$1"
+    fi
+}
+
 # Detect which crates have staged changes.
 # `--diff-filter=ACMR` = Added / Copied / Modified / Renamed (skip Deleted).
 STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
@@ -89,15 +121,11 @@ for crate_path in $TOUCHED_CRATES; do
     cargo clippy -p "$crate" --all-targets -- -D warnings
 done
 
-# Per-crate nextest (or `cargo test` if nextest is absent).
+# Per-crate tests (runner selected above: macOS → cargo test, else nextest).
 for crate_path in $TOUCHED_CRATES; do
     crate=$(basename "$crate_path")
-    echo "Running tests for $crate..."
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        cargo nextest run -p "$crate"
-    else
-        cargo test -p "$crate"
-    fi
+    echo "Running tests for $crate (runner: $TEST_RUNNER)..."
+    run_pkg_tests "$crate"
 done
 
 # Root package (`.` workspace member, package name `mununu`) — test
@@ -106,12 +134,8 @@ done
 if [ $ROOT_TOUCHED -eq 1 ]; then
     echo "Running cargo clippy for root package (mununu)..."
     cargo clippy -p mununu --all-targets -- -D warnings
-    echo "Running tests for root package (mununu)..."
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        cargo nextest run -p mununu
-    else
-        cargo test -p mununu
-    fi
+    echo "Running tests for root package (mununu) (runner: $TEST_RUNNER)..."
+    run_pkg_tests mununu
 fi
 
 # Workspace-wide doctests. Fast — doctests compile + run quickly per
@@ -128,4 +152,4 @@ cargo test --lib api --features api
 
 echo ""
 echo "All pre-commit checks passed."
-echo "NOTE: full-workspace nextest runs in pre-push (scripts/pre-push) and CI."
+echo "NOTE: full-workspace tests run in pre-push (scripts/pre-push) and CI (nextest)."

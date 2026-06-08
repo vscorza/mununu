@@ -59,12 +59,31 @@ build:
 	$(CARGO) build --release -p mununu-cli
 	$(CARGO) build --release -p mununu-extract
 
-# Prefer cargo-nextest when available (CI's dev image installs it). nextest
-# is faster but does NOT run doctests — invoke them separately so they
-# cannot silently drop. Falling back to `cargo test --workspace` covers
-# both unit and doc tests in one shot.
+# Test-runner selection.
+#
+# Linux (CI's dev image): prefer cargo-nextest. nextest is faster there
+# and refuses to silently drop a test binary that crashes without
+# reporting; doctests run separately because nextest skips them.
+#
+# macOS: use `cargo test --workspace` instead. nextest spawns one process
+# PER TEST, and macOS Gatekeeper runs a synchronous security assessment on
+# the first exec of every freshly-built (unsigned) test binary — measured
+# ~1–3 s wall / ~0 s CPU, the process parked in kernel state `U`. Paid
+# thousands of times, and starved when the hook runs backgrounded at
+# lowered priority, that wedges for hours (the 2026-05-27 R.2.5 incident
+# and the 2026-06-07 recurrence). `cargo test` runs all tests as threads
+# inside ONE process per test-binary, paying the tax once per binary —
+# measured ~25× faster locally (1391 mununu-core tests in 4.9 s vs.
+# nextest taking 1:59 for just 9). It also covers unit + doc tests in one
+# shot. Override the auto-detection with MUNUNU_TEST_RUNNER=nextest|cargo.
 test:
-	@if command -v cargo-nextest >/dev/null 2>&1; then \
+	@runner="$(MUNUNU_TEST_RUNNER)"; \
+	if [ -z "$$runner" ]; then \
+		if [ "$$(uname -s)" = "Darwin" ]; then runner=cargo; \
+		elif command -v cargo-nextest >/dev/null 2>&1; then runner=nextest; \
+		else runner=cargo; fi; \
+	fi; \
+	if [ "$$runner" = "nextest" ]; then \
 		$(CARGO) nextest run --workspace && \
 		$(CARGO) test --workspace --doc; \
 	else \
