@@ -174,6 +174,16 @@ enum MustEdgeInferenceArg {
     /// depending on the inferred must-edges carry an
     /// `[R.2.5b-sampling-must]` AdapterWarning.
     SamplingConfluence,
+    /// R.2.5b session 2 (2026-06-08). SMT-backed must-edge inference
+    /// via Z3 BV theory. For each (source cube, sampled target)
+    /// pair, run an UNSAT check on `src ∧ transition ∧ ¬tgt`;
+    /// UNSAT promotes MayOnly → Sharp. SOUNDNESS: SMT-proved (no
+    /// sampling). The MVP uses the stronger ∀∀ form (`∀ state.
+    /// ∀ input. transition ⟹ next ⊨ tgt`); the standard ∀∃ form
+    /// is queued for the session-2 follow-up. Hyper-must inference
+    /// is also queued. Verdicts carry an `[R.2.5b-smt-must]`
+    /// AdapterWarning.
+    SmtPerTarget,
 }
 
 #[derive(Args, Debug)]
@@ -1743,6 +1753,9 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         MustEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         MustEdgeInferenceArg::SamplingConfluence => {
             mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SamplingConfluence
+        }
+        MustEdgeInferenceArg::SmtPerTarget => {
+            mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SmtPerTarget
         }
     };
 
