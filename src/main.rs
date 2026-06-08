@@ -3735,6 +3735,19 @@ fn unrolled_automata_to_cytoscape(
                     })
                     .collect();
 
+                // R.5 Item K sub-item K.1b-unrolled (2026-06-08) —
+                // resolve additional_targets to location names.
+                let additional_targets: Vec<String> = t
+                    .additional_targets
+                    .iter()
+                    .filter_map(|sel| match sel {
+                        StateSelector::Named(state_ref) => match state_ref {
+                            StateRef::Simple(ident) => Some(ident.name.clone()),
+                            StateRef::Indexed { name, .. } => Some(name.name.clone()),
+                        },
+                        _ => None,
+                    })
+                    .collect();
                 Some(OriginalTransition {
                     from: source_name,
                     to: target_name,
@@ -3750,6 +3763,7 @@ fn unrolled_automata_to_cytoscape(
                     // the unrolled-CLTS path emits the right
                     // CLTS edge modality.
                     modality: t.modality,
+                    additional_targets,
                 })
             })
             .collect();

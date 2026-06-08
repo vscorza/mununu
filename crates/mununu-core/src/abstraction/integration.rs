@@ -4,7 +4,31 @@ use super::heuristics::HeuristicConfig;
 use super::unrolling::{
     Effect, OriginalState, OriginalTransition, UnrollingError, UnrollingOptions, VariableDecl,
 };
+use crate::context_dsl::ast::TransitionModalitySpec;
 use serde_json::Value;
+
+/// R.5 Item K JSON-schema modality (2026-06-08) — parse an
+/// optional `modality` JSON field into a
+/// [`TransitionModalitySpec`]. Accepted string values:
+/// `"sharp"` / `"may"` / `"must"` (case-sensitive, matching the
+/// CTXDSL attribute names). Absent or unknown values default to
+/// `Sharp` — preserves pre-this-commit JSON-sourced behaviour
+/// byte-for-byte. JSON-schema readers that want strict validation
+/// can pre-check the field before calling
+/// `convert_transitions_from_json`.
+fn parse_json_modality(value: Option<&Value>) -> TransitionModalitySpec {
+    let Some(v) = value else {
+        return TransitionModalitySpec::Sharp;
+    };
+    let Some(s) = v.as_str() else {
+        return TransitionModalitySpec::Sharp;
+    };
+    match s {
+        "may" => TransitionModalitySpec::MayOnly,
+        "must" => TransitionModalitySpec::MustOnly,
+        _ => TransitionModalitySpec::Sharp,
+    }
+}
 
 /// Converts JSON model structures to unrolling structures.
 ///
@@ -80,16 +104,29 @@ impl JsonToUnrollingConverter {
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    // R.5 Item K sub-item K.2b (2026-06-06) — JSON-
-                    // sourced transitions default to Sharp; modality
-                    // is not yet plumbed through the JSON schema
-                    // (queued for a separate JSON-schema follow-up).
-                    modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
-                    // R.5 Item K sub-item K.1b-unrolled — JSON
-                    // schema doesn't carry multi-target hyper-must;
-                    // defaults to empty (singleton hyper-must when
-                    // modality is MustOnly).
-                    additional_targets: Vec::new(),
+                    // R.5 Item K JSON-schema modality (2026-06-08)
+                    // — read optional `modality` field from the
+                    // JSON transition object. Accepted string
+                    // values: `"sharp"` / `"may"` / `"must"`
+                    // (case-sensitive, matching the CTXDSL
+                    // attribute names). Absent or unknown values
+                    // default to `Sharp` — preserves pre-this-
+                    // commit JSON-sourced behaviour byte-for-byte.
+                    modality: parse_json_modality(t.get("modality")),
+                    // R.5 Item K JSON-schema additional_targets
+                    // (2026-06-08) — read optional
+                    // `additional_targets` array of state names.
+                    // Defaults to empty (singleton hyper-must when
+                    // modality is `must`).
+                    additional_targets: t
+                        .get("additional_targets")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -184,6 +221,70 @@ mod tests {
             JsonToUnrollingConverter::convert_transitions_from_json(&transitions).unwrap();
         assert_eq!(original_transitions.len(), 1);
         assert_eq!(original_transitions[0].from, "Start");
+    }
+
+    /// R.5 Item K JSON-schema modality (2026-06-08) — JSON
+    /// transition without `modality` field defaults to Sharp +
+    /// empty `additional_targets` (pre-this-commit behaviour
+    /// byte-for-byte).
+    #[test]
+    fn r5_json_modality_absent_defaults_to_sharp() {
+        let transitions = vec![json!({
+            "from": "a",
+            "to": "b",
+            "label": "x"
+        })];
+        let out = JsonToUnrollingConverter::convert_transitions_from_json(&transitions).unwrap();
+        assert_eq!(out[0].modality, TransitionModalitySpec::Sharp);
+        assert!(out[0].additional_targets.is_empty());
+    }
+
+    /// R.5 Item K JSON-schema modality — `"may"` parses as
+    /// `MayOnly`.
+    #[test]
+    fn r5_json_modality_may_parses_as_may_only() {
+        let transitions = vec![json!({
+            "from": "a",
+            "to": "b",
+            "label": "x",
+            "modality": "may"
+        })];
+        let out = JsonToUnrollingConverter::convert_transitions_from_json(&transitions).unwrap();
+        assert_eq!(out[0].modality, TransitionModalitySpec::MayOnly);
+    }
+
+    /// R.5 Item K JSON-schema modality — `"must"` parses as
+    /// `MustOnly`; `additional_targets` array parses correctly.
+    #[test]
+    fn r5_json_modality_must_with_additional_targets_parses_correctly() {
+        let transitions = vec![json!({
+            "from": "s0",
+            "to": "t1",
+            "label": "go",
+            "modality": "must",
+            "additional_targets": ["t2", "t3"]
+        })];
+        let out = JsonToUnrollingConverter::convert_transitions_from_json(&transitions).unwrap();
+        assert_eq!(out[0].modality, TransitionModalitySpec::MustOnly);
+        assert_eq!(out[0].additional_targets, vec!["t2", "t3"]);
+    }
+
+    /// R.5 Item K JSON-schema modality — unknown `modality`
+    /// string falls back to `Sharp` (defensive default; matches
+    /// the soundness discipline of the CTXDSL parser's K.1
+    /// `UnexpectedToken` for unknown keywords but defaults silently
+    /// here since the JSON layer has no error-reporting story for
+    /// per-field unknown-value rejection).
+    #[test]
+    fn r5_json_modality_unknown_value_falls_back_to_sharp() {
+        let transitions = vec![json!({
+            "from": "a",
+            "to": "b",
+            "label": "x",
+            "modality": "weak"
+        })];
+        let out = JsonToUnrollingConverter::convert_transitions_from_json(&transitions).unwrap();
+        assert_eq!(out[0].modality, TransitionModalitySpec::Sharp);
     }
 
     #[test]
