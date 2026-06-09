@@ -1,0 +1,60 @@
+; V.6 — Tiny AMBA-style arbiter BTOR2 for the R.6.7 controllability-aware
+; KMTS demonstration.
+;
+; Equivalent to amba_arbiter.sv in this directory. Hand-written to
+; sidestep the sv2v + Yosys subprocess requirement for the V.6 MVP
+; test (the SV is the canonical documentation; the BTOR2 is what
+; the integration test consumes).
+;
+; State + input layout:
+;   - State cells:
+;       burst   (2 bits) — predicate-abstraction target
+;       grant_0 (1 bit)  — controller decision output (registered)
+;       grant_1 (1 bit)  — same
+;   - Inputs:
+;       req_0   (1 bit)  — environment (uncontrollable)
+;       req_1   (1 bit)  — environment (uncontrollable)
+;       ctrl_g0 (1 bit)  — controller (controllable; the R.6.6 split target)
+;       ctrl_g1 (1 bit)  — controller (controllable)
+;
+; Transitions (matching amba_arbiter.sv):
+;   - grant_0' = ctrl_g0
+;   - grant_1' = ctrl_g1
+;   - burst'   = (ctrl_g0 || ctrl_g1) ? (burst==0 ? 3 : burst-1) : burst
+;
+; Init:
+;   - burst = 0, grant_0 = 0, grant_1 = 0
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 req_0
+4 input 1 req_1
+5 input 1 ctrl_g0
+6 input 1 ctrl_g1
+7 state 2 burst
+8 state 1 grant_0
+9 state 1 grant_1
+10 zero 1
+11 zero 2
+12 init 1 8 10
+13 init 1 9 10
+14 init 2 7 11
+15 one 1
+16 const 2 11
+17 const 2 01
+18 const 2 10
+19 const 2 00
+; grant_0' = ctrl_g0
+20 next 1 8 5
+; grant_1' = ctrl_g1
+21 next 1 9 6
+; or_ctrl = ctrl_g0 || ctrl_g1
+22 or 1 5 6
+; burst_eq_0 = (burst == 0)
+23 eq 1 7 19
+; burst_minus_1 = burst - 1
+24 sub 2 7 17
+; burst_when_granting = (burst==0 ? 3 : burst-1)
+25 ite 2 23 16 24
+; burst' = or_ctrl ? burst_when_granting : burst
+26 ite 2 22 25 7
+27 next 2 7 26
