@@ -253,6 +253,24 @@ struct Btor2CegarArgs {
     /// human-readable format.
     #[arg(long)]
     json: bool,
+    /// R.6.6 / V.6 (2026-06-09) — name of a BTOR2 input symbol the
+    /// controller drives. Repeated to declare multiple controllable
+    /// inputs. When non-empty, the predicate-cube lifter partitions
+    /// boolean inputs into env (uncontrollable) + ctrl (controllable)
+    /// classes per-symbol-name + emits per-combo dual-label
+    /// transitions `[env_cN, ctrl_cM]` with appropriate
+    /// `LabelControllability` tags. The Skolem grouping in the
+    /// R.6.3 modal step then partitions correctly along the
+    /// controllability axis (∀ env-combo, ∃ ctrl-combo for the
+    /// synthesis idiom).
+    ///
+    /// When omitted (default empty): the lifter emits the legacy
+    /// single-`step` label shape (pre-R.6.6 behaviour, no
+    /// controllability axis on labels).
+    ///
+    /// Example: `--controllable-input ctrl_g0 --controllable-input ctrl_g1`.
+    #[arg(long = "controllable-input", value_name = "INPUT_NAME")]
+    controllable_inputs: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1794,7 +1812,13 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // signal per flag entry; the CEGAR loop reads `sidecar_json`
     // via the bridge and threads `config_values` into the
     // predicate-cube lift.
-    let adapter_options = build_adapter_options_with_config_values(&args.config_values)?;
+    let mut adapter_options = build_adapter_options_with_config_values(&args.config_values)?;
+    // R.6.6 / V.6 (2026-06-09) — thread the `--controllable-input`
+    // CLI flag values into `AdapterOptions::controllable_inputs`,
+    // which the predicate-cube lifter reads to partition boolean
+    // inputs into env / ctrl classes + emit per-combo dual-label
+    // transitions with the appropriate `LabelControllability` tags.
+    adapter_options.controllable_inputs = args.controllable_inputs.clone();
 
     let trace = cegar_refine_loop(
         &formula,

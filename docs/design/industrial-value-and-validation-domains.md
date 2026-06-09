@@ -1,6 +1,6 @@
 # Industrial Value and Validation Domains
 
-> **Status: planning.** This document scopes the classes of industrial verification problems where mununu's KMTS-based 3-valued mu-calculus stack delivers value that incumbent SVA / BMC / commercial-property-checker flows structurally cannot reach. It maps mununu's shipped capabilities (R.1 + R.2 + R.3 + R.4 per the plan's §10.1) onto the load-bearing requirements of six target domains, and queues six validation phases (V.0–V.5; see [`../../.claude/plans/you-are-a-formal-vast-lake.md`](../../.claude/plans/you-are-a-formal-vast-lake.md) §Phase 7) that anchor the claims to runnable fixtures. Per CLAUDE.md §Documentation Traceability, the capability-inventory section (§2) carries `> Source of truth:` anchors against live code; the domain sections (§3–§8) cite the planned fixture paths they ship with the V.x phases. Per the §Phase 5 framework integration of the plan, the GKMTS extension (R.4.5) and the parity-game 3-valued evaluator (R.5.0) precede most of the V.x domain work — V.0 (the "smallest possible coherence" demo) is the only V.x that can ship pre-R.5.
+> **Status: planning.** This document scopes the classes of industrial verification problems where mununu's KMTS-based 3-valued mu-calculus stack delivers value that incumbent SVA / BMC / commercial-property-checker flows structurally cannot reach. It maps mununu's shipped capabilities (R.1 + R.2 + R.3 + R.4 per the plan's §10.1) onto the load-bearing requirements of seven target domains, and queues seven validation phases (V.0–V.6; V.0–V.5 from the original KMTS plan, V.6 added by the [R.6 replanning pass](../../.claude/plans/r6-controllability-aware-kmts-game-abstraction.md) for controllability-aware synthesis) that anchor the claims to runnable fixtures. Per CLAUDE.md §Documentation Traceability, the capability-inventory section (§2) carries `> Source of truth:` anchors against live code; the domain sections (§3–§8.5) cite the planned fixture paths they ship with the V.x phases. Per the §Phase 5 framework integration of the plan, the GKMTS extension (R.4.5) and the parity-game 3-valued evaluator (R.5.0) precede most of the V.x domain work — V.0 (the "smallest possible coherence" demo) is the only V.x that can ship pre-R.5.
 
 ---
 
@@ -244,6 +244,46 @@ mununu's capabilities map cleanly (parametric tile templates, sync barriers, asy
 
 ---
 
+## §8.5 Domain 7: Controller synthesis over abstracted reactive systems (V.6)
+
+> Added 2026-06-08 by the R.6 replanning pass ([`../../.claude/plans/r6-controllability-aware-kmts-game-abstraction.md`](../../.claude/plans/r6-controllability-aware-kmts-game-abstraction.md)). Domains 1–6 are *verification* (single-agent KMTS); this domain is *synthesis* (two-player KMTS), which §1–§7 of this doc do not cover.
+
+### Why this is hard for current tools
+
+Reactive controller synthesis with an *abstracted* plant is the gap. GR(1) synthesis tools (Slugs, the original Anzu/RATSY line) are exact on finite Boolean state but have no abstraction-refinement story for data-dependent plants (burst counters, credit windows, address ranges) — the engineer must manually finitize. Abstraction-based model checkers (the KMTS stack of §1–§7) are single-agent: they verify a property of a *closed* system, not synthesize a controller against an adversarial environment. No industrial tool combines *predicate abstraction* with *controller synthesis* soundly, because the soundness story is subtle: the controller's chosen move must be one the abstraction can *vouch for* (a must-edge), while the environment ranges over everything the abstraction *admits* (may-edges). Treating an abstract may-edge as a definite controllable move **over-claims a controller that the concrete system does not admit**.
+
+### Where mununu's capabilities pay off
+
+This is the domain that motivates the controllability-aware KMTS work (R.6): the §7.2 (kmts-theory) 2×2 rule — ∀ over uncontrollable *may*-edges, ∃ over controllable *must*-edges — is exactly the sound mixing GR(1)-over-abstraction needs.
+
+- **Per-label controllability** (`LabelControllability`) for the environment/controller input partition.
+- **3-valued (may/must) transition modality** for the abstracted datapath.
+- **μ-calculus alternation** for GR(1) response liveness (νμ).
+- **CEGAR refinement** keyed on the *owning player* of the uncertain edge (kmts-theory §7.6): an uncertain controllable edge drives must-growth (confirm the move); an uncertain environment edge drives may-shrinking (rule out a phantom adversary move).
+
+### Template properties
+
+- **GR(1) response (request → eventual grant)**: `νY. μZ. ((¬request ∨ granted) ∧ [(ctrl = environment)] ⟨(ctrl = controllable)⟩ (Y ∧ Z-progress))` — the box ranges over environment may-edges, the diamond over controllable must-edges.
+- **Safety under adversarial environment**: `νX. (safe ∧ [(ctrl = environment)] ⟨(ctrl = controllable)⟩ X)` — controller maintains an invariant against all admitted environment moves.
+
+### Validation phase
+
+**V.6** ships the controllability-aware proof-of-fire (R.6.7): a **hand-authored AMBA-style arbiter** (synthesisable Verilog + equivalent BTOR2) where the burst-length counter is predicate-abstracted to produce `MayOnly` edges, the request/grant signals split into uncontrollable/controllable inputs, and the response-liveness property is GR(1). The done-criterion is a demonstrated **divergence**: the modality-blind verdict path returns a spurious "controller exists," while the controllability-aware path (R.6.3) returns a sound `KleeneBot`-then-refine verdict. Fixture: [`examples/verify/v6_controllability_kmts/`](../../examples/verify/v6_controllability_kmts/) (ships with V.6 at the 2026-06-09 partial; see §"V.6 fixture-provenance" below for the path-chosen rationale).
+
+### V.6 fixture-provenance (added 2026-06-09 per the R.6.7 path-chosen analysis)
+
+The original V.6 framing assumed the public **AMBA AHB from the GR(1)/TLSF corpus** (Bloem–Jobstmann–Piterman–Pnueli–Sa'ar). The 2026-06-09 R.6.7 fixture-path analysis found this requires infrastructure mununu does NOT have: the TLSF adapter (`crates/mununu-core/src/adapter/tlsf/mod.rs`) goes directly TLSF → CTXDSL (Sharp-only); the path to KMTS with predicate-abstraction-induced MayOnly edges requires BTOR2 input, and TLSF → BTOR2 (with a predicate-abstractable datapath) requires either (a) an external GR(1) synthesiser producing the controller mununu is supposed to *verify*, or (b) hand-authored Verilog.
+
+The V.6 fixture-path chosen is **Option B (hand-authored Verilog with predicate-abstractable burst counter)**, per CLAIM Integrity labeled as a hand-authored fixture demonstrating the verdict-divergence pattern on real RTL semantics rather than a SYNTCOMP-corpus claim. The R.6.6 controllability-aware lifter + R.6.3 modality-aware evaluator are exercised end-to-end on the actual production code paths (5 integration tests confirm the lift produces BOTH controllable labels AND MayOnly edges from the same source); the only difference vs the original framing is the fixture provenance.
+
+The path that *would* connect to the public TLSF corpus — TLSF → controller-RTL via external synthesis (Strix / BoSy / similar) → BTOR2 → predicate-cube lift — is a multi-week infrastructure expansion currently parked as a follow-up. It would couple mununu to external synthesisers in a way the rest of the verification stack does not, so the engineering trade-off is genuinely structural.
+
+### Realistic assessment
+
+The newest and least-proven domain. V.6 partial-shipped 2026-06-09: R.6.3–R.6.6 evaluator stack closed, V.6 Option B fixture demonstrates end-to-end controllability-aware lift + R.2.5 MayOnly emission on RTL semantics (5 integration tests pass; `validate.sh` runs the CLI invocation end-to-end with the new `--controllable-input` flag). Remaining: mu-calc safety/liveness property authoring + verdict-divergence demonstration + mununu-ui SV-source workflow + tutorial. The honest-state claim today is *partial demonstration of the controllability-aware verdict-divergence pattern on a hand-authored RTL fixture*, not yet a full SYNTCOMP-corpus AMBA result. Its strategic value remains unique: it is the only V.x that exercises mununu as a *synthesis* tool over abstraction, which no incumbent does.
+
+---
+
 ## §9 Capability-to-domain matrix
 
 | Domain (V.x) | Compositional | State valuations | Multi-label | Sync+Async | 3-valued / GKMTS | μ-cal alternation |
@@ -253,7 +293,10 @@ mununu's capabilities map cleanly (parametric tile templates, sync barriers, asy
 | V.2 Memory consistency | High | Critical | Critical | High | Moderate | Yes (νμ) |
 | V.3 Speculative security | High | Critical | High | Critical (self-comp) | Critical | Moderate (mostly ν) |
 | V.5 GALS / async | High | High | Critical | Critical | High | Yes (νμ) |
+| V.6 Synthesis over abstraction † | Moderate | High | High | High | Critical | Yes (νμ, GR(1)) |
 | (deferred) Distributed accelerator | Critical | High | High | Critical | High | Yes (νμ) |
+
+† V.6 additionally requires **per-label controllability** (the environment/controller partition) composed with the 3-valued/GKMTS column — the controllability × may/must product of [`kmts-theory.md`](kmts-theory.md) §7. It is the only V.x that exercises mununu as a *synthesis* tool; the matrix columns above are verification-oriented and do not capture the controllability axis on their own.
 
 Every shipped + planned capability earns its keep in at least three V.x domains; no capability is decorative.
 
@@ -279,7 +322,7 @@ Concentrate initial validation investment on two domains where the wedge is shar
 1. **V.0 → V.4: parameterized cache coherence** — highest willingness-to-pay, clearest property structure match, strongest published evidence of the gap. V.0 is achievable pre-R.5; V.4 closes the parametric story post-R.5b.
 2. **V.5: asynchronous / GALS verification with data abstraction** — clearest predecessor (CADP), shortest path to a working prototype, smallest gap between research and industrial usability.
 
-V.1 (NoC), V.2 (MCM), V.3 (speculative security) are deferred to second-phase investment once V.0 / V.4 / V.5 demonstrate the substrate. Domain 6 (distributed accelerator coordination) is deferred to a second-phase plan.
+V.1 (NoC), V.2 (MCM), V.3 (speculative security) are deferred to second-phase investment once V.0 / V.4 / V.5 demonstrate the substrate. Domain 6 (distributed accelerator coordination) is deferred to a second-phase plan. **V.6 (synthesis over abstraction)** is sequenced last and gated on the full R.6 arc landing (the sound controllability-aware evaluator does not yet exist in the production verdict path) — it is a high-risk, high-uniqueness bet rather than a near-term wedge.
 
 External framing for mununu post-V.5: *"a verification stack for parameterized and asynchronous hardware coordination, complementing existing SVA-based flows on problems they structurally cannot reach."* This framing is defensible against any incumbent comparison because it does not compete with incumbents on their strong ground.
 
@@ -291,4 +334,4 @@ mununu's load-bearing capabilities — compositional, valuation-aware, multi-lab
 
 The honest claim is not "mununu verifies critical industrial hardware." The honest claim is: **for a specific, identifiable, valuable class of hardware verification problems characterized by parameterization, asynchronous composition, hyperproperty structure, or deep liveness alternation, mununu occupies a wedge that no industrial tool today addresses, and the wedge is wide enough to support a credible product line.** That claim is defensible. Anything broader is not.
 
-The V.0–V.5 validation phases (next; see plan §Phase 7) anchor this claim to runnable fixtures, with the same blocker-protocol discipline (§10.2 of the plan) that gates the R.x / M.x track. **A V.x failure means the domain claim is downgraded or retracted, not that the fixture is hand-translated** — same evidence discipline.
+The V.0–V.5 validation phases (next; see plan §Phase 7), plus V.6 (synthesis over abstraction; §8.5, gated on the R.6 arc), anchor this claim to runnable fixtures, with the same blocker-protocol discipline (§10.2 of the plan) that gates the R.x / M.x track. **A V.x failure means the domain claim is downgraded or retracted, not that the fixture is hand-translated** — same evidence discipline.
