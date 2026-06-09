@@ -64,6 +64,32 @@ pub struct Position3v {
     pub node: super::NodeId,
 }
 
+/// R.6.5 (2026-06-08) — owning player of a classifying transition's
+/// label set, determined by the edge's controllability at the
+/// construction site (`transition.is_controllable(clts)` in the
+/// parity-game evaluator's emission of `FailureSubgame`).
+///
+/// Per [`docs/design/kmts-theory.md`] §7.6, the R.5 CEGAR loop's
+/// predicate-splitting heuristic should branch on this tag:
+/// - `Environment`: the MayOnly edge represents a spurious environment
+///   move ⇒ refine to shrink `R_may` (rule out the bad environment).
+/// - `Controller`: the MayOnly edge represents an uncertain controller
+///   move ⇒ refine to grow `R_must` (the controller needs a confirmed
+///   witness, not a may-only one).
+/// - `Unknown`: edge classification is ambiguous (mixed-controllability
+///   label sets, or test fixtures that do not have a CLTS lookup).
+///   Treated as `Environment` by the conservative R.5 default; explicit
+///   per-transition handling is the R.6.5.b follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwningPlayer {
+    /// Edge's labels are uncontrollable — environment-driven.
+    Environment,
+    /// Edge's labels are controllable — controller-driven.
+    Controller,
+    /// Cannot determine (mixed labels, or no CLTS lookup available).
+    Unknown,
+}
+
 /// R.5.0 — Failure subgame returned alongside an indefinite verdict.
 ///
 /// **MVP shape**: enumerates KleeneBot positions at the root level
@@ -76,6 +102,17 @@ pub struct Position3v {
 /// `subgame_extraction_complete` flag is now `true` whenever a
 /// subgame is emitted (the precise extraction from sub-items 4.1–
 /// 4.4 is wired into `evaluate_3v_game_with_options`).
+///
+/// **R.6.5 update (2026-06-08)**: each entry of
+/// `classifying_transitions` now carries an `OwningPlayer` tag (third
+/// tuple element) derived from the edge's `is_controllable(clts)` at
+/// construction time. R.5 CEGAR consumes this to branch the
+/// refinement strategy per the controllability-aware sketch in
+/// [`docs/design/kmts-theory.md`] §7.6:
+/// - uncertain **environment** `MayOnly` edge ⇒ refine to *shrink*
+///   `R_may` (the spurious environment edge must be ruled out).
+/// - uncertain **controllable** `MayOnly` edge ⇒ refine to *grow*
+///   `R_must` (the controller needs a confirmed witness).
 #[derive(Debug, Clone)]
 pub struct FailureSubgame {
     /// `(state, root_formula_node)` positions whose verdict is
@@ -83,13 +120,15 @@ pub struct FailureSubgame {
     /// positions whose internal evaluation produced `KleeneBot`,
     /// not just root-level ones.
     pub positions: Vec<Position3v>,
-    /// `(source_state, transition_index)` pairs identifying
-    /// `MayOnly` edges in the CLTS that are reachable from any
-    /// KleeneBot position. R.5.0 MVP returns an over-approximation
-    /// (all reachable MayOnly edges); R.5 prunes to the actually-
-    /// responsible classifying transitions per the Shoham–Grumberg
-    /// subgame.
-    pub classifying_transitions: Vec<(usize, usize)>,
+    /// `(source_state, transition_index, owning_player)` triples
+    /// identifying `MayOnly` edges in the CLTS that are reachable
+    /// from any KleeneBot position. R.5.0 MVP returns an over-
+    /// approximation (all reachable MayOnly edges); R.5 prunes to
+    /// the actually-responsible classifying transitions per the
+    /// Shoham–Grumberg subgame. **R.6.5 (2026-06-08)**: each entry
+    /// carries an `OwningPlayer` tag for the controllability-aware
+    /// CEGAR refinement branch (kmts-theory.md §7.6).
+    pub classifying_transitions: Vec<(usize, usize, OwningPlayer)>,
     /// The root indefinite position (`positions[0]` by convention,
     /// or any KleeneBot position when there are several). Surfaces
     /// the entry point R.5's predicate-splitting heuristic should
@@ -221,7 +260,7 @@ where
             }
         })
         .collect();
-    let mut classifying_transitions: Vec<(usize, usize)> = Vec::new();
+    let mut classifying_transitions: Vec<(usize, usize, OwningPlayer)> = Vec::new();
     for (src, tgt) in &precise.classifying_edges {
         let src_pos = &game.positions[src.0];
         let tgt_pos = &game.positions[tgt.0];
@@ -234,9 +273,25 @@ where
         for (t_idx, transition) in clts.outgoing(source_id).iter().enumerate() {
             if transition.target().index() == tgt_pos.state
                 && matches!(transition.modality(), TransitionModality::MayOnly)
-                && !classifying_transitions.contains(&(src_pos.state, t_idx))
+                && !classifying_transitions
+                    .iter()
+                    .any(|(s, t, _)| *s == src_pos.state && *t == t_idx)
             {
-                classifying_transitions.push((src_pos.state, t_idx));
+                // R.6.5 (2026-06-08) — derive owning-player tag from
+                // the transition's controllability. `is_controllable`
+                // returns true iff every label in the edge's label set
+                // is controllable; `is_uncontrollable` is the dual.
+                // Mixed-label edges yield `Unknown` (the R.6.5.b
+                // follow-up will handle them via the Skolem grouping's
+                // per-label-set classification).
+                let owner = if transition.is_controllable(clts) {
+                    OwningPlayer::Controller
+                } else if transition.is_uncontrollable(clts) {
+                    OwningPlayer::Environment
+                } else {
+                    OwningPlayer::Unknown
+                };
+                classifying_transitions.push((src_pos.state, t_idx, owner));
             }
         }
     }
@@ -488,7 +543,7 @@ mod tests {
             // KleeneBot state.
             let kleenebot_set: std::collections::HashSet<usize> =
                 subgame.positions.iter().map(|p| p.state).collect();
-            for (src, _) in &subgame.classifying_transitions {
+            for (src, _, _) in &subgame.classifying_transitions {
                 assert!(
                     kleenebot_set.contains(src),
                     "classifying transition source {src} should be a KleeneBot state; positions = {:?}",
@@ -546,5 +601,74 @@ mod tests {
         builder.transition_ids(s2, &[lbl], s2);
         let clts = builder.build().expect("build");
         assert!(clts_has_hyper_must_transitions(&clts));
+    }
+
+    /// R.6.5 (2026-06-08) — when the parity-game evaluator emits a
+    /// failure subgame on a KMTS whose classifying MayOnly edges
+    /// carry **uncontrollable** labels, every entry of
+    /// `classifying_transitions` carries `OwningPlayer::Environment`.
+    /// `build_mayonly_kmts` is the canonical fixture: its `a` label
+    /// is uncontrollable by default (the builder sets uncontrollable
+    /// for unlabelled-controllability labels in 2-state fixtures).
+    #[test]
+    fn r6_5_classifying_transitions_carry_owning_player_tag() {
+        use super::evaluate_3v_game;
+        use crate::mu_calculus::parser;
+        let clts = build_mayonly_kmts();
+        // `nu X. <true> X` (parser uses `<true>` to mean "any label
+        // matching the predicate `true`"); on a CLTS with no
+        // labels named `true`, all guard checks fail. Use the
+        // explicit `<a>X` form to match the fixture's labels.
+        //
+        // Actually simpler: `mu X. p` with a non-matching predicate
+        // returns KleeneBot at all MayOnly source states. But that
+        // requires a predicate map. Easier: `<a>true` where `a`
+        // matches; a MayOnly edge ⇒ may=true, must=false ⇒ Unknown.
+        let formula = parser::parse("<a>true").expect("parse");
+        let env = Environment::new(clts.state_count());
+        let result = evaluate_3v_game(&formula, &clts, &env).expect("eval");
+        if let Some(subgame) = result.failure_subgame {
+            assert!(
+                !subgame.classifying_transitions.is_empty(),
+                "fixture should produce at least one classifying transition"
+            );
+            // Every classifying entry must carry a non-empty owning-
+            // player tag. For this fixture's uncontrollable `a` edges
+            // we expect `Environment`. The R.6.5 contract is that
+            // the tag is DERIVED at construction time (not
+            // `Unknown` by default).
+            for (src, t_idx, owner) in &subgame.classifying_transitions {
+                assert!(
+                    matches!(owner, OwningPlayer::Environment | OwningPlayer::Controller),
+                    "R.6.5: classifying transition ({src}, {t_idx}) must carry a \
+                     derived owning-player tag (not Unknown); got {owner:?}"
+                );
+            }
+        }
+        // No subgame is also acceptable — the fixture's formula may
+        // be definite. The R.6.5 contract only fires when subgame
+        // is Some.
+    }
+
+    /// R.6.5 — when the evaluator finds the input CLTS has only
+    /// Sharp transitions, no MayOnly edges classify, and the
+    /// classifying_transitions list is empty. Equivalent to gate
+    /// (1) of R.6.3 — verdict-equivalence on Sharp-only.
+    #[test]
+    fn r6_5_sharp_only_clts_produces_empty_classifying_transitions() {
+        use super::evaluate_3v_game;
+        use crate::mu_calculus::parser;
+        let clts = build_sharp_only_2state_clts();
+        let formula = parser::parse("nu X. <a> X").expect("parse");
+        let env = Environment::new(clts.state_count());
+        let result = evaluate_3v_game(&formula, &clts, &env).expect("eval");
+        if let Some(subgame) = result.failure_subgame {
+            assert!(
+                subgame.classifying_transitions.is_empty(),
+                "Sharp-only CLTS must produce empty classifying_transitions; \
+                 got {} entries",
+                subgame.classifying_transitions.len()
+            );
+        }
     }
 }

@@ -1088,7 +1088,10 @@ fn craig_interpolation_predicates(
         .iter()
         .map(|p| (p.register.clone(), p.value))
         .collect();
-    for (src_idx, t_idx) in &subgame.classifying_transitions {
+    for (src_idx, t_idx, _owner) in &subgame.classifying_transitions {
+        // R.6.5 — owning-player tag ignored by the Craig path's MVP;
+        // R.6.5.b will branch on it to pick the refinement direction
+        // (env ⇒ shrink R_may; ctrl ⇒ grow R_must).
         let Some(src_id) = StateId::<crate::clts::DefaultStateIdx>::from_index(*src_idx) else {
             continue;
         };
@@ -1561,7 +1564,11 @@ mod tests {
         // propose predicates over reg_b (the uncovered register).
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
@@ -1589,7 +1596,11 @@ mod tests {
         // current predicate set — WP has nothing more to propose.
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
@@ -1618,7 +1629,11 @@ mod tests {
         // (the loop then terminates with PredicateSourceExhausted).
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
@@ -1655,7 +1670,11 @@ mod tests {
         // include the literal `5` extracted from `const 1 0101`.
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
@@ -1682,7 +1701,11 @@ mod tests {
         // next candidate (`5` from the BTOR2 const literal).
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
@@ -1760,7 +1783,11 @@ mod tests {
         // is cnt_b → WP proposes for cnt_b.
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
@@ -1792,7 +1819,11 @@ mod tests {
         // gets proposed under the unrestricted walk.
         let subgame = FailureSubgame {
             positions: Vec::new(),
-            classifying_transitions: vec![(0, 0)],
+            classifying_transitions: vec![(
+                0,
+                0,
+                crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+            )],
             root: None,
             subgame_extraction_complete: false,
         };
