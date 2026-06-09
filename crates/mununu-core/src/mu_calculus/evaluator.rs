@@ -10,7 +10,54 @@ use super::{
     Control, Formula, FormulaVarId, Guard, ModalKind, Node, NodeId, NodeOps,
     guard_matches_labels_and_vars, memo::MemoizationCache,
 };
-use crate::clts::{Clts, IdStorage, LabelId, StateId, Transition};
+use crate::clts::{Clts, IdStorage, LabelId, StateId, Transition, TransitionModality};
+
+/// R.6.3 (2026-06-08) — restricts which transitions a modal helper
+/// considers, composed with the existing `guard_matches` +
+/// `group_transitions_by_uncontrollable_labels` Skolem grouping.
+///
+/// The 3-valued modal step needs this distinction because the
+/// **player establishing a modality may rely only on `R_must`**
+/// (Sharp ∪ MustHyperOnly) **edges**; the player refuting it ranges
+/// over `R_may` (every transition). See [`docs/design/kmts-theory.md`]
+/// §7.2 for the rule table.
+///
+/// Per the duality:
+/// - `must_bits(<a>φ)` needs `∃ must-edge ⊨ φ` ⇒ `MustOnly`.
+/// - `may_bits(<a>φ)` needs `∃ may-edge ⊨ φ` ⇒ `All`.
+/// - `must_bits([a]φ)` needs `∀ may-edge ⊨ φ` ⇒ `All`.
+/// - `may_bits([a]φ)` needs `∀ must-edge ⊨ φ` ⇒ `MustOnly`.
+///
+/// The 2-valued path (`eval_modal`) always passes `All` to preserve
+/// pre-R.6.3 behaviour bit-for-bit. The 3-valued path
+/// (`modal_bits_from_target`) reads it per (`ModalKind`, must|may).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransitionModalityFilter {
+    /// Pre-R.6.3 default. Every transition passes (regardless of
+    /// modality). Used by the 2-valued evaluator path and by the
+    /// 3-valued path for `may_bits(<a>φ)` + `must_bits([a]φ)`.
+    #[default]
+    All,
+    /// R.6.3 — Only `Sharp` and `MustHyperOnly` transitions pass;
+    /// `MayOnly` transitions are skipped. Used by the 3-valued path
+    /// for `must_bits(<a>φ)` + `may_bits([a]φ)`.
+    MustOnly,
+}
+
+impl TransitionModalityFilter {
+    /// R.6.3 — Does this filter admit the given transition?
+    /// `All` is always `true`. `MustOnly` rejects `MayOnly`
+    /// transitions.
+    #[inline]
+    fn allows<S: IdStorage, L: IdStorage>(self, transition: &Transition<S, L>) -> bool {
+        match self {
+            TransitionModalityFilter::All => true,
+            TransitionModalityFilter::MustOnly => {
+                !matches!(transition.modality(), TransitionModality::MayOnly)
+            }
+        }
+    }
+}
 
 // Type alias to reduce complexity in function signatures
 type TransitionGroupMap<'a, S, L> = HashMap<String, Vec<(&'a Transition<S, L>, usize)>>;
@@ -740,6 +787,152 @@ fn bit_is_set(bits: &BitVec<usize, Lsb0>, idx: usize) -> bool {
 type GroupedTransitions<'b, S, L> =
     HashMap<SmallVec<[LabelId<L>; 4]>, Vec<(&'b Transition<S, L>, usize)>>;
 
+/// R.6 (draft, 2026-06-08) — classified facts about one guard-matched
+/// outgoing edge, consumed by [`modal_trit_core`].
+///
+/// Carries the two axes a controllability-aware KMTS modal step reads:
+/// the controllability of the edge's label set, and whether the edge is in
+/// the must-relation. See [`docs/design/kmts-theory.md`] §7.2.
+// R.6 staged draft (see kmts-theory.md §7.5): the modality-aware modal step
+// below is exercised by `modal_trit_draft_tests` but not yet wired into the
+// production `eval_node_tri` path. Swapping it in is the gated R.6 integration
+// item; until then these items are dead in a non-test build.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct EdgeFacts {
+    /// Edge's label set is controllable (the system chooses it). `false` ⇒
+    /// uncontrollable / environment.
+    controllable: bool,
+    /// Edge is in `R_must` (`TransitionModality::Sharp` ∪ `MustHyperOnly`).
+    /// Every edge is in `R_may`, so `!is_must` ⇒ `MayOnly`.
+    is_must: bool,
+    /// Three-valued verdict of the target subformula at this edge's target
+    /// state.
+    target: super::trit::Trit,
+}
+
+/// `def_t` — the target subformula is *definitely* true (`KleeneT`).
+#[allow(dead_code)] // R.6 staged draft; see EdgeFacts above.
+fn trit_def_true(t: super::trit::Trit) -> bool {
+    matches!(t, super::trit::Trit::True)
+}
+
+/// `not_f` — the target subformula is *possibly* true (`KleeneT` ∪ `KleeneBot`).
+#[allow(dead_code)] // R.6 staged draft; see EdgeFacts above.
+fn trit_not_false(t: super::trit::Trit) -> bool {
+    !matches!(t, super::trit::Trit::False)
+}
+
+/// R.6 (draft) — the controllability-aware 3-valued modal verdict for one
+/// source state, given its guard-matched outgoing edges classified on the
+/// 2×2 (controllability × modality) partition.
+///
+/// Pure function of the classified edge facts; the CLTS walk that produces
+/// `edges` lives in [`EvalContext::modal_trit_from_target`]. Implements the
+/// rule table of [`docs/design/kmts-theory.md`] §7.2: **the player
+/// establishing a modality may rely only on `must`-edges; the player
+/// refuting it ranges over `may`-edges.**
+///
+/// - [`Control::All`] — single-agent Kleene modal (§4.3), relation-gated.
+/// - [`Control::Controllable`] — controller-predecessor: `∀` admitted
+///   environment moves good **and** `∃` confirmed controllable move good.
+/// - [`Control::Environment`] — the De Morgan dual (draft; less exercised).
+///
+/// **Draft limitations** (see §7.5): edge classification is flat, not the
+/// full label-set Skolem sub-grouping of
+/// [`EvalContext::group_transitions_by_uncontrollable_labels`]; under
+/// `Control::{Controllable, Environment}` the `Box`/`Diamond` polarity is
+/// subsumed by the controllability structure (exact for the guard-filtered
+/// synthesis idiom). Hyper-must targets of cardinality > 1 are handled by
+/// the caller (it records the single K.2 target).
+#[allow(dead_code)] // R.6 staged draft; see EdgeFacts above.
+fn modal_trit_core(kind: ModalKind, control: Control, edges: &[EdgeFacts]) -> super::trit::Trit {
+    use super::trit::Trit;
+
+    // Quantifiers over edge subsets. `ctrl = Some(c)` restricts to edges whose
+    // controllability equals `c`; `None` keeps all. `must = true` restricts to
+    // must-edges (`R_may` is all edges, so `must = false` is the may-relation).
+    // `forall` is vacuously true on an empty subset.
+    let in_subset = |e: &EdgeFacts, ctrl: Option<bool>, must: bool| -> bool {
+        ctrl.is_none_or(|c| e.controllable == c) && (!must || e.is_must)
+    };
+    let exists = |ctrl: Option<bool>, must: bool, p: fn(Trit) -> bool| -> bool {
+        edges
+            .iter()
+            .any(|e| in_subset(e, ctrl, must) && p(e.target))
+    };
+    let forall = |ctrl: Option<bool>, must: bool, p: fn(Trit) -> bool| -> bool {
+        edges
+            .iter()
+            .all(|e| !in_subset(e, ctrl, must) || p(e.target))
+    };
+
+    let env = Some(false);
+    let ctrl = Some(true);
+    let has_ctrl = edges.iter().any(|e| e.controllable);
+
+    match control {
+        Control::All => match kind {
+            // ⟨⟩φ: T iff ∃ must-edge into def-T; F iff ∀ may-edge into def-F.
+            ModalKind::Diamond => {
+                if exists(None, true, trit_def_true) {
+                    Trit::True
+                } else if exists(None, false, trit_not_false) {
+                    Trit::Unknown
+                } else {
+                    Trit::False
+                }
+            }
+            // []φ: T iff ∀ may-edge into def-T; F iff ∃ must-edge into def-F.
+            ModalKind::Box => {
+                if forall(None, false, trit_def_true) {
+                    Trit::True
+                } else if forall(None, true, trit_not_false) {
+                    Trit::Unknown
+                } else {
+                    Trit::False
+                }
+            }
+        },
+        // System perspective (Skolem): ∀ uncontrollable, ∃ controllable. The
+        // controller forces φ. `kind` is subsumed by the controllability
+        // structure for the synthesis idiom (§7.2).
+        Control::Controllable => {
+            // Definite-T: every admitted (may) environment move is def-good AND
+            // the controller has a confirmed (must) move to a def-good state
+            // (or there is no controllable choice and the environment decides).
+            let must_good = forall(env, false, trit_def_true)
+                && (exists(ctrl, true, trit_def_true) || !has_ctrl);
+            // Possible-T: no forced (must) environment move is def-bad AND
+            // optimistically a controllable move may be good (or no ctrl choice).
+            let may_good = forall(env, true, trit_not_false)
+                && (exists(ctrl, false, trit_not_false) || !has_ctrl);
+            if must_good {
+                Trit::True
+            } else if may_good {
+                Trit::Unknown
+            } else {
+                Trit::False
+            }
+        }
+        // Environment perspective (dual of Controllable): ∃ uncontrollable OR
+        // ∀ controllable. Draft semantics — see §7.5.
+        Control::Environment => {
+            let must_good = exists(env, true, trit_def_true)
+                || (has_ctrl && forall(ctrl, false, trit_def_true));
+            let may_good = exists(env, false, trit_not_false)
+                || (has_ctrl && forall(ctrl, true, trit_not_false));
+            if must_good {
+                Trit::True
+            } else if may_good {
+                Trit::Unknown
+            } else {
+                Trit::False
+            }
+        }
+    }
+}
+
 struct EvalContext<'a, S, L>
 where
     S: IdStorage,
@@ -912,6 +1105,10 @@ where
                     &target_set,
                     guard_parts.as_deref(),
                     modal_node_id,
+                    // R.6.3 — the 2-valued path always passes
+                    // `All`. Modality-aware filtering happens only
+                    // on the 3-valued path (`modal_bits_from_target`).
+                    TransitionModalityFilter::All,
                 ),
                 ModalKind::Box => self.modal_forall(
                     state,
@@ -919,6 +1116,7 @@ where
                     &target_set,
                     guard_parts.as_deref(),
                     modal_node_id,
+                    TransitionModalityFilter::All,
                 ),
             };
             if satisfies {
@@ -1027,6 +1225,7 @@ where
         guard: &Guard,
         state: StateId<S>,
         guard_parts: Option<&GuardPartitions>,
+        modality_filter: TransitionModalityFilter,
     ) -> GroupedTransitions<'b, S, L> {
         // Use pre-computed groups from CLTS
         let precomputed_groups = self
@@ -1046,6 +1245,20 @@ where
             for &idx in transition_indices {
                 if idx < transitions.len() {
                     let transition = &transitions[idx];
+                    // R.6.3 (2026-06-08) — the modality filter is the
+                    // **single composition point** for the
+                    // controllability × may/must product. By rejecting
+                    // `MayOnly` transitions here when
+                    // `modality_filter = MustOnly`, the downstream
+                    // Skolem grouping + sub-group analysis operate on
+                    // the filtered transition set transparently —
+                    // gate (2) of R.6.3 ("full label-set Skolem
+                    // integration") falls out for free because every
+                    // `modal_exists`/`modal_forall` caller already
+                    // routes through this helper.
+                    if !modality_filter.allows(transition) {
+                        continue;
+                    }
                     if self.guard_matches(state, transition, guard) {
                         if let Some(parts) = guard_parts
                             && !parts.matches_next(transition.target().index())
@@ -1073,6 +1286,7 @@ where
         targets: &BitVec<usize, Lsb0>,
         guard_parts: Option<&GuardPartitions>,
         _modal_node_id: NodeId,
+        modality_filter: TransitionModalityFilter,
     ) -> bool {
         if let Some(parts) = guard_parts
             && !parts.matches_current(state.index())
@@ -1083,8 +1297,13 @@ where
         let outgoing = self.clts.outgoing(state);
 
         // Group uncontrollable transitions by their label sets (Skolem paradigm)
-        let uncontrollable_groups =
-            self.group_transitions_by_uncontrollable_labels(outgoing, guard, state, guard_parts);
+        let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
+            outgoing,
+            guard,
+            state,
+            guard_parts,
+            modality_filter,
+        );
 
         // For diamond operator with Skolem paradigm: we need at least ONE group to have
         // a transition leading to the target (not all groups)
@@ -1179,6 +1398,10 @@ where
         // by their full label set to handle nondeterminism
         let mut all_transitions_by_label_set: TransitionGroupMap<'_, S, L> = HashMap::new();
         for (idx, transition) in outgoing.iter().enumerate() {
+            // R.6.3 — same modality filter as `group_transitions_by_uncontrollable_labels`.
+            if !modality_filter.allows(transition) {
+                continue;
+            }
             if !self.guard_matches(state, transition, guard) {
                 continue;
             }
@@ -1276,6 +1499,10 @@ where
         if guard.control == Control::Environment {
             // Check: ∃ uncontrollable transition → targets
             for transition in outgoing.iter() {
+                // R.6.3 — apply modality filter alongside controllability check.
+                if !modality_filter.allows(transition) {
+                    continue;
+                }
                 if !transition.is_uncontrollable(self.clts) {
                     continue;
                 }
@@ -1300,6 +1527,10 @@ where
             let mut ctrl_seen = false;
             let mut all_ctrl_satisfy = true;
             for transition in outgoing.iter() {
+                // R.6.3 — same modality filter.
+                if !modality_filter.allows(transition) {
+                    continue;
+                }
                 if !transition.is_controllable(self.clts) {
                     continue;
                 }
@@ -1346,6 +1577,7 @@ where
         targets: &BitVec<usize, Lsb0>,
         guard_parts: Option<&GuardPartitions>,
         _modal_node_id: NodeId,
+        modality_filter: TransitionModalityFilter,
     ) -> bool {
         if let Some(parts) = guard_parts
             && !parts.matches_current(state.index())
@@ -1363,6 +1595,7 @@ where
                     guard,
                     state,
                     guard_parts,
+                    modality_filter,
                 );
 
                 // For each group of uncontrollable transitions, ALL must satisfy
@@ -1384,6 +1617,12 @@ where
                 // no need to compute uncontrollable_label_set
 
                 for transition in outgoing.iter() {
+                    // R.6.3 — modality filter composes with the existing
+                    // controllability + guard checks; MayOnly transitions
+                    // are skipped when the filter is `MustOnly`.
+                    if !modality_filter.allows(transition) {
+                        continue;
+                    }
                     if transition.is_controllable(self.clts) {
                         if !self.guard_matches(state, transition, guard) {
                             continue;
@@ -1419,6 +1658,10 @@ where
                 // If no uncontrollable groups, check all transitions normally
                 if uncontrollable_groups.is_empty() {
                     for transition in outgoing.iter() {
+                        // R.6.3 — same filter check as the controllable-group loop above.
+                        if !modality_filter.allows(transition) {
+                            continue;
+                        }
                         if !self.guard_matches(state, transition, guard) {
                             continue;
                         }
@@ -1447,6 +1690,7 @@ where
                     guard,
                     state,
                     guard_parts,
+                    modality_filter,
                 );
 
                 // For each group of uncontrollable transitions, ALL must satisfy
@@ -1467,6 +1711,11 @@ where
                 let mut ctrl_seen = false;
                 let mut ctrl_satisfied = false;
                 for transition in outgoing {
+                    // R.6.3 — apply the filter before any controllability /
+                    // satisfaction check.
+                    if !modality_filter.allows(transition) {
+                        continue;
+                    }
                     if !self.guard_matches(state, transition, guard) {
                         continue;
                     }
@@ -1498,6 +1747,11 @@ where
                 // This case is rare — inversion primarily produces <ctrl=environment>.
                 let outgoing = self.clts.outgoing(state);
                 for transition in outgoing {
+                    // R.6.3 — modality filter applies even in the rare
+                    // `Control::Environment` Box case, for consistency.
+                    if !modality_filter.allows(transition) {
+                        continue;
+                    }
                     if !self.guard_matches(state, transition, guard) {
                         continue;
                     }
@@ -1539,8 +1793,14 @@ where
         let outgoing = self.clts.outgoing(state);
 
         // Group uncontrollable transitions by their label sets (Skolem paradigm)
+        // R.6.3 — bounded variants are documented in `modal_bits_from_target`
+        // as deferred to R.6.3.b; pass `All` to preserve pre-R.6.3 semantics.
         let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
-            outgoing, guard, state, None, // No guard_parts for bounded version
+            outgoing,
+            guard,
+            state,
+            None, // No guard_parts for bounded version
+            TransitionModalityFilter::All,
         );
 
         // For each group of transitions sharing the same uncontrollable labels, check if at least one can satisfy
@@ -1716,8 +1976,14 @@ where
         let outgoing = self.clts.outgoing(state);
 
         // Group uncontrollable transitions by their label sets (Skolem paradigm)
+        // R.6.3 — bounded variants are documented in `modal_bits_from_target`
+        // as deferred to R.6.3.b; pass `All` to preserve pre-R.6.3 semantics.
         let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
-            outgoing, guard, state, None, // No guard_parts for bounded version
+            outgoing,
+            guard,
+            state,
+            None, // No guard_parts for bounded version
+            TransitionModalityFilter::All,
         );
 
         // For each group of uncontrollable transitions, ALL must satisfy
@@ -1839,9 +2105,14 @@ where
         } else {
             let outgoing = self.clts.outgoing(state);
 
-            // Group uncontrollable transitions by their label sets (Skolem paradigm)
+            // Group uncontrollable transitions by their label sets (Skolem paradigm).
+            // R.6.3 — bounded variant, see modal_bits_from_target's comment.
             let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
-                outgoing, guard, state, None, // No guard_parts for bounded version
+                outgoing,
+                guard,
+                state,
+                None, // No guard_parts for bounded version
+                TransitionModalityFilter::All,
             );
 
             // For each group of uncontrollable transitions, ALL must satisfy
@@ -2244,8 +2515,17 @@ where
         kind: ModalKind,
         guard: &Guard,
         target_set: &BitVec<usize, Lsb0>,
+        modality_filter: TransitionModalityFilter,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
         if let Some(bound) = guard.max_steps {
+            // R.6.3 — bounded variants do not yet thread the
+            // modality filter; per the kmts-theory §7.5 implementation-
+            // status boundary, bounded modalities are deferred to an
+            // R.6.3.b follow-up. For Sharp-only fixtures this is safe
+            // (no MayOnly transitions exist); on KMTSes with MayOnly
+            // edges + a bounded modality the result is the pre-R.6.3
+            // modality-blind verdict (over-claims must_bits for
+            // Diamond, under-claims may_bits for Box).
             return self.eval_modal_bounded(kind, guard, target_set, bound);
         }
 
@@ -2269,6 +2549,7 @@ where
                     target_set,
                     guard_parts.as_deref(),
                     placeholder,
+                    modality_filter,
                 ),
                 ModalKind::Box => self.modal_forall(
                     state,
@@ -2276,6 +2557,7 @@ where
                     target_set,
                     guard_parts.as_deref(),
                     placeholder,
+                    modality_filter,
                 ),
             };
             if satisfies {
@@ -2283,6 +2565,87 @@ where
             }
         }
         Ok(result)
+    }
+
+    /// R.6 (draft, 2026-06-08) — controllability-aware 3-valued modal step.
+    ///
+    /// This is the **integration target** for closing the controllability ×
+    /// may/must composition gap documented in
+    /// [`docs/design/kmts-theory.md`] §7. It is **not yet wired into**
+    /// [`Self::eval_node_tri`]; the production 3v modal path still runs the
+    /// two modality-blind [`Self::modal_bits_from_target`] passes. Swapping
+    /// this in is the R.6 follow-up gated on the §7.3 per-player preservation
+    /// audit and the §7.4 hyper-must handling.
+    ///
+    /// Unlike `modal_bits_from_target` — which is called twice (once on
+    /// `target.must_true()`, once on `target.may_true()`) and reads *every*
+    /// outgoing transition as if `Sharp` — this routine makes a single pass
+    /// that reads BOTH axes a controllability-aware KMTS carries:
+    ///
+    /// 1. **Transition modality** (`R_must` vs `R_may`): the player
+    ///    establishing the modality may rely only on `must`-edges
+    ///    (`Sharp` ∪ `MustHyperOnly`); the player refuting it ranges over
+    ///    `may`-edges (all transitions).
+    /// 2. **Controllability** (`guard.control`): `Control::Controllable`
+    ///    makes the controller `∃` over controllable edges and the
+    ///    environment `∀` over uncontrollable edges (the Skolem paradigm);
+    ///    `Control::All` is the plain single-agent Kleene modal.
+    ///
+    /// The soundness-critical consequence (and why the current production
+    /// path is unsound on a genuinely controllability-aware KMTS): a
+    /// *controllable* `MayOnly` edge into a definite-good state yields
+    /// `Unknown`, not `True` — the controller cannot rely on a move the
+    /// abstraction only admits as *possible*.
+    ///
+    /// **Draft scope.** Edge classification is flat (per-edge), not the full
+    /// label-set Skolem sub-grouping of
+    /// [`Self::group_transitions_by_uncontrollable_labels`]; for the
+    /// guard-filtered synthesis idiom it is exact, and the mixed-label
+    /// set-forcing case is the integration step. Next-state guard partitions
+    /// and `max_steps` bounds are deferred to integration. A `MustHyperOnly`
+    /// edge is classified as a must-edge to its single recorded target (the
+    /// K.2 cardinality-1 encoding).
+    #[allow(dead_code)] // R.6 staged draft; wired into eval_node_tri by R.6.
+    fn modal_trit_from_target(
+        &self,
+        kind: ModalKind,
+        guard: &Guard,
+        target: &super::trit::TritSet,
+    ) -> Result<super::trit::TritSet, EvaluationError> {
+        use super::trit::Trit;
+        let n = self.env.state_count();
+        let mut must = BitVec::<usize, Lsb0>::repeat(false, n);
+        let mut may = BitVec::<usize, Lsb0>::repeat(false, n);
+
+        let mut edges: Vec<EdgeFacts> = Vec::new();
+        for state in self.clts.states() {
+            edges.clear();
+            for transition in self.clts.outgoing(state) {
+                if !self.guard_matches(state, transition, guard) {
+                    continue;
+                }
+                let tgt = transition.target().index();
+                edges.push(EdgeFacts {
+                    controllable: transition.is_controllable(self.clts),
+                    is_must: !matches!(
+                        transition.modality(),
+                        crate::clts::TransitionModality::MayOnly
+                    ),
+                    target: target.verdict_at(tgt),
+                });
+            }
+            match modal_trit_core(kind, guard.control, &edges) {
+                Trit::True => {
+                    must.set(state.index(), true);
+                    may.set(state.index(), true);
+                }
+                Trit::Unknown => {
+                    may.set(state.index(), true);
+                }
+                Trit::False => {}
+            }
+        }
+        Ok(super::trit::TritSet::from_parts(must, may))
     }
 
     /// Evaluate a formula node under three-valued (Kleene) semantics.
@@ -2349,10 +2712,55 @@ where
                 // R-A2 fusion attempt (see §Phase 6 §6.7 R-A2 anchor; if this
                 // does not clear the 15% pass-bar, the heavier modal-walk
                 // fusion is the next attempt).
+                //
+                // R.6.3 (2026-06-08) — controllability-aware modality
+                // composition. SOUNDNESS: the player establishing a
+                // modality may rely only on `R_must` edges; the player
+                // refuting it ranges over `R_may` edges
+                // (kmts-theory.md §7.2 + Bruns–Godefroid CONCUR 2000 +
+                // de Alfaro–Godefroid–Jagadeesan LICS 2004 for the
+                // per-player extension). The per-(kind, must|may)
+                // filter dispatch:
+                //
+                // - `must_bits(<a>φ)` ↦ `∃ must-edge ⊨ φ_must` ⇒ `MustOnly`.
+                //   Without this gate, the pre-R.6.3 path returned True
+                //   on a controllable `MayOnly` edge into a definite-True
+                //   state — over-claiming a witness the abstraction only
+                //   admits as *possible* (the soundness corner closed by
+                //   `controllable_mayonly_ctrl_witness_is_unknown`).
+                // - `may_bits([a]φ)` ↦ `∀ must-edge ⊨ φ_may` ⇒ `MustOnly`.
+                //   Without this gate, the pre-R.6.3 path checked `∀
+                //   any-edge ⊨ φ_may` (over-strict), producing fewer
+                //   Unknowns + more spurious False verdicts on KMTSes
+                //   with MayOnly edges.
+                // - The other two combinations (`may_bits(<a>φ)`,
+                //   `must_bits([a]φ)`) keep `All` — the refuting side
+                //   ranges over `R_may`.
+                //
+                // The filter composes with the existing
+                // `group_transitions_by_uncontrollable_labels` Skolem
+                // grouping (gate (2) of R.6.3): the grouping operates
+                // on the filtered transition set transparently because
+                // the filter is applied at the single entry point of
+                // the group helper + at each direct transition loop in
+                // `modal_forall`. Verdict-equivalence on Sharp-only
+                // KMTSes follows from `Filter::MustOnly` admitting
+                // every `Sharp` transition (gate (1)).
+                let (must_filter, may_filter) = match kind {
+                    ModalKind::Diamond => (
+                        TransitionModalityFilter::MustOnly,
+                        TransitionModalityFilter::All,
+                    ),
+                    ModalKind::Box => (
+                        TransitionModalityFilter::All,
+                        TransitionModalityFilter::MustOnly,
+                    ),
+                };
                 let target_tri = self.eval_node_tri(*target, bindings)?;
                 let must_bits =
-                    self.modal_bits_from_target(*kind, guard, target_tri.must_true())?;
-                let may_bits = self.modal_bits_from_target(*kind, guard, target_tri.may_true())?;
+                    self.modal_bits_from_target(*kind, guard, target_tri.must_true(), must_filter)?;
+                let may_bits =
+                    self.modal_bits_from_target(*kind, guard, target_tri.may_true(), may_filter)?;
                 Ok(super::trit::TritSet::from_parts(must_bits, may_bits))
             }
             Node::Mu { var, body } => {
@@ -3877,5 +4285,412 @@ mod tests {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod modal_trit_draft_tests {
+    //! R.6 (draft) — validation for the controllability-aware 3-valued
+    //! modal step ([`super::modal_trit_core`] + [`EvalContext::
+    //! modal_trit_from_target`]). Covers the 2×2 (controllability ×
+    //! modality) rule table of `docs/design/kmts-theory.md` §7.2, the
+    //! `Sharp`-everywhere reduction to the §4.3 single-agent semantics,
+    //! and integration through a real KMTS `Clts`. The soundness corner
+    //! — a controllable `MayOnly` witness yielding `Unknown`, not `True`
+    //! — is `controllable_mayonly_ctrl_witness_is_unknown` (pure) and
+    //! `integration_controllable_mayonly_edge_is_unknown` (end-to-end).
+    use super::*;
+    use crate::clts::{
+        Clts, DefaultLabelIdx, DefaultStateIdx, LabelControllability, TransitionModality,
+    };
+    use crate::mu_calculus::parser;
+    use crate::mu_calculus::trit::{Trit, TritSet};
+    use std::collections::HashMap;
+
+    fn edge(controllable: bool, is_must: bool, target: Trit) -> EdgeFacts {
+        EdgeFacts {
+            controllable,
+            is_must,
+            target,
+        }
+    }
+
+    fn bv(bits: &[bool]) -> BitVec<usize, Lsb0> {
+        let mut b = BitVec::repeat(false, bits.len());
+        for (i, v) in bits.iter().enumerate() {
+            b.set(i, *v);
+        }
+        b
+    }
+
+    // ---- Pure-core tests: Control::All reduces to §4.3 Kleene modal ----
+
+    #[test]
+    fn all_diamond_relation_gated_kleene() {
+        // ∃ must-edge into def-True ⇒ True.
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Diamond,
+                Control::All,
+                &[edge(false, true, Trit::True)]
+            ),
+            Trit::True
+        );
+        // Only a MayOnly edge into True ⇒ Unknown (no must-witness).
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Diamond,
+                Control::All,
+                &[edge(false, false, Trit::True)]
+            ),
+            Trit::Unknown
+        );
+        // All may-edges into def-False ⇒ False.
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Diamond,
+                Control::All,
+                &[edge(false, true, Trit::False)]
+            ),
+            Trit::False
+        );
+    }
+
+    #[test]
+    fn all_box_relation_gated_kleene() {
+        // All may-edges into def-True ⇒ True.
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Box,
+                Control::All,
+                &[edge(false, true, Trit::True)]
+            ),
+            Trit::True
+        );
+        // A must-edge into def-False ⇒ False.
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Box,
+                Control::All,
+                &[edge(false, true, Trit::False)]
+            ),
+            Trit::False
+        );
+        // A MayOnly edge into def-False cannot refute definitely ⇒ Unknown.
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Box,
+                Control::All,
+                &[edge(false, false, Trit::False)]
+            ),
+            Trit::Unknown
+        );
+        // Vacuous box (no edges) ⇒ True.
+        assert_eq!(
+            modal_trit_core(ModalKind::Box, Control::All, &[]),
+            Trit::True
+        );
+    }
+
+    // ---- Pure-core tests: Control::Controllable (the Skolem product) ----
+
+    #[test]
+    fn controllable_mayonly_ctrl_witness_is_unknown() {
+        // THE CORNER: the controller has only a MayOnly edge into a
+        // definite-good state. The move might not exist concretely, so the
+        // verdict must be Unknown — NOT True (what the modality-blind
+        // production path returns today).
+        let edges = [edge(true, false, Trit::True)];
+        assert_eq!(
+            modal_trit_core(ModalKind::Diamond, Control::Controllable, &edges),
+            Trit::Unknown
+        );
+    }
+
+    #[test]
+    fn controllable_sharp_ctrl_witness_is_true() {
+        // A confirmed (must) controllable move into a definite-good state,
+        // no environment edges ⇒ definite True.
+        let edges = [edge(true, true, Trit::True)];
+        assert_eq!(
+            modal_trit_core(ModalKind::Diamond, Control::Controllable, &edges),
+            Trit::True
+        );
+    }
+
+    #[test]
+    fn controllable_env_sharp_bad_is_false() {
+        // Controller has a confirmed good move, but a confirmed (must)
+        // environment move escapes into a definite-bad state ⇒ False
+        // (the environment can force the violation).
+        let edges = [edge(true, true, Trit::True), edge(false, true, Trit::False)];
+        assert_eq!(
+            modal_trit_core(ModalKind::Diamond, Control::Controllable, &edges),
+            Trit::False
+        );
+    }
+
+    #[test]
+    fn controllable_env_mayonly_bad_is_unknown() {
+        // Same, but the escaping environment edge is MayOnly — it cannot
+        // refute definitely (it might not exist) ⇒ Unknown.
+        let edges = [
+            edge(true, true, Trit::True),
+            edge(false, false, Trit::False),
+        ];
+        assert_eq!(
+            modal_trit_core(ModalKind::Diamond, Control::Controllable, &edges),
+            Trit::Unknown
+        );
+    }
+
+    #[test]
+    fn controllable_pure_environment_is_box_like() {
+        // No controllable edges: Control::Controllable degrades to a
+        // universal over the (may) environment moves.
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Diamond,
+                Control::Controllable,
+                &[edge(false, true, Trit::True)]
+            ),
+            Trit::True
+        );
+        assert_eq!(
+            modal_trit_core(
+                ModalKind::Diamond,
+                Control::Controllable,
+                &[edge(false, true, Trit::Unknown)]
+            ),
+            Trit::Unknown
+        );
+    }
+
+    #[test]
+    fn sharp_everywhere_controllable_has_no_unknown() {
+        // On a Sharp-everywhere controllability-aware model (every edge a
+        // must-edge), the controllable product never produces Unknown — it
+        // collapses to the 2-valued Skolem semantics.
+        let combos = [
+            [edge(true, true, Trit::True), edge(false, true, Trit::True)],
+            [edge(true, true, Trit::True), edge(false, true, Trit::False)],
+            [edge(true, true, Trit::False), edge(false, true, Trit::True)],
+        ];
+        for edges in combos {
+            let v = modal_trit_core(ModalKind::Diamond, Control::Controllable, &edges);
+            assert_ne!(
+                v,
+                Trit::Unknown,
+                "Sharp-everywhere must be 2-valued: {edges:?}"
+            );
+        }
+    }
+
+    // ---- Integration tests: through a real KMTS Clts + EvalContext ----
+
+    fn ctx<'a>(
+        formula: &'a Formula,
+        clts: &'a Clts<DefaultStateIdx, DefaultLabelIdx>,
+        env: &'a Environment,
+    ) -> EvalContext<'a, DefaultStateIdx, DefaultLabelIdx> {
+        let oob_bits = compute_oob_bits(clts);
+        let not_oob_bits = !oob_bits.clone();
+        EvalContext {
+            formula,
+            clts,
+            env,
+            options: EvaluationOptions::default(),
+            memo: MemoizationCache::default(),
+            guard_cache: HashMap::new(),
+            expression_eval_cache: HashMap::new(),
+            witness_map: None,
+            not_oob_bits,
+            oob_bits,
+        }
+    }
+
+    /// 2-state KMTS: a single controllable `act` edge `s0 -> s1`, plus a
+    /// Sharp self-loop at `s1` for well-formedness. The `s0 -> s1` edge is
+    /// `MayOnly` when `may_only`, else `Sharp`.
+    fn build_ctrl_kmts(may_only: bool) -> Clts<DefaultStateIdx, DefaultLabelIdx> {
+        let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let act = builder.labels().intern(["act"]).expect("intern act");
+        builder.set_label_controllability(act, LabelControllability::Controllable);
+        let s0 = builder.state_id_or_insert("s0").expect("s0");
+        let s1 = builder.state_id_or_insert("s1").expect("s1");
+        if may_only {
+            builder.transition_ids_with_modality(s0, &[act], s1, TransitionModality::MayOnly);
+        } else {
+            builder.transition_ids(s0, &[act], s1);
+        }
+        builder.transition_ids(s1, &[act], s1);
+        builder.build().expect("build")
+    }
+
+    fn controllable_guard() -> Guard {
+        Guard {
+            control: Control::Controllable,
+            ..Default::default()
+        }
+    }
+
+    /// Target TritSet: `s1` definitely-True, `s0` definitely-False.
+    fn target_s1_true() -> TritSet {
+        TritSet::from_parts(bv(&[false, true]), bv(&[false, true]))
+    }
+
+    #[test]
+    fn integration_controllable_mayonly_edge_is_unknown() {
+        let clts = build_ctrl_kmts(/* may_only */ true);
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("true").expect("parse");
+        let ev = ctx(&formula, &clts, &env);
+
+        let result = ev
+            .modal_trit_from_target(ModalKind::Diamond, &controllable_guard(), &target_s1_true())
+            .expect("eval");
+
+        let s0 = clts.state_id("s0").expect("s0").index();
+        assert_eq!(
+            result.verdict_at(s0),
+            Trit::Unknown,
+            "controllable MayOnly witness into a good state ⇒ Unknown"
+        );
+        // must ⊆ may invariant on the produced set.
+        for i in 0..result.len() {
+            assert!(
+                !*result.must_true().get(i).unwrap() || *result.may_true().get(i).unwrap(),
+                "must ⊆ may violated at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_controllable_sharp_edge_is_true() {
+        let clts = build_ctrl_kmts(/* may_only */ false);
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("true").expect("parse");
+        let ev = ctx(&formula, &clts, &env);
+
+        let result = ev
+            .modal_trit_from_target(ModalKind::Diamond, &controllable_guard(), &target_s1_true())
+            .expect("eval");
+
+        let s0 = clts.state_id("s0").expect("s0").index();
+        assert_eq!(
+            result.verdict_at(s0),
+            Trit::True,
+            "controllable Sharp (must) witness into a good state ⇒ True"
+        );
+    }
+
+    #[test]
+    fn integration_all_mode_sharp_diamond_is_true() {
+        // Control::All over a Sharp edge into a good state ⇒ True (the
+        // single-agent §4.3 baseline, unchanged by the controllability axis).
+        let clts = build_ctrl_kmts(/* may_only */ false);
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("true").expect("parse");
+        let ev = ctx(&formula, &clts, &env);
+
+        let result = ev
+            .modal_trit_from_target(ModalKind::Diamond, &Guard::default(), &target_s1_true())
+            .expect("eval");
+
+        let s0 = clts.state_id("s0").expect("s0").index();
+        assert_eq!(result.verdict_at(s0), Trit::True);
+    }
+
+    // ---- R.6.3 (2026-06-08) — end-to-end through `evaluate_tri` ----
+    //
+    // Validates that the production `evaluate_tri` (the cheap 3-valued
+    // verdict path the CEGAR loop's `evaluate_3v_game_with_options`
+    // falls through to) now honors the per-(kind, must|may) modality
+    // filter on its `Node::Modal` arm. The R.6.2 integration tests
+    // above call `modal_trit_from_target` (the staged draft) directly;
+    // these tests exercise the wired-in `modal_bits_from_target` +
+    // `modal_exists`/`modal_forall` + Skolem grouping chain.
+
+    /// R.6.3 — Sharp-only CLTS: `evaluate_tri` returns definite True
+    /// at `s0` on `<>true` (empty guard matches any label). Confirms
+    /// gate (1) of R.6.3 — verdict-equivalence on Sharp-only fixtures.
+    #[test]
+    fn r6_3_evaluate_tri_sharp_diamond_is_definite_true() {
+        let clts = build_ctrl_kmts(/* may_only */ false);
+        let env = Environment::new(clts.state_count());
+        // `<>true` = ∃ any outgoing edge into a true-target state. The
+        // empty guard matches every label.
+        let formula = parser::parse("<>true").expect("parse");
+        let result = evaluate_tri(&formula, &clts, &env).expect("evaluate_tri");
+        let s0 = clts.state_id("s0").expect("s0").index();
+        assert_eq!(
+            result.verdict_at(s0),
+            Trit::True,
+            "Sharp `act` edge from s0 into a True target ⇒ definite True"
+        );
+    }
+
+    /// R.6.3 — THE SOUNDNESS FIX: on a CLTS where `s0`'s only outgoing
+    /// transition is a `MayOnly` `act` edge into a definite-True
+    /// target, the pre-R.6.3 production path returned `True` at `s0`
+    /// (over-claiming a witness the abstraction only admits as
+    /// *possible*); the post-R.6.3 path returns `Unknown`. The fix
+    /// applies regardless of the formula's `Control` mode — the
+    /// MayOnly transition is filtered out of `must_bits(<>φ)` even
+    /// in the single-agent (Control::All) case.
+    #[test]
+    fn r6_3_evaluate_tri_mayonly_diamond_is_unknown_at_source() {
+        let clts = build_ctrl_kmts(/* may_only */ true);
+        let env = Environment::new(clts.state_count());
+        // `<>true` reduces to "∃ outgoing edge into a true-target
+        // state". Every state in this fixture satisfies "true" at the
+        // target, so the modality is the only discriminator: a MayOnly
+        // edge from s0 ⇒ Unknown (modality-aware); pre-R.6.3 ⇒ True.
+        let formula = parser::parse("<>true").expect("parse");
+        let result = evaluate_tri(&formula, &clts, &env).expect("evaluate_tri");
+        let s0 = clts.state_id("s0").expect("s0").index();
+        assert_eq!(
+            result.verdict_at(s0),
+            Trit::Unknown,
+            "R.6.3: MayOnly Diamond witness ⇒ Unknown (not True). \
+             Pre-R.6.3 baseline returned True — over-claimed a may-only \
+             witness as definite."
+        );
+        // must ⊆ may invariant.
+        for i in 0..result.len() {
+            assert!(
+                !*result.must_true().get(i).unwrap() || *result.may_true().get(i).unwrap(),
+                "must ⊆ may violated at state {i}"
+            );
+        }
+    }
+
+    /// R.6.3 — dual fix on the Box side: `[]false` over a CLTS where
+    /// s0's only outgoing edge is MayOnly. Pre-R.6.3 path computed
+    /// `may_bits([]false) = ∀ any-edge ⊨ false_may` ⇒ false at s0
+    /// (over-strict — the may-edge target s1 is not in may_true(false)
+    /// so the universal fails). Post-R.6.3 path computes `∀ must-edge
+    /// ⊨ false_may`, which is vacuously True when no must-edges exist
+    /// from s0 ⇒ may_bits[s0] = true. The verdict moves from False to
+    /// Unknown — the sound direction.
+    #[test]
+    fn r6_3_evaluate_tri_mayonly_box_false_is_unknown() {
+        let clts = build_ctrl_kmts(/* may_only */ true);
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("[]false").expect("parse");
+        let result = evaluate_tri(&formula, &clts, &env).expect("evaluate_tri");
+        let s0 = clts.state_id("s0").expect("s0").index();
+        // must_bits([]false) at s0 = ∀ may-edge (s0→s1) into
+        //   target.must_true(false=∅): s1 ∉ ∅, so universal fails ⇒ false.
+        // may_bits([]false) at s0 = ∀ must-edge (none, the only edge
+        //   from s0 is MayOnly so it's filtered out): vacuous ⇒ true.
+        // So verdict at s0 = Unknown (must=false, may=true).
+        assert_eq!(
+            result.verdict_at(s0),
+            Trit::Unknown,
+            "R.6.3: []false on a CLTS where the only outgoing edge is \
+             MayOnly ⇒ Unknown (vacuously satisfied over the empty must-edge set)."
+        );
     }
 }
