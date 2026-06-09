@@ -175,15 +175,26 @@ enum MustEdgeInferenceArg {
     /// `[R.2.5b-sampling-must]` AdapterWarning.
     SamplingConfluence,
     /// R.2.5b session 2 (2026-06-08). SMT-backed must-edge inference
-    /// via Z3 BV theory. For each (source cube, sampled target)
-    /// pair, run an UNSAT check on `src ∧ transition ∧ ¬tgt`;
-    /// UNSAT promotes MayOnly → Sharp. SOUNDNESS: SMT-proved (no
-    /// sampling). The MVP uses the stronger ∀∀ form (`∀ state.
-    /// ∀ input. transition ⟹ next ⊨ tgt`); the standard ∀∃ form
-    /// is queued for the session-2 follow-up. Hyper-must inference
-    /// is also queued. Verdicts carry an `[R.2.5b-smt-must]`
-    /// AdapterWarning.
+    /// via Z3 BV theory using the **stronger ∀∀ form** (`∀ state.
+    /// ∀ input. transition ⟹ next ⊨ tgt` — deterministic into tgt
+    /// regardless of input). SOUNDNESS: SMT-proved (no sampling).
+    /// Verdicts carry an `[R.2.5b-smt-must]` AdapterWarning.
     SmtPerTarget,
+    /// R.2.5b session-2 follow-up (2026-06-09). SMT-backed must-edge
+    /// inference using the **canonical ∀∃ form** (`∀ state ⊨ src.
+    /// ∃ input. next ⊨ tgt`) via Z3 quantifier alternation. Strictly
+    /// more permissive than `smt-per-target` (every ∀∀-Must is also
+    /// ∀∃-Must; the ∀∃ form additionally promotes edges where SOME
+    /// input per state reaches tgt). Verdicts carry an
+    /// `[R.2.5b-smt-must-standard]` AdapterWarning.
+    SmtPerTargetStandard,
+    /// R.2.5b session-2 follow-up (2026-06-09). SMT-backed
+    /// **hyper-must** inference. For each source cube, tries the
+    /// per-target ∀∃ singleton checks first; if no singleton proves
+    /// Must, runs a full-target-set ∀∃ check and emits
+    /// `MustHyperOnly` with the full sampled target set on Must.
+    /// Verdicts carry an `[R.2.5b-smt-must-hyper]` AdapterWarning.
+    SmtHyperMust,
 }
 
 #[derive(Args, Debug)]
@@ -1756,6 +1767,12 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         }
         MustEdgeInferenceArg::SmtPerTarget => {
             mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SmtPerTarget
+        }
+        MustEdgeInferenceArg::SmtPerTargetStandard => {
+            mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SmtPerTargetStandard
+        }
+        MustEdgeInferenceArg::SmtHyperMust => {
+            mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SmtHyperMust
         }
     };
 

@@ -206,6 +206,237 @@ impl PredicateLike for crate::adapter::btor2::kmts_lift::PredicateSpec {
     }
 }
 
+/// R.2.5b session-2 follow-up (2026-06-09) — build per-predicate
+/// constraints for both the source cube (over `state_curr` BVs) and
+/// the target cube (over `state_next` BVs). Shared helper so the
+/// standard ∀∃ check + the hyper-must check don't duplicate the
+/// per-predicate plumbing. Returns `None` if any predicate's
+/// register isn't in `nid_map` (caller treats as Unknown verdict).
+fn build_src_tgt_constraints<P>(
+    view: &Btor2SmtView,
+    src_bits: u64,
+    tgt_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+) -> Option<(Vec<z3::ast::Bool>, Vec<z3::ast::Bool>)>
+where
+    P: PredicateLike,
+{
+    let mut src = Vec::with_capacity(predicates.len());
+    let mut tgt = Vec::with_capacity(predicates.len());
+    for (i, pred) in predicates.iter().enumerate() {
+        let nid = *nid_map.get(pred.register())?;
+        let curr_bv = view.curr_state(nid)?;
+        let next_bv = view.next_state(nid)?;
+        let src_polarity = (src_bits >> i) & 1 == 1;
+        let tgt_polarity = (tgt_bits >> i) & 1 == 1;
+        src.push(build_predicate_constraint(
+            curr_bv,
+            pred.value(),
+            src_polarity,
+        ));
+        tgt.push(build_predicate_constraint(
+            next_bv,
+            pred.value(),
+            tgt_polarity,
+        ));
+    }
+    Some((src, tgt))
+}
+
+/// R.2.5b session-2 follow-up (2026-06-09) — conjoin a vec of
+/// per-predicate constraints into a single Bool. Returns
+/// `Bool::from_bool(true)` for an empty input (vacuous conjunction).
+fn conj_bool(constraints: &[z3::ast::Bool]) -> z3::ast::Bool {
+    if constraints.is_empty() {
+        z3::ast::Bool::from_bool(true)
+    } else {
+        let refs: Vec<&z3::ast::Bool> = constraints.iter().collect();
+        z3::ast::Bool::and(&refs)
+    }
+}
+
+/// R.2.5b session-2 follow-up (2026-06-09) — collect the universal-
+/// quantification bound vars (inputs + state_next BVs) for the ∀∃
+/// must-edge check. Returns a Vec of cloned BVs whose references the
+/// caller wraps as `&dyn Ast` for `forall_const`.
+fn universal_bound_bvs(view: &Btor2SmtView) -> Vec<z3::ast::BV> {
+    let mut bvs: Vec<z3::ast::BV> = Vec::new();
+    for bv in view.inputs.values() {
+        bvs.push(bv.clone());
+    }
+    for bv in view.state_next.values() {
+        bvs.push(bv.clone());
+    }
+    bvs
+}
+
+/// R.2.5b session-2 follow-up (2026-06-09) — standard ∀∃ form of
+/// the SMT must-edge query for one (source-cube, target-cube) pair.
+///
+/// **Semantics (per [`docs/design/kmts-theory.md`] standard KMTS):**
+/// the must-edge `(src, label, tgt)` holds iff
+///
+/// ```text
+/// ∀ state ⊨ src. ∃ inputs. ∃ state_next. (transition(state, inputs, state_next) ∧ state_next ⊨ tgt)
+/// ```
+///
+/// This is **more permissive** than the MVP's ∀∀ form
+/// ([`smt_per_target_must_check`]) — the ∀∀ form requires every
+/// input combination to reach tgt; the ∀∃ standard form only
+/// requires SOME input combination per concrete source state. Every
+/// must-edge the ∀∀ form proves is also proved by the ∀∃ form, so
+/// the ∀∃ form produces a STRICT SUPERSET of Sharp promotions.
+///
+/// **Encoding via Z3 quantifier alternation:**
+///
+/// Negation of the must-edge condition:
+/// `∃ state ⊨ src. ∀ inputs. ∀ state_next. ¬(transition ∧ state_next ⊨ tgt)`
+///
+/// We build the inner formula and SAT-check:
+/// `src_constraints(state_curr) ∧ forall_const([inputs, state_next], ¬(transition ∧ tgt_constraints))`
+///
+/// - SAT ⇒ negation holds ⇒ NotMust.
+/// - UNSAT ⇒ negation refuted ⇒ Must.
+/// - Unknown ⇒ Unknown (timeout / unsupported operator).
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub fn smt_per_target_must_check_standard<P>(
+    view: &Btor2SmtView,
+    src_bits: u64,
+    tgt_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMustVerdict
+where
+    P: PredicateLike,
+{
+    let Some((src_constraints, tgt_constraints)) =
+        build_src_tgt_constraints(view, src_bits, tgt_bits, predicates, nid_map)
+    else {
+        return SmtMustVerdict::Unknown;
+    };
+
+    // Inner body: ¬(transition ∧ ∧ tgt_i).
+    let tgt_conj = conj_bool(&tgt_constraints);
+    let inner_body = z3::ast::Bool::and(&[&view.transition, &tgt_conj]).not();
+
+    // Universal bounds: every input BV + every state_next BV. The
+    // state_next is determined by (state_curr, inputs) via transition;
+    // universally quantifying over both is equivalent semantically
+    // and is the cleanest encoding given the view's BV vocabulary.
+    let bound_bvs = universal_bound_bvs(view);
+    let bound_refs: Vec<&dyn z3::ast::Ast> =
+        bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+
+    // Assert src_constraints (state_curr is existentially free at
+    // the top level — the outer ∃ in the negation).
+    for c in &src_constraints {
+        solver.assert(c);
+    }
+    solver.assert(&universal);
+
+    match solver.check() {
+        z3::SatResult::Unsat => SmtMustVerdict::Must,
+        z3::SatResult::Sat => SmtMustVerdict::NotMust,
+        z3::SatResult::Unknown => SmtMustVerdict::Unknown,
+    }
+}
+
+/// R.2.5b session-2 follow-up (2026-06-09) — SMT-backed hyper-must
+/// check over a target SET T.
+///
+/// **Semantics (per [`docs/design/kmts-theory.md`] §7.4 generalised
+/// KMTS hyper-must):** the hyper-must edge `(src, label, T)` holds iff
+///
+/// ```text
+/// ∀ state ⊨ src. ∃ inputs. ∃ t ∈ T. ∃ state_next. (transition(state, inputs, state_next) ∧ state_next ⊨ t)
+/// ```
+///
+/// The abstraction guarantees some t ∈ T is reached, but not
+/// necessarily the same t across concrete states. This is the
+/// standard hyper-must reading from Shoham–Grumberg LMCS 2007 §4.
+///
+/// **Encoding:** same shape as the per-target ∀∃ check, but with
+/// the target-side constraint being a disjunction over the candidate
+/// targets in `target_bits_set`:
+///
+/// `src_constraints ∧ forall_const([inputs, state_next], ¬(transition ∧ ⋁_t tgt_t_constraints))`
+///
+/// - SAT ⇒ some state in src can escape every t ∈ T ⇒ NotMust.
+/// - UNSAT ⇒ every state in src has some (input, t ∈ T) witness ⇒ Must.
+/// - Unknown ⇒ Unknown.
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub fn smt_hyper_must_check<P>(
+    view: &Btor2SmtView,
+    src_bits: u64,
+    target_bits_set: &[u64],
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMustVerdict
+where
+    P: PredicateLike,
+{
+    if target_bits_set.is_empty() {
+        // Empty target set — no possible witnesses; trivially not a must.
+        return SmtMustVerdict::NotMust;
+    }
+
+    // Build src constraints once (state_curr is shared across the
+    // disjunction's target constraints).
+    let Some((src_constraints, _placeholder)) = build_src_tgt_constraints(
+        view, src_bits, 0, // tgt_bits placeholder — not used below; we rebuild per target
+        predicates, nid_map,
+    ) else {
+        return SmtMustVerdict::Unknown;
+    };
+
+    // Build a target-conjunction per candidate, then OR them together.
+    let mut tgt_disjuncts: Vec<z3::ast::Bool> = Vec::with_capacity(target_bits_set.len());
+    for &tgt_bits in target_bits_set {
+        let Some((_, tgt_constraints)) =
+            build_src_tgt_constraints(view, src_bits, tgt_bits, predicates, nid_map)
+        else {
+            return SmtMustVerdict::Unknown;
+        };
+        tgt_disjuncts.push(conj_bool(&tgt_constraints));
+    }
+    let tgt_disjuncts_refs: Vec<&z3::ast::Bool> = tgt_disjuncts.iter().collect();
+    let any_tgt = z3::ast::Bool::or(&tgt_disjuncts_refs);
+
+    let inner_body = z3::ast::Bool::and(&[&view.transition, &any_tgt]).not();
+
+    let bound_bvs = universal_bound_bvs(view);
+    let bound_refs: Vec<&dyn z3::ast::Ast> =
+        bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+
+    for c in &src_constraints {
+        solver.assert(c);
+    }
+    solver.assert(&universal);
+
+    match solver.check() {
+        z3::SatResult::Unsat => SmtMustVerdict::Must,
+        z3::SatResult::Sat => SmtMustVerdict::NotMust,
+        z3::SatResult::Unknown => SmtMustVerdict::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +568,194 @@ mod tests {
             );
             SmtMustVerdict::Must
         });
+    }
+
+    // ---- R.2.5b session-2 follow-up (2026-06-09) ----
+    //
+    // Tests for the standard ∀∃ must-check + hyper-must helpers.
+    //
+    // The discriminating contrast vs the MVP ∀∀ check:
+    // - ∀∀: deterministic into tgt regardless of input.
+    // - ∀∃: for every state in src, SOME input reaches tgt.
+    //
+    // The INPUT_DRIVEN fixture (reg_a := in_a) is the canonical
+    // discriminator: ∀∀ rejects the src=tgt={p} self-loop (input=1
+    // escapes); ∀∃ ACCEPTS it (input=0 keeps reg_a==0). So the same
+    // fixture that produced NotMust under the MVP produces Must
+    // under the standard form — the strict-supremacy invariant.
+
+    /// R.2.5b session-2 follow-up — on the input-driven fixture
+    /// where input=0 keeps `reg_a==0` and input=1 sets `reg_a:=1`,
+    /// the standard ∀∃ check proves the must-edge src=tgt={p}
+    /// (for every state in src, the input=0 witness reaches tgt).
+    /// The MVP ∀∀ check rejected this same edge.
+    #[test]
+    fn smt_standard_must_check_input_driven_proves_must() {
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse input-driven fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode input-driven");
+            let nid_map = build_register_nid_map(&view);
+            smt_per_target_must_check_standard(&view, 0b1, 0b1, &predicates, &nid_map, 5_000)
+        });
+
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::Must,
+            "standard ∀∃: input=0 witness reaches src=tgt={{p}} from every state in src \
+             ⇒ Must (more permissive than the MVP's ∀∀ form which rejected this)"
+        );
+    }
+
+    /// R.2.5b session-2 follow-up — on the deterministic-zero
+    /// fixture (always sets `reg_a:=0`), the standard ∀∃ check
+    /// proves the must-edge (same as the MVP ∀∀ form). Confirms
+    /// strict-supremacy: every ∀∀ Must is also a ∀∃ Must.
+    #[test]
+    fn smt_standard_must_check_deterministic_zero_proves_must() {
+        let file = parse(DETERMINISTIC_ZERO_BTOR2).expect("parse deterministic fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode deterministic");
+            let nid_map = build_register_nid_map(&view);
+            smt_per_target_must_check_standard(&view, 0b1, 0b1, &predicates, &nid_map, 5_000)
+        });
+
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::Must,
+            "deterministic reg_a := 0 with src=tgt={{p}} must prove ∀∃-Must too \
+             (strict-supremacy invariant: every ∀∀-Must is also ∀∃-Must)"
+        );
+    }
+
+    /// R.2.5b session-2 follow-up — when the src→tgt transition is
+    /// IMPOSSIBLE under all inputs (e.g. src={p}, tgt={¬p}, with
+    /// reg_a := 0 — every input keeps p true so tgt is never
+    /// reached), the standard ∀∃ check returns NotMust (no input
+    /// witness exists for any state in src).
+    #[test]
+    fn smt_standard_must_check_unreachable_target_returns_not_must() {
+        let file = parse(DETERMINISTIC_ZERO_BTOR2).expect("parse deterministic fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode deterministic");
+            let nid_map = build_register_nid_map(&view);
+            // src cube = {p}: src_bits = 0b1.
+            // tgt cube = {¬p}: tgt_bits = 0b0.
+            // reg_a := 0 always; from src (reg_a==0), next is reg_a==0 ⇒ p stays true.
+            // So tgt={¬p} is unreachable ⇒ NotMust.
+            smt_per_target_must_check_standard(&view, 0b1, 0b0, &predicates, &nid_map, 5_000)
+        });
+
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::NotMust,
+            "unreachable target ⇒ NotMust under standard ∀∃ form"
+        );
+    }
+
+    /// R.2.5b session-2 follow-up — hyper-must on a 2-target set.
+    /// On the input-driven fixture, hyper-must over {p, ¬p} covers
+    /// both possible next-states (input=0 → p; input=1 → ¬p). For
+    /// every state in src, some input reaches some target in the
+    /// set ⇒ Must.
+    #[test]
+    fn smt_hyper_must_covers_full_target_set_proves_must() {
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse input-driven fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode input-driven");
+            let nid_map = build_register_nid_map(&view);
+            // src cube = {p}: src_bits = 0b1.
+            // target set = [{p}, {¬p}] (bits 0b1 + 0b0).
+            // Every input combo from src reaches some target in the set ⇒ Must.
+            smt_hyper_must_check(&view, 0b1, &[0b1, 0b0], &predicates, &nid_map, 5_000)
+        });
+
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::Must,
+            "hyper-must over the full {{p, ¬p}} target set covers all input-driven \
+             paths from src ⇒ Must"
+        );
+    }
+
+    /// R.2.5b session-2 follow-up — hyper-must on a singleton
+    /// (degenerates to the per-target ∀∃ check). Confirms the
+    /// hyper-must helper agrees with `smt_per_target_must_check_standard`
+    /// on cardinality-1 target sets.
+    #[test]
+    fn smt_hyper_must_singleton_agrees_with_per_target_standard() {
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let (singleton_hyper, per_target) = run_two_checks(|| {
+            let view = encode_design(&file).expect("encode fixture");
+            let nid_map = build_register_nid_map(&view);
+            let h = smt_hyper_must_check(&view, 0b1, &[0b1], &predicates, &nid_map, 5_000);
+            let p =
+                smt_per_target_must_check_standard(&view, 0b1, 0b1, &predicates, &nid_map, 5_000);
+            (h, p)
+        });
+
+        assert_eq!(
+            singleton_hyper, per_target,
+            "hyper-must({{p}}) must agree with per-target ∀∃({{p}}) \
+             (cardinality-1 reduction); got singleton={singleton_hyper:?}, per-target={per_target:?}"
+        );
+    }
+
+    /// R.2.5b session-2 follow-up — hyper-must on an empty target
+    /// set returns NotMust (no possible witnesses).
+    #[test]
+    fn smt_hyper_must_empty_set_returns_not_must() {
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode fixture");
+            let nid_map = build_register_nid_map(&view);
+            smt_hyper_must_check(&view, 0b1, &[], &predicates, &nid_map, 5_000)
+        });
+
+        assert_eq!(verdict, SmtMustVerdict::NotMust);
+    }
+
+    /// Run a closure inside the Z3 scope returning two verdicts.
+    /// Local helper since `run_check` is single-verdict.
+    fn run_two_checks<F: FnOnce() -> (SmtMustVerdict, SmtMustVerdict) + Send + Sync>(
+        f: F,
+    ) -> (SmtMustVerdict, SmtMustVerdict) {
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, f)
     }
 }
