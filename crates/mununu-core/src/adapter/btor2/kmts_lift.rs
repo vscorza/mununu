@@ -1348,6 +1348,51 @@ pub fn predicate_cube_lift(
         let boolean_inputs: Vec<String> = collect_boolean_input_symbols(&file, &symbols);
         let n_inputs = boolean_inputs.len().min(lift_opts.max_input_bits);
         let n_combos: usize = 1usize << n_inputs;
+
+        // R.6.6 (2026-06-08) — controllability-aware label emission.
+        // When `AdapterOptions.controllable_inputs` is non-empty, the
+        // lifter partitions boolean inputs into env (uncontrollable) +
+        // ctrl (controllable) classes per-symbol-name, then emits each
+        // transition with a dual-label set `[env_combo_label,
+        // ctrl_combo_label]`. The env labels are tagged
+        // `LabelControllability::Uncontrollable`; ctrl labels are
+        // `Controllable`. The Skolem grouping in modal_exists /
+        // modal_forall (group_transitions_by_uncontrollable_labels)
+        // then partitions correctly along the controllability axis:
+        // ∀ env-combo, ∃ ctrl-combo for the synthesis idiom.
+        //
+        // When `controllable_inputs` is empty: legacy single-`step`
+        // label behavior (controllability axis disabled). This keeps
+        // every pre-R.6.6 fixture verdict-equivalent — the new path
+        // is strictly opt-in.
+        //
+        // Per the R.6.6 done-criterion (kmts-theory.md §7 / R.6 plan §1):
+        // this is the first adapter that emits a CLTS carrying BOTH
+        // controllable labels AND MayOnly/MustHyperOnly edges from the
+        // same source — the model R.6.3/4/5 evaluators are designed to
+        // consume.
+        let controllable_inputs_set: std::collections::HashSet<&str> = options
+            .controllable_inputs
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let env_input_indices: Vec<usize> = boolean_inputs
+            .iter()
+            .take(n_inputs)
+            .enumerate()
+            .filter(|(_, name)| !controllable_inputs_set.contains(name.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let ctrl_input_indices: Vec<usize> = boolean_inputs
+            .iter()
+            .take(n_inputs)
+            .enumerate()
+            .filter(|(_, name)| controllable_inputs_set.contains(name.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let controllability_aware = !controllable_inputs_set.is_empty()
+            && (!env_input_indices.is_empty() || !ctrl_input_indices.is_empty());
+
         let label_id = builder
             .labels()
             .intern(["step"])
@@ -1356,6 +1401,58 @@ pub fn predicate_cube_lift(
                 location: None,
                 message: format!("adapter/btor2/predicate_cube_lift: label intern failed: {e}"),
             })?;
+
+        // R.6.6 — pre-intern the per-combo controllability-aware
+        // labels when opted in. We intern up-front (rather than
+        // lazily per-transition) so the controllability map is set
+        // exactly once per label. The label names encode the input-
+        // combo bit-pattern for unique identification.
+        let n_env = env_input_indices.len();
+        let n_ctrl = ctrl_input_indices.len();
+        let n_env_combos: usize = 1usize << n_env;
+        let n_ctrl_combos: usize = 1usize << n_ctrl;
+        let mut env_label_ids: Vec<crate::clts::LabelId<DefaultLabelIdx>> =
+            Vec::with_capacity(n_env_combos);
+        let mut ctrl_label_ids: Vec<crate::clts::LabelId<DefaultLabelIdx>> =
+            Vec::with_capacity(n_ctrl_combos);
+        if controllability_aware {
+            for env_c in 0..n_env_combos {
+                let name = format!("env_c{env_c}");
+                let lid = builder
+                    .labels()
+                    .intern([name.as_str()])
+                    .map_err(|e| AdapterError {
+                        kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                        location: None,
+                        message: format!(
+                            "adapter/btor2/predicate_cube_lift R.6.6: env label intern failed: {e}"
+                        ),
+                    })?;
+                builder.set_label_controllability(
+                    lid,
+                    crate::clts::LabelControllability::Uncontrollable,
+                );
+                env_label_ids.push(lid);
+            }
+            for ctrl_c in 0..n_ctrl_combos {
+                let name = format!("ctrl_c{ctrl_c}");
+                let lid = builder
+                    .labels()
+                    .intern([name.as_str()])
+                    .map_err(|e| AdapterError {
+                        kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                        location: None,
+                        message: format!(
+                            "adapter/btor2/predicate_cube_lift R.6.6: ctrl label intern failed: {e}"
+                        ),
+                    })?;
+                builder.set_label_controllability(
+                    lid,
+                    crate::clts::LabelControllability::Controllable,
+                );
+                ctrl_label_ids.push(lid);
+            }
+        }
 
         // Collect register widths so we can mask the representative
         // values to the cell's bit-width.
@@ -1448,6 +1545,39 @@ pub fn predicate_cube_lift(
                 // Emit one may-edge per representative. Duplicate
                 // target cubes get deduplicated via the builder's
                 // transition merging.
+                //
+                // R.6.6 (2026-06-08) — when controllability-aware,
+                // compute the (env_combo, ctrl_combo) projection of
+                // this input combo and emit the transition with a
+                // dual-label set `[env_label, ctrl_label]`. The
+                // Skolem grouping (group_transitions_by_uncontrollable_labels)
+                // then partitions transitions by env_label correctly.
+                let labels: smallvec::SmallVec<[crate::clts::LabelId<DefaultLabelIdx>; 4]> =
+                    if controllability_aware {
+                        let mut env_c: usize = 0;
+                        for (slot, &raw_idx) in env_input_indices.iter().enumerate() {
+                            if (combo >> raw_idx) & 1 == 1 {
+                                env_c |= 1 << slot;
+                            }
+                        }
+                        let mut ctrl_c: usize = 0;
+                        for (slot, &raw_idx) in ctrl_input_indices.iter().enumerate() {
+                            if (combo >> raw_idx) & 1 == 1 {
+                                ctrl_c |= 1 << slot;
+                            }
+                        }
+                        let mut lbls = smallvec::SmallVec::new();
+                        if !env_input_indices.is_empty() {
+                            lbls.push(env_label_ids[env_c]);
+                        }
+                        if !ctrl_input_indices.is_empty() {
+                            lbls.push(ctrl_label_ids[ctrl_c]);
+                        }
+                        lbls
+                    } else {
+                        smallvec::smallvec![label_id]
+                    };
+
                 for next_registers in &next_register_snapshots {
                     // Determine the resulting cube index by
                     // re-evaluating each predicate against the new
@@ -1463,7 +1593,7 @@ pub fn predicate_cube_lift(
                         let tgt_id = state_ids[target_index];
                         builder.transition_ids_with_modality(
                             src_id,
-                            &[label_id],
+                            &labels,
                             tgt_id,
                             crate::clts::TransitionModality::MayOnly,
                         );
@@ -1492,10 +1622,23 @@ pub fn predicate_cube_lift(
         // predicate-false cubes (registers may take many values).
         // The R.2.5b follow-up session will replace this with
         // a Z3-array-theory query proving must-edges.
-        if matches!(
-            lift_opts.must_edge_inference,
-            MustEdgeInference::SamplingConfluence
-        ) {
+        // R.6.6 (2026-06-08) — when controllability-aware, the post-
+        // pass Sharp/MustHyperOnly promotions would emit edges labelled
+        // with the legacy single-`step` label that mismatches the
+        // controllability-aware dual-label may-edges already in the
+        // CLTS. Such edges DO NOT supersede the may-edges (different
+        // label sets ⇒ different transitions in the builder's view) and
+        // would produce a misshaped model. The MVP gate skips the post-
+        // passes entirely under controllability-aware mode; R.6.6.b
+        // follow-up extends the post-pass to emit per-combo promoted
+        // edges (or aggregate label sets) for soundness preservation
+        // under the synthesis idiom.
+        if !controllability_aware
+            && matches!(
+                lift_opts.must_edge_inference,
+                MustEdgeInference::SamplingConfluence
+            )
+        {
             for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
                 if targets.is_empty() {
                     continue;
@@ -1562,10 +1705,15 @@ pub fn predicate_cube_lift(
         // KMTS preservation holds. The MVP simply produces fewer
         // Sharp edges than the standard `∀ state ∃ input` form
         // would.
-        if matches!(
-            lift_opts.must_edge_inference,
-            MustEdgeInference::SmtPerTarget
-        ) {
+        // R.6.6 — same gate as the SamplingConfluence post-pass: skip
+        // SmtPerTarget under controllability-aware mode (the promoted
+        // Sharp edges would carry mismatched labels). R.6.6.b follow-up.
+        if !controllability_aware
+            && matches!(
+                lift_opts.must_edge_inference,
+                MustEdgeInference::SmtPerTarget
+            )
+        {
             use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
             let cfg = z3::Config::new();
             let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
@@ -2479,6 +2627,135 @@ mod tests {
                 result.warnings
             );
         }
+    }
+
+    // ---- R.6.6 (2026-06-08) — controllability-aware lifter tests ----
+
+    /// R.6.6 — when `AdapterOptions::controllable_inputs` is empty
+    /// (the default), the lifter preserves pre-R.6.6 behavior
+    /// bit-for-bit: a single `step` label per transition, no
+    /// controllability tags on labels. Verdict-equivalence invariant
+    /// for the R-track's existing fixtures.
+    #[test]
+    fn r6_6_no_controllable_inputs_preserves_legacy_single_label() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let result = predicate_cube_lift(
+            preds,
+            COUNTER_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("lift succeeds");
+        let labels = result.clts.alphabet();
+        assert!(
+            labels.iter().any(|l| l == "step"),
+            "legacy `step` label must be present; got labels: {labels:?}"
+        );
+        // No env_/ctrl_ labels emitted in legacy mode.
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.starts_with("env_c") || l.starts_with("ctrl_c")),
+            "no R.6.6 env_/ctrl_ labels in legacy mode; got: {labels:?}"
+        );
+    }
+
+    /// R.6.6 — when `controllable_inputs = ["clr"]` on the counter
+    /// fixture (whose single boolean input is `clr`), the lifter
+    /// emits per-combo labels with controllability tags. The counter
+    /// has 1 input, so n_env=0 + n_ctrl=1 ⇒ 2 ctrl labels
+    /// (`ctrl_c0`, `ctrl_c1`), no env labels.
+    #[test]
+    fn r6_6_single_controllable_input_emits_ctrl_labels() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let mut opts = AdapterOptions::default();
+        opts.controllable_inputs.push("clr".into());
+        let result = predicate_cube_lift(
+            preds,
+            COUNTER_BTOR2,
+            &opts,
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("lift succeeds");
+        let labels = result.clts.alphabet();
+        assert!(
+            labels.iter().any(|l| l == "ctrl_c0"),
+            "expected ctrl_c0 label; got: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "ctrl_c1"),
+            "expected ctrl_c1 label; got: {labels:?}"
+        );
+        // No env labels (0 env inputs).
+        assert!(
+            !labels.iter().any(|l| l.starts_with("env_c")),
+            "no env labels expected with 0 env inputs; got: {labels:?}"
+        );
+        // Every ctrl_c* label must land in the controllable alphabet.
+        for &label_id in result.clts.controllable_alphabet() {
+            if let Some(payload) = result.clts.label_payload(label_id)
+                && let Some(name) = payload.first()
+            {
+                assert!(
+                    name.starts_with("ctrl_c") || name == "step",
+                    "controllable alphabet must contain only ctrl_c* or legacy step; got {name:?}"
+                );
+            }
+        }
+        // ctrl_c0 + ctrl_c1 must NOT appear in the uncontrollable alphabet.
+        for &label_id in result.clts.uncontrollable_alphabet() {
+            if let Some(payload) = result.clts.label_payload(label_id)
+                && let Some(name) = payload.first()
+            {
+                assert!(
+                    !name.starts_with("ctrl_c"),
+                    "ctrl_c* label {name:?} must not appear in uncontrollable alphabet"
+                );
+            }
+        }
+    }
+
+    /// R.6.6 — when controllability-aware, the post-pass Sharp /
+    /// MustHyperOnly promotions are SKIPPED (the gate flags
+    /// `!controllability_aware` before firing). Even with
+    /// `MustEdgeInference::SamplingConfluence` requested, no
+    /// promotions happen. R.6.6.b will lift this gate by adding the
+    /// per-combo promotion shape.
+    #[test]
+    fn r6_6_controllability_aware_skips_post_pass_promotions() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let mut adapter_opts = AdapterOptions::default();
+        adapter_opts.controllable_inputs.push("clr".into());
+        let lift_opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::SamplingConfluence,
+            config_values: std::collections::HashMap::new(),
+        };
+        let result = predicate_cube_lift(preds, COUNTER_BTOR2, &adapter_opts, &lift_opts)
+            .expect("lift succeeds");
+        assert_eq!(
+            result.sharp_edges_promoted, 0,
+            "R.6.6 gate: controllability-aware mode skips Sharp promotion (R.6.6.b follow-up); got {} promotions",
+            result.sharp_edges_promoted
+        );
+        assert_eq!(
+            result.hyper_must_edges_emitted, 0,
+            "R.6.6 gate: controllability-aware mode skips MustHyperOnly emission; got {}",
+            result.hyper_must_edges_emitted
+        );
     }
 
     /// R.2.5b — Empty predicate set: the may-edge loop is skipped
