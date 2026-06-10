@@ -463,6 +463,25 @@ pub async fn context_import_handler(
         serde_json::to_value(&output.transition_observations).ok()
     };
 
+    // R.6.7 / V.6 (2026-06-09) — when the request declares
+    // `predicates` AND `controllable_inputs`, post-process the
+    // adapter output through `predicate_cube_lift` with the R.6.6
+    // controllability-aware dispatch. Today only the `btor2` format
+    // is wired through this path (the `sv-yosys` route returns
+    // CTXDSL directly; routing it through predicate_cube_lift
+    // requires a multi-step plumbing that lifts BTOR2 from the
+    // sv2v+Yosys output — queued as a V.6 follow-up).
+    //
+    // Per CLAUDE.md §Surface Parity, this API surface mirrors the
+    // CLI's `--controllable-input` + `--predicate` flags on
+    // `mununu btor2 cegar`. The UI consumer (mununu-ui) renders
+    // the lift summary in its dedicated workflow page.
+    let is_btor2_format = matches!(request.format.as_str(), "btor2" | "btor");
+    if !request.predicates.is_empty() && !request.controllable_inputs.is_empty() && is_btor2_format
+    {
+        return run_controllability_aware_lift(&request);
+    }
+
     Ok(Json(ContextImportResponse {
         success: true,
         ctxdsl: output.ctxdsl,
@@ -473,6 +492,114 @@ pub async fn context_import_handler(
         property_count: output.source_info.property_count,
         state_valuations,
         transition_observations,
+    }))
+}
+
+/// R.6.7 / V.6 (2026-06-09) — controllability-aware predicate-cube
+/// lift entry point. Invoked from `context_import_handler` when the
+/// request declares both `predicates` + `controllable_inputs`.
+///
+/// Today: BTOR2 input only. Returns a `ContextImportResponse` whose
+/// `warnings` list captures the lift's `AdapterWarning`s + a
+/// summary line counting `MayOnly` / `Sharp` / `MustHyperOnly`
+/// transitions for UI rendering. The `ctxdsl` field carries a
+/// human-readable summary line + the warnings as comments — full
+/// CTXDSL emit from a `Clts` is a follow-up (the existing
+/// `adapter::emit::emit` takes an `AdapterIR`, not a `Clts`).
+fn run_controllability_aware_lift(
+    request: &ContextImportRequest,
+) -> ApiResult<Json<ContextImportResponse>> {
+    use crate::adapter::AdapterOptions;
+    use crate::adapter::btor2::kmts_lift::{
+        MustEdgeInference, PredicateCubeLiftOptions, PredicateSpec, predicate_cube_lift,
+    };
+    use crate::clts::TransitionModality;
+
+    let predicates: Vec<PredicateSpec> = request
+        .predicates
+        .iter()
+        .map(|p| PredicateSpec {
+            name: p.name.clone(),
+            register: p.register.clone(),
+            value: p.value,
+        })
+        .collect();
+
+    let adapter_options = AdapterOptions {
+        controllable_inputs: request.controllable_inputs.clone(),
+        ..Default::default()
+    };
+
+    let lift_opts = PredicateCubeLiftOptions {
+        // Reasonable defaults for an interactive UI workflow.
+        max_cube_count: 1024,
+        max_input_bits: 8,
+        must_edge_inference: MustEdgeInference::Off,
+        config_values: std::collections::HashMap::new(),
+    };
+
+    let lift_result =
+        predicate_cube_lift(predicates, &request.content, &adapter_options, &lift_opts).map_err(
+            |e| ApiError::BadRequest {
+                message: format!("controllability-aware lift failed: {}", e.message),
+                details: None,
+            },
+        )?;
+
+    let mut mayonly = 0usize;
+    let mut sharp = 0usize;
+    let mut hyper_must = 0usize;
+    for state in lift_result.clts.states() {
+        for trans in lift_result.clts.outgoing(state) {
+            match trans.modality() {
+                TransitionModality::MayOnly => mayonly += 1,
+                TransitionModality::Sharp => sharp += 1,
+                TransitionModality::MustHyperOnly(_) => hyper_must += 1,
+            }
+        }
+    }
+
+    let alphabet = lift_result.clts.alphabet();
+    let env_label_count = alphabet.iter().filter(|l| l.starts_with("env_c")).count();
+    let ctrl_label_count = alphabet.iter().filter(|l| l.starts_with("ctrl_c")).count();
+
+    let mut warnings: Vec<String> = lift_result
+        .warnings
+        .iter()
+        .map(|w| w.message.clone())
+        .collect();
+    warnings.push(format!(
+        "[R.6.7 V.6 controllability-aware lift] cubes={}, mayonly={}, sharp={}, hyper_must={}, env_labels={}, ctrl_labels={}",
+        lift_result.cube_count, mayonly, sharp, hyper_must, env_label_count, ctrl_label_count
+    ));
+
+    // Summary CTXDSL — the full Clts→CTXDSL emit is queued as a
+    // follow-up. For the V.6 UI MVP we return a comment-only CTXDSL
+    // carrying the lift summary, so the UI's Monaco editor +
+    // existing graph view degrade gracefully (the warnings list +
+    // numeric fields are the canonical summary).
+    let summary_ctxdsl = format!(
+        "// R.6.7 / V.6 controllability-aware lift summary.\n\
+         // cubes={}\n// mayonly={}\n// sharp={}\n// hyper_must={}\n\
+         // env_labels={} (Uncontrollable)\n// ctrl_labels={} (Controllable)\n\
+         // Full CTXDSL emit from the lifted KMTS is a follow-up;\n\
+         // the structured lift fields (state_count, warnings) are\n\
+         // the canonical summary for now.\n\
+         context v6_controllability_kmts_summary {{\n\
+         }}\n",
+        lift_result.cube_count, mayonly, sharp, hyper_must, env_label_count, ctrl_label_count
+    );
+
+    Ok(Json(ContextImportResponse {
+        success: true,
+        ctxdsl: summary_ctxdsl,
+        source_format: format!("{:?}", lift_result.source_info.format).to_lowercase(),
+        warnings,
+        signal_count: lift_result.source_info.signal_count,
+        state_count: lift_result.cube_count,
+        property_count: 0,
+        state_valuations: None,
+        transition_observations: None,
     }))
 }
 
@@ -2546,6 +2673,7 @@ members = ["x"]
             sidecar: None,
             additional_sources: Vec::new(),
             use_sv2v: false,
+            ..Default::default()
         };
         let Json(out) = context_import_handler(Json(request))
             .await
@@ -2574,11 +2702,127 @@ members = ["x"]
             sidecar: None,
             additional_sources: Vec::new(),
             use_sv2v: false,
+            ..Default::default()
         };
         let Json(out) = context_import_handler(Json(request))
             .await
             .expect("langgraph dispatch should succeed");
         assert!(out.ctxdsl.contains("automaton Linear"));
+    }
+
+    /// R.6.7 / V.6 (2026-06-09) — API surface for the
+    /// controllability-aware predicate-cube lift. When the request
+    /// declares `predicates` + `controllable_inputs` + `format == "btor2"`,
+    /// the handler routes through `predicate_cube_lift` + returns
+    /// a summary CTXDSL + the lift's `AdapterWarning`s + a summary
+    /// line counting cube / mayonly / sharp / hyper-must / env-label /
+    /// ctrl-label counts.
+    #[tokio::test]
+    async fn context_import_handler_routes_through_controllability_aware_lift() {
+        use crate::api::models::PredicateSpecRequest;
+        // V.6 AMBA arbiter BTOR2 (inline; matches
+        // examples/verify/v6_controllability_kmts/source/amba_arbiter.btor2).
+        let btor2 = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 req_0
+4 input 1 req_1
+5 input 1 ctrl_g0
+6 input 1 ctrl_g1
+7 state 2 burst
+8 state 1 grant_0
+9 state 1 grant_1
+10 zero 1
+11 zero 2
+12 init 1 8 10
+13 init 1 9 10
+14 init 2 7 11
+15 one 1
+16 const 2 11
+17 const 2 01
+18 const 2 10
+19 const 2 00
+20 next 1 8 5
+21 next 1 9 6
+22 or 1 5 6
+23 eq 1 7 19
+24 sub 2 7 17
+25 ite 2 23 16 24
+26 ite 2 22 25 7
+27 next 2 7 26
+";
+
+        let request = ContextImportRequest {
+            content: btor2.to_string(),
+            format: "btor2".to_string(),
+            filename: Some("amba_arbiter.btor2".to_string()),
+            sidecar: None,
+            additional_sources: Vec::new(),
+            use_sv2v: false,
+            predicates: vec![PredicateSpecRequest {
+                name: "burst_zero".to_string(),
+                register: "burst".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec!["ctrl_g0".to_string(), "ctrl_g1".to_string()],
+        };
+
+        let Json(out) = context_import_handler(Json(request))
+            .await
+            .expect("V.6 controllability-aware lift via API should succeed");
+
+        // The handler returns a summary CTXDSL + the lift's
+        // [R.6.7 V.6 ...] summary line in `warnings`.
+        assert!(
+            out.ctxdsl
+                .contains("R.6.7 / V.6 controllability-aware lift summary"),
+            "summary CTXDSL must contain the V.6 marker; got: {}",
+            out.ctxdsl
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("[R.6.7 V.6 controllability-aware lift]")),
+            "warnings must contain the lift summary line; got: {:?}",
+            out.warnings
+        );
+        // Single predicate ⇒ 2 cubes (matches `cube_count` in the
+        // existing V.6 integration test
+        // `v6_amba_arbiter_lift_produces_expected_cube_count`).
+        assert_eq!(out.state_count, 2);
+    }
+
+    /// R.6.7 / V.6 — when only `predicates` is set (no
+    /// `controllable_inputs`), the controllability-aware path does
+    /// not fire; the legacy BTOR2 adapter runs.
+    #[tokio::test]
+    async fn context_import_handler_skips_v6_path_without_controllable_inputs() {
+        use crate::api::models::PredicateSpecRequest;
+        let btor2 = "1 sort bitvec 1\n2 state 1 reg_a\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
+        let request = ContextImportRequest {
+            content: btor2.to_string(),
+            format: "btor2".to_string(),
+            filename: Some("trivial.btor2".to_string()),
+            sidecar: None,
+            additional_sources: Vec::new(),
+            use_sv2v: false,
+            predicates: vec![PredicateSpecRequest {
+                name: "p".to_string(),
+                register: "reg_a".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: Vec::new(), // <-- empty disables V.6 path
+        };
+        let Json(out) = context_import_handler(Json(request))
+            .await
+            .expect("legacy BTOR2 import should succeed");
+        // Legacy BTOR2 adapter output — no V.6 summary marker.
+        assert!(
+            !out.ctxdsl
+                .contains("R.6.7 / V.6 controllability-aware lift summary"),
+            "V.6 marker must NOT appear when controllable_inputs is empty; got: {}",
+            out.ctxdsl
+        );
     }
 
     #[tokio::test]

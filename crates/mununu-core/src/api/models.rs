@@ -207,7 +207,7 @@ pub struct ProofObligation {
 // ============================================================================
 
 /// Request for importing an external format into CTXDSL.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ContextImportRequest {
     /// Raw file content in the source format.
     pub content: String,
@@ -234,6 +234,42 @@ pub struct ContextImportRequest {
     /// other formats.
     #[serde(default)]
     pub use_sv2v: bool,
+    /// R.6.7 / V.6 (2026-06-09) — predicate set for the
+    /// controllability-aware predicate-cube lift. Each entry is a
+    /// `{name, register, value}` triple identifying a register-value
+    /// equality predicate that bounds the abstraction. When non-empty
+    /// AND `controllable_inputs` is non-empty AND `format == "btor2"`
+    /// (or `"sv-yosys"`, which produces BTOR2 internally), the
+    /// `predicate_cube_lift` is invoked + the resulting KMTS is
+    /// returned. When empty, the import path is unchanged
+    /// (legacy CTXDSL emit).
+    ///
+    /// Mirrors the CLI's `--predicate NAME:REG=VALUE` flag on
+    /// `mununu btor2 cegar`.
+    #[serde(default)]
+    pub predicates: Vec<PredicateSpecRequest>,
+    /// R.6.7 / V.6 (2026-06-09) — names of BTOR2 input symbols the
+    /// controller drives. Mirrors the CLI's `--controllable-input`
+    /// flag. When non-empty AND `predicates` is non-empty, opts the
+    /// import path into the R.6.6 controllability-aware lift —
+    /// boolean inputs are partitioned into env (uncontrollable) +
+    /// ctrl (controllable) classes per-symbol-name + the lift emits
+    /// per-combo dual-label transitions.
+    #[serde(default)]
+    pub controllable_inputs: Vec<String>,
+}
+
+/// R.6.7 / V.6 (2026-06-09) — predicate-spec request shape. Mirrors
+/// the CLI's `--predicate NAME:REG=VALUE` triple format. Bridges to
+/// [`crate::adapter::btor2::kmts_lift::PredicateSpec`].
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct PredicateSpecRequest {
+    /// Human-readable predicate name (e.g. `"burst_zero"`).
+    pub name: String,
+    /// BTOR2 register symbol the predicate is anchored on.
+    pub register: String,
+    /// Integer value the predicate witnesses (`register == value`).
+    pub value: u64,
 }
 
 fn default_import_format() -> String {

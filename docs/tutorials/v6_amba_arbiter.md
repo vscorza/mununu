@@ -182,36 +182,118 @@ edges from the same source. This is the R.6.7 done-criterion (R.6 plan §1).
 
 ## Web UI integration
 
-**Status: not yet shipped (queued for next R.6.7 session).**
+**Status: MVP shipped 2026-06-09.** API extension (`/api/v1/context/import`
+accepts `predicates` + `controllable_inputs` for BTOR2 input) + a
+dedicated UI workflow panel mounted at the `/v6` route. SV-direct
+input (UI runs sv2v + Yosys + lift internally) is the next session
+item; today the user runs `mununu sv emit-btor2-per-module` first
+to produce BTOR2 from SV, then pastes/uploads the BTOR2 in the UI.
 
-Today the V.6 fixture is runnable via the CLI only. Per CLAUDE.md
-§Surface Parity, every user-visible capability should ship on CLI +
-HTTP API + UI. The R.6.6 controllability-aware lifter shipped CLI
-access on 2026-06-09; the API + UI surfaces are queued.
+### Backend API shape (shipped)
 
-### What the next session will add
+The `/api/v1/context/import` endpoint accepts two new optional
+fields:
 
-1. **Backend** (`crates/mununu-core/src/api/handlers.rs`): extend the
-   `/api/v1/context/import` endpoint to accept optional `predicates`
-   + `controllable_inputs` request fields. When present + `format ==
-   "sv-yosys"`, route through:
-   `SV → sv2v → Yosys → BTOR2 → predicate_cube_lift(predicates, controllable_inputs) → emit CTXDSL with [may] modality attributes`.
+- `predicates: PredicateSpecRequest[]` — `{name, register, value}`
+  triples.
+- `controllable_inputs: string[]` — BTOR2 input symbol names the
+  controller drives.
 
-2. **Frontend** (`mununu-ui`): add form fields to the existing SV
-   import workflow for predicates + controllable inputs. The rendered
-   CTXDSL (with `[may]` modality attributes) is already supported by
-   the Monaco editor + graph view via the K.1 / K.3 attribute syntax.
+When both are non-empty AND `format == "btor2"`, the backend routes
+through `predicate_cube_lift` with the R.6.6 controllability-aware
+dispatch + returns a `ContextImportResponse` whose:
+- `state_count` = cube count (= 2^|predicates|).
+- `warnings` includes the lift's `AdapterWarning`s + a
+  `[R.6.7 V.6 controllability-aware lift]` summary line counting
+  mayonly / sharp / hyper_must / env_label / ctrl_label counts.
+- `ctxdsl` is a comment-only summary CTXDSL (full Clts→CTXDSL emit
+  is a follow-up).
 
-3. **Tutorial section here**: replace this §"Web UI integration"
-   section with a step-by-step walkthrough — load the SV file via
-   the UI, enter the predicates + controllable inputs, see the
-   resulting CTXDSL, view the graph + verdicts.
+Direct curl example:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/context/import \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "content": "<paste full V.6 BTOR2 here>",
+    "format": "btor2",
+    "filename": "amba_arbiter.btor2",
+    "predicates": [{"name": "burst_zero", "register": "burst", "value": 0}],
+    "controllable_inputs": ["ctrl_g0", "ctrl_g1"]
+  }'
+```
+
+### Step-by-step UI walkthrough
+
+1. **Start the mununu HTTP API server** (from the mununu repo root):
+
+   ```bash
+   LIBRARY_PATH=/usr/local/opt/z3/lib cargo run -p mununu-cli -- serve
+   ```
+
+   Default port: 8080.
+
+2. **Start the mununu-ui dev server** (from the mununu-ui repo root):
+
+   ```bash
+   cd ~/git_repo/mununu-ui
+   npm run dev
+   ```
+
+   Default port: 5173.
+
+3. **Open the V.6 workflow panel**: navigate to
+   `http://localhost:5173/v6` in your browser.
+
+4. **Paste the V.6 BTOR2**: open
+   `examples/verify/v6_controllability_kmts/source/amba_arbiter.btor2`
+   in your editor (or `cat` it) and paste the contents into the
+   "BTOR2 source" textarea. Alternatively click "Choose file" and
+   select the `.btor2` file directly.
+
+5. **Confirm the defaults**: the predicates field defaults to
+   `burst_zero, burst, 0` (the V.6 fixture's predicate set); the
+   controllable inputs default to `ctrl_g0` + `ctrl_g1` (the V.6
+   fixture's controller inputs).
+
+6. **Click "Run controllability-aware lift"**. The panel sends the
+   request to the backend + renders the result.
+
+7. **Inspect the lift summary**: expect to see:
+   - Cube count: 2 (= 2^|predicates| for one predicate).
+   - Warnings list containing the
+     `[R.6.7 V.6 controllability-aware lift]` summary line — parse
+     the inline metrics: mayonly / sharp / hyper_must / env_labels
+     (should be 4) / ctrl_labels (should be 4).
+
+   The summary CTXDSL is a comment block reproducing the same
+   metrics; full Clts→CTXDSL emit is a follow-up.
+
+### What the UI still needs (next session)
+
+- **SV-direct input**: extend the panel to accept SV files + call
+  the backend with `format: "sv-yosys"` which internally runs
+  sv2v + Yosys before the predicate_cube_lift. Requires a parallel
+  backend extension routing the SV path through
+  `translate_sv_per_module` to get BTOR2 before lifting.
+- **Full CTXDSL emit + graph rendering**: today the summary CTXDSL
+  is a comment block. The next session extends `adapter::emit::emit`
+  to accept a `Clts` directly (or a `Clts → AdapterIR` adapter),
+  then the existing Monaco editor + cytoscape graph view render
+  the result.
+- **Property eval + verdict display**: integrate the CEGAR loop
+  invocation so the panel can run a mu-calc property + show the
+  verdict (Sharp / MayOnly / Unknown).
 
 ### How to track progress
 
 - Master roadmap §11.4 V.6 sub-item 7: `~/.claude/plans/you-are-a-formal-vast-lake.md`.
 - Surface parity skill: run `/parity-check` to verify the V.6 surface
-  ships on CLI + API + UI when the API + UI work lands.
+  ships on CLI + API + UI. As of 2026-06-09 the V.6 surface is:
+  - **CLI**: `mununu btor2 cegar --controllable-input ... --predicate ...` ✓
+  - **API**: `POST /api/v1/context/import` with `predicates` +
+    `controllable_inputs` (BTOR2-only today; SV-direct queued) ✓ MVP
+  - **UI**: `V6ControllabilityAwareLiftPanel` at `/v6` ✓ MVP
 
 ## What's NOT in this tutorial (deferred)
 
