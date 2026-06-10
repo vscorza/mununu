@@ -406,16 +406,15 @@ where
     false
 }
 
-// The MVP only operates on the DefaultStateIdx / DefaultLabelIdx
-// monomorphisation in tests; the public API is generic over S, L
-// per the existing evaluator family's conventions.
-#[allow(dead_code)]
-type DefaultClts = Clts<DefaultStateIdx, DefaultLabelIdx>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clts::{LabelControllability, TransitionModality};
+
+    // The MVP only operates on the DefaultStateIdx / DefaultLabelIdx
+    // monomorphisation in tests; the public API is generic over S, L
+    // per the existing evaluator family's conventions.
+    type DefaultClts = Clts<DefaultStateIdx, DefaultLabelIdx>;
 
     fn build_sharp_only_2state_clts() -> DefaultClts {
         let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
