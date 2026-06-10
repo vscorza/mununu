@@ -45,7 +45,7 @@
 //!   solve_3v` + `parity_game_3v_subgame::extract_failure_subgame`
 //!   directly for full granularity.
 
-use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, IdStorage, StateId, TransitionModality};
+use crate::clts::{Clts, IdStorage, StateId, TransitionModality};
 use crate::mu_calculus::trit::{Trit, TritSet};
 use crate::mu_calculus::{
     Environment, EvaluationError, EvaluationOptions, Formula, evaluate_tri_with_options,
@@ -409,7 +409,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clts::{LabelControllability, TransitionModality};
+    use crate::clts::{DefaultLabelIdx, DefaultStateIdx, LabelControllability, TransitionModality};
 
     // The MVP only operates on the DefaultStateIdx / DefaultLabelIdx
     // monomorphisation in tests; the public API is generic over S, L
