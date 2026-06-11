@@ -890,6 +890,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "vcd",
  "z3",
 ]
 
@@ -1827,6 +1828,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcd"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4505774fc84de82eb04caa74d859342b0daa376f4c6df45149593245dd62c004"
 
 [[package]]
 name = "wait-timeout"

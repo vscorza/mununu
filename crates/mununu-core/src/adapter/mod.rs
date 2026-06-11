@@ -55,6 +55,7 @@ pub mod sv_pipeline_compare;
 pub mod systemverilog;
 pub mod templates;
 pub mod tlsf;
+pub mod vcd;
 pub mod verilator;
 pub mod xstate;
 pub mod yosys;

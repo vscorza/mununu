@@ -35,6 +35,15 @@ toml = "0.8"
 # installed, so the cost is negligible for library callers.
 tracing = "0.1"
 
+# VCD parser — used by §Phase 9 R-S6 (VCD trace mining). Reads
+# IEEE-1364 Value Change Dump files produced by Verilator / VCS /
+# QuestaSim / Icarus regression suites; mininu mines them for
+# observed-value-frequency seeding of the bit-blaster's EnumValues
+# discriminators. Canonical Rust VCD crate (~3 KLOC, narrow scope,
+# stable API since 2018). Per CLAUDE.md "Code Reuse" — established
+# library beats hand-rolling.
+vcd = "0.7"
+
 # API (optional)
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
