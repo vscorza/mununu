@@ -689,6 +689,149 @@ pub fn parse_reset_simulation_dump(stdout: &str) -> Vec<RegisterValuation> {
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// R-S2b.3b (2026-06-11) — end-to-end reset-simulation runner
+// ─────────────────────────────────────────────────────────────────────
+
+/// R-S2b.3b (2026-06-11) — derive the [`VerilatorOptions`] the
+/// reset-simulation harness should pass to [`compile_verilator`],
+/// starting from the caller's base options.
+///
+/// The runner always forces two options regardless of the caller's
+/// base:
+///
+/// - `top = Some(config.top.clone())` — `compile_verilator` uses
+///   this to derive the `V<top>.h` header + `V<top>.mk` Makefile
+///   name. The testbench source embeds `V<top>` literally, so the
+///   compile + the testbench must agree.
+/// - `expose_internal_signals = true` — required for the testbench
+///   to read internal registers via `dut->reg_name`. Without
+///   `--public-flat-rw`, Verilator hides everything but top-level
+///   ports.
+///
+/// All other options (`optimize`, `silence_warnings`) carry
+/// through from the caller's base unchanged.
+///
+/// **Pure**: no I/O. Unit-testable in isolation.
+pub fn derive_simulation_options(
+    base: &VerilatorOptions,
+    config: &ResetSimConfig,
+) -> VerilatorOptions {
+    VerilatorOptions {
+        top: Some(config.top.clone()),
+        optimize: base.optimize,
+        silence_warnings: base.silence_warnings,
+        expose_internal_signals: true,
+    }
+}
+
+/// R-S2b.3b (2026-06-11) — verify the parsed dump contains every
+/// register the config asked to observe. Returns the names of
+/// missing registers (preserving the declaration order in
+/// `config.observe_registers`) — empty when complete.
+///
+/// **Pure**: no I/O. The caller decides whether a missing
+/// register is an error or a warning. The strict R-S2b.3b
+/// runner returns an error; R-S2b.4 (predicate-seeding pipeline)
+/// can choose to keep going with whatever the dump captured.
+pub fn missing_observed_registers(
+    config: &ResetSimConfig,
+    valuations: &[RegisterValuation],
+) -> Vec<String> {
+    let present: std::collections::HashSet<&str> =
+        valuations.iter().map(|v| v.name.as_str()).collect();
+    config
+        .observe_registers
+        .iter()
+        .filter(|name| !present.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// R-S2b.3b (2026-06-11) — end-to-end reset-simulation runner.
+///
+/// 1. Validates the `config` (rejects empty signal names + bad
+///    `reset_asserted` + empty `observe_registers`).
+/// 2. Derives the effective `VerilatorOptions` (forces `top` +
+///    `expose_internal_signals`).
+/// 3. Renders the testbench C++ source from `config` via
+///    [`build_reset_simulation_tb_cpp`].
+/// 4. Compiles the design + testbench via [`compile_verilator`]
+///    (R-S2b.2); returns the produced binary path.
+/// 5. Spawns the binary, captures stdout.
+/// 6. Parses stdout via [`parse_reset_simulation_dump`].
+/// 7. Cross-checks that every `config.observe_registers` entry
+///    appeared in the dump. If any are missing, returns an
+///    `AdapterError` naming them (Verilator's `--public-flat-rw`
+///    sometimes fails to expose a signal when the user mistyped
+///    a register name — the error message points the user at
+///    the right fix).
+/// 8. Returns the valuations in the order declared in
+///    `config.observe_registers`.
+///
+/// **Workdir lifetime** is the caller's responsibility. Typical
+/// usage:
+/// ```ignore
+/// let tmp = VerilatorTempDir::new()?;
+/// let valuations = run_reset_simulation(&bin.path, &opts, sv, &cfg, tmp.path())?;
+/// // tmp drops + removes the workdir here (unless
+/// // MUNUNU_KEEP_VERILATOR_TMP=1).
+/// ```
+pub fn run_reset_simulation(
+    verilator: &Path,
+    base_opts: &VerilatorOptions,
+    sv_path: &Path,
+    config: &ResetSimConfig,
+    workdir: &Path,
+) -> Result<Vec<RegisterValuation>, AdapterError> {
+    config.validate()?;
+    let opts = derive_simulation_options(base_opts, config);
+    let tb_cpp_content = build_reset_simulation_tb_cpp(config)?;
+    let bin_path = compile_verilator(verilator, &opts, sv_path, &tb_cpp_content, workdir)?;
+
+    let out = Command::new(&bin_path).output().map_err(|e| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: format!(
+            "adapter/verilator: failed to spawn reset-simulation binary {}: {e}",
+            bin_path.display()
+        ),
+        location: None,
+    })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/verilator: reset-simulation binary {} exited with status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                bin_path.display(),
+                out.status
+            ),
+            location: None,
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let valuations = parse_reset_simulation_dump(&stdout);
+
+    let missing = missing_observed_registers(config, &valuations);
+    if !missing.is_empty() {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/verilator: reset-simulation dump missing registers: {}. \
+                 Check the register names in ResetSimConfig.observe_registers \
+                 against the SV declarations + confirm \
+                 --public-flat-rw exposed them (current opts: expose_internal_signals=true).\nstdout:\n{stdout}",
+                missing.join(", ")
+            ),
+            location: None,
+        });
+    }
+
+    Ok(valuations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,5 +1405,147 @@ mod tests {
         assert_eq!(out[0].value, 0xdeadbeef);
         assert_eq!(out[1].name, "grant_state");
         assert_eq!(out[1].value, 0x42);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S2b.3b tests — derive_simulation_options + missing_observed_registers
+    // + #[ignore]-gated end-to-end runner
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn derive_simulation_options_forces_top_and_public_flat_rw() {
+        let base = VerilatorOptions {
+            top: None,
+            optimize: true,
+            silence_warnings: true,
+            expose_internal_signals: false, // even when false in base, runner must force true
+        };
+        let cfg = sample_config();
+        let derived = derive_simulation_options(&base, &cfg);
+        assert_eq!(derived.top, Some("amba_arbiter".to_string()));
+        assert!(
+            derived.expose_internal_signals,
+            "runner must always set expose_internal_signals=true"
+        );
+        // Other options carry through from base.
+        assert!(derived.optimize);
+        assert!(derived.silence_warnings);
+    }
+
+    #[test]
+    fn derive_simulation_options_overrides_base_top() {
+        // Even when the caller's base specifies a different top, the
+        // runner forces config.top so the testbench (which embeds
+        // V<config.top> literally) stays consistent with the compile.
+        let base = VerilatorOptions {
+            top: Some("different_top".to_string()),
+            ..VerilatorOptions::default()
+        };
+        let cfg = sample_config();
+        let derived = derive_simulation_options(&base, &cfg);
+        assert_eq!(derived.top, Some("amba_arbiter".to_string()));
+    }
+
+    #[test]
+    fn missing_observed_registers_empty_on_complete_dump() {
+        let cfg = sample_config();
+        let valuations = vec![
+            RegisterValuation {
+                name: "burst_count".to_string(),
+                value: 0,
+            },
+            RegisterValuation {
+                name: "grant_state".to_string(),
+                value: 0,
+            },
+        ];
+        assert!(missing_observed_registers(&cfg, &valuations).is_empty());
+    }
+
+    #[test]
+    fn missing_observed_registers_lists_missing_in_declaration_order() {
+        let cfg = ResetSimConfig {
+            observe_registers: vec!["zzz".to_string(), "aaa".to_string(), "mmm".to_string()],
+            ..sample_config()
+        };
+        // Only `aaa` showed up.
+        let valuations = vec![RegisterValuation {
+            name: "aaa".to_string(),
+            value: 0,
+        }];
+        let missing = missing_observed_registers(&cfg, &valuations);
+        // Order preserved: zzz declared first, then mmm.
+        assert_eq!(missing, vec!["zzz".to_string(), "mmm".to_string()]);
+    }
+
+    #[test]
+    fn missing_observed_registers_ignores_extra_dumped_registers() {
+        // The runner should NOT complain about extra registers in
+        // the dump — Verilator may surface internal signals the
+        // caller didn't ask for. Missing is the failure mode, not
+        // surplus.
+        let cfg = ResetSimConfig {
+            observe_registers: vec!["a".to_string()],
+            ..sample_config()
+        };
+        let valuations = vec![
+            RegisterValuation {
+                name: "a".to_string(),
+                value: 0,
+            },
+            RegisterValuation {
+                name: "b_extra".to_string(),
+                value: 0,
+            },
+        ];
+        assert!(missing_observed_registers(&cfg, &valuations).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires verilator + make installed; run with --ignored when available"]
+    fn run_reset_simulation_returns_post_reset_counter_value() {
+        // End-to-end runner test on a small synchronous counter:
+        // - reset is active-low, held for 1 cycle (counter → 0).
+        // - settle 2 cycles deasserted (counter → 2).
+        // - observe `count`; expect value 2.
+        let bin = locate_verilator().expect("verilator must be installed for this test");
+        let tmp = VerilatorTempDir::new().expect("tempdir");
+        let sv_path = tmp.path().join("simple_counter.sv");
+        std::fs::write(
+            &sv_path,
+            concat!(
+                "module simple_counter (\n",
+                "    input wire clk,\n",
+                "    input wire rst_n,\n",
+                "    output reg [3:0] count\n",
+                ");\n",
+                "    always @(posedge clk or negedge rst_n) begin\n",
+                "        if (!rst_n) count <= 4'd0;\n",
+                "        else count <= count + 4'd1;\n",
+                "    end\n",
+                "endmodule\n",
+            ),
+        )
+        .expect("write sv");
+
+        let cfg = ResetSimConfig {
+            top: "simple_counter".to_string(),
+            clock_signal: "clk".to_string(),
+            reset_signal: "rst_n".to_string(),
+            reset_asserted: 0,
+            hold_cycles: 1,
+            settle_cycles: 2,
+            observe_registers: vec!["count".to_string()],
+        };
+        let base = VerilatorOptions::default();
+
+        let valuations = run_reset_simulation(&bin.path, &base, &sv_path, &cfg, tmp.path())
+            .expect("run_reset_simulation must succeed");
+        assert_eq!(valuations.len(), 1);
+        assert_eq!(valuations[0].name, "count");
+        assert_eq!(
+            valuations[0].value, 2,
+            "after 1-cycle reset + 2 settle cycles, the counter must read 2; got {valuations:?}"
+        );
     }
 }
