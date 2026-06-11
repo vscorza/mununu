@@ -1293,6 +1293,41 @@ fn enumerate_and_blast(
     // arrives). Strictly additive — never replaces existing entries.
     apply_btor2_init_seeding(file, &state_meta, &symbols, &mut cell_domains);
 
+    // R-S2b.6 (§Phase 9 §9.1) — Verilator reset-simulation seeding.
+    // Fires when the sidecar declares a `simulate_reset` block AND
+    // the caller provided `AdapterOptions::sv_source_path` AND a
+    // Verilator binary is discoverable. On any precondition failing
+    // (no sidecar, no SV path, sidecar parse error, no simulate_reset
+    // block), the labeled-break exits the block cheaply — falls
+    // through silently. See `apply_simulate_reset_seeding` for the
+    // full graceful-fallback contract once the simulation does run.
+    'simulate_reset_seed: {
+        let Some(json) = &options.sidecar_json else {
+            break 'simulate_reset_seed;
+        };
+        let Some(sv_path) = &options.sv_source_path else {
+            break 'simulate_reset_seed;
+        };
+        let Ok(ann) =
+            serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+        else {
+            break 'simulate_reset_seed;
+        };
+        let Some(sim_decl) = &ann.simulate_reset else {
+            break 'simulate_reset_seed;
+        };
+        let sim_config = sim_decl.to_reset_sim_config(ann.module.clone());
+        let nid_widths: Vec<(Nid, u32)> = state_meta.iter().map(|sm| (sm.nid, sm.width)).collect();
+        apply_simulate_reset_seeding(
+            &sim_config,
+            sv_path,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+            warnings,
+        );
+    }
+
     let cells = CellEnumeration::build(&state_meta, &cell_domains);
 
     // Phase 1.6: per-input sidecar resolution. The sidecar already
@@ -2773,13 +2808,9 @@ fn apply_btor2_init_seeding(
 /// downstream predicate-cube partition; it cannot remove behaviour.
 /// No `// SOUNDNESS:` annotation needed beyond R-S2a's existing one.
 ///
-/// **Staged shipping**: R-S2b.4 lands the helper ahead of R-S2b.5
-/// (sidecar `simulate_reset` field) and R-S2b.6 (CLI flag +
-/// orchestration call site). Until the orchestration is wired the
-/// helper has only test callers — same staged-API pattern the R.6
-/// evaluator-helpers used during the R.6.1 → R.6.6 multi-session
-/// arc. The `#[allow(dead_code)]` annotation comes off in R-S2b.6.
-#[allow(dead_code)]
+/// R-S2b.6 (2026-06-11) — `apply_simulate_reset_seeding` (below)
+/// is the production call site; the staged `#[allow(dead_code)]`
+/// from R-S2b.4's first shipping commit was removed in R-S2b.6.
 pub(crate) fn apply_reset_simulation_seeding(
     valuations: &[crate::adapter::verilator::RegisterValuation],
     nid_widths: &[(Nid, u32)],
@@ -2828,6 +2859,129 @@ pub(crate) fn apply_reset_simulation_seeding(
             None => fd.variants = Some(vec![variant_name]),
         }
     }
+}
+
+/// R-S2b.6 (2026-06-11) — orchestrates the Verilator reset
+/// simulation + bit-blaster seeding. Production call site for
+/// R-S2b.4's [`apply_reset_simulation_seeding`].
+///
+/// **Inputs**:
+/// - `sim_config`: from `SvAnnotation::simulate_reset.as_ref().map(|s| s.to_reset_sim_config(module.clone()))`.
+/// - `sv_source_path`: from `AdapterOptions::sv_source_path`.
+/// - `state_meta`, `symbols`, `cell_domains`: as built upstream
+///   in `translate()`.
+/// - `warnings`: receives soundness / fallback notices.
+///
+/// **Behaviour**:
+/// 1. Calls [`crate::adapter::verilator::locate_verilator`]. On
+///    `Err` (binary absent), pushes an informational
+///    `AdapterWarning` listing the fallback strategies and
+///    returns without seeding. This is the **graceful-fallback**
+///    path — Verilator is optional at runtime; missing it must
+///    never break the build.
+/// 2. On `Ok`, allocates a per-call [`crate::adapter::verilator::VerilatorTempDir`],
+///    calls [`crate::adapter::verilator::run_reset_simulation`],
+///    and on success feeds the resulting `Vec<RegisterValuation>`
+///    to `apply_reset_simulation_seeding`. The tempdir drops at
+///    the end of this function (unless `MUNUNU_KEEP_VERILATOR_TMP=1`).
+/// 3. On `run_reset_simulation` `Err` (validation / compile /
+///    run / parse / missing-observed-register), pushes an
+///    `AdapterWarning` with the error message and returns. The
+///    bit-blaster continues with the cell_domains it had before
+///    the simulation attempt — no half-seeded state.
+///
+/// **Soundness**: same posture as `apply_reset_simulation_seeding`.
+/// The seeded value is a witness — it lies inside the cell's full
+/// admissible set by construction. Adding a new EnumValues
+/// variant only refines the downstream predicate-cube partition;
+/// it cannot remove behaviour. Verilator-absent is sound by
+/// fall-through (other Phase 9 strategies still apply).
+pub(crate) fn apply_simulate_reset_seeding(
+    sim_config: &crate::adapter::verilator::ResetSimConfig,
+    sv_source_path: &std::path::Path,
+    nid_widths: &[(Nid, u32)],
+    symbols: &std::collections::HashMap<i64, String>,
+    cell_domains: &mut CellDomainMap,
+    warnings: &mut Vec<AdapterWarning>,
+) {
+    let _bin = match crate::adapter::verilator::locate_verilator() {
+        Ok(b) => b,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S2b.6: sidecar declared `simulate_reset` but Verilator is not \
+                     discoverable ({}); skipping reset-simulation seeding. Other Phase 9 \
+                     strategies (R-S5 type-driven, R-S7 property-syntactic, R-S3 case-literal) \
+                     still apply. Install Verilator (`brew install verilator` / \
+                     `apt install verilator`) or set MUNUNU_VERILATOR_PATH to enable.",
+                    e.message
+                ),
+                location: None,
+            });
+            return;
+        }
+    };
+
+    let tmp = match crate::adapter::verilator::VerilatorTempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S2b.6: failed to create Verilator tempdir: {}; skipping \
+                     reset-simulation seeding.",
+                    e.message
+                ),
+                location: None,
+            });
+            return;
+        }
+    };
+
+    let base_opts = crate::adapter::verilator::VerilatorOptions::default();
+    match crate::adapter::verilator::run_reset_simulation(
+        &_bin.path,
+        &base_opts,
+        sv_source_path,
+        sim_config,
+        tmp.path(),
+    ) {
+        Ok(valuations) => {
+            let before = cell_domains_value_count(cell_domains);
+            apply_reset_simulation_seeding(&valuations, nid_widths, symbols, cell_domains);
+            let after = cell_domains_value_count(cell_domains);
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S2b.6: reset-simulation seeded {observed} register valuation(s); \
+                     added {added} new EnumValues discriminator(s) to cell_domains \
+                     (before={before}, after={after}).",
+                    observed = valuations.len(),
+                    added = after.saturating_sub(before),
+                ),
+                location: None,
+            });
+        }
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S2b.6: reset-simulation failed: {}; skipping seeding. \
+                     Other Phase 9 strategies still apply.",
+                    e.message
+                ),
+                location: None,
+            });
+        }
+    }
+}
+
+/// R-S2b.6 helper — count the total number of value_map entries
+/// across every cell. Used to summarize how many discriminators
+/// the seeding step added (before vs after the apply call).
+fn cell_domains_value_count(cell_domains: &CellDomainMap) -> usize {
+    cell_domains.values().map(|(_, vm)| vm.len()).sum()
 }
 
 /// R-S2a helper — resolve a BTOR2 NID to its constant `u64` value if
@@ -5362,5 +5516,165 @@ mod tests {
             !value_map_a.iter().any(|(_, v)| *v == 7),
             "valuation for `b` must not leak into cell `a`"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S2b.6 tests — translate() integration + graceful fallback
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r_s2b_6_translate_no_op_when_sidecar_omits_simulate_reset() {
+        // No simulate_reset block → R-S2b.6 must skip cleanly
+        // without spawning Verilator and without emitting any
+        // R-S2b.6 warning.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test"
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            sv_source_path: Some(std::path::PathBuf::from("/nonexistent.sv")),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        assert!(
+            !out.warnings.iter().any(|w| w.message.contains("R-S2b.6")),
+            "no R-S2b.6 warning when sidecar omits simulate_reset; got: {:?}",
+            out.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn r_s2b_6_translate_no_op_when_sv_source_path_missing() {
+        // simulate_reset present but sv_source_path=None → must
+        // skip silently (no SV to feed Verilator).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "simulate_reset": {
+                "clock_signal": "clk",
+                "reset_signal": "rst",
+                "reset_asserted": 1,
+                "hold_cycles": 1,
+                "observe_registers": ["q"]
+            }
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            // sv_source_path intentionally omitted.
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        assert!(
+            !out.warnings.iter().any(|w| w.message.contains("R-S2b.6")),
+            "no R-S2b.6 warning when sv_source_path is absent; got: {:?}",
+            out.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn r_s2b_6_translate_emits_warning_when_verilator_absent() {
+        // simulate_reset + sv_source_path both set, but Verilator
+        // is forced absent via env var. Translate must succeed AND
+        // emit the R-S2b.6 "Verilator not discoverable" warning
+        // (graceful fallback).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "simulate_reset": {
+                "clock_signal": "clk",
+                "reset_signal": "rst",
+                "reset_asserted": 1,
+                "hold_cycles": 1,
+                "observe_registers": ["q"]
+            }
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            sv_source_path: Some(std::path::PathBuf::from("/nonexistent.sv")),
+            ..Default::default()
+        };
+
+        // SAFETY: required for env-var manipulation in tests; the
+        // value is restored before the test returns.
+        let original = std::env::var("MUNUNU_VERILATOR_PATH").ok();
+        unsafe {
+            std::env::set_var(
+                "MUNUNU_VERILATOR_PATH",
+                "/nonexistent/path/to/verilator/binary",
+            );
+        }
+        let out = translate(src, &opts).expect("translate");
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("MUNUNU_VERILATOR_PATH", v),
+                None => std::env::remove_var("MUNUNU_VERILATOR_PATH"),
+            }
+        }
+
+        let r_s2b_6_warning = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("R-S2b.6"))
+            .expect("R-S2b.6 must emit a warning when Verilator is absent");
+        assert!(
+            r_s2b_6_warning.message.contains("not discoverable")
+                || r_s2b_6_warning.message.contains("Verilator"),
+            "warning must mention Verilator absence; got: {}",
+            r_s2b_6_warning.message
+        );
+    }
+
+    #[test]
+    fn r_s2b_6_translate_no_op_when_sidecar_malformed() {
+        // sidecar_json is non-empty but doesn't parse as
+        // SvAnnotation. Translate must continue (the unrelated
+        // BTOR2 lifter doesn't depend on the sidecar for the
+        // minimal fixture below) and not emit a panic / R-S2b.6
+        // warning.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let opts = AdapterOptions {
+            sidecar_json: Some("{ not valid json at all".to_string()),
+            sv_source_path: Some(std::path::PathBuf::from("/nonexistent.sv")),
+            ..Default::default()
+        };
+        // Translate may fail for unrelated reasons (the malformed
+        // sidecar might trip some other parser), but R-S2b.6's
+        // labeled-block must break early, not propagate the JSON
+        // error. Either way: no R-S2b.6 warning, no panic.
+        let result = translate(src, &opts);
+        if let Ok(out) = result {
+            assert!(
+                !out.warnings.iter().any(|w| w.message.contains("R-S2b.6")),
+                "no R-S2b.6 warning on malformed sidecar"
+            );
+        }
     }
 }

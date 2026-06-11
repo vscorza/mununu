@@ -125,6 +125,24 @@ pub struct AdapterOptions {
     /// AdapterOptions construction site. Default `false` — preserves
     /// legacy full-bit-blast behaviour for unsidecared cells.
     pub smart_init_defaults: bool,
+
+    /// R-S2b.6 (§Phase 9 §9.1, 2026-06-11) — path to the original
+    /// SystemVerilog source. When `Some` AND the sidecar declares
+    /// a `simulate_reset` block AND a Verilator binary is
+    /// discoverable, the BTOR2 bit-blaster runs a short concrete
+    /// reset simulation via
+    /// [`crate::adapter::verilator::run_reset_simulation`] and
+    /// feeds the result through
+    /// [`crate::adapter::btor2::bit_blast::apply_reset_simulation_seeding`].
+    ///
+    /// The path is populated by the caller (CLI / API / yosys
+    /// driver) — the BTOR2 bit-blaster does not derive it.
+    /// `None` (default) preserves the legacy "no simulation seeding"
+    /// behaviour; Verilator is also skipped silently when the
+    /// binary is absent (graceful fallback to other Phase 9
+    /// strategies). See R-S2b.4 / R-S2b.5 for the prerequisite
+    /// helpers + sidecar schema.
+    pub sv_source_path: Option<std::path::PathBuf>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.
