@@ -2740,6 +2740,96 @@ fn apply_btor2_init_seeding(
     }
 }
 
+/// R-S2b.4 (2026-06-11) — apply the reset-simulation seeding strategy
+/// to a `CellDomainMap`. Walks every [`RegisterValuation`] produced by
+/// [`crate::adapter::verilator::run_reset_simulation`]; for cells whose
+/// signal name matches a valuation AND whose sidecar abstraction is
+/// `EnumValues`, appends the observed value to the value_map +
+/// variants if not already present.
+///
+/// Mirrors [`apply_btor2_init_seeding`] in shape: same `EnumValues`
+/// gate, same `(variant_name, value)` augmentation, same
+/// non-destructive "skip if already known" check. The only difference
+/// is the value source — instead of resolving a BTOR2 `Init` line's
+/// constant, R-S2b.4 reads the value from a `RegisterValuation` the
+/// caller obtained from a Verilator reset simulation.
+///
+/// **Signal-name matching**: reverse-lookup via `symbols` (NID →
+/// name). Valuations whose name doesn't match any state cell are
+/// silently skipped — common cause is a Yosys rename
+/// (`reg_a` → `reg_a_q`) the user can fix in the sidecar.
+/// R-S2b.6's CLI flag will surface a diagnostic warning naming
+/// unmatched valuations.
+///
+/// **Width clamping**: each valuation's `u64 value` is masked to the
+/// matched cell's BTOR2 width via `state_meta` lookup. Bits above the
+/// cell width are discarded silently (Verilator may sign-extend on
+/// the printf cast).
+///
+/// **Soundness**: same posture as R-S2a. The seeded value is a
+/// witness — it lies inside the cell's full admissible set by
+/// construction (the simulation ran the actual gate-level model).
+/// Adding it as a named `EnumValues` variant only refines the
+/// downstream predicate-cube partition; it cannot remove behaviour.
+/// No `// SOUNDNESS:` annotation needed beyond R-S2a's existing one.
+///
+/// **Staged shipping**: R-S2b.4 lands the helper ahead of R-S2b.5
+/// (sidecar `simulate_reset` field) and R-S2b.6 (CLI flag +
+/// orchestration call site). Until the orchestration is wired the
+/// helper has only test callers — same staged-API pattern the R.6
+/// evaluator-helpers used during the R.6.1 → R.6.6 multi-session
+/// arc. The `#[allow(dead_code)]` annotation comes off in R-S2b.6.
+#[allow(dead_code)]
+pub(crate) fn apply_reset_simulation_seeding(
+    valuations: &[crate::adapter::verilator::RegisterValuation],
+    nid_widths: &[(Nid, u32)],
+    symbols: &std::collections::HashMap<i64, String>,
+    cell_domains: &mut CellDomainMap,
+) {
+    // NID → bit-width, for the value-masking step. The caller passes
+    // a `&[(Nid, u32)]` slice (not the private `StateMeta` struct)
+    // so the helper's signature does not leak module-private types.
+    let nid_to_width: std::collections::HashMap<Nid, u32> = nid_widths.iter().copied().collect();
+    // signal-name → NID, for the valuation-to-cell lookup.
+    let name_to_nid: std::collections::HashMap<&str, i64> = symbols
+        .iter()
+        .map(|(nid, name)| (name.as_str(), *nid))
+        .collect();
+
+    for valuation in valuations {
+        let Some(&nid) = name_to_nid.get(valuation.name.as_str()) else {
+            continue;
+        };
+        let Some((fd, value_map)) = cell_domains.get_mut(&nid) else {
+            continue;
+        };
+        if !matches!(
+            fd.abstraction,
+            crate::adapter::domain::AbstractionType::EnumValues
+        ) {
+            continue;
+        }
+        let Some(width) = nid_to_width.get(&nid) else {
+            continue;
+        };
+        let masked = if *width >= 64 {
+            valuation.value
+        } else {
+            valuation.value & ((1u64 << *width) - 1)
+        };
+        let masked_signed = masked as i64;
+        if value_map.iter().any(|(_, v)| *v == masked_signed) {
+            continue;
+        }
+        let variant_name = format!("{}_{}", valuation.name, masked_signed);
+        value_map.push((variant_name.clone(), masked_signed));
+        match &mut fd.variants {
+            Some(v) => v.push(variant_name),
+            None => fd.variants = Some(vec![variant_name]),
+        }
+    }
+}
+
 /// R-S2a helper — resolve a BTOR2 NID to its constant `u64` value if
 /// it's one of the simple constant nodes mununu's bit-blaster
 /// recognises: `Node::Const { value: Binary/Decimal/Hex }`, or one
@@ -5059,6 +5149,218 @@ mod tests {
             with_uf.get("cnt").copied(),
             Some(0),
             "with UF wrap on mul_inst, cnt should stay at 0 (UF substitutes zero)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S2b.4 (§Phase 9 §9.1) — reset-simulation seeding helper
+    // ─────────────────────────────────────────────────────────────
+
+    use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
+    use crate::adapter::verilator::RegisterValuation;
+
+    fn enum_field(name: &str, variants: Vec<&str>) -> FieldDomain {
+        FieldDomain {
+            name: name.to_string(),
+            abstraction: AbstractionType::EnumValues,
+            bound: None,
+            lower_bound: None,
+            variants: Some(variants.into_iter().map(|s| s.to_string()).collect()),
+            initial: AbstractValue::Counter(0),
+        }
+    }
+
+    fn counter_field(name: &str, bound: i64) -> FieldDomain {
+        FieldDomain {
+            name: name.to_string(),
+            abstraction: AbstractionType::BoundedCounter,
+            bound: Some(bound),
+            lower_bound: Some(0),
+            variants: None,
+            initial: AbstractValue::Counter(0),
+        }
+    }
+
+    #[test]
+    fn r_s2b_4_seeds_observed_value_when_sidecar_enum_lacks_it() {
+        // signal `q` declared as enum with variants {Q_0: 0}.
+        // Verilator reset simulation observed q=3.
+        // R-S2b.4 must append (q_3, 3) to the value_map.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (enum_field("q", vec!["Q_0"]), vec![("Q_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        let valuations = vec![RegisterValuation {
+            name: "q".to_string(),
+            value: 3,
+        }];
+
+        apply_reset_simulation_seeding(&valuations, &nid_widths, &symbols, &mut cell_domains);
+
+        let (fd, value_map) = cell_domains.get(&42).expect("cell still present");
+        assert_eq!(
+            value_map,
+            &vec![("Q_0".to_string(), 0), ("q_3".to_string(), 3)]
+        );
+        assert_eq!(
+            fd.variants.as_deref(),
+            Some(vec!["Q_0".to_string(), "q_3".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn r_s2b_4_no_op_when_observed_value_already_in_value_map() {
+        // value_map already covers q=3; R-S2b.4 must skip
+        // (additive, dedupes).
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (
+                enum_field("q", vec!["Q_0", "Q_3"]),
+                vec![("Q_0".to_string(), 0), ("Q_3".to_string(), 3)],
+            ),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        let valuations = vec![RegisterValuation {
+            name: "q".to_string(),
+            value: 3,
+        }];
+
+        apply_reset_simulation_seeding(&valuations, &nid_widths, &symbols, &mut cell_domains);
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        assert_eq!(
+            value_map.len(),
+            2,
+            "no duplicate added; value_map={value_map:?}"
+        );
+    }
+
+    #[test]
+    fn r_s2b_4_skips_signals_without_matching_state_cell() {
+        // Valuation mentions `unknown_reg`, which has no sidecar
+        // entry / no symbol mapping. R-S2b.4 must silently skip
+        // (the typical cause is a Yosys rename or a typo; R-S2b.6
+        // will surface a CLI warning).
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (enum_field("q", vec!["Q_0"]), vec![("Q_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        let valuations = vec![RegisterValuation {
+            name: "unknown_reg".to_string(),
+            value: 5,
+        }];
+
+        apply_reset_simulation_seeding(&valuations, &nid_widths, &symbols, &mut cell_domains);
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        assert_eq!(
+            value_map,
+            &vec![("Q_0".to_string(), 0)],
+            "unmatched valuation must be silently skipped"
+        );
+    }
+
+    #[test]
+    fn r_s2b_4_skips_non_enum_abstractions() {
+        // signal `counter` declared as BoundedCounter. R-S2b.4
+        // only widens EnumValues (mirrors R-S2a) — counters
+        // already use a different value-set construction.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(7, (counter_field("counter", 15), Vec::new()));
+        let nid_widths: [(Nid, u32); 1] = [(7, 4)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(7i64, "counter".to_string());
+        let valuations = vec![RegisterValuation {
+            name: "counter".to_string(),
+            value: 3,
+        }];
+
+        apply_reset_simulation_seeding(&valuations, &nid_widths, &symbols, &mut cell_domains);
+
+        let (fd, value_map) = cell_domains.get(&7).expect("cell still present");
+        assert!(
+            matches!(fd.abstraction, AbstractionType::BoundedCounter),
+            "abstraction unchanged"
+        );
+        assert!(
+            value_map.is_empty(),
+            "BoundedCounter cells must not receive R-S2b.4 widening; got {value_map:?}"
+        );
+    }
+
+    #[test]
+    fn r_s2b_4_masks_value_to_cell_width() {
+        // 4-bit signal observed as 0xFF (8 bits) — R-S2b.4 must
+        // mask to the cell's width (4 bits), giving 0xF = 15.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            11,
+            (enum_field("x", vec!["X_0"]), vec![("X_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(11, 4)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(11i64, "x".to_string());
+        let valuations = vec![RegisterValuation {
+            name: "x".to_string(),
+            value: 0xFF,
+        }];
+
+        apply_reset_simulation_seeding(&valuations, &nid_widths, &symbols, &mut cell_domains);
+
+        let (_, value_map) = cell_domains.get(&11).expect("cell still present");
+        // Expect the masked value (15) to have been appended, not 255.
+        assert!(value_map.iter().any(|(_, v)| *v == 15));
+        assert!(value_map.iter().all(|(_, v)| *v != 0xFF));
+    }
+
+    #[test]
+    fn r_s2b_4_handles_multiple_valuations_independently() {
+        // Two signals each get one new value. Both should land in
+        // their respective cells without interfering.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            100,
+            (enum_field("a", vec!["A_0"]), vec![("A_0".to_string(), 0)]),
+        );
+        cell_domains.insert(
+            200,
+            (enum_field("b", vec!["B_0"]), vec![("B_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 2] = [(100, 8), (200, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(100i64, "a".to_string());
+        symbols.insert(200i64, "b".to_string());
+        let valuations = vec![
+            RegisterValuation {
+                name: "a".to_string(),
+                value: 1,
+            },
+            RegisterValuation {
+                name: "b".to_string(),
+                value: 7,
+            },
+        ];
+
+        apply_reset_simulation_seeding(&valuations, &nid_widths, &symbols, &mut cell_domains);
+
+        let (_, value_map_a) = cell_domains.get(&100).expect("cell a");
+        let (_, value_map_b) = cell_domains.get(&200).expect("cell b");
+        assert!(value_map_a.iter().any(|(_, v)| *v == 1));
+        assert!(value_map_b.iter().any(|(_, v)| *v == 7));
+        assert!(
+            !value_map_a.iter().any(|(_, v)| *v == 7),
+            "valuation for `b` must not leak into cell `a`"
         );
     }
 }
