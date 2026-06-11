@@ -723,6 +723,7 @@ fn build_per_module_annotation(
         discovered_values,
         parameters: entry.parameters.clone(),
         reset_sequence: None,
+        simulate_reset: None,
         memories: Vec::new(),
         uf_wrap: Vec::new(),
         uf_unwrap: Vec::new(),

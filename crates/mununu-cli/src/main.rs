@@ -1962,6 +1962,7 @@ fn btor2_discover(args: Btor2DiscoverArgs) -> Result<(), String> {
             discovered_values: std::collections::HashMap::new(),
             parameters: std::collections::HashMap::new(),
             reset_sequence: None,
+            simulate_reset: None,
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3134,6 +3135,7 @@ fn sv_init(args: SvInitArgs) -> Result<(), String> {
             .map(|p| (p.name.clone(), p.default_value))
             .collect(),
         reset_sequence: None,
+        simulate_reset: None,
         memories: Vec::new(),
         uf_wrap: Vec::new(),
         uf_unwrap: Vec::new(),
@@ -3615,6 +3617,7 @@ fn sv_discover_multi(args: SvDiscoverArgs) -> Result<(), String> {
                 discovered_values: module_entry.discovered_values.clone(),
                 parameters: module_entry.parameters.clone(),
                 reset_sequence: None,
+                simulate_reset: None,
                 memories: Vec::new(),
                 uf_wrap: Vec::new(),
                 uf_unwrap: Vec::new(),

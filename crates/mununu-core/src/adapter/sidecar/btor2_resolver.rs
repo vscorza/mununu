@@ -112,6 +112,7 @@ mod tests {
             discovered_values: std::collections::HashMap::new(),
             parameters: std::collections::HashMap::new(),
             reset_sequence: None,
+            simulate_reset: None,
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),

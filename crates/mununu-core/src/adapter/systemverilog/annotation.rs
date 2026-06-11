@@ -84,6 +84,31 @@ pub struct SvAnnotation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_sequence: Option<ResetSequence>,
 
+    /// R-S2b.5 (§Phase 9 §9.1, 2026-06-11) — Verilator-driven
+    /// reset-simulation declaration. When set + Verilator
+    /// discoverable, R-S2b.6's orchestration runs a short concrete
+    /// simulation through Verilator, captures the post-reset
+    /// valuation of the declared `observe_registers`, and feeds
+    /// the result to the bit-blaster's R-S2b.4 seeding helper.
+    /// Verilator-absent falls back gracefully to other Phase 9
+    /// strategies (R-S5 / R-S7 / R-S3).
+    ///
+    /// Distinct from `reset_sequence` (R-Y6) — R-Y6 runs an
+    /// _abstract_ K-cycle reset hold inside the bit-blaster
+    /// (no external simulator) to settle the init state of
+    /// flip-flops behind a synchronizer; R-S2b.5 runs a
+    /// _concrete_ Verilator simulation to seed the abstraction
+    /// with observed register values. The two compose — a sidecar
+    /// may set both.
+    ///
+    /// Default `None` — preserves the legacy behaviour.
+    /// R-S2b.6's orchestration (queued under §Phase 11 §11.1
+    /// slot 3) is the consumer of this field; until that lands,
+    /// declarations here are accepted by the schema but have no
+    /// effect on the abstract model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulate_reset: Option<SimulateReset>,
+
     /// §Phase 10 §10.2 stage 2 — Memory-cell annotations. For each
     /// `$mem` / `$mem_v2` BTOR2 cell the user wants to abstract,
     /// declare its address-width, data-width, and abstraction strategy
@@ -226,6 +251,84 @@ impl Default for MemoryAbstraction {
     /// liveness modulo CEGAR refinement on KleeneBot verdicts.
     fn default() -> Self {
         Self::Uf
+    }
+}
+
+/// R-S2b.5 (§Phase 9 §9.1, 2026-06-11) — declaration of a
+/// Verilator-driven reset simulation, used by R-S2b's
+/// predicate-set seeding strategy. Mirrors
+/// [`crate::adapter::verilator::ResetSimConfig`] one-for-one
+/// minus the `top` field (which the sidecar already declares as
+/// `SvAnnotation::module`).
+///
+/// When this field is set on a sidecar AND a Verilator binary is
+/// discoverable, R-S2b.6's orchestration runs
+/// [`crate::adapter::verilator::run_reset_simulation`], feeds the
+/// resulting `Vec<RegisterValuation>` to
+/// [`crate::adapter::btor2::bit_blast::apply_reset_simulation_seeding`],
+/// and the seeded values land in the bit-blaster's `EnumValues`
+/// variant lists exactly the way R-S2a's BTOR2-init seeding
+/// already does. Verilator-absent falls back gracefully —
+/// downstream Phase 9 strategies (R-S5 type-driven, R-S7
+/// property-syntactic, R-S3 case-literal) still apply.
+///
+/// Default: omitted entirely (`Option::None`) — the simulation
+/// is opt-in per sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SimulateReset {
+    /// SV signal name for the clock. The testbench toggles it
+    /// `0 → 1 → 0` once per cycle. Typically `clk` / `clk_i` /
+    /// `clk_aon`.
+    pub clock_signal: String,
+    /// SV signal name for the reset. Held at `reset_asserted`
+    /// during the hold phase, then flipped to `1 - reset_asserted`
+    /// for the settle phase.
+    pub reset_signal: String,
+    /// Logical value driven on `reset_signal` during the hold
+    /// phase. Use `0` for active-low resets (`rst_n` / `rst_ni`)
+    /// and `1` for active-high (`rst`).
+    pub reset_asserted: u8,
+    /// Cycles to hold the reset asserted before deasserting.
+    /// Caliptra `soc_ifc_boot_fsm` needs 1; OpenTitan `uart_tx`
+    /// needs ~4 (the synchronizer chain + reset-domain ff).
+    pub hold_cycles: u32,
+    /// Cycles to run after deasserting reset before sampling
+    /// register valuations. Default `1` is sufficient for
+    /// the M.0–M.4 fixtures.
+    #[serde(default = "default_settle_cycles")]
+    pub settle_cycles: u32,
+    /// Register names (matching the SV declarations) to dump
+    /// after the settle phase. Order is preserved in the output
+    /// `Vec<RegisterValuation>` — `apply_reset_simulation_seeding`
+    /// resolves each by name against the BTOR2 symbols map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observe_registers: Vec<String>,
+}
+
+fn default_settle_cycles() -> u32 {
+    1
+}
+
+impl SimulateReset {
+    /// R-S2b.5 (2026-06-11) — convert the sidecar declaration to
+    /// the runner's [`crate::adapter::verilator::ResetSimConfig`].
+    /// Combines the sidecar's settings with the `top` module name
+    /// (which lives at the [`SvAnnotation`] top level, not on the
+    /// `SimulateReset` substruct).
+    ///
+    /// Pure helper — no I/O. Round-trips the field set without
+    /// loss. The runner then calls `config.validate()` before
+    /// invoking Verilator.
+    pub fn to_reset_sim_config(&self, top: String) -> crate::adapter::verilator::ResetSimConfig {
+        crate::adapter::verilator::ResetSimConfig {
+            top,
+            clock_signal: self.clock_signal.clone(),
+            reset_signal: self.reset_signal.clone(),
+            reset_asserted: self.reset_asserted,
+            hold_cycles: self.hold_cycles,
+            settle_cycles: self.settle_cycles,
+            observe_registers: self.observe_registers.clone(),
+        }
     }
 }
 
@@ -1865,6 +1968,7 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         discovered_values: HashMap::new(),
         parameters: HashMap::new(),
         reset_sequence: None,
+        simulate_reset: None,
         memories: Vec::new(),
         uf_wrap: Vec::new(),
         uf_unwrap: Vec::new(),
@@ -2474,6 +2578,7 @@ mod tests {
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
             reset_sequence: None,
+            simulate_reset: None,
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3109,6 +3214,7 @@ mod tests {
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
             reset_sequence: None,
+            simulate_reset: None,
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3173,6 +3279,7 @@ mod tests {
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
             reset_sequence: None,
+            simulate_reset: None,
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3186,5 +3293,168 @@ mod tests {
             !json.contains("uf_unwrap"),
             "empty uf_unwrap must be omitted from JSON; got {json}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S2b.5 (§Phase 9 §9.1) — SimulateReset serde + converter
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r_s2b_5_simulate_reset_round_trips_through_json() {
+        let json = r#"{
+            "clock_signal": "clk_i",
+            "reset_signal": "rst_ni",
+            "reset_asserted": 0,
+            "hold_cycles": 4,
+            "settle_cycles": 2,
+            "observe_registers": ["boot_fsm_ns", "wait_count"]
+        }"#;
+        let sim: SimulateReset = serde_json::from_str(json).expect("parse");
+        assert_eq!(sim.clock_signal, "clk_i");
+        assert_eq!(sim.reset_signal, "rst_ni");
+        assert_eq!(sim.reset_asserted, 0);
+        assert_eq!(sim.hold_cycles, 4);
+        assert_eq!(sim.settle_cycles, 2);
+        assert_eq!(
+            sim.observe_registers,
+            vec!["boot_fsm_ns".to_string(), "wait_count".to_string()]
+        );
+        let back = serde_json::to_string(&sim).expect("serialize");
+        let again: SimulateReset = serde_json::from_str(&back).expect("re-parse");
+        assert_eq!(again, sim);
+    }
+
+    #[test]
+    fn r_s2b_5_simulate_reset_settle_cycles_defaults_to_1_when_omitted() {
+        // R-S2b.3a's ResetSimConfig defaults settle_cycles to 1
+        // (sufficient for M.0–M.4 fixtures). The sidecar's serde
+        // default mirrors that.
+        let json = r#"{
+            "clock_signal": "clk",
+            "reset_signal": "rst",
+            "reset_asserted": 1,
+            "hold_cycles": 1,
+            "observe_registers": ["q"]
+        }"#;
+        let sim: SimulateReset = serde_json::from_str(json).expect("parse");
+        assert_eq!(sim.settle_cycles, 1);
+    }
+
+    #[test]
+    fn r_s2b_5_simulate_reset_observe_registers_defaults_to_empty_when_omitted() {
+        // observe_registers may legitimately be omitted in a draft
+        // sidecar (the user will fill it in later). The runner
+        // (R-S2b.3b) validates non-emptiness before invoking
+        // Verilator.
+        let json = r#"{
+            "clock_signal": "clk",
+            "reset_signal": "rst",
+            "reset_asserted": 1,
+            "hold_cycles": 1
+        }"#;
+        let sim: SimulateReset = serde_json::from_str(json).expect("parse");
+        assert!(sim.observe_registers.is_empty());
+    }
+
+    #[test]
+    fn r_s2b_5_simulate_reset_omits_empty_observe_registers_on_serialize() {
+        let sim = SimulateReset {
+            clock_signal: "clk".into(),
+            reset_signal: "rst".into(),
+            reset_asserted: 1,
+            hold_cycles: 1,
+            settle_cycles: 1,
+            observe_registers: Vec::new(),
+        };
+        let json = serde_json::to_string(&sim).expect("serialize");
+        assert!(
+            !json.contains("observe_registers"),
+            "empty observe_registers must be omitted from JSON; got {json}"
+        );
+    }
+
+    #[test]
+    fn r_s2b_5_sv_annotation_with_simulate_reset_loads() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "soc_ifc_boot_fsm",
+            "simulate_reset": {
+                "clock_signal": "clk_i",
+                "reset_signal": "rst_ni",
+                "reset_asserted": 0,
+                "hold_cycles": 1,
+                "settle_cycles": 1,
+                "observe_registers": ["boot_fsm_ns", "wait_count"]
+            }
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        let sim = ann.simulate_reset.as_ref().expect("simulate_reset present");
+        assert_eq!(sim.clock_signal, "clk_i");
+        assert_eq!(sim.hold_cycles, 1);
+        assert_eq!(sim.observe_registers.len(), 2);
+    }
+
+    #[test]
+    fn r_s2b_5_legacy_sidecar_without_simulate_reset_loads_with_none() {
+        // Strict additivity — existing fixtures' sidecars continue
+        // to work, with simulate_reset defaulting to None.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "legacy"
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse legacy");
+        assert!(ann.simulate_reset.is_none());
+    }
+
+    #[test]
+    fn r_s2b_5_simulate_reset_omitted_on_serialize_when_none() {
+        let ann = SvAnnotation {
+            schema: None,
+            module: "test".into(),
+            source: None,
+            signals: Vec::new(),
+            inputs: Vec::new(),
+            controllable: Vec::new(),
+            properties: Vec::new(),
+            discovered_values: HashMap::new(),
+            parameters: HashMap::new(),
+            reset_sequence: None,
+            simulate_reset: None,
+            memories: Vec::new(),
+            uf_wrap: Vec::new(),
+            uf_unwrap: Vec::new(),
+        };
+        let json = serde_json::to_string(&ann).expect("serialize");
+        assert!(
+            !json.contains("simulate_reset"),
+            "None simulate_reset must be omitted from JSON; got {json}"
+        );
+    }
+
+    #[test]
+    fn r_s2b_5_to_reset_sim_config_carries_all_fields() {
+        let sim = SimulateReset {
+            clock_signal: "clk_i".into(),
+            reset_signal: "rst_ni".into(),
+            reset_asserted: 0,
+            hold_cycles: 3,
+            settle_cycles: 2,
+            observe_registers: vec!["a".into(), "b".into()],
+        };
+        let cfg = sim.to_reset_sim_config("soc_ifc_boot_fsm".into());
+        assert_eq!(cfg.top, "soc_ifc_boot_fsm");
+        assert_eq!(cfg.clock_signal, "clk_i");
+        assert_eq!(cfg.reset_signal, "rst_ni");
+        assert_eq!(cfg.reset_asserted, 0);
+        assert_eq!(cfg.hold_cycles, 3);
+        assert_eq!(cfg.settle_cycles, 2);
+        assert_eq!(
+            cfg.observe_registers,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // The resulting config validates cleanly (sanity check that
+        // a well-formed sidecar produces a well-formed runner
+        // input — round-trips into R-S2b.3a's validator).
+        assert!(cfg.validate().is_ok());
     }
 }
