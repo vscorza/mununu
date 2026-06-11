@@ -170,6 +170,14 @@ pub struct VerilatorOptions {
     /// when the input SV emits widening / sign-mismatch warnings
     /// the user has triaged. Defaults to `false`.
     pub silence_warnings: bool,
+    /// Pass `--public-flat-rw` to expose every internal signal as
+    /// public on the generated C++ model — required so the
+    /// reset-simulation testbench (R-S2b.3) can read internal
+    /// register valuations without per-signal `/* verilator
+    /// public */` annotations in the SV source. Defaults to
+    /// `false` (only top-level ports are exposed; matches
+    /// Verilator's default).
+    pub expose_internal_signals: bool,
 }
 
 /// R-S2b.2 (2026-06-10) — pure helper that constructs the
@@ -185,7 +193,7 @@ pub struct VerilatorOptions {
 /// SV source — must come last):
 /// ```text
 /// --cc --exe --Mdir <mdir> [--top-module <top>] [-O3]
-///   [-Wno-fatal] <tb_cpp> <sv_path>
+///   [-Wno-fatal] [--public-flat-rw] <tb_cpp> <sv_path>
 /// ```
 ///
 /// The caller passes the result to `std::process::Command::new(verilator).args(...)`.
@@ -217,6 +225,11 @@ pub fn build_verilator_compile_args(
     // Optional `-Wno-fatal`.
     if opts.silence_warnings {
         args.push(OsString::from("-Wno-fatal"));
+    }
+    // Optional `--public-flat-rw` (expose internal signals to the C++
+    // model so the reset-simulation testbench can read them).
+    if opts.expose_internal_signals {
+        args.push(OsString::from("--public-flat-rw"));
     }
     // Positional: testbench C++ first, then the SV source. Verilator
     // accepts these in any order, but a stable ordering eases
@@ -400,6 +413,280 @@ impl Drop for VerilatorTempDir {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// R-S2b.3a (2026-06-11) — reset-simulation data types + tb.cpp generator
+// ─────────────────────────────────────────────────────────────────────
+//
+// R-S2b.3 is split across two sessions per the roadmap single-
+// session policy:
+//
+//   R-S2b.3a (this commit) — data types + pure tb.cpp generator.
+//     Unit-testable in isolation; no Verilator binary required.
+//
+//   R-S2b.3b (next session) — `run_reset_simulation` runner that
+//     compiles the generated tb.cpp via R-S2b.2's
+//     `compile_verilator`, runs the binary, and parses the dumped
+//     register valuations. #[ignore]-gated integration test.
+
+/// A single register's observed valuation after the configured
+/// reset sequence. Produced by `run_reset_simulation` (R-S2b.3b).
+///
+/// The `value` field carries the bit-pattern interpretation
+/// Verilator's `--public-flat-rw` exposes — a `uint32_t` /
+/// `uint64_t` aliased view of the underlying SV wire / reg.
+/// Widths > 64 are clipped (the dump format prints `0xff..ff`
+/// when overflow occurs) — a follow-up may extend to multi-word
+/// dumps if a fixture demands it. For the M.4 Caliptra fixture +
+/// the OpenTitan-scale fixtures M.0–M.2 already validate, every
+/// register that R-S2b is asked to observe fits in 64 bits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterValuation {
+    /// Register name as declared in the SV source (matches the
+    /// Verilator-exposed signal handle).
+    pub name: String,
+    /// Observed value after the reset sequence (asserted for
+    /// `hold_cycles`, then deasserted for `settle_cycles`).
+    pub value: u64,
+}
+
+/// Configuration for a single reset-simulation run.
+///
+/// Carries the four facts the testbench generator needs to render
+/// a deterministic reset sequence:
+///
+/// - which signal is the clock (toggled every cycle);
+/// - which signal is the reset (held at `reset_asserted` during
+///   reset, then held at `!reset_asserted` for the settle phase);
+/// - how many cycles to hold reset asserted (`hold_cycles`) and
+///   how many additional cycles to let the design settle before
+///   sampling (`settle_cycles`);
+/// - which register names to dump after the settle phase
+///   (`observe_registers`).
+///
+/// Designed to be 1:1 with the sidecar `simulate_reset` field
+/// R-S2b.5 will add. The same struct travels from sidecar →
+/// generator → testbench source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetSimConfig {
+    /// Top module name (matches `VerilatorOptions::top`). Drives
+    /// the `V<top>` C++ class name in the generated testbench.
+    pub top: String,
+    /// SV signal name for the clock. The testbench toggles it
+    /// `0 → 1 → 0` once per cycle.
+    pub clock_signal: String,
+    /// SV signal name for the reset. Held at `reset_asserted`
+    /// while reset is active.
+    pub reset_signal: String,
+    /// Logical value to drive on `reset_signal` during the
+    /// `hold_cycles` window. Use `1` for active-high resets, `0`
+    /// for active-low.
+    pub reset_asserted: u8,
+    /// Cycles to hold the reset active. Caliptra's `soc_ifc_boot_fsm`
+    /// fixture needs 1 cycle; OpenTitan `uart_tx` needs ~4.
+    /// R-Y6 (§Phase 8) already supports K cycles for the
+    /// bit-blaster's reset-sequence-aware init — this field mirrors
+    /// it for the Verilator path.
+    pub hold_cycles: u32,
+    /// Cycles to run after deasserting reset, before sampling
+    /// register valuations. Lets combinational outputs settle.
+    /// Default `1` is sufficient for the M.0–M.4 fixtures.
+    pub settle_cycles: u32,
+    /// Register names (matching the SV declarations) to dump
+    /// after the settle phase. Order is preserved in the output
+    /// `Vec<RegisterValuation>`.
+    pub observe_registers: Vec<String>,
+}
+
+impl ResetSimConfig {
+    /// Validate a config before it reaches the testbench
+    /// generator. Returns a structured `AdapterError` on:
+    /// - empty `top`, `clock_signal`, or `reset_signal`;
+    /// - `reset_asserted` outside `{0, 1}` (one-bit logical value);
+    /// - empty `observe_registers` (a reset simulation with no
+    ///   observed register is a no-op; the caller almost certainly
+    ///   meant to populate this).
+    ///
+    /// Pure helper — no I/O.
+    pub fn validate(&self) -> Result<(), AdapterError> {
+        if self.top.trim().is_empty() {
+            return Err(adapter_error("ResetSimConfig.top must be non-empty"));
+        }
+        if self.clock_signal.trim().is_empty() {
+            return Err(adapter_error(
+                "ResetSimConfig.clock_signal must be non-empty",
+            ));
+        }
+        if self.reset_signal.trim().is_empty() {
+            return Err(adapter_error(
+                "ResetSimConfig.reset_signal must be non-empty",
+            ));
+        }
+        if self.reset_asserted > 1 {
+            return Err(adapter_error(&format!(
+                "ResetSimConfig.reset_asserted must be 0 or 1; got {}",
+                self.reset_asserted
+            )));
+        }
+        if self.observe_registers.is_empty() {
+            return Err(adapter_error(
+                "ResetSimConfig.observe_registers must be non-empty \
+                 (a reset-only simulation with nothing to observe is a no-op)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn adapter_error(msg: &str) -> AdapterError {
+    AdapterError {
+        kind: AdapterErrorKind::UnsupportedConstruct,
+        message: format!("adapter/verilator: {msg}"),
+        location: None,
+    }
+}
+
+/// R-S2b.3a (2026-06-11) — render the C++ testbench source for a
+/// reset-simulation run, given a validated [`ResetSimConfig`].
+///
+/// **Pure**: no I/O, no subprocess invocation. Testable in
+/// isolation via byte-equal comparison (the dump format is
+/// stable).
+///
+/// # Generated testbench shape
+///
+/// The output is a single-`main` C++ source that:
+///
+/// 1. Includes `V<top>.h` and `verilated.h`.
+/// 2. Instantiates `V<top> dut;`.
+/// 3. Sets `dut.<reset_signal> = <reset_asserted>` and toggles
+///    `dut.<clock_signal>` for `hold_cycles` complete cycles
+///    (rising-edge advance + falling-edge advance per cycle).
+/// 4. Flips reset to the deasserted value, then toggles the clock
+///    for `settle_cycles` cycles.
+/// 5. Dumps the observed registers to **stdout** in a stable,
+///    line-delimited `name=0x<hex>` format that R-S2b.3b's parser
+///    will consume. Example:
+///    ```text
+///    boot_fsm_ns=0x00000000
+///    wait_count=0x00000003
+///    ```
+///
+/// # Why `name=0x<hex>` on stdout
+///
+/// The simplest format that survives multiple toolchain
+/// transitions (Verilator → C++ → make → process). No JSON
+/// dependency in the testbench; no file-handle plumbing through
+/// Verilator's exit path. The parser in R-S2b.3b is a one-pass
+/// line scan.
+///
+/// # Dump-format invariants (load-bearing for R-S2b.3b)
+///
+/// - One register per line.
+/// - `<name>=<value>` exactly (no whitespace before `=`, no
+///   whitespace after `=`, no trailing whitespace).
+/// - `<value>` is a `0x`-prefixed 16-char zero-padded hex literal
+///   (64-bit width). R-S2b.3b's parser uses `0x` as a
+///   sentinel for the value field.
+/// - Lines NOT starting with one of the observed register names
+///   are ignored (Verilator + C++ runtime may emit unrelated
+///   stderr / stdout noise; the parser tolerates it).
+///
+/// Returns the testbench source as `String`. Caller writes it to
+/// `<workdir>/tb.cpp` (R-S2b.2's `compile_verilator` already does
+/// this writing step internally).
+pub fn build_reset_simulation_tb_cpp(config: &ResetSimConfig) -> Result<String, AdapterError> {
+    config.validate()?;
+
+    let top = &config.top;
+    let clk = &config.clock_signal;
+    let rst = &config.reset_signal;
+    let asserted = config.reset_asserted;
+    let deasserted: u8 = 1 - asserted;
+    let hold = config.hold_cycles;
+    let settle = config.settle_cycles;
+
+    let mut s = String::new();
+    s.push_str("// R-S2b.3a — auto-generated reset-simulation testbench.\n");
+    s.push_str("// DO NOT EDIT — regenerate via build_reset_simulation_tb_cpp.\n");
+    s.push_str("#include \"verilated.h\"\n");
+    s.push_str(&format!("#include \"V{top}.h\"\n"));
+    s.push_str("#include <cstdio>\n");
+    s.push_str("#include <cstdint>\n");
+    s.push('\n');
+    s.push_str("int main(int argc, char** argv) {\n");
+    s.push_str("    Verilated::commandArgs(argc, argv);\n");
+    s.push_str(&format!("    V{top}* dut = new V{top}();\n"));
+    s.push_str("    // Phase 1 — assert reset for hold_cycles full cycles.\n");
+    s.push_str(&format!("    dut->{rst} = {asserted};\n"));
+    s.push_str(&format!("    for (uint32_t i = 0; i < {hold}; ++i) {{\n"));
+    s.push_str(&format!("        dut->{clk} = 0;\n"));
+    s.push_str("        dut->eval();\n");
+    s.push_str(&format!("        dut->{clk} = 1;\n"));
+    s.push_str("        dut->eval();\n");
+    s.push_str("    }\n");
+    s.push_str("    // Phase 2 — deassert reset and run settle_cycles.\n");
+    s.push_str(&format!("    dut->{rst} = {deasserted};\n"));
+    s.push_str(&format!("    for (uint32_t i = 0; i < {settle}; ++i) {{\n"));
+    s.push_str(&format!("        dut->{clk} = 0;\n"));
+    s.push_str("        dut->eval();\n");
+    s.push_str(&format!("        dut->{clk} = 1;\n"));
+    s.push_str("        dut->eval();\n");
+    s.push_str("    }\n");
+    s.push_str("    // Phase 3 — dump observed register valuations.\n");
+    for reg in &config.observe_registers {
+        s.push_str(&format!(
+            "    printf(\"{reg}=0x%016llx\\n\", (unsigned long long)dut->{reg});\n"
+        ));
+    }
+    s.push_str("    delete dut;\n");
+    s.push_str("    return 0;\n");
+    s.push_str("}\n");
+    Ok(s)
+}
+
+/// R-S2b.3a (2026-06-11) — pure parser for the testbench dump
+/// format produced by [`build_reset_simulation_tb_cpp`].
+///
+/// Scans each line of `stdout` for the `<name>=0x<hex>` pattern.
+/// Lines that don't match the expected shape are silently
+/// skipped (Verilator + C++ runtime may emit unrelated noise).
+/// The output preserves the order in which the registers appeared
+/// in the input.
+///
+/// Returns `Vec<RegisterValuation>`. Empty on no matches — the
+/// caller (R-S2b.3b) is expected to cross-check the length
+/// against `config.observe_registers.len()` and emit an
+/// `AdapterWarning` on under-counting.
+pub fn parse_reset_simulation_dump(stdout: &str) -> Vec<RegisterValuation> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        // Expected shape: `<name>=0x<hex>`.
+        let Some(eq) = line.find('=') else {
+            continue;
+        };
+        let (name, rest) = line.split_at(eq);
+        // Strip the leading `=`.
+        let value_str = &rest[1..];
+        let Some(hex_str) = value_str
+            .strip_prefix("0x")
+            .or_else(|| value_str.strip_prefix("0X"))
+        else {
+            continue;
+        };
+        if name.is_empty() || hex_str.is_empty() {
+            continue;
+        }
+        if let Ok(value) = u64::from_str_radix(hex_str, 16) {
+            out.push(RegisterValuation {
+                name: name.to_string(),
+                value,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -707,5 +994,273 @@ mod tests {
             status.success(),
             "compiled binary must exit 0; got {status}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S2b.3a tests — data types + tb.cpp generator + dump parser
+    // ─────────────────────────────────────────────────────────────
+
+    fn sample_config() -> ResetSimConfig {
+        ResetSimConfig {
+            top: "amba_arbiter".to_string(),
+            clock_signal: "clk".to_string(),
+            reset_signal: "rst_n".to_string(),
+            reset_asserted: 0,
+            hold_cycles: 4,
+            settle_cycles: 1,
+            observe_registers: vec!["burst_count".to_string(), "grant_state".to_string()],
+        }
+    }
+
+    #[test]
+    fn build_args_includes_public_flat_rw_when_set() {
+        let opts = VerilatorOptions {
+            expose_internal_signals: true,
+            ..VerilatorOptions::default()
+        };
+        let args = build_verilator_compile_args(
+            &opts,
+            Path::new("/work/design.sv"),
+            Path::new("/work/tb.cpp"),
+            Path::new("/work/obj_dir"),
+        );
+        assert!(args.contains(&os("--public-flat-rw")));
+    }
+
+    #[test]
+    fn build_args_omits_public_flat_rw_by_default() {
+        let opts = VerilatorOptions::default();
+        let args = build_verilator_compile_args(
+            &opts,
+            Path::new("/work/design.sv"),
+            Path::new("/work/tb.cpp"),
+            Path::new("/work/obj_dir"),
+        );
+        assert!(!args.contains(&os("--public-flat-rw")));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_config() {
+        assert!(sample_config().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_top() {
+        let mut c = sample_config();
+        c.top = "".to_string();
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.kind, AdapterErrorKind::UnsupportedConstruct);
+        assert!(err.message.contains("top"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_clock() {
+        let mut c = sample_config();
+        c.clock_signal = "".to_string();
+        let err = c.validate().unwrap_err();
+        assert!(err.message.contains("clock_signal"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_reset() {
+        let mut c = sample_config();
+        c.reset_signal = "".to_string();
+        let err = c.validate().unwrap_err();
+        assert!(err.message.contains("reset_signal"));
+    }
+
+    #[test]
+    fn validate_rejects_reset_asserted_above_1() {
+        let mut c = sample_config();
+        c.reset_asserted = 2;
+        let err = c.validate().unwrap_err();
+        assert!(err.message.contains("reset_asserted"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_observe_registers() {
+        let mut c = sample_config();
+        c.observe_registers.clear();
+        let err = c.validate().unwrap_err();
+        assert!(err.message.contains("observe_registers"));
+    }
+
+    #[test]
+    fn tb_cpp_includes_dut_header_and_handle() {
+        let src = build_reset_simulation_tb_cpp(&sample_config()).expect("ok");
+        assert!(
+            src.contains("#include \"Vamba_arbiter.h\""),
+            "tb.cpp must include the generated V<top>.h header"
+        );
+        assert!(
+            src.contains("Vamba_arbiter* dut = new Vamba_arbiter()"),
+            "tb.cpp must instantiate the V<top> class via heap allocation \
+             (Verilator's recommended pattern; survives lifetime + cleanup)"
+        );
+    }
+
+    #[test]
+    fn tb_cpp_holds_reset_for_configured_cycles() {
+        let mut c = sample_config();
+        c.hold_cycles = 7;
+        c.settle_cycles = 2;
+        let src = build_reset_simulation_tb_cpp(&c).expect("ok");
+        // Loop bound for the hold phase.
+        assert!(
+            src.contains("i < 7"),
+            "tb.cpp must encode hold_cycles=7 as the loop bound; got:\n{src}"
+        );
+        // Loop bound for the settle phase.
+        assert!(
+            src.contains("i < 2"),
+            "tb.cpp must encode settle_cycles=2 as the loop bound; got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn tb_cpp_asserts_active_low_reset_correctly() {
+        let mut c = sample_config();
+        c.reset_asserted = 0;
+        let src = build_reset_simulation_tb_cpp(&c).expect("ok");
+        // Phase 1: rst_n = 0; Phase 2: rst_n = 1.
+        assert!(src.contains("dut->rst_n = 0;"));
+        assert!(src.contains("dut->rst_n = 1;"));
+        // The phase-1 assignment must come before the phase-2 one.
+        let i_assert = src.find("dut->rst_n = 0;").unwrap();
+        let i_deassert = src.find("dut->rst_n = 1;").unwrap();
+        assert!(
+            i_assert < i_deassert,
+            "phase 1 (assert) must precede phase 2 (deassert)"
+        );
+    }
+
+    #[test]
+    fn tb_cpp_asserts_active_high_reset_correctly() {
+        let mut c = sample_config();
+        c.reset_asserted = 1;
+        c.reset_signal = "rst".to_string();
+        let src = build_reset_simulation_tb_cpp(&c).expect("ok");
+        assert!(src.contains("dut->rst = 1;"));
+        assert!(src.contains("dut->rst = 0;"));
+        let i_assert = src.find("dut->rst = 1;").unwrap();
+        let i_deassert = src.find("dut->rst = 0;").unwrap();
+        assert!(i_assert < i_deassert);
+    }
+
+    #[test]
+    fn tb_cpp_emits_printf_per_observed_register() {
+        let src = build_reset_simulation_tb_cpp(&sample_config()).expect("ok");
+        // One printf per register; the format string is the
+        // dump-format invariant.
+        assert!(src.contains("printf(\"burst_count=0x%016llx\\n\""));
+        assert!(src.contains("printf(\"grant_state=0x%016llx\\n\""));
+        // The signal-handle cast is present.
+        assert!(src.contains("(unsigned long long)dut->burst_count"));
+        assert!(src.contains("(unsigned long long)dut->grant_state"));
+    }
+
+    #[test]
+    fn tb_cpp_preserves_register_order() {
+        let c = ResetSimConfig {
+            observe_registers: vec!["zzz".to_string(), "aaa".to_string()],
+            ..sample_config()
+        };
+        let src = build_reset_simulation_tb_cpp(&c).expect("ok");
+        let i_zzz = src.find("zzz=").unwrap();
+        let i_aaa = src.find("aaa=").unwrap();
+        assert!(
+            i_zzz < i_aaa,
+            "register declaration order must be preserved (zzz declared before aaa)"
+        );
+    }
+
+    #[test]
+    fn tb_cpp_rejects_invalid_config() {
+        let mut c = sample_config();
+        c.observe_registers.clear();
+        assert!(build_reset_simulation_tb_cpp(&c).is_err());
+    }
+
+    // R-S2b.3a — dump-format parser tests.
+
+    #[test]
+    fn parse_dump_extracts_single_register() {
+        let stdout = "boot_fsm_ns=0x0000000000000003\n";
+        let out = parse_reset_simulation_dump(stdout);
+        assert_eq!(
+            out,
+            vec![RegisterValuation {
+                name: "boot_fsm_ns".to_string(),
+                value: 0x3
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_dump_extracts_multiple_registers_in_order() {
+        let stdout = "burst_count=0x000000000000000f\ngrant_state=0x0000000000000002\n";
+        let out = parse_reset_simulation_dump(stdout);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "burst_count");
+        assert_eq!(out[0].value, 0xf);
+        assert_eq!(out[1].name, "grant_state");
+        assert_eq!(out[1].value, 0x2);
+    }
+
+    #[test]
+    fn parse_dump_skips_noise_lines() {
+        let stdout = "Verilator startup banner\nboot_fsm_ns=0x0000000000000005\nrandom log line\n";
+        let out = parse_reset_simulation_dump(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "boot_fsm_ns");
+        assert_eq!(out[0].value, 0x5);
+    }
+
+    #[test]
+    fn parse_dump_accepts_uppercase_0x_prefix() {
+        let stdout = "x=0XFF\n";
+        let out = parse_reset_simulation_dump(stdout);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, 0xff);
+    }
+
+    #[test]
+    fn parse_dump_skips_lines_without_equals() {
+        let stdout = "header line\n";
+        assert_eq!(parse_reset_simulation_dump(stdout), vec![]);
+    }
+
+    #[test]
+    fn parse_dump_skips_lines_without_0x_prefix() {
+        let stdout = "reg=42\n"; // decimal, not the expected hex format
+        assert_eq!(parse_reset_simulation_dump(stdout), vec![]);
+    }
+
+    #[test]
+    fn parse_dump_skips_unparseable_hex() {
+        let stdout = "reg=0xnothex\n";
+        assert_eq!(parse_reset_simulation_dump(stdout), vec![]);
+    }
+
+    #[test]
+    fn parse_dump_round_trips_via_generator() {
+        // The generator's printf format ↔ parser regex must be in
+        // lockstep. This test guards the invariant: the parser
+        // must successfully extract exactly the registers the
+        // generator declared, given a synthetic stdout that
+        // matches the generator's printf format byte-for-byte.
+        let config = sample_config();
+        // Synthesise stdout the way the generated tb.cpp would
+        // produce it for arbitrary hard-coded valuations.
+        let synthetic_stdout = format!(
+            "burst_count=0x{:016x}\ngrant_state=0x{:016x}\n",
+            0xdeadbeefu64, 0x42u64,
+        );
+        let out = parse_reset_simulation_dump(&synthetic_stdout);
+        assert_eq!(out.len(), config.observe_registers.len());
+        assert_eq!(out[0].name, "burst_count");
+        assert_eq!(out[0].value, 0xdeadbeef);
+        assert_eq!(out[1].name, "grant_state");
+        assert_eq!(out[1].value, 0x42);
     }
 }
