@@ -160,6 +160,156 @@ pub fn parse_vcd_header(content: &[u8]) -> Result<VcdHeader, AdapterError> {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// R-S6.2 (2026-06-11) — value-change parsing over time
+// ─────────────────────────────────────────────────────────────────────
+
+/// A single sampled value at one VCD time marker.
+///
+/// `Determinate` carries the bit-pattern as `u64` (clipped to the
+/// low 64 bits when the signal is wider — the R-S2b
+/// `RegisterValuation` contract uses the same shape, so downstream
+/// R-S6.5 seeding can lift values one-for-one). `Indeterminate`
+/// fires when any bit of the change is `x`/`X`/`z`/`Z` — these
+/// values do NOT belong in EnumValues discriminator lists (a
+/// predicate cube can't meaningfully refer to an X/Z bit-pattern),
+/// so R-S6.3's frequency miner discards them silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcdSampleValue {
+    /// All bits are `0` or `1`; bit-pattern encoded as `u64`
+    /// (clipped at 64 bits for wider signals).
+    Determinate(u64),
+    /// At least one bit is `x` / `X` / `z` / `Z`.
+    Indeterminate,
+}
+
+/// A single value-change record from a VCD trace.
+///
+/// `id` matches [`VcdSignal::id`] (the VCD signal-id, NOT the
+/// signal name); the caller correlates by id to map a change
+/// back to the declaration. The R-S6.3 miner builds a
+/// `HashMap<id, Vec<u64>>` of per-signal observed values from
+/// the change stream this function produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcdChange {
+    /// VCD time stamp at which this change happened. The unit is
+    /// whatever [`VcdHeader::timescale`] declares.
+    pub time: u64,
+    /// VCD signal-id (matches [`VcdSignal::id`]).
+    pub id: String,
+    /// The sampled value.
+    pub value: VcdSampleValue,
+}
+
+/// R-S6.2 (2026-06-11) — parse the value-change section of a VCD
+/// file. Reads the header internally (re-using the underlying
+/// [`vcd::Parser`]) and walks every Command until EOF, emitting
+/// one `VcdChange` per scalar / vector value change.
+///
+/// Maintains the current time stamp across `Command::Timestamp`
+/// records; every change inherits the most recent stamp. Initial
+/// changes that appear before the first `#<time>` marker carry
+/// `time = 0` (matches the VCD spec's "initial value" convention).
+///
+/// **Skipped commands** (irrelevant for bit-vector predicate
+/// seeding):
+/// - `Command::ChangeReal` — predicate-cube discriminators are
+///   bit-vector values, not floats. Real signals are typically
+///   `$display` / `$monitor` artefacts.
+/// - `Command::ChangeString` — same rationale.
+/// - `Command::Begin` / `Command::End` — simulation-command
+///   bracketing (`$dumpall`, `$dumpvars`); the contained value
+///   changes are parsed individually.
+///
+/// **Width handling**: vectors wider than 64 bits clip to the
+/// low 64 bits silently. The R-S5 / R-S2b / R-Y? family of
+/// seeding strategies all use `u64` values, so a wider signal's
+/// upper bits can't be carried into the bit-blaster anyway; the
+/// clip is information-lossy but downstream-honest. R-S6.3's
+/// miner adds a per-signal width annotation so the consumer
+/// knows the clip happened.
+///
+/// # Errors
+///
+/// Returns `AdapterError { kind: ParseError, ... }` when the
+/// underlying [`vcd`] crate rejects the input as malformed
+/// (header parse error, mid-trace `Command` decode error).
+pub fn parse_vcd_changes(content: &[u8]) -> Result<Vec<VcdChange>, AdapterError> {
+    let mut parser = vcd::Parser::new(content);
+    parser.parse_header().map_err(|e| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: format!("adapter/vcd: failed to parse VCD header: {e}"),
+        location: None,
+    })?;
+
+    let mut changes = Vec::new();
+    let mut current_time: u64 = 0;
+
+    for cmd in parser {
+        let cmd = cmd.map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!("adapter/vcd: failed to parse value-change record: {e}"),
+            location: None,
+        })?;
+        match cmd {
+            vcd::Command::Timestamp(t) => {
+                current_time = t;
+            }
+            vcd::Command::ChangeScalar(id, value) => {
+                changes.push(VcdChange {
+                    time: current_time,
+                    id: id.to_string(),
+                    value: scalar_to_sample_value(value),
+                });
+            }
+            vcd::Command::ChangeVector(id, vector) => {
+                changes.push(VcdChange {
+                    time: current_time,
+                    id: id.to_string(),
+                    value: vector_to_sample_value(&vector),
+                });
+            }
+            // ChangeReal / ChangeString / Begin / End — silently
+            // skipped. Bit-vector predicate seeding has no use for
+            // float / string values, and the Begin/End brackets
+            // don't carry value information of their own (the
+            // contained changes parse as their own commands).
+            _ => {}
+        }
+    }
+
+    Ok(changes)
+}
+
+/// R-S6.2 helper — convert a `vcd::Value` (scalar) to a
+/// `VcdSampleValue`. `V0` → 0, `V1` → 1, `X`/`Z` → Indeterminate.
+fn scalar_to_sample_value(v: vcd::Value) -> VcdSampleValue {
+    match v {
+        vcd::Value::V0 => VcdSampleValue::Determinate(0),
+        vcd::Value::V1 => VcdSampleValue::Determinate(1),
+        vcd::Value::X | vcd::Value::Z => VcdSampleValue::Indeterminate,
+    }
+}
+
+/// R-S6.2 helper — convert a `vcd::Vector` to a `VcdSampleValue`.
+///
+/// VCD vectors are stored MSB-first. This helper reads the bits
+/// in declaration order (left → right) and shifts them into a
+/// `u64` accumulator (MSB-first). Any X/Z bit triggers an early
+/// return of `Indeterminate`. Vectors wider than 64 bits clip
+/// silently to the low 64 bits.
+fn vector_to_sample_value(vector: &vcd::Vector) -> VcdSampleValue {
+    let mut accumulator: u64 = 0;
+    for bit in vector {
+        accumulator = match bit {
+            vcd::Value::V0 => accumulator << 1,
+            vcd::Value::V1 => (accumulator << 1) | 1,
+            vcd::Value::X | vcd::Value::Z => return VcdSampleValue::Indeterminate,
+        };
+    }
+    VcdSampleValue::Determinate(accumulator)
+}
+
 /// Walk every `vcd::ScopeItem` recursively + flatten declared
 /// variables into `VcdSignal`s, joining the enclosing scope
 /// path. Pure helper.
@@ -304,5 +454,156 @@ mod tests {
         assert_eq!(h.signals[0].name, "zzz");
         assert_eq!(h.signals[1].name, "aaa");
         assert_eq!(h.signals[2].name, "mmm");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S6.2 tests — value-change parsing over time
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_vcd_changes_extracts_two_changes_from_sample() {
+        let changes = parse_vcd_changes(sample_vcd()).expect("parse ok");
+        // sample_vcd() declares 4 value changes: b0000 ! and 0 " at
+        // time 0, then b0001 ! at time 1. (The 0 " is a scalar.)
+        // Time 0: 2 changes. Time 1: 1 change. Total 3.
+        assert_eq!(changes.len(), 3, "got: {changes:?}");
+    }
+
+    #[test]
+    fn parse_vcd_changes_preserves_time_progression() {
+        let changes = parse_vcd_changes(sample_vcd()).expect("parse ok");
+        // The first two changes are at #0; the third is at #1.
+        assert_eq!(changes[0].time, 0);
+        assert_eq!(changes[1].time, 0);
+        assert_eq!(changes[2].time, 1);
+    }
+
+    #[test]
+    fn parse_vcd_changes_decodes_determinate_vector_value() {
+        let changes = parse_vcd_changes(sample_vcd()).expect("parse ok");
+        // Time 1, signal !: b0001 → 1.
+        let last = &changes[2];
+        assert_eq!(last.id, "!");
+        assert_eq!(last.value, VcdSampleValue::Determinate(1));
+    }
+
+    #[test]
+    fn parse_vcd_changes_decodes_scalar_zero_to_determinate() {
+        let changes = parse_vcd_changes(sample_vcd()).expect("parse ok");
+        // The `0 "` scalar at time 0 must surface as
+        // Determinate(0) bound to signal-id `"`.
+        let scalar = changes
+            .iter()
+            .find(|c| c.id == "\"")
+            .expect("scalar change for signal \" present");
+        assert_eq!(scalar.value, VcdSampleValue::Determinate(0));
+    }
+
+    #[test]
+    fn parse_vcd_changes_decodes_x_value_to_indeterminate() {
+        // A 4-bit vector with `x` in one position must surface as
+        // Indeterminate — these are not safe for predicate seeding.
+        let trace = b"$timescale 1ns $end\n\
+                      $scope module top $end\n\
+                      $var wire 4 ! count $end\n\
+                      $upscope $end\n\
+                      $enddefinitions $end\n\
+                      #0\n\
+                      b0x10 !\n";
+        let changes = parse_vcd_changes(trace).expect("parse ok");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].value, VcdSampleValue::Indeterminate);
+    }
+
+    #[test]
+    fn parse_vcd_changes_decodes_z_value_to_indeterminate() {
+        let trace = b"$timescale 1ns $end\n\
+                      $scope module top $end\n\
+                      $var wire 4 ! count $end\n\
+                      $upscope $end\n\
+                      $enddefinitions $end\n\
+                      #0\n\
+                      b0z10 !\n";
+        let changes = parse_vcd_changes(trace).expect("parse ok");
+        assert_eq!(changes[0].value, VcdSampleValue::Indeterminate);
+    }
+
+    #[test]
+    fn parse_vcd_changes_decodes_full_byte_vector() {
+        // 8-bit vector b11111111 → 255.
+        let trace = b"$timescale 1ns $end\n\
+                      $scope module top $end\n\
+                      $var wire 8 ! byte $end\n\
+                      $upscope $end\n\
+                      $enddefinitions $end\n\
+                      #0\n\
+                      b11111111 !\n";
+        let changes = parse_vcd_changes(trace).expect("parse ok");
+        assert_eq!(changes[0].value, VcdSampleValue::Determinate(0xFF));
+    }
+
+    #[test]
+    fn parse_vcd_changes_clips_wide_vector_to_low_64_bits() {
+        // 72-bit vector. The clip semantics: as the parser shifts
+        // u64 left for each new MSB-first bit, bits beyond position
+        // 63 fall off the top. The result is the LAST 64 bits of
+        // the original vector — not the first 64.
+        //
+        // Encoding: 8 leading 1s (which will fall off) followed by
+        // 56 zeros and the trailing byte 0x5A. The last 64 bits are
+        // "0000...0 (56 zeros) 01011010" = 0x000000000000005A.
+        let mut bits = "1".repeat(8); // these 8 bits get shifted off the top
+        bits.push_str(&"0".repeat(56));
+        bits.push_str("01011010"); // 0x5A
+        assert_eq!(bits.len(), 72);
+        let trace = format!(
+            "$timescale 1ns $end\n\
+             $scope module top $end\n\
+             $var wire 72 ! wide $end\n\
+             $upscope $end\n\
+             $enddefinitions $end\n\
+             #0\n\
+             b{bits} !\n"
+        );
+        let changes = parse_vcd_changes(trace.as_bytes()).expect("parse ok");
+        assert_eq!(
+            changes[0].value,
+            VcdSampleValue::Determinate(0x5A),
+            "wide vector must clip to its low 64 bits (last 64 bits of the vector); got {:?}",
+            changes[0].value
+        );
+    }
+
+    #[test]
+    fn parse_vcd_changes_returns_empty_for_no_changes() {
+        let header_only = b"$timescale 1ns $end\n\
+                            $scope module top $end\n\
+                            $var wire 4 ! count $end\n\
+                            $upscope $end\n\
+                            $enddefinitions $end\n";
+        let changes = parse_vcd_changes(header_only).expect("parse ok");
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn parse_vcd_changes_skips_real_and_string_commands() {
+        // Mununu does not consume float / string changes — silently
+        // skip them. The bit-vector scalar `0 !` must still surface.
+        let trace = b"$timescale 1ns $end\n\
+                      $scope module top $end\n\
+                      $var wire 1 ! enable $end\n\
+                      $var real 64 # data_real $end\n\
+                      $var string 64 % msg_string $end\n\
+                      $upscope $end\n\
+                      $enddefinitions $end\n\
+                      #0\n\
+                      0 !\n\
+                      r3.14 #\n\
+                      shello %\n";
+        let changes = parse_vcd_changes(trace).expect("parse ok");
+        // Only the scalar change surfaces.
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, "!");
+        assert_eq!(changes[0].value, VcdSampleValue::Determinate(0));
     }
 }
