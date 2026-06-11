@@ -373,9 +373,7 @@ impl VerilatorTempDir {
         let tid = format!("{:?}", std::thread::current().id());
         let tid_digits: String = tid.chars().filter(|c| c.is_ascii_digit()).collect();
         let mut base = std::env::temp_dir();
-        base.push(format!(
-            "mununu-verilator-{pid}-{tid_digits}-{seq}-{nanos}"
-        ));
+        base.push(format!("mununu-verilator-{pid}-{tid_digits}-{seq}-{nanos}"));
         std::fs::create_dir_all(&base).map_err(|e| AdapterError {
             kind: AdapterErrorKind::ParseError,
             message: format!(
@@ -688,22 +686,26 @@ mod tests {
         let bin = locate_verilator().expect("verilator must be installed for this test");
         let tmp = VerilatorTempDir::new().expect("tempdir");
         let sv_path = tmp.path().join("trivial.sv");
-        std::fs::write(
-            &sv_path,
-            "module trivial(input wire clk); endmodule\n",
-        )
-        .expect("write sv");
-        let tb = "#include \"Vtrivial.h\"\nint main(int,char**){ Vtrivial m; m.eval(); return 0; }\n";
+        std::fs::write(&sv_path, "module trivial(input wire clk); endmodule\n").expect("write sv");
+        let tb =
+            "#include \"Vtrivial.h\"\nint main(int,char**){ Vtrivial m; m.eval(); return 0; }\n";
         let opts = VerilatorOptions {
             top: Some("trivial".to_string()),
             ..VerilatorOptions::default()
         };
         let bin_path = compile_verilator(&bin.path, &opts, &sv_path, tb, tmp.path())
             .expect("compile_verilator must succeed on the trivial module");
-        assert!(bin_path.exists(), "binary path {} must exist", bin_path.display());
+        assert!(
+            bin_path.exists(),
+            "binary path {} must exist",
+            bin_path.display()
+        );
         let status = Command::new(&bin_path)
             .status()
             .expect("spawn compiled binary");
-        assert!(status.success(), "compiled binary must exit 0; got {status}");
+        assert!(
+            status.success(),
+            "compiled binary must exit 0; got {status}"
+        );
     }
 }
