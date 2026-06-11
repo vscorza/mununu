@@ -343,6 +343,131 @@ fn collect_signals(items: &[vcd::ScopeItem], path: &mut Vec<String>, out: &mut V
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// R-S6.3 (2026-06-11) — per-signal value-frequency miner
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-signal observed-value statistics. Output of
+/// [`mine_vcd_frequencies`]; consumed by R-S6.5's bit-blaster
+/// seeding helper.
+///
+/// The mining strategy is split into three categories per §Phase 9
+/// R-S6's design:
+///
+/// - **Heavy-hitter values** (`heavy_hitters`): the values that
+///   appear most often across the trace. These are the values the
+///   designer cares about — initial states, idle states, common
+///   steady-state register valuations. R-S6.5 lifts the top-N
+///   into `EnumValues` discriminators.
+/// - **Boundary values** (`min` / `max`): the extreme values
+///   observed. Useful for counter / saturator predicates ("did
+///   the counter reach its full count?") and for typedef-style
+///   FSM states where the encoding hits 0 or `(2^width - 1)`.
+/// - **Indeterminate sample count** (`indeterminate_count`): not
+///   a seed source — Indeterminate samples carry no
+///   predicate-cube meaning — but surfaces as a diagnostic in
+///   R-S6.6 (a signal that's mostly X means the trace doesn't
+///   exercise it).
+///
+/// The reserve set (rare values R.5 CEGAR may promote on
+/// KleeneBot) is derived implicitly by the R-S6.5 caller from
+/// the tail of `heavy_hitters` (entries below a count threshold).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcdValueStats {
+    /// VCD signal-id (matches [`VcdSignal::id`] and
+    /// [`VcdChange::id`]). Caller correlates back to a declared
+    /// signal via `VcdHeader::signals`.
+    pub id: String,
+    /// Observed determinate values + their occurrence counts.
+    /// Sorted by count descending, then by value ascending (so
+    /// the result is deterministic even when counts tie).
+    /// `heavy_hitters[0]` is the most-frequent value; the tail
+    /// is the reserve-set candidate.
+    pub heavy_hitters: Vec<(u64, usize)>,
+    /// Minimum determinate value observed. `None` when no
+    /// determinate samples appeared.
+    pub min: Option<u64>,
+    /// Maximum determinate value observed. `None` when no
+    /// determinate samples appeared.
+    pub max: Option<u64>,
+    /// Count of indeterminate samples (X / Z). Diagnostic only
+    /// — these never become EnumValues discriminators.
+    pub indeterminate_count: usize,
+}
+
+/// R-S6.3 (2026-06-11) — mine per-signal value frequencies from
+/// a stream of [`VcdChange`] records.
+///
+/// **Algorithm**:
+/// 1. Walk every change once.
+/// 2. For each `Determinate(v)`, increment the `(signal_id,
+///    value) → count` map and update min/max.
+/// 3. For each `Indeterminate`, increment a per-signal counter.
+/// 4. For each signal observed, sort its heavy_hitters by
+///    `(-count, value)` for determinism.
+///
+/// **Pure**: no I/O. Stable output ordering — signals are
+/// returned in ascending id order so the caller (R-S6.5) sees a
+/// deterministic stats list across runs.
+///
+/// **Time complexity**: `O(N log N)` for N = total change count
+/// (the dominant term is the per-signal heavy_hitters sort).
+/// Space: `O(N)` for the value-frequency hashmaps.
+///
+/// **Note on `id` matching**: the returned `VcdValueStats::id`
+/// matches the change-stream's `id`, which in turn matches the
+/// VCD header's `VcdSignal::id`. To resolve a stats entry to a
+/// signal name, the caller looks up the id in `VcdHeader::signals`.
+pub fn mine_vcd_frequencies(changes: &[VcdChange]) -> Vec<VcdValueStats> {
+    use std::collections::HashMap;
+
+    // Per-signal accumulators. Indexed by signal-id.
+    #[derive(Default)]
+    struct Acc {
+        counts: HashMap<u64, usize>,
+        min: Option<u64>,
+        max: Option<u64>,
+        indeterminate_count: usize,
+    }
+    let mut accumulators: HashMap<String, Acc> = HashMap::new();
+
+    for change in changes {
+        let acc = accumulators.entry(change.id.clone()).or_default();
+        match change.value {
+            VcdSampleValue::Determinate(v) => {
+                *acc.counts.entry(v).or_insert(0) += 1;
+                acc.min = Some(acc.min.map_or(v, |m| m.min(v)));
+                acc.max = Some(acc.max.map_or(v, |m| m.max(v)));
+            }
+            VcdSampleValue::Indeterminate => {
+                acc.indeterminate_count += 1;
+            }
+        }
+    }
+
+    // Render to the public type. Sort signals by id for
+    // determinism, and within each signal sort heavy_hitters by
+    // (-count, value) so ties resolve deterministically.
+    let mut ids: Vec<String> = accumulators.keys().cloned().collect();
+    ids.sort();
+
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let acc = accumulators.remove(&id).expect("id from keys()");
+        let mut heavy_hitters: Vec<(u64, usize)> = acc.counts.into_iter().collect();
+        // Sort by count descending; tie-break by value ascending.
+        heavy_hitters.sort_by(|(va, ca), (vb, cb)| cb.cmp(ca).then_with(|| va.cmp(vb)));
+        out.push(VcdValueStats {
+            id,
+            heavy_hitters,
+            min: acc.min,
+            max: acc.max,
+            indeterminate_count: acc.indeterminate_count,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,5 +730,138 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].id, "!");
         assert_eq!(changes[0].value, VcdSampleValue::Determinate(0));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S6.3 tests — per-signal value-frequency mining
+    // ─────────────────────────────────────────────────────────────
+
+    fn d(time: u64, id: &str, v: u64) -> VcdChange {
+        VcdChange {
+            time,
+            id: id.to_string(),
+            value: VcdSampleValue::Determinate(v),
+        }
+    }
+
+    fn ind(time: u64, id: &str) -> VcdChange {
+        VcdChange {
+            time,
+            id: id.to_string(),
+            value: VcdSampleValue::Indeterminate,
+        }
+    }
+
+    #[test]
+    fn mine_frequencies_empty_input_returns_empty_output() {
+        assert!(mine_vcd_frequencies(&[]).is_empty());
+    }
+
+    #[test]
+    fn mine_frequencies_single_determinate_change() {
+        let changes = vec![d(0, "!", 5)];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats.len(), 1);
+        let s = &stats[0];
+        assert_eq!(s.id, "!");
+        assert_eq!(s.heavy_hitters, vec![(5u64, 1usize)]);
+        assert_eq!(s.min, Some(5));
+        assert_eq!(s.max, Some(5));
+        assert_eq!(s.indeterminate_count, 0);
+    }
+
+    #[test]
+    fn mine_frequencies_counts_repeated_values_per_signal() {
+        let changes = vec![d(0, "!", 0), d(1, "!", 1), d(2, "!", 0), d(3, "!", 0)];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats.len(), 1);
+        // Value 0 wins (3 occurrences); value 1 trails (1).
+        assert_eq!(stats[0].heavy_hitters, vec![(0u64, 3usize), (1u64, 1usize)]);
+    }
+
+    #[test]
+    fn mine_frequencies_tracks_min_and_max_correctly() {
+        let changes = vec![d(0, "!", 3), d(1, "!", 1), d(2, "!", 7), d(3, "!", 2)];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats[0].min, Some(1));
+        assert_eq!(stats[0].max, Some(7));
+    }
+
+    #[test]
+    fn mine_frequencies_separates_per_signal() {
+        // Two signals, distinct heavy-hitters per signal.
+        let changes = vec![
+            d(0, "a", 1),
+            d(0, "b", 100),
+            d(1, "a", 1),
+            d(1, "b", 200),
+            d(2, "a", 2),
+        ];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats.len(), 2);
+        // Ordering is by id ascending — "a" first, then "b".
+        assert_eq!(stats[0].id, "a");
+        assert_eq!(stats[0].heavy_hitters, vec![(1u64, 2usize), (2u64, 1usize)]);
+        assert_eq!(stats[1].id, "b");
+        // 100 and 200 each appear once → sorted by value (100 first).
+        assert_eq!(
+            stats[1].heavy_hitters,
+            vec![(100u64, 1usize), (200u64, 1usize)]
+        );
+    }
+
+    #[test]
+    fn mine_frequencies_counts_indeterminate_samples() {
+        // Indeterminate samples don't populate heavy_hitters or
+        // min/max, but the per-signal counter must surface for
+        // R-S6.6 diagnostics.
+        let changes = vec![
+            d(0, "!", 5),
+            ind(1, "!"),
+            ind(2, "!"),
+            d(3, "!", 5),
+            ind(4, "!"),
+        ];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats[0].heavy_hitters, vec![(5u64, 2usize)]);
+        assert_eq!(stats[0].min, Some(5));
+        assert_eq!(stats[0].max, Some(5));
+        assert_eq!(stats[0].indeterminate_count, 3);
+    }
+
+    #[test]
+    fn mine_frequencies_signal_with_only_indeterminate_samples() {
+        // No determinate samples → min/max stay None;
+        // heavy_hitters empty; indeterminate_count carries the
+        // diagnostic.
+        let changes = vec![ind(0, "!"), ind(1, "!"), ind(2, "!")];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].heavy_hitters.is_empty());
+        assert_eq!(stats[0].min, None);
+        assert_eq!(stats[0].max, None);
+        assert_eq!(stats[0].indeterminate_count, 3);
+    }
+
+    #[test]
+    fn mine_frequencies_ties_resolve_by_value_ascending() {
+        // Two values with identical counts — tiebreaker is value
+        // ascending so the output is deterministic across runs.
+        let changes = vec![d(0, "!", 5), d(1, "!", 2), d(2, "!", 5), d(3, "!", 2)];
+        let stats = mine_vcd_frequencies(&changes);
+        // Both values have count 2; value 2 comes first.
+        assert_eq!(stats[0].heavy_hitters, vec![(2u64, 2usize), (5u64, 2usize)]);
+    }
+
+    #[test]
+    fn mine_frequencies_returns_signals_in_ascending_id_order() {
+        // Three signals declared in arbitrary order — output must
+        // sort by id for determinism.
+        let changes = vec![d(0, "zzz", 1), d(0, "aaa", 1), d(0, "mmm", 1)];
+        let stats = mine_vcd_frequencies(&changes);
+        assert_eq!(stats.len(), 3);
+        assert_eq!(stats[0].id, "aaa");
+        assert_eq!(stats[1].id, "mmm");
+        assert_eq!(stats[2].id, "zzz");
     }
 }
