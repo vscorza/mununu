@@ -2439,16 +2439,6 @@ fn build_input_domains(
     )
 }
 
-#[allow(dead_code)]
-fn combinations_of(meta: &[StateMeta]) -> usize {
-    meta.iter()
-        .fold(1usize, |acc, m| acc.saturating_mul(1usize << m.width))
-}
-
-// `combinations_of_inputs` was removed in Phase 1.6 — input enumeration
-// now goes through `InputCellEnumeration::total_combos`, which respects
-// per-input `FieldDomain` abstractions from the sidecar.
-
 /// Enumerate state names as `s0`, `s1`, ..., `s{total-1}`.
 ///
 /// Per-state register valuations are carried via [`StateSpec.valuations`]
@@ -2536,47 +2526,6 @@ fn signal_labels_for_input(
     } else {
         labels
     }
-}
-
-/// Legacy bit-shift extraction — kept for historical reference. The
-/// active code path uses [`CellEnumeration::value_at`], which respects
-/// the per-cell `FieldDomain` mixed-radix encoding.
-#[allow(dead_code)]
-fn extract_combo(combo: usize, meta: &[StateMeta], target_nid: Nid) -> u128 {
-    let mut shift = 0u32;
-    for sm in meta {
-        if sm.nid == target_nid {
-            return ((combo >> shift) & ((1usize << sm.width) - 1)) as u128;
-        }
-        shift += sm.width;
-    }
-    0
-}
-
-/// Extract the bit-vector value of `target_nid` from a packed combo
-/// index. Clock inputs are skipped during packing/unpacking — they are
-/// not part of the enumerated input space — and their value is always
-/// reported as 1 (posedge active) so the BTOR2 evaluator sees the
-/// active clock edge on every CLTS step.
-///
-/// Superseded in Phase 1.6 by [`InputCellEnumeration::value_at`], which
-/// respects per-input `FieldDomain` mixed-radix encoding. Kept for
-/// reference only.
-#[allow(dead_code)]
-fn extract_input_combo(combo: usize, meta: &[InputMeta], target_nid: Nid) -> u128 {
-    let mut shift = 0u32;
-    for im in meta {
-        if im.nid == target_nid {
-            if im.is_clock {
-                return 1;
-            }
-            return ((combo >> shift) & ((1usize << im.width) - 1)) as u128;
-        }
-        if !im.is_clock {
-            shift += im.width;
-        }
-    }
-    0
 }
 
 fn make_step_env(
