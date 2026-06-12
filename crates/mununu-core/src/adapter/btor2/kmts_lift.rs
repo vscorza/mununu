@@ -809,6 +809,40 @@ impl KmtsLiftLazy for LazyLift {
 /// the caller visits a strict subset of cubes — which is what
 /// sub-item 2.5's bench fixture will exercise standalone (not
 /// via the CEGAR loop).
+/// §Phase 10 stage 3.c.2a (2026-06-12) — encode a BTOR2 file for the
+/// must-edge SMT post-passes, selecting the theory by whether the
+/// design carries memory cells.
+///
+/// - No array-sorted state cells → `Theory::BvOnly` (pure QF_BV;
+///   the pre-stage-3.c.2a behaviour, unchanged for every memory-
+///   free fixture).
+/// - One or more array-sorted state cells → `Theory::BvUfArray`
+///   (QF_AUFBV), so the encoder's stage-3.c.1 `select`/`store`
+///   handling produces an array-aware transition relation. This is
+///   the **must-side** of the §Phase 10 havoc-may / array-must
+///   composition: the must-edge query reasons about memory
+///   precisely via Z3 array theory.
+///
+/// The cube predicates the must-edge query asserts are over BV
+/// registers only (memory cells are not in `view.signals`), so the
+/// query construction in `smt_must_edge.rs` is unchanged — it just
+/// consumes a richer transition relation.
+fn encode_design_for_lift(
+    file: &crate::adapter::btor2::ast::Btor2File,
+) -> Result<
+    crate::adapter::sidecar::predicate_image::btor2_encode::Btor2SmtView,
+    crate::adapter::sidecar::predicate_image::btor2_encode::EncodeError,
+> {
+    use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design_with_theory;
+    use crate::adapter::sidecar::predicate_image::theory::Theory;
+    let theory = if crate::adapter::btor2::bit_blast::detect_btor2_memories(file).is_empty() {
+        Theory::BvOnly
+    } else {
+        Theory::BvUfArray
+    };
+    encode_design_with_theory(file, theory)
+}
+
 pub fn materialize_clts_from_lazy(
     lazy: &mut LazyLift,
     btor2_source_info_format: SourceFormat,
@@ -943,10 +977,9 @@ pub fn materialize_clts_from_lazy(
     // confirmed edges to Sharp. Hyper-must inference is queued
     // for the session-2 follow-up.
     if matches!(must_edge_inference, MustEdgeInference::SmtPerTarget) {
-        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
         let cfg = z3::Config::new();
         let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-            let view = match encode_design(lazy.file()) {
+            let view = match encode_design_for_lift(lazy.file()) {
                 Ok(v) => v,
                 Err(_) => return 0,
             };
@@ -1001,10 +1034,9 @@ pub fn materialize_clts_from_lazy(
     // ∀∃ form in the lazy materialiser. Same shape as the eager
     // path's SmtPerTargetStandard post-pass.
     if matches!(must_edge_inference, MustEdgeInference::SmtPerTargetStandard) {
-        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
         let cfg = z3::Config::new();
         let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-            let view = match encode_design(lazy.file()) {
+            let view = match encode_design_for_lift(lazy.file()) {
                 Ok(v) => v,
                 Err(_) => return 0,
             };
@@ -1060,12 +1092,11 @@ pub fn materialize_clts_from_lazy(
     // lazy materialiser. Same shape as the eager path: per-target
     // ∀∃ singletons first, then full-set hyper-must fallback.
     if matches!(must_edge_inference, MustEdgeInference::SmtHyperMust) {
-        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
         let cfg = z3::Config::new();
         let (smt_sharp_promoted, smt_hyper_emitted) = z3::with_z3_config(
             &cfg,
             || -> (usize, usize) {
-                let view = match encode_design(lazy.file()) {
+                let view = match encode_design_for_lift(lazy.file()) {
                     Ok(v) => v,
                     Err(_) => return (0, 0),
                 };
@@ -1907,10 +1938,9 @@ pub fn predicate_cube_lift(
                 MustEdgeInference::SmtPerTarget
             )
         {
-            use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
             let cfg = z3::Config::new();
             let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-                let view = match encode_design(&file) {
+                let view = match encode_design_for_lift(&file) {
                     Ok(v) => v,
                     Err(_) => return 0,
                 };
@@ -1984,10 +2014,9 @@ pub fn predicate_cube_lift(
                 MustEdgeInference::SmtPerTargetStandard
             )
         {
-            use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
             let cfg = z3::Config::new();
             let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-                let view = match encode_design(&file) {
+                let view = match encode_design_for_lift(&file) {
                     Ok(v) => v,
                     Err(_) => return 0,
                 };
@@ -2056,12 +2085,11 @@ pub fn predicate_cube_lift(
                 MustEdgeInference::SmtHyperMust
             )
         {
-            use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
             let cfg = z3::Config::new();
             let (smt_sharp_promoted, smt_hyper_emitted) = z3::with_z3_config(
                 &cfg,
                 || -> (usize, usize) {
-                    let view = match encode_design(&file) {
+                    let view = match encode_design_for_lift(&file) {
                         Ok(v) => v,
                         Err(_) => return (0, 0),
                     };
@@ -4166,5 +4194,64 @@ mod tests {
         )
         .expect("lazy lift succeeds");
         assert_eq!(lazy.predicates(), preds.as_slice());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // §Phase 10 stage 3.c.2a — encode_design_for_lift theory pick
+    // ─────────────────────────────────────────────────────────────
+
+    /// A memory-bearing BTOR2 (one array-sorted state cell).
+    const MEM_BTOR_FOR_LIFT: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 8
+4 sort array 2 3
+5 state 4 mem
+6 input 2 a
+7 input 3 v
+8 write 4 5 6 7
+9 next 4 5 8
+10 read 3 8 6
+11 zero 3
+12 eq 1 10 11
+13 bad 12
+"#;
+
+    #[test]
+    fn encode_design_for_lift_uses_array_theory_for_memory_design() {
+        // A design with an array state cell must encode (not error)
+        // through encode_design_for_lift, because the helper selects
+        // Theory::BvUfArray. Under the bare BvOnly `encode_design`
+        // this same design errors with ArraySortUnsupportedInBvOnly.
+        let file = crate::adapter::btor2::parser::parse(MEM_BTOR_FOR_LIFT).expect("parse");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_for_lift(&file);
+            assert!(
+                view.is_ok(),
+                "encode_design_for_lift must select BvUfArray + encode a memory design"
+            );
+            let view = view.unwrap();
+            assert_eq!(
+                view.state_curr_arr.len(),
+                1,
+                "the array (memory) state cell must be encoded as a Z3 Array"
+            );
+        });
+    }
+
+    #[test]
+    fn encode_design_for_lift_uses_bvonly_for_memory_free_design() {
+        // A memory-free design must still encode via BvOnly (the
+        // pre-stage-3.c.2a path; array maps empty).
+        let file = crate::adapter::btor2::parser::parse(SMALL_BTOR2).expect("parse");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_for_lift(&file).expect("memory-free encodes");
+            assert!(
+                view.state_curr_arr.is_empty(),
+                "a memory-free design must have no array cells"
+            );
+        });
     }
 }
