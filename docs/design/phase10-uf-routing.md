@@ -84,23 +84,41 @@ Stage 3.b's commit ships the routing decision + a stub `uf_lift_to_adapter_outpu
 
 The existing `sidecar_uf_memory_nids` helper (shipped at `46b15a3`) becomes `pub(crate)` so the routing dispatcher in `mod.rs` can call it. The is_blastable error path stage 3.a installed stays in place as a defensive fallback — if dispatch fails to fire (e.g. malformed sidecar), the bit-blaster still emits the stage-3.a hint.
 
-### Stage 3.c — Z3 Array theory + kripke_smt extension (~2 sessions)
+### Stage 3.c — Z3 Array theory in the BTOR2 SMT encoder (CORRECTED 2026-06-12)
 
-**File:** `crates/mununu-core/src/adapter/systemverilog/kripke_smt.rs::discover_significant_values`. Today it builds Z3 bit-vector terms via the `z3::ast::BV` family. Extension:
+> **Correction.** The original stage-3.c draft (above this line in git history) named `kripke_smt.rs::discover_significant_values` and `kmts_lift.rs::evaluate_pure` as the extension sites. **Both are wrong**, per the architecture map in [`expression-interpretation-unification.md`](expression-interpretation-unification.md):
+> - `kripke_smt.rs` walks the **SystemVerilog `Expr` AST**, not BTOR2 — wrong tree entirely.
+> - `evaluate_pure` is the **concrete** `BvValue` evaluator — it cannot hold a *symbolic* array term; it can only bounded-enumerate (that is stage 4, not stage 3.c).
+>
+> The real BTOR2→Z3 encoder is [`predicate_image/btor2_encode.rs::encode_op`](../../crates/mununu-core/src/adapter/sidecar/predicate_image/btor2_encode.rs) (~:356), which `smt_must_edge.rs` consumes for must-edge queries. [`theory.rs`](../../crates/mununu-core/src/adapter/sidecar/predicate_image/theory.rs) already declares the `QF_AUFBV` logic string (~:44). Stage 3.c is **one encoder file**, not three.
 
-- Add `z3::ast::Array` term construction for state cells whose BTOR2 sort is `Sort::Array { index_width, element_width }`.
-- For `Op::Read(arr, idx)`: emit `Array::select(&arr_ast, &idx_ast)`.
-- For `Op::Write(arr, idx, val)`: emit `Array::store(&arr_ast, &idx_ast, &val_ast)`.
-- Thread the array-typed cell through the existing per-step state-cell map (`HashMap<Nid, BV>` becomes `HashMap<Nid, Z3Term>` where `Z3Term` is an enum over `BV(BV)` and `Arr(Array)`).
-- Functional-consistency axioms (`read(write(a, i, v), j) = if i==j then v else read(a, j)`) are emitted automatically by Z3's Array theory — no explicit axiom encoding needed.
+**The may/must composition (the key simplification).** The predicate-cube lift computes may-edges via the *concrete sampling* path ([`kmts_lift.rs` ~:1710](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs) → `simulate_one_step` → `eval_op`, which cannot evaluate Read/Write), and must-edges via the *SMT* path (`btor2_encode` → `smt_must_edge`, which can). For a UF memory:
 
-**File:** `crates/mununu-core/src/adapter/btor2/kmts_lift.rs::evaluate_pure`. Mirror the same array-term handling in the pure (UF-wrapped) evaluator. Use a `Z3Term` enum if the BV-only `BV` type doesn't suffice. The R.5b UF wrapping check at `kmts_lift.rs:1242` (`if ctx.uf_wrapped_nids.is_empty()`) gets a parallel branch for array-sorted UF.
+- **may-side = havoc** — reuse the **already-shipped** stage-1b machinery (`Op::Read` → fresh nondeterministic input; `Write`/`Init`/`Next` dropped). Sound over-approximation.
+- **must-side = z3 array theory** — the new `select`/`store` encoding in `btor2_encode.rs`. Precise.
 
-**File:** `crates/mununu-core/src/adapter/btor2/kmts_lift.rs::PredicateCubeLiftOptions`. Add a `uf_memories: HashMap<String, MemoryAnnotation>` field carrying the sidecar's UF-memory declarations. The lift consumer wires it from the BTOR2 adapter's dispatch (stage 3.b above).
+Havoc-may + array-must is a proper KMTS — loose-but-sound may, tight must — that **composes existing code** instead of requiring a symbolic-array concrete evaluator.
+
+**Stage 3.c file-level changes:**
+
+1. **`predicate_image/btor2_encode.rs`** — extend `encode_op` (or the array-rejection sites at ~:21/:62/:166/:495) with:
+   - `Op::Read(arr, idx)` → `z3::ast::Array::select(&arr, &idx)`
+   - `Op::Write(arr, idx, val)` → `z3::ast::Array::store(&arr, &idx, &val)`
+   - Declare array-sorted `Node::State` cells as `z3::ast::Array` (index/element widths from `Sort::Array`).
+   - Widen the per-cell map from `HashMap<Nid, z3::ast::BV>` to `enum Z3Term { Bv(BV), Arr(Array) }`. (This is a localized `Z3Term` enum scoped to `btor2_encode.rs` — NOT the broad cross-module change the original draft implied.)
+   - Functional-consistency axioms come free from Z3 Array theory — no manual axiom encoding.
+
+2. **`predicate_image/theory.rs`** — flip the logic selector to `QF_AUFBV` (already present at ~:44) when any array-sorted cell is encoded.
+
+3. **`kmts_lift.rs` predicate-cube lift** — for UF-declared memories: route the **may-edge** construction through the stage-1b havoc rewrite (reuse `havoc_rewrite_memories`) so the concrete sampling path sees a memory-free design, while the **must-edge** SMT post-pass (`SmtPerTarget` / `SmtPerTargetStandard` / `SmtHyperMust`) consumes the array-aware `encode_design` output. No `evaluate_pure` change — the concrete path never sees an array.
+
+4. **`uf_lift_to_adapter_output`** (the stage-3.b stub in `btor2/mod.rs`) — populate with the `predicate_cube_lift` call, threading the sidecar's UF-memory declarations + forcing the must-edge SMT inference policy on (array-must requires the SMT post-pass).
+
+**Deferred to the unification track (Move B/C), NOT stage 3.c:** the `BvTermBackend` trait that would merge the concrete (#1) and z3 (#2) interpreters, and real UF (`z3::FuncDecl`) replacing the concrete Zero/Ones representative. See [`expression-interpretation-unification.md`](expression-interpretation-unification.md) §"The three moves". Stage 3.c does Move A only.
 
 ## Open questions (track during stage 3.b + 3.c implementation)
 
-1. **`Z3Term` enum vs separate Array path.** The bit-vector branch in `kripke_smt` is highly tuned. Adding an `Array(z3::ast::Array)` variant to every match arm is intrusive. The alternative is two parallel code paths (one for bit-vec-only state, one for mixed) — duplication cost vs uniform-term-handling cost. **Mitigation:** prototype the enum approach in stage 3.c first; fall back to parallel paths if the match coverage proves unwieldy.
+1. **`Z3Term` enum vs separate Array path.** The bit-vector branch in `btor2_encode.rs::encode_op` is the encoder to extend (corrected — NOT `kripke_smt`). Adding an `Arr(z3::ast::Array)` variant to the per-cell map requires updating the term-handling at each `encode_op` site. The alternative is two parallel code paths (one for bit-vec-only state, one for mixed) — duplication cost vs uniform-term-handling cost. **Mitigation:** prototype the `Z3Term` enum scoped to `btor2_encode.rs` in stage 3.c first; fall back to parallel paths if the match coverage proves unwieldy. The eventual `BvTermBackend` unification (Move B, separate track) supersedes both.
 2. **`selected_addresses` interaction.** The sidecar schema lets the user supplement UF mode with a `selected_addresses` list (concrete addresses kept exact). Stage 3.c's UF query needs to consult this list per memory and emit a `(select arr addr) == concrete_value` constraint for each selected address. The constraint encoding shape is straightforward; the open question is whether the constraint goes in the predicate-image query body or in a separate axiom set passed to the SMT solver.
 3. **Multi-memory designs.** Caliptra mbox has ONE external SRAM. ibex regfile has ONE register file. Designs with N memory cells (e.g. a CPU with separate I-cache + D-cache) would have N Z3 array variables threaded through every step. Stage 3.c's `HashMap<Nid, Z3Term>` extension scales to this naturally, but the predicate-image SMT-query complexity scales O(N · cube_count) which may need explicit budget management.
 4. **Reset semantics for UF arrays.** Today the bit-blaster handles `Init` by pinning state cells to their initial value at cycle 0. For UF arrays, the initial state of every address is undefined unless the sidecar declares an init policy (e.g. "all addresses init to 0"). Stage 3.c's lift either (a) treats every read at cycle 0 as nondeterministic (sound over-approximation), or (b) accepts a sidecar `init_value` for UF memories (more precise; needs schema extension). **Mitigation:** ship (a) in stage 3.c; defer (b) to a follow-up.
@@ -111,7 +129,7 @@ The existing `sidecar_uf_memory_nids` helper (shipped at `46b15a3`) becomes `pub
 | Stage | Scope | Effort |
 |---|---|---|
 | Stage 3.b | Routing dispatch + stub `uf_lift_to_adapter_output` + integration test pinning the dispatch | ~3 days (1 session) |
-| Stage 3.c | Z3 Array term construction in `kripke_smt` + `evaluate_pure` + `PredicateCubeLiftOptions::uf_memories` + 6-8 unit tests | ~1.5 wk (4-5 sessions) |
+| Stage 3.c | Z3 Array `select`/`store` in `btor2_encode.rs::encode_op` + `QF_AUFBV` selector in `theory.rs` + havoc-may/array-must wiring in `kmts_lift.rs` + `uf_lift_to_adapter_output` population + 6-8 unit tests | ~1 wk (3-4 sessions; smaller than the original ~1.5 wk estimate now that the encoder location is corrected to one file) |
 | Stage 4 | Bounded bit-blast mode (mode-3 reading: enumerate `selected_addresses` as a per-address state-cell ladder) | ~3 days |
 | Stage 5 | Caliptra mbox vendoring + sidecar build + SBY oracle + verdict polarity comparison | ~5 days |
 
