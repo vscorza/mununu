@@ -271,6 +271,20 @@ struct Btor2CegarArgs {
     /// Example: `--controllable-input ctrl_g0 --controllable-input ctrl_g1`.
     #[arg(long = "controllable-input", value_name = "INPUT_NAME")]
     controllable_inputs: Vec<String>,
+    /// R-S2b.6 (§Phase 9 §9.1, 2026-06-12) — path to the original
+    /// SystemVerilog source for the BTOR2 input. When set AND
+    /// the sidecar declares a `simulate_reset` block AND a
+    /// Verilator binary is discoverable, the BTOR2 bit-blaster
+    /// runs a short concrete reset simulation through Verilator
+    /// and feeds the post-reset register valuations into the
+    /// EnumValues discriminator lists (§Phase 9 R-S2b strategy).
+    /// Verilator-absent / sidecar-omits-simulate_reset / SV-path-
+    /// missing all fall through silently with an explanatory
+    /// AdapterWarning — the feature is opt-in per sidecar.
+    ///
+    /// Example: `--sv-source designs/uart_tx.sv`.
+    #[arg(long = "sv-source", value_name = "PATH")]
+    sv_source: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1819,6 +1833,16 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // inputs into env / ctrl classes + emit per-combo dual-label
     // transitions with the appropriate `LabelControllability` tags.
     adapter_options.controllable_inputs = args.controllable_inputs.clone();
+    // R-S2b.6 / P1 (§Phase 11 slot-3 close follow-up, 2026-06-12)
+    // — thread the `--sv-source` CLI flag value into
+    // `AdapterOptions::sv_source_path`, which the bit-blaster's
+    // `apply_simulate_reset_seeding` orchestration reads to
+    // trigger the Verilator reset simulation when the sidecar
+    // declares a `simulate_reset` block. Closes the parity gap
+    // surfaced by the slot-3 close cadence checkpoint at
+    // .claude/reviews/slot-3-close-cadence-2026-06-12.md (R-S2b.6
+    // unreachable from CLI before this wire-in).
+    adapter_options.sv_source_path = args.sv_source.clone();
 
     let trace = cegar_refine_loop(
         &formula,
