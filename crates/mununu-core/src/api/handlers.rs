@@ -352,7 +352,24 @@ pub async fn context_import_handler(
 ) -> ApiResult<Json<ContextImportResponse>> {
     use crate::adapter::{AdapterOptions, FormatAdapter};
 
-    let options = AdapterOptions::default();
+    // P3 (§Phase 11 slot-3 close follow-up, 2026-06-12) — thread
+    // R-S2b.6 + R-S6.6 path-context options into the bit-blaster
+    // (Verilator reset simulation + VCD trace mining
+    // orchestrations) AND populate `sidecar_json` so the BTOR2
+    // path can consume the sidecar's declarations (which today
+    // only the SV adapter reads). Closes the parity gap surfaced
+    // by the slot-3 close cadence checkpoint at
+    // .claude/reviews/slot-3-close-cadence-2026-06-12.md
+    // (R-S2b.6 + R-S6.6 unreachable from API before this wire-in).
+    let options = AdapterOptions {
+        sidecar_json: request.sidecar.clone(),
+        sv_source_path: request
+            .sv_source_path
+            .as_ref()
+            .map(std::path::PathBuf::from),
+        sidecar_path: request.sidecar_path.as_ref().map(std::path::PathBuf::from),
+        ..AdapterOptions::default()
+    };
 
     let result = match request.format.as_str() {
         "tlsf" => crate::adapter::tlsf::TlsfAdapter::translate(&request.content, &options),
@@ -2765,6 +2782,8 @@ members = ["x"]
                 value: 0,
             }],
             controllable_inputs: vec!["ctrl_g0".to_string(), "ctrl_g1".to_string()],
+            sv_source_path: None,
+            sidecar_path: None,
         };
 
         let Json(out) = context_import_handler(Json(request))
@@ -2812,6 +2831,8 @@ members = ["x"]
                 value: 0,
             }],
             controllable_inputs: Vec::new(), // <-- empty disables V.6 path
+            sv_source_path: None,
+            sidecar_path: None,
         };
         let Json(out) = context_import_handler(Json(request))
             .await

@@ -257,6 +257,33 @@ pub struct ContextImportRequest {
     /// per-combo dual-label transitions.
     #[serde(default)]
     pub controllable_inputs: Vec<String>,
+
+    /// R-S2b.6 / P3 (§Phase 11 slot-3 close follow-up, 2026-06-12)
+    /// — filesystem path to the original SystemVerilog source for
+    /// the BTOR2 input. Mirrors the CLI's `--sv-source <PATH>`
+    /// flag. When set AND the supplied `sidecar` declares a
+    /// `simulate_reset` block AND a Verilator binary is
+    /// discoverable on the server, the BTOR2 bit-blaster runs a
+    /// short concrete reset simulation and feeds post-reset
+    /// register valuations into the EnumValues discriminators
+    /// (§Phase 9 R-S2b strategy). Default `None` preserves the
+    /// legacy "no reset simulation" behaviour.
+    #[serde(default)]
+    pub sv_source_path: Option<String>,
+
+    /// R-S6.6 / P3 (§Phase 11 slot-3 close follow-up, 2026-06-12)
+    /// — filesystem path to the sidecar JSON file. Mirrors the
+    /// CLI's `--sidecar <PATH>` flag. When set, the bit-blaster's
+    /// `apply_vcd_trace_seeding` orchestration uses this path's
+    /// parent directory to resolve relative `vcd_traces` entries
+    /// declared in the sidecar (§Phase 9 R-S6 strategy). The
+    /// `sidecar` field above carries the file's CONTENT; this
+    /// field carries the file's PATH so the bit-blaster can
+    /// resolve relative paths within the sidecar's directory
+    /// scope. Default `None` — relative VCD paths emit an
+    /// AdapterWarning and fall through.
+    #[serde(default)]
+    pub sidecar_path: Option<String>,
 }
 
 /// R.6.7 / V.6 (2026-06-09) — predicate-spec request shape. Mirrors
