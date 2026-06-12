@@ -113,6 +113,18 @@ pub struct Btor2SmtView {
     pub state_next: HashMap<Nid, z3::ast::BV>,
     /// Z3 BV handle for each input (constant across the step).
     pub inputs: HashMap<Nid, z3::ast::BV>,
+    /// §Phase 10 stage 3.c.1 — Z3 Array handle for the current-step
+    /// value of each array-sorted (memory) state cell. Empty under
+    /// `Theory::BvOnly`; populated under `Theory::BvUfArray`. The
+    /// array's domain sort is the BTOR2 index width, the range sort
+    /// is the element width. Memory cells only flow into the BV
+    /// world through `Op::Read` (→ `select`); their own next-state
+    /// is an extensional array equality in the transition relation.
+    pub state_curr_arr: HashMap<Nid, z3::ast::Array>,
+    /// §Phase 10 stage 3.c.1 — Z3 Array handle for the next-step
+    /// value of each array-sorted state cell. Mirror of
+    /// `state_curr_arr` over `s_next`.
+    pub state_next_arr: HashMap<Nid, z3::ast::Array>,
     /// Per-signal metadata for callers that need to round-trip
     /// names / widths back to the sidecar.
     pub signals: Vec<EncodedSignal>,
@@ -137,45 +149,104 @@ impl Btor2SmtView {
     }
 }
 
-/// Encode a BTOR2 file into a Z3 transition relation.
+/// Encode a BTOR2 file into a Z3 transition relation under
+/// `Theory::BvOnly` (pure bit-vectors; array sorts rejected).
 ///
 /// Must be called inside a [`z3::with_z3_config`] scope. Returns
 /// [`EncodeError::UnsupportedOperator`] on the first non-blastable
 /// op encountered; the caller has no way to recover other than
 /// rejecting the design or switching to an external symbolic engine.
+///
+/// §Phase 10 stage 3.c.1 — this is now a thin delegator to
+/// [`encode_design_with_theory`] with [`Theory::BvOnly`]. Every
+/// existing caller (must-edge queries, all-SMT enumeration) keeps
+/// the identical behaviour: array-sorted designs still error with
+/// [`EncodeError::ArraySortUnsupportedInBvOnly`]. Memory-bearing
+/// designs opt into the array encoding via
+/// `encode_design_with_theory(file, Theory::BvUfArray)`.
 pub fn encode_design(file: &Btor2File) -> Result<Btor2SmtView, EncodeError> {
-    // Z3 0.20's BV handles carry a lifetime tied to the global
-    // context the `with_z3_config` scope installed; using `'static`
-    // here is the convention the crate's API exposes (every
-    // `BV::new_const` returns BV<'static>).
+    encode_design_with_theory(file, super::theory::Theory::BvOnly)
+}
+
+/// §Phase 10 stage 3.c.1 (2026-06-12) — encode a BTOR2 file into a
+/// Z3 transition relation under the chosen [`Theory`].
+///
+/// - [`Theory::BvOnly`]: pure QF_BV. Array-sorted state cells +
+///   `Op::Read`/`Op::Write` error out (the pre-stage-3.c.1
+///   behaviour, preserved bit-for-bit).
+/// - [`Theory::BvUfArray`]: QF_AUFBV. Array-sorted state cells are
+///   declared as Z3 `Array` consts (domain = index width, range =
+///   element width); `Op::Read` encodes as `select` (→ BV);
+///   array-sorted `next` lines encode as extensional array
+///   equalities in the transition relation. The functional-
+///   consistency axioms (`read(write(a,i,v),j) = i==j ? v :
+///   read(a,j)`) are emitted automatically by Z3's Array theory —
+///   no manual axiom encoding.
+///
+/// **Soundness.** The array encoding is *exact* for the memory
+/// semantics BTOR2 expresses — it does not over-approximate. (The
+/// §Phase 10 havoc-may / array-must composition handles the
+/// may-side over-approximation upstream in the predicate-cube lift;
+/// this encoder is the precise must-side oracle.)
+pub fn encode_design_with_theory(
+    file: &Btor2File,
+    theory: super::theory::Theory,
+) -> Result<Btor2SmtView, EncodeError> {
+    let arrays_ok = theory.supports_indirect_references();
+
+    // Z3 0.20's handles carry a lifetime tied to the global context
+    // the `with_z3_config` scope installed; the crate's API returns
+    // `'static`-flavoured handles.
     let mut state_curr: HashMap<Nid, z3::ast::BV> = HashMap::new();
     let mut state_next: HashMap<Nid, z3::ast::BV> = HashMap::new();
+    let mut state_curr_arr: HashMap<Nid, z3::ast::Array> = HashMap::new();
+    let mut state_next_arr: HashMap<Nid, z3::ast::Array> = HashMap::new();
     let mut inputs: HashMap<Nid, z3::ast::BV> = HashMap::new();
     let mut signals = Vec::new();
 
-    // Symbol map populated by the BTOR2 parser (already factored out;
-    // re-using it keeps the encoder's signal names aligned with the
-    // bit-blaster's).
     let symbols = crate::adapter::btor2::parser::collect_symbols(file);
 
-    // Pass 1 — declare BV handles for every state cell and input.
+    // Pass 1 — declare handles for every state cell and input.
     for line in &file.lines {
         match &line.node {
             Node::State { sort, .. } => {
-                let width = bv_width(file, *sort)
-                    .ok_or(EncodeError::ArraySortUnsupportedInBvOnly { nid: line.nid })?;
-                let sym = symbols.get(&line.nid).cloned();
-                let label = sym.clone().unwrap_or_else(|| format!("st{}", line.nid));
-                let curr = z3::ast::BV::new_const(format!("s_{label}").as_str(), width);
-                let next = z3::ast::BV::new_const(format!("s_next_{label}").as_str(), width);
-                state_curr.insert(line.nid, curr);
-                state_next.insert(line.nid, next);
-                signals.push(EncodedSignal {
-                    nid: line.nid,
-                    width,
-                    symbol: sym,
-                    kind: SignalKind::State,
-                });
+                // Distinguish bit-vector state cells from array
+                // (memory) state cells. `bv_width` returns None for
+                // array sorts.
+                if let Some(width) = bv_width(file, *sort) {
+                    let sym = symbols.get(&line.nid).cloned();
+                    let label = sym.clone().unwrap_or_else(|| format!("st{}", line.nid));
+                    let curr = z3::ast::BV::new_const(format!("s_{label}").as_str(), width);
+                    let next = z3::ast::BV::new_const(format!("s_next_{label}").as_str(), width);
+                    state_curr.insert(line.nid, curr);
+                    state_next.insert(line.nid, next);
+                    signals.push(EncodedSignal {
+                        nid: line.nid,
+                        width,
+                        symbol: sym,
+                        kind: SignalKind::State,
+                    });
+                } else if arrays_ok {
+                    // Array-sorted memory cell — declare Z3 Array
+                    // consts for the current + next step.
+                    let (idx_w, elem_w) = array_widths(file, *sort)
+                        .ok_or(EncodeError::ArraySortUnsupportedInBvOnly { nid: line.nid })?;
+                    let sym = symbols.get(&line.nid).cloned();
+                    let label = sym.clone().unwrap_or_else(|| format!("mem{}", line.nid));
+                    let dom = z3::Sort::bitvector(idx_w);
+                    let rng = z3::Sort::bitvector(elem_w);
+                    let curr = z3::ast::Array::new_const(format!("a_{label}").as_str(), &dom, &rng);
+                    let next =
+                        z3::ast::Array::new_const(format!("a_next_{label}").as_str(), &dom, &rng);
+                    state_curr_arr.insert(line.nid, curr);
+                    state_next_arr.insert(line.nid, next);
+                    // Memory cells are tracked in the array maps, not
+                    // the BV `signals` vector (which feeds bit-vector
+                    // cube enumeration). The predicate-cube lift's
+                    // cube predicates reference BV registers only.
+                } else {
+                    return Err(EncodeError::ArraySortUnsupportedInBvOnly { nid: line.nid });
+                }
             }
             Node::Input { sort, .. } => {
                 let width = bv_width(file, *sort)
@@ -195,14 +266,38 @@ pub fn encode_design(file: &Btor2File) -> Result<Btor2SmtView, EncodeError> {
         }
     }
 
-    // Pass 2 — walk every `next` line and conjoin
-    // `s_next_<state> == eval(value)` into the transition relation.
+    // Pass 2 — walk every `next` line and conjoin the appropriate
+    // equality into the transition relation. BV state cells get a
+    // BV equality `s_next == eval(value)`; array state cells get an
+    // extensional array equality `a_next == eval_array(value)`.
     let mut conjuncts: Vec<z3::ast::Bool> = Vec::new();
     let mut cache: HashMap<Nid, z3::ast::BV> = HashMap::new();
+    let mut array_cache: HashMap<Nid, z3::ast::Array> = HashMap::new();
+    let array_curr = if arrays_ok {
+        Some(&state_curr_arr)
+    } else {
+        None
+    };
 
     for line in &file.lines {
         if let Node::Next { state, value, .. } = &line.node {
-            let value_bv = eval_operand(*value, file, &state_curr, &inputs, &mut cache)?;
+            // Array-sorted next: extensional array equality.
+            if let Some(arr_next) = state_next_arr.get(state) {
+                let value_arr = eval_array_operand(
+                    *value,
+                    file,
+                    &state_curr,
+                    &inputs,
+                    &state_curr_arr,
+                    &mut cache,
+                    &mut array_cache,
+                )?;
+                conjuncts.push(arr_next.eq(&value_arr));
+                continue;
+            }
+            // BV-sorted next: bit-vector equality.
+            let value_bv =
+                eval_operand(*value, file, &state_curr, &inputs, array_curr, &mut cache)?;
             let next_bv = state_next
                 .get(state)
                 .ok_or(EncodeError::WidthMismatch {
@@ -222,9 +317,6 @@ pub fn encode_design(file: &Btor2File) -> Result<Btor2SmtView, EncodeError> {
         }
     }
 
-    // Conjoin into a single Bool. If the design has no `next` lines
-    // (rare — a degenerate fixture), the transition is trivially
-    // `true` (every state is a self-loop).
     let transition = if conjuncts.is_empty() {
         z3::ast::Bool::from_bool(true)
     } else {
@@ -235,10 +327,149 @@ pub fn encode_design(file: &Btor2File) -> Result<Btor2SmtView, EncodeError> {
     Ok(Btor2SmtView {
         state_curr,
         state_next,
+        state_curr_arr,
+        state_next_arr,
         inputs,
         signals,
         transition,
     })
+}
+
+/// §Phase 10 stage 3.c.1 — resolve the index + element bit-widths of
+/// an array sort. BTOR2 `Sort::Array { index, element }` references
+/// two other sort lines (each a bitvec sort); this resolves both.
+fn array_widths(file: &Btor2File, sort_nid: Nid) -> Option<(u32, u32)> {
+    let line = file.lookup(sort_nid)?;
+    let Node::Sort {
+        sort: Sort::Array { index, element },
+    } = &line.node
+    else {
+        return None;
+    };
+    let idx_w = bv_width(file, *index)?;
+    let elem_w = bv_width(file, *element)?;
+    Some((idx_w, elem_w))
+}
+
+/// §Phase 10 stage 3.c.1 — resolve an array-sorted operand to a Z3
+/// `Array` term. Array values occupy a sub-DAG that exits to the BV
+/// world only through `Op::Read` (→ `select`). The producers of
+/// array values are:
+/// - `Node::State` (array sort) → the declared current-step Array.
+/// - `Op::Write(arr, idx, val)` → `arr.store(idx, val)`.
+/// - `Op::Ite(cond, then_arr, else_arr)` → conditional array select.
+///
+/// Caches by NID so DAG sharing in the BTOR2 file maps to Z3
+/// expression sharing. Index/value sub-terms are evaluated through
+/// the BV path (`eval_operand`).
+#[allow(clippy::too_many_arguments)]
+fn eval_array_operand(
+    operand: Operand,
+    file: &Btor2File,
+    state_curr: &HashMap<Nid, z3::ast::BV>,
+    inputs: &HashMap<Nid, z3::ast::BV>,
+    state_curr_arr: &HashMap<Nid, z3::ast::Array>,
+    cache: &mut HashMap<Nid, z3::ast::BV>,
+    array_cache: &mut HashMap<Nid, z3::ast::Array>,
+) -> Result<z3::ast::Array, EncodeError> {
+    // Array operands are never negated (BTOR2 only negates bit-vec
+    // signals); `nid()` strips any sign defensively.
+    let nid = operand.nid();
+
+    if let Some(cached) = array_cache.get(&nid) {
+        return Ok(cached.clone());
+    }
+
+    let line = file.lookup(nid).ok_or(EncodeError::UnsupportedOperator {
+        nid,
+        op_name: "<missing-array-nid>",
+    })?;
+
+    let arr = match &line.node {
+        Node::State { .. } => {
+            state_curr_arr
+                .get(&nid)
+                .cloned()
+                .ok_or(EncodeError::UnsupportedOperator {
+                    nid,
+                    op_name: "array-state",
+                })?
+        }
+        Node::Op {
+            op: Op::Write,
+            args,
+            ..
+        } => {
+            let base = eval_array_operand(
+                args[0],
+                file,
+                state_curr,
+                inputs,
+                state_curr_arr,
+                cache,
+                array_cache,
+            )?;
+            let idx = eval_operand(
+                args[1],
+                file,
+                state_curr,
+                inputs,
+                Some(state_curr_arr),
+                cache,
+            )?;
+            let val = eval_operand(
+                args[2],
+                file,
+                state_curr,
+                inputs,
+                Some(state_curr_arr),
+                cache,
+            )?;
+            base.store(&idx, &val)
+        }
+        Node::Op {
+            op: Op::Ite, args, ..
+        } => {
+            let cond = eval_operand(
+                args[0],
+                file,
+                state_curr,
+                inputs,
+                Some(state_curr_arr),
+                cache,
+            )?;
+            let then_arr = eval_array_operand(
+                args[1],
+                file,
+                state_curr,
+                inputs,
+                state_curr_arr,
+                cache,
+                array_cache,
+            )?;
+            let else_arr = eval_array_operand(
+                args[2],
+                file,
+                state_curr,
+                inputs,
+                state_curr_arr,
+                cache,
+                array_cache,
+            )?;
+            let zero = z3::ast::BV::from_u64(0, cond.get_size());
+            let cond_bool = cond.eq(&zero).not();
+            cond_bool.ite(&then_arr, &else_arr)
+        }
+        _ => {
+            return Err(EncodeError::UnsupportedOperator {
+                nid,
+                op_name: "non-array-producing node in array position",
+            });
+        }
+    };
+
+    array_cache.insert(nid, arr.clone());
+    Ok(arr)
 }
 
 /// Recursively evaluate an operand to a Z3 BV. Caches sub-expressions
@@ -249,6 +480,7 @@ fn eval_operand(
     file: &Btor2File,
     state_curr: &HashMap<Nid, z3::ast::BV>,
     inputs: &HashMap<Nid, z3::ast::BV>,
+    array_curr: Option<&HashMap<Nid, z3::ast::Array>>,
     cache: &mut HashMap<Nid, z3::ast::BV>,
 ) -> Result<z3::ast::BV, EncodeError> {
     let nid = operand.nid();
@@ -296,6 +528,7 @@ fn eval_operand(
                 file,
                 state_curr,
                 inputs,
+                array_curr,
                 cache,
             )?
         }
@@ -362,11 +595,43 @@ fn encode_op(
     file: &Btor2File,
     state_curr: &HashMap<Nid, z3::ast::BV>,
     inputs: &HashMap<Nid, z3::ast::BV>,
+    array_curr: Option<&HashMap<Nid, z3::ast::Array>>,
     cache: &mut HashMap<Nid, z3::ast::BV>,
 ) -> Result<z3::ast::BV, EncodeError> {
+    // §Phase 10 stage 3.c.1 — `Op::Read` is the one operator that
+    // joins the array sub-DAG to the BV world (`select` yields the
+    // element BV). It must be handled BEFORE the `get` closure below
+    // borrows `cache`, because it needs both the BV cache (for the
+    // index sub-term) and the array evaluator (for the array
+    // sub-term). Under `Theory::BvOnly` (`array_curr == None`) it
+    // falls through to the array-rejection error, preserving the
+    // pre-stage-3.c.1 behaviour.
+    if op == Op::Read {
+        let array_curr = array_curr.ok_or(EncodeError::ArraySortUnsupportedInBvOnly { nid })?;
+        let mut array_cache: HashMap<Nid, z3::ast::Array> = HashMap::new();
+        let arr = eval_array_operand(
+            args[0],
+            file,
+            state_curr,
+            inputs,
+            array_curr,
+            cache,
+            &mut array_cache,
+        )?;
+        let idx = eval_operand(args[1], file, state_curr, inputs, Some(array_curr), cache)?;
+        let elem = arr
+            .select(&idx)
+            .as_bv()
+            .ok_or(EncodeError::UnsupportedOperator {
+                nid,
+                op_name: "read (select did not yield a bit-vector element)",
+            })?;
+        return Ok(elem);
+    }
+
     // Helpers to materialise operands inline.
     let mut get = |i: usize| -> Result<z3::ast::BV, EncodeError> {
-        eval_operand(args[i], file, state_curr, inputs, cache)
+        eval_operand(args[i], file, state_curr, inputs, array_curr, cache)
     };
     let bool_to_bv1 = |b: z3::ast::Bool| {
         let one = z3::ast::BV::from_u64(1, 1);
@@ -577,5 +842,159 @@ mod tests {
             assert_eq!(s.width, 3);
             assert_eq!(s.kind, SignalKind::State);
         });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // §Phase 10 stage 3.c.1 — Z3 Array theory (QF_AUFBV) encoding
+    // ─────────────────────────────────────────────────────────────
+
+    use super::super::theory::Theory;
+
+    /// A tiny memory design: a single array-sorted state cell `mem`
+    /// (5-bit address, 8-bit data), one ite-on-array next (no-op
+    /// write), one read. Mirrors `bit_blast.rs`'s
+    /// PHASE10_FIXTURE_WITH_MEMORY.
+    const MEM_BTOR_READ_ONLY: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 8
+4 sort array 2 3
+5 state 4 mem
+6 input 1 we
+7 input 2 addr
+8 input 3 wdata
+9 ite 4 6 5 5
+10 next 4 5 9
+11 read 3 5 7
+12 zero 3
+13 eq 1 11 12
+14 bad 13
+"#;
+
+    /// A memory design that performs an actual `write` (store) then
+    /// reads back the same address into an observed BV register. The
+    /// array functional-consistency axiom forces
+    /// `read(store(mem, a, v), a) == v`.
+    const MEM_BTOR_WRITE_THEN_READ: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 8
+4 sort array 2 3
+5 state 4 mem
+6 state 3 observed
+7 input 2 a
+8 input 3 v
+9 write 4 5 7 8
+10 next 4 5 9
+11 read 3 9 7
+12 next 3 6 11
+"#;
+
+    #[test]
+    fn bvonly_rejects_array_design() {
+        // Regression guard: the BvOnly path (and the `encode_design`
+        // delegator) must STILL reject array-sorted designs, exactly
+        // as before stage 3.c.1.
+        let file = parse(MEM_BTOR_READ_ONLY).expect("parse mem design");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let result = encode_design(&file);
+            assert!(
+                matches!(
+                    result.err(),
+                    Some(EncodeError::ArraySortUnsupportedInBvOnly { .. })
+                ),
+                "BvOnly must reject array-sorted state cells with ArraySortUnsupportedInBvOnly"
+            );
+        });
+    }
+
+    #[test]
+    fn bvufarray_encodes_array_design() {
+        // Under BvUfArray the same design encodes successfully.
+        let file = parse(MEM_BTOR_READ_ONLY).expect("parse mem design");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_with_theory(&file, Theory::BvUfArray)
+                .expect("BvUfArray must encode the array design");
+            // The memory cell is tracked in the array maps, not the
+            // BV `signals` vector.
+            assert_eq!(view.state_curr_arr.len(), 1, "one array state cell");
+            assert_eq!(view.state_next_arr.len(), 1);
+            // The BV input registers are still present.
+            assert!(view.inputs.values().count() >= 3, "we + addr + wdata");
+        });
+    }
+
+    #[test]
+    fn bvufarray_read_after_write_is_forced_by_array_axiom() {
+        // The transition relation must FORCE
+        // `observed_next == v` because
+        // `read(store(mem, a, v), a) == v` by Z3's extensional
+        // array axiom. We prove this by asserting the transition
+        // AND `observed_next != v` and checking UNSAT.
+        let file = parse(MEM_BTOR_WRITE_THEN_READ).expect("parse write-then-read");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_with_theory(&file, Theory::BvUfArray)
+                .expect("encode write-then-read");
+
+            // Locate the `observed` state cell's next BV (NID 6) and
+            // the `v` input BV (NID 8).
+            let observed_next = view
+                .state_next
+                .get(&6)
+                .expect("observed next BV present")
+                .clone();
+            let v_input = view.inputs.get(&8).expect("v input BV present").clone();
+
+            let solver = z3::Solver::new();
+            solver.assert(&view.transition);
+            // Negation of the array-consistency consequence.
+            solver.assert(observed_next.eq(&v_input).not());
+            assert_eq!(
+                solver.check(),
+                z3::SatResult::Unsat,
+                "read(store(mem,a,v),a) != v must be UNSAT under array theory"
+            );
+        });
+    }
+
+    #[test]
+    fn bvufarray_read_after_write_equality_is_sat() {
+        // Dual of the above: the transition AND
+        // `observed_next == v` must be SAT (the axiom is satisfiable,
+        // not vacuous).
+        let file = parse(MEM_BTOR_WRITE_THEN_READ).expect("parse write-then-read");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_with_theory(&file, Theory::BvUfArray)
+                .expect("encode write-then-read");
+            let observed_next = view.state_next.get(&6).expect("observed next").clone();
+            let v_input = view.inputs.get(&8).expect("v input").clone();
+
+            let solver = z3::Solver::new();
+            solver.assert(&view.transition);
+            solver.assert(observed_next.eq(&v_input));
+            assert_eq!(
+                solver.check(),
+                z3::SatResult::Sat,
+                "read(store(mem,a,v),a) == v must be SAT (axiom not vacuous)"
+            );
+        });
+    }
+
+    #[test]
+    fn array_widths_resolves_index_and_element() {
+        // The array_widths helper must resolve both sort widths from
+        // a `sort array <idx> <elem>` declaration.
+        let file = parse(MEM_BTOR_READ_ONLY).expect("parse");
+        // Sort NID 4 is `sort array 2 3` → index sort 2 (5-bit),
+        // element sort 3 (8-bit).
+        let (idx_w, elem_w) = array_widths(&file, 4).expect("array_widths resolves NID 4");
+        assert_eq!(idx_w, 5);
+        assert_eq!(elem_w, 8);
+        // A bitvec sort NID returns None.
+        assert!(array_widths(&file, 3).is_none());
     }
 }
