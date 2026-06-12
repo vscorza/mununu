@@ -1328,6 +1328,40 @@ fn enumerate_and_blast(
         );
     }
 
+    // R-S6.6 (§Phase 9 §9.1) — VCD trace-mining seeding. Walks
+    // every `SvAnnotation::vcd_traces` entry; for each, reads the
+    // declared VCD file (path resolved against
+    // `AdapterOptions::sidecar_path`'s parent dir for relative
+    // paths) and mines per-signal heavy-hitter + boundary values
+    // into cell_domains via R-S6.5's seeding helper. See
+    // `apply_vcd_trace_seeding` for the per-trace graceful-
+    // fallback contract.
+    'vcd_trace_seed: {
+        let Some(json) = &options.sidecar_json else {
+            break 'vcd_trace_seed;
+        };
+        let Ok(ann) =
+            serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+        else {
+            break 'vcd_trace_seed;
+        };
+        if ann.vcd_traces.is_empty() {
+            break 'vcd_trace_seed;
+        }
+        let sidecar_dir = options.sidecar_path.as_deref().and_then(|p| p.parent());
+        let nid_widths: Vec<(Nid, u32)> = state_meta.iter().map(|sm| (sm.nid, sm.width)).collect();
+        for trace in &ann.vcd_traces {
+            apply_vcd_trace_seeding(
+                trace,
+                sidecar_dir,
+                &nid_widths,
+                &symbols,
+                &mut cell_domains,
+                warnings,
+            );
+        }
+    }
+
     let cells = CellEnumeration::build(&state_meta, &cell_domains);
 
     // Phase 1.6: per-input sidecar resolution. The sidecar already
@@ -3022,14 +3056,9 @@ fn cell_domains_value_count(cell_domains: &CellDomainMap) -> usize {
 /// downstream predicate-cube partition; it cannot remove
 /// behaviour. No new `// SOUNDNESS:` annotation needed.
 ///
-/// # Staged shipping
-///
-/// R-S6.5 lands the helper ahead of R-S6.6 (CLI flag +
-/// orchestration call site). Until R-S6.6 is wired the helper
-/// has only test callers — same staged-API pattern R-S2b.4
-/// followed during the R-S2b arc. The `#[allow(dead_code)]`
-/// annotation comes off in R-S6.6.
-#[allow(dead_code)]
+/// R-S6.6 (2026-06-11) — `apply_vcd_trace_seeding` (below) is
+/// the production call site; the staged `#[allow(dead_code)]`
+/// from R-S6.5's first shipping commit was removed in R-S6.6.
 pub(crate) fn apply_vcd_seeding(
     signal_stats: &[crate::adapter::vcd::VcdValueStats],
     max_heavy_hitters_per_signal: u32,
@@ -3104,6 +3133,177 @@ fn try_append_value(
         Some(v) => v.push(variant_name),
         None => fd.variants = Some(vec![variant_name]),
     }
+}
+
+/// R-S6.6 (2026-06-11) — orchestrates the VCD trace mining +
+/// bit-blaster seeding for a single
+/// [`crate::adapter::systemverilog::annotation::VcdTraceConfig`].
+/// Production call site for R-S6.5's [`apply_vcd_seeding`].
+///
+/// **Inputs**:
+/// - `trace_config`: one entry from `SvAnnotation::vcd_traces`.
+/// - `sidecar_dir`: parent directory of the sidecar (from
+///   `AdapterOptions::sidecar_path.parent()`). Used to resolve
+///   relative paths in `trace_config.path`. May be `None` when
+///   the sidecar path wasn't supplied — only absolute trace
+///   paths can be read in that case.
+/// - `nid_widths`, `symbols`, `cell_domains`: as built upstream.
+/// - `warnings`: receives soundness / fallback notices.
+///
+/// **Behaviour**:
+/// 1. Resolves the trace path: absolute → use as-is; relative →
+///    join with `sidecar_dir`. If the result is unreadable
+///    (file missing, no read permission), pushes an
+///    `AdapterWarning` and returns.
+/// 2. Parses header + value changes via
+///    [`crate::adapter::vcd::parse_vcd_header`] +
+///    [`crate::adapter::vcd::parse_vcd_changes`]. Parse failures
+///    surface as `AdapterWarning` (graceful — the bit-blaster
+///    continues with its pre-mining cell_domains).
+/// 3. Mines per-signal frequencies via
+///    [`crate::adapter::vcd::mine_vcd_frequencies`].
+/// 4. Rewrites each stats entry's `id` from the raw VCD signal-id
+///    to the SV signal name (using the header's
+///    `signals` lookup, leaf-name only — the BTOR2 symbols map
+///    uses leaf names).
+/// 5. Applies the per-trace allowlist if `trace_config.signals`
+///    is non-empty.
+/// 6. Calls [`apply_vcd_seeding`] with the rewritten stats.
+/// 7. Pushes a summary `AdapterWarning` recording the trace
+///    consumed + value count before/after.
+///
+/// **Soundness**: same posture as R-S6.5. Every seeded value is a
+/// witness observed during real simulation — it lies inside the
+/// cell's full admissible set by construction.
+pub(crate) fn apply_vcd_trace_seeding(
+    trace_config: &crate::adapter::systemverilog::annotation::VcdTraceConfig,
+    sidecar_dir: Option<&std::path::Path>,
+    nid_widths: &[(Nid, u32)],
+    symbols: &std::collections::HashMap<i64, String>,
+    cell_domains: &mut CellDomainMap,
+    warnings: &mut Vec<AdapterWarning>,
+) {
+    let path_obj = std::path::Path::new(&trace_config.path);
+    let resolved = if path_obj.is_absolute() {
+        path_obj.to_path_buf()
+    } else if let Some(dir) = sidecar_dir {
+        dir.join(path_obj)
+    } else {
+        warnings.push(AdapterWarning {
+            kind: WarningKind::ApproximateTranslation,
+            message: format!(
+                "R-S6.6: relative VCD trace path `{}` cannot be resolved without \
+                 AdapterOptions::sidecar_path; skipping. Set the sidecar path or use \
+                 an absolute trace path.",
+                trace_config.path
+            ),
+            location: None,
+        });
+        return;
+    };
+
+    let content = match std::fs::read(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S6.6: failed to read VCD trace at `{}`: {e}; skipping.",
+                    resolved.display()
+                ),
+                location: None,
+            });
+            return;
+        }
+    };
+
+    let header = match crate::adapter::vcd::parse_vcd_header(&content) {
+        Ok(h) => h,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S6.6: VCD header parse failed for `{}`: {}; skipping.",
+                    resolved.display(),
+                    e.message
+                ),
+                location: None,
+            });
+            return;
+        }
+    };
+
+    let changes = match crate::adapter::vcd::parse_vcd_changes(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            warnings.push(AdapterWarning {
+                kind: WarningKind::ApproximateTranslation,
+                message: format!(
+                    "R-S6.6: VCD changes parse failed for `{}`: {}; skipping.",
+                    resolved.display(),
+                    e.message
+                ),
+                location: None,
+            });
+            return;
+        }
+    };
+
+    let mut stats = crate::adapter::vcd::mine_vcd_frequencies(&changes);
+
+    // Build VCD signal-id → SV leaf name map (R-S6.5 expects the
+    // stats id field to carry the SV signal name).
+    let id_to_name: std::collections::HashMap<&str, &str> = header
+        .signals
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str()))
+        .collect();
+
+    // Rewrite + (optionally) filter by allowlist.
+    let allowlist: Option<std::collections::HashSet<&str>> = if trace_config.signals.is_empty() {
+        None
+    } else {
+        Some(trace_config.signals.iter().map(String::as_str).collect())
+    };
+
+    let mut rewritten = Vec::with_capacity(stats.len());
+    for s in stats.drain(..) {
+        let Some(name) = id_to_name.get(s.id.as_str()) else {
+            continue;
+        };
+        if let Some(allow) = &allowlist
+            && !allow.contains(name)
+        {
+            continue;
+        }
+        rewritten.push(crate::adapter::vcd::VcdValueStats {
+            id: (*name).to_string(),
+            ..s
+        });
+    }
+
+    let before = cell_domains_value_count(cell_domains);
+    apply_vcd_seeding(
+        &rewritten,
+        trace_config.max_heavy_hitters_per_signal,
+        trace_config.seed_boundary_values,
+        nid_widths,
+        symbols,
+        cell_domains,
+    );
+    let after = cell_domains_value_count(cell_domains);
+
+    warnings.push(AdapterWarning {
+        kind: WarningKind::ApproximateTranslation,
+        message: format!(
+            "R-S6.6: VCD trace `{}` mined {signals} signals; added {added} new EnumValues \
+             discriminator(s) (before={before}, after={after}).",
+            resolved.display(),
+            signals = rewritten.len(),
+            added = after.saturating_sub(before),
+        ),
+        location: None,
+    });
 }
 
 /// R-S2a helper — resolve a BTOR2 NID to its constant `u64` value if
@@ -6030,5 +6230,164 @@ mod tests {
                 "no R-S2b.6 warning on malformed sidecar"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S6.6 tests — translate() integration + graceful fallback
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r_s6_6_translate_no_op_when_sidecar_omits_vcd_traces() {
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test"
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        assert!(
+            !out.warnings.iter().any(|w| w.message.contains("R-S6.6")),
+            "no R-S6.6 warning when sidecar omits vcd_traces; got: {:?}",
+            out.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn r_s6_6_translate_emits_warning_for_missing_trace_file() {
+        // Sidecar declares a vcd_traces entry but the path doesn't
+        // exist; R-S6.6 must emit a warning + continue cleanly.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "vcd_traces": [
+                { "path": "/nonexistent/trace.vcd" }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        let warn = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("R-S6.6"))
+            .expect("R-S6.6 must emit a warning when trace file is missing");
+        assert!(
+            warn.message.contains("failed to read") || warn.message.contains("nonexistent"),
+            "warning must mention the read failure; got: {}",
+            warn.message
+        );
+    }
+
+    #[test]
+    fn r_s6_6_translate_emits_warning_for_relative_path_without_sidecar_path() {
+        // Relative path + sidecar_path=None → R-S6.6 must emit a
+        // warning (no resolution context) + continue.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "vcd_traces": [
+                { "path": "relative/trace.vcd" }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            sidecar_path: None,
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        let warn = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("R-S6.6"))
+            .expect("R-S6.6 must emit a warning when relative path lacks resolution context");
+        assert!(
+            warn.message.contains("relative") || warn.message.contains("sidecar_path"),
+            "warning must mention the resolution-context issue; got: {}",
+            warn.message
+        );
+    }
+
+    #[test]
+    fn r_s6_6_translate_consumes_real_trace_and_emits_summary_warning() {
+        // Happy path: write a small VCD to a tempdir, point a
+        // sidecar at it, and assert that R-S6.6 emits the summary
+        // warning naming the trace. The trace covers signal `q`
+        // (which matches the BTOR2 state cell's symbol) with
+        // values 0 and 1.
+        let tmp = std::env::temp_dir().join(format!("mununu-r-s6-6-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir tempdir");
+        let trace_path = tmp.join("q.vcd");
+        std::fs::write(
+            &trace_path,
+            "$timescale 1ns $end\n\
+             $scope module top $end\n\
+             $var wire 1 ! q $end\n\
+             $upscope $end\n\
+             $enddefinitions $end\n\
+             #0\n\
+             0 !\n\
+             #1\n\
+             1 !\n",
+        )
+        .expect("write vcd");
+        let sidecar_path = tmp.join("test.mununu.json");
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 q
+4 init 1 3 2
+5 next 1 3 3
+"#;
+        let sidecar_json = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "vcd_traces": [
+                { "path": "q.vcd" }
+            ]
+        });
+        std::fs::write(&sidecar_path, sidecar_json.to_string()).expect("write sidecar");
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar_json.to_string()),
+            sidecar_path: Some(sidecar_path.clone()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // Cleanup before assertions so failures don't leak the dir.
+        let _ = std::fs::remove_dir_all(&tmp);
+        let warn = out
+            .warnings
+            .iter()
+            .find(|w| w.message.contains("R-S6.6"))
+            .expect("R-S6.6 must emit a summary warning for a successfully mined trace");
+        assert!(
+            warn.message.contains("mined"),
+            "warning must mention the mining summary; got: {}",
+            warn.message
+        );
     }
 }

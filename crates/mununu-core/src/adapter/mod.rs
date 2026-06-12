@@ -144,6 +144,20 @@ pub struct AdapterOptions {
     /// strategies). See R-S2b.4 / R-S2b.5 for the prerequisite
     /// helpers + sidecar schema.
     pub sv_source_path: Option<std::path::PathBuf>,
+
+    /// R-S6.6 (§Phase 9 §9.1, 2026-06-11) — filesystem path to
+    /// the sidecar that produced `sidecar_json` (when known).
+    /// Used by R-S6.6's orchestration to resolve VCD trace paths
+    /// declared in `SvAnnotation::vcd_traces`: relative paths in
+    /// the sidecar (e.g. `"regression/uart_tx.vcd"`) are resolved
+    /// against this path's parent directory.
+    ///
+    /// When `None`, only absolute trace paths can be read; relative
+    /// paths emit an `AdapterWarning` and fall through. Default
+    /// `None` preserves the legacy behaviour. Populated by the CLI
+    /// (`mununu sv extract --sidecar <path>`) and any API caller
+    /// that has the sidecar file system path.
+    pub sidecar_path: Option<std::path::PathBuf>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.
