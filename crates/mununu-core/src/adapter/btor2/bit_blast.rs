@@ -2984,6 +2984,128 @@ fn cell_domains_value_count(cell_domains: &CellDomainMap) -> usize {
     cell_domains.values().map(|(_, vm)| vm.len()).sum()
 }
 
+/// R-S6.5 (§Phase 9 §9.1, 2026-06-11) — apply the VCD-trace
+/// mining seeding strategy to a `CellDomainMap`. Companion to
+/// R-S2b.4's [`apply_reset_simulation_seeding`]; mirrors its
+/// shape one-for-one — same `EnumValues` gate, same
+/// `(variant_name, value)` augmentation, same non-destructive
+/// "skip if already known" check.
+///
+/// The only differences from R-S2b.4 are the **value source**
+/// and the **multi-value-per-signal budget**:
+///
+/// - **Value source**: instead of a single
+///   `RegisterValuation { value }` (R-S2b's "observe one steady
+///   state"), this helper consumes a [`VcdValueStats`] entry
+///   carrying a heavy-hitter list + boundary values mined from
+///   pre-existing regression traces (R-S6.3's miner output).
+/// - **Multi-value budget**: each signal contributes up to
+///   `max_heavy_hitters_per_signal` heavy-hitter values + (when
+///   `seed_boundary_values`) the min and max. R-S2b.4 contributes
+///   one value per signal.
+///
+/// **Signal-name matching**: each `VcdValueStats::id` field is
+/// expected to carry the **signal name** (NOT the VCD signal-id
+/// the raw miner output uses). R-S6.6's orchestration rewrites
+/// the `id` field by joining mining output with the
+/// `VcdHeader::signals` lookup before invoking this helper —
+/// keeps R-S6.5's signature aligned with R-S2b.4's
+/// signal-name-keyed contract.
+///
+/// **Width clamping**: each value is masked to the matched
+/// cell's BTOR2 bit-width via `nid_widths` (same as R-S2b.4).
+///
+/// **Soundness**: same posture as R-S2a / R-S2b.4. Every seeded
+/// value is a witness observed during real simulation — it lies
+/// inside the cell's full admissible set by construction. Adding
+/// it as a named `EnumValues` variant only refines the
+/// downstream predicate-cube partition; it cannot remove
+/// behaviour. No new `// SOUNDNESS:` annotation needed.
+///
+/// # Staged shipping
+///
+/// R-S6.5 lands the helper ahead of R-S6.6 (CLI flag +
+/// orchestration call site). Until R-S6.6 is wired the helper
+/// has only test callers — same staged-API pattern R-S2b.4
+/// followed during the R-S2b arc. The `#[allow(dead_code)]`
+/// annotation comes off in R-S6.6.
+#[allow(dead_code)]
+pub(crate) fn apply_vcd_seeding(
+    signal_stats: &[crate::adapter::vcd::VcdValueStats],
+    max_heavy_hitters_per_signal: u32,
+    seed_boundary_values: bool,
+    nid_widths: &[(Nid, u32)],
+    symbols: &std::collections::HashMap<i64, String>,
+    cell_domains: &mut CellDomainMap,
+) {
+    let nid_to_width: std::collections::HashMap<Nid, u32> = nid_widths.iter().copied().collect();
+    let name_to_nid: std::collections::HashMap<&str, i64> = symbols
+        .iter()
+        .map(|(nid, name)| (name.as_str(), *nid))
+        .collect();
+
+    for stats in signal_stats {
+        let Some(&nid) = name_to_nid.get(stats.id.as_str()) else {
+            continue;
+        };
+        let Some((fd, value_map)) = cell_domains.get_mut(&nid) else {
+            continue;
+        };
+        if !matches!(
+            fd.abstraction,
+            crate::adapter::domain::AbstractionType::EnumValues
+        ) {
+            continue;
+        }
+        let Some(width) = nid_to_width.get(&nid).copied() else {
+            continue;
+        };
+        let mask: u64 = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+
+        // Top-N heavy-hitters (in count-descending order; R-S6.3
+        // sorted the list deterministically).
+        let take_n = max_heavy_hitters_per_signal as usize;
+        for (raw_value, _count) in stats.heavy_hitters.iter().take(take_n) {
+            try_append_value(&stats.id, *raw_value & mask, fd, value_map);
+        }
+
+        // Boundary values: min and max.
+        if seed_boundary_values {
+            if let Some(min_v) = stats.min {
+                try_append_value(&stats.id, min_v & mask, fd, value_map);
+            }
+            if let Some(max_v) = stats.max {
+                try_append_value(&stats.id, max_v & mask, fd, value_map);
+            }
+        }
+    }
+}
+
+/// R-S6.5 helper — append a `(variant_name, value)` to a cell's
+/// `value_map` and `variants` if the value isn't already there.
+/// Variant name format matches R-S2b.4: `<signal_name>_<value>`.
+fn try_append_value(
+    signal_name: &str,
+    masked: u64,
+    fd: &mut crate::adapter::domain::FieldDomain,
+    value_map: &mut Vec<(String, i64)>,
+) {
+    let masked_signed = masked as i64;
+    if value_map.iter().any(|(_, v)| *v == masked_signed) {
+        return;
+    }
+    let variant_name = format!("{signal_name}_{masked_signed}");
+    value_map.push((variant_name.clone(), masked_signed));
+    match &mut fd.variants {
+        Some(v) => v.push(variant_name),
+        None => fd.variants = Some(vec![variant_name]),
+    }
+}
+
 /// R-S2a helper — resolve a BTOR2 NID to its constant `u64` value if
 /// it's one of the simple constant nodes mununu's bit-blaster
 /// recognises: `Node::Const { value: Binary/Decimal/Hex }`, or one
@@ -5516,6 +5638,238 @@ mod tests {
             !value_map_a.iter().any(|(_, v)| *v == 7),
             "valuation for `b` must not leak into cell `a`"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S6.5 tests — VCD trace-mining seeding helper
+    // ─────────────────────────────────────────────────────────────
+
+    use crate::adapter::vcd::VcdValueStats;
+
+    fn stats(
+        id: &str,
+        heavy: Vec<(u64, usize)>,
+        min: Option<u64>,
+        max: Option<u64>,
+    ) -> VcdValueStats {
+        VcdValueStats {
+            id: id.to_string(),
+            heavy_hitters: heavy,
+            min,
+            max,
+            indeterminate_count: 0,
+        }
+    }
+
+    #[test]
+    fn r_s6_5_seeds_top_n_heavy_hitters() {
+        // Cell `q` has 3 distinct values in the trace (top 3 only;
+        // R-S6.5 budget cap = 2). The 3rd value must be dropped.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (enum_field("q", vec!["Q_0"]), vec![("Q_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        // Heavy hitters: value 1 (count 10), value 2 (count 5),
+        // value 3 (count 2). Budget = 2 → only values 1 and 2
+        // should be seeded.
+        let signal_stats = vec![stats("q", vec![(1, 10), (2, 5), (3, 2)], Some(1), Some(3))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            /* max_heavy_hitters_per_signal */ 2,
+            /* seed_boundary_values */ false,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        // Pre-existing 0 + heavy-hitters 1, 2. No 3 (budget cap).
+        let values: Vec<i64> = value_map.iter().map(|(_, v)| *v).collect();
+        assert!(values.contains(&0));
+        assert!(values.contains(&1));
+        assert!(values.contains(&2));
+        assert!(
+            !values.contains(&3),
+            "value 3 must not be seeded; got {value_map:?}"
+        );
+    }
+
+    #[test]
+    fn r_s6_5_seeds_boundary_values_when_enabled() {
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (enum_field("q", vec!["Q_0"]), vec![("Q_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        // No heavy-hitters under the budget cap (cap = 0); rely on
+        // boundary values to seed.
+        let signal_stats = vec![stats("q", vec![(1, 1), (5, 1), (9, 1)], Some(1), Some(9))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            /* max_heavy_hitters_per_signal */ 0,
+            /* seed_boundary_values */ true,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        // 0 was pre-existing; 1 (min) and 9 (max) seeded.
+        let values: Vec<i64> = value_map.iter().map(|(_, v)| *v).collect();
+        assert!(values.contains(&0));
+        assert!(values.contains(&1), "min must be seeded; got {value_map:?}");
+        assert!(values.contains(&9), "max must be seeded; got {value_map:?}");
+    }
+
+    #[test]
+    fn r_s6_5_skips_boundary_when_disabled() {
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (enum_field("q", vec!["Q_0"]), vec![("Q_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        // Heavy-hitters list empty + boundary values 1 and 9
+        // present in the stats. With cap=0 + boundary=false, no
+        // seeding should occur.
+        let signal_stats = vec![stats("q", vec![], Some(1), Some(9))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            0,
+            false,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        assert_eq!(value_map.len(), 1, "no values seeded; got {value_map:?}");
+    }
+
+    #[test]
+    fn r_s6_5_skips_non_enum_abstractions() {
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(7, (counter_field("counter", 15), Vec::new()));
+        let nid_widths: [(Nid, u32); 1] = [(7, 4)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(7i64, "counter".to_string());
+        let signal_stats = vec![stats("counter", vec![(1, 10)], Some(1), Some(1))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            10,
+            true,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (fd, value_map) = cell_domains.get(&7).expect("cell still present");
+        assert!(matches!(fd.abstraction, AbstractionType::BoundedCounter));
+        assert!(
+            value_map.is_empty(),
+            "BoundedCounter cells must not receive R-S6.5 widening; got {value_map:?}"
+        );
+    }
+
+    #[test]
+    fn r_s6_5_skips_signals_without_matching_cell() {
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (enum_field("q", vec!["Q_0"]), vec![("Q_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        // Stats name = "unknown_reg" → no matching cell.
+        let signal_stats = vec![stats("unknown_reg", vec![(5, 10)], Some(5), Some(5))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            10,
+            true,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        assert_eq!(value_map.len(), 1, "no values seeded; got {value_map:?}");
+    }
+
+    #[test]
+    fn r_s6_5_dedupes_against_existing_value_map() {
+        // Value 3 already in the value_map; the trace's heavy-
+        // hitter top-N also includes 3 → must not duplicate.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            42,
+            (
+                enum_field("q", vec!["Q_0", "Q_3"]),
+                vec![("Q_0".to_string(), 0), ("Q_3".to_string(), 3)],
+            ),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(42, 8)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(42i64, "q".to_string());
+        let signal_stats = vec![stats("q", vec![(3, 10), (7, 3)], Some(3), Some(7))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            10,
+            true,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (_, value_map) = cell_domains.get(&42).expect("cell still present");
+        // Expect: 0 (pre-existing) + 3 (pre-existing, deduped) + 7 (new).
+        // No duplicate 3.
+        let count_3 = value_map.iter().filter(|(_, v)| *v == 3).count();
+        assert_eq!(count_3, 1, "value 3 must not duplicate; got {value_map:?}");
+        let values: Vec<i64> = value_map.iter().map(|(_, v)| *v).collect();
+        assert!(values.contains(&7));
+    }
+
+    #[test]
+    fn r_s6_5_masks_values_to_cell_width() {
+        // 4-bit cell with a trace value 0xFF — must mask to 0xF.
+        let mut cell_domains: CellDomainMap = std::collections::HashMap::new();
+        cell_domains.insert(
+            11,
+            (enum_field("x", vec!["X_0"]), vec![("X_0".to_string(), 0)]),
+        );
+        let nid_widths: [(Nid, u32); 1] = [(11, 4)];
+        let mut symbols = std::collections::HashMap::new();
+        symbols.insert(11i64, "x".to_string());
+        let signal_stats = vec![stats("x", vec![(0xFF, 5)], Some(0xFF), Some(0xFF))];
+
+        apply_vcd_seeding(
+            &signal_stats,
+            10,
+            true,
+            &nid_widths,
+            &symbols,
+            &mut cell_domains,
+        );
+
+        let (_, value_map) = cell_domains.get(&11).expect("cell still present");
+        assert!(value_map.iter().any(|(_, v)| *v == 15));
+        assert!(value_map.iter().all(|(_, v)| *v != 0xFF));
     }
 
     // ─────────────────────────────────────────────────────────────
