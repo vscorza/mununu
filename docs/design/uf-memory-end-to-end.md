@@ -1,93 +1,123 @@
-# UF-memory end-to-end: the may/must problem and the paths to a verdict
+# UF-memory end-to-end: `BvTermBackend` unification with memory as a capability
 
-> **Status: planning** — the deferred "Option A" from the §Phase 10 stage-3.c fork (2026-06-12). The array *encoder* is shipped (commits `9c5fa09` must-side encoder, `3600cba` must-side routing); what remains is turning it into an end-to-end KMTS verdict for an internal-memory design (e.g. ibex `ibex_register_file_ff`). This doc states the problem, lays out four implementation options with pros/cons, and gives the soundness concern + validation path for each.
+> **Status: planning** — the decided post-stage-5 path for UF-memory verification. After §Phase 10 stage 5 ships the Caliptra-mbox black-box-interface milestone (the independent near-term deliverable), the internal-memory verification track goes via **Option 4: the full `BvTermBackend` unification** from [`expression-interpretation-unification.md`](expression-interpretation-unification.md) §"Move B", with memory carried as a **backend capability** rather than a special-cased path. This doc is the implementation plan for that work.
 
-> **Concept:** lifting a BTOR2 design with an internal memory cell to a 3-valued KMTS that the modal-mu evaluator can verify. Builds on [`expression-interpretation-unification.md`](expression-interpretation-unification.md) (the interpreter-layer map) and [`phase10-uf-routing.md`](phase10-uf-routing.md) (the routing dispatch).
+> **Concept:** lifting a BTOR2 design with an internal memory cell to a 3-valued KMTS the modal-mu evaluator can verify, by unifying the concrete and SMT operator interpreters behind one trait and expressing memory as a capability each backend provides in its own theory.
 
-## The problem
+## Decision
 
-The predicate-cube lift ([`kmts_lift.rs::predicate_cube_lift`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs)) builds a KMTS over `2^|P|` predicate-cube states. Each cube is a conjunction of register-equality predicates. The lift computes two transition relations between cubes:
+The §Phase 10 stage-3.c fork (2026-06-12) deferred end-to-end UF-memory verification. Of the four options surveyed (below, §"Why Option 4"), the chosen path is **Option 4 — the `BvTermBackend` unification**, sequenced **after stage 5**:
 
-- **may-edges** (`R_may`) — an **over-approximation**: a may-edge `b → b'` exists if *some* concrete state in `b` can reach *some* concrete state in `b'`. Sound for safety (∀-properties): if the over-approximation has no bad path, neither does the concrete.
-- **must-edges** (`R_must ⊆ R_may`) — an **under-approximation / witness**: a must-edge `b → b'` holds if the concrete relation *forces* the transition (the exact ∀∃ shape depends on the must form). Needed for liveness (∃-properties), for alternating fixpoints, and for any property that asserts a value *must* be produced — like **read-after-write** (`read(addr) must equal the last write`).
+1. **Stage 5 first (independent, ships the milestone):** Caliptra mbox's external SRAM via the black-box contract path — see `.claude/plans/measurements/Phase10-stage5-caliptra-mbox-blackbox-2026-06-12.md`. This is unrelated to the interpreter unification and must not be blocked by it.
+2. **Then Option 4 (its own track):** merge the concrete (`eval_op`) and SMT (`encode_op`) interpreters behind `BvTermBackend`; memory becomes a capability each backend implements. The already-shipped Z3 array encoder (`9c5fa09` + `3600cba`) is reframed as the `Z3Backend`'s array methods. UF migrates from the concrete Zero/Ones representative hack to real `z3::FuncDecl`.
 
-A 3-valued (KMTS) verdict needs **both** relations. Bruns–Godefroid: definite verdicts (`KleeneT`/`KleeneF`) transfer to the concrete iff the may side over-approximates *and* the must side under-approximates the same concrete relation.
+The internal-memory fixture for the Option-4 milestone is **ibex `ibex_register_file_ff`** (the natural internal-`$mem` design), not Caliptra mbox (external SRAM, handled by stage 5).
 
-### Where memory breaks the current machinery
+## The problem (grounding)
 
-The two relations are computed by **two different mechanisms** today:
+The predicate-cube lift ([`kmts_lift.rs::predicate_cube_lift`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs)) builds a KMTS over `2^|P|` predicate-cube states, computing two relations between cubes:
 
-| Relation | Mechanism | Memory-capable? |
+- **may-edges** (`R_may`) — sound **over-approximation** (some concrete state in `b` reaches some in `b'`). Sound for safety.
+- **must-edges** (`R_must ⊆ R_may`) — sound **under-approximation / witness** (the concrete relation forces it). Needed for liveness, alternating fixpoints, and **read-after-write** (`read(addr)` *must* equal the last write).
+
+A 3-valued (KMTS) verdict needs both (Bruns–Godefroid: definite verdicts transfer iff may over-approximates *and* must under-approximates the same concrete relation).
+
+Today the two relations come from **two different mechanisms**, and only one is memory-capable:
+
+| Relation | Mechanism | Memory? |
 |---|---|---|
-| may | **concrete sampling** — [`simulate_one_step`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) → `eval_op` over `BvValue`, sampling `(input, UF-representative)` pairs | **No** — `eval_op` errors on `Op::Read`/`Op::Write`; concrete `BvValue` has no array type |
-| must | **SMT** — `encode_design_for_lift` → `smt_must_edge` Z3 query | **Yes** (since `9c5fa09`) — Z3 array theory `select`/`store` |
+| may | concrete sampling — [`simulate_one_step`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs) → `eval_op` over `BvValue` | **No** — `eval_op` errors on `Op::Read`/`Op::Write` |
+| must | SMT — `encode_design_for_lift` → Z3 array theory | **Yes** (since `9c5fa09`) |
 
-The must side is solved. The may side is the open problem: **concrete sampling cannot evaluate an array operation.** A design with an internal memory cell, fed to today's `predicate_cube_lift`, errors during may-edge sampling.
+The **may side cannot evaluate an array operation** — concrete `BvValue` has no array type. That is the open problem. Today the two relations are written as two hand-maintained interpreters of the same operator set; memory exposes that this duplication has *diverged in capability* (one speaks arrays, the other does not).
 
-### The core tension
+## Why Option 4 (over the interim options)
 
-The two relations want **different versions of the design**:
+Three narrower options exist; Option 4 subsumes or supersedes each:
 
-- The may-sampling wants a **memory-free** design — so it can run concretely. The natural memory-free version is the **havoc rewrite** (shipped stage-1b: `Op::Read` → fresh nondeterministic input, `Op::Write` dropped), which is a sound over-approximation of reads.
-- The must-SMT wants the **original array** design — so Z3 array theory can prove `read(store(mem,a,v),a) == v` precisely.
+- **Option 1 — two-design threading (havoc-may + array-must).** Thread a havoc-rewritten file for may-sampling + the original array file for the must-SMT. *Works, medium risk, but* hard-codes the two-mechanism split it is trying to bridge: two design representations in flight, a consistency invariant to police (havoc must touch only array NIDs), and a may side that stays *havoc-loose* (read-after-write's may admits the violation, so the verdict leans entirely on must-promotion). **Under Option 4 this is expressed without two files:** may = run the `Concrete` backend with the memory capability set to havoc/bounded; must = run the `Z3Backend` with the array capability. Same AST, same driver, different backend — no second design.
+- **Option 2 — symbolic SMT may-image.** Replace concrete may-sampling with an existential SMT image (one encoder, exact may). Cleaner than Option 1 *but* rips out the load-bearing R.2.5 sampling mechanism wholesale. **Under Option 4 this becomes a backend choice, not a rewrite:** an `Smt`-flavoured may pass is "run the may query against the `Z3Backend`" — opt-in, side-by-side with the concrete `Concrete`-backend sampling, not a replacement.
+- **Option 3 — bounded bit-blast small memories.** Enumerate a tiny array as `N` bit-vector cells (no SMT, no havoc). **This is the planned stage 4 and ships independently** as `MemoryAbstraction::BoundedBitBlast`. Under Option 4 it is simply the `Concrete` backend's array capability for small `N` — the bounded enumeration becomes one of the concrete backend's memory strategies. Stage 4 ships first; Option 4 later absorbs it as a capability.
 
-So `read(addr)` is **havoc on the may side** (returns anything → loose, sound) and **array-exact on the must side** (returns the written value → tight). That is exactly the KMTS shape we want: `R_must ⊆ R_concrete ⊆ R_may`, with the may side loose-but-sound and the must side precise. The implementation problem is **how to feed both design versions through one lift.**
+**Why Option 4 is the right end state:** the may/must tension is *caused* by maintaining two interpreters that have drifted in capability. Unifying them behind one trait + driver means memory is implemented **once per backend, in that backend's natural theory**, and the may/must choice becomes "which backend you run over the one shared AST" — the tension dissolves structurally rather than being worked around per-fixture. It also kills the dual-maintenance burden (every operator is implemented twice today) and gives a clean home for future backends (CVC5 SMT-LIB, abstract-interval).
 
-## The four options
+Cost: it is the largest change — a refactor of two soundness-critical, heavily-tested interpreters. That is exactly why it is sequenced **after** stage 5 (which carries the milestone narrative on its own) and run as its own gated track.
 
-### Option 1 — Two-design threading (havoc-may + array-must)
+## Option 4 — the plan
 
-Thread **both** design versions through `predicate_cube_lift`: the havoc-rewritten file drives the may-sampling; the original array file drives the must-edge SMT post-pass. Add `PredicateCubeLiftOptions::array_must_file: Option<Btor2File>` (or similar); when set, the must post-passes call `encode_design_for_lift(array_must_file)` instead of `lazy.file()`.
+### The seam
 
-- **Pros:** Minimal new infrastructure — reuses the shipped havoc rewrite (may) + the shipped array encoder (must). Directly produces the loose-may/tight-must KMTS. ~2–3 sessions.
-- **Cons:** Two design representations in flight is a footgun — the cube indexing, register-NID maps, and predicate resolution must stay consistent across the havoc'd and original files (their state-cell NIDs match because havoc only rewrites array ops, but this is an invariant to test hard). The may-side stays *havoc-loose* — a read-after-write property's may side admits the violation, so the verdict relies entirely on the must side promoting the right edges; if must-promotion misses, the verdict is `KleeneBot` (refine) rather than `KleeneT`.
-- **Soundness concern:** The havoc may-edge over-approximation is sound **only if** the havoc rewrite faithfully over-approximates every concrete read (it does — a fresh unconstrained input admits every value the concrete memory could hold). The risk is the *consistency* invariant: if the havoc'd file and the array file disagree on a non-memory NID, the may and must relations describe different designs and the KMTS is unsound. **Mitigation:** assert (test) that havoc rewriting changes *only* array-op NIDs, leaving every BV NID identical.
-- **Validation path:** (a) the read-after-write UNSAT test on the array encoder (done); (b) a monotonicity test — every must-edge is also a may-edge (`R_must ⊆ R_may`) on a hand-built memory fixture; (c) end-to-end read-after-write on ibex `ibex_register_file_ff` scaled to 4×4 bits, verdict `KleeneT`, cross-checked against SBY bounded-check.
+```rust
+// crates/mununu-core/src/adapter/btor2/term_backend.rs  (NEW)
+trait BvTermBackend {
+    type Value;                  // Concrete: BvValue;  Z3: Z3Term { Bv(BV), Arr(Array) }
+    type Error;
+    // bit-vector capability (every backend)
+    fn const_bv(&mut self, bits: u128, width: u32) -> Self::Value;
+    fn op_add(&mut self, a: &Self::Value, b: &Self::Value) -> Result<Self::Value, Self::Error>;
+    fn op_mul(&mut self, a: &Self::Value, b: &Self::Value) -> Result<Self::Value, Self::Error>;
+    // … one method per operator family (≈ the 40-op set both interpreters already share)
+    // memory capability — each backend implements in its own theory
+    fn array_decl(&mut self, nid: Nid, idx_w: u32, elem_w: u32) -> Self::Value;
+    fn op_read(&mut self, arr: &Self::Value, idx: &Self::Value) -> Result<Self::Value, Self::Error>;
+    fn op_write(&mut self, arr: &Self::Value, idx: &Self::Value, v: &Self::Value) -> Result<Self::Value, Self::Error>;
+    // UF capability — real uninterpreted application (Z3: FuncDecl; Concrete: representative)
+    fn uf_apply(&mut self, op_nid: Nid, width: u32, args: &[Self::Value]) -> Self::Value;
+}
+```
 
-### Option 2 — Symbolic may-side (SMT may-image)
+One generic driver walks the BTOR2 DAG once:
 
-Replace the concrete may-sampling with an **SMT-based may-image**: `R_may(b,b') ⟺ ∃ s ⊨ b, ∃ input, ∃ s' ⊨ b'. (s, input, s') ∈ T`, encoded via the **same** array-aware `encode_design_for_lift`. Both relations then come from one encoder; no havoc, no two-design threading.
+```rust
+fn walk_design<B: BvTermBackend>(file: &Btor2File, backend: &mut B) -> Result<Step<B::Value>, B::Error>;
+```
 
-- **Pros:** Architecturally clean — one design, one encoder, both relations from SMT. The may side becomes *exact* (the existential image), tighter than havoc, so fewer `KleeneBot` verdicts and read-after-write's may side no longer admits the violation. No consistency-invariant footgun.
-- **Cons:** Replaces the *entire* shipped sampling-based may-edge mechanism with SMT — a much bigger change than Option 1, touching the load-bearing R.2.5 may-edge construction that every existing predicate-cube fixture depends on. Per-cube-pair SMT cost (`2^|P| × 2^|P|` existential checks) is higher than sampling; needs the budget guards the R.2.5b SMT post-passes already use. Risk of regressing memory-free fixtures' may-edges if the SMT image disagrees with sampling on edge cases.
-- **Soundness concern:** The existential SMT may-image is *exact* (neither over- nor under-approximating the predicate-abstraction image) — which is *more* precise than the sound over-approximation a may side strictly requires. That's fine (exact ⊆ over-approx). The concern flips to *completeness/cost*: an SMT timeout must fall back to a sound over-approximation (admit the edge), never silently drop it (which would be unsound under-approximation of may).
-- **Validation path:** (a) on every memory-free R.2.5 fixture, the SMT may-image must produce a may-edge set that is a *superset-or-equal* of today's sampling may-edges (sampling can miss edges; SMT must not lose soundness) — a regression test across the fixture corpus; (b) the read-after-write KleeneT on ibex regfile; (c) timeout-fallback test (forced timeout → edge admitted, not dropped).
+This replaces `eval_op` (concrete) and `encode_op` (SMT) — currently ~40 operator arms maintained twice.
 
-### Option 3 — Bounded bit-blast the memory (stage 4)
+### The backends
 
-For *small* memories, enumerate the array concretely: a `N`-entry × `W`-bit memory becomes `N` ordinary `W`-bit bit-vector state cells (the `selected_addresses` ladder). No SMT, no havoc — the array disappears into the existing concrete bit-blast path.
+- **`Concrete` (`Value = BvValue`).** The current `eval_op` becomes its `impl`. Memory capability: `op_read`/`op_write` via **bounded enumeration** (small `N`, the stage-4 mode) or **havoc** (`op_read` → fresh nondeterministic value) for the may-side over-approximation. No symbolic arrays — concrete can't hold them, and doesn't need to.
+- **`Z3Backend` (`Value = Z3Term { Bv(BV), Arr(Array) }`).** The current `encode_op` + the **already-shipped** array encoder (`btor2_encode.rs`'s `select`/`store`/array-decl) become its `impl`. Memory capability: Z3 array theory (exact). UF capability: real `z3::FuncDecl` (replacing the concrete Zero/Ones representative — closes the must-edge-under-UF soundness gap noted in `smt_must_edge.rs`).
+- **(future) `SmtLibBackend` (`Value = text`).** cvc5 / bitwuzla via SMT-LIB rendering — folds in the existing cvc5 interpolation path as a third backend variant. Out of the initial Option-4 scope.
 
-- **Pros:** Reuses the entire concrete machinery unchanged; both may (sampling) and must work because there is no array left. Exact (no abstraction) within the cap. This is **already the planned stage 4** (`MemoryAbstraction::BoundedBitBlast` + `selected_addresses`).
-- **Cons:** Only viable when `N × W` is tiny (the `MAX_STATE_BITS = 20` cap). ibex regfile is 32 × 32 = 1024 bits raw — needs the property to touch only a handful of addresses (`selected_addresses: [0, 1, 5, 31]`) for the rest to be dropped/havoc'd. Doesn't scale to real memories; it's a demonstration mode, not the general answer.
-- **Soundness concern:** Exact for the *selected* addresses; the *unselected* addresses must be havoc'd (sound over-approximation) or the design is unsound (silently dropping them would under-approximate). The soundness hinges on the unselected-address policy being havoc, not drop.
-- **Validation path:** (a) a fixture where `N × W` fits the cap entirely → exact verdict, SBY cross-check; (b) a fixture where only `selected_addresses` fit → the unselected addresses are havoc'd, verdict is sound-but-loose; assert it's weaker-or-equal to the full-enumeration verdict.
+### How the may/must tension dissolves
 
-### Option 4 — Full `BvTermBackend` unification (Move B + memory as a capability)
+`predicate_cube_lift` runs the **same driver** twice over the **same AST**:
 
-The long-term answer from [`expression-interpretation-unification.md`](expression-interpretation-unification.md): merge the concrete (`eval_op`) and SMT (`encode_op`) interpreters behind one `BvTermBackend` trait + a generic AST-walk driver. Memory becomes a *backend capability* — the `Z3Backend` does arrays via theory; the `Concrete` backend does them via bounded enumeration; a future `AbstractBackend` could do interval/octagon. The may/must split becomes "which backend you run," not "which mechanism you wrote."
+- **may-edges:** `walk_design::<Concrete>(file, &mut concrete_backend)` with the concrete backend's memory capability set to havoc (loose, sound) or bounded (exact for small `N`). No havoc-rewritten *file* — the havoc lives in the backend's `op_read`, not in a second IR.
+- **must-edges:** `walk_design::<Z3Backend>(file, &mut z3_backend)` with array theory. The must-edge SMT post-passes already route here via `encode_design_for_lift` (shipped `3600cba`) — they become "run the Z3Backend."
 
-- **Pros:** Eliminates the dual-maintenance of two interpreters *and* gives memory a uniform home. The may/must tension dissolves: run the `Concrete` backend (with bounded or havoc memory) for may, the `Z3Backend` (array theory) for must — same driver, same AST, different backend. The cleanest, most future-proof architecture.
-- **Cons:** The largest change — a refactor of two load-bearing, soundness-critical, heavily-tested interpreters into a trait. ~5–8 sessions for the trait + driver + two backend impls, before any memory-specific work. High risk of subtle behavioral drift if any operator's two implementations weren't actually identical (they should be, but the merge is where you find out).
-- **Soundness concern:** The merge itself is soundness-neutral *if* every operator's concrete and SMT implementations were semantically identical pre-merge (they walk the same AST with the same arity/width). The risk is discovering a latent disagreement during the merge — which is actually a *find*, not a regression, but must be handled carefully.
-- **Validation path:** the merge is validated by the *union* of the existing concrete + SMT test suites passing against the unified driver (both backends produce their pre-merge results bit-for-bit). Memory then rides in as a capability test per Option 1/2/3's validation.
+Memory is implemented **once per backend**; the lift picks the backend per relation. `R_must ⊆ R_concrete ⊆ R_may` holds by construction: concrete-havoc over-approximates reads (may), Z3-array is exact (must).
 
-## Recommendation + sequencing
+### Staging (each step ships green + test-pinned)
 
-| Option | When | Risk | Delivers |
-|---|---|---|---|
-| 3 (bounded bit-blast) | **stage 4, soon** | low | small-memory demo; no SMT |
-| 1 (two-design threading) | **the uf-memory milestone** | medium | havoc-may/array-must on ibex regfile |
-| 2 (symbolic may-image) | after 1, if havoc-may is too loose | medium-high | exact may; fewer KleeneBot |
-| 4 (`BvTermBackend`) | post-slot-4, own track | high | the unified architecture |
+1. **Extract `BvTermBackend` + `walk_design`; port `Concrete` first.** Prove identical: the entire existing bit-blast + R.2.5 sampling suite passes against the driver bit-for-bit. ~2–3 sessions. No behavior change.
+2. **Port `Z3Backend` (encode_op + the shipped array encoder).** Prove identical: the must-edge + all-SMT suites pass against the driver. The array methods are the `9c5fa09` code, now expressed as trait methods. ~2 sessions.
+3. **Wire `predicate_cube_lift` to the backend choice** — may via `Concrete`, must via `Z3Backend`. The two-mechanism split becomes the two-backend choice; the memory tension is resolved. ~1–2 sessions.
+4. **Real UF in `Z3Backend::uf_apply`** (`FuncDecl`), retiring the concrete representative as the may-side approximation only. Closes the must-under-UF soundness gap. ~2 sessions.
+5. **ibex regfile milestone:** end-to-end read-after-write on `ibex_register_file_ff` (4×4-bit instance), verdict `KleeneT`, SBY-cross-checked. ~1 session + fixture.
 
-**Recommended path:** ship **Option 3** as stage 4 (it's the already-planned bounded mode and gives a concrete small-memory verdict with no new abstraction risk), then do **Option 1** as the uf-memory milestone on ibex regfile (havoc-may + the shipped array-must). Treat **Option 2** as the precision upgrade only if Option 1's havoc-may produces too many `KleeneBot` verdicts in practice (measure first). Keep **Option 4** as the post-slot-4 unification track — it subsumes all of the above but must not block the milestone.
+Total Option-4 track: ~8–10 sessions. Sequenced after stage 5; own design-doc-gated track.
 
-The unifying soundness invariant across every option: **`R_must ⊆ R_concrete ⊆ R_may`**, with the may side a sound over-approximation (havoc, exact-existential, or havoc'd-unselected-addresses) and the must side a sound under-approximation (array theory). Every validation path above is ultimately a test that this chain holds on a fixture where the answer is independently known (read-after-write on ibex regfile, SBY-cross-checked).
+## Soundness
+
+- **The merge is soundness-neutral** *iff* every operator's concrete and SMT implementations were semantically identical pre-merge — which they are (same AST, arity, width propagation). The merge's risk is *discovering* a latent disagreement, which is a find, not a regression; the staging's "prove identical" gates surface it.
+- **Memory capability soundness:** the invariant is `R_must ⊆ R_concrete ⊆ R_may`. The `Concrete` backend's havoc `op_read` is a sound over-approximation (a fresh value admits everything the concrete memory could hold). The `Z3Backend`'s array `op_read`/`op_write` is exact (Z3 extensional array axioms). The bounded-enumeration `Concrete` memory is exact for selected addresses + havoc for the rest (sound).
+- **UF capability soundness:** real `FuncDecl` UF over-approximates on the may side (functional consistency only) and is *unsound* as a must witness — so `uf_apply` is may-only; the must side must use concrete/array operators. This is the existing R.5b asymmetry, now enforced at the backend boundary instead of by convention.
+
+## Validation paths
+
+- **Merge fidelity:** the union of the existing concrete (`bit_blast`, R.2.5 sampling) + SMT (`smt_must_edge`, `all_smt`, `btor2_encode`) test suites must pass against the unified driver, each backend producing its pre-merge result bit-for-bit. This is the load-bearing regression gate for steps 1–2.
+- **Array correctness (shipped):** the read-after-write UNSAT proof on the `Z3Backend` array methods (`9c5fa09` test `bvufarray_read_after_write_is_forced_by_array_axiom`).
+- **Monotonicity:** on a hand-built memory fixture, assert `R_must ⊆ R_may` after step 3 (every must-edge is a may-edge) — the KMTS well-formedness check.
+- **End-to-end (the milestone):** read-after-write on ibex `ibex_register_file_ff` (4×4-bit), verdict `KleeneT`, cross-checked against an SBY bounded safety check at the same scale. A divergence from SBY is a soundness bug in the backend.
+- **UF asymmetry:** a fixture with a UF-wrapped operator where the may side admits a behavior the must side must not claim — assert the must side does not promote it (the `uf_apply`-is-may-only enforcement).
 
 ## Cross-references
 
-- Interpreter-layer map + the three unification moves: [`expression-interpretation-unification.md`](expression-interpretation-unification.md)
+- Interpreter-layer map + the three unification moves (Option 4 = Move B): [`expression-interpretation-unification.md`](expression-interpretation-unification.md)
 - Routing dispatch + corrected stage-3.c: [`phase10-uf-routing.md`](phase10-uf-routing.md)
-- Stage-5 Option-B (Caliptra mbox black-box): `.claude/plans/measurements/Phase10-stage5-caliptra-mbox-blackbox-2026-06-12.md`
-- Array encoder (shipped): commits `9c5fa09` (encoder), `3600cba` (must-side routing)
+- Stage-5 Option-B (Caliptra mbox black-box, ships first): `.claude/plans/measurements/Phase10-stage5-caliptra-mbox-blackbox-2026-06-12.md`
+- Array encoder (shipped, becomes `Z3Backend` array methods): commits `9c5fa09`, `3600cba`
+- Verdict-evaluator tagless-final precedent (the pattern Option 4 mirrors): [`truth_domain.rs`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs)
 - KMTS soundness foundation: [`kmts-theory.md`](kmts-theory.md)
