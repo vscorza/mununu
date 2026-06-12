@@ -61,8 +61,34 @@ pub struct SvAnnotation {
     pub discovered_values: HashMap<String, DiscoveredValues>,
 
     /// Module parameter overrides (e.g., `{"DEPTH": 4}`).
+    ///
+    /// Bare name→value map. Preserved for backwards compatibility
+    /// with sidecars authored before R-S1 (every existing fixture).
+    /// When a parameter appears in both this map AND
+    /// `parameter_concretizations`, the structured entry wins —
+    /// see [`SvAnnotation::effective_parameters`].
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub parameters: HashMap<String, i64>,
+
+    /// R-S1 (§Phase 9 §9.1, 2026-06-11) — structured parameter
+    /// concretization profile. Same key space as `parameters` but
+    /// each entry also carries a rationale (why this value was
+    /// chosen) and an optional milestone / fixture citation.
+    /// Formalises M.0's manual `N=8 → N=2` scale-down — that
+    /// decision was recorded ad-hoc in the M-0-result.md ledger;
+    /// R-S1 promotes it to a first-class sidecar field so future
+    /// contributors can see WHY a given parameter was concretized
+    /// without grepping milestone notes.
+    ///
+    /// Coexists with `parameters` (above) — the resolver
+    /// [`SvAnnotation::effective_parameters`] folds both into a
+    /// single name→value map, with structured entries winning
+    /// over bare entries on name conflict.
+    ///
+    /// Default empty — preserves the legacy behaviour for every
+    /// existing fixture.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub parameter_concretizations: HashMap<String, ParameterConcretization>,
 
     /// R-Y6 (§Phase 8) — reset-sequence-aware init. When set, the
     /// BTOR2 bit-blaster runs `hold_cycles` cycles of "reset asserted"
@@ -410,6 +436,40 @@ impl SimulateReset {
     }
 }
 
+/// R-S1 (§Phase 9 §9.1, 2026-06-11) — structured parameter
+/// concretization profile for one module parameter.
+///
+/// Generalises the bare `HashMap<String, i64>` parameters field
+/// by attaching a rationale (why this value was chosen) and an
+/// optional citation (which milestone / fixture justified it).
+///
+/// Per §Phase 9 R-S1's design: M.0 scaled `prim_arbiter_fixed`'s
+/// `N=8, DW=32` to `N=2, DW=2` to fit within MAX_STATE_BITS=20.
+/// That decision was recorded ad-hoc in the M-0-result.md ledger;
+/// R-S1 promotes it to a first-class sidecar field so the
+/// decision survives independent of the milestone notes + so
+/// future contributors can see WHY a parameter was concretized
+/// without grepping outside the sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParameterConcretization {
+    /// The concretized parameter value.
+    pub value: i64,
+    /// Human-readable explanation for why this value was chosen.
+    /// Examples:
+    /// - "Scaled N from 8 to 2 to fit within MAX_STATE_BITS=20."
+    /// - "DW reduced from 32 to 4 — property does not observe
+    ///   data bits beyond the LSB."
+    /// - "Common case observed in regression sweep at this
+    ///   parameter level."
+    pub rationale: String,
+    /// Optional reference to a milestone or fixture record where
+    /// this concretization was first justified. Examples:
+    /// `Some(".claude/plans/milestones/M-0-result.md")`,
+    /// `Some("examples/verify/sv_yosys_caliptra_rtl_150/README.md")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justified_by: Option<String>,
+}
+
 /// R-Y6 (§Phase 8) — declaration of a reset-hold sequence for the
 /// bit-blaster's init-state computation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -592,6 +652,36 @@ fn is_inherit_init_policy(p: &InitPolicy) -> bool {
 }
 
 impl SvAnnotation {
+    /// R-S1 (§Phase 9 §9.1, 2026-06-11) — compute the effective
+    /// parameter override map for this annotation.
+    ///
+    /// Folds two sources:
+    /// 1. The legacy `parameters: HashMap<String, i64>` field
+    ///    (bare name→value pairs; preserved for backwards
+    ///    compatibility with sidecars authored before R-S1).
+    /// 2. The structured `parameter_concretizations:
+    ///    HashMap<String, ParameterConcretization>` field
+    ///    (R-S1's new schema; each entry carries a value +
+    ///    rationale + optional citation).
+    ///
+    /// **Conflict rule**: when the same parameter name appears
+    /// in BOTH maps, the structured entry wins. The structured
+    /// schema is the authoritative source per §Phase 9 R-S1's
+    /// design — the bare map is a legacy fallback, not a
+    /// preferred override channel.
+    ///
+    /// Pure helper — no I/O. Order is non-deterministic (the
+    /// underlying HashMap iteration is hash-randomised); callers
+    /// that need stable ordering should sort by key after this
+    /// method returns.
+    pub fn effective_parameters(&self) -> HashMap<String, i64> {
+        let mut out: HashMap<String, i64> = self.parameters.clone();
+        for (name, concretization) in &self.parameter_concretizations {
+            out.insert(name.clone(), concretization.value);
+        }
+        out
+    }
+
     /// R-Y2 (§Phase 8 §8.1) — Collect per-signal init-policy overrides
     /// from the sidecar's `signals` + `inputs` declarations. Returns
     /// `(signal_name, InitPolicy)` pairs for every signal whose policy
@@ -2045,6 +2135,7 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         }],
         discovered_values: HashMap::new(),
         parameters: HashMap::new(),
+        parameter_concretizations: HashMap::new(),
         reset_sequence: None,
         simulate_reset: None,
         vcd_traces: Vec::new(),
@@ -2656,6 +2747,7 @@ mod tests {
             properties: vec![],
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
+            parameter_concretizations: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
             vcd_traces: Vec::new(),
@@ -3293,6 +3385,7 @@ mod tests {
             properties: vec![],
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
+            parameter_concretizations: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
             vcd_traces: Vec::new(),
@@ -3359,6 +3452,7 @@ mod tests {
             properties: vec![],
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
+            parameter_concretizations: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
             vcd_traces: Vec::new(),
@@ -3500,6 +3594,7 @@ mod tests {
             properties: Vec::new(),
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
+            parameter_concretizations: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
             vcd_traces: Vec::new(),
@@ -3650,6 +3745,7 @@ mod tests {
             properties: Vec::new(),
             discovered_values: HashMap::new(),
             parameters: HashMap::new(),
+            parameter_concretizations: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
             vcd_traces: Vec::new(),
@@ -3662,5 +3758,177 @@ mod tests {
             !json.contains("vcd_traces"),
             "empty vcd_traces must be omitted from JSON; got {json}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S1 (§Phase 9 §9.1) — ParameterConcretization + resolver
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r_s1_parameter_concretization_round_trips_through_json() {
+        let json = r#"{
+            "value": 2,
+            "rationale": "Scaled N from 8 to 2 to fit MAX_STATE_BITS=20.",
+            "justified_by": ".claude/plans/milestones/M-0-result.md"
+        }"#;
+        let pc: ParameterConcretization = serde_json::from_str(json).expect("parse");
+        assert_eq!(pc.value, 2);
+        assert!(pc.rationale.contains("Scaled"));
+        assert_eq!(
+            pc.justified_by.as_deref(),
+            Some(".claude/plans/milestones/M-0-result.md")
+        );
+        let back = serde_json::to_string(&pc).expect("serialize");
+        let again: ParameterConcretization = serde_json::from_str(&back).expect("re-parse");
+        assert_eq!(again, pc);
+    }
+
+    #[test]
+    fn r_s1_parameter_concretization_omits_justified_by_when_none() {
+        let pc = ParameterConcretization {
+            value: 4,
+            rationale: "Default fit".into(),
+            justified_by: None,
+        };
+        let json = serde_json::to_string(&pc).expect("serialize");
+        assert!(
+            !json.contains("justified_by"),
+            "None justified_by must be omitted from JSON; got {json}"
+        );
+    }
+
+    #[test]
+    fn r_s1_sv_annotation_with_parameter_concretizations_loads() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "prim_arbiter_fixed",
+            "parameter_concretizations": {
+                "N": {
+                    "value": 2,
+                    "rationale": "Scaled from 8 to 2 to fit MAX_STATE_BITS=20."
+                },
+                "DW": {
+                    "value": 2,
+                    "rationale": "Reduced from 32 to 2 — property only observes the LSB."
+                }
+            }
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        assert_eq!(ann.parameter_concretizations.len(), 2);
+        assert_eq!(ann.parameter_concretizations.get("N").unwrap().value, 2);
+        assert_eq!(ann.parameter_concretizations.get("DW").unwrap().value, 2);
+    }
+
+    #[test]
+    fn r_s1_legacy_sidecar_without_parameter_concretizations_loads() {
+        // Strict additivity — sidecars authored before R-S1
+        // continue to work; field defaults to empty HashMap.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "legacy"
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse legacy");
+        assert!(ann.parameter_concretizations.is_empty());
+    }
+
+    #[test]
+    fn r_s1_empty_parameter_concretizations_omitted_on_serialize() {
+        let ann = SvAnnotation {
+            schema: None,
+            module: "test".into(),
+            source: None,
+            signals: Vec::new(),
+            inputs: Vec::new(),
+            controllable: Vec::new(),
+            properties: Vec::new(),
+            discovered_values: HashMap::new(),
+            parameters: HashMap::new(),
+            parameter_concretizations: HashMap::new(),
+            reset_sequence: None,
+            simulate_reset: None,
+            vcd_traces: Vec::new(),
+            memories: Vec::new(),
+            uf_wrap: Vec::new(),
+            uf_unwrap: Vec::new(),
+        };
+        let json = serde_json::to_string(&ann).expect("serialize");
+        assert!(
+            !json.contains("parameter_concretizations"),
+            "empty parameter_concretizations must be omitted; got {json}"
+        );
+    }
+
+    #[test]
+    fn r_s1_effective_parameters_returns_legacy_when_concretizations_empty() {
+        // Sidecar only uses the legacy `parameters` map; resolver
+        // returns its contents verbatim.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "parameters": { "DEPTH": 4, "WIDTH": 8 }
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        let effective = ann.effective_parameters();
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective.get("DEPTH").copied(), Some(4));
+        assert_eq!(effective.get("WIDTH").copied(), Some(8));
+    }
+
+    #[test]
+    fn r_s1_effective_parameters_returns_concretizations_when_legacy_empty() {
+        // Sidecar only uses the structured concretizations field.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "parameter_concretizations": {
+                "N": { "value": 2, "rationale": "Scaled for M.0." }
+            }
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        let effective = ann.effective_parameters();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective.get("N").copied(), Some(2));
+    }
+
+    #[test]
+    fn r_s1_effective_parameters_structured_wins_on_name_conflict() {
+        // Same parameter declared in both maps with different
+        // values — the structured concretization wins (the bare
+        // map is the legacy fallback).
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "parameters": { "N": 8 },
+            "parameter_concretizations": {
+                "N": { "value": 2, "rationale": "Scaled for M.0." }
+            }
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        let effective = ann.effective_parameters();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(
+            effective.get("N").copied(),
+            Some(2),
+            "structured concretization must win over bare value; got {effective:?}"
+        );
+    }
+
+    #[test]
+    fn r_s1_effective_parameters_merges_disjoint_keys() {
+        // Different parameter names in each map; resolver returns
+        // their union.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "parameters": { "DEPTH": 4 },
+            "parameter_concretizations": {
+                "N": { "value": 2, "rationale": "Scaled for M.0." }
+            }
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        let effective = ann.effective_parameters();
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective.get("DEPTH").copied(), Some(4));
+        assert_eq!(effective.get("N").copied(), Some(2));
     }
 }
