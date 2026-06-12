@@ -109,6 +109,32 @@ pub struct SvAnnotation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub simulate_reset: Option<SimulateReset>,
 
+    /// R-S6.4 (§Phase 9 §9.1, 2026-06-11) — Pre-existing VCD
+    /// trace files to mine for predicate-cube seeds. Each entry
+    /// declares a path (relative to the sidecar) + per-trace
+    /// sampling policy. R-S6.6's orchestration walks every entry
+    /// when the bit-blaster runs, parses the trace via
+    /// [`crate::adapter::vcd::parse_vcd_changes`], mines per-
+    /// signal value frequencies via
+    /// [`crate::adapter::vcd::mine_vcd_frequencies`], and feeds
+    /// the top-N heavy-hitters + boundary values to the
+    /// bit-blaster's `EnumValues` discriminator lists via R-S6.5's
+    /// seeding helper.
+    ///
+    /// Distinct from R-S2b's `simulate_reset` (which RUNS a fresh
+    /// concrete simulation via Verilator): R-S6 reuses traces the
+    /// project's regression suite already produced. The two
+    /// compose — a sidecar may set both, in which case both
+    /// strategies feed cell_domains independently and additively.
+    ///
+    /// Default empty (no traces) — preserves the legacy behaviour.
+    /// R-S6.5 (bit-blaster seeding helper) + R-S6.6 (CLI flag +
+    /// orchestration) are the consumers of this field; until R-S6.6
+    /// ships, declarations here are accepted by the schema but
+    /// have no effect on the abstract model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vcd_traces: Vec<VcdTraceConfig>,
+
     /// §Phase 10 §10.2 stage 2 — Memory-cell annotations. For each
     /// `$mem` / `$mem_v2` BTOR2 cell the user wants to abstract,
     /// declare its address-width, data-width, and abstraction strategy
@@ -307,6 +333,58 @@ pub struct SimulateReset {
 
 fn default_settle_cycles() -> u32 {
     1
+}
+
+/// R-S6.4 (§Phase 9 §9.1, 2026-06-11) — declaration of a
+/// pre-existing VCD trace file to mine for predicate-cube seeds.
+///
+/// One entry per trace file the sidecar wants the bit-blaster to
+/// consume. R-S6.6's orchestration reads the file via
+/// [`crate::adapter::vcd::parse_vcd_changes`], runs the R-S6.3
+/// frequency miner, and feeds the result through R-S6.5's
+/// seeding helper.
+///
+/// Path semantics: resolved relative to the sidecar's containing
+/// directory (matches the convention `SvAnnotation::source` uses
+/// for the `.sv` source path). Absolute paths are used verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VcdTraceConfig {
+    /// Path to the VCD file, relative to the sidecar's parent
+    /// directory (or absolute). The orchestration in R-S6.6
+    /// reads this path on the file system; non-existent files
+    /// surface an `AdapterWarning` and the bit-blaster falls
+    /// through.
+    pub path: String,
+    /// Maximum number of heavy-hitter values per signal to lift
+    /// into `EnumValues` discriminators. Caps the seeding budget
+    /// so a long-running trace with many distinct values doesn't
+    /// blow up the cube space. Defaults to 4 (covers most FSM
+    /// state machines + a handful of common counter values).
+    #[serde(default = "default_max_heavy_hitters_per_signal")]
+    pub max_heavy_hitters_per_signal: u32,
+    /// When true (default), R-S6.5 also seeds the boundary
+    /// values (min / max) per signal in addition to the
+    /// heavy-hitter top-N. Useful for counter / saturator
+    /// predicates: "did the counter ever reach its boundary?"
+    /// Disable when the trace's tail values (often X-during-
+    /// shutdown artefacts) would pollute the cube space.
+    #[serde(default = "default_seed_boundary_values")]
+    pub seed_boundary_values: bool,
+    /// Whitelist of signal names (matching SV declarations) to
+    /// mine. Empty (default) means mine every signal declared in
+    /// the trace; R-S6.5 cross-references each mined signal
+    /// against the BTOR2 symbols map and only seeds cells that
+    /// match (silently skips the rest).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<String>,
+}
+
+fn default_max_heavy_hitters_per_signal() -> u32 {
+    4
+}
+
+fn default_seed_boundary_values() -> bool {
+    true
 }
 
 impl SimulateReset {
@@ -1969,6 +2047,7 @@ pub fn generate_sidecar(module: &super::ast::Module) -> SvAnnotation {
         parameters: HashMap::new(),
         reset_sequence: None,
         simulate_reset: None,
+        vcd_traces: Vec::new(),
         memories: Vec::new(),
         uf_wrap: Vec::new(),
         uf_unwrap: Vec::new(),
@@ -2579,6 +2658,7 @@ mod tests {
             parameters: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
+            vcd_traces: Vec::new(),
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3215,6 +3295,7 @@ mod tests {
             parameters: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
+            vcd_traces: Vec::new(),
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3280,6 +3361,7 @@ mod tests {
             parameters: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
+            vcd_traces: Vec::new(),
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3420,6 +3502,7 @@ mod tests {
             parameters: HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
+            vcd_traces: Vec::new(),
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
@@ -3456,5 +3539,128 @@ mod tests {
         // a well-formed sidecar produces a well-formed runner
         // input — round-trips into R-S2b.3a's validator).
         assert!(cfg.validate().is_ok());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // R-S6.4 (§Phase 9 §9.1) — VcdTraceConfig serde + defaults
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r_s6_4_vcd_trace_config_round_trips_through_json() {
+        let json = r#"{
+            "path": "regression/uart_tx.vcd",
+            "max_heavy_hitters_per_signal": 6,
+            "seed_boundary_values": false,
+            "signals": ["count", "state"]
+        }"#;
+        let cfg: VcdTraceConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.path, "regression/uart_tx.vcd");
+        assert_eq!(cfg.max_heavy_hitters_per_signal, 6);
+        assert!(!cfg.seed_boundary_values);
+        assert_eq!(cfg.signals, vec!["count".to_string(), "state".to_string()]);
+        let back = serde_json::to_string(&cfg).expect("serialize");
+        let again: VcdTraceConfig = serde_json::from_str(&back).expect("re-parse");
+        assert_eq!(again, cfg);
+    }
+
+    #[test]
+    fn r_s6_4_max_heavy_hitters_defaults_to_4() {
+        let json = r#"{ "path": "trace.vcd" }"#;
+        let cfg: VcdTraceConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.max_heavy_hitters_per_signal, 4);
+    }
+
+    #[test]
+    fn r_s6_4_seed_boundary_values_defaults_to_true() {
+        let json = r#"{ "path": "trace.vcd" }"#;
+        let cfg: VcdTraceConfig = serde_json::from_str(json).expect("parse");
+        assert!(cfg.seed_boundary_values);
+    }
+
+    #[test]
+    fn r_s6_4_signals_defaults_to_empty() {
+        // Empty signals means "mine every signal in the trace"
+        // — explicit per-trace allowlisting is opt-in.
+        let json = r#"{ "path": "trace.vcd" }"#;
+        let cfg: VcdTraceConfig = serde_json::from_str(json).expect("parse");
+        assert!(cfg.signals.is_empty());
+    }
+
+    #[test]
+    fn r_s6_4_empty_signals_omitted_on_serialize() {
+        let cfg = VcdTraceConfig {
+            path: "trace.vcd".into(),
+            max_heavy_hitters_per_signal: 4,
+            seed_boundary_values: true,
+            signals: Vec::new(),
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(
+            !json.contains("signals"),
+            "empty signals must be omitted from JSON; got {json}"
+        );
+    }
+
+    #[test]
+    fn r_s6_4_sv_annotation_with_vcd_traces_loads() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "uart_tx",
+            "vcd_traces": [
+                {
+                    "path": "regression/uart_tx.vcd",
+                    "signals": ["count"]
+                },
+                {
+                    "path": "regression/uart_tx_corner.vcd",
+                    "max_heavy_hitters_per_signal": 8
+                }
+            ]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse");
+        assert_eq!(ann.vcd_traces.len(), 2);
+        assert_eq!(ann.vcd_traces[0].path, "regression/uart_tx.vcd");
+        assert_eq!(ann.vcd_traces[0].max_heavy_hitters_per_signal, 4); // default
+        assert_eq!(ann.vcd_traces[0].signals, vec!["count".to_string()]);
+        assert_eq!(ann.vcd_traces[1].max_heavy_hitters_per_signal, 8);
+        assert!(ann.vcd_traces[1].signals.is_empty());
+    }
+
+    #[test]
+    fn r_s6_4_legacy_sidecar_without_vcd_traces_loads_with_empty_vec() {
+        // Strict additivity — existing fixtures' sidecars continue
+        // to work, vcd_traces defaults to empty Vec.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "legacy"
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parse legacy");
+        assert!(ann.vcd_traces.is_empty());
+    }
+
+    #[test]
+    fn r_s6_4_empty_vcd_traces_omitted_on_serialize() {
+        let ann = SvAnnotation {
+            schema: None,
+            module: "test".into(),
+            source: None,
+            signals: Vec::new(),
+            inputs: Vec::new(),
+            controllable: Vec::new(),
+            properties: Vec::new(),
+            discovered_values: HashMap::new(),
+            parameters: HashMap::new(),
+            reset_sequence: None,
+            simulate_reset: None,
+            vcd_traces: Vec::new(),
+            memories: Vec::new(),
+            uf_wrap: Vec::new(),
+            uf_unwrap: Vec::new(),
+        };
+        let json = serde_json::to_string(&ann).expect("serialize");
+        assert!(
+            !json.contains("vcd_traces"),
+            "empty vcd_traces must be omitted from JSON; got {json}"
+        );
     }
 }

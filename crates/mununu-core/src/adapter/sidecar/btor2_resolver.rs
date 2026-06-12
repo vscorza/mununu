@@ -113,6 +113,7 @@ mod tests {
             parameters: std::collections::HashMap::new(),
             reset_sequence: None,
             simulate_reset: None,
+            vcd_traces: Vec::new(),
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
