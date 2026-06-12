@@ -2731,30 +2731,27 @@ fn apply_btor2_init_seeding(
             continue;
         };
         // Mask to the cell's bit-width.
-        let Some(width) = nid_to_width.get(state) else {
+        let Some(width) = nid_to_width.get(state).copied() else {
             continue;
         };
-        let masked = if *width >= 64 {
-            init_value
+        let mask: u64 = if width >= 64 {
+            u64::MAX
         } else {
-            init_value & ((1u64 << *width) - 1)
+            (1u64 << width) - 1
         };
-        let masked_signed = masked as i64;
-        // Skip if init value already in value_map.
-        if value_map.iter().any(|(_, v)| *v == masked_signed) {
-            continue;
-        }
-        // Augment: append new (name, value) to value_map AND name to variants.
+        // Resolve the signal name for the variant name; fall back
+        // to a synthetic `nid_<state>` label when the BTOR2 symbol
+        // table doesn't carry one.
         let signal_name = symbols
             .get(state)
             .cloned()
             .unwrap_or_else(|| format!("nid_{state}"));
-        let variant_name = format!("{}_{}", signal_name, masked_signed);
-        value_map.push((variant_name.clone(), masked_signed));
-        match &mut fd.variants {
-            Some(v) => v.push(variant_name),
-            None => fd.variants = Some(vec![variant_name]),
-        }
+        // Q2 (§Phase 11 slot-3 close follow-up): delegate the
+        // dedupe + append + variants-list update to R-S6.5's
+        // `try_append_value` helper. The helper supersedes the
+        // inlined logic these helpers carried at their original
+        // (R-S2a / R-S2b.4) shipping commits.
+        try_append_value(&signal_name, init_value & mask, fd, value_map);
     }
 }
 
@@ -2823,24 +2820,20 @@ pub(crate) fn apply_reset_simulation_seeding(
         ) {
             continue;
         }
-        let Some(width) = nid_to_width.get(&nid) else {
+        let Some(width) = nid_to_width.get(&nid).copied() else {
             continue;
         };
-        let masked = if *width >= 64 {
-            valuation.value
+        let mask: u64 = if width >= 64 {
+            u64::MAX
         } else {
-            valuation.value & ((1u64 << *width) - 1)
+            (1u64 << width) - 1
         };
-        let masked_signed = masked as i64;
-        if value_map.iter().any(|(_, v)| *v == masked_signed) {
-            continue;
-        }
-        let variant_name = format!("{}_{}", valuation.name, masked_signed);
-        value_map.push((variant_name.clone(), masked_signed));
-        match &mut fd.variants {
-            Some(v) => v.push(variant_name),
-            None => fd.variants = Some(vec![variant_name]),
-        }
+        // Q2 (§Phase 11 slot-3 close follow-up): delegate the
+        // dedupe + append + variants-list update to R-S6.5's
+        // `try_append_value` helper. The helper supersedes the
+        // inlined logic this helper carried at its original
+        // (R-S2b.4) shipping commit.
+        try_append_value(&valuation.name, valuation.value & mask, fd, value_map);
     }
 }
 
