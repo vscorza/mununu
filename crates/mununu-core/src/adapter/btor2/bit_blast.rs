@@ -784,7 +784,7 @@ fn enrich_symbols_with_sidecar_drives(
 /// symbol (from `parser::collect_symbols`), used to cross-reference
 /// against the sidecar's `memories[]` declarations.
 #[derive(Debug, Clone)]
-struct MemoryCellMeta {
+pub(crate) struct MemoryCellMeta {
     /// BTOR2 NID of the `state` line; reserved for the §Phase 10
     /// §10.2 stage 3+ lifter to look up the cell during predicate-image
     /// queries. Currently unused in stage 1 (schema/validate-only).
@@ -805,7 +805,7 @@ struct MemoryCellMeta {
 /// case for FSM-only fixtures). Memory cells without a resolvable
 /// symbol get a synthetic `nid_<n>` name so the sidecar validator
 /// can still emit an actionable error pointing at the BTOR2 line.
-fn detect_btor2_memories(file: &Btor2File) -> Vec<MemoryCellMeta> {
+pub(crate) fn detect_btor2_memories(file: &Btor2File) -> Vec<MemoryCellMeta> {
     let symbols = parser::collect_symbols(file);
     let mut out = Vec::new();
     for line in &file.lines {
@@ -991,7 +991,7 @@ fn sidecar_havoc_memory_nids(
 ///
 /// **Pure**: no I/O; testable in isolation against a synthetic
 /// `MemoryCellMeta` + sidecar JSON pair.
-fn sidecar_uf_memory_nids(
+pub(crate) fn sidecar_uf_memory_nids(
     memory_cells: &[MemoryCellMeta],
     options: &AdapterOptions,
 ) -> std::collections::HashSet<Nid> {
