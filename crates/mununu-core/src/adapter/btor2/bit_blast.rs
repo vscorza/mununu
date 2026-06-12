@@ -458,6 +458,27 @@ pub fn to_ir(
     // simply passes the file through unchanged in those cases, and
     // the is_blastable check below produces the existing
     // "stage 3/4 not yet shipped" error.
+    // §Phase 10 §10.2 stage 3.a (2026-06-12) — UF-mode recognition.
+    // Computed once up-front so the is_blastable error path below
+    // can prepend a stage-3.a-specific hint when the Read/Write
+    // bail-out fires on a memory the sidecar declared with
+    // `abstraction: uf`. Stage 3.a ships the recognition layer
+    // only; the actual Z3 Array `select`/`store` encoding (stage
+    // 3.b) and predicate-image query integration (stage 3.c) are
+    // queued. The hint narrows the generic "stage 3/4 not yet
+    // shipped" error to "your specific UF declaration is recognised;
+    // stages 3.b/c track the actual lift."
+    let uf_memory_names: std::collections::HashMap<Nid, String> = if memory_cells.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let uf_nids = sidecar_uf_memory_nids(&memory_cells, options);
+        memory_cells
+            .iter()
+            .filter(|m| uf_nids.contains(&m.nid))
+            .map(|m| (m.nid, m.name.clone()))
+            .collect()
+    };
+
     let mut rewritten_holder: Option<Btor2File> = None;
     if !memory_cells.is_empty() {
         validate_sidecar_memories(file, &memory_cells, options)?;
@@ -495,20 +516,39 @@ pub fn to_ir(
     // includes the §Phase 10 hint so the user knows to wait for
     // (or contribute) the stage 3/4 implementation.
     for line in &file.lines {
-        if let Node::Op { op, .. } = &line.node
+        if let Node::Op { op, args, .. } = &line.node
             && !op.is_blastable()
         {
-            let phase10_hint = if matches!(op, Op::Read | Op::Write) {
+            // §Phase 10 §10.2 stage 3.a (2026-06-12) — when the
+            // bail-out fires on a Read/Write whose array operand
+            // (args[0]) was declared with `abstraction: uf`,
+            // prepend a UF-specific hint that narrows the generic
+            // stage-3/4 message to "your specific declaration is
+            // recognised; stages 3.b/c track the actual lift."
+            let uf_memory_hint = if matches!(op, Op::Read | Op::Write)
+                && let Some(arr_operand) = args.first()
+                && let Some(name) = uf_memory_names.get(&arr_operand.nid())
+            {
+                format!(
+                    " (§Phase 10 §10.2 stage 3.a: memory `{name}` was declared with \
+                     `abstraction: uf`; the recognition layer is shipped, but the \
+                     Z3 Array `select`/`store` encoding [stage 3.b] and the \
+                     predicate-image query integration [stage 3.c] are queued. \
+                     Until stages 3.b + 3.c ship, switch to `abstraction: havoc` \
+                     for a sound over-approximating safety verdict.)"
+                )
+            } else if matches!(op, Op::Read | Op::Write) {
                 " (§Phase 10 §10.2 stage 1 has detected memory cells in this BTOR2 \
                  and validated the sidecar; the actual lift will succeed once \
                  stage 3 (UF mode) or stage 4 (bounded bit-blast) ships.)"
+                    .to_string()
             } else {
-                ""
+                String::new()
             };
             return Err(AdapterError {
                 kind: AdapterErrorKind::UnsupportedConstruct,
                 message: format!(
-                    "BTOR2 operator '{op:?}' at NID {} is not supported by the Phase 1 bit-blaster.{phase10_hint} \
+                    "BTOR2 operator '{op:?}' at NID {} is not supported by the Phase 1 bit-blaster.{uf_memory_hint} \
                      Hand the BTOR2 to an external symbolic engine (Phase 3 hand-off) instead.",
                     line.nid
                 ),
@@ -924,6 +964,54 @@ fn sidecar_havoc_memory_nids(
     memory_cells
         .iter()
         .filter(|m| havoc_names.contains(m.name.as_str()))
+        .map(|m| m.nid)
+        .collect()
+}
+
+/// §Phase 10 §10.2 stage 3.a (2026-06-12) — collect the NIDs of
+/// memory cells the sidecar declared with `abstraction: uf`.
+///
+/// Mirrors [`sidecar_havoc_memory_nids`] for the UF abstraction
+/// mode. Stage 3.a ships ONLY the recognition layer; the actual
+/// UF rewriting (rewriting `Op::Read` to a Z3 Array `select`
+/// expression and `Op::Write` to a `store` expression in the
+/// downstream SMT-query layer) is stage 3.b + 3.c work. The
+/// translate() integration path uses the result of this helper to
+/// emit a distinct `AdapterWarning` that tells the user the
+/// recognition layer is shipped while the actual lift is still
+/// queued — finer-grained than the generic
+/// "operator not blastable" error users get today for any
+/// UF-declared memory.
+///
+/// **Why the staged shipping**: matches the §Phase 11 §11.4
+/// multi-session sub-item discipline (the R-S2b / R-S6 arcs
+/// followed the same pattern). Stage 3.a is a small unblock-
+/// for-stage-3.b commit; stage 3.b adds the SMT-side encoding;
+/// stage 3.c wires the predicate-image queries.
+///
+/// **Pure**: no I/O; testable in isolation against a synthetic
+/// `MemoryCellMeta` + sidecar JSON pair.
+fn sidecar_uf_memory_nids(
+    memory_cells: &[MemoryCellMeta],
+    options: &AdapterOptions,
+) -> std::collections::HashSet<Nid> {
+    use crate::adapter::systemverilog::annotation::{MemoryAbstraction, SvAnnotation};
+
+    let Some(json) = &options.sidecar_json else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(ann) = serde_json::from_str::<SvAnnotation>(json) else {
+        return std::collections::HashSet::new();
+    };
+    let uf_names: std::collections::HashSet<&str> = ann
+        .memories
+        .iter()
+        .filter(|m| matches!(m.abstraction, MemoryAbstraction::Uf))
+        .map(|m| m.name.as_str())
+        .collect();
+    memory_cells
+        .iter()
+        .filter(|m| uf_names.contains(m.name.as_str()))
         .map(|m| m.nid)
         .collect()
 }
@@ -4707,6 +4795,82 @@ mod tests {
             "op-check hint should point at stages 3/4: {}",
             err.message
         );
+    }
+
+    // ---- §Phase 10 §10.2 stage 3.a — UF-mode recognition layer ----
+
+    #[test]
+    fn phase10_stage3a_uf_declaration_yields_uf_specific_hint() {
+        // When the sidecar declares `abstraction: uf` on a memory
+        // that's referenced by an Op::Read in the BTOR2, the
+        // op-check error message must include the stage-3.a hint
+        // naming the memory + pointing at stages 3.b/3.c. This is
+        // strictly more specific than the generic stage 1
+        // "stage 3/4 not yet shipped" message.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 5,
+                    "data_width": 8,
+                    "abstraction": "uf"
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let err = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect_err("stage 1 still errors at Read/Write op check under uf abstraction");
+        assert!(
+            err.message.contains("stage 3.a"),
+            "stage 3.a hint should appear when UF was declared: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("rf_reg"),
+            "stage 3.a hint should name the UF-declared memory: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("stage 3.b") || err.message.contains("stage 3.c"),
+            "stage 3.a hint should point at stages 3.b/3.c: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn phase10_stage3a_havoc_declaration_does_not_get_uf_hint() {
+        // Confirm the stage 3.a UF-specific hint does NOT fire on
+        // havoc-declared memories. The havoc path lifts end-to-end
+        // (see phase10_stage1b_havoc_rewrites_and_lifts_end_to_end)
+        // so the op-check error doesn't fire at all here — but we
+        // double-check by asserting that translate succeeds.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "memories": [
+                {
+                    "name": "rf_reg",
+                    "address_width": 5,
+                    "data_width": 8,
+                    "abstraction": "havoc"
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        // Translate succeeds end-to-end on the havoc path → no
+        // error to inspect for stage-3.a hint leakage. The mere
+        // success here proves the stage-3.a recognition doesn't
+        // interfere with the havoc lift.
+        let _out = translate(PHASE10_FIXTURE_WITH_MEMORY, &opts)
+            .expect("havoc path lifts end-to-end, regardless of stage 3.a recognition");
     }
 
     // ---- §Phase 10 §10.2 stage 1b — havoc-mode BTOR2 rewriting ----
