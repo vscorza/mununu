@@ -1,0 +1,27 @@
+{
+  "clauses": [
+    {
+      "id": "mbox_sram__sc_guarantee__1",
+      "kind": "guarantee",
+      "owner": "mbox_sram",
+      "description": "G((mbox_sram_req_cs && !mbox_sram_req_we && mbox_sram_req_addr == A) -> mbox_sram_resp_rdata == mem[A])"
+    },
+    {
+      "id": "mbox_sram__sc_assumption__1",
+      "kind": "assumption",
+      "owner": "mbox_sram",
+      "description": "G(mbox_sram_req_cs -> mbox_sram_req_addr stable for the access window)"
+    },
+    {
+      "id": "mbox_sram__sc_assumption__2",
+      "kind": "assumption",
+      "owner": "mbox_sram",
+      "description": "G(!(mbox_sram_req_cs && mbox_sram_req_we && read_to_same_addr))"
+    }
+  ],
+  "discharges": [],
+  "environment_assumptions": [
+    "mbox_sram__sc_assumption__1",
+    "mbox_sram__sc_assumption__2"
+  ]
+}

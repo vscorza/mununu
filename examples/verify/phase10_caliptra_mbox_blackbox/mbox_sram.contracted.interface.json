@@ -1,0 +1,64 @@
+{
+  "name": "mbox_sram",
+  "ports": [
+    {
+      "name": "clk",
+      "direction": "Input",
+      "description": "Synchronous clock for the mailbox SRAM black box."
+    },
+    {
+      "name": "mbox_sram_req_cs",
+      "direction": "Input",
+      "description": "Chip select asserted by the mailbox FSM to start an SRAM access."
+    },
+    {
+      "name": "mbox_sram_req_we",
+      "direction": "Input",
+      "description": "Write-enable: 1 = write wdata to addr, 0 = read addr into resp_rdata."
+    },
+    {
+      "name": "mbox_sram_req_addr",
+      "direction": "Input",
+      "description": "16-bit dword address into the mailbox payload buffer."
+    },
+    {
+      "name": "mbox_sram_req_wdata",
+      "direction": "Input",
+      "description": "32-bit write data (valid when req_cs && req_we)."
+    },
+    {
+      "name": "mbox_sram_req_ecc",
+      "direction": "Input",
+      "description": "7-bit write-side ECC accompanying wdata."
+    },
+    {
+      "name": "mbox_sram_resp_rdata",
+      "direction": "Output",
+      "description": "32-bit read data returned by the SRAM (the read-after-write contract target)."
+    },
+    {
+      "name": "mbox_sram_resp_ecc",
+      "direction": "Output",
+      "description": "7-bit read-side ECC accompanying resp_rdata."
+    }
+  ],
+  "source_file": "mbox.sv",
+  "source_line": null,
+  "annotations": [
+    {
+      "tag": "guarantee",
+      "value": "G((mbox_sram_req_cs && !mbox_sram_req_we && mbox_sram_req_addr == A) -> mbox_sram_resp_rdata == mem[A])",
+      "source_line": null
+    },
+    {
+      "tag": "assume",
+      "value": "G(mbox_sram_req_cs -> mbox_sram_req_addr stable for the access window)",
+      "source_line": null
+    },
+    {
+      "tag": "assume",
+      "value": "G(!(mbox_sram_req_cs && mbox_sram_req_we && read_to_same_addr))",
+      "source_line": null
+    }
+  ]
+}

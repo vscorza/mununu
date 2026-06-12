@@ -1,0 +1,12 @@
+{
+  "kind": "acyclic",
+  "topological": [
+    "mbox_sram__sc_assumption__2",
+    "mbox_sram__sc_assumption__1",
+    "mbox_sram__sc_guarantee__1"
+  ],
+  "unmet_environment": [
+    "mbox_sram__sc_assumption__1",
+    "mbox_sram__sc_assumption__2"
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "module": "mbox_sram",
+  "labels": [
+    {
+      "name": "clk",
+      "controllability": "Uncontrollable",
+      "direction": "Input",
+      "description": "Synchronous clock for the mailbox SRAM black box."
+    },
+    {
+      "name": "mbox_sram_req_cs",
+      "controllability": "Uncontrollable",
+      "direction": "Input",
+      "description": "Chip select asserted by the mailbox FSM to start an SRAM access."
+    },
+    {
+      "name": "mbox_sram_req_we",
+      "controllability": "Uncontrollable",
+      "direction": "Input",
+      "description": "Write-enable: 1 = write wdata to addr, 0 = read addr into resp_rdata."
+    },
+    {
+      "name": "mbox_sram_req_addr",
+      "controllability": "Uncontrollable",
+      "direction": "Input",
+      "description": "16-bit dword address into the mailbox payload buffer."
+    },
+    {
+      "name": "mbox_sram_req_wdata",
+      "controllability": "Uncontrollable",
+      "direction": "Input",
+      "description": "32-bit write data (valid when req_cs && req_we)."
+    },
+    {
+      "name": "mbox_sram_req_ecc",
+      "controllability": "Uncontrollable",
+      "direction": "Input",
+      "description": "7-bit write-side ECC accompanying wdata."
+    },
+    {
+      "name": "mbox_sram_resp_rdata",
+      "controllability": "Controllable",
+      "direction": "Output",
+      "description": "32-bit read data returned by the SRAM (the read-after-write contract target)."
+    },
+    {
+      "name": "mbox_sram_resp_ecc",
+      "controllability": "Controllable",
+      "direction": "Output",
+      "description": "7-bit read-side ECC accompanying resp_rdata."
+    }
+  ],
+  "gaps": {
+    "markers": [
+      {
+        "module": "mbox_sram",
+        "kind": "latency_bound",
+        "labels": [
+          "mbox_sram_resp_rdata",
+          "mbox_sram_resp_ecc"
+        ],
+        "description": "Phase-2 discovery — 1 guarantee clause(s) found on mbox_sram; latency bound still unauthored",
+        "source_location": null
+      }
+    ]
+  },
+  "corpus_resolutions": []
+}
