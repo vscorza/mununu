@@ -3863,69 +3863,53 @@ fn evaluate_pure_with_uf_rep(
     uf_wrapped_nids: Option<&std::collections::HashSet<Nid>>,
     rep: UfRepresentative,
 ) -> Result<(), AdapterError> {
-    for line in &file.lines {
-        match &line.node {
-            Node::Sort { .. } | Node::Input { .. } | Node::State { .. } => {
-                // Inputs and states are already populated by make_*_env.
-            }
-            Node::Const { sort, value } => {
-                let width = parser::bv_width(file, *sort)
-                    .ok_or_else(|| constancy_err(line, "constant references non-bitvec sort"))?;
-                let bv = eval_const_value(value, width).map_err(|msg| constancy_err(line, &msg))?;
-                env.values.insert(line.nid, bv);
-            }
-            Node::Init { state, value, .. } => {
-                if honor_init {
-                    let v = read_operand(env, *value)
-                        .ok_or_else(|| constancy_err(line, "init value not yet evaluated"))?;
-                    env.values.insert(*state, v);
-                }
-            }
-            Node::Op { sort, op, args, .. } => {
-                let width = parser::bv_width(file, *sort)
-                    .ok_or_else(|| constancy_err(line, "operator references non-bitvec sort"))?;
-                // R.5b lifter integration MVP + multi-value follow-up —
-                // when this Op's NID is in the UF-wrapped set, substitute
-                // the chosen representative (zero / ones / etc.) instead
-                // of evaluating the arithmetic. Downstream Ops that read
-                // env see the substituted value, propagating UF semantics
-                // through the dependency chain.
-                if uf_wrapped_nids.is_some_and(|s| s.contains(&line.nid)) {
-                    env.values.insert(line.nid, rep.to_value(width));
-                    continue;
-                }
-                let result =
-                    eval_op(*op, &line.immediates, args, width, env).map_err(|e| AdapterError {
-                        kind: AdapterErrorKind::IrConsistencyError,
-                        message: format!("at NID {}: {}", line.nid, e),
-                        location: Some(SourceLocation {
-                            line: line.source_line,
-                            column: 0,
-                        }),
-                    })?;
-                env.values.insert(line.nid, result);
-            }
-            // Side-effect declarations don't add to env.
-            Node::Next { .. }
-            | Node::Bad { .. }
-            | Node::Constraint { .. }
-            | Node::Fair { .. }
-            | Node::Output { .. }
-            | Node::Justice { .. } => {}
-        }
-    }
-    Ok(())
-}
+    use crate::adapter::btor2::term_backend::{WalkError, walk_design};
 
-fn constancy_err(line: &Line, msg: &str) -> AdapterError {
-    AdapterError {
-        kind: AdapterErrorKind::IrConsistencyError,
-        message: format!("NID {}: {msg}", line.nid),
-        location: Some(SourceLocation {
-            line: line.source_line,
-            column: 0,
-        }),
-    }
+    // §Phase 10 Option-4 step 1b (2026-06-12) — cutover. The bespoke
+    // node loop is retired; `evaluate_pure_with_uf_rep` now drives
+    // the unified `walk_design` over a `ConcreteBackend`. The
+    // ConcreteBackend delegates operator + constant evaluation to the
+    // same `eval_op` / `eval_const_value` the bespoke loop used, so
+    // the computed env is bit-identical — proven by the step-1a
+    // equivalence tests (`option4_backend_matches_bespoke_*`).
+    //
+    // The backend owns its env; we move the caller's env in, walk,
+    // and move it back (restoring it even on error so partial
+    // results remain inspectable, matching the bespoke in-place
+    // mutation contract).
+    let seeded = std::mem::take(env);
+    let mut backend = ConcreteBackend::new(seeded, honor_init, uf_wrapped_nids, rep);
+    let walk_result = walk_design(file, &mut backend);
+    *env = backend.into_env();
+
+    walk_result.map_err(|e| {
+        // Map the structural / backend error back to the AdapterError
+        // shape callers expect (IrConsistencyError + source location
+        // looked up by NID), preserving the pre-cutover diagnostics.
+        let lookup_loc = |nid: Nid| {
+            file.lookup(nid).map(|l| SourceLocation {
+                line: l.source_line,
+                column: 0,
+            })
+        };
+        match e {
+            WalkError::NonBitvecSort(nid) => AdapterError {
+                kind: AdapterErrorKind::IrConsistencyError,
+                message: format!("NID {nid}: node references non-bitvec sort"),
+                location: lookup_loc(nid),
+            },
+            WalkError::Unevaluated(nid) => AdapterError {
+                kind: AdapterErrorKind::IrConsistencyError,
+                message: format!("NID {nid}: init value not yet evaluated"),
+                location: lookup_loc(nid),
+            },
+            WalkError::Backend(msg) => AdapterError {
+                kind: AdapterErrorKind::IrConsistencyError,
+                message: format!("operator evaluation failed: {msg}"),
+                location: None,
+            },
+        }
+    })
 }
 
 fn eval_op(
@@ -4220,16 +4204,9 @@ pub(crate) fn eval_const_value(value: &ConstValue, width: u32) -> Result<BvValue
 ///
 /// Holds its own [`Env`] (the `Nid → BvValue` store), seeded by the
 /// caller with the input + state bindings (the same env
-/// `make_*_env` builds for the bespoke loop). Step 1b cuts
-/// `evaluate_pure` over to drive this backend; step 1a ships it as a
-/// parallel, test-pinned path with the production loop unchanged.
-///
-/// `#[allow(dead_code)]`: step 1a ships the backend with only its
-/// equivalence test as the caller (a `#[cfg(test)]` user, which the
-/// lib-build dead-code pass does not count). Step 1b's cutover makes
-/// it the production evaluator and removes this annotation — the same
-/// staged-API pattern the R-S2b / R-S6 helpers followed.
-#[allow(dead_code)]
+/// `make_*_env` builds). As of step 1b this IS the production
+/// concrete evaluator: `evaluate_pure_with_uf_rep` drives
+/// `walk_design::<ConcreteBackend>`.
 pub(crate) struct ConcreteBackend<'a> {
     env: Env,
     honor_init: bool,
@@ -4237,7 +4214,6 @@ pub(crate) struct ConcreteBackend<'a> {
     rep: UfRepresentative,
 }
 
-#[allow(dead_code)]
 impl<'a> ConcreteBackend<'a> {
     /// Build a concrete backend over a pre-seeded env (input + state
     /// bindings). `uf_wrapped_nids` + `rep` mirror
