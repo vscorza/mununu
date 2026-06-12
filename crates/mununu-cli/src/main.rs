@@ -285,6 +285,21 @@ struct Btor2CegarArgs {
     /// Example: `--sv-source designs/uart_tx.sv`.
     #[arg(long = "sv-source", value_name = "PATH")]
     sv_source: Option<PathBuf>,
+    /// R-S6.6 (§Phase 9 §9.1, 2026-06-12) — path to a sidecar
+    /// JSON file (`.mununu.json`). When set, the file's contents
+    /// override the synthetic sidecar built from `--config-values`,
+    /// AND `AdapterOptions::sidecar_path` is populated so the
+    /// bit-blaster's `apply_vcd_trace_seeding` orchestration can
+    /// resolve relative `vcd_traces` paths against the sidecar's
+    /// parent directory.
+    ///
+    /// Without `--sidecar`, only absolute VCD trace paths in a
+    /// `--config-values`-built sidecar can be read; relative
+    /// paths emit an `AdapterWarning` and fall through.
+    ///
+    /// Example: `--sidecar examples/v6_controllability_kmts/source/amba_arbiter.mununu.json`.
+    #[arg(long = "sidecar", value_name = "PATH")]
+    sidecar: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1843,6 +1858,27 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // .claude/reviews/slot-3-close-cadence-2026-06-12.md (R-S2b.6
     // unreachable from CLI before this wire-in).
     adapter_options.sv_source_path = args.sv_source.clone();
+
+    // R-S6.6 / P2 (§Phase 11 slot-3 close follow-up, 2026-06-12)
+    // — thread the `--sidecar` CLI flag into
+    // `AdapterOptions::sidecar_path` AND override the synthetic
+    // `sidecar_json` with the file's contents when provided. The
+    // bit-blaster's `apply_vcd_trace_seeding` orchestration reads
+    // `sidecar_path.parent()` to resolve relative `vcd_traces`
+    // paths declared in the sidecar. Closes the second parity gap
+    // surfaced by the slot-3 close cadence checkpoint (R-S6.6
+    // unreachable from CLI before this wire-in).
+    //
+    // When both `--sidecar` and `--config-values` are set, the
+    // file-based sidecar wins (the file is the authoritative
+    // schema source; `--config-values` is the synth-sidecar
+    // convenience flag for hand-tuning).
+    if let Some(sidecar_path) = &args.sidecar {
+        let sidecar_content = std::fs::read_to_string(sidecar_path)
+            .map_err(|e| format!("Failed to read sidecar '{}': {e}", sidecar_path.display()))?;
+        adapter_options.sidecar_json = Some(sidecar_content);
+        adapter_options.sidecar_path = Some(sidecar_path.clone());
+    }
 
     let trace = cegar_refine_loop(
         &formula,
