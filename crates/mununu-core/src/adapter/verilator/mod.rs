@@ -298,64 +298,77 @@ pub fn compile_verilator(
     let mdir = workdir.join("obj_dir");
     let args = build_verilator_compile_args(opts, sv_path, &tb_cpp_path, &mdir);
 
-    let v_out = Command::new(verilator)
-        .args(&args)
-        .output()
-        .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::ParseError,
-            message: format!(
-                "adapter/verilator: failed to spawn `{}`: {e}",
-                verilator.display()
-            ),
-            location: None,
-        })?;
-    if !v_out.status.success() {
-        let stderr = String::from_utf8_lossy(&v_out.stderr);
-        let stdout = String::from_utf8_lossy(&v_out.stdout);
-        return Err(AdapterError {
-            kind: AdapterErrorKind::ParseError,
-            message: format!(
-                "adapter/verilator: verilator exited with status {} for {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                v_out.status,
-                sv_path.display()
-            ),
-            location: None,
-        });
-    }
+    let mut verilator_cmd = Command::new(verilator);
+    verilator_cmd.args(&args);
+    run_and_check(
+        verilator_cmd,
+        &format!("`{}`", verilator.display()),
+        &format!("verilator for {}", sv_path.display()),
+    )?;
 
     let top = derive_top_name(opts, sv_path);
     let mk_name = format!("V{top}.mk");
     let bin_name = format!("V{top}");
-    let m_out = Command::new("make")
+    let mut make_cmd = Command::new("make");
+    make_cmd
         .arg("-C")
         .arg(&mdir)
         .arg("-f")
         .arg(&mk_name)
-        .arg(&bin_name)
-        .output()
-        .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::ParseError,
-            message: format!(
-                "adapter/verilator: failed to spawn `make` for {}: {e}",
-                mdir.display()
-            ),
-            location: None,
-        })?;
-    if !m_out.status.success() {
-        let stderr = String::from_utf8_lossy(&m_out.stderr);
-        let stdout = String::from_utf8_lossy(&m_out.stdout);
+        .arg(&bin_name);
+    run_and_check(
+        make_cmd,
+        &format!("`make` for {}", mdir.display()),
+        &format!("make -f {mk_name} {bin_name} in {}", mdir.display()),
+    )?;
+
+    Ok(mdir.join(bin_name))
+}
+
+/// Q3 (§Phase 11 slot-3 close follow-up, 2026-06-12) — shared
+/// "spawn + check exit status" subprocess helper for the
+/// verilator-adapter call chain. Mirrors the
+/// `crate::adapter::yosys::run_yosys` pattern (yosys/mod.rs:607)
+/// which Q3's quality-session candidate cited as the precedent.
+///
+/// **Inputs**:
+/// - `cmd`: a pre-configured `Command` (caller has already set
+///   the binary + args).
+/// - `bin_label`: short identifier for the spawn-error message
+///   (typically the binary path in backticks). The full message
+///   becomes `"adapter/verilator: failed to spawn <bin_label>: <io_err>"`.
+/// - `context`: short description of the invocation for the
+///   non-success error message (e.g. `"verilator for foo.sv"`,
+///   `"make -f Vtop.mk Vtop in obj_dir"`).
+///
+/// **Behaviour**:
+/// 1. Spawn via `cmd.output()`. On `Err`, return a
+///    `ParseError`-kind `AdapterError` naming the bin_label +
+///    the I/O error.
+/// 2. If the child exited non-success, return a `ParseError`-kind
+///    `AdapterError` embedding the exit status + stdout + stderr
+///    (so users can diagnose Verilator parse failures + missing-
+///    construct gaps inline).
+/// 3. Otherwise return `Ok(())`.
+fn run_and_check(mut cmd: Command, bin_label: &str, context: &str) -> Result<(), AdapterError> {
+    let out = cmd.output().map_err(|e| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: format!("adapter/verilator: failed to spawn {bin_label}: {e}"),
+        location: None,
+    })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
         return Err(AdapterError {
             kind: AdapterErrorKind::ParseError,
             message: format!(
-                "adapter/verilator: make -f {mk_name} {bin_name} exited with status {} in {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                m_out.status,
-                mdir.display()
+                "adapter/verilator: {context} exited with status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                out.status,
             ),
             location: None,
         });
     }
-
-    Ok(mdir.join(bin_name))
+    Ok(())
 }
 
 /// R-S2b.2 (2026-06-10) — per-call work directory for Verilator
