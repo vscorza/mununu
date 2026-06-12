@@ -2067,7 +2067,7 @@ fn apply_next(
 // =====================================================================
 
 #[derive(Debug, Clone, Default)]
-struct Env {
+pub(crate) struct Env {
     values: std::collections::HashMap<Nid, BvValue>,
 }
 
@@ -3871,36 +3871,7 @@ fn evaluate_pure_with_uf_rep(
             Node::Const { sort, value } => {
                 let width = parser::bv_width(file, *sort)
                     .ok_or_else(|| constancy_err(line, "constant references non-bitvec sort"))?;
-                let bv = match value {
-                    ConstValue::Zero => BvValue::zero(width),
-                    ConstValue::One => BvValue::one(width),
-                    ConstValue::Ones => BvValue::ones(width),
-                    ConstValue::Bin(s) => {
-                        let bits = u128::from_str_radix(s, 2)
-                            .map_err(|_| constancy_err(line, "bad binary literal"))?;
-                        BvValue::new(bits, width)
-                    }
-                    ConstValue::Dec(d) => {
-                        let bits = if *d >= 0 {
-                            *d as u128
-                        } else {
-                            // Two's complement of a negative literal.
-                            let abs = (-d) as u128;
-                            let mask = if width >= 128 {
-                                u128::MAX
-                            } else {
-                                (1u128 << width) - 1
-                            };
-                            (mask.wrapping_sub(abs).wrapping_add(1)) & mask
-                        };
-                        BvValue::new(bits, width)
-                    }
-                    ConstValue::Hex(s) => {
-                        let bits = u128::from_str_radix(s, 16)
-                            .map_err(|_| constancy_err(line, "bad hex literal"))?;
-                        BvValue::new(bits, width)
-                    }
-                };
+                let bv = eval_const_value(value, width).map_err(|msg| constancy_err(line, &msg))?;
                 env.values.insert(line.nid, bv);
             }
             Node::Init { state, value, .. } => {
@@ -4198,6 +4169,139 @@ fn sign_extend(bits: u128, width: u32) -> i128 {
     }
 }
 
+/// §Phase 10 Option-4 step 1a (2026-06-12) — shared constant-node
+/// evaluation. Extracted from `evaluate_pure_with_uf_rep`'s inline
+/// `Node::Const` match so the bespoke loop AND the new
+/// `ConcreteBackend` (the [`crate::adapter::btor2::term_backend::BvTermBackend`]
+/// impl) compute constants from ONE source — no duplication, no
+/// drift. Returns `Err(message)` on a malformed literal.
+pub(crate) fn eval_const_value(value: &ConstValue, width: u32) -> Result<BvValue, String> {
+    let bv = match value {
+        ConstValue::Zero => BvValue::zero(width),
+        ConstValue::One => BvValue::one(width),
+        ConstValue::Ones => BvValue::ones(width),
+        ConstValue::Bin(s) => {
+            let bits = u128::from_str_radix(s, 2).map_err(|_| "bad binary literal".to_string())?;
+            BvValue::new(bits, width)
+        }
+        ConstValue::Dec(d) => {
+            let bits = if *d >= 0 {
+                *d as u128
+            } else {
+                // Two's complement of a negative literal.
+                let abs = (-d) as u128;
+                let mask = if width >= 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << width) - 1
+                };
+                (mask.wrapping_sub(abs).wrapping_add(1)) & mask
+            };
+            BvValue::new(bits, width)
+        }
+        ConstValue::Hex(s) => {
+            let bits = u128::from_str_radix(s, 16).map_err(|_| "bad hex literal".to_string())?;
+            BvValue::new(bits, width)
+        }
+    };
+    Ok(bv)
+}
+
+/// §Phase 10 Option-4 step 1a (2026-06-12) — the concrete
+/// instantiation of [`crate::adapter::btor2::term_backend::BvTermBackend`].
+///
+/// `Value = BvValue`. Delegates operator evaluation to the existing
+/// [`eval_op`] free function so the arithmetic is bit-identical to
+/// the production `evaluate_pure` path — this backend is a faithful
+/// re-expression of the concrete evaluator behind the unified seam,
+/// not a reimplementation. Constants go through the shared
+/// [`eval_const_value`]; the UF substitution mirrors
+/// `evaluate_pure_with_uf_rep`'s representative logic.
+///
+/// Holds its own [`Env`] (the `Nid → BvValue` store), seeded by the
+/// caller with the input + state bindings (the same env
+/// `make_*_env` builds for the bespoke loop). Step 1b cuts
+/// `evaluate_pure` over to drive this backend; step 1a ships it as a
+/// parallel, test-pinned path with the production loop unchanged.
+///
+/// `#[allow(dead_code)]`: step 1a ships the backend with only its
+/// equivalence test as the caller (a `#[cfg(test)]` user, which the
+/// lib-build dead-code pass does not count). Step 1b's cutover makes
+/// it the production evaluator and removes this annotation — the same
+/// staged-API pattern the R-S2b / R-S6 helpers followed.
+#[allow(dead_code)]
+pub(crate) struct ConcreteBackend<'a> {
+    env: Env,
+    honor_init: bool,
+    uf_wrapped_nids: Option<&'a std::collections::HashSet<Nid>>,
+    rep: UfRepresentative,
+}
+
+#[allow(dead_code)]
+impl<'a> ConcreteBackend<'a> {
+    /// Build a concrete backend over a pre-seeded env (input + state
+    /// bindings). `uf_wrapped_nids` + `rep` mirror
+    /// `evaluate_pure_with_uf_rep`'s UF-substitution parameters;
+    /// pass `None` + `UfRepresentative::Zero` for the no-UF path.
+    pub(crate) fn new(
+        env: Env,
+        honor_init: bool,
+        uf_wrapped_nids: Option<&'a std::collections::HashSet<Nid>>,
+        rep: UfRepresentative,
+    ) -> Self {
+        Self {
+            env,
+            honor_init,
+            uf_wrapped_nids,
+            rep,
+        }
+    }
+
+    /// Consume the backend, returning the populated env.
+    pub(crate) fn into_env(self) -> Env {
+        self.env
+    }
+}
+
+impl crate::adapter::btor2::term_backend::BvTermBackend for ConcreteBackend<'_> {
+    type Value = BvValue;
+    type Error = String;
+
+    fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<BvValue, String> {
+        eval_const_value(value, width)
+    }
+
+    fn eval_op(
+        &mut self,
+        op: Op,
+        immediates: &[u32],
+        args: &[Operand],
+        width: u32,
+    ) -> Result<BvValue, String> {
+        eval_op(op, immediates, args, width, &self.env)
+    }
+
+    fn bind(&mut self, nid: Nid, value: BvValue) {
+        self.env.values.insert(nid, value);
+    }
+
+    fn honor_init(&self) -> bool {
+        self.honor_init
+    }
+
+    fn read_operand(&self, op: Operand) -> Option<BvValue> {
+        read_operand(&self.env, op)
+    }
+
+    fn uf_substitute(&mut self, nid: Nid, width: u32) -> Option<BvValue> {
+        if self.uf_wrapped_nids.is_some_and(|s| s.contains(&nid)) {
+            Some(self.rep.to_value(width))
+        } else {
+            None
+        }
+    }
+}
+
 /// High-level entry: parse + bit-blast + emit.
 pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutput, AdapterError> {
     let file = super::parser::parse(content)?;
@@ -4254,6 +4358,132 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
 mod tests {
     use super::*;
     use crate::adapter::AdapterOptions;
+
+    // ─────────────────────────────────────────────────────────────
+    // §Phase 10 Option-4 step 1a — BvTermBackend equivalence.
+    //
+    // Proves `walk_design::<ConcreteBackend>` produces the SAME
+    // per-NID env as the bespoke `evaluate_pure_with_uf_rep` loop,
+    // bit-for-bit, over a spread of operators. This is the
+    // load-bearing gate for the step-1b cutover: it certifies the
+    // unified seam is a faithful re-expression of the concrete
+    // evaluator before the production path switches to it.
+    // ─────────────────────────────────────────────────────────────
+
+    /// Seed an env by binding every input + state NID to a
+    /// deterministic per-NID value (so both evaluators start from an
+    /// identical state). Mirrors what `make_*_env` does in
+    /// production, but with synthetic values.
+    fn seed_env(file: &Btor2File) -> Env {
+        let mut env = Env::default();
+        for line in &file.lines {
+            let (nid, sort) = match &line.node {
+                Node::Input { sort, .. } | Node::State { sort, .. } => (line.nid, *sort),
+                _ => continue,
+            };
+            let width = parser::bv_width(file, sort).unwrap_or(1);
+            // A deterministic non-trivial value per NID: low bits of
+            // the NID, masked to width.
+            let raw = (line.nid as u128).wrapping_mul(0x9E37) ^ 0x5A5A;
+            env.values.insert(nid, BvValue::new(raw, width));
+        }
+        env
+    }
+
+    /// Run BOTH evaluators on the same seeded env + assert the
+    /// resulting `Nid → BvValue` maps are identical.
+    fn assert_backend_matches_bespoke(src: &str, honor_init: bool) {
+        use crate::adapter::btor2::term_backend::walk_design;
+        let file = super::parser::parse(src).expect("parse fixture");
+
+        // Bespoke path.
+        let mut bespoke_env = seed_env(&file);
+        evaluate_pure_with_uf_rep(
+            &file,
+            &mut bespoke_env,
+            honor_init,
+            None,
+            UfRepresentative::Zero,
+        )
+        .expect("bespoke eval");
+
+        // Unified-seam path.
+        let mut backend =
+            ConcreteBackend::new(seed_env(&file), honor_init, None, UfRepresentative::Zero);
+        walk_design(&file, &mut backend).expect("walk_design eval");
+        let backend_env = backend.into_env();
+
+        assert_eq!(
+            bespoke_env.values, backend_env.values,
+            "walk_design::<ConcreteBackend> must match evaluate_pure_with_uf_rep bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn option4_backend_matches_bespoke_arith_and_logic() {
+        // A spread of operators: const, and/or/xor, add/sub/mul,
+        // eq/ult/slt, ite, concat, slice, uext/sext.
+        let src = r#"
+1 sort bitvec 8
+2 sort bitvec 1
+3 sort bitvec 16
+4 input 1 a
+5 input 1 b
+6 constd 1 100
+7 add 1 4 5
+8 sub 1 4 5
+9 mul 1 7 8
+10 and 1 4 5
+11 or 1 4 5
+12 xor 1 10 11
+13 eq 2 4 5
+14 ult 2 4 5
+15 slt 2 4 5
+16 ite 1 13 4 5
+17 concat 3 4 5
+18 slice 1 17 7 0
+19 uext 3 4 8
+20 sext 3 4 8
+"#;
+        assert_backend_matches_bespoke(src, false);
+    }
+
+    #[test]
+    fn option4_backend_matches_bespoke_shifts_and_reductions() {
+        let src = r#"
+1 sort bitvec 8
+2 sort bitvec 1
+3 input 1 x
+4 input 1 y
+5 sll 1 3 4
+6 srl 1 3 4
+7 sra 1 3 4
+8 rol 1 3 4
+9 ror 1 3 4
+10 redand 2 3
+11 redor 2 3
+12 redxor 2 3
+13 not 1 3
+14 neg 1 3
+15 inc 1 3
+16 dec 1 3
+"#;
+        assert_backend_matches_bespoke(src, false);
+    }
+
+    #[test]
+    fn option4_backend_matches_bespoke_with_init() {
+        // honor_init = true exercises the Node::Init copy path in
+        // both evaluators.
+        let src = r#"
+1 sort bitvec 4
+2 constd 1 7
+3 state 1 q
+4 init 1 3 2
+5 add 1 3 2
+"#;
+        assert_backend_matches_bespoke(src, true);
+    }
 
     #[test]
     fn toggle_latch_safety_unrealizable_when_bad_reachable() {

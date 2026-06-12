@@ -27,6 +27,7 @@ pub mod kmts_lift;
 pub mod parser;
 pub mod r_s8_encoder;
 pub mod smt_must_edge;
+pub mod term_backend;
 
 pub use cegar::{
     CegarIteration, CegarOptions, CegarTermination, CegarTrace, PredicateSource, cegar_refine_loop,
