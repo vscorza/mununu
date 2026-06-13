@@ -552,6 +552,7 @@ fn run_controllability_aware_lift(
         max_cube_count: 1024,
         max_input_bits: 8,
         must_edge_inference: MustEdgeInference::Off,
+        may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
     };
 

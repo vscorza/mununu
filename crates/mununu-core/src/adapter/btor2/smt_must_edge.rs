@@ -478,12 +478,8 @@ pub enum SmtMayVerdict {
 ///
 /// **Caller must hold a [`z3::with_z3_config`] scope.**
 //
-// Staged-API (MIG-3 increment 1): the sound may-edge PRIMITIVE + its
-// soundness tests. The `predicate_cube_lift` wiring — a
-// `MayEdgeInference` policy that replaces the sampling may-edges with
-// this query (with the all-SMT-enumeration tractability story for large
-// |P|) — is MIG-3 increment 2, at which point the allow is removed.
-#[allow(dead_code)]
+// Consumed by `predicate_cube_lift`'s `MayEdgeInference::SmtAllPairs`
+// policy (MIG-3.2) — the sound all-pairs may relation.
 pub fn smt_per_target_may_check<P>(
     view: &Btor2SmtView,
     src_bits: u64,

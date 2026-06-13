@@ -561,6 +561,10 @@ pub fn cegar_refine_loop(
         // edges + a [R.2.5b-sampling-must] AdapterWarning that
         // propagates through the CegarTrace to the verdict surface.
         must_edge_inference: cegar_opts.must_edge_inference,
+        // MIG-3.2 (2026-06-13) — may-edge policy. CEGAR keeps the
+        // sampling default; the sound all-pairs SMT may-edge path is
+        // opt-in at the lift layer (not yet surfaced to CegarOptions).
+        may_edge_inference: Default::default(),
         // R-Y7 (2026-06-07) + R-S8 session 2 (2026-06-08) —
         // symbolic-init via predicate cubes. Read the
         // `signals[].config_values` map from the sidecar JSON

@@ -85,6 +85,7 @@ fn v6_amba_arbiter_lifts_with_controllability_aware_dual_labels() {
         // ctrl-combos.
         max_input_bits: 8,
         must_edge_inference: MustEdgeInference::Off,
+        may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
     };
 
@@ -158,6 +159,7 @@ fn v6_amba_arbiter_lifts_with_mayonly_transitions_present() {
         max_cube_count: 1024,
         max_input_bits: 8,
         must_edge_inference: MustEdgeInference::Off,
+        may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
     };
 
@@ -240,6 +242,7 @@ fn v6_amba_arbiter_controllability_aware_skips_smt_post_pass() {
         max_cube_count: 1024,
         max_input_bits: 8,
         must_edge_inference: MustEdgeInference::SmtPerTarget,
+        may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
     };
 

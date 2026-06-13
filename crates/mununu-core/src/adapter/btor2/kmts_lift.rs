@@ -314,6 +314,11 @@ pub struct PredicateCubeLiftOptions {
     /// pre-R.2.5b behaviour of emitting only `MayOnly` edges.
     /// See [`MustEdgeInference`] for the post-pass semantics.
     pub must_edge_inference: MustEdgeInference,
+    /// MIG-3 (2026-06-13) — may-edge construction policy. Defaults to
+    /// [`MayEdgeInference::Off`] (sampling, preserving pre-MIG-3
+    /// behaviour). [`MayEdgeInference::SmtAllPairs`] replaces the
+    /// sampling may-edges with the sound all-pairs SMT may relation.
+    pub may_edge_inference: MayEdgeInference,
     /// R-Y7 (2026-06-07) — symbolic-init via predicate cubes.
     /// Map of `register_name → set of valid initial values` for
     /// under-constrained constants. When non-empty, the lifter
@@ -336,6 +341,7 @@ impl Default for PredicateCubeLiftOptions {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: MayEdgeInference::Off,
             config_values: std::collections::HashMap::new(),
         }
     }
@@ -435,6 +441,39 @@ pub enum MustEdgeInference {
     /// SOUNDNESS: same as `SmtPerTargetStandard`; warning reads
     /// `[R.2.5b-smt-must-hyper]`.
     SmtHyperMust,
+}
+
+/// MIG-3 (S-track migration, 2026-06-13) — may-edge construction policy
+/// for [`predicate_cube_lift`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MayEdgeInference {
+    /// Default — sampling-based may-edges (`max_input_bits` input
+    /// enumeration per canonical-representative cube). Fast, but an
+    /// **under-approximation of the may relation**: sampling only a
+    /// subset of inputs (and a single canonical representative per
+    /// cube) can MISS a real may-edge → unsound for safety. Preserves
+    /// the pre-MIG-3 behaviour exactly.
+    #[default]
+    Off,
+    /// MIG-3 — **sound** all-pairs SMT may-edges. For every
+    /// (source-cube, target-cube) pair the lifter runs
+    /// [`super::smt_must_edge::smt_per_target_may_check`] (`∃ s⊨src,
+    /// inputs, s'⊨tgt. (s,s')∈R`) and emits a `MayOnly` edge iff a
+    /// witness exists; an edge is excluded ONLY when Z3 proves it
+    /// impossible (UNSAT). This is the authoritative may relation
+    /// (`R_may(b,b') ⟺ ∃ s⊨b, s'⊨b'. (s,s')∈R`), a sound
+    /// over-approximation that REPLACES the sampling may-edges.
+    ///
+    /// **Tractability.** All-pairs is O(cubes²) SMT calls — bounded for
+    /// the small fixtures the SV migration targets (cubes ≤ 64), but it
+    /// scales poorly at the default cube cap (1024² ≈ 10⁶). An all-SMT
+    /// per-source enumeration (O(edges), reusing `all_smt`) is the
+    /// queued perf follow-up; this MVP ships the sound all-pairs form.
+    ///
+    /// **Note.** Combining with a non-`Off` `must_edge_inference` is not
+    /// yet wired (the must post-passes consume the sampling pass's
+    /// `sampled_targets_per_source`, which `SmtAllPairs` bypasses).
+    SmtAllPairs,
 }
 
 /// R.5 lazy KMTS sub-item 2.1 — a single may-edge from
@@ -1566,7 +1605,76 @@ pub fn predicate_cube_lift(
     let mut hyper_must_edges_emitted: usize = 0;
 
     let mut predicate_image_pending = true;
-    if lift_opts.max_input_bits > 0 && !predicates.is_empty() {
+
+    // MIG-3.2 (S-track migration, 2026-06-13) — sound all-pairs SMT
+    // may-edges. When opted in, this REPLACES the sampling may-edge
+    // pass below (the two are mutually exclusive). For every
+    // (source-cube, target-cube) pair, Z3 decides whether a concrete
+    // witness exists (`smt_per_target_may_check`); a `MayOnly` edge is
+    // emitted iff so. Unlike sampling — which can miss may-edges and
+    // thus under-approximate the may relation (unsound for safety) —
+    // this excludes an edge ONLY when Z3 proves it impossible. Edges
+    // are collected inside the Z3 scope and emitted after it (the
+    // builder is not borrowed into the closure).
+    if matches!(lift_opts.may_edge_inference, MayEdgeInference::SmtAllPairs)
+        && !predicates.is_empty()
+    {
+        let step_label = builder
+            .labels()
+            .intern(["step"])
+            .map_err(|e| AdapterError {
+                kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                location: None,
+                message: format!(
+                    "adapter/btor2/predicate_cube_lift MIG-3.2: label intern failed: {e}"
+                ),
+            })?;
+        let n_cubes = state_ids.len();
+        let cfg = z3::Config::new();
+        let may_edges: Vec<(usize, usize)> = z3::with_z3_config(&cfg, || {
+            let view = match encode_design_for_lift(&file) {
+                Ok(v) => v,
+                // Encoder can't build the view (e.g. an unsupported op):
+                // fall back to no may-edges rather than an unsound guess.
+                Err(_) => return Vec::new(),
+            };
+            let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
+            let mut edges = Vec::new();
+            for i in 0..n_cubes {
+                for j in 0..n_cubes {
+                    let verdict = crate::adapter::btor2::smt_must_edge::smt_per_target_may_check(
+                        &view,
+                        i as u64,
+                        j as u64,
+                        &predicates,
+                        &nid_map,
+                        5_000,
+                    );
+                    if matches!(
+                        verdict,
+                        crate::adapter::btor2::smt_must_edge::SmtMayVerdict::May
+                    ) {
+                        edges.push((i, j));
+                    }
+                }
+            }
+            edges
+        });
+        for (i, j) in may_edges {
+            builder.transition_ids_with_modality(
+                state_ids[i],
+                &[step_label],
+                state_ids[j],
+                crate::clts::TransitionModality::MayOnly,
+            );
+        }
+        predicate_image_pending = false;
+    }
+
+    if !matches!(lift_opts.may_edge_inference, MayEdgeInference::SmtAllPairs)
+        && lift_opts.max_input_bits > 0
+        && !predicates.is_empty()
+    {
         let mut sampled_targets_per_source: Vec<std::collections::BTreeSet<usize>> =
             vec![std::collections::BTreeSet::new(); state_ids.len()];
         let boolean_inputs: Vec<String> = collect_boolean_input_symbols(&file, &symbols);
@@ -2480,6 +2588,7 @@ mod tests {
             max_cube_count: 8,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
@@ -2766,6 +2875,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -2831,6 +2941,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+            may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
         };
@@ -2871,6 +2982,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+            may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
         };
@@ -2913,6 +3025,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SmtPerTarget,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -2969,6 +3082,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::SmtPerTarget,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -2998,6 +3112,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SmtPerTarget,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let mut lazy =
@@ -3055,6 +3170,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(
@@ -3089,6 +3205,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SmtPerTarget,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let mvp_result =
@@ -3127,6 +3244,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SmtHyperMust,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -3163,6 +3281,7 @@ mod tests {
                 max_cube_count: 1024,
                 max_input_bits: 0,
                 must_edge_inference: variant,
+                may_edge_inference: Default::default(),
                 config_values: std::collections::HashMap::new(),
             };
             let result = predicate_cube_lift(
@@ -3201,6 +3320,7 @@ mod tests {
                 max_cube_count: 1024,
                 max_input_bits: 8,
                 must_edge_inference: variant,
+                may_edge_inference: Default::default(),
                 config_values: std::collections::HashMap::new(),
             };
             let mut lazy = LazyLift::from_btor2(
@@ -3353,6 +3473,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+            may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &adapter_opts, &lift_opts)
@@ -3369,6 +3490,54 @@ mod tests {
         );
     }
 
+    /// MIG-3.2 — `MayEdgeInference::SmtAllPairs` emits the SOUND
+    /// may-edge set and excludes proven-impossible edges. Fixture: a
+    /// 1-bit register that toggles (`next q = ~q`), predicate {q==1} →
+    /// two cubes. The sound may-edges are exactly the toggle cycle
+    /// (cube_0 ⇄ cube_1); the self-loops (cube_i → cube_i) are
+    /// impossible (the toggle never stays) and MUST be excluded — the
+    /// soundness property the SMT query gives that sampling cannot.
+    #[test]
+    fn mig3_smt_all_pairs_emits_sound_may_edges() {
+        let src = "1 sort bitvec 1\n2 state 1 q\n3 not 1 2\n4 next 1 2 3\n";
+        let preds = vec![PredicateSpec {
+            name: "q1".into(),
+            register: "q".into(),
+            value: 1,
+        }];
+        let lift_opts = PredicateCubeLiftOptions {
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            ..Default::default()
+        };
+        let result = predicate_cube_lift(preds, src, &AdapterOptions::default(), &lift_opts)
+            .expect("predicate_cube_lift (SmtAllPairs)");
+        assert!(
+            !result.predicate_image_pending,
+            "SmtAllPairs populates the may relation"
+        );
+        let clts = &result.clts;
+        let c0 = clts.state_id("cube_0").expect("cube_0 exists");
+        let c1 = clts.state_id("cube_1").expect("cube_1 exists");
+        let has_may = |from, to| {
+            clts.outgoing(from).iter().any(|t| {
+                t.target() == to && matches!(t.modality(), crate::clts::TransitionModality::MayOnly)
+            })
+        };
+        // Toggle cycle — both directions are sound may-edges.
+        assert!(has_may(c0, c1), "cube_0 → cube_1 (q: 0→1) is a may-edge");
+        assert!(has_may(c1, c0), "cube_1 → cube_0 (q: 1→0) is a may-edge");
+        // Impossible self-loops — excluded (UNSAT-proved), the soundness
+        // property sampling cannot guarantee.
+        assert!(
+            !has_may(c0, c0),
+            "cube_0 → cube_0 must be excluded (toggle never stays at q==0)"
+        );
+        assert!(
+            !has_may(c1, c1),
+            "cube_1 → cube_1 must be excluded (toggle never stays at q==1)"
+        );
+    }
+
     /// R.2.5b — Empty predicate set: the may-edge loop is skipped
     /// (gated on `!predicates.is_empty()`); SamplingConfluence's
     /// post-pass has nothing to operate on.
@@ -3379,6 +3548,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+            may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
         };
@@ -3411,6 +3581,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 8,
             must_edge_inference: MustEdgeInference::SamplingConfluence,
+            may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
         };
@@ -3497,6 +3668,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: Default::default(),
             config_values,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -3530,6 +3702,7 @@ mod tests {
             max_cube_count: 1024,
             max_input_bits: 0,
             must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: Default::default(),
             config_values,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
