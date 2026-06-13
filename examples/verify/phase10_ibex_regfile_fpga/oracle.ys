@@ -1,0 +1,5 @@
+read_verilog -sv -formal ibex_register_file_fpga.sv ibex_raw_oracle.sv
+hierarchy -top ibex_raw_oracle
+proc; flatten; memory -nomap; opt -fast
+async2sync; dffunmap
+write_smt2 -wires ibex_raw_oracle.smt2

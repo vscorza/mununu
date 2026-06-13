@@ -1466,4 +1466,88 @@ mod tests {
             }
         });
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // §Phase 10 step 1d.3 — ibex register-file milestone (real RTL)
+    // ─────────────────────────────────────────────────────────────
+
+    /// **Milestone.** Read-after-write on the REAL ibex register file
+    /// (`ibex_register_file_fpga`, lowRISC/ibex, Apache-2.0), at the
+    /// RV32E=1 / DataWidth=4 instance → a 16×4 `$mem` array. The BTOR2
+    /// fixture is the verbatim Yosys output (sv2v-free; SV → yosys
+    /// `memory_collect` → `write_btor`), checked in under `tests/data`
+    /// as a generated artifact (the RTL itself is NOT vendored, per the
+    /// plan's §10.3).
+    ///
+    /// The defining property: when `we_a_i` writes `wdata_a_i` to a
+    /// nonzero address, the post-write memory reads that value back at
+    /// that address. This is a transition-relation property — the array
+    /// functional-consistency axiom `read(store(m,A,v),A) == v` forces
+    /// it — and mununu's `BvUfArray` encoder (now driven through
+    /// `walk_design::<Z3Backend>` after the 1c.3 cutover) proves it:
+    /// the *violation* is UNSAT.
+    ///
+    /// Cross-checked independently by `yosys-smtbmc -s z3` on the same
+    /// RTL (see the example README); a divergence would be a soundness
+    /// bug in the encoder.
+    #[test]
+    fn ibex_regfile_fpga_read_after_write_holds() {
+        let src = include_str!("../../../../tests/data/ibex_register_file_fpga_16x4.btor2");
+        let file = parse(src).expect("parse ibex regfile btor2");
+
+        // The design lifts to exactly one inferred `$mem` array.
+        let mems = crate::adapter::btor2::bit_blast::detect_btor2_memories(&file);
+        assert_eq!(mems.len(), 1, "ibex_register_file_fpga has one $mem array");
+
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_with_theory(&file, Theory::BvUfArray)
+                .expect("encode ibex regfile under BvUfArray");
+
+            // Resolve the write-port inputs by symbol (robust to NID
+            // renumbering if the fixture is regenerated).
+            let nid = |sym: &str| {
+                view.signals
+                    .iter()
+                    .find(|s| s.symbol.as_deref() == Some(sym))
+                    .map(|s| s.nid)
+                    .unwrap_or_else(|| panic!("signal {sym} not found"))
+            };
+            let we = view.inputs.get(&nid("we_a_i")).expect("we_a_i");
+            let waddr = view.inputs.get(&nid("waddr_a_i")).expect("waddr_a_i"); // 5-bit
+            let wdata = view.inputs.get(&nid("wdata_a_i")).expect("wdata_a_i"); // 4-bit
+
+            // The single array state cell's next-step handle.
+            let next_mem = view
+                .state_next_arr
+                .values()
+                .next()
+                .expect("one next-step array");
+
+            // read(next_mem, waddr[3:0]) — the array index sort is 4-bit.
+            let waddr4 = waddr.extract(3, 0);
+            let read_back = next_mem
+                .select(&waddr4)
+                .as_bv()
+                .expect("array element is a bit-vector");
+
+            // Violation of read-after-write must be UNSAT: there is NO
+            // state/input where a write of `wdata` to a nonzero address
+            // fails to read `wdata` back next step. (Address 0 is
+            // hard-wired to zero in the regfile, so the property is
+            // conditioned on `waddr_a_i != 0`, matching the RTL's
+            // write-enable carve-out.)
+            let solver = z3::Solver::new();
+            solver.assert(&view.transition);
+            solver.assert(we.eq(z3::ast::BV::from_u64(1, 1)));
+            solver.assert(waddr.eq(z3::ast::BV::from_u64(0, 5)).not());
+            solver.assert(read_back.eq(wdata).not());
+            assert_eq!(
+                solver.check(),
+                z3::SatResult::Unsat,
+                "read-after-write must hold on the ibex regfile \
+                 (array axiom forces read(store(mem,A,v),A) == v)"
+            );
+        });
+    }
 }

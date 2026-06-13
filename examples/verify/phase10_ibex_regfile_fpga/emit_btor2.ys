@@ -1,0 +1,11 @@
+read_verilog -sv ibex_register_file_fpga.sv
+chparam -set RV32E 1 -set DataWidth 4 ibex_register_file_fpga
+hierarchy -top ibex_register_file_fpga
+proc
+flatten
+memory_dff
+memory_collect
+async2sync
+dffunmap
+opt -fast
+write_btor ibex_register_file_fpga_16x4.btor2
