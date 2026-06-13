@@ -579,6 +579,11 @@ pub fn inspect_project(
 ///   currently ignored by this layer — the SV adapter has its own
 ///   per-source sidecar conventions (`.mununu.json` next to the
 ///   `.sv` file).
+/// - `"sv-yosys"` — MIG-4 (S-track migration): the KMTS SV route via
+///   [`crate::adapter::yosys::translate_sv`]
+///   (sv2v→Yosys→BTOR2→bit-blast, carrying the MIG-1/MIG-2 soundness
+///   fixes). Coexists with `sv-rtl` for parity validation before the
+///   native path is retired. Requires `yosys` on PATH.
 /// - `"crewai"` — uses [`crate::adapter::crewai::CrewaiAdapter`].
 ///   Per-agent automata + sequential supervisor + asynchronous
 ///   composition. Options currently ignored.
@@ -633,6 +638,18 @@ fn dispatch_adapter(
                 .map_err(|err| err_for(adapter, source_id, err))
         }
         "sv-rtl" => dispatch_sv_rtl(source_id, content, additional_files),
+        // MIG-4 (S-track migration, 2026-06-13) — the KMTS SV route,
+        // alongside the native `sv-rtl` adapter. Runs the
+        // sv2v→Yosys-per-module→BTOR2→bit-blast chain
+        // (`yosys::translate_sv`), which now carries the MIG-1 (Ignored
+        // / auto-COI) + MIG-2 (OOB-sink) soundness fixes. The native
+        // and KMTS routes coexist so the `sv_compare_pipelines` parity
+        // gate can validate verdict equivalence before the S-track
+        // deletes the native path. Single-module + additional sources
+        // (multi-module composition driven from the top netlist is a
+        // follow-up). Requires `yosys` on PATH; absence surfaces as an
+        // `AdapterTranslationFailed` (locate_yosys error), not silently.
+        "sv-yosys" => dispatch_sv_yosys(source_id, content, additional_files),
         "crewai" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
@@ -762,6 +779,43 @@ fn dispatch_sv_rtl(
                 message: err.to_string(),
             })
     }
+}
+
+/// MIG-4 (S-track migration) — dispatch the `sv-yosys` KMTS route.
+/// Runs the SV → (sv2v) → Yosys → BTOR2 → bit-blast chain via
+/// [`crate::adapter::yosys::translate_sv`], which produces CTXDSL the
+/// verify assembler ingests exactly like the native `sv-rtl` path's
+/// output. The bit-blast lift carries the MIG-1 (Ignored / auto-COI)
+/// and MIG-2 (OOB-sink over-approximation) soundness fixes, so this
+/// route is a sound SV abstraction. `additional_files` are threaded as
+/// Yosys additional sources (by basename) so multi-file designs
+/// elaborate; top-netlist-driven multi-module composition is a
+/// follow-up. Requires `yosys` on PATH.
+fn dispatch_sv_yosys(
+    source_id: &str,
+    content: &str,
+    additional_files: &[(PathBuf, String)],
+) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
+    let opts = AdapterOptions::default();
+    let additional_sources: Vec<(String, String)> = additional_files
+        .iter()
+        .filter_map(|(path, body)| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .map(|name| (name.to_string(), body.clone()))
+        })
+        .collect();
+    let yopts = crate::adapter::yosys::YosysOptions {
+        additional_sources,
+        ..Default::default()
+    };
+    crate::adapter::yosys::translate_sv(content, &opts, &yopts)
+        .map(|out| (out.ctxdsl, out.partition_summary))
+        .map_err(|err| VerifyError::AdapterTranslationFailed {
+            source_id: source_id.to_string(),
+            adapter: "sv-yosys".to_string(),
+            message: err.to_string(),
+        })
 }
 
 /// Dispatch the `c-codesign` adapter — runs LLVM-IR extraction via
@@ -1712,6 +1766,31 @@ formula = "true"
             err,
             VerifyError::UnknownAdapter { adapter, .. } if adapter == "made-up-adapter"
         ));
+    }
+
+    /// MIG-4 (S-track migration) — the `sv-yosys` KMTS route is a
+    /// recognized adapter. CI-safe: the route calls `yosys`, but if
+    /// yosys is absent the dispatch returns `AdapterTranslationFailed`
+    /// (a locate_yosys error), NOT `UnknownAdapter` — so this holds
+    /// regardless of whether yosys is installed. (When yosys IS present
+    /// the route runs the full SV→BTOR2→bit-blast chain.)
+    #[test]
+    fn sv_yosys_adapter_route_is_recognized() {
+        let result = dispatch_adapter(
+            "sv-yosys",
+            "src0",
+            std::path::Path::new("work.sv"),
+            "module m(input logic clk_i); endmodule",
+            &[],
+            &std::collections::BTreeMap::new(),
+            std::path::Path::new("."),
+        );
+        // Ok (yosys present) OR AdapterTranslationFailed (yosys absent)
+        // both prove the route is wired; only UnknownAdapter fails.
+        assert!(
+            !matches!(result, Err(VerifyError::UnknownAdapter { .. })),
+            "sv-yosys must be a recognized adapter route, not UnknownAdapter"
+        );
     }
 
     #[test]
