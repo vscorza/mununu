@@ -27,4 +27,17 @@ module axi4lite_slave(
             RD_DATA: if (rready) state <= IDLE;
         endcase
     end
+
+    // Drive the channel handshake outputs from the FSM state. Without
+    // these the outputs are undriven, which the Yosys/BTOR2 pipeline
+    // cuts into free inputs (an input-combination blow-up that exceeds
+    // the bit-blast cap). Driving them from state completes the slave,
+    // keeps it a meaningful verification target, and lets BOTH the
+    // native and KMTS pipelines lift it. The `state`-only properties
+    // (safety, wr_response) are unaffected.
+    assign awready = (state == WR_ADDR);
+    assign wready  = (state == WR_DATA);
+    assign bvalid  = (state == WR_RESP);
+    assign arready = (state == RD_ADDR);
+    assign rvalid  = (state == RD_DATA);
 endmodule

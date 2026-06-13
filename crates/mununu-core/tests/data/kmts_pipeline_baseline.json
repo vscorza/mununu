@@ -65,11 +65,17 @@
       "error": null
     },
     "kmts": {
-      "submodule_count": 0,
-      "state_count_sum": null,
-      "property_count_sum": null,
-      "per_submodule": [],
-      "error": "adapter/yosys: per-module BTOR2 reader failed for 'axi4lite_slave': BTOR2 design enumerates 2048 input combinations per step (max supported: 2^10 = 1024). Add `.mununu.json` `inputs[]` entries declaring `Ignored` / `Boolean` / `EnumValues` per non-essential input to prune the enumeration."
+      "submodule_count": 1,
+      "state_count_sum": 8,
+      "property_count_sum": 0,
+      "per_submodule": [
+        {
+          "module_name": "axi4lite_slave",
+          "state_count": 8,
+          "property_count": 0
+        }
+      ],
+      "error": null
     },
     "sva_gate": {
       "passed": true,
