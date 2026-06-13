@@ -9,11 +9,17 @@
       "error": null
     },
     "kmts": {
-      "submodule_count": 0,
-      "state_count_sum": null,
-      "property_count_sum": null,
-      "per_submodule": [],
-      "error": "adapter/yosys: per-module BTOR2 reader failed for 'alu': BTOR2 design enumerates 16384 input combinations per step (max supported: 2^10 = 1024). Add `.mununu.json` `inputs[]` entries declaring `Ignored` / `Boolean` / `EnumValues` per non-essential input to prune the enumeration."
+      "submodule_count": 1,
+      "state_count_sum": 8,
+      "property_count_sum": 1,
+      "per_submodule": [
+        {
+          "module_name": "alu",
+          "state_count": 8,
+          "property_count": 1
+        }
+      ],
+      "error": null
     },
     "sva_gate": {
       "passed": true,
@@ -82,13 +88,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 16,
-      "property_count_sum": 0,
+      "state_count_sum": 3,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "axilite_deadlock_bug",
-          "state_count": 16,
-          "property_count": 0
+          "state_count": 3,
+          "property_count": 2
         }
       ],
       "error": null
@@ -110,13 +116,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 16,
-      "property_count_sum": 0,
+      "state_count_sum": 3,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "axilite_deadlock_fixed",
-          "state_count": 16,
-          "property_count": 0
+          "state_count": 3,
+          "property_count": 2
         }
       ],
       "error": null
@@ -194,13 +200,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 8,
-      "property_count_sum": 0,
+      "state_count_sum": 4,
+      "property_count_sum": 3,
       "per_submodule": [
         {
           "module_name": "cwe1245_fsm_bug",
-          "state_count": 8,
-          "property_count": 0
+          "state_count": 4,
+          "property_count": 3
         }
       ],
       "error": null
@@ -222,13 +228,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 16,
-      "property_count_sum": 0,
+      "state_count_sum": 7,
+      "property_count_sum": 3,
       "per_submodule": [
         {
           "module_name": "cwe1245_fsm_fixed",
-          "state_count": 16,
-          "property_count": 0
+          "state_count": 7,
+          "property_count": 3
         }
       ],
       "error": null
@@ -250,13 +256,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 4,
-      "property_count_sum": 0,
+      "state_count_sum": 2,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "cwe1260_addr_overlap_bug",
-          "state_count": 4,
-          "property_count": 0
+          "state_count": 2,
+          "property_count": 2
         }
       ],
       "error": null
@@ -278,13 +284,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 4,
-      "property_count_sum": 0,
+      "state_count_sum": 2,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "cwe1260_addr_overlap_fixed",
-          "state_count": 4,
-          "property_count": 0
+          "state_count": 2,
+          "property_count": 2
         }
       ],
       "error": null
@@ -305,11 +311,17 @@
       "error": null
     },
     "kmts": {
-      "submodule_count": 0,
-      "state_count_sum": null,
-      "property_count_sum": null,
-      "per_submodule": [],
-      "error": "adapter/yosys: per-module BTOR2 reader failed for 'cwe1262_csr_bypass_bug': BTOR2 design enumerates 65536 input combinations per step (max supported: 2^10 = 1024). Add `.mununu.json` `inputs[]` entries declaring `Ignored` / `Boolean` / `EnumValues` per non-essential input to prune the enumeration."
+      "submodule_count": 1,
+      "state_count_sum": 2,
+      "property_count_sum": 2,
+      "per_submodule": [
+        {
+          "module_name": "cwe1262_csr_bypass_bug",
+          "state_count": 2,
+          "property_count": 2
+        }
+      ],
+      "error": null
     },
     "sva_gate": {
       "passed": true,
@@ -327,11 +339,17 @@
       "error": null
     },
     "kmts": {
-      "submodule_count": 0,
-      "state_count_sum": null,
-      "property_count_sum": null,
-      "per_submodule": [],
-      "error": "adapter/yosys: per-module BTOR2 reader failed for 'cwe1262_csr_bypass_fixed': BTOR2 design enumerates 65536 input combinations per step (max supported: 2^10 = 1024). Add `.mununu.json` `inputs[]` entries declaring `Ignored` / `Boolean` / `EnumValues` per non-essential input to prune the enumeration."
+      "submodule_count": 1,
+      "state_count_sum": 2,
+      "property_count_sum": 2,
+      "per_submodule": [
+        {
+          "module_name": "cwe1262_csr_bypass_fixed",
+          "state_count": 2,
+          "property_count": 2
+        }
+      ],
+      "error": null
     },
     "sva_gate": {
       "passed": true,
@@ -349,11 +367,17 @@
       "error": null
     },
     "kmts": {
-      "submodule_count": 0,
-      "state_count_sum": null,
-      "property_count_sum": null,
-      "per_submodule": [],
-      "error": "adapter/yosys: per-module BTOR2 reader failed for 'fifo': BTOR2 design enumerates 2048 input combinations per step (max supported: 2^10 = 1024). Add `.mununu.json` `inputs[]` entries declaring `Ignored` / `Boolean` / `EnumValues` per non-essential input to prune the enumeration."
+      "submodule_count": 1,
+      "state_count_sum": 9,
+      "property_count_sum": 1,
+      "per_submodule": [
+        {
+          "module_name": "fifo",
+          "state_count": 9,
+          "property_count": 1
+        }
+      ],
+      "error": null
     },
     "sva_gate": {
       "passed": true,
@@ -372,13 +396,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 32,
-      "property_count_sum": 0,
+      "state_count_sum": 7,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "fifo_overflow_bug",
-          "state_count": 32,
-          "property_count": 0
+          "state_count": 7,
+          "property_count": 2
         }
       ],
       "error": null
@@ -400,13 +424,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 32,
-      "property_count_sum": 0,
+      "state_count_sum": 7,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "fifo_overflow_fixed",
-          "state_count": 32,
-          "property_count": 0
+          "state_count": 7,
+          "property_count": 2
         }
       ],
       "error": null

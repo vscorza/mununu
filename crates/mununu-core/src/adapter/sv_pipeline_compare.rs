@@ -201,7 +201,20 @@ pub fn compare_pipelines(
         per_module_btor: true,
         ..Default::default()
     };
-    let kmts = match yosys::translate_sv_per_module(content, &AdapterOptions::default(), &yopts) {
+    // MIG-4 parity-gate fairness (2026-06-13): load the adjacent
+    // `.mununu.json` so the KMTS arm gets the SAME input/state
+    // abstractions the native arm auto-loads via `translate_with_path`
+    // (which calls `find_sidecar` internally). Without this, wide-input
+    // fixtures hit the bit-blast input-combination cap ONLY on the KMTS
+    // arm — an unfair asymmetry, not a real pipeline gap (Yosys
+    // preserves top-level port names, so the sidecar's per-input
+    // abstractions resolve against the BTOR2 input symbols).
+    let kmts_opts = AdapterOptions {
+        sidecar_json: crate::adapter::systemverilog::annotation::find_sidecar(sv_path)
+            .and_then(|p| std::fs::read_to_string(p).ok()),
+        ..Default::default()
+    };
+    let kmts = match yosys::translate_sv_per_module(content, &kmts_opts, &yopts) {
         Ok(outputs) => {
             let per_submodule: Vec<KmtsSubmodule> = outputs
                 .iter()
