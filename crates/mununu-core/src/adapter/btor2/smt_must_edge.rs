@@ -437,6 +437,113 @@ where
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// MIG-3 (S-track migration, 2026-06-13) — sound SMT may-edge query.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Verdict of the SMT may-edge query ([`smt_per_target_may_check`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtMayVerdict {
+    /// A concrete `(state ⊨ src, inputs, next ⊨ tgt)` witness exists
+    /// (SAT): `src → tgt` is a sound may-edge. Also returned
+    /// **conservatively on Unknown** (timeout) and when a predicate's
+    /// register/handle is unresolved — the may relation must
+    /// over-approximate, so only PROVEN-impossible edges are excluded.
+    May,
+    /// Z3 proved no witness exists (UNSAT): `src → tgt` is impossible
+    /// and is excluded from the may relation.
+    NotMay,
+}
+
+/// MIG-3 — the sound SMT may-edge query for one
+/// (source-cube, target-cube) pair. This is the existential **dual** of
+/// [`smt_per_target_must_check`]: it asserts
+/// `transition ∧ src_constraints ∧ tgt_constraints` (target POSITIVE,
+/// not negated) and returns [`SmtMayVerdict::May`] iff SAT — i.e. a
+/// concrete `(s ⊨ src, inputs, s' ⊨ tgt)` witness exists. This is the
+/// may-relation definition `R_may(b, b') ⟺ ∃ s ⊨ b, s' ⊨ b'. (s,s') ∈ R`.
+///
+/// **Why this is the sound replacement for sampling.** The
+/// `predicate_cube_lift` sampling may-edges enumerate only a *subset*
+/// of inputs per cube, so they can MISS a real may-edge → an
+/// under-approximation of the may relation → unsound for safety (a
+/// violation reachable only via an unsampled transition is lost). This
+/// SMT query is exact: an edge is excluded ONLY when Z3 proves no
+/// witness exists. On Unknown / unresolved predicates it conservatively
+/// returns `May` (over-approximation).
+///
+/// `src_bits` / `tgt_bits` are predicate-polarity bitmasks (bit `i` =
+/// predicate `predicates[i]` holds), exactly as in
+/// [`smt_per_target_must_check`].
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+//
+// Staged-API (MIG-3 increment 1): the sound may-edge PRIMITIVE + its
+// soundness tests. The `predicate_cube_lift` wiring — a
+// `MayEdgeInference` policy that replaces the sampling may-edges with
+// this query (with the all-SMT-enumeration tractability story for large
+// |P|) — is MIG-3 increment 2, at which point the allow is removed.
+#[allow(dead_code)]
+pub fn smt_per_target_may_check<P>(
+    view: &Btor2SmtView,
+    src_bits: u64,
+    tgt_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMayVerdict
+where
+    P: PredicateLike,
+{
+    let mut constraints: Vec<z3::ast::Bool> = Vec::new();
+
+    for (i, pred) in predicates.iter().enumerate() {
+        // Unresolved predicate → conservatively include the edge
+        // (over-approximation: never exclude an edge we cannot rule out).
+        let Some(&nid) = nid_map.get(pred.register()) else {
+            return SmtMayVerdict::May;
+        };
+        let Some(curr_bv) = view.curr_state(nid) else {
+            return SmtMayVerdict::May;
+        };
+        let Some(next_bv) = view.next_state(nid) else {
+            return SmtMayVerdict::May;
+        };
+
+        let src_polarity = (src_bits >> i) & 1 == 1;
+        let tgt_polarity = (tgt_bits >> i) & 1 == 1;
+
+        constraints.push(build_predicate_constraint(
+            curr_bv,
+            pred.value(),
+            src_polarity,
+        ));
+        constraints.push(build_predicate_constraint(
+            next_bv,
+            pred.value(),
+            tgt_polarity,
+        ));
+    }
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+
+    solver.assert(&view.transition);
+    for c in &constraints {
+        solver.assert(c);
+    }
+
+    match solver.check() {
+        z3::SatResult::Sat => SmtMayVerdict::May,
+        z3::SatResult::Unsat => SmtMayVerdict::NotMay,
+        // Conservative: an undecided edge stays in the (over-approximate)
+        // may relation.
+        z3::SatResult::Unknown => SmtMayVerdict::May,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +864,79 @@ mod tests {
     ) -> (SmtMustVerdict, SmtMustVerdict) {
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, f)
+    }
+
+    // ── MIG-3 — sound SMT may-edge query tests ──────────────────────
+
+    /// MIG-3 — an input-driven transition `reg_a := in_a` admits BOTH
+    /// targets from src cube `{p}` (reg_a==0): input=0 reaches `{p}`,
+    /// input=1 reaches `{¬p}`. Both are sound may-edges (∃ witness),
+    /// even though the must-check rejects src→`{p}` (input=1 escapes).
+    /// This is the may/must distinction the sound may-edge captures and
+    /// the sampling could miss.
+    #[test]
+    fn smt_may_check_input_driven_admits_both_targets() {
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse input-driven fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let cfg = z3::Config::new();
+        let (to_p, to_not_p) = z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode input-driven");
+            let nid_map = build_register_nid_map(&view);
+            // src cube {p} = reg_a==0 (src_bits = 0b1).
+            let to_p = smt_per_target_may_check(&view, 0b1, 0b1, &predicates, &nid_map, 5_000);
+            let to_not_p = smt_per_target_may_check(&view, 0b1, 0b0, &predicates, &nid_map, 5_000);
+            (to_p, to_not_p)
+        });
+
+        assert_eq!(
+            to_p,
+            SmtMayVerdict::May,
+            "input=0 reaches reg_a==0, so src{{p}}→tgt{{p}} is a may-edge"
+        );
+        assert_eq!(
+            to_not_p,
+            SmtMayVerdict::May,
+            "input=1 reaches reg_a==1, so src{{p}}→tgt{{¬p}} is a may-edge"
+        );
+    }
+
+    /// MIG-3 — a deterministic transition `reg_a := 0` makes the target
+    /// `{¬p}` (reg_a==1) UNREACHABLE from any source. The sound
+    /// may-edge query EXCLUDES it (UNSAT → NotMay) — the key soundness
+    /// property: only proven-impossible edges are excluded, never a
+    /// reachable one (which sampling could miss).
+    #[test]
+    fn smt_may_check_excludes_proven_impossible_target() {
+        let file = parse(DETERMINISTIC_ZERO_BTOR2).expect("parse deterministic fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+
+        let cfg = z3::Config::new();
+        let (to_p, to_not_p) = z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode deterministic");
+            let nid_map = build_register_nid_map(&view);
+            let to_p = smt_per_target_may_check(&view, 0b1, 0b1, &predicates, &nid_map, 5_000);
+            let to_not_p = smt_per_target_may_check(&view, 0b1, 0b0, &predicates, &nid_map, 5_000);
+            (to_p, to_not_p)
+        });
+
+        assert_eq!(
+            to_p,
+            SmtMayVerdict::May,
+            "reg_a:=0 reaches reg_a==0, so src{{p}}→tgt{{p}} is a may-edge"
+        );
+        assert_eq!(
+            to_not_p,
+            SmtMayVerdict::NotMay,
+            "reg_a:=0 can NEVER reach reg_a==1, so src{{p}}→tgt{{¬p}} is excluded"
+        );
     }
 }
