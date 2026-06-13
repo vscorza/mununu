@@ -21,7 +21,7 @@
 //! over-approximation. Array sorts (`read`/`write`) are rejected in
 //! `Theory::BvOnly`; step 4.5 will handle them under `Theory::BvUfArray`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand, Sort};
 use crate::adapter::btor2::parser::bv_width;
@@ -798,6 +798,23 @@ pub(crate) struct Z3Backend<'a> {
     /// `eval_array_operand` resolution in `transition()`. Empty for
     /// BV-only designs.
     array_cache: HashMap<Nid, z3::ast::Array>,
+    /// §Phase 10 step 1d.1 — Op NIDs to abstract as uninterpreted
+    /// functions (real `z3::FuncDecl`). Empty in the production
+    /// must-edge path (`from_view`): the SMT backend then evaluates
+    /// every operator precisely, which is the only sound choice for
+    /// must-edges. A non-empty set is the **may-only** UF
+    /// over-approximation — populate it via [`Z3Backend::with_uf_wrapped`].
+    uf_wrapped: HashSet<Nid>,
+    /// §Phase 10 step 1d.1 — per-signature uninterpreted-function
+    /// registry, keyed by `uf_<op>_<arg-widths>_<result-width>`. One
+    /// `FuncDecl` per signature so that equal operator applications
+    /// across the design share the SAME function symbol — Z3's
+    /// functional-consistency axiom (`f(x) == f(x)`) is then the only
+    /// thing the abstracted operator is known to satisfy. Wrapped in
+    /// `Rc` because `z3::FuncDecl` is not `Clone` (and to guarantee
+    /// object identity for consistency rather than relying on Z3's
+    /// name interning).
+    uf_decls: HashMap<String, std::rc::Rc<z3::FuncDecl>>,
 }
 
 impl<'a> Z3Backend<'a> {
@@ -812,7 +829,59 @@ impl<'a> Z3Backend<'a> {
             state_curr_arr: view.state_curr_arr.clone(),
             cache: HashMap::new(),
             array_cache: HashMap::new(),
+            uf_wrapped: HashSet::new(),
+            uf_decls: HashMap::new(),
         }
+    }
+
+    /// §Phase 10 step 1d.1 — enable real-UF abstraction for the given
+    /// Op NIDs (the **may-side** over-approximation). When set, the
+    /// walk replaces each listed operator node with an uninterpreted
+    /// `FuncDecl` application instead of its precise BV semantics.
+    ///
+    /// **Soundness (may-only).** A `FuncDecl` knows only functional
+    /// consistency (`f(x) == f(x)`); it admits *more* behaviours than
+    /// the concrete operator, so it is a sound over-approximation for
+    /// may-edges but an **unsound** must-witness. The production
+    /// must-edge path ([`from_view`] alone) leaves this empty, so
+    /// must-edges stay precise. This builder is the may-side capability
+    /// (the consumer wiring is a follow-up); it replaces the concrete
+    /// Zero/Ones representative hack with a proper EUF over-approximation.
+    // Staged-API: test-pinned in step 1d.1 (the over-approximation /
+    // consistency test is the only consumer). The production may-path
+    // wiring — `predicate_cube_lift` running the Z3 backend in may-mode
+    // with UF — is step 1d.2, at which point the allow is removed.
+    #[allow(dead_code)]
+    pub(crate) fn with_uf_wrapped(mut self, uf_wrapped: HashSet<Nid>) -> Self {
+        self.uf_wrapped = uf_wrapped;
+        self
+    }
+
+    /// §Phase 10 step 1d.1 — fetch (or lazily build + cache) the
+    /// uninterpreted function symbol for an operator of the given
+    /// signature. Keyed by `uf_<op>_<arg-widths>_<result-width>` so
+    /// that two operator applications with the same signature share a
+    /// symbol — the cross-design functional-consistency guarantee.
+    fn uf_decl_for(
+        &mut self,
+        op: Op,
+        args: &[z3::ast::BV],
+        width: u32,
+    ) -> std::rc::Rc<z3::FuncDecl> {
+        let arg_widths: Vec<String> = args.iter().map(|b| b.get_size().to_string()).collect();
+        let name = format!("uf_{op:?}_{}_{width}", arg_widths.join("x"));
+        if let Some(fd) = self.uf_decls.get(&name) {
+            return fd.clone();
+        }
+        let domain_sorts: Vec<z3::Sort> = args
+            .iter()
+            .map(|b| z3::Sort::bitvector(b.get_size()))
+            .collect();
+        let domain_refs: Vec<&z3::Sort> = domain_sorts.iter().collect();
+        let range = z3::Sort::bitvector(width);
+        let fd = std::rc::Rc::new(z3::FuncDecl::new(name.as_str(), &domain_refs, &range));
+        self.uf_decls.insert(name, fd.clone());
+        fd
     }
 
     /// Resolve a BV operand from the backend's env (cache, then
@@ -961,12 +1030,31 @@ impl crate::adapter::btor2::term_backend::BvTermBackend for Z3Backend<'_> {
         self.resolve_bv(op)
     }
 
-    fn uf_substitute(&mut self, _nid: Nid, _width: u32) -> Option<z3::ast::BV> {
-        // The concrete Zero/Ones representative substitution is a
-        // may-side approximation that does NOT apply to the SMT
-        // backend — real UF (z3::FuncDecl) is step 1d. The SMT
-        // backend evaluates every operator precisely.
-        None
+    fn uf_substitute(&mut self, nid: Nid, width: u32) -> Option<z3::ast::BV> {
+        // §Phase 10 step 1d.1 — real UF via z3::FuncDecl. Only fires
+        // for NIDs the caller declared UF-wrapped (the may-only
+        // over-approximation); the production must-edge path leaves
+        // `uf_wrapped` empty, so this returns None and the operator is
+        // evaluated precisely (the sound choice for must-edges).
+        if !self.uf_wrapped.contains(&nid) {
+            return None;
+        }
+        // Resolve the operator + its operands (cloned so the immutable
+        // `file` borrow drops before the `&mut self` FuncDecl build).
+        let (op, args): (Op, Vec<Operand>) = match &self.file.lookup(nid)?.node {
+            Node::Op { op, args, .. } => (*op, args.clone()),
+            _ => return None,
+        };
+        // Operands are already bound by the forward walk (topological
+        // order), so they resolve from the env without recursion.
+        let arg_bvs: Vec<z3::ast::BV> = args
+            .iter()
+            .map(|a| self.resolve_bv(*a))
+            .collect::<Option<_>>()?;
+        let fd = self.uf_decl_for(op, &arg_bvs, width);
+        let arg_refs: Vec<&dyn z3::ast::Ast> =
+            arg_bvs.iter().map(|b| b as &dyn z3::ast::Ast).collect();
+        fd.apply(&arg_refs).as_bv()
     }
 }
 
@@ -1296,6 +1384,86 @@ mod tests {
                 z3::SatResult::Unsat,
                 "Z3Backend transition for the memory design must match encode_design_with_theory(BvUfArray) (XOR UNSAT)"
             );
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // §Phase 10 step 1d.1 — real UF (z3::FuncDecl) in Z3Backend
+    // ─────────────────────────────────────────────────────────────
+
+    /// `x * 0`: the precise BV semantics force the product to 0, but
+    /// real UF (a `FuncDecl`) does NOT know that — it admits a nonzero
+    /// product (sound MAY over-approximation), while staying
+    /// functionally consistent (two `x*0` nodes share the same
+    /// uninterpreted symbol, so they are forced equal). Together these
+    /// two assertions fully characterise real UF: uninterpreted
+    /// (over-approximating) yet consistent.
+    #[test]
+    fn z3backend_real_uf_over_approximates_and_is_consistent() {
+        // Two duplicate `x * 0` mul nodes (NIDs 4, 5) feeding two
+        // separate state cells s1 (6) / s2 (7).
+        let src = r#"
+1 sort bitvec 3
+2 input 1 x
+3 zero 1
+4 mul 1 2 3
+5 mul 1 2 3
+6 state 1 s1
+7 state 1 s2
+8 next 1 6 4
+9 next 1 7 5
+"#;
+        let file = parse(src).expect("parse uf-mul fixture");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let zero3 = z3::ast::BV::from_u64(0, 3);
+
+            // Baseline: precise (no UF) forces s1_next == 0.
+            let precise = encode_design(&file).expect("encode precise");
+            {
+                let solver = z3::Solver::new();
+                solver.assert(&precise.transition);
+                let s1_next = precise.state_next.get(&6).expect("s1_next");
+                solver.assert(s1_next.eq(&zero3).not());
+                assert_eq!(
+                    solver.check(),
+                    z3::SatResult::Unsat,
+                    "precise x*0 must force s1_next == 0 (UNSAT of != 0)"
+                );
+            }
+
+            // Real UF: wrap both mul nodes.
+            let uf_view = encode_design(&file).expect("encode for uf");
+            let mut backend =
+                Z3Backend::from_view(&file, &uf_view).with_uf_wrapped(HashSet::from([4, 5]));
+            walk_design(&file, &mut backend).expect("walk uf");
+            let uf_transition = backend.transition(&uf_view).expect("uf transition");
+            let s1_next = uf_view.state_next.get(&6).expect("s1_next");
+            let s2_next = uf_view.state_next.get(&7).expect("s2_next");
+
+            // (a) Over-approximation — f_mul(x,0) may be nonzero.
+            {
+                let solver = z3::Solver::new();
+                solver.assert(&uf_transition);
+                solver.assert(s1_next.eq(&zero3).not());
+                assert_eq!(
+                    solver.check(),
+                    z3::SatResult::Sat,
+                    "real UF must admit f_mul(x,0) != 0 (over-approximation)"
+                );
+            }
+            // (b) Functional consistency — both `x*0` share f_mul, so
+            // s1_next == s2_next is forced.
+            {
+                let solver = z3::Solver::new();
+                solver.assert(&uf_transition);
+                solver.assert(s1_next.eq(s2_next).not());
+                assert_eq!(
+                    solver.check(),
+                    z3::SatResult::Unsat,
+                    "functional consistency: f_mul(x,0) == f_mul(x,0) (UNSAT of !=)"
+                );
+            }
         });
     }
 }
