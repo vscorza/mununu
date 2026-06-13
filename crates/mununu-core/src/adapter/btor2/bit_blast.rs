@@ -4249,11 +4249,14 @@ impl crate::adapter::btor2::term_backend::BvTermBackend for ConcreteBackend<'_> 
 
     fn eval_op(
         &mut self,
+        _nid: Nid,
         op: Op,
         immediates: &[u32],
         args: &[Operand],
         width: u32,
     ) -> Result<BvValue, String> {
+        // The concrete free-fn `eval_op` derives its own error
+        // context from the operand NIDs; the node nid is unused here.
         eval_op(op, immediates, args, width, &self.env)
     }
 

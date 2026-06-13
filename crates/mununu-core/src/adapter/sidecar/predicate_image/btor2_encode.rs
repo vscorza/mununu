@@ -559,6 +559,14 @@ fn encode_const(
 ) -> Result<z3::ast::BV, EncodeError> {
     let width =
         bv_width(file, sort_nid).ok_or(EncodeError::ArraySortUnsupportedInBvOnly { nid })?;
+    encode_const_bits(nid, value, width)
+}
+
+/// §Phase 10 Option-4 step 1c.1 (2026-06-12) — width-keyed constant
+/// encoding, shared by [`encode_const`] (recursive path) and
+/// [`Z3Backend::eval_const`] (the `BvTermBackend` forward-walk
+/// path) so both produce identical Z3 constants from one source.
+fn encode_const_bits(nid: Nid, value: &ConstValue, width: u32) -> Result<z3::ast::BV, EncodeError> {
     let bits: u64 = match value {
         ConstValue::Zero => 0,
         ConstValue::One => 1,
@@ -766,6 +774,199 @@ fn encode_op(
 // since the parser already validated widths.
 #[allow(dead_code)]
 fn _sort_check(_s: &Sort) {}
+
+// ─────────────────────────────────────────────────────────────────────
+// §Phase 10 Option-4 step 1c.1 (2026-06-12) — Z3Backend: the SMT
+// instantiation of `BvTermBackend`.
+// ─────────────────────────────────────────────────────────────────────
+
+/// The Z3 (SMT) instantiation of
+/// [`crate::adapter::btor2::term_backend::BvTermBackend`], over
+/// `Value = z3::ast::BV`.
+///
+/// Delegates operator evaluation to the existing [`encode_op`] —
+/// which reads operands through [`eval_operand`]'s cache. Because
+/// the generic `walk_design` driver visits nodes in declaration
+/// (topological) order and binds each into the backend's cache, by
+/// the time `encode_op` runs for a node every operand is ALREADY
+/// cached, so `eval_operand` returns the cached term WITHOUT
+/// recursing. This is how the forward-bind walk reconciles with
+/// `encode_design`'s recursive-on-demand resolution: same
+/// `encode_op`, same cached operands, same terms — proven by the
+/// `z3backend_transition_matches_encode_design` test.
+///
+/// **BV-only (step 1c.1).** Array support (`Op::Read` / `Op::Write`
+/// → the `Z3Term { Bv, Arr }` enum) is step 1c.2; this struct
+/// carries `array_curr` so the existing array-aware `encode_op`
+/// path stays reachable, but the `Value` is `BV` (read results are
+/// BVs; the array sub-DAG is not yet walked as a backend value).
+///
+/// Constructed from an already-encoded [`Btor2SmtView`]
+/// ([`Z3Backend::from_view`]) so it reuses the view's variable
+/// declarations (pass-1) — the equivalence test isolates the
+/// *forward-walk term construction*, not the variable naming.
+///
+// Staged-API: test-pinned in step 1c.1 (the equivalence test is the
+// only consumer). The must-edge path cutover that makes this the
+// production SMT encoder is step 1c.3 — at which point the allow is
+// removed, mirroring `ConcreteBackend`'s 1a→1b lifecycle.
+#[allow(dead_code)]
+pub(crate) struct Z3Backend<'a> {
+    file: &'a Btor2File,
+    state_curr: HashMap<Nid, z3::ast::BV>,
+    inputs: HashMap<Nid, z3::ast::BV>,
+    state_curr_arr: HashMap<Nid, z3::ast::Array>,
+    cache: HashMap<Nid, z3::ast::BV>,
+}
+
+#[allow(dead_code)] // Staged-API: see Z3Backend doc-comment (removed at 1c.3).
+impl<'a> Z3Backend<'a> {
+    /// Build a Z3 backend reusing an encoded view's current-step
+    /// variable declarations. The cache starts empty; `walk_design`
+    /// fills it with the per-node terms.
+    pub(crate) fn from_view(file: &'a Btor2File, view: &Btor2SmtView) -> Self {
+        Self {
+            file,
+            state_curr: view.state_curr.clone(),
+            inputs: view.inputs.clone(),
+            state_curr_arr: view.state_curr_arr.clone(),
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Resolve a BV operand from the backend's env (cache, then
+    /// state, then input), applying BTOR2 negative-NID negation.
+    fn resolve_bv(&self, op: Operand) -> Option<z3::ast::BV> {
+        let nid = op.nid();
+        let v = self
+            .cache
+            .get(&nid)
+            .or_else(|| self.state_curr.get(&nid))
+            .or_else(|| self.inputs.get(&nid))
+            .cloned()?;
+        Some(if op.is_negated() { v.bvnot() } else { v })
+    }
+
+    /// Build the BV-only transition relation from the post-`walk_design`
+    /// cache, mirroring pass-2 of [`encode_design_with_theory`]. Each
+    /// `Node::Next` over a BV state cell contributes
+    /// `s_next == eval(value)`; the `value` operand is resolved through
+    /// [`eval_operand`], which hits the cache the forward walk
+    /// pre-populated (so no recursion happens for already-bound nodes).
+    /// Reads `state_next` from `view` (the backend does not own it).
+    ///
+    /// BV-only (step 1c.1): array-sorted `next` lines are not handled
+    /// here — the equivalence test uses BV-only fixtures. Array `next`
+    /// support is step 1c.2.
+    pub(crate) fn transition(&mut self, view: &Btor2SmtView) -> Result<z3::ast::Bool, EncodeError> {
+        let array_curr = if self.state_curr_arr.is_empty() {
+            None
+        } else {
+            Some(&self.state_curr_arr)
+        };
+        let mut conjuncts: Vec<z3::ast::Bool> = Vec::new();
+        for line in &self.file.lines {
+            if let Node::Next { state, value, .. } = &line.node {
+                let value_bv = eval_operand(
+                    *value,
+                    self.file,
+                    &self.state_curr,
+                    &self.inputs,
+                    array_curr,
+                    &mut self.cache,
+                )?;
+                let next_bv = view
+                    .state_next
+                    .get(state)
+                    .ok_or(EncodeError::WidthMismatch {
+                        nid: line.nid,
+                        state_width: 0,
+                        operand_width: value_bv.get_size(),
+                    })?
+                    .clone();
+                if next_bv.get_size() != value_bv.get_size() {
+                    return Err(EncodeError::WidthMismatch {
+                        nid: line.nid,
+                        state_width: next_bv.get_size(),
+                        operand_width: value_bv.get_size(),
+                    });
+                }
+                conjuncts.push(next_bv.eq(&value_bv));
+            }
+        }
+        Ok(if conjuncts.is_empty() {
+            z3::ast::Bool::from_bool(true)
+        } else {
+            let refs: Vec<&z3::ast::Bool> = conjuncts.iter().collect();
+            z3::ast::Bool::and(&refs)
+        })
+    }
+}
+
+impl crate::adapter::btor2::term_backend::BvTermBackend for Z3Backend<'_> {
+    type Value = z3::ast::BV;
+    type Error = EncodeError;
+
+    fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<z3::ast::BV, EncodeError> {
+        // `nid` is used only for ConstantOutOfRange diagnostics; the
+        // walk does not thread the const node's nid into eval_const,
+        // so use a 0 sentinel (well-formed constants never error).
+        encode_const_bits(0, value, width)
+    }
+
+    fn eval_op(
+        &mut self,
+        nid: Nid,
+        op: Op,
+        immediates: &[u32],
+        args: &[Operand],
+        width: u32,
+    ) -> Result<z3::ast::BV, EncodeError> {
+        let array_curr = if self.state_curr_arr.is_empty() {
+            None
+        } else {
+            Some(&self.state_curr_arr)
+        };
+        encode_op(
+            nid,
+            op,
+            args,
+            immediates,
+            width,
+            self.file,
+            &self.state_curr,
+            &self.inputs,
+            array_curr,
+            &mut self.cache,
+        )
+    }
+
+    fn bind(&mut self, nid: Nid, value: z3::ast::BV) {
+        self.cache.insert(nid, value);
+    }
+
+    fn honor_init(&self) -> bool {
+        // The transition relation is built from `next` lines, not
+        // `init` (init is a separate constraint in the SMT model).
+        // So the walk never copies init values — matching
+        // `encode_design`, which ignores `Init` nodes.
+        false
+    }
+
+    fn read_operand(&self, op: Operand) -> Option<z3::ast::BV> {
+        // Never invoked by `walk_design` (honor_init is false), but
+        // implemented for completeness + future init-constraint use.
+        self.resolve_bv(op)
+    }
+
+    fn uf_substitute(&mut self, _nid: Nid, _width: u32) -> Option<z3::ast::BV> {
+        // The concrete Zero/Ones representative substitution is a
+        // may-side approximation that does NOT apply to the SMT
+        // backend — real UF (z3::FuncDecl) is step 1d. The SMT
+        // backend evaluates every operator precisely.
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -996,5 +1197,73 @@ mod tests {
         assert_eq!(elem_w, 8);
         // A bitvec sort NID returns None.
         assert!(array_widths(&file, 3).is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // §Phase 10 Option-4 step 1c.1 — Z3Backend transition-equivalence
+    // ─────────────────────────────────────────────────────────────
+
+    use crate::adapter::btor2::term_backend::walk_design;
+
+    /// Drive `walk_design::<Z3Backend>` over `src` and assert the
+    /// transition relation it builds is SEMANTICALLY EQUIVALENT to the
+    /// one `encode_design`'s recursive path builds. Both run over the
+    /// SAME Z3 variable declarations (the backend reuses
+    /// `encode_design`'s view), so the only thing under test is whether
+    /// the forward-bind walk reconstructs the same per-node terms as
+    /// the recursive resolution. `z3::ast::BV` has no structural `==`,
+    /// so equivalence is checked by UNSAT of `ref XOR walk`.
+    fn assert_z3backend_matches_encode_design(src: &str, name: &str) {
+        let file = parse(src).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            // Reference: the recursive-on-demand encoder.
+            let ref_view = encode_design(&file).unwrap_or_else(|e| panic!("encode {name}: {e:?}"));
+            // Backend: forward-bind walk over the same variable decls.
+            let mut backend = Z3Backend::from_view(&file, &ref_view);
+            walk_design(&file, &mut backend)
+                .unwrap_or_else(|e| panic!("walk_design {name}: {e:?}"));
+            let walk_transition = backend
+                .transition(&ref_view)
+                .unwrap_or_else(|e| panic!("backend.transition {name}: {e:?}"));
+
+            // The two Bools reference identical Z3 consts (same names);
+            // they are equivalent iff `ref XOR walk` is UNSAT.
+            let solver = z3::Solver::new();
+            solver.assert(ref_view.transition.xor(&walk_transition));
+            assert_eq!(
+                solver.check(),
+                z3::SatResult::Unsat,
+                "Z3Backend transition for {name} must match encode_design's bit-for-bit (XOR UNSAT)"
+            );
+        });
+    }
+
+    #[test]
+    fn z3backend_transition_matches_encode_design_safety_demo() {
+        assert_z3backend_matches_encode_design(
+            include_str!("../../../../../../examples/btor2/safety_demo.btor"),
+            "safety_demo",
+        );
+    }
+
+    #[test]
+    fn z3backend_transition_matches_encode_design_cap_overflow() {
+        assert_z3backend_matches_encode_design(
+            include_str!(
+                "../../../../../../examples/verify/bench_predicate_image_a4/adversarial/cap_overflow.btor"
+            ),
+            "cap_overflow",
+        );
+    }
+
+    #[test]
+    fn z3backend_transition_matches_encode_design_sparse_predicates() {
+        assert_z3backend_matches_encode_design(
+            include_str!(
+                "../../../../../../examples/verify/bench_predicate_image_a4/adversarial/sparse_predicates.btor"
+            ),
+            "sparse_predicates",
+        );
     }
 }

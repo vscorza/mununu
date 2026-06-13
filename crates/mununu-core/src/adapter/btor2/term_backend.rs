@@ -66,9 +66,13 @@ pub trait BvTermBackend {
     /// Evaluate a `Node::Op` to a value. This is the seam that
     /// `eval_op` (concrete) and `encode_op` (SMT) each provide.
     /// Operand values are read from the backend's env via its own
-    /// resolution (the backend holds the env).
+    /// resolution (the backend holds the env). `nid` is the
+    /// operator node's id — passed for the backend's diagnostics
+    /// (the concrete backend ignores it; the SMT backend threads it
+    /// into `encode_op`'s error context).
     fn eval_op(
         &mut self,
+        nid: Nid,
         op: Op,
         immediates: &[u32],
         args: &[Operand],
@@ -149,7 +153,7 @@ pub fn walk_design<B: BvTermBackend>(
                     continue;
                 }
                 let v = backend
-                    .eval_op(*op, &line.immediates, args, width)
+                    .eval_op(line.nid, *op, &line.immediates, args, width)
                     .map_err(WalkError::Backend)?;
                 backend.bind(line.nid, v);
             }
