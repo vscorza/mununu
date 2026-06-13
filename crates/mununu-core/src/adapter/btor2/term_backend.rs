@@ -45,7 +45,7 @@
 //! tagless-final precedent the verdict evaluator already uses.
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
-use crate::adapter::btor2::parser::bv_width;
+use crate::adapter::btor2::parser::{array_widths, bv_width};
 
 /// A backend that interprets BTOR2 operators into some value type.
 ///
@@ -145,7 +145,26 @@ pub fn walk_design<B: BvTermBackend>(
                 }
             }
             Node::Op { sort, op, args, .. } => {
-                let width = bv_width(file, *sort).ok_or(WalkError::NonBitvecSort(line.nid))?;
+                let Some(width) = bv_width(file, *sort) else {
+                    // §Phase 10 Option-4 step 1c.2 — array-sorted op
+                    // (`Op::Write` / `Op::Ite`-on-array). Array values
+                    // are NOT part of the BV walk's value domain: the
+                    // walk produces `Value` per node, and `Value` is
+                    // bit-vector-typed. An array-capable backend (the
+                    // Z3 SMT backend) resolves the array sub-DAG
+                    // on-demand inside its transition builder (via
+                    // `eval_array_operand`, which self-caches), so the
+                    // walk skips array-sorted nodes here. Concrete /
+                    // BV-only backends cannot represent arrays at all;
+                    // they error when a downstream BV op (`Op::Read`)
+                    // tries to consume one — never on the array node
+                    // itself. Skip iff this is a well-formed array
+                    // sort; otherwise it is a genuine non-bitvec sort.
+                    if array_widths(file, *sort).is_some() {
+                        continue;
+                    }
+                    return Err(WalkError::NonBitvecSort(line.nid));
+                };
                 // UF substitution: bind the representative + skip the
                 // operator evaluation when the node is UF-wrapped.
                 if let Some(sub) = backend.uf_substitute(line.nid, width) {

@@ -673,6 +673,25 @@ pub fn bv_width(file: &Btor2File, sort_nid: Nid) -> Option<u32> {
     }
 }
 
+/// Resolve the index + element bit-widths of an array sort. BTOR2
+/// `Sort::Array { index, element }` references two other (bitvec) sort
+/// lines; this resolves both. Returns `None` if the referenced node is
+/// not an array sort or either inner sort is unresolvable.
+///
+/// Sibling of [`bv_width`]: callers distinguish bit-vector from array
+/// sorts by which of the two returns `Some`. Used by the generic
+/// `walk_design` driver to route (skip) array-sorted op nodes and by
+/// the Z3 array encoder to declare `Array` consts.
+pub fn array_widths(file: &Btor2File, sort_nid: Nid) -> Option<(u32, u32)> {
+    let Node::Sort {
+        sort: Sort::Array { index, element },
+    } = &file.lookup(sort_nid)?.node
+    else {
+        return None;
+    };
+    Some((bv_width(file, *index)?, bv_width(file, *element)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

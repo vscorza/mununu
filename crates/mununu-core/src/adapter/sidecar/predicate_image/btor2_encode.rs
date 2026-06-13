@@ -336,19 +336,12 @@ pub fn encode_design_with_theory(
 }
 
 /// §Phase 10 stage 3.c.1 — resolve the index + element bit-widths of
-/// an array sort. BTOR2 `Sort::Array { index, element }` references
-/// two other sort lines (each a bitvec sort); this resolves both.
+/// an array sort. Thin alias over [`crate::adapter::btor2::parser::array_widths`]
+/// (the canonical implementation, shared with the `walk_design` driver);
+/// kept as a module-local name so existing call sites + the test read
+/// unchanged.
 fn array_widths(file: &Btor2File, sort_nid: Nid) -> Option<(u32, u32)> {
-    let line = file.lookup(sort_nid)?;
-    let Node::Sort {
-        sort: Sort::Array { index, element },
-    } = &line.node
-    else {
-        return None;
-    };
-    let idx_w = bv_width(file, *index)?;
-    let elem_w = bv_width(file, *element)?;
-    Some((idx_w, elem_w))
+    crate::adapter::btor2::parser::array_widths(file, sort_nid)
 }
 
 /// §Phase 10 stage 3.c.1 — resolve an array-sorted operand to a Z3
@@ -795,19 +788,26 @@ fn _sort_check(_s: &Sort) {}
 /// `encode_op`, same cached operands, same terms — proven by the
 /// `z3backend_transition_matches_encode_design` test.
 ///
-/// **BV-only (step 1c.1).** Array support (`Op::Read` / `Op::Write`
-/// → the `Z3Term { Bv, Arr }` enum) is step 1c.2; this struct
-/// carries `array_curr` so the existing array-aware `encode_op`
-/// path stays reachable, but the `Value` is `BV` (read results are
-/// BVs; the array sub-DAG is not yet walked as a backend value).
+/// **The walk's `Value` is `BV`** — and stays so through array
+/// support (step 1c.2). Array values are never bound as walk values:
+/// the `walk_design` driver skips array-sorted op nodes, and the
+/// array sub-DAG is resolved on-demand inside [`Z3Backend::transition`]
+/// via [`eval_array_operand`] (which self-caches into `array_cache`).
+/// `Op::Read` results ARE BVs (`select` yields an element), so they
+/// flow through the BV cache normally. The plan's anticipated
+/// `Z3Term { Bv, Arr }` enum proved unnecessary: forcing arrays into
+/// the walk's value type would route array nodes through the trait
+/// for no functional gain — the on-demand path produces identical Z3
+/// terms (proven by XOR-UNSAT vs `encode_design_with_theory(BvUfArray)`
+/// in `z3backend_transition_matches_uf_array`).
 ///
 /// Constructed from an already-encoded [`Btor2SmtView`]
 /// ([`Z3Backend::from_view`]) so it reuses the view's variable
 /// declarations (pass-1) — the equivalence test isolates the
 /// *forward-walk term construction*, not the variable naming.
 ///
-// Staged-API: test-pinned in step 1c.1 (the equivalence test is the
-// only consumer). The must-edge path cutover that makes this the
+// Staged-API: test-pinned through step 1c.2 (the equivalence tests are
+// the only consumers). The must-edge path cutover that makes this the
 // production SMT encoder is step 1c.3 — at which point the allow is
 // removed, mirroring `ConcreteBackend`'s 1a→1b lifecycle.
 #[allow(dead_code)]
@@ -817,6 +817,10 @@ pub(crate) struct Z3Backend<'a> {
     inputs: HashMap<Nid, z3::ast::BV>,
     state_curr_arr: HashMap<Nid, z3::ast::Array>,
     cache: HashMap<Nid, z3::ast::BV>,
+    /// §Phase 10 step 1c.2 — array sub-DAG cache for the on-demand
+    /// `eval_array_operand` resolution in `transition()`. Empty for
+    /// BV-only designs.
+    array_cache: HashMap<Nid, z3::ast::Array>,
 }
 
 #[allow(dead_code)] // Staged-API: see Z3Backend doc-comment (removed at 1c.3).
@@ -831,6 +835,7 @@ impl<'a> Z3Backend<'a> {
             inputs: view.inputs.clone(),
             state_curr_arr: view.state_curr_arr.clone(),
             cache: HashMap::new(),
+            array_cache: HashMap::new(),
         }
     }
 
@@ -847,17 +852,22 @@ impl<'a> Z3Backend<'a> {
         Some(if op.is_negated() { v.bvnot() } else { v })
     }
 
-    /// Build the BV-only transition relation from the post-`walk_design`
-    /// cache, mirroring pass-2 of [`encode_design_with_theory`]. Each
+    /// Build the transition relation from the post-`walk_design` cache,
+    /// mirroring pass-2 of [`encode_design_with_theory`]. Each
     /// `Node::Next` over a BV state cell contributes
-    /// `s_next == eval(value)`; the `value` operand is resolved through
+    /// `s_next == eval(value)` (the `value` operand is resolved through
     /// [`eval_operand`], which hits the cache the forward walk
-    /// pre-populated (so no recursion happens for already-bound nodes).
-    /// Reads `state_next` from `view` (the backend does not own it).
+    /// pre-populated, so no recursion happens for already-bound nodes);
+    /// each `Node::Next` over an array (memory) state cell contributes
+    /// the extensional array equality `a_next == eval_array(value)`
+    /// (resolved on-demand through [`eval_array_operand`], which builds
+    /// the `store`/`ite` array sub-DAG and self-caches into
+    /// `array_cache`). Reads the `state_next` / `state_next_arr` handles
+    /// from `view` (the backend does not own the next-step decls).
     ///
-    /// BV-only (step 1c.1): array-sorted `next` lines are not handled
-    /// here — the equivalence test uses BV-only fixtures. Array `next`
-    /// support is step 1c.2.
+    /// §Phase 10 step 1c.2 — array-`next` support. The walk itself
+    /// stays BV-valued (it skips array-sorted op nodes); arrays appear
+    /// only here, as the RHS of the array-equality conjuncts.
     pub(crate) fn transition(&mut self, view: &Btor2SmtView) -> Result<z3::ast::Bool, EncodeError> {
         let array_curr = if self.state_curr_arr.is_empty() {
             None
@@ -867,6 +877,22 @@ impl<'a> Z3Backend<'a> {
         let mut conjuncts: Vec<z3::ast::Bool> = Vec::new();
         for line in &self.file.lines {
             if let Node::Next { state, value, .. } = &line.node {
+                // Array-sorted next: extensional array equality. Checked
+                // first (mirrors `encode_design_with_theory`).
+                if let Some(arr_next) = view.state_next_arr.get(state) {
+                    let value_arr = eval_array_operand(
+                        *value,
+                        self.file,
+                        &self.state_curr,
+                        &self.inputs,
+                        &self.state_curr_arr,
+                        &mut self.cache,
+                        &mut self.array_cache,
+                    )?;
+                    conjuncts.push(arr_next.eq(&value_arr));
+                    continue;
+                }
+                // BV-sorted next.
                 let value_bv = eval_operand(
                     *value,
                     self.file,
@@ -1265,5 +1291,35 @@ mod tests {
             ),
             "sparse_predicates",
         );
+    }
+
+    /// §Phase 10 step 1c.2 — array equivalence. `MEM_BTOR_WRITE_THEN_READ`
+    /// exercises BOTH next kinds (array-next `next mem = write(...)` and
+    /// BV-next `next observed = read(...)`) plus `Op::Write` + `Op::Read`.
+    /// The walk skips the array-sorted `write` op node; `transition()`
+    /// rebuilds it on-demand via `eval_array_operand`. The result must
+    /// match `encode_design_with_theory(BvUfArray)`'s recursive pass-2
+    /// bit-for-bit (XOR UNSAT). Reference must be the BvUfArray view
+    /// (BvOnly rejects the array sort).
+    #[test]
+    fn z3backend_transition_matches_uf_array() {
+        let file = parse(MEM_BTOR_WRITE_THEN_READ).expect("parse mem write-then-read");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let ref_view =
+                encode_design_with_theory(&file, Theory::BvUfArray).expect("encode BvUfArray");
+            let mut backend = Z3Backend::from_view(&file, &ref_view);
+            walk_design(&file, &mut backend).expect("walk_design mem");
+            let walk_transition = backend
+                .transition(&ref_view)
+                .expect("backend.transition mem");
+            let solver = z3::Solver::new();
+            solver.assert(ref_view.transition.xor(&walk_transition));
+            assert_eq!(
+                solver.check(),
+                z3::SatResult::Unsat,
+                "Z3Backend transition for the memory design must match encode_design_with_theory(BvUfArray) (XOR UNSAT)"
+            );
+        });
     }
 }
