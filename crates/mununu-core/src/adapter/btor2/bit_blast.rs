@@ -37,6 +37,22 @@ use crate::adapter::{
 /// the boundary). Designs above this still error rather than truncate.
 pub const MAX_STATE_BITS: u32 = 20;
 
+/// MIG-2 (§S-track migration, 2026-06-13) — the out-of-bounds sink
+/// state. When a transition's next-state escapes the sidecar-declared
+/// abstraction (a bounded counter overflows, an enum index leaves its
+/// value set, an `Ignored`/`Dropped` cell leaves its pinned value),
+/// the transition is routed to this absorbing sink instead of being
+/// dropped. The sink carries the valuation `{"__mununu_oob__": "true"}`
+/// — the marker [`crate::mu_calculus::evaluator`]'s `compute_oob_bits`
+/// masks out of every formula's satisfying set (OOB-as-bottom). This
+/// turns the abstraction from an **under-approximation** (drop = miss
+/// behaviours, unsound for safety) into a sound **over-approximation**
+/// (escape ⇒ "anything could happen" ⇒ falsifies safety), matching the
+/// native `kripke.rs` `OOB_STATE_KEY` mechanism. The state NAME and the
+/// marker valuation KEY are deliberately the same string; only the
+/// valuation entry is load-bearing (the evaluator keys on it).
+const OOB_SINK_KEY: &str = "__mununu_oob__";
+
 /// Maximum total bits across all input declarations (per-step combinations).
 /// 2^10 = 1024 input combos per state → up to ~1 G transitions at the
 /// raised state cap (MAX_STATE_BITS = 20). Lifting the input cap further
@@ -1318,7 +1334,10 @@ fn enumerate_and_blast(
     // pins a `Dropped` signal to a single value via
     // `AbstractionType::Ignored`; the abstract model admits more
     // behaviours than the concrete one (sound for safety + over-
-    // approximation).
+    // approximation). This over-approximation is realized by MIG-2: a
+    // pinned cell whose next-state escapes its single value routes to
+    // the [`OOB_SINK_KEY`] sink (evaluator-masked), so "escape ⇒
+    // anything could happen" rather than the transition being dropped.
     let partition = {
         use crate::adapter::partition::{self, PartitionOptions};
         let seeds = super::dep_graph::extract_property_seeds(file);
@@ -1637,19 +1656,23 @@ fn enumerate_and_blast(
     // Each transition carries one label per input signal (`signal_value`)
     // — multi-label transitions, the natural CLTS encoding.
     //
-    // SOUNDNESS: When the bit-blaster is given a sidecar that bounds a
-    // state cell tighter than its BTOR2 width allows, the design's
-    // next-state function may transition to a value outside the
-    // declared abstraction (e.g., `cnt + 1` overflows past `bound`).
-    // Stage 2B drops these transitions and emits a warning — this is
-    // an *under-approximation* (we miss some reachable behaviors).
-    // Sound for liveness; **unsound for safety** under tight bounds.
-    // The OOB-sink upgrade (transitions to a designated "anything bad"
-    // sink state) is tracked as a follow-up. The warning lets the
-    // user widen bounds or run `mununu sv discover` to enlarge the
-    // declared value set.
+    // SOUNDNESS (MIG-2, 2026-06-13): When the bit-blaster is given a
+    // sidecar that bounds a state cell tighter than its BTOR2 width
+    // allows, the design's next-state function may transition to a
+    // value outside the declared abstraction (e.g., `cnt + 1` overflows
+    // past `bound`, an `Ignored` cell leaves its pinned value). Such a
+    // transition is routed to the [`OOB_SINK_KEY`] sink (an absorbing
+    // state the evaluator masks out of every formula's satisfying set)
+    // rather than dropped. This is a sound **over-approximation**
+    // (escape ⇒ "anything could happen" ⇒ falsifies safety), matching
+    // the native `kripke.rs` OOB mechanism — and it is what makes the
+    // `Ignored` / `BoundedCounter` / `EnumValues` pinning soundly
+    // over-approximate (the `partition::classify` auto-COI relies on
+    // this). Previously these transitions were *dropped* (an
+    // under-approximation: unsound for safety) — see the git history of
+    // this block.
     let mut transitions: Vec<TransitionSpec> = Vec::new();
-    let mut oob_dropped: usize = 0;
+    let mut oob_escapes: usize = 0;
     for (state_idx, state_name) in state_names.iter().enumerate() {
         for input_idx in 0..total_input_combos {
             let mut env = make_step_env(
@@ -1669,17 +1692,22 @@ fn enumerate_and_blast(
                 continue;
             }
 
-            // Compute next-state assignment.
+            // Compute next-state assignment. A next-state outside the
+            // enumerated abstraction routes to the OOB sink (sound
+            // over-approximation), not a dropped transition.
             let mut next_env = env.clone();
             apply_next(file, &mut next_env, &state_meta)?;
-            let Some(next_state_idx) = encode_state(&next_env, &state_meta, &cells) else {
-                oob_dropped += 1;
-                continue;
+            let target = match encode_state(&next_env, &state_meta, &cells) {
+                Some(next_state_idx) => state_names[next_state_idx].clone(),
+                None => {
+                    oob_escapes += 1;
+                    OOB_SINK_KEY.to_string()
+                }
             };
 
             transitions.push(TransitionSpec {
                 source: state_name.clone(),
-                target: state_names[next_state_idx].clone(),
+                target,
                 labels: signal_labels_for_input(input_idx, &input_meta, &input_cells),
                 modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
 
@@ -1687,14 +1715,28 @@ fn enumerate_and_blast(
             });
         }
     }
-    if oob_dropped > 0 {
+    // If any transition escaped the abstraction, add the absorbing OOB
+    // sink: a self-loop on every input combination (so it is reachable,
+    // non-deadlocking, and absorbing). The sink's `__mununu_oob__`
+    // valuation is added to `states_vec` below.
+    if oob_escapes > 0 {
+        for input_idx in 0..total_input_combos {
+            transitions.push(TransitionSpec {
+                source: OOB_SINK_KEY.to_string(),
+                target: OOB_SINK_KEY.to_string(),
+                labels: signal_labels_for_input(input_idx, &input_meta, &input_cells),
+                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+                additional_targets: Vec::new(),
+            });
+        }
         warnings.push(AdapterWarning {
             kind: WarningKind::ApproximateTranslation,
             message: format!(
-                "{oob_dropped} transitions dropped because they led to a state \
-                 outside the sidecar-declared abstraction. Under-approximation: \
-                 sound for liveness, unsound for safety. Widen bounds or run \
-                 `mununu sv discover` to enlarge declared value sets."
+                "{oob_escapes} transitions led to a state outside the \
+                 sidecar-declared abstraction and were routed to the OOB sink \
+                 (over-approximation: sound for safety, the sink falsifies \
+                 safety formulas). Widen bounds or run `mununu sv discover` to \
+                 enlarge declared value sets and tighten the model."
             ),
             location: None,
         });
@@ -1740,7 +1782,7 @@ fn enumerate_and_blast(
         });
     }
 
-    let states_vec: Vec<StateSpec> = state_names
+    let mut states_vec: Vec<StateSpec> = state_names
         .iter()
         .enumerate()
         .map(|(i, n)| {
@@ -1752,6 +1794,19 @@ fn enumerate_and_blast(
             }
         })
         .collect();
+    // MIG-2 — declare the absorbing OOB sink (only when reached). Its
+    // `__mununu_oob__ → "true"` valuation is the marker
+    // `crate::mu_calculus::evaluator::compute_oob_bits` keys on to mask
+    // it out of every formula (OOB-as-bottom → sound over-approximation).
+    if oob_escapes > 0 {
+        let mut oob_val = std::collections::BTreeMap::new();
+        oob_val.insert(OOB_SINK_KEY.to_string(), "true".to_string());
+        states_vec.push(StateSpec {
+            name: OOB_SINK_KEY.to_string(),
+            is_initial: false,
+            valuations: Some(oob_val),
+        });
+    }
 
     // With per-signal labels, controllability becomes per-signal-value:
     // every `<signal>_<value>` label belonging to a controllable input is
@@ -4826,6 +4881,61 @@ mod tests {
         let out = translate(src, &opts).expect("translate");
         // After R-S2a seeding, the abstraction set has {0, 3} → 2 states.
         assert_eq!(out.source_info.state_count, 2);
+    }
+
+    #[test]
+    fn mig2_escape_routes_to_oob_sink_not_dropped() {
+        // MIG-2 — a 2-bit counter `cnt` that increments, but the
+        // sidecar declares it `enum {0, 1}`. From cnt=1 the next value
+        // is 2, which escapes the declared value set. Previously this
+        // transition was DROPPED (under-approximation); now it routes
+        // to the `__mununu_oob__` sink (sound over-approximation).
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 constd 2 0
+4 state 2 cnt
+5 init 2 4 3
+6 one 2
+7 add 2 4 6
+8 next 2 4 7
+9 eq 1 4 3
+10 bad 9
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {
+                    "name": "cnt",
+                    "abstraction": "enum",
+                    "variants": ["C_0", "C_1"],
+                    "value_map": [
+                        {"name": "C_0", "value": 0},
+                        {"name": "C_1", "value": 1}
+                    ]
+                }
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        // The escaping transition (cnt=1 → cnt=2) routes to the OOB
+        // sink: the sink state + its `__mununu_oob__` marker valuation
+        // appear in the emitted CTXDSL, and a transition targets it.
+        assert!(
+            out.ctxdsl.contains(OOB_SINK_KEY),
+            "OOB sink must appear in the CTXDSL when an abstraction escape occurs:\n{}",
+            out.ctxdsl
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.message.contains("routed to the OOB sink")),
+            "an OOB-routing warning must be emitted"
+        );
     }
 
     #[test]
