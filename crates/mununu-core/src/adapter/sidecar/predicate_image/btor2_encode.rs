@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand, Sort};
 use crate::adapter::btor2::parser::bv_width;
+use crate::adapter::btor2::term_backend::{WalkError, walk_design};
 
 /// Error variants raised by [`encode_design`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,73 +267,50 @@ pub fn encode_design_with_theory(
         }
     }
 
-    // Pass 2 — walk every `next` line and conjoin the appropriate
-    // equality into the transition relation. BV state cells get a
-    // BV equality `s_next == eval(value)`; array state cells get an
-    // extensional array equality `a_next == eval_array(value)`.
-    let mut conjuncts: Vec<z3::ast::Bool> = Vec::new();
-    let mut cache: HashMap<Nid, z3::ast::BV> = HashMap::new();
-    let mut array_cache: HashMap<Nid, z3::ast::Array> = HashMap::new();
-    let array_curr = if arrays_ok {
-        Some(&state_curr_arr)
-    } else {
-        None
-    };
-
-    for line in &file.lines {
-        if let Node::Next { state, value, .. } = &line.node {
-            // Array-sorted next: extensional array equality.
-            if let Some(arr_next) = state_next_arr.get(state) {
-                let value_arr = eval_array_operand(
-                    *value,
-                    file,
-                    &state_curr,
-                    &inputs,
-                    &state_curr_arr,
-                    &mut cache,
-                    &mut array_cache,
-                )?;
-                conjuncts.push(arr_next.eq(&value_arr));
-                continue;
-            }
-            // BV-sorted next: bit-vector equality.
-            let value_bv =
-                eval_operand(*value, file, &state_curr, &inputs, array_curr, &mut cache)?;
-            let next_bv = state_next
-                .get(state)
-                .ok_or(EncodeError::WidthMismatch {
-                    nid: line.nid,
-                    state_width: 0,
-                    operand_width: value_bv.get_size(),
-                })?
-                .clone();
-            if next_bv.get_size() != value_bv.get_size() {
-                return Err(EncodeError::WidthMismatch {
-                    nid: line.nid,
-                    state_width: next_bv.get_size(),
-                    operand_width: value_bv.get_size(),
-                });
-            }
-            conjuncts.push(next_bv.eq(&value_bv));
-        }
-    }
-
-    let transition = if conjuncts.is_empty() {
-        z3::ast::Bool::from_bool(true)
-    } else {
-        let refs: Vec<&z3::ast::Bool> = conjuncts.iter().collect();
-        z3::ast::Bool::and(&refs)
-    };
-
-    Ok(Btor2SmtView {
+    // Pass 2 (§Phase 10 Option-4 step 1c.3) — build the transition
+    // relation through the unified `walk_design` driver instead of an
+    // inline recursive loop. `Z3Backend` is the SMT instantiation of
+    // `BvTermBackend`: the forward walk binds every Const/Op node into
+    // the backend's cache, then `transition()` conjoins the per-`next`
+    // equalities (BV `s_next == eval(value)` + array
+    // `a_next == eval_array(value)`), reading the already-bound
+    // operands from the cache. Proven equivalent to the prior inline
+    // pass-2 by the `z3backend_transition_matches_*` tests (XOR-UNSAT,
+    // bit-for-bit) and guarded by the full must-edge + lift suites.
+    //
+    // This puts the must-edge SMT path on the SAME driver as the
+    // concrete bit-blast path (step 1b), so the `uf_substitute` hook
+    // (step 1d real UF) applies uniformly without separate plumbing.
+    //
+    // The view is assembled with a placeholder transition first so the
+    // backend can read the `state_*` / `input` declarations through
+    // `from_view` (which clones them — it does not borrow the view);
+    // the real transition then overwrites the placeholder.
+    let mut view = Btor2SmtView {
         state_curr,
         state_next,
         state_curr_arr,
         state_next_arr,
         inputs,
         signals,
-        transition,
-    })
+        transition: z3::ast::Bool::from_bool(true),
+    };
+    let mut backend = Z3Backend::from_view(file, &view);
+    walk_design(file, &mut backend).map_err(|e| match e {
+        WalkError::Backend(inner) => inner,
+        // A genuinely non-bitvec, non-array sort on a value node — not
+        // expected on well-formed BTOR2 the parser accepts.
+        WalkError::NonBitvecSort(nid) => EncodeError::ArraySortUnsupportedInBvOnly { nid },
+        // `honor_init()` is false for the SMT backend, so the walk
+        // never honours `Init` lines; this arm is unreachable in
+        // practice but mapped defensively.
+        WalkError::Unevaluated(nid) => EncodeError::UnsupportedOperator {
+            nid,
+            op_name: "uninitialized-init-value",
+        },
+    })?;
+    view.transition = backend.transition(&view)?;
+    Ok(view)
 }
 
 /// §Phase 10 stage 3.c.1 — resolve the index + element bit-widths of
@@ -803,14 +781,13 @@ fn _sort_check(_s: &Sort) {}
 ///
 /// Constructed from an already-encoded [`Btor2SmtView`]
 /// ([`Z3Backend::from_view`]) so it reuses the view's variable
-/// declarations (pass-1) — the equivalence test isolates the
-/// *forward-walk term construction*, not the variable naming.
-///
-// Staged-API: test-pinned through step 1c.2 (the equivalence tests are
-// the only consumers). The must-edge path cutover that makes this the
-// production SMT encoder is step 1c.3 — at which point the allow is
-// removed, mirroring `ConcreteBackend`'s 1a→1b lifecycle.
-#[allow(dead_code)]
+/// declarations (pass-1). [`encode_design_with_theory`] drives it as
+/// its pass-2 (step 1c.3 cutover): it assembles the view with a
+/// placeholder transition, builds the backend over those decls, runs
+/// [`walk_design`], and overwrites the placeholder with
+/// [`Z3Backend::transition`]'s result. The equivalence tests isolate
+/// the *forward-walk term construction* against the prior inline
+/// recursive pass-2 (XOR-UNSAT).
 pub(crate) struct Z3Backend<'a> {
     file: &'a Btor2File,
     state_curr: HashMap<Nid, z3::ast::BV>,
@@ -823,7 +800,6 @@ pub(crate) struct Z3Backend<'a> {
     array_cache: HashMap<Nid, z3::ast::Array>,
 }
 
-#[allow(dead_code)] // Staged-API: see Z3Backend doc-comment (removed at 1c.3).
 impl<'a> Z3Backend<'a> {
     /// Build a Z3 backend reusing an encoded view's current-step
     /// variable declarations. The cache starts empty; `walk_design`
@@ -1228,8 +1204,8 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     // §Phase 10 Option-4 step 1c.1 — Z3Backend transition-equivalence
     // ─────────────────────────────────────────────────────────────
-
-    use crate::adapter::btor2::term_backend::walk_design;
+    // (`walk_design` is in scope via `use super::*` — the production
+    // pass-2 imports it at module level since the step 1c.3 cutover.)
 
     /// Drive `walk_design::<Z3Backend>` over `src` and assert the
     /// transition relation it builds is SEMANTICALLY EQUIVALENT to the
