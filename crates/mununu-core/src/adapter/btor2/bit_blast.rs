@@ -2385,9 +2385,30 @@ impl CellEnumeration {
         match fd.abstraction {
             AbstractionType::Ignored => vec![0u128],
             _ => {
-                let mut values: Vec<u128> = fd.values().iter().filter_map(to_concrete).collect();
-                // Catch-all variant has no value_map entry; default to 0
-                // (won't collide if the user-named variants don't include 0).
+                // S-track clamp-everywhere (2026-06-14), increment A —
+                // default-by-index for unmapped enum variants. When a
+                // sidecar enum variant has no `value_map` entry, assign
+                // it the SV *default* enum value = its declaration index
+                // (variant 0 → 0, variant 1 → 1, …). This mirrors the
+                // native parser, which reads the encoding straight from
+                // the typedef; the KMTS path otherwise can't (BTOR2
+                // drops the variant names), so an absent value_map
+                // collapsed the value set to `{0}` → the design's real
+                // states escaped to the OOB sink → spurious `[]`-formula
+                // failures (the S-track verdict divergence). Variants
+                // WITH a value_map entry keep their explicit value; the
+                // remaining unmapped variant in an otherwise-mapped enum
+                // (the catch-all, e.g. cwe1245's UNDEF) is handled by the
+                // encode()-time clamp (increment B).
+                let mut values: Vec<u128> =
+                    fd.values()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, av)| {
+                            to_concrete(av).or(matches!(av, AbstractValue::Variant(_))
+                                .then_some((idx as u128) & mask))
+                        })
+                        .collect();
                 if values.is_empty() {
                     values.push(0u128);
                 }
