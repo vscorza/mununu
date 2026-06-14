@@ -1,0 +1,21 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "spi_master",
+  "source": "spi_master.sv",
+  "note": "S.2b-0 migration: inline `@mununu ltl` annotations moved to this sidecar for the KMTS pipeline. DONE (a state variant) → state_DONE.",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "LOAD", "SHIFT", "CAPTURE", "DONE"]
+    }
+  ],
+  "inputs": [
+    {"name": "start", "abstraction": "boolean"},
+    {"name": "miso", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {"id": "safety", "formula": "nu X. ([] X)"},
+    {"id": "done_reachable", "formula": "mu X. (state_DONE || <> X)"}
+  ]
+}

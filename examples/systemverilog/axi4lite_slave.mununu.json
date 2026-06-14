@@ -1,0 +1,24 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "axi4lite_slave",
+  "source": "axi4lite_slave.sv",
+  "note": "S.2b-0 migration: inline `@mununu ltl` annotations moved to this sidecar for the KMTS pipeline. WR_RESP (a state variant) → state_WR_RESP. Outputs are driven from state (assigns already present).",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "WR_ADDR", "WR_DATA", "WR_RESP", "RD_ADDR", "RD_DATA"]
+    }
+  ],
+  "inputs": [
+    {"name": "awvalid", "abstraction": "boolean"},
+    {"name": "wvalid", "abstraction": "boolean"},
+    {"name": "bready", "abstraction": "boolean"},
+    {"name": "arvalid", "abstraction": "boolean"},
+    {"name": "rready", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {"id": "safety", "formula": "nu X. ([] X)"},
+    {"id": "wr_response", "formula": "mu X. (state_WR_RESP || <> X)"}
+  ]
+}

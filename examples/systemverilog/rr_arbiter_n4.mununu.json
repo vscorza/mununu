@@ -1,0 +1,22 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "rr_arbiter",
+  "source": "rr_arbiter_n4.sv",
+  "note": "S.2b-0 migration: inline `@mununu ltl safety` moved to this sidecar for the KMTS pipeline. grant_a..d are undriven outputs (cut to free inputs); the state-based safety property is unaffected.",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "GRANT_A", "GRANT_B", "GRANT_C", "GRANT_D"]
+    }
+  ],
+  "inputs": [
+    {"name": "req_a", "abstraction": "boolean"},
+    {"name": "req_b", "abstraction": "boolean"},
+    {"name": "req_c", "abstraction": "boolean"},
+    {"name": "req_d", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {"id": "safety", "formula": "nu X. ([] X)"}
+  ]
+}

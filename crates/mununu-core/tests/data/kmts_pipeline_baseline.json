@@ -38,13 +38,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 4,
-      "property_count_sum": 0,
+      "state_count_sum": 3,
+      "property_count_sum": 1,
       "per_submodule": [
         {
           "module_name": "arbiter",
-          "state_count": 4,
-          "property_count": 0
+          "state_count": 3,
+          "property_count": 1
         }
       ],
       "error": null
@@ -66,13 +66,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 8,
-      "property_count_sum": 0,
+      "state_count_sum": 6,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "axi4lite_slave",
-          "state_count": 8,
-          "property_count": 0
+          "state_count": 6,
+          "property_count": 2
         }
       ],
       "error": null
@@ -459,12 +459,12 @@
     "kmts": {
       "submodule_count": 1,
       "state_count_sum": 4,
-      "property_count_sum": 0,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "handshake",
           "state_count": 4,
-          "property_count": 0
+          "property_count": 2
         }
       ],
       "error": null
@@ -832,13 +832,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 8,
-      "property_count_sum": 0,
+      "state_count_sum": 5,
+      "property_count_sum": 1,
       "per_submodule": [
         {
           "module_name": "rr_arbiter",
-          "state_count": 8,
-          "property_count": 0
+          "state_count": 5,
+          "property_count": 1
         }
       ],
       "error": null
@@ -860,13 +860,13 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 8,
-      "property_count_sum": 0,
+      "state_count_sum": 5,
+      "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "spi_master",
-          "state_count": 8,
-          "property_count": 0
+          "state_count": 5,
+          "property_count": 2
         }
       ],
       "error": null
@@ -889,12 +889,12 @@
     "kmts": {
       "submodule_count": 1,
       "state_count_sum": 4,
-      "property_count_sum": 0,
+      "property_count_sum": 1,
       "per_submodule": [
         {
           "module_name": "traffic_light",
           "state_count": 4,
-          "property_count": 0
+          "property_count": 1
         }
       ],
       "error": null

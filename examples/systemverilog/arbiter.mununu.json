@@ -1,0 +1,20 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "arbiter",
+  "source": "arbiter.sv",
+  "note": "S.2b-0 migration: inline `@mununu ltl safety` moved to this sidecar for the KMTS pipeline. grant_a/grant_b are undriven outputs (Yosys cuts them to free inputs); the state-based safety property is unaffected.",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "GRANT_A", "GRANT_B"]
+    }
+  ],
+  "inputs": [
+    {"name": "req_a", "abstraction": "boolean"},
+    {"name": "req_b", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {"id": "safety", "formula": "nu X. ([] X)"}
+  ]
+}

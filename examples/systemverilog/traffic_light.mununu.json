@@ -1,0 +1,19 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "traffic_light",
+  "source": "traffic_light.sv",
+  "note": "S.2b-0 migration: inline `@mununu ltl safety` annotation moved to this sidecar so the KMTS (sv-yosys) pipeline can extract the property (Yosys strips comments).",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["GREEN", "YELLOW", "RED", "RED_WAIT"]
+    }
+  ],
+  "inputs": [
+    {"name": "sensor", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {"id": "safety", "formula": "nu X. ([] X)"}
+  ]
+}

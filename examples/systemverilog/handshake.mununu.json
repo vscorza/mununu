@@ -1,0 +1,20 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "handshake",
+  "source": "handshake.sv",
+  "note": "S.2b-0 migration: inline `@mununu ltl` annotations moved to this sidecar for the KMTS pipeline. ACTIVE (a state variant) → state_ACTIVE.",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "WAIT_ACK", "ACTIVE", "DONE"]
+    }
+  ],
+  "inputs": [
+    {"name": "req", "abstraction": "boolean"}
+  ],
+  "properties": [
+    {"id": "safety", "formula": "nu X. ([] X)"},
+    {"id": "ack_reachable", "formula": "mu X. (state_ACTIVE || <> X)"}
+  ]
+}
