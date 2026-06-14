@@ -1703,6 +1703,70 @@ mod tests {
         );
     }
 
+    /// R-MM-4b — `AdapterOptions::surface_output_ports` makes the per-module
+    /// lift surface a net-driving combinational OUTPUT as a per-state
+    /// valuation. Without it, the producer's `valid` (a Moore fn of its
+    /// register) is dropped entirely; with it, every state carries
+    /// `valid = T/F` — the value the driver turns into rendezvous labels.
+    #[test]
+    fn surface_output_ports_surfaces_moore_output_valuation() {
+        if !yosys_available() {
+            eprintln!("skip: yosys not installed");
+            return;
+        }
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+        let producer = match std::fs::read_to_string(dir.join("multi_producer.sv")) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("skip: multi_producer.sv not found");
+                return;
+            }
+        };
+        let yopts = YosysOptions {
+            top: Some("producer".into()),
+            per_module_btor: true,
+            ..Default::default()
+        };
+
+        // Baseline: without surfacing, `valid` appears in NO state valuation.
+        let baseline = translate_sv_per_module(&producer, &AdapterOptions::default(), &yopts)
+            .expect("baseline per-module");
+        let baseline_has_valid = baseline.iter().any(|o| {
+            o.output
+                .state_valuations
+                .values()
+                .flat_map(|states| states.values())
+                .any(|vals| vals.contains_key("valid"))
+        });
+        assert!(
+            !baseline_has_valid,
+            "valid must be dropped without surfacing"
+        );
+
+        // With surface_output_ports=["valid"], every state carries valid=T/F.
+        let opts = AdapterOptions {
+            surface_output_ports: vec!["valid".to_string()],
+            ..Default::default()
+        };
+        let surfaced = translate_sv_per_module(&producer, &opts, &yopts).expect("surfaced");
+        let producer_out = surfaced
+            .iter()
+            .find(|o| o.module_name == "producer")
+            .expect("producer module");
+        let vals: Vec<&str> = producer_out
+            .output
+            .state_valuations
+            .values()
+            .flat_map(|states| states.values())
+            .filter_map(|m| m.get("valid").map(String::as_str))
+            .collect();
+        assert!(!vals.is_empty(), "valid surfaced as a valuation");
+        // valid = (state == 1): true in exactly one of the 4 register-states.
+        assert!(vals.contains(&"T"), "valid=T in some state");
+        assert!(vals.contains(&"F"), "valid=F in some state");
+    }
+
     // ----- R-Y1 (§Phase 8): setundef 3-way precedence ----------------
 
     #[test]

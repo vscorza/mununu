@@ -1690,6 +1690,16 @@ fn enumerate_and_blast(
     // unsound under-approximation).
     let comb_candidates = property_combinational_candidate_names(options);
     let mut comb_nids = combinational_signal_nids(&comb_candidates, file, &state_meta, &input_meta);
+    // R-MM-4b: also surface explicitly-requested net-driving output ports
+    // (their value-node from the BTOR2 `output` line). Union into the
+    // combinational-signal set (dedup by name) so the existing aggregation +
+    // state-splitting + `build_state_valuations` surface them per state — the
+    // values the multi-module driver turns into `net_<v>` rendezvous labels.
+    for (nid, name) in output_port_nids(&options.surface_output_ports, file) {
+        if !comb_nids.iter().any(|(_, n)| n == &name) {
+            comb_nids.push((nid, name));
+        }
+    }
     // Cap the split factor at 2^COMB_SPLIT_CAP variants per register-state.
     const COMB_SPLIT_CAP: usize = 8;
     if comb_nids.len() > COMB_SPLIT_CAP {
@@ -2985,6 +2995,37 @@ fn combinational_signal_nids(
             && seen.insert(name.clone())
         {
             out.push((line.nid, name.clone()));
+        }
+    }
+    out
+}
+
+/// R-MM-4b — Resolve the BTOR2 value-node NID for each requested OUTPUT
+/// PORT name. An output port carries its name on a `Node::Output` line
+/// (`<nid> output <signal> <name>`); the value to surface is the
+/// referenced `signal` node (e.g. a producer's `valid` output references
+/// the `eq(state, …)` node). Returns `(value_nid, name)` pairs for the
+/// requested names that exist as output ports of this module; names that
+/// are not output ports here are silently skipped, so the multi-module
+/// driver can pass the union of all net-driving output names across the
+/// design and each module's lift picks up only its own.
+fn output_port_nids(surface_names: &[String], file: &Btor2File) -> Vec<(Nid, String)> {
+    if surface_names.is_empty() {
+        return Vec::new();
+    }
+    let wanted: std::collections::HashSet<&str> =
+        surface_names.iter().map(String::as_str).collect();
+    let mut out: Vec<(Nid, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::Output {
+            signal,
+            symbol: Some(name),
+        } = &line.node
+            && wanted.contains(name.as_str())
+            && seen.insert(name.clone())
+        {
+            out.push((signal.nid(), name.clone()));
         }
     }
     out

@@ -158,6 +158,29 @@ pub struct AdapterOptions {
     /// (`mununu sv extract --sidecar <path>`) and any API caller
     /// that has the sidecar file system path.
     pub sidecar_path: Option<std::path::PathBuf>,
+
+    /// R-MM-4b (KMTS multi-module composition) — names of module
+    /// **output ports** the BTOR2 bit-blaster should surface as per-state
+    /// valuations (`<port> = T/F`), in addition to the property-referenced
+    /// combinational signals it surfaces by default.
+    ///
+    /// Net-driving combinational outputs (e.g. a producer's `valid`, a
+    /// Moore function of its register) are otherwise dropped entirely — not
+    /// a label, not a valuation, not a transition observation — because
+    /// they neither appear in a property formula nor name an `Op` line the
+    /// default candidate scan picks up. The multi-module composition driver
+    /// (R-MM-4d) needs these values to synthesise the value-encoded
+    /// rendezvous labels (`net_<v>`) that let a driver instance's output
+    /// rendezvous with a reader instance's input under composition.
+    ///
+    /// A name that is not an output port of the module being lifted is a
+    /// silent no-op, so the driver can pass the union of all net-driving
+    /// output names across the design. Surfaced ports flow through the
+    /// same state-splitting machinery as property-referenced combinational
+    /// signals, so an input-dependent (Mealy) output is split per
+    /// achievable value. Default empty — the single-module path passes
+    /// none, leaving the verdict-parity gate untouched.
+    pub surface_output_ports: Vec<String>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.
