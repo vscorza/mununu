@@ -1248,6 +1248,9 @@ fn enumerate_and_blast(
         })
         .collect();
 
+    // F1.0 — async-reset detection: the sidecar `reset_sequence` signal
+    // (if any) overrides the name heuristic.
+    let sidecar_reset = sidecar_reset_signal(options);
     let input_meta: Vec<InputMeta> = inputs
         .iter()
         .enumerate()
@@ -1257,12 +1260,26 @@ fn enumerate_and_blast(
                 .cloned()
                 .unwrap_or_else(|| format!("in{idx}_n{}", l.nid));
             let is_clock = looks_like_clock(&symbol);
+            // F1.0 — a clock is never also a reset; sidecar wins over the
+            // name heuristic.
+            let is_reset = if is_clock {
+                None
+            } else if let Some((rname, active_high)) = &sidecar_reset {
+                if rname == &symbol {
+                    Some(*active_high)
+                } else {
+                    looks_like_reset(&symbol)
+                }
+            } else {
+                looks_like_reset(&symbol)
+            };
             InputMeta {
                 nid: l.nid,
                 width: parser::bv_width(file, sort_of(&l.node)).expect("validated above"),
                 symbol,
                 controllable: false, // resolved below
                 is_clock,
+                is_reset,
             }
         })
         .collect();
@@ -1298,7 +1315,10 @@ fn enumerate_and_blast(
     let mut input_meta = input_meta;
     let derived_from_directions = !options.port_directions.is_empty();
     for im in input_meta.iter_mut() {
-        if im.is_clock {
+        // Clocks and resets are never controllable — the world drives the
+        // clock edge and the reset, not the controller. (F1: reset, like
+        // clock, is excluded from the controllable signal set.)
+        if im.is_clock || im.is_reset.is_some() {
             continue;
         }
         if let Some(dir) = options.port_directions.get(&im.symbol) {
@@ -1483,12 +1503,13 @@ fn enumerate_and_blast(
     // Clock inputs are auto-pinned by the bit-blaster regardless; the
     // partition's Dropped classification on a clock would be redundant
     // but harmless. We filter clocks out here only to avoid an
-    // unnecessary "auto-COI dropped 'clk'" warning.
+    // unnecessary "auto-COI dropped 'clk'" warning. F1: reset inputs are
+    // likewise pinned (inactive) regardless, so exclude them too.
     apply_partition_drops(
         &mut input_domains,
         input_meta
             .iter()
-            .filter(|m| !m.is_clock)
+            .filter(|m| !m.is_clock && m.is_reset.is_none())
             .map(|m| (m.nid, m.symbol.as_str())),
         &partition,
         warnings,
@@ -1618,6 +1639,10 @@ fn enumerate_and_blast(
             &symbols,
             options,
         )?;
+        // F1.1 — auto-reset initial state for async-reset designs with no
+        // BTOR2 Init line (no-op when reset_sequence already handled init,
+        // no reset is detected, or any cell has an Init line).
+        apply_auto_reset(file, &mut init_env, &state_meta, &input_meta, options)?;
         // R-Y4 — bounded-init overrides from the sidecar.
         let bounded_init_overrides = sidecar_bounded_init_overrides(options, &state_meta, &symbols);
         let combos = enumerate_initial_combos(
@@ -1746,8 +1771,15 @@ fn enumerate_and_blast(
     // Clock inputs are excluded: each CLTS step is a clock edge, so the
     // clock is not a signal mununu reasons over. Including it would put
     // a useless `clk_0`/`clk_1` pair in the alphabet.
+    //
+    // F1: reset inputs are excluded for the same reason — they are
+    // modeled as init-only (pinned inactive at runtime), matching the
+    // native pipeline's alphabet (no `rst` label).
     let mut signals: Vec<Signal> = Vec::new();
-    for im in input_meta.iter().filter(|im| !im.is_clock) {
+    for im in input_meta
+        .iter()
+        .filter(|im| !im.is_clock && im.is_reset.is_none())
+    {
         signals.push(Signal {
             name: im.symbol.clone(),
             kind: if im.controllable {
@@ -2145,6 +2177,18 @@ struct InputMeta {
     /// during next-state evaluation so `clk2fflogic`-introduced edge
     /// detectors fire on every CLTS transition exactly once.
     is_clock: bool,
+    /// F1 (S-track KMTS-fidelity, 2026-06-14) — `Some(active_high)` when
+    /// this input is the design's async reset. Reset inputs are modeled
+    /// like the native pipeline does: as *init-only*, NOT a free runtime
+    /// transition. Concretely they are (a) pinned to their INACTIVE level
+    /// for every runtime transition (like clocks are pinned, but to
+    /// inactive rather than 1) and (b) excluded from the transition label
+    /// alphabet. The reset-active behaviour is captured exactly once, as
+    /// the initial state (see `apply_auto_reset`). Without this, Yosys's
+    /// lowering of `posedge rst` makes `rst` a free input whose asserted
+    /// edge returns every state to init — vacuously satisfying
+    /// liveness/recovery properties and masking stuck-state bugs.
+    is_reset: Option<bool>,
 }
 
 /// Parse `options.sidecar_json` (when present) and resolve each
@@ -2273,6 +2317,59 @@ fn looks_like_clock(symbol: &str) -> bool {
         lower.as_str(),
         "clk" | "clock" | "ck" | "i_clk" | "clk_i" | "iclk" | "clki"
     )
+}
+
+/// F1.0 (S-track KMTS-fidelity, 2026-06-14) — heuristic async-reset
+/// detection, mirroring [`looks_like_clock`]. Returns `Some(active_high)`
+/// when `symbol` names a reset, with the active level inferred from the
+/// conventional negation marker; `None` for non-reset names.
+///
+/// Why a name heuristic (like the clock one) rather than structural
+/// BTOR2 analysis: the native pipeline knows the reset from the SV
+/// `always_ff @(posedge clk or posedge rst)` syntax; Yosys lowers that
+/// into an `ite` reset-mux, losing the syntactic marker. The codebase
+/// already recovers the clock by name; reset follows the same precedent.
+/// A sidecar `reset_sequence.reset_input` overrides this (see
+/// [`sidecar_reset_signal`]). The allow-list is conservative to avoid
+/// false-positives (mis-pinning a real input would drop behaviour);
+/// a missed reset is safe (the fix simply doesn't apply).
+fn looks_like_reset(symbol: &str) -> Option<bool> {
+    let lower = symbol.to_ascii_lowercase();
+    let core = lower
+        .strip_prefix("i_")
+        .or_else(|| lower.strip_prefix("o_"))
+        .unwrap_or(lower.as_str());
+    let core = core
+        .strip_suffix("_i")
+        .or_else(|| core.strip_suffix("_o"))
+        .unwrap_or(core);
+    let active_low = matches!(
+        core,
+        "rst_n" | "resetn" | "rstn" | "reset_n" | "arstn" | "arst_n" | "nrst" | "nreset" | "rst_ni"
+    );
+    let active_high = matches!(
+        core,
+        "rst" | "reset" | "arst" | "srst" | "rst_i" | "reset_i"
+    );
+    if active_low {
+        Some(false)
+    } else if active_high {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// F1.0 — the sidecar-declared reset signal, if any: returns
+/// `(reset_input_name, active_high)` from a `reset_sequence` block. This
+/// overrides the [`looks_like_reset`] name heuristic. `active_high` is
+/// derived from `asserted_value` (non-zero ⇒ active-high).
+fn sidecar_reset_signal(options: &AdapterOptions) -> Option<(String, bool)> {
+    let json = options.sidecar_json.as_ref()?;
+    let ann = serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+        .ok()?;
+    let seq = ann.reset_sequence.as_ref()?;
+    Some((seq.reset_input.clone(), seq.asserted_value != 0))
 }
 
 fn sort_of(node: &Node) -> Nid {
@@ -2562,6 +2659,21 @@ impl InputCellEnumeration {
                     // Implicit clock: pinned to 1 (posedge active).
                     return vec![1u128];
                 }
+                // F1: a reset input is pinned to its INACTIVE level for
+                // runtime transitions (active-high → 0, active-low → all
+                // ones). The reset-active edge is captured only as the
+                // initial state (apply_auto_reset), never as a runtime
+                // recovery transition — matching the native pipeline and
+                // keeping liveness/recovery verdicts sound.
+                if let Some(active_high) = im.is_reset {
+                    let mask = if im.width >= 128 {
+                        u128::MAX
+                    } else {
+                        (1u128 << im.width) - 1
+                    };
+                    let inactive = if active_high { 0u128 } else { mask };
+                    return vec![inactive];
+                }
                 if let Some((fd, vm)) = input_domains.get(&im.nid) {
                     CellEnumeration::values_for_field_domain(fd, vm, im.width)
                 } else {
@@ -2708,15 +2820,17 @@ fn signal_labels_for_input(
     let labels: Vec<String> = meta
         .iter()
         .enumerate()
-        .filter(|(_, im)| !im.is_clock)
+        // F1: reset inputs are excluded from labels (pinned inactive,
+        // init-only) alongside clocks — matching the native alphabet.
+        .filter(|(_, im)| !im.is_clock && im.is_reset.is_none())
         .map(|(i, im)| {
             let v = input_cells.value_at(combo, i);
             format!("{}_{}", im.symbol, v)
         })
         .collect();
     if labels.is_empty() {
-        // No non-clock inputs: every CLTS step is just a clock tick.
-        // `step` is the conventional fallback (matches AIGER's behavior).
+        // No non-clock/non-reset inputs: every CLTS step is just a clock
+        // tick. `step` is the conventional fallback (matches AIGER).
         vec!["step".into()]
     } else {
         labels
@@ -3736,17 +3850,94 @@ fn apply_reset_sequence(
         (1u128 << width) - 1
     };
     let asserted_bv = BvValue::new(seq.asserted_value as u128 & mask, width);
-    for _ in 0..seq.hold_cycles {
-        // Pin the reset input to its asserted value.
+    apply_reset_hold(
+        file,
+        init_env,
+        state_meta,
+        reset_nid,
+        asserted_bv,
+        seq.hold_cycles,
+    )
+}
+
+/// Core reset-hold loop shared by [`apply_reset_sequence`] (sidecar) and
+/// [`apply_auto_reset`] (auto-detected). For each held cycle: pin the
+/// reset input to its asserted value, re-evaluate combinational logic
+/// (`honor_init=false`, past cycle 0), then advance state cells via their
+/// next-state functions. The post-loop `init_env` state is the effective
+/// initial state.
+fn apply_reset_hold(
+    file: &Btor2File,
+    init_env: &mut Env,
+    state_meta: &[StateMeta],
+    reset_nid: Nid,
+    asserted_bv: BvValue,
+    hold_cycles: u32,
+) -> Result<(), AdapterError> {
+    for _ in 0..hold_cycles {
         init_env.values.insert(reset_nid, asserted_bv);
-        // Re-evaluate pure expressions (constants, propagation through
-        // combinational logic) — honor_init=false because we're past
-        // cycle 0 now.
         evaluate_pure(file, init_env, /*honor_init=*/ false)?;
-        // Advance state cells via their next-state functions.
         apply_next(file, init_env, state_meta)?;
     }
     Ok(())
+}
+
+/// F1.1 (S-track KMTS-fidelity, 2026-06-14) — auto-reset initial state.
+///
+/// When the design has an auto-detected async reset (an `InputMeta` with
+/// `is_reset = Some(_)`) and **no** state cell carries a BTOR2 `Init`
+/// line — the async-reset shape, where *reset* (not init) establishes the
+/// start state — assert the reset for one cycle to derive the post-reset
+/// initial state. Without this, the uninitialised power-on cube (all
+/// state cells default 0) becomes the initial state; once the enum
+/// catch-all clamp runs, that lands in a catch-all variant (e.g.
+/// cwe1245's `UNDEF`) rather than the design's real reset state (`IDLE`).
+/// Mirrors the native pipeline, which starts in the reset state.
+///
+/// No-op when: a sidecar `reset_sequence` (hold>0) already established
+/// init (handled by [`apply_reset_sequence`]); no reset is detected; or
+/// any state cell has an `Init` line (then the BTOR2 init is
+/// authoritative and we must not advance past it).
+fn apply_auto_reset(
+    file: &Btor2File,
+    init_env: &mut Env,
+    state_meta: &[StateMeta],
+    input_meta: &[InputMeta],
+    options: &AdapterOptions,
+) -> Result<(), AdapterError> {
+    // Skip if a sidecar reset_sequence with a real hold already ran.
+    if let Some(json) = &options.sidecar_json
+        && let Ok(ann) =
+            serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+        && ann
+            .reset_sequence
+            .as_ref()
+            .is_some_and(|s| s.hold_cycles > 0)
+    {
+        return Ok(());
+    }
+    // The auto-detected reset input (first is_reset; single-reset scope).
+    let Some(reset_im) = input_meta.iter().find(|im| im.is_reset.is_some()) else {
+        return Ok(());
+    };
+    let active_high = reset_im.is_reset == Some(true);
+    // Guard: only the pure-async-reset shape (no Init line on any state
+    // cell). If any cell has init, the BTOR2 init is authoritative.
+    let any_init = file
+        .lines
+        .iter()
+        .any(|l| matches!(&l.node, Node::Init { state, .. } if state_meta.iter().any(|sm| sm.nid == *state)));
+    if any_init {
+        return Ok(());
+    }
+    let mask = if reset_im.width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << reset_im.width) - 1
+    };
+    let asserted = if active_high { 1u128 & mask } else { 0u128 };
+    let asserted_bv = BvValue::new(asserted, reset_im.width);
+    apply_reset_hold(file, init_env, state_meta, reset_im.nid, asserted_bv, 1)
 }
 
 /// R-Y4 (§Phase 8) — collect per-signal bounded-init overrides from
@@ -5572,6 +5763,93 @@ mod tests {
         let out = translate(src, &opts).expect("translate");
         // Without applicable reset signal, init state is cycle 0 (q=0).
         assert!(out.ctxdsl.contains("q = 0"));
+    }
+
+    // ---- F1 (S-track KMTS-fidelity) — async-reset modeling ----
+
+    #[test]
+    fn f1_looks_like_reset_heuristic() {
+        assert_eq!(looks_like_reset("rst"), Some(true));
+        assert_eq!(looks_like_reset("reset"), Some(true));
+        assert_eq!(looks_like_reset("arst"), Some(true));
+        assert_eq!(looks_like_reset("i_rst"), Some(true)); // i_ affix stripped
+        assert_eq!(looks_like_reset("rst_n"), Some(false)); // active-low
+        assert_eq!(looks_like_reset("resetn"), Some(false));
+        assert_eq!(looks_like_reset("arst_n"), Some(false));
+        assert_eq!(looks_like_reset("rst_ni"), Some(false));
+        assert_eq!(looks_like_reset("clk"), None);
+        assert_eq!(looks_like_reset("data"), None);
+        assert_eq!(looks_like_reset("address"), None); // contains no reset word
+    }
+
+    #[test]
+    fn f1_auto_reset_inits_at_reset_value_and_excludes_rst_label() {
+        // Async-reset shape: state `fsm` has NO `init` line; its next is
+        // `ite(rst, 1, 2)` — asserting rst forces fsm to the reset value
+        // 1, otherwise it goes to 2. The name `rst` is auto-detected
+        // (active-high), so F1 should (a) init at fsm=1 (reset value),
+        // NOT fsm=0 (uninitialised power-on), and (b) pin rst inactive →
+        // no `rst_*` label in the alphabet.
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 fsm
+4 constd 2 1
+5 constd 2 2
+6 input 1 rst
+7 ite 2 6 4 5
+8 next 2 3 7
+9 ones 2
+10 eq 1 3 9
+11 bad 10
+"#;
+        let opts = AdapterOptions::default();
+        let out = translate(src, &opts).expect("translate");
+        // F1.1 — initial state is the reset value (fsm=1 → state name s1),
+        // not the uninitialised default (fsm=0 → s0).
+        assert!(
+            out.ctxdsl.contains("s1 initial"),
+            "F1.1: expected initial state = reset value fsm=1 (s1); got:\n{}",
+            out.ctxdsl
+        );
+        assert!(
+            !out.ctxdsl.contains("s0 initial"),
+            "F1.1: initial state must not be the uninitialised default fsm=0 (s0); got:\n{}",
+            out.ctxdsl
+        );
+        // F1.2 — rst is pinned inactive and excluded from the label
+        // alphabet (no `rst_0`/`rst_1` labels), matching native.
+        assert!(
+            !out.ctxdsl.contains("rst_0") && !out.ctxdsl.contains("rst_1"),
+            "F1.2: reset input must be excluded from the transition labels; got:\n{}",
+            out.ctxdsl
+        );
+    }
+
+    #[test]
+    fn f1_no_reset_leaves_inputs_unpinned() {
+        // Negative control: an input named `enable` (not a reset) must
+        // still be a free label — F1 must not over-pin non-reset inputs.
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 fsm
+4 constd 2 1
+5 constd 2 2
+6 input 1 enable
+7 ite 2 6 4 5
+8 next 2 3 7
+9 ones 2
+10 eq 1 3 9
+11 bad 10
+"#;
+        let opts = AdapterOptions::default();
+        let out = translate(src, &opts).expect("translate");
+        assert!(
+            out.ctxdsl.contains("enable_0") || out.ctxdsl.contains("enable_1"),
+            "non-reset input `enable` must remain a free label; got:\n{}",
+            out.ctxdsl
+        );
     }
 
     // ---- R-Y4 (§Phase 8) — bounded-havoc init value sets ----

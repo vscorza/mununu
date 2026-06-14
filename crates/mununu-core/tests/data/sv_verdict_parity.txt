@@ -1,12 +1,12 @@
 # S-track verdict-polarity parity (native sv-rtl vs KMTS sv-yosys)
-# comparable=24 match=20 mismatch=4
+# comparable=24 match=21 mismatch=3
 # GATE: RED — native deletion BLOCKED
 alu/safety native=false kmts=false AGREE
 axilite_deadlock_bug/no_overlap native=false kmts=false AGREE
 axilite_deadlock_bug/safety native=true kmts=true AGREE
 axilite_deadlock_fixed/no_overlap native=true kmts=false MISMATCH
 axilite_deadlock_fixed/safety native=true kmts=true AGREE
-cwe1245_fsm_bug/always_recoverable native=false kmts=true MISMATCH
+cwe1245_fsm_bug/always_recoverable native=false kmts=false AGREE
 cwe1245_fsm_bug/recoverable native=true kmts=true AGREE
 cwe1245_fsm_bug/safety native=true kmts=true AGREE
 cwe1245_fsm_fixed/always_recoverable native=true kmts=true AGREE
