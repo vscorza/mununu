@@ -1340,6 +1340,10 @@ mod tests {
         // therefore reports unrealizable — the *right* answer for the ALU as
         // written. To make it realizable the user would need a wider `acc`
         // bound or a guard that prevents the overflowing transitions.
+        // (An S-track saturate-everywhere convention that would have flipped
+        // this to realizable was rejected 2026-06-14: counter overflow → OOB
+        // is uniformly sound; saturate is not — see clamp_to_domain's
+        // SOUNDNESS note + tests/soundness_kripke.rs b1/b8.)
         assert!(
             !synth.realizable,
             "ALU safety should be unrealizable due to reachable OOB sink (states: {})",

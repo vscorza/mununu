@@ -2096,6 +2096,21 @@ fn clamp_to_domain(
     if let Some(reg) = registers.iter().find(|r| r.name == target) {
         match (&reg.domain.abstraction, value) {
             (AbstractionType::BoundedCounter, AbstractValue::Counter(n)) => {
+                // SOUNDNESS: over-approx — a bounded-counter overflow
+                // (value > bound) routes the transition to the OOB sink
+                // (CounterAbove), NOT a saturate-to-bound clamp. OOB is
+                // uniformly sound for every property shape: the escaped
+                // state fails all positive predicates, so e.g.
+                // `no_overflow = [](count <= bound)` correctly reports a
+                // violation when the design overflows. Saturating to the
+                // bound would falsely satisfy `count <= bound` (claims
+                // safe when the concrete overflows) and would erase the
+                // 3-valued `Unknown` "bound too small → can't verify"
+                // signal (see tests/soundness_kripke.rs b1/b8). The KMTS
+                // bit-blast pipeline mirrors this OOB convention
+                // (bit_blast.rs encode → None) for verdict parity. An
+                // S-track exploration of saturate-everywhere was reverted
+                // 2026-06-14 because it weakened these guarantees.
                 let bound = reg
                     .domain
                     .bound

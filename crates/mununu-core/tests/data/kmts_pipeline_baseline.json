@@ -10,12 +10,12 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 8,
+      "state_count_sum": 9,
       "property_count_sum": 1,
       "per_submodule": [
         {
           "module_name": "alu",
-          "state_count": 8,
+          "state_count": 9,
           "property_count": 1
         }
       ],
@@ -206,12 +206,12 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 5,
+      "state_count_sum": 4,
       "property_count_sum": 3,
       "per_submodule": [
         {
           "module_name": "cwe1245_fsm_bug",
-          "state_count": 5,
+          "state_count": 4,
           "property_count": 3
         }
       ],
@@ -234,12 +234,12 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 9,
+      "state_count_sum": 8,
       "property_count_sum": 3,
       "per_submodule": [
         {
           "module_name": "cwe1245_fsm_fixed",
-          "state_count": 9,
+          "state_count": 8,
           "property_count": 3
         }
       ],
@@ -402,12 +402,12 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 18,
+      "state_count_sum": 19,
       "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "fifo_overflow_bug",
-          "state_count": 18,
+          "state_count": 19,
           "property_count": 2
         }
       ],

@@ -2310,22 +2310,19 @@ struct CellEnumeration {
     per_cell: Vec<Vec<u128>>,
     /// Per state cell, cached `per_cell[i].len()` (the radix base).
     radices: Vec<usize>,
-    /// Per state cell, whether `encode` should saturate out-of-range
-    /// values to the nearest in-range value (true for `BoundedCounter`
-    /// abstraction; false otherwise). Saturating maps the design's
-    /// arbitrary concrete writes (e.g. `wait_count = 5`) onto the
-    /// declared abstract counter range (e.g. `bound = 1` → values
-    /// `{0, 1}`, with `5` saturating to `1` = the "non-zero" class).
-    /// This is an over-approximation: a smaller abstract domain
-    /// represents a larger concrete one. Sound for safety; under-
-    /// approximates liveness. See `docs/abstraction.md` for the
-    /// memory-soundness matrix.
-    saturate: Vec<bool>,
+    /// Per state cell, the position within `per_cell[i]` of the enum's
+    /// **catch-all variant** (the first declared variant with no
+    /// `value_map` entry), or `None` when the cell has no catch-all.
+    /// When `encode` sees an `EnumValues` value outside the declared
+    /// set, it clamps to this position instead of returning `None`
+    /// (OOB). Mirrors native `kripke.rs` `clamp_to_domain`'s
+    /// "value not in value_map → first unmapped variant" rule —
+    /// S-track clamp-everywhere (2026-06-14), increment B.
+    catch_all: Vec<Option<usize>>,
 }
 
 impl CellEnumeration {
     fn build(state_meta: &[StateMeta], cell_domains: &CellDomainMap) -> Self {
-        use crate::adapter::domain::AbstractionType;
         let per_cell: Vec<Vec<u128>> = state_meta
             .iter()
             .map(|sm| {
@@ -2339,20 +2336,64 @@ impl CellEnumeration {
             })
             .collect();
         let radices: Vec<usize> = per_cell.iter().map(|v| v.len().max(1)).collect();
-        let saturate: Vec<bool> = state_meta
+        // S-track clamp-everywhere (2026-06-14), increment B — per-cell
+        // catch-all position. For an `EnumValues` cell with a catch-all
+        // variant (a declared variant with no `value_map` entry), record
+        // the position of that variant's value in `per_cell`; `encode`
+        // clamps out-of-set values to it instead of routing to OOB.
+        // `None` for non-enum cells, value_map-absent enums (native OOBs
+        // those), and fully-mapped enums (no catch-all) — those keep the
+        // OOB convention, matching native `kripke.rs` `clamp_to_domain`.
+        let catch_all: Vec<Option<usize>> = state_meta
             .iter()
-            .map(|sm| {
-                cell_domains
-                    .get(&sm.nid)
-                    .map(|(fd, _)| fd.abstraction == AbstractionType::BoundedCounter)
-                    .unwrap_or(false)
+            .enumerate()
+            .map(|(i, sm)| {
+                cell_domains.get(&sm.nid).and_then(|(fd, vm)| {
+                    Self::catch_all_value(fd, vm, sm.width)
+                        .and_then(|cav| per_cell[i].iter().position(|x| *x == cav))
+                })
             })
             .collect();
         CellEnumeration {
             per_cell,
             radices,
-            saturate,
+            catch_all,
         }
+    }
+
+    /// The concrete value of the enum's catch-all variant — the first
+    /// declared variant with NO `value_map` entry — or `None` when the
+    /// cell is not an `EnumValues` abstraction, has no `value_map`
+    /// (native routes out-of-set values to OOB in that case), or maps
+    /// every variant (no catch-all). Mirrors native `kripke.rs`
+    /// `clamp_to_domain`. The catch-all's value follows increment A's
+    /// default-by-index rule (an unmapped variant takes its declaration
+    /// index as its concrete enum value), so it matches the value
+    /// `values_for_field_domain` placed in `per_cell` for that variant.
+    fn catch_all_value(
+        fd: &crate::adapter::domain::FieldDomain,
+        vm: &[(String, i64)],
+        width: u32,
+    ) -> Option<u128> {
+        use crate::adapter::domain::{AbstractValue, AbstractionType};
+        if fd.abstraction != AbstractionType::EnumValues || vm.is_empty() {
+            return None;
+        }
+        let mask = if width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
+        };
+        let mapped: std::collections::HashSet<&str> = vm.iter().map(|(n, _)| n.as_str()).collect();
+        fd.values()
+            .iter()
+            .enumerate()
+            .find_map(|(idx, av)| match av {
+                AbstractValue::Variant(name) if !mapped.contains(name.as_str()) => {
+                    Some((idx as u128) & mask)
+                }
+                _ => None,
+            })
     }
 
     fn values_for_field_domain(
@@ -2446,44 +2487,34 @@ impl CellEnumeration {
     /// happens when the design's transition function lands a state
     /// outside the sidecar-declared abstraction (e.g., an `EnumValues`
     /// signal landing outside its variant set). The caller treats
-    /// this as out-of-bounds.
+    /// this as out-of-bounds and routes the transition to the OOB sink.
     ///
-    /// For cells whose `saturate` flag is set (`BoundedCounter`), an
-    /// out-of-range value is clamped to the nearest in-range value:
-    /// `v > max(per_cell)` → `max`; `v < min(per_cell)` → `min`. This
-    /// is the standard saturating-counter semantics — a soundness-
-    /// preserving over-approximation that lets the abstract domain
-    /// stand in for an unbounded concrete domain without dropping
-    /// transitions. The classic use case is `bound = 1` standing in
-    /// for `{0, non-zero}`: the design's `wait_count = 5` write
-    /// saturates to `1` (= the "non-zero" abstract class).
+    /// The ONE exception is the enum **catch-all** clamp (S-track
+    /// increment B): when the cell declares a catch-all variant (a
+    /// declared variant with no `value_map` entry, e.g. cwe1245's
+    /// `UNDEF`), an out-of-set value maps to that variant's position
+    /// rather than OOB — mirroring native `kripke.rs` `clamp_to_domain`.
+    /// This is sound because the catch-all variant + its `default:`
+    /// handler over-approximate every invalid encoding uniformly.
+    ///
+    /// `BoundedCounter` overflow is NOT clamped (no saturate): an
+    /// overflow has no sound in-model representative (saturating to the
+    /// bound would falsely satisfy `count <= bound`), so it returns
+    /// `None` → OOB, matching native's uniformly-sound OOB convention.
+    /// (An S-track saturate-everywhere exploration was reverted
+    /// 2026-06-14 — see `kripke.rs` `clamp_to_domain`'s SOUNDNESS note.)
     fn encode(&self, values: &[u128]) -> Option<usize> {
         let mut combo = 0usize;
         let mut multiplier = 1usize;
         for (i, &v) in values.iter().enumerate() {
             let radix = self.radices[i];
             let cell_values = &self.per_cell[i];
-            let idx = cell_values.iter().position(|x| *x == v).or_else(|| {
-                if !self.saturate[i] || cell_values.is_empty() {
-                    return None;
-                }
-                // `per_cell` is sorted ascending in `build`. Clamp.
-                let last = *cell_values.last()?;
-                let first = *cell_values.first()?;
-                if v > last {
-                    Some(cell_values.len() - 1)
-                } else if v < first {
-                    Some(0)
-                } else {
-                    // Value sits in a gap within the declared range.
-                    // For `BoundedCounter` the range is contiguous,
-                    // so this branch is unreachable in practice; if
-                    // the abstraction ever gets gappy variants the
-                    // saturation is undefined and we drop the
-                    // transition (under-approx) rather than guess.
-                    None
-                }
-            })?;
+            // In-set → its position; else the enum catch-all position
+            // (increment B) if the cell has one; else None → OOB.
+            let idx = cell_values
+                .iter()
+                .position(|x| *x == v)
+                .or(self.catch_all[i])?;
             combo = combo.checked_add(idx.checked_mul(multiplier)?)?;
             multiplier = multiplier.checked_mul(radix)?;
         }
