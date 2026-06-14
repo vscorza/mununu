@@ -35,6 +35,9 @@
 //! - Multi-clock SVA, classes, and Verific-only constructs are out of scope —
 //!   Yosys errors will surface with a layer-tagged context (`adapter/yosys: ...`).
 
+/// R-MM (KMTS multi-module composition) — netlist-driven driver.
+pub mod multi_module;
+
 use crate::adapter::{
     AdapterError, AdapterErrorKind, AdapterOptions, AdapterOutput, FormatAdapter, SourceFormat,
     SourceInfo,
