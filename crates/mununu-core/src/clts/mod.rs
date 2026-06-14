@@ -1480,6 +1480,26 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
             .copied()
     }
 
+    /// R-MM — Returns every 3-valued predicate labelling attached to
+    /// `state`, as `(predicate_name, verdict)` pairs in predicate-name
+    /// order (empty when none are set).
+    ///
+    /// The per-`(state, predicate)` map is private; composition needs to
+    /// *enumerate* a state's predicates (not just query one by name) to
+    /// carry them onto product states, so this accessor exposes the
+    /// per-state slice. Backed by a `BTreeMap` range, so it touches only
+    /// the entries for `state`, not the whole map.
+    pub fn state_3valued_predicate_entries(&self, state: StateId<S>) -> Vec<(&str, Tristate)> {
+        match &self.state_3valued_predicates {
+            Some(map) => map
+                .range((state, String::new())..)
+                .take_while(move |((s, _), _)| *s == state)
+                .map(|((_, name), verdict)| (name.as_str(), *verdict))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// R.1 — Returns `true` if any 3-valued predicate labelling has
     /// been populated. `KleeneDomain` callers can branch on this to
     /// fall back to the 2-valued `state_variables` path when the

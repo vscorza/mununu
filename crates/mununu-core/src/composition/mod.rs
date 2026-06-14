@@ -15,12 +15,12 @@ mod transition;
 
 use crate::clts::{
     Clts, CltsBuilder, CltsResult, DefaultLabelIdx, DefaultStateIdx, LabelControllability, StateId,
-    Transition, TransitionModality,
+    Transition, TransitionModality, Tristate,
 };
 use crate::composition::controllability::ControllabilityChecker;
 use crate::composition::transition::TransitionKeyBuilder;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 /// Key for state variables.
@@ -295,6 +295,58 @@ impl ProductStateBuilder {
         let composed_vars = arena.merge_state_variables(left, l_state, right, r_state);
         if !composed_vars.is_empty() {
             builder.with_variables_for_state(state_id, composed_vars.iter().map(|s| s.as_str()));
+        }
+
+        // R-MM-2 — Carry structured valuations + 3-valued predicate
+        // labellings through composition. The native explicit-state path
+        // drops these at the product boundary (it merges only variable
+        // *names*), so properties on a composed design cannot reference
+        // abstract values. KMTS composition must preserve them, or the
+        // "composed properties become first-class" benefit is vacuous.
+        //
+        // Module signal namespaces are normally disjoint, so the union is
+        // collision-free in practice. On a key collision we stay sound:
+        // valuations take the left side deterministically (display-only
+        // metadata); predicate verdicts that DISAGREE collapse to
+        // KleeneBot — never fabricate a definite verdict from conflicting
+        // modules. The driver (R-MM-4) module-qualifies signal names so
+        // collisions do not arise on the real multi-module path.
+        let l_val = left.state_valuation(l_state);
+        let r_val = right.state_valuation(r_state);
+        if l_val.is_some() || r_val.is_some() {
+            let mut merged: BTreeMap<String, String> = BTreeMap::new();
+            if let Some(rv) = r_val {
+                merged.extend(rv.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            if let Some(lv) = l_val {
+                // Left wins on collision.
+                merged.extend(lv.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            if !merged.is_empty() {
+                builder.with_valuation_for_state(state_id, merged);
+            }
+        }
+
+        let l_preds = left.state_3valued_predicate_entries(l_state);
+        let r_preds = right.state_3valued_predicate_entries(r_state);
+        if !l_preds.is_empty() || !r_preds.is_empty() {
+            let mut merged: BTreeMap<String, Tristate> = BTreeMap::new();
+            for (name, verdict) in r_preds {
+                merged.insert(name.to_string(), verdict);
+            }
+            for (name, verdict) in l_preds {
+                merged
+                    .entry(name.to_string())
+                    .and_modify(|existing| {
+                        if *existing != verdict {
+                            *existing = Tristate::KleeneBot;
+                        }
+                    })
+                    .or_insert(verdict);
+            }
+            for (name, verdict) in merged {
+                builder.with_3valued_predicate(state_id, name, verdict);
+            }
         }
 
         self.state_map.insert((l_state, r_state), state_id);
@@ -1245,6 +1297,103 @@ mod tests {
         assert_eq!(
             first_outgoing_modality(&composed, "s0|s0")?,
             TransitionModality::MayOnly,
+        );
+        Ok(())
+    }
+
+    // ---- R-MM-2 — valuations + 3-valued predicates survive composition ----
+
+    /// Builds a 2-state CLTS whose initial `s0` carries a structured
+    /// valuation + one 3-valued predicate, with a single shared-label edge.
+    fn valued_one_edge(
+        label: &str,
+        valuation: &[(&str, &str)],
+        predicate: (&str, Tristate),
+    ) -> TestResult<Clts<DefaultStateIdx, DefaultLabelIdx>> {
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let id = builder.labels().intern([label])?;
+        builder.set_label_controllability(id, LabelControllability::Uncontrollable);
+        let s0 = builder.state_id_or_insert("s0").expect("s0 inserted");
+        let s1 = builder.state_id_or_insert("s1").expect("s1 inserted");
+        builder.transition_ids(s0, &[id], s1);
+        let val: BTreeMap<String, String> = valuation
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        builder.with_valuation_for_state(s0, val);
+        builder.with_3valued_predicate(s0, predicate.0, predicate.1);
+        builder.build().map_err(|e| e.into())
+    }
+
+    #[test]
+    fn compose_carries_valuations_and_predicates_to_product() -> TestResult {
+        // The native explicit-state path drops valuations/predicates at the
+        // product boundary; KMTS composition must carry them so a composed
+        // property can reference abstract values from both modules.
+        let left = valued_one_edge(
+            "clk",
+            &[("prod_state", "SENDING")],
+            ("prod_sent", Tristate::KleeneT),
+        )?;
+        let right = valued_one_edge(
+            "clk",
+            &[("cons_state", "RECV")],
+            ("cons_ready", Tristate::KleeneBot),
+        )?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+
+        let prod = composed.state_id("s0|s0")?;
+
+        // Valuations from BOTH modules are present on the product state.
+        let val = composed
+            .state_valuation(prod)
+            .expect("product carries a valuation");
+        assert_eq!(val.get("prod_state").map(|s| s.as_str()), Some("SENDING"));
+        assert_eq!(val.get("cons_state").map(|s| s.as_str()), Some("RECV"));
+
+        // 3-valued predicates from BOTH modules survive with their verdicts.
+        assert_eq!(
+            composed.state_3valued_predicate(prod, "prod_sent"),
+            Some(Tristate::KleeneT)
+        );
+        assert_eq!(
+            composed.state_3valued_predicate(prod, "cons_ready"),
+            Some(Tristate::KleeneBot)
+        );
+        assert!(composed.has_valuations());
+        assert!(composed.has_3valued_predicates());
+        Ok(())
+    }
+
+    #[test]
+    fn compose_predicate_disagreement_collapses_to_kleenebot() -> TestResult {
+        // Same predicate name in both modules with conflicting verdicts must
+        // NOT fabricate a definite verdict — it collapses to KleeneBot
+        // (sound: the composed product is genuinely uncertain there).
+        let left = valued_one_edge("clk", &[("v", "1")], ("p", Tristate::KleeneT))?;
+        let right = valued_one_edge("clk", &[("v", "2")], ("p", Tristate::KleeneF))?;
+        let composed = compose(
+            &left,
+            &right,
+            &CompositionOptions::new(CompositionSemantics::Synchronous),
+        )?;
+        let prod = composed.state_id("s0|s0")?;
+        assert_eq!(
+            composed.state_3valued_predicate(prod, "p"),
+            Some(Tristate::KleeneBot)
+        );
+        // Valuation collision: left wins deterministically.
+        assert_eq!(
+            composed
+                .state_valuation(prod)
+                .and_then(|m| m.get("v"))
+                .map(|s| s.as_str()),
+            Some("1")
         );
         Ok(())
     }
