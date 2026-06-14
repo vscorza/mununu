@@ -1757,6 +1757,114 @@ impl Clts<DefaultStateIdx, DefaultLabelIdx> {
     pub fn builder() -> CltsBuilder<DefaultStateIdx, DefaultLabelIdx> {
         CltsBuilder::default()
     }
+
+    /// R-MM — Rebuilds this CLTS with label symbols renamed per `rename`.
+    ///
+    /// Every symbol in every transition's label payload is mapped through
+    /// `rename` (symbols absent from the map are kept verbatim), then the
+    /// renamed symbol set is re-interned. The state space is unchanged;
+    /// only label payloads differ.
+    ///
+    /// This is the load-bearing primitive for the **KMTS multi-module
+    /// composition driver** (R-MM): each per-module KMTS lifted from a
+    /// submodule's BTOR2 carries its *port* names as labels, but two
+    /// instances connected by a shared net must rendezvous on the *net*
+    /// name. `relabel` rewrites each instance's port labels to the
+    /// connected-net names so [`crate::composition::compose`]'s
+    /// name-equality rendezvous fires on the shared nets.
+    ///
+    /// Unlike [`crate::composition::hide::hide_labels`] (which splits a
+    /// multi-label edge into one edge per label and only carries
+    /// controllability), `relabel` preserves the **exact edge structure**:
+    /// a multi-label edge stays one edge, and crucially the transition's
+    /// [`TransitionModality`] (may / must / hyper-must) is carried through
+    /// rather than collapsed to `Sharp` — relabelling a KMTS must not
+    /// silently fabricate must-witnesses. Structured state valuations and
+    /// 3-valued predicate labellings are copied verbatim (the abstract
+    /// AP labels the composed property reads).
+    pub fn relabel(
+        &self,
+        rename: &HashMap<String, String>,
+    ) -> CltsResult<Clts<DefaultStateIdx, DefaultLabelIdx>> {
+        let mut builder = Clts::builder();
+
+        // 1. Copy states (names, initial flags, variable name-sets).
+        let mut state_mapping: HashMap<StateId<DefaultStateIdx>, StateId<DefaultStateIdx>> =
+            HashMap::new();
+        for state in self.states() {
+            let name = self.state_name(state).unwrap_or("state").to_owned();
+            if let Some(new_id) = builder.state_with_name(name) {
+                if self.initial_states().contains(&state) {
+                    builder.initial_state_id(new_id);
+                }
+                let vars = self.state_variables(state);
+                if !vars.is_empty() {
+                    builder.with_variables_for_state(new_id, vars.iter().map(|s| s.as_str()));
+                }
+                state_mapping.insert(state, new_id);
+            }
+        }
+
+        // 2. Copy transitions — rename label symbols, preserve the
+        //    multi-label edge shape AND the modality (may/must).
+        for state in self.states() {
+            let &source_new = match state_mapping.get(&state) {
+                Some(id) => id,
+                None => continue,
+            };
+            for transition in self.outgoing(state) {
+                let &target_new = match state_mapping.get(&transition.target()) {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let mut new_labels: SmallVec<[LabelId<DefaultLabelIdx>; 4]> = SmallVec::new();
+                for &label_id in transition.labels() {
+                    let payload = match self.label_payload(label_id) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let renamed: Vec<String> = payload
+                        .iter()
+                        .map(|s| rename.get(s).cloned().unwrap_or_else(|| s.clone()))
+                        .collect();
+                    let new_label_id = builder
+                        .labels()
+                        .intern(renamed.iter().map(|s| s.as_str()))?;
+                    if let Some(ctrl) = self.label_controllability(label_id) {
+                        builder.set_label_controllability(new_label_id, ctrl);
+                    }
+                    new_labels.push(new_label_id);
+                }
+                builder.transition_ids_with_modality(
+                    source_new,
+                    &new_labels,
+                    target_new,
+                    transition.modality().clone(),
+                );
+            }
+        }
+
+        // 3. Copy structured state valuations (display-only abstract values).
+        for state in self.states() {
+            if let (Some(&new_id), Some(valuation)) =
+                (state_mapping.get(&state), self.state_valuation(state))
+            {
+                builder.with_valuation_for_state(new_id, valuation.clone());
+            }
+        }
+
+        // 4. Copy 3-valued predicate labellings (the AP labels the
+        //    KleeneDomain evaluator reads on the composed product).
+        if let Some(map) = &self.state_3valued_predicates {
+            for ((state, predicate), verdict) in map {
+                if let Some(&new_id) = state_mapping.get(state) {
+                    builder.with_3valued_predicate(new_id, predicate.clone(), *verdict);
+                }
+            }
+        }
+
+        builder.build()
+    }
 }
 
 #[derive(Debug)]
@@ -2871,6 +2979,107 @@ mod tests {
             clts.state_3valued_predicate(clts.state_id("s0")?, "p"),
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relabel_renames_labels_preserving_modality_valuation_and_predicates() -> TestResult {
+        let mut builder = Clts::builder();
+        let s0 = builder.state_with_name("s0".to_string()).expect("s0");
+        let s1 = builder.state_with_name("s1".to_string()).expect("s1");
+        builder.initial_state_id(s0);
+
+        // A may-only edge labelled with the *port* name (the case R-MM
+        // exists for) plus a sharp self-loop on an untouched label.
+        let port = builder.labels().intern(["port_valid"]).expect("port label");
+        let tick = builder.labels().intern(["tick"]).expect("tick label");
+        builder.set_label_controllability(port, LabelControllability::Uncontrollable);
+        builder.transition_ids_with_modality(s0, &[port], s1, TransitionModality::MayOnly);
+        builder.transition_ids(s1, &[tick], s1); // Sharp self-loop
+
+        // Abstract metadata the composed property reads — must survive.
+        let mut valuation: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        valuation.insert("state".to_string(), "ACTIVE".to_string());
+        builder.with_valuation_for_state(s1, valuation);
+        builder.with_3valued_predicate(s1, "ready", Tristate::KleeneBot);
+
+        let clts = builder.build()?;
+
+        // Rename the port label to the connected-net name.
+        let mut rename: HashMap<String, String> = HashMap::new();
+        rename.insert("port_valid".to_string(), "net_3".to_string());
+        let renamed = clts.relabel(&rename)?;
+
+        // State space is unchanged; initial flag preserved.
+        assert_eq!(renamed.state_count(), clts.state_count());
+        assert!(!renamed.initial_states().is_empty());
+
+        // The port label is renamed; the untouched label is kept.
+        let alphabet = renamed.alphabet();
+        assert!(
+            alphabet.contains(&"net_3".to_string()),
+            "renamed label present"
+        );
+        assert!(
+            !alphabet.contains(&"port_valid".to_string()),
+            "old label gone"
+        );
+        assert!(
+            alphabet.contains(&"tick".to_string()),
+            "untouched label kept"
+        );
+
+        // Modality preserved: the renamed edge is still MayOnly — relabel
+        // must NOT fabricate a Sharp (must) witness.
+        let s0_new = renamed.state_id("s0")?;
+        let may_edge = renamed
+            .outgoing(s0_new)
+            .iter()
+            .find(|t| {
+                t.labels().iter().any(|&l| {
+                    renamed
+                        .label_payload(l)
+                        .is_some_and(|p| p.iter().any(|s| s == "net_3"))
+                })
+            })
+            .expect("renamed may-edge present");
+        assert_eq!(*may_edge.modality(), TransitionModality::MayOnly);
+
+        // Structured valuation + 3-valued predicate carried through.
+        let s1_new = renamed.state_id("s1")?;
+        assert_eq!(
+            renamed
+                .state_valuation(s1_new)
+                .and_then(|v| v.get("state"))
+                .map(|s| s.as_str()),
+            Some("ACTIVE")
+        );
+        assert_eq!(
+            renamed.state_3valued_predicate(s1_new, "ready"),
+            Some(Tristate::KleeneBot)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relabel_identity_map_is_structure_preserving() -> TestResult {
+        // An empty rename map leaves every label untouched — relabel is a
+        // faithful structural copy (the driver applies it per instance even
+        // when a module's ports already match net names).
+        let mut builder = Clts::builder();
+        let s0 = builder.state_with_name("s0".to_string()).expect("s0");
+        let s1 = builder.state_with_name("s1".to_string()).expect("s1");
+        builder.initial_state_id(s0);
+        let a = builder.labels().intern(["a"]).expect("a");
+        builder.transition_ids(s0, &[a], s1);
+
+        let clts = builder.build()?;
+        let copy = clts.relabel(&HashMap::new())?;
+
+        assert_eq!(copy.state_count(), clts.state_count());
+        assert_eq!(copy.alphabet(), clts.alphabet());
+        assert_eq!(copy.outgoing(copy.state_id("s0")?).len(), 1);
         Ok(())
     }
 
