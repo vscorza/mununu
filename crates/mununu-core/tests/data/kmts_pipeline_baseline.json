@@ -262,12 +262,12 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 3,
+      "state_count_sum": 6,
       "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "cwe1260_addr_overlap_bug",
-          "state_count": 3,
+          "state_count": 6,
           "property_count": 2
         }
       ],
@@ -318,12 +318,12 @@
     },
     "kmts": {
       "submodule_count": 1,
-      "state_count_sum": 3,
+      "state_count_sum": 6,
       "property_count_sum": 2,
       "per_submodule": [
         {
           "module_name": "cwe1262_csr_bypass_bug",
-          "state_count": 3,
+          "state_count": 6,
           "property_count": 2
         }
       ],
@@ -465,6 +465,62 @@
           "module_name": "handshake",
           "state_count": 4,
           "property_count": 0
+        }
+      ],
+      "error": null
+    },
+    "sva_gate": {
+      "passed": true,
+      "matches": [],
+      "error": null
+    }
+  },
+  {
+    "fixture": "joint_mutex_demo_bug.sv",
+    "top": null,
+    "native": {
+      "state_count": null,
+      "property_count": null,
+      "signal_count": null,
+      "error": "expected ';'"
+    },
+    "kmts": {
+      "submodule_count": 1,
+      "state_count_sum": 8,
+      "property_count_sum": 2,
+      "per_submodule": [
+        {
+          "module_name": "joint_mutex_demo_bug",
+          "state_count": 8,
+          "property_count": 2
+        }
+      ],
+      "error": null
+    },
+    "sva_gate": {
+      "passed": true,
+      "matches": [],
+      "error": null
+    }
+  },
+  {
+    "fixture": "joint_mutex_demo_fixed.sv",
+    "top": null,
+    "native": {
+      "state_count": null,
+      "property_count": null,
+      "signal_count": null,
+      "error": "expected ';'"
+    },
+    "kmts": {
+      "submodule_count": 1,
+      "state_count_sum": 6,
+      "property_count_sum": 2,
+      "per_submodule": [
+        {
+          "module_name": "joint_mutex_demo_fixed",
+          "state_count": 6,
+          "property_count": 2
         }
       ],
       "error": null

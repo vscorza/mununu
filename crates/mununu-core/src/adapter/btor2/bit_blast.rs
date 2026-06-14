@@ -1674,91 +1674,159 @@ fn enumerate_and_blast(
             combos
         }
     };
-    let init_state_set: std::collections::HashSet<usize> =
-        init_state_indices.iter().copied().collect();
-
-    // Build transitions by walking every (state, input) combination.
-    // Each transition carries one label per input signal (`signal_value`)
-    // — multi-label transitions, the natural CLTS encoding.
+    // State-splitting over property-referenced combinational signals
+    // (S-track KMTS-fidelity). Each register-state is split into one
+    // variant per JOINTLY-achievable assignment of the property-referenced
+    // combinational signals (over admissible inputs), so a joint property
+    // like `!(sel_a_T && sel_b_T)` reasons over the per-input joint
+    // (sel_a, sel_b) — which a per-signal ∃ labeling cannot express. With
+    // k=0 combinational signals the split is a no-op (one variant per
+    // register-state) — byte-identical to the register-only model.
     //
-    // SOUNDNESS (MIG-2, 2026-06-13): When the bit-blaster is given a
-    // sidecar that bounds a state cell tighter than its BTOR2 width
-    // allows, the design's next-state function may transition to a
-    // value outside the declared abstraction (e.g., `cnt + 1` overflows
-    // past `bound`, an `Ignored` cell leaves its pinned value). Such a
-    // transition is routed to the [`OOB_SINK_KEY`] sink (an absorbing
-    // state the evaluator masks out of every formula's satisfying set)
-    // rather than dropped. This is a sound **over-approximation**
-    // (escape ⇒ "anything could happen" ⇒ falsifies safety), matching
-    // the native `kripke.rs` OOB mechanism — and it is what makes the
-    // `Ignored` / `BoundedCounter` / `EnumValues` pinning soundly
-    // over-approximate (the `partition::classify` auto-COI relies on
-    // this). Previously these transitions were *dropped* (an
-    // under-approximation: unsound for safety) — see the git history of
-    // this block.
-    // F2 combinational-output support — property-referenced combinational
-    // signals (e.g. cwe1260's `overlap`, cwe1262's `bypass`) are labeled
-    // into the state valuations with their ∃-over-inputs achievable value,
-    // aggregated during the transition walk below.
+    // SOUNDNESS (MIG-2): a next-state outside the enumerated abstraction
+    // routes to the [`OOB_SINK_KEY`] sink (absorbing, evaluator-masked) —
+    // a sound over-approximation (escape ⇒ falsifies safety), matching
+    // native `kripke.rs`; previously such transitions were dropped (an
+    // unsound under-approximation).
     let comb_candidates = property_combinational_candidate_names(options);
-    let comb_nids = combinational_signal_nids(&comb_candidates, file, &state_meta, &input_meta);
+    let mut comb_nids = combinational_signal_nids(&comb_candidates, file, &state_meta, &input_meta);
+    // Cap the split factor at 2^COMB_SPLIT_CAP variants per register-state.
+    const COMB_SPLIT_CAP: usize = 8;
+    if comb_nids.len() > COMB_SPLIT_CAP {
+        warnings.push(AdapterWarning {
+            kind: WarningKind::ApproximateTranslation,
+            message: format!(
+                "{n} property-referenced combinational signals exceed the \
+                 state-splitting cap ({cap}); only the first {cap} are split \
+                 (joint) — joint/`_F_` properties over the excess may be \
+                 unsound. Reduce the property's combinational signal count.",
+                n = comb_nids.len(),
+                cap = COMB_SPLIT_CAP
+            ),
+            location: None,
+        });
+        comb_nids.truncate(COMB_SPLIT_CAP);
+    }
     let comb_signal_names: Vec<String> = comb_nids.iter().map(|(_, n)| n.clone()).collect();
-    let mut comb_true_per_state: Vec<std::collections::BTreeSet<String>> =
-        vec![std::collections::BTreeSet::new(); state_names.len()];
-
-    let mut transitions: Vec<TransitionSpec> = Vec::new();
+    let base_total = state_names.len();
     let mut oob_escapes: usize = 0;
-    for (state_idx, state_name) in state_names.iter().enumerate() {
+
+    // Pass 1 — per (register-state, input): admissibility, the joint
+    // combinational mask, and the next register-state (or OOB). One
+    // evaluate_pure per pair; results reused by Pass 2 (no re-eval).
+    struct StepInfo {
+        cv: u32,
+        target: Option<usize>,
+    }
+    let mut step: Vec<Vec<Option<StepInfo>>> = Vec::with_capacity(base_total);
+    let mut achievable: Vec<std::collections::BTreeSet<u32>> = Vec::with_capacity(base_total);
+    for base in 0..base_total {
+        let mut row: Vec<Option<StepInfo>> = Vec::with_capacity(total_input_combos);
+        let mut ach: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         for input_idx in 0..total_input_combos {
             let mut env = make_step_env(
                 &state_meta,
                 &input_meta,
                 &cells,
                 &input_cells,
-                state_idx,
+                base,
                 input_idx,
             );
             evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
-
-            // Evaluate every constraint — if any is false in (state, input)
-            // pair, skip this transition (assumption violated, environment
-            // would not produce this input).
             if !constraints_hold(file, &env)? {
+                row.push(None);
                 continue;
             }
+            let mut cv: u32 = 0;
+            for (j, (nid, _)) in comb_nids.iter().enumerate() {
+                if env.values.get(nid).is_some_and(|bv| bv.bits != 0) {
+                    cv |= 1u32 << j;
+                }
+            }
+            ach.insert(cv);
+            let mut next_env = env.clone();
+            apply_next(file, &mut next_env, &state_meta)?;
+            let target = encode_state(&next_env, &state_meta, &cells);
+            if target.is_none() {
+                oob_escapes += 1;
+            }
+            row.push(Some(StepInfo { cv, target }));
+        }
+        // Every register-state needs ≥1 variant (a base with no admissible
+        // input is still a valid transition target / deadlock state).
+        if ach.is_empty() {
+            ach.insert(0);
+        }
+        step.push(row);
+        achievable.push(ach);
+    }
 
-            // F2 — record which property-referenced combinational signals
-            // can be TRUE at this (admissible) state, for the ∃-priority
-            // valuation label.
-            if !comb_nids.is_empty() && state_idx < comb_true_per_state.len() {
-                for (nid, name) in &comb_nids {
-                    if env.values.get(nid).is_some_and(|bv| bv.bits != 0) {
-                        comb_true_per_state[state_idx].insert(name.clone());
+    // Split-state enumeration (base-major). For k=0, achievable[base]={0}
+    // → one variant per base → split_idx == base → names s0..s{n-1}
+    // (identical to the register-only model).
+    let mut split_of: Vec<std::collections::BTreeMap<u32, usize>> = (0..base_total)
+        .map(|_| std::collections::BTreeMap::new())
+        .collect();
+    let mut split_base: Vec<usize> = Vec::new();
+    let mut split_cv: Vec<u32> = Vec::new();
+    for (base, set) in achievable.iter().enumerate() {
+        for &cv in set {
+            let idx = split_base.len();
+            split_of[base].insert(cv, idx);
+            split_base.push(base);
+            split_cv.push(cv);
+        }
+    }
+    let split_total = split_base.len();
+    let split_names: Vec<String> = (0..split_total).map(|i| format!("s{i}")).collect();
+
+    // Initial split-states: each initial register-state splits into all of
+    // its achievable combinational variants (the initial combinational
+    // value is set by the initial input, which is free).
+    let init_split_set: std::collections::HashSet<usize> = init_state_indices
+        .iter()
+        .flat_map(|&base| achievable[base].iter().map(move |cv| (base, *cv)))
+        .filter_map(|(base, cv)| split_of[base].get(&cv).copied())
+        .collect();
+
+    // Pass 2 — transitions over split-states. From variant (base, cv) on
+    // an input `i` whose joint combinational mask equals `cv` (source
+    // consistency), go to register-state `base'` and fan out to EACH
+    // achievable variant of `base'` (the target's combinational value is
+    // set by the next cycle's free input). OOB targets route to the sink.
+    let mut transitions: Vec<TransitionSpec> = Vec::new();
+    for split_idx in 0..split_total {
+        let base = split_base[split_idx];
+        let cv = split_cv[split_idx];
+        for (input_idx, info_opt) in step[base].iter().enumerate() {
+            let Some(info) = info_opt else {
+                continue;
+            };
+            if info.cv != cv {
+                continue; // input inconsistent with this variant's comb value
+            }
+            let labels = signal_labels_for_input(input_idx, &input_meta, &input_cells);
+            match info.target {
+                None => transitions.push(TransitionSpec {
+                    source: split_names[split_idx].clone(),
+                    target: OOB_SINK_KEY.to_string(),
+                    labels,
+                    modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+                    additional_targets: Vec::new(),
+                }),
+                Some(tbase) => {
+                    for &cv2 in &achievable[tbase] {
+                        let tsplit = split_of[tbase][&cv2];
+                        transitions.push(TransitionSpec {
+                            source: split_names[split_idx].clone(),
+                            target: split_names[tsplit].clone(),
+                            labels: labels.clone(),
+                            modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
+                            additional_targets: Vec::new(),
+                        });
                     }
                 }
             }
-
-            // Compute next-state assignment. A next-state outside the
-            // enumerated abstraction routes to the OOB sink (sound
-            // over-approximation), not a dropped transition.
-            let mut next_env = env.clone();
-            apply_next(file, &mut next_env, &state_meta)?;
-            let target = match encode_state(&next_env, &state_meta, &cells) {
-                Some(next_state_idx) => state_names[next_state_idx].clone(),
-                None => {
-                    oob_escapes += 1;
-                    OOB_SINK_KEY.to_string()
-                }
-            };
-
-            transitions.push(TransitionSpec {
-                source: state_name.clone(),
-                target,
-                labels: signal_labels_for_input(input_idx, &input_meta, &input_cells),
-                modality: crate::context_dsl::ast::TransitionModalitySpec::Sharp,
-
-                additional_targets: Vec::new(),
-            });
         }
     }
     // If any transition escaped the abstraction, add the absorbing OOB
@@ -1835,21 +1903,23 @@ fn enumerate_and_blast(
         });
     }
 
-    let mut states_vec: Vec<StateSpec> = state_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
+    let k = comb_signal_names.len();
+    let mut states_vec: Vec<StateSpec> = (0..split_total)
+        .map(|i| {
+            let base = split_base[i];
+            let cv = split_cv[i];
+            let cv_bits: Vec<bool> = (0..k).map(|j| (cv >> j) & 1 == 1).collect();
             let vals = build_state_valuations(
-                i,
+                base,
                 &state_meta,
                 &cells,
                 &cell_domains,
                 &comb_signal_names,
-                &comb_true_per_state,
+                &cv_bits,
             );
             StateSpec {
-                name: n.clone(),
-                is_initial: init_state_set.contains(&i),
+                name: split_names[i].clone(),
+                is_initial: init_split_set.contains(&i),
                 valuations: if vals.is_empty() { None } else { Some(vals) },
             }
         })
@@ -2926,7 +2996,7 @@ fn build_state_valuations(
     cells: &CellEnumeration,
     cell_domains: &CellDomainMap,
     comb_signal_names: &[String],
-    comb_true_per_state: &[std::collections::BTreeSet<String>],
+    cv_bits: &[bool],
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     for (i, sm) in meta.iter().enumerate() {
@@ -2950,21 +3020,14 @@ fn build_state_valuations(
             .unwrap_or_else(|| v.to_string());
         out.insert(sm.symbol.clone(), display);
     }
-    // F2 combinational-output support — label each property-referenced
-    // combinational signal with its ∃-over-inputs achievable value at
-    // this state: `T` when some admissible input drives it true here,
-    // else `F`. This matches the native pipeline's safety verdict (its
-    // cross-product reaches the `sig=T` state-variant iff `sig` can be
-    // true at the register-state). `nu X.(!sig_T_state_V && [] X)`
-    // (no_overlap / no_bypass) then correctly fails iff a reachable
-    // state-V can have `sig` true. (∃-priority: a single valuation per
-    // signal; sound for safety. Both-polarity / liveness over a
-    // combinational variant would need per-value state-splitting — a
-    // documented follow-up.)
-    let comb_true = comb_true_per_state.get(combo);
-    for sig in comb_signal_names {
-        let can_be_true = comb_true.is_some_and(|s| s.contains(sig));
-        out.insert(sig.clone(), if can_be_true { "T" } else { "F" }.to_string());
+    // State-splitting: label each property-referenced combinational signal
+    // with THIS split-variant's value (`T`/`F`) from the joint assignment
+    // `cv_bits`. Because the variant is one jointly-achievable assignment
+    // (computed per input), a joint property `!(sig_a_T && sig_b_T)`
+    // resolves correctly — the per-signal ∃-priority limitation is gone.
+    for (j, sig) in comb_signal_names.iter().enumerate() {
+        let val = cv_bits.get(j).copied().unwrap_or(false);
+        out.insert(sig.clone(), if val { "T" } else { "F" }.to_string());
     }
     out
 }
@@ -6050,6 +6113,68 @@ mod tests {
         assert!(
             !cands.contains("state"),
             "should not extract `state`; got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn state_splitting_resolves_joint_mutex_unit() {
+        // Two named combinational signals that are MUTUALLY EXCLUSIVE per
+        // input: sa = a && !b, sb = !a && b. A joint mutex `!(sa_T && sb_T)`
+        // therefore HOLDS. Per-signal ∃-priority would wrongly flag it
+        // (sa can be T for a=1,b=0; sb for a=0,b=1) → false; full
+        // state-splitting over the JOINT (sa, sb) assignment resolves it
+        // correctly → true. Pure BTOR2 path (no yosys).
+        let src = r#"
+1 sort bitvec 1
+2 input 1 a
+3 input 1 b
+4 not 1 3
+5 and 1 2 4 sa
+6 not 1 2
+7 and 1 6 3 sb
+8 state 1 state
+9 zero 1
+10 init 1 8 9
+11 next 1 8 8
+"#;
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "signals": [
+                {"name": "state", "abstraction": "enum", "variants": ["S0", "S1"]},
+                {"name": "sa", "abstraction": "boolean", "combinational": true},
+                {"name": "sb", "abstraction": "boolean", "combinational": true}
+            ],
+            "properties": [
+                {"id": "no_both",
+                 "formula": "nu X. (!(sa_T_state_S0 && sb_T_state_S0) && !(sa_T_state_S1 && sb_T_state_S1) && [] X)"}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let out = translate(src, &opts).expect("translate");
+        let doc = crate::context_dsl::parse(&out.ctxdsl).expect("parse");
+        let realized = crate::context_dsl::realize_context(&doc, &[]).expect("realize");
+        let over = realized.context.clts_names().first().unwrap().clone();
+        let clts = realized.context.clts(&over).unwrap();
+        let env = realized.environment_for(&over);
+        let rf = realized.formulas.get("no_both").expect("no_both formula");
+        let result = realized
+            .context
+            .evaluate_mu(&over, &rf.formula, &env, None)
+            .expect("eval");
+        let inits: Vec<_> = clts.initial_states().iter().copied().collect();
+        assert!(!inits.is_empty(), "expected initial states");
+        let satisfied = inits
+            .iter()
+            .all(|s| result.get(s.index()).map(|b| *b).unwrap_or(false));
+        assert!(
+            satisfied,
+            "joint mutex must HOLD via state-splitting (sa, sb mutually \
+             exclusive); ∃-priority would give false.\nctxdsl:\n{}",
+            out.ctxdsl
         );
     }
 

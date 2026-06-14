@@ -1,0 +1,45 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "joint_mutex_demo_bug",
+  "source": "joint_mutex_demo_bug.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "BUSY_S"]
+    },
+    {
+      "name": "sel_a",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "assign sel_a = (addr >= 4) && (addr < 10)"
+    },
+    {
+      "name": "sel_b",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "assign sel_b = (addr >= 8) && (addr < 12)"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "addr",
+      "abstraction": "bit_blast"
+    },
+    {
+      "name": "req",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "no_double_sel",
+      "formula": "nu X. (!(sel_a_T_state_IDLE && sel_b_T_state_IDLE) && !(sel_a_T_state_BUSY_S && sel_b_T_state_BUSY_S) && [] X)",
+      "description": "JOINT mutex: sel_a and sel_b are never simultaneously high. Overlapping regions (addr in [8,10) drives both) → genuinely VIOLATED (false) under BOTH ∃-priority and state-splitting. The contrast to the fixed variant: state-splitting reports false here and true on the disjoint fixed variant (it is not trivially always-true)."
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)"
+    }
+  ]
+}

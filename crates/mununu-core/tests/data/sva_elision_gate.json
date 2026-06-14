@@ -84,6 +84,16 @@
     "matches": [],
     "error": null
   },
+  "joint_mutex_demo_bug.sv": {
+    "passed": true,
+    "matches": [],
+    "error": null
+  },
+  "joint_mutex_demo_fixed.sv": {
+    "passed": true,
+    "matches": [],
+    "error": null
+  },
   "multi_axilite_master.sv": {
     "passed": true,
     "matches": [],

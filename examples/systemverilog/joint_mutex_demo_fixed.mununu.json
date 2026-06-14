@@ -1,0 +1,45 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "joint_mutex_demo_fixed",
+  "source": "joint_mutex_demo_fixed.sv",
+  "signals": [
+    {
+      "name": "state",
+      "abstraction": "enum",
+      "variants": ["IDLE", "BUSY_S"]
+    },
+    {
+      "name": "sel_a",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "assign sel_a = (addr >= 4) && (addr < 8)"
+    },
+    {
+      "name": "sel_b",
+      "abstraction": "boolean",
+      "combinational": true,
+      "note": "assign sel_b = (addr >= 8) && (addr < 12)"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "addr",
+      "abstraction": "bit_blast"
+    },
+    {
+      "name": "req",
+      "abstraction": "boolean"
+    }
+  ],
+  "properties": [
+    {
+      "id": "no_double_sel",
+      "formula": "nu X. (!(sel_a_T_state_IDLE && sel_b_T_state_IDLE) && !(sel_a_T_state_BUSY_S && sel_b_T_state_BUSY_S) && [] X)",
+      "description": "JOINT mutex: sel_a and sel_b are never simultaneously high. Disjoint regions → HOLDS (true). The KMTS F2 ∃-priority labeling reports a SPURIOUS violation (false) because it tracks each select's can-be-high independently; full per-value state-splitting over the joint (sel_a, sel_b) assignment is required for the correct verdict. Consumer for the state-splitting follow-up."
+    },
+    {
+      "id": "safety",
+      "formula": "nu X. ([] X)"
+    }
+  ]
+}
