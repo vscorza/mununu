@@ -747,6 +747,138 @@ fn parse_port_directions_per_module(
     all
 }
 
+/// R-MM — Connectivity of one submodule instance inside the top module,
+/// with each port resolved to the connected net NAME.
+///
+/// The KMTS multi-module composition driver (R-MM-4) uses this to rename
+/// each instance's per-module port labels to the *parent net* names, so
+/// two instances sharing a net rendezvous under
+/// [`crate::composition::compose`] (whose synchronisation is name-equality
+/// on label payloads). Example from `producer_consumer_top`: the producer
+/// drives net `valid`, the buffer reads it as port `push`; both resolve to
+/// net `valid` here, so after relabelling they synchronise on `valid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceConnections {
+    /// Cell instance name in the parent (e.g. `u_producer`).
+    pub instance: String,
+    /// Instantiated submodule type (e.g. `producer`). May be a Yosys
+    /// `$paramod$…` mangled name for parameterised instances; the driver
+    /// resolves that to the source module.
+    pub module_type: String,
+    /// Port name on the instance → connected net name in the parent. Only
+    /// ports whose bit-vector resolves to a *named* net appear here;
+    /// constant-tied or sub-ranged ports are omitted (they do not
+    /// participate in net-name rendezvous).
+    pub port_to_net: std::collections::BTreeMap<String, String>,
+}
+
+/// R-MM — Parses the top module's instance connectivity from a Yosys
+/// hierarchy JSON snapshot (the `write_json` artifact captured *before*
+/// `flatten` in the per-module discovery pass), resolving every instance
+/// port to the connected net NAME via the top module's `netnames` table.
+///
+/// The top is `explicit_top` when given, else the module flagged
+/// `attributes.top`. Returns an empty Vec on parse failure / missing top
+/// — best-effort, mirroring [`enumerate_submodules`].
+pub fn parse_instance_connections(
+    hier_json: &str,
+    explicit_top: Option<&str>,
+) -> Vec<InstanceConnections> {
+    use std::collections::BTreeMap;
+
+    let root: serde_json::Value = match serde_json::from_str(hier_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let modules = match root.get("modules").and_then(|m| m.as_object()) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    // Resolve the top (explicit, else attributes.top ends with '1').
+    let auto_top: Option<String> = modules.iter().find_map(|(name, body)| {
+        let is_top = body
+            .get("attributes")
+            .and_then(|a| a.get("top"))
+            .map(|v| v.as_str().is_some_and(|s| s.ends_with('1')))
+            .unwrap_or(false);
+        if is_top { Some(name.clone()) } else { None }
+    });
+    let top_name = match explicit_top.map(str::to_string).or(auto_top) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let top = match modules.get(&top_name).and_then(|m| m.as_object()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    // Net-bits → net-name reverse map from the top's `netnames` table.
+    let mut bits_to_net: HashMap<Vec<String>, String> = HashMap::new();
+    if let Some(netnames) = top.get("netnames").and_then(|n| n.as_object()) {
+        for (net_name, info) in netnames {
+            if let Some(bits) = info.get("bits").and_then(|b| b.as_array()) {
+                let key = normalize_net_bits(bits);
+                if !key.is_empty() {
+                    // First writer wins (deterministic under preserve_order)
+                    // when a net carries multiple alias names.
+                    bits_to_net.entry(key).or_insert_with(|| net_name.clone());
+                }
+            }
+        }
+    }
+
+    // Walk each instance's port connections; resolve bits → net name.
+    let cells = match top.get("cells").and_then(|c| c.as_object()) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (instance, body) in cells {
+        let module_type = body
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut port_to_net: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(conns) = body.get("connections").and_then(|c| c.as_object()) {
+            for (port, bits_val) in conns {
+                if let Some(bits) = bits_val.as_array()
+                    && let Some(net) = bits_to_net.get(&normalize_net_bits(bits))
+                {
+                    port_to_net.insert(port.clone(), net.clone());
+                }
+            }
+        }
+        out.push(InstanceConnections {
+            instance: instance.clone(),
+            module_type,
+            port_to_net,
+        });
+    }
+    out.sort_by(|a, b| a.instance.cmp(&b.instance));
+    out
+}
+
+/// Normalises a Yosys JSON bit array — elements are net-id integers or
+/// constant strings (`"0"`/`"1"`/`"x"`/`"z"`) — to a canonical
+/// `Vec<String>` usable as a net-identity map key. The same normalisation
+/// is applied to `netnames` bits and cell-connection bits so they compare
+/// equal.
+fn normalize_net_bits(bits: &[serde_json::Value]) -> Vec<String> {
+    bits.iter()
+        .map(|b| {
+            if let Some(n) = b.as_i64() {
+                n.to_string()
+            } else if let Some(s) = b.as_str() {
+                s.to_string()
+            } else {
+                b.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Parse the yosys `write_json` output and extract any modules with the
 /// `(* blackbox *)` attribute as `BlackBoxInterface` records. Returns an
 /// empty Vec on parse failures — the sidecar emission is best-effort
@@ -1339,6 +1471,128 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    // ----- R-MM-3: top-module instance connectivity parsing ----------
+    //
+    // The embedded snapshot mirrors the real `write_json` output captured
+    // from `producer_consumer_top` (yosys `hierarchy -top … ; proc ;
+    // write_json`): three instances over a shared `valid` net (producer
+    // drives it, buffer reads it as `push`, consumer reads it as `valid`)
+    // plus broadcast `clk` / `rst`. The load-bearing assertion is that the
+    // parser identifies `u_producer.valid` and `u_buffer.push` as the SAME
+    // net (`valid`), which is what lets the driver make them rendezvous.
+    const HIER_JSON_PRODUCER_CONSUMER: &str = r#"{
+      "modules": {
+        "producer_consumer_top": {
+          "attributes": { "top": "00000000000000000000000000000001" },
+          "ports": {
+            "clk": { "direction": "input", "bits": [2] },
+            "rst": { "direction": "input", "bits": [3] },
+            "enable": { "direction": "input", "bits": [4] }
+          },
+          "cells": {
+            "u_producer": {
+              "type": "producer",
+              "connections": {
+                "clk": [2], "rst": [3], "enable": [4], "valid": [7]
+              }
+            },
+            "u_buffer": {
+              "type": "bounded_buffer",
+              "connections": {
+                "clk": [2], "rst": [3], "push": [7], "pop": [6], "full": [5]
+              }
+            },
+            "u_consumer": {
+              "type": "consumer",
+              "connections": { "clk": [2], "rst": [3], "valid": [7] }
+            }
+          },
+          "netnames": {
+            "clk": { "bits": [2] },
+            "rst": { "bits": [3] },
+            "enable": { "bits": [4] },
+            "full": { "bits": [5] },
+            "pop_sig": { "bits": [6] },
+            "valid": { "bits": [7] }
+          }
+        },
+        "producer": { "ports": { "valid": { "direction": "output", "bits": [2] } } }
+      }
+    }"#;
+
+    #[test]
+    fn parse_instance_connections_resolves_shared_net() {
+        let conns = parse_instance_connections(HIER_JSON_PRODUCER_CONSUMER, None);
+        // Three instances, sorted by instance name.
+        let names: Vec<&str> = conns.iter().map(|c| c.instance.as_str()).collect();
+        assert_eq!(names, vec!["u_buffer", "u_consumer", "u_producer"]);
+
+        let by_name = |n: &str| conns.iter().find(|c| c.instance == n).unwrap();
+
+        let producer = by_name("u_producer");
+        assert_eq!(producer.module_type, "producer");
+        assert_eq!(
+            producer.port_to_net.get("valid").map(|s| s.as_str()),
+            Some("valid")
+        );
+        assert_eq!(
+            producer.port_to_net.get("clk").map(|s| s.as_str()),
+            Some("clk")
+        );
+        assert_eq!(
+            producer.port_to_net.get("enable").map(|s| s.as_str()),
+            Some("enable")
+        );
+
+        let buffer = by_name("u_buffer");
+        assert_eq!(buffer.module_type, "bounded_buffer");
+        // The crux: the buffer's `push` port and the producer's `valid`
+        // port both resolve to net `valid` → they will rendezvous.
+        assert_eq!(
+            buffer.port_to_net.get("push").map(|s| s.as_str()),
+            Some("valid")
+        );
+        assert_eq!(
+            buffer.port_to_net.get("pop").map(|s| s.as_str()),
+            Some("pop_sig")
+        );
+        assert_eq!(
+            buffer.port_to_net.get("full").map(|s| s.as_str()),
+            Some("full")
+        );
+
+        let consumer = by_name("u_consumer");
+        assert_eq!(consumer.module_type, "consumer");
+        assert_eq!(
+            consumer.port_to_net.get("valid").map(|s| s.as_str()),
+            Some("valid")
+        );
+
+        // Broadcast nets resolve identically across instances → the driver
+        // synchronises clk/rst across all three.
+        assert_eq!(
+            producer.port_to_net.get("clk"),
+            buffer.port_to_net.get("clk")
+        );
+        assert_eq!(
+            buffer.port_to_net.get("clk"),
+            consumer.port_to_net.get("clk")
+        );
+    }
+
+    #[test]
+    fn parse_instance_connections_handles_missing_top_and_garbage() {
+        // No top flag, no explicit top → empty (best-effort).
+        assert!(parse_instance_connections(r#"{"modules":{"m":{}}}"#, None).is_empty());
+        // Unparseable JSON → empty, never panics.
+        assert!(parse_instance_connections("not json", Some("top")).is_empty());
+        // Explicit top with no cells → empty instance list.
+        assert!(
+            parse_instance_connections(r#"{"modules":{"top":{"netnames":{}}}}"#, Some("top"))
+                .is_empty()
+        );
     }
 
     // ----- R-Y1 (§Phase 8): setundef 3-way precedence ----------------
