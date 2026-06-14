@@ -1696,6 +1696,16 @@ fn enumerate_and_blast(
     // this). Previously these transitions were *dropped* (an
     // under-approximation: unsound for safety) — see the git history of
     // this block.
+    // F2 combinational-output support — property-referenced combinational
+    // signals (e.g. cwe1260's `overlap`, cwe1262's `bypass`) are labeled
+    // into the state valuations with their ∃-over-inputs achievable value,
+    // aggregated during the transition walk below.
+    let comb_candidates = property_combinational_candidate_names(options);
+    let comb_nids = combinational_signal_nids(&comb_candidates, file, &state_meta, &input_meta);
+    let comb_signal_names: Vec<String> = comb_nids.iter().map(|(_, n)| n.clone()).collect();
+    let mut comb_true_per_state: Vec<std::collections::BTreeSet<String>> =
+        vec![std::collections::BTreeSet::new(); state_names.len()];
+
     let mut transitions: Vec<TransitionSpec> = Vec::new();
     let mut oob_escapes: usize = 0;
     for (state_idx, state_name) in state_names.iter().enumerate() {
@@ -1715,6 +1725,17 @@ fn enumerate_and_blast(
             // would not produce this input).
             if !constraints_hold(file, &env)? {
                 continue;
+            }
+
+            // F2 — record which property-referenced combinational signals
+            // can be TRUE at this (admissible) state, for the ∃-priority
+            // valuation label.
+            if !comb_nids.is_empty() && state_idx < comb_true_per_state.len() {
+                for (nid, name) in &comb_nids {
+                    if env.values.get(nid).is_some_and(|bv| bv.bits != 0) {
+                        comb_true_per_state[state_idx].insert(name.clone());
+                    }
+                }
             }
 
             // Compute next-state assignment. A next-state outside the
@@ -1818,7 +1839,14 @@ fn enumerate_and_blast(
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let vals = build_state_valuations(i, &state_meta, &cells, &cell_domains);
+            let vals = build_state_valuations(
+                i,
+                &state_meta,
+                &cells,
+                &cell_domains,
+                &comb_signal_names,
+                &comb_true_per_state,
+            );
             StateSpec {
                 name: n.clone(),
                 is_initial: init_state_set.contains(&i),
@@ -2770,11 +2798,135 @@ fn enumerate_state_names(total: usize) -> Vec<String> {
 /// on-demand expression-evaluation path: `predicate_bits("state == 0")`
 /// → parse as a guard → evaluate against valuations across all states →
 /// return a bitset.
+/// F2.1 (S-track KMTS-fidelity, 2026-06-14) — inverse of
+/// [`CellEnumeration::values_for_field_domain`]'s value assignment: map a
+/// concrete enum value back to its variant NAME. A variant's value is its
+/// `value_map` entry, or — when unmapped (increment A default-by-index) —
+/// its declaration index. `None` for non-`EnumValues` cells or values
+/// with no matching variant.
+///
+/// Emitting the variant NAME (`state = ADDR_WAIT`) instead of the raw
+/// integer (`state = 1`) is what lets a compound predicate
+/// `bvalid_r_T_state_ADDR_WAIT` resolve against the valuation via
+/// [`crate::context_dsl::state_matching`]'s compound matcher — restoring
+/// the binding the native pipeline carries in its cross-product state
+/// names. Crucially this works even when the sidecar has NO `value_map`
+/// (variants-only, e.g. axilite/cwe1260/cwe1262): default-by-index gives
+/// `state = 1 → ADDR_WAIT`.
+fn variant_name_for_value(
+    fd: &crate::adapter::domain::FieldDomain,
+    vm: &[(String, i64)],
+    width: u32,
+    v: u128,
+) -> Option<String> {
+    use crate::adapter::domain::{AbstractValue, AbstractionType};
+    if fd.abstraction != AbstractionType::EnumValues {
+        return None;
+    }
+    let mask = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
+    fd.values().iter().enumerate().find_map(|(idx, av)| {
+        let AbstractValue::Variant(name) = av else {
+            return None;
+        };
+        let assigned = vm
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, val)| (*val as u128) & mask)
+            .unwrap_or((idx as u128) & mask);
+        (assigned == v).then(|| name.clone())
+    })
+}
+
+/// F2 combinational-output support (S-track KMTS-fidelity, 2026-06-14) —
+/// candidate combinational-signal names referenced by sidecar property
+/// formulas. A compound predicate `<sig>_T_state_VARIANT` (or `_F_`)
+/// names a boolean signal `<sig>` whose value the property cares about;
+/// we collect the `<sig>` prefixes so the bit-blaster can label states
+/// with their achievable values. Registers and inputs among them are
+/// filtered out by the caller — only genuine combinational nodes (e.g.
+/// cwe1260's `overlap = uart_sel && aes_sel`, cwe1262's `bypass`) get
+/// labeled. Returns the prefix before the first `_T_` / `_F_` marker of
+/// each property-formula token that contains one.
+fn property_combinational_candidate_names(
+    options: &AdapterOptions,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some(json) = &options.sidecar_json else {
+        return out;
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return out;
+    };
+    for prop in &ann.properties {
+        let Some(f) = &prop.formula else {
+            continue;
+        };
+        for token in f.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let idx = match (token.find("_T_"), token.find("_F_")) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(i) = idx
+                && i > 0
+            {
+                out.insert(token[..i].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// F2 combinational-output support — resolve the BTOR2 node NIDs for the
+/// property-referenced combinational signals: a candidate name that maps
+/// to a symbol on a node that is NOT a state cell and NOT an input (i.e.
+/// a genuine combinational signal that survives the no-`opt` Yosys script
+/// as a named node). These are labeled into the state valuations with
+/// their ∃-over-inputs achievable value (see the transition loop's
+/// aggregation + [`build_state_valuations`]).
+fn combinational_signal_nids(
+    candidates: &std::collections::HashSet<String>,
+    file: &Btor2File,
+    state_meta: &[StateMeta],
+    input_meta: &[InputMeta],
+) -> Vec<(Nid, String)> {
+    // Combinational signals carry their name on an `Op` line (Yosys emits
+    // `<nid> uext 1 <src> 0 <name>` for a 1-bit `assign` output). They are
+    // NOT in `collect_symbols` (whose Pass 2 traces such aliases back to
+    // *state* cells, not the Op node itself), so scan the BTOR2 directly.
+    let state_nids: std::collections::HashSet<Nid> = state_meta.iter().map(|s| s.nid).collect();
+    let input_nids: std::collections::HashSet<Nid> = input_meta.iter().map(|i| i.nid).collect();
+    let mut out: Vec<(Nid, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in &file.lines {
+        if let Node::Op {
+            symbol: Some(name), ..
+        } = &line.node
+            && candidates.contains(name.as_str())
+            && !state_nids.contains(&line.nid)
+            && !input_nids.contains(&line.nid)
+            && seen.insert(name.clone())
+        {
+            out.push((line.nid, name.clone()));
+        }
+    }
+    out
+}
+
 fn build_state_valuations(
     combo: usize,
     meta: &[StateMeta],
     cells: &CellEnumeration,
     cell_domains: &CellDomainMap,
+    comb_signal_names: &[String],
+    comb_true_per_state: &[std::collections::BTreeSet<String>],
 ) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     for (i, sm) in meta.iter().enumerate() {
@@ -2786,19 +2938,33 @@ fn build_state_valuations(
             continue;
         }
         let v = cells.value_at(combo, i);
-        // For enum/discover cells, prefer the variant name from the
-        // value-name map (matched by integer value); otherwise display
-        // the raw integer. The on-demand expression evaluator parses
-        // both forms (`state == 0` works for either).
+        // For enum/discover cells, emit the variant NAME (matched by value
+        // via `value_map` OR increment-A default-by-index — see
+        // `variant_name_for_value`); otherwise the raw integer. The named
+        // form lets a compound `state == VARIANT` predicate resolve
+        // definitely (F2.1), matching native. (Was: value_map-only lookup,
+        // which fell back to the raw integer when the map was absent.)
         let display = cell_domains
             .get(&sm.nid)
-            .and_then(|(_, vm)| {
-                vm.iter()
-                    .find(|(_, val)| (*val as u128) == v)
-                    .map(|(n, _)| n.clone())
-            })
+            .and_then(|(fd, vm)| variant_name_for_value(fd, vm, sm.width, v))
             .unwrap_or_else(|| v.to_string());
         out.insert(sm.symbol.clone(), display);
+    }
+    // F2 combinational-output support — label each property-referenced
+    // combinational signal with its ∃-over-inputs achievable value at
+    // this state: `T` when some admissible input drives it true here,
+    // else `F`. This matches the native pipeline's safety verdict (its
+    // cross-product reaches the `sig=T` state-variant iff `sig` can be
+    // true at the register-state). `nu X.(!sig_T_state_V && [] X)`
+    // (no_overlap / no_bypass) then correctly fails iff a reachable
+    // state-V can have `sig` true. (∃-priority: a single valuation per
+    // signal; sound for safety. Both-polarity / liveness over a
+    // combinational variant would need per-value state-splitting — a
+    // documented follow-up.)
+    let comb_true = comb_true_per_state.get(combo);
+    for sig in comb_signal_names {
+        let can_be_true = comb_true.is_some_and(|s| s.contains(sig));
+        out.insert(sig.clone(), if can_be_true { "T" } else { "F" }.to_string());
     }
     out
 }
@@ -5849,6 +6015,41 @@ mod tests {
             out.ctxdsl.contains("enable_0") || out.ctxdsl.contains("enable_1"),
             "non-reset input `enable` must remain a free label; got:\n{}",
             out.ctxdsl
+        );
+    }
+
+    // ---- F2 (S-track KMTS-fidelity) — combinational-output support ----
+
+    #[test]
+    fn f2_property_combinational_candidate_names_extracts_signal() {
+        // A `<sig>_T_state_VARIANT` compound predicate names the boolean
+        // signal `<sig>`; the extractor returns the prefix before `_T_`.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "test",
+            "properties": [
+                {"id": "no_overlap",
+                 "formula": "nu X. (!overlap_T_state_IDLE && !overlap_T_state_AES_ACCESS && [] X)"},
+                {"id": "no_bypass",
+                 "formula": "nu X. (!bypass_T_state_GRANTED && [] X)"}
+            ]
+        });
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let cands = property_combinational_candidate_names(&opts);
+        assert!(
+            cands.contains("overlap"),
+            "expected `overlap`; got {cands:?}"
+        );
+        assert!(cands.contains("bypass"), "expected `bypass`; got {cands:?}");
+        // `state` is the SECOND signal in the compound; it is NOT a `_T_`
+        // prefix, so it is not extracted here (and is a register anyway,
+        // filtered by combinational_signal_nids).
+        assert!(
+            !cands.contains("state"),
+            "should not extract `state`; got {cands:?}"
         );
     }
 

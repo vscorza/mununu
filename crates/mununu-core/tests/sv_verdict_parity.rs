@@ -12,14 +12,21 @@
 //! load-bearing gate the native-parser deletion depends on: deletion is
 //! safe ONLY when the baseline's `mismatch=` count is 0.
 //!
-//! **Current state: the gate is RED** — the two pipelines produce
-//! materially different verdicts (mismatches in BOTH directions ⇒
-//! genuinely different abstractions, not a uniform over-approximation),
-//! so the native-parser deletion is BLOCKED pending root-cause +
-//! reconciliation of the divergence.
+//! **Current state: the gate is GREEN (mismatch=0)** — native and KMTS
+//! AGREE on all comparable verdicts, so the native-parser deletion is
+//! unblocked by THIS gate. Reaching it took the S-track KMTS-fidelity
+//! arc: escape-convention alignment (counter→OOB + enum→catch-all;
+//! commit 51a5d13), F1 async-reset modeling (reset is init-only, not a
+//! free runtime recovery edge; bb778c3), and F2 predicate resolution
+//! (compound-pair matching of `signal_T_state_VARIANT`, variant-named
+//! valuations, and ∃-priority labeling of property-referenced
+//! combinational outputs). See
+//! `.claude/plans/measurements/F{1,2}-*.md`. (Deletion still depends on
+//! the separate SVA-elision gate + fixture migration per §S.2a/S.2b —
+//! this gate certifies verdict parity only.)
 //!
 //! Design (a baseline-recorded report, not a hard pass/fail on
-//! mismatch — the RED state is real and recorded honestly, like
+//! mismatch — recorded honestly against the committed baseline, like
 //! `kmts_pipeline_baseline.json`):
 //! - Only SIDECAR-property fixtures are comparable. Inline `@mununu`
 //!   annotation properties produce 0 properties on the KMTS arm (Yosys
@@ -230,11 +237,12 @@ fn kmts_and_native_pipelines_agree_on_verdicts() {
     );
 
     // Drift detection against the recorded baseline. The baseline
-    // captures the CURRENT parity state (RED today — the two pipelines
-    // produce materially different verdicts, so the native-parser
-    // deletion is gated). Regenerate with MUNUNU_VERDICT_PARITY_UPDATE=1
-    // when the parity legitimately changes; a diff here flags an
-    // unexpected verdict drift on either pipeline.
+    // captures the CURRENT parity state (GREEN — mismatch=0; native and
+    // KMTS agree on every comparable verdict). Regenerate with
+    // MUNUNU_VERDICT_PARITY_UPDATE=1 when the parity legitimately changes;
+    // a diff here flags an unexpected verdict drift on either pipeline —
+    // in particular a regression BACK to mismatch>0 must be investigated,
+    // not blindly re-baselined.
     let expected = std::fs::read_to_string(&baseline_path).unwrap_or_default();
     assert_eq!(
         report.trim(),

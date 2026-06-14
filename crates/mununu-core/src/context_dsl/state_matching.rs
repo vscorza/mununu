@@ -87,16 +87,30 @@ impl StateNameMatcher {
         }
     }
 
-    /// Attempts structured matching: tries to parse the predicate pattern as
-    /// `variable_value` and checks against the structured valuation data on each state.
+    /// Attempts structured matching: parses the predicate pattern as a
+    /// **conjunction** of `variable_value` pairs and checks it against the
+    /// structured valuation data on each state.
     ///
-    /// Returns `None` if the pattern cannot be interpreted as a variable-value pair
-    /// (no state has a valuation matching any split of the pattern).
+    /// Single pair (`fill_3` → `fill == 3`, `data_out_r_IDLE` →
+    /// `data_out_r == IDLE`) is the common case. **Compound** patterns —
+    /// `signal_T_state_VARIANT` → `signal == T ∧ state == VARIANT` — arise
+    /// when the cross-product predicate names from the native pipeline are
+    /// evaluated against the KMTS bit-blaster's per-cell valuations (which
+    /// store each signal separately, unlike native's combined state
+    /// names). The old single-pair parse turned
+    /// `bvalid_r_T_state_ADDR_WAIT` into `bvalid_r == "T_state_ADDR_WAIT"`
+    /// (never matched) → the predicate resolved to false → safety formulas
+    /// became vacuous totality. (F2, S-track KMTS-fidelity 2026-06-14.)
+    ///
+    /// Returns `None` if the pattern is not a conjunction of known-variable
+    /// assignments (the caller then falls back to string-name matching —
+    /// the native cross-product-state-name path, which is unaffected
+    /// because its valuations carry only the non-name-encoded variables).
     fn create_bitset_from_valuations(
         clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
         pattern: &str,
     ) -> Option<BitVec<usize, Lsb0>> {
-        // Collect all variable names from valuations to find valid splits
+        // Collect all variable names from valuations to find valid splits.
         let mut known_vars: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for state_id in clts.states() {
             if let Some(valuation) = clts.state_valuation(state_id) {
@@ -105,50 +119,175 @@ impl StateNameMatcher {
                 }
             }
         }
-
         if known_vars.is_empty() {
             return None;
         }
 
-        // Try to split the pattern into (variable_name, value) using known variables.
-        // For a pattern like "fill_3", try "fill" + "3".
-        // For a pattern like "data_out_r_IDLE", try "data_out_r" + "IDLE".
-        // We try all possible splits and check if the variable name is known.
-        let mut matched_var = None;
-        let mut matched_val = None;
-
-        for (i, _) in pattern.char_indices() {
-            if i == 0 {
-                continue;
-            }
-            if pattern.as_bytes().get(i.wrapping_sub(1)) == Some(&b'_') {
-                let (var_candidate, val_with_underscore) = pattern.split_at(i);
-                let var_candidate = var_candidate.trim_end_matches('_');
-                if known_vars.contains(var_candidate) {
-                    // Found a valid split
-                    matched_var = Some(var_candidate);
-                    matched_val = Some(val_with_underscore);
-                    // Keep searching for longer variable names (prefer longest match)
-                }
-            }
-        }
-
-        let var_name = matched_var?;
-        let var_value = matched_val?;
+        let pairs = Self::split_compound_pairs(pattern, &known_vars)?;
 
         let mut bits = BitVec::repeat(false, clts.state_count());
         let mut any_match = false;
-
         for state_id in clts.states() {
-            if let Some(valuation) = clts.state_valuation(state_id)
-                && let Some(state_val) = valuation.get(var_name)
-                && state_val == var_value
-            {
+            let Some(valuation) = clts.state_valuation(state_id) else {
+                continue;
+            };
+            let all_match = pairs.iter().all(|(var, value)| {
+                valuation
+                    .get(*var)
+                    .map(|sv| Self::value_matches(sv, value))
+                    .unwrap_or(false)
+            });
+            if all_match {
                 bits.set(state_id.index(), true);
                 any_match = true;
             }
         }
 
         if any_match { Some(bits) } else { None }
+    }
+
+    /// Match a state's valuation string against a pattern value, with
+    /// boolean normalization: the native cross-product naming uses `T` / `F`
+    /// for boolean-true / -false, while the KMTS valuations store `1` / `0`.
+    fn value_matches(state_val: &str, pattern_val: &str) -> bool {
+        if state_val == pattern_val {
+            return true;
+        }
+        match pattern_val {
+            "T" => state_val == "1" || state_val.eq_ignore_ascii_case("true"),
+            "F" => state_val == "0" || state_val.eq_ignore_ascii_case("false"),
+            _ => false,
+        }
+    }
+
+    /// Parse `pattern` as a sequence of `<known_var>_<value>` segments,
+    /// where each value runs until the next `_<known_var>_` boundary (the
+    /// last value runs to the end). Returns the `(var, value)` pairs, or
+    /// `None` when the pattern does not start with a known variable (the
+    /// native state-name case — falls back to string matching).
+    ///
+    /// Greedy longest-known-var match at each position. For
+    /// `bvalid_r_T_state_ADDR_WAIT` with known vars `{bvalid_r, state}`:
+    /// `[(bvalid_r, "T"), (state, "ADDR_WAIT")]`.
+    fn split_compound_pairs<'a>(
+        pattern: &'a str,
+        known_vars: &std::collections::HashSet<&str>,
+    ) -> Option<Vec<(&'a str, &'a str)>> {
+        let bytes = pattern.as_bytes();
+        // Longest known var that prefixes `pattern[pos..]` immediately
+        // followed by a `_`.
+        let var_at = |pos: usize| -> Option<&'a str> {
+            let mut chosen: Option<&str> = None;
+            for &kv in known_vars {
+                if pattern[pos..].starts_with(kv)
+                    && bytes.get(pos + kv.len()) == Some(&b'_')
+                    && chosen.is_none_or(|c| kv.len() > c.len())
+                {
+                    chosen = Some(kv);
+                }
+            }
+            chosen.map(|kv| &pattern[pos..pos + kv.len()])
+        };
+
+        let mut pairs = Vec::new();
+        let mut pos = 0;
+        while pos < pattern.len() {
+            let var = var_at(pos)?;
+            let val_start = pos + var.len() + 1; // skip "var_"
+            // Find the next `_<known_var>_` boundary at/after val_start.
+            let mut val_end = pattern.len();
+            let mut scan = val_start;
+            while scan < pattern.len() {
+                if bytes[scan] == b'_' && var_at(scan + 1).is_some() {
+                    val_end = scan;
+                    break;
+                }
+                scan += 1;
+            }
+            pairs.push((var, &pattern[val_start..val_end]));
+            pos = if val_end < pattern.len() {
+                val_end + 1
+            } else {
+                pattern.len()
+            };
+        }
+
+        if pairs.is_empty() { None } else { Some(pairs) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn kv(names: &[&str]) -> HashSet<&'static str> {
+        // Leak to get 'static &str for the test's known-var set.
+        names
+            .iter()
+            .map(|n| Box::leak(n.to_string().into_boxed_str()) as &'static str)
+            .collect()
+    }
+
+    #[test]
+    fn f2_split_single_pair() {
+        // `fill_3` → fill == 3 (the common single-pair case).
+        let pairs = StateNameMatcher::split_compound_pairs("fill_3", &kv(&["fill"])).unwrap();
+        assert_eq!(pairs, vec![("fill", "3")]);
+    }
+
+    #[test]
+    fn f2_split_single_pair_variant_value_with_underscore() {
+        // `data_out_r_IDLE` → data_out_r == IDLE (value has no further var).
+        let pairs = StateNameMatcher::split_compound_pairs("data_out_r_IDLE", &kv(&["data_out_r"]))
+            .unwrap();
+        assert_eq!(pairs, vec![("data_out_r", "IDLE")]);
+    }
+
+    #[test]
+    fn f2_split_compound_two_pairs() {
+        // The F2 case: bvalid_r_T_state_ADDR_WAIT →
+        // [(bvalid_r, "T"), (state, "ADDR_WAIT")].
+        let pairs = StateNameMatcher::split_compound_pairs(
+            "bvalid_r_T_state_ADDR_WAIT",
+            &kv(&["bvalid_r", "state"]),
+        )
+        .unwrap();
+        assert_eq!(pairs, vec![("bvalid_r", "T"), ("state", "ADDR_WAIT")]);
+    }
+
+    #[test]
+    fn f2_split_combinational_two_pairs() {
+        // cwe1260: overlap_T_state_IDLE (overlap is a labeled combinational
+        // signal) → [(overlap, "T"), (state, "IDLE")].
+        let pairs = StateNameMatcher::split_compound_pairs(
+            "overlap_T_state_IDLE",
+            &kv(&["overlap", "state"]),
+        )
+        .unwrap();
+        assert_eq!(pairs, vec![("overlap", "T"), ("state", "IDLE")]);
+    }
+
+    #[test]
+    fn f2_split_native_state_name_returns_none() {
+        // Native carries only `state` in valuations (bvalid_r is in the
+        // state NAME). The compound parse finds no leading known-var →
+        // None → caller falls back to string-name matching (unchanged).
+        assert!(
+            StateNameMatcher::split_compound_pairs("bvalid_r_T_state_ADDR_WAIT", &kv(&["state"]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn f2_value_matches_boolean_normalization() {
+        // T/F ↔ 1/0 normalization for boolean valuations.
+        assert!(StateNameMatcher::value_matches("1", "T"));
+        assert!(StateNameMatcher::value_matches("0", "F"));
+        assert!(StateNameMatcher::value_matches("true", "T"));
+        assert!(StateNameMatcher::value_matches("false", "F"));
+        assert!(StateNameMatcher::value_matches("ADDR_WAIT", "ADDR_WAIT"));
+        assert!(!StateNameMatcher::value_matches("0", "T"));
+        assert!(!StateNameMatcher::value_matches("IDLE", "ADDR_WAIT"));
     }
 }
