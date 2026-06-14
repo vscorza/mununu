@@ -26,7 +26,11 @@
 //! Modality (may/must), structured valuations, and 3-valued predicates are
 //! preserved (the composed property reads them).
 
+use super::YosysOptions;
+use crate::adapter::{AdapterError, AdapterErrorKind, AdapterOptions};
 use crate::clts::{Clts, CltsResult, DefaultLabelIdx, DefaultStateIdx, LabelId, StateId};
+use crate::composition::{CompositionOptions, CompositionSemantics, compose};
+use crate::controllability::BoundaryDirection;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
@@ -121,12 +125,21 @@ pub fn prepare_instance_for_composition(
         }
     }
 
-    // 3. Copy structured valuations + 3-valued predicates verbatim.
+    // 3. Copy structured valuations + 3-valued predicates, instance-qualifying
+    //    each KEY with `<instance>__` so the composed product references each
+    //    module's signals unambiguously — two instances commonly share a
+    //    register name (`state`), and the compose merge (R-MM-2) would
+    //    otherwise collide them. A composed property names a signal as
+    //    `<instance>__<signal>`.
     for state in clts.states() {
         if let (Some(&new_id), Some(valuation)) =
             (state_mapping.get(&state), clts.state_valuation(state))
         {
-            builder.with_valuation_for_state(new_id, valuation.clone());
+            let qualified: std::collections::BTreeMap<String, String> = valuation
+                .iter()
+                .map(|(k, v)| (format!("{instance}__{k}"), v.clone()))
+                .collect();
+            builder.with_valuation_for_state(new_id, qualified);
         }
     }
     for (state, predicate, verdict) in clts
@@ -139,7 +152,7 @@ pub fn prepare_instance_for_composition(
         .collect::<Vec<_>>()
     {
         if let Some(&new_id) = state_mapping.get(&state) {
-            builder.with_3valued_predicate(new_id, predicate, verdict);
+            builder.with_3valued_predicate(new_id, format!("{instance}__{predicate}"), verdict);
         }
     }
 
@@ -213,6 +226,138 @@ fn normalize_driver_value(raw: &str) -> String {
         "F" => "0".to_string(),
         other => other.to_string(),
     }
+}
+
+/// R-MM-4d — the composed KMTS for a multi-module SV design.
+pub struct MultiModuleComposition {
+    /// The composed product KMTS, ready for property evaluation.
+    pub composed: Clts<DefaultStateIdx, DefaultLabelIdx>,
+    /// Instance names folded into the product, in fold order.
+    pub instances: Vec<String>,
+}
+
+/// R-MM-4d — Compose a multi-module SystemVerilog design into one KMTS.
+///
+/// Pipeline: yosys per-module BTOR2 with net-driving outputs surfaced +
+/// top-netlist connectivity + port directions
+/// ([`super::translate_sv_per_module_with_connectivity`]) → realise each
+/// module *type*'s CTXDSL into a `Clts` (inline valuations carry the
+/// surfaced output values) → rewrite each *instance* for composition
+/// ([`prepare_instance_for_composition`], classifying each connected port as
+/// a reader input or driver output by direction) → synchronously
+/// fold-compose the instances ([`crate::composition::compose`]). The result
+/// is one product KMTS where shared nets rendezvous on `<net>_<v>`.
+///
+/// Instance types not lifted (black-box / unsupported) are skipped — the
+/// composition simply omits them (sound: fewer constraints, more behaviour).
+pub fn compose_sv_multi_module(
+    content: &str,
+    options: &AdapterOptions,
+    yopts: &YosysOptions,
+) -> Result<MultiModuleComposition, AdapterError> {
+    let (outputs, connectivity, directions) =
+        super::translate_sv_per_module_with_connectivity(content, options, yopts)?;
+    if connectivity.is_empty() {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: "adapter/yosys multi-module: no instance connectivity in the top netlist \
+                      (single-module design? use translate_sv)"
+                .into(),
+            location: None,
+        });
+    }
+
+    // Realise each module type's CTXDSL into a Clts once (cache by type).
+    let mut clts_by_type: HashMap<String, Clts<DefaultStateIdx, DefaultLabelIdx>> = HashMap::new();
+    for out in &outputs {
+        let clts = realize_module_clts(&out.output.ctxdsl).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/yosys multi-module: realising module '{}' failed: {e}",
+                out.module_name
+            ),
+            location: None,
+        })?;
+        clts_by_type.insert(out.module_name.clone(), clts);
+    }
+
+    // Rewrite each instance for composition (relabel readers + driver labels).
+    let mut prepared: Vec<(String, Clts<DefaultStateIdx, DefaultLabelIdx>)> = Vec::new();
+    for inst in &connectivity {
+        let Some(base) = clts_by_type.get(&inst.module_type) else {
+            continue; // type not lifted (black-box / unsupported) — skip
+        };
+        let dirs = directions.get(&inst.module_type);
+        let mut readers: HashMap<String, String> = HashMap::new();
+        let mut drivers: HashMap<String, String> = HashMap::new();
+        for (port, net) in &inst.port_to_net {
+            match dirs.and_then(|d| d.get(port)) {
+                Some(BoundaryDirection::Output) => {
+                    drivers.insert(port.clone(), net.clone());
+                }
+                // Input / Inout / unknown → reader (reads the net value).
+                _ => {
+                    readers.insert(port.clone(), net.clone());
+                }
+            }
+        }
+        let inst_clts = prepare_instance_for_composition(base, &readers, &drivers, &inst.instance)
+            .map_err(|e| AdapterError {
+                kind: AdapterErrorKind::ParseError,
+                message: format!(
+                    "adapter/yosys multi-module: preparing instance '{}' failed: {e}",
+                    inst.instance
+                ),
+                location: None,
+            })?;
+        prepared.push((inst.instance.clone(), inst_clts));
+    }
+    if prepared.is_empty() {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: "adapter/yosys multi-module: no liftable instances to compose".into(),
+            location: None,
+        });
+    }
+
+    // Synchronous fold-compose: each clock step advances every instance;
+    // shared nets rendezvous on `<net>_<v>`, free inputs ride in the union.
+    let comp_opts = CompositionOptions::new(CompositionSemantics::Synchronous);
+    let mut iter = prepared.into_iter();
+    let (first, mut acc) = iter.next().expect("prepared is non-empty");
+    let mut instances = vec![first];
+    for (name, next) in iter {
+        acc = compose(&acc, &next, &comp_opts).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!("adapter/yosys multi-module: composing '{name}' failed: {e}"),
+            location: None,
+        })?;
+        instances.push(name);
+    }
+
+    Ok(MultiModuleComposition {
+        composed: acc,
+        instances,
+    })
+}
+
+/// Realise one per-module CTXDSL (with inline valuations) into its `Clts`.
+/// The BTOR2 adapter emits a single automaton per module; we take it.
+fn realize_module_clts(ctxdsl: &str) -> Result<Clts<DefaultStateIdx, DefaultLabelIdx>, String> {
+    let doc = crate::context_dsl::parser::parse(ctxdsl).map_err(|e| format!("parse: {e}"))?;
+    let realized =
+        crate::context_dsl::realize::realize(&doc, &[]).map_err(|e| format!("realize: {e}"))?;
+    let name = realized
+        .context
+        .clts_names()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no automaton in per-module ctxdsl".to_string())?;
+    realized
+        .context
+        .clts(&name)
+        .cloned()
+        .ok_or_else(|| format!("automaton '{name}' missing after realise"))
 }
 
 #[cfg(test)]
@@ -346,9 +491,94 @@ mod tests {
         assert_eq!(modality, TransitionModality::MayOnly, "modality preserved");
         let s1n = out.state_id("s1").unwrap();
         assert_eq!(
-            out.state_3valued_predicate(s1n, "ready"),
+            out.state_3valued_predicate(s1n, "u_x__ready"),
             Some(Tristate::KleeneBot),
-            "3-valued predicate preserved"
+            "3-valued predicate preserved + instance-qualified"
+        );
+    }
+
+    fn yosys_available() -> bool {
+        std::process::Command::new("yosys")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// R-MM-4d — end-to-end: compose `producer_consumer_top` (producer ⊗
+    /// bounded_buffer ⊗ consumer) through the real yosys pipeline into one
+    /// KMTS. Validates the whole driver: lift → surface net-driving outputs
+    /// → prepare each instance → synchronous fold-compose. Structural
+    /// assertions (no property eval): the shared-net rendezvous labels
+    /// survived and the synchronisation pruned the naive product.
+    #[test]
+    fn compose_sv_multi_module_producer_consumer_top() {
+        if !yosys_available() {
+            eprintln!("skip: yosys not installed");
+            return;
+        }
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+        let read = |f: &str| std::fs::read_to_string(dir.join(f));
+        let (top, producer, consumer, buffer) = match (
+            read("multi_producer_consumer_top.sv"),
+            read("multi_producer.sv"),
+            read("multi_consumer.sv"),
+            read("bounded_buffer.sv"),
+        ) {
+            (Ok(t), Ok(p), Ok(c), Ok(b)) => (t, p, c, b),
+            _ => {
+                eprintln!("skip: multi-module fixtures not found");
+                return;
+            }
+        };
+        let yopts = YosysOptions {
+            top: Some("producer_consumer_top".into()),
+            per_module_btor: true,
+            additional_sources: vec![
+                ("multi_producer.sv".into(), producer),
+                ("multi_consumer.sv".into(), consumer),
+                ("bounded_buffer.sv".into(), buffer),
+            ],
+            ..Default::default()
+        };
+
+        let comp = compose_sv_multi_module(&top, &AdapterOptions::default(), &yopts)
+            .expect("multi-module composition");
+
+        // All three instances folded in.
+        assert_eq!(comp.instances.len(), 3, "producer + buffer + consumer");
+
+        let composed = &comp.composed;
+        assert!(composed.state_count() > 1, "non-trivial product");
+
+        // The shared-net `valid` rendezvous labels survived into the product
+        // (proves the driver synthesised driver labels + relabelled readers).
+        let alpha = composed.alphabet();
+        assert!(
+            alpha.iter().any(|l| l == "valid_0") && alpha.iter().any(|l| l == "valid_1"),
+            "shared-net rendezvous labels present; got {alpha:?}"
+        );
+
+        // Synchronisation + reachability pruned the naive product. Each
+        // module has at most 4 register-states, so a free product would be
+        // up to 4×4×4 = 64; the rendezvous on `valid` constrains it.
+        assert!(
+            composed.state_count() < 64,
+            "rendezvous + reachability pruned the product; got {}",
+            composed.state_count()
+        );
+
+        // Composed states carry instance-qualified valuations (so a property
+        // can reference each module's register unambiguously).
+        let has_qualified = composed.states().any(|s| {
+            composed
+                .state_valuation(s)
+                .is_some_and(|v| v.keys().any(|k| k.starts_with("u_producer__")))
+        });
+        assert!(
+            has_qualified,
+            "instance-qualified valuations present on the product"
         );
     }
 }

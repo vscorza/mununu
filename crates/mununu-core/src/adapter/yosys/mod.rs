@@ -394,40 +394,85 @@ pub fn translate_sv_per_module(
     options: &AdapterOptions,
     yopts: &YosysOptions,
 ) -> Result<Vec<PerModuleOutput>, AdapterError> {
-    translate_sv_per_module_impl(content, options, yopts).map(|(outputs, _hier)| outputs)
+    translate_sv_per_module_impl(content, options, yopts, /*surface_net_driving=*/ false)
+        .map(|(outputs, _hier)| outputs)
 }
 
+/// Per-module port-direction map: `module type → (port → direction)`.
+pub type PortDirectionsPerModule =
+    HashMap<String, HashMap<String, crate::controllability::BoundaryDirection>>;
+
 /// R-MM — Like [`translate_sv_per_module`] but additionally returns the
-/// top module's instance connectivity, parsed from the same discovery-pass
-/// hierarchy snapshot the per-module emission already produces (no extra
-/// Yosys invocation). This is the netlist input the KMTS multi-module
-/// composition driver (R-MM-4) needs to wire the per-module KMTSes
-/// together: it pairs each [`PerModuleOutput`] (keyed by module *type*)
-/// with the [`InstanceConnections`] (keyed by *instance*, carrying the
-/// port→net map) so the driver can relabel each instance's ports to the
-/// shared net names before composing.
+/// top module's instance connectivity + per-module port directions, parsed
+/// from the same discovery-pass hierarchy snapshot the per-module emission
+/// already produces (no extra Yosys invocation). This is the netlist input
+/// the KMTS multi-module composition driver (R-MM-4d) needs to wire the
+/// per-module KMTSes together: it pairs each [`PerModuleOutput`] (keyed by
+/// module *type*) with the [`InstanceConnections`] (keyed by *instance*,
+/// carrying the port→net map) and the directions (so each connected port is
+/// classified as a reader input vs a driver output).
 ///
-/// The connectivity Vec can be empty (single-module designs, or a parse
-/// miss) without affecting the per-module outputs.
+/// Unlike the plain entry, this path **surfaces net-driving combinational
+/// outputs** (R-MM-4b) in every per-module lift — the driver needs those
+/// output values to synthesise the `<net>_<v>` rendezvous labels. The
+/// surface set is computed from the connectivity + directions (output ports
+/// that drive a connected net), so single-module designs / parse misses
+/// surface nothing.
 pub fn translate_sv_per_module_with_connectivity(
     content: &str,
     options: &AdapterOptions,
     yopts: &YosysOptions,
-) -> Result<(Vec<PerModuleOutput>, Vec<InstanceConnections>), AdapterError> {
-    let (outputs, hier_body) = translate_sv_per_module_impl(content, options, yopts)?;
+) -> Result<
+    (
+        Vec<PerModuleOutput>,
+        Vec<InstanceConnections>,
+        PortDirectionsPerModule,
+    ),
+    AdapterError,
+> {
+    let (outputs, hier_body) =
+        translate_sv_per_module_impl(content, options, yopts, /*surface_net_driving=*/ true)?;
     let connectivity = parse_instance_connections(&hier_body, yopts.top.as_deref());
-    Ok((outputs, connectivity))
+    let directions = parse_port_directions_per_module(&hier_body, yopts.top.as_deref());
+    Ok((outputs, connectivity, directions))
+}
+
+/// R-MM-4d — Output ports that drive a connected net: a port `P` of module
+/// type `M` such that `direction(M, P) == Output` and `P` appears in some
+/// instance-of-`M`'s `port_to_net`. These are surfaced as per-state
+/// valuations (R-MM-4b) so the driver can synthesise their rendezvous
+/// labels.
+fn net_driving_output_ports(
+    connectivity: &[InstanceConnections],
+    directions: &PortDirectionsPerModule,
+) -> Vec<String> {
+    use crate::controllability::BoundaryDirection;
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for inst in connectivity {
+        let Some(dirs) = directions.get(&inst.module_type) else {
+            continue;
+        };
+        for port in inst.port_to_net.keys() {
+            if matches!(dirs.get(port), Some(BoundaryDirection::Output)) {
+                out.insert(port.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Shared body for [`translate_sv_per_module`] +
 /// [`translate_sv_per_module_with_connectivity`]: runs the two-pass Yosys
 /// flow and returns the per-module outputs alongside the raw discovery-pass
 /// hierarchy JSON (so the connectivity wrapper can parse it without a
-/// second Yosys run).
+/// second Yosys run). When `surface_net_driving` is set, net-driving output
+/// ports (computed from the connectivity + directions in the same hier.json)
+/// are surfaced as per-state valuations in every per-module lift.
 fn translate_sv_per_module_impl(
     content: &str,
     options: &AdapterOptions,
     yopts: &YosysOptions,
+    surface_net_driving: bool,
 ) -> Result<(Vec<PerModuleOutput>, String), AdapterError> {
     let yosys = locate_yosys()?;
     if !yopts.skip_verific_check {
@@ -494,6 +539,17 @@ fn translate_sv_per_module_impl(
     let top_directions_per_module =
         parse_port_directions_per_module(&hier_body, yopts.top.as_deref());
 
+    // R-MM-4d — when surfacing for composition, compute the net-driving
+    // output ports from the connectivity + directions (same hier.json) so
+    // each per-module lift surfaces them (R-MM-4b) for the driver's
+    // rendezvous-label synthesis.
+    let surface_outputs: Vec<String> = if surface_net_driving {
+        let connectivity = parse_instance_connections(&hier_body, yopts.top.as_deref());
+        net_driving_output_ports(&connectivity, &top_directions_per_module)
+    } else {
+        Vec::new()
+    };
+
     // Choose output directory for the per-submodule BTOR2 files.
     let out_dir = match &yopts.per_module_output_dir {
         Some(dir) => {
@@ -532,13 +588,18 @@ fn translate_sv_per_module_impl(
         // Per-module port-direction context (Document B task B1 — same
         // mechanism as `translate_sv`, scoped to each submodule's
         // boundary).
-        let btor_options = match top_directions_per_module.get(module_name) {
+        let mut btor_options = match top_directions_per_module.get(module_name) {
             Some(directions) if !directions.is_empty() => crate::adapter::AdapterOptions {
                 port_directions: directions.clone(),
                 ..options.clone()
             },
             _ => options.clone(),
         };
+        // R-MM-4d — surface net-driving outputs for composition (each
+        // module's lift picks up only its own from the design-wide union).
+        if !surface_outputs.is_empty() {
+            btor_options.surface_output_ports = surface_outputs.clone();
+        }
 
         let mut out =
             super::btor2::Btor2Adapter::translate(&btor, &btor_options).map_err(|mut e| {
@@ -1672,7 +1733,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (outputs, connectivity) =
+        let (outputs, connectivity, _directions) =
             translate_sv_per_module_with_connectivity(&top, &opts, &yopts)
                 .expect("per-module + connectivity");
 
