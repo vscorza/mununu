@@ -391,6 +391,41 @@ pub fn translate_sv_per_module(
     options: &AdapterOptions,
     yopts: &YosysOptions,
 ) -> Result<Vec<PerModuleOutput>, AdapterError> {
+    translate_sv_per_module_impl(content, options, yopts).map(|(outputs, _hier)| outputs)
+}
+
+/// R-MM — Like [`translate_sv_per_module`] but additionally returns the
+/// top module's instance connectivity, parsed from the same discovery-pass
+/// hierarchy snapshot the per-module emission already produces (no extra
+/// Yosys invocation). This is the netlist input the KMTS multi-module
+/// composition driver (R-MM-4) needs to wire the per-module KMTSes
+/// together: it pairs each [`PerModuleOutput`] (keyed by module *type*)
+/// with the [`InstanceConnections`] (keyed by *instance*, carrying the
+/// port→net map) so the driver can relabel each instance's ports to the
+/// shared net names before composing.
+///
+/// The connectivity Vec can be empty (single-module designs, or a parse
+/// miss) without affecting the per-module outputs.
+pub fn translate_sv_per_module_with_connectivity(
+    content: &str,
+    options: &AdapterOptions,
+    yopts: &YosysOptions,
+) -> Result<(Vec<PerModuleOutput>, Vec<InstanceConnections>), AdapterError> {
+    let (outputs, hier_body) = translate_sv_per_module_impl(content, options, yopts)?;
+    let connectivity = parse_instance_connections(&hier_body, yopts.top.as_deref());
+    Ok((outputs, connectivity))
+}
+
+/// Shared body for [`translate_sv_per_module`] +
+/// [`translate_sv_per_module_with_connectivity`]: runs the two-pass Yosys
+/// flow and returns the per-module outputs alongside the raw discovery-pass
+/// hierarchy JSON (so the connectivity wrapper can parse it without a
+/// second Yosys run).
+fn translate_sv_per_module_impl(
+    content: &str,
+    options: &AdapterOptions,
+    yopts: &YosysOptions,
+) -> Result<(Vec<PerModuleOutput>, String), AdapterError> {
     let yosys = locate_yosys()?;
     if !yopts.skip_verific_check {
         verify_no_verific(&yosys)?;
@@ -522,7 +557,7 @@ pub fn translate_sv_per_module(
         });
     }
 
-    Ok(outputs)
+    Ok((outputs, hier_body))
 }
 
 /// Yosys discovery-pass script: read sources, set up hierarchy,
@@ -1592,6 +1627,79 @@ mod tests {
         assert!(
             parse_instance_connections(r#"{"modules":{"top":{"netnames":{}}}}"#, Some("top"))
                 .is_empty()
+        );
+    }
+
+    /// R-MM-4a — `translate_sv_per_module_with_connectivity` surfaces the
+    /// top-module instance connectivity alongside the per-module BTOR2,
+    /// from a single discovery pass. Validates the shared-net wiring the
+    /// composition driver depends on: `producer_consumer_top` has a `valid`
+    /// net driven by `u_producer.valid` and read by `u_buffer.push` /
+    /// `u_consumer.valid`.
+    #[test]
+    fn per_module_with_connectivity_surfaces_shared_net() {
+        if !yosys_available() {
+            eprintln!("skip: yosys not installed");
+            return;
+        }
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+        let read = |f: &str| std::fs::read_to_string(dir.join(f));
+        let (top, producer, consumer, buffer) = match (
+            read("multi_producer_consumer_top.sv"),
+            read("multi_producer.sv"),
+            read("multi_consumer.sv"),
+            read("bounded_buffer.sv"),
+        ) {
+            (Ok(t), Ok(p), Ok(c), Ok(b)) => (t, p, c, b),
+            _ => {
+                eprintln!("skip: multi-module fixtures not found");
+                return;
+            }
+        };
+        let opts = AdapterOptions::default();
+        let yopts = YosysOptions {
+            top: Some("producer_consumer_top".into()),
+            per_module_btor: true,
+            additional_sources: vec![
+                ("multi_producer.sv".into(), producer),
+                ("multi_consumer.sv".into(), consumer),
+                ("bounded_buffer.sv".into(), buffer),
+            ],
+            ..Default::default()
+        };
+
+        let (outputs, connectivity) =
+            translate_sv_per_module_with_connectivity(&top, &opts, &yopts)
+                .expect("per-module + connectivity");
+
+        // Per-module BTOR2 still produced (one AdapterOutput per type).
+        let types: std::collections::BTreeSet<&str> =
+            outputs.iter().map(|o| o.module_name.as_str()).collect();
+        assert!(types.contains("producer"), "producer lifted");
+        assert!(types.contains("consumer"), "consumer lifted");
+        assert!(types.contains("bounded_buffer"), "bounded_buffer lifted");
+
+        // Connectivity surfaced for all three instances.
+        let inst = |n: &str| connectivity.iter().find(|c| c.instance == n);
+        let producer_i = inst("u_producer").expect("u_producer connectivity");
+        let buffer_i = inst("u_buffer").expect("u_buffer connectivity");
+        let consumer_i = inst("u_consumer").expect("u_consumer connectivity");
+
+        // The shared `valid` net: producer drives it (.valid), buffer reads
+        // it as .push, consumer reads it as .valid — all resolve to net
+        // `valid`, which is what lets the driver make them rendezvous.
+        assert_eq!(
+            producer_i.port_to_net.get("valid").map(String::as_str),
+            Some("valid")
+        );
+        assert_eq!(
+            buffer_i.port_to_net.get("push").map(String::as_str),
+            Some("valid")
+        );
+        assert_eq!(
+            consumer_i.port_to_net.get("valid").map(String::as_str),
+            Some("valid")
         );
     }
 
