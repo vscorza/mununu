@@ -130,14 +130,17 @@ pub fn prepare_instance_for_composition(
     //    module's signals unambiguously — two instances commonly share a
     //    register name (`state`), and the compose merge (R-MM-2) would
     //    otherwise collide them. A composed property names a signal as
-    //    `<instance>__<signal>`.
+    //    `<instance>__<signal>`. Each VALUE is normalised to its integer
+    //    encoding (`normalize_signal_value`: the 1-bit surfaced outputs'
+    //    `T`/`F` → `1`/`0`) so the composed product is all-numeric and the
+    //    verify pipeline can bind `<instance>__<signal> == k` atoms (R-MM-5b).
     for state in clts.states() {
         if let (Some(&new_id), Some(valuation)) =
             (state_mapping.get(&state), clts.state_valuation(state))
         {
             let qualified: std::collections::BTreeMap<String, String> = valuation
                 .iter()
-                .map(|(k, v)| (format!("{instance}__{k}"), v.clone()))
+                .map(|(k, v)| (format!("{instance}__{k}"), normalize_signal_value(v)))
                 .collect();
             builder.with_valuation_for_state(new_id, qualified);
         }
@@ -210,17 +213,27 @@ fn driver_labels_for_state(
     let mut out = Vec::new();
     for (port, net) in driver_ports {
         if let Some(raw) = valuation.get(port) {
-            out.push(format!("{net}_{}", normalize_driver_value(raw)));
+            out.push(format!("{net}_{}", normalize_signal_value(raw)));
         }
     }
     out
 }
 
-/// Normalise a surfaced output value to the same encoding readers use:
-/// the bit-blaster surfaces 1-bit combinational outputs as `T`/`F`, but
-/// input labels are `<sig>_<integer>`, so map `T`→`1`, `F`→`0`. A raw
-/// integer (multi-bit, future) passes through unchanged.
-fn normalize_driver_value(raw: &str) -> String {
+/// Normalise a 1-bit signal value to the integer encoding the rest of the
+/// pipeline uses: the bit-blaster surfaces 1-bit combinational outputs as
+/// `T`/`F` (R-MM-4b), but readers' value-encoded labels — and register
+/// valuations — are decimal (`<sig>_<integer>`, `state = 2`). Map `T`→`1`,
+/// `F`→`0`; a decimal value (multi-bit register, already numeric) passes
+/// through unchanged.
+///
+/// Used both to synthesise driver rendezvous labels and to keep the
+/// composed product's **valuations all-numeric** — the latter is what lets
+/// the verify pipeline's `environment_for` wire the `abstract_states`
+/// channel (gated on every valuation parsing as `i64`), so a composed
+/// property atom like `u_consumer__state == 2` binds to the actual value
+/// instead of falling through to the empty-bitset under-approximation. A
+/// single stray `T`/`F` would disqualify the whole CLTS from that channel.
+fn normalize_signal_value(raw: &str) -> String {
     match raw {
         "T" => "1".to_string(),
         "F" => "0".to_string(),
@@ -612,6 +625,109 @@ mod tests {
             out.state_3valued_predicate(s1n, "u_x__ready"),
             Some(Tristate::KleeneBot),
             "3-valued predicate preserved + instance-qualified"
+        );
+    }
+
+    #[test]
+    fn valuations_are_normalised_to_numeric_and_qualified() {
+        // R-MM-5b — a 1-bit output surfaced as T/F plus a numeric register;
+        // after prepare, the composed product must be all-numeric (T→1, F→0)
+        // and instance-qualified so the verify pipeline's `abstract_states`
+        // channel (gated on every valuation parsing as i64) binds composed
+        // property atoms like `u_c__state == k`.
+        let mut b = Clts::builder();
+        let s0 = b.state_with_name("s0".into()).unwrap();
+        b.initial_state_id(s0);
+        let step = b.labels().intern(["step"]).unwrap();
+        b.transition_ids(s0, &[step], s0);
+        let mut v = std::collections::BTreeMap::new();
+        v.insert("state".to_string(), "2".to_string());
+        v.insert("valid".to_string(), "T".to_string());
+        b.with_valuation_for_state(s0, v);
+        let clts = b.build().unwrap();
+
+        let out = prepare_instance_for_composition(&clts, &HashMap::new(), &HashMap::new(), "u_c")
+            .unwrap();
+        let s0n = out.state_id("s0").unwrap();
+        let val = out.state_valuation(s0n).expect("valuation");
+        assert_eq!(
+            val.get("u_c__state").map(String::as_str),
+            Some("2"),
+            "numeric register stays numeric + instance-qualified"
+        );
+        assert_eq!(
+            val.get("u_c__valid").map(String::as_str),
+            Some("1"),
+            "1-bit T → 1 (numeric) + instance-qualified"
+        );
+        assert!(
+            val.values().all(|s| s.parse::<i64>().is_ok()),
+            "all valuation values are numeric (the verify-pipeline gate); got {val:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_numeric_atom_resolves_through_verify_pipeline() {
+        // R-MM-5b — the open risk, closed in isolation (no yosys): a composed
+        // product with instance-qualified valuations re-enters the verify
+        // pipeline (prepare → clts_to_ctxdsl → parse → realise →
+        // environment_for → evaluate) and a property atom `u_c__state == 2`
+        // binds to the actual value at every state — proving multi-module
+        // composed properties resolve.
+        use crate::mu_calculus::evaluator::{EvaluationOptions, evaluate_with_options};
+
+        // Consumer-like instance: idle(state=0,valid=F) --step--> busy(state=2,
+        // valid=T), busy self-loops (a sink).
+        let mut b = Clts::builder();
+        let idle = b.state_with_name("idle".into()).unwrap();
+        let busy = b.state_with_name("busy".into()).unwrap();
+        b.initial_state_id(idle);
+        let step = b.labels().intern(["step"]).unwrap();
+        b.transition_ids(idle, &[step], busy);
+        b.transition_ids(busy, &[step], busy);
+        let mut vi = std::collections::BTreeMap::new();
+        vi.insert("state".to_string(), "0".to_string());
+        vi.insert("valid".to_string(), "F".to_string());
+        b.with_valuation_for_state(idle, vi);
+        let mut vb = std::collections::BTreeMap::new();
+        vb.insert("state".to_string(), "2".to_string());
+        vb.insert("valid".to_string(), "T".to_string());
+        b.with_valuation_for_state(busy, vb);
+        let clts = b.build().unwrap();
+
+        // Prepare (normalises + qualifies), round-trip to CTXDSL, realise.
+        let prepared =
+            prepare_instance_for_composition(&clts, &HashMap::new(), &HashMap::new(), "u_c")
+                .unwrap();
+        let ctxdsl = clts_to_ctxdsl(&prepared, "system", "mm_system").unwrap();
+        let doc = crate::context_dsl::parser::parse(&ctxdsl).expect("parse emitted ctxdsl");
+        let realized =
+            crate::context_dsl::realize::realize(&doc, &[]).expect("realise emitted ctxdsl");
+        let name = realized.context.clts_names().into_iter().next().unwrap();
+        let composed = realized.context.clts(&name).unwrap();
+        let env = realized.environment_for(&name);
+        let opts = EvaluationOptions::default();
+
+        let holds_at_initial = |formula_src: &str| -> bool {
+            let formula = crate::mu_calculus::parser::parse(formula_src).expect("parse formula");
+            let result = evaluate_with_options(&formula, composed, &env, &opts).expect("evaluate");
+            composed
+                .initial_states()
+                .iter()
+                .all(|sid| result.get(sid.index()).map(|b| *b).unwrap_or(false))
+        };
+
+        // "state==2 is reachable" — TRUE (idle --step--> busy, where state==2).
+        assert!(
+            holds_at_initial("mu X. ((u_c__state == 2) || (<> X))"),
+            "reachability binds the qualified atom u_c__state == 2"
+        );
+        // "never state==2" (safety) — FALSE (busy with state==2 is reachable).
+        // Confirms the atom resolves to a non-vacuous bitset, not the
+        // empty-bitset under-approximation a missing predicate would give.
+        assert!(
+            !holds_at_initial("nu X. ((!(u_c__state == 2)) && ([] X))"),
+            "safety fails because state==2 is reachable (atom is non-vacuous)"
         );
     }
 
