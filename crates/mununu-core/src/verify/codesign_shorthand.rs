@@ -13,19 +13,24 @@
 //! | `[project] name + peripheral`            | `[project] name`                           |
 //! | `[register_map] svd|json + peripheral_name` | `[alphabet] strategy="register_map", register_map=…` |
 //! | `[firmware] sources + include_paths + …` | `[[sources]] adapter="c-codesign", files, options{…}` |
-//! | `[rtl] sources + top_module + frontend`  | `[[sources]] adapter="sv-rtl", files, options{…}` |
+//! | `[rtl] sources + top_module`             | `[[sources]] adapter="sv-yosys", files, options{top}` |
 //! | implicit `<peripheral>System` composition | `[composition] semantics="asynchronous", members=["firmware","rtl"], name=…` |
 //! | `[[properties]]`                         | `[[properties]]` (verbatim)                |
 //!
 //! ## Adapter dispatch dependency
 //!
-//! [`codesign_to_verify`] produces a [`VerifyConfig`] that names
-//! `"c-codesign"` and `"sv-rtl"` adapters. These aren't yet
-//! supported by [`crate::verify::orchestrator::dispatch_adapter`] —
-//! that work lands in A2.6b. Until then, this translator's output
-//! is usable for everything except actually running the pipeline
-//! (parse, validate, examine the assembled
-//! [`crate::verify::config::VerifyConfig`]).
+//! [`codesign_to_verify`] produces a [`VerifyConfig`] that names the
+//! `"c-codesign"` and `"sv-yosys"` adapters, both supported by
+//! [`crate::verify::orchestrator::dispatch_adapter`]. Under the
+//! `register_map` alphabet strategy the orchestrator reconciles the
+//! firmware rendezvous labels against the SV peripheral via
+//! [`crate::verify::register_map_rewriter`]; the SV side emits
+//! `<signal>_<value>` labels under the KMTS route exactly as the native
+//! route did (see `adapter::btor2::bit_blast`), so the renaming
+//! derivation is route-agnostic and the migration to `sv-yosys` needs
+//! no change to the rewriter. The remaining gap is the CLI/manifest
+//! wiring that feeds a `mununu.codesign.toml` through this translator
+//! into `verify_project`.
 //!
 //! ## SVD vs JSON register-map sources
 //!
@@ -204,18 +209,22 @@ fn build_firmware_source(codesign: &CodesignProjectConfig) -> SourceSection {
 
 fn build_rtl_source(codesign: &CodesignProjectConfig) -> SourceSection {
     let mut options: BTreeMap<String, toml::Value> = BTreeMap::new();
+    // The KMTS `sv-yosys` route reads `top` as the elaboration root
+    // (consumed on the multi-module path; harmless on the single-module
+    // path the codesign flow uses today — one peripheral, one top).
+    // The codesign schema's `rtl.frontend` selector is no longer
+    // emitted: the native `custom-sv` frontend is gone (S.2b
+    // singular-pipeline commitment), so sv2v → Yosys → BTOR2 is the
+    // only SV frontend. The vestigial schema field is retired
+    // separately (S.2b-3, Tier D).
     options.insert(
-        "top_module".to_string(),
+        "top".to_string(),
         toml::Value::String(codesign.rtl.top_module.clone()),
-    );
-    options.insert(
-        "frontend".to_string(),
-        toml::Value::String(codesign.rtl.frontend.clone()),
     );
 
     SourceSection {
         id: "rtl".to_string(),
-        adapter: "sv-rtl".to_string(),
+        adapter: "sv-yosys".to_string(),
         files: codesign.rtl.sources.clone(),
         options,
         count: None,
@@ -400,7 +409,7 @@ top_module = "TWIM0"
     }
 
     #[test]
-    fn emits_rtl_source_with_sv_rtl_adapter_and_options() {
+    fn emits_rtl_source_with_sv_yosys_adapter_and_options() {
         let codesign = parse_codesign(CODESIGN_JSON_TOML);
         let verify = codesign_to_verify(&codesign);
         let rtl = verify
@@ -408,16 +417,21 @@ top_module = "TWIM0"
             .iter()
             .find(|s| s.id == "rtl")
             .expect("rtl source present");
-        assert_eq!(rtl.adapter, "sv-rtl");
+        // S.2b: the codesign RTL source drives the KMTS `sv-yosys`
+        // route — the sole surviving SV frontend.
+        assert_eq!(rtl.adapter, "sv-yosys");
         assert_eq!(rtl.files, vec![PathBuf::from("rtl/uart.sv")]);
+        // `top_module` from the codesign schema becomes the sv-yosys
+        // `top` elaboration root.
         assert_eq!(
-            rtl.options.get("top_module"),
+            rtl.options.get("top"),
             Some(&toml::Value::String("uart_lite".to_string()))
         );
-        assert_eq!(
-            rtl.options.get("frontend"),
-            Some(&toml::Value::String("custom-sv".to_string()))
-        );
+        // The native `frontend` selector and the legacy `top_module`
+        // option are no longer emitted: sv2v → Yosys → BTOR2 is the only
+        // SV frontend now, and the option key is `top`.
+        assert!(!rtl.options.contains_key("frontend"));
+        assert!(!rtl.options.contains_key("top_module"));
     }
 
     #[test]

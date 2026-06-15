@@ -1,27 +1,47 @@
-# `sv_multi_module` — multi-file source dispatch demo
+# `sv_multi_module` — SV multi-module composition via the sv-yosys path
 
-> **Source of truth:** [`crates/mununu-core/src/verify/orchestrator.rs`](../../../crates/mununu-core/src/verify/orchestrator.rs) (`dispatch_sv_rtl`, `read_additional_files`) — surface: CLI+API+UI.
+> **Source of truth:** [`crates/mununu-core/src/verify/orchestrator.rs`](../../../crates/mununu-core/src/verify/orchestrator.rs) (`dispatch_sv_yosys`) — surface: CLI+API+UI.
 
-The verify framework now passes every file listed in `[[sources]].files` to the adapter, not just `files[0]`. When the SystemVerilog adapter receives a primary file that looks like a multi-module sidecar (`$schema = "mununu_sv_multi_v1"`), it routes through `SystemVerilogAdapter::translate_multi_module_content` and reads each module's SV from the additional files.
+A producer and a consumer SystemVerilog module composed through the KMTS
+`sv-yosys` multi-module pipeline. A **top module**
+(`producer_consumer_system_top.sv`) structurally instantiates both
+submodules and wires the producer's `valid` output to the consumer's
+`valid` input; the orchestrator elaborates each submodule to BTOR2, lifts
+it to a KMTS, renames its port labels to the connected nets (discovered
+from the top module's Yosys netlist), and synchronously composes the
+instances. The composed automaton is named `Circuit`.
 
 ## What it demonstrates
 
-- **Multi-file source dispatch (Stream A1).** One `[[sources]]` declaration consumes a sidecar JSON + N SystemVerilog modules.
-- **Schema-driven adapter routing.** The sv-rtl dispatcher detects the multi-module marker and switches to the in-memory multi-module entry point automatically; no separate `adapter = "sv-yosys"` or `adapter = "sv-multi"` setting needed.
-- **Warning, not error, on extra files for single-file adapters.** A `tracing::warn!` records the dropped extras when a single-file adapter (xstate, crewai, langgraph, microcode, ctxdsl, extraction, c-codesign) receives `files = [primary, extra1, extra2]` — the verify run still succeeds against the primary file.
+- **sv-yosys multi-module composition.** One `[[sources]]` declaration
+  with `files = [top.sv, module_a.sv, module_b.sv]` and
+  `[sources.options] multi_module = true` (+ `top`) drives the
+  multi-module entry point (`compose_sv_multi_module`).
+- **Shared-net rendezvous.** The producer drives `valid`; the consumer
+  reads it. The `consumer_reacts` property — the consumer eventually
+  reaches BUSY (`u_consumer__state == 1`) — holds **only** because the
+  rendezvous propagates the producer's `valid` to the consumer. It is
+  vacuous if the rendezvous is dropped.
+- **Instance-qualified predicates.** Composed-state valuations are
+  numeric and instance-qualified (`u_consumer__state == k`), so
+  properties reference a submodule's state by value across the product.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `system.mununu.json` | Multi-module sidecar declaring two modules: `producer` + `consumer`. References each module's SV source by filename. |
-| `producer.sv` | RTL for the producer module (3-state FSM). |
-| `consumer.sv` | RTL for the consumer module (3-state FSM). |
-| `verify.toml` | Single source declaration with `files = [sidecar, producer.sv, consumer.sv]` |
-| `validate.sh` | End-to-end reproduction |
-| `transcript.txt` | Byte-deterministic expected output |
+| `producer_consumer_system_top.sv` | Top module instantiating `producer` + `consumer`, wiring the shared `valid` net. |
+| `producer.sv` | RTL for the producer module (3-state FSM driving `valid`). |
+| `consumer.sv` | RTL for the consumer module (3-state FSM reacting to `valid`). |
+| `verify.toml` | Single source with `files = [top, producer, consumer]` + `multi_module = true`. |
+| `validate.sh` | End-to-end reproduction (guards on `yosys` + `sv2v`). |
+| `transcript.txt` | Checked-in expected output. |
 
 ## Reproduce
+
+Requires `yosys` and `sv2v` on `PATH` (`validate.sh` exits with a clear
+error if either is missing). They are not bundled with the repo — the dev
+container installs them.
 
 ```bash
 bash examples/verify/sv_multi_module/validate.sh
@@ -29,24 +49,34 @@ bash examples/verify/sv_multi_module/validate.sh
 
 ## Authoring shape
 
-For any SV multi-module composition under the verify framework, the convention is:
+For any SV multi-module composition under the verify framework, the
+convention is a top module + the submodules it instantiates:
 
 ```toml
 [[sources]]
 id = "system"
-adapter = "sv-rtl"
+adapter = "sv-yosys"
 files = [
-    "system.mununu.json",   # multi-module sidecar (mununu_sv_multi_v1 schema)
+    "top.sv",        # structurally instantiates the submodules
     "module_a.sv",
     "module_b.sv",
-    # ... one entry per module
+    # ... one entry per submodule
 ]
+
+[sources.options]
+multi_module = true
+top = "top"          # the top module's name
 ```
 
-The sidecar's `modules[*].source` fields reference each SV by filename (basename); the orchestrator builds the source-name → content map from the additional-files list and hands it to `translate_multi_module_content`.
+Instance connectivity is discovered from the top module's Yosys netlist
+(`hier.json`), so the wiring lives in the RTL itself — no separate
+connections sidecar.
 
 ## What this slice does not cover
 
-- **Multiple C source files** under `c-codesign`. The current dispatcher logs the dropped files via the warn helper. A multi-translation-unit C extraction is queued as a v2 — would need the LLVM-IR extractor to accept and link multiple translation units.
-- **Adapter-output-as-additional-file**. Today every additional file is text fed through `std::fs::read_to_string`. Future binary adapters (e.g., a `.btor2` byte-stream additional input) would need a different ingest path.
-- **Cross-source file references**. A `verify.toml` source can reference files in its own `files` list, but not files belonging to another source. Each source is self-contained.
+- **Multi-bit shared buses.** The shared `valid` net is 1-bit, so the
+  value-encoded rendezvous is exact. A multi-bit data bus would surface
+  the §7.2 spurious-cross-data precision gap (see the R-MM plan).
+- **Cross-source file references.** A `verify.toml` source references
+  files in its own `files` list, not files belonging to another source.
+  Each source is self-contained.

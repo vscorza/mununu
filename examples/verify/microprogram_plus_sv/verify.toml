@@ -3,18 +3,19 @@
 #
 # The point of this example is to demonstrate the framework's
 # adapter-agnosticism: the orchestrator pairs a `ctxdsl` source
-# (microcode authored by hand) with an `sv-rtl` source (real SV
-# parsed via `SystemVerilogAdapter::translate`) under one
+# (microcode authored by hand) with an `sv-yosys` source (real SV
+# elaborated via sv2v → Yosys → BTOR2 → KMTS bit-blast) under one
 # `verify.toml`. The two automata have disjoint label alphabets here
-# (the microcode steps on `tick_microcode`; the SV adapter emits
-# port-binding labels for `req` / `ack`), so the asynchronous
-# composition just interleaves their independent state spaces — no
-# rendezvous synchronisation. Direct alphabet binding.
+# (the microcode steps on `tick_microcode`; the SV side steps on the
+# bit-blaster's clock label), so the asynchronous composition just
+# interleaves their independent state spaces — no rendezvous
+# synchronisation. Direct alphabet binding.
 #
-# Future extension: author a `.mununu.json` sidecar next to the SV
-# file declaring rendezvous labels matching the microprogram's
-# events, switching the binding from `direct` to `renamings` so the
-# two sides actually coordinate.
+# The KMTS SV path names its single automaton `Circuit`, and exposes
+# the FSM register as a numeric valuation, so the peripheral property
+# references the enum state by value (`state == 2` is ACTIVE in the
+# {IDLE=0, WAIT_ACK=1, ACTIVE=2, DONE=3} encoding) rather than by the
+# native adapter's variant-named predicate.
 
 [project]
 name = "MicroprogramPlusSv"
@@ -26,7 +27,7 @@ files = ["microprogram.ctxdsl"]
 
 [[sources]]
 id = "peripheral"
-adapter = "sv-rtl"
+adapter = "sv-yosys"
 files = ["handshake_peripheral.sv"]
 
 [alphabet]
@@ -45,11 +46,11 @@ template = "no_deadlock"
 over = "Microprogram"
 
 [[properties]]
-# Peripheral reachability — the SV adapter's 4-state automaton
-# eventually visits ACTIVE.
+# Peripheral reachability — the KMTS bit-blast automaton eventually
+# visits ACTIVE (state == 2 in the enum encoding).
 name = "peripheral_reaches_active"
-formula = "mu X. (ACTIVE || <> X)"
-over = "handshake_peripheral"
+formula = "mu X. ((state == 2) || <> X)"
+over = "Circuit"
 
 [[properties]]
 # Composed-system no-deadlock — vacuous on this asynchronous

@@ -753,67 +753,6 @@ pub struct ExtractionAutomatonInfo {
 }
 
 // ============================================================================
-// SV Init Endpoint
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct SvInitRequest {
-    pub source: FileContent,
-    #[serde(default)]
-    pub additional_sources: Vec<FileContent>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SvInitResponse {
-    pub success: bool,
-    pub sidecar: String,
-    pub schema: String,
-    pub signals: Vec<SvSignalInfo>,
-    pub inputs: Vec<SvInputInfo>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SvSignalInfo {
-    pub name: String,
-    pub width: usize,
-    pub abstraction: String,
-    pub preserve: bool,
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SvInputInfo {
-    pub name: String,
-    pub abstraction: String,
-}
-
-// ============================================================================
-// SV Discover Endpoint
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct SvDiscoverRequest {
-    pub source: FileContent,
-    pub sidecar: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SvDiscoverResponse {
-    pub success: bool,
-    pub sidecar: String,
-    pub discoveries: Vec<SvDiscoveryResult>,
-    pub smt_available: bool,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SvDiscoveryResult {
-    pub signal: String,
-    pub values_found: usize,
-}
-
-// ============================================================================
 // Extraction Validate Endpoint
 // ============================================================================
 

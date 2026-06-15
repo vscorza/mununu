@@ -88,8 +88,9 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
         AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
     let per_source_renamings = binding.per_source_renamings();
     // For RegisterMap binding, eagerly derive the SV-side renaming
-    // table once — it's identical for every sv-rtl source under this
-    // binding. `None` when binding is Direct or Renamings.
+    // table once — it's identical for every SV (`sv-rtl` / `sv-yosys`)
+    // source under this binding. `None` when binding is Direct or
+    // Renamings.
     let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
         AlphabetBinding::RegisterMap { map, .. } => {
             Some(derive_sv_renamings_from_register_map(map))
@@ -150,8 +151,8 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 }
                 _ => raw_ctxdsl,
             };
-            if let (Some(rm_renamings), "sv-rtl") =
-                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+            if let Some(rm_renamings) = register_map_sv_renamings.as_ref()
+                && is_sv_adapter(&source.adapter)
                 && !rm_renamings.is_empty()
             {
                 rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
@@ -356,6 +357,8 @@ pub fn inspect_project(
     let binding =
         AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
     let per_source_renamings = binding.per_source_renamings();
+    // SV-side renaming table (identical for every `sv-rtl` / `sv-yosys`
+    // source); `None` for Direct / Renamings bindings.
     let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
         AlphabetBinding::RegisterMap { map, .. } => {
             Some(derive_sv_renamings_from_register_map(map))
@@ -407,8 +410,8 @@ pub fn inspect_project(
                 }
                 _ => raw_ctxdsl,
             };
-            if let (Some(rm_renamings), "sv-rtl") =
-                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+            if let Some(rm_renamings) = register_map_sv_renamings.as_ref()
+                && is_sv_adapter(&source.adapter)
                 && !rm_renamings.is_empty()
             {
                 rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
@@ -574,16 +577,14 @@ pub fn inspect_project(
 ///
 /// - `"ctxdsl"` — pass-through; `content` is already CTXDSL.
 /// - `"xstate"` — uses [`XStateAdapter`].
-/// - `"sv-rtl"` — uses the SystemVerilog adapter via the existing
-///   `SystemVerilogAdapter::translate` entry point. Options
-///   currently ignored by this layer — the SV adapter has its own
-///   per-source sidecar conventions (`.mununu.json` next to the
-///   `.sv` file).
-/// - `"sv-yosys"` — MIG-4 (S-track migration): the KMTS SV route via
+/// - `"sv-yosys"` — the **sole** SystemVerilog route (the native
+///   `sv-rtl` parser path was removed in S.2b). KMTS SV via
 ///   [`crate::adapter::yosys::translate_sv`]
 ///   (sv2v→Yosys→BTOR2→bit-blast, carrying the MIG-1/MIG-2 soundness
-///   fixes). Coexists with `sv-rtl` for parity validation before the
-///   native path is retired. Requires `yosys` on PATH.
+///   fixes). The SV adapter has its own per-source sidecar conventions
+///   (`.mununu.json` next to the `.sv` file). Requires `yosys` on PATH.
+///   Multi-module composition opts in via `multi_module = true`
+///   (+ optional `top`).
 /// - `"crewai"` — uses [`crate::adapter::crewai::CrewaiAdapter`].
 ///   Per-agent automata + sequential supervisor + asynchronous
 ///   composition. Options currently ignored.
@@ -637,17 +638,13 @@ fn dispatch_adapter(
                 .map(to_pair)
                 .map_err(|err| err_for(adapter, source_id, err))
         }
-        "sv-rtl" => dispatch_sv_rtl(source_id, content, additional_files),
-        // MIG-4 (S-track migration, 2026-06-13) — the KMTS SV route,
-        // alongside the native `sv-rtl` adapter. Runs the
-        // sv2v→Yosys-per-module→BTOR2→bit-blast chain
-        // (`yosys::translate_sv`), which now carries the MIG-1 (Ignored
-        // / auto-COI) + MIG-2 (OOB-sink) soundness fixes. The native
-        // and KMTS routes coexist so the `sv_compare_pipelines` parity
-        // gate can validate verdict equivalence before the S-track
-        // deletes the native path. Single-module + additional sources
-        // (multi-module composition driven from the top netlist is a
-        // follow-up). Requires `yosys` on PATH; absence surfaces as an
+        // The sole SystemVerilog route (S.2b removed the native `sv-rtl`
+        // parser path). Runs the sv2v→Yosys-per-module→BTOR2→bit-blast
+        // chain (`yosys::translate_sv`), carrying the MIG-1 (Ignored /
+        // auto-COI) + MIG-2 (OOB-sink) soundness fixes. Single-module by
+        // default; multi-module composition opts in via the source option
+        // `multi_module = true` (+ optional `top`), driven from the top
+        // netlist. Requires `yosys` on PATH; absence surfaces as an
         // `AdapterTranslationFailed` (locate_yosys error), not silently.
         "sv-yosys" => dispatch_sv_yosys(source_id, content, additional_files, options),
         "crewai" => {
@@ -704,8 +701,10 @@ fn dispatch_adapter(
 /// the extras were dropped so they don't silently misinterpret the
 /// model.
 ///
-/// Today every adapter except `sv-rtl` is single-file; the framework
-/// only honours multi-file on the sv-rtl multi-module path.
+/// Today every adapter except `sv-yosys` is single-file; the framework
+/// only honours multi-file on the `sv-yosys` multi-module path
+/// (`multi_module = true`), where the additional files are the
+/// submodule sources the top instantiates.
 fn warn_unused_additional_files(
     adapter: &str,
     source_id: &str,
@@ -729,56 +728,15 @@ fn warn_unused_additional_files(
     );
 }
 
-/// Dispatch sv-rtl. When the primary content looks like a
-/// multi-module sidecar (`$schema = "mununu_sv_multi_v1"` or carries
-/// a `"modules"` array), use the SV adapter's multi-module entry
-/// point, sourcing each module's RTL from the additional files. When
-/// it's a single SV source, dispatch the regular `translate` path
-/// (extras dropped with a warning).
-fn dispatch_sv_rtl(
-    source_id: &str,
-    content: &str,
-    additional_files: &[(PathBuf, String)],
-) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
-    let is_multi_module = content.contains("mununu_sv_multi_v1") || content.contains("\"modules\"");
-    if is_multi_module {
-        // Build the source-name → content map the SV adapter expects.
-        // The sidecar's "modules[*].source" fields reference each
-        // module's RTL by filename; the user lists those files in
-        // [[sources]].files after the sidecar.
-        let mut sources: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for (path, body) in additional_files {
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                sources.insert(name.to_string(), body.clone());
-            }
-            // Also register the full path string in case the sidecar
-            // references files by relative path rather than basename.
-            if let Some(s) = path.to_str() {
-                sources.insert(s.to_string(), body.clone());
-            }
-        }
-        let opts = AdapterOptions::default();
-        crate::adapter::systemverilog::SystemVerilogAdapter::translate_multi_module_content(
-            content, &sources, &opts,
-        )
-        .map(|out| (out.ctxdsl, out.partition_summary))
-        .map_err(|err| VerifyError::AdapterTranslationFailed {
-            source_id: source_id.to_string(),
-            adapter: "sv-rtl".to_string(),
-            message: err.to_string(),
-        })
-    } else {
-        warn_unused_additional_files("sv-rtl", source_id, additional_files);
-        let opts = AdapterOptions::default();
-        crate::adapter::systemverilog::SystemVerilogAdapter::translate(content, &opts)
-            .map(|out| (out.ctxdsl, out.partition_summary))
-            .map_err(|err| VerifyError::AdapterTranslationFailed {
-                source_id: source_id.to_string(),
-                adapter: "sv-rtl".to_string(),
-                message: err.to_string(),
-            })
-    }
+/// The SV peripheral adapter (`sv-yosys`) that consumes the
+/// register-map SV-side renaming table. The KMTS route emits
+/// `<signal>_<value>` labels (`adapter::btor2::bit_blast`), exactly the
+/// shape the renaming derivation in
+/// [`crate::verify::register_map_rewriter`] targets, so the firmware↔RTL
+/// rendezvous reconciliation applies to it. (The native `sv-rtl` route
+/// that previously also matched here was removed in S.2b.)
+fn is_sv_adapter(adapter: &str) -> bool {
+    adapter == "sv-yosys"
 }
 
 /// MIG-4 (S-track migration) — dispatch the `sv-yosys` KMTS route.
@@ -1898,128 +1856,23 @@ template = "reachable"
         ));
     }
 
-    /// End-to-end: a tiny SV peripheral + a register map mapping its
-    /// `req` input onto a synthetic `ctrl.req` field flows through the
-    /// orchestrator's register-map SV rewriter and the verify pipeline
-    /// completes against the rewritten alphabet.
+    /// The register-map SV-side rewriter gate ([`is_sv_adapter`]) admits
+    /// the KMTS route (`sv-yosys`) — the sole SystemVerilog route after
+    /// the S.2b native-parser excision. The rewriter targets the
+    /// `<signal>_<value>` labels the KMTS bit-blaster emits, so the
+    /// firmware↔RTL rendezvous reconciliation applies. (The native
+    /// `sv-rtl` route that previously also matched here was removed.)
+    /// The renaming derivation itself is unit-tested in
+    /// `crate::verify::register_map_rewriter`; an end-to-end
+    /// SV+register_map rewrite is a yosys-gated integration-test
+    /// follow-up.
     #[test]
-    fn register_map_binding_rewrites_sv_source_labels() {
-        let temp = tempdir().unwrap();
-        // Minimal SV module — same shape as the codesign-uart tests.
-        let sv = r#"
-module periph(
-    input        clk,
-    input        rst,
-    input        req,
-    output reg   ack
-);
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) ack <= 1'b0;
-        else if (req) ack <= 1'b1;
-        else ack <= 1'b0;
-    end
-endmodule
-"#;
-        fs::write(temp.path().join("periph.sv"), sv).unwrap();
-
-        // Register-map sidecar: a single-bit control field `req`
-        // exposed via SV signal `dut.req`.
-        let register_map = r#"{
-            "peripheral": "PERIPH",
-            "base_address": "0x40000000",
-            "registers": [
-                {
-                    "name": "ctrl",
-                    "offset": 0,
-                    "width_bits": 32,
-                    "direction": "WO",
-                    "visibility_class": "control",
-                    "fields": [
-                        {
-                            "name": "req",
-                            "bits": [0, 0],
-                            "sv_signal": "dut.req",
-                            "c_accessor": "PERIPH->CTRL.bit.req"
-                        }
-                    ]
-                }
-            ]
-        }"#;
-        fs::write(temp.path().join("register_map.json"), register_map).unwrap();
-
-        let toml_src = r#"
-[project]
-name = "RewriteTest"
-
-[[sources]]
-id = "rtl"
-adapter = "sv-rtl"
-files = ["periph.sv"]
-
-[alphabet]
-strategy = "register_map"
-register_map = "register_map.json"
-
-[composition]
-semantics = "asynchronous"
-members = ["rtl"]
-name = "P"
-
-[[properties]]
-name = "always_true"
-formula = "true"
-over = "P"
-"#;
-        let config = VerifyConfig::from_toml(toml_src).unwrap();
-        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
-        assert_eq!(report.project, "RewriteTest");
-        // Single source; verdict satisfied (vacuous property —
-        // the test's point is that the pipeline completes, with the
-        // register-map binding's SV rewriter applied without choking
-        // on the SV adapter's `<signal>_<value>` labels.
-        assert_eq!(report.property_verdicts.len(), 1);
-        assert!(report.property_verdicts[0].satisfied);
-    }
-
-    /// Direct-binding sanity: a register-map sidecar present but the
-    /// strategy is `direct` — the rewriter must not fire.
-    #[test]
-    fn direct_binding_with_sv_source_skips_register_map_rewriter() {
-        let temp = tempdir().unwrap();
-        let sv = r#"
-module tiny(input clk, input rst, input go, output reg done);
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) done <= 1'b0; else done <= go;
-    end
-endmodule
-"#;
-        fs::write(temp.path().join("tiny.sv"), sv).unwrap();
-        let toml_src = r#"
-[project]
-name = "DirectOnly"
-
-[[sources]]
-id = "rtl"
-adapter = "sv-rtl"
-files = ["tiny.sv"]
-
-[alphabet]
-strategy = "direct"
-
-[composition]
-semantics = "asynchronous"
-members = ["rtl"]
-name = "T"
-
-[[properties]]
-name = "p"
-formula = "true"
-over = "T"
-"#;
-        let config = VerifyConfig::from_toml(toml_src).unwrap();
-        let report = verify_project(&config, temp.path()).expect("verify pipeline succeeded");
-        assert_eq!(report.property_verdicts.len(), 1);
-        assert!(report.property_verdicts[0].satisfied);
+    fn is_sv_adapter_matches_only_the_kmts_route() {
+        assert!(is_sv_adapter("sv-yosys"));
+        assert!(!is_sv_adapter("sv-rtl"));
+        assert!(!is_sv_adapter("ctxdsl"));
+        assert!(!is_sv_adapter("c-codesign"));
+        assert!(!is_sv_adapter("xstate"));
     }
 
     #[test]

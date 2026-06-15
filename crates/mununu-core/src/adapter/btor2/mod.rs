@@ -140,7 +140,7 @@ fn requires_uf_routing(content: &str, options: &AdapterOptions) -> bool {
 /// populate this function with a call to
 /// [`crate::adapter::btor2::kmts_lift::predicate_cube_lift`] +
 /// the array-aware Z3 term construction in
-/// [`crate::adapter::systemverilog::kripke_smt::discover_significant_values`]
+/// [`crate::adapter::sidecar::predicate_image::all_smt`]
 /// and [`crate::adapter::btor2::kmts_lift::evaluate_pure`].
 ///
 /// Today it returns an `AdapterError` with a stage-3.c-specific
