@@ -2,25 +2,26 @@
 # Regenerated via examples/verify/microprogram_plus_sv/validate.sh
 #
 # Hand-authored CTXDSL microcode (Microprogram) + real SV
-# peripheral (handshake_peripheral) parsed via the sv-rtl adapter.
+# peripheral elaborated via the sv-yosys (sv2v -> Yosys -> BTOR2
+# -> KMTS) pipeline; its single automaton is named Circuit.
 # Disjoint label alphabets → asynchronous composition = product of
 # the independent state spaces (4 microcode states × 4 peripheral
 # states = 16 composed states).
 
 === mununu verify (human-readable) ===
 verify report — project `MicroprogramPlusSv`:
-  composition: asynchronous Driver { members = [Microprogram, handshake_peripheral] }
+  composition: asynchronous Driver { members = [Microprogram, Circuit] }
     - microcode (adapter = ctxdsl, automaton = Microprogram)
-    - peripheral (adapter = sv-rtl, automaton = handshake_peripheral)
+    - peripheral (adapter = sv-yosys, automaton = Circuit)
     microcode_no_deadlock: SATISFIED (4/4 states, 1/1 initial) [template `no_deadlock`, over = Microprogram]
-    peripheral_reaches_active: SATISFIED (4/4 states, 1/1 initial) [inline, over = handshake_peripheral]
+    peripheral_reaches_active: SATISFIED (4/4 states, 1/1 initial) [inline, over = Circuit]
     composed_no_deadlock: SATISFIED (16/16 states, 1/1 initial) [template `no_deadlock`, over = Driver]
 
 === verdict shape (from --json output) ===
 project = MicroprogramPlusSv
 composition.name = Driver
 composition.semantics = asynchronous
-composition.members = Microprogram, handshake_peripheral
+composition.members = Microprogram, Circuit
   microcode_no_deadlock: SATISFIED (4/4 states) [over = Microprogram]
-  peripheral_reaches_active: SATISFIED (4/4 states) [over = handshake_peripheral]
+  peripheral_reaches_active: SATISFIED (4/4 states) [over = Circuit]
   composed_no_deadlock: SATISFIED (16/16 states) [over = Driver]

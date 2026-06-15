@@ -5,17 +5,18 @@
 Third example in the verify-framework fleet. Demonstrates the
 framework's **adapter-agnosticism** by pairing a hand-authored
 CTXDSL microprogram with a real SystemVerilog peripheral
-(`SystemVerilogAdapter::translate`) under one `verify.toml`.
+(elaborated via the `sv-yosys` pipeline: sv2v → Yosys → BTOR2 →
+KMTS bit-blast) under one `verify.toml`.
 
 ## What it demonstrates
 
 - **Heterogeneous sources end-to-end.** One `ctxdsl` source +
-  one `sv-rtl` source compose without code changes on the
+  one `sv-yosys` source compose without code changes on the
   framework side. Each adapter runs independently; the assembler
   merges their CTXDSL outputs into a single context.
 - **Asynchronous composition with disjoint alphabets.** The two
   sides share no labels — the microprogram cycles on
-  `tick_microcode`, the SV peripheral on its port-binding labels.
+  `tick_microcode`, the SV side on the bit-blaster's clock label.
   Asynchronous composition produces a **product state space**:
   4 microcode states × 4 peripheral states = 16 composed states.
 - **Property reasoning over the product.** The orchestrator's
@@ -37,8 +38,10 @@ CTXDSL microprogram with a real SystemVerilog peripheral
 
 ## Reproduce
 
-No special prerequisites (the SV adapter parses inline; no clang
-shell-out required):
+Requires `yosys` and `sv2v` on `PATH` (the SV peripheral is elaborated
+through them; `validate.sh` exits with a clear error if either is
+missing). They are not bundled with the repo — the dev container
+installs them.
 
 ```bash
 bash examples/verify/microprogram_plus_sv/validate.sh
@@ -54,7 +57,7 @@ mununu verify examples/verify/microprogram_plus_sv/verify.toml --json
 Successful run produces:
 
 ```
-composition: asynchronous Driver { members = [Microprogram, handshake_peripheral] }
+composition: asynchronous Driver { members = [Microprogram, Circuit] }
 microcode_no_deadlock: SATISFIED (4/4 states, 1/1 initial)
 peripheral_reaches_active: SATISFIED (4/4 states, 1/1 initial)
 composed_no_deadlock: SATISFIED (16/16 states, 1/1 initial)
@@ -69,12 +72,12 @@ actually coordinate (e.g., a microcode `AssertReq` step driving the
 peripheral's `req → WAIT_ACK` transition), the SV side would need
 either:
 
-1. A `.mununu.json` sidecar declaring the SV adapter's
-   port-binding labels with names matching the microprogram's
+1. A `.mununu.json` sidecar declaring the SV side's
+   port/predicate labels with names matching the microprogram's
    events, or
 2. A `[alphabet] strategy = "renamings"` entry in `verify.toml`
-   pointing the SV adapter's `req_T` / `req_F` labels at the
-   microprogram's `tick_microcode`-style events.
+   binding the SV side's labels to the microprogram's
+   `tick_microcode`-style events.
 
 These extensions are tracked as future verify-framework work; the
 present fixture exercises the **adapter dispatch and composition**
