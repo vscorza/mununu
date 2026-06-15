@@ -1,39 +1,59 @@
 # sv_multi_module — SystemVerilog multi-module composition under the
-# verify framework (Stream A1 of the adjacent-work plan).
+# verify framework, via the KMTS `sv-yosys` pipeline.
 #
-# Demonstrates: a single `[[sources]]` block with `files = [sidecar,
-# module_1.sv, module_2.sv]` drives the SV adapter's multi-module
-# entry point. The orchestrator reads every file, recognises the
-# multi-module sidecar shape (`mununu_sv_multi_v1` schema), and
-# dispatches via `SystemVerilogAdapter::translate_multi_module_content`.
+# Migrated from the native `mununu_sv_multi_v1` sidecar form (S.2b,
+# native-parser deletion). A single `[[sources]]` block with
+# `files = [top.sv, module_1.sv, module_2.sv]` and
+# `[sources.options] multi_module = true` drives the sv-yosys
+# multi-module entry point: each submodule is elaborated to BTOR2,
+# lifted to a KMTS, its port labels renamed to the connected nets
+# (discovered from the top module's Yosys netlist), and the instances
+# are synchronously composed. The composed automaton is named `Circuit`.
 #
-# Without multi-file source support, the user would have to either
-# pre-compose the SV blob (lossy) or hand-author a CTXDSL stub.
+# The shared net `valid` (producer drives, consumer reads) rendezvouses
+# across the composition, so the consumer reacts to the producer — the
+# `consumer_reacts` property below exercises that cross-module coupling
+# (it is vacuous if the rendezvous is dropped).
 
 [project]
 name = "SvMultiModule"
-description = "Producer + consumer composed via the SV adapter's multi-module path."
+description = "Producer + consumer composed via the sv-yosys multi-module path."
 
 [[sources]]
 id = "system"
-adapter = "sv-rtl"
-# Primary file is the multi-module sidecar; additional files are the
-# SV sources it references via the `source` field on each module.
+# Primary file is the top module; additional files are the submodule
+# sources it structurally instantiates.
 files = [
-    "system.mununu.json",
+    "producer_consumer_system_top.sv",
     "producer.sv",
     "consumer.sv",
 ]
+adapter = "sv-yosys"
+
+[sources.options]
+multi_module = true
+top = "producer_consumer_system_top"
 
 [alphabet]
 strategy = "direct"
 
 [composition]
-semantics = "asynchronous"
+semantics = "synchronous"
 members = ["system"]
 name = "ProducerConsumerSystem"
 
 [[properties]]
+# Liveness floor: the composed product is non-empty and every state has
+# a successor (the FSMs all cycle).
 name = "system_alive"
 formula = "true"
-over = "system"
+over = "Circuit"
+
+[[properties]]
+# Cross-module rendezvous: the consumer eventually reaches BUSY (state
+# == 1 in {IDLE=0, BUSY=1, ACK=2}), which only happens when the
+# producer drives `valid` high — proves the shared-net rendezvous is
+# live, not dropped.
+name = "consumer_reacts"
+formula = "mu X. ((u_consumer__state == 1) || (<> X))"
+over = "Circuit"
