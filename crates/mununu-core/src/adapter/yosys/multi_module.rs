@@ -134,14 +134,31 @@ pub fn prepare_instance_for_composition(
     //    encoding (`normalize_signal_value`: the 1-bit surfaced outputs'
     //    `T`/`F` → `1`/`0`) so the composed product is all-numeric and the
     //    verify pipeline can bind `<instance>__<signal> == k` atoms (R-MM-5b).
+    //
+    //    R-MM-7 (port-equality realisation): for each output port this
+    //    instance DRIVES onto a shared net, ALSO surface the value under the
+    //    bare NET name (`valid`, not just `u_producer__valid`). The driver's
+    //    surfaced output is a function of its state (Moore), so the net value
+    //    is well-defined per composed state; the synchronous rendezvous on
+    //    `<net>_<v>` labels already forces the reader side to agree, so the
+    //    bare net valuation IS the connected ports' single agreed value — the
+    //    §7.2 port-equality predicate, made first-class. A composed property
+    //    can then reference the shared net directly (`valid == 1`) without
+    //    knowing which instance drives it. Precision-only: it adds a queryable
+    //    predicate, never changes the transition structure or a verdict.
     for state in clts.states() {
         if let (Some(&new_id), Some(valuation)) =
             (state_mapping.get(&state), clts.state_valuation(state))
         {
-            let qualified: std::collections::BTreeMap<String, String> = valuation
+            let mut qualified: std::collections::BTreeMap<String, String> = valuation
                 .iter()
                 .map(|(k, v)| (format!("{instance}__{k}"), normalize_signal_value(v)))
                 .collect();
+            for (port, net) in driver_ports {
+                if let Some(v) = valuation.get(port) {
+                    qualified.insert(net.clone(), normalize_signal_value(v));
+                }
+            }
             builder.with_valuation_for_state(new_id, qualified);
         }
     }
@@ -586,6 +603,53 @@ mod tests {
     }
 
     #[test]
+    fn driver_net_value_surfaced_under_bare_net_name() {
+        // R-MM-7: a driver's output value is surfaced BOTH instance-qualified
+        // (`u_p__valid`) AND under the bare connected-NET name — using the net
+        // name (`handshake`), not the port name (`valid`) — so a composed
+        // property can reference the shared net directly.
+        let mut b = Clts::builder();
+        let s0 = b.state_with_name("s0".into()).unwrap();
+        let s1 = b.state_with_name("s1".into()).unwrap();
+        b.initial_state_id(s0);
+        let step = b.labels().intern(["step"]).unwrap();
+        b.transition_ids(s0, &[step], s1);
+        b.transition_ids(s1, &[step], s0);
+        let mut v0 = std::collections::BTreeMap::new();
+        v0.insert("valid".to_string(), "F".to_string());
+        b.with_valuation_for_state(s0, v0);
+        let mut v1 = std::collections::BTreeMap::new();
+        v1.insert("valid".to_string(), "T".to_string());
+        b.with_valuation_for_state(s1, v1);
+        let clts = b.build().unwrap();
+
+        let mut drivers = HashMap::new();
+        drivers.insert("valid".to_string(), "handshake".to_string());
+        let out =
+            prepare_instance_for_composition(&clts, &HashMap::new(), &drivers, "u_p").unwrap();
+
+        let s1n = out.state_id("s1").unwrap();
+        let v = out.state_valuation(s1n).unwrap();
+        assert_eq!(
+            v.get("u_p__valid").map(String::as_str),
+            Some("1"),
+            "instance-qualified valuation retained"
+        );
+        assert_eq!(
+            v.get("handshake").map(String::as_str),
+            Some("1"),
+            "bare NET name surfaced (net `handshake`, not port `valid`)"
+        );
+        let s0n = out.state_id("s0").unwrap();
+        let v0 = out.state_valuation(s0n).unwrap();
+        assert_eq!(
+            v0.get("handshake").map(String::as_str),
+            Some("0"),
+            "bare net value tracks the driver's state"
+        );
+    }
+
+    #[test]
     fn step_label_is_kept_verbatim() {
         let mut b = Clts::builder();
         let s0 = b.state_with_name("s0".into()).unwrap();
@@ -813,6 +877,48 @@ mod tests {
         assert!(
             has_qualified,
             "instance-qualified valuations present on the product"
+        );
+    }
+
+    /// R-MM-7 — the bare shared-net valuation re-enters the verify pipeline:
+    /// the composed `producer_consumer_top` carries `valid` (the net name,
+    /// un-qualified) and a property referencing the net directly (`valid == 1`)
+    /// binds non-vacuously through clts_to_ctxdsl → parse → realise → evaluate.
+    #[test]
+    fn bare_net_value_resolves_in_composed_property() {
+        use crate::mu_calculus::evaluator::{EvaluationOptions, evaluate_with_options};
+        let Some(comp) = compose_producer_consumer() else {
+            eprintln!("skip: yosys / fixtures unavailable");
+            return;
+        };
+        // The product carries the bare shared-net valuation `valid` (R-MM-7),
+        // not only `u_producer__valid`.
+        let has_bare_valid = comp.composed.states().any(|s| {
+            comp.composed
+                .state_valuation(s)
+                .is_some_and(|v| v.contains_key("valid"))
+        });
+        assert!(
+            has_bare_valid,
+            "bare net `valid` valuation surfaced on the composed product"
+        );
+
+        let ctxdsl = clts_to_ctxdsl(&comp.composed, "system", "mm_system").unwrap();
+        let doc = crate::context_dsl::parser::parse(&ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize::realize(&doc, &[]).unwrap();
+        let name = realized.context.clts_names().into_iter().next().unwrap();
+        let composed = realized.context.clts(&name).unwrap();
+        let env = realized.environment_for(&name);
+        let f = crate::mu_calculus::parser::parse("valid == 1").unwrap();
+        let result =
+            evaluate_with_options(&f, composed, &env, &EvaluationOptions::default()).unwrap();
+        let sat = (0..composed.state_count())
+            .filter(|i| result.get(*i).map(|b| *b).unwrap_or(false))
+            .count();
+        assert!(
+            sat > 0 && sat < composed.state_count(),
+            "bare-net atom `valid == 1` binds non-vacuously: {sat}/{}",
+            composed.state_count()
         );
     }
 
