@@ -32,7 +32,7 @@ use crate::clts::{Clts, CltsResult, DefaultLabelIdx, DefaultStateIdx, LabelId, S
 use crate::composition::{CompositionOptions, CompositionSemantics, compose};
 use crate::controllability::BoundaryDirection;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The clock-step fallback label the bit-blaster emits for a module with no
 /// free (non-clock, non-reset) inputs. It is shared across such modules so
@@ -360,6 +360,124 @@ fn realize_module_clts(ctxdsl: &str) -> Result<Clts<DefaultStateIdx, DefaultLabe
         .ok_or_else(|| format!("automaton '{name}' missing after realise"))
 }
 
+/// R-MM-5a — Serialise a `Clts` to CTXDSL by building a single-automaton
+/// [`crate::adapter::ir::AdapterIR`] and reusing the IR→CTXDSL emitter
+/// ([`crate::adapter::emit::emit`]).
+///
+/// This is what lets a composed multi-module KMTS re-enter the standard
+/// parse→realise→evaluate verify pipeline: the pipeline rebuilds the
+/// predicate `Environment` from the inline state valuations, so no bespoke
+/// direct-evaluation path (and its duplicated predicate-bitset machinery)
+/// is needed. The composed design becomes a first-class, inspectable CTXDSL
+/// artifact.
+///
+/// Emits the 2-valued shape (states + inline valuations + multi-label
+/// transitions + controllability + modality). 3-valued predicate labellings
+/// have no CTXDSL syntax and are absent on the 2-valued multi-module path.
+pub fn clts_to_ctxdsl(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+    context_name: &str,
+) -> Result<String, AdapterError> {
+    use crate::adapter::SourceFormat;
+    use crate::adapter::emit::emit;
+    use crate::adapter::ir::{AdapterIR, AutomatonSpec, Metadata, StateSpec, TransitionSpec};
+
+    let state_name = |s| clts.state_name(s).unwrap_or("state").to_string();
+
+    let states: Vec<StateSpec> = clts
+        .states()
+        .map(|s| StateSpec {
+            name: state_name(s),
+            is_initial: clts.initial_states().contains(&s),
+            valuations: clts.state_valuation(s).cloned(),
+        })
+        .collect();
+
+    let mut transitions: Vec<TransitionSpec> = Vec::new();
+    for s in clts.states() {
+        let source = state_name(s);
+        for t in clts.outgoing(s) {
+            let mut labels: Vec<String> = Vec::new();
+            for &lid in t.labels() {
+                if let Some(payload) = clts.label_payload(lid) {
+                    labels.extend(payload.iter().cloned());
+                }
+            }
+            let (modality, additional_targets) = modality_to_spec(clts, t);
+            transitions.push(TransitionSpec {
+                source: source.clone(),
+                target: state_name(t.target()),
+                labels,
+                modality,
+                additional_targets,
+            });
+        }
+    }
+
+    let label_names = |set: &HashSet<LabelId<DefaultLabelIdx>>| -> Vec<String> {
+        let mut v: Vec<String> = set
+            .iter()
+            .filter_map(|&l| clts.label_payload(l))
+            .flatten()
+            .cloned()
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    let automaton = AutomatonSpec {
+        name: automaton_name.to_string(),
+        states,
+        transitions,
+        controllable_labels: label_names(clts.controllable_alphabet()),
+        internal_labels: label_names(clts.internal_alphabet()),
+    };
+
+    let ir = AdapterIR {
+        metadata: Metadata {
+            title: context_name.to_string(),
+            source_format: SourceFormat::SystemVerilog,
+            description: Some("R-MM composed multi-module KMTS".to_string()),
+            game_semantics: None,
+            known_status: None,
+        },
+        signals: Vec::new(),
+        automata: vec![automaton],
+        compositions: Vec::new(),
+        properties: Vec::new(),
+        controller: None,
+    };
+
+    emit(&ir).map(|r| r.ctxdsl)
+}
+
+/// Map a transition's [`crate::clts::TransitionModality`] to the CTXDSL
+/// emitter's `TransitionModalitySpec` + the additional hyper-must target
+/// names (targets beyond the primary). Sharp / MayOnly carry no extra
+/// targets; the 2-valued multi-module path is all Sharp.
+fn modality_to_spec(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    t: &crate::clts::Transition<DefaultStateIdx, DefaultLabelIdx>,
+) -> (crate::context_dsl::ast::TransitionModalitySpec, Vec<String>) {
+    use crate::clts::TransitionModality;
+    use crate::context_dsl::ast::TransitionModalitySpec;
+    match t.modality() {
+        TransitionModality::Sharp => (TransitionModalitySpec::Sharp, Vec::new()),
+        TransitionModality::MayOnly => (TransitionModalitySpec::MayOnly, Vec::new()),
+        TransitionModality::MustHyperOnly(_) => {
+            let targets = t.modality().must_target_set(t.target());
+            let additional: Vec<String> = targets
+                .iter()
+                .skip(1)
+                .filter_map(|&st| clts.state_name(st).map(str::to_string))
+                .collect();
+            (TransitionModalitySpec::MustOnly, additional)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +697,80 @@ mod tests {
         assert!(
             has_qualified,
             "instance-qualified valuations present on the product"
+        );
+    }
+
+    /// Compose `producer_consumer_top` via the real yosys pipeline, or
+    /// `None` when yosys / the fixtures are unavailable (test skip).
+    fn compose_producer_consumer() -> Option<MultiModuleComposition> {
+        if !yosys_available() {
+            return None;
+        }
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/systemverilog");
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
+        let top = read("multi_producer_consumer_top.sv")?;
+        let producer = read("multi_producer.sv")?;
+        let consumer = read("multi_consumer.sv")?;
+        let buffer = read("bounded_buffer.sv")?;
+        let yopts = YosysOptions {
+            top: Some("producer_consumer_top".into()),
+            per_module_btor: true,
+            additional_sources: vec![
+                ("multi_producer.sv".into(), producer),
+                ("multi_consumer.sv".into(), consumer),
+                ("bounded_buffer.sv".into(), buffer),
+            ],
+            ..Default::default()
+        };
+        compose_sv_multi_module(&top, &AdapterOptions::default(), &yopts).ok()
+    }
+
+    /// R-MM-5a — the composed KMTS round-trips through CTXDSL: emit it, then
+    /// re-parse + realise, and confirm the structure (state count, the
+    /// shared-net rendezvous label, instance-qualified valuations) survives.
+    /// This is what makes the composed design re-enter the verify pipeline.
+    #[test]
+    fn clts_to_ctxdsl_round_trips_composed_design() {
+        let Some(comp) = compose_producer_consumer() else {
+            eprintln!("skip: yosys / fixtures unavailable");
+            return;
+        };
+        let ctxdsl = clts_to_ctxdsl(&comp.composed, "system", "mm_system").expect("emit ctxdsl");
+
+        // Re-parse + realise the emitted CTXDSL — proves it is valid, and
+        // recovers an equivalent Clts via the standard pipeline.
+        let doc = crate::context_dsl::parser::parse(&ctxdsl).expect("re-parse emitted ctxdsl");
+        let realized =
+            crate::context_dsl::realize::realize(&doc, &[]).expect("re-realise emitted ctxdsl");
+        let name = realized
+            .context
+            .clts_names()
+            .into_iter()
+            .next()
+            .expect("one automaton");
+        let recovered = realized.context.clts(&name).expect("recovered clts");
+
+        assert_eq!(
+            recovered.state_count(),
+            comp.composed.state_count(),
+            "state count survives the CTXDSL round-trip"
+        );
+        let alpha = recovered.alphabet();
+        assert!(
+            alpha.iter().any(|l| l == "valid_0") && alpha.iter().any(|l| l == "valid_1"),
+            "shared-net rendezvous labels survive the round-trip; got {alpha:?}"
+        );
+        // Instance-qualified valuations survive (so a composed property can
+        // reference each module's signals after the round-trip).
+        let has_qualified = recovered.states().any(|s| {
+            recovered
+                .state_valuation(s)
+                .is_some_and(|v| v.keys().any(|k| k.starts_with("u_producer__")))
+        });
+        assert!(
+            has_qualified,
+            "instance-qualified valuations survive the round-trip"
         );
     }
 }
