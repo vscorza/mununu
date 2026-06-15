@@ -91,10 +91,11 @@ pub fn discover_values_for_state_cell(
 /// in the design and convert the results into the existing
 /// `DiscoveredValues` sidecar shape.
 ///
-/// Each entry's `name` is `VAL_<k>` (matching the convention in
-/// [`crate::adapter::systemverilog::kripke_smt::engine`]); each entry's
-/// `from` provenance string is `"predicate-image: ..."` for downstream
-/// traceability.
+/// Each entry's `name` is `VAL_<k>`; each entry's `from` provenance
+/// string is `"predicate-image: ..."` for downstream traceability.
+/// (This BTOR2-native discovery superseded the native-SV
+/// `kripke_smt` significant-value discovery removed in S.2b — it is the
+/// authoring path behind `mununu btor2 discover`.)
 pub fn discover_design_values(
     file: &Btor2File,
     view: &Btor2SmtView,

@@ -8,7 +8,6 @@ use mununu_core::adapter::xstate::emit_controller::controller_to_xstate_json;
 use mununu_core::adapter::{AdapterOptions, FormatAdapter};
 use mununu_core::context_dsl;
 
-use mununu_core::adapter::systemverilog::SystemVerilogAdapter;
 use mununu_core::adapter::systemverilog::emit_controller::controller_to_systemverilog;
 
 // ---------------------------------------------------------------------------
@@ -64,32 +63,38 @@ fn xstate_round_trip_json_output() {
 // SystemVerilog round-trip: SV → synthesize → SV module controller
 // ---------------------------------------------------------------------------
 
-const SV_HANDSHAKE: &str = r#"
-    // @mununu ltl safety: nu X. ([] X)
-    module handshake(
-        input logic clk, input logic rst,
-        input logic req,
-        output logic ack
-    );
-        typedef enum logic [1:0] {IDLE, WAIT, ACTIVE, DONE} state_t;
-        state_t state;
-        always_ff @(posedge clk or posedge rst) begin
-            if (rst) state <= IDLE;
-            else case (state)
-                IDLE: if (req) state <= WAIT;
-                WAIT: state <= ACTIVE;
-                ACTIVE: if (!req) state <= DONE;
-                DONE: state <= IDLE;
-            endcase
-        end
-    endmodule
+// CTXDSL equivalent of a 4-state handshake FSM (IDLE/WAIT/ACTIVE/DONE).
+// S.2b removed the native SV input parser; this test exercises the
+// `controller_to_systemverilog` *emitter* (a keep-feature), which is
+// input-agnostic — it renders a synthesised `Clts` controller, so any
+// CTXDSL source that yields a multi-state controller drives it.
+const HANDSHAKE_CTXDSL: &str = r#"
+    context handshake {
+        alphabet { label req; label noreq; }
+        automata {
+            automaton handshake {
+                controllable { label req; label noreq; }
+                states { state IDLE initial; state WAIT; state ACTIVE; state DONE; }
+                transitions {
+                    transition IDLE -> WAIT on label req;
+                    transition IDLE -> IDLE on label noreq;
+                    transition WAIT -> ACTIVE on label req;
+                    transition WAIT -> ACTIVE on label noreq;
+                    transition ACTIVE -> ACTIVE on label req;
+                    transition ACTIVE -> DONE on label noreq;
+                    transition DONE -> IDLE on label req;
+                    transition DONE -> IDLE on label noreq;
+                }
+            }
+        }
+        mu_formulas { formula safety { over handshake; body = nu X. ([] X); } }
+        controllers { controller c { source handshake; satisfying safety; } }
+    }
 "#;
 
 #[test]
 fn systemverilog_round_trip_sv_output() {
-    let options = AdapterOptions::default();
-    let output = SystemVerilogAdapter::translate(SV_HANDSHAKE, &options).unwrap();
-    let doc = context_dsl::parse(&output.ctxdsl).unwrap();
+    let doc = context_dsl::parse(HANDSHAKE_CTXDSL).unwrap();
     let realized = context_dsl::realize_context(&doc, &[]).unwrap();
 
     let formula = realized.formulas.get("safety").unwrap();

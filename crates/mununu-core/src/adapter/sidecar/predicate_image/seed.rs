@@ -47,13 +47,13 @@ pub fn collect_btor2_seeds(_file: &crate::adapter::btor2::ast::Btor2File) -> Vec
 
 /// Placeholder for the SV syntactic seed walker. Step 4.3 will
 /// implement this: harvest case-label constants and `signal == k`
-/// RHS literals from `always_ff` / `always_comb` blocks. The existing
-/// [`crate::adapter::systemverilog::kripke::scan_significant_constants`]
-/// is the closest current code; this module supersedes it once step
-/// 4.3 lands.
-pub fn collect_sv_seeds(
-    _module: &crate::adapter::systemverilog::ast::Module,
-) -> Vec<SeedPredicate> {
+/// RHS literals from `always_ff` / `always_comb` blocks. With the
+/// native SV parser removed (S.2b), this operates on the SV source
+/// text directly (the standalone scanners in
+/// [`crate::adapter::systemverilog::typedef_extract`] /
+/// [`crate::adapter::systemverilog::case_literal_extract`] are the
+/// closest current code).
+pub fn collect_sv_seeds(_source: &str) -> Vec<SeedPredicate> {
     Vec::new()
 }
 

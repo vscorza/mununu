@@ -51,7 +51,6 @@ pub mod partition;
 pub mod promela;
 pub mod sidecar;
 pub mod state_enum;
-pub mod sv_pipeline_compare;
 pub mod systemverilog;
 pub mod templates;
 pub mod tlsf;
@@ -453,16 +452,18 @@ pub fn auto_translate(
     if microcode::MicrocodeAdapter::detect(content) {
         return microcode::MicrocodeAdapter::translate(content, options);
     }
-    if systemverilog::SystemVerilogAdapter::detect(content) {
-        return systemverilog::SystemVerilogAdapter::translate(content, options);
-    }
+    // SystemVerilog is intentionally NOT content-auto-detected: the sole
+    // SV route (`sv-yosys`) runs sv2v + Yosys subprocesses over the file
+    // on disk (plus any submodule sources), which the content-only
+    // auto-detect path cannot supply. Drive SV explicitly via the verify
+    // framework with `adapter = "sv-yosys"`.
     if extraction::ExtractionAdapter::detect(content) {
         return extraction::ExtractionAdapter::translate(content, options);
     }
 
     Err(AdapterError {
         kind: AdapterErrorKind::ParseError,
-        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), BTOR2 (.btor/.btor2), Promela (.pml), XState (.xstate or .xstate.json), CrewAI (.crewai.json), LangGraph (.langgraph.json), SystemVerilog (.sv/.v via Yosys frontend), Extraction (.espec.json)".into(),
+        message: "Could not detect source format. Supported formats: TLSF (.tlsf), AIGER (.aag/.aig), BTOR2 (.btor/.btor2), Promela (.pml), XState (.xstate or .xstate.json), CrewAI (.crewai.json), LangGraph (.langgraph.json), Extraction (.espec.json). SystemVerilog is not auto-detected — use the verify framework with adapter = \"sv-yosys\".".into(),
         location: None,
     })
 }

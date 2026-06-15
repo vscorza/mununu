@@ -2297,23 +2297,6 @@ fn load_with_adapter_mode(
             );
             output.ctxdsl
         }
-        Some("systemverilog") | Some("sv") => {
-            use mununu::adapter::{AdapterOptions, FormatAdapter};
-            let options = AdapterOptions::default();
-            let output =
-                mununu::adapter::systemverilog::SystemVerilogAdapter::translate(&source, &options)
-                    .map_err(|e| format!("SystemVerilog adapter error: {e}"))?;
-            for w in &output.warnings {
-                eprintln!("adapter warning: {}", w.message);
-            }
-            eprintln!(
-                "Translated SystemVerilog: {} signals, {} states, {} properties",
-                output.source_info.signal_count,
-                output.source_info.state_count,
-                output.source_info.property_count,
-            );
-            output.ctxdsl
-        }
         Some("xstate") => {
             use mununu::adapter::{AdapterOptions, FormatAdapter};
             let options = AdapterOptions::default();

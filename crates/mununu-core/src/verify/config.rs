@@ -115,7 +115,9 @@ pub struct SourceSection {
     /// Adapter name. Dispatched through the registry assembled in
     /// A2.4. Recognised values today (subject to A2 evolution):
     /// `"c-codesign"` (firmware C via `codesign::c_extract_llvm`),
-    /// `"sv-rtl"` (custom-SV / yosys frontend), `"ctxdsl"` (raw
+    /// `"sv-yosys"` / `"yosys"` (SystemVerilog via sv2v→Yosys→BTOR2 —
+    /// the sole SV route since S.2b; `multi_module = true` opts into
+    /// top-netlist composition), `"ctxdsl"` (raw
     /// hand-authored automaton), `"xstate"`, `"crewai"` (CrewAI
     /// agentic JSON), `"langgraph"` (LangGraph StateGraph JSON),
     /// `"microcode"` (restricted JSON microcode form — plan Part 5.5),
@@ -776,7 +778,7 @@ files = ["firmware.c"]
 
 [[sources]]
 id = "periph"
-adapter = "sv-rtl"
+adapter = "sv-yosys"
 files = ["uart.sv"]
 
 [alphabet]
