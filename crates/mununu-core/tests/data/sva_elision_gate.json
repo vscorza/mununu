@@ -114,6 +114,16 @@
     "matches": [],
     "error": null
   },
+  "multi_buffer_overflow_bug_top.sv": {
+    "passed": true,
+    "matches": [],
+    "error": null
+  },
+  "multi_buffer_overflow_fixed_top.sv": {
+    "passed": true,
+    "matches": [],
+    "error": null
+  },
   "multi_buffer_producer_bug.sv": {
     "passed": true,
     "matches": [],

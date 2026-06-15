@@ -644,6 +644,50 @@
     }
   },
   {
+    "fixture": "multi_buffer_overflow_bug_top.sv",
+    "top": null,
+    "native": {
+      "state_count": 0,
+      "property_count": 0,
+      "signal_count": 4,
+      "error": null
+    },
+    "kmts": {
+      "submodule_count": 0,
+      "state_count_sum": null,
+      "property_count_sum": null,
+      "per_submodule": [],
+      "error": "adapter/yosys: yosys exited with status exit status: 1 (script: read_verilog -formal -sv <tempdir>/work.sv; hierarchy -check -auto-top; proc; write_json <tempdir>/hier.json)\nstdout:\n\nstderr:\nERROR: Module `\\bounded_buffer' referenced in module `\\buffer_overflow_bug_top' in cell `\\u_buffer' is not part of the design.\n"
+    },
+    "sva_gate": {
+      "passed": true,
+      "matches": [],
+      "error": null
+    }
+  },
+  {
+    "fixture": "multi_buffer_overflow_fixed_top.sv",
+    "top": null,
+    "native": {
+      "state_count": 0,
+      "property_count": 0,
+      "signal_count": 4,
+      "error": null
+    },
+    "kmts": {
+      "submodule_count": 0,
+      "state_count_sum": null,
+      "property_count_sum": null,
+      "per_submodule": [],
+      "error": "adapter/yosys: yosys exited with status exit status: 1 (script: read_verilog -formal -sv <tempdir>/work.sv; hierarchy -check -auto-top; proc; write_json <tempdir>/hier.json)\nstdout:\n\nstderr:\nERROR: Module `\\bounded_buffer' referenced in module `\\buffer_overflow_fixed_top' in cell `\\u_buffer' is not part of the design.\n"
+    },
+    "sva_gate": {
+      "passed": true,
+      "matches": [],
+      "error": null
+    }
+  },
+  {
     "fixture": "multi_buffer_producer_bug.sv",
     "top": "buffer_producer_bug",
     "native": {
