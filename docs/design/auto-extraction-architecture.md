@@ -134,15 +134,15 @@ the schema is **format-agnostic by construction**.
 
 ### 1.6 SMT discovery (today)
 
-> Source of truth: [`crates/mununu-core/src/adapter/systemverilog/kripke_smt.rs`](../../crates/mununu-core/src/adapter/systemverilog/kripke_smt.rs#L20) — surface: CLI (`mununu sv discover`)
+> Source of truth: [`crates/mununu-core/src/adapter/sidecar/predicate_image/all_smt.rs`](../../crates/mununu-core/src/adapter/sidecar/predicate_image/all_smt.rs) — surface: CLI (`mununu btor2 discover`)
 
-`discover_significant_values(&Module, &SvAnnotation)` walks the SV AST,
-collects guard expressions that mention each `Discover`-marked signal,
-asks Z3 for satisfying constants per guard (capped at
-`MAX_VALUES_PER_SIGNAL=32`), then merges with syntactically-extracted
-case-label constants. The result is written into the sidecar's
-`discovered_values` map. **Requires the SV adapter's AST** — BTOR2
-designs cannot use this path today.
+`discover_design_values(&Btor2File, …)` walks the BTOR2 IR, asks Z3 for
+satisfying constants per state cell (SMT predicate-image), and writes the
+result into the sidecar's `discovered_values` map. (S.2b removed the
+native-SV-AST predecessor, `kripke_smt::discover_significant_values`,
+which required the hand-rolled SV parser; the BTOR2-IR path operates on
+the same IR the verify pipeline uses and is therefore the canonical
+discovery for the `sv-yosys` flow.)
 
 ### 1.7 Mu-calculus
 

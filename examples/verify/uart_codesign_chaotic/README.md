@@ -26,8 +26,9 @@ every register access at any time.
   renamings; today both sides already speak the rendezvous alphabet
   (firmware via the c-codesign adapter, peripheral by author
   convention) so the binding projection is a no-op. The orchestrator
-  wires this strategy through cleanly; a follow-up adds SV-side
-  label rewriting when the peripheral is sourced from `sv-rtl`.
+  wires this strategy through cleanly; SV-side label rewriting fires
+  when the peripheral is sourced from `sv-yosys` (the register-map
+  rewriter gate, `is_sv_adapter`).
 - **`allow_peripheral_superset = true`.** The peripheral exposes all
   register-map labels (chaotic stub admits everything); the firmware
   exercises only a subset. Without the flag this would be a
@@ -95,7 +96,7 @@ SystemVerilog model:
 ```toml
 [[sources]]
 id = "peripheral"
-adapter = "sv-rtl"
+adapter = "sv-yosys"
 files = ["uart_lite.sv"]   # real RTL
 ```
 

@@ -344,9 +344,11 @@ pub fn collect_syntactic_predicates(module: &Module) -> Vec<PredicateSeed> {
 ```
 
 **Map to mununu.** Stage 3 (predicate seeding). Closest published
-artefact to what mununu's `mununu sv discover` already does
-*syntactically* (case-label scrape in
-[`kripke.rs:scan_significant_constants`](../../crates/mununu-core/src/adapter/systemverilog/kripke.rs));
+artefact to what mununu's `mununu btor2 discover` already does
+*syntactically* (SMT predicate-image over the BTOR2 IR in
+[`adapter/sidecar/predicate_image/all_smt.rs`](../../crates/mununu-core/src/adapter/sidecar/predicate_image/all_smt.rs);
+the case-literal scrape lives in
+[`adapter/systemverilog/case_literal_extract.rs`](../../crates/mununu-core/src/adapter/systemverilog/case_literal_extract.rs));
 this paper formalises the rule and shows it scales.
 
 ---
@@ -394,7 +396,7 @@ sense if Phase A's enumeration runtime fails the decision gate.
 **Theoretical core.** Extends #6 by replacing hand-chosen predicate
 grammars with *learned* sub-term grammars: SyGuS synthesises lemmas to
 strengthen IC3 frames. Relevant to mununu only as a forward-looking
-direction — once `mununu sv discover` produces stable significant-value
+direction — once `mununu btor2 discover` produces stable significant-value
 sets, a SyGuS layer could *propose* new predicates from cex traces
 without WP.
 

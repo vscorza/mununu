@@ -24,7 +24,7 @@
       "name": "data_out_r",
       "preserve": false,
       "abstraction": "discover",
-      "note": "wide register — run `mununu sv discover` to find significant values"
+      "note": "wide register — run `mununu btor2 discover` to find significant values"
     }
   ],
   "inputs": [

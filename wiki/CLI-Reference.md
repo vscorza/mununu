@@ -71,9 +71,9 @@ mununu context eval examples/agentic/mcp_auth.ctxdsl \
 ```
 
 ```bash
-# Evaluate a SystemVerilog design
-mununu context eval design.sv --adapter sv \
-    --formula safety --automaton handshake
+# Evaluate a SystemVerilog design (sv2v → Yosys → BTOR2 → bit-blast)
+mununu context eval design.sv --adapter sv-yosys \
+    --formula safety --automaton Circuit
 
 # Evaluate an XState machine
 mununu context eval machine.xstate --adapter xstate \
@@ -288,7 +288,7 @@ mununu context predicates examples/hw/arbiter.ctxdsl --automaton Arbiter
 
 ## `mununu verify`
 
-Run the general N-source verification framework against a `verify.toml` manifest. The manifest lists sources (any combination of `ctxdsl`, `xstate`, `crewai`, `langgraph`, `sv-rtl`, `c-codesign`, `extraction`), an alphabet-binding strategy, a composition shape, and properties. See [Verify Project Flow](Verify-Project-Flow.md) for the conceptual model and the `verify.toml` schema.
+Run the general N-source verification framework against a `verify.toml` manifest. The manifest lists sources (any combination of `ctxdsl`, `xstate`, `crewai`, `langgraph`, `sv-yosys`, `c-codesign`, `extraction`), an alphabet-binding strategy, a composition shape, and properties. See [Verify Project Flow](Verify-Project-Flow.md) for the conceptual model and the `verify.toml` schema.
 
 > Source of truth: [`mununu-cli::handle_verify`](../crates/mununu-cli/src/main.rs) — surface: CLI.
 
@@ -395,8 +395,8 @@ mununu context synth machine.xstate --adapter xstate \
     --output-format xstate --emit-native controller.json
 
 # Import SystemVerilog RTL, synthesize, export as SV module
-mununu context synth design.sv --adapter sv \
-    --formula safety --automaton FSM \
+mununu context synth design.sv --adapter sv-yosys \
+    --formula safety --automaton Circuit \
     --output-format systemverilog --emit-native controller.sv
 
 # Auto-detect format from extension
@@ -407,55 +407,31 @@ See [Adapter Formats](Adapter-Formats.md) for supported formats and limitations.
 
 ---
 
-## `mununu sv` — SystemVerilog Analysis Tools
+## `mununu sv` — SystemVerilog Frontend Tools
 
-### `mununu sv init`
+> **S.2b note.** The native `mununu sv init` / `sv discover` commands (which
+> parsed SV with a hand-rolled recursive-descent frontend) were **removed**.
+> SystemVerilog now has exactly one pipeline — `sv-yosys` (sv2v → Yosys →
+> BTOR2 → bit-blast). Sidecar significant-value discovery moved to
+> [`mununu btor2 discover`](#mununu-btor2), which runs SMT predicate-image
+> discovery over the BTOR2 IR the verify path uses and writes the
+> `discovered_values` map into the sidecar. Author the `.mununu.json`
+> sidecar by hand or seed it via `btor2 discover`.
 
-Generate a skeleton `.mununu.json` annotation sidecar from a SystemVerilog module.
+### `mununu sv preprocess`
 
-```bash
-mununu sv init <FILE> [--output <FILE>] [--force]
-```
+Lower SystemVerilog-2017 to a Verilog-2005 subset via `sv2v` (the KMTS
+frontend normaliser), preserving module hierarchy and signal names.
+Requires `sv2v` on `PATH`. Output goes to `--output` or `<stem>.elab.v`.
+Used internally by the `sv-yosys` pipeline; exposed standalone for
+inspection. Run `mununu sv preprocess --help` for flags.
 
-| Flag | Description |
-|------|-------------|
-| `--output <FILE>` | Output path (default: `<stem>.mununu.json` next to the `.sv` file) |
-| `--force` | Overwrite existing sidecar |
+### `mununu sv emit-btor2-per-module`
 
-**Defaults:** 1-bit registers → `boolean`, enums → `enum` with variants, ≤4-bit → `bounded_counter`, >4-bit → `discover`. Includes a `safety` property placeholder and detected `localparam` values.
-
-**Example:**
-```bash
-mununu sv init examples/systemverilog/fifo.sv
-# → Generated sidecar: examples/systemverilog/fifo.mununu.json
-#   3 signal(s), 3 input(s), 1 property/ies
-```
-
-### `mununu sv discover`
-
-Discover significant register values via SMT analysis. Requires `--features smt` at build time.
-
-```bash
-mununu sv discover <FILE> [--annotation <FILE>] [--output <FILE>] [--max-values <N>]
-```
-
-| Flag | Description |
-|------|-------------|
-| `--annotation <FILE>` | Path to `.mununu.json` (default: auto-detected next to `.sv`) |
-| `--output <FILE>` | Write updated sidecar to a different file |
-| `--max-values <N>` | Max values per signal (default: 32) |
-
-Finds concrete values that make guard conditions satisfiable — even through combinational logic (e.g., `assign y = x * 4; if (y == 12)` → discovers `x = 3`). Updates the sidecar's `discovered_values` section, preserving user-given variant names.
-
-**Example:**
-```bash
-mununu sv discover examples/systemverilog/alu.sv
-# → cmd — 5 value(s):
-#     VAL_0 = 0 (SMT: guard (cmd == 0) at line 0)
-#     VAL_1 = 1 (SMT: guard (cmd == 1) at line 0)
-#     ...
-# → Updated sidecar: examples/systemverilog/alu.mununu.json
-```
+Run Yosys with `hierarchy -check` (no `flatten`) and emit one BTOR2 per
+submodule reachable from the top — the per-submodule IR the KMTS lifter and
+multi-module composition consume. Requires `yosys` on `PATH`. Run
+`mununu sv emit-btor2-per-module --help` for flags.
 
 See [RTL Verification Pipeline](RTL-Verification-Pipeline) for the full workflow.
 
