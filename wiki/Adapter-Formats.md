@@ -14,8 +14,7 @@ Mununu can import specifications from external formats and export synthesized co
 | **BTOR2** | `.btor`, `.btor2` | Yes | No | Explicit automaton |
 | **Promela** | `.pml`, `.promela` | Yes | No | Explicit automaton |
 | **XState** | `.xstate`, `.json` | Yes | Yes | Explicit automaton |
-| **SystemVerilog** (hand-written parser) | `.sv`, `.v` | Yes | Yes | Explicit automaton |
-| **SystemVerilog via Yosys** | `.sv`, `.v` (with `--adapter sv-yosys`) | Yes | No | Explicit automaton |
+| **SystemVerilog** (via Yosys) | `.sv`, `.v` (`--adapter sv-yosys`) | Yes | Yes | Explicit automaton |
 | **Extraction Spec** | `.espec.json` | Yes | No | Explicit automaton |
 | **CrewAI** | `.crewai.json` | Yes | No | Explicit automaton (per-agent + sequential supervisor + asynchronous composition) |
 | **LangGraph** | `.langgraph.json` | Yes | No | Explicit automaton (nodes → states, edges → `node_<from>_enter` transitions) |
@@ -114,189 +113,21 @@ Synthesized controllers are emitted as flat XState v5 JSON with a `__mununu` met
 
 ## SystemVerilog
 
-Imports behavioral SystemVerilog RTL descriptions. Two modes:
+SystemVerilog (`.sv` / `.v`) is verified through the **`sv-yosys`** pipeline: `sv2v` normalises SV-2017 to Verilog-2005, Yosys elaborates with `hierarchy -check` (no `flatten`) and emits one BTOR2 per module, and mununu lifts each module to a KMTS by bit-blasting through the [BTOR2 reader](#btor2--yosys-rtl-phase-1). This is the **sole** SV path — the legacy hand-written FSM parser (inline `// @mununu` annotations, `--adapter sv`) was removed in S.2b.
 
-1. **FSM mode** (default): extracts `typedef enum` FSMs from `always_ff` blocks
-2. **Kripke mode**: builds a Kripke structure from all registers, supporting counters, data-path registers, and mixed enum+register designs
+Yosys handles the full synthesizable subset — `generate` blocks, parameter elaboration, packages, module instantiation, arrays/memories — so there is no hand-maintained "supported subset" table: whatever Yosys elaborates, mununu lifts (within the BTOR2 reader's `MAX_STATE_BITS` bit-blast cap; see [§BTOR2 + Yosys](#btor2--yosys-rtl-phase-1)).
 
-### Supported Subset
+### Abstraction posture (`.mununu.json` sidecar)
 
-| Feature | Supported |
-|---------|-----------|
-| `module` with input/output ports | Yes |
-| `always_ff @(posedge clk)` | Yes |
-| `always_comb` | Yes |
-| `typedef enum logic` | Yes |
-| `case` / `if-else` (including numeric labels) | Yes |
-| `assign` statements | Yes |
-| `// @mununu` property comments | Yes |
-| `// @mununu domain` register annotations | Yes (Kripke mode) |
-| Ternary `? :`, bit-select, bit-slice, concat | Yes |
-| Arithmetic, shifts, comparisons | Yes |
-| `localparam` / `parameter` constants | Yes |
-| Module instantiation | Not yet |
-| Arrays/memories | No |
-| Interfaces/classes | No |
+Abstraction is driven by a `.mununu.json` sidecar next to the source (not inline comments). It declares per-signal `FieldDomain` (Boolean / BoundedCounter / EnumValues / Ignored), `discovered_values`, init/memory abstractions, and controllability. See [RTL Verification Pipeline](RTL-Verification-Pipeline) for the schema and the authoring workflow — `mununu btor2 discover` seeds `discovered_values` via SMT predicate-image over the BTOR2 IR.
 
 ### Controllability
 
-Derived from port directions and `@mununu` annotations:
-- `input` ports → **uncontrollable** (environment)
-- `output` ports → **controllable** (system)
-- `// @mununu controllable sig1, sig2` → override to controllable
-- `// @mununu input sig1, sig2` → override to uncontrollable
+Derived from port directions: `input` ports → **uncontrollable** (environment), `output` ports → **controllable** (system). Override via the sidecar's `controllable` list.
 
-### Property Specification
+### Multi-module composition
 
-Properties are specified via inline comments:
-
-```systemverilog
-// @mununu ltl safety: nu X. ([] X)
-// @mununu assume env_constraint: G(req -> X req)
-// @mununu guarantee liveness: G(req -> F grant)
-```
-
-### FSM Extraction (Default Mode)
-
-The adapter extracts FSMs from `typedef enum` + `always_ff` + `case(state)` patterns:
-
-```systemverilog
-typedef enum logic [1:0] {IDLE, WAIT, ACTIVE, DONE} state_t;
-state_t state;
-always_ff @(posedge clk or posedge rst) begin
-    if (rst) state <= IDLE;
-    else case (state)
-        IDLE: if (req) state <= WAIT;
-        WAIT: state <= ACTIVE;
-        ACTIVE: if (!req) state <= DONE;
-        DONE: state <= IDLE;
-    endcase
-end
-```
-
-### Kripke Mode (Register-Level Verification)
-
-Activated by `// @mununu mode kripke` or automatically when no `typedef enum` FSM is found. Builds a Kripke structure where each state is a valuation of all active registers.
-
-#### Register Domain Annotations
-
-Each register can be annotated with a domain to control how it contributes to the state space:
-
-```systemverilog
-// @mununu domain counter: bounded_counter 0..7    // 8 abstract values
-// @mununu domain cmd: enum {NOP=0, ADD=1, OTHER}  // 3 named values with numeric mapping
-// @mununu domain data: ignored                     // excluded from state space
-// @mununu domain flag: boolean                     // 2 values (auto-inferred for 1-bit)
-```
-
-**Domain types:**
-
-| Domain | Syntax | Values | Use for |
-|--------|--------|--------|---------|
-| `boolean` | `boolean` | `{false, true}` | 1-bit flags (auto-inferred) |
-| `bounded_counter` | `bounded_counter L..U` | `{L, L+1, ..., U}` | Counters, fill levels, indices |
-| `enum` | `enum {A, B, C}` | Named variants | State machines, command opcodes |
-| `enum` (value-mapped) | `enum {IDLE=0, RUN=3, OTHER}` | Named variants with numeric mapping | Wide registers with significant constants |
-| `ignored` | `ignored` | (excluded) | Data-path registers, buffers |
-
-**Value-mapped enums:** When a wide register (e.g., `logic [7:0] cmd`) is used in comparisons against specific constants (`cmd == 3`, `case(cmd) 0: ... 1: ...`), the constants can be mapped to named variants. The last variant without `=` acts as a catch-all for all other values.
-
-#### Automatic Optimizations
-
-**Cone-of-influence reduction:** Registers not referenced by any property formula (transitively through the dependency graph) are automatically excluded. No annotation needed.
-
-**Constant discovery:** When a wide register is ignored but appears in comparisons or case statements with specific numeric values, a warning is emitted suggesting a value-mapped enum annotation:
-
-```
-warning: Register 'cmd' (8-bit, ignored) uses significant constants: [0, 3, 255].
-         Suggested: // @mununu domain cmd: enum {VAL_0=0, VAL_3=3, VAL_255=255, OTHER}
-```
-
-#### Complete Kripke Example
-
-```systemverilog
-// @mununu mode kripke
-// @mununu domain fill: bounded_counter 0..4
-// @mununu domain data_out_r: ignored
-// @mununu input wr_en, rd_en
-// @mununu ltl safety: nu X. ([] X)
-module fifo(
-    input  logic       clk, input logic rst,
-    input  logic       wr_en, input logic rd_en,
-    input  logic [7:0] data_in,
-    output logic [7:0] data_out,
-    output logic       full, output logic empty
-);
-    typedef enum logic [1:0] {IDLE, WRITING, READING, RDWR} state_t;
-    state_t state;
-    logic [2:0] fill;
-    logic [7:0] data_out_r;
-    localparam DEPTH = 4;
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin state <= IDLE; fill <= 0; end
-        else case (state)
-            IDLE: begin
-                if (wr_en && rd_en) state <= RDWR;
-                else if (wr_en)     state <= WRITING;
-                else if (rd_en)     state <= READING;
-            end
-            WRITING: begin
-                if (fill < DEPTH) fill <= fill + 1;
-                state <= IDLE;
-            end
-            READING: begin
-                if (fill > 0) fill <= fill - 1;
-                state <= IDLE;
-            end
-            RDWR: begin
-                if (fill == 0) fill <= fill + 1;
-                state <= IDLE;
-            end
-        endcase
-    end
-endmodule
-```
-
-State space: 4 (state) x 5 (fill 0..4) = 20 states. `data_out_r` is ignored, `data_in`/`data_out` are ports (not registers).
-
-#### Multi-label transitions
-
-In Kripke mode, each input signal produces its own label. Transitions carry the full set of input signal values as a multi-label, making the CTXDSL output readable at a glance:
-
-```
-transition fill_0_state_IDLE -> fill_0_state_WRITING on label rd_en_F, label wr_en_F;
-transition fill_0_state_IDLE -> fill_0_state_RDWR    on label rd_en_T, label wr_en_T;
-```
-
-This is equivalent to the single-label encoding used by the signal-state path (TLSF/AIGER) but with named per-signal labels instead of compound bitvectors. For value-mapped enums, labels use the variant names (e.g., `cmd_LOAD`, `cmd_ADD`) rather than numeric indices.
-
-### State Space Limits
-
-- Designs with > 2^18 states (262K) are **rejected**
-- Designs with > 2^12 states emit a **warning**
-- Kripke mode: registers > 4 bits without annotation are auto-ignored with a warning
-
-### Controller Output
-
-Synthesized controllers are emitted as SystemVerilog modules:
-
-```systemverilog
-module FSM_controller (
-    input  logic clk,
-    input  logic rst
-);
-    typedef enum logic [1:0] {IDLE, WAIT, ACTIVE, DONE} state_t;
-    state_t state;
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) state <= IDLE;
-        else case (state)
-            IDLE: state <= WAIT;
-            // ... synthesized transitions
-        endcase
-    end
-endmodule
-```
+A top module that instantiates submodules composes structurally: each instance is lifted to a KMTS, its ports renamed to the connected nets (from the Yosys netlist), and the instances synchronously composed. Opt in with `[sources.options] multi_module = true` (+ optional `top`) on a `verify.toml` source. The composed automaton is named `Circuit`.
 
 ---
 
@@ -357,7 +188,7 @@ mununu context eval design.sv --adapter sv-yosys --formula safety_bad_0 --automa
 # Or hand mununu an existing BTOR2 file:
 mununu context eval design.btor --adapter btor2 --formula safety_bad_0 --automaton Circuit
 
-# Auto-detection works for both .sv (via Yosys when --adapter sv-yosys, hand-written parser otherwise) and .btor / .btor2 (via the BTOR2 reader directly).
+# SystemVerilog (.sv / .v) is verified via the sv-yosys pipeline (--adapter sv-yosys); .btor / .btor2 go through the BTOR2 reader directly.
 ```
 
 ### Soundness
@@ -400,7 +231,7 @@ mununu context eval support_pipeline.xstate.json \
 
 # Explicit adapter selection
 mununu context eval machine.json --adapter xstate --formula safety --automaton light
-mununu context eval design.sv --adapter sv --formula safety --automaton FSM
+mununu context eval design.sv --adapter sv-yosys --formula safety --automaton Circuit
 mununu context eval spec.espec.json --adapter extraction --formula safety --automaton Main
 ```
 
@@ -410,25 +241,29 @@ When using an adapter, add `--print-ctxdsl` to see the translated CTXDSL model:
 
 ```bash
 # Print to stdout (alongside normal verification output)
-mununu context eval design.sv --adapter sv --formula safety --automaton FSM --print-ctxdsl
+mununu context eval design.sv --adapter sv-yosys --formula safety --automaton Circuit --print-ctxdsl
 
 # Write to a file
-mununu context eval design.sv --adapter sv --formula safety --automaton FSM --print-ctxdsl output.ctxdsl
+mununu context eval design.sv --adapter sv-yosys --formula safety --automaton Circuit --print-ctxdsl output.ctxdsl
 ```
 
-This works with all adapters (`--adapter tlsf`, `--adapter sv`, `--adapter xstate`, etc.) and with both `context eval` and `context synth`. The CTXDSL is printed before verification runs, so you can inspect the model even if verification fails.
+This works with all adapters (`--adapter tlsf`, `--adapter sv-yosys`, `--adapter xstate`, etc.) and with both `context eval` and `context synth`. The CTXDSL is printed before verification runs, so you can inspect the model even if verification fails.
 
 ### SystemVerilog Pipeline
 
+The sole SV pipeline is `sv-yosys` (sv2v → Yosys → BTOR2 → bit-blast).
+Author the `.mununu.json` sidecar by hand, or seed its `discovered_values`
+via `mununu btor2 discover` (S.2b replaced the native `sv init`/`sv discover`
+with BTOR2-IR discovery):
+
 ```bash
-# Generate skeleton sidecar from SV module
-mununu sv init design.sv
+# (Optional) seed discovered values into the sidecar from the BTOR2 IR
+mununu sv emit-btor2-per-module design.sv --output-dir build/
+mununu btor2 discover build/design.btor2
 
-# Discover significant register values via SMT (requires --features smt)
-mununu sv discover design.sv
-
-# Verify with sidecar (auto-loaded from <stem>.mununu.json)
-mununu context eval design.sv --adapter sv --formula safety --automaton FSM
+# Verify with sidecar (auto-loaded from <stem>.mununu.json); the bit-blast
+# names the composed automaton `Circuit`.
+mununu context eval design.sv --adapter sv-yosys --formula safety --automaton Circuit
 ```
 
 See [RTL Verification Pipeline](RTL-Verification-Pipeline) for the full annotation workflow.
@@ -442,8 +277,8 @@ mununu context synth machine.xstate --adapter xstate \
     --output-format xstate --emit-native controller.json
 
 # Export controller as SystemVerilog module
-mununu context synth design.sv --adapter sv \
-    --formula safety --automaton FSM \
+mununu context synth design.sv --adapter sv-yosys \
+    --formula safety --automaton Circuit \
     --output-format systemverilog --emit-native controller.sv
 ```
 

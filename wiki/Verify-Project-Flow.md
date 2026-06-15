@@ -12,7 +12,7 @@ The codesign C+SV flow, the protocol-spec recipe, and the agentic verification e
 
 A verification project is the tuple `(Sources, AlphabetBinding, Composition, Properties)`:
 
-- **Sources** — N entries, each `{ id, adapter, files, options }`. The `adapter` field names a [`FormatAdapter`](../crates/mununu-core/src/adapter/mod.rs) implementation. Today's dispatch table: `ctxdsl`, `xstate`, `crewai`, `langgraph`, `sv-rtl`, `c-codesign`, `extraction`.
+- **Sources** — N entries, each `{ id, adapter, files, options }`. The `adapter` field names a [`FormatAdapter`](../crates/mununu-core/src/adapter/mod.rs) implementation. Today's dispatch table: `ctxdsl`, `xstate`, `crewai`, `langgraph`, `sv-yosys` (alias `yosys`), `c-codesign`, `extraction`.
 
 - **AlphabetBinding** — how labels across sources synchronise:
   - **`direct`** (default) — names must already match across sources.
@@ -70,13 +70,13 @@ The KMTS pivot replaces the SystemVerilog extraction story end-to-end while leav
 - **3-valued evaluator.** The `TruthDomain` trait surfaces both the truth lattice (formula semantics) and the information lattice (fixpoint convergence). `BoolDomain` instantiates the 2-valued specialisation; `KleeneDomain` instantiates the 3-valued one. Verdicts are `KleeneT` / `KleeneF` / `KleeneBot`; `KleeneBot` triggers CEGAR.
 - **CEGAR refinement.** On `KleeneBot`, the lifter lifts the abstract counterexample, SMT-discharges it for spuriousness, and on UNSAT extracts predicate refinements via IC3-IA-style interpolation. Bounded by `cegar_max_rounds` (default 16). Two-axis refinement: predicate addition vs. UF instance concretisation, partitioned by unsat-core symbol kind.
 
-**Singular-pipeline commitment.** By the end of S.2b, the legacy native-SV adapter (the hand-rolled recursive-descent parser + explicit cross-product enumerator) is deleted. There is no `--engine native-sv` escape hatch. SV verification has exactly one pipeline. See [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) §9 (simplification phases) and §10 (validation milestones M.0–M.6 against industrially realistic OpenTitan / ibex / Caliptra fixtures).
+**Singular-pipeline commitment.** As of S.2b the legacy native-SV adapter (the hand-rolled recursive-descent parser + explicit cross-product enumerator) is **deleted**. There is no `--engine native-sv` escape hatch. SV verification has exactly one pipeline — `sv-yosys` (sv2v → Yosys → BTOR2 → bit-blast). Sidecar significant-value discovery moved to `mununu btor2 discover` (which runs over the BTOR2 IR the verify path uses). See [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) for the architecture.
 
 ## Automatic partition (Phase A.3)
 
 > **Source of truth:** [`adapter::partition::classify`](../crates/mununu-core/src/adapter/partition/mod.rs) — surface: CLI+API.
 
-SV (`sv-rtl`) and BTOR2 sources run an **automatic cone-of-influence
+SV (`sv-yosys`) and BTOR2 sources run an **automatic cone-of-influence
 pass** during their `dispatch_adapter` translation. The pass walks the
 frontend IR's dependency graph from property atoms and marks signals
 outside the cone as `AbstractionType::Ignored`. The composition rule
@@ -123,7 +123,7 @@ options = {
 
 [[sources]]
 id = "periph"
-adapter = "sv-rtl"
+adapter = "sv-yosys"
 files = ["rtl/uart_peripheral.sv"]
 
 [alphabet]

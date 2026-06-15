@@ -6,19 +6,23 @@
 //
 // Property of interest: the buffer never overflows (count < 3).
 //
-// Usage (CLI):
-//   mununu sv init --multi multi_producer_consumer_top.sv
-//   mununu context eval <sidecar>.mununu.json \
-//     --adapter sv --formula no_overflow --automaton system
+// Usage (sv-yosys multi-module path; requires yosys + sv2v):
+//   A verify.toml source lists this top module + its submodules and sets
+//   [sources.options] multi_module = true (+ optional top). The driver
+//   lifts each submodule to a KMTS, renames its ports to the connected
+//   nets (from the Yosys netlist), and synchronously composes them; the
+//   composed automaton is named `Circuit`.
 //
-// Usage (UI — Extraction tab):
-//   1. Load this file as primary source (SystemVerilog RTL domain)
-//   2. Click "+ Add Files" and add: multi_producer.sv, multi_consumer.sv, multi_buffer.sv
-//   3. Run "Initialize Sidecar" (generates multi-module .mununu.json)
-//   4. Edit sidecar: add the no_overflow property (see guide)
-//   5. Click "Continue to Translate"
-//   6. Click "Run Translate" to generate CTXDSL
-//   7. Switch to Verification tab to check properties
+//   [[sources]]
+//   id = "system"
+//   adapter = "sv-yosys"
+//   files = ["multi_producer_consumer_top.sv", "multi_producer.sv",
+//            "multi_consumer.sv", "multi_buffer.sv"]
+//   [sources.options]
+//   multi_module = true
+//   top = "producer_consumer_top"
+//
+// See examples/verify/sv_multi_module/ for a runnable instance of this pattern.
 
 module producer_consumer_top(
     input logic clk,

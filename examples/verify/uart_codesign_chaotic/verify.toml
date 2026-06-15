@@ -13,11 +13,11 @@
 # generate from the register map; both sides already speak the
 # rendezvous alphabet (the firmware via the c-codesign adapter's
 # `coupling::rendezvous_label_name` call; the peripheral by
-# convention). The `register_map` strategy on `[alphabet]` is
-# declared here as the eventual home for sv-rtl-side label
-# rewriting; today the orchestrator's strategy projection is a
-# no-op because both sources already align (a follow-up wires the
-# strategy to drive SV-side renaming when sv-rtl is paired in).
+# convention). The `register_map` strategy on `[alphabet]` is the
+# home for SV-side label rewriting; today the orchestrator's strategy
+# projection is a no-op because both sources already align. When a
+# real peripheral is sourced from `sv-yosys`, the register-map
+# rewriter (`is_sv_adapter` gate) drives SV-side renaming.
 #
 # Recreate the run (requires `clang` on PATH):
 #   $ bash examples/verify/uart_codesign_chaotic/validate.sh

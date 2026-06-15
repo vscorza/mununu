@@ -2,56 +2,47 @@
 
 > **Alpha Software** — Mununu is under active development. APIs, syntax, and behavior may change.
 
-Mununu has **two RTL ingestion paths** today:
+Mununu has **one** RTL ingestion path: the **Yosys-driven `sv-yosys` pipeline** (sv2v → Yosys → BTOR2 → bit-blast). It elaborates the full SystemVerilog subset Yosys handles — generate blocks, parameter elaboration, packages, structural SV — and lifts the per-module BTOR2 to a KMTS. A `.mununu.json` annotation sidecar drives the abstraction posture (`FieldDomain` Boolean / BoundedCounter / EnumValues / Ignored, `discovered_values`, automatic cone-of-influence).
 
-- **Hand-written SV parser** (`--adapter sv`): the original FSM-class adapter, with `.mununu.json` annotation sidecars driving abstraction (`FieldDomain` Boolean / Presence / BoundedCounter / EnumValues / Ignored, `discovered_values`, COI). Best for small SystemVerilog FSMs where you want to author the abstraction explicitly.
-- **Yosys-driven path** (`--adapter sv-yosys`): elaborate via Yosys to BTOR2, then bit-blast through the [BTOR2 reader](Adapter-Formats#btor2--yosys-rtl-phase-1). Generate blocks, parameter elaboration, packages, and structural SV that the hand-written parser cannot handle all flow through Yosys's mature elaboration. The price is no automatic abstraction — the BTOR2 reader bit-blasts within the `MAX_STATE_BITS = 16` cap and rejects designs beyond it.
-
-The roadmap unifies the two paths: the BTOR2 reader will gain a shared `adapter/sidecar/` module so the same `.mununu.json` schema feeds both paths, and the BTOR2 bit-blaster will consume `FieldDomain` instead of raw bit-vectors. Until that lands, the hand-written and Yosys paths are independent.
+> **S.2b note.** The legacy hand-written SV parser (`--adapter sv`, `mununu sv init`, `mununu sv discover`) was **removed**. Its sidecar-authoring role is now hand-editing plus `mununu btor2 discover`, which runs SMT predicate-image discovery over the same BTOR2 IR the verify path uses and writes `discovered_values` into the sidecar. SystemVerilog has exactly one pipeline.
 
 ---
-
-## Hand-written SV Parser Path
-
-This page below documents the hand-written SV path with `.mununu.json` sidecars. For the Yosys path, see [Adapter Formats — BTOR2 + Yosys](Adapter-Formats#btor2--yosys-rtl-phase-1) and the corpus walkthrough in `examples/btor2/README.md`.
 
 ### Pipeline Overview
 
 ```
-SV Source → Parse → Load Sidecar → (optional: SMT Discovery) → Build Abstraction → Kripke → Verify
+SV Source → sv2v → Yosys (hierarchy, no flatten) → BTOR2 (per module) → Load Sidecar → bit-blast (+ optional SMT discovery) → KMTS → Verify
 ```
 
 | Step | Command | Input | Output |
 |------|---------|-------|--------|
-| 1. Init | `mununu sv init design.sv` | `.sv` file | Skeleton `.mununu.json` |
-| 2. Edit | (manual) | `.mununu.json` | Refined annotations |
-| 3. Discover | `mununu sv discover design.sv` | `.sv` + `.mununu.json` | Updated `discovered_values` |
-| 4. Verify | `mununu context eval design.sv --adapter sv` | `.sv` + `.mununu.json` | Property results |
+| 1. (optional) Emit BTOR2 | `mununu sv emit-btor2-per-module design.sv --output-dir build/` | `.sv` | per-module `.btor2` |
+| 2. (optional) Discover | `mununu btor2 discover build/design.btor2` | `.btor2` + `.mununu.json` | Updated `discovered_values` |
+| 3. Edit | (manual) | `.mununu.json` | Refined annotations |
+| 4. Verify | `mununu context eval design.sv --adapter sv-yosys` (or a `verify.toml` source) | `.sv` + `.mununu.json` | Property results |
 
-Steps 2-4 are iterative — refine annotations and properties based on verification results.
+Requires `yosys` (and `sv2v` for SV-2017 constructs) on `PATH`. Steps 2-4 are iterative — refine annotations and properties based on verification results.
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Generate skeleton sidecar
-mununu sv init examples/systemverilog/alu.sv
+# 1. (optional) Seed discovered values into the sidecar from the BTOR2 IR
+mununu sv emit-btor2-per-module examples/systemverilog/alu.sv --output-dir build/
+mununu btor2 discover build/alu.btor2
 
 # 2. Review and edit alu.mununu.json
 #    - Adjust bounds, mark signals to preserve/ignore
 #    - Mark wide registers as "discover" for SMT analysis
 
-# 3. Discover significant values (requires --features smt)
-mununu sv discover examples/systemverilog/alu.sv
-
-# 4. Verify
+# 3. Verify (the bit-blast names the composed automaton `Circuit`)
 mununu context eval examples/systemverilog/alu.sv \
-    --adapter sv --formula safety --automaton alu
+    --adapter sv-yosys --formula safety --automaton Circuit
 
-# 5. Inspect the intermediate CTXDSL
+# 4. Inspect the intermediate CTXDSL
 mununu context eval examples/systemverilog/alu.sv \
-    --adapter sv --formula safety --automaton alu --print-ctxdsl
+    --adapter sv-yosys --formula safety --automaton Circuit --print-ctxdsl
 ```
 
 ---
@@ -154,7 +145,7 @@ Roles: `"guarantee"` (default), `"assumption"`, `"standalone"`.
 
 ### `discovered_values`
 
-Populated by `mununu sv discover`. Each entry maps a signal to its SMT-discovered significant values:
+Populated by `mununu btor2 discover`. Each entry maps a signal to its SMT-discovered significant values:
 
 ```json
 "discovered_values": {
@@ -168,7 +159,7 @@ Populated by `mununu sv discover`. Each entry maps a signal to its SMT-discovere
 }
 ```
 
-You can rename the `name` fields — re-running `sv discover` preserves user-given names.
+You can rename the `name` fields — re-running `btor2 discover` preserves user-given names.
 
 ### `parameters`
 
@@ -182,7 +173,7 @@ Override module `localparam` / `parameter` values:
 
 ## SMT Discovery
 
-When a register is marked `"abstraction": "discover"`, the `mununu sv discover` command uses z3 bitvector theory to find concrete values that make guard conditions satisfiable — even through combinational logic.
+When a register is marked `"abstraction": "discover"`, the `mununu btor2 discover` command uses z3 bitvector theory (SMT predicate-image over the BTOR2 IR) to find concrete values that make guard conditions satisfiable — even through combinational logic.
 
 **Example:** If `assign y = x * 4;` and a guard checks `if (y == 12)`, SMT discovers `x = 3`.
 
@@ -234,13 +225,13 @@ end
 
 ```bash
 # Buggy: UNREALIZABLE — overflow is reachable
-mununu context synth fifo_overflow_bug.sv --adapter sv \
-    --formula no_overflow --automaton fifo_overflow_bug
+mununu context synth fifo_overflow_bug.sv --adapter sv-yosys \
+    --formula no_overflow --automaton Circuit
 # → Realizable: no
 
 # Fixed: REALIZABLE — guard prevents overflow
-mununu context synth fifo_overflow_fixed.sv --adapter sv \
-    --formula no_overflow --automaton fifo_overflow_fixed
+mununu context synth fifo_overflow_fixed.sv --adapter sv-yosys \
+    --formula no_overflow --automaton Circuit
 # → Realizable: yes
 ```
 
@@ -290,5 +281,5 @@ Based on MITRE CWE-1245, with real CVEs (CVE-2024-21853, CVE-2024-24968). One-ho
 
 - [Adapter Formats — SystemVerilog](Adapter-Formats#systemverilog) — supported SV subset and inline annotations
 - [Hardware Verification Patterns](Hardware-Verification-Patterns) — CTXDSL patterns for common hardware
-- [CLI Reference](CLI-Reference) — `sv init`, `sv discover`, `context eval`, `context synth`
+- [CLI Reference](CLI-Reference) — `sv preprocess`, `sv emit-btor2-per-module`, `btor2 discover`, `context eval`, `context synth`
 - [Controller Synthesis](Controller-Synthesis) — synthesizing controllers from specifications

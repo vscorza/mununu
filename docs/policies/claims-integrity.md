@@ -80,7 +80,7 @@ Long-form public content (LinkedIn, Substack, blog posts, conference talks) must
 
 The same verification-first principles apply to the SV Kripke pipeline:
 
-- **Never present hand-written data as pipeline output.** If `discovered_values` in a `.mununu.json` sidecar were written by a human or AI agent (not by `mununu sv discover`), they must be disclosed as hand-written. Claims like "SMT discovers x=3" require actually running the discover command.
+- **Never present hand-written data as pipeline output.** If `discovered_values` in a `.mununu.json` sidecar were written by a human or AI agent (not by `mununu btor2 discover`), they must be disclosed as hand-written. Claims like "SMT discovers x=3" require actually running the discover command.
 - **Run the pipeline, don't simulate it.** Before presenting verification results in any public material, execute the actual commands and capture real terminal output. Do not fabricate or predict mununu output.
 - **Properties must come from specifications, not bug knowledge.** Adding a detector register to catch a known bug and then verifying it fires is circular. Properties should come from protocol specs, safety invariants, or security requirements.
 - **Distinguish syntactic from SMT-discovered values.** Literals found directly in `case` labels are syntactic. Values found through combinational logic inversion are SMT-discovered. Don't claim SMT discovery for trivially visible constants.

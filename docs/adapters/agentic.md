@@ -24,7 +24,7 @@ Pick the entry point that matches your authoring environment: native CTXDSL for 
 
 ## Verifying multi-source agentic projects
 
-For verification problems that compose multiple agentic sources — or one agentic source with non-agentic peers — use the verify framework: drop a `verify.toml` listing the sources, an alphabet binding, a composition shape, and a list of properties, then run `mununu verify <verify.toml>`. The agentic adapters plug into the framework on equal footing with `xstate`, `sv-rtl`, `c-codesign`, etc. See [`wiki/Verify-Project-Flow.md`](../../wiki/Verify-Project-Flow.md) for the conceptual model and the example fleet under [`examples/verify/`](../../examples/verify/).
+For verification problems that compose multiple agentic sources — or one agentic source with non-agentic peers — use the verify framework: drop a `verify.toml` listing the sources, an alphabet binding, a composition shape, and a list of properties, then run `mununu verify <verify.toml>`. The agentic adapters plug into the framework on equal footing with `xstate`, `sv-yosys`, `c-codesign`, etc. See [`wiki/Verify-Project-Flow.md`](../../wiki/Verify-Project-Flow.md) for the conceptual model and the example fleet under [`examples/verify/`](../../examples/verify/).
 
 ## Property templates
 
