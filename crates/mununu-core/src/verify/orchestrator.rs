@@ -88,8 +88,9 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
         AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
     let per_source_renamings = binding.per_source_renamings();
     // For RegisterMap binding, eagerly derive the SV-side renaming
-    // table once — it's identical for every sv-rtl source under this
-    // binding. `None` when binding is Direct or Renamings.
+    // table once — it's identical for every SV (`sv-rtl` / `sv-yosys`)
+    // source under this binding. `None` when binding is Direct or
+    // Renamings.
     let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
         AlphabetBinding::RegisterMap { map, .. } => {
             Some(derive_sv_renamings_from_register_map(map))
@@ -150,8 +151,8 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 }
                 _ => raw_ctxdsl,
             };
-            if let (Some(rm_renamings), "sv-rtl") =
-                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+            if let Some(rm_renamings) = register_map_sv_renamings.as_ref()
+                && is_sv_adapter(&source.adapter)
                 && !rm_renamings.is_empty()
             {
                 rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
@@ -356,6 +357,8 @@ pub fn inspect_project(
     let binding =
         AlphabetBinding::from_config(config, base_dir).map_err(VerifyError::AlphabetBinding)?;
     let per_source_renamings = binding.per_source_renamings();
+    // SV-side renaming table (identical for every `sv-rtl` / `sv-yosys`
+    // source); `None` for Direct / Renamings bindings.
     let register_map_sv_renamings: Option<BTreeMap<String, String>> = match &binding {
         AlphabetBinding::RegisterMap { map, .. } => {
             Some(derive_sv_renamings_from_register_map(map))
@@ -407,8 +410,8 @@ pub fn inspect_project(
                 }
                 _ => raw_ctxdsl,
             };
-            if let (Some(rm_renamings), "sv-rtl") =
-                (register_map_sv_renamings.as_ref(), source.adapter.as_str())
+            if let Some(rm_renamings) = register_map_sv_renamings.as_ref()
+                && is_sv_adapter(&source.adapter)
                 && !rm_renamings.is_empty()
             {
                 rewritten = apply_renamings_to_ctxdsl(&rewritten, rm_renamings);
@@ -607,6 +610,17 @@ pub fn inspect_project(
 /// `AdapterOutput`. The orchestrator threads the summary onto the
 /// source's `SourceSummary` so the `VerifyReport` surfaces COI
 /// telemetry per source.
+/// SV peripheral adapters that consume the register-map SV-side
+/// renaming table. Both the legacy native (`sv-rtl`) and KMTS
+/// (`sv-yosys`) routes emit `<signal>_<value>` labels
+/// (`adapter::btor2::bit_blast` for the KMTS route), so the renaming
+/// derivation in [`crate::verify::register_map_rewriter`] is
+/// route-agnostic. `sv-rtl` is removed at S.2b-2, after which
+/// `sv-yosys` is the sole match.
+fn is_sv_adapter(adapter: &str) -> bool {
+    matches!(adapter, "sv-rtl" | "sv-yosys")
+}
+
 fn dispatch_adapter(
     adapter: &str,
     source_id: &str,
@@ -1979,6 +1993,24 @@ over = "P"
         // on the SV adapter's `<signal>_<value>` labels.
         assert_eq!(report.property_verdicts.len(), 1);
         assert!(report.property_verdicts[0].satisfied);
+    }
+
+    /// S.2b-1.6: the register-map SV-side rewriter gate
+    /// ([`is_sv_adapter`]) must admit BOTH the legacy native route
+    /// (`sv-rtl`) and the KMTS route (`sv-yosys`). The codesign
+    /// shorthand now emits `sv-yosys`, and both routes emit
+    /// `<signal>_<value>` labels the rewriter targets, so the renaming
+    /// derivation is route-agnostic. (`sv-rtl` is removed at S.2b-2,
+    /// after which `sv-yosys` is the sole match.) This is the yosys-free
+    /// guard on the gate behaviour; the end-to-end rewrite is covered by
+    /// `register_map_binding_rewrites_sv_source_labels` (native) above.
+    #[test]
+    fn is_sv_adapter_admits_both_sv_routes() {
+        assert!(is_sv_adapter("sv-rtl"));
+        assert!(is_sv_adapter("sv-yosys"));
+        assert!(!is_sv_adapter("ctxdsl"));
+        assert!(!is_sv_adapter("c-codesign"));
+        assert!(!is_sv_adapter("xstate"));
     }
 
     /// Direct-binding sanity: a register-map sidecar present but the
