@@ -649,7 +649,7 @@ fn dispatch_adapter(
         // (multi-module composition driven from the top netlist is a
         // follow-up). Requires `yosys` on PATH; absence surfaces as an
         // `AdapterTranslationFailed` (locate_yosys error), not silently.
-        "sv-yosys" => dispatch_sv_yosys(source_id, content, additional_files),
+        "sv-yosys" => dispatch_sv_yosys(source_id, content, additional_files, options),
         "crewai" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
@@ -789,12 +789,27 @@ fn dispatch_sv_rtl(
 /// and MIG-2 (OOB-sink over-approximation) soundness fixes, so this
 /// route is a sound SV abstraction. `additional_files` are threaded as
 /// Yosys additional sources (by basename) so multi-file designs
-/// elaborate; top-netlist-driven multi-module composition is a
-/// follow-up. Requires `yosys` on PATH.
+/// elaborate. Requires `yosys` on PATH.
+///
+/// R-MM-5b — multi-module composition route. Opt in with the source
+/// option `multi_module = true` (optional `top = "<module>"`; the top is
+/// auto-detected from the netlist when omitted). The driver lifts each
+/// submodule to a KMTS, renames each instance's ports to the connected
+/// nets, and synchronously fold-composes the instances
+/// ([`crate::adapter::yosys::multi_module::compose_sv_multi_module`]); the
+/// composed product is serialised back to CTXDSL
+/// ([`crate::adapter::yosys::multi_module::clts_to_ctxdsl`], automaton
+/// `Circuit` to match the single-module path's name so a property's `over`
+/// binds identically) and re-enters the standard parse→realise→evaluate
+/// pipeline. Composed valuations are all-numeric (R-MM-5b-i) so property
+/// atoms like `<inst>__<sig> == k` bind to actual values. Properties come
+/// from the verify manifest's `[[properties]]` (over the composed
+/// automaton), so no property block is injected into the emitted CTXDSL.
 fn dispatch_sv_yosys(
     source_id: &str,
     content: &str,
     additional_files: &[(PathBuf, String)],
+    options: &std::collections::BTreeMap<String, toml::Value>,
 ) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
     let opts = AdapterOptions::default();
     let additional_sources: Vec<(String, String)> = additional_files
@@ -805,6 +820,42 @@ fn dispatch_sv_yosys(
                 .map(|name| (name.to_string(), body.clone()))
         })
         .collect();
+
+    let is_multi_module = options
+        .get("multi_module")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_multi_module {
+        let top = options
+            .get("top")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let yopts = crate::adapter::yosys::YosysOptions {
+            top,
+            per_module_btor: true,
+            additional_sources,
+            ..Default::default()
+        };
+        let comp =
+            crate::adapter::yosys::multi_module::compose_sv_multi_module(content, &opts, &yopts)
+                .map_err(|err| VerifyError::AdapterTranslationFailed {
+                    source_id: source_id.to_string(),
+                    adapter: "sv-yosys".to_string(),
+                    message: err.to_string(),
+                })?;
+        let ctxdsl = crate::adapter::yosys::multi_module::clts_to_ctxdsl(
+            &comp.composed,
+            "Circuit",
+            source_id,
+        )
+        .map_err(|err| VerifyError::AdapterTranslationFailed {
+            source_id: source_id.to_string(),
+            adapter: "sv-yosys".to_string(),
+            message: err.to_string(),
+        })?;
+        return Ok((ctxdsl, None));
+    }
+
     let yopts = crate::adapter::yosys::YosysOptions {
         additional_sources,
         ..Default::default()
