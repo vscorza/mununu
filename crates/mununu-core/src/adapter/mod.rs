@@ -180,6 +180,24 @@ pub struct AdapterOptions {
     /// achievable value. Default empty — the single-module path passes
     /// none, leaving the verdict-parity gate untouched.
     pub surface_output_ports: Vec<String>,
+
+    /// R4W-2 (R.4 clustered-COI wiring) — per-property COI seed atoms
+    /// harvested from the verify manifest's `[[properties]]` formulas
+    /// (`(property_name, seed_atom_names)`). The verify orchestrator
+    /// resolves each property, parses it, and runs
+    /// [`crate::adapter::partition::coi::property_seed_atoms`] to fill
+    /// this in. When non-empty, the BTOR2 bit-blaster computes a
+    /// joint-vs-clustered COI comparison
+    /// ([`crate::adapter::partition::coi::cluster_coi_report`]) over its
+    /// own dep graph and surfaces it on
+    /// [`crate::adapter::partition::PartitionSummary::cluster_coi`].
+    ///
+    /// Pure telemetry — does **not** change which signals the partition
+    /// keeps. Default empty (the legacy intrinsic-seed-only path; no
+    /// behaviour change). The configurable similarity floor + the
+    /// CLI / API / UI surface for the comparison land in R4W-3; this
+    /// field uses the recommended `0.5` default at the bit-blast layer.
+    pub property_seeds: Vec<(String, Vec<String>)>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.

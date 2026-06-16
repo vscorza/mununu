@@ -98,6 +98,15 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
         _ => None,
     };
 
+    // R4W-2 (R.4 clustered-COI wiring) — harvest each property's COI
+    // seed atoms *before* adapter dispatch. The BTOR2 bit-blaster owns
+    // the per-module dep graph, so the seeds must reach it through
+    // `AdapterOptions::property_seeds` for the joint-vs-clustered cone
+    // comparison to be computable. Properties are resolved again (for
+    // real) in step 5; this early pass is best-effort telemetry and
+    // never aborts the run.
+    let property_seeds = harvest_property_seeds(config);
+
     // 3. For each source: read files, dispatch adapter, apply renamings.
     // Parameterised sources (`count >= 2`) expand to N instances
     // named `<id>_0` .. `<id>_<N-1>`. Each instance substitutes
@@ -140,6 +149,7 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 &additional_files,
                 &source.options,
                 base_dir,
+                &property_seeds,
             )?;
 
             // Apply per-source renamings from the binding. The renamings
@@ -395,6 +405,10 @@ pub fn inspect_project(
                 .collect()
         };
         for (instance_id, content) in instances {
+            // Inspection never resolves properties (step 5 is a no-op),
+            // so there are no per-property COI seeds to harvest — pass
+            // an empty slice. The bit-blaster then skips the clustered-
+            // COI comparison (legacy intrinsic-seed-only behaviour).
             let (raw_ctxdsl, partition_summary) = dispatch_adapter(
                 &source.adapter,
                 &instance_id,
@@ -403,6 +417,7 @@ pub fn inspect_project(
                 &additional_files,
                 &source.options,
                 base_dir,
+                &[],
             )?;
             let mut rewritten = match per_source_renamings.get(&source.id) {
                 Some(renamings) if !renamings.is_empty() => {
@@ -608,6 +623,12 @@ pub fn inspect_project(
 /// `AdapterOutput`. The orchestrator threads the summary onto the
 /// source's `SourceSummary` so the `VerifyReport` surfaces COI
 /// telemetry per source.
+// R4W-2 added `property_seeds` as an 8th argument; the dispatch context
+// is a flat list of independent inputs (adapter name, ids, paths,
+// options) rather than a cohesive struct, so an allow is the right call
+// here — matching the precedent on the other multi-input dispatch /
+// realize helpers in this crate.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_adapter(
     adapter: &str,
     source_id: &str,
@@ -616,6 +637,11 @@ fn dispatch_adapter(
     additional_files: &[(PathBuf, String)],
     options: &std::collections::BTreeMap<String, toml::Value>,
     base_dir: &Path,
+    // R4W-2 — manifest per-property COI seeds for the clustered-COI
+    // telemetry. Consumed only by the `sv-yosys` (BTOR2) route, which
+    // owns the dep graph; other adapters ignore it. Empty on the
+    // inspection path (no property resolution there).
+    property_seeds: &[(String, Vec<String>)],
 ) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
     let to_pair = |out: crate::adapter::AdapterOutput| (out.ctxdsl, out.partition_summary);
     let err_for = |adapter: &str, source_id: &str, err: crate::adapter::AdapterError| {
@@ -646,7 +672,13 @@ fn dispatch_adapter(
         // `multi_module = true` (+ optional `top`), driven from the top
         // netlist. Requires `yosys` on PATH; absence surfaces as an
         // `AdapterTranslationFailed` (locate_yosys error), not silently.
-        "sv-yosys" => dispatch_sv_yosys(source_id, content, additional_files, options),
+        "sv-yosys" => dispatch_sv_yosys(
+            source_id,
+            content,
+            additional_files,
+            options,
+            property_seeds,
+        ),
         "crewai" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
@@ -768,8 +800,17 @@ fn dispatch_sv_yosys(
     content: &str,
     additional_files: &[(PathBuf, String)],
     options: &std::collections::BTreeMap<String, toml::Value>,
+    property_seeds: &[(String, Vec<String>)],
 ) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
-    let opts = AdapterOptions::default();
+    // R4W-2 — carry the manifest's per-property COI seeds into the
+    // bit-blaster so it can compute the joint-vs-clustered cone
+    // comparison over its dep graph (surfaced on
+    // `PartitionSummary::cluster_coi`). Empty seeds preserve the legacy
+    // intrinsic-seed-only behaviour.
+    let opts = AdapterOptions {
+        property_seeds: property_seeds.to_vec(),
+        ..AdapterOptions::default()
+    };
     let additional_sources: Vec<(String, String)> = additional_files
         .iter()
         .filter_map(|(path, body)| {
@@ -975,6 +1016,33 @@ fn dispatch_c_codesign(
 // ---------------------------------------------------------------------------
 // Property template resolution
 // ---------------------------------------------------------------------------
+
+/// R4W-2 (R.4 clustered-COI wiring) — resolve + parse each manifest
+/// property and collect its COI seed atoms as
+/// `(property_name, seed_atom_names)`.
+///
+/// The seeds feed [`crate::adapter::partition::coi::cluster_coi_report`]
+/// in the BTOR2 bit-blaster (via [`AdapterOptions::property_seeds`]),
+/// which owns the per-module dep graph the cones are walked over.
+///
+/// Best-effort telemetry: a property that fails to resolve (bad
+/// template) or fails to parse (malformed formula) contributes no
+/// seeds — its real error surfaces in step 5 / the eval phase, so this
+/// pass never aborts the verify run. Returns an empty vec when the
+/// manifest declares no properties.
+fn harvest_property_seeds(config: &VerifyConfig) -> Vec<(String, Vec<String>)> {
+    let registry = TemplateRegistry::builtin();
+    config
+        .properties
+        .iter()
+        .filter_map(|p| {
+            let (formula_text, _src) = resolve_property_formula(p, &registry).ok()?;
+            let formula = crate::mu_calculus::parser::parse(&formula_text).ok()?;
+            let atoms = crate::adapter::partition::coi::property_seed_atoms(&formula);
+            Some((p.name.clone(), atoms.into_iter().collect()))
+        })
+        .collect()
+}
 
 fn resolve_property_formula(
     p: &PropertySection,
@@ -1793,6 +1861,7 @@ formula = "true"
             &[],
             &std::collections::BTreeMap::new(),
             std::path::Path::new("."),
+            &[],
         );
         // Ok (yosys present) OR AdapterTranslationFailed (yosys absent)
         // both prove the route is wired; only UnknownAdapter fails.
