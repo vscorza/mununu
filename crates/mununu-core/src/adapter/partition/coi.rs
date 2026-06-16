@@ -20,6 +20,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::mu_calculus::{Formula, Node};
+
 /// BFS reachability from `seeds` through `deps`.
 ///
 /// `deps` is the adjacency returned by `DepGraphBuilder::build()`.
@@ -175,6 +177,120 @@ pub fn cluster_properties_by_jaccard(
     }
 
     clusters
+}
+
+/// R4W-1 (R.4 clustered-COI wiring, 2026-06-16) — harvest the
+/// cone-of-influence **seed atoms** a μ-calculus formula references.
+///
+/// This is the glue the verify path was missing: [`cone_of_influence`]
+/// and [`cluster_properties_by_jaccard`] consume per-property seed sets,
+/// but nothing extracted those seeds from a parsed [`Formula`]. The
+/// harvest walks the formula's node arena and collects:
+///
+/// - every atomic proposition ([`Node::Predicate`]);
+/// - every modal guard's current-state and next-state signal
+///   references (`req_cur` / `forb_cur` / `req_next` / `forb_next`);
+/// - every modal guard's label set.
+///
+/// The returned names are *seeds*, not a cone — feed them to
+/// [`cone_of_influence`] (or [`cluster_coi_report`]) to walk the
+/// dependency graph. Names that do not appear in the dep graph are
+/// harmless: the COI walk treats them as zero-out-degree seeds.
+pub fn property_seed_atoms(formula: &Formula) -> HashSet<String> {
+    let mut seeds = HashSet::new();
+    for node in formula.nodes() {
+        match node {
+            Node::Predicate(name) => {
+                seeds.insert(name.clone());
+            }
+            Node::Modal { guard, .. } => {
+                seeds.extend(guard.labels.iter().cloned());
+                seeds.extend(guard.current.required.iter().cloned());
+                seeds.extend(guard.current.forbidden.iter().cloned());
+                seeds.extend(guard.next.required.iter().cloned());
+                seeds.extend(guard.next.forbidden.iter().cloned());
+            }
+            Node::True
+            | Node::False
+            | Node::Variable(_)
+            | Node::Not(_)
+            | Node::And(_, _)
+            | Node::Or(_, _)
+            | Node::Mu { .. }
+            | Node::Nu { .. } => {}
+        }
+    }
+    seeds
+}
+
+/// R4W-1 — One cluster's entry in a [`ClusterCoiReport`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterCoiEntry {
+    /// Property identifiers merged into this cluster.
+    pub members: Vec<PropertyId>,
+    /// Size of this cluster's cone (the union of its members' cones) —
+    /// the signal count a per-cluster bit-blast must carry.
+    pub cone_size: usize,
+}
+
+/// R4W-1 — Joint-vs-clustered cone comparison, the core M.3 metric.
+///
+/// `joint_cone_size` is what a single naive COI over **all** properties
+/// would keep (the union of every property's cone). `max_cluster_cone_size`
+/// is the largest per-cluster cone — the binding constraint when each
+/// cluster is analysed independently. Clustering provides value exactly
+/// when `max_cluster_cone_size < joint_cone_size` (and, at the bit-blast
+/// layer, when the joint cone busts the state-bit cap while each cluster
+/// fits).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterCoiReport {
+    /// Signals a naive joint COI over all properties would keep.
+    pub joint_cone_size: usize,
+    /// Per-cluster entries (deterministic input order).
+    pub clusters: Vec<ClusterCoiEntry>,
+    /// Largest per-cluster cone — bounds independent per-cluster analysis.
+    pub max_cluster_cone_size: usize,
+}
+
+/// R4W-1 — Compute the joint-vs-clustered COI comparison for a set of
+/// properties over a dependency graph.
+///
+/// Each input is `(property_id, seed_atoms)` — typically
+/// `(name, property_seed_atoms(&formula))`. `deps` is the design's
+/// signal dependency graph; `similarity_floor` is the Jaccard threshold
+/// passed to [`cluster_properties_by_jaccard`] (see its docs for the
+/// `0.5` default and the floor→{joint, per-property} limits).
+pub fn cluster_coi_report(
+    properties: &[(PropertyId, HashSet<String>)],
+    deps: &HashMap<String, HashSet<String>>,
+    similarity_floor: f64,
+) -> ClusterCoiReport {
+    // Joint COI = cone over the union of every property's seed atoms.
+    let joint_seeds: HashSet<String> = properties
+        .iter()
+        .flat_map(|(_, s)| s.iter().cloned())
+        .collect();
+    let joint_cone_size = cone_of_influence(&joint_seeds, deps).len();
+
+    // Per-cluster cones. `PropertyCluster::seed_union` is already the
+    // union of its members' cones (see `cluster_properties_by_jaccard`),
+    // so its length is the cluster's cone size directly.
+    let clusters: Vec<ClusterCoiEntry> =
+        cluster_properties_by_jaccard(properties, deps, similarity_floor)
+            .into_iter()
+            .map(|c| ClusterCoiEntry {
+                members: c.members,
+                cone_size: c.seed_union.len(),
+            })
+            .collect();
+
+    let max_cluster_cone_size = clusters.iter().map(|c| c.cone_size).max().unwrap_or(0);
+
+    ClusterCoiReport {
+        joint_cone_size,
+        clusters,
+        max_cluster_cone_size,
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +449,80 @@ mod tests {
         let r = cone_of_influence(&seeds(&["a"]), &deps);
         assert!(r.contains("a") && r.contains("b"));
         assert_eq!(r.len(), 2);
+    }
+
+    // ---- R4W-1: Formula seed harvester + cluster_coi_report ----
+
+    #[test]
+    fn property_seed_atoms_collects_predicates() {
+        use crate::mu_calculus::parser::parse;
+        let f = parse("nu X. (active && [] X)").expect("parse");
+        let s = property_seed_atoms(&f);
+        assert!(s.contains("active"), "predicate `active` harvested: {s:?}");
+    }
+
+    #[test]
+    fn property_seed_atoms_collects_guard_current_and_next() {
+        use crate::mu_calculus::parser::parse;
+        // A modal guard referencing current- and next-state signals.
+        let f = parse("[(req_cur = {flag}, req_next = {done})] busy").expect("parse");
+        let s = property_seed_atoms(&f);
+        assert!(s.contains("flag"), "req_cur signal harvested: {s:?}");
+        assert!(s.contains("done"), "req_next signal harvested: {s:?}");
+        assert!(s.contains("busy"), "predicate harvested: {s:?}");
+    }
+
+    #[test]
+    fn property_seed_atoms_ignores_fixpoint_vars() {
+        use crate::mu_calculus::parser::parse;
+        // `X` is a fixpoint variable, not an atomic proposition — it
+        // must not appear as a seed.
+        let f = parse("mu X. (p || <> X)").expect("parse");
+        let s = property_seed_atoms(&f);
+        assert!(s.contains("p"));
+        assert!(!s.contains("X"), "fixpoint var must not be a seed: {s:?}");
+    }
+
+    #[test]
+    fn cluster_coi_report_disjoint_properties_reduce_max_cone() {
+        // Two properties over two disjoint sub-graphs: P1 over {a→b→c},
+        // P2 over {x→y→z}. Joint COI keeps all 6; each cluster keeps 3.
+        let deps = deps_of(&[
+            ("a", &["b"]),
+            ("b", &["c"]),
+            ("c", &[]),
+            ("x", &["y"]),
+            ("y", &["z"]),
+            ("z", &[]),
+        ]);
+        let props = vec![
+            ("P1".to_string(), seeds(&["a"])),
+            ("P2".to_string(), seeds(&["x"])),
+        ];
+        let report = cluster_coi_report(&props, &deps, 0.5);
+        assert_eq!(report.joint_cone_size, 6, "joint keeps both sub-graphs");
+        assert_eq!(report.clusters.len(), 2, "disjoint cones → 2 clusters");
+        assert_eq!(
+            report.max_cluster_cone_size, 3,
+            "each cluster keeps one chain"
+        );
+        assert!(
+            report.max_cluster_cone_size < report.joint_cone_size,
+            "clustering reduces the per-analysis cone (the M.3 claim)"
+        );
+    }
+
+    #[test]
+    fn cluster_coi_report_floor_zero_collapses_to_joint() {
+        // similarity_floor = 0.0 merges everything into one cluster, so
+        // the max cluster cone equals the joint cone (no clustering value).
+        let deps = deps_of(&[("a", &["b"]), ("b", &[]), ("x", &["y"]), ("y", &[])]);
+        let props = vec![
+            ("P1".to_string(), seeds(&["a"])),
+            ("P2".to_string(), seeds(&["x"])),
+        ];
+        let report = cluster_coi_report(&props, &deps, 0.0);
+        assert_eq!(report.clusters.len(), 1, "floor 0 → single joint cluster");
+        assert_eq!(report.max_cluster_cone_size, report.joint_cone_size);
     }
 }
