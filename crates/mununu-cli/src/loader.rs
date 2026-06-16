@@ -438,7 +438,7 @@ pub(crate) fn load_with_adapter_mode_extra(
         ),
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, btor2, promela, xstate, sv-yosys, extraction, auto"
             ));
         }
         None => {

@@ -425,7 +425,7 @@ pub async fn context_import_handler(
         other => {
             return Err(ApiError::BadRequest {
                 message: format!(
-                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, systemverilog, sv-yosys, extraction, crewai, langgraph, microcode"
+                    "Unknown format '{other}'. Supported: auto, tlsf, aiger, btor2, promela, xstate, sv-yosys, extraction, crewai, langgraph, microcode"
                 ),
                 details: None,
             });

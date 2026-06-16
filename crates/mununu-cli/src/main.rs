@@ -966,7 +966,7 @@ struct ContextSummarizeArgs {
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
     /// Translate from an external format before processing
-    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
+    /// (tlsf, aiger, promela, xstate, sv-yosys, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
@@ -993,7 +993,7 @@ struct ContextPredicatesArgs {
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
     /// Translate from an external format before processing
-    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
+    /// (tlsf, aiger, promela, xstate, sv-yosys, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
@@ -1018,7 +1018,7 @@ struct ContextEvalArgs {
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
     /// Translate from an external format before processing
-    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
+    /// (tlsf, aiger, promela, xstate, sv-yosys, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
@@ -1073,7 +1073,7 @@ struct ContextSynthesizeArgs {
     #[arg(long = "sidecar", value_name = "FILE")]
     sidecars: Vec<PathBuf>,
     /// Translate from an external format before processing
-    /// (tlsf, aiger, promela, xstate, systemverilog, extraction, auto).
+    /// (tlsf, aiger, promela, xstate, sv-yosys, extraction, auto).
     #[arg(long = "adapter", value_name = "FORMAT")]
     adapter: Option<String>,
     /// Mode for extraction adapter: "fixed" or "vulnerable".
