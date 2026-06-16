@@ -2397,7 +2397,7 @@ fn load_with_adapter_mode(
         }
         Some(fmt) => {
             return Err(format!(
-                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, systemverilog, extraction, crewai, langgraph, microcode, auto"
+                "unknown adapter format '{fmt}'. Supported: tlsf, aiger, promela, xstate, sv-yosys, extraction, crewai, langgraph, microcode, auto"
             ));
         }
         None => {
