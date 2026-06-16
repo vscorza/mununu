@@ -589,6 +589,142 @@ fn run_controllability_aware_lift(
     }))
 }
 
+/// U.0 (slot 6) — run the CEGAR predicate-abstraction-refinement loop over
+/// a BTOR2 design and return the per-iteration refinement trace + the final
+/// 3-valued verdict. The API equivalent of `mununu btor2 cegar`, exposed so
+/// the UI refinement-trace viewer can render the refinement story (which
+/// predicates were added at each iteration, where KleeneBot drove a split,
+/// and why the loop terminated). Heavy (Z3); UI calls it via the extended
+/// timeout client.
+pub async fn btor2_cegar_handler(
+    Json(request): Json<Btor2CegarRequest>,
+) -> ApiResult<Json<Btor2CegarResponse>> {
+    use crate::adapter::AdapterOptions;
+    use crate::adapter::btor2::cegar::{
+        CegarOptions, CegarTermination, LiftStrategy, PredicateSource, cegar_refine_loop,
+    };
+    use crate::adapter::btor2::kmts_lift::{MustEdgeInference, PredicateSpec};
+    use crate::mu_calculus::trit::{Trit, TritSet};
+    use crate::mu_calculus::{Environment, parser as mu_parser};
+
+    if request.predicates.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "at least one predicate is required to bootstrap the cube space".to_string(),
+            details: None,
+        });
+    }
+
+    let predicates: Vec<PredicateSpec> = request
+        .predicates
+        .iter()
+        .map(|p| PredicateSpec {
+            name: p.name.clone(),
+            register: p.register.clone(),
+            value: p.value,
+        })
+        .collect();
+
+    let formula = mu_parser::parse(&request.formula).map_err(|e| ApiError::BadRequest {
+        message: format!("formula parse error: {e:?}"),
+        details: None,
+    })?;
+
+    // Environment is sized to the cube space (2^|predicates|), matching the
+    // CLI `btor2 cegar` bootstrap.
+    let env = Environment::new(1usize << predicates.len());
+
+    let predicate_source = match request.predicate_source.as_deref() {
+        Some("craig") => PredicateSource::CraigInterpolation,
+        _ => PredicateSource::WeakestPrecondition,
+    };
+    let must_edge_inference = match request.must_edge_inference.as_deref() {
+        Some("sampling-confluence") => MustEdgeInference::SamplingConfluence,
+        Some("smt-per-target") => MustEdgeInference::SmtPerTarget,
+        Some("smt-per-target-standard") => MustEdgeInference::SmtPerTargetStandard,
+        Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
+        _ => MustEdgeInference::Off,
+    };
+
+    let cegar_opts = CegarOptions {
+        max_iterations: request.max_iterations.unwrap_or(16),
+        predicate_source,
+        max_cube_count: 1024,
+        capture_approximants: false,
+        enable_approximant_reuse: false,
+        smart_uf_cap: true,
+        lift_strategy: LiftStrategy::Eager,
+        must_edge_inference,
+    };
+
+    let adapter_options = AdapterOptions {
+        controllable_inputs: request.controllable_inputs.clone(),
+        ..Default::default()
+    };
+
+    let trace = cegar_refine_loop(
+        &formula,
+        &request.content,
+        predicates,
+        &env,
+        &adapter_options,
+        &cegar_opts,
+    )
+    .map_err(|e| ApiError::BadRequest {
+        message: format!("CEGAR refine loop: {}", e.message),
+        details: None,
+    })?;
+
+    let summarize = |v: &TritSet| -> CegarVerdictSummary {
+        let mut s = CegarVerdictSummary {
+            true_cells: 0,
+            false_cells: 0,
+            unknown_cells: 0,
+        };
+        for i in 0..v.len() {
+            match v.verdict_at(i) {
+                Trit::True => s.true_cells += 1,
+                Trit::False => s.false_cells += 1,
+                Trit::Unknown => s.unknown_cells += 1,
+            }
+        }
+        s
+    };
+    let pred_view = |p: &PredicateSpec| PredicateView {
+        name: p.name.clone(),
+        register: p.register.clone(),
+        value: p.value,
+    };
+
+    let iterations = trace
+        .iterations
+        .iter()
+        .map(|it| CegarIterationView {
+            iteration: it.iteration,
+            predicate_count: it.predicates_at_start.len(),
+            had_failure_subgame: it.failure_subgame.is_some(),
+            predicates_added: it.predicates_added.iter().map(&pred_view).collect(),
+            game_position_evaluations: it.game_position_evaluations,
+            verdict: summarize(&it.verdict),
+        })
+        .collect();
+
+    Ok(Json(Btor2CegarResponse {
+        success: true,
+        iterations,
+        final_predicates: trace.final_predicates.iter().map(&pred_view).collect(),
+        terminated_with: match trace.terminated_with {
+            CegarTermination::Converged => "converged",
+            CegarTermination::BoundedIterationsReached => "bounded-iterations-reached",
+            CegarTermination::PredicateSourceExhausted => "predicate-source-exhausted",
+        }
+        .to_string(),
+        verdict: summarize(&trace.final_verdict),
+        lazy_lift_pending: trace.lazy_lift_pending,
+        approximant_reuse_enabled: trace.approximant_reuse_enabled,
+        warnings: trace.warnings.iter().map(|w| w.message.clone()).collect(),
+    }))
+}
+
 /// Generate graph data for visualization
 pub async fn context_graphs_handler(
     Json(request): Json<ContextGraphsRequest>,
@@ -2620,6 +2756,88 @@ members = ["x"]
         // existing V.6 integration test
         // `v6_amba_arbiter_lift_produces_expected_cube_count`).
         assert_eq!(out.state_count, 2);
+    }
+
+    /// U.0 (slot 6) — the `/api/v1/btor2/cegar` endpoint runs the CEGAR
+    /// loop end-to-end and returns the refinement trace the UI viewer
+    /// renders: per-iteration records + a terminated_with reason + the
+    /// final 3-valued verdict cell counts.
+    #[tokio::test]
+    async fn btor2_cegar_handler_returns_refinement_trace() {
+        use crate::api::models::PredicateSpecRequest;
+        // Reuse the V.6 AMBA arbiter (a burst counter → MayOnly edges
+        // under the `burst==0` predicate abstraction).
+        let btor2 = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 req_0
+4 input 1 req_1
+5 input 1 ctrl_g0
+6 input 1 ctrl_g1
+7 state 2 burst
+8 state 1 grant_0
+9 state 1 grant_1
+10 zero 1
+11 zero 2
+12 init 1 8 10
+13 init 1 9 10
+14 init 2 7 11
+15 one 1
+16 const 2 11
+17 const 2 01
+18 const 2 10
+19 const 2 00
+20 next 1 8 5
+21 next 1 9 6
+22 or 1 5 6
+23 eq 1 7 19
+24 sub 2 7 17
+25 ite 2 23 16 24
+26 ite 2 22 25 7
+27 next 2 7 26
+";
+
+        let request = Btor2CegarRequest {
+            content: btor2.to_string(),
+            formula: "nu X. < true > X".to_string(),
+            predicates: vec![PredicateSpecRequest {
+                name: "burst_zero".to_string(),
+                register: "burst".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec!["ctrl_g0".to_string(), "ctrl_g1".to_string()],
+            predicate_source: None,
+            max_iterations: Some(4),
+            must_edge_inference: None,
+        };
+
+        let Json(out) = btor2_cegar_handler(Json(request))
+            .await
+            .expect("CEGAR endpoint should run end-to-end");
+
+        assert!(out.success);
+        // iteration 0 is always present (the initial evaluation).
+        assert!(
+            !out.iterations.is_empty(),
+            "trace must record at least the initial iteration"
+        );
+        assert_eq!(out.iterations[0].iteration, 0);
+        assert!(
+            matches!(
+                out.terminated_with.as_str(),
+                "converged" | "bounded-iterations-reached" | "predicate-source-exhausted"
+            ),
+            "unexpected terminated_with: {}",
+            out.terminated_with
+        );
+        // Single predicate ⇒ 2 cubes; the verdict summary covers every cube.
+        let total = out.verdict.true_cells + out.verdict.false_cells + out.verdict.unknown_cells;
+        assert_eq!(
+            total, 2,
+            "verdict summary must cover both cubes; got {total}"
+        );
+        // The final predicate set includes at least the bootstrap predicate.
+        assert!(!out.final_predicates.is_empty());
     }
 
     /// R.6.7 / V.6 — when only `predicates` is set (no
