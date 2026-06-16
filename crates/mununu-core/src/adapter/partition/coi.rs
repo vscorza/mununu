@@ -20,6 +20,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mu_calculus::{Formula, Node};
 
 /// BFS reachability from `seeds` through `deps`.
@@ -224,7 +226,7 @@ pub fn property_seed_atoms(formula: &Formula) -> HashSet<String> {
 }
 
 /// R4W-1 — One cluster's entry in a [`ClusterCoiReport`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterCoiEntry {
     /// Property identifiers merged into this cluster.
     pub members: Vec<PropertyId>,
@@ -242,7 +244,7 @@ pub struct ClusterCoiEntry {
 /// when `max_cluster_cone_size < joint_cone_size` (and, at the bit-blast
 /// layer, when the joint cone busts the state-bit cap while each cluster
 /// fits).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterCoiReport {
     /// Signals a naive joint COI over all properties would keep.
     pub joint_cone_size: usize,

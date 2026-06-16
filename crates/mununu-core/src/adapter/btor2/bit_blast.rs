@@ -1996,10 +1996,37 @@ fn enumerate_and_blast(
                 .map(|m| (m.symbol.clone(), m.width as usize)),
         )
         .collect();
-    let partition_summary = Some(crate::adapter::partition::PartitionSummary::from_partition(
-        &partition,
-        Some(&widths),
-    ));
+    let mut summary =
+        crate::adapter::partition::PartitionSummary::from_partition(&partition, Some(&widths));
+
+    // R4W-2 (R.4 clustered-COI wiring) — when the caller threaded the
+    // manifest's per-property COI seeds, compute the joint-vs-clustered
+    // cone comparison over *this* module's BTOR2 dep graph and surface
+    // it on the summary. Pure telemetry: it reports what a per-cluster
+    // bit-blast could save vs the naive joint COI (the M.3 reduction
+    // metric); it does not change which signals the partition keeps.
+    // Skipped entirely when `property_seeds` is empty (the legacy
+    // intrinsic-seed-only path), so there is no behaviour change for
+    // existing single-property / no-manifest runs.
+    if !options.property_seeds.is_empty() {
+        use crate::adapter::partition::{DepGraphBuilder, coi};
+        // The recommended Jaccard floor (see `coi::cluster_coi_report`
+        // docs). The configurable floor + the CLI/API/UI surface for
+        // the comparison are R4W-3; R4W-2 uses the 0.5 default.
+        const CLUSTER_SIMILARITY_FLOOR: f64 = 0.5;
+        let deps = file.build();
+        let props: Vec<(String, std::collections::HashSet<String>)> = options
+            .property_seeds
+            .iter()
+            .map(|(name, atoms)| (name.clone(), atoms.iter().cloned().collect()))
+            .collect();
+        summary.cluster_coi = Some(coi::cluster_coi_report(
+            &props,
+            &deps,
+            CLUSTER_SIMILARITY_FLOOR,
+        ));
+    }
+    let partition_summary = Some(summary);
 
     Ok(BlastOutput {
         signals,
@@ -5219,6 +5246,95 @@ mod tests {
         assert!(
             after < before,
             "expected reduction from dropping s_drop; got before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn cluster_coi_report_surfaced_when_property_seeds_present() {
+        // R4W-2 (R.4 clustered-COI wiring) — when the caller threads
+        // per-property COI seeds via `AdapterOptions::property_seeds`,
+        // the bit-blaster computes a joint-vs-clustered cone comparison
+        // over its dep graph and surfaces it on
+        // `PartitionSummary::cluster_coi`.
+        //
+        // Fixture: two independent 2-state chains. Chain A is
+        // `sa -> sa2 -> 0`; chain B is `sb -> sb2 -> 0`. The two cones
+        // are disjoint, so a per-property cluster keeps only 2 signals
+        // while the naive joint COI keeps all 4 — the M.3 reduction.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+4 state 1 sa
+5 state 1 sa2
+6 init 1 4 2
+7 init 1 5 2
+8 next 1 4 5
+9 next 1 5 2
+10 state 1 sb
+11 state 1 sb2
+12 init 1 10 2
+13 init 1 11 2
+14 next 1 10 11
+15 next 1 11 2
+16 bad 4
+"#;
+        let options = AdapterOptions {
+            property_seeds: vec![
+                ("propA".to_string(), vec!["sa".to_string()]),
+                ("propB".to_string(), vec!["sb".to_string()]),
+            ],
+            ..AdapterOptions::default()
+        };
+        let out = translate(src, &options).expect("translate");
+        let summary = out
+            .partition_summary
+            .expect("partition_summary must be populated");
+        let report = summary
+            .cluster_coi
+            .expect("cluster_coi must be Some when property_seeds is non-empty");
+
+        // Joint COI over {sa, sb} reaches {sa, sa2, sb, sb2}.
+        assert_eq!(
+            report.joint_cone_size, 4,
+            "joint cone = {{sa, sa2, sb, sb2}}; got {report:?}"
+        );
+        // Disjoint cones at the 0.5 floor → two singleton clusters.
+        assert_eq!(
+            report.clusters.len(),
+            2,
+            "disjoint cones must yield 2 clusters; got {report:?}"
+        );
+        // Each cluster's cone is exactly 2 signals.
+        assert_eq!(
+            report.max_cluster_cone_size, 2,
+            "each per-cluster cone = 2 signals; got {report:?}"
+        );
+        // The load-bearing M.3 claim: clustering shrinks the binding cone.
+        assert!(
+            report.max_cluster_cone_size < report.joint_cone_size,
+            "clustering must reduce the max cone vs the joint cone; got {report:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_coi_absent_without_property_seeds() {
+        // R4W-2 — the legacy intrinsic-seed-only path leaves
+        // `cluster_coi` as `None` (no behaviour change).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+4 state 1 sa
+6 init 1 4 2
+8 next 1 4 2
+16 bad 4
+"#;
+        let out = translate(src, &AdapterOptions::default()).expect("translate");
+        let summary = out
+            .partition_summary
+            .expect("partition_summary must be populated");
+        assert!(
+            summary.cluster_coi.is_none(),
+            "cluster_coi must be None when property_seeds is empty; got {summary:?}"
         );
     }
 

@@ -108,6 +108,17 @@ pub struct PartitionSummary {
     /// Total raw bit-width across kept state cells after the
     /// partition's `Dropped` signals collapsed to `Ignored`.
     pub state_bits_after: Option<usize>,
+    /// R4W-2 (R.4 clustered-COI wiring) — joint-vs-clustered cone
+    /// comparison over the manifest's per-property COI seeds. `Some`
+    /// only when the caller threaded `AdapterOptions::property_seeds`
+    /// (i.e. the verify orchestrator resolved `[[properties]]` and
+    /// harvested their seed atoms); `None` for intrinsic-seed-only
+    /// runs (the legacy default — no behaviour change). Pure telemetry:
+    /// the report does not drive which signals the partition keeps; it
+    /// reports what a per-cluster bit-blast *could* save vs the naive
+    /// joint COI (the M.3 reduction metric).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_coi: Option<coi::ClusterCoiReport>,
 }
 
 impl PartitionSummary {
@@ -172,6 +183,11 @@ impl PartitionSummary {
             datapath_uf,
             state_bits_before: tracking_widths.then_some(sb_before),
             state_bits_after: tracking_widths.then_some(sb_after),
+            // R4W-2 — populated by the caller (the BTOR2 bit-blaster)
+            // when `AdapterOptions::property_seeds` is non-empty; this
+            // constructor has no access to the dep graph or the seeds,
+            // so it defaults to `None` and the caller fills it in.
+            cluster_coi: None,
         }
     }
 }
