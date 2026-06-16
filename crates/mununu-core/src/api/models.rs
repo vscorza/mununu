@@ -821,3 +821,96 @@ pub struct ContextPredicatesResponse {
     pub success: bool,
     pub predicates: std::collections::HashMap<String, Vec<String>>,
 }
+
+// ============================================================================
+// BTOR2 CEGAR Endpoint (U.0 slot-6 refinement-trace viewer)
+// ============================================================================
+
+/// U.0 (slot 6) — request for the CEGAR refinement endpoint
+/// (`POST /api/v1/btor2/cegar`). Mirrors the CLI `mununu btor2 cegar`:
+/// runs the predicate-abstraction-refinement loop over a BTOR2 design and
+/// returns the per-iteration refinement trace the UI viewer renders.
+#[derive(Debug, Deserialize)]
+pub struct Btor2CegarRequest {
+    /// BTOR2 source content.
+    pub content: String,
+    /// μ-calculus formula evaluated over the lifted KMTS.
+    pub formula: String,
+    /// Initial predicate set (bootstraps the `2^|P|` cube space). At least
+    /// one entry is required. Reuses the `PredicateSpecRequest` shape.
+    pub predicates: Vec<PredicateSpecRequest>,
+    /// Optional R.6.6 controllability split — controller-driven input
+    /// symbols (mirrors `--controllable-input`).
+    #[serde(default)]
+    pub controllable_inputs: Vec<String>,
+    /// Predicate-discovery source: `"wp"` (default) | `"craig"`.
+    #[serde(default)]
+    pub predicate_source: Option<String>,
+    /// Max CEGAR iterations (default 16).
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Must-edge inference policy (kebab-case; default `"off"`):
+    /// `"sampling-confluence"` | `"smt-per-target"` |
+    /// `"smt-per-target-standard"` | `"smt-hyper-must"`.
+    #[serde(default)]
+    pub must_edge_inference: Option<String>,
+}
+
+/// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace
+/// viewer. Mirrors [`crate::adapter::btor2::cegar::CegarTrace`].
+#[derive(Debug, Serialize)]
+pub struct Btor2CegarResponse {
+    pub success: bool,
+    /// Per-iteration refinement records (iteration 0 = initial evaluation).
+    pub iterations: Vec<CegarIterationView>,
+    /// Predicate set at termination (initial + every added predicate).
+    pub final_predicates: Vec<PredicateView>,
+    /// Why the loop stopped: `"converged"` |
+    /// `"bounded-iterations-reached"` | `"predicate-source-exhausted"`.
+    pub terminated_with: String,
+    /// Cell-count summary of the final 3-valued verdict.
+    pub verdict: CegarVerdictSummary,
+    /// `true` when the eager `predicate_cube_lift` was used (R.2.5 MVP).
+    pub lazy_lift_pending: bool,
+    /// Whether prior-iteration approximants were threaded forward.
+    pub approximant_reuse_enabled: bool,
+    /// Soundness / advisory warnings produced during the run.
+    pub warnings: Vec<String>,
+}
+
+/// One CEGAR iteration, viewer-shaped.
+#[derive(Debug, Serialize)]
+pub struct CegarIterationView {
+    pub iteration: usize,
+    /// Predicate-set size at the start of this iteration.
+    pub predicate_count: usize,
+    /// `true` iff this iteration's verdict carried `KleeneBot` cells
+    /// (a failure subgame drove a refinement).
+    pub had_failure_subgame: bool,
+    /// Predicates the source added in response to this iteration.
+    pub predicates_added: Vec<PredicateView>,
+    /// Proxy counter for game-position evaluations (approximant-reuse
+    /// diagnostics).
+    pub game_position_evaluations: usize,
+    /// Cell-count summary of this iteration's 3-valued verdict.
+    pub verdict: CegarVerdictSummary,
+}
+
+/// Cell counts of a 3-valued (Kleene) verdict over the cube space.
+#[derive(Debug, Serialize)]
+pub struct CegarVerdictSummary {
+    /// KleeneT (definitely-true) cells.
+    pub true_cells: usize,
+    /// KleeneF (definitely-false) cells.
+    pub false_cells: usize,
+    /// KleeneBot (unknown — needs refinement) cells.
+    pub unknown_cells: usize,
+}
+
+/// A predicate spec, response-shaped.
+#[derive(Debug, Serialize)]
+pub struct PredicateView {
+    pub name: String,
+    pub register: String,
+    pub value: u64,
+}

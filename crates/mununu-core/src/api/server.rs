@@ -108,6 +108,7 @@ fn create_router() -> Router {
             post(handlers::codesign_verify_handler),
         )
         .route("/api/v1/verify", post(handlers::verify_project_handler))
+        .route("/api/v1/btor2/cegar", post(handlers::btor2_cegar_handler))
         .route(
             "/api/v1/verify/memory-check",
             post(handlers::memory_check_handler),
