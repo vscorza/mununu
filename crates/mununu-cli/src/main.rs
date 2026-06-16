@@ -448,6 +448,15 @@ struct VerifyArgs {
     /// byte-stable; opt-in for debugging.
     #[arg(long = "print-counterexample")]
     print_counterexample: bool,
+    /// R4W-3 (R.4 clustered-COI) — Jaccard similarity floor for the
+    /// clustered cone-of-influence comparison the BTOR2 (`sv-yosys`)
+    /// route reports per source. Overrides any `cluster_similarity_floor`
+    /// set in the `verify.toml`. Omitted → the recommended `0.5`.
+    /// Tighter (→ `1.0`) approaches per-property COI; looser (→ `0.0`)
+    /// collapses toward joint COI. Only affects `sv-yosys` sources with
+    /// declared properties; a no-op for other adapters.
+    #[arg(long = "cluster-coi-floor", value_name = "FLOAT")]
+    cluster_coi_floor: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -1339,8 +1348,15 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
 
     let body = std::fs::read_to_string(&args.config)
         .map_err(|e| format!("failed to read {}: {e}", args.config.display()))?;
-    let config = VerifyConfig::from_toml(&body)
+    let mut config = VerifyConfig::from_toml(&body)
         .map_err(|e| format!("failed to parse {} as TOML: {e}", args.config.display()))?;
+
+    // R4W-3 — the CLI flag overrides any `cluster_similarity_floor` set
+    // in the verify.toml; absent flag leaves the manifest value (or its
+    // None default) in place.
+    if args.cluster_coi_floor.is_some() {
+        config.cluster_similarity_floor = args.cluster_coi_floor;
+    }
 
     let base_dir = args.base_dir.clone().unwrap_or_else(|| {
         args.config
@@ -1385,6 +1401,30 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
                 adapter = s.adapter,
                 automaton = s.automaton.as_deref().unwrap_or("(unresolved)"),
             );
+            // R4W-3 — clustered cone-of-influence comparison (BTOR2 /
+            // `sv-yosys` route with declared properties). Present only
+            // when the bit-blaster computed it; absent for other
+            // adapters or property-less sources.
+            if let Some(cc) = s
+                .partition_summary
+                .as_ref()
+                .and_then(|ps| ps.cluster_coi.as_ref())
+            {
+                println!(
+                    "        clustered-COI: joint cone {joint} signals, {n} cluster(s), max cluster cone {max} signals{verdict}",
+                    joint = cc.joint_cone_size,
+                    n = cc.clusters.len(),
+                    max = cc.max_cluster_cone_size,
+                    verdict = if cc.max_cluster_cone_size < cc.joint_cone_size {
+                        format!(
+                            " (reduces binding cone by {} vs joint COI)",
+                            cc.joint_cone_size - cc.max_cluster_cone_size
+                        )
+                    } else {
+                        " (no reduction — cones overlap or single cluster)".to_string()
+                    },
+                );
+            }
         }
         println!("  properties ({}):", report.property_verdicts.len());
         for v in &report.property_verdicts {

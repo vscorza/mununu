@@ -194,10 +194,23 @@ pub struct AdapterOptions {
     ///
     /// Pure telemetry — does **not** change which signals the partition
     /// keeps. Default empty (the legacy intrinsic-seed-only path; no
-    /// behaviour change). The configurable similarity floor + the
-    /// CLI / API / UI surface for the comparison land in R4W-3; this
-    /// field uses the recommended `0.5` default at the bit-blast layer.
+    /// behaviour change). R4W-2 used the recommended `0.5` default at
+    /// the bit-blast layer; R4W-3 threads
+    /// [`Self::cluster_similarity_floor`] as the override.
     pub property_seeds: Vec<(String, Vec<String>)>,
+
+    /// R4W-3 (R.4 clustered-COI wiring) — Jaccard similarity floor for
+    /// the clustered-COI comparison (see
+    /// [`crate::adapter::partition::coi::cluster_properties_by_jaccard`]).
+    /// `None` → the bit-blaster uses the recommended `0.5` default
+    /// (R4W-2 behaviour). Tighter floors (→ `1.0`) approach
+    /// per-property COI; looser floors (→ `0.0`) collapse toward joint
+    /// COI. Only consulted when [`Self::property_seeds`] is non-empty.
+    /// The verify orchestrator populates this from
+    /// `VerifyConfig::cluster_similarity_floor` (settable in
+    /// `verify.toml`, or overridden by the CLI `--cluster-coi-floor`
+    /// flag / the API request's `cluster_similarity_floor` field).
+    pub cluster_similarity_floor: Option<f64>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.
