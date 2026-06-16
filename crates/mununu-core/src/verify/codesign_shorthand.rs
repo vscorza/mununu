@@ -136,6 +136,9 @@ pub fn codesign_to_verify(codesign: &CodesignProjectConfig) -> VerifyConfig {
         alphabet,
         composition,
         properties,
+        // R4W-3 — codesign shorthand does not tune clustered-COI; the
+        // verify path uses the recommended 0.5 default.
+        cluster_similarity_floor: None,
     }
 }
 

@@ -83,6 +83,17 @@ pub struct VerifyConfig {
     /// `[[properties]]` array.
     #[serde(default)]
     pub properties: Vec<PropertySection>,
+    /// R4W-3 (R.4 clustered-COI wiring) — optional Jaccard similarity
+    /// floor for the clustered-COI comparison the BTOR2 bit-blaster
+    /// reports on each source's `PartitionSummary.cluster_coi`. `None`
+    /// (the default) → the recommended `0.5`. Settable directly in
+    /// `verify.toml` (`cluster_similarity_floor = 0.7`), and overridden
+    /// by the CLI `mununu verify --cluster-coi-floor <F>` flag or the
+    /// API verify request's `cluster_similarity_floor` field. Tighter
+    /// floors (→ `1.0`) approach per-property COI; looser (→ `0.0`)
+    /// collapse toward joint COI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_similarity_floor: Option<f64>,
 }
 
 /// `[project]` block.
@@ -1417,5 +1428,41 @@ members = ["memory"]
         let toml_text = toml::to_string(&cfg).unwrap();
         let reparsed = VerifyConfig::from_toml(&toml_text).unwrap();
         assert_eq!(cfg, reparsed);
+    }
+
+    #[test]
+    fn cluster_similarity_floor_defaults_to_none_and_parses_when_set() {
+        // R4W-3 — the optional top-level `cluster_similarity_floor`
+        // defaults to None (legacy manifests unaffected) and round-trips
+        // when present. The key is top-level, so it must precede any
+        // table header in the TOML source.
+        let default_cfg = VerifyConfig::from_toml(VALID_DIRECT).unwrap();
+        assert!(
+            default_cfg.cluster_similarity_floor.is_none(),
+            "absent field must default to None"
+        );
+
+        let with_floor = r#"
+cluster_similarity_floor = 0.7
+
+[project]
+name = "floored"
+
+[[sources]]
+id = "a"
+adapter = "xstate"
+files = ["a.xstate.json"]
+
+[composition]
+semantics = "synchronous"
+members = ["a"]
+name = "Solo"
+"#;
+        let cfg = VerifyConfig::from_toml(with_floor).expect("parse with floor");
+        assert_eq!(cfg.cluster_similarity_floor, Some(0.7));
+
+        // Serde round-trip preserves it.
+        let reparsed = VerifyConfig::from_toml(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(reparsed.cluster_similarity_floor, Some(0.7));
     }
 }

@@ -2010,21 +2010,22 @@ fn enumerate_and_blast(
     // existing single-property / no-manifest runs.
     if !options.property_seeds.is_empty() {
         use crate::adapter::partition::{DepGraphBuilder, coi};
-        // The recommended Jaccard floor (see `coi::cluster_coi_report`
-        // docs). The configurable floor + the CLI/API/UI surface for
-        // the comparison are R4W-3; R4W-2 uses the 0.5 default.
-        const CLUSTER_SIMILARITY_FLOOR: f64 = 0.5;
+        // R4W-3 — honour the caller's Jaccard floor
+        // (`AdapterOptions::cluster_similarity_floor`, threaded from
+        // `VerifyConfig` / the CLI flag / the API request field). `None`
+        // falls back to the recommended 0.5 default (R4W-2 behaviour;
+        // see `coi::cluster_coi_report` docs).
+        const DEFAULT_CLUSTER_SIMILARITY_FLOOR: f64 = 0.5;
+        let floor = options
+            .cluster_similarity_floor
+            .unwrap_or(DEFAULT_CLUSTER_SIMILARITY_FLOOR);
         let deps = file.build();
         let props: Vec<(String, std::collections::HashSet<String>)> = options
             .property_seeds
             .iter()
             .map(|(name, atoms)| (name.clone(), atoms.iter().cloned().collect()))
             .collect();
-        summary.cluster_coi = Some(coi::cluster_coi_report(
-            &props,
-            &deps,
-            CLUSTER_SIMILARITY_FLOOR,
-        ));
+        summary.cluster_coi = Some(coi::cluster_coi_report(&props, &deps, floor));
     }
     let partition_summary = Some(summary);
 
@@ -5335,6 +5336,86 @@ mod tests {
         assert!(
             summary.cluster_coi.is_none(),
             "cluster_coi must be None when property_seeds is empty; got {summary:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_similarity_floor_is_honored_through_adapter_options() {
+        // R4W-3 — the bit-blaster honours
+        // `AdapterOptions::cluster_similarity_floor`, not a hardcoded
+        // 0.5. Fixture: two chains that SHARE one signal, so their cones
+        // partially overlap (Jaccard = |{shared}| / |{sa,sa2,sb,sb2,shared}|
+        // = 1/5 = 0.2):
+        //   chain A: sa' = and(sa2, shared)  → cone {sa, sa2, shared}
+        //   chain B: sb' = and(sb2, shared)  → cone {sb, sb2, shared}
+        // A floor of 0.0 (≤ 0.2) merges them into one cluster; a floor of
+        // 0.9 (> 0.2) keeps them apart. The cluster count flipping with
+        // the floor proves the override threads end-to-end.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 shared
+4 init 1 3 2
+5 next 1 3 2
+6 state 1 sa
+7 state 1 sa2
+8 init 1 6 2
+9 init 1 7 2
+10 and 1 7 3
+11 next 1 6 10
+12 next 1 7 2
+13 state 1 sb
+14 state 1 sb2
+15 init 1 13 2
+16 init 1 14 2
+17 and 1 14 3
+18 next 1 13 17
+19 next 1 14 2
+20 bad 6
+"#;
+        let seeds = vec![
+            ("propA".to_string(), vec!["sa".to_string()]),
+            ("propB".to_string(), vec!["sb".to_string()]),
+        ];
+
+        // Loose floor (0.0): the 0.2-overlapping cones merge → 1 cluster
+        // whose cone is the full joint cone (5 signals).
+        let loose = translate(
+            src,
+            &AdapterOptions {
+                property_seeds: seeds.clone(),
+                cluster_similarity_floor: Some(0.0),
+                ..AdapterOptions::default()
+            },
+        )
+        .expect("translate")
+        .partition_summary
+        .and_then(|s| s.cluster_coi)
+        .expect("cluster_coi");
+        assert_eq!(loose.clusters.len(), 1, "floor 0.0 must merge; {loose:?}");
+        assert_eq!(
+            loose.max_cluster_cone_size, loose.joint_cone_size,
+            "merged cluster cone == joint cone; {loose:?}"
+        );
+
+        // Tight floor (0.9): 0.2 < 0.9 → the cones stay in 2 clusters,
+        // each smaller than the joint cone.
+        let tight = translate(
+            src,
+            &AdapterOptions {
+                property_seeds: seeds,
+                cluster_similarity_floor: Some(0.9),
+                ..AdapterOptions::default()
+            },
+        )
+        .expect("translate")
+        .partition_summary
+        .and_then(|s| s.cluster_coi)
+        .expect("cluster_coi");
+        assert_eq!(tight.clusters.len(), 2, "floor 0.9 must split; {tight:?}");
+        assert!(
+            tight.max_cluster_cone_size < tight.joint_cone_size,
+            "split clusters reduce the binding cone; {tight:?}"
         );
     }
 

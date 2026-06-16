@@ -2124,6 +2124,15 @@ pub struct VerifyProjectRequest {
     /// Required — the server has no implicit "client working
     /// directory" the way the CLI does.
     pub base_dir: String,
+    /// R4W-3 (R.4 clustered-COI) — Jaccard similarity floor for the
+    /// clustered cone-of-influence comparison the BTOR2 (`sv-yosys`)
+    /// route reports on each source's `partition_summary.cluster_coi`.
+    /// Overrides any `cluster_similarity_floor` in the supplied config /
+    /// config_toml. `None` (default) → the recommended `0.5`. The
+    /// comparison itself rides the response's `VerifyReport` (no extra
+    /// response field needed).
+    #[serde(default)]
+    pub cluster_similarity_floor: Option<f64>,
 }
 
 /// HTTP handler for the general verify pipeline. Mirrors
@@ -2136,7 +2145,7 @@ pub struct VerifyProjectRequest {
 pub async fn verify_project_handler(
     Json(request): Json<VerifyProjectRequest>,
 ) -> ApiResult<Json<crate::verify::report::VerifyReport>> {
-    let config = match (request.config, request.config_toml) {
+    let mut config = match (request.config, request.config_toml) {
         (Some(c), None) => c,
         (None, Some(toml_text)) => crate::verify::config::VerifyConfig::from_toml(&toml_text)
             .map_err(|e| ApiError::BadRequest {
@@ -2156,6 +2165,12 @@ pub async fn verify_project_handler(
             });
         }
     };
+    // R4W-3 — the request floor overrides any value in the config /
+    // config_toml; absent leaves the manifest value (or its None
+    // default → 0.5 at the bit-blast layer) in place.
+    if request.cluster_similarity_floor.is_some() {
+        config.cluster_similarity_floor = request.cluster_similarity_floor;
+    }
     let base_dir = std::path::PathBuf::from(&request.base_dir);
     crate::verify::verify_project(&config, &base_dir)
         .map(Json)
@@ -2584,6 +2599,7 @@ over = "Sys"
             config: None,
             config_toml: Some(toml.to_string()),
             base_dir: tmp.path().to_string_lossy().to_string(),
+            cluster_similarity_floor: None,
         };
         let Json(report) = verify_project_handler(Json(request))
             .await
@@ -2613,6 +2629,7 @@ members = ["x"]
             config: Some(cfg),
             config_toml: Some("[project]\nname = \"Y\"\n".to_string()),
             base_dir: ".".to_string(),
+            cluster_similarity_floor: None,
         };
         let err = verify_project_handler(Json(request)).await.unwrap_err();
         match err {
@@ -2881,6 +2898,7 @@ members = ["x"]
             config: None,
             config_toml: None,
             base_dir: ".".to_string(),
+            cluster_similarity_floor: None,
         };
         let err = verify_project_handler(Json(request)).await.unwrap_err();
         match err {
