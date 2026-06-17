@@ -1,7 +1,43 @@
 # sv_yosys_caliptra_rtl_150 — Caliptra-RTL boot FSM auto-extraction
 
-> **Phase A.3 structural sanity check.** This fixture is *not yet*
-> a property-verification claim — see [Status](#status) below.
+> **Two entry points.** [`validate.sh`](validate.sh) is the original
+> Phase-A.3 *structural* sanity check (bit-blast reduction; not a
+> property claim — see [Status](#status)). [`validate_m4_cegar.sh`](validate_m4_cegar.sh)
+> is the **M.4 milestone**: full automated predicate-abstraction CEGAR
+> that decides a sound, definite, **pre/post-distinguishing** verdict on
+> the CWE-1245 boot-FSM hazard (see [M.4](#m4--predicate-abstraction-cegar) below).
+
+## M.4 — predicate-abstraction CEGAR
+
+`validate_m4_cegar.sh` runs the R.5 predicate-cube CEGAR path
+(sv2v → Yosys `setundef -anyconst` → BTOR2 → `mununu btor2 cegar` with
+per-target SMT-proved must-edge inference) on both the bug-bearing
+`pre_fix` and fixed `post_fix` variants.
+
+Property: `<> (p5 || p6 || p7)` over the cube `{boot_fsm_ns ∈ {5,6,7}}` —
+"the next-state register can transition into an unmatched (undefined)
+`boot_fsm_state_e` encoding" (the legal encodings are 0..4; the
+default-less `unique casez` leaves 5/6/7 unhandled — CWE-1245).
+
+```
+pre_fix  (no default arm):     verdict cells T=7 F=1 ⊥=0  → hazard REACHABLE
+post_fix (default → defined):  verdict cells T=0 F=8 ⊥=0  → hazard UNREACHABLE
+```
+
+The undefined-encoding transition is reachable/absorbing in the
+bug-bearing variant and proven unreachable in the fixed variant — the
+pre/post difference is the milestone evidence. Soundness: the must-edges
+are Z3-proved (∀∀, no sampling); `setundef -anyconst` over-approximates
+power-up, so the definite verdict transfers to the concrete reset
+behaviour. The verdict is established over the extracted model; an
+RTL-level counterexample replay under a cycle-accurate simulator is the
+deferred empirical step (M.0–M.2 SBY precedent). This reproduces the
+known caliptra-rtl #150 bug/fix pair via the automated pipeline.
+
+```bash
+cargo build -p mununu-cli
+./validate_m4_cegar.sh        # requires yosys + sv2v on PATH
+```
 
 ## What this exercises
 
