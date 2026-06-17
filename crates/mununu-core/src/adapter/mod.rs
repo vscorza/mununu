@@ -211,6 +211,25 @@ pub struct AdapterOptions {
     /// `verify.toml`, or overridden by the CLI `--cluster-coi-floor`
     /// flag / the API request's `cluster_similarity_floor` field).
     pub cluster_similarity_floor: Option<f64>,
+
+    /// R.4.6 (per-cluster verification) — when `Some`, restrict the BTOR2
+    /// bit-blast to the cone of influence of these property atoms (one
+    /// cluster's members). Every state cell **not** in the cone is pinned
+    /// to `Ignored` (cut from the state space), and its width is
+    /// subtracted from the `MAX_STATE_BITS` cap check — so a design whose
+    /// JOINT cone busts the cap can still be verified per-cluster when
+    /// each cluster's cone fits ("joint busts cap, clusters fit").
+    ///
+    /// SOUNDNESS: the cone of influence is exact (bisimilar) on the atom
+    /// set, so cutting out-of-cone cells cannot change any verdict over
+    /// those atoms (CLAUDE.md §Soundness — COI is the exact / free /
+    /// sound abstraction). This is *not* an approximation. `None`
+    /// (default) preserves the joint single-bit-blast behaviour. The
+    /// verify orchestrator (R46-2 / R46-3) sets this per cluster from
+    /// [`crate::adapter::partition::coi::PropertyCluster::members`]'
+    /// resolved atoms. The cone itself is computed by
+    /// [`crate::adapter::btor2::dep_graph::state_cone_nids`].
+    pub cone_restrict_atoms: Option<Vec<String>>,
 }
 
 /// A sidecar file the adapter produced alongside its CTXDSL output.

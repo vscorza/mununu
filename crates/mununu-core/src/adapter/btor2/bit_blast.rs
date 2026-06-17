@@ -595,8 +595,17 @@ pub fn to_ir(
     // when no sidecar is provided OR no cells are Ignored, the
     // accounting is identical to the legacy behaviour.
     let raw_state_bits = sum_widths(file, &states)?;
-    let total_state_bits =
-        raw_state_bits.saturating_sub(sidecar_ignored_state_bits(file, &states, options));
+    // R.4.6 — when a per-cluster cone restriction is active, out-of-cone
+    // state cells are pinned to Ignored (below, in `enumerate_and_blast`),
+    // so they contribute zero bits. Subtract them here too so the cap
+    // check is gated on the *cluster* cone, not the joint design — this is
+    // what lets a design whose joint cone busts the cap be verified
+    // per-cluster ("joint busts cap, clusters fit"). Disjoint from
+    // `sidecar_ignored_state_bits` (see `cone_dropped_state_bits`), so no
+    // double-subtraction.
+    let total_state_bits = raw_state_bits
+        .saturating_sub(sidecar_ignored_state_bits(file, &states, options))
+        .saturating_sub(cone_dropped_state_bits(file, &states, options));
     let total_input_bits = sum_widths(file, &inputs)?;
 
     if total_state_bits > MAX_STATE_BITS {
@@ -712,18 +721,49 @@ fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
 /// from the `state` line and only attaches it via an Op-alias or
 /// `output` port symbol.
 fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &AdapterOptions) -> u32 {
-    let Some(json) = &options.sidecar_json else {
+    let ignored_nids = sidecar_ignored_nids(file, options);
+    if ignored_nids.is_empty() {
         return 0;
+    }
+    let mut sum: u32 = 0;
+    for line in states {
+        if !ignored_nids.contains(&line.nid) {
+            continue;
+        }
+        let sort_nid = match &line.node {
+            Node::State { sort, .. } => *sort,
+            _ => continue,
+        };
+        let Some(width) = parser::bv_width(file, sort_nid) else {
+            continue;
+        };
+        sum = sum.saturating_add(width);
+    }
+    sum
+}
+
+/// The set of BTOR2 state NIDs the sidecar declares `abstraction:
+/// ignored`. Resolves each Ignored signal via the `drives` override
+/// (falling back to the sidecar `name`) using
+/// [`parser::resolve_state_by_symbol`]. Returns an empty set when no
+/// sidecar is provided, it fails to parse, or no cells are Ignored.
+///
+/// Split out of [`sidecar_ignored_state_bits`] (R.4.6) so the cone
+/// restriction's cap accounting can subtract out-of-cone cells *without*
+/// double-counting cells the sidecar already pins to Ignored.
+fn sidecar_ignored_nids(
+    file: &Btor2File,
+    options: &AdapterOptions,
+) -> std::collections::HashSet<Nid> {
+    let Some(json) = &options.sidecar_json else {
+        return std::collections::HashSet::new();
     };
     let Ok(ann) =
         serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
     else {
-        return 0;
+        return std::collections::HashSet::new();
     };
-    // Map each Ignored sidecar signal → its resolved BTOR2 state NID
-    // (drives override > sidecar name; BFS-nearest-state).
-    let ignored_nids: std::collections::HashSet<Nid> = ann
-        .signals
+    ann.signals
         .iter()
         .filter(|s| {
             matches!(
@@ -735,13 +775,38 @@ fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &Adap
             let target = s.drives.as_deref().unwrap_or(s.name.as_str());
             parser::resolve_state_by_symbol(file, target)
         })
-        .collect();
-    if ignored_nids.is_empty() {
-        return 0;
+        .collect()
+}
+
+/// R.4.6 (per-cluster verification) — the cone keep-set of state NIDs for
+/// the current restriction, or `None` when `cone_restrict_atoms` is unset
+/// / empty (the joint single-bit-blast path). Delegates the cone
+/// computation to [`super::dep_graph::state_cone_nids`].
+fn cone_keep_state_nids(
+    file: &Btor2File,
+    options: &AdapterOptions,
+) -> Option<std::collections::HashSet<Nid>> {
+    let atoms = options.cone_restrict_atoms.as_ref()?;
+    if atoms.is_empty() {
+        return None;
     }
+    Some(super::dep_graph::state_cone_nids(file, atoms))
+}
+
+/// R.4.6 — sum the widths of state cells that the cone restriction drops
+/// (out-of-cone) but that the sidecar has *not* already pinned to Ignored
+/// (those are subtracted by [`sidecar_ignored_state_bits`]). Returns 0
+/// when no restriction is active. Subtracted from the cap-check total so
+/// a per-cluster bit-blast is gated on the *cluster* cone's bit count,
+/// not the joint design's.
+fn cone_dropped_state_bits(file: &Btor2File, states: &[&Line], options: &AdapterOptions) -> u32 {
+    let Some(keep) = cone_keep_state_nids(file, options) else {
+        return 0;
+    };
+    let already_ignored = sidecar_ignored_nids(file, options);
     let mut sum: u32 = 0;
     for line in states {
-        if !ignored_nids.contains(&line.nid) {
+        if keep.contains(&line.nid) || already_ignored.contains(&line.nid) {
             continue;
         }
         let sort_nid = match &line.node {
@@ -1381,6 +1446,24 @@ fn enumerate_and_blast(
         warnings,
         "state cell",
     );
+
+    // R.4.6 (per-cluster verification) — explicit per-cluster cone
+    // restriction. When `cone_restrict_atoms` is set, pin every state
+    // cell whose NID is NOT in the cluster's cone keep-set to `Ignored`,
+    // mirroring the auto-partition drop above but driven by the explicit
+    // cluster cone rather than the intrinsic-seed partition. The
+    // cap-check in `to_ir` subtracts the same cells' widths
+    // (`cone_dropped_state_bits`), so a design whose joint cone busts the
+    // cap can still be verified per-cluster when each cone fits. The
+    // "user wins" guard (a cell already keyed in `cell_domains`) leaves
+    // sidecar-declared cells untouched.
+    if let Some(keep) = cone_keep_state_nids(file, options) {
+        apply_cone_restriction(
+            &mut cell_domains,
+            state_meta.iter().map(|m| (m.nid, m.symbol.as_str())),
+            &keep,
+        );
+    }
 
     // R-Y3 (§Phase 8) — BTOR2 init-line smart defaults for cells
     // WITHOUT sidecar entries. Opt-in via `MUNUNU_BTOR2_SMART_INIT_DEFAULTS=1`.
@@ -2462,6 +2545,50 @@ fn apply_partition_drops<'a>(
                 // (full bit-blast) applies.
             }
         }
+    }
+}
+
+/// R.4.6 (per-cluster verification) — pin every state cell whose NID is
+/// **not** in `keep_nids` (the cluster's cone keep-set) to `Ignored`,
+/// cutting it from the enumerated state space. The "user wins" guard (a
+/// cell already keyed in `domains`) leaves sidecar-declared cells
+/// untouched, matching [`apply_partition_drops`].
+///
+/// SOUNDNESS: the cone of influence is **exact** (bisimilar) on the
+/// cluster's atom set — out-of-cone cells cannot influence those atoms,
+/// so pinning them to a single value cannot change any verdict over the
+/// cluster's properties. This is the COI "exact / free / sound"
+/// abstraction (CLAUDE.md §Soundness), *not* an over- or
+/// under-approximation; no warning is emitted because no precision is
+/// lost on the cluster's properties.
+fn apply_cone_restriction<'a>(
+    domains: &mut CellDomainMap,
+    iter: impl Iterator<Item = (i64, &'a str)>,
+    keep_nids: &std::collections::HashSet<Nid>,
+) {
+    use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
+
+    for (nid, symbol) in iter {
+        if keep_nids.contains(&nid) {
+            continue; // in the cluster cone → keep (full bit-blast / sidecar domain)
+        }
+        if domains.contains_key(&nid) {
+            continue; // user wins — sidecar already declared this cell
+        }
+        domains.insert(
+            nid,
+            (
+                FieldDomain {
+                    name: symbol.to_string(),
+                    abstraction: AbstractionType::Ignored,
+                    bound: None,
+                    lower_bound: None,
+                    variants: None,
+                    initial: AbstractValue::Counter(0),
+                },
+                Vec::new(),
+            ),
+        );
     }
 }
 
@@ -5123,6 +5250,79 @@ mod tests {
             src.push_str(&format!("{} state 1 s{}\n", i + 2, i));
         }
         let err = translate(&src, &AdapterOptions::default()).unwrap_err();
+        assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
+    }
+
+    /// R.4.6 — the "joint busts cap, clusters fit" capability at the
+    /// bit-blast layer. Two independent 11-bit registers (22 state bits
+    /// jointly, > MAX_STATE_BITS = 20). `a_hot = (reg_a == 1)` so reg_a
+    /// is in the cone and reg_b is not. Without a restriction the design
+    /// busts the cap; restricting to `a_hot`'s cone drops reg_b's 11 bits
+    /// and the cluster (11 bits) fits + translates.
+    #[test]
+    fn cone_restriction_unlocks_cap_busting_design_per_cluster() {
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 11
+3 zero 2
+4 state 2 reg_a
+5 init 2 4 3
+6 state 2 reg_b
+7 init 2 6 3
+8 one 2
+9 eq 1 4 8
+10 output 9 a_hot
+"#;
+        // 1) Joint — both 11-bit registers → 22 state bits → cap-bust.
+        let joint = translate(src, &AdapterOptions::default());
+        assert!(
+            joint.is_err(),
+            "joint design (22 state bits) must bust the cap"
+        );
+        assert_eq!(
+            joint.unwrap_err().kind,
+            AdapterErrorKind::StateSpaceOverflow
+        );
+
+        // 2) Per-cluster — restrict to a_hot's cone {reg_a}; reg_b's
+        // 11 bits are cut, leaving 11 ≤ MAX_STATE_BITS → translates.
+        let opts = AdapterOptions {
+            cone_restrict_atoms: Some(vec!["a_hot".to_string()]),
+            ..Default::default()
+        };
+        let out = translate(src, &opts)
+            .expect("cone-restricted cluster (11 state bits) must fit the cap");
+        assert!(
+            out.ctxdsl.contains("automaton"),
+            "restricted cluster must produce an automaton; ctxdsl:\n{}",
+            out.ctxdsl
+        );
+    }
+
+    /// R.4.6 — a restriction whose cone covers *every* state cell is a
+    /// no-op: nothing is dropped, so a design that already busts the cap
+    /// still busts it (the restriction cannot manufacture headroom it has
+    /// no out-of-cone cells to reclaim).
+    #[test]
+    fn cone_restriction_covering_all_cells_does_not_unlock_cap() {
+        // Two registers, but the atom's cone reaches BOTH (out = reg_a ==
+        // reg_b), so neither is droppable.
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 11
+3 zero 2
+4 state 2 reg_a
+5 init 2 4 3
+6 state 2 reg_b
+7 init 2 6 3
+8 eq 1 4 6
+9 output 8 both_hot
+"#;
+        let opts = AdapterOptions {
+            cone_restrict_atoms: Some(vec!["both_hot".to_string()]),
+            ..Default::default()
+        };
+        let err = translate(src, &opts).expect_err("cone covers both regs → still 22 bits");
         assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
     }
 
