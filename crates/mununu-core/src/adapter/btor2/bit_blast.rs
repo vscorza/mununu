@@ -442,6 +442,25 @@ pub fn to_ir(
 > {
     let mut warnings = Vec::new();
 
+    // R46-1/R46-2 (R.4.6) — cone restriction by SLICING. When the caller
+    // (or the per-cluster fallback) requests a cone restriction, replace
+    // the design with the exact sub-circuit its property atoms depend on:
+    // every out-of-cone state cell, its next/init, and any out-of-cone
+    // input or output is removed from the BTOR2 entirely. The rest of
+    // `to_ir` then bit-blasts a strictly smaller design. This SUPERSEDES
+    // the earlier pin-to-`Ignored` mechanism (which was sound only for
+    // safety and, because transitions are synchronous, dropped in-cone
+    // updates whenever an out-of-cone cell changed). Slicing is exact /
+    // bisimilar on the atom set — sound for the full mu-calculus.
+    let cone_sliced;
+    let file: &Btor2File = match &options.cone_restrict_atoms {
+        Some(atoms) if !atoms.is_empty() => {
+            cone_sliced = cone_slice(file, atoms);
+            &cone_sliced
+        }
+        _ => file,
+    };
+
     // §Phase 10 §10.2 stage 1 — detect array-typed state cells
     // (BTOR2 `state` lines whose sort is `Sort::Array`) and validate
     // them against the sidecar's `memories: [...]` declarations.
@@ -594,21 +613,26 @@ pub fn to_ir(
     // cells' widths before checking the cap. Strict additivity:
     // when no sidecar is provided OR no cells are Ignored, the
     // accounting is identical to the legacy behaviour.
-    let raw_state_bits = sum_widths(file, &states)?;
-    // R.4.6 — when a per-cluster cone restriction is active, out-of-cone
-    // state cells are pinned to Ignored (below, in `enumerate_and_blast`),
-    // so they contribute zero bits. Subtract them here too so the cap
-    // check is gated on the *cluster* cone, not the joint design — this is
-    // what lets a design whose joint cone busts the cap be verified
-    // per-cluster ("joint busts cap, clusters fit"). Disjoint from
-    // `sidecar_ignored_state_bits` (see `cone_dropped_state_bits`), so no
-    // double-subtraction.
-    let total_state_bits = raw_state_bits
-        .saturating_sub(sidecar_ignored_state_bits(file, &states, options))
-        .saturating_sub(cone_dropped_state_bits(file, &states, options));
+    // Note: `file` is already the cone slice when a restriction is active
+    // (see the top of `to_ir`), so the cap is naturally measured against
+    // the restricted design — no separate cone-bit subtraction needed.
+    let total_state_bits = sum_widths(file, &states)?
+        .saturating_sub(sidecar_ignored_state_bits(file, &states, options));
     let total_input_bits = sum_widths(file, &inputs)?;
 
     if total_state_bits > MAX_STATE_BITS {
+        // R46-2 (R.4.6 per-cluster verification) — the joint design busts
+        // the cap. If the manifest threaded per-property COI seeds AND we
+        // are not already inside a single-cone slice, try to partition the
+        // properties by cone overlap and bit-blast each cluster sliced to
+        // its own cone. When every cluster fits and there is more than
+        // one, this yields K automata + a routing map ("joint busts cap,
+        // clusters fit"). Otherwise fall through to the joint cap error.
+        if options.cone_restrict_atoms.is_none()
+            && let Some((ir, summary)) = try_per_cluster_blast(file, options, &mut warnings)?
+        {
+            return Ok((ir, warnings, summary));
+        }
         return Err(AdapterError {
             kind: AdapterErrorKind::StateSpaceOverflow,
             message: format!(
@@ -664,6 +688,328 @@ pub fn to_ir(
         warnings,
         blasted.partition_summary,
     ))
+}
+
+/// R46-2 (R.4.6 per-cluster verification) — the "joint busts cap,
+/// clusters fit" fallback. Called from [`to_ir`] when the joint design
+/// exceeds [`MAX_STATE_BITS`] AND the manifest threaded per-property COI
+/// seeds (`AdapterOptions::property_seeds`).
+///
+/// Partitions the properties by cone overlap
+/// ([`coi::cluster_properties_by_jaccard`], reusing the same atom→terminal
+/// resolution as the clustered-COI telemetry), then bit-blasts each
+/// cluster restricted to its own cone (R46-1's `cone_restrict_atoms`,
+/// applied internally). Returns:
+///
+/// - `Some((ir, summary))` with one automaton per cluster (named
+///   `Circuit__cl{k}`) and a property→automaton routing map on the
+///   summary, when there is **more than one** cluster AND **every**
+///   cluster fits the cap. This is the case the report's clustered-COI
+///   reduction predicted.
+/// - `None` when per-cluster cannot help — no seeds, a single cluster
+///   (equivalent to the joint design), or some cluster still busts the
+///   cap even restricted (it carries a wide field; see GAP-2 /
+///   param-concretization). The caller then emits the joint cap error.
+///
+/// SOUNDNESS: each cluster's model is the joint design restricted to that
+/// cluster's exact cone of influence; cutting out-of-cone cells cannot
+/// change any verdict over the cluster's properties (CLAUDE.md
+/// §Soundness — COI is exact). Each property lands in exactly one cluster
+/// (the clustering invariant), so routing it to its cluster's model is
+/// sound and complete.
+#[allow(clippy::type_complexity)]
+fn try_per_cluster_blast(
+    file: &Btor2File,
+    options: &AdapterOptions,
+    warnings: &mut Vec<AdapterWarning>,
+) -> Result<
+    Option<(
+        AdapterIR,
+        Option<crate::adapter::partition::PartitionSummary>,
+    )>,
+    AdapterError,
+> {
+    use crate::adapter::partition::{DepGraphBuilder, Partition, PartitionSummary, coi};
+    use std::collections::{BTreeMap, HashSet};
+
+    if options.property_seeds.is_empty() {
+        return Ok(None);
+    }
+
+    let deps = file.build();
+    const DEFAULT_CLUSTER_SIMILARITY_FLOOR: f64 = 0.5;
+    let floor = options
+        .cluster_similarity_floor
+        .unwrap_or(DEFAULT_CLUSTER_SIMILARITY_FLOOR);
+
+    // Resolve each property's raw atoms to its terminal symbols before
+    // clustering (same resolution the cluster_coi telemetry uses — a
+    // bare output atom is not a dep-graph key).
+    let resolved: Vec<(String, HashSet<String>)> = options
+        .property_seeds
+        .iter()
+        .map(|(name, atoms)| {
+            let mut seeds = HashSet::new();
+            for atom in atoms {
+                match super::dep_graph::resolve_atom_to_terminals(file, atom) {
+                    Some(terminals) => seeds.extend(terminals),
+                    None => {
+                        seeds.insert(atom.clone());
+                    }
+                }
+            }
+            (name.clone(), seeds)
+        })
+        .collect();
+
+    let clusters = coi::cluster_properties_by_jaccard(&resolved, &deps, floor);
+    if clusters.len() < 2 {
+        // A single cluster spans every property → its cone is the joint
+        // cone → no benefit over the joint design. Fall through.
+        return Ok(None);
+    }
+
+    // property name → its raw atoms (the cone_restrict_atoms seed).
+    let raw_by_name: std::collections::HashMap<&str, &Vec<String>> = options
+        .property_seeds
+        .iter()
+        .map(|(n, a)| (n.as_str(), a))
+        .collect();
+
+    let mut automata = Vec::with_capacity(clusters.len());
+    let mut signals: Vec<crate::adapter::ir::Signal> = Vec::new();
+    let mut seen_signals: HashSet<String> = HashSet::new();
+    let mut properties: Vec<crate::adapter::ir::PropertySpec> = Vec::new();
+    let mut routing: BTreeMap<String, String> = BTreeMap::new();
+
+    for (k, cluster) in clusters.iter().enumerate() {
+        let aut_name = format!("Circuit__cl{k}");
+
+        // This cluster's cone atoms = union of its members' raw property
+        // atoms; `cone_slice` resolves them to terminals internally.
+        let mut cone_atoms: Vec<String> = Vec::new();
+        for member in &cluster.members {
+            if let Some(atoms) = raw_by_name.get(member.as_str()) {
+                cone_atoms.extend(atoms.iter().cloned());
+            }
+            routing.insert(member.clone(), aut_name.clone());
+        }
+
+        // Slice the BTOR2 to this cluster's cone — a sound, exact
+        // sub-circuit (out-of-cone state cells AND the inputs that only
+        // feed them are removed). The per-cluster blast calls
+        // `enumerate_and_blast` directly on the slice (not `to_ir`), so it
+        // cannot recurse into another per-cluster fallback.
+        let sliced = cone_slice(file, &cone_atoms);
+        let sliced_states: Vec<&Line> = sliced.states().collect();
+        let sliced_inputs: Vec<&Line> = sliced.inputs().collect();
+
+        // Cap-check this cluster's sliced state bits. If a single cluster
+        // still busts the cap (a wide field inside one cluster — GAP-2),
+        // per-cluster cannot rescue the design; fall through to the joint
+        // error so the user gets one clear diagnostic.
+        let cluster_bits = sum_widths(&sliced, &sliced_states)?
+            .saturating_sub(sidecar_ignored_state_bits(&sliced, &sliced_states, options));
+        if cluster_bits > MAX_STATE_BITS {
+            return Ok(None);
+        }
+
+        let mut blast =
+            enumerate_and_blast(&sliced, &sliced_states, &sliced_inputs, options, warnings)?;
+        blast.automaton.name = aut_name;
+        automata.push(blast.automaton);
+        for sig in blast.signals {
+            if seen_signals.insert(sig.name.clone()) {
+                signals.push(sig);
+            }
+        }
+        properties.extend(blast.properties);
+    }
+
+    warnings.push(AdapterWarning {
+        kind: WarningKind::LargeStateSpace,
+        message: format!(
+            "R.4.6 per-cluster verification: joint design exceeded the state-bit cap; \
+             partitioned into {} clusters and bit-blasted each restricted to its own cone",
+            automata.len()
+        ),
+        location: None,
+    });
+
+    // Telemetry + routing on the partition summary. The summary's
+    // kept/dropped counts are not meaningful in per-cluster mode (there
+    // are K partitions, not one), so they default to zero; the
+    // cluster_coi report carries the cone sizes and cluster_routing
+    // drives the orchestrator's per-property routing.
+    let mut summary = PartitionSummary::from_partition(&Partition::default(), None);
+    summary.cluster_coi = Some(coi::cluster_coi_report(&resolved, &deps, floor));
+    summary.cluster_routing = Some(routing);
+
+    let context_name = options
+        .context_name
+        .clone()
+        .unwrap_or_else(|| "btor2_design".into());
+
+    let ir = AdapterIR {
+        metadata: Metadata {
+            title: context_name,
+            source_format: SourceFormat::Btor2,
+            description: None,
+            game_semantics: None,
+            known_status: None,
+        },
+        signals,
+        automata,
+        compositions: vec![],
+        properties,
+        controller: None,
+    };
+
+    Ok(Some((ir, Some(summary))))
+}
+
+/// R46-1/R46-2 (R.4.6) — slice a BTOR2 file to the cone of influence of
+/// `atoms`: keep only the lines transitively reachable from the atoms'
+/// defining expressions, the state cells they read, those cells'
+/// init/next, and so on. Out-of-cone state cells, their init/next, the
+/// inputs that only feed them, and the other clusters' outputs are
+/// removed from the IR entirely.
+///
+/// The result is the exact sub-circuit the cluster's properties depend
+/// on. Because cone-of-influence is bisimilar on the atom set, every
+/// mu-calculus verdict over `atoms` agrees between the slice and the full
+/// design — sound at every alternation depth, not just for safety (this
+/// is why slicing supersedes the pin-to-`Ignored` mechanism). Sort lines
+/// are always kept (cheap, shared); NIDs are preserved so surviving
+/// references stay valid without renumbering.
+fn cone_slice(file: &Btor2File, atoms: &[String]) -> Btor2File {
+    use std::collections::HashSet;
+
+    let mut keep: HashSet<Nid> = HashSet::new();
+    let mut work: Vec<Nid> = Vec::new();
+
+    // Seed from each atom's defining line (output / op / state / input
+    // whose symbol matches the atom).
+    for line in &file.lines {
+        let sym = match &line.node {
+            Node::Output {
+                symbol: Some(s), ..
+            }
+            | Node::Op {
+                symbol: Some(s), ..
+            }
+            | Node::State {
+                symbol: Some(s), ..
+            }
+            | Node::Input {
+                symbol: Some(s), ..
+            } => Some(s.as_str()),
+            _ => None,
+        };
+        if let Some(s) = sym
+            && atoms.iter().any(|a| a == s)
+        {
+            work.push(line.nid);
+        }
+    }
+
+    // Transitive closure over operands. Keeping a State cell pulls in its
+    // Init/Next lines (whose value fan-in is then closed over) — that is
+    // how the cone walks backwards through the transition relation.
+    while let Some(nid) = work.pop() {
+        if !keep.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        push_operand_nids(&line.node, &mut work);
+        if matches!(line.node, Node::State { .. }) {
+            for l in &file.lines {
+                match &l.node {
+                    Node::Init { state, .. } | Node::Next { state, .. } if *state == nid => {
+                        work.push(l.nid);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Forward-observation pass (fixpoint). The backward closure above keeps
+    // what FEEDS the cone, but the bit-blaster also needs the named
+    // combinational OBSERVATIONS computed FROM the cone: Yosys emits a
+    // register's name on a `uext` alias line (`<nid> uext W <reg> 0 cnt_x`)
+    // that `collect_symbols` traces to attach the symbol to the state cell
+    // — without it the cell stays anonymous and emits no predicate. We
+    // therefore additionally keep any symbol-bearing `Op` and any
+    // property/output line whose operands are ALL already in-cone, iterating
+    // to a fixpoint so chained aliases survive. This keeps the other
+    // clusters' outputs out (their operands are out-of-cone) so no dangling
+    // reference can result.
+    loop {
+        let mut added = false;
+        for line in &file.lines {
+            if keep.contains(&line.nid) {
+                continue;
+            }
+            let refs: Vec<Nid> = match &line.node {
+                Node::Op {
+                    symbol: Some(_),
+                    args,
+                    ..
+                } => args.iter().map(|a| a.nid()).collect(),
+                Node::Output { signal, .. }
+                | Node::Bad { signal }
+                | Node::Constraint { signal }
+                | Node::Fair { signal } => vec![signal.nid()],
+                Node::Justice { signals } => signals.iter().map(|s| s.nid()).collect(),
+                _ => continue,
+            };
+            if !refs.is_empty() && refs.iter().all(|n| keep.contains(n)) {
+                keep.insert(line.nid);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    let new_lines: Vec<Line> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::Sort { .. }) || keep.contains(&l.nid))
+        .cloned()
+        .collect();
+    let by_nid = new_lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.nid, i))
+        .collect();
+    Btor2File {
+        lines: new_lines,
+        by_nid,
+    }
+}
+
+/// Push the operand NIDs a node references onto `work` (for the
+/// [`cone_slice`] transitive closure). Sort references are omitted —
+/// `cone_slice` keeps every Sort line unconditionally.
+fn push_operand_nids(node: &Node, work: &mut Vec<Nid>) {
+    match node {
+        Node::Op { args, .. } => work.extend(args.iter().map(|a| a.nid())),
+        Node::Init { state, value, .. } | Node::Next { state, value, .. } => {
+            work.push(*state);
+            work.push(value.nid());
+        }
+        Node::Bad { signal }
+        | Node::Constraint { signal }
+        | Node::Fair { signal }
+        | Node::Output { signal, .. } => work.push(signal.nid()),
+        Node::Justice { signals } => work.extend(signals.iter().map(|s| s.nid())),
+        Node::State { .. } | Node::Input { .. } | Node::Const { .. } | Node::Sort { .. } => {}
+    }
 }
 
 fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
@@ -776,49 +1122,6 @@ fn sidecar_ignored_nids(
             parser::resolve_state_by_symbol(file, target)
         })
         .collect()
-}
-
-/// R.4.6 (per-cluster verification) — the cone keep-set of state NIDs for
-/// the current restriction, or `None` when `cone_restrict_atoms` is unset
-/// / empty (the joint single-bit-blast path). Delegates the cone
-/// computation to [`super::dep_graph::state_cone_nids`].
-fn cone_keep_state_nids(
-    file: &Btor2File,
-    options: &AdapterOptions,
-) -> Option<std::collections::HashSet<Nid>> {
-    let atoms = options.cone_restrict_atoms.as_ref()?;
-    if atoms.is_empty() {
-        return None;
-    }
-    Some(super::dep_graph::state_cone_nids(file, atoms))
-}
-
-/// R.4.6 — sum the widths of state cells that the cone restriction drops
-/// (out-of-cone) but that the sidecar has *not* already pinned to Ignored
-/// (those are subtracted by [`sidecar_ignored_state_bits`]). Returns 0
-/// when no restriction is active. Subtracted from the cap-check total so
-/// a per-cluster bit-blast is gated on the *cluster* cone's bit count,
-/// not the joint design's.
-fn cone_dropped_state_bits(file: &Btor2File, states: &[&Line], options: &AdapterOptions) -> u32 {
-    let Some(keep) = cone_keep_state_nids(file, options) else {
-        return 0;
-    };
-    let already_ignored = sidecar_ignored_nids(file, options);
-    let mut sum: u32 = 0;
-    for line in states {
-        if keep.contains(&line.nid) || already_ignored.contains(&line.nid) {
-            continue;
-        }
-        let sort_nid = match &line.node {
-            Node::State { sort, .. } => *sort,
-            _ => continue,
-        };
-        let Some(width) = parser::bv_width(file, sort_nid) else {
-            continue;
-        };
-        sum = sum.saturating_add(width);
-    }
-    sum
 }
 
 /// M.1 Path B (§Phase 11) — build an augmented NID→sidecar-name map
@@ -1447,23 +1750,9 @@ fn enumerate_and_blast(
         "state cell",
     );
 
-    // R.4.6 (per-cluster verification) — explicit per-cluster cone
-    // restriction. When `cone_restrict_atoms` is set, pin every state
-    // cell whose NID is NOT in the cluster's cone keep-set to `Ignored`,
-    // mirroring the auto-partition drop above but driven by the explicit
-    // cluster cone rather than the intrinsic-seed partition. The
-    // cap-check in `to_ir` subtracts the same cells' widths
-    // (`cone_dropped_state_bits`), so a design whose joint cone busts the
-    // cap can still be verified per-cluster when each cone fits. The
-    // "user wins" guard (a cell already keyed in `cell_domains`) leaves
-    // sidecar-declared cells untouched.
-    if let Some(keep) = cone_keep_state_nids(file, options) {
-        apply_cone_restriction(
-            &mut cell_domains,
-            state_meta.iter().map(|m| (m.nid, m.symbol.as_str())),
-            &keep,
-        );
-    }
+    // R.4.6 cone restriction is applied UPSTREAM by slicing the BTOR2 in
+    // `to_ir` (out-of-cone cells are removed from the design before this
+    // point), so `enumerate_and_blast` needs no cone-specific handling.
 
     // R-Y3 (§Phase 8) — BTOR2 init-line smart defaults for cells
     // WITHOUT sidecar entries. Opt-in via `MUNUNU_BTOR2_SMART_INIT_DEFAULTS=1`.
@@ -2545,50 +2834,6 @@ fn apply_partition_drops<'a>(
                 // (full bit-blast) applies.
             }
         }
-    }
-}
-
-/// R.4.6 (per-cluster verification) — pin every state cell whose NID is
-/// **not** in `keep_nids` (the cluster's cone keep-set) to `Ignored`,
-/// cutting it from the enumerated state space. The "user wins" guard (a
-/// cell already keyed in `domains`) leaves sidecar-declared cells
-/// untouched, matching [`apply_partition_drops`].
-///
-/// SOUNDNESS: the cone of influence is **exact** (bisimilar) on the
-/// cluster's atom set — out-of-cone cells cannot influence those atoms,
-/// so pinning them to a single value cannot change any verdict over the
-/// cluster's properties. This is the COI "exact / free / sound"
-/// abstraction (CLAUDE.md §Soundness), *not* an over- or
-/// under-approximation; no warning is emitted because no precision is
-/// lost on the cluster's properties.
-fn apply_cone_restriction<'a>(
-    domains: &mut CellDomainMap,
-    iter: impl Iterator<Item = (i64, &'a str)>,
-    keep_nids: &std::collections::HashSet<Nid>,
-) {
-    use crate::adapter::domain::{AbstractValue, AbstractionType, FieldDomain};
-
-    for (nid, symbol) in iter {
-        if keep_nids.contains(&nid) {
-            continue; // in the cluster cone → keep (full bit-blast / sidecar domain)
-        }
-        if domains.contains_key(&nid) {
-            continue; // user wins — sidecar already declared this cell
-        }
-        domains.insert(
-            nid,
-            (
-                FieldDomain {
-                    name: symbol.to_string(),
-                    abstraction: AbstractionType::Ignored,
-                    bound: None,
-                    lower_bound: None,
-                    variants: None,
-                    initial: AbstractValue::Counter(0),
-                },
-                Vec::new(),
-            ),
-        );
     }
 }
 
@@ -5323,6 +5568,152 @@ mod tests {
             ..Default::default()
         };
         let err = translate(src, &opts).expect_err("cone covers both regs → still 22 bits");
+        assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
+    }
+
+    /// R46-2 — the per-cluster fallback. Two independent 11-bit registers
+    /// (22 state bits jointly → over the cap), with one property over each
+    /// (disjoint cones). With the manifest's per-property seeds threaded,
+    /// `to_ir` partitions into two clusters, bit-blasts each restricted to
+    /// its own 11-bit cone, and returns two automata plus a routing map.
+    const TWO_DISJOINT_CONES_BTOR2: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 11
+3 zero 2
+4 state 2 reg_a
+5 init 2 4 3
+6 state 2 reg_b
+7 init 2 6 3
+8 one 2
+9 eq 1 4 8
+10 output 9 a_hot
+11 eq 1 6 8
+12 output 11 b_hot
+"#;
+
+    #[test]
+    fn per_cluster_fallback_splits_cap_busting_design() {
+        let file = parser::parse(TWO_DISJOINT_CONES_BTOR2).expect("parse");
+        let opts = AdapterOptions {
+            property_seeds: vec![
+                ("pa".to_string(), vec!["a_hot".to_string()]),
+                ("pb".to_string(), vec!["b_hot".to_string()]),
+            ],
+            ..Default::default()
+        };
+        let (ir, _warnings, summary) =
+            to_ir(&file, &opts).expect("per-cluster fallback must rescue the cap-busting design");
+
+        // Two clusters → two automata, each restricted to its 11-bit cone.
+        assert_eq!(ir.automata.len(), 2, "expected one automaton per cluster");
+        let names: std::collections::HashSet<&str> =
+            ir.automata.iter().map(|a| a.name.as_str()).collect();
+        assert!(
+            names.contains("Circuit__cl0") && names.contains("Circuit__cl1"),
+            "automata must be named per cluster; got {names:?}"
+        );
+
+        // Routing map sends each property to a distinct cluster automaton.
+        let routing = summary
+            .expect("per-cluster summary")
+            .cluster_routing
+            .expect("cluster_routing must be Some on the per-cluster path");
+        assert_eq!(routing.len(), 2);
+        assert!(routing.contains_key("pa") && routing.contains_key("pb"));
+        assert_ne!(
+            routing["pa"], routing["pb"],
+            "disjoint-cone properties must route to different automata"
+        );
+        assert!(names.contains(routing["pa"].as_str()));
+    }
+
+    /// R46-2 — `cone_slice` keeps the backward cone (what feeds the
+    /// atom's state) AND the forward naming/observation aliases computed
+    /// from it (the `uext … cnt_x` lines Yosys uses to name registers),
+    /// while dropping the other cone entirely. The forward-alias keep is
+    /// load-bearing: without it the sliced state cell stays anonymous and
+    /// emits no predicate (the bug this test guards against).
+    #[test]
+    fn cone_slice_keeps_forward_naming_aliases_and_drops_other_cone() {
+        // Mirrors the Yosys output shape: anonymous state cells named via
+        // `uext` alias lines; one comparison-output per cone.
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 zero 2
+4 state 2
+5 init 2 4 3
+6 state 2
+7 init 2 6 3
+8 ones 2
+9 eq 1 4 8
+10 output 9 a_max_o
+11 uext 2 4 0 cnt_a
+12 eq 1 6 8
+13 output 12 b_max_o
+14 uext 2 6 0 cnt_b
+"#;
+        let file = parser::parse(src).expect("parse");
+        let sliced = cone_slice(&file, &["a_max_o".to_string()]);
+
+        let symbols: std::collections::HashSet<&str> = sliced
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::Op {
+                    symbol: Some(s), ..
+                }
+                | Node::Output {
+                    symbol: Some(s), ..
+                } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            symbols.contains("a_max_o"),
+            "cluster-A cone must keep its output a_max_o; got {symbols:?}"
+        );
+        assert!(
+            symbols.contains("cnt_a"),
+            "cluster-A cone must keep the forward `uext cnt_a` naming alias \
+             (else the state cell is anonymous and emits no predicate); got {symbols:?}"
+        );
+        assert!(
+            !symbols.contains("b_max_o") && !symbols.contains("cnt_b"),
+            "cluster-B cone must be dropped entirely; got {symbols:?}"
+        );
+        // Exactly one state cell survives (cnt_a's register, nid 4).
+        assert_eq!(
+            sliced.states().count(),
+            1,
+            "the out-of-cone state cell must be removed from the slice"
+        );
+    }
+
+    #[test]
+    fn per_cluster_fallback_absent_without_property_seeds() {
+        // Same cap-busting design, no per-property seeds → no partition
+        // information → the joint cap error stands (legacy behaviour).
+        let err = translate(TWO_DISJOINT_CONES_BTOR2, &AdapterOptions::default())
+            .expect_err("no seeds → joint cap error");
+        assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
+    }
+
+    #[test]
+    fn per_cluster_fallback_declines_single_cluster() {
+        // Both properties read reg_a (cones identical → one cluster).
+        // A single cluster spans the joint cone, so per-cluster cannot
+        // beat the joint design and the cap error stands.
+        let file = parser::parse(TWO_DISJOINT_CONES_BTOR2).expect("parse");
+        let opts = AdapterOptions {
+            property_seeds: vec![
+                ("p0".to_string(), vec!["a_hot".to_string()]),
+                ("p1".to_string(), vec!["a_hot".to_string()]),
+            ],
+            ..Default::default()
+        };
+        let err =
+            to_ir(&file, &opts).expect_err("single cluster → no per-cluster benefit → cap error");
         assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
     }
 

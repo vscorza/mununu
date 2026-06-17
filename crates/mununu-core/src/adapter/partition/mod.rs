@@ -119,6 +119,18 @@ pub struct PartitionSummary {
     /// joint COI (the M.3 reduction metric).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_coi: Option<coi::ClusterCoiReport>,
+    /// R46-2 (R.4.6 per-cluster verification) — populated ONLY when the
+    /// joint design busted the state-bit cap and the bit-blaster fell
+    /// back to per-cluster verification. Maps each manifest property name
+    /// to the cluster automaton it must be evaluated over (`Circuit__cl0`,
+    /// `Circuit__cl1`, …). `None` on the joint path (the design fit, or no
+    /// per-property seeds were threaded). The verify orchestrator reads
+    /// this to route each property's `over` target to its cluster's
+    /// reduced model instead of the single joint automaton. Unlike
+    /// [`Self::cluster_coi`] (pure telemetry), this field *drives*
+    /// evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_routing: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl PartitionSummary {
@@ -188,6 +200,8 @@ impl PartitionSummary {
             // constructor has no access to the dep graph or the seeds,
             // so it defaults to `None` and the caller fills it in.
             cluster_coi: None,
+            // R46-2 — only the per-cluster fallback path sets this.
+            cluster_routing: None,
         }
     }
 }
