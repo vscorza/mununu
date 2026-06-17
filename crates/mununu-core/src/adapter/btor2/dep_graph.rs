@@ -175,6 +175,64 @@ pub fn resolve_atom_to_terminals(file: &Btor2File, atom: &str) -> Option<HashSet
     None
 }
 
+/// R.4.6 (per-cluster verification) — the set of **state-cell NIDs** in
+/// the cone of influence of `atoms` (one cluster's property atoms). This
+/// is the keep-set a per-cluster bit-blast restricts to: every state cell
+/// whose NID is in the returned set is kept; every other state cell is
+/// out-of-cone and can be cut (pinned to `Ignored`) without affecting the
+/// cluster's verdicts.
+///
+/// Pipeline: each atom → its terminal symbols
+/// ([`resolve_atom_to_terminals`], falling back to the bare atom string
+/// when the BTOR2 doesn't name it) → union → transitive cone over the
+/// register dep graph ([`cone_of_influence`] on
+/// [`DepGraphBuilder::build`]) → map the resulting state symbols back to
+/// their state-line NIDs.
+///
+/// [`cone_of_influence`]: crate::adapter::partition::coi::cone_of_influence
+///
+/// # SOUNDNESS
+///
+/// The cone of influence is exact (bisimilar) on the atom set:
+/// out-of-cone state cells cannot influence any atom in `atoms`, so
+/// cutting them is sound for the full mu-calculus over those atoms (the
+/// COI "exact / free / sound" abstraction; CLAUDE.md §Soundness). This
+/// is *not* an over- or under-approximation — the restricted model
+/// agrees with the joint model on every property over `atoms`.
+pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
+    use crate::adapter::partition::coi::cone_of_influence;
+
+    let symbols = parser::collect_symbols(file);
+    let deps = file.build();
+
+    // Seed the cone with each atom's terminal symbols. An atom the BTOR2
+    // doesn't name (no `output`/`state`/`input`/`op` symbol matches)
+    // falls back to seeding with the bare atom string — matching the
+    // cluster-COI seed-resolution convention (R4W-3.5b).
+    let mut seeds: HashSet<String> = HashSet::new();
+    for atom in atoms {
+        match resolve_atom_to_terminals(file, atom) {
+            Some(terminals) => seeds.extend(terminals),
+            None => {
+                seeds.insert(atom.clone());
+            }
+        }
+    }
+
+    let cone = cone_of_influence(&seeds, &deps);
+
+    // Map cone state symbols back to their state-line NIDs.
+    file.states()
+        .filter(|l| {
+            symbols
+                .get(&l.nid)
+                .map(|sym| cone.contains(sym))
+                .unwrap_or(false)
+        })
+        .map(|l| l.nid)
+        .collect()
+}
+
 /// Collect the COI seed set for a BTOR2 file from its intrinsic
 /// property declarations (`bad`, `constraint`, `justice`, `fair`).
 ///
@@ -373,6 +431,66 @@ mod tests {
             terminals,
             HashSet::from(["reg".to_string()]),
             "a register atom seeds with itself"
+        );
+    }
+
+    #[test]
+    fn state_cone_nids_keeps_only_cone_register() {
+        // R.4.6 — two independent registers. `a_hot = (reg_a == 1)` so
+        // the cone of `a_hot` is {reg_a}; `reg_b` is never reached and
+        // must be excluded from the keep-set. This is the minimal
+        // "joint busts cap, clusters fit" shape at the cone level.
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 zero 2
+4 state 2 reg_a
+5 init 2 4 3
+6 state 2 reg_b
+7 init 2 6 3
+8 one 2
+9 eq 1 4 8
+10 output 9 a_hot
+"#;
+        let file = parser::parse(src).expect("parse");
+        let keep = state_cone_nids(&file, &["a_hot".to_string()]);
+        assert!(
+            keep.contains(&4),
+            "reg_a (nid 4) is in a_hot's cone; got {keep:?}"
+        );
+        assert!(
+            !keep.contains(&6),
+            "reg_b (nid 6) is independent, out of cone; got {keep:?}"
+        );
+    }
+
+    #[test]
+    fn state_cone_nids_follows_next_dependency() {
+        // The cone is transitive through `next` functions: `out = reg_a`,
+        // and `reg_a`'s next reads `reg_mid`, so the cone is
+        // {reg_a, reg_mid}; the independent `reg_b` is excluded.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 reg_a
+4 init 1 3 2
+5 state 1 reg_mid
+6 init 1 5 2
+7 state 1 reg_b
+8 init 1 7 2
+9 next 1 3 5
+10 output 3 out
+"#;
+        let file = parser::parse(src).expect("parse");
+        let keep = state_cone_nids(&file, &["out".to_string()]);
+        assert!(keep.contains(&3), "reg_a in cone; got {keep:?}");
+        assert!(
+            keep.contains(&5),
+            "reg_mid feeds reg_a's next, must be in cone; got {keep:?}"
+        );
+        assert!(
+            !keep.contains(&7),
+            "reg_b is independent, out of cone; got {keep:?}"
         );
     }
 
