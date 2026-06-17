@@ -673,7 +673,14 @@ fn dispatch_adapter(
         // `multi_module = true` (+ optional `top`), driven from the top
         // netlist. Requires `yosys` on PATH; absence surfaces as an
         // `AdapterTranslationFailed` (locate_yosys error), not silently.
-        "sv-yosys" => dispatch_sv_yosys(source_id, content, additional_files, options, cluster_coi),
+        "sv-yosys" => dispatch_sv_yosys(
+            source_id,
+            content,
+            additional_files,
+            options,
+            base_dir,
+            cluster_coi,
+        ),
         "crewai" => {
             warn_unused_additional_files(adapter, source_id, additional_files);
             let opts = AdapterOptions::default();
@@ -795,8 +802,41 @@ fn dispatch_sv_yosys(
     content: &str,
     additional_files: &[(PathBuf, String)],
     options: &std::collections::BTreeMap<String, toml::Value>,
+    base_dir: &Path,
     cluster_coi: &ClusterCoiInputs,
 ) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
+    // R4W-3.5 — `use_sv2v = true` runs sv2v as a preprocessing pass
+    // before Yosys, unblocking the SV-2009/2012 `module M import pkg::*;`
+    // header form real OpenTitan / Caliptra / ibex RTL uses (yosys's
+    // built-in parser rejects it otherwise). Matches the API's
+    // `use_sv2v` field and the CLI's `--preprocessor sv2v`. Default
+    // false preserves the plain-Verilog behaviour existing fixtures rely
+    // on.
+    let use_sv2v = options
+        .get("use_sv2v")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // R4W-3.5 — `sidecar = "<file>.mununu.json"` (path relative to the
+    // verify.toml's base_dir) supplies the per-signal abstractions the
+    // bit-blaster needs to keep a real design under the state-bit cap
+    // and the transition fan-out tractable. Previously only
+    // `context eval --sidecar` could do this; the verify path now reads
+    // it from the source options so a `verify.toml` can drive the same
+    // abstraction the M.0–M.2 fixtures used.
+    let sidecar_json = match options.get("sidecar").and_then(|v| v.as_str()) {
+        Some(rel) => {
+            let path = resolve_path(base_dir, Path::new(rel));
+            Some(std::fs::read_to_string(&path).map_err(|source| {
+                VerifyError::SourceReadFailed {
+                    path: path.clone(),
+                    source,
+                }
+            })?)
+        }
+        None => None,
+    };
+
     // R4W-2/R4W-3 — carry the manifest's per-property COI seeds + the
     // similarity floor into the bit-blaster so it can compute the
     // joint-vs-clustered cone comparison over its dep graph (surfaced on
@@ -805,6 +845,7 @@ fn dispatch_sv_yosys(
     let opts = AdapterOptions {
         property_seeds: cluster_coi.property_seeds.clone(),
         cluster_similarity_floor: cluster_coi.similarity_floor,
+        sidecar_json,
         ..AdapterOptions::default()
     };
     let additional_sources: Vec<(String, String)> = additional_files
@@ -829,6 +870,7 @@ fn dispatch_sv_yosys(
             top,
             per_module_btor: true,
             additional_sources,
+            use_sv2v,
             ..Default::default()
         };
         let comp =
@@ -853,6 +895,7 @@ fn dispatch_sv_yosys(
 
     let yopts = crate::adapter::yosys::YosysOptions {
         additional_sources,
+        use_sv2v,
         ..Default::default()
     };
     crate::adapter::yosys::translate_sv(content, &opts, &yopts)
