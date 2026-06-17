@@ -1425,6 +1425,28 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
                     },
                 );
             }
+            // R46-4 (R.4.6) — per-cluster verification mode. Present only
+            // when the joint design busted the state-bit cap and the
+            // bit-blaster fell back to verifying each cluster separately
+            // (`PartitionSummary::cluster_routing`). Each property's
+            // per-cluster automaton is also visible in its `over` field
+            // below; this line surfaces the mode + the distinct cluster
+            // count up front.
+            if let Some(routing) = s
+                .partition_summary
+                .as_ref()
+                .and_then(|ps| ps.cluster_routing.as_ref())
+            {
+                let n_clusters = routing
+                    .values()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                println!(
+                    "        per-cluster verification: joint design exceeded the state-bit cap → \
+                     {n_clusters} cluster(s) verified separately ({} property route(s))",
+                    routing.len(),
+                );
+            }
         }
         println!("  properties ({}):", report.property_verdicts.len());
         for v in &report.property_verdicts {
