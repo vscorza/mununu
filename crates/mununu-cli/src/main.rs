@@ -1849,6 +1849,30 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     )
     .map_err(|e| format!("cegar refine loop: {}", e.message))?;
 
+    // #2 (M.4) — surface the final 3-valued verdict the loop reached.
+    // Previously the CLI printed only `terminated_with` + the predicate
+    // count, so a `Converged` run gave no T/F/⊥ polarity (the API
+    // handler already exposes the cell counts; this mirrors it on the
+    // CLI). The verdict is over the lifted KMTS's cube cells: `false`
+    // cells falsify the formula (e.g. a reachable unmatched encoding),
+    // `unknown` cells are still indefinite, `true` cells satisfy it.
+    use mununu_core::mu_calculus::trit::Trit;
+    let (mut t_cells, mut f_cells, mut bot_cells) = (0usize, 0usize, 0usize);
+    for i in 0..trace.final_verdict.len() {
+        match trace.final_verdict.verdict_at(i) {
+            Trit::True => t_cells += 1,
+            Trit::False => f_cells += 1,
+            Trit::Unknown => bot_cells += 1,
+        }
+    }
+    let outcome = if bot_cells > 0 {
+        format!("INDEFINITE — {bot_cells} cell(s) need further refinement")
+    } else if f_cells > 0 {
+        format!("PROPERTY VIOLATED — {f_cells} cell(s) falsify the formula")
+    } else {
+        format!("PROPERTY HOLDS — all {t_cells} cell(s) satisfy the formula")
+    };
+
     if args.json {
         let summary = serde_json::json!({
             "fixture": args.file.display().to_string(),
@@ -1857,6 +1881,12 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
             "iterations": trace.iterations.len(),
             "terminated_with": format!("{:?}", trace.terminated_with),
             "final_predicate_count": trace.final_predicates.len(),
+            "verdict": {
+                "true_cells": t_cells,
+                "false_cells": f_cells,
+                "unknown_cells": bot_cells,
+            },
+            "outcome": outcome,
             "approximant_reuse_enabled": trace.approximant_reuse_enabled,
             "lazy_lift_pending": trace.lazy_lift_pending,
             "warnings": trace.warnings.iter().map(|w| w.message.clone()).collect::<Vec<_>>(),
@@ -1874,6 +1904,8 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         println!("  iterations:        {}", trace.iterations.len());
         println!("  terminated_with:   {:?}", trace.terminated_with);
         println!("  final predicates:  {}", trace.final_predicates.len());
+        println!("  verdict cells:     T={t_cells} F={f_cells} ⊥={bot_cells}");
+        println!("  outcome:           {outcome}");
         if !trace.warnings.is_empty() {
             println!("  warnings:");
             for w in &trace.warnings {
