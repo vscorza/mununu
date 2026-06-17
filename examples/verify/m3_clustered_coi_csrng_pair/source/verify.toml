@@ -1,0 +1,63 @@
+# M.3 — clustered cone-of-influence on real OpenTitan RTL (R4W-4).
+#
+# Two independent instances of the real OpenTitan `csrng_main_sm` sparse
+# FSM, wired by a thin harness so each instance has its own primary
+# inputs (they share only clk/rst). The single-module `sv-yosys` route
+# FLATTENS the harness into one BTOR2 whose dep graph has two disjoint
+# state-register cones — the structure clustered COI exploits: a property
+# over u0's error output has a cone disjoint from a property over u1's,
+# so the max per-cluster cone is strictly smaller than the naive joint COI.
+#
+# R4W-3.5 made this runnable through the verify path:
+#   - `use_sv2v = true`  — sv2v lowers the `import csrng_pkg::*;` header
+#     form yosys's parser rejects.
+#   - (no sidecar needed here — the harness ties off every wide/
+#     non-essential input internally, leaving 2 free 1-bit inputs.)
+# and fixed the cone seeding so a property over a combinational *output*
+# (`u0_main_sm_err_o`) seeds the COI from the register/input terminals in
+# its fan-in instead of the bare atom (which gave a degenerate size-1 cone).
+#
+# Done-criterion (R4W-5 / §10.3 M.3): clustered cones reduce state space
+# vs the naive joint COI on a real fixture (measured), verdicts non-vacuous.
+
+[project]
+name = "M3ClusteredCoiCsrngPair"
+description = "Two independent OpenTitan csrng_main_sm instances — clustered COI K=2 on real RTL."
+
+[[sources]]
+id = "pair"
+# Primary = the harness; the rest are the real module + its stub deps.
+files = [
+    "csrng_main_sm_pair.sv",
+    "csrng_main_sm.sv",
+    "csrng_pkg.sv",
+    "prim_assert.sv",
+]
+adapter = "sv-yosys"
+
+[sources.options]
+use_sv2v = true
+top = "csrng_main_sm_pair"
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "synchronous"
+members = ["pair"]
+# Must differ from the bit-blast automaton name "Circuit" (else the
+# composition would reference itself → circular-dependency error).
+name = "PairTop"
+
+[[properties]]
+# u0's error encoding is reachable (a least-fixpoint reachability check).
+# Property atom `u0_main_sm_err_o` seeds the COI from u0's register cone,
+# disjoint from u1's — this is what drives the K=2 clustering.
+name = "u0_err_reachable"
+formula = "mu X. (u0_main_sm_err_o || (<> X))"
+over = "Circuit"
+
+[[properties]]
+name = "u1_err_reachable"
+formula = "mu X. (u1_main_sm_err_o || (<> X))"
+over = "Circuit"
