@@ -2366,6 +2366,54 @@ where
             return Ok(bits);
         }
 
+        // M.4 verdict-binding fix (Option 1) — predicate-cube-lifted models
+        // (`adapter::btor2::predicate_cube_lift`, the BTOR2 CEGAR path)
+        // record each predicate's per-state truth in
+        // `Clts::state_3valued_predicates`, keyed by the predicate's
+        // display name. The `env.predicate` map above never sees those
+        // labels, so before this bridge a formula's bare `Node::Predicate`
+        // fell through to the "unknown ⇒ false" fallback, collapsing any
+        // safety formula `νX.((¬p…) ∧ [−]X)` to `νX.[−]X` (a vacuous
+        // PROPERTY HOLDS). When the CLTS carries a 3-valued labelling that
+        // mentions `name`, build the must-bitset of states where the
+        // predicate is definitely `KleeneT`.
+        //
+        // SOUNDNESS: a `KleeneBot` (or absent) label at a state leaves its
+        // bit 0 — treated as not-definitely-true, the same under-approx the
+        // fallback uses (sound for universal / box modalities). Cube
+        // predicates are definite at every cube cell, so this must-bitset
+        // is exact on the CEGAR path; the under-approx only bites
+        // hypothetical KleeneBot labels. Legacy / bit-blast CLTSes have no
+        // 3-valued labelling (`has_3valued_predicates() == false`), so this
+        // block is inert for them — purely additive.
+        if self.clts.has_3valued_predicates() {
+            use crate::clts::Tristate;
+            let mut bits = self.alloc_bitvec(false)?;
+            let mut mentioned = false;
+            for i in 0..self.env.state_count() {
+                let Some(sid) = StateId::<S>::from_index(i) else {
+                    continue;
+                };
+                match self.clts.state_3valued_predicate(sid, name) {
+                    Some(Tristate::KleeneT) => {
+                        mentioned = true;
+                        bits.set(i, true);
+                    }
+                    Some(_) => mentioned = true,
+                    None => {}
+                }
+            }
+            // Only treat `name` as a cube predicate when the labelling
+            // actually mentions it; otherwise fall through so genuine
+            // unknown atoms keep the existing on-demand / false behaviour.
+            if mentioned {
+                bits.bitand_assign(self.not_oob_bits.as_bitslice());
+                let cached = bits.clone();
+                self.expression_eval_cache.insert(name.to_string(), cached);
+                return Ok(bits);
+            }
+        }
+
         // Try on-demand evaluation if abstract states are available
         if self.env.has_abstract_states()
             && let Some(mut bits) = self.evaluate_expression_on_demand(name)?
