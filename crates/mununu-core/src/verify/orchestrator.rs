@@ -181,6 +181,22 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
         }
     }
 
+    // R46-3 (R.4.6 per-cluster verification) — collect the
+    // property→cluster-automaton routing any source emitted. The BTOR2
+    // bit-blaster sets `PartitionSummary::cluster_routing` ONLY when the
+    // joint design busted the state-bit cap and it fell back to
+    // per-cluster verification (R46-2): the source's CTXDSL then declares
+    // one automaton per cluster (`Circuit__cl0`, …) instead of a single
+    // `Circuit`, and each manifest property must be routed to its
+    // cluster's reduced model. On the joint path this map is empty and
+    // property routing is unchanged.
+    let property_cluster_routing: std::collections::HashMap<String, String> = source_summaries
+        .iter()
+        .filter_map(|s| s.partition_summary.as_ref())
+        .filter_map(|ps| ps.cluster_routing.as_ref())
+        .flat_map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .collect();
+
     // 4. Build CompositionSpec (resolve composition_name default).
     let composition = CompositionSpec {
         semantics: config.composition.semantics.clone(),
@@ -196,7 +212,13 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     let mut property_formula_sources: Vec<PropertyFormulaSource> = Vec::new();
     for p in &config.properties {
         let (formula_text, source) = resolve_property_formula(p, &template_registry)?;
-        let over = config.resolve_over(p);
+        // R46-3 — when per-cluster verification fired (R46-2), route this
+        // property to its cluster's reduced automaton; otherwise fall back
+        // to the manifest's `over` (or the composition default).
+        let over = property_cluster_routing
+            .get(&p.name)
+            .cloned()
+            .unwrap_or_else(|| config.resolve_over(p));
         resolved_properties.push(ResolvedProperty {
             name: p.name.clone(),
             formula: formula_text,
