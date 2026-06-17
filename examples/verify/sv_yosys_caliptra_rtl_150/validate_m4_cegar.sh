@@ -41,7 +41,13 @@ set -euo pipefail
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MUNUNU="${MUNUNU:-${THIS_DIR}/../../../target/debug/mununu}"
 SRC="${THIS_DIR}/source"
-OUT="${THIS_DIR}/build/m4"
+# Transient BTOR2/CEGAR artefacts go to a tmp dir, NOT under examples/.
+# The full Caliptra BTOR2 busts the bit-blast state-bit cap by design
+# (M.4 decides it via predicate-cube CEGAR, not the full R.2 lift), so
+# leaving it under examples/ would trip the `btor2_kmts_lift_sweep` test
+# which globs `examples/**/*.btor2`. mktemp + EXIT-trap keeps it clean.
+OUT="$(mktemp -d -t mununu-m4-XXXXXX)"
+trap 'rm -rf "${OUT}"' EXIT
 
 if [[ ! -x "${MUNUNU}" ]]; then
   echo "validate_m4_cegar.sh: mununu binary not found at ${MUNUNU}" >&2
@@ -55,7 +61,6 @@ for tool in yosys sv2v; do
   fi
 done
 
-rm -rf "${OUT}" && mkdir -p "${OUT}"
 
 echo "=== M.4 — Caliptra soc_ifc_boot_fsm predicate-abstraction CEGAR ==="
 echo "upstream: chipsalliance/caliptra-rtl @ (see source/, issue #150 bug/fix pair)"

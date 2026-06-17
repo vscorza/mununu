@@ -21,4 +21,5 @@
 pub mod annotation;
 pub mod case_literal_extract;
 pub mod emit_controller;
+pub mod sidecar_widening;
 pub mod typedef_extract;

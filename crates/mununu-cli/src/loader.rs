@@ -220,173 +220,45 @@ pub(crate) fn load_with_adapter_mode_extra(
             // skips when no sidecar exists or the schema does not
             // parse — non-blocking for fixtures that pre-date R-Y2/
             // R-S5.
+            // R-Y2 + R-S5/R-S4/R-S3/R-S7 — load the SV sidecar (if it
+            // exists next to the source) and apply the SHARED
+            // abstraction-widening via
+            // `sidecar_widening::widen_sidecar` — the same helper the
+            // verify `sv-yosys` orchestrator calls. sidecar-audit F1
+            // (2026-06-17): both entry points must produce an identical
+            // abstraction for the same `.mununu.json`; the widening logic
+            // used to live inline here only, so the verify path diverged.
+            // Silently skips when no sidecar exists / it does not parse.
             let mut widened_sidecar_json: Option<String> = None;
-            let init_policy_overrides: mununu_core::adapter::yosys::InitPolicyOverrides = {
-                let mut overrides = Vec::new();
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    let candidate = path.with_file_name(format!("{stem}.mununu.json"));
-                    if candidate.exists()
-                        && let Ok(content) = fs::read_to_string(&candidate)
-                        && let Ok(mut ann) = serde_json::from_str::<
-                            mununu_core::adapter::systemverilog::annotation::SvAnnotation,
-                        >(&content)
-                    {
-                        // R-S5 — build typedef map from primary +
-                        // additional SV sources, then auto-widen any
-                        // signal that declares a `type_name`.
-                        let mut typedefs = std::collections::HashMap::new();
-                        typedefs.extend(
-                            mununu_core::adapter::systemverilog::typedef_extract::extract_typedef_enums(&source),
-                        );
-                        for (_, content) in &additional {
-                            typedefs.extend(
-                                mununu_core::adapter::systemverilog::typedef_extract::extract_typedef_enums(content),
-                            );
-                        }
-                        let widened = ann.apply_type_driven_widening(&typedefs);
-                        if !widened.is_empty() {
-                            eprintln!(
-                                "R-S5: applying type-driven widening from SV typedefs: {}",
-                                widened
-                                    .iter()
-                                    .map(|(s, t, n)| format!("{s}:{t}({n} variants)"))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
-                        // R-S3 (§Phase 9 §9.1) — case-literal
-                        // seeding. Scan the primary SV source +
-                        // additional sidecar SV files for
-                        // `case (signal) <LITERAL>: …` blocks; harvest
-                        // the numeric labels per switched-on signal.
-                        // Complements R-S5 (which handles typedef-
-                        // typed signals) and R-S7 (which handles
-                        // property-referenced predicates) by
-                        // capturing designer-intended distinctions
-                        // expressed directly in case-statement
-                        // labels — typically the case for hand-
-                        // written non-typedef FSMs and decoders.
-                        let mut case_literals = std::collections::HashMap::new();
-                        for (name, value) in
-                            std::iter::once((String::from("__primary__"), source.clone()))
-                                .chain(additional.iter().map(|(n, c)| (n.clone(), c.clone())))
+            let init_policy_overrides: mununu_core::adapter::yosys::InitPolicyOverrides =
+                {
+                    let mut overrides = mununu_core::adapter::yosys::InitPolicyOverrides::new();
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let candidate = path.with_file_name(format!("{stem}.mununu.json"));
+                        if candidate.exists()
+                            && let Ok(content) = fs::read_to_string(&candidate)
                         {
-                            let _ = name;
-                            for (sig, lits) in
-                                mununu_core::adapter::systemverilog::case_literal_extract::extract_case_literals(&value)
+                            let widened =
+                            mununu_core::adapter::systemverilog::sidecar_widening::widen_sidecar(
+                                &content, &source, &additional,
+                            );
+                            for line in &widened.summary {
+                                eprintln!("{line}");
+                            }
+                            // Debug aid: MUNUNU_R_S5_DUMP_PATH=/path dumps the
+                            // post-widening JSON for inspection.
+                            if let Some(json) = &widened.widened_json
+                                && let Ok(dump_path) = std::env::var("MUNUNU_R_S5_DUMP_PATH")
                             {
-                                case_literals
-                                    .entry(sig)
-                                    .or_insert_with(Vec::new)
-                                    .extend(lits);
+                                let _ = std::fs::write(&dump_path, json);
+                                eprintln!("R-S5/R-S7: dumped widened sidecar to {dump_path}");
                             }
-                        }
-                        // Dedupe per signal (multiple SV files may
-                        // reference the same signal).
-                        for v in case_literals.values_mut() {
-                            v.sort_unstable();
-                            v.dedup();
-                        }
-                        // R-S4 (§Phase 9 §9.1) — equivalence-class
-                        // seeding. Runs BEFORE R-S3 (apply_case_literal_seeding)
-                        // so signals declaring `equivalence_classes: true`
-                        // get their case literals + OTHER catch-all populated
-                        // into discovered_values; R-S3 then skips those
-                        // signals (mutually exclusive per signal).
-                        let class_seeded = ann.apply_equivalence_class_seeding(&case_literals);
-                        if !class_seeded.is_empty() {
-                            eprintln!(
-                                "R-S4: equivalence-class seeding (discriminators + OTHER catch-all): {}",
-                                class_seeded
-                                    .iter()
-                                    .map(|(s, vs)| format!(
-                                        "{s}=[{}]+OTHER",
-                                        vs.iter()
-                                            .map(|v| v.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(",")
-                                    ))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
-                        let case_seeded = ann.apply_case_literal_seeding(&case_literals);
-                        if !case_seeded.is_empty() {
-                            eprintln!(
-                                "R-S3: seeding discriminators from case-statement labels: {}",
-                                case_seeded
-                                    .iter()
-                                    .map(|(s, vs)| format!(
-                                        "{s}=[{}]",
-                                        vs.iter()
-                                            .map(|v| v.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(",")
-                                    ))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
-                        // R-S7 (§Phase 9 §9.1) — property-syntactic
-                        // seeding. Bridges the gap when R-S5 didn't
-                        // fire (no typedef on the signal) but a
-                        // property formula references discriminator
-                        // values like `count_3` or `mode_7`. Strictly
-                        // additive — only injects values not already
-                        // in the signal's value_map.
-                        let seeded = ann.apply_property_syntactic_seeding();
-                        if !seeded.is_empty() {
-                            eprintln!(
-                                "R-S7: seeding discriminators from property formulas: {}",
-                                seeded
-                                    .iter()
-                                    .map(|(s, vs)| format!(
-                                        "{s}=[{}]",
-                                        vs.iter()
-                                            .map(|v| v.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(",")
-                                    ))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
-                        if !widened.is_empty()
-                            || !seeded.is_empty()
-                            || !case_seeded.is_empty()
-                            || !class_seeded.is_empty()
-                        {
-                            // Re-serialise so the BTOR2 lifter sees
-                            // the widened+seeded variants + value_map.
-                            // Falls back to the raw content if
-                            // serialisation fails (would only happen
-                            // on schema drift).
-                            if let Ok(json) = serde_json::to_string_pretty(&ann) {
-                                // Debug aid (shared with R-S5):
-                                // MUNUNU_R_S5_DUMP_PATH=/path dumps the
-                                // post-widening JSON for inspection.
-                                if let Ok(dump_path) = std::env::var("MUNUNU_R_S5_DUMP_PATH") {
-                                    let _ = std::fs::write(&dump_path, &json);
-                                    eprintln!("R-S5/R-S7: dumped widened sidecar to {dump_path}");
-                                }
-                                widened_sidecar_json = Some(json);
-                            }
-                        }
-                        overrides = ann.init_policy_overrides();
-                        if !overrides.is_empty() {
-                            eprintln!(
-                                "R-Y2: applying per-signal init-policy overrides from sidecar: {}",
-                                overrides
-                                    .iter()
-                                    .map(|(n, p)| format!("{n}={p:?}"))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
+                            widened_sidecar_json = widened.widened_json;
+                            overrides = widened.init_policy_overrides;
                         }
                     }
-                }
-                overrides
-            };
+                    overrides
+                };
             let yopts = mununu_core::adapter::yosys::YosysOptions {
                 primary_source_path: Some(path.to_string_lossy().into_owned()),
                 additional_sources: additional,

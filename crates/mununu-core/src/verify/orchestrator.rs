@@ -817,22 +817,51 @@ fn dispatch_sv_yosys(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Additional SV sources (submodules / stub packages), by basename —
+    // also the typedef / case-literal source for sidecar widening below.
+    let additional_sources: Vec<(String, String)> = additional_files
+        .iter()
+        .filter_map(|(path, body)| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .map(|name| (name.to_string(), body.clone()))
+        })
+        .collect();
+
     // R4W-3.5 — `sidecar = "<file>.mununu.json"` (path relative to the
-    // verify.toml's base_dir) supplies the per-signal abstractions the
-    // bit-blaster needs to keep a real design under the state-bit cap
-    // and the transition fan-out tractable. Previously only
-    // `context eval --sidecar` could do this; the verify path now reads
-    // it from the source options so a `verify.toml` can drive the same
-    // abstraction the M.0–M.2 fixtures used.
+    // verify.toml's base_dir) supplies the per-signal abstractions.
+    //
+    // sidecar-audit F1 (2026-06-17) — the raw sidecar is run through the
+    // SHARED widening (`sidecar_widening::widen_sidecar`) — the SAME
+    // R-S5/R-S4/R-S3/R-S7 value widening + R-Y2 init-policy extraction the
+    // CLI `context eval` loader applies — so a `verify.toml` and a
+    // `context eval` produce an IDENTICAL abstraction for the same
+    // sidecar. Before F1 the verify path consumed the raw sidecar, which
+    // dropped the typedef `UNMATCHED_<n>` widening + per-signal
+    // `init_policy: anyconst` and could yield a coarser, bug-masking
+    // abstraction than the eval route.
+    let mut init_policy_overrides = crate::adapter::yosys::InitPolicyOverrides::new();
     let sidecar_json = match options.get("sidecar").and_then(|v| v.as_str()) {
         Some(rel) => {
             let path = resolve_path(base_dir, Path::new(rel));
-            Some(std::fs::read_to_string(&path).map_err(|source| {
-                VerifyError::SourceReadFailed {
+            let raw =
+                std::fs::read_to_string(&path).map_err(|source| VerifyError::SourceReadFailed {
                     path: path.clone(),
                     source,
-                }
-            })?)
+                })?;
+            let widened = crate::adapter::systemverilog::sidecar_widening::widen_sidecar(
+                &raw,
+                content,
+                &additional_sources,
+            );
+            for line in &widened.summary {
+                tracing::info!(source_id, "sv-yosys sidecar widening: {line}");
+            }
+            init_policy_overrides = widened.init_policy_overrides;
+            // Use the widened sidecar when any value-widening stage fired;
+            // otherwise the raw sidecar (the init-policy overrides ride
+            // YosysOptions, not the sidecar JSON).
+            Some(widened.widened_json.unwrap_or(raw))
         }
         None => None,
     };
@@ -848,14 +877,6 @@ fn dispatch_sv_yosys(
         sidecar_json,
         ..AdapterOptions::default()
     };
-    let additional_sources: Vec<(String, String)> = additional_files
-        .iter()
-        .filter_map(|(path, body)| {
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .map(|name| (name.to_string(), body.clone()))
-        })
-        .collect();
 
     let is_multi_module = options
         .get("multi_module")
@@ -871,6 +892,7 @@ fn dispatch_sv_yosys(
             per_module_btor: true,
             additional_sources,
             use_sv2v,
+            init_policy_overrides: init_policy_overrides.clone(),
             ..Default::default()
         };
         let comp =
@@ -896,6 +918,7 @@ fn dispatch_sv_yosys(
     let yopts = crate::adapter::yosys::YosysOptions {
         additional_sources,
         use_sv2v,
+        init_policy_overrides,
         ..Default::default()
     };
     crate::adapter::yosys::translate_sv(content, &opts, &yopts)

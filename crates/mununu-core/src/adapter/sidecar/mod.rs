@@ -78,6 +78,14 @@ pub fn resolve_to_field_domain(
         ),
 
         SignalAbstraction::BoundedCounter => {
+            // SOUNDNESS (sidecar-audit F3): a missing `bound` defaults to
+            // 3 (saturating {0,1,2,≥3}). A bound smaller than the
+            // property's value sensitivity UNDER-approximates the
+            // reachable value set — high values saturate into one class,
+            // so a safety property that distinguishes them can be missed.
+            // Declare an explicit `bound` for value-sensitive properties.
+            // (Legacy SV-specific variant scheduled for removal per
+            // docs/abstraction.md — not a target for a smarter default.)
             let bound = sig.bound.unwrap_or(3);
             (
                 FieldDomain {
@@ -153,6 +161,17 @@ pub fn resolve_to_field_domain(
                     value_map,
                 )
             } else {
+                // SOUNDNESS (sidecar-audit F2): a `Discover` signal with
+                // no discovered values (SMT discovery skipped, or the
+                // seeding stages R-S3/R-S4/R-S5/R-S7 did not fire)
+                // collapses to `Ignored` — the cell is pinned to one value
+                // and dropped from the state space. Over-approximation:
+                // sound for safety (the model admits every concrete value
+                // the cell could take), UNDER-approximation for liveness
+                // (a progress path that depends on the cell deviating is
+                // masked). `initial` is a placeholder — irrelevant for a
+                // dropped cell. Future refinement: emit an AdapterWarning
+                // naming the silently dropped signal.
                 (
                     FieldDomain {
                         name: sig.name.clone(),
@@ -168,6 +187,11 @@ pub fn resolve_to_field_domain(
         }
 
         SignalAbstraction::BitBlast => {
+            // SOUNDNESS (sidecar-audit F3): same direction as
+            // BoundedCounter above — a missing `bound` defaults to 15; too
+            // small under-approximates the value set (unsound for
+            // value-sensitive safety). Legacy SV-specific variant,
+            // scheduled for removal per docs/abstraction.md.
             let bound = sig.bound.unwrap_or(15);
             (
                 FieldDomain {
@@ -183,6 +207,11 @@ pub fn resolve_to_field_domain(
         }
 
         SignalAbstraction::Ignored => (
+            // SOUNDNESS (sidecar-audit F2/F4): the cell is pinned to a
+            // single value and dropped from the state space —
+            // over-approximation (sound for safety, under-approx for
+            // liveness). `initial` is a placeholder, irrelevant for a
+            // dropped cell.
             FieldDomain {
                 name: sig.name.clone(),
                 abstraction: AbstractionType::Ignored,
