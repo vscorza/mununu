@@ -112,6 +112,69 @@ fn collect_operand_terminals(
     }
 }
 
+/// R4W-3.5b — resolve a property atom (a BTOR2 symbol named in a
+/// mu-calculus formula — typically a combinational *output* like
+/// `main_sm_err_o`, or a named wire) to the set of **state/input
+/// terminal symbols** in its combinational fan-in.
+///
+/// This is the seed-resolution the clustered-COI path needs.
+/// [`DepGraphBuilder::build`] keys the dep graph on **state registers**
+/// (edges to the terminals each register's `next` reaches), so seeding
+/// [`crate::adapter::partition::coi::cone_of_influence`] with a bare
+/// output atom — which is neither a key nor reached by any `next` —
+/// yields a degenerate size-1 cone. Walking the atom's defining
+/// expression down to its register/input terminals gives the COI a real
+/// foothold: the returned terminals are the same symbols `build()` keys
+/// on (both use [`parser::collect_symbols`]), so the subsequent cone
+/// walk expands through the design.
+///
+/// Returns `None` when no line carries `atom` as its symbol — the caller
+/// then falls back to seeding with the atom string itself (preserving
+/// the pre-R4W-3.5b behaviour for atoms the BTOR2 doesn't name).
+pub fn resolve_atom_to_terminals(file: &Btor2File, atom: &str) -> Option<HashSet<String>> {
+    let symbols = parser::collect_symbols(file);
+    for line in &file.lines {
+        let is_match = matches!(
+            &line.node,
+            Node::Output { symbol: Some(s), .. }
+            | Node::Op { symbol: Some(s), .. }
+            | Node::Input { symbol: Some(s), .. }
+            | Node::State { symbol: Some(s), .. } if s == atom
+        );
+        if !is_match {
+            continue;
+        }
+        let mut reached = HashSet::new();
+        let mut visited = HashSet::new();
+        match &line.node {
+            // An output / named wire: walk its defining expression to the
+            // state + input terminals it combinationally depends on.
+            Node::Output { signal, .. } => {
+                collect_operand_terminals(file, signal.nid(), &symbols, &mut reached, &mut visited);
+            }
+            Node::Op { args, .. } => {
+                for arg in args {
+                    collect_operand_terminals(
+                        file,
+                        arg.nid(),
+                        &symbols,
+                        &mut reached,
+                        &mut visited,
+                    );
+                }
+            }
+            // Already a terminal — its own symbol is the seed (a property
+            // referencing a register or input directly).
+            Node::Input { .. } | Node::State { .. } => {
+                reached.insert(atom.to_string());
+            }
+            _ => {}
+        }
+        return Some(reached);
+    }
+    None
+}
+
 /// Collect the COI seed set for a BTOR2 file from its intrinsic
 /// property declarations (`bad`, `constraint`, `justice`, `fair`).
 ///
@@ -258,5 +321,73 @@ mod tests {
             "trigger should be Kept (drives s_relevant's next), got {:?}",
             p.classes.get("trigger")
         );
+    }
+
+    #[test]
+    fn resolve_atom_output_reaches_register_and_input_terminals() {
+        // R4W-3.5b — a property atom naming a combinational *output*
+        // (`out = reg & trig`) resolves to the state/input terminals in
+        // its fan-in ({reg, trig}), not the bare atom string. This is
+        // what gives the clustered-COI seed a real dep-graph foothold.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 input 1 trig
+4 state 1 reg
+5 init 1 4 2
+6 and 1 4 3
+7 next 1 4 3
+8 output 6 out
+"#;
+        let file = parser::parse(src).expect("parse");
+        let terminals = resolve_atom_to_terminals(&file, "out").expect("out resolves");
+        assert!(
+            terminals.contains("reg"),
+            "out's cone must include the register `reg`; got {terminals:?}"
+        );
+        assert!(
+            terminals.contains("trig"),
+            "out's cone must include the input `trig`; got {terminals:?}"
+        );
+        assert!(
+            !terminals.contains("out"),
+            "the bare output atom must NOT be the seed; got {terminals:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_atom_register_is_its_own_terminal() {
+        // A property referencing a register directly seeds with that
+        // register (it is already a dep-graph key).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 input 1 trig
+4 state 1 reg
+5 init 1 4 2
+7 next 1 4 3
+"#;
+        let file = parser::parse(src).expect("parse");
+        let terminals = resolve_atom_to_terminals(&file, "reg").expect("reg resolves");
+        assert_eq!(
+            terminals,
+            HashSet::from(["reg".to_string()]),
+            "a register atom seeds with itself"
+        );
+    }
+
+    #[test]
+    fn resolve_atom_unknown_symbol_returns_none() {
+        // An atom the BTOR2 doesn't name → None (caller falls back to the
+        // bare-atom seed).
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+4 state 1 reg
+5 init 1 4 2
+7 next 1 4 2
+"#;
+        let file = parser::parse(src).expect("parse");
+        assert!(resolve_atom_to_terminals(&file, "nonexistent").is_none());
     }
 }

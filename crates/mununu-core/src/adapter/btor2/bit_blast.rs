@@ -2020,10 +2020,31 @@ fn enumerate_and_blast(
             .cluster_similarity_floor
             .unwrap_or(DEFAULT_CLUSTER_SIMILARITY_FLOOR);
         let deps = file.build();
+        // R4W-3.5b — resolve each property atom to the state/input
+        // terminals in its combinational fan-in before seeding the COI.
+        // A property typically names a combinational *output* (e.g.
+        // `main_sm_err_o`), which is neither a dep-graph key nor reached
+        // by any `next` — seeding the cone with the bare atom yields a
+        // degenerate size-1 cone. `resolve_atom_to_terminals` walks the
+        // atom's defining expression down to the registers/inputs it
+        // depends on (the same symbols `build()` keys on), giving the
+        // cone a real foothold. Atoms the BTOR2 doesn't name fall back
+        // to the bare-atom seed (pre-R4W-3.5b behaviour).
         let props: Vec<(String, std::collections::HashSet<String>)> = options
             .property_seeds
             .iter()
-            .map(|(name, atoms)| (name.clone(), atoms.iter().cloned().collect()))
+            .map(|(name, atoms)| {
+                let mut seeds = std::collections::HashSet::new();
+                for atom in atoms {
+                    match super::dep_graph::resolve_atom_to_terminals(file, atom) {
+                        Some(terminals) => seeds.extend(terminals),
+                        None => {
+                            seeds.insert(atom.clone());
+                        }
+                    }
+                }
+                (name.clone(), seeds)
+            })
             .collect();
         summary.cluster_coi = Some(coi::cluster_coi_report(&props, &deps, floor));
     }
