@@ -1,0 +1,7 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "wide7",
+  "signals": [
+    { "name": "cnt", "abstraction": "bounded_counter", "bound": 7 }
+  ]
+}
