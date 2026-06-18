@@ -1,6 +1,6 @@
 # Predicate-Abstraction Recipe — KMTS Lifter Operational Guide
 
-> **Status: planning** until R.5 ships. Practical recipe for predicate seeding, may/must image computation, CEGAR refinement, and operational debugging in mununu's BTOR2 → KMTS lifter. Companions: [`native-sv-abstraction.md`](native-sv-abstraction.md) (architecture; §6 is the design framing), [`kmts-theory.md`](kmts-theory.md) (theoretical foundations). Sections that reference proposed code are unanchored; sections that reference live code carry inline anchors but do not graduate to `> Source of truth:` until the corresponding roadmap phase ships.
+> **Status: planning** until R.5 ships. Practical recipe for predicate seeding, may/must image computation, CEGAR refinement, and operational debugging in mununu's BTOR2 → KMTS lifter. Companions: [`native-sv-abstraction.md`](native-sv-abstraction.md) (architecture; §6 is the design framing), [`kmts-theory.md`](kmts-theory.md) (theoretical foundations), [`predicate-abstraction-worked-example.md`](predicate-abstraction-worked-example.md) (one module carried end to end — RTL → BTOR2 → coarse `KleeneBot` → interpolant → refined `KleeneT`). Sections that reference proposed code are unanchored; sections that reference live code carry inline anchors but do not graduate to `> Source of truth:` until the corresponding roadmap phase ships.
 
 ## §1 What predicate abstraction is
 

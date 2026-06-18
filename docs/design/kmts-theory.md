@@ -302,35 +302,117 @@ The mapping from this doc's notation to the mununu types:
 
 A standard (Sharp-only) Kripke structure is the special case where every transition is `Sharp` and `state_3valued_predicates` is `None` (the 2-valued `state_variable_bitset` is used directly). The KleeneDomain evaluator on such a CLTS returns verdicts in `{KleeneT, KleeneF}` only — `KleeneBot` never appears, because the lattice has no `⊥` content to produce. The BoolDomain monomorphisation of the evaluator computes the same verdicts more cheaply (one Boolean per state instead of a tri-state); for adapters that produce only Sharp KMTSes (XState, microcode, agentic), BoolDomain is the default and KleeneDomain is unused.
 
-## §7 Reading list
+## §7 Controllability-Aware KMTS — Three-Valued Game Abstraction
 
-This list cites primary sources for every load-bearing claim in this doc. Read in roughly the order presented to build the framework from first principles; skip to §7.2/§7.3 if you already have the MTS background.
+> **Concept + design note.** §1–§6 develop KMTS as a *single-agent* abstraction: one transition relation (split into may/must), one player implicitly resolving all nondeterminism. Synthesis and controllability change the picture — the transition relation is now resolved by *two* adversarial agents (controller vs environment), and a sound abstraction must track may/must **per agent**. This section states the composition, names the governing theory, and records the current implementation gap. It anchors the planned `modal_trit_from_target` integration target but, like the rest of this doc, is exempt from `> Source of truth:` (it is design/theory, not a feature page).
 
-### §7.1 Foundations of modal / mixed transition systems
+### §7.1 Two orthogonal asymmetries
+
+A controllability-aware model carries **two independent quantifier-asymmetry axes**, and the soundness question is whether they compose:
+
+- **Modal axis (abstraction soundness).** The KMTS may/must split of §4.3: `⟨a⟩φ` needs a *must*-witness to claim `T` and rules out `T` only when *all may*-successors fail; `[a]φ` needs *all may*-successors to claim `T` and a *must*-witness to claim `F`. This axis is about whether the abstraction can *vouch* for an edge.
+- **Controllability axis (the Skolem paradigm).** For controller synthesis the transition relation is resolved by two players: the **environment** (uncontrollable labels) moves adversarially — `∀` — and the **controller** (controllable labels) moves cooperatively — `∃`. A synthesis obligation reads "*for every* uncontrollable move *there exists* a controllable assignment such that the successor condition holds." In mununu this axis is selected by the `Control` enum on a modal guard (`Control::{All, Controllable, Environment}`, [`crates/mununu-core/src/mu_calculus/mod.rs`](../../crates/mununu-core/src/mu_calculus/mod.rs)), realised today by the label-set Skolem grouping in `modal_exists` / `modal_forall`.
+
+The two axes are **orthogonal**: controllability is a *filter / quantifier-mode over which player resolves an edge*; modality is *the abstraction's confidence in that edge's existence*. Soundness requires both at once, and the product is not the conjunction of two single-axis checks — it is a single rule over a 2×2 partition of the outgoing edges.
+
+### §7.2 The 2×2 product and the modal rules
+
+Partition the guard-matched outgoing edges of a state on both axes:
+
+| | edge ∈ `R_must` (`Sharp` ∪ `MustHyperOnly`) | edge ∈ `R_may ∖ R_must` (`MayOnly`) |
+|---|---|---|
+| **controllable (∃)** | usable as a definite witness | usable only for the *may*-bound |
+| **uncontrollable (∀)** | forces a definite refutation | must be *covered*, cannot refute definitely |
+
+The load-bearing rule — the one sentence that makes the two asymmetries compose — is:
+
+> **The player *establishing* a modality may rely only on `must`-edges; the player *refuting* it ranges over `may`-edges.**
+
+Spelled out for the canonical synthesis idiom `[(ctrl = environment)] ⟨(ctrl = controllable)⟩ φ`:
+
+- **`⟨(ctrl = controllable)⟩ φ`** (the ∃-controller step):
+  - `KleeneT` iff ∃ a **must** controllable edge into a `must_true(φ)` state — the controller's move *really exists* and *really lands good*.
+  - `KleeneF` iff ∀ **may** controllable edges land in `must_false(φ)` — even the optimistic edge set cannot help.
+  - `KleeneBot` otherwise — **including the corner this section exists for**: the controller has only a `MayOnly` edge into a good state. The move *might not exist* in the concrete, so the verdict must be indefinite, not `T`.
+- **`[(ctrl = environment)] φ`** (the ∀-environment step):
+  - `KleeneT` iff ∀ **may** environment edges land in `must_true(φ)` — every move the abstraction admits is good.
+  - `KleeneF` iff ∃ a **must** environment edge into `must_false(φ)` — a move that definitely exists escapes the obligation.
+  - `KleeneBot` otherwise — including: a `MayOnly` environment edge into a bad state, which *cannot* refute definitely (it might not exist).
+
+For `Control::Controllable` the controller-predecessor (`CPre`) form folds both players into one step: definite-`T` requires *every admitted (`may`) environment move* to be good **and** *a confirmed (`must`) controllable move* to a good state; the `may`-bound dualises (no forced (`must`) environment move definitely bad, and optimistically some (`may`) controllable move possibly good). `Control::Environment` is the De Morgan dual.
+
+A standard, controllability-free KMTS (`Control::All`) collapses the table to the §4.3 single-agent rules; a `Sharp`-everywhere controllability-aware model collapses the modality column and recovers the existing 2-valued Skolem semantics of `modal_exists` / `modal_forall`. The 2×2 rule is therefore a conservative extension of both shipped behaviours.
+
+### §7.3 The governing theory — three-valued abstraction of *games*
+
+The preservation theorem of §4.5 (Bruns–Godefroid CONCUR 2000; Huth–Jagadeesan–Schmidt TACAS 2001) is a **single-agent** result. Once the transition relation is resolved by two adversarial players, the object being abstracted is a **two-player game graph**, and the governing soundness result is the *three-valued abstraction of games* line:
+
+- **L. de Alfaro, P. Godefroid, and R. Jagadeesan, *Three-Valued Abstractions of Games: Uncertainty, but with Precision*** (LICS 2004). Establishes that may/must abstraction extends to games when may/must are tracked **per player**, and that definite (`T`/`F`) game values on the abstract game transfer to the concrete game — the game analogue of §4.5. A definite *controller win* requires *must*-moves for the controller and *may*-moves for the environment, which is exactly the 2×2 rule of §7.2.
+- **T. A. Henzinger, R. Majumdar, and others**, on *abstract interpretation of game properties* / *counterexample-guided control* — the refinement counterpart (the game version of Godefroid–Jagadeesan TACAS 2003), driving CEGAR on `KleeneBot` game values.
+
+The practical consequence for mununu: the controllability axis moves the soundness story from "3-valued model checking" to "3-valued game solving." The verdict path that today is correct for the single-agent KMTS (verification adapters) is **not automatically** correct for a controllability-aware KMTS; it needs the per-player may/must of de Alfaro et al.
+
+### §7.4 Must-hypertransitions are required for completeness
+
+A controller guarantee is "I can force the play into *this set* of successors," not "into this single successor." Under nondeterminism a single `must`-edge is too weak: the controller may be able to force the *set* `{s1, s2}` without being able to force either one individually. The sound under-approximation of a forcing move is therefore a **must-hypertransition** (the GKMTS generalisation of Shoham–Grumberg LMCS 2007; de Alfaro et al. for the game setting), whose target is a *set* of abstract states.
+
+mununu already anticipates this: [`EdgeModality::MustHyperOnly`](../../crates/mununu-core/src/mu_calculus/parity_game_3v_build.rs) is a stubbed variant (currently treated as `Sharp` because the K.2 encoding has hyper-target cardinality 1). A complete controllability-aware evaluator must read the hyper-target *set*, not collapse it to a single state. Notably, the existing label-set Skolem grouping in `modal_exists` ([`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs)) *already* implements set-forcing on the controllable side (a controllable action requires *all* its nondeterministic targets to satisfy) — so the hyper-must machinery on the controllable side is half-present; what is missing is the may/must *edge gate* layered on top of it.
+
+### §7.5 Implementation status — the soundness boundary
+
+As of 2026-06-08 the two axes live on **disjoint, non-composing code paths**:
+
+- The production 3-valued verdict (`evaluate_tri`, [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs)) is **modality-blind**: its `Node::Modal` arm runs `modal_bits_from_target` twice (once on `must_true(φ)`, once on `may_true(φ)`), and *neither* pass reads `transition.modality()`. Its 3-valuedness comes entirely from 3-valued *state predicates* (the `L` labelling of §2.5), not from the may/must *transition* relation. It does implement the controllability axis (the Skolem grouping).
+- The only code that reads `TransitionModality::MayOnly` for modal verdicts is the parity-game solver (`parity_game_3v_*`), which is **not** the production verdict path (it feeds failure-subgame extraction for CEGAR, [`parity_game_3v.rs`](../../crates/mununu-core/src/mu_calculus/parity_game_3v.rs) still delegates verdicts to `evaluate_tri`) and assigns owners by `Box`/`Diamond` operator only — it does **not** implement the controllability axis.
+
+**Net effect.** A genuinely controllability-aware KMTS — controllable labels *and* `MayOnly` edges in the same model — would be evaluated unsoundly in the §7.2 corners: a `MayOnly` controllable edge would be accepted as a definite `∃`-witness (over-claiming controller capability), and a `MayOnly` environment edge would be accepted as a definite refutation. The gap is currently **latent**: no shipped adapter emits both (the BTOR2 KMTS lifter sets no controllability; the synthesis adapters emit `Sharp` everywhere). It becomes **active** the moment an adapter emits a controllability-aware KMTS.
+
+**Integration target.** The fix is a single modality-aware modal step that reads both axes in one pass — drafted as `modal_trit_from_target(kind, guard, target: &TritSet) -> TritSet` (the controllability-aware replacement for the two modality-blind `modal_bits_from_target` calls). Its pure core implements the §7.2 table; its CLTS walk classifies each guard-matched edge on the 2×2 partition. Swapping it into `eval_node_tri`'s `Node::Modal` arm is gated on (a) the per-player preservation audit of §7.3 and (b) the hyper-must handling of §7.4. Until then, the boundary is documented here and at the `modal_exists` / `modal_forall` sites.
+
+### §7.6 Controllability-aware refinement (CEGAR)
+
+The refinement loop (R.5) consumes the failure subgame — the `MayOnly` edges reachable from `KleeneBot` positions — to choose predicates to split. Made controllability-aware, the `KleeneBot`s of §7.2 split into two refinement *directions* that pick different predicates:
+
+- An uncertain **environment** `MayOnly` edge → refine to *shrink* `R_may` (rule out a phantom adversary move).
+- An uncertain **controllable** `MayOnly` edge → refine to *grow* `R_must` (confirm a controller move the abstraction only admits as possible).
+
+This requires the subgame's classifying transitions to carry the owning player, i.e. `classifying_transitions: Vec<(usize, usize)>` ([`parity_game_3v.rs`](../../crates/mununu-core/src/mu_calculus/parity_game_3v.rs)) gains a `Player` (or `Control`) tag. With that tag the standard CEGAR loop drives *controllability-aware* refinement with no new fixpoint machinery — the abstraction refinement and the game solving stay separated, exactly as §5.2's "structural free lunch" keeps composition separated from per-module proof.
+
+## §8 Reading list
+
+This list cites primary sources for every load-bearing claim in this doc. Read in roughly the order presented to build the framework from first principles; skip to §8.2/§8.3 if you already have the MTS background.
+
+### §8.1 Foundations of modal / mixed transition systems
 
 1. **K. G. Larsen and B. Thomsen, *A Modal Process Logic*** (LICS 1988). Original modal transition systems. Defines `(S, R_must, R_may)` over an action alphabet with `R_must ⊆ R_may`; introduces the refinement preorder.
 2. **K. G. Larsen, *Modal Specifications*** (CAV 1989 / 1990 — published as part of the *Automatic Verification Methods for Finite State Systems* proceedings). The refinement-based specification language built on MTSes; foundational for treating MTSes as under-specified contracts.
 3. **D. Dams, R. Gerth, and O. Grumberg, *Abstract Interpretation of Reactive Systems*** (TOPLAS 1997, Vol. 19 No. 2, pp. 253–291). The *mixed transition system* generalisation dropping the `R_must ⊆ R_may` invariant; the foundational treatment of abstraction-as-interpretation for branching-time temporal logic. Mununu's standard-KMTS shape (§2.2) is the restricted-to-`R_must ⊆ R_may` case.
 
-### §7.2 KMTS and 3-valued mu-calculus
+### §8.2 KMTS and 3-valued mu-calculus
 
 4. **G. Bruns and P. Godefroid, *Model Checking Partial State Spaces with 3-Valued Temporal Logics*** (CAV 1999) — original paper; **G. Bruns and P. Godefroid, *Generalized Model Checking: Reasoning about Partial State Spaces*** (CONCUR 2000) — extended results. Together establish the 3-valued modal mu-calculus semantics (§4.3) and the preservation theorem (§4.5). The CONCUR 2000 paper is the canonical citation for the preservation result for full mu-calculus including alternating fixpoints.
 5. **M. Huth, R. Jagadeesan, and D. A. Schmidt, *Modal Transition Systems: A Foundation for Three-Valued Program Analysis*** (TACAS 2001, LNCS 2028). The KMTS definition (§2.2) — the explicit 3-valued AP labelling extension of Larsen–Thomsen MTS — and the proof that 3-valued mu-calculus model checking on KMTSes is sound, complete (up to the lattice's expressiveness), and decidable for finite KMTSes. The companion to Bruns–Godefroid for the *finite-state* model-checking setting; mununu's KMTS is in this class.
 6. **P. Godefroid and R. Jagadeesan, *Automatic Abstraction Using Generalized Model Checking*** (TACAS 2003, LNCS 2619). The CEGAR-style refinement loop for KMTS — how to respond to `⊥` verdicts by extracting refinement predicates from spurious abstract counterexamples. Foundational for the mununu architecture doc §6.8 CEGAR loop and the [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md) §4 algorithm.
 
-### §7.3 Compositional KMTS and modal contracts
+### §8.3 Compositional KMTS and modal contracts
 
 7. **K. G. Larsen, U. Nyman, and A. Wąsowski, *Modal I/O Automata for Interface and Product Line Theories*** (FoSSaCS 2007, LNCS 4421). The compositional theory of KMTSes with input/output asymmetry. The congruentiality of refinement under composition (§5.2) and the structural soundness of compositional abstraction are proved here.
 8. **A. Antonik, M. Huth, K. G. Larsen, U. Nyman, and A. Wąsowski, *20 Years of Modal and Mixed Specifications*** (Bulletin of the EATCS 95, 2008; also in FMCO 2008 proceedings). Survey of the modal-specification literature 1988–2008; useful both for historical context and for surveying extensions (parametric modal specifications, disjunctive modal transition systems, branching-time modal contracts) that mununu may want to revisit if AGR-style work becomes load-bearing.
 
-### §7.4 Adjacent — background on 3-valued logic and fixpoint theory
+### §8.4 Adjacent — background on 3-valued logic and fixpoint theory
 
 For readers unfamiliar with Kleene's 3-valued logic or Tarski's fixpoint theorem:
 
 - **S. C. Kleene, *Introduction to Metamathematics*** (North-Holland 1952), Chapter XII §64. The original strong 3-valued logic with truth tables for `∨`, `∧`, `¬` extended to `{T, F, ⊥}` (Kleene's "undefined" value). The truth-lattice operations of §4.1 are these connectives.
 - **A. Tarski, *A Lattice-Theoretical Fixpoint Theorem and Its Applications*** (Pacific J. Math. 5, 1955, pp. 285–309). The least-fixpoint and greatest-fixpoint existence theorem for monotone functions on complete lattices. The mu-calculus fixpoint semantics is an instance of Tarski's framework lifted to the lattice of 3-valued state valuations under the information order (§4.4).
 
-### §7.5 Mununu cross-references
+### §8.5 Controllability-aware KMTS and game abstraction (§7)
+
+9. **L. de Alfaro, P. Godefroid, and R. Jagadeesan, *Three-Valued Abstractions of Games: Uncertainty, but with Precision*** (LICS 2004). The game generalisation of Bruns–Godefroid: may/must abstraction tracked per player, with definite (`T`/`F`) game-value preservation from abstract to concrete. The soundness foundation for §7.2–§7.3 — a definite controller win requires *must*-moves for the controller and *may*-moves for the environment.
+10. **L. de Alfaro, T. A. Henzinger, and R. Majumdar, *From Verification to Control: Dynamic Programs for Omega-Regular Objectives*** (LICS 2001), and the abstract-interpretation-of-games / counterexample-guided-control literature that follows it. The refinement counterpart for §7.6 — driving CEGAR on `KleeneBot` game values and the controllable-predecessor (`CPre`) fixpoint form.
+11. **O. Grumberg, M. Lange, M. Leucker, and S. Shoham, *When not losing is better than winning: Abstraction and refinement for the full mu-calculus*** (Information and Computation 2007; the GKMTS / must-hypertransition line). Establishes that completeness of must-abstraction for the full mu-calculus requires hypertransitions — the §7.4 justification for `EdgeModality::MustHyperOnly`.
+
+### §8.6 Mununu cross-references
 
 - Architecture: [`native-sv-abstraction.md`](native-sv-abstraction.md) §6.
 - Practical recipe (predicate seeding, image, CEGAR): [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md).
