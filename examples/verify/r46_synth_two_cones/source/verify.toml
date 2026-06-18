@@ -1,0 +1,45 @@
+# R46-5 / R.4.6 — synthetic "joint busts cap, clusters fit" regression.
+#
+# `two_cones.sv` has two independent 11-bit counters → 22 joint state bits,
+# which busts the bit-blast cap (MAX_STATE_BITS = 20). Each property below
+# reads only one counter, so the two cones are disjoint and cluster K=2.
+# Per-cluster verification (R46-2/R46-3) detects the cap overrun, slices
+# each cluster to its own 11-bit cone, and verifies it — both properties
+# come back SATISFIED over `Circuit__cl0` / `Circuit__cl1`.
+#
+# `over = "Circuit"` is the joint default; when per-cluster verification
+# fires the orchestrator overrides it with each property's cluster
+# automaton (visible in the report's `over =` field).
+
+[project]
+name = "R46SynthTwoCones"
+description = "Synthetic two-independent-counter design: joint cone busts the state-bit cap, per-cluster verification rescues it."
+
+[[sources]]
+id = "tc"
+files = ["two_cones.sv"]
+adapter = "sv-yosys"
+
+[sources.options]
+use_sv2v = true
+top = "two_cones"
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "synchronous"
+members = ["tc"]
+name = "TwoConesTop"
+
+[[properties]]
+# cnt_a's max encoding is reachable. Cone = {cnt_a, a_en_i} — disjoint
+# from cnt_b's, which is what drives the K=2 clustering.
+name = "a_max_reachable"
+formula = "mu X. (a_max_o || (<> X))"
+over = "Circuit"
+
+[[properties]]
+name = "b_max_reachable"
+formula = "mu X. (b_max_o || (<> X))"
+over = "Circuit"
