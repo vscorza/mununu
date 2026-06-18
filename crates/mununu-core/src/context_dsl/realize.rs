@@ -375,12 +375,32 @@ impl RealizedContext {
     }
 }
 
-/// Return `true` when every valuation string on every CLTS state
-/// parses as an `i64`. The scope guard for the Phase A.3 follow-up
+/// The BTOR2 bit-blaster's absorbing out-of-bounds sink carries the
+/// single non-numeric marker valuation `__mununu_oob__ = "true"` (see
+/// `adapter::btor2::bit_blast::OOB_SINK_KEY`). The evaluator masks the
+/// sink out of every formula via this same key
+/// (`mu_calculus::evaluator::compute_oob_bits`). The numericity gate
+/// below must IGNORE this marker — it is not a design valuation and its
+/// presence (whenever a `BoundedCounter` / `EnumValues`-subset transition
+/// escapes its declared value set) must not disable numeric atom binding
+/// for the model's real, fully-numeric states.
+const OOB_SINK_MARKER_KEY: &str = "__mununu_oob__";
+
+/// Return `true` when every (non-marker) valuation string on every CLTS
+/// state parses as an `i64`. The scope guard for the Phase A.3 follow-up
 /// abstract-states wiring above — only the BTOR2 bit-blaster's
 /// decimal-encoded valuations qualify, so semantic SV-adapter
 /// encodings (variant names like `T`/`F`/`IDLE`) are left to the
 /// existing pre-computed-predicate path.
+///
+/// The OOB sink's `__mununu_oob__` marker (see [`OOB_SINK_MARKER_KEY`])
+/// is exempt: a single escaped transition would otherwise add a
+/// non-numeric valuation and trip the gate, disabling numeric binding
+/// for every real state — the cause of the R46-6 spurious-`VIOLATED`
+/// divergence between a `BoundedCounter` model that escapes to OOB and
+/// the otherwise-identical full bit-blast model. The wiring loop already
+/// skips per-value non-numeric strings (`if let Ok(n) = parse()`), so
+/// the marker contributes no variables to the sink's abstract state.
 fn clts_valuations_are_numeric<S, L>(clts: &crate::clts::Clts<S, L>) -> bool
 where
     S: crate::clts::IdStorage,
@@ -389,7 +409,10 @@ where
     let mut any_value = false;
     for state_id in clts.states() {
         if let Some(vals) = clts.state_valuation(state_id) {
-            for v in vals.values() {
+            for (key, v) in vals {
+                if key == OOB_SINK_MARKER_KEY {
+                    continue;
+                }
                 any_value = true;
                 if v.parse::<i64>().is_err() {
                     return false;
@@ -3296,6 +3319,59 @@ mod tests {
         assert!(!is_simple_identifier("123abc"));
         assert!(!is_simple_identifier("with spaces"));
         assert!(!is_simple_identifier("dot.notation"));
+    }
+
+    /// R46-6 regression — the OOB sink's `__mununu_oob__` marker must NOT
+    /// trip the numericity gate. A `BoundedCounter` (or `EnumValues`-subset)
+    /// model whose transition escapes its declared value set gains an
+    /// absorbing OOB sink carrying `{__mununu_oob__: "true"}`; before the
+    /// fix that single non-numeric marker made `clts_valuations_are_numeric`
+    /// return `false`, disabling abstract-states wiring for every real
+    /// (fully numeric) state — which flipped reachability verdicts from
+    /// SATISFIED to a spurious VIOLATED relative to the otherwise-identical
+    /// full bit-blast model.
+    #[test]
+    fn oob_sink_marker_does_not_trip_numericity_gate() {
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        let s0 = b.state_id_or_insert("s0").expect("s0");
+        let s1 = b.state_id_or_insert("s1").expect("s1");
+        let oob = b.state_id_or_insert(OOB_SINK_MARKER_KEY).expect("oob");
+        b.initial("s0");
+        b.with_valuation_for_state(s0, BTreeMap::from([("timer".to_string(), "0".to_string())]));
+        b.with_valuation_for_state(s1, BTreeMap::from([("timer".to_string(), "1".to_string())]));
+        // The bit-blaster's exact OOB-sink valuation (key == value-marker).
+        b.with_valuation_for_state(
+            oob,
+            BTreeMap::from([(OOB_SINK_MARKER_KEY.to_string(), "true".to_string())]),
+        );
+        let clts = b.build().expect("clts builds");
+
+        // Real states are all numeric; the OOB marker is exempt → gate passes.
+        assert!(
+            clts_valuations_are_numeric(&clts),
+            "OOB sink marker must be exempt from the numericity gate"
+        );
+    }
+
+    /// Complement to the R46-6 regression: a genuinely non-numeric *real*
+    /// valuation (e.g. the SV adapter's semantic `state == IDLE` / `T`/`F`
+    /// encodings) must still trip the gate, leaving those models on the
+    /// pre-computed-predicate path. Exempting the OOB marker must not widen
+    /// the exemption to real design valuations.
+    #[test]
+    fn non_numeric_real_valuation_still_trips_numericity_gate() {
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        let s0 = b.state_id_or_insert("s0").expect("s0");
+        b.initial("s0");
+        b.with_valuation_for_state(
+            s0,
+            BTreeMap::from([("state".to_string(), "IDLE".to_string())]),
+        );
+        let clts = b.build().expect("clts builds");
+        assert!(
+            !clts_valuations_are_numeric(&clts),
+            "a non-numeric design valuation must keep the gate closed"
+        );
     }
 
     #[test]

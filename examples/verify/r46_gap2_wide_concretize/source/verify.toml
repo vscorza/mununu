@@ -1,0 +1,48 @@
+# R46-6 / GAP-2 — wide field concretized to a small value set, with an
+# escape-to-OOB that exercises the realize numericity-gate fix.
+#
+# `wide7.sv` has a 24-bit `cnt` (24 raw state bits > MAX_STATE_BITS = 20 →
+# rejected without abstraction). The sidecar concretizes `cnt` to
+# `bounded_counter bound=7` → value set {0..7} = 3 effective bits → fits
+# the cap (GAP-2 effective-bits accounting). `cnt` escapes at 7→8 →
+# absorbing OOB sink. The two reachability properties target values that
+# ARE in the concretized set (1 and 7), so both are genuinely reachable
+# and must come back SATISFIED. Before the realize OOB-marker fix the OOB
+# sink's `__mununu_oob__` valuation tripped the numericity gate and these
+# reported a spurious VIOLATED.
+
+[project]
+name = "R46Gap2WideConcretize"
+description = "24-bit counter concretized to bounded_counter bound=7: raw width busts the cap, concretization fits it, and the escape-to-OOB exercises the realize numericity-gate fix."
+
+[[sources]]
+id = "w"
+files = ["wide7.sv"]
+adapter = "sv-yosys"
+
+[sources.options]
+use_sv2v = true
+top = "wide7"
+sidecar = "wide7.mununu.json"
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "synchronous"
+members = ["w"]
+name = "Wide7Top"
+
+[[properties]]
+# cnt == 1 is in the concretized set {0..7} and reached on the path
+# 0 → 1, so this is genuinely reachable → SATISFIED.
+name = "reach_t1"
+formula = "mu X. (at1_o || (<> X))"
+over = "Circuit"
+
+[[properties]]
+# cnt == 7 is the top of the concretized set; reached on 0 → … → 7 just
+# before the 7 → 8 escape to OOB → SATISFIED.
+name = "reach_t7"
+formula = "mu X. (at7_o || (<> X))"
+over = "Circuit"
