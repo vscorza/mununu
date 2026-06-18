@@ -450,8 +450,11 @@ pub fn to_ir(
     // `to_ir` then bit-blasts a strictly smaller design. This SUPERSEDES
     // the earlier pin-to-`Ignored` mechanism (which was sound only for
     // safety and, because transitions are synchronous, dropped in-cone
-    // updates whenever an out-of-cone cell changed). Slicing is exact /
-    // bisimilar on the atom set — sound for the full mu-calculus.
+    // updates whenever an out-of-cone cell changed). On a synchronous
+    // system a cone closed over BOTH data-flow and constraint/fairness
+    // co-occurrence is a strong bisimulation on the atom set, so slicing is
+    // exact — sound for the full mu-calculus (`cone_slice` enforces the
+    // constraint/fairness half of that closure).
     let cone_sliced;
     let file: &Btor2File = match &options.cone_restrict_atoms {
         Some(atoms) if !atoms.is_empty() => {
@@ -615,9 +618,11 @@ pub fn to_ir(
     // accounting is identical to the legacy behaviour.
     // Note: `file` is already the cone slice when a restriction is active
     // (see the top of `to_ir`), so the cap is naturally measured against
-    // the restricted design — no separate cone-bit subtraction needed.
-    let total_state_bits = sum_widths(file, &states)?
-        .saturating_sub(sidecar_ignored_state_bits(file, &states, options));
+    // the restricted design. Per-cell EFFECTIVE bits (GAP-2): a
+    // sidecar-concretized wide field counts ceil(log2(value-set)) bits,
+    // not its raw width, so a property over a wide-but-concretized
+    // register fits the cap (see `sidecar_effective_state_bits`).
+    let total_state_bits = sidecar_effective_state_bits(file, &states, options)?;
     let total_input_bits = sum_widths(file, &inputs)?;
 
     if total_state_bits > MAX_STATE_BITS {
@@ -711,12 +716,15 @@ pub fn to_ir(
 ///   cap even restricted (it carries a wide field; see GAP-2 /
 ///   param-concretization). The caller then emits the joint cap error.
 ///
-/// SOUNDNESS: each cluster's model is the joint design restricted to that
-/// cluster's exact cone of influence; cutting out-of-cone cells cannot
-/// change any verdict over the cluster's properties (CLAUDE.md
-/// §Soundness — COI is exact). Each property lands in exactly one cluster
-/// (the clustering invariant), so routing it to its cluster's model is
-/// sound and complete.
+/// SOUNDNESS: each cluster's model is the joint design restricted (via
+/// [`cone_slice`]) to that cluster's exact cone of influence. On the
+/// synchronous BTOR2 system that cone is closed over both data-flow and
+/// `constraint`/`fair`/`justice` coupling (`cone_slice` enforces the
+/// latter), making the restriction a strong bisimulation on the cluster's
+/// atoms: cutting out-of-cone cells cannot change any verdict over the
+/// cluster's properties (CLAUDE.md §Soundness — COI is exact). Each
+/// property lands in exactly one cluster (the clustering invariant), so
+/// routing it to its cluster's model is sound and complete.
 #[allow(clippy::type_complexity)]
 fn try_per_cluster_blast(
     file: &Btor2File,
@@ -804,12 +812,13 @@ fn try_per_cluster_blast(
         let sliced_states: Vec<&Line> = sliced.states().collect();
         let sliced_inputs: Vec<&Line> = sliced.inputs().collect();
 
-        // Cap-check this cluster's sliced state bits. If a single cluster
-        // still busts the cap (a wide field inside one cluster — GAP-2),
-        // per-cluster cannot rescue the design; fall through to the joint
-        // error so the user gets one clear diagnostic.
-        let cluster_bits = sum_widths(&sliced, &sliced_states)?
-            .saturating_sub(sidecar_ignored_state_bits(&sliced, &sliced_states, options));
+        // Cap-check this cluster's sliced state bits, EFFECTIVE (GAP-2):
+        // a wide field inside the cluster that the sidecar concretizes
+        // counts ceil(log2(value-set)) bits, so a cluster with a
+        // param-concretized wide register fits. A cluster that STILL busts
+        // the cap (an un-concretized wide field) returns None → the joint
+        // error stands, so the user gets one clear diagnostic.
+        let cluster_bits = sidecar_effective_state_bits(&sliced, &sliced_states, options)?;
         if cluster_bits > MAX_STATE_BITS {
             return Ok(None);
         }
@@ -876,12 +885,23 @@ fn try_per_cluster_blast(
 /// removed from the IR entirely.
 ///
 /// The result is the exact sub-circuit the cluster's properties depend
-/// on. Because cone-of-influence is bisimilar on the atom set, every
-/// mu-calculus verdict over `atoms` agrees between the slice and the full
-/// design — sound at every alternation depth, not just for safety (this
-/// is why slicing supersedes the pin-to-`Ignored` mechanism). Sort lines
-/// are always kept (cheap, shared); NIDs are preserved so surviving
-/// references stay valid without renumbering.
+/// on. On a **synchronous** transition system (BTOR2) a correctly closed
+/// cone is a strong bisimulation on the atom set, so every mu-calculus
+/// verdict over `atoms` — including the single-step `[]` / `<>` modalities
+/// and nested fixpoints — agrees between the slice and the full design,
+/// sound at every alternation depth, not just for safety (this is why
+/// slicing supersedes the pin-to-`Ignored` mechanism).
+///
+/// "Correctly closed" is the load-bearing precondition: the cone must be
+/// closed not only under the data-flow (`next` / `init`) dependency
+/// relation but also under `constraint` / `fair` / `justice` co-occurrence
+/// — a line that couples an in-cone signal to an out-of-cone one keeps the
+/// latter in the cone. The closure loop below enforces both; without the
+/// constraint/fairness half the slice silently drops assumptions the joint
+/// bit-blaster enforces and degrades to an unsound over-approximation.
+///
+/// Sort lines are always kept (cheap, shared); NIDs are preserved so
+/// surviving references stay valid without renumbering.
 fn cone_slice(file: &Btor2File, atoms: &[String]) -> Btor2File {
     use std::collections::HashSet;
 
@@ -913,26 +933,73 @@ fn cone_slice(file: &Btor2File, atoms: &[String]) -> Btor2File {
         }
     }
 
-    // Transitive closure over operands. Keeping a State cell pulls in its
-    // Init/Next lines (whose value fan-in is then closed over) — that is
-    // how the cone walks backwards through the transition relation.
-    while let Some(nid) = work.pop() {
-        if !keep.insert(nid) {
-            continue;
-        }
-        let Some(line) = file.lookup(nid) else {
-            continue;
-        };
-        push_operand_nids(&line.node, &mut work);
-        if matches!(line.node, Node::State { .. }) {
-            for l in &file.lines {
-                match &l.node {
-                    Node::Init { state, .. } | Node::Next { state, .. } if *state == nid => {
-                        work.push(l.nid);
+    // Transitive closure over operands, interleaved with constraint /
+    // fairness pullback, iterated to a joint fixpoint.
+    //
+    // The operand closure keeps everything that FEEDS the cone: keeping a
+    // State cell pulls in its Init/Next lines (whose value fan-in is then
+    // closed over) — that is how the cone walks backwards through the
+    // transition relation.
+    //
+    // But the data-flow closure alone is NOT the full cone of influence.
+    // BTOR2 `constraint` / `fair` / `justice` lines couple signals into the
+    // cone that no `next` reads: a `constraint` mentioning an in-cone signal
+    // RESTRICTS the reachable state space (the joint bit-blaster enforces it
+    // via `constraints_hold`), and a `fair` / `justice` line referencing an
+    // in-cone signal shapes which infinite paths count. Their other operands
+    // are therefore in the true cone of influence and MUST be retained.
+    // Dropping such a line silently removes an assumption / fairness
+    // obligation, turning the "exact" slice into an over-approximation — a
+    // spurious counterexample for safety, an unsound verdict for liveness.
+    // This pullback is load-bearing for the "exact / bisimilar / full
+    // mu-calculus" guarantee in this function's doc comment; removing it
+    // reintroduces the soundness bug.
+    //
+    // We therefore loop: drain the operand-closure frontier, then pull in
+    // every constraint / fairness line whose operand DAG touches the current
+    // cone (and all signals it references), until neither step grows `keep`.
+    // `keep` only ever grows and is bounded by the line count, so this
+    // terminates. Constraints/fairness disjoint from the cone are correctly
+    // left out — they cannot restrict any in-cone signal.
+    loop {
+        while let Some(nid) = work.pop() {
+            if !keep.insert(nid) {
+                continue;
+            }
+            let Some(line) = file.lookup(nid) else {
+                continue;
+            };
+            push_operand_nids(&line.node, &mut work);
+            if matches!(line.node, Node::State { .. }) {
+                for l in &file.lines {
+                    match &l.node {
+                        Node::Init { state, .. } | Node::Next { state, .. } if *state == nid => {
+                            work.push(l.nid);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
+        }
+
+        let mut grew = false;
+        for line in &file.lines {
+            if keep.contains(&line.nid) {
+                continue;
+            }
+            let operands: Vec<Nid> = match &line.node {
+                Node::Constraint { signal } | Node::Fair { signal } => vec![signal.nid()],
+                Node::Justice { signals } => signals.iter().map(|s| s.nid()).collect(),
+                _ => continue,
+            };
+            if operands.iter().any(|&op| dag_touches_keep(file, op, &keep)) {
+                work.push(line.nid);
+                work.extend(operands);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
         }
     }
 
@@ -1012,6 +1079,31 @@ fn push_operand_nids(node: &Node, work: &mut Vec<Nid>) {
     }
 }
 
+/// Does the operand DAG rooted at `start` reach any NID already in `keep`?
+///
+/// Used by [`cone_slice`]'s constraint / fairness pullback to decide
+/// whether a `constraint` / `fair` / `justice` line couples the current
+/// cone to additional signals (and so must be retained, pulling its
+/// operands in). Walks operands only; membership of *any* reached node —
+/// terminal or intermediate — short-circuits to `true`. A `visited` set
+/// guards against cycles (BTOR2 is acyclic, but the guard is cheap).
+fn dag_touches_keep(file: &Btor2File, start: Nid, keep: &std::collections::HashSet<Nid>) -> bool {
+    let mut stack = vec![start];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(nid) = stack.pop() {
+        if !visited.insert(nid) {
+            continue;
+        }
+        if keep.contains(&nid) {
+            return true;
+        }
+        if let Some(line) = file.lookup(nid) {
+            push_operand_nids(&line.node, &mut stack);
+        }
+    }
+    false
+}
+
 fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
     let mut total: u32 = 0;
     for line in lines {
@@ -1066,62 +1158,110 @@ fn sum_widths(file: &Btor2File, lines: &[&Line]) -> Result<u32, AdapterError> {
 /// state cells even when Yosys strips the original register symbol
 /// from the `state` line and only attaches it via an Op-alias or
 /// `output` port symbol.
-fn sidecar_ignored_state_bits(file: &Btor2File, states: &[&Line], options: &AdapterOptions) -> u32 {
-    let ignored_nids = sidecar_ignored_nids(file, options);
-    if ignored_nids.is_empty() {
-        return 0;
-    }
-    let mut sum: u32 = 0;
+/// R46-6 / GAP-2 — effective state-bit count for the cap check. A state
+/// cell the sidecar param-concretizes (`Boolean` / `BoundedCounter` /
+/// `EnumValues` / `Ignored`) contributes `ceil(log2(value-set size))`
+/// bits — the number of distinct values the bit-blaster actually
+/// enumerates for it — instead of its full register width. Cells with no
+/// sidecar entry contribute their raw width (the legacy behaviour, so
+/// no-sidecar designs are unchanged).
+///
+/// This is what lets a property over a WIDE field (a 32-bit timer, a
+/// 64-bit data word) fit the cap once that field is concretized to a
+/// small value set, instead of being rejected on raw width before
+/// enumeration ever runs — the GAP-2 enabler for per-cluster verification
+/// of real RTL whose clusters carry wide datapath/counters.
+///
+/// Subsumes the old `sidecar_ignored_state_bits`: an `Ignored` cell has a
+/// one-element value set → 0 effective bits.
+///
+/// SOUNDNESS: the bit-blaster enumerates exactly the abstraction's value
+/// set (see `CellEnumeration::values_for_field_domain`), so
+/// `ceil(log2(|values|))` is the true per-cell contribution to the
+/// explicit state space; the cap then bounds the actual enumerated size,
+/// not an over-conservative raw-width proxy. Strictly more permissive
+/// than the raw-width cap and never accepts a design whose enumeration
+/// would exceed `2^MAX_STATE_BITS`.
+fn sidecar_effective_state_bits(
+    file: &Btor2File,
+    states: &[&Line],
+    options: &AdapterOptions,
+) -> Result<u32, AdapterError> {
+    let value_counts = sidecar_state_value_counts(file, options);
+    let mut total: u32 = 0;
     for line in states {
-        if !ignored_nids.contains(&line.nid) {
-            continue;
-        }
         let sort_nid = match &line.node {
             Node::State { sort, .. } => *sort,
             _ => continue,
         };
-        let Some(width) = parser::bv_width(file, sort_nid) else {
+        // §Phase 10 — array-sorted state cells are handled by memory
+        // abstraction, not the bit cap; skip (mirrors `sum_widths`).
+        if matches!(
+            sort_of_arc(file, sort_nid),
+            Some(crate::adapter::btor2::ast::Sort::Array { .. })
+        ) {
             continue;
+        }
+        let raw_width = parser::bv_width(file, sort_nid).ok_or_else(|| AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            message: format!(
+                "state NID {} references non-bitvec sort {sort_nid}",
+                line.nid
+            ),
+            location: None,
+        })?;
+        let eff = match value_counts.get(&line.nid) {
+            Some(count) => effective_bits(*count),
+            None => raw_width,
         };
-        sum = sum.saturating_add(width);
+        total = total.checked_add(eff).ok_or_else(|| AdapterError {
+            kind: AdapterErrorKind::StateSpaceOverflow,
+            message: "total effective bit-width exceeds u32 range".into(),
+            location: None,
+        })?;
     }
-    sum
+    Ok(total)
 }
 
-/// The set of BTOR2 state NIDs the sidecar declares `abstraction:
-/// ignored`. Resolves each Ignored signal via the `drives` override
-/// (falling back to the sidecar `name`) using
-/// [`parser::resolve_state_by_symbol`]. Returns an empty set when no
-/// sidecar is provided, it fails to parse, or no cells are Ignored.
-///
-/// Split out of [`sidecar_ignored_state_bits`] (R.4.6) so the cone
-/// restriction's cap accounting can subtract out-of-cone cells *without*
-/// double-counting cells the sidecar already pins to Ignored.
-fn sidecar_ignored_nids(
+/// Per-state-cell enumerated value count from the sidecar's declared
+/// abstraction (NID → `|value set|`). Only sidecar-declared cells appear;
+/// the caller treats absent cells as full-width bit-blast. Each signal is
+/// resolved via the `drives` override (falling back to `name`) like the
+/// other sidecar helpers, then through the canonical
+/// [`crate::adapter::sidecar::resolve_to_field_domain`] resolver.
+fn sidecar_state_value_counts(
     file: &Btor2File,
     options: &AdapterOptions,
-) -> std::collections::HashSet<Nid> {
+) -> std::collections::HashMap<Nid, usize> {
+    let mut out = std::collections::HashMap::new();
     let Some(json) = &options.sidecar_json else {
-        return std::collections::HashSet::new();
+        return out;
     };
     let Ok(ann) =
         serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
     else {
-        return std::collections::HashSet::new();
+        return out;
     };
-    ann.signals
-        .iter()
-        .filter(|s| {
-            matches!(
-                s.abstraction,
-                crate::adapter::systemverilog::annotation::SignalAbstraction::Ignored
-            )
-        })
-        .filter_map(|s| {
-            let target = s.drives.as_deref().unwrap_or(s.name.as_str());
-            parser::resolve_state_by_symbol(file, target)
-        })
-        .collect()
+    for sig in &ann.signals {
+        let target = sig.drives.as_deref().unwrap_or(sig.name.as_str());
+        if let Some(nid) = parser::resolve_state_by_symbol(file, target) {
+            let (fd, _vm) = crate::adapter::sidecar::resolve_to_field_domain(sig, &ann);
+            // `values()` is empty for `Ignored` → one pinned value.
+            out.insert(nid, fd.values().len().max(1));
+        }
+    }
+    out
+}
+
+/// `ceil(log2(value_count))` — the bits needed to index a
+/// `value_count`-element value set. 0 for a singleton (a pinned /
+/// `Ignored` cell).
+fn effective_bits(value_count: usize) -> u32 {
+    if value_count <= 1 {
+        0
+    } else {
+        (value_count as u64).next_power_of_two().trailing_zeros()
+    }
 }
 
 /// M.1 Path B (§Phase 11) — build an augmented NID→sidecar-name map
@@ -5571,6 +5711,63 @@ mod tests {
         assert_eq!(err.kind, AdapterErrorKind::StateSpaceOverflow);
     }
 
+    #[test]
+    fn effective_bits_is_ceil_log2() {
+        assert_eq!(effective_bits(1), 0);
+        assert_eq!(effective_bits(2), 1);
+        assert_eq!(effective_bits(3), 2);
+        assert_eq!(effective_bits(4), 2);
+        assert_eq!(effective_bits(5), 3);
+        assert_eq!(effective_bits(2048), 11);
+    }
+
+    /// R46-6 / GAP-2 — a wide state cell the sidecar param-concretizes
+    /// counts `ceil(log2(value-set))` effective bits, not its raw width,
+    /// so a design that busts the cap on raw width fits once concretized.
+    #[test]
+    fn effective_cap_counts_concretized_wide_cell_by_value_set() {
+        // 24-bit state cell `cnt` — over the cap on raw width.
+        let src = r#"
+1 sort bitvec 1
+2 sort bitvec 24
+3 zero 2
+4 state 2 cnt
+5 init 2 4 3
+6 ones 2
+7 eq 1 4 6
+8 output 7 cnt_max
+"#;
+        let file = parser::parse(src).expect("parse");
+
+        // Without a sidecar: 24 raw state bits → StateSpaceOverflow.
+        let bare = translate(src, &AdapterOptions::default());
+        assert_eq!(
+            bare.unwrap_err().kind,
+            AdapterErrorKind::StateSpaceOverflow,
+            "24-bit cell must bust the cap on raw width"
+        );
+
+        // With BoundedCounter bound=3 → {0,1,2,3} = 4 values → 2 bits.
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [ { "name": "cnt", "abstraction": "bounded_counter", "bound": 3 } ],
+        })
+        .to_string();
+        let states: Vec<&Line> = file.states().collect();
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar),
+            ..Default::default()
+        };
+        let eff = sidecar_effective_state_bits(&file, &states, &opts).expect("eff bits");
+        assert_eq!(
+            eff, 2,
+            "24-bit cell concretized to 4 values must count 2 effective bits"
+        );
+        let out = translate(src, &opts).expect("concretized design must fit the cap");
+        assert!(out.ctxdsl.contains("automaton"));
+    }
+
     /// R46-2 — the per-cluster fallback. Two independent 11-bit registers
     /// (22 state bits jointly → over the cap), with one property over each
     /// (disjoint cones). With the manifest's per-property seeds threaded,
@@ -5687,6 +5884,164 @@ mod tests {
             sliced.states().count(),
             1,
             "the out-of-cone state cell must be removed from the slice"
+        );
+    }
+
+    /// R46-6a (constraint/fairness pullback, soundness fix) — a
+    /// `constraint` coupling an in-cone register to an out-of-cone register
+    /// must pull the out-of-cone register AND the constraint into the slice.
+    ///
+    /// Before the fix, `cone_slice` seeded only from property atoms and
+    /// closed only over `next`/`init` data-flow, then kept a `constraint`
+    /// line only if *all* its operands were already in-cone — so a
+    /// constraint mentioning an out-of-cone signal was silently dropped.
+    /// The joint bit-blaster enforces every constraint via
+    /// `constraints_hold` (see `constraint_filters_transitions`), so the
+    /// slice became strictly more permissive: an over-approximation that
+    /// can report a spurious counterexample, not the documented exact /
+    /// bisimilar reduction.
+    #[test]
+    fn cone_slice_pulls_in_constraint_coupled_register() {
+        // `reg_a` is the property atom; `reg_b` is reached by no `next`
+        // that `reg_a` depends on, so it is out-of-cone by data-flow alone.
+        // The `constraint (reg_a == reg_b)` couples them — `reg_b` restricts
+        // `reg_a`'s reachable values, so it is in the true cone of influence.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 reg_a
+4 init 1 3 2
+5 input 1 tgl
+6 next 1 3 5
+7 state 1 reg_b
+8 init 1 7 2
+9 next 1 7 2
+10 eq 1 3 7
+11 constraint 10
+12 bad 3
+"#;
+        let file = parser::parse(src).expect("parse");
+        let sliced = cone_slice(&file, &["reg_a".to_string()]);
+
+        let state_syms: std::collections::HashSet<&str> = sliced
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::State {
+                    symbol: Some(s), ..
+                } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            state_syms.contains("reg_a"),
+            "in-cone register `reg_a` must be retained; got {state_syms:?}"
+        );
+        assert!(
+            state_syms.contains("reg_b"),
+            "constraint-coupled out-of-cone register `reg_b` must be retained \
+             (else the assumption `reg_a == reg_b` is silently dropped and the \
+             slice over-approximates); got {state_syms:?}"
+        );
+        assert!(
+            sliced
+                .lines
+                .iter()
+                .any(|l| matches!(l.node, Node::Constraint { .. })),
+            "the coupling `constraint` line must survive the slice"
+        );
+    }
+
+    /// R46-6a — the same pullback for `fair` (fairness) lines: a fairness
+    /// obligation referencing an in-cone signal shapes which infinite paths
+    /// count, so the signals it references are in the cone and must be
+    /// retained. Dropping fairness is unsound for liveness verdicts (the
+    /// abstraction can manufacture or destroy spurious progress).
+    #[test]
+    fn cone_slice_pulls_in_fairness_coupled_register() {
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 reg_a
+4 init 1 3 2
+5 input 1 tgl
+6 next 1 3 5
+7 state 1 reg_b
+8 init 1 7 2
+9 next 1 7 2
+10 and 1 3 7
+11 fair 10
+12 bad 3
+"#;
+        let file = parser::parse(src).expect("parse");
+        let sliced = cone_slice(&file, &["reg_a".to_string()]);
+        let has_reg_b = sliced
+            .lines
+            .iter()
+            .any(|l| matches!(&l.node, Node::State { symbol: Some(s), .. } if s == "reg_b"));
+        assert!(
+            has_reg_b,
+            "fairness-coupled register `reg_b` must be retained in the slice"
+        );
+        assert!(
+            sliced
+                .lines
+                .iter()
+                .any(|l| matches!(l.node, Node::Fair { .. })),
+            "the coupling `fair` line must survive the slice"
+        );
+    }
+
+    /// R46-6a — a constraint whose signals are ALL out-of-cone (it
+    /// constrains a different cluster's registers) does NOT pull anything
+    /// in: it cannot restrict any in-cone signal, so dropping it stays
+    /// sound and the clustering reduction is preserved.
+    #[test]
+    fn cone_slice_drops_constraint_disjoint_from_cone() {
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 reg_a
+4 init 1 3 2
+5 input 1 tgl
+6 next 1 3 5
+7 state 1 reg_b
+8 init 1 7 2
+9 next 1 7 2
+10 state 1 reg_c
+11 init 1 10 2
+12 next 1 10 2
+13 eq 1 7 10
+14 constraint 13
+15 bad 3
+"#;
+        let file = parser::parse(src).expect("parse");
+        let sliced = cone_slice(&file, &["reg_a".to_string()]);
+        let state_syms: std::collections::HashSet<&str> = sliced
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::State {
+                    symbol: Some(s), ..
+                } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            state_syms.contains("reg_a"),
+            "in-cone register retained; got {state_syms:?}"
+        );
+        assert!(
+            !state_syms.contains("reg_b") && !state_syms.contains("reg_c"),
+            "a constraint over only out-of-cone registers must NOT pull them \
+             into the slice (it cannot restrict the cone); got {state_syms:?}"
+        );
+        assert!(
+            !sliced
+                .lines
+                .iter()
+                .any(|l| matches!(l.node, Node::Constraint { .. })),
+            "the cone-disjoint constraint must be dropped"
         );
     }
 

@@ -193,12 +193,23 @@ pub fn resolve_atom_to_terminals(file: &Btor2File, atom: &str) -> Option<HashSet
 ///
 /// # SOUNDNESS
 ///
-/// The cone of influence is exact (bisimilar) on the atom set:
+/// On a **synchronous** transition system (BTOR2), a cone closed under
+/// both the data-flow dependency relation AND `constraint` / `fair` /
+/// `justice` co-occurrence is a strong bisimulation on the atom set:
 /// out-of-cone state cells cannot influence any atom in `atoms`, so
 /// cutting them is sound for the full mu-calculus over those atoms (the
-/// COI "exact / free / sound" abstraction; CLAUDE.md §Soundness). This
-/// is *not* an over- or under-approximation — the restricted model
-/// agrees with the joint model on every property over `atoms`.
+/// COI "exact / free / sound" abstraction; CLAUDE.md §Soundness). With
+/// that closure it is *not* an over- or under-approximation — the
+/// restricted model agrees with the joint model on every property over
+/// `atoms`.
+///
+/// The constraint/fairness half of the closure is essential: a
+/// `constraint` mentioning an in-cone signal restricts the reachable
+/// state space (the joint bit-blaster enforces it via `constraints_hold`),
+/// so its other signals are in the true cone of influence. The pullback
+/// loop below adds them; omitting it silently drops assumptions and turns
+/// the reduction into an unsound over-approximation. This mirrors the
+/// closure in [`super::bit_blast`]'s `cone_slice`.
 pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
     use crate::adapter::partition::coi::cone_of_influence;
 
@@ -219,7 +230,55 @@ pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
         }
     }
 
-    let cone = cone_of_influence(&seeds, &deps);
+    let mut cone = cone_of_influence(&seeds, &deps);
+
+    // Constraint / fairness pullback (R46-6a) — close the cone over
+    // assumption + fairness coupling, mirroring `cone_slice`. Any
+    // `constraint` / `fair` / `justice` line whose terminal symbols touch
+    // the current cone pulls all of its terminals into the seed set;
+    // recompute and iterate to a fixpoint. `seeds` grows monotonically and
+    // is bounded by the symbol count, so this terminates.
+    loop {
+        let mut grew = false;
+        for line in &file.lines {
+            let mut terminals: HashSet<String> = HashSet::new();
+            let mut visited = HashSet::new();
+            match &line.node {
+                Node::Constraint { signal } | Node::Fair { signal } => {
+                    collect_operand_terminals(
+                        file,
+                        signal.nid(),
+                        &symbols,
+                        &mut terminals,
+                        &mut visited,
+                    );
+                }
+                Node::Justice { signals } => {
+                    for sig in signals {
+                        collect_operand_terminals(
+                            file,
+                            sig.nid(),
+                            &symbols,
+                            &mut terminals,
+                            &mut visited,
+                        );
+                    }
+                }
+                _ => continue,
+            }
+            if terminals.iter().any(|t| cone.contains(t)) {
+                let before = seeds.len();
+                seeds.extend(terminals);
+                if seeds.len() != before {
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+        cone = cone_of_influence(&seeds, &deps);
+    }
 
     // Map cone state symbols back to their state-line NIDs.
     file.states()
@@ -491,6 +550,66 @@ mod tests {
         assert!(
             !keep.contains(&7),
             "reg_b is independent, out of cone; got {keep:?}"
+        );
+    }
+
+    #[test]
+    fn state_cone_nids_retains_constraint_coupled_register() {
+        // R46-6a — `state_cone_nids` must close the cone over constraint
+        // coupling, mirroring `cone_slice`. `reg_b` (nid 7) is out-of-cone
+        // by data-flow but coupled to in-cone `reg_a` (nid 3) by the
+        // `constraint (reg_a == reg_b)`, so it must be retained.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 reg_a
+4 init 1 3 2
+5 input 1 tgl
+6 next 1 3 5
+7 state 1 reg_b
+8 init 1 7 2
+9 next 1 7 2
+10 eq 1 3 7
+11 constraint 10
+12 bad 3
+"#;
+        let file = parser::parse(src).expect("parse");
+        let keep = state_cone_nids(&file, &["reg_a".to_string()]);
+        assert!(keep.contains(&3), "reg_a (nid 3) in cone; got {keep:?}");
+        assert!(
+            keep.contains(&7),
+            "constraint-coupled reg_b (nid 7) must be retained; got {keep:?}"
+        );
+    }
+
+    #[test]
+    fn state_cone_nids_ignores_constraint_disjoint_from_cone() {
+        // A constraint over only out-of-cone registers does not pull them
+        // in — it cannot restrict the cone, so dropping it stays sound.
+        let src = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 reg_a
+4 init 1 3 2
+5 input 1 tgl
+6 next 1 3 5
+7 state 1 reg_b
+8 init 1 7 2
+9 next 1 7 2
+10 state 1 reg_c
+11 init 1 10 2
+12 next 1 10 2
+13 eq 1 7 10
+14 constraint 13
+15 bad 3
+"#;
+        let file = parser::parse(src).expect("parse");
+        let keep = state_cone_nids(&file, &["reg_a".to_string()]);
+        assert!(keep.contains(&3), "reg_a (nid 3) in cone; got {keep:?}");
+        assert!(
+            !keep.contains(&7) && !keep.contains(&10),
+            "a constraint over only out-of-cone registers must not pull them \
+             into the cone; got {keep:?}"
         );
     }
 

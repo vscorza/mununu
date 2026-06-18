@@ -1,0 +1,21 @@
+# charge_commit_to_btor2.ys — lower charge_commit.sv to BTOR2 via the real yosys frontend.
+#
+# Reproduces examples/hw/charge_commit.yosys.btor2 from examples/hw/charge_commit.sv.
+# The FORMAL define activates the clocked immediate assertion `safety_charged`,
+# which yosys lowers to a BTOR2 `bad` state (the obligation G(commit_en -> lvl>=6)).
+#
+#   $ yosys charge_commit_to_btor2.ys
+#   $ mununu btor2 cegar charge_commit.yosys.btor2 \
+#       --formula 'nu X. ([] X)' --predicate 'committed:phase=3' --predicate-source wp
+#
+# Tested with Yosys 0.59 (oss-cad-suite). sv2v is not required: yosys reads the
+# SystemVerilog directly with `-sv`. The dffunmap / async2sync / chformal -lower
+# sequence is the standard write_btor preparation for clocked formal properties.
+read_verilog -sv -formal -DFORMAL charge_commit.sv
+prep -top charge_commit -flatten
+async2sync
+chformal -lower
+memory -nomap
+opt -fast
+dffunmap
+write_btor charge_commit.yosys.btor2

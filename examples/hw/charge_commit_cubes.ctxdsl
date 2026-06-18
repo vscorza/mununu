@@ -1,0 +1,72 @@
+context charge_commit_cubes {
+    alphabet {
+        label req;
+        label pulse;
+        label fire;
+        label clr;
+        label tick;
+    }
+
+    automata {
+        automaton Cubes {
+            controllable {
+                label fire;
+            }
+            internal {
+                label tick;
+            }
+
+            states {
+                state Filling initial {
+                    valuations { committed = 0; charged = 0; half = 0; lvl = 0; }
+                };
+                state HalfCharged {
+                    valuations { committed = 0; charged = 0; half = 1; lvl = 4; }
+                };
+                state Charged {
+                    valuations { committed = 0; charged = 1; half = 1; lvl = 6; }
+                };
+                state Committed {
+                    valuations { committed = 1; charged = 1; half = 1; lvl = 6; }
+                };
+                state BadCommit {
+                    valuations { committed = 1; charged = 0; half = 0; lvl = 0; }
+                };
+            }
+
+            transitions {
+                transition Filling -> Filling on label req;
+                transition Filling -> HalfCharged on label pulse;
+                transition HalfCharged -> Charged on label pulse;
+                transition Charged -> Charged on label tick;
+                transition Charged -> Committed on label fire;
+                transition Committed -> Filling on label clr;
+                transition BadCommit -> BadCommit on label tick;
+            }
+
+            predicates {
+                predicate good_commit = state Committed;
+                predicate bad_commit  = state BadCommit;
+            }
+        }
+    }
+
+    mu_formulas {
+        formula commit_reachable {
+            over Cubes;
+            body = mu X. (Committed || <> X);
+        }
+        formula bad_commit_reachable {
+            over Cubes;
+            body = mu X. (BadCommit || <> X);
+        }
+        formula fire_implies_committed {
+            over Cubes;
+            body = nu X. ([ labels = { fire } ] Committed && [] X);
+        }
+        formula safety_invariant {
+            over Cubes;
+            body = nu X. ([] X);
+        }
+    }
+}

@@ -15,7 +15,7 @@ Use this doc when:
 
 ## The canonical recipe — KMTS predicates
 
-> **Status (2026-05-21).** The KMTS pipeline is the **canonical recipe** for SystemVerilog and BTOR2 extraction. Other adapters (XState, microcode, agentic, hand-written CTXDSL) continue to use the legacy primitives (§"Legacy primitives" below) and produce Sharp-everywhere KMTSes vacuously. Architecture: [`docs/design/native-sv-abstraction.md`](design/native-sv-abstraction.md). Theory: [`docs/design/kmts-theory.md`](design/kmts-theory.md). Practical recipe: [`docs/design/predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md).
+> **Status (2026-05-21).** The KMTS pipeline is the **canonical recipe** for SystemVerilog and BTOR2 extraction. Other adapters (XState, microcode, agentic, hand-written CTXDSL) continue to use the legacy primitives (§"Legacy primitives" below) and produce Sharp-everywhere KMTSes vacuously. Architecture: [`docs/design/native-sv-abstraction.md`](design/native-sv-abstraction.md). Theory: [`docs/design/kmts-theory.md`](design/kmts-theory.md). Practical recipe: [`docs/design/predicate-abstraction-recipe.md`](design/predicate-abstraction-recipe.md). Worked example (RTL → BTOR2 → coarse `KleeneBot` → Craig interpolant → refined `KleeneT`): [`docs/design/predicate-abstraction-worked-example.md`](design/predicate-abstraction-worked-example.md).
 
 The canonical recipe has four moving parts: a **predicate set** that partitions the abstract state space, a **modality** that captures the may/must distinction on each transition, a **3-valued evaluator** that returns `KleeneT / KleeneF / KleeneBot`, and a **CEGAR refinement loop** that responds to `KleeneBot` verdicts by adding predicates.
 

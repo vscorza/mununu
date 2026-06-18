@@ -46,6 +46,9 @@ secrets.toml
 bench_results/
 /.mununu_dsl_debug/
 
+# Generated verify-example build output (CEGAR run artifacts, etc.)
+examples/verify/**/build/
+
 # Reproducible-experiments scaffold: target/test-fixtures/ holds canonical
 # CLTS fixtures rebuilt from seeds, and per-EXP bench stdout is captured
 # alongside the criterion archive but the live run log shouldn't be tracked.
