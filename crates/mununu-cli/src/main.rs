@@ -862,6 +862,32 @@ enum SvCommand {
     /// when --output-dir is omitted. Also prints the per-submodule
     /// state-count / property-count summary to stdout.
     EmitBtor2PerModule(SvEmitBtor2PerModuleArgs),
+    /// Validate a `.mununu.json` sidecar (sidecar-audit C0.2).
+    ///
+    /// Runs the same load-time lint the CLI / API / verify paths apply
+    /// automatically (C0.1): hard-fails on a removed `$schema`, warns on
+    /// unknown fields at the root / signals[] / inputs[] / properties[]
+    /// levels (a likely typo that would otherwise deserialize to a serde
+    /// default), and tolerates `$`/`_`-prefixed comment keys. This is the
+    /// standalone way to check a sidecar without running a full extraction.
+    ///
+    /// surface: CLI-only — a developer convenience that surfaces the
+    /// shared `lint_annotation_json` check; that check already runs on
+    /// every sidecar load across CLI + API + verify, so the *capability*
+    /// is on all surfaces. The API/UI validation peer lands with the C2.2
+    /// sidecar-editor panel where it has a consumer.
+    Validate(SvValidateArgs),
+}
+
+#[derive(Args, Debug)]
+struct SvValidateArgs {
+    /// Path to the `.mununu.json` sidecar to validate.
+    #[arg(value_name = "SIDECAR")]
+    sidecar: PathBuf,
+    /// Treat warnings (unknown fields, unrecognized `$schema`) as errors —
+    /// exit non-zero if any are found. Default: warnings print but exit 0.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Args, Debug)]
@@ -3024,7 +3050,53 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
     match command {
         SvCommand::Preprocess(args) => sv_preprocess(args),
         SvCommand::EmitBtor2PerModule(args) => sv_emit_btor2_per_module(args),
+        SvCommand::Validate(args) => sv_validate(args),
     }
+}
+
+/// `mununu sv validate <SIDECAR>` — sidecar-audit C0.2.
+///
+/// Surfaces the shared C0.1 load-time lint
+/// ([`mununu_core::adapter::systemverilog::annotation::lint_annotation_json`])
+/// as a standalone check: hard-fails on a removed `$schema`, reports unknown
+/// fields (typo guard), and confirms the sidecar deserializes. `--strict`
+/// turns warnings into a non-zero exit.
+fn sv_validate(args: SvValidateArgs) -> Result<(), String> {
+    use mununu_core::adapter::systemverilog::annotation;
+
+    let label = args.sidecar.display().to_string();
+    let content = std::fs::read_to_string(&args.sidecar)
+        .map_err(|e| format!("failed to read sidecar '{label}': {e}"))?;
+
+    // Lint first — this is the hard-fail (removed `$schema`) + warnings path.
+    let warnings = annotation::lint_annotation_json(&content, &label)?;
+
+    // Then confirm it actually deserializes into the sidecar model (catches
+    // type errors the key-level lint does not, e.g. a string where an int
+    // is expected).
+    serde_json::from_str::<annotation::SvAnnotation>(&content)
+        .map_err(|e| format!("sidecar '{label}': failed to parse — {e}"))?;
+
+    if warnings.is_empty() {
+        println!("OK: sidecar '{label}' is valid (no warnings).");
+        return Ok(());
+    }
+
+    eprintln!("{} warning(s) for sidecar '{label}':", warnings.len());
+    for w in &warnings {
+        eprintln!("  - {w}");
+    }
+    if args.strict {
+        return Err(format!(
+            "{} warning(s) found and --strict was set",
+            warnings.len()
+        ));
+    }
+    println!(
+        "sidecar '{label}' loaded with {} warning(s) (re-run with --strict to fail on them).",
+        warnings.len()
+    );
+    Ok(())
 }
 
 fn sv_emit_btor2_per_module(args: SvEmitBtor2PerModuleArgs) -> Result<(), String> {
@@ -4887,5 +4959,78 @@ mod vacuity_warning_tests {
                 "did not expect vacuity warning for {n}-state model",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sv_validate_tests {
+    //! C0.2 `mununu sv validate` glue. The lint core is unit-tested in
+    //! `annotation::tests` (C0.1); these cover the exit-code / `--strict`
+    //! wiring of the command.
+    use super::{SvValidateArgs, sv_validate};
+    use std::io::Write;
+
+    fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("mununu_sv_validate_{name}.mununu.json"));
+        std::fs::File::create(&p)
+            .and_then(|mut f| f.write_all(body.as_bytes()))
+            .expect("write temp sidecar");
+        p
+    }
+
+    #[test]
+    fn clean_sidecar_is_ok() {
+        let p = write_tmp(
+            "clean",
+            r#"{"$schema":"mununu_sv_annotation_v1","module":"m"}"#,
+        );
+        let r = sv_validate(SvValidateArgs {
+            sidecar: p.clone(),
+            strict: false,
+        });
+        let _ = std::fs::remove_file(&p);
+        assert!(r.is_ok(), "clean sidecar should validate: {r:?}");
+    }
+
+    #[test]
+    fn typo_warns_but_passes_without_strict() {
+        let p = write_tmp(
+            "typo_lenient",
+            r#"{"$schema":"mununu_sv_annotation_v1","module":"m","signals":[{"name":"x","abstration":"boolean"}]}"#,
+        );
+        let r = sv_validate(SvValidateArgs {
+            sidecar: p.clone(),
+            strict: false,
+        });
+        let _ = std::fs::remove_file(&p);
+        assert!(r.is_ok(), "a typo warns but does not fail without --strict");
+    }
+
+    #[test]
+    fn typo_fails_under_strict() {
+        let p = write_tmp(
+            "typo_strict",
+            r#"{"$schema":"mununu_sv_annotation_v1","module":"m","signals":[{"name":"x","abstration":"boolean"}]}"#,
+        );
+        let r = sv_validate(SvValidateArgs {
+            sidecar: p.clone(),
+            strict: true,
+        });
+        let _ = std::fs::remove_file(&p);
+        assert!(r.is_err(), "--strict must fail on an unknown-field warning");
+    }
+
+    #[test]
+    fn removed_schema_hard_fails_even_without_strict() {
+        let p = write_tmp(
+            "removed",
+            r#"{"$schema":"mununu_sv_multi_v1","module":"m"}"#,
+        );
+        let r = sv_validate(SvValidateArgs {
+            sidecar: p.clone(),
+            strict: false,
+        });
+        let _ = std::fs::remove_file(&p);
+        assert!(r.is_err(), "a removed `$schema` must hard-fail");
     }
 }
