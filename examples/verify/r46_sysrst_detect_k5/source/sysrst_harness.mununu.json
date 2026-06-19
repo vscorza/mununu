@@ -1,0 +1,11 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "sysrst_harness",
+  "signals": [
+    { "name": "u_det0.cnt_q", "abstraction": "bounded_counter", "bound": 7 },
+    { "name": "u_det1.cnt_q", "abstraction": "bounded_counter", "bound": 7 },
+    { "name": "u_det2.cnt_q", "abstraction": "bounded_counter", "bound": 7 },
+    { "name": "u_det3.cnt_q", "abstraction": "bounded_counter", "bound": 7 },
+    { "name": "u_det4.cnt_q", "abstraction": "bounded_counter", "bound": 7 }
+  ]
+}
