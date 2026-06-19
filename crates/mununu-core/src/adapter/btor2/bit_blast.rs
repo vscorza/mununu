@@ -442,6 +442,13 @@ pub fn to_ir(
 > {
     let mut warnings = Vec::new();
 
+    // C1.3 (sidecar Phase 1) — warn for sidecar `signals[]` entries whose
+    // name (or `drives` override) matches no state cell. Runs HERE, against
+    // the original full `file` BEFORE the cone-slice rebinding below, so a
+    // name that resolves in the whole circuit but is later sliced out of a
+    // per-cluster cone does NOT warn — only genuine non-matches do.
+    warn_unmatched_sidecar_signals(file, options, &mut warnings);
+
     // R46-1/R46-2 (R.4.6) — cone restriction by SLICING. When the caller
     // (or the per-cluster fallback) requests a cone restriction, replace
     // the design with the exact sub-circuit its property atoms depend on:
@@ -1301,6 +1308,62 @@ fn enrich_symbols_with_sidecar_drives(
         }
     }
     out
+}
+
+/// C1.3 (sidecar Phase 1) — warn for each sidecar `signals[]` entry
+/// whose resolved target (the `drives` override, falling back to
+/// `name`) matches no state cell in the BTOR2.
+///
+/// Such an entry is a silent no-op today:
+/// [`enrich_symbols_with_sidecar_drives`],
+/// [`sidecar_state_value_counts`], and the `sidecar_effective_state_bits`
+/// accounting all skip names that [`parser::resolve_state_by_symbol`]
+/// cannot resolve. So a mistyped dotted name — the common error when
+/// hand-editing a `mununu sv discover` skeleton — declares an
+/// abstraction that never takes effect, and the lift proceeds as if the
+/// entry were absent. The warning names the offending entry and points
+/// the user back at `mununu sv discover` for the real post-flatten cell
+/// names.
+///
+/// Absent / unparseable sidecar JSON is skipped silently here — the
+/// load-time lint ([`crate::adapter::systemverilog::annotation::lint_annotation_json`])
+/// owns malformed-sidecar diagnostics; this pass only catches
+/// well-formed entries that point at nothing.
+fn warn_unmatched_sidecar_signals(
+    file: &Btor2File,
+    options: &AdapterOptions,
+    warnings: &mut Vec<AdapterWarning>,
+) {
+    let Some(json) = &options.sidecar_json else {
+        return;
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return;
+    };
+    for sig in &ann.signals {
+        let target = sig.drives.as_deref().unwrap_or(sig.name.as_str());
+        if parser::resolve_state_by_symbol(file, target).is_some() {
+            continue;
+        }
+        let drives_note = if sig.drives.is_some() {
+            format!(" (drives = \"{target}\")")
+        } else {
+            String::new()
+        };
+        warnings.push(AdapterWarning {
+            kind: WarningKind::UnsupportedConstruct,
+            message: format!(
+                "sidecar signal \"{}\"{} matched no state cell in the BTOR2 — its declared \
+                 abstraction has no effect. Check the name against the design; \
+                 `mununu sv discover` prints the real post-flatten cell names (dotted per \
+                 instance, e.g. `u_inst.reg_q`).",
+                sig.name, drives_note
+            ),
+            location: None,
+        });
+    }
 }
 
 /// §Phase 10 §10.2 stage 1 — metadata for one memory state cell
@@ -6161,6 +6224,90 @@ mod tests {
         assert!(
             !ctxdsl.contains("drop_1"),
             "drop should be pinned to 0; ctxdsl was:\n{ctxdsl}"
+        );
+    }
+
+    #[test]
+    fn c1_3_unmatched_sidecar_signal_name_warns() {
+        // C1.3 — a sidecar `signals[]` entry whose name matches no
+        // state cell is a silent no-op today. The warning catches the
+        // mistyped-dotted-name case (the common error when editing a
+        // `mununu sv discover` skeleton).
+        let src = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n";
+        let file = parser::parse(src).expect("parse");
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [
+                { "name": "nonexistent_reg", "abstraction": "ignored" },
+            ],
+        })
+        .to_string();
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar),
+            ..Default::default()
+        };
+        let (_ir, warnings, _summary) = to_ir(&file, &opts).expect("translate");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("nonexistent_reg")
+                    && w.message.contains("matched no state cell")),
+            "expected an unmatched-sidecar-signal warning; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn c1_3_matched_sidecar_signal_name_does_not_warn() {
+        // The mirror: a name that DOES resolve to a state cell must not
+        // trip the unmatched-name warning.
+        let src = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n";
+        let file = parser::parse(src).expect("parse");
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [
+                { "name": "q", "abstraction": "boolean" },
+            ],
+        })
+        .to_string();
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar),
+            ..Default::default()
+        };
+        let (_ir, warnings, _summary) = to_ir(&file, &opts).expect("translate");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.message.contains("matched no state cell")),
+            "matched signal must not warn; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn c1_3_unmatched_sidecar_signal_via_drives_warns() {
+        // When `drives` is the resolution target, the warning names both
+        // the sidecar entry and the unresolved `drives` value.
+        let src = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n";
+        let file = parser::parse(src).expect("parse");
+        let sidecar = serde_json::json!({
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "demo",
+            "signals": [
+                { "name": "alias", "drives": "ghost", "abstraction": "ignored" },
+            ],
+        })
+        .to_string();
+        let opts = AdapterOptions {
+            sidecar_json: Some(sidecar),
+            ..Default::default()
+        };
+        let (_ir, warnings, _summary) = to_ir(&file, &opts).expect("translate");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("alias") && w.message.contains("drives = \"ghost\"")),
+            "expected drives-note in warning; got {warnings:?}"
         );
     }
 
