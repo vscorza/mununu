@@ -1694,37 +1694,20 @@ pub fn predicate_cube_lift(
                     "adapter/btor2/predicate_cube_lift MIG-3.2: label intern failed: {e}"
                 ),
             })?;
-        let n_cubes = state_ids.len();
-        let cfg = z3::Config::new();
-        let may_edges: Vec<(usize, usize)> = z3::with_z3_config(&cfg, || {
-            let view = match encode_design_for_lift(&file) {
-                Ok(v) => v,
-                // Encoder can't build the view (e.g. an unsupported op):
-                // fall back to no may-edges rather than an unsound guess.
-                Err(_) => return Vec::new(),
-            };
-            let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-            let mut edges = Vec::new();
-            for i in 0..n_cubes {
-                for j in 0..n_cubes {
-                    let verdict = crate::adapter::btor2::smt_must_edge::smt_per_target_may_check(
-                        &view,
-                        i as u64,
-                        j as u64,
-                        &predicates,
-                        &nid_map,
-                        5_000,
-                    );
-                    if matches!(
-                        verdict,
-                        crate::adapter::btor2::smt_must_edge::SmtMayVerdict::May
-                    ) {
-                        edges.push((i, j));
-                    }
-                }
-            }
-            edges
-        });
+        // P1 #2 (IR-unification track) — consume the STS-IR seam's
+        // batched `SmtEncode::may_edges` instead of re-inlining the
+        // `encode_design_for_lift` → `build_register_nid_map` →
+        // all-pairs `smt_per_target_may_check` Z3 loop here. The seam
+        // wraps the identical memory-aware encode, the same cube
+        // encoding (indices `0..2^|P|`), the same per-pair may-check, and
+        // the same "no edges on encoder error" fallback — so this is
+        // behaviour-preserving and de-dups the inlined loop onto the
+        // single seam implementation `predicate_cube_lift` now shares
+        // with `BtorSts::may_edges` and the lazy must-edge passes.
+        let may_edges: Vec<(usize, usize)> = {
+            use crate::adapter::sts_ir::{BtorSts, SmtEncode};
+            BtorSts::new(&file).may_edges(&predicates, 5_000)
+        };
         for (i, j) in may_edges {
             builder.transition_ids_with_modality(
                 state_ids[i],
