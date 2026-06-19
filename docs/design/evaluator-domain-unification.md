@@ -1,8 +1,17 @@
 # Evaluator unification over a bulk `Domain` trait (IR-track P2)
 
 > Status: planning (IR-unification track, P2). Design note; the implementation lands in
-> P2.2 (rewire 2v, perf-gated) → P2.3 (rewire 3v) → P2.4 (retire the dead per-element
-> `truth_domain`). Companion: `docs/design/sts-ir.md` (P0/P1), `docs/design/kmts-theory.md` §4.
+> P2.2 (rewire 2v, perf-gated — **SHIPPED 2026-06-19**) → P2.3 (rewire 3v) → P2.4 (retire the
+> dead per-element `truth_domain`). Companion: `docs/design/sts-ir.md` (P0/P1),
+> `docs/design/kmts-theory.md` §4.
+>
+> **P2.2 shipped notes.** The trait is named `EvalDomain` (private) with markers `BoolDom` /
+> `KleeneDom`. It lives in `evaluator.rs` **co-located with `EvalContext`**, not in a separate
+> `domain.rs` — the ctx-dependent trait methods (`modal_image`, `memo_*`, `top`/`bottom`/`not`)
+> call `EvalContext`'s private methods, so a separate module would force exposing ~10 internals
+> crate-wide; encapsulation won over the file-name suggestion below. Gate met: 2083/2083 crate
+> tests pass (verdict-equivalence) + criterion "No change in performance detected" on
+> `mu_calculus_evaluate` |S|=2048 and |S|=8192. Record: `.claude/plans/measurements/P2-2-2026-06-19.md`.
 
 ## 1. Why
 
@@ -63,7 +72,11 @@ The genuine divergences a single body must reconcile are narrow:
 ## 3. The `Domain` trait (bulk; one generic body over it)
 
 ```rust
-// crates/mununu-core/src/mu_calculus/domain.rs  (NEW, P2.2)
+// As shipped: in crates/mununu-core/src/mu_calculus/evaluator.rs (P2.2),
+// co-located with EvalContext (NOT a separate domain.rs — see the status note
+// at the top of this file). The trait is private and named `EvalDomain`;
+// constructors (`top`/`bottom`/`from_predicate`/`from_binding`) take `&EvalContext`
+// so each impl reads the masks/state-count it needs.
 //
 // `Valuation` is the whole-state-set representation. The generic
 // `eval_node_generic<D: Domain>` is monomorphised to BitVec (Bool) and
@@ -111,9 +124,9 @@ struct BoolDom;    // Valuation = BitVec<usize, Lsb0>
 struct KleeneDom;  // Valuation = TritSet
 ```
 
-> Naming: the new marker types are `BoolDom` / `KleeneDom` (or the trait is named `EvalDomain`)
-> to avoid collision with both the dead `truth_domain::{BoolDomain, KleeneDomain}` (retired in
-> P2.4) and the unrelated `abstraction::domains::BoolDomain`. Final names chosen at P2.2.
+> Naming (final, P2.2): the trait is `EvalDomain`; the markers are `BoolDom` / `KleeneDom`.
+> This avoids collision with both the dead `truth_domain::{BoolDomain, KleeneDomain}` (retired in
+> P2.4) and the unrelated `abstraction::domains::BoolDomain`.
 
 ### Generic body — the 9 `Node` arms
 
@@ -152,7 +165,7 @@ The existing `eval_node` / `eval_node_tri` become thin wrappers:
 | Step | Scope | Gate |
 |---|---|---|
 | **P2.1** (this note) | Design: the `Domain` trait, the generic-body sketch, the divergence-handlers, the decomposition. | — |
-| **P2.2** | Define `Domain` + `BoolDom` (Valuation = BitVec) + `eval_node_generic` + `eval_fixpoint_generic`; rewire `eval_node`/`eval_fixpoint` to delegate to `::<BoolDom>`. `eval_node_tri` untouched. | **HARD zero-perf-regression** on `benches/mu_calculus.rs` `mu_calculus_evaluate` (|S|=2048/8192, the BitVec hot path) + full `cargo test -p mununu-core` verdict-equivalence. |
+| **P2.2** ✅ SHIPPED | Defined `EvalDomain` + `BoolDom` (Valuation = BitVec) + `eval_node_generic` + `eval_fixpoint_generic`; rewired `eval_node`/`eval_fixpoint` to delegate to `::<BoolDom>`; deleted the now-dead `bitwise_{and,or,not}` / `variable_bits` (→ `BoolDom` ops) + the standalone `eval_fixpoint`; `eval_modal` → `eval_modal_with_target_set`. `eval_node_tri` untouched. | **PASSED.** `cargo test -p mununu-core` = 2083/2083 (verdict-equivalence); criterion `mu_calculus_evaluate` |S|=2048 (+0.80%, p=0.09) and |S|=8192 (−1.64%, p=0.45) both "No change in performance detected". |
 | **P2.3** | `KleeneDom` (Valuation = TritSet) + rewire `eval_node_tri`/`eval_fixpoint_tri` to `::<KleeneDom>`; delete the old hand-written 3v body. | Trit benches (`trit_eval_shared_subexpr`, `trit_eval_modal_dense`, `trit_fixpoint_invariant_subterm`) no regression + `r3_kleene_baseline` projection invariant + full suite. |
 | **P2.4** | Retire the dead per-element `truth_domain` module (`TruthDomain`/`BoolDomain`/`KleeneDomain` + tests); update `docs/design/native-sv-abstraction.md` §6.4 + `kmts-theory.md` §4 anchors to point at the bulk `Domain`. | `cargo test` + `/docs-traceability`. |
 

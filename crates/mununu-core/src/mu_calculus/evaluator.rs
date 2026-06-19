@@ -1044,109 +1044,357 @@ where
     bits
 }
 
+/// IR-track P2.2 — the bulk evaluation domain.
+///
+/// `EvalDomain` is the seam that lets a single generic evaluator body
+/// ([`EvalContext::eval_node_generic`] / [`EvalContext::eval_fixpoint_generic`])
+/// serve both the 2-valued (`BitVec`) and — once P2.3 lands `KleeneDom` — the
+/// 3-valued (`TritSet`) model-checking paths. The associated `Valuation` is the
+/// WHOLE-state-set representation (not a per-element value): `BitVec` for
+/// [`BoolDom`], `TritSet` for the future `KleeneDom`. Bulk-bitwise ops
+/// monomorphise verbatim, so the `BoolDom` instantiation preserves today's hot
+/// loop (the P2.2 HARD zero-perf-regression gate).
+///
+/// This is deliberately NOT the per-element `mu_calculus::truth_domain` trait
+/// (a dead R.1 design artifact the R.3 evaluator bypassed; retired in P2.4) —
+/// routing the bulk evaluator through `Vec<Element>` per-state loops would gut
+/// the BitVec hot path. See [`docs/design/evaluator-domain-unification.md`].
+trait EvalDomain {
+    /// Whole-state-set representation (`BitVec` for `BoolDom`).
+    type Valuation: Clone;
+
+    /// `true` ⇒ the generic body consults the memoisation cache (2-valued
+    /// only). A compile-time const so the 3-valued monomorphisation drops the
+    /// memo branch entirely (no trit memo — design-note §5).
+    const MEMOISED: bool;
+
+    // --- lattice corners + lifts (OOB-aware via ctx) ---
+
+    /// All-True (`Node::True` + ν/Greatest fixpoint init). OOB-aware: the OOB
+    /// sink is held at bottom (2v) / Unknown (3v).
+    fn top<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation;
+    /// All-False (`Node::False` + μ/Least fixpoint init).
+    fn bottom<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation;
+    /// Lift the shared `predicate_bits` output (already OOB-masked) into a
+    /// `Valuation` (identity for 2v; `TritSet::from_predicate` for 3v).
+    fn from_predicate<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        bits: BitVec<usize, Lsb0>,
+    ) -> Self::Valuation;
+    /// Bound fixpoint-variable lookup: the binding's value if present, else
+    /// `bottom`.
+    fn from_binding<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        bound: Option<&Self::Valuation>,
+    ) -> Self::Valuation;
+
+    // --- boolean ops ---
+
+    /// Negation. Absorbs the divergence: 2v complements + re-masks OOB-as-
+    /// bottom; 3v (P2.3) swaps must/may.
+    fn not<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        v: Self::Valuation,
+    ) -> Self::Valuation;
+    /// Conjunction. Consumes `a` (always a freshly-owned valuation) to avoid a
+    /// clone; reads `b` by reference (design-note §5 clone discipline).
+    fn and(a: Self::Valuation, b: &Self::Valuation) -> Self::Valuation;
+    /// Disjunction. Same clone discipline as `and`.
+    fn or(a: Self::Valuation, b: &Self::Valuation) -> Self::Valuation;
+
+    // --- modal step (whole-valuation; impl owns filter dispatch + witnessing) ---
+
+    /// Modal pre-image over an already-evaluated `target`. The 2v impl makes a
+    /// single witness-recording pass (`All` filter); the 3v impl (P2.3) makes
+    /// the two filtered passes (`must`/`may`) and recombines.
+    fn modal_image<S: IdStorage, L: IdStorage>(
+        ctx: &mut EvalContext<'_, S, L>,
+        kind: ModalKind,
+        guard: &Guard,
+        target: &Self::Valuation,
+        modal_node_id: NodeId,
+    ) -> Result<Self::Valuation, EvaluationError>;
+
+    // --- fixpoint support ---
+
+    /// Convergence test (`==` for both representations).
+    fn fixpoint_eq(a: &Self::Valuation, b: &Self::Valuation) -> bool;
+    /// Seed the iterate from a prior approximant (R.5 reuse). 2v reads only
+    /// `must_true`; 3v (P2.3) builds a `(must, may)` `TritSet`.
+    fn seed_from_prior(pa: &PriorApproximant, kind: FixpointKind) -> Option<Self::Valuation>;
+    /// Definite-true bit-set of a valuation (for the convergence callback's
+    /// [`ApproximantView`]). 2v: the valuation itself; 3v: its `must` half.
+    fn must_view(v: &Self::Valuation) -> &EvalResult;
+    /// May-true bit-set of a valuation. 2v: the valuation itself; 3v: its `may`
+    /// half.
+    fn may_view(v: &Self::Valuation) -> &EvalResult;
+    /// Record per-state fixpoint iteration ranks (2v strategy witnesses).
+    /// No-op default for the 3v path (witnesses are meaningless under Kleene).
+    fn record_iteration_ranks<S: IdStorage, L: IdStorage>(
+        _ctx: &mut EvalContext<'_, S, L>,
+        _var: FormulaVarId,
+        _prev: &Self::Valuation,
+        _next: &Self::Valuation,
+        _iteration: usize,
+    ) {
+    }
+
+    // --- memoisation (2v only; `MEMOISED` const-gates the call sites) ---
+
+    fn memo_get<S: IdStorage, L: IdStorage>(
+        _ctx: &EvalContext<'_, S, L>,
+        _node: NodeId,
+    ) -> Option<Self::Valuation> {
+        None
+    }
+    fn memo_store<S: IdStorage, L: IdStorage>(
+        _ctx: &mut EvalContext<'_, S, L>,
+        _node: NodeId,
+        _v: &Self::Valuation,
+    ) {
+    }
+}
+
+/// 2-valued (`BitVec`) evaluation domain. Every op preserves the exact bits the
+/// pre-P2.2 `eval_node` produced; the only deltas are removed redundant clones
+/// (the `and`/`or`/fixpoint paths consume the freshly-owned LHS instead of
+/// re-cloning it), which can only lower allocation pressure — never change a
+/// verdict.
+struct BoolDom;
+
+impl EvalDomain for BoolDom {
+    type Valuation = BitVec<usize, Lsb0>;
+    const MEMOISED: bool = true;
+
+    #[inline]
+    fn top<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation {
+        // == alloc_bitvec(true): all-true minus the OOB sink (OOB-as-bottom).
+        let mut bits = BitVec::repeat(true, ctx.env.state_count());
+        bits.bitand_assign(ctx.not_oob_bits.as_bitslice());
+        bits
+    }
+
+    #[inline]
+    fn bottom<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation {
+        // == alloc_bitvec(false).
+        BitVec::repeat(false, ctx.env.state_count())
+    }
+
+    #[inline]
+    fn from_predicate<S: IdStorage, L: IdStorage>(
+        _ctx: &EvalContext<'_, S, L>,
+        bits: BitVec<usize, Lsb0>,
+    ) -> Self::Valuation {
+        // `predicate_bits` already applied the OOB mask — identity here.
+        bits
+    }
+
+    #[inline]
+    fn from_binding<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        bound: Option<&Self::Valuation>,
+    ) -> Self::Valuation {
+        // == variable_bits: bound value if present, else empty.
+        match bound {
+            Some(v) => v.clone(),
+            None => BitVec::repeat(false, ctx.env.state_count()),
+        }
+    }
+
+    #[inline]
+    fn not<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        input: Self::Valuation,
+    ) -> Self::Valuation {
+        // == bitwise_not: per-bit complement, then re-mask OOB-as-bottom so
+        // ¬P does not spuriously satisfy at the OOB sink.
+        let mut result = BitVec::repeat(false, ctx.env.state_count());
+        for (mut out, value) in result.iter_mut().zip(input.iter()) {
+            out.set(!*value);
+        }
+        result.bitand_assign(ctx.not_oob_bits.as_bitslice());
+        result
+    }
+
+    #[inline]
+    fn and(mut a: Self::Valuation, b: &Self::Valuation) -> Self::Valuation {
+        a.as_mut_bitslice().bitand_assign(b.as_bitslice());
+        a
+    }
+
+    #[inline]
+    fn or(mut a: Self::Valuation, b: &Self::Valuation) -> Self::Valuation {
+        a.as_mut_bitslice().bitor_assign(b.as_bitslice());
+        a
+    }
+
+    #[inline]
+    fn modal_image<S: IdStorage, L: IdStorage>(
+        ctx: &mut EvalContext<'_, S, L>,
+        kind: ModalKind,
+        guard: &Guard,
+        target: &Self::Valuation,
+        modal_node_id: NodeId,
+    ) -> Result<Self::Valuation, EvaluationError> {
+        ctx.eval_modal_with_target_set(kind, guard, target, modal_node_id)
+    }
+
+    #[inline]
+    fn fixpoint_eq(a: &Self::Valuation, b: &Self::Valuation) -> bool {
+        a == b
+    }
+
+    #[inline]
+    fn seed_from_prior(pa: &PriorApproximant, _kind: FixpointKind) -> Option<Self::Valuation> {
+        // 2v reads only the definite-true bit-set (must ≡ may here).
+        Some(pa.must_true.clone())
+    }
+
+    #[inline]
+    fn must_view(v: &Self::Valuation) -> &EvalResult {
+        v
+    }
+
+    #[inline]
+    fn may_view(v: &Self::Valuation) -> &EvalResult {
+        v
+    }
+
+    fn record_iteration_ranks<S: IdStorage, L: IdStorage>(
+        ctx: &mut EvalContext<'_, S, L>,
+        var: FormulaVarId,
+        prev: &Self::Valuation,
+        next: &Self::Valuation,
+        iteration: usize,
+    ) {
+        // == the 2v fixpoint loop's strategy-witness recording: for each state
+        // newly entering the iterate, record its first-entry iteration rank.
+        if ctx.witness_map.is_some() {
+            let state_count = next.len();
+            for state_idx in 0..state_count {
+                let was_in = prev.get(state_idx).map(|b| *b).unwrap_or(false);
+                let now_in = next.get(state_idx).map(|b| *b).unwrap_or(false);
+                if now_in
+                    && !was_in
+                    && let Some(ref mut wm) = ctx.witness_map
+                {
+                    wm.iteration_ranks
+                        .record(var, state_idx, iteration, state_count);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn memo_get<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        node: NodeId,
+    ) -> Option<Self::Valuation> {
+        ctx.memo.get(&node)
+    }
+
+    #[inline]
+    fn memo_store<S: IdStorage, L: IdStorage>(
+        ctx: &mut EvalContext<'_, S, L>,
+        node: NodeId,
+        v: &Self::Valuation,
+    ) {
+        ctx.memo.insert(node, v);
+    }
+}
+
 impl<'a, S, L> EvalContext<'a, S, L>
 where
     S: IdStorage,
     L: IdStorage,
 {
+    /// 2-valued entry into the unified evaluator (BitVec hot path). Thin
+    /// wrapper over [`Self::eval_node_generic`] monomorphised to [`BoolDom`].
     fn eval_node(
         &mut self,
         node_id: NodeId,
         bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        let use_memo = self.options.use_memoisation && bindings.is_empty();
-        if use_memo && let Some(clone) = self.memo.get(&node_id) {
-            return Ok(clone);
+        self.eval_node_generic::<BoolDom>(node_id, bindings)
+    }
+
+    /// The single generic evaluator body, monomorphised per [`EvalDomain`].
+    /// `BoolDom` (2v BitVec) is the only instantiation in P2.2; `KleeneDom` (3v
+    /// TritSet) is wired here in P2.3, replacing the hand-written `eval_node_tri`.
+    fn eval_node_generic<D: EvalDomain>(
+        &mut self,
+        node_id: NodeId,
+        bindings: &HashMap<FormulaVarId, D::Valuation>,
+    ) -> Result<D::Valuation, EvaluationError> {
+        // `D::MEMOISED` is a const, so the whole memo path is dead-code-
+        // eliminated for non-memoised domains (the 3v path in P2.3).
+        let use_memo = D::MEMOISED && self.options.use_memoisation && bindings.is_empty();
+        if use_memo && let Some(hit) = D::memo_get(self, node_id) {
+            return Ok(hit);
         }
 
         let store_result = use_memo && !self.formula.node(node_id).is_fixpoint();
 
         let result = match self.formula.node(node_id) {
-            Node::True => self.alloc_bitvec(true)?,
-            Node::False => self.alloc_bitvec(false)?,
-            Node::Predicate(name) => self.predicate_bits(name)?,
-            Node::Variable(var) => self.variable_bits(var, bindings)?,
-            Node::Not(inner) => {
-                let bits = self.eval_node(*inner, bindings)?;
-                self.bitwise_not(bits)?
+            Node::True => D::top(self),
+            Node::False => D::bottom(self),
+            Node::Predicate(name) => {
+                let bits = self.predicate_bits(name)?;
+                D::from_predicate(self, bits)
             }
-            Node::And(left, right) => self.bitwise_and(*left, *right, bindings)?,
-            Node::Or(left, right) => self.bitwise_or(*left, *right, bindings)?,
+            Node::Variable(var) => D::from_binding(self, bindings.get(var)),
+            Node::Not(inner) => {
+                let inner_val = self.eval_node_generic::<D>(*inner, bindings)?;
+                D::not(self, inner_val)
+            }
+            Node::And(left, right) => {
+                let l = self.eval_node_generic::<D>(*left, bindings)?;
+                let r = self.eval_node_generic::<D>(*right, bindings)?;
+                D::and(l, &r)
+            }
+            Node::Or(left, right) => {
+                let l = self.eval_node_generic::<D>(*left, bindings)?;
+                let r = self.eval_node_generic::<D>(*right, bindings)?;
+                D::or(l, &r)
+            }
             Node::Modal {
                 kind,
                 guard,
                 target,
-            } => self.eval_modal(*kind, guard, *target, bindings, node_id)?,
+            } => {
+                let target_val = self.eval_node_generic::<D>(*target, bindings)?;
+                D::modal_image(self, *kind, guard, &target_val, node_id)?
+            }
             Node::Mu { var, body } => {
-                self.eval_fixpoint(*var, *body, FixpointKind::Least, bindings)?
+                self.eval_fixpoint_generic::<D>(*var, *body, FixpointKind::Least, bindings)?
             }
             Node::Nu { var, body } => {
-                self.eval_fixpoint(*var, *body, FixpointKind::Greatest, bindings)?
+                self.eval_fixpoint_generic::<D>(*var, *body, FixpointKind::Greatest, bindings)?
             }
         };
 
         if store_result {
-            self.memo.insert(node_id, &result);
+            D::memo_store(self, node_id, &result);
         }
 
         Ok(result)
     }
 
-    fn bitwise_not(
-        &mut self,
-        input: BitVec<usize, Lsb0>,
-    ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        let mut result = self.alloc_bitvec(false)?;
-        for (mut out, value) in result.iter_mut().zip(input.iter()) {
-            out.set(!value);
-        }
-        // OOB-as-bottom invariant: bitwise_not flips OOB to true if the input had
-        // OOB cleared. Re-mask so OOB stays bottom under negation (avoids the
-        // polarity bug where !P would satisfy at OOB but P would not).
-        result.bitand_assign(self.not_oob_bits.as_bitslice());
-        Ok(result)
-    }
-
-    fn bitwise_and(
-        &mut self,
-        left: NodeId,
-        right: NodeId,
-        bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
-    ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        let lhs = self.eval_node(left, bindings)?;
-        let rhs = self.eval_node(right, bindings)?;
-
-        // Clone lhs before modifying to avoid corrupting cached or reused bitsets
-        let mut result = self.clone_bitvec(&lhs)?;
-        result.as_mut_bitslice().bitand_assign(rhs.as_bitslice());
-        Ok(result)
-    }
-
-    fn bitwise_or(
-        &mut self,
-        left: NodeId,
-        right: NodeId,
-        bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
-    ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        let lhs = self.eval_node(left, bindings)?;
-        let rhs = self.eval_node(right, bindings)?;
-        // Clone lhs before modifying to avoid corrupting cached or reused bitsets
-        let mut result = self.clone_bitvec(&lhs)?;
-        result.as_mut_bitslice().bitor_assign(rhs.as_bitslice());
-        Ok(result)
-    }
-
-    fn eval_modal(
+    /// Modal pre-image over an already-evaluated `target_set` (the BitVec hot
+    /// path; called via [`BoolDom::modal_image`]). The target is evaluated by
+    /// the generic body and passed in by reference. Single pass over states
+    /// with the `All` modality filter + Diamond witness recording. The
+    /// 3-valued path uses [`Self::modal_bits_from_target`] instead (two
+    /// filtered passes — must/may).
+    fn eval_modal_with_target_set(
         &mut self,
         kind: ModalKind,
         guard: &Guard,
-        target: NodeId,
-        bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
+        target_set: &BitVec<usize, Lsb0>,
         modal_node_id: NodeId,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        let target_set = self.eval_node(target, bindings)?;
         if let Some(bound) = guard.max_steps {
-            return self.eval_modal_bounded(kind, guard, &target_set, bound);
+            return self.eval_modal_bounded(kind, guard, target_set, bound);
         }
 
         let mut result = self.alloc_bitvec(false)?;
@@ -1161,7 +1409,7 @@ where
                 ModalKind::Diamond => self.modal_exists(
                     state,
                     guard,
-                    &target_set,
+                    target_set,
                     guard_parts.as_deref(),
                     modal_node_id,
                     // R.6.3 — the 2-valued path always passes
@@ -1172,7 +1420,7 @@ where
                 ModalKind::Box => self.modal_forall(
                     state,
                     guard,
-                    &target_set,
+                    target_set,
                     guard_parts.as_deref(),
                     modal_node_id,
                     TransitionModalityFilter::All,
@@ -1187,7 +1435,7 @@ where
                     // witnessed by ANY t ∈ T in target_set (any-coverage).
                     for (idx, transition) in self.clts.outgoing(state).iter().enumerate() {
                         if self.guard_matches(state, transition, guard)
-                            && transition_target_in_set_diamond(transition, &target_set)
+                            && transition_target_in_set_diamond(transition, target_set)
                         {
                             if let Some(ref mut wm) = self.witness_map {
                                 wm.witnesses.insert((state.index(), modal_node_id), idx);
@@ -2239,37 +2487,42 @@ where
         guard_matches_labels_and_vars(state, transition, guard, self.clts)
     }
 
-    fn eval_fixpoint(
+    /// The single generic fixpoint body, monomorphised per [`EvalDomain`].
+    /// Mirrors the pre-P2.2 2v `eval_fixpoint`: seed from a prior approximant
+    /// (R.5 reuse) of matching state count when present, else bottom (μ) / top
+    /// (ν); iterate `current ← body(current)` until [`EvalDomain::fixpoint_eq`];
+    /// fire the convergence callback with an [`ApproximantView`]. Strategy-
+    /// witness iteration ranks are recorded per-iteration via
+    /// [`EvalDomain::record_iteration_ranks`] (2v only; no-op for 3v).
+    fn eval_fixpoint_generic<D: EvalDomain>(
         &mut self,
         var: FormulaVarId,
         body: NodeId,
         kind: FixpointKind,
-        bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
-    ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        // R.5 approximant reuse — when a prior approximant exists
-        // for this fixpoint var under the current state count, seed
-        // the iterate with it instead of starting from bottom/top.
-        // The cube-refinement mapping (using a prior approximant
-        // from a coarser cube space on a refined one) is queued as
-        // a follow-up; the MVP requires exact state-count match,
-        // which only fires when CEGAR re-runs without refinement
-        // (verdict-cache pattern) or when iteration 2+ over the
-        // same predicate set re-evaluates the same formula.
+        bindings: &HashMap<FormulaVarId, D::Valuation>,
+    ) -> Result<D::Valuation, EvaluationError> {
+        // R.5 approximant reuse — when a prior approximant exists for this
+        // fixpoint var under the current state count, seed the iterate with it
+        // instead of starting from bottom/top. The cube-refinement mapping
+        // (using a prior approximant from a coarser cube space on a refined
+        // one) is queued as a follow-up; the MVP requires exact state-count
+        // match, which only fires when CEGAR re-runs without refinement
+        // (verdict-cache pattern) or when iteration 2+ over the same predicate
+        // set re-evaluates the same formula. `D::seed_from_prior` owns the
+        // 2v-reads-must / 3v-reads-both divergence.
         let state_count = self.env.state_count();
-        // 2v path: only `must_true` is read; `may_true` is ignored
-        // (the 2v fixpoint loop has no must/may distinction).
-        let seed: Option<BitVec<usize, Lsb0>> = self
+        let seed: Option<D::Valuation> = self
             .options
             .prior_approximants
             .as_ref()
             .and_then(|m| m.get(&var.index()))
             .filter(|pa| pa.state_count == state_count)
-            .map(|pa| pa.must_true.clone());
-        let mut current_set = match seed {
-            Some(prior) => self.clone_bitvec(&prior)?,
+            .and_then(|pa| D::seed_from_prior(pa, kind));
+        let mut current = match seed {
+            Some(prior) => prior,
             None => match kind {
-                FixpointKind::Least => self.alloc_bitvec(false)?, // ∅
-                FixpointKind::Greatest => self.alloc_bitvec(true)?, // States
+                FixpointKind::Least => D::bottom(self), // ∅
+                FixpointKind::Greatest => D::top(self), // States (OOB-aware)
             },
         };
         let mut iteration: usize = 0;
@@ -2277,51 +2530,36 @@ where
         loop {
             iteration += 1;
             let mut next_bindings = bindings.clone();
-            next_bindings.insert(var, self.clone_bitvec(&current_set)?);
-            let next_set = self.eval_node(body, &next_bindings)?;
+            next_bindings.insert(var, current.clone());
+            let next = self.eval_node_generic::<D>(body, &next_bindings)?;
 
-            // Record iteration ranks for newly entering states (strategy witness data)
-            if self.witness_map.is_some() {
-                let state_count = next_set.len();
-                for state_idx in 0..state_count {
-                    let was_in = current_set.get(state_idx).map(|b| *b).unwrap_or(false);
-                    let now_in = next_set.get(state_idx).map(|b| *b).unwrap_or(false);
-                    if now_in
-                        && !was_in
-                        && let Some(ref mut wm) = self.witness_map
-                    {
-                        wm.iteration_ranks
-                            .record(var, state_idx, iteration, state_count);
-                    }
-                }
-            }
+            // Strategy-witness iteration ranks for newly entering states
+            // (2v only; no-op for 3v, where witnesses are meaningless).
+            D::record_iteration_ranks(self, var, &current, &next, iteration);
 
-            if next_set == current_set {
-                // R.5 CEGAR auto-capture sub-item 1.1 — fire the
-                // convergence callback (when present) before
-                // returning the iterate. **B.1.a (2026-06-01)**:
-                // the view's `must_true` and `may_true` both
-                // borrow `next_set` because the 2-valued path has
-                // no KleeneBot positions (must ≡ may by
-                // construction). Consumers needing the indefinite
-                // bit-set get an empty BitVec from
-                // `view.indefinite()`, which is correct for the
-                // 2-valued case.
-                // **Sub-item 1.4.a (2026-06-01)**: polarity flows
-                // from `FixpointKind` so the cube-refinement
-                // mapping can pick the polarity-appropriate seed.
-                // **Sub-item 1.5 (2026-06-01)**: pass the
-                // iteration count so reuse-savings benches can
-                // measure the seeded-vs-from-scratch delta.
+            if D::fixpoint_eq(&next, &current) {
+                // R.5 CEGAR auto-capture (sub-items 1.1 / 1.2 / B.1.a / 1.4.a /
+                // 1.5) — fire the convergence callback (when present) before
+                // returning. The view exposes `must_true` / `may_true` (via
+                // `D::must_view` / `D::may_view` — identical for the 2-valued
+                // path where must ≡ may, the two TritSet halves for 3v), the
+                // fixpoint polarity (so the cube-refinement mapping can pick a
+                // polarity-appropriate seed), and the iteration count (for
+                // reuse-savings benches).
                 if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
                     let polarity = fixpoint_kind_to_polarity(kind);
-                    let view = ApproximantView::new(&next_set, &next_set, polarity, iteration);
+                    let view = ApproximantView::new(
+                        D::must_view(&next),
+                        D::may_view(&next),
+                        polarity,
+                        iteration,
+                    );
                     cb(var, &view);
                 }
-                return self.clone_bitvec(&next_set);
+                return Ok(next);
             }
 
-            current_set = self.clone_bitvec(&next_set)?;
+            current = next;
         }
     }
 
@@ -2558,18 +2796,6 @@ where
 
         // Otherwise treat as variable
         Ok(Expr::var(trimmed))
-    }
-
-    fn variable_bits(
-        &mut self,
-        var: &FormulaVarId,
-        bindings: &HashMap<FormulaVarId, BitVec<usize, Lsb0>>,
-    ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        if let Some(bits) = bindings.get(var) {
-            self.clone_bitvec(bits)
-        } else {
-            self.alloc_bitvec(false)
-        }
     }
 
     // -----------------------------------------------------------------------

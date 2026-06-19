@@ -154,7 +154,16 @@ invisible to callers.
     `cargo test -p mununu-core` sweep is verdict-equivalent (exit 0); no perf regression — the
     reroute *removes* the per-step full-env `clone()` and adds only bounded O(states+inputs) maps.
     Phase 3 = a non-RTL frontend inherits Enumerate (the P4/P5 payoff).
-- **P2:** unify the evaluator over `TruthDomain` (orthogonal to the IR, same track).
+- **P2:** unify the two evaluator bodies (`eval_node` BitVec / `eval_node_tri` TritSet) over one
+  generic body (orthogonal to the IR, same track). NOTE: the per-element `truth_domain` trait is a
+  dead R.1 artifact the R.3 evaluator bypassed; P2 builds a NEW **bulk** `EvalDomain` trait
+  (associated `Valuation` = `BitVec` | `TritSet`, whole-set ops) instead. See
+  `docs/design/evaluator-domain-unification.md`.
+  - **P2.1 (shipped, #111):** design note.
+  - **P2.2 (shipped):** `EvalDomain` + `BoolDom` + `eval_node_generic`/`eval_fixpoint_generic`;
+    the 2v `eval_node`/`eval_fixpoint` now delegate to `::<BoolDom>`. HARD gate met (2083/2083
+    crate tests; criterion "no change" on `mu_calculus_evaluate` |S|=2048/8192). `eval_node_tri`
+    untouched until P2.3.
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.
 - **P4/P5:** a non-RTL frontend (Promela, then C-extraction) *lowers to* the IR and inherits the
