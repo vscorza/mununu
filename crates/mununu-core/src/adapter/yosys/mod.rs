@@ -174,11 +174,26 @@ impl FormatAdapter for YosysAdapter {
 
 /// Translate SystemVerilog source to AdapterOutput by invoking Yosys and
 /// reading back the BTOR2.
-pub fn translate_sv(
+/// The flattened-design artifacts produced by [`run_sv_flatten_btor2`]:
+/// the BTOR2 text, the pre-flatten hierarchy JSON (empty when Yosys did
+/// not emit it), and the staged primary-source path (for rewriting
+/// tempdir paths back to the user's invocation path).
+struct SvFlattenArtifacts {
+    btor2: String,
+    hier_json: String,
+    staged_primary: String,
+}
+
+/// Run sv2v (optional) + the flattened Yosys script and return the
+/// design's BTOR2 text plus the hierarchy snapshot. Shared by
+/// [`translate_sv`] (which bit-blasts the BTOR2) and
+/// [`sv_discover_state_cells`] (which only reads the BTOR2's named state
+/// cells), so the sv2v include-path + Yosys-invocation logic lives in one
+/// place.
+fn run_sv_flatten_btor2(
     content: &str,
-    options: &AdapterOptions,
     yopts: &YosysOptions,
-) -> Result<AdapterOutput, AdapterError> {
+) -> Result<SvFlattenArtifacts, AdapterError> {
     let yosys = locate_yosys()?;
     if !yopts.skip_verific_check {
         verify_no_verific(&yosys)?;
@@ -277,7 +292,7 @@ pub fn translate_sv(
         });
     }
 
-    let btor = std::fs::read_to_string(&btor_path).map_err(|e| AdapterError {
+    let btor2 = std::fs::read_to_string(&btor_path).map_err(|e| AdapterError {
         kind: AdapterErrorKind::ParseError,
         message: format!(
             "adapter/yosys: yosys ran but did not produce {} ({e})",
@@ -285,6 +300,77 @@ pub fn translate_sv(
         ),
         location: None,
     })?;
+
+    // Best-effort hierarchy snapshot (port directions + blackbox scan);
+    // empty when Yosys did not emit it.
+    let hier_json = std::fs::read_to_string(&hier_json_path).unwrap_or_default();
+
+    Ok(SvFlattenArtifacts {
+        btor2,
+        hier_json,
+        staged_primary: primary.to_string_lossy().into_owned(),
+    })
+}
+
+/// A named state cell discovered in a flattened SV design — the
+/// post-`flatten` dotted-instance name (`u_chan0.prediv_q`) the
+/// bit-blaster sees, plus its register width. Surfaced by
+/// [`sv_discover_state_cells`] so authors can populate a sidecar's
+/// `signals[]` without a manual Yosys netlist dump (sidecar-audit C1.1 /
+/// finding E1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvStateCell {
+    /// The cell's Yosys symbol (e.g. `u_chan0.prediv_q`).
+    pub name: String,
+    /// The register's bit width.
+    pub width: u32,
+}
+
+/// Drive sv2v → Yosys-flatten → BTOR2 and return the design's named state
+/// cells (sidecar-audit C1.1 / finding E1). Unlike [`translate_sv`], this
+/// does NOT bit-blast, so it succeeds on cap-busting designs — exactly the
+/// case where the author needs the dotted state-cell names to write a
+/// param-concretization sidecar. Cells without a Yosys symbol (synthetic
+/// `chformal`-lowered flops) are skipped. Sorted by name; deduped.
+pub fn sv_discover_state_cells(
+    content: &str,
+    yopts: &YosysOptions,
+) -> Result<Vec<SvStateCell>, AdapterError> {
+    use super::btor2::ast::Node;
+    let artifacts = run_sv_flatten_btor2(content, yopts)?;
+    let file = super::btor2::parser::parse(&artifacts.btor2).map_err(|e| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: format!("adapter/yosys: discover could not parse the BTOR2: {e}"),
+        location: None,
+    })?;
+    let symbols = super::btor2::parser::collect_symbols(&file);
+    let mut cells: Vec<SvStateCell> = file
+        .lines
+        .iter()
+        .filter_map(|line| match &line.node {
+            Node::State { sort, .. } => {
+                let name = symbols.get(&line.nid)?.clone();
+                let width = super::btor2::parser::bv_width(&file, *sort)?;
+                Some(SvStateCell { name, width })
+            }
+            _ => None,
+        })
+        .collect();
+    cells.sort_by(|a, b| a.name.cmp(&b.name));
+    cells.dedup();
+    Ok(cells)
+}
+
+pub fn translate_sv(
+    content: &str,
+    options: &AdapterOptions,
+    yopts: &YosysOptions,
+) -> Result<AdapterOutput, AdapterError> {
+    let SvFlattenArtifacts {
+        btor2: btor,
+        hier_json,
+        staged_primary,
+    } = run_sv_flatten_btor2(content, yopts)?;
 
     // Document B task B1: capture the top module's port directions
     // from the pre-flatten hierarchy snapshot, feed them through the
@@ -294,10 +380,11 @@ pub fn translate_sv(
     let top_directions: std::collections::HashMap<
         String,
         crate::controllability::BoundaryDirection,
-    > = std::fs::read_to_string(&hier_json_path)
-        .ok()
-        .map(|body| parse_top_module_port_directions(&body, yopts.top.as_deref()))
-        .unwrap_or_default();
+    > = if hier_json.is_empty() {
+        Default::default()
+    } else {
+        parse_top_module_port_directions(&hier_json, yopts.top.as_deref())
+    };
 
     let btor_options = if top_directions.is_empty() {
         options.clone()
@@ -327,17 +414,16 @@ pub fn translate_sv(
     // each. The hierarchy file is best-effort — if yosys did not
     // produce it, we proceed without sidecars rather than failing the
     // whole translation.
-    if let Ok(hier_body) = std::fs::read_to_string(&hier_json_path) {
-        let mut blackboxes = parse_blackbox_modules(&hier_body);
+    if !hier_json.is_empty() {
+        let mut blackboxes = parse_blackbox_modules(&hier_json);
         // Rewrite the tempdir path back to the user's primary source
         // path when known. Yosys saw the SV as `<tempdir>/work.sv`;
         // the user expects to see the path they actually invoked
         // mununu on.
         if let Some(real_path) = yopts.primary_source_path.as_ref() {
-            let tempdir_prefix = primary.to_string_lossy().into_owned();
             for bb in blackboxes.iter_mut() {
                 if let Some(ref src) = bb.source_file
-                    && src == &tempdir_prefix
+                    && src == &staged_primary
                 {
                     bb.source_file = Some(real_path.clone());
                 }
@@ -2429,6 +2515,43 @@ endmodule
             out.source_info.state_count >= 1,
             "got state_count = {}",
             out.source_info.state_count
+        );
+    }
+
+    #[test]
+    fn sv_discover_state_cells_reports_named_registers_and_widths() {
+        // C1.1 (finding E1): discovery returns the design's named state
+        // cells + widths WITHOUT bit-blasting, so it works even when the
+        // raw design would bust MAX_STATE_BITS. Plain Verilog → no sv2v
+        // needed (only Yosys).
+        if !yosys_available() {
+            eprintln!("skipping: yosys not on PATH");
+            return;
+        }
+        let dut = r#"
+module dut(input wire clk, input wire rst_ni, input wire en, output wire [7:0] o);
+  reg [7:0] wide;
+  reg flag;
+  always @(posedge clk or negedge rst_ni)
+    if (!rst_ni) begin wide <= 8'd0; flag <= 1'b0; end
+    else begin if (en) wide <= wide + 8'd1; flag <= en; end
+  assign o = wide;
+endmodule
+"#;
+        let yopts = YosysOptions {
+            top: Some("dut".into()),
+            use_sv2v: false,
+            ..Default::default()
+        };
+        let cells = sv_discover_state_cells(dut, &yopts).expect("discover state cells");
+        let wide = cells
+            .iter()
+            .find(|c| c.name == "wide")
+            .expect("the 8-bit `wide` register is discovered by name");
+        assert_eq!(wide.width, 8, "wide register width");
+        assert!(
+            cells.iter().any(|c| c.name == "flag" && c.width == 1),
+            "the 1-bit `flag` register is discovered too; got {cells:?}"
         );
     }
 

@@ -877,6 +877,29 @@ enum SvCommand {
     /// is on all surfaces. The API/UI validation peer lands with the C2.2
     /// sidecar-editor panel where it has a consumer.
     Validate(SvValidateArgs),
+    /// Discover a design's state cells and emit a skeleton sidecar
+    /// (sidecar-audit C1.1 / finding E1).
+    ///
+    /// Drives sv2v → Yosys-flatten → BTOR2 and prints a `.mununu.json`
+    /// skeleton pre-populated with the design's real post-`flatten`
+    /// dotted-instance state-cell names (`u_chan0.prediv_q`) — the names
+    /// the bit-blaster and a param-concretization sidecar key on. Removes
+    /// the manual "run yosys by hand, read the netlist, transcribe the
+    /// names" step the R46-6 GAP-2 fixtures required.
+    ///
+    /// Unlike a verify/extract run, discovery does NOT bit-blast, so it
+    /// succeeds on cap-busting designs — exactly when you need the names to
+    /// write a concretization sidecar. Multi-bit cells are emitted as
+    /// `ignored` placeholders with a width note (edit to concretize:
+    /// `bounded_counter` / `enum` / keep `ignored`); 1-bit cells are
+    /// omitted (the bit-blaster handles them natively). The skeleton JSON
+    /// goes to stdout (or --output); a human summary goes to stderr.
+    ///
+    /// surface: CLI-only — a developer authoring aid for the file-based
+    /// `.mununu.json` workflow, alongside `sv preprocess` /
+    /// `sv emit-btor2-per-module`. The API/UI authoring peer lands with the
+    /// C2.2 sidecar-editor panel.
+    Discover(SvDiscoverArgs),
 }
 
 #[derive(Args, Debug)]
@@ -888,6 +911,28 @@ struct SvValidateArgs {
     /// exit non-zero if any are found. Default: warnings print but exit 0.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Args, Debug)]
+struct SvDiscoverArgs {
+    /// SystemVerilog source file(s). The FIRST is the primary/top source;
+    /// the rest are additional sources / `\`include` targets (e.g. a
+    /// package or a `prim_assert.sv` stub), staged so includes resolve —
+    /// the same convention as a `verify.toml` `files` list.
+    #[arg(value_name = "FILE", num_args = 1..)]
+    files: Vec<PathBuf>,
+    /// Top module name. Recommended for multi-module designs so Yosys
+    /// flattens from the right root.
+    #[arg(long)]
+    top: Option<String>,
+    /// Run sv2v before Yosys. Required for modern SV (module-header
+    /// `import pkg::*;`, structs, interfaces) — i.e. essentially all real
+    /// OpenTitan / Caliptra / ibex RTL.
+    #[arg(long)]
+    preprocess_sv2v: bool,
+    /// Write the skeleton sidecar here instead of stdout.
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -3051,7 +3096,107 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Preprocess(args) => sv_preprocess(args),
         SvCommand::EmitBtor2PerModule(args) => sv_emit_btor2_per_module(args),
         SvCommand::Validate(args) => sv_validate(args),
+        SvCommand::Discover(args) => sv_discover(args),
     }
+}
+
+/// Build the skeleton `SvAnnotation` from discovered state cells (the pure,
+/// testable core of `sv discover`). Multi-bit cells become `ignored`
+/// placeholders carrying a width note (the author edits them to
+/// `bounded_counter` / `enum`); 1-bit cells are omitted — the bit-blaster
+/// handles them natively, so listing them is noise.
+fn build_discover_skeleton(
+    module: &str,
+    cells: &[mununu_core::adapter::yosys::SvStateCell],
+) -> mununu_core::adapter::systemverilog::annotation::SvAnnotation {
+    use mununu_core::adapter::systemverilog::annotation::{
+        SV_ANNOTATION_SCHEMA, SignalAbstraction, SignalAnnotation, SvAnnotation,
+    };
+    let signals = cells
+        .iter()
+        .filter(|c| c.width > 1)
+        .map(|c| SignalAnnotation {
+            name: c.name.clone(),
+            abstraction: SignalAbstraction::Ignored,
+            note: Some(format!(
+                "width={} — TODO concretize: bounded_counter (bound=K) | enum | keep ignored",
+                c.width
+            )),
+            ..Default::default()
+        })
+        .collect();
+    SvAnnotation {
+        schema: Some(SV_ANNOTATION_SCHEMA.to_string()),
+        module: module.to_string(),
+        signals,
+        ..Default::default()
+    }
+}
+
+/// `mununu sv discover <FILE..>` — sidecar-audit C1.1 / finding E1.
+fn sv_discover(args: SvDiscoverArgs) -> Result<(), String> {
+    use std::fs;
+
+    let (primary, rest) = args
+        .files
+        .split_first()
+        .ok_or("sv discover: at least one .sv file is required")?;
+    let content = fs::read_to_string(primary)
+        .map_err(|e| format!("failed to read '{}': {e}", primary.display()))?;
+    let mut additional_sources: Vec<(String, String)> = Vec::new();
+    for src in rest {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("invalid additional source path: {}", src.display()))?;
+        let body = fs::read_to_string(src)
+            .map_err(|e| format!("failed to read '{}': {e}", src.display()))?;
+        additional_sources.push((name.to_string(), body));
+    }
+
+    let yopts = mununu_core::adapter::yosys::YosysOptions {
+        top: args.top.clone(),
+        additional_sources,
+        primary_source_path: Some(primary.display().to_string()),
+        use_sv2v: args.preprocess_sv2v,
+        ..Default::default()
+    };
+
+    let cells = mununu_core::adapter::yosys::sv_discover_state_cells(&content, &yopts)
+        .map_err(|e| format!("sv discover: {e}"))?;
+
+    let module = args.top.clone().unwrap_or_else(|| "TOP_MODULE".to_string());
+    let skeleton = build_discover_skeleton(&module, &cells);
+    let json = serde_json::to_string_pretty(&skeleton)
+        .map_err(|e| format!("sv discover: failed to serialize skeleton: {e}"))?;
+
+    // Human summary → stderr; clean skeleton JSON → stdout (or --output).
+    let total_bits: u32 = cells.iter().map(|c| c.width).sum();
+    let multi_bit = cells.iter().filter(|c| c.width > 1).count();
+    eprintln!(
+        "sv discover: {} state cell(s), {} state bit(s); {} multi-bit cell(s) in the skeleton, \
+         {} 1-bit cell(s) omitted (handled natively).",
+        cells.len(),
+        total_bits,
+        multi_bit,
+        cells.len() - multi_bit,
+    );
+    if total_bits > 20 {
+        eprintln!(
+            "sv discover: raw state width {total_bits} exceeds MAX_STATE_BITS=20 — \
+             concretize the multi-bit cells above (e.g. bounded_counter) to fit the bit-blaster."
+        );
+    }
+
+    match &args.output {
+        Some(path) => {
+            fs::write(path, format!("{json}\n"))
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+            eprintln!("sv discover: wrote skeleton sidecar to {}", path.display());
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
 }
 
 /// `mununu sv validate <SIDECAR>` — sidecar-audit C0.2.
@@ -5032,5 +5177,59 @@ mod sv_validate_tests {
         });
         let _ = std::fs::remove_file(&p);
         assert!(r.is_err(), "a removed `$schema` must hard-fail");
+    }
+}
+
+#[cfg(test)]
+mod sv_discover_tests {
+    //! C1.1 `mununu sv discover` skeleton-building core (the SV→BTOR2 +
+    //! state-cell extraction is integration-tested in
+    //! `adapter::yosys::tests`; this covers the pure skeleton shape).
+    use super::build_discover_skeleton;
+    use mununu_core::adapter::systemverilog::annotation::SignalAbstraction;
+    use mununu_core::adapter::yosys::SvStateCell;
+
+    #[test]
+    fn skeleton_keeps_multi_bit_cells_and_omits_one_bit() {
+        let cells = vec![
+            SvStateCell {
+                name: "u0.cnt".into(),
+                width: 32,
+            },
+            SvStateCell {
+                name: "u0.flag".into(),
+                width: 1,
+            },
+            SvStateCell {
+                name: "u0.state".into(),
+                width: 2,
+            },
+        ];
+        let sk = build_discover_skeleton("top", &cells);
+        assert_eq!(sk.module, "top");
+        assert_eq!(sk.schema.as_deref(), Some("mununu_sv_annotation_v1"));
+        // Only the two multi-bit cells; the 1-bit `flag` is omitted.
+        assert_eq!(sk.signals.len(), 2, "got {:?}", sk.signals);
+        assert!(!sk.signals.iter().any(|s| s.name == "u0.flag"));
+        let cnt = sk
+            .signals
+            .iter()
+            .find(|s| s.name == "u0.cnt")
+            .expect("cnt in skeleton");
+        assert!(matches!(cnt.abstraction, SignalAbstraction::Ignored));
+        assert!(cnt.note.as_deref().unwrap_or_default().contains("width=32"));
+    }
+
+    #[test]
+    fn skeleton_for_all_one_bit_design_has_no_signals() {
+        let cells = vec![SvStateCell {
+            name: "st".into(),
+            width: 1,
+        }];
+        let sk = build_discover_skeleton("fsm", &cells);
+        assert!(
+            sk.signals.is_empty(),
+            "a pure 1-bit design needs no abstraction entries"
+        );
     }
 }

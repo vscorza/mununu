@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Top-level annotation loaded from `<module>.mununu.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SvAnnotation {
     /// Schema version identifier.
     #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
@@ -490,7 +490,7 @@ pub struct ResetSequence {
 }
 
 /// Annotation for a register or internal signal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SignalAnnotation {
     /// Signal name (must match an SV declaration).
     pub name: String,
