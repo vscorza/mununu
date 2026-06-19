@@ -141,11 +141,19 @@ invisible to callers.
     (`combinational_signal_nids`), else `Output` → referenced-signal value (`output_port_nids`),
     else `State`/`Input` → own value; precedence `Op > Output > State/Input`. Makes a future Pass-1
     reroute *value-faithful* (the `cv` mask reads the same signals it does today) and is a
-    correctness fix on its own (output-port observation now follows the signal). Remaining Phase-2
-    steps: **2b** a *prepared stepper* (build symbols / `state_meta` once, step many) so the reroute
-    carries no per-step `collect_symbols` cost; **2c** the Pass-1 reroute, gated on the full
-    SV/BTOR2 fixture verdict sweep + a no-perf-regression check. Phase 3 = a non-RTL frontend
-    inherits Enumerate.
+    correctness fix on its own (output-port observation now follows the signal).
+  - **P1 #4 Phase 2b+2c (shipped):** `enumerate_and_blast`'s Pass 1 now consumes the `StepEval`
+    primitive. **2b** a `PreparedStep` (builds `collect_symbols` + the state/input lists + the
+    observe-resolution maps ONCE) so the hot loop carries no per-step setup cost; `simulate_one_step_observe`
+    is now a build-once-step-once wrapper over it. **2c** Pass 1 routes each `(cube, input)` through
+    `PreparedStep::step` (admissibility + the `cv` mask + the next register-state from one outcome);
+    the domain-encoding / OOB-sink / state-splitting stay enumerator-side policy (`cells.encode`,
+    `__mununu_oob__`). Correctness-by-construction: `PreparedStep`'s state/input lists are
+    `file.states()` / `file.inputs()` order — the same as `state_meta` / `input_meta` — so position
+    `i` aligns and the seeding is identical to the old `make_step_env`. Gates: the full
+    `cargo test -p mununu-core` sweep is verdict-equivalent (exit 0); no perf regression — the
+    reroute *removes* the per-step full-env `clone()` and adds only bounded O(states+inputs) maps.
+    Phase 3 = a non-RTL frontend inherits Enumerate (the P4/P5 payoff).
 - **P2:** unify the evaluator over `TruthDomain` (orthogonal to the IR, same track).
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.
