@@ -470,9 +470,16 @@ pub enum MayEdgeInference {
     /// per-source enumeration (O(edges), reusing `all_smt`) is the
     /// queued perf follow-up; this MVP ships the sound all-pairs form.
     ///
-    /// **Note.** Combining with a non-`Off` `must_edge_inference` is not
-    /// yet wired (the must post-passes consume the sampling pass's
-    /// `sampled_targets_per_source`, which `SmtAllPairs` bypasses).
+    /// **Composing with must (P1 #3, IR-unification track).** Combining
+    /// with a non-`Off` `must_edge_inference` now composes: the eager
+    /// `predicate_cube_lift` computes the canonical ∀∃ KMTS must-relation
+    /// via [`crate::adapter::sts_ir::SmtEncode::must_edges`] and promotes
+    /// each must-edge `MayOnly` → `Sharp` (every must-edge ⊆ the
+    /// SmtAllPairs may-edges by construction). This yields a KMTS with
+    /// both may and must edges — the prerequisite for sound DEFINITE
+    /// 3-valued verdicts (DR1 F5). The SmtAllPairs path uses the standard
+    /// ∀∃ must for any non-Off inference; the per-variant ∀∀ / hyper-must
+    /// distinctions remain on the sampling (`!SmtAllPairs`) path.
     SmtAllPairs,
 }
 
@@ -1715,6 +1722,50 @@ pub fn predicate_cube_lift(
                 state_ids[j],
                 crate::clts::TransitionModality::MayOnly,
             );
+        }
+
+        // P1 #3 (IR-unification track) — may+must composition. Closes
+        // the DR1 F5 gap: a sound DEFINITE verdict needs must-witnesses
+        // (diamonds need a must-successor), but SmtAllPairs may + a
+        // non-Off must inference previously did not compose (the must
+        // post-pass consumed the sampling pass's candidate set, which
+        // SmtAllPairs bypasses). When a non-Off must inference is
+        // requested alongside SmtAllPairs may, compute the canonical ∀∃
+        // KMTS must-relation via the same STS-IR seam and promote each
+        // must-edge MayOnly → Sharp. `R_must ⊆ R_may` by construction
+        // (∀∃ ⟹ ∃), so every promoted edge already exists as a may-edge
+        // above; the builder's edge-modality merge (Sharp dominates
+        // MayOnly to the same target) upgrades it in place.
+        //
+        // The SmtAllPairs composition uses the standard ∀∃ must for ANY
+        // non-Off inference — it is the canonical, sound KMTS must
+        // (Bruns–Godefroid CONCUR 2000) and supersedes the
+        // sampling-derived SamplingConfluence heuristic, which has no
+        // meaning without a sampling pass. The per-variant ∀∀ /
+        // hyper-must distinctions remain selectable on the sampling
+        // (`!SmtAllPairs`) path below.
+        if !matches!(lift_opts.must_edge_inference, MustEdgeInference::Off) {
+            use crate::adapter::sts_ir::{BtorSts, SmtEncode};
+            let must_edges = BtorSts::new(&file).must_edges(&predicates, 5_000);
+            let promoted = must_edges.len();
+            for (i, j) in must_edges {
+                builder.transition_ids_with_modality(
+                    state_ids[i],
+                    &[step_label],
+                    state_ids[j],
+                    crate::clts::TransitionModality::Sharp,
+                );
+            }
+            sharp_edges_promoted += promoted;
+            if promoted > 0 {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: crate::adapter::WarningKind::ApproximateTranslation,
+                    message: format!(
+                        "[P1 #3 may+must] predicate_cube_lift: SmtAllPairs may + SMT must composition promoted {promoted} edge(s) MayOnly → Sharp via the canonical ∀∃ must-relation (Z3-proved; sound under-approximation). The resulting KMTS carries both may (over-approx) and must (under-approx) edges, enabling sound DEFINITE 3-valued verdicts."
+                    ),
+                    location: None,
+                });
+            }
         }
         predicate_image_pending = false;
     }
@@ -3013,6 +3064,69 @@ mod tests {
             err.message.contains("no_such_signal"),
             "error should name the unknown register; got: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn p1_3_smt_all_pairs_composes_with_must_promotes_sharp() {
+        // P1 #3 (IR-unification track) — SmtAllPairs may + a non-Off must
+        // inference now compose (DR1 F5). On the deterministic toggle
+        // q'=!q the canonical ∀∃ must-relation equals the may-relation, so
+        // both 0→1 and 1→0 promote MayOnly → Sharp. Baseline (must=Off)
+        // composes nothing; the composed run promotes two edges.
+        let toggle =
+            "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+        let preds = || {
+            vec![PredicateSpec {
+                name: "q_is_1".into(),
+                register: "q".into(),
+                value: 1,
+            }]
+        };
+        let opts = |must| PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: must,
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            config_values: std::collections::HashMap::new(),
+        };
+
+        // Baseline: SmtAllPairs may, no must → MayOnly only, zero promotions.
+        let no_must = predicate_cube_lift(
+            preds(),
+            toggle,
+            &AdapterOptions::default(),
+            &opts(MustEdgeInference::Off),
+        )
+        .expect("lift (may only)");
+        assert_eq!(
+            no_must.sharp_edges_promoted, 0,
+            "must=Off composes no must-edges"
+        );
+
+        // Composed: SmtAllPairs may + ∀∃ must → 2 Sharp promotions.
+        let composed = predicate_cube_lift(
+            preds(),
+            toggle,
+            &AdapterOptions::default(),
+            &opts(MustEdgeInference::SmtPerTargetStandard),
+        )
+        .expect("lift (may + must)");
+        assert_eq!(
+            composed.sharp_edges_promoted, 2,
+            "both toggle edges (0→1, 1→0) must promote MayOnly → Sharp"
+        );
+        let mut sharp = 0usize;
+        for s in composed.clts.states() {
+            for t in composed.clts.outgoing(s) {
+                if matches!(t.modality(), crate::clts::TransitionModality::Sharp) {
+                    sharp += 1;
+                }
+            }
+        }
+        assert!(
+            sharp >= 2,
+            "composed CLTS must carry the promoted Sharp must-edges; got {sharp}"
         );
     }
 

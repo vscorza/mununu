@@ -102,6 +102,29 @@ pub trait SmtEncode: SymbolicTransitionSystem {
     /// shape over the same encoding (`smt_must_edge::smt_per_target_must_*`);
     /// DR0 ships only the may-relation to prove the seam.
     fn may_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)>;
+
+    /// P1 #3 (IR-unification track) — sound under-approximating
+    /// **must-relation** over predicate cubes, the canonical ∀∃ KMTS
+    /// must per Bruns–Godefroid CONCUR 2000:
+    ///
+    /// ```text
+    /// (src, tgt) ∈ R_must  ⟺  ∀ s ⊨ src. ∃ inputs, s'. (s, s') ∈ R ∧ s' ⊨ tgt
+    /// ```
+    ///
+    /// Same cube encoding as [`SmtEncode::may_edges`] (indices
+    /// `0..2^|predicates|`). A pair is **included only when the SMT
+    /// backend proves the ∀∃ obligation** (UNSAT of its negation), so the
+    /// relation is a sound under-approximation: timeouts / unresolved
+    /// predicates / encoder failure conservatively *drop* the edge (never
+    /// fabricate a must-witness). By construction `R_must ⊆ R_may` (∀∃ ⟹
+    /// ∃), so callers can promote each returned pair from `MayOnly` to
+    /// `Sharp`.
+    ///
+    /// The ∀∃ *standard* form is the default companion to `may_edges`;
+    /// the stricter ∀∀ form and the generalised hyper-must form remain
+    /// available directly via `smt_must_edge::smt_per_target_must_check`
+    /// / `smt_hyper_must_check` on the sampling-candidate path.
+    fn must_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)>;
 }
 
 /// The BTOR2 implementation of the STS-IR seam — a thin borrow over a
@@ -213,6 +236,45 @@ impl SmtEncode for BtorSts<'_> {
             edges
         })
     }
+
+    fn must_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)> {
+        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
+        use crate::adapter::btor2::smt_must_edge::{
+            SmtMustVerdict, build_register_nid_map, smt_per_target_must_check_standard,
+        };
+
+        if predicates.is_empty() {
+            return Vec::new();
+        }
+        // Mirrors `may_edges` exactly — same faithful memory-aware encode,
+        // same cube encoding, same all-pairs sweep — but runs the ∀∃
+        // standard must-check and keeps a pair only on a definite `Must`
+        // (UNSAT) verdict. NotMust / Unknown / encoder failure drop the
+        // edge (sound under-approximation: never fabricate a must-witness).
+        let n_cubes = 1usize << predicates.len();
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = match encode_design_for_lift(self.file) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            let nid_map = build_register_nid_map(&view);
+            let mut edges = Vec::new();
+            for i in 0..n_cubes {
+                for j in 0..n_cubes {
+                    if matches!(
+                        smt_per_target_must_check_standard(
+                            &view, i as u64, j as u64, predicates, &nid_map, timeout_ms,
+                        ),
+                        SmtMustVerdict::Must
+                    ) {
+                        edges.push((i, j));
+                    }
+                }
+            }
+            edges
+        })
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +369,35 @@ mod tests {
             !edges.contains(&(0, 0)) && !edges.contains(&(1, 1)),
             "self-loops are provably impossible: {edges:?}"
         );
+    }
+
+    #[test]
+    fn btor_sts_must_edges_match_predicate_image() {
+        // P1 #3 — same deterministic toggle `q' = !q`. The transition is
+        // a function (no inputs), so the ∀∃ must-relation coincides with
+        // the may-relation: 0→1 and 1→0 are forced, the self-loops are
+        // provably never must. Confirms the seam's must companion is sound
+        // and the cube encoding matches `may_edges`.
+        let toggle =
+            "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+        let file = parser::parse(toggle).expect("parse");
+        let sts = BtorSts::new(&file);
+        let preds = vec![PredicateSpec {
+            name: "q_is_1".into(),
+            register: "q".into(),
+            value: 1,
+        }];
+        let must = sts.must_edges(&preds, 5_000);
+        assert!(must.contains(&(0, 1)), "0→1 must be a must-edge: {must:?}");
+        assert!(must.contains(&(1, 0)), "1→0 must be a must-edge: {must:?}");
+        assert!(
+            !must.contains(&(0, 0)) && !must.contains(&(1, 1)),
+            "self-loops are never must (the toggle never stays): {must:?}"
+        );
+        // R_must ⊆ R_may by construction.
+        let may: std::collections::HashSet<_> = sts.may_edges(&preds, 5_000).into_iter().collect();
+        for e in &must {
+            assert!(may.contains(e), "must-edge {e:?} must also be a may-edge");
+        }
     }
 }
