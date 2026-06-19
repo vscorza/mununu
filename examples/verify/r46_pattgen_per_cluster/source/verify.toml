@@ -1,0 +1,24 @@
+[project]
+name = "R46PattgenPerCluster"
+[[sources]]
+id = "pg"
+files = ["pattgen_ctrl_pkg.sv", "pattgen_chan.sv", "pattgen_harness.sv"]
+adapter = "sv-yosys"
+[sources.options]
+use_sv2v = true
+top = "pattgen_harness"
+sidecar = "pattgen_harness.mununu.json"
+[alphabet]
+strategy = "direct"
+[composition]
+semantics = "synchronous"
+members = ["pg"]
+name = "PattgenTop"
+[[properties]]
+name = "reach_done0"
+formula = "mu X. (done0_o || (<> X))"
+over = "Circuit"
+[[properties]]
+name = "reach_done1"
+formula = "mu X. (done1_o || (<> X))"
+over = "Circuit"

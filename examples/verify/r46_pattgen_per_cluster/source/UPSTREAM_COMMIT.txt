@@ -1,0 +1,11 @@
+558921ccc8aeefab652b45c1402c10bceb63accc
+
+Vendored from lowRISC/opentitan at the pinned commit above (Apache-2.0):
+  pattgen_ctrl_pkg.sv   hw/ip/pattgen/rtl/pattgen_ctrl_pkg.sv
+  pattgen_chan.sv       hw/ip/pattgen/rtl/pattgen_chan.sv
+
+Hand-written (NOT vendored), clearly labeled in-file:
+  pattgen_harness.sv          2-channel harness narrowing the 116-bit
+                              ctrl_i struct to a small constant config +
+                              free per-channel enables.
+  pattgen_harness.mununu.json param-concretization sidecar.
