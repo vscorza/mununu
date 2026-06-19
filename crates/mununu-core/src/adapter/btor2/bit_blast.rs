@@ -261,84 +261,86 @@ pub fn simulate_one_step_observe(
     input_values: &std::collections::HashMap<String, u128>,
     observe: &[String],
 ) -> Result<crate::adapter::sts_ir::StepOutcome, AdapterError> {
-    // Setup mirrors `simulate_one_step` (kept separate so the hot
-    // `simulate_one_step` path carries no admissibility/observe cost).
-    let symbols = parser::collect_symbols(file);
-    let mut symbol_to_input_nid: std::collections::HashMap<String, (Nid, u32)> =
-        std::collections::HashMap::new();
-    let mut state_meta: Vec<StateMeta> = Vec::new();
-    for line in &file.lines {
-        match &line.node {
-            Node::State { sort, .. } => {
-                let width = parser::bv_width(file, *sort).unwrap_or(0);
-                let symbol = symbols
-                    .get(&line.nid)
-                    .cloned()
-                    .unwrap_or_else(|| format!("st_n{}", line.nid));
-                state_meta.push(StateMeta {
-                    nid: line.nid,
-                    width,
-                    symbol,
-                });
+    // Build-once-step-once over the prepared evaluator. Hot callers that
+    // step the same design many times (the Enumerate strategy) build a
+    // `PreparedStep` once and call `.step` per (state, input) instead.
+    PreparedStep::new(file).step(register_values, input_values, observe)
+}
+
+/// P1 #4 Phase 2b (IR-unification track, Q2 = B) — a prepared one-step
+/// evaluator. Builds the per-design setup ONCE — the state / input lists
+/// (each keyed by its *step name*: the [`parser::collect_symbols`] symbol,
+/// or a deterministic `st_n<nid>` / `in_n<nid>` fallback) and the
+/// observe-resolution maps — so the Enumerate strategy can step many
+/// `(state, inputs)` assignments without re-running `collect_symbols` per
+/// step (the cost the original Pass-1 cached once via `make_step_env` over
+/// a shared `state_meta`).
+///
+/// `step` has the exact semantics of [`simulate_one_step_observe`] (which
+/// is now a build-once-step-once wrapper over this).
+struct PreparedStep<'a> {
+    file: &'a Btor2File,
+    /// `file.states()` order; `StateMeta.symbol` holds the step name.
+    states: Vec<StateMeta>,
+    /// `file.inputs()` order; `StateMeta.symbol` holds the step name.
+    inputs: Vec<StateMeta>,
+    /// Observe resolution (Phase 2a semantics), built once: Op symbol →
+    /// own NID; Output symbol → referenced signal NID; State/Input → own.
+    op_nid: std::collections::HashMap<String, Nid>,
+    out_sig_nid: std::collections::HashMap<String, Nid>,
+    si_nid: std::collections::HashMap<String, Nid>,
+}
+
+impl<'a> PreparedStep<'a> {
+    fn new(file: &'a Btor2File) -> Self {
+        let symbols = parser::collect_symbols(file);
+        let mut states: Vec<StateMeta> = Vec::new();
+        let mut inputs: Vec<StateMeta> = Vec::new();
+        for line in &file.lines {
+            match &line.node {
+                Node::State { sort, .. } => {
+                    let width = parser::bv_width(file, *sort).unwrap_or(0);
+                    let symbol = symbols
+                        .get(&line.nid)
+                        .cloned()
+                        .unwrap_or_else(|| format!("st_n{}", line.nid));
+                    states.push(StateMeta {
+                        nid: line.nid,
+                        width,
+                        symbol,
+                    });
+                }
+                Node::Input { sort, .. } => {
+                    let width = parser::bv_width(file, *sort).unwrap_or(0);
+                    let symbol = symbols
+                        .get(&line.nid)
+                        .cloned()
+                        .unwrap_or_else(|| format!("in_n{}", line.nid));
+                    inputs.push(StateMeta {
+                        nid: line.nid,
+                        width,
+                        symbol,
+                    });
+                }
+                _ => {}
             }
-            Node::Input { sort, .. } => {
-                let width = parser::bv_width(file, *sort).unwrap_or(0);
-                let symbol = symbols
-                    .get(&line.nid)
-                    .cloned()
-                    .unwrap_or_else(|| format!("in_n{}", line.nid));
-                symbol_to_input_nid.insert(symbol, (line.nid, width));
-            }
-            _ => {}
         }
-    }
-
-    let mut env = Env::default();
-    for sm in &state_meta {
-        let bits = register_values.get(&sm.symbol).copied().unwrap_or(0);
-        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
-    }
-    for (symbol, &(nid, width)) in &symbol_to_input_nid {
-        let bits = input_values.get(symbol).copied().unwrap_or(0);
-        env.values.insert(nid, BvValue::new(bits, width));
-    }
-
-    // Evaluate the combinational cone; observability + admissibility are
-    // read here (current cycle), BEFORE `apply_next` commits the updates.
-    evaluate_pure(file, &mut env, false)?;
-    let admissible = constraints_hold(file, &env)?;
-
-    let mut observed: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
-    if !observe.is_empty() {
-        // P1 #4 Phase 2a (Q2 = B) — resolve observe names to NIDs the SAME
-        // way the Enumerate strategy does, so a future Pass-1 reroute onto
-        // this primitive is value-faithful (the `cv` mask reads the same
-        // signal values it does today):
-        //   1. an `Op` node carrying the symbol → its own computed value
-        //      (mirrors `combinational_signal_nids`);
-        //   2. else an `Output` node carrying the symbol → the value of its
-        //      referenced signal (mirrors `output_port_nids`, which keys on
-        //      `signal.nid()`); read the raw signal NID — no negation
-        //      follow — to match that helper exactly;
-        //   3. else a `State` / `Input` carrying the symbol → its own value.
-        // First occurrence wins within each tier; precedence Op > Output >
-        // State/Input (matching the enumerator's union order).
-        let mut op_nid: std::collections::HashMap<&str, Nid> = std::collections::HashMap::new();
-        let mut out_sig_nid: std::collections::HashMap<&str, Nid> =
+        let mut op_nid: std::collections::HashMap<String, Nid> = std::collections::HashMap::new();
+        let mut out_sig_nid: std::collections::HashMap<String, Nid> =
             std::collections::HashMap::new();
-        let mut si_nid: std::collections::HashMap<&str, Nid> = std::collections::HashMap::new();
+        let mut si_nid: std::collections::HashMap<String, Nid> = std::collections::HashMap::new();
         for line in &file.lines {
             match &line.node {
                 Node::Op {
                     symbol: Some(s), ..
                 } => {
-                    op_nid.entry(s.as_str()).or_insert(line.nid);
+                    op_nid.entry(s.clone()).or_insert(line.nid);
                 }
                 Node::Output {
                     symbol: Some(s),
                     signal,
                 } => {
-                    out_sig_nid.entry(s.as_str()).or_insert(signal.nid());
+                    out_sig_nid.entry(s.clone()).or_insert(signal.nid());
                 }
                 Node::State {
                     symbol: Some(s), ..
@@ -346,36 +348,87 @@ pub fn simulate_one_step_observe(
                 | Node::Input {
                     symbol: Some(s), ..
                 } => {
-                    si_nid.entry(s.as_str()).or_insert(line.nid);
+                    si_nid.entry(s.clone()).or_insert(line.nid);
                 }
                 _ => {}
             }
         }
+        Self {
+            file,
+            states,
+            inputs,
+            op_nid,
+            out_sig_nid,
+            si_nid,
+        }
+    }
+
+    /// State cells in `file.states()` order; each `StateMeta.symbol` is the
+    /// step name the caller keys `register_values` / reads `next_state` by.
+    /// The Enumerate strategy's `state_meta` is the same order (both
+    /// `file.states()`), so position `i` refers to the same cell.
+    fn states(&self) -> &[StateMeta] {
+        &self.states
+    }
+
+    /// Inputs in `file.inputs()` order; `StateMeta.symbol` is the step name.
+    fn inputs(&self) -> &[StateMeta] {
+        &self.inputs
+    }
+
+    fn step(
+        &self,
+        register_values: &std::collections::HashMap<String, u128>,
+        input_values: &std::collections::HashMap<String, u128>,
+        observe: &[String],
+    ) -> Result<crate::adapter::sts_ir::StepOutcome, AdapterError> {
+        let mut env = Env::default();
+        for sv in &self.states {
+            let bits = register_values.get(&sv.symbol).copied().unwrap_or(0);
+            env.values.insert(sv.nid, BvValue::new(bits, sv.width));
+        }
+        for sv in &self.inputs {
+            let bits = input_values.get(&sv.symbol).copied().unwrap_or(0);
+            env.values.insert(sv.nid, BvValue::new(bits, sv.width));
+        }
+
+        // Evaluate the combinational cone; observability + admissibility
+        // are read here (current cycle), BEFORE `apply_next` commits.
+        evaluate_pure(self.file, &mut env, false)?;
+        let admissible = constraints_hold(self.file, &env)?;
+
+        let mut observed: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
         for name in observe {
-            let v = op_nid
+            // Phase 2a resolution: Op > Output(signal) > State/Input.
+            let v = self
+                .op_nid
                 .get(name.as_str())
-                .or_else(|| out_sig_nid.get(name.as_str()))
-                .or_else(|| si_nid.get(name.as_str()))
+                .or_else(|| self.out_sig_nid.get(name.as_str()))
+                .or_else(|| self.si_nid.get(name.as_str()))
                 .and_then(|nid| env.values.get(nid))
                 .map(|bv| bv.bits);
             if let Some(v) = v {
                 observed.insert(name.clone(), v);
             }
         }
-    }
 
-    apply_next(file, &mut env, &state_meta)?;
-    let mut next_state: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
-    for sm in &state_meta {
-        let bits = env.values.get(&sm.nid).map(|v| v.bits).unwrap_or(0);
-        next_state.insert(sm.symbol.clone(), bits);
-    }
+        // `apply_next` mutates `env` in place — no full-env clone (the
+        // original Pass-1 cloned the evaluated env per step).
+        apply_next(self.file, &mut env, &self.states)?;
+        let mut next_state: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
+        for sv in &self.states {
+            let bits = env.values.get(&sv.nid).map(|v| v.bits).unwrap_or(0);
+            next_state.insert(sv.symbol.clone(), bits);
+        }
 
-    Ok(crate::adapter::sts_ir::StepOutcome {
-        next_state,
-        observed,
-        admissible,
-    })
+        Ok(crate::adapter::sts_ir::StepOutcome {
+            next_state,
+            observed,
+            admissible,
+        })
+    }
 }
 
 /// R.5b lifter integration MVP — variant of [`simulate_one_step`]
@@ -2456,33 +2509,66 @@ fn enumerate_and_blast(
     }
     let mut step: Vec<Vec<Option<StepInfo>>> = Vec::with_capacity(base_total);
     let mut achievable: Vec<std::collections::BTreeSet<u32>> = Vec::with_capacity(base_total);
+
+    // P1 #4 Phase 2c (Q2 = B) — route the concrete step through the STS-IR
+    // `StepEval` primitive (prepared ONCE here so the hot loop carries no
+    // per-step `collect_symbols` cost). The prepared stepper's state /
+    // input lists are `file.states()` / `file.inputs()` order — the SAME
+    // order as `state_meta` / `input_meta` — so position `i` refers to the
+    // same cell and the concrete values come from `cells` / `input_cells`
+    // by position, keyed for the step by the stepper's step-names. The
+    // abstraction policy (domain-encoding via `cells.encode`, OOB sink on
+    // escape, combinational state-splitting via `cv`) stays here in the
+    // enumerator — the seam never sees `FieldDomain`.
+    let prep = PreparedStep::new(file);
+    debug_assert_eq!(
+        prep.states().len(),
+        state_meta.len(),
+        "PreparedStep / state_meta state-count mismatch"
+    );
+    debug_assert_eq!(
+        prep.inputs().len(),
+        input_meta.len(),
+        "PreparedStep / input_meta input-count mismatch"
+    );
     for base in 0..base_total {
         let mut row: Vec<Option<StepInfo>> = Vec::with_capacity(total_input_combos);
         let mut ach: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        // Concrete register valuation for this cube (by step-name); constant
+        // across input combos for this base.
+        let register_values: std::collections::HashMap<String, u128> = prep
+            .states()
+            .iter()
+            .enumerate()
+            .map(|(i, sv)| (sv.symbol.clone(), cells.value_at(base, i)))
+            .collect();
         for input_idx in 0..total_input_combos {
-            let mut env = make_step_env(
-                &state_meta,
-                &input_meta,
-                &cells,
-                &input_cells,
-                base,
-                input_idx,
-            );
-            evaluate_pure(file, &mut env, /*honor_init=*/ false)?;
-            if !constraints_hold(file, &env)? {
+            let input_values: std::collections::HashMap<String, u128> = prep
+                .inputs()
+                .iter()
+                .enumerate()
+                .map(|(i, sv)| (sv.symbol.clone(), input_cells.value_at(input_idx, i)))
+                .collect();
+            let outcome = prep.step(&register_values, &input_values, &comb_signal_names)?;
+            if !outcome.admissible {
                 row.push(None);
                 continue;
             }
             let mut cv: u32 = 0;
-            for (j, (nid, _)) in comb_nids.iter().enumerate() {
-                if env.values.get(nid).is_some_and(|bv| bv.bits != 0) {
+            for (j, name) in comb_signal_names.iter().enumerate() {
+                if outcome.observed.get(name).is_some_and(|&v| v != 0) {
                     cv |= 1u32 << j;
                 }
             }
             ach.insert(cv);
-            let mut next_env = env.clone();
-            apply_next(file, &mut next_env, &state_meta)?;
-            let target = encode_state(&next_env, &state_meta, &cells);
+            // Encode the next register-state into the abstract cube (OOB →
+            // None). Values in `state_meta` / `prep.states()` position order.
+            let next_values: Vec<u128> = prep
+                .states()
+                .iter()
+                .map(|sv| outcome.next_state.get(&sv.symbol).copied().unwrap_or(0))
+                .collect();
+            let target = cells.encode(&next_values);
             if target.is_none() {
                 oob_escapes += 1;
             }
