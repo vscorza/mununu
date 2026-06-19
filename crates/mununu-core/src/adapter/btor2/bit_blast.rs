@@ -227,6 +227,135 @@ pub fn simulate_one_step(
     Ok(out)
 }
 
+/// P1 #4 Phase 1 (IR-unification track, Q2 = B) — the observability-rich
+/// one-step primitive behind
+/// [`crate::adapter::sts_ir::StepEval::step_observe`].
+///
+/// Same concrete `(state, inputs) ↦ next_state` semantics as
+/// [`simulate_one_step`] (absent keys default to 0, the `setundef -zero`
+/// convention), but additionally reports, from the post-`evaluate_pure` /
+/// pre-`apply_next` env (the current-cycle values):
+///
+/// - `observed`: the current value of each requested signal name. A name
+///   is resolved to the NID of the *symbol-bearing node* that carries it
+///   (a combinational `Op`'s own computed value, or a state / input
+///   value) — distinct from [`parser::collect_symbols`], which attaches
+///   alias symbols onto state cells. Names that resolve to no symbol-
+///   bearing node, or whose node has no env value (e.g. an `output` line),
+///   are omitted from the map.
+/// - `admissible`: whether every BTOR2 `constraint` line holds under this
+///   `(state, inputs)` assignment. [`simulate_one_step`] returns the
+///   next-state regardless; this variant surfaces the verdict so the
+///   Enumerate strategy can drop inadmissible input combos *without*
+///   re-opening the BTOR2 design — the Q2 = B "observability-rich
+///   contract, clamping stays policy" decision.
+///
+/// Returns a [`crate::adapter::sts_ir::StepOutcome`] (`next_state` +
+/// `observed` + `admissible`). The domain-encoding / OOB-sink /
+/// state-splitting policy stays in the caller (`enumerate_and_blast`);
+/// this primitive never mentions `FieldDomain`.
+pub fn simulate_one_step_observe(
+    file: &Btor2File,
+    register_values: &std::collections::HashMap<String, u128>,
+    input_values: &std::collections::HashMap<String, u128>,
+    observe: &[String],
+) -> Result<crate::adapter::sts_ir::StepOutcome, AdapterError> {
+    // Setup mirrors `simulate_one_step` (kept separate so the hot
+    // `simulate_one_step` path carries no admissibility/observe cost).
+    let symbols = parser::collect_symbols(file);
+    let mut symbol_to_input_nid: std::collections::HashMap<String, (Nid, u32)> =
+        std::collections::HashMap::new();
+    let mut state_meta: Vec<StateMeta> = Vec::new();
+    for line in &file.lines {
+        match &line.node {
+            Node::State { sort, .. } => {
+                let width = parser::bv_width(file, *sort).unwrap_or(0);
+                let symbol = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("st_n{}", line.nid));
+                state_meta.push(StateMeta {
+                    nid: line.nid,
+                    width,
+                    symbol,
+                });
+            }
+            Node::Input { sort, .. } => {
+                let width = parser::bv_width(file, *sort).unwrap_or(0);
+                let symbol = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("in_n{}", line.nid));
+                symbol_to_input_nid.insert(symbol, (line.nid, width));
+            }
+            _ => {}
+        }
+    }
+
+    let mut env = Env::default();
+    for sm in &state_meta {
+        let bits = register_values.get(&sm.symbol).copied().unwrap_or(0);
+        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
+    }
+    for (symbol, &(nid, width)) in &symbol_to_input_nid {
+        let bits = input_values.get(symbol).copied().unwrap_or(0);
+        env.values.insert(nid, BvValue::new(bits, width));
+    }
+
+    // Evaluate the combinational cone; observability + admissibility are
+    // read here (current cycle), BEFORE `apply_next` commits the updates.
+    evaluate_pure(file, &mut env, false)?;
+    let admissible = constraints_hold(file, &env)?;
+
+    let mut observed: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+    if !observe.is_empty() {
+        // name → own NID for any symbol-bearing node (Op / State / Input /
+        // Output). First occurrence wins on collision.
+        let mut name_to_nid: std::collections::HashMap<&str, Nid> =
+            std::collections::HashMap::new();
+        for line in &file.lines {
+            let sym = match &line.node {
+                Node::Op {
+                    symbol: Some(s), ..
+                }
+                | Node::State {
+                    symbol: Some(s), ..
+                }
+                | Node::Input {
+                    symbol: Some(s), ..
+                }
+                | Node::Output {
+                    symbol: Some(s), ..
+                } => Some(s.as_str()),
+                _ => None,
+            };
+            if let Some(s) = sym {
+                name_to_nid.entry(s).or_insert(line.nid);
+            }
+        }
+        for name in observe {
+            if let Some(nid) = name_to_nid.get(name.as_str())
+                && let Some(bv) = env.values.get(nid)
+            {
+                observed.insert(name.clone(), bv.bits);
+            }
+        }
+    }
+
+    apply_next(file, &mut env, &state_meta)?;
+    let mut next_state: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+    for sm in &state_meta {
+        let bits = env.values.get(&sm.nid).map(|v| v.bits).unwrap_or(0);
+        next_state.insert(sm.symbol.clone(), bits);
+    }
+
+    Ok(crate::adapter::sts_ir::StepOutcome {
+        next_state,
+        observed,
+        admissible,
+    })
+}
+
 /// R.5b lifter integration MVP — variant of [`simulate_one_step`]
 /// that substitutes a UF zero-value for each Op NID in
 /// `uf_wrapped_nids` during the per-step evaluation. Use
@@ -8030,6 +8159,49 @@ mod tests {
         assert!(
             !nids.contains(&6),
             "uf_unwrap must suppress the symbol-carrying Op (NID 6 / `small_mul`); got {nids:?}"
+        );
+    }
+
+    // P1 #4 Phase 1 (Q2 = B) — observability-rich step primitive.
+    // q' = en; g = q & en (combinational, symbol `g`); `en` is
+    // constrained to be high.
+    const STEP_OBSERVE_FIXTURE: &str =
+        "1 sort bitvec 1\n2 state 1 q\n3 input 1 en\n4 and 1 2 3 g\n5 next 1 2 3\n6 constraint 3\n";
+
+    #[test]
+    fn p1_4_simulate_one_step_observe_reports_observed_and_admissible() {
+        let file = crate::adapter::btor2::parser::parse(STEP_OBSERVE_FIXTURE).expect("parse");
+        let st = |q: u128| std::collections::HashMap::from([("q".to_string(), q)]);
+        let inp = |en: u128| std::collections::HashMap::from([("en".to_string(), en)]);
+
+        // en=1: g = q&en = 1, next q = en = 1, constraint (en) holds.
+        let out =
+            simulate_one_step_observe(&file, &st(1), &inp(1), &["g".to_string()]).expect("step");
+        assert_eq!(out.next_state.get("q"), Some(&1), "q' = en = 1");
+        assert_eq!(out.observed.get("g"), Some(&1), "g = q & en = 1");
+        assert!(out.admissible, "constraint `en` holds when en=1");
+
+        // en=0: g = 1&0 = 0, next q = 0, constraint (en) VIOLATED.
+        let out0 =
+            simulate_one_step_observe(&file, &st(1), &inp(0), &["g".to_string()]).expect("step");
+        assert_eq!(out0.next_state.get("q"), Some(&0), "q' = en = 0");
+        assert_eq!(out0.observed.get("g"), Some(&0), "g = q & en = 0");
+        assert!(!out0.admissible, "constraint `en` violated when en=0");
+
+        // next_state matches the narrow simulate_one_step (no drift).
+        let narrow = simulate_one_step(&file, &st(1), &inp(1)).expect("narrow step");
+        assert_eq!(
+            narrow, out.next_state,
+            "observe variant must match simulate_one_step's next-state"
+        );
+
+        // An unresolvable observe name is simply omitted.
+        let out_missing =
+            simulate_one_step_observe(&file, &st(1), &inp(1), &["no_such_signal".to_string()])
+                .expect("step");
+        assert!(
+            !out_missing.observed.contains_key("no_such_signal"),
+            "unresolvable observe names are omitted"
         );
     }
 

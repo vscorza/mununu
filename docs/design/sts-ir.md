@@ -128,6 +128,16 @@ invisible to callers.
     `MayOnly` → `Sharp`, yielding a KMTS with both relations — the prerequisite for sound DEFINITE
     3-valued verdicts (closes DR1 F5; previously the must post-pass only consumed the sampling
     pass's candidate set, which `SmtAllPairs` bypassed).
+  - **P1 #4 Phase 1 (shipped):** widened `StepEval` for the `bit_blast` (Enumerate) reroute, per
+    the **Q2 = B** decision (observability-rich contract, clamping stays policy). Added
+    `StepOutcome { next_state, observed, admissible }` + `StepEval::step_observe(state, inputs,
+    observe)`; `step` is now a provided default over it (next-state only, discards
+    observability/admissibility — the pre-Phase-1 contract). `BtorSts::step_observe` delegates to
+    the new `bit_blast::simulate_one_step_observe`, which reports the requested combinational
+    signals' current-cycle values + whether the BTOR2 `constraint` lines hold. The trait never
+    mentions `FieldDomain` — domain-encoding / OOB-sink / state-splitting stay caller-side policy.
+    Phase 2 (reroute `enumerate_and_blast`'s Pass 1 onto `step_observe`, fixture-sweep
+    equivalence-gated) and Phase 3 (a non-RTL frontend inherits Enumerate) are the follow-ups.
 - **P2:** unify the evaluator over `TruthDomain` (orthogonal to the IR, same track).
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.

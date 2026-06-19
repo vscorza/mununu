@@ -69,19 +69,64 @@ pub trait SymbolicTransitionSystem {
     fn resolve_register(&self, name: &str) -> Option<String>;
 }
 
+/// P1 #4 Phase 1 (IR-unification track, Q2 = B) — the structured result of
+/// an observability-rich step. Everything the *explicit / Enumerate*
+/// edge-strategy (`enumerate_and_blast`) needs from one concrete step,
+/// WITHOUT the trait knowing anything about the abstraction model
+/// (`FieldDomain` / OOB sink stay caller-side policy).
+#[derive(Debug, Clone, Default)]
+pub struct StepOutcome {
+    /// Next state assignment, keyed by [`StsVar::name`].
+    pub next_state: HashMap<String, u128>,
+    /// Current-cycle value of each requested observable signal name
+    /// (combinational signals, ports, registers). Names that resolve to
+    /// no signal are omitted — callers treat absence as "not observable
+    /// in this design".
+    pub observed: HashMap<String, u128>,
+    /// Whether every constraint of the system holds under this
+    /// `(state, inputs)` assignment. Lets the Enumerate strategy drop
+    /// inadmissible input combinations without re-opening the frontend.
+    pub admissible: bool,
+}
+
 /// Concrete one-step semantics: given a full assignment of state vars +
 /// inputs, compute the next state assignment. This is everything the
 /// *explicit / Enumerate* edge-strategy (today's `bit_blast`) needs to
 /// build a Sharp CLTS.
 pub trait StepEval: SymbolicTransitionSystem {
-    /// Step the design one clock: `(state, inputs) ↦ next_state`. Both
-    /// maps are keyed by [`StsVar::name`]; absent keys default to 0
-    /// (the `setundef -zero` convention).
+    /// P1 #4 Phase 1 (Q2 = B) — the **observability-rich** one-step
+    /// primitive. Steps the design one clock and additionally reports the
+    /// current-cycle value of each requested `observe` signal plus whether
+    /// the step's constraints held. Both `state` / `inputs` maps are keyed
+    /// by [`StsVar::name`]; absent keys default to 0 (`setundef -zero`).
+    ///
+    /// This is the contract the Enumerate strategy consumes: it supplies
+    /// the concrete next-state (for the caller's domain-encoding / OOB
+    /// policy), the property/combinational signal values (for state
+    /// splitting), and the admissibility verdict (for constraint
+    /// filtering) — all without the trait referencing the abstraction
+    /// model. A non-RTL frontend that can answer these inherits the
+    /// Enumerate strategy with mununu's abstraction policy layered on top.
+    fn step_observe(
+        &self,
+        state: &HashMap<String, u128>,
+        inputs: &HashMap<String, u128>,
+        observe: &[String],
+    ) -> Result<StepOutcome, AdapterError>;
+
+    /// The narrow `(state, inputs) ↦ next_state` step. Both maps are keyed
+    /// by [`StsVar::name`]; absent keys default to 0 (the `setundef -zero`
+    /// convention). Provided in terms of [`StepEval::step_observe`] with no
+    /// observed signals; the admissibility verdict is discarded (the
+    /// next-state is returned regardless, matching the pre-Phase-1 contract
+    /// the predicate-cube sampling path relies on).
     fn step(
         &self,
         state: &HashMap<String, u128>,
         inputs: &HashMap<String, u128>,
-    ) -> Result<HashMap<String, u128>, AdapterError>;
+    ) -> Result<HashMap<String, u128>, AdapterError> {
+        Ok(self.step_observe(state, inputs, &[])?.next_state)
+    }
 }
 
 /// SMT predicate-image: the *predicate-cube / SmtImage* edge-strategy
@@ -186,13 +231,17 @@ impl SymbolicTransitionSystem for BtorSts<'_> {
 }
 
 impl StepEval for BtorSts<'_> {
-    fn step(
+    fn step_observe(
         &self,
         state: &HashMap<String, u128>,
         inputs: &HashMap<String, u128>,
-    ) -> Result<HashMap<String, u128>, AdapterError> {
-        // Delegate to the shipped concrete-step evaluator unchanged.
-        bit_blast::simulate_one_step(self.file, state, inputs)
+        observe: &[String],
+    ) -> Result<StepOutcome, AdapterError> {
+        // Delegate to the shipped observability-rich evaluator (it returns
+        // `StepOutcome` directly). `step` (the narrow next-state-only form)
+        // is the provided default over this, so it keeps delegating to the
+        // same concrete-step logic.
+        bit_blast::simulate_one_step_observe(self.file, state, inputs, observe)
     }
 }
 
@@ -303,6 +352,52 @@ mod tests {
         assert_eq!(sts.resolve_register("cnt_d").as_deref(), Some("cnt_d"));
         // A name matching no state cell does not resolve.
         assert_eq!(sts.resolve_register("nonexistent"), None);
+    }
+
+    // P1 #4 Phase 1 (Q2 = B) — `q' = en`, combinational `g = q & en`,
+    // and `en` constrained high. Exercises the seam's observability-rich
+    // step + the provided narrow `step` default.
+    const OBSERVE_BTOR2: &str =
+        "1 sort bitvec 1\n2 state 1 q\n3 input 1 en\n4 and 1 2 3 g\n5 next 1 2 3\n6 constraint 3\n";
+
+    #[test]
+    fn btor_sts_step_observe_reports_observed_and_admissible() {
+        let file = parser::parse(OBSERVE_BTOR2).expect("parse");
+        let sts = BtorSts::new(&file);
+        let st = HashMap::from([("q".to_string(), 1u128)]);
+
+        // en=1 → g=1, q'=1, admissible.
+        let out = sts
+            .step_observe(
+                &st,
+                &HashMap::from([("en".to_string(), 1u128)]),
+                &["g".to_string()],
+            )
+            .expect("step_observe");
+        assert_eq!(out.next_state.get("q"), Some(&1));
+        assert_eq!(out.observed.get("g"), Some(&1));
+        assert!(out.admissible);
+
+        // en=0 → g=0, q'=0, NOT admissible (constraint violated).
+        let out0 = sts
+            .step_observe(
+                &st,
+                &HashMap::from([("en".to_string(), 0u128)]),
+                &["g".to_string()],
+            )
+            .expect("step_observe");
+        assert_eq!(out0.observed.get("g"), Some(&0));
+        assert!(!out0.admissible);
+
+        // The provided narrow `step` default returns just the next-state,
+        // identical to step_observe's, discarding observability/admissibility.
+        let next = sts
+            .step(&st, &HashMap::from([("en".to_string(), 1u128)]))
+            .expect("step");
+        assert_eq!(
+            next, out.next_state,
+            "provided `step` matches step_observe's next-state"
+        );
     }
 
     #[test]
