@@ -866,7 +866,11 @@ impl KmtsLiftLazy for LazyLift {
 /// registers only (memory cells are not in `view.signals`), so the
 /// query construction in `smt_must_edge.rs` is unchanged — it just
 /// consumes a richer transition relation.
-fn encode_design_for_lift(
+// P0 (IR-unification track) — `pub(crate)` so the STS-IR seam
+// (`adapter::sts_ir::BtorSts`) encodes faithfully (memory-aware, array
+// theory) rather than via the BvOnly `encode_design`, matching the
+// production predicate-cube lift.
+pub(crate) fn encode_design_for_lift(
     file: &crate::adapter::btor2::ast::Btor2File,
 ) -> Result<
     crate::adapter::sidecar::predicate_image::btor2_encode::Btor2SmtView,
