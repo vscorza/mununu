@@ -51,6 +51,7 @@ pub mod partition;
 pub mod promela;
 pub mod sidecar;
 pub mod state_enum;
+pub mod sts_ir;
 pub mod systemverilog;
 pub mod templates;
 pub mod tlsf;
