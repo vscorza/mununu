@@ -725,7 +725,7 @@ impl LazyLift {
     /// Parses the BTOR2 + collects the context once; subsequent
     /// `expand_cube` calls are per-cube on-demand.
     pub fn from_btor2(
-        predicates: Vec<PredicateSpec>,
+        mut predicates: Vec<PredicateSpec>,
         btor2_content: &str,
         adapter_options: &crate::adapter::AdapterOptions,
         lift_opts: &PredicateCubeLiftOptions,
@@ -738,6 +738,11 @@ impl LazyLift {
                 message: format!("adapter/btor2/lazy_lift: parse failed: {}", e.message),
             })?;
         let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+        // P1 #1 (IR-unification track) — resolve predicate register
+        // aliases to canonical state-cell names *before* the context
+        // stores them, so the lazy per-cube `compute_cube_outgoing_edges`
+        // path binds correctly (same fix as the eager `predicate_cube_lift`).
+        resolve_predicate_registers(&file, &mut predicates)?;
         let cube_count: usize = 1usize << predicates.len();
         if cube_count > lift_opts.max_cube_count {
             return Err(AdapterError {
@@ -1408,6 +1413,67 @@ pub struct PredicateCubeLiftResult {
     pub hyper_must_edges_emitted: usize,
 }
 
+/// P1 #1 (IR-unification track) — resolve every predicate's `register`
+/// to the **canonical state-cell name** the SMT predicate-image and
+/// `simulate_one_step` both bind against, via the STS-IR seam
+/// ([`crate::adapter::sts_ir::BtorSts::resolve_register`]).
+///
+/// Three outcomes per predicate:
+/// - **Direct hit** — the name is already a canonical state-cell symbol
+///   (present in the BTOR2 symbol table). Kept verbatim.
+/// - **Alias** — the name survives only on a `uext` / `Output` node
+///   because Yosys' `flatten` stripped the symbol off the `state` line
+///   (the uart_tx `bit_cnt_q` → `bit_cnt_d` case, the DR1 #1 blocker).
+///   `resolve_register` BFS-walks to the nearest state cell and the name
+///   is rewritten to that cell's canonical symbol, so every downstream
+///   bind — the `registers` map fed to `simulate_one_step`, the
+///   `next_registers` readback, `pred_register_widths`, and the SMT
+///   `build_register_nid_map` — keys correctly.
+/// - **Unresolvable** — resolves to no state cell. Errors, naming the
+///   unknown register (matches the pre-P1 validation behaviour).
+///
+/// Both the eager [`predicate_cube_lift`] and the lazy
+/// [`LazyLift::from_btor2`] call this so the resolution is shared across
+/// the two lift strategies CEGAR routes between.
+fn resolve_predicate_registers(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    predicates: &mut [PredicateSpec],
+) -> Result<(), AdapterError> {
+    use crate::adapter::sts_ir::SymbolicTransitionSystem;
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let known: std::collections::HashSet<&String> = symbols.values().collect();
+    let sts = crate::adapter::sts_ir::BtorSts::new(file);
+    for pred in predicates.iter_mut() {
+        if known.contains(&pred.register) {
+            continue;
+        }
+        match sts.resolve_register(&pred.register) {
+            Some(canonical) => {
+                tracing::debug!(
+                    predicate = %pred.name,
+                    alias = %pred.register,
+                    canonical = %canonical,
+                    "predicate_cube_lift: resolved alias register name to canonical state cell"
+                );
+                pred.register = canonical;
+            }
+            None => {
+                return Err(AdapterError {
+                    kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                    location: None,
+                    message: format!(
+                        "adapter/btor2/predicate_cube_lift: predicate `{}` references unknown register `{}` (known: {:?})",
+                        pred.name,
+                        pred.register,
+                        symbols.values().collect::<std::collections::BTreeSet<_>>()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// R.2.5 — Lift one BTOR2 source through the predicate-cube path.
 ///
 /// **Does NOT call `Btor2Adapter::translate`** — the bit-blaster is
@@ -1429,7 +1495,7 @@ pub struct PredicateCubeLiftResult {
 ///   source's symbol table.
 /// - The cube count exceeds `lift_opts.max_cube_count`.
 pub fn predicate_cube_lift(
-    predicates: Vec<PredicateSpec>,
+    mut predicates: Vec<PredicateSpec>,
     btor2_content: &str,
     options: &AdapterOptions,
     lift_opts: &PredicateCubeLiftOptions,
@@ -1477,18 +1543,13 @@ pub fn predicate_cube_lift(
         });
     }
 
-    for pred in &predicates {
-        if !known_registers.contains(&pred.register) {
-            return Err(AdapterError {
-                kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
-                location: None,
-                message: format!(
-                    "adapter/btor2/predicate_cube_lift: predicate `{}` references unknown register `{}` (known: {:?})",
-                    pred.name, pred.register, known_registers
-                ),
-            });
-        }
-    }
+    // P1 #1 (IR-unification track) — resolve each predicate's register
+    // name to the canonical state-cell symbol via the STS-IR seam, so a
+    // predicate over a symbol-stripped alias (the uart_tx `bit_cnt_q` →
+    // `bit_cnt_d` case, the DR1 #1 blocker) binds to the real register
+    // everywhere downstream. Direct hits are kept; aliases are rewritten;
+    // unresolvable names still error.
+    resolve_predicate_registers(&file, &mut predicates)?;
 
     // 2. Cube count check — `2^|P|` must fit `max_cube_count`. For
     //    |P| > 63 the shift overflows so we cap at 63 explicitly.
@@ -2862,6 +2923,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    // P1 #1 (IR-unification track) — uart_tx alias pattern: a 1-bit
+    // toggle register whose `state` line is labelled `cnt_d` (the `_d`
+    // flavour Yosys' flatten leaves), with the `_q` flavour surviving
+    // only on a `uext` alias node. A predicate over `cnt_q` must resolve
+    // to the real register `cnt_d` (the DR1 #1 blocker) so the toggle
+    // transition relation binds correctly.
+    const ALIASED_TOGGLE_BTOR2: &str = "1 sort bitvec 1\n2 zero 1\n3 state 1 cnt_d\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n7 uext 1 3 0 cnt_q\n";
+
+    /// Collect every `(src_cube, tgt_cube)` edge of a lifted Clts.
+    fn collect_cube_edges(
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> std::collections::HashSet<(usize, usize)> {
+        let mut edges = std::collections::HashSet::new();
+        for s in clts.states() {
+            for t in clts.outgoing(s) {
+                edges.insert((s.index(), t.target().index()));
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn p1_predicate_cube_lift_resolves_alias_register_eager() {
+        // Predicate names the alias `cnt_q`. Pre-P1 this errored with
+        // "unknown register `cnt_q`"; with the seam resolution it binds
+        // to the canonical `cnt_d` and the toggle relation (0↔1) emerges.
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_1".into(),
+            register: "cnt_q".into(),
+            value: 1,
+        }];
+        let result = predicate_cube_lift(
+            preds,
+            ALIASED_TOGGLE_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("alias `cnt_q` must resolve to canonical `cnt_d`, not error");
+
+        // The predicate was rewritten to the canonical state-cell name.
+        assert_eq!(
+            result.predicates[0].register, "cnt_d",
+            "P1 #1: predicate register should be rewritten to the canonical state cell"
+        );
+
+        // Toggle binding: cube_0 (cnt_q==1 false ⇒ cnt_d=0) → cube_1,
+        // cube_1 (cnt_d=1) → cube_0. The self-loop (1,1) would only
+        // appear if the alias never bound (cnt_d stuck at its default 0).
+        let edges = collect_cube_edges(&result.clts);
+        assert!(edges.contains(&(0, 1)), "0→1 expected: {edges:?}");
+        assert!(edges.contains(&(1, 0)), "1→0 expected (toggle): {edges:?}");
+        assert!(
+            !edges.contains(&(1, 1)),
+            "no self-loop on cube_1 — its presence means `cnt_q` never bound: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn p1_lazy_lift_resolves_alias_register() {
+        // Same alias fixture through the lazy path CEGAR also routes
+        // through. Pre-P1 the lazy path did no resolution at all, so the
+        // unbound `cnt_q` left `cnt_d` stuck at 0 and cube_1 self-looped.
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_1".into(),
+            register: "cnt_q".into(),
+            value: 1,
+        }];
+        let mut lazy = LazyLift::from_btor2(
+            preds,
+            ALIASED_TOGGLE_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect("lazy from_btor2 must resolve the alias, not error");
+
+        let t0: Vec<usize> = lazy.expand_cube(0).iter().map(|e| e.target_cube).collect();
+        let t1: Vec<usize> = lazy.expand_cube(1).iter().map(|e| e.target_cube).collect();
+        assert_eq!(t0, vec![1], "cube_0 toggles to cube_1: {t0:?}");
+        assert_eq!(
+            t1,
+            vec![0],
+            "cube_1 toggles to cube_0 — a [1] here means the alias never bound: {t1:?}"
+        );
+    }
+
+    #[test]
+    fn p1_predicate_cube_lift_unresolvable_register_still_errors() {
+        // A predicate over a name that matches no state cell (directly
+        // or via any alias) must still error, naming the register.
+        let preds = vec![PredicateSpec {
+            name: "bogus".into(),
+            register: "no_such_signal".into(),
+            value: 1,
+        }];
+        let err = predicate_cube_lift(
+            preds,
+            ALIASED_TOGGLE_BTOR2,
+            &AdapterOptions::default(),
+            &PredicateCubeLiftOptions::default(),
+        )
+        .expect_err("an unresolvable register must error");
+        assert!(
+            err.message.contains("no_such_signal"),
+            "error should name the unknown register; got: {}",
+            err.message
+        );
     }
 
     #[test]

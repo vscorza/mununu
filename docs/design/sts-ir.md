@@ -112,6 +112,13 @@ invisible to callers.
   canonical interface); BTOR2 stays the only impl; behaviour-preserving.
 - **P1:** reroute `bit_blast` (Enumerate) and `predicate_cube_lift` (SmtImage) to consume
   `&dyn StepEval` / `&dyn SmtEncode` instead of `Btor2File` directly; add the batched must methods.
+  - **P1 #1 (shipped):** `predicate_cube_lift` + `LazyLift::from_btor2` now resolve every
+    predicate's `register` through `SymbolicTransitionSystem::resolve_register` (via a shared
+    `resolve_predicate_registers` helper) *before* binding — a predicate over a symbol-stripped
+    alias (the uart_tx `bit_cnt_q` → canonical state cell `bit_cnt_d`, the DR1 #1 blocker) now
+    binds to the real register across the `simulate_one_step` map, the `next_registers` readback,
+    `pred_register_widths`, and the SMT `build_register_nid_map`. Direct hits are kept; aliases
+    are rewritten; unresolvable names still error. This is the first call site to consume the seam.
 - **P2:** unify the evaluator over `TruthDomain` (orthogonal to the IR, same track).
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.
