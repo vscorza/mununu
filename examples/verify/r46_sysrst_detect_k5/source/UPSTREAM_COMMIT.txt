@@ -1,0 +1,14 @@
+558921ccc8aeefab652b45c1402c10bceb63accc
+
+Vendored from lowRISC/opentitan at the pinned commit above (Apache-2.0):
+  sysrst_ctrl_detect.sv  hw/ip/sysrst_ctrl/rtl/sysrst_ctrl_detect.sv
+  sysrst_ctrl_pkg.sv     hw/ip/sysrst_ctrl/rtl/sysrst_ctrl_pkg.sv
+
+Stub (synthesis-equivalent empty SVA macros), copied from the M.2 fixture:
+  prim_assert.sv         (sysrst_ctrl_detect does `include "prim_assert.sv")
+
+Hand-written (NOT vendored), clearly labeled in-file:
+  sysrst_harness.sv          K=5 harness instantiating 5 sysrst_ctrl_detect
+                             with narrow free trigger/enable + small constant
+                             timer thresholds.
+  sysrst_harness.mununu.json param-concretization sidecar (the 5 32-bit timers).

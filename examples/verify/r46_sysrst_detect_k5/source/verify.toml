@@ -1,0 +1,36 @@
+[project]
+name = "R46SysrstDetectK5"
+[[sources]]
+id = "sr"
+files = ["sysrst_ctrl_pkg.sv", "sysrst_ctrl_detect.sv", "prim_assert.sv", "sysrst_harness.sv"]
+adapter = "sv-yosys"
+[sources.options]
+use_sv2v = true
+top = "sysrst_harness"
+sidecar = "sysrst_harness.mununu.json"
+[alphabet]
+strategy = "direct"
+[composition]
+semantics = "synchronous"
+members = ["sr"]
+name = "SysrstTop"
+[[properties]]
+name = "reach_det0"
+formula = "mu X. (det0_o || (<> X))"
+over = "Circuit"
+[[properties]]
+name = "reach_det1"
+formula = "mu X. (det1_o || (<> X))"
+over = "Circuit"
+[[properties]]
+name = "reach_det2"
+formula = "mu X. (det2_o || (<> X))"
+over = "Circuit"
+[[properties]]
+name = "reach_det3"
+formula = "mu X. (det3_o || (<> X))"
+over = "Circuit"
+[[properties]]
+name = "reach_det4"
+formula = "mu X. (det4_o || (<> X))"
+over = "Circuit"

@@ -207,25 +207,32 @@ pub fn translate_sv(
     if yopts.use_sv2v {
         let sv2v = locate_sv2v()?;
         let preprocessed = tmp.path().join("preprocessed.sv");
-        // Include-search path: the parent dir of the primary source on
-        // disk, if known. `caliptra_sva.svh` and similar header files
-        // live next to the `.sv` the user invoked us on; sv2v can't
-        // see them otherwise because mununu staged a per-call tempdir.
+        // Include-search path. Two sources, in priority order:
         //
-        // Canonicalize to an absolute path so relative invocations
-        // (e.g. `mununu context eval foo.sv` from the source dir)
-        // resolve to a usable `-I` rather than the empty-parent path.
-        let include_dirs: Vec<PathBuf> = yopts
-            .primary_source_path
-            .as_ref()
-            .and_then(|p| {
-                let abs = Path::new(p)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(p));
-                abs.parent().map(Path::to_path_buf)
-            })
-            .into_iter()
-            .collect();
+        // 1. The staging tempdir itself. Every `additional_sources` entry
+        //    is written here (see above), so an `\`include "X.sv"` whose
+        //    target is one of the staged sources — e.g. real OpenTitan RTL
+        //    doing `\`include "prim_assert.sv"` where the stub prim_assert
+        //    is passed as an additional source (the verify-path /
+        //    multi-file case, which never sets `primary_source_path`) —
+        //    resolves against the staged copy. sv2v does not search the
+        //    including file's own directory by default, so without this the
+        //    include fails even though the file is right next to it.
+        //
+        // 2. The parent dir of the primary source on disk, if known.
+        //    `caliptra_sva.svh` and similar header files live next to the
+        //    `.sv` the user invoked us on (the `context eval` single-file
+        //    case); sv2v can't see them otherwise because mununu staged a
+        //    per-call tempdir. Canonicalized to an absolute path so
+        //    relative invocations (e.g. `mununu context eval foo.sv` from
+        //    the source dir) resolve to a usable `-I`.
+        let mut include_dirs: Vec<PathBuf> = vec![tmp.path().to_path_buf()];
+        include_dirs.extend(yopts.primary_source_path.as_ref().and_then(|p| {
+            let abs = Path::new(p)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(p));
+            abs.parent().map(Path::to_path_buf)
+        }));
         run_sv2v(&sv2v, &sources, &include_dirs, &preprocessed)?;
         // Replace the original .sv inputs with the single combined
         // Verilog-2005 file. sv2v resolves cross-file packages,
@@ -2375,6 +2382,49 @@ endpackage
         let out = translate_sv(primary, &opts, &yopts).expect("sv2v multi-file translate");
         // Reachability: at least 1 state. The actual count depends on
         // Yosys's flatten + chformal; we assert non-empty.
+        assert!(
+            out.source_info.state_count >= 1,
+            "got state_count = {}",
+            out.source_info.state_count
+        );
+    }
+
+    #[test]
+    fn sv2v_include_resolves_staged_additional_source_header() {
+        if !yosys_available() || !sv2v_available() {
+            eprintln!("skipping: yosys or sv2v not on PATH");
+            return;
+        }
+        // An `\`include`d header supplied as an `additional_sources` entry
+        // (staged into the per-call tempdir) must resolve — even on the
+        // verify / multi-file path, which never sets
+        // `primary_source_path`. Real OpenTitan RTL does
+        // `\`include "prim_assert.sv"`; before the staging tempdir was
+        // added to sv2v's `-I` search path the include failed with
+        // "Could not find file", because sv2v does not search the
+        // including file's own directory by default. Regression for the
+        // R46-6 sysrst_ctrl K=5 fixture.
+        let primary = r#"
+`include "defs.svh"
+module top (input wire clk, input wire rst_ni, output logic flag);
+    logic q;
+    always_ff @(posedge clk or negedge rst_ni)
+        if (!rst_ni) q <= 1'b0; else q <= `MK_NEXT(q);
+    assign flag = q;
+endmodule
+"#;
+        let header = "`define MK_NEXT(x) (~(x))\n";
+        let opts = AdapterOptions::default();
+        let yopts = YosysOptions {
+            top: Some("top".into()),
+            // No `primary_source_path` (the verify-path shape). The header
+            // resolves only because the staging tempdir is on sv2v's `-I`.
+            additional_sources: vec![("defs.svh".into(), header.into())],
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let out = translate_sv(primary, &opts, &yopts)
+            .expect("`include of a staged additional-source header resolves");
         assert!(
             out.source_info.state_count >= 1,
             "got state_count = {}",
