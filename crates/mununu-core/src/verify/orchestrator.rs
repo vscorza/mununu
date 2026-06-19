@@ -959,7 +959,20 @@ fn dispatch_sv_yosys(
         ..Default::default()
     };
     crate::adapter::yosys::translate_sv(content, &opts, &yopts)
-        .map(|out| (out.ctxdsl, out.partition_summary))
+        .map(|out| {
+            // C1.3 — surface the bit-blaster's AdapterWarnings on the
+            // verify path, at the same `tracing::warn!` visibility as the
+            // C0.1 sidecar lint above (the CLI defaults to the "info"
+            // EnvFilter, so WARN is shown without RUST_LOG). Without this
+            // the warnings (an unmatched sidecar signal name — the C1.3
+            // typo guard — plus large-state-space / havoc / per-cluster
+            // notes) are dropped here, never reaching a `mununu verify`
+            // user editing a `sv discover` skeleton.
+            for w in &out.warnings {
+                tracing::warn!(source_id, "{}", w.message);
+            }
+            (out.ctxdsl, out.partition_summary)
+        })
         .map_err(|err| VerifyError::AdapterTranslationFailed {
             source_id: source_id.to_string(),
             adapter: "sv-yosys".to_string(),
