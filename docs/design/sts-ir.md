@@ -136,8 +136,16 @@ invisible to callers.
     the new `bit_blast::simulate_one_step_observe`, which reports the requested combinational
     signals' current-cycle values + whether the BTOR2 `constraint` lines hold. The trait never
     mentions `FieldDomain` — domain-encoding / OOB-sink / state-splitting stay caller-side policy.
-    Phase 2 (reroute `enumerate_and_blast`'s Pass 1 onto `step_observe`, fixture-sweep
-    equivalence-gated) and Phase 3 (a non-RTL frontend inherits Enumerate) are the follow-ups.
+  - **P1 #4 Phase 2a (shipped):** aligned `simulate_one_step_observe`'s observe resolution with the
+    Enumerate strategy's combinational-signal resolution — `Op` → own value
+    (`combinational_signal_nids`), else `Output` → referenced-signal value (`output_port_nids`),
+    else `State`/`Input` → own value; precedence `Op > Output > State/Input`. Makes a future Pass-1
+    reroute *value-faithful* (the `cv` mask reads the same signals it does today) and is a
+    correctness fix on its own (output-port observation now follows the signal). Remaining Phase-2
+    steps: **2b** a *prepared stepper* (build symbols / `state_meta` once, step many) so the reroute
+    carries no per-step `collect_symbols` cost; **2c** the Pass-1 reroute, gated on the full
+    SV/BTOR2 fixture verdict sweep + a no-perf-regression check. Phase 3 = a non-RTL frontend
+    inherits Enumerate.
 - **P2:** unify the evaluator over `TruthDomain` (orthogonal to the IR, same track).
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.

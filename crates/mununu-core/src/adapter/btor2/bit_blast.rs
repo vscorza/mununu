@@ -236,13 +236,14 @@ pub fn simulate_one_step(
 /// convention), but additionally reports, from the post-`evaluate_pure` /
 /// pre-`apply_next` env (the current-cycle values):
 ///
-/// - `observed`: the current value of each requested signal name. A name
-///   is resolved to the NID of the *symbol-bearing node* that carries it
-///   (a combinational `Op`'s own computed value, or a state / input
-///   value) — distinct from [`parser::collect_symbols`], which attaches
-///   alias symbols onto state cells. Names that resolve to no symbol-
-///   bearing node, or whose node has no env value (e.g. an `output` line),
-///   are omitted from the map.
+/// - `observed`: the current value of each requested signal name, resolved
+///   the SAME way the Enumerate strategy resolves combinational signals so
+///   a future Pass-1 reroute is value-faithful — an `Op` node carrying the
+///   symbol → its own computed value (mirrors `combinational_signal_nids`);
+///   else an `Output` node → its referenced signal's value (mirrors
+///   `output_port_nids`); else a `State` / `Input` → its own value.
+///   Precedence Op > Output > State/Input. Names that resolve to no
+///   symbol-bearing node are omitted from the map.
 /// - `admissible`: whether every BTOR2 `constraint` line holds under this
 ///   `(state, inputs)` assignment. [`simulate_one_step`] returns the
 ///   next-state regardless; this variant surfaces the verdict so the
@@ -309,35 +310,56 @@ pub fn simulate_one_step_observe(
 
     let mut observed: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
     if !observe.is_empty() {
-        // name → own NID for any symbol-bearing node (Op / State / Input /
-        // Output). First occurrence wins on collision.
-        let mut name_to_nid: std::collections::HashMap<&str, Nid> =
+        // P1 #4 Phase 2a (Q2 = B) — resolve observe names to NIDs the SAME
+        // way the Enumerate strategy does, so a future Pass-1 reroute onto
+        // this primitive is value-faithful (the `cv` mask reads the same
+        // signal values it does today):
+        //   1. an `Op` node carrying the symbol → its own computed value
+        //      (mirrors `combinational_signal_nids`);
+        //   2. else an `Output` node carrying the symbol → the value of its
+        //      referenced signal (mirrors `output_port_nids`, which keys on
+        //      `signal.nid()`); read the raw signal NID — no negation
+        //      follow — to match that helper exactly;
+        //   3. else a `State` / `Input` carrying the symbol → its own value.
+        // First occurrence wins within each tier; precedence Op > Output >
+        // State/Input (matching the enumerator's union order).
+        let mut op_nid: std::collections::HashMap<&str, Nid> = std::collections::HashMap::new();
+        let mut out_sig_nid: std::collections::HashMap<&str, Nid> =
             std::collections::HashMap::new();
+        let mut si_nid: std::collections::HashMap<&str, Nid> = std::collections::HashMap::new();
         for line in &file.lines {
-            let sym = match &line.node {
+            match &line.node {
                 Node::Op {
                     symbol: Some(s), ..
+                } => {
+                    op_nid.entry(s.as_str()).or_insert(line.nid);
                 }
-                | Node::State {
+                Node::Output {
+                    symbol: Some(s),
+                    signal,
+                } => {
+                    out_sig_nid.entry(s.as_str()).or_insert(signal.nid());
+                }
+                Node::State {
                     symbol: Some(s), ..
                 }
                 | Node::Input {
                     symbol: Some(s), ..
+                } => {
+                    si_nid.entry(s.as_str()).or_insert(line.nid);
                 }
-                | Node::Output {
-                    symbol: Some(s), ..
-                } => Some(s.as_str()),
-                _ => None,
-            };
-            if let Some(s) = sym {
-                name_to_nid.entry(s).or_insert(line.nid);
+                _ => {}
             }
         }
         for name in observe {
-            if let Some(nid) = name_to_nid.get(name.as_str())
-                && let Some(bv) = env.values.get(nid)
-            {
-                observed.insert(name.clone(), bv.bits);
+            let v = op_nid
+                .get(name.as_str())
+                .or_else(|| out_sig_nid.get(name.as_str()))
+                .or_else(|| si_nid.get(name.as_str()))
+                .and_then(|nid| env.values.get(nid))
+                .map(|bv| bv.bits);
+            if let Some(v) = v {
+                observed.insert(name.clone(), v);
             }
         }
     }
@@ -8202,6 +8224,33 @@ mod tests {
         assert!(
             !out_missing.observed.contains_key("no_such_signal"),
             "unresolvable observe names are omitted"
+        );
+    }
+
+    #[test]
+    fn p1_4_phase2a_observe_follows_output_port_signal() {
+        // P1 #4 Phase 2a — an OUTPUT-port name resolves to the value of its
+        // referenced signal (matching `output_port_nids`), not the output
+        // node itself. `myport` is an output of the combinational `q & en`
+        // (nid 4), which carries no symbol of its own.
+        let src = "1 sort bitvec 1\n2 state 1 q\n3 input 1 en\n4 and 1 2 3\n5 output 4 myport\n6 next 1 2 3\n";
+        let file = crate::adapter::btor2::parser::parse(src).expect("parse");
+        let st = |q: u128| std::collections::HashMap::from([("q".to_string(), q)]);
+        let inp = |en: u128| std::collections::HashMap::from([("en".to_string(), en)]);
+
+        let out = simulate_one_step_observe(&file, &st(1), &inp(1), &["myport".to_string()])
+            .expect("step");
+        assert_eq!(
+            out.observed.get("myport"),
+            Some(&1),
+            "output port follows its signal `q & en` = 1"
+        );
+        let out0 = simulate_one_step_observe(&file, &st(1), &inp(0), &["myport".to_string()])
+            .expect("step");
+        assert_eq!(
+            out0.observed.get("myport"),
+            Some(&0),
+            "output port follows its signal `q & en` = 0"
         );
     }
 
