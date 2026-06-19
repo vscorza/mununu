@@ -1269,10 +1269,163 @@ pub fn find_sidecar(sv_path: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Canonical `$schema` tag for the single-module SV/BTOR2 sidecar.
+pub const SV_ANNOTATION_SCHEMA: &str = "mununu_sv_annotation_v1";
+
+/// `$schema` tags removed from the tool. The native multi-module sidecar
+/// path was excised in S.2b; a sidecar still tagged with one of these is
+/// stale and would load with most fields silently defaulted, so loading
+/// hard-fails with a migration hint instead.
+const REMOVED_SCHEMA_TAGS: &[&str] = &["mununu_sv_multi_v1"];
+
+// Per-level known-key allowlists for the load-time lint (C0.1 / finding E3).
+// Kept in sync with the structs above by `sidecar_key_allowlists_match_structs`.
+const SV_TOP_KEYS: &[&str] = &[
+    "$schema",
+    "module",
+    "source",
+    "signals",
+    "inputs",
+    "controllable",
+    "properties",
+    "discovered_values",
+    "parameters",
+    "parameter_concretizations",
+    "reset_sequence",
+    "simulate_reset",
+    "vcd_traces",
+    "memories",
+    "uf_wrap",
+    "uf_unwrap",
+];
+const SV_SIGNAL_KEYS: &[&str] = &[
+    "name",
+    "preserve",
+    "abstraction",
+    "bound",
+    "variants",
+    "value_map",
+    "combinational",
+    "init_policy",
+    "bounded_init",
+    "equivalence_classes",
+    "config_values",
+    "drives",
+    "type_name",
+    "note",
+];
+const SV_INPUT_KEYS: &[&str] = &[
+    "name",
+    "preserve",
+    "abstraction",
+    "bound",
+    "variants",
+    "value_map",
+    "label_name",
+    "init_policy",
+];
+const SV_PROPERTY_KEYS: &[&str] = &["id", "formula", "description", "role", "template_ref"];
+
+/// A JSON key is a documentation comment — never a typo — when it begins
+/// with `$` or `_`. Authors annotate sidecars with `$comment_*` / `_note`;
+/// these are tolerated and never flagged. (`$schema` is also in the
+/// top-level allowlist; either rule accepts it.)
+fn is_sidecar_comment_key(k: &str) -> bool {
+    k.starts_with('$') || k.starts_with('_')
+}
+
+fn collect_unknown_key_warnings(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    allow: &[&str],
+    ctx: &str,
+    label: &str,
+    out: &mut Vec<String>,
+) {
+    for k in obj.keys() {
+        if !allow.contains(&k.as_str()) && !is_sidecar_comment_key(k) {
+            out.push(format!(
+                "sidecar `{label}`: unknown field `{k}` in {ctx} — IGNORED (typo? \
+                 a `$`- or `_`-prefixed key is treated as a comment). Known {ctx} \
+                 fields: {}.",
+                allow.join(", ")
+            ));
+        }
+    }
+}
+
+/// Lint a sidecar's raw JSON before it is deserialized into [`SvAnnotation`].
+///
+/// Returns the list of non-fatal warnings (unknown fields at the root /
+/// `signals[]` / `inputs[]` / `properties[]` levels — a likely typo that
+/// would otherwise silently deserialize to a serde default, e.g. a
+/// mistyped `abstraction` collapsing a register to `Discover`/`bound: 3`).
+/// `$`- and `_`-prefixed keys are author comments and never flagged.
+///
+/// Hard-fails (`Err`) only when `$schema` names a removed schema
+/// ([`REMOVED_SCHEMA_TAGS`]). A parse error is left to the real
+/// deserialize so its message + location are preserved.
+///
+/// Sidecar-audit finding E3/O3 (C0.1). Returning the warnings (rather than
+/// logging inside) keeps the detection testable; callers log each via
+/// `tracing::warn!`.
+pub fn lint_annotation_json(content: &str, label: &str) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Ok(warnings); // parse error surfaces in the real deserialize
+    };
+    let Some(top) = value.as_object() else {
+        return Ok(warnings);
+    };
+
+    if let Some(schema) = top.get("$schema").and_then(|v| v.as_str()) {
+        if REMOVED_SCHEMA_TAGS.contains(&schema) {
+            return Err(format!(
+                "sidecar `{label}`: `$schema = \"{schema}\"` is a removed schema \
+                 — the native multi-module SV sidecar path was excised in S.2b. \
+                 Convert to `{SV_ANNOTATION_SCHEMA}` (single-module); multi-module \
+                 composition is now driven structurally from the hierarchy, not a \
+                 sidecar."
+            ));
+        }
+        if schema != SV_ANNOTATION_SCHEMA {
+            warnings.push(format!(
+                "sidecar `{label}`: unrecognized `$schema = \"{schema}\"` (expected \
+                 `{SV_ANNOTATION_SCHEMA}`) — loading leniently."
+            ));
+        }
+    }
+
+    collect_unknown_key_warnings(top, SV_TOP_KEYS, "the sidecar root", label, &mut warnings);
+    let nested = [
+        ("signals", SV_SIGNAL_KEYS, "a signals[] entry"),
+        ("inputs", SV_INPUT_KEYS, "an inputs[] entry"),
+        ("properties", SV_PROPERTY_KEYS, "a properties[] entry"),
+    ];
+    for (key, allow, ctx) in nested {
+        for entry in top
+            .get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(o) = entry.as_object() {
+                collect_unknown_key_warnings(o, allow, ctx, label, &mut warnings);
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 /// Load and parse a `.mununu.json` sidecar file (single-module format).
 pub fn load_annotation(path: &Path) -> Result<SvAnnotation, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let label = path.display().to_string();
+    // C0.1 (finding E3/O3): hard-fail on a removed `$schema`, warn on
+    // unknown fields (typo guard) before the lenient deserialize.
+    for w in lint_annotation_json(&content, &label)? {
+        tracing::warn!("{w}");
+    }
     serde_json::from_str(&content).map_err(|e| format!("failed to parse '{}': {e}", path.display()))
 }
 
@@ -2725,5 +2878,137 @@ mod tests {
         assert_eq!(effective.len(), 2);
         assert_eq!(effective.get("DEPTH").copied(), Some(4));
         assert_eq!(effective.get("N").copied(), Some(2));
+    }
+
+    // ---- C0.1 sidecar load-time lint (finding E3/O3) -------------------
+
+    #[test]
+    fn lint_clean_sidecar_has_no_warnings() {
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "m",
+            "signals": [ { "name": "cnt", "abstraction": "bounded_counter", "bound": 7 } ],
+            "properties": [ { "id": "p", "formula": "nu X. ([] X)" } ]
+        }"#;
+        let w = lint_annotation_json(json, "clean").expect("no hard fail");
+        assert!(w.is_empty(), "clean sidecar should not warn; got {w:?}");
+    }
+
+    #[test]
+    fn lint_flags_unknown_signal_field_typo() {
+        // `abstration` (typo of `abstraction`) + `bonud` (typo of `bound`)
+        // would otherwise silently deserialize to serde defaults.
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "m",
+            "signals": [ { "name": "cnt", "abstration": "bounded_counter", "bonud": 7 } ]
+        }"#;
+        let w = lint_annotation_json(json, "typo").expect("no hard fail");
+        assert!(
+            w.iter().any(|m| m.contains("abstration")) && w.iter().any(|m| m.contains("bonud")),
+            "both field typos should be flagged; got {w:?}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_unknown_root_field() {
+        let json = r#"{ "$schema": "mununu_sv_annotation_v1", "module": "m", "signls": [] }"#;
+        let w = lint_annotation_json(json, "root").expect("no hard fail");
+        assert!(
+            w.iter()
+                .any(|m| m.contains("signls") && m.contains("sidecar root")),
+            "root-level typo should be flagged; got {w:?}"
+        );
+    }
+
+    #[test]
+    fn lint_tolerates_comment_keys() {
+        // `$comment_*` and `_note` are author comments — never flagged.
+        // (Both shapes appear in the shipped fixture corpus.)
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "$comment_distinguishing_property": "doc",
+            "_note": "doc",
+            "module": "m",
+            "signals": [ { "name": "x", "abstraction": "boolean", "_why": "doc" } ]
+        }"#;
+        let w = lint_annotation_json(json, "comments").expect("no hard fail");
+        assert!(w.is_empty(), "comment keys must not warn; got {w:?}");
+    }
+
+    #[test]
+    fn lint_hard_fails_on_removed_multi_schema() {
+        let json = r#"{ "$schema": "mununu_sv_multi_v1", "module": "m" }"#;
+        let err = lint_annotation_json(json, "stale").expect_err("removed schema must hard-fail");
+        assert!(
+            err.contains("removed schema") && err.contains(SV_ANNOTATION_SCHEMA),
+            "error should name the removal + the migration target; got {err}"
+        );
+    }
+
+    #[test]
+    fn lint_warns_on_unrecognized_schema() {
+        let json = r#"{ "$schema": "mununu_sv_v99", "module": "m" }"#;
+        let w = lint_annotation_json(json, "future").expect("unrecognized schema warns, not fails");
+        assert!(
+            w.iter()
+                .any(|m| m.contains("unrecognized") && m.contains("mununu_sv_v99")),
+            "unrecognized schema should warn; got {w:?}"
+        );
+    }
+
+    /// Drift guard, two ways: the exhaustive struct literals below fail to
+    /// COMPILE if a field is added to `SignalAnnotation` / `PropertyAnnotation`
+    /// without updating this test, and the runtime assertions fail if such a
+    /// new field serializes to a key not in the corresponding lint allowlist.
+    /// Together they keep the C0.1 allowlists in sync with the structs, so the
+    /// lint never flags a real (new) field as an unknown typo.
+    #[test]
+    fn sidecar_key_allowlists_match_structs() {
+        fn keys(v: &serde_json::Value) -> Vec<String> {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        // Populate every field so each serializes (skip_serializing_if'd
+        // Options would otherwise vanish), giving the runtime check coverage.
+        let sig = SignalAnnotation {
+            name: "s".into(),
+            preserve: true,
+            abstraction: SignalAbstraction::BoundedCounter,
+            bound: Some(1),
+            variants: Some(vec!["A".into()]),
+            value_map: Some(vec![ValueMapEntry {
+                name: "A".into(),
+                value: 0,
+            }]),
+            combinational: true,
+            init_policy: InitPolicy::Zero,
+            bounded_init: Some(vec![0]),
+            equivalence_classes: true,
+            config_values: Some(vec![0u64]),
+            drives: Some("o".into()),
+            type_name: Some("t".into()),
+            note: Some("n".into()),
+        };
+        for k in keys(&serde_json::to_value(&sig).expect("serialize signal")) {
+            assert!(
+                SV_SIGNAL_KEYS.contains(&k.as_str()),
+                "SignalAnnotation field `{k}` missing from SV_SIGNAL_KEYS allowlist"
+            );
+        }
+        let prop = PropertyAnnotation {
+            id: "p".into(),
+            formula: Some("nu X. ([] X)".into()),
+            description: Some("d".into()),
+            role: "standalone".into(),
+            template_ref: None,
+        };
+        for k in keys(&serde_json::to_value(&prop).expect("serialize property")) {
+            assert!(
+                SV_PROPERTY_KEYS.contains(&k.as_str()),
+                "PropertyAnnotation field `{k}` missing from SV_PROPERTY_KEYS allowlist"
+            );
+        }
     }
 }
