@@ -233,6 +233,18 @@ pub struct CegarOptions {
     /// R.2.5b session 2 (SMT-backed must-edge query via Z3 array
     /// theory) replaces the sampling pass with a sound proof.
     pub must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference,
+    /// DR1 (IR-unification track, 2026-06-19) — may-edge inference
+    /// policy forwarded to each iteration's `predicate_cube_lift`.
+    /// `Off` (default) keeps the sampling may-edges (fast, but an
+    /// under-approximation of the may relation — unsound for safety);
+    /// `SmtAllPairs` uses the sound all-pairs SMT may relation
+    /// (over-approximation; an edge is excluded only when Z3 proves it
+    /// impossible). Surfacing this through `CegarOptions` is the DR1
+    /// enablement that lets the CEGAR path run with a sound may
+    /// relation (the P1/P3 prerequisite). Note: combining `SmtAllPairs`
+    /// with a non-`Off` `must_edge_inference` is not yet wired — see
+    /// [`crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs`].
+    pub may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference,
 }
 
 /// R.5 lazy KMTS sub-item 2.4 (2026-06-04) — selector for the
@@ -300,6 +312,7 @@ impl Default for CegarOptions {
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         }
     }
 }
@@ -561,10 +574,11 @@ pub fn cegar_refine_loop(
         // edges + a [R.2.5b-sampling-must] AdapterWarning that
         // propagates through the CegarTrace to the verdict surface.
         must_edge_inference: cegar_opts.must_edge_inference,
-        // MIG-3.2 (2026-06-13) — may-edge policy. CEGAR keeps the
-        // sampling default; the sound all-pairs SMT may-edge path is
-        // opt-in at the lift layer (not yet surfaced to CegarOptions).
-        may_edge_inference: Default::default(),
+        // MIG-3.2 (2026-06-13) — may-edge policy. DR1 (2026-06-19)
+        // surfaces this through `CegarOptions::may_edge_inference`:
+        // `Off` (default) keeps the sampling may-edges; `SmtAllPairs`
+        // selects the sound all-pairs SMT may relation.
+        may_edge_inference: cegar_opts.may_edge_inference,
         // R-Y7 (2026-06-07) + R-S8 session 2 (2026-06-08) —
         // symbolic-init via predicate cubes. Read the
         // `signals[].config_values` map from the sidecar JSON
@@ -1380,6 +1394,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1399,6 +1414,60 @@ mod tests {
         }
         assert!(trace.lazy_lift_pending);
         assert!(!trace.approximant_reuse_enabled);
+    }
+
+    #[test]
+    fn cegar_honors_smt_all_pairs_may_edge_inference() {
+        // DR1 (IR-unification track) — CegarOptions::may_edge_inference =
+        // SmtAllPairs threads through to predicate_cube_lift's sound
+        // all-pairs may relation. On a toggle (q' = !q) with predicate
+        // {q == 0}, EF(q==0) = `mu X. (p0 | <step> X)`: the q==0 cube is
+        // KleeneT (already idle); the q≠0 cube is KleeneBot — the
+        // diamond `<step>` needs a must-witness to be KleeneT, and
+        // must-edge inference is Off, so the SOUND verdict is "indefinite,
+        // refine", NOT a (spurious) definite false. This pins the sound
+        // outcome through the CEGAR surface, distinct from any sampling
+        // under-approximation that could drop the q≠0 → q==0 may-edge.
+        const TOGGLE: &str =
+            "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+        let formula = parser::parse("mu X. (p0 | <step> X)").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p0".into(),
+            register: "q".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 3,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs,
+            ..Default::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            TOGGLE,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds under SmtAllPairs");
+        // Count the verdict cells: exactly one KleeneT (q==0) and one
+        // KleeneBot (q≠0); no spurious definite-false.
+        let mut t = 0;
+        let mut f = 0;
+        let mut bot = 0;
+        for s in 0..trace.final_verdict.len() {
+            match trace.final_verdict.verdict_at(s) {
+                Trit::True => t += 1,
+                Trit::False => f += 1,
+                Trit::Unknown => bot += 1,
+            }
+        }
+        assert_eq!(
+            (t, f, bot),
+            (1, 0, 1),
+            "SmtAllPairs EF(q==0) should be sound (T + ⊥, no spurious F); got T={t} F={f} ⊥={bot}"
+        );
     }
 
     #[test]
@@ -1440,6 +1509,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1498,6 +1568,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1898,6 +1969,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -1928,6 +2000,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -2022,6 +2095,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -2043,6 +2117,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -2245,6 +2320,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let env_iter0 = Environment::new(2);
         let result_off = cegar_refine_loop(
@@ -2269,6 +2345,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let result_on = cegar_refine_loop(
             &formula,
@@ -2342,6 +2419,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2391,6 +2469,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2527,6 +2606,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2570,6 +2650,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2653,6 +2734,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2738,6 +2820,7 @@ mod tests {
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2801,6 +2884,7 @@ mod tests {
             smart_uf_cap: false,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2865,6 +2949,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let debug_str = format!("{opts:?}");
         assert!(
@@ -2917,6 +3002,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace_result = cegar_refine_loop(
             &formula,
@@ -2971,6 +3057,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -3021,6 +3108,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -3083,6 +3171,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         };
         let trace_eager = cegar_refine_loop(
             &formula,

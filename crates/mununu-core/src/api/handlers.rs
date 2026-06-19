@@ -654,6 +654,9 @@ pub async fn btor2_cegar_handler(
         smart_uf_cap: true,
         lift_strategy: LiftStrategy::Eager,
         must_edge_inference,
+        // DR1 (2026-06-19) — API keeps the sampling may-edges (default);
+        // the sound `SmtAllPairs` path is opt-in via the CLI for now.
+        may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
     };
 
     let adapter_options = AdapterOptions {

@@ -153,6 +153,25 @@ enum PredicateSourceArg {
     Craig,
 }
 
+/// DR1 (IR-unification track, 2026-06-19) — may-edge inference
+/// selector for `mununu btor2 cegar`. Mirrors
+/// [`mununu_core::adapter::btor2::kmts_lift::MayEdgeInference`].
+#[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
+enum MayEdgeInferenceArg {
+    /// Sampling-based may-edges (default). Fast, but an
+    /// under-approximation of the may relation — sampling can MISS a
+    /// real may-edge, which is unsound for safety. Preserves the
+    /// pre-DR1 CEGAR behaviour.
+    #[default]
+    Off,
+    /// Sound all-pairs SMT may-edges: for every (src, tgt) cube pair Z3
+    /// decides whether a concrete witness exists; an edge is excluded
+    /// only when proven impossible (a sound over-approximation). O(cubes²)
+    /// SMT calls — tractable at small cube counts. Combining with a
+    /// non-`off` `--must-edge-inference` is not yet wired.
+    SmtAllPairs,
+}
+
 /// R.2.5b session-1 follow-up (2026-06-06) — must-edge inference
 /// selector for `mununu btor2 cegar`. Mirrors the values of
 /// [`mununu_core::adapter::btor2::kmts_lift::MustEdgeInference`].
@@ -230,6 +249,14 @@ struct Btor2CegarArgs {
     /// post-pass fires.
     #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
     must_edge_inference: MustEdgeInferenceArg,
+    /// DR1 (IR-unification track, 2026-06-19) — may-edge inference
+    /// policy for the per-iteration `predicate_cube_lift`. Defaults to
+    /// `off` (sampling may-edges; fast but an under-approximation of the
+    /// may relation, unsound for safety). Set to `smt-all-pairs` for the
+    /// sound all-pairs SMT may relation (an edge is excluded only when
+    /// Z3 proves it impossible).
+    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::Off)]
+    may_edge_inference: MayEdgeInferenceArg,
     /// R-S8 session 2 (2026-06-08) — under-constrained constant's
     /// admissible value set. Format: `REGISTER=v1,v2,v3`. May be
     /// repeated. Bridges to the R-Y7 symbolic-init path by
@@ -1875,6 +1902,14 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         }
     };
 
+    // DR1 (2026-06-19) — map CLI MayEdgeInferenceArg to the core enum.
+    let may_edge_inference = match args.may_edge_inference {
+        MayEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+        MayEdgeInferenceArg::SmtAllPairs => {
+            mununu_core::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs
+        }
+    };
+
     let cegar_opts = CegarOptions {
         max_iterations: args.max_iterations,
         predicate_source,
@@ -1884,6 +1919,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         smart_uf_cap: true,
         lift_strategy: LiftStrategy::Eager,
         must_edge_inference,
+        may_edge_inference,
     };
 
     // R-S8 session 2 (2026-06-08) — parse the `--config-values`
