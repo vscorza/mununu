@@ -871,6 +871,21 @@ fn dispatch_sv_yosys(
                     path: path.clone(),
                     source,
                 })?;
+            // C0.1 (finding E3/O3): lint the sidecar before widening — hard-fail
+            // on a removed `$schema`, warn on unknown fields (typo guard) — the
+            // same check the CLI `load_annotation` path runs.
+            let lint_warnings = crate::adapter::systemverilog::annotation::lint_annotation_json(
+                &raw,
+                &path.display().to_string(),
+            )
+            .map_err(|message| VerifyError::AdapterTranslationFailed {
+                source_id: source_id.to_string(),
+                adapter: "sv-yosys".to_string(),
+                message,
+            })?;
+            for w in &lint_warnings {
+                tracing::warn!(source_id, "{w}");
+            }
             let widened = crate::adapter::systemverilog::sidecar_widening::widen_sidecar(
                 &raw,
                 content,
