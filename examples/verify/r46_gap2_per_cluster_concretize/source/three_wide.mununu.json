@@ -1,0 +1,9 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "three_wide",
+  "signals": [
+    { "name": "cnt_a", "abstraction": "bounded_counter", "bound": 127 },
+    { "name": "cnt_b", "abstraction": "bounded_counter", "bound": 127 },
+    { "name": "cnt_c", "abstraction": "bounded_counter", "bound": 127 }
+  ]
+}

@@ -1,0 +1,55 @@
+# R46-6 / GAP-2 — per-cluster slicing × param-concretization, composed.
+#
+# `three_wide.sv` has three independent 24-bit counters. Each property
+# reads only one counter, so the cones are disjoint and cluster K=3.
+#
+# Joint effective width (with the sidecar) = 3 × 7 = 21 state bits, past
+# MAX_STATE_BITS = 20 → the bit-blaster overflows → automatic per-cluster
+# verification fires. It partitions the three properties by cone overlap,
+# slices the netlist to each cluster's own counter, and the sidecar's
+# `bounded_counter bound=127` concretizes that counter to 7 effective bits
+# so each cluster fits. All three reachability targets (cnt == 7) are in
+# the concretized set {0..127} and genuinely reached, so all three come
+# back SATISFIED, each over a distinct cluster automaton (`Circuit__clK`).
+#
+# Without the sidecar the design is rejected outright (72 raw state bits):
+# per-cluster slicing alone cannot rescue it because each cluster's cone is
+# still a 24-bit counter > the cap. The param-concretization is what makes
+# each cluster fit — the two primitives compose.
+
+[project]
+name = "R46Gap2PerClusterConcretize"
+description = "Three independent 24-bit counters: joint busts the cap even after concretization, per-cluster slicing isolates each cone, and param-concretization shrinks the wide counter inside each cone so the cluster fits."
+
+[[sources]]
+id = "t"
+files = ["three_wide.sv"]
+adapter = "sv-yosys"
+
+[sources.options]
+use_sv2v = true
+top = "three_wide"
+sidecar = "three_wide.mununu.json"
+
+[alphabet]
+strategy = "direct"
+
+[composition]
+semantics = "synchronous"
+members = ["t"]
+name = "ThreeWideTop"
+
+[[properties]]
+name = "reach_a7"
+formula = "mu X. (a7_o || (<> X))"
+over = "Circuit"
+
+[[properties]]
+name = "reach_b7"
+formula = "mu X. (b7_o || (<> X))"
+over = "Circuit"
+
+[[properties]]
+name = "reach_c7"
+formula = "mu X. (c7_o || (<> X))"
+over = "Circuit"
