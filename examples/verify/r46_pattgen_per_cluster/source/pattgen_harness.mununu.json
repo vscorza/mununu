@@ -1,0 +1,20 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "pattgen_harness",
+  "signals": [
+    { "name": "u_chan0.prediv_q",  "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan0.clk_cnt_q", "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan0.data_q",    "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan0.len_q",     "abstraction": "ignored" },
+    { "name": "u_chan0.bit_cnt_q", "abstraction": "ignored" },
+    { "name": "u_chan0.reps_q",    "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan0.rep_cnt_q", "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan1.prediv_q",  "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan1.clk_cnt_q", "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan1.data_q",    "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan1.len_q",     "abstraction": "ignored" },
+    { "name": "u_chan1.bit_cnt_q", "abstraction": "ignored" },
+    { "name": "u_chan1.reps_q",    "abstraction": "bounded_counter", "bound": 1 },
+    { "name": "u_chan1.rep_cnt_q", "abstraction": "bounded_counter", "bound": 1 }
+  ]
+}
