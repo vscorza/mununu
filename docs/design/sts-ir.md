@@ -119,6 +119,15 @@ invisible to callers.
     binds to the real register across the `simulate_one_step` map, the `next_registers` readback,
     `pred_register_widths`, and the SMT `build_register_nid_map`. Direct hits are kept; aliases
     are rewritten; unresolvable names still error. This is the first call site to consume the seam.
+  - **P1 #2 (shipped):** `predicate_cube_lift`'s `SmtAllPairs` may-block consumes
+    `SmtEncode::may_edges` instead of re-inlining the encode → nid-map → all-pairs Z3 loop —
+    de-dups the two copies onto the single seam implementation.
+  - **P1 #3 (shipped):** added `SmtEncode::must_edges` (the canonical ∀∃ KMTS must-relation,
+    all-pairs, sound under-approximation, `R_must ⊆ R_may`). The eager `predicate_cube_lift`
+    composes it: `SmtAllPairs` may + a non-Off must inference now promote each must-edge
+    `MayOnly` → `Sharp`, yielding a KMTS with both relations — the prerequisite for sound DEFINITE
+    3-valued verdicts (closes DR1 F5; previously the must post-pass only consumed the sampling
+    pass's candidate set, which `SmtAllPairs` bypassed).
 - **P2:** unify the evaluator over `TruthDomain` (orthogonal to the IR, same track).
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.
