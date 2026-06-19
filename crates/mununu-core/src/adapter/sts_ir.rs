@@ -1,14 +1,16 @@
 //! Symbolic Transition System IR — the frontend-agnostic abstraction seam.
 //!
-//! > Status: planning / DR0 stub (IR-unification track). Design:
+//! > Status: planning / P0 canonical seam (IR-unification track). Design:
 //! > `docs/design/sts-ir.md`. This module defines the *interface* the two
 //! > abstraction engines need from a symbolic transition system, plus one
 //! > implementation ([`BtorSts`]) that wraps a parsed BTOR2 file by
 //! > delegating to existing, already-shipped functions. **No existing
-//! > call site is rewired by DR0** — `bit_blast` and `predicate_cube_lift`
-//! > still talk to BTOR2 directly; this seam exists to prove the
-//! > abstraction is expressible without leaking BTOR2/Z3 types, and to be
-//! > the consumption point that P1 reroutes the engines onto.
+//! > call site is rewired yet** — `bit_blast` and `predicate_cube_lift`
+//! > still talk to BTOR2 directly; P1 reroutes them onto this seam. P0
+//! > makes the seam the *canonical, faithful* interface: register-name
+//! > resolution ([`SymbolicTransitionSystem::resolve_register`], the home
+//! > of the DR1 #1 blocker fix) and a memory-aware SMT encode (array
+//! > theory), so P1 can consume it without behaviour drift.
 //!
 //! The seam is two traits over a shared metadata trait:
 //!
@@ -49,6 +51,22 @@ pub trait SymbolicTransitionSystem {
     fn state_vars(&self) -> Vec<StsVar>;
     /// Free input variables, sorted by name.
     fn input_vars(&self) -> Vec<StsVar>;
+    /// P0 (IR-unification track) — resolve a user-facing register name
+    /// (which may be an *alias*, e.g. the `_q` flavour Yosys leaves on a
+    /// `uext` node after flatten strips the symbol from the state line)
+    /// to the **canonical state-cell name** that the SMT predicate-image
+    /// binds against (the `_d` symbol the SMT view keys on). Returns
+    /// `None` when the name resolves to no state cell, or the resolved
+    /// cell carries no symbol.
+    ///
+    /// This is the architectural home of the DR1 #1 blocker fix: the
+    /// predicate-cube path can use this so a sidecar predicate over
+    /// `bit_cnt_q` binds to the real counter register even when the
+    /// state line is labelled `bit_cnt_d`. The `bit_blast`/sidecar path
+    /// already does the equivalent BFS via `resolve_state_by_symbol` +
+    /// the `drives` override; surfacing it here lets the cube path share
+    /// the same resolution (P1 wires it into `predicate_cube_lift`).
+    fn resolve_register(&self, name: &str) -> Option<String>;
 }
 
 /// Concrete one-step semantics: given a full assignment of state vars +
@@ -133,6 +151,15 @@ impl SymbolicTransitionSystem for BtorSts<'_> {
     fn input_vars(&self) -> Vec<StsVar> {
         self.vars_of(false)
     }
+
+    fn resolve_register(&self, name: &str) -> Option<String> {
+        // BFS-backward from any node carrying `name` (direct state match,
+        // or an Op / Output alias) to the nearest state cell, then return
+        // that cell's own symbol — the name the SMT view + predicate-image
+        // bind against. Mirrors the sidecar resolver's `drives` path.
+        let nid = parser::resolve_state_by_symbol(self.file, name)?;
+        parser::collect_symbols(self.file).get(&nid).cloned()
+    }
 }
 
 impl StepEval for BtorSts<'_> {
@@ -148,21 +175,21 @@ impl StepEval for BtorSts<'_> {
 
 impl SmtEncode for BtorSts<'_> {
     fn may_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)> {
+        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMayVerdict, build_register_nid_map, smt_per_target_may_check,
         };
-        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
 
         if predicates.is_empty() {
             return Vec::new();
         }
-        // DR0 uses the BvOnly `encode_design`; P1 swaps in the
-        // memory-aware `encode_design_for_lift` (array theory) — see
-        // `docs/design/sts-ir.md` §"Z3 scope".
+        // P0 — faithful, memory-aware encode (array theory for `$mem`
+        // cells), matching the production `predicate_cube_lift`. (DR0 used
+        // the BvOnly `encode_design`.)
         let n_cubes = 1usize << predicates.len();
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
-            let view = match encode_design(self.file) {
+            let view = match encode_design_for_lift(self.file) {
                 Ok(v) => v,
                 // Encoder can't build the view (e.g. an unsupported op):
                 // no may-edges rather than an unsound guess. Mirrors the
@@ -196,6 +223,25 @@ mod tests {
     // both the state/input metadata and the concrete-step delegation.
     const STEP_BTOR2: &str =
         "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 input 1 en\n6 next 1 3 5\n";
+
+    // P0 — a 4-bit state cell labelled `cnt_d` on the state line, with the
+    // `cnt_q` flavour surviving only on a `uext` alias. This mirrors the
+    // uart_tx pattern where Yosys' flatten strips the `_q` symbol from the
+    // state line (the DR1 #1 blocker).
+    const ALIASED_BTOR2: &str = "1 sort bitvec 4\n2 zero 4\n3 state 4 cnt_d\n4 init 4 3 2\n5 uext 4 3 0 cnt_q\n6 next 4 3 2\n";
+
+    #[test]
+    fn btor_sts_resolve_register_follows_uext_alias_to_state_cell() {
+        // The DR1 #1 blocker fix, homed in the seam: a predicate over the
+        // alias `cnt_q` resolves to the canonical state-cell name `cnt_d`.
+        let file = parser::parse(ALIASED_BTOR2).expect("parse");
+        let sts = BtorSts::new(&file);
+        assert_eq!(sts.resolve_register("cnt_q").as_deref(), Some("cnt_d"));
+        // The canonical name resolves to itself.
+        assert_eq!(sts.resolve_register("cnt_d").as_deref(), Some("cnt_d"));
+        // A name matching no state cell does not resolve.
+        assert_eq!(sts.resolve_register("nonexistent"), None);
+    }
 
     #[test]
     fn btor_sts_reports_state_and_input_vars() {
