@@ -30,7 +30,7 @@ CADP's industrial track record (LNT process algebra + MCL mu-calculus over the s
 >
 > Source of truth: [`CompositionSemantics`](../../crates/mununu-core/src/composition/mod.rs) — surface: API
 >
-> Source of truth: [`Tristate`](../../crates/mununu-core/src/clts/mod.rs#L278) + [`TransitionModality`](../../crates/mununu-core/src/clts/mod.rs#L311) + [`KleeneDomain`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs) — surface: API
+> Source of truth: [`Tristate`](../../crates/mununu-core/src/clts/mod.rs#L278) + [`TransitionModality`](../../crates/mununu-core/src/clts/mod.rs#L311) + [`KleeneDom`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) — surface: API
 
 Five mununu primitives sit at the root of every V.x domain claim below:
 
@@ -38,7 +38,7 @@ Five mununu primitives sit at the root of every V.x domain claim below:
 2. **Per-state structured valuations** — `state_valuation: HashMap<String, String>` for display-only metadata, `state_variable_bitset: Bitset<String>` for the 2-valued AP labelling that drives modal evaluation, and `state_3valued_predicates: Option<BTreeMap<(StateId, String), Tristate>>` (R.1 addition) for KMTS-aware 3-valued AP labels. State valuations survive composition by construction post-R.1.
 3. **Multi-label transitions** — every transition holds a `SmallVec<[LabelId; 4]>` of intern'd labels. A single transition can carry `(msg-type, src, dest, tag)` without spurious interleaving. Modal guards (`Guard::labels`) filter on label membership; transition rendezvous in synchronous composition matches on shared labels.
 4. **CompositionSemantics: synchronous / asynchronous / mixed** — the same machinery composes a hardware FSM with a software task by interleaving, or composes two RTL modules with shared-net rendezvous. This is the substrate every domain below leans on.
-5. **3-valued KMTS semantics** — `Tristate { KleeneT, KleeneF, KleeneBot }` (R.1) for state AP labellings, `TransitionModality { Sharp, MayOnly }` (R.1) plus the R.4.5 addition `MustHyperOnly { targets: SmallVec<[StateId; 4]> }`, evaluated via either the cheap-path fixpoint `evaluate_tri` (R.3) or the planned parity-game `evaluate_3v_game` (R.5.0). `KleeneDomain` implements `TruthDomain` per [`truth_domain.rs`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs).
+5. **3-valued KMTS semantics** — `Tristate { KleeneT, KleeneF, KleeneBot }` (R.1) for state AP labellings, `TransitionModality { Sharp, MayOnly }` (R.1) plus the R.4.5 addition `MustHyperOnly { targets: SmallVec<[StateId; 4]> }`, evaluated via either the cheap-path fixpoint `evaluate_tri` (R.3) or the planned parity-game `evaluate_3v_game` (R.5.0). `KleeneDom` implements the bulk `EvalDomain` trait per [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) (unified P2.2/P2.3).
 
 What's planned (per [`../../.claude/plans/you-are-a-formal-vast-lake.md`](../../.claude/plans/you-are-a-formal-vast-lake.md) §Phase 5):
 
@@ -72,7 +72,7 @@ The hard properties are not the safety invariants (single-writer-multiple-reader
 | `CompositionSemantics::Asynchronous` | Independent agents interleave local transitions |
 | `state_valuation` + `state_3valued_predicates` | Per-agent coherence state, pending request set, outstanding-ack counter |
 | Multi-label transitions | `(message-type, data, source, dest, tag)` carried atomically |
-| `KleeneDomain` + R.4.5 `MustHyperOnly` | Sound abstraction of the "rest of the population" as a may-environment; hyper-must keeps the directory's "send to one of these agents" abstract under refinement |
+| `KleeneDom` + R.4.5 `MustHyperOnly` | Sound abstraction of the "rest of the population" as a may-environment; hyper-must keeps the directory's "send to one of these agents" abstract under refinement |
 
 ### Template properties (mu-calculus form)
 

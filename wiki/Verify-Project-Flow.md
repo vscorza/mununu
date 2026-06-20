@@ -52,7 +52,7 @@ verify.toml --> parse + validate
                        \--> environment_for(automaton) wires CLTS state_valuations
                                 into Environment::abstract_states when numeric (Phase A.3)
               \--> for each property: resolve template, evaluate via mu_calculus
-                       \--> TruthDomain choice: BoolDomain (default; 2-valued) or KleeneDomain (3-valued)
+                       \--> EvalDomain choice: BoolDom (default; 2-valued) or KleeneDom (3-valued)
                        \--> on-demand `signal == const` atoms resolve through
                             abstract_states + state-valuation binding (Phase A.3)
                        \--> on KleeneBot verdict: CEGAR refinement loop (post-R.5; bounded at 16 rounds)
@@ -67,7 +67,7 @@ The KMTS pivot replaces the SystemVerilog extraction story end-to-end while leav
 
 - **Frontend: sv2v + Yosys-no-flatten + BTOR2-per-module.** sv2v normalises SV-2017 to a Verilog-2005 subset (preserves hierarchy and signal names); Yosys runs `read_verilog; hierarchy -check; proc; opt -fast -purge -keepdc` **without `flatten`** then emits one BTOR2 per submodule via `submod -name <m>; write_btor`. Top-module netlist drives composition.
 - **KMTS data model.** Each `Transition` carries a `TransitionModality` (`Sharp` for must ∧ may; `MayOnly` for over-approximation). Each `Clts` optionally carries `state_3valued_predicates: BTreeMap<(StateId, PredId), Tristate>` where `Tristate ∈ { KleeneT, KleeneF, KleeneBot }`. Legacy adapters produce `Sharp` everywhere with `None` for the 3-valued field — vacuous KMTS, identical to today's 2-valued behaviour.
-- **3-valued evaluator.** The `TruthDomain` trait surfaces both the truth lattice (formula semantics) and the information lattice (fixpoint convergence). `BoolDomain` instantiates the 2-valued specialisation; `KleeneDomain` instantiates the 3-valued one. Verdicts are `KleeneT` / `KleeneF` / `KleeneBot`; `KleeneBot` triggers CEGAR.
+- **3-valued evaluator.** One generic evaluator body monomorphises over the bulk `EvalDomain` trait (associated `Valuation` = whole-state-set representation). `BoolDom` (BitVec) is the 2-valued cheap path; `KleeneDom` (TritSet) the 3-valued one — the truth-lattice (formula semantics) vs information-lattice (fixpoint convergence) distinction is absorbed into `TritSet`'s must/may pair. Verdicts are `KleeneT` / `KleeneF` / `KleeneBot`; `KleeneBot` triggers CEGAR. (Unified onto the single body in IR-track P2.2/P2.3; the earlier per-element `TruthDomain` trait was retired in P2.4.)
 - **CEGAR refinement.** On `KleeneBot`, the lifter lifts the abstract counterexample, SMT-discharges it for spuriousness, and on UNSAT extracts predicate refinements via IC3-IA-style interpolation. Bounded by `cegar_max_rounds` (default 16). Two-axis refinement: predicate addition vs. UF instance concretisation, partitioned by unsat-core symbol kind.
 
 **Singular-pipeline commitment.** As of S.2b the legacy native-SV adapter (the hand-rolled recursive-descent parser + explicit cross-product enumerator) is **deleted**. There is no `--engine native-sv` escape hatch. SV verification has exactly one pipeline — `sv-yosys` (sv2v → Yosys → BTOR2 → bit-blast). Sidecar significant-value discovery moved to `mununu btor2 discover` (which runs over the BTOR2 IR the verify path uses). See [`docs/design/native-sv-abstraction.md`](../docs/design/native-sv-abstraction.md) for the architecture.
@@ -168,7 +168,7 @@ pub struct PropertyVerdict {
     pub satisfied: bool,                       // true iff KleeneT (preserved for 2-valued clients)
     pub total_states: usize,
     pub satisfying_states: usize,              // for KleeneT/KleeneF; not meaningful for KleeneBot
-    pub bot_states: usize,                     // count of KleeneBot states (post-R.3; 0 for BoolDomain)
+    pub bot_states: usize,                     // count of KleeneBot states (post-R.3; 0 for BoolDom)
     pub initial_states: Vec<String>,
     pub initial_satisfying: Vec<String>,
     pub refinement_trace: Option<RefinementTrace>, // populated when CEGAR ran (post-R.5)
@@ -177,7 +177,7 @@ pub struct PropertyVerdict {
 pub enum KleeneVerdict { KleeneT, KleeneF, KleeneBot }
 ```
 
-For BoolDomain (legacy adapters, Sharp-everywhere KMTSes), `verdict` is always `KleeneT` or `KleeneF` and `bot_states` is always `0`. For KleeneDomain (KMTS lifter output with `MayOnly` transitions), `KleeneBot` is possible; when CEGAR refinement closes it, `refinement_trace` is `Some(_)` with per-round predicate / UF additions.
+For `BoolDom` (legacy adapters, Sharp-everywhere KMTSes), `verdict` is always `KleeneT` or `KleeneF` and `bot_states` is always `0`. For `KleeneDom` (KMTS lifter output with `MayOnly` transitions), `KleeneBot` is possible; when CEGAR refinement closes it, `refinement_trace` is `Some(_)` with per-round predicate / UF additions.
 
 ## CLI
 

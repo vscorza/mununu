@@ -420,4 +420,4 @@ For readers unfamiliar with Kleene's 3-valued logic or Tarski's fixpoint theorem
 - Mununu's `Clts<S, L>` extension (§6 of this doc): [`crates/mununu-core/src/clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) (post-R.1).
 - Composition modality merge: [`crates/mununu-core/src/composition/mod.rs`](../../crates/mununu-core/src/composition/mod.rs) (post-R.1).
 - KMTS-aware BTOR2 lifter: [`crates/mununu-core/src/adapter/btor2/kmts_lift.rs`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs) (post-R.2).
-- KleeneDomain evaluator instantiation: [`crates/mununu-core/src/mu_calculus/truth_domain.rs`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs) (post-R.3).
+- KleeneDom evaluator instantiation: [`crates/mununu-core/src/mu_calculus/evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) — the bulk `EvalDomain` trait + `BoolDom` / `KleeneDom` (post-R.3; the per-element `truth_domain` trait this section's §4.x prose describes was a dead R.1 artifact, retired in P2.4 — the shipped trait is bulk; see [`evaluator-domain-unification.md`](evaluator-domain-unification.md)).

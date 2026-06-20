@@ -906,7 +906,11 @@ Fixpoints: Kleene iteration over the *information order*
 **mununu-shaped Rust sketch.**
 
 ```rust
-// crates/mununu-core/src/mu_calculus/truth_domain.rs (NEW; post-R.3)
+// Illustrative per-element sketch. As-built diverged: the production trait is
+// the BULK `EvalDomain` (associated `Valuation` type = whole-state-set
+// BitVec | TritSet) in crates/mununu-core/src/mu_calculus/evaluator.rs; this
+// per-element `truth_domain` trait was an R.1 artifact the R.3 evaluator
+// bypassed, retired in P2.4. See evaluator-domain-unification.md.
 trait TruthDomain {
     type Element: Clone + Eq;
     fn truth_top(&self) -> Self::Element;
@@ -1288,7 +1292,7 @@ cover the KMTS pivot's literature anchors and lift verbatim into
 | 18 | Caliptra 2.0/2.1 spec | Empirical target | [`/tmp/caliptra_retry/`](file:///tmp/caliptra_retry/) | n/a | A.4–A.5 fixtures |
 | 19 | Larsen–Thomsen 1988 — MTS | KMTS data model | [`clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) (`Transition`) | `TransitionModality` enum addition | R.1 |
 | 20 | Dams–Gerth–Grumberg 1997 — Mixed TS | KMTS data model (theoretical) | [`clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) | n/a (mixed-system extension consciously omitted) | R.1 (cite) |
-| 21 | Bruns–Godefroid CONCUR 2000 — 3-valued mu-calculus | KMTS evaluator | [`mu_calculus/evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) | `mu_calculus/truth_domain.rs` (`TruthDomain` trait + `KleeneDomain` instantiation) | R.3 |
+| 21 | Bruns–Godefroid CONCUR 2000 — 3-valued mu-calculus | KMTS evaluator | [`mu_calculus/evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) | `mu_calculus/evaluator.rs` (bulk `EvalDomain` trait + `BoolDom` / `KleeneDom` instantiations, unified P2.2/P2.3) | R.3 |
 | 22 | Huth–Jagadeesan–Schmidt TACAS 2001 — KMTS | KMTS evaluator + composition | [`composition/mod.rs`](../../crates/mununu-core/src/composition/mod.rs), [`clts/mod.rs`](../../crates/mununu-core/src/clts/mod.rs) | `state_3valued_predicates`, `TransitionModality` merge in `composition` | R.1, R.3 |
 | 23 | Godefroid–Jagadeesan TACAS 2003 — CEGAR for KMTS | KMTS lifter refinement | n/a (new) | `adapter/btor2/kmts_lift.rs::refine` | R.5 |
 | 24 | Larsen–Nyman–Wąsowski FoSSaCS 2007 — Modal I/O automata | Compositional KMTS soundness | [`composition/mod.rs`](../../crates/mununu-core/src/composition/mod.rs) | n/a (theorem; no algorithmic code) | R.1 (cite) |

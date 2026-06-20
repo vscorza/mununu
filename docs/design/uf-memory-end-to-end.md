@@ -119,5 +119,5 @@ Total Option-4 track: ~8–10 sessions. Sequenced after stage 5; own design-doc-
 - Routing dispatch + corrected stage-3.c: [`phase10-uf-routing.md`](phase10-uf-routing.md)
 - Stage-5 Option-B (Caliptra mbox black-box, ships first): `.claude/plans/measurements/Phase10-stage5-caliptra-mbox-blackbox-2026-06-12.md`
 - Array encoder (shipped, becomes `Z3Backend` array methods): commits `9c5fa09`, `3600cba`
-- Verdict-evaluator tagless-final precedent (the pattern Option 4 mirrors): [`truth_domain.rs`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs)
+- Verdict-evaluator tagless-final precedent (the pattern Option 4 mirrors): [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) (the bulk `EvalDomain` trait + `BoolDom` / `KleeneDom`, unified P2.2/P2.3)
 - KMTS soundness foundation: [`kmts-theory.md`](kmts-theory.md)

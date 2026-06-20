@@ -41,8 +41,8 @@
 //! - step 1d+: real UF in the Z3 backend; the ibex-regfile
 //!   read-after-write milestone.
 //!
-//! Mirrors the [`crate::mu_calculus::truth_domain::TruthDomain`]
-//! tagless-final precedent the verdict evaluator already uses.
+//! Mirrors the tagless-final `EvalDomain` trait (`mu_calculus::evaluator`)
+//! the verdict evaluator uses to monomorphise over `BoolDom` / `KleeneDom`.
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
 use crate::adapter::btor2::parser::{array_widths, bv_width};

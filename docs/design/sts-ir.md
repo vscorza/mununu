@@ -20,7 +20,7 @@ STS-IR is the **narrow waist** that decouples the abstraction engines from the B
 
 ```
 frontend ──lower──▶ STS-IR ──┬─ Enumerate strategy ─▶ Sharp CLTS ─┐
- (BTOR2 ~1:1;                 └─ SmtImage strategy ──▶ KMTS        ─┴▶ one Clts ─▶ eval_node<D: TruthDomain>
+ (BTOR2 ~1:1;                 └─ SmtImage strategy ──▶ KMTS        ─┴▶ one Clts ─▶ eval_node_generic<D: EvalDomain>
   C/Promela lower under P5)
 ```
 
@@ -89,7 +89,7 @@ functions — **DR0 changes no behaviour and rewires no call site**:
   longer parses BTOR2 or touches Z3; it consumes an `&dyn SmtEncode`.
 
 Both consumption paths produce the *same* `Clts` (a Sharp CLTS is a degenerate KMTS), fed to the
-one evaluator family (`BoolDomain` cheap path / `KleeneDomain` sound-abstraction path).
+one evaluator family (`BoolDom` cheap path / `KleeneDom` sound-abstraction path).
 
 ## 5. Z3 scope & batching (why `may_edges` is batched, not per-pair)
 

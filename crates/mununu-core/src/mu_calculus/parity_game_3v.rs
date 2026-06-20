@@ -430,7 +430,7 @@ mod tests {
     }
 
     fn build_mayonly_kmts() -> DefaultClts {
-        // 2-state KMTS with one MayOnly transition. The TruthDomain
+        // 2-state KMTS with one MayOnly transition. The 3-valued (KleeneDom)
         // box modality on a state with a MayOnly outgoing edge to a
         // state that does NOT satisfy φ produces KleeneBot (the may-
         // successor is not T, but no must-witness backs the false

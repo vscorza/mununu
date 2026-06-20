@@ -264,6 +264,21 @@ struct Clts<S, L> {
 
 ### §6.4 Evaluator changes — `trait TruthDomain` over two lattice structures
 
+> **As-built note (P2.4, 2026-06-19).** The per-element `truth_domain::TruthDomain`
+> trait sketched below was an R.1 design artifact that the R.3 evaluator **bypassed** —
+> it was pub-exported but only ever exercised by its own unit tests, and the production
+> evaluator kept two hand-written bulk bodies (`eval_node` over `BitVec`, `eval_node_tri`
+> over `TritSet`). The IR-unification track's **P2** collapsed those two bodies onto one
+> generic body over a NEW **bulk** trait — `EvalDomain` (associated `Valuation` type =
+> whole-state-set `BitVec` | `TritSet`; `BoolDom` / `KleeneDom` impls) in
+> [`crates/mununu-core/src/mu_calculus/evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs).
+> The dual-lattice reasoning below is still correct theory, but in the shipped code it is
+> absorbed into whole-`Valuation` ops (and, for the 3-valued case, into `TritSet`'s
+> must/may pair) rather than the per-`Element` method split sketched here. The dead
+> `truth_domain` module was retired in P2.4. See
+> [`evaluator-domain-unification.md`](evaluator-domain-unification.md) for the full
+> rationale + the perf-gate evidence.
+
 3-valued model checking involves **two distinct lattice structures over the same element set**, and conflating them is the most common implementation pitfall:
 
 - **Truth lattice** — formula semantics (`∧`, `∨`, `¬`). In `BoolDomain` this is `false < true`. In `KleeneDomain`, `false < true` with `KleeneBot` *incomparable* to both: `KleeneBot ∨ KleeneT = KleeneT`, `KleeneBot ∧ KleeneF = KleeneF`, `KleeneBot ∧ KleeneT = KleeneBot`, `KleeneBot ∨ KleeneF = KleeneBot`.
