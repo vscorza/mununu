@@ -2,7 +2,7 @@
 
 > **Status: planning** — architecture analysis + staged proposal for unifying mununu's BTOR2/SV operator-interpretation layer. Code anchors are current-state references; the trait seam this doc proposes does not exist yet. Graduates to live `Source of truth` anchors as each move lands.
 
-> **Concept:** This doc reasons about *expression interpretation* (BTOR2 operator → some value/term), a layer distinct from *formula evaluation* (mu-calculus formula → verdict). The two are different axes and must not be conflated — the verdict evaluator already has its own tagless-final abstraction (`TruthDomain`); this doc is about the expression layer that feeds the lift.
+> **Concept:** This doc reasons about *expression interpretation* (BTOR2 operator → some value/term), a layer distinct from *formula evaluation* (mu-calculus formula → verdict). The two are different axes and must not be conflated — the verdict evaluator already has its own tagless-final abstraction (the bulk `EvalDomain` trait, P2.2/P2.3); this doc is about the expression layer that feeds the lift.
 
 ## Problem
 
@@ -22,7 +22,7 @@ mununu interprets the same BTOR2 operator set in **five places** that grew indep
 
 1. **The AST is already unified and array-capable.** [`Sort::Array`](../../crates/mununu-core/src/adapter/btor2/ast.rs), `Op::Read`, `Op::Write` all exist (ast.rs ~:48, ~:137). The syntax layer needs no change.
 2. **#1 and #2 are the same walk over the same AST**, differing only in the `Value` type and the per-op primitive (`wrapping_add` vs `bvadd`; `concat` vs `concat`; `extract` vs `extract`). Every new operator is implemented twice today. The other independent walk (#3) is over a *different* grammar (SV `Expr`, not BTOR2), so it's genuinely separate.
-3. **mununu already embraces tagless-final.** [`TruthDomain`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs) (~:60) abstracts the verdict evaluator over an `Element` type with `BoolDomain` / `KleeneDomain` implementors. The expression layer should mirror that idiom.
+3. **mununu already embraces tagless-final.** [`EvalDomain`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) abstracts the verdict evaluator over a whole-state-set `Valuation` type with `BoolDom` / `KleeneDom` implementors (unified P2.2/P2.3). The expression layer should mirror that idiom.
 
 ## Where each concept belongs
 
@@ -41,7 +41,7 @@ fast; no arrays/UF  sound; UF + Array (QF_AUFBV) portable; cvc5 / bitwuzla / …
         └──── feed ──→ predicate_cube_lift / bit_blast / must-edge / interpolant
                                    │
                                    ▼  CLTS / KMTS
-                       mu_calculus evaluator (TruthDomain)  ← SEPARATE axis, untouched
+                       mu_calculus evaluator (EvalDomain)  ← SEPARATE axis, untouched
 ```
 
 - **bit-blast** = the `Concrete` instantiation of the seam. `eval_op` becomes its `impl`; stays where it is.
@@ -50,7 +50,7 @@ fast; no arrays/UF  sound; UF + Array (QF_AUFBV) portable; cvc5 / bitwuzla / …
 - **array / memory** = a **capability** of the symbolic backends (`select` / `store`, logic `QF_AUFBV`). The concrete backend can only bounded-enumerate it (that is what stage 4 bounded-bit-blast is).
 - **z3 terms** = the `Z3Backend::Value` type. One place, hosting BV ∪ Array ∪ uninterpreted `FuncDecl`.
 
-The **mu-calculus evaluator is a different axis** — it consumes the lifted KMTS and already has `TruthDomain`. The expression-interpretation unification must not touch it.
+The **mu-calculus evaluator is a different axis** — it consumes the lifted KMTS and already has `EvalDomain`. The expression-interpretation unification must not touch it.
 
 ## Working with z3 / cvc5
 
@@ -90,7 +90,7 @@ struct Concrete;  // Value = BvValue       (eval_op today; no arrays/UF — boun
 struct Z3Backend; // Value = Z3Term        (encode_op today; arrays + real UF)
 ```
 
-One generic `walk_design::<B: BvTermBackend>(file, &mut backend)` replaces the dual maintenance. Mirror `TruthDomain`. Heavily test-pinned (both paths have extensive suites). ~5–8 sessions. **Own design-doc-gated track — not smuggled into slot 4.**
+One generic `walk_design::<B: BvTermBackend>(file, &mut backend)` replaces the dual maintenance. Mirror `EvalDomain`. Heavily test-pinned (both paths have extensive suites). ~5–8 sessions. **Own design-doc-gated track — not smuggled into slot 4.**
 
 ### Move C — RECLASSIFY UF as a backend capability (closes a soundness gap)
 
@@ -129,5 +129,5 @@ Do **not** start B/C mid-slot-4. Stage 3.b's dispatch (UF → `predicate_cube_li
 
 - §Phase 10 UF routing (stage 3.b dispatch + corrected stage 3.c): [`phase10-uf-routing.md`](phase10-uf-routing.md)
 - §Phase 10 fixture selection (Caliptra mbox): [`../../../.claude/plans/measurements/Phase10-fixture-selection-caliptra-mbox-2026-06-12.md`](../../../.claude/plans/measurements/Phase10-fixture-selection-caliptra-mbox-2026-06-12.md)
-- Verdict-evaluator tagless-final precedent: [`truth_domain.rs`](../../crates/mununu-core/src/mu_calculus/truth_domain.rs)
+- Verdict-evaluator tagless-final precedent: [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) (the bulk `EvalDomain` trait + `BoolDom` / `KleeneDom`)
 - §Phase 11 master roadmap: [`../../../.claude/plans/you-are-a-formal-vast-lake.md`](../../../.claude/plans/you-are-a-formal-vast-lake.md)

@@ -19,7 +19,6 @@ pub mod parity_game_3v_subgame;
 pub mod parser;
 pub mod simplify;
 pub mod trit;
-pub mod truth_domain;
 
 pub use evaluator::{
     ApproximantView, Environment, EvalResult, EvaluationError, EvaluationOptions,
@@ -33,7 +32,6 @@ pub use parity_game_3v::{
 };
 pub use simplify::simplify;
 pub use trit::{Trit, TritSet};
-pub use truth_domain::{BoolDomain, KleeneDomain, TruthDomain};
 
 /// Classification of a μ-calculus formula by its fixpoint structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 # Abstraction guidelines for mununu
 
-> Source of truth: [`crates/mununu-core/src/clts/`](../crates/mununu-core/src/clts/) (state-variable + per-state predicate primitives + `TransitionModality` post-R.1), [`crates/mununu-core/src/adapter/btor2/`](../crates/mununu-core/src/adapter/btor2/) (BTOR2 → KMTS lifter, post-R.2), [`crates/mununu-core/src/adapter/systemverilog/`](../crates/mununu-core/src/adapter/systemverilog/) (legacy native-SV adapter; scheduled for removal in S.2b), [`crates/mununu-core/src/mu_calculus/`](../crates/mununu-core/src/mu_calculus/) (`TruthDomain` trait + `KleeneDomain` instantiation, post-R.3) — surface: CLI+API+UI.
+> Source of truth: [`crates/mununu-core/src/clts/`](../crates/mununu-core/src/clts/) (state-variable + per-state predicate primitives + `TransitionModality` post-R.1), [`crates/mununu-core/src/adapter/btor2/`](../crates/mununu-core/src/adapter/btor2/) (BTOR2 → KMTS lifter, post-R.2), [`crates/mununu-core/src/adapter/systemverilog/`](../crates/mununu-core/src/adapter/systemverilog/) (legacy native-SV adapter; scheduled for removal in S.2b), [`crates/mununu-core/src/mu_calculus/`](../crates/mununu-core/src/mu_calculus/) (`EvalDomain` trait + `BoolDom`/`KleeneDom` instantiations, post-R.3; both evaluator paths unified onto one generic body in P2.2/P2.3) — surface: CLI+API+UI.
 
 ## Why this doc exists
 
@@ -40,7 +40,7 @@ KMTS abstraction is **uniformly sound for the full mu-calculus including livenes
 
 ### When to stay on the legacy primitives
 
-XState, microcode, agentic adapters, and hand-written CTXDSL sources continue to produce **Sharp-everywhere KMTSes** — every transition is `Sharp`, every predicate valuation is two-valued, no `KleeneBot` ever appears in the verdict. These adapters use the legacy `AbstractionType::*` primitives (Boolean / Symbols / Ignored / per-state predicates / multi-label transitions / rich modal guards) without change. The `KleeneDomain` evaluator on such a CLTS returns verdicts in `{KleeneT, KleeneF}` only, identical to today's 2-valued `{true, false}` semantics. The `BoolDomain` monomorphisation of the evaluator computes the same verdicts more cheaply and is the default for Sharp-only adapters.
+XState, microcode, agentic adapters, and hand-written CTXDSL sources continue to produce **Sharp-everywhere KMTSes** — every transition is `Sharp`, every predicate valuation is two-valued, no `KleeneBot` ever appears in the verdict. These adapters use the legacy `AbstractionType::*` primitives (Boolean / Symbols / Ignored / per-state predicates / multi-label transitions / rich modal guards) without change. The `KleeneDom` evaluator on such a CLTS returns verdicts in `{KleeneT, KleeneF}` only, identical to today's 2-valued `{true, false}` semantics. The `BoolDom` monomorphisation of the evaluator computes the same verdicts more cheaply and is the default for Sharp-only adapters.
 
 ### Migration table — legacy `AbstractionType::*` → KMTS predicates
 
@@ -97,7 +97,7 @@ One interpolation query, two refinement decisions, partitioned by symbol kind.
 
 > Source of truth: [`crates/mununu-core/src/adapter/domain.rs`](../crates/mununu-core/src/adapter/domain.rs) — surface: CLI+API+UI.
 
-The pre-KMTS primitives remain canonical for adapters that do not need predicate abstraction (XState, microcode, agentic, hand-written CTXDSL). These adapters produce Sharp-everywhere KMTSes with two-valued AP labellings; the KleeneDomain evaluator reduces to 2-valued semantics on them.
+The pre-KMTS primitives remain canonical for adapters that do not need predicate abstraction (XState, microcode, agentic, hand-written CTXDSL). These adapters produce Sharp-everywhere KMTSes with two-valued AP labellings; the KleeneDom evaluator reduces to 2-valued semantics on them.
 
 | Primitive | What it abstracts | Surface where exposed | Soundness | Status |
 |---|---|---|---|---|
@@ -340,7 +340,7 @@ When introducing an abstraction decision — whether in an adapter, a CTXDSL sou
 - **Quantify state-space cost** per abstraction choice. That depends on the user's specific model; a follow-up benchmark suite would help, but it does not exist today. The KMTS recipe's `2^|P|` upper bound on abstract states is a worst case; reachable abstract state counts are typically much smaller.
 - **Prescribe one abstraction class as "the right one"** for any subsystem. The right class depends on the property — the recipe above gives the *minimum*; safety-only properties often tolerate coarser abstractions than liveness properties.
 - **Cover weak-memory-model semantics** (RVWMO, TSO, sequential consistency) **as an enforcement layer**. The [memory soundness matrix](#memory-soundness-matrix) above documents which fence semantics mununu's orchestrator enforces today (`global_barrier`, `release_acquire`) and which are aspirational (`rvwmo`). Verifying memory-order intent at the architectural level still requires either an external checker integrated as an adapter (Herd / RMEM) or a heavy abstraction (TSO / SC) that ignores weak orderings.
-- **Cover 3-valued controller synthesis.** Synthesis is de-prioritised under the KMTS pivot. The synthesiser runs on the `BoolDomain`-projected KMTS (Sharp-only transitions) and hard-errors when fed a KMTS with `MayOnly` transitions. Revisit if synthesis is re-prioritised; until then, the recipe is "if you want synthesis, stay on Sharp-everywhere adapters (XState, microcode, agentic, hand-written CTXDSL)."
+- **Cover 3-valued controller synthesis.** Synthesis is de-prioritised under the KMTS pivot. The synthesiser runs on the `BoolDom`-projected KMTS (Sharp-only transitions) and hard-errors when fed a KMTS with `MayOnly` transitions. Revisit if synthesis is re-prioritised; until then, the recipe is "if you want synthesis, stay on Sharp-everywhere adapters (XState, microcode, agentic, hand-written CTXDSL)."
 
 ## See also
 
