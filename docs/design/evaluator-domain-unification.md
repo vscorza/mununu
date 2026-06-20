@@ -1,8 +1,8 @@
 # Evaluator unification over a bulk `Domain` trait (IR-track P2)
 
 > Status: planning (IR-unification track, P2). Design note; the implementation lands in
-> P2.2 (rewire 2v, perf-gated — **SHIPPED 2026-06-19**) → P2.3 (rewire 3v) → P2.4 (retire the
-> dead per-element `truth_domain`). Companion: `docs/design/sts-ir.md` (P0/P1),
+> P2.2 (rewire 2v, perf-gated — **SHIPPED 2026-06-19**) → P2.3 (rewire 3v — **SHIPPED 2026-06-19**)
+> → P2.4 (retire the dead per-element `truth_domain`). Companion: `docs/design/sts-ir.md` (P0/P1),
 > `docs/design/kmts-theory.md` §4.
 >
 > **P2.2 shipped notes.** The trait is named `EvalDomain` (private) with markers `BoolDom` /
@@ -166,7 +166,7 @@ The existing `eval_node` / `eval_node_tri` become thin wrappers:
 |---|---|---|
 | **P2.1** (this note) | Design: the `Domain` trait, the generic-body sketch, the divergence-handlers, the decomposition. | — |
 | **P2.2** ✅ SHIPPED | Defined `EvalDomain` + `BoolDom` (Valuation = BitVec) + `eval_node_generic` + `eval_fixpoint_generic`; rewired `eval_node`/`eval_fixpoint` to delegate to `::<BoolDom>`; deleted the now-dead `bitwise_{and,or,not}` / `variable_bits` (→ `BoolDom` ops) + the standalone `eval_fixpoint`; `eval_modal` → `eval_modal_with_target_set`. `eval_node_tri` untouched. | **PASSED.** `cargo test -p mununu-core` = 2083/2083 (verdict-equivalence); criterion `mu_calculus_evaluate` |S|=2048 (+0.80%, p=0.09) and |S|=8192 (−1.64%, p=0.45) both "No change in performance detected". |
-| **P2.3** | `KleeneDom` (Valuation = TritSet) + rewire `eval_node_tri`/`eval_fixpoint_tri` to `::<KleeneDom>`; delete the old hand-written 3v body. | Trit benches (`trit_eval_shared_subexpr`, `trit_eval_modal_dense`, `trit_fixpoint_invariant_subterm`) no regression + `r3_kleene_baseline` projection invariant + full suite. |
+| **P2.3** ✅ SHIPPED | Added `KleeneDom` (Valuation = TritSet, `MEMOISED = false`); `eval_node_tri` now delegates to `::<KleeneDom>`; deleted the hand-written 3v `eval_node_tri` match + `eval_fixpoint_tri` (divergences now in `KleeneDom`: `not` = must/may swap, `modal_image` = the two filtered passes, `seed_from_prior` = both halves). | **PASSED.** `cargo test -p mununu-core` = 2083/2083 incl. `r3_kleene_baseline` projection invariant; trit benches vs `p23-pre` — `shared_subexpr` −2…−4%, `modal_dense` no change (the dense/64 first-run "+18.57%" was a wide-CI noise outlier, confirmed no-change on isolated recheck), `fixpoint_invariant` −0.3…−2%. Record: `.claude/plans/measurements/P2-3-2026-06-19.md`. |
 | **P2.4** | Retire the dead per-element `truth_domain` module (`TruthDomain`/`BoolDomain`/`KleeneDomain` + tests); update `docs/design/native-sv-abstraction.md` §6.4 + `kmts-theory.md` §4 anchors to point at the bulk `Domain`. | `cargo test` + `/docs-traceability`. |
 
 Each step is its own PR. P2.2 is the load-bearing, riskiest one (the model-checking hot path); it
