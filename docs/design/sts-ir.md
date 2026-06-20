@@ -160,10 +160,13 @@ invisible to callers.
   (associated `Valuation` = `BitVec` | `TritSet`, whole-set ops) instead. See
   `docs/design/evaluator-domain-unification.md`.
   - **P2.1 (shipped, #111):** design note.
-  - **P2.2 (shipped):** `EvalDomain` + `BoolDom` + `eval_node_generic`/`eval_fixpoint_generic`;
+  - **P2.2 (shipped, #112):** `EvalDomain` + `BoolDom` + `eval_node_generic`/`eval_fixpoint_generic`;
     the 2v `eval_node`/`eval_fixpoint` now delegate to `::<BoolDom>`. HARD gate met (2083/2083
-    crate tests; criterion "no change" on `mu_calculus_evaluate` |S|=2048/8192). `eval_node_tri`
-    untouched until P2.3.
+    crate tests; criterion "no change" on `mu_calculus_evaluate` |S|=2048/8192).
+  - **P2.3 (shipped):** `KleeneDom` (TritSet); `eval_node_tri` now delegates to `::<KleeneDom>`;
+    the hand-written 3v body + `eval_fixpoint_tri` are deleted. Both 2v + 3v now run ONE generic
+    body. Gate met (2083/2083 incl. `r3_kleene_baseline`; trit benches no regression). P2.4 next:
+    retire the dead per-element `truth_domain`.
 - **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
   `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.
 - **P4/P5:** a non-RTL frontend (Promela, then C-extraction) *lowers to* the IR and inherits the

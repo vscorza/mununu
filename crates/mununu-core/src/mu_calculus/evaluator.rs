@@ -1130,6 +1130,7 @@ trait EvalDomain {
     fn may_view(v: &Self::Valuation) -> &EvalResult;
     /// Record per-state fixpoint iteration ranks (2v strategy witnesses).
     /// No-op default for the 3v path (witnesses are meaningless under Kleene).
+    #[inline]
     fn record_iteration_ranks<S: IdStorage, L: IdStorage>(
         _ctx: &mut EvalContext<'_, S, L>,
         _var: FormulaVarId,
@@ -1141,12 +1142,14 @@ trait EvalDomain {
 
     // --- memoisation (2v only; `MEMOISED` const-gates the call sites) ---
 
+    #[inline]
     fn memo_get<S: IdStorage, L: IdStorage>(
         _ctx: &EvalContext<'_, S, L>,
         _node: NodeId,
     ) -> Option<Self::Valuation> {
         None
     }
+    #[inline]
     fn memo_store<S: IdStorage, L: IdStorage>(
         _ctx: &mut EvalContext<'_, S, L>,
         _node: NodeId,
@@ -1303,6 +1306,155 @@ impl EvalDomain for BoolDom {
     }
 }
 
+/// 3-valued (Kleene) evaluation domain over [`super::trit::TritSet`] — a
+/// must/may bit-set pair with `must ⊆ may`. Wired in P2.3 to replace the
+/// hand-written `eval_node_tri` / `eval_fixpoint_tri`. Not memoised
+/// (`MEMOISED = false` const-gates the memo path out — a trit memo is scope
+/// creep per design-note §5; bench R-A1 showed it does not pay off at current
+/// scales). Witnesses / strategy extraction are meaningless under Kleene, so
+/// `record_iteration_ranks` uses the no-op default.
+struct KleeneDom;
+
+impl EvalDomain for KleeneDom {
+    type Valuation = super::trit::TritSet;
+    const MEMOISED: bool = false;
+
+    #[inline]
+    fn top<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation {
+        // ν/Greatest init + Node::True: all-True with the OOB sink held Unknown.
+        super::trit::TritSet::all_true(ctx.env.state_count(), &ctx.oob_bits)
+    }
+
+    #[inline]
+    fn bottom<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation {
+        // μ/Least init + Node::False: all-False.
+        super::trit::TritSet::all_false(ctx.env.state_count())
+    }
+
+    #[inline]
+    fn from_predicate<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        bits: BitVec<usize, Lsb0>,
+    ) -> Self::Valuation {
+        // `predicate_bits` already masked OOB out (that is the must bitset);
+        // `from_predicate` sets OOB in may, giving Unknown at the OOB sink.
+        super::trit::TritSet::from_predicate(bits, &ctx.oob_bits)
+    }
+
+    #[inline]
+    fn from_binding<S: IdStorage, L: IdStorage>(
+        ctx: &EvalContext<'_, S, L>,
+        bound: Option<&Self::Valuation>,
+    ) -> Self::Valuation {
+        match bound {
+            Some(t) => t.clone(),
+            None => super::trit::TritSet::all_false(ctx.env.state_count()),
+        }
+    }
+
+    #[inline]
+    fn not<S: IdStorage, L: IdStorage>(
+        _ctx: &EvalContext<'_, S, L>,
+        v: Self::Valuation,
+    ) -> Self::Valuation {
+        // Kleene negation: the TritSet swaps (must, may) and complements — the
+        // single hardest unification (not a per-half complement). OOB stays
+        // Unknown because the swap maps `may`-but-not-`must` to itself.
+        v.not()
+    }
+
+    #[inline]
+    fn and(a: Self::Valuation, b: &Self::Valuation) -> Self::Valuation {
+        a.and(b)
+    }
+
+    #[inline]
+    fn or(a: Self::Valuation, b: &Self::Valuation) -> Self::Valuation {
+        a.or(b)
+    }
+
+    fn modal_image<S: IdStorage, L: IdStorage>(
+        ctx: &mut EvalContext<'_, S, L>,
+        kind: ModalKind,
+        guard: &Guard,
+        target: &Self::Valuation,
+        _modal_node_id: NodeId,
+    ) -> Result<Self::Valuation, EvaluationError> {
+        // The target's TritSet is decomposed into (must, may) and each is fed
+        // through `modal_bits_from_target` independently — sound because modal
+        // operators do not mix polarity (unlike Not). Witness recording is
+        // skipped (meaningless under Kleene), so `_modal_node_id` is unused.
+        //
+        // R.6.3 (2026-06-08) — controllability-aware modality composition.
+        // SOUNDNESS: the player establishing a modality may rely only on
+        // `R_must` edges; the player refuting it ranges over `R_may` edges
+        // (kmts-theory.md §7.2 + Bruns–Godefroid CONCUR 2000 +
+        // de Alfaro–Godefroid–Jagadeesan LICS 2004 for the per-player
+        // extension). The per-(kind, must|may) filter dispatch:
+        //
+        // - `must_bits(<a>φ)` ↦ `∃ must-edge ⊨ φ_must` ⇒ `MustOnly`. Without
+        //   this gate, the pre-R.6.3 path returned True on a controllable
+        //   `MayOnly` edge into a definite-True state — over-claiming a witness
+        //   the abstraction only admits as *possible* (the corner closed by
+        //   `controllable_mayonly_ctrl_witness_is_unknown`).
+        // - `may_bits([a]φ)` ↦ `∀ must-edge ⊨ φ_may` ⇒ `MustOnly`. Without this
+        //   gate, the pre-R.6.3 path checked `∀ any-edge ⊨ φ_may` (over-strict),
+        //   producing fewer Unknowns + more spurious False verdicts on KMTSes
+        //   with MayOnly edges.
+        // - The other two combinations (`may_bits(<a>φ)`, `must_bits([a]φ)`)
+        //   keep `All` — the refuting side ranges over `R_may`.
+        //
+        // The filter composes with the existing
+        // `group_transitions_by_uncontrollable_labels` Skolem grouping: the
+        // grouping operates on the filtered transition set transparently.
+        // Verdict-equivalence on Sharp-only KMTSes follows from
+        // `Filter::MustOnly` admitting every `Sharp` transition.
+        let (must_filter, may_filter) = match kind {
+            ModalKind::Diamond => (
+                TransitionModalityFilter::MustOnly,
+                TransitionModalityFilter::All,
+            ),
+            ModalKind::Box => (
+                TransitionModalityFilter::All,
+                TransitionModalityFilter::MustOnly,
+            ),
+        };
+        let must_bits = ctx.modal_bits_from_target(kind, guard, target.must_true(), must_filter)?;
+        let may_bits = ctx.modal_bits_from_target(kind, guard, target.may_true(), may_filter)?;
+        Ok(super::trit::TritSet::from_parts(must_bits, may_bits))
+    }
+
+    #[inline]
+    fn fixpoint_eq(a: &Self::Valuation, b: &Self::Valuation) -> bool {
+        a.eq_set(b)
+    }
+
+    #[inline]
+    fn seed_from_prior(pa: &PriorApproximant, _kind: FixpointKind) -> Option<Self::Valuation> {
+        // 3v seed consumes BOTH halves regardless of polarity (must positions →
+        // KleeneT, may-but-not-must → KleeneBot, rest → KleeneF). Soundness:
+        // μ-LFP must ⊆ LFP.must; ν-GFP must ⊆ GFP.must AND may ⊇ GFP.may
+        // (Tarski monotone convergence in both directions).
+        Some(super::trit::TritSet::from_parts(
+            pa.must_true.clone(),
+            pa.may_true.clone(),
+        ))
+    }
+
+    #[inline]
+    fn must_view(v: &Self::Valuation) -> &EvalResult {
+        v.must_true()
+    }
+
+    #[inline]
+    fn may_view(v: &Self::Valuation) -> &EvalResult {
+        v.may_true()
+    }
+
+    // record_iteration_ranks + memo_get/memo_store use the no-op trait defaults
+    // (3v records no witnesses and is not memoised).
+}
+
 impl<'a, S, L> EvalContext<'a, S, L>
 where
     S: IdStorage,
@@ -1319,8 +1471,10 @@ where
     }
 
     /// The single generic evaluator body, monomorphised per [`EvalDomain`].
-    /// `BoolDom` (2v BitVec) is the only instantiation in P2.2; `KleeneDom` (3v
-    /// TritSet) is wired here in P2.3, replacing the hand-written `eval_node_tri`.
+    /// Both [`BoolDom`] (2v BitVec) and [`KleeneDom`] (3v TritSet) instantiate
+    /// it; the 2v `eval_node` and the 3v `eval_node_tri` are thin wrappers. The
+    /// hand-written `eval_node_tri` / `eval_fixpoint_tri` bodies were retired in
+    /// P2.3 so the two paths can never drift again.
     fn eval_node_generic<D: EvalDomain>(
         &mut self,
         node_id: NodeId,
@@ -2951,231 +3105,21 @@ where
         Ok(super::trit::TritSet::from_parts(must, may))
     }
 
-    /// Evaluate a formula node under three-valued (Kleene) semantics.
-    ///
-    /// Mirrors [`Self::eval_node`] but operates on [`super::trit::TritSet`]
-    /// instead of `BitVec`. For modal nodes, the target's TritSet is decomposed
-    /// into `(must, may)` and each is fed through `modal_bits_from_target`
-    /// independently — the parallel-evaluation strategy is sound because modal
-    /// operators do not mix polarity. Boolean Not is handled by the `TritSet`
-    /// type, which swaps `(must, may)` and complements per Kleene semantics.
+    /// 3-valued (Kleene) entry into the unified evaluator. Thin wrapper over
+    /// [`Self::eval_node_generic`] monomorphised to [`KleeneDom`] (TritSet).
+    /// The hand-written 3v body + `eval_fixpoint_tri` were retired in P2.3 —
+    /// the divergences from the 2v path now live entirely inside `KleeneDom`:
+    /// Boolean `Not` is the TritSet must/may swap ([`KleeneDom::not`]); modal
+    /// nodes decompose the target into (must, may) and run the two
+    /// `modal_bits_from_target` filtered passes ([`KleeneDom::modal_image`]);
+    /// fixpoints seed/converge over TritSet ([`KleeneDom::seed_from_prior`] /
+    /// [`KleeneDom::fixpoint_eq`]).
     fn eval_node_tri(
         &mut self,
         node_id: NodeId,
         bindings: &HashMap<FormulaVarId, super::trit::TritSet>,
     ) -> Result<super::trit::TritSet, EvaluationError> {
-        match self.formula.node(node_id) {
-            Node::True => Ok(super::trit::TritSet::all_true(
-                self.env.state_count(),
-                &self.oob_bits,
-            )),
-            Node::False => Ok(super::trit::TritSet::all_false(self.env.state_count())),
-            Node::Predicate(name) => {
-                // predicate_bits already masks OOB out (Phase 3) — that's the
-                // must bitset. from_predicate sets OOB in may, giving Unknown
-                // at OOB.
-                let bits = self.predicate_bits(name)?;
-                Ok(super::trit::TritSet::from_predicate(bits, &self.oob_bits))
-            }
-            Node::Variable(var) => {
-                if let Some(t) = bindings.get(var) {
-                    Ok(t.clone())
-                } else {
-                    Ok(super::trit::TritSet::all_false(self.env.state_count()))
-                }
-            }
-            Node::Not(inner) => {
-                let t = self.eval_node_tri(*inner, bindings)?;
-                Ok(t.not())
-            }
-            Node::And(left, right) => {
-                let l = self.eval_node_tri(*left, bindings)?;
-                let r = self.eval_node_tri(*right, bindings)?;
-                Ok(l.and(&r))
-            }
-            Node::Or(left, right) => {
-                let l = self.eval_node_tri(*left, bindings)?;
-                let r = self.eval_node_tri(*right, bindings)?;
-                Ok(l.or(&r))
-            }
-            Node::Modal {
-                kind,
-                guard,
-                target,
-            } => {
-                // R-A2 attempt 1 (clone elision): the previous shape cloned
-                // `target_tri.must_true()` / `.may_true()` before passing them
-                // to `modal_bits_from_target`, which already accepts `&BitVec`.
-                // The clones were defensive against borrow-checker problems
-                // that do not actually arise: `target_tri` outlives both calls
-                // and `modal_bits_from_target` only needs an immutable view of
-                // the bitset. Cloning a BitVec at |S|=2048 is ~256 bytes per
-                // clone × 2 clones × every modal node × every fixpoint
-                // iteration; dropping the clones is the cheapest possible
-                // R-A2 fusion attempt (see §Phase 6 §6.7 R-A2 anchor; if this
-                // does not clear the 15% pass-bar, the heavier modal-walk
-                // fusion is the next attempt).
-                //
-                // R.6.3 (2026-06-08) — controllability-aware modality
-                // composition. SOUNDNESS: the player establishing a
-                // modality may rely only on `R_must` edges; the player
-                // refuting it ranges over `R_may` edges
-                // (kmts-theory.md §7.2 + Bruns–Godefroid CONCUR 2000 +
-                // de Alfaro–Godefroid–Jagadeesan LICS 2004 for the
-                // per-player extension). The per-(kind, must|may)
-                // filter dispatch:
-                //
-                // - `must_bits(<a>φ)` ↦ `∃ must-edge ⊨ φ_must` ⇒ `MustOnly`.
-                //   Without this gate, the pre-R.6.3 path returned True
-                //   on a controllable `MayOnly` edge into a definite-True
-                //   state — over-claiming a witness the abstraction only
-                //   admits as *possible* (the soundness corner closed by
-                //   `controllable_mayonly_ctrl_witness_is_unknown`).
-                // - `may_bits([a]φ)` ↦ `∀ must-edge ⊨ φ_may` ⇒ `MustOnly`.
-                //   Without this gate, the pre-R.6.3 path checked `∀
-                //   any-edge ⊨ φ_may` (over-strict), producing fewer
-                //   Unknowns + more spurious False verdicts on KMTSes
-                //   with MayOnly edges.
-                // - The other two combinations (`may_bits(<a>φ)`,
-                //   `must_bits([a]φ)`) keep `All` — the refuting side
-                //   ranges over `R_may`.
-                //
-                // The filter composes with the existing
-                // `group_transitions_by_uncontrollable_labels` Skolem
-                // grouping (gate (2) of R.6.3): the grouping operates
-                // on the filtered transition set transparently because
-                // the filter is applied at the single entry point of
-                // the group helper + at each direct transition loop in
-                // `modal_forall`. Verdict-equivalence on Sharp-only
-                // KMTSes follows from `Filter::MustOnly` admitting
-                // every `Sharp` transition (gate (1)).
-                let (must_filter, may_filter) = match kind {
-                    ModalKind::Diamond => (
-                        TransitionModalityFilter::MustOnly,
-                        TransitionModalityFilter::All,
-                    ),
-                    ModalKind::Box => (
-                        TransitionModalityFilter::All,
-                        TransitionModalityFilter::MustOnly,
-                    ),
-                };
-                let target_tri = self.eval_node_tri(*target, bindings)?;
-                let must_bits =
-                    self.modal_bits_from_target(*kind, guard, target_tri.must_true(), must_filter)?;
-                let may_bits =
-                    self.modal_bits_from_target(*kind, guard, target_tri.may_true(), may_filter)?;
-                Ok(super::trit::TritSet::from_parts(must_bits, may_bits))
-            }
-            Node::Mu { var, body } => {
-                self.eval_fixpoint_tri(*var, *body, FixpointKind::Least, bindings)
-            }
-            Node::Nu { var, body } => {
-                self.eval_fixpoint_tri(*var, *body, FixpointKind::Greatest, bindings)
-            }
-        }
-    }
-
-    /// Compute a TritSet fixpoint by Kleene iteration.
-    ///
-    /// `Least` (μ) starts at the all-False trit set. `Greatest` (ν) starts at
-    /// the all-True trit set with OOB held as Unknown. Iterates the body until
-    /// both `must` and `may` stabilize.
-    fn eval_fixpoint_tri(
-        &mut self,
-        var: FormulaVarId,
-        body: NodeId,
-        kind: FixpointKind,
-        bindings: &HashMap<FormulaVarId, super::trit::TritSet>,
-    ) -> Result<super::trit::TritSet, EvaluationError> {
-        // R.5 sub-item 1.4.a (2026-06-01) — honor
-        // `prior_approximants` on the 3v path. Until 1.4.a, the
-        // 3v fixpoint loop silently ignored the seed even when
-        // the CEGAR loop (sub-item 1.3) plumbed it through —
-        // a no-op reuse on the path the CEGAR loop actually
-        // runs. The polarity-appropriate seed construction is:
-        // - μ-LFP: (must = prior, may = prior) — treat unset
-        //   positions as KleeneF (definite-false). Sound because
-        //   the prior must-set is a subset of the LFP and
-        //   iteration grows monotonically toward the LFP.
-        // - ν-GFP: (must = prior, may = all_true) — treat unset
-        //   positions as KleeneBot (definite-true OR indefinite).
-        //   Sound because the prior must-set is a subset of the
-        //   GFP.must AND all_true is a superset of the GFP.may;
-        //   iteration shrinks monotonically toward the GFP.
-        //
-        // The state-count match filter (same as the 2v path)
-        // silently drops stale entries when refinement grew the
-        // cube space — sub-item 1.4.b's cube-refinement mapping
-        // handles that case at the CEGAR loop level by translating
-        // the prior bit-set to the refined cube space BEFORE
-        // passing it as the seed.
-        let state_count = self.env.state_count();
-        // 3v path (sub-item 1.4.b widening): consume both
-        // `must_true` AND `may_true` from `PriorApproximant`.
-        // The TritSet seed is `(must, may)` regardless of
-        // polarity — must positions claimed as KleeneT, may-but-
-        // not-must positions claimed as KleeneBot, rest as
-        // KleeneF.
-        //
-        // Soundness:
-        // - μ-LFP: must ⊆ LFP.must (sound subset, iteration
-        //   grows monotonically to LFP per Tarski).
-        // - ν-GFP: must ⊆ GFP.must (sound subset) AND may ⊇
-        //   GFP.may (sound superset, iteration shrinks
-        //   monotonically to GFP per Tarski).
-        let tri_seed: Option<super::trit::TritSet> = self
-            .options
-            .prior_approximants
-            .as_ref()
-            .and_then(|m| m.get(&var.index()))
-            .filter(|pa| pa.state_count == state_count)
-            .map(|pa| super::trit::TritSet::from_parts(pa.must_true.clone(), pa.may_true.clone()));
-        let mut current = match tri_seed {
-            Some(seed) => seed,
-            None => match kind {
-                FixpointKind::Least => super::trit::TritSet::all_false(self.env.state_count()),
-                FixpointKind::Greatest => {
-                    super::trit::TritSet::all_true(self.env.state_count(), &self.oob_bits)
-                }
-            },
-        };
-        // **Sub-item 1.5 (2026-06-01)**: track body-iteration
-        // count so the callback can expose it to consumers
-        // measuring reuse savings. Mirrors the 2v path's
-        // existing `iteration` counter.
-        let mut iteration: usize = 0;
-        loop {
-            iteration += 1;
-            let mut next_bindings = bindings.clone();
-            next_bindings.insert(var, current.clone());
-            let next = self.eval_node_tri(body, &next_bindings)?;
-            if current.eq_set(&next) {
-                // R.5 CEGAR auto-capture sub-item 1.2 + B.1.a
-                // (2026-06-01) + sub-item 1.4.a (2026-06-01) +
-                // sub-item 1.5 (2026-06-01) — fire the
-                // convergence callback (when present) before
-                // returning. The view exposes BOTH `must_true`
-                // (KleeneT positions, the definite-truth bit-set
-                // safe to seed as a μ lower bound) AND `may_true`
-                // (KleeneT ∪ KleeneBot positions, the upper-bound
-                // bit-set safe to seed as a ν upper bound) AND
-                // the fixpoint polarity so consumers can pick the
-                // polarity-appropriate seed AND the iteration
-                // count for reuse-savings benches.
-                if let Some(cb) = self.options.on_fixpoint_convergence.clone() {
-                    let polarity = fixpoint_kind_to_polarity(kind);
-                    let view = ApproximantView::new(
-                        next.must_true(),
-                        next.may_true(),
-                        polarity,
-                        iteration,
-                    );
-                    cb(var, &view);
-                }
-                return Ok(next);
-            }
-            current = next;
-        }
+        self.eval_node_generic::<KleeneDom>(node_id, bindings)
     }
 }
 
