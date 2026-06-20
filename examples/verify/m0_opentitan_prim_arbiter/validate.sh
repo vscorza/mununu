@@ -14,8 +14,16 @@
 #      chain. Output is non-empty.
 #   2. mununu sv emit-btor2-per-module: Yosys-no-flatten emits one
 #      BTOR2 per submodule. At least one BTOR2 lands on disk.
-#   3. mununu sv compare-pipelines: native + KMTS arms both run
-#      (errors are recorded, not fatal); SVA-elision gate runs.
+#
+# RETIRED (M.5, 2026-06-20): the original step 3 ran
+# `mununu sv compare-pipelines` (R.0c), which diffed the NATIVE-parser
+# arm against the KMTS arm. The native SV parser was fully excised in
+# S.2b (singular-pipeline commitment), so `compare-pipelines` — along
+# with `sv_pipeline_compare::compare_pipelines` and
+# `tests/sv_compare_pipelines.rs` — no longer exists: there is only one
+# pipeline left to compare against itself. M.0's load-bearing capability
+# is the frontend reach (steps 1+2), which the M.5 regression sweep
+# confirms is intact.
 #
 # OUT OF SCOPE (deferred to later milestones):
 #   - Property-verification verdict (M.1+; needs R.2 KMTS lifter +
@@ -55,7 +63,7 @@ echo "note:     M.0 Fix B per M-0-blocker-2026-05-21.md — small-param wrapper 
 echo "          Scale to production N=8, DW=32 lands at M.1+ once R.2 KMTS lifter is on."
 
 echo
-echo "--- step 1/3: mununu sv preprocess (R.0a) ---"
+echo "--- step 1/2: mununu sv preprocess (R.0a) ---"
 "${MUNUNU}" sv preprocess \
   "${SRC}/prim_arbiter_fixed.sv" \
   "${SRC}/prim_arbiter_fixed_m0_wrapper.sv" \
@@ -69,7 +77,7 @@ WC_ELAB="$(wc -l < "${OUT}/elaborated.v" | tr -d ' ')"
 echo "PASS: sv preprocess emitted ${WC_ELAB} lines of Verilog-2005"
 
 echo
-echo "--- step 2/3: mununu sv emit-btor2-per-module (R.0b) ---"
+echo "--- step 2/2: mununu sv emit-btor2-per-module (R.0b) ---"
 # Top is the wrapper; the upstream module is included via --source so
 # Yosys can resolve the instantiation. The hierarchy snapshot will
 # enumerate both modules as submodules of the wrapper.
@@ -86,28 +94,6 @@ fi
 echo "PASS: emit-btor2-per-module produced ${N_BTOR} BTOR2 file(s)"
 
 echo
-echo "--- step 3/3: mununu sv compare-pipelines (R.0c) ---"
-"${MUNUNU}" sv compare-pipelines "${SRC}/prim_arbiter_fixed_m0_wrapper.sv" \
-  --source "${SRC}/prim_arbiter_fixed.sv" \
-  --top prim_arbiter_fixed_m0_wrapper 2>&1 | tee "${OUT}/comparison.json" | tail -25
-
-# The comparison.json must parse and contain the fixture name. Any
-# pipeline-arm error is *not* fatal at the M.0 milestone — error
-# messages are recorded in the JSON so downstream milestones can
-# track them. The contract is "we got a structured record", not
-# "every arm succeeded".
-python3 -c "
-import json, sys
-data = json.load(open('${OUT}/comparison.json'))
-# CLI prints the log-init line first; strip if present
-" 2>/dev/null || {
-  # Best-effort JSON validation via mununu's own output. If python3 is
-  # missing we just trust the tail above (the CLI exited 0 above).
-  echo "(python3 not available; skipping JSON structural check)"
-}
-
-echo
 echo "=== M.0 PIPELINE-REACH VALIDATION PASSED ==="
 echo "elaborated.v:    ${OUT}/elaborated.v (${WC_ELAB} lines)"
 echo "BTOR2 per-mod:   ${OUT}/btor2/*.btor2 (${N_BTOR} file(s))"
-echo "comparison.json: ${OUT}/comparison.json"
