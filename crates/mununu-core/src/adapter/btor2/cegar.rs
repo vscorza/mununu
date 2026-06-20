@@ -1356,10 +1356,77 @@ fn walk_state_cells_proposing(
     out
 }
 
+/// Parse `--config-values`-style `REG=v1,v2,...` entries into the synthetic
+/// sidecar JSON the predicate-cube lift reads via `sidecar_config_values`
+/// (R-S8). Shared by the CLI (`mununu btor2 cegar --config-values`) and the
+/// HTTP API (`POST /api/v1/btor2/cegar` `config_values`) so the entry format
+/// has a single source of truth (no CLI↔API drift). Returns `None` for an
+/// empty input (no synthetic sidecar), `Some(json)` otherwise. Each entry is
+/// `REG=v1,v2,...` with at least one `u64` value.
+pub fn config_values_to_sidecar_json(entries: &[String]) -> Result<Option<String>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut signals = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (reg, values_str) = entry.split_once('=').ok_or_else(|| {
+            format!("invalid config-values entry {entry:?}: expected REG=v1,v2,v3 format")
+        })?;
+        let values: Vec<u64> = values_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid value {s:?} in config-values: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.is_empty() {
+            return Err(format!(
+                "config-values {entry:?}: at least one value required"
+            ));
+        }
+        signals.push(serde_json::json!({ "name": reg, "config_values": values }));
+    }
+    let synthetic = serde_json::json!({
+        "module": "cegar",
+        "source": "cegar.btor2",
+        "signals": signals,
+    });
+    Ok(Some(synthetic.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mu_calculus::parser;
+
+    // M.6 parity — the shared `REG=v1,v2,...` parse used by both the CLI
+    // `--config-values` flag and the API `config_values` field.
+    #[test]
+    fn config_values_to_sidecar_json_empty_is_none() {
+        assert_eq!(config_values_to_sidecar_json(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn config_values_to_sidecar_json_parses_entries() {
+        let json = config_values_to_sidecar_json(&["boot_fsm_ns=0,1,2,3,4,5,6,7".to_string()])
+            .unwrap()
+            .expect("non-empty input yields a synthetic sidecar");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sig = &parsed["signals"][0];
+        assert_eq!(sig["name"], "boot_fsm_ns");
+        assert_eq!(
+            sig["config_values"],
+            serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7])
+        );
+    }
+
+    #[test]
+    fn config_values_to_sidecar_json_rejects_malformed() {
+        assert!(config_values_to_sidecar_json(&["no_equals_sign".to_string()]).is_err());
+        assert!(config_values_to_sidecar_json(&["reg=".to_string()]).is_err());
+        assert!(config_values_to_sidecar_json(&["reg=1,notanumber".to_string()]).is_err());
+    }
 
     const SMALL_BTOR2: &str = "\
 1 sort bitvec 1

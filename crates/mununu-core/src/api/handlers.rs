@@ -602,8 +602,9 @@ pub async fn btor2_cegar_handler(
     use crate::adapter::AdapterOptions;
     use crate::adapter::btor2::cegar::{
         CegarOptions, CegarTermination, LiftStrategy, PredicateSource, cegar_refine_loop,
+        config_values_to_sidecar_json,
     };
-    use crate::adapter::btor2::kmts_lift::{MustEdgeInference, PredicateSpec};
+    use crate::adapter::btor2::kmts_lift::{MayEdgeInference, MustEdgeInference, PredicateSpec};
     use crate::mu_calculus::trit::{Trit, TritSet};
     use crate::mu_calculus::{Environment, parser as mu_parser};
 
@@ -644,6 +645,13 @@ pub async fn btor2_cegar_handler(
         Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
         _ => MustEdgeInference::Off,
     };
+    // M.6 parity (2026-06-20) — the may-edge inference policy is now an API
+    // field (was CLI-only). `smt-all-pairs` selects the sound all-pairs
+    // may-relation, matching `--may-edge-inference`; default is Off.
+    let may_edge_inference = match request.may_edge_inference.as_deref() {
+        Some("smt-all-pairs") => MayEdgeInference::SmtAllPairs,
+        _ => MayEdgeInference::Off,
+    };
 
     let cegar_opts = CegarOptions {
         max_iterations: request.max_iterations.unwrap_or(16),
@@ -654,13 +662,24 @@ pub async fn btor2_cegar_handler(
         smart_uf_cap: true,
         lift_strategy: LiftStrategy::Eager,
         must_edge_inference,
-        // DR1 (2026-06-19) — API keeps the sampling may-edges (default);
-        // the sound `SmtAllPairs` path is opt-in via the CLI for now.
-        may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+        may_edge_inference,
     };
 
+    // M.6 parity (2026-06-20) — config-values symbolic init is now an API
+    // field (was CLI-only). The shared `config_values_to_sidecar_json` helper
+    // gives the CLI and the API one parse for the `REG=v1,v2,...` format; the
+    // synthetic sidecar threads through to the predicate-cube lift's
+    // `config_values` (R-S8 init expansion — e.g. the M.4 boot_fsm_ns hazard).
+    let sidecar_json =
+        config_values_to_sidecar_json(&request.config_values).map_err(|message| {
+            ApiError::BadRequest {
+                message,
+                details: None,
+            }
+        })?;
     let adapter_options = AdapterOptions {
         controllable_inputs: request.controllable_inputs.clone(),
+        sidecar_json,
         ..Default::default()
     };
 
@@ -2829,6 +2848,8 @@ members = ["x"]
             predicate_source: None,
             max_iterations: Some(4),
             must_edge_inference: None,
+            may_edge_inference: None,
+            config_values: vec![],
         };
 
         let Json(out) = btor2_cegar_handler(Json(request))
@@ -2858,6 +2879,69 @@ members = ["x"]
         );
         // The final predicate set includes at least the bootstrap predicate.
         assert!(!out.final_predicates.is_empty());
+    }
+
+    /// M.6 parity (2026-06-20) — the CEGAR endpoint now accepts `config_values`
+    /// (R-S8 symbolic init) and `may_edge_inference`, both previously CLI-only.
+    /// A well-formed request with both set runs end-to-end.
+    #[tokio::test]
+    async fn btor2_cegar_handler_accepts_config_values_and_may_edge() {
+        use crate::api::models::PredicateSpecRequest;
+        let btor2 = "\
+1 sort bitvec 2
+2 state 2 burst
+3 zero 2
+4 init 2 2 3
+5 const 2 01
+6 sub 2 2 5
+7 next 2 2 6
+";
+        let request = Btor2CegarRequest {
+            content: btor2.to_string(),
+            formula: "nu X. < true > X".to_string(),
+            predicates: vec![PredicateSpecRequest {
+                name: "burst_zero".to_string(),
+                register: "burst".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec![],
+            predicate_source: None,
+            max_iterations: Some(4),
+            must_edge_inference: None,
+            may_edge_inference: Some("smt-all-pairs".to_string()),
+            config_values: vec!["burst=0,1,2,3".to_string()],
+        };
+        let Json(out) = btor2_cegar_handler(Json(request))
+            .await
+            .expect("CEGAR endpoint should accept config_values + may_edge_inference");
+        assert!(out.success);
+        assert!(!out.iterations.is_empty());
+    }
+
+    /// M.6 parity — a malformed `config_values` entry is a 400, not a panic.
+    #[tokio::test]
+    async fn btor2_cegar_handler_rejects_malformed_config_values() {
+        use crate::api::models::PredicateSpecRequest;
+        let btor2 = "1 sort bitvec 1\n2 state 1 r\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
+        let request = Btor2CegarRequest {
+            content: btor2.to_string(),
+            formula: "nu X. < true > X".to_string(),
+            predicates: vec![PredicateSpecRequest {
+                name: "r_zero".to_string(),
+                register: "r".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec![],
+            predicate_source: None,
+            max_iterations: Some(2),
+            must_edge_inference: None,
+            may_edge_inference: None,
+            config_values: vec!["this is not valid".to_string()],
+        };
+        let err = btor2_cegar_handler(Json(request))
+            .await
+            .expect_err("malformed config_values must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 
     /// R.6.7 / V.6 — when only `predicates` is set (no
