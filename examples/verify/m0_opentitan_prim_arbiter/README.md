@@ -59,8 +59,6 @@ Outputs land under `build/`:
 
 - `build/elaborated.v` — sv2v output (R.0a).
 - `build/btor2/<module>.btor2` — per-submodule BTOR2 (R.0b).
-- `build/comparison.json` — native + KMTS pipeline shape diff +
-  SVA-elision gate (R.0c).
 
 The script asserts at each stage and exits non-zero on failure.
 
@@ -97,22 +95,19 @@ KMTS lifter is on; the lifter abstracts the wide `data_i` port via
 predicate / UF wrapping, making the bit-blaster's input-cap stop
 being load-bearing.
 
-## Known KMTS-arm caveat at R.0c stage
+## R.0c `compare-pipelines` retired (M.5, 2026-06-20)
 
-`mununu sv compare-pipelines` runs sv2v + Yosys per pipeline arm,
-but the internal Yosys script (in `compare_pipelines`) does not
-currently thread the wrapper's include directory through to Yosys.
-The KMTS arm therefore errors with
-`Can't open include file 'prim_assert.sv'!` while the standalone
-R.0a / R.0b stages above succeed (they DO thread `-I`). The error
-is recorded in `build/comparison.json` honestly; the regression
-contract in `crates/mununu-core/tests/sv_compare_pipelines.rs`
-stays stable.
-
-The fix is to add `--include-dir` plumbing through
-`sv_pipeline_compare::compare_pipelines` — deferred to a follow-up
-commit (does not affect M.0's pass/fail status; the contract is
-"structured record produced" and it is).
+The original step 3 ran `mununu sv compare-pipelines` (R.0c), the
+pipeline-faithfulness harness that diffed the **native-parser arm**
+against the **KMTS arm**. The native SV parser was fully excised in
+**S.2b** (the singular-pipeline commitment), so `compare-pipelines` —
+along with the `sv_pipeline_compare::compare_pipelines` module and
+`crates/mununu-core/tests/sv_compare_pipelines.rs` — no longer exists:
+there is exactly one SV pipeline left, with nothing to compare it
+against. The **M.5 regression sweep** (2026-06-20) confirmed M.0's
+load-bearing capability — the **frontend reach** (sv2v → Yosys-no-flatten
+→ BTOR2-per-module, steps 1+2) — is intact, and dropped the obsolete
+step 3 from `validate.sh`.
 
 ## If something fails
 
