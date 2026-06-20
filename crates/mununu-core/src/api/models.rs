@@ -854,6 +854,17 @@ pub struct Btor2CegarRequest {
     /// `"smt-per-target-standard"` | `"smt-hyper-must"`.
     #[serde(default)]
     pub must_edge_inference: Option<String>,
+    /// May-edge inference policy (kebab-case; default `"off"`):
+    /// `"smt-all-pairs"` for the sound all-pairs may-relation. Mirrors the
+    /// CLI `--may-edge-inference`.
+    #[serde(default)]
+    pub may_edge_inference: Option<String>,
+    /// R-S8 symbolic-init config-values, one entry per register as
+    /// `"REG=v1,v2,..."` (mirrors the CLI `--config-values`). Each register's
+    /// admissible power-up set seeds the predicate-cube initial states. Empty =
+    /// no synthetic init sidecar.
+    #[serde(default)]
+    pub config_values: Vec<String>,
 }
 
 /// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace

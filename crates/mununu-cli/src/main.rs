@@ -1777,39 +1777,14 @@ fn build_adapter_options_with_config_values(
     config_values_args: &[String],
 ) -> Result<mununu_core::adapter::AdapterOptions, String> {
     use mununu_core::adapter::AdapterOptions;
-    if config_values_args.is_empty() {
-        return Ok(AdapterOptions::default());
-    }
-    let mut signals = Vec::with_capacity(config_values_args.len());
-    for entry in config_values_args {
-        let (reg, values_str) = entry.split_once('=').ok_or_else(|| {
-            format!("invalid --config-values entry {entry:?}: expected REG=v1,v2,v3 format")
-        })?;
-        let values: Vec<u64> = values_str
-            .split(',')
-            .map(|s| {
-                s.trim()
-                    .parse::<u64>()
-                    .map_err(|e| format!("invalid value {s:?} in --config-values: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if values.is_empty() {
-            return Err(format!(
-                "--config-values {entry:?}: at least one value required"
-            ));
-        }
-        signals.push(serde_json::json!({
-            "name": reg,
-            "config_values": values,
-        }));
-    }
-    let synthetic = serde_json::json!({
-        "module": "cli-cegar",
-        "source": "cli-cegar.btor2",
-        "signals": signals,
-    });
+    // M.6 parity (2026-06-20) — the `REG=v1,v2,...` parse moved to the shared
+    // core helper `adapter::btor2::cegar::config_values_to_sidecar_json` so the
+    // CLI `--config-values` and the API `config_values` field parse identically
+    // (single source of truth; the format can't drift between surfaces).
+    let sidecar_json =
+        mununu_core::adapter::btor2::cegar::config_values_to_sidecar_json(config_values_args)?;
     Ok(AdapterOptions {
-        sidecar_json: Some(synthetic.to_string()),
+        sidecar_json,
         ..AdapterOptions::default()
     })
 }
