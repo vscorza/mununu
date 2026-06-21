@@ -149,6 +149,34 @@ pub struct StateDecl {
     /// and that the trace renderer prints alongside state names in
     /// counterexamples / counterstrategies.
     pub valuations: Vec<Assignment>,
+    /// Per-state 3-valued (Kleene) predicate labels, written as
+    /// `predicates_3v { p = unknown; q = true; r = false; }` inside the optional
+    /// outer block on a state declaration. Unlike the 2-valued `predicates`
+    /// block (predicate ⇒ true at a state), these carry a full `Tristate`
+    /// (`true` / `false` / `unknown`) and realize into
+    /// [`crate::clts::Clts::with_3valued_predicate`] — the round-trippable
+    /// surface for a predicate-cube KMTS's `state_3valued_predicates`.
+    pub three_valued: Vec<ThreeValuedDecl>,
+}
+
+/// One `<predicate> = <tristate>` entry inside a state's `predicates_3v { … }`
+/// block.
+#[derive(Debug, Clone)]
+pub struct ThreeValuedDecl {
+    pub name: Ident,
+    pub value: TristateLit,
+}
+
+/// CTXDSL surface literal for a Kleene tristate, mapping to
+/// [`crate::clts::Tristate`] at the realize step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TristateLit {
+    /// `true` ⇒ `Tristate::KleeneT`.
+    True,
+    /// `false` ⇒ `Tristate::KleeneF`.
+    False,
+    /// `unknown` ⇒ `Tristate::KleeneBot`.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
