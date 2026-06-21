@@ -686,11 +686,13 @@ impl<'a> Parser<'a> {
         // is either `vars { ... }` (per-state initialiser overrides) or
         // `valuations { ... }` (per-state structured display metadata). They
         // may appear in any order; either may be omitted.
-        let (overrides, valuations) = if self.match_symbol(Symbol::LBrace) {
+        let (overrides, valuations, three_valued) = if self.match_symbol(Symbol::LBrace) {
             let mut overrides: Vec<Assignment> = Vec::new();
             let mut valuations: Vec<Assignment> = Vec::new();
+            let mut three_valued: Vec<ThreeValuedDecl> = Vec::new();
             let mut saw_vars = false;
             let mut saw_valuations = false;
+            let mut saw_3v = false;
             while !self.check_symbol(Symbol::RBrace) {
                 let block_span = self.peek().span;
                 if self.match_keyword(Keyword::Vars) {
@@ -719,19 +721,32 @@ impl<'a> Parser<'a> {
                         valuations.push(self.parse_valuation_pair()?);
                     }
                     self.expect_symbol(Symbol::RBrace)?;
+                } else if self.match_keyword(Keyword::Predicates3v) {
+                    if saw_3v {
+                        return Err(ParseError::DuplicateItem {
+                            name: "predicates_3v".into(),
+                            span: block_span,
+                        });
+                    }
+                    saw_3v = true;
+                    self.expect_symbol(Symbol::LBrace)?;
+                    while !self.check_symbol(Symbol::RBrace) {
+                        three_valued.push(self.parse_three_valued_pair()?);
+                    }
+                    self.expect_symbol(Symbol::RBrace)?;
                 } else {
                     let found = self.peek_kind().clone();
                     return Err(ParseError::UnexpectedToken {
                         found,
-                        expected: "`vars` or `valuations` block",
+                        expected: "`vars`, `valuations`, or `predicates_3v` block",
                         span: block_span,
                     });
                 }
             }
             self.expect_symbol(Symbol::RBrace)?;
-            (overrides, valuations)
+            (overrides, valuations, three_valued)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         self.expect_symbol(Symbol::Semicolon)?;
@@ -742,7 +757,37 @@ impl<'a> Parser<'a> {
             is_initial,
             overrides,
             valuations,
+            three_valued,
         })
+    }
+
+    /// Parse one `<predicate> = <tristate>;` entry inside a `predicates_3v { … }`
+    /// block. The tristate literal is `true` / `false` (existing keywords) or the
+    /// identifier `unknown`.
+    fn parse_three_valued_pair(&mut self) -> Result<ThreeValuedDecl, ParseError> {
+        let name = self.expect_ident()?;
+        self.expect_symbol(Symbol::Assign)?;
+        let value = self.parse_tristate_lit()?;
+        self.expect_symbol(Symbol::Semicolon)?;
+        Ok(ThreeValuedDecl { name, value })
+    }
+
+    fn parse_tristate_lit(&mut self) -> Result<TristateLit, ParseError> {
+        let span = self.peek().span;
+        if self.match_keyword(Keyword::True) {
+            Ok(TristateLit::True)
+        } else if self.match_keyword(Keyword::False) {
+            Ok(TristateLit::False)
+        } else if matches!(self.peek_kind(), TokenKind::Identifier(s) if s.as_str() == "unknown") {
+            self.advance();
+            Ok(TristateLit::Unknown)
+        } else {
+            Err(ParseError::UnexpectedToken {
+                found: self.peek_kind().clone(),
+                expected: "`true`, `false`, or `unknown`",
+                span,
+            })
+        }
     }
 
     fn parse_assignment(&mut self) -> Result<Assignment, ParseError> {

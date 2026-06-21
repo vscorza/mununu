@@ -141,6 +141,26 @@ states {
 
 The block lives inside the optional outer state block; it can coexist with a `vars { … }` block in any order. Reserved-keyword names (e.g. `state`, `on`, `group`) are accepted as keys so the round-trip with adapter-emitted CTXDSL is safe. See [`examples/hw/traffic_light_valuations.ctxdsl`](https://github.com/vscorza/mununu/blob/main/examples/hw/traffic_light_valuations.ctxdsl) for the canonical worked example.
 
+#### Per-state 3-valued (Kleene) predicates
+
+> Source of truth: [`Clts::with_3valued_predicate`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/clts/mod.rs) + [`parse_three_valued_pair`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/context_dsl/parser.rs) — surface: CLI+API+UI (the realized CLTS evaluates under any surface).
+
+A state may carry a `predicates_3v { … }` block with `predicate = tristate;` pairs, where the tristate is `true`, `false`, or `unknown`. Unlike the 2-valued `predicates` block (which asserts a predicate *holds* at a state), these carry a full Kleene verdict and realize into the CLTS's `state_3valued_predicates` map (`KleeneT` / `KleeneF` / `KleeneBot`) — the round-trippable surface for a predicate-cube KMTS produced by the BTOR2 predicate-abstraction lift.
+
+```
+states {
+    state cube_0 initial {
+        predicates_3v {
+            boot_fsm_is_idle = true;
+            boot_fsm_is_done = false;
+            counter_overflow = unknown;
+        }
+    };
+}
+```
+
+The block lives inside the optional outer state block and coexists with `vars { … }` / `valuations { … }` in any order. `unknown` ⇒ `KleeneBot` (the abstraction is too coarse to decide the predicate at that cube — the CEGAR loop refines it).
+
 ### Controllable
 
 The `controllable` block lists labels that the controller is allowed to enable or disable. Labels not listed here are treated as **uncontrollable** (environment actions that the controller cannot prevent).

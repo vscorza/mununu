@@ -81,6 +81,8 @@ pub enum Keyword {
     ProofObligations,
     True,
     False,
+    // Per-state 3-valued (Kleene) predicate block: `predicates_3v { p = unknown; }`
+    Predicates3v,
     // Enum types
     Enums, // "enums" section keyword
     Enum,  // "enum" declaration keyword
@@ -129,6 +131,7 @@ impl Keyword {
             "initial" => Initial,
             "vars" => Vars,
             "valuations" => Valuations,
+            "predicates_3v" => Predicates3v,
             "transitions" => Transitions,
             "transition" => Transition,
             "on" => On,

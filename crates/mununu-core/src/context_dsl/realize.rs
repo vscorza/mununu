@@ -1075,6 +1075,7 @@ fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Auto
                         is_initial: state.is_initial,
                         overrides: state.overrides.clone(),
                         valuations: state.valuations.clone(),
+                        three_valued: state.three_valued.clone(),
                     });
                 } else {
                     // Different iteration variable — keep as-is for now
@@ -1090,6 +1091,7 @@ fn substitute_param(automaton: &Automaton, param_name: &str, value: i64) -> Auto
                         is_initial: state.is_initial,
                         overrides: state.overrides.clone(),
                         valuations: state.valuations.clone(),
+                        three_valued: state.three_valued.clone(),
                     });
                 } else {
                     states.push(state.clone());
@@ -2609,6 +2611,19 @@ fn build_automaton(
             if !merged.is_empty() {
                 builder.with_valuation_for_state(state_id, merged);
             }
+            // Per-state 3-valued (Kleene) predicate labels from a
+            // `predicates_3v { … }` block → `Clts::state_3valued_predicates`.
+            // This is the round-trippable surface for a predicate-cube KMTS.
+            for tv in &state.three_valued {
+                let verdict = match tv.value {
+                    crate::context_dsl::ast::TristateLit::True => crate::clts::Tristate::KleeneT,
+                    crate::context_dsl::ast::TristateLit::False => crate::clts::Tristate::KleeneF,
+                    crate::context_dsl::ast::TristateLit::Unknown => {
+                        crate::clts::Tristate::KleeneBot
+                    }
+                };
+                builder.with_3valued_predicate(state_id, tv.name.name.clone(), verdict);
+            }
         }
     }
 
@@ -3426,6 +3441,59 @@ context structured_test {
         )
         .expect("context parses");
         let _ = realize(&doc, &[]).expect("structured-pattern predicate skipped");
+    }
+
+    #[test]
+    fn predicates_3v_block_realizes_into_state_3valued_predicates() {
+        // CTXDSL-output gap fix (IR-track) — a per-state `predicates_3v { … }`
+        // block carries Kleene labels that realize into the CLTS's
+        // `state_3valued_predicates`, the round-trippable surface for a
+        // predicate-cube KMTS.
+        use crate::clts::Tristate;
+        let doc = parse(
+            r#"
+context tri_test {
+    alphabet { label tick; }
+    automata {
+        automaton M {
+            states {
+                state s0 initial {
+                    predicates_3v { p = unknown; q = true; r = false; }
+                };
+                state s1;
+            }
+            transitions {
+                transition s0 -> s1 on label tick;
+                transition s1 -> s1 on label tick;
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        let realized = realize(&doc, &[]).expect("realizes");
+        let clts = realized.context.clts("M").expect("automaton M exists");
+        assert!(
+            clts.has_3valued_predicates(),
+            "3-valued labels must be registered on the CLTS"
+        );
+        let s0 = clts.state_id("s0").expect("s0 exists");
+        assert_eq!(
+            clts.state_3valued_predicate(s0, "p"),
+            Some(Tristate::KleeneBot)
+        );
+        assert_eq!(
+            clts.state_3valued_predicate(s0, "q"),
+            Some(Tristate::KleeneT)
+        );
+        assert_eq!(
+            clts.state_3valued_predicate(s0, "r"),
+            Some(Tristate::KleeneF)
+        );
+        // A state with no `predicates_3v` block carries no 3-valued labels.
+        let s1 = clts.state_id("s1").expect("s1 exists");
+        assert_eq!(clts.state_3valued_predicate(s1, "p"), None);
     }
 
     #[test]

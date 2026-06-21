@@ -307,6 +307,7 @@ mod tests {
                         },
                     }],
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("A"),
@@ -320,6 +321,7 @@ mod tests {
                         },
                     }],
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
             ],
             transitions: vec![
@@ -688,6 +690,7 @@ mod tests {
                     is_initial: true,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T1"),
@@ -695,6 +698,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T2"),
@@ -702,6 +706,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -874,6 +879,7 @@ mod tests {
                     is_initial: true,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T1"),
@@ -881,6 +887,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T2"),
@@ -888,6 +895,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -1093,6 +1101,7 @@ mod tests {
                     is_initial: true,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T"),
@@ -1100,6 +1109,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -1184,6 +1194,7 @@ mod tests {
                     is_initial: true,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T1"),
@@ -1191,6 +1202,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
                 StateDecl {
                     name: ident("T2"),
@@ -1198,6 +1210,7 @@ mod tests {
                     is_initial: false,
                     overrides: Vec::new(),
                     valuations: Vec::new(),
+                    three_valued: Vec::new(),
                 },
             ],
             transitions: Vec::new(),
@@ -1409,6 +1422,7 @@ mod tests {
                 },
             ],
             valuations: Vec::new(),
+            three_valued: Vec::new(),
         });
 
         canonicalize_automaton(&mut auto);
