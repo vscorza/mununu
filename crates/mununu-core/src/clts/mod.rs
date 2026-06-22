@@ -1510,6 +1510,19 @@ impl<S: IdStorage, L: IdStorage> Clts<S, L> {
             .is_some_and(|m| !m.is_empty())
     }
 
+    /// Returns `true` if `name` is a 3-valued predicate labelled on any
+    /// state — i.e. a formula atom referencing it is resolvable by the
+    /// `KleeneDomain` evaluator's `predicate_bits` (which reads
+    /// [`Clts::state_3valued_predicate`] by name). IR-track P3.3 uses this
+    /// so the realize-time formula-predicate validation accepts the
+    /// predicate-cube's Kleene labels (round-tripped through CTXDSL's
+    /// `predicates_3v` blocks) as referenceable predicates.
+    pub fn has_3valued_predicate_named(&self, name: &str) -> bool {
+        self.state_3valued_predicates
+            .as_ref()
+            .is_some_and(|m| m.keys().any(|(_, n)| n == name))
+    }
+
     /// Borrows a reusable state-set bit vector sized to this CLTS instance.
     ///
     /// The returned [`StateSet`] clears its contents upon `Drop` and returns the

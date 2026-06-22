@@ -1794,6 +1794,28 @@ fn validate_formula_predicates(realized: &RealizedContext) -> Result<(), Realiza
                     return true;
                 }
 
+                // Path 4 (IR-track P3.3): a predicate-cube 3-valued
+                // predicate. The cube CTXDSL round-trips per-state Kleene
+                // labels into the CLTS's `state_3valued_predicates`; the
+                // KleeneDomain evaluator's `predicate_bits` resolves the
+                // atom by name there, so a formula may reference it. Check
+                // the automaton itself + any composition member.
+                if let Some(clts) = realized.context.clts(automaton)
+                    && clts.has_3valued_predicate_named(predicate)
+                {
+                    return true;
+                }
+                if let Some(members) = realized.composition_members.get(automaton)
+                    && members.iter().any(|m| {
+                        realized
+                            .context
+                            .clts(m)
+                            .is_some_and(|c| c.has_3valued_predicate_named(predicate))
+                    })
+                {
+                    return true;
+                }
+
                 false
             });
 
@@ -3494,6 +3516,54 @@ context tri_test {
         // A state with no `predicates_3v` block carries no 3-valued labels.
         let s1 = clts.state_id("s1").expect("s1 exists");
         assert_eq!(clts.state_3valued_predicate(s1, "p"), None);
+    }
+
+    #[test]
+    fn formula_referencing_a_3valued_predicate_realizes() {
+        // IR-track P3.3 — a formula atom that names a `predicates_3v`
+        // (Kleene) predicate must pass realize-time validation (Path 4):
+        // the predicate-cube verify path round-trips its labels through
+        // `predicates_3v` and references them from the checked formula.
+        // Before the fix this errored with `UnknownPredicate` (the 3-valued
+        // names weren't registered as referenceable predicates), even
+        // though the KleeneDomain evaluator resolves them by name.
+        let doc = parse(
+            r#"
+context tri_formula {
+    alphabet { label tick; }
+    automata {
+        automaton M {
+            states {
+                state s0 initial {
+                    predicates_3v { boot_idle = true; }
+                };
+                state s1 {
+                    predicates_3v { boot_idle = false; }
+                };
+            }
+            transitions {
+                transition s0 -> s1 on label tick;
+                transition s1 -> s1 on label tick;
+            }
+        }
+    }
+    mu_formulas {
+        formula holds_idle {
+            over M;
+            body = "boot_idle";
+        }
+    }
+}
+"#,
+        )
+        .expect("context parses");
+        // The key assertion: realize SUCCEEDS — the formula's `boot_idle`
+        // atom resolves to the 3-valued predicate (Path 4), not rejected
+        // as an unknown predicate.
+        let realized = realize(&doc, &[]).expect("realizes (3-valued predicate resolves)");
+        let clts = realized.context.clts("M").expect("automaton M exists");
+        assert!(clts.has_3valued_predicate_named("boot_idle"));
+        assert!(!clts.has_3valued_predicate_named("nonexistent"));
     }
 
     #[test]
