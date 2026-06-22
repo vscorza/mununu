@@ -54,7 +54,7 @@ use crate::adapter::templates::{TemplateRef, TemplateRegistry};
 use crate::adapter::xstate::XStateAdapter;
 use crate::adapter::{AdapterOptions, FormatAdapter};
 use crate::clts::IdStorage;
-use crate::mu_calculus::{EvaluationOptions, evaluate_with_options};
+use crate::mu_calculus::{EvaluationOptions, evaluate_tri_with_options, evaluate_with_options};
 use crate::verify::assemble::{
     AutomatonDiscovery, CompositionSpec, ResolvedProperty, SourceCtxdsl, assemble_unified_ctxdsl,
     extract_context_body,
@@ -919,6 +919,37 @@ fn dispatch_sv_yosys(
         .get("multi_module")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // IR-track P3.3 — predicate-cube verify path. When the (widened)
+    // sidecar declares `predicates`, route a single-module SV source
+    // through SV → BTOR2 → `predicate_cube_lift` (a 3-valued KMTS) instead
+    // of the bit-blast path; `evaluate_one_property`'s 3-valued branch then
+    // evaluates the realized cube. Multi-module cube *composition* is a
+    // follow-up (composition's 3-valued-predicate merge is not yet wired),
+    // so multi-module falls through to the bit-blast path below. An empty
+    // `predicates` (every existing fixture) also falls through — the
+    // bit-blast default is unchanged.
+    if !is_multi_module
+        && let Some(sc) = opts.sidecar_json.as_deref()
+        && let Ok(ann) =
+            serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(sc)
+        && !ann.predicates.is_empty()
+    {
+        let top = options
+            .get("top")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        return dispatch_sv_predicate_cube(
+            source_id,
+            content,
+            &ann,
+            &opts,
+            additional_sources.clone(),
+            use_sv2v,
+            top,
+        );
+    }
+
     if is_multi_module {
         let top = options
             .get("top")
@@ -978,6 +1009,79 @@ fn dispatch_sv_yosys(
             adapter: "sv-yosys".to_string(),
             message: err.to_string(),
         })
+}
+
+/// IR-track P3.3 — the predicate-cube verify path for a single-module SV
+/// source whose sidecar declares `predicates`. Lifts SV → one flattened
+/// BTOR2 (sv2v + Yosys) → `predicate_cube_lift` (a 3-valued KMTS over the
+/// `2^|P|` predicate cube), then emits CTXDSL (carrying transition
+/// modality + the per-state `predicates_3v` Kleene labels) for the normal
+/// assemble→realize→evaluate flow. `evaluate_one_property` detects the
+/// realized KMTS (`has_3valued_predicates`) and evaluates it 3-valued.
+///
+/// SOUNDNESS: the lift uses `SmtAllPairs` may-edges (a sound over-approx)
+/// together with `SmtPerTargetStandard` (∀∃) must-edges (a sound
+/// under-approx), so a definite KleeneT/KleeneF transfers to the concrete
+/// design; a KleeneBot is "needs refinement" (surfaced as `unknown_cells`,
+/// never satisfied). This is a single-shot lift+evaluate — no CEGAR — so a
+/// too-coarse predicate set yields ⊥ rather than a wrong verdict.
+fn dispatch_sv_predicate_cube(
+    source_id: &str,
+    content: &str,
+    ann: &crate::adapter::systemverilog::annotation::SvAnnotation,
+    opts: &AdapterOptions,
+    additional_sources: Vec<(String, String)>,
+    use_sv2v: bool,
+    top: Option<String>,
+) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
+    use crate::adapter::btor2::kmts_lift::{
+        MayEdgeInference, MustEdgeInference, PredicateCubeLiftOptions, PredicateSpec,
+        predicate_cube_lift,
+    };
+
+    let translate_err = |message: String| VerifyError::AdapterTranslationFailed {
+        source_id: source_id.to_string(),
+        adapter: "sv-yosys-cube".to_string(),
+        message,
+    };
+
+    let yopts = crate::adapter::yosys::YosysOptions {
+        top,
+        additional_sources,
+        use_sv2v,
+        ..Default::default()
+    };
+    let btor2 = crate::adapter::yosys::sv_to_btor2(content, &yopts)
+        .map_err(|err| translate_err(format!("SV → BTOR2: {}", err.message)))?;
+
+    let predicates: Vec<PredicateSpec> = ann
+        .predicates
+        .iter()
+        .map(|p| PredicateSpec {
+            name: p.name.clone(),
+            register: p.register.clone(),
+            value: p.value,
+        })
+        .collect();
+
+    let lift_opts = PredicateCubeLiftOptions {
+        max_cube_count: 1024,
+        max_input_bits: 8,
+        must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
+        may_edge_inference: MayEdgeInference::SmtAllPairs,
+        config_values: crate::adapter::btor2::r_s8_encoder::sidecar_config_values(opts),
+    };
+    let result = predicate_cube_lift(predicates, &btor2, opts, &lift_opts)
+        .map_err(|err| translate_err(format!("predicate-cube lift: {}", err.message)))?;
+    for w in &result.warnings {
+        tracing::warn!(source_id, "{}", w.message);
+    }
+
+    // Automaton name = the SV module; the verify.toml property `over` must
+    // reference it (the same name the module declares).
+    let ctxdsl = crate::adapter::clts_to_ir::clts_to_ctxdsl(&result.clts, &ann.module, source_id)
+        .map_err(|err| translate_err(format!("cube → CTXDSL: {}", err.message)))?;
+    Ok((ctxdsl, None))
 }
 
 /// Dispatch the `c-codesign` adapter — runs LLVM-IR extraction via
@@ -1252,53 +1356,117 @@ fn evaluate_one_property(
     })?;
     let env = realized.environment_for(over);
     let options = EvaluationOptions::default();
-    let result = evaluate_with_options(&formula.formula, clts, &env, &options).map_err(|e| {
-        VerifyError::EvaluationFailed {
-            property: name.to_string(),
-            message: e.to_string(),
-        }
-    })?;
 
     let total_states = clts.state_count();
-    let satisfying_states = (0..total_states)
-        .filter(|i| result.get(*i).map(|b| *b).unwrap_or(false))
-        .count();
     let initial_states: Vec<String> = clts
         .initial_states()
         .iter()
         .filter_map(|sid| clts.state_name(*sid).map(str::to_string))
         .collect();
-    let initial_satisfying: Vec<String> = clts
-        .initial_states()
-        .iter()
-        .filter_map(|sid| {
-            if result.get(sid.index()).map(|b| *b).unwrap_or(false) {
-                clts.state_name(*sid).map(str::to_string)
+
+    // IR-track P3.3 — route the verdict through the 3-valued (KleeneDom)
+    // evaluator when the realized CLTS is a predicate-cube KMTS (carries
+    // per-state 3-valued labels). The cube verify path (the predicate
+    // branch in `dispatch_sv_yosys`) produces these; the bit-blast path
+    // does not, so it stays on the 2-valued evaluator (`else` arm,
+    // byte-for-byte unchanged).
+    let (satisfied, satisfying_states, initial_satisfying, initial_verdict_summary, counterexample) =
+        if clts.has_3valued_predicates() {
+            use crate::mu_calculus::trit::Trit;
+            // SOUNDNESS: the cube KMTS carries SmtAllPairs may-edges
+            // (sound over-approx) + ∀∃ must-edges (sound under-approx), so
+            // a definite KleeneT/KleeneF transfers to the concrete design
+            // (Bruns–Godefroid CONCUR 2000). A KleeneBot is "needs
+            // refinement" — surfaced via `unknown_cells`, never reported as
+            // satisfied and never given a (spurious) counterexample.
+            let tri =
+                evaluate_tri_with_options(&formula.formula, clts, &env, &options).map_err(|e| {
+                    VerifyError::EvaluationFailed {
+                        property: name.to_string(),
+                        message: e.to_string(),
+                    }
+                })?;
+            let satisfying_states = (0..total_states)
+                .filter(|i| matches!(tri.verdict_at(*i), Trit::True))
+                .count();
+            let initial_satisfying: Vec<String> = clts
+                .initial_states()
+                .iter()
+                .filter_map(|sid| match tri.verdict_at(sid.index()) {
+                    Trit::True => clts.state_name(*sid).map(str::to_string),
+                    _ => None,
+                })
+                .collect();
+            let mut summary = crate::verify::report::ThreeValuedSummary::default();
+            for sid in clts.initial_states() {
+                match tri.verdict_at(sid.index()) {
+                    Trit::True => summary.true_cells += 1,
+                    Trit::False => summary.false_cells += 1,
+                    Trit::Unknown => summary.unknown_cells += 1,
+                }
+            }
+            // The property holds iff every initial state is a definite
+            // KleeneT. Any KleeneF (definite violation) or KleeneBot
+            // (indefinite) ⇒ not satisfied. The 3-valued path emits no
+            // counterexample witness — ⊥ is not a concrete violation, and a
+            // definite F over the abstract cube has no single concrete
+            // trace to walk (refine via more predicates or `btor2 cegar`).
+            let satisfied = !initial_states.is_empty()
+                && summary.false_cells == 0
+                && summary.unknown_cells == 0;
+            (
+                satisfied,
+                satisfying_states,
+                initial_satisfying,
+                summary,
+                None,
+            )
+        } else {
+            let result =
+                evaluate_with_options(&formula.formula, clts, &env, &options).map_err(|e| {
+                    VerifyError::EvaluationFailed {
+                        property: name.to_string(),
+                        message: e.to_string(),
+                    }
+                })?;
+            let satisfying_states = (0..total_states)
+                .filter(|i| result.get(*i).map(|b| *b).unwrap_or(false))
+                .count();
+            let initial_satisfying: Vec<String> = clts
+                .initial_states()
+                .iter()
+                .filter_map(|sid| {
+                    if result.get(sid.index()).map(|b| *b).unwrap_or(false) {
+                        clts.state_name(*sid).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let satisfied =
+                !initial_states.is_empty() && initial_satisfying.len() == initial_states.len();
+            // IR-track P3.1 — derived 3-valued summary over the initial
+            // states. The bit-blast model is exact for the explicit state
+            // space, so every initial state is definite (no ⊥): T =
+            // satisfying, F = the rest. No second eval — zero perf cost.
+            let summary = crate::verify::report::ThreeValuedSummary {
+                true_cells: initial_satisfying.len(),
+                false_cells: initial_states.len() - initial_satisfying.len(),
+                unknown_cells: 0,
+            };
+            let counterexample = if !satisfied {
+                build_counterexample_witness(clts, &result, TRACE_WITNESS_STEP_CAP)
             } else {
                 None
-            }
-        })
-        .collect();
-    let satisfied = !initial_states.is_empty() && initial_satisfying.len() == initial_states.len();
-
-    // IR-track P3.1 — 3-valued { T, F, ⊥ } summary over the initial
-    // states, derived from the 2-valued `result`. This is the verify
-    // path's bit-blast model (exact for the explicit state space), so
-    // every initial state is definite: T = satisfying, F = not. No
-    // KleeneBot arises here (`unknown_cells = 0`); the predicate-cube
-    // path (P3.3) is what introduces ⊥. Derived, not a second eval —
-    // additive surface with zero verdict change + zero perf cost.
-    let initial_verdict_summary = crate::verify::report::ThreeValuedSummary {
-        true_cells: initial_satisfying.len(),
-        false_cells: initial_states.len() - initial_satisfying.len(),
-        unknown_cells: 0,
-    };
-
-    let counterexample = if !satisfied {
-        build_counterexample_witness(clts, &result, TRACE_WITNESS_STEP_CAP)
-    } else {
-        None
-    };
+            };
+            (
+                satisfied,
+                satisfying_states,
+                initial_satisfying,
+                summary,
+                counterexample,
+            )
+        };
 
     Ok(PropertyVerdict {
         name: name.to_string(),
@@ -1874,6 +2042,112 @@ over = "S"
         assert_eq!(s.true_cells + s.false_cells, v.initial_states.len());
         assert_eq!(s.unknown_cells, 0, "bit-blast verify path has no ⊥");
         assert_eq!(s.false_cells, 0, "satisfied ⇒ no violating initial state");
+    }
+
+    /// IR-track P3.3 — a sidecar with `predicates` routes the SV source
+    /// through the predicate-cube (3-valued KMTS) verify path:
+    /// SV → BTOR2 → `predicate_cube_lift` → 3-valued evaluate. The cube has
+    /// `2^|P|` cells (not the bit-blast explicit space), the formula binds
+    /// to the declared `cnt_zero` predicate (the bit-blast path wouldn't
+    /// define it), and the verdict is DEFINITE (no ⊥). yosys-gated.
+    #[test]
+    fn predicate_cube_sidecar_routes_verify_through_3valued_cube() {
+        if std::process::Command::new("yosys")
+            .arg("-V")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skip: yosys not installed");
+            return;
+        }
+        let temp = tempdir().unwrap();
+        // 2-bit up-counter; cnt inits to 0 under the default setundef -zero.
+        let sv = "module cube_ctr (input logic clk, input logic rst);\n  \
+            logic [1:0] cnt;\n  \
+            always_ff @(posedge clk) cnt <= rst ? 2'd0 : cnt + 2'd1;\n\
+            endmodule\n";
+        let sidecar = r#"{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "cube_ctr",
+  "source": "cube_ctr.sv",
+  "predicates": [ { "name": "cnt_zero", "register": "cnt", "value": 0 } ]
+}"#;
+        write_ctxdsl_source(temp.path(), "cube_ctr.sv", sv);
+        write_ctxdsl_source(temp.path(), "cube_ctr.mununu.json", sidecar);
+        let toml_src = r#"
+[project]
+name = "CubeCtr"
+
+[[sources]]
+id = "ctr"
+adapter = "sv-yosys"
+files = ["cube_ctr.sv"]
+
+[sources.options]
+sidecar = "cube_ctr.mununu.json"
+
+[composition]
+semantics = "synchronous"
+members = ["ctr"]
+name = "Sys"
+
+[[properties]]
+name = "init_is_zero"
+formula = "cnt_zero"
+over = "cube_ctr"
+
+[[properties]]
+name = "always_zero"
+formula = "nu X. (cnt_zero && [] X)"
+over = "cube_ctr"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).expect("parse manifest");
+        let report = verify_project(&config, temp.path()).expect("cube verify runs");
+        let verdict = |n: &str| {
+            report
+                .property_verdicts
+                .iter()
+                .find(|v| v.name == n)
+                .unwrap_or_else(|| panic!("missing verdict for '{n}'"))
+        };
+
+        // The cube path ran: the predicate cube has 2^|P| = 2 cells (the
+        // bit-blast path would enumerate the explicit register space). This
+        // asserts the *plumbing* — routing + 3-valued eval + the
+        // predicate-name resolution — not the lift's initial-state
+        // soundness (the same `predicate_cube_lift` cegar uses, validated
+        // by M.4); P3.4 re-validates per-fixture verdict polarity.
+        let init = verdict("init_is_zero");
+        assert_eq!(init.total_states, 2, "predicate cube has 2^|P| = 2 cells");
+        // The bare atom `cnt_zero` binds to the cube's Kleene label and is
+        // value-sensitive: it holds at exactly one of the two cells (not a
+        // vacuous all-true / all-false fallthrough). The bit-blast path
+        // would not even define `cnt_zero`.
+        assert_eq!(
+            init.satisfying_states, 1,
+            "cnt_zero holds at exactly one cube cell (value-sensitive bind)"
+        );
+        // DEFINITE 3-valued verdict — no KleeneBot — the P3.3 done-criterion.
+        assert_eq!(
+            init.initial_verdict_summary.unknown_cells, 0,
+            "the cube path produced a definite verdict (no ⊥)"
+        );
+
+        // □cnt_zero (νX. cnt_zero ∧ []X) holds nowhere — the counter leaves
+        // 0, so the box modality over the cube's may-edges falsifies it.
+        // Exercises the 3-valued modal evaluator over the lifted KMTS.
+        let always = verdict("always_zero");
+        assert_eq!(always.total_states, 2);
+        assert_eq!(
+            always.satisfying_states, 0,
+            "□cnt_zero holds in no cube cell (counter advances off 0)"
+        );
+        assert_eq!(
+            always.initial_verdict_summary.unknown_cells, 0,
+            "definite verdict on the modal property"
+        );
+        assert!(!always.satisfied);
     }
 
     #[test]
