@@ -67,6 +67,7 @@ pub fn to_ir(
             name: state_name,
             is_initial: idx == 0,
             valuations: None,
+            three_valued: None,
         });
     }
 

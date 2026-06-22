@@ -142,6 +142,15 @@ pub struct StateSpec {
     /// Populated by adapters that enumerate states from cross-product domains
     /// (SV Kripke, extraction). Enables structured predicate matching.
     pub valuations: Option<std::collections::BTreeMap<String, String>>,
+    /// CTXDSL Phase 1b — per-state 3-valued (Kleene) predicate labels,
+    /// keyed by predicate name. Populated by the cube `Clts` → IR bridge
+    /// ([`crate::adapter::clts_to_ir::clts_to_ctxdsl`]) so the CTXDSL
+    /// emitter can serialize them as `predicates_3v { p = true|false|unknown; }`
+    /// blocks — the round-trippable surface for a predicate-cube KMTS's
+    /// `state_3valued_predicates`. `None` (the default for every 2-valued
+    /// adapter) emits no `predicates_3v` block, preserving prior output
+    /// byte-for-byte.
+    pub three_valued: Option<std::collections::BTreeMap<String, crate::clts::Tristate>>,
 }
 
 /// A transition in an explicit automaton.

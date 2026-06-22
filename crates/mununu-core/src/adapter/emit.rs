@@ -155,6 +155,21 @@ fn sanitize_valuation_value(value: &str) -> String {
     }
 }
 
+/// CTXDSL Phase 1b — render a [`crate::clts::Tristate`] as its CTXDSL
+/// `predicates_3v` literal: `KleeneT → "true"`, `KleeneF → "false"`,
+/// `KleeneBot → "unknown"`. The parser's `parse_tristate_lit`
+/// (the `true` / `false` keywords + the `unknown` identifier) accepts
+/// exactly these three forms, so emit ∘ parse round-trips the Kleene
+/// labels of a predicate-cube KMTS.
+fn tristate_to_ctxdsl(t: crate::clts::Tristate) -> &'static str {
+    use crate::clts::Tristate;
+    match t {
+        Tristate::KleeneT => "true",
+        Tristate::KleeneF => "false",
+        Tristate::KleeneBot => "unknown",
+    }
+}
+
 /// Convert a title to snake_case for the context name.
 fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
@@ -534,11 +549,21 @@ fn emit_explicit(ir: &AdapterIR) -> Result<String, AdapterError> {
             } else {
                 format!("state {}", sanitize(&state.name))
             };
-            match state.valuations.as_ref().filter(|m| !m.is_empty()) {
-                None => w.write_line(&format!("{head};")),
-                Some(vals) => {
-                    w.write_line(&format!("{head} {{"));
-                    w.indent();
+            // CTXDSL Phase 1b — a state's optional outer block carries a
+            // `valuations { … }` block (display metadata) and/or a
+            // `predicates_3v { … }` block (Kleene labels lifted from a
+            // predicate-cube KMTS's `state_3valued_predicates`). Emit the
+            // outer block when EITHER is non-empty; emit the bare
+            // `state s;` form when both are empty (preserving pre-1b output
+            // byte-for-byte for the 2-valued adapters).
+            let vals = state.valuations.as_ref().filter(|m| !m.is_empty());
+            let preds3v = state.three_valued.as_ref().filter(|m| !m.is_empty());
+            if vals.is_none() && preds3v.is_none() {
+                w.write_line(&format!("{head};"));
+            } else {
+                w.write_line(&format!("{head} {{"));
+                w.indent();
+                if let Some(vals) = vals {
                     w.write_line("valuations {");
                     w.indent();
                     for (k, v) in vals.iter() {
@@ -550,9 +575,18 @@ fn emit_explicit(ir: &AdapterIR) -> Result<String, AdapterError> {
                     }
                     w.deindent();
                     w.write_line("}");
-                    w.deindent();
-                    w.write_line("};");
                 }
+                if let Some(preds) = preds3v {
+                    w.write_line("predicates_3v {");
+                    w.indent();
+                    for (k, v) in preds.iter() {
+                        w.write_line(&format!("{} = {};", sanitize(k), tristate_to_ctxdsl(*v)));
+                    }
+                    w.deindent();
+                    w.write_line("}");
+                }
+                w.deindent();
+                w.write_line("};");
             }
         }
         w.deindent();
@@ -1149,11 +1183,13 @@ mod tests {
                         name: "idle".into(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "critical".into(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![
@@ -1309,11 +1345,13 @@ context k3_roundtrip {
                         name: "s0".into(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "s1".into(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![TransitionSpec {
@@ -1354,21 +1392,25 @@ context k3_roundtrip {
                         name: "s0".into(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "t1".into(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "t2".into(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "t3".into(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![TransitionSpec {

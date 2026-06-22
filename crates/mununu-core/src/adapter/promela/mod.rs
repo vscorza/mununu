@@ -127,6 +127,7 @@ fn to_ir(program: &ast::Program, options: &AdapterOptions) -> Result<AdapterIR, 
                 name: loc.label.clone(),
                 is_initial: loc.id == proc_cfg.initial,
                 valuations: None,
+                three_valued: None,
             })
             .collect();
 
@@ -318,6 +319,7 @@ fn create_variable_automaton(
             name: state_name.clone(),
             is_initial: val == init_val,
             valuations: None,
+            three_valued: None,
         });
 
         // set_var_val transitions from any state to this value
@@ -378,6 +380,7 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
             name: format!("{}_idle", chan.name),
             is_initial: true,
             valuations: None,
+            three_valued: None,
         });
         let rendezvous_label = format!("rendezvous_{}", chan.name);
         transitions.push(TransitionSpec {
@@ -400,6 +403,7 @@ fn create_channel_automaton(chan: &ast::ChanDecl) -> AutomatonSpec {
                 name: state_name.clone(),
                 is_initial: k == 0,
                 valuations: None,
+                three_valued: None,
             });
         }
 

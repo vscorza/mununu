@@ -44,16 +44,19 @@ fn viability_simple_automaton_eval_synth() {
                     name: "Green".to_string(),
                     is_initial: true,
                     valuations: None,
+                    three_valued: None,
                 },
                 StateSpec {
                     name: "Yellow".to_string(),
                     is_initial: false,
                     valuations: None,
+                    three_valued: None,
                 },
                 StateSpec {
                     name: "Red".to_string(),
                     is_initial: false,
                     valuations: None,
+                    three_valued: None,
                 },
             ],
             transitions: vec![
@@ -171,11 +174,13 @@ fn viability_synchronous_composition() {
                         name: "Off".to_string(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "On".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![
@@ -207,16 +212,19 @@ fn viability_synchronous_composition() {
                         name: "Idle".to_string(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "Active".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "Done".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![
@@ -340,16 +348,19 @@ fn viability_variable_automaton_guard_sync() {
                         name: "Idle".to_string(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "Working".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "Done".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![
@@ -423,16 +434,19 @@ fn viability_variable_automaton_guard_sync() {
                         name: "counter_0".to_string(),
                         is_initial: true,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "counter_1".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                     StateSpec {
                         name: "counter_2".to_string(),
                         is_initial: false,
                         valuations: None,
+                        three_valued: None,
                     },
                 ],
                 transitions: vec![

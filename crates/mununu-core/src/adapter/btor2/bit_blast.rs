@@ -2743,6 +2743,7 @@ fn enumerate_and_blast(
                 name: split_names[i].clone(),
                 is_initial: init_split_set.contains(&i),
                 valuations: if vals.is_empty() { None } else { Some(vals) },
+                three_valued: None,
             }
         })
         .collect();
@@ -2757,6 +2758,7 @@ fn enumerate_and_blast(
             name: OOB_SINK_KEY.to_string(),
             is_initial: false,
             valuations: Some(oob_val),
+            three_valued: None,
         });
     }
 

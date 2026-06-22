@@ -32,7 +32,7 @@ use crate::clts::{Clts, CltsResult, DefaultLabelIdx, DefaultStateIdx, LabelId, S
 use crate::composition::{CompositionOptions, CompositionSemantics, compose};
 use crate::controllability::BoundaryDirection;
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// The clock-step fallback label the bit-blaster emits for a module with no
 /// free (non-clock, non-reset) inputs. It is shared across such modules so
@@ -390,123 +390,24 @@ fn realize_module_clts(ctxdsl: &str) -> Result<Clts<DefaultStateIdx, DefaultLabe
         .ok_or_else(|| format!("automaton '{name}' missing after realise"))
 }
 
-/// R-MM-5a — Serialise a `Clts` to CTXDSL by building a single-automaton
-/// [`crate::adapter::ir::AdapterIR`] and reusing the IR→CTXDSL emitter
-/// ([`crate::adapter::emit::emit`]).
+/// R-MM-5a / CTXDSL Phase 1b — Serialise a `Clts` to CTXDSL by building a
+/// single-automaton [`crate::adapter::ir::AdapterIR`] and reusing the
+/// IR→CTXDSL emitter.
 ///
 /// This is what lets a composed multi-module KMTS re-enter the standard
 /// parse→realise→evaluate verify pipeline: the pipeline rebuilds the
 /// predicate `Environment` from the inline state valuations, so no bespoke
-/// direct-evaluation path (and its duplicated predicate-bitset machinery)
-/// is needed. The composed design becomes a first-class, inspectable CTXDSL
-/// artifact.
+/// direct-evaluation path is needed. The composed design becomes a
+/// first-class, inspectable CTXDSL artifact.
 ///
-/// Emits the 2-valued shape (states + inline valuations + multi-label
-/// transitions + controllability + modality). 3-valued predicate labellings
-/// have no CTXDSL syntax and are absent on the 2-valued multi-module path.
-pub fn clts_to_ctxdsl(
-    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
-    automaton_name: &str,
-    context_name: &str,
-) -> Result<String, AdapterError> {
-    use crate::adapter::SourceFormat;
-    use crate::adapter::emit::emit;
-    use crate::adapter::ir::{AdapterIR, AutomatonSpec, Metadata, StateSpec, TransitionSpec};
-
-    let state_name = |s| clts.state_name(s).unwrap_or("state").to_string();
-
-    let states: Vec<StateSpec> = clts
-        .states()
-        .map(|s| StateSpec {
-            name: state_name(s),
-            is_initial: clts.initial_states().contains(&s),
-            valuations: clts.state_valuation(s).cloned(),
-        })
-        .collect();
-
-    let mut transitions: Vec<TransitionSpec> = Vec::new();
-    for s in clts.states() {
-        let source = state_name(s);
-        for t in clts.outgoing(s) {
-            let mut labels: Vec<String> = Vec::new();
-            for &lid in t.labels() {
-                if let Some(payload) = clts.label_payload(lid) {
-                    labels.extend(payload.iter().cloned());
-                }
-            }
-            let (modality, additional_targets) = modality_to_spec(clts, t);
-            transitions.push(TransitionSpec {
-                source: source.clone(),
-                target: state_name(t.target()),
-                labels,
-                modality,
-                additional_targets,
-            });
-        }
-    }
-
-    let label_names = |set: &HashSet<LabelId<DefaultLabelIdx>>| -> Vec<String> {
-        let mut v: Vec<String> = set
-            .iter()
-            .filter_map(|&l| clts.label_payload(l))
-            .flatten()
-            .cloned()
-            .collect();
-        v.sort();
-        v.dedup();
-        v
-    };
-
-    let automaton = AutomatonSpec {
-        name: automaton_name.to_string(),
-        states,
-        transitions,
-        controllable_labels: label_names(clts.controllable_alphabet()),
-        internal_labels: label_names(clts.internal_alphabet()),
-    };
-
-    let ir = AdapterIR {
-        metadata: Metadata {
-            title: context_name.to_string(),
-            source_format: SourceFormat::SystemVerilog,
-            description: Some("R-MM composed multi-module KMTS".to_string()),
-            game_semantics: None,
-            known_status: None,
-        },
-        signals: Vec::new(),
-        automata: vec![automaton],
-        compositions: Vec::new(),
-        properties: Vec::new(),
-        controller: None,
-    };
-
-    emit(&ir).map(|r| r.ctxdsl)
-}
-
-/// Map a transition's [`crate::clts::TransitionModality`] to the CTXDSL
-/// emitter's `TransitionModalitySpec` + the additional hyper-must target
-/// names (targets beyond the primary). Sharp / MayOnly carry no extra
-/// targets; the 2-valued multi-module path is all Sharp.
-fn modality_to_spec(
-    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
-    t: &crate::clts::Transition<DefaultStateIdx, DefaultLabelIdx>,
-) -> (crate::context_dsl::ast::TransitionModalitySpec, Vec<String>) {
-    use crate::clts::TransitionModality;
-    use crate::context_dsl::ast::TransitionModalitySpec;
-    match t.modality() {
-        TransitionModality::Sharp => (TransitionModalitySpec::Sharp, Vec::new()),
-        TransitionModality::MayOnly => (TransitionModalitySpec::MayOnly, Vec::new()),
-        TransitionModality::MustHyperOnly(_) => {
-            let targets = t.modality().must_target_set(t.target());
-            let additional: Vec<String> = targets
-                .iter()
-                .skip(1)
-                .filter_map(|&st| clts.state_name(st).map(str::to_string))
-                .collect();
-            (TransitionModalitySpec::MustOnly, additional)
-        }
-    }
-}
+/// The implementation moved to the frontend-neutral
+/// [`crate::adapter::clts_to_ir`] module (CTXDSL Phase 1b) so the
+/// predicate-cube / CEGAR path can reuse it. It now also carries each
+/// state's 3-valued (Kleene) labels as `predicates_3v { … }` blocks — the
+/// gap the prior multi-module note ("3-valued predicate labellings have no
+/// CTXDSL syntax") flagged, now closed by Phase 1a (grammar) + 1b (emit).
+/// Re-exported here for the existing R-MM multi-module callers.
+pub use crate::adapter::clts_to_ir::clts_to_ctxdsl;
 
 #[cfg(test)]
 mod tests {

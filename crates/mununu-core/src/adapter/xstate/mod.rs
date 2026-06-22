@@ -168,6 +168,7 @@ fn build_automaton_from_region(
             name: s.name.clone(),
             is_initial: s.is_initial,
             valuations: None,
+            three_valued: None,
         })
         .collect();
 
@@ -293,11 +294,13 @@ fn create_bool_variable_automaton(name: &str, initial: bool) -> AutomatonSpec {
                 name: true_state.clone(),
                 is_initial: initial,
                 valuations: None,
+                three_valued: None,
             },
             StateSpec {
                 name: false_state.clone(),
                 is_initial: !initial,
                 valuations: None,
+                three_valued: None,
             },
         ],
         transitions: vec![
@@ -369,6 +372,7 @@ fn create_int_variable_automaton(name: &str, lo: i64, hi: i64, initial: i64) -> 
             name: format!("{name}_{v}"),
             is_initial: v == initial,
             valuations: None,
+            three_valued: None,
         });
     }
 

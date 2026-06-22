@@ -39,16 +39,19 @@ fn fixture_ir() -> AdapterIR {
                     name: "s0".to_string(),
                     is_initial: true,
                     valuations: Some(val(&[("empty", "1"), ("full", "0")])),
+                    three_valued: None,
                 },
                 StateSpec {
                     name: "s1".to_string(),
                     is_initial: false,
                     valuations: Some(val(&[("empty", "0"), ("full", "0")])),
+                    three_valued: None,
                 },
                 StateSpec {
                     name: "s2".to_string(),
                     is_initial: false,
                     valuations: Some(val(&[("empty", "0"), ("full", "1"), ("phase", "writing")])),
+                    three_valued: None,
                 },
             ],
             transitions: vec![
