@@ -109,6 +109,11 @@ fn create_router() -> Router {
         )
         .route("/api/v1/verify", post(handlers::verify_project_handler))
         .route("/api/v1/btor2/cegar", post(handlers::btor2_cegar_handler))
+        // cegar-extraction Stage 2 — SV-direct CEGAR one-call (sv2v +
+        // Yosys → flattened BTOR2 → cegar_refine_loop). Surface peer of
+        // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow
+        // run CEGAR without a manual emit-btor2-per-module step.
+        .route("/api/v1/sv/cegar", post(handlers::sv_cegar_handler))
         .route(
             "/api/v1/verify/memory-check",
             post(handlers::memory_check_handler),

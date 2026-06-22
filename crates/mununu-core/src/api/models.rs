@@ -874,6 +874,69 @@ pub struct Btor2CegarRequest {
     pub emit_ctxdsl: bool,
 }
 
+/// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
+/// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
+/// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2
+/// (sv2v + Yosys) in one call, then runs the same predicate-abstraction
+/// refinement loop as `/btor2/cegar` and returns the same
+/// [`Btor2CegarResponse`]. The CEGAR fields below are identical to
+/// [`Btor2CegarRequest`]; only the source half differs (SV + Yosys
+/// options instead of raw BTOR2 `content`).
+#[derive(Debug, Deserialize)]
+pub struct SvCegarRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV source files (multi-file designs / packages /
+    /// `include` targets), staged alongside the primary source.
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module name. Recommended for multi-module designs so Yosys
+    /// flattens from the right root; `None` lets Yosys auto-detect.
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys (required for modern SV: module-header
+    /// `import pkg::*;`, structs, interfaces). Mirrors the CLI
+    /// `--preprocess-sv2v`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// Yosys `setundef -anyseq` (per-cycle havoc on undefined nets).
+    /// Mirrors the CLI `--setundef-anyseq`.
+    #[serde(default)]
+    pub setundef_anyseq: bool,
+    /// Yosys `setundef -anyconst` (one nondeterministic constant input
+    /// per undefined bit — the Caliptra CWE-1245 power-up policy).
+    /// Mirrors the CLI `--setundef-anyconst`.
+    #[serde(default)]
+    pub setundef_anyconst: bool,
+
+    // --- CEGAR parameters (identical to Btor2CegarRequest) ---
+    /// μ-calculus formula evaluated over the lifted KMTS.
+    pub formula: String,
+    /// Initial predicate set (bootstraps the `2^|P|` cube space).
+    pub predicates: Vec<PredicateSpecRequest>,
+    /// R.6.6 controllability split — controller-driven input symbols.
+    #[serde(default)]
+    pub controllable_inputs: Vec<String>,
+    /// Predicate-discovery source: `"wp"` (default) | `"craig"`.
+    #[serde(default)]
+    pub predicate_source: Option<String>,
+    /// Max CEGAR iterations (default 16).
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Must-edge inference policy (default `"off"`).
+    #[serde(default)]
+    pub must_edge_inference: Option<String>,
+    /// May-edge inference policy (default `"off"`).
+    #[serde(default)]
+    pub may_edge_inference: Option<String>,
+    /// R-S8 symbolic-init config-values (`"REG=v1,v2,..."`).
+    #[serde(default)]
+    pub config_values: Vec<String>,
+    /// CTXDSL Phase 2 — opt-in CTXDSL of the final refined model + formula.
+    #[serde(default)]
+    pub emit_ctxdsl: bool,
+}
+
 /// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace
 /// viewer. Mirrors [`crate::adapter::btor2::cegar::CegarTrace`].
 #[derive(Debug, Serialize)]
