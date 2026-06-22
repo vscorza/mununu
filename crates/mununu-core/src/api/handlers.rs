@@ -599,6 +599,104 @@ fn run_controllability_aware_lift(
 pub async fn btor2_cegar_handler(
     Json(request): Json<Btor2CegarRequest>,
 ) -> ApiResult<Json<Btor2CegarResponse>> {
+    if request.predicates.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "at least one predicate is required to bootstrap the cube space".to_string(),
+            details: None,
+        });
+    }
+    let params = CegarRunParams {
+        btor2_content: &request.content,
+        formula: &request.formula,
+        predicates: &request.predicates,
+        controllable_inputs: &request.controllable_inputs,
+        predicate_source: request.predicate_source.as_deref(),
+        max_iterations: request.max_iterations,
+        must_edge_inference: request.must_edge_inference.as_deref(),
+        may_edge_inference: request.may_edge_inference.as_deref(),
+        config_values: &request.config_values,
+        emit_ctxdsl: request.emit_ctxdsl,
+    };
+    Ok(Json(run_cegar_build_response(params)?))
+}
+
+/// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
+///
+/// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
+/// same server-side pipeline `/context/import` already runs) and then
+/// runs the *identical* predicate-abstraction refinement loop as
+/// [`btor2_cegar_handler`], returning the same [`Btor2CegarResponse`].
+/// Surface peer of the CLI `mununu sv cegar`; lets the extraction-tab SV
+/// workflow run CEGAR end-to-end without a manual
+/// `sv emit-btor2-per-module` step.
+pub async fn sv_cegar_handler(
+    Json(request): Json<SvCegarRequest>,
+) -> ApiResult<Json<Btor2CegarResponse>> {
+    use crate::adapter::yosys::{YosysOptions, sv_to_btor2};
+
+    if request.predicates.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "at least one predicate is required to bootstrap the cube space".to_string(),
+            details: None,
+        });
+    }
+
+    // SV → single flattened BTOR2 (sv2v optional + Yosys). The per-module
+    // split is for composition; CEGAR's predicate-cube lift wants one
+    // transition system, so the flattened shape is the right input.
+    let yopts = YosysOptions {
+        top: request.top.clone(),
+        additional_sources: request
+            .additional_sources
+            .iter()
+            .map(|f| (f.name.clone(), f.content.clone()))
+            .collect(),
+        use_sv2v: request.use_sv2v,
+        setundef_anyseq: request.setundef_anyseq,
+        setundef_anyconst: request.setundef_anyconst,
+        ..Default::default()
+    };
+    let btor2 = sv_to_btor2(&request.source, &yopts).map_err(|e| ApiError::BadRequest {
+        message: format!("SV → BTOR2 (sv2v + Yosys): {}", e.message),
+        details: None,
+    })?;
+
+    let params = CegarRunParams {
+        btor2_content: &btor2,
+        formula: &request.formula,
+        predicates: &request.predicates,
+        controllable_inputs: &request.controllable_inputs,
+        predicate_source: request.predicate_source.as_deref(),
+        max_iterations: request.max_iterations,
+        must_edge_inference: request.must_edge_inference.as_deref(),
+        may_edge_inference: request.may_edge_inference.as_deref(),
+        config_values: &request.config_values,
+        emit_ctxdsl: request.emit_ctxdsl,
+    };
+    Ok(Json(run_cegar_build_response(params)?))
+}
+
+/// Shared parameters for the CEGAR run/report logic, sourced identically
+/// from [`Btor2CegarRequest`] (raw BTOR2) and [`SvCegarRequest`] (SV
+/// lifted to BTOR2 first).
+struct CegarRunParams<'a> {
+    btor2_content: &'a str,
+    formula: &'a str,
+    predicates: &'a [PredicateSpecRequest],
+    controllable_inputs: &'a [String],
+    predicate_source: Option<&'a str>,
+    max_iterations: Option<usize>,
+    must_edge_inference: Option<&'a str>,
+    may_edge_inference: Option<&'a str>,
+    config_values: &'a [String],
+    emit_ctxdsl: bool,
+}
+
+/// Run the predicate-abstraction refinement loop over a BTOR2 design and
+/// build the JSON response. Shared by `btor2_cegar_handler` (BTOR2-direct)
+/// and `sv_cegar_handler` (SV lifted to BTOR2 first) so the two surfaces
+/// stay byte-for-byte in lockstep on the CEGAR semantics + report shape.
+fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResponse, ApiError> {
     use crate::adapter::AdapterOptions;
     use crate::adapter::btor2::cegar::{
         CegarOptions, CegarTermination, LiftStrategy, PredicateSource, cegar_refine_loop,
@@ -608,14 +706,7 @@ pub async fn btor2_cegar_handler(
     use crate::mu_calculus::trit::{Trit, TritSet};
     use crate::mu_calculus::{Environment, parser as mu_parser};
 
-    if request.predicates.is_empty() {
-        return Err(ApiError::BadRequest {
-            message: "at least one predicate is required to bootstrap the cube space".to_string(),
-            details: None,
-        });
-    }
-
-    let predicates: Vec<PredicateSpec> = request
+    let predicates: Vec<PredicateSpec> = params
         .predicates
         .iter()
         .map(|p| PredicateSpec {
@@ -625,7 +716,7 @@ pub async fn btor2_cegar_handler(
         })
         .collect();
 
-    let formula = mu_parser::parse(&request.formula).map_err(|e| ApiError::BadRequest {
+    let formula = mu_parser::parse(params.formula).map_err(|e| ApiError::BadRequest {
         message: format!("formula parse error: {e:?}"),
         details: None,
     })?;
@@ -634,11 +725,11 @@ pub async fn btor2_cegar_handler(
     // CLI `btor2 cegar` bootstrap.
     let env = Environment::new(1usize << predicates.len());
 
-    let predicate_source = match request.predicate_source.as_deref() {
+    let predicate_source = match params.predicate_source {
         Some("craig") => PredicateSource::CraigInterpolation,
         _ => PredicateSource::WeakestPrecondition,
     };
-    let must_edge_inference = match request.must_edge_inference.as_deref() {
+    let must_edge_inference = match params.must_edge_inference {
         Some("sampling-confluence") => MustEdgeInference::SamplingConfluence,
         Some("smt-per-target") => MustEdgeInference::SmtPerTarget,
         Some("smt-per-target-standard") => MustEdgeInference::SmtPerTargetStandard,
@@ -648,13 +739,13 @@ pub async fn btor2_cegar_handler(
     // M.6 parity (2026-06-20) — the may-edge inference policy is now an API
     // field (was CLI-only). `smt-all-pairs` selects the sound all-pairs
     // may-relation, matching `--may-edge-inference`; default is Off.
-    let may_edge_inference = match request.may_edge_inference.as_deref() {
+    let may_edge_inference = match params.may_edge_inference {
         Some("smt-all-pairs") => MayEdgeInference::SmtAllPairs,
         _ => MayEdgeInference::Off,
     };
 
     let cegar_opts = CegarOptions {
-        max_iterations: request.max_iterations.unwrap_or(16),
+        max_iterations: params.max_iterations.unwrap_or(16),
         predicate_source,
         max_cube_count: 1024,
         capture_approximants: false,
@@ -665,7 +756,7 @@ pub async fn btor2_cegar_handler(
         may_edge_inference,
         // CTXDSL Phase 2 — capture the final cube model only when the
         // request opts in via `emit_ctxdsl`.
-        emit_ctxdsl: request.emit_ctxdsl,
+        emit_ctxdsl: params.emit_ctxdsl,
     };
 
     // M.6 parity (2026-06-20) — config-values symbolic init is now an API
@@ -673,22 +764,21 @@ pub async fn btor2_cegar_handler(
     // gives the CLI and the API one parse for the `REG=v1,v2,...` format; the
     // synthetic sidecar threads through to the predicate-cube lift's
     // `config_values` (R-S8 init expansion — e.g. the M.4 boot_fsm_ns hazard).
-    let sidecar_json =
-        config_values_to_sidecar_json(&request.config_values).map_err(|message| {
-            ApiError::BadRequest {
-                message,
-                details: None,
-            }
-        })?;
+    let sidecar_json = config_values_to_sidecar_json(params.config_values).map_err(|message| {
+        ApiError::BadRequest {
+            message,
+            details: None,
+        }
+    })?;
     let adapter_options = AdapterOptions {
-        controllable_inputs: request.controllable_inputs.clone(),
+        controllable_inputs: params.controllable_inputs.to_vec(),
         sidecar_json,
         ..Default::default()
     };
 
     let trace = cegar_refine_loop(
         &formula,
-        &request.content,
+        params.btor2_content,
         predicates,
         &env,
         &adapter_options,
@@ -725,7 +815,7 @@ pub async fn btor2_cegar_handler(
     // `Clts` into `trace.final_clts`; serialize it together with the checked
     // formula (the original request string). Absent ⇒ `None` ⇒ the `ctxdsl`
     // response field is omitted.
-    let ctxdsl = if request.emit_ctxdsl {
+    let ctxdsl = if params.emit_ctxdsl {
         match &trace.final_clts {
             Some(clts) => Some(
                 crate::adapter::clts_to_ir::clts_to_ctxdsl_with_formula(
@@ -733,7 +823,7 @@ pub async fn btor2_cegar_handler(
                     "lifted_kmts",
                     "cegar_model",
                     "checked_property",
-                    &request.formula,
+                    params.formula,
                 )
                 .map_err(|e| ApiError::BadRequest {
                     message: format!("emit ctxdsl: {}", e.message),
@@ -759,7 +849,7 @@ pub async fn btor2_cegar_handler(
         })
         .collect();
 
-    Ok(Json(Btor2CegarResponse {
+    Ok(Btor2CegarResponse {
         success: true,
         iterations,
         final_predicates: trace.final_predicates.iter().map(&pred_view).collect(),
@@ -774,7 +864,7 @@ pub async fn btor2_cegar_handler(
         approximant_reuse_enabled: trace.approximant_reuse_enabled,
         warnings: trace.warnings.iter().map(|w| w.message.clone()).collect(),
         ctxdsl,
-    }))
+    })
 }
 
 /// Generate graph data for visualization
@@ -3033,6 +3123,97 @@ members = ["x"]
             .await
             .expect_err("malformed config_values must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    /// cegar-extraction Stage 2 — the SV-direct CEGAR endpoint rejects an
+    /// empty predicate set BEFORE invoking the (heavy) sv2v+Yosys lift, so
+    /// the guard is testable without the toolchain present.
+    #[tokio::test]
+    async fn sv_cegar_handler_rejects_empty_predicates() {
+        let request = SvCegarRequest {
+            source: "module m(input logic clk); endmodule\n".to_string(),
+            additional_sources: vec![],
+            top: None,
+            use_sv2v: false,
+            setundef_anyseq: false,
+            setundef_anyconst: false,
+            formula: "nu X. < true > X".to_string(),
+            predicates: vec![],
+            controllable_inputs: vec![],
+            predicate_source: None,
+            max_iterations: Some(2),
+            must_edge_inference: None,
+            may_edge_inference: None,
+            config_values: vec![],
+            emit_ctxdsl: false,
+        };
+        let err = sv_cegar_handler(Json(request))
+            .await
+            .expect_err("empty predicates must be rejected before the lift");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    /// cegar-extraction Stage 2 — the SV-direct CEGAR endpoint lifts a real
+    /// SV design (sv2v + Yosys → flattened BTOR2) and runs the CEGAR loop
+    /// end-to-end, returning the same trace shape as `/btor2/cegar`. Gated
+    /// on the yosys toolchain (skips when absent, matching the yosys-test
+    /// convention).
+    #[tokio::test]
+    async fn sv_cegar_handler_lifts_sv_and_runs_cegar() {
+        // Skip when yosys is not on PATH (CI-without-toolchain).
+        if std::process::Command::new("yosys")
+            .arg("-V")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skip: yosys not installed");
+            return;
+        }
+        // A 2-bit down-counter register `burst`; clk/rst become inputs.
+        let sv = "\
+module ctr (input logic clk, input logic rst);
+  logic [1:0] burst;
+  always_ff @(posedge clk) begin
+    if (rst) burst <= 2'd0;
+    else burst <= burst - 2'd1;
+  end
+endmodule
+";
+        let request = SvCegarRequest {
+            source: sv.to_string(),
+            additional_sources: vec![],
+            top: Some("ctr".to_string()),
+            use_sv2v: false,
+            setundef_anyseq: false,
+            setundef_anyconst: false,
+            formula: "nu X. < true > X".to_string(),
+            predicates: vec![PredicateSpecRequest {
+                name: "burst_zero".to_string(),
+                register: "burst".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec![],
+            predicate_source: None,
+            max_iterations: Some(4),
+            must_edge_inference: None,
+            may_edge_inference: None,
+            config_values: vec![],
+            emit_ctxdsl: false,
+        };
+        let Json(out) = sv_cegar_handler(Json(request))
+            .await
+            .expect("SV-direct CEGAR should lift + run end-to-end");
+        assert!(out.success);
+        assert!(
+            !out.iterations.is_empty(),
+            "trace must record at least the initial iteration"
+        );
+        assert_eq!(out.iterations[0].iteration, 0);
+        // Single predicate ⇒ 2 cubes; the verdict covers every cube.
+        let total = out.verdict.true_cells + out.verdict.false_cells + out.verdict.unknown_cells;
+        assert_eq!(total, 2, "verdict must cover both cubes; got {total}");
+        assert!(!out.final_predicates.is_empty());
     }
 
     /// R.6.7 / V.6 — when only `predicates` is set (no

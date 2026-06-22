@@ -937,6 +937,15 @@ enum SvCommand {
     /// `sv emit-btor2-per-module`. The API/UI authoring peer lands with the
     /// C2.2 sidecar-editor panel.
     Discover(SvDiscoverArgs),
+    /// SV-direct CEGAR in one command (cegar-extraction Stage 2).
+    ///
+    /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys) and
+    /// runs the same predicate-abstraction refinement loop as
+    /// `mununu btor2 cegar`, printing the per-iteration trace + 3-valued
+    /// verdict. Removes the manual "run `sv emit-btor2-per-module` first,
+    /// then `btor2 cegar`" two-step. Surface peer of the API
+    /// `POST /api/v1/sv/cegar` and the extraction-tab SV → CEGAR flow.
+    Cegar(SvCegarArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1030,6 +1039,83 @@ struct SvEmitBtor2PerModuleArgs {
     /// `--setundef-anyseq` wins (strictly more permissive).
     #[arg(long = "setundef-anyconst")]
     setundef_anyconst: bool,
+}
+
+/// cegar-extraction Stage 2 — `mununu sv cegar`. SV-direct CEGAR in one
+/// command: lift SV → single flattened BTOR2 (sv2v + Yosys) → predicate-
+/// abstraction refinement loop. The CEGAR flags mirror `btor2 cegar`
+/// exactly; the source half mirrors `sv emit-btor2-per-module`.
+#[derive(Args, Debug)]
+struct SvCegarArgs {
+    /// Primary SystemVerilog source file (.sv / .v).
+    #[arg(value_name = "SV_FILE")]
+    file: PathBuf,
+    /// Additional SV source files (packages, sub-modules, `include`
+    /// targets), staged alongside the primary input. Repeatable.
+    #[arg(long = "source", value_name = "FILE")]
+    sources: Vec<PathBuf>,
+    /// Top module name. Recommended for multi-module designs so Yosys
+    /// flattens from the right root; omitted lets Yosys auto-detect.
+    #[arg(long = "top", value_name = "NAME")]
+    top: Option<String>,
+    /// Run sv2v before Yosys. Required for modern SV (module-header
+    /// `import pkg::*;`, structs, interfaces) — essentially all real
+    /// OpenTitan / Caliptra / ibex RTL.
+    #[arg(long = "preprocess-sv2v")]
+    preprocess_sv2v: bool,
+    /// Use Yosys's `setundef -anyseq` instead of the default
+    /// `setundef -zero` (per-cycle havoc on undefined nets).
+    #[arg(long = "setundef-anyseq")]
+    setundef_anyseq: bool,
+    /// Use Yosys's `setundef -anyconst` (one nondeterministic constant
+    /// input per undef bit — the Caliptra CWE-1245 power-up policy).
+    /// `--setundef-anyseq` wins when both are set.
+    #[arg(long = "setundef-anyconst")]
+    setundef_anyconst: bool,
+
+    // --- CEGAR flags (identical to `btor2 cegar`) ---
+    /// μ-calculus formula evaluated over the lifted KMTS.
+    #[arg(long, value_name = "FORMULA")]
+    formula: String,
+    /// Initial predicate, repeatable. Format `NAME:REGISTER=VALUE`.
+    /// At least one is required to bootstrap the `2^|P|` cube space.
+    #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
+    predicates: Vec<String>,
+    /// Predicate-discovery source on `KleeneBot` refinement.
+    #[arg(long, value_enum, default_value_t = PredicateSourceArg::Wp)]
+    predicate_source: PredicateSourceArg,
+    /// Path to the cvc5 binary (Craig interpolation). Overrides
+    /// `MUNUNU_CVC5_PATH`.
+    #[arg(long, value_name = "PATH")]
+    cvc5_path: Option<PathBuf>,
+    /// Max CEGAR iterations before bailing with the current verdict.
+    #[arg(long, default_value_t = 16)]
+    max_iterations: usize,
+    /// Must-edge inference policy.
+    #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
+    must_edge_inference: MustEdgeInferenceArg,
+    /// May-edge inference policy.
+    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::Off)]
+    may_edge_inference: MayEdgeInferenceArg,
+    /// R-S8 symbolic-init config-values, repeatable. Format
+    /// `REG=v1,v2,...` — the register's admissible power-up set.
+    #[arg(long = "config-values", value_name = "REG=v1,v2,...")]
+    config_values: Vec<String>,
+    /// Print a JSON summary instead of the human-readable report.
+    #[arg(long)]
+    json: bool,
+    /// R.6.6 controllability split — controller-driven input symbol,
+    /// repeatable.
+    #[arg(long = "controllable-input", value_name = "INPUT_NAME")]
+    controllable_inputs: Vec<String>,
+    /// Sidecar `.mununu.json` path (abstractions / simulate_reset /
+    /// vcd_traces). Overrides any `--config-values` synthetic sidecar.
+    #[arg(long = "sidecar", value_name = "PATH")]
+    sidecar: Option<PathBuf>,
+    /// CTXDSL Phase 2 — write the final refined model + formula as
+    /// CTXDSL to this path (stderr confirmation; stdout stays clean).
+    #[arg(long = "emit-ctxdsl", value_name = "PATH")]
+    emit_ctxdsl: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1805,12 +1891,6 @@ fn build_adapter_options_with_config_values(
 /// Prints a human-readable or JSON summary of the resulting
 /// [`CegarTrace`].
 fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
-    use mununu_core::adapter::btor2::PredicateSpec;
-    use mununu_core::adapter::btor2::cegar::{
-        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
-    };
-    use mununu_core::mu_calculus::{Environment, parser as mu_parser};
-
     if !args.file.exists() {
         return Err(format!(
             "BTOR2 input file does not exist: {}",
@@ -1820,19 +1900,132 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
 
+    run_cegar_cli(
+        &content,
+        &args.file.display().to_string(),
+        CegarCliParams {
+            formula: &args.formula,
+            predicates: &args.predicates,
+            predicate_source: args.predicate_source,
+            cvc5_path: args.cvc5_path.as_deref(),
+            max_iterations: args.max_iterations,
+            must_edge_inference: args.must_edge_inference,
+            may_edge_inference: args.may_edge_inference,
+            config_values: &args.config_values,
+            controllable_inputs: &args.controllable_inputs,
+            sv_source: args.sv_source.as_deref(),
+            sidecar: args.sidecar.as_deref(),
+            emit_ctxdsl: args.emit_ctxdsl.as_deref(),
+            json: args.json,
+        },
+    )
+}
+
+/// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one
+/// command: lift SystemVerilog to a single flattened BTOR2 (sv2v +
+/// Yosys) and run the same predicate-abstraction refinement loop as
+/// `btor2 cegar`. Surface peer of the API `POST /api/v1/sv/cegar`.
+fn sv_cegar(args: SvCegarArgs) -> Result<(), String> {
+    use std::collections::HashMap;
+
+    let primary_content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read SV source '{}': {e}", args.file.display()))?;
+    let mut additional: HashMap<String, String> = HashMap::new();
+    for src in &args.sources {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid additional source path: {}", src.display()))?;
+        let body = std::fs::read_to_string(src)
+            .map_err(|e| format!("Failed to read additional source '{}': {e}", src.display()))?;
+        additional.insert(name.to_string(), body);
+    }
+
+    let yopts = mununu_core::adapter::yosys::YosysOptions {
+        top: args.top.clone(),
+        additional_sources: additional.into_iter().collect(),
+        primary_source_path: Some(args.file.display().to_string()),
+        use_sv2v: args.preprocess_sv2v,
+        setundef_anyseq: args.setundef_anyseq,
+        setundef_anyconst: args.setundef_anyconst,
+        ..Default::default()
+    };
+    // SV → single flattened BTOR2 (the predicate-cube lift wants one
+    // transition system, not the per-module split).
+    let btor2 = mununu_core::adapter::yosys::sv_to_btor2(&primary_content, &yopts)
+        .map_err(|e| format!("sv cegar: SV → BTOR2 (sv2v + Yosys): {}", e.message))?;
+
+    run_cegar_cli(
+        &btor2,
+        &args.file.display().to_string(),
+        CegarCliParams {
+            formula: &args.formula,
+            predicates: &args.predicates,
+            predicate_source: args.predicate_source,
+            cvc5_path: args.cvc5_path.as_deref(),
+            max_iterations: args.max_iterations,
+            must_edge_inference: args.must_edge_inference,
+            may_edge_inference: args.may_edge_inference,
+            config_values: &args.config_values,
+            controllable_inputs: &args.controllable_inputs,
+            // The SV input itself is the reset-simulation source.
+            sv_source: Some(args.file.as_path()),
+            sidecar: args.sidecar.as_deref(),
+            emit_ctxdsl: args.emit_ctxdsl.as_deref(),
+            json: args.json,
+        },
+    )
+}
+
+/// Shared CEGAR parameters for the CLI handlers. Both `btor2 cegar`
+/// (BTOR2-direct) and `sv cegar` (SV lifted to BTOR2 first) populate this
+/// from their arg structs and call [`run_cegar_cli`], so the two surfaces
+/// stay in lockstep on the CEGAR semantics + report shape.
+struct CegarCliParams<'a> {
+    formula: &'a str,
+    predicates: &'a [String],
+    predicate_source: PredicateSourceArg,
+    cvc5_path: Option<&'a Path>,
+    max_iterations: usize,
+    must_edge_inference: MustEdgeInferenceArg,
+    may_edge_inference: MayEdgeInferenceArg,
+    config_values: &'a [String],
+    controllable_inputs: &'a [String],
+    sv_source: Option<&'a Path>,
+    sidecar: Option<&'a Path>,
+    emit_ctxdsl: Option<&'a Path>,
+    json: bool,
+}
+
+/// Run the predicate-abstraction refinement loop over a BTOR2 design
+/// (`content`) and print the trace + 3-valued verdict. `fixture_label` is
+/// the human-facing source identifier echoed in the report (the BTOR2 path
+/// for `btor2 cegar`, the SV path for `sv cegar`). Shared by both CLI
+/// handlers so identical CEGAR inputs produce identical output.
+fn run_cegar_cli(
+    content: &str,
+    fixture_label: &str,
+    params: CegarCliParams<'_>,
+) -> Result<(), String> {
+    use mununu_core::adapter::btor2::PredicateSpec;
+    use mununu_core::adapter::btor2::cegar::{
+        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
+    };
+    use mununu_core::mu_calculus::{Environment, parser as mu_parser};
+
     // Honor --cvc5-path via env var (the locate_cvc5 helper
     // reads MUNUNU_CVC5_PATH first). SAFETY: env vars are
     // process-global; this is fine for the CLI handler which
     // is single-threaded + runs once per invocation.
-    if let Some(p) = &args.cvc5_path {
+    if let Some(p) = params.cvc5_path {
         unsafe {
             std::env::set_var("MUNUNU_CVC5_PATH", p);
         }
     }
 
     // Parse initial predicates from `NAME:REGISTER=VALUE` triples.
-    let mut initial_predicates: Vec<PredicateSpec> = Vec::with_capacity(args.predicates.len());
-    for raw in &args.predicates {
+    let mut initial_predicates: Vec<PredicateSpec> = Vec::with_capacity(params.predicates.len());
+    for raw in params.predicates {
         let (name, rest) = raw.split_once(':').ok_or_else(|| {
             format!("predicate spec '{raw}' missing ':' separator (expected NAME:REGISTER=VALUE)")
         })?;
@@ -1857,21 +2050,21 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
 
     // Parse the μ-calculus formula.
     let formula =
-        mu_parser::parse(&args.formula).map_err(|e| format!("formula parse error: {e:?}"))?;
+        mu_parser::parse(params.formula).map_err(|e| format!("formula parse error: {e:?}"))?;
 
     // Build the environment with state_count = 2^|predicates|.
     let cube_count = 1usize << initial_predicates.len();
     let env = Environment::new(cube_count);
 
     // Map the CLI's PredicateSourceArg to the core's PredicateSource.
-    let predicate_source = match args.predicate_source {
+    let predicate_source = match params.predicate_source {
         PredicateSourceArg::Wp => PredicateSource::WeakestPrecondition,
         PredicateSourceArg::Craig => PredicateSource::CraigInterpolation,
     };
 
     // R.2.5b session-1 follow-up — map CLI MustEdgeInferenceArg to
     // the core MustEdgeInference enum.
-    let must_edge_inference = match args.must_edge_inference {
+    let must_edge_inference = match params.must_edge_inference {
         MustEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
         MustEdgeInferenceArg::SamplingConfluence => {
             mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SamplingConfluence
@@ -1888,7 +2081,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     };
 
     // DR1 (2026-06-19) — map CLI MayEdgeInferenceArg to the core enum.
-    let may_edge_inference = match args.may_edge_inference {
+    let may_edge_inference = match params.may_edge_inference {
         MayEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MayEdgeInference::Off,
         MayEdgeInferenceArg::SmtAllPairs => {
             mununu_core::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs
@@ -1896,7 +2089,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     };
 
     let cegar_opts = CegarOptions {
-        max_iterations: args.max_iterations,
+        max_iterations: params.max_iterations,
         predicate_source,
         max_cube_count: 1024,
         capture_approximants: false,
@@ -1907,7 +2100,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         may_edge_inference,
         // CTXDSL Phase 2 — capture the final cube model only when the
         // `--emit-ctxdsl` flag asks for it.
-        emit_ctxdsl: args.emit_ctxdsl.is_some(),
+        emit_ctxdsl: params.emit_ctxdsl.is_some(),
     };
 
     // R-S8 session 2 (2026-06-08) — parse the `--config-values`
@@ -1917,13 +2110,13 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // signal per flag entry; the CEGAR loop reads `sidecar_json`
     // via the bridge and threads `config_values` into the
     // predicate-cube lift.
-    let mut adapter_options = build_adapter_options_with_config_values(&args.config_values)?;
+    let mut adapter_options = build_adapter_options_with_config_values(params.config_values)?;
     // R.6.6 / V.6 (2026-06-09) — thread the `--controllable-input`
     // CLI flag values into `AdapterOptions::controllable_inputs`,
     // which the predicate-cube lifter reads to partition boolean
     // inputs into env / ctrl classes + emit per-combo dual-label
     // transitions with the appropriate `LabelControllability` tags.
-    adapter_options.controllable_inputs = args.controllable_inputs.clone();
+    adapter_options.controllable_inputs = params.controllable_inputs.to_vec();
     // R-S2b.6 / P1 (§Phase 11 slot-3 close follow-up, 2026-06-12)
     // — thread the `--sv-source` CLI flag value into
     // `AdapterOptions::sv_source_path`, which the bit-blaster's
@@ -1933,7 +2126,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // surfaced by the slot-3 close cadence checkpoint at
     // .claude/reviews/slot-3-close-cadence-2026-06-12.md (R-S2b.6
     // unreachable from CLI before this wire-in).
-    adapter_options.sv_source_path = args.sv_source.clone();
+    adapter_options.sv_source_path = params.sv_source.map(|p| p.to_path_buf());
 
     // R-S6.6 / P2 (§Phase 11 slot-3 close follow-up, 2026-06-12)
     // — thread the `--sidecar` CLI flag into
@@ -1949,16 +2142,16 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // file-based sidecar wins (the file is the authoritative
     // schema source; `--config-values` is the synth-sidecar
     // convenience flag for hand-tuning).
-    if let Some(sidecar_path) = &args.sidecar {
+    if let Some(sidecar_path) = params.sidecar {
         let sidecar_content = std::fs::read_to_string(sidecar_path)
             .map_err(|e| format!("Failed to read sidecar '{}': {e}", sidecar_path.display()))?;
         adapter_options.sidecar_json = Some(sidecar_content);
-        adapter_options.sidecar_path = Some(sidecar_path.clone());
+        adapter_options.sidecar_path = Some(sidecar_path.to_path_buf());
     }
 
     let trace = cegar_refine_loop(
         &formula,
-        &content,
+        content,
         initial_predicates,
         &env,
         &adapter_options,
@@ -1972,7 +2165,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
     // with the checked formula (the original `--formula` string) and write
     // the document to PATH. Uses stderr for the confirmation so the
     // `--json` verdict on stdout stays clean.
-    if let Some(emit_path) = &args.emit_ctxdsl {
+    if let Some(emit_path) = params.emit_ctxdsl {
         match &trace.final_clts {
             Some(clts) => {
                 let model_ctxdsl = mununu_core::adapter::clts_to_ir::clts_to_ctxdsl_with_formula(
@@ -1980,7 +2173,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
                     "lifted_kmts",
                     "cegar_model",
                     "checked_property",
-                    &args.formula,
+                    params.formula,
                 )
                 .map_err(|e| format!("emit ctxdsl: {}", e.message))?;
                 std::fs::write(emit_path, &model_ctxdsl)
@@ -2023,11 +2216,11 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         format!("PROPERTY HOLDS — all {t_cells} cell(s) satisfy the formula")
     };
 
-    if args.json {
+    if params.json {
         let summary = serde_json::json!({
-            "fixture": args.file.display().to_string(),
-            "formula": args.formula,
-            "predicate_source": format!("{:?}", args.predicate_source),
+            "fixture": fixture_label,
+            "formula": params.formula,
+            "predicate_source": format!("{:?}", params.predicate_source),
             "iterations": trace.iterations.len(),
             "terminated_with": format!("{:?}", trace.terminated_with),
             "final_predicate_count": trace.final_predicates.len(),
@@ -2048,9 +2241,9 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         );
     } else {
         println!("CEGAR refinement loop completed");
-        println!("  fixture:           {}", args.file.display());
-        println!("  formula:           {}", args.formula);
-        println!("  predicate_source:  {:?}", args.predicate_source);
+        println!("  fixture:           {fixture_label}");
+        println!("  formula:           {}", params.formula);
+        println!("  predicate_source:  {:?}", params.predicate_source);
         println!("  iterations:        {}", trace.iterations.len());
         println!("  terminated_with:   {:?}", trace.terminated_with);
         println!("  final predicates:  {}", trace.final_predicates.len());
@@ -3154,6 +3347,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::EmitBtor2PerModule(args) => sv_emit_btor2_per_module(args),
         SvCommand::Validate(args) => sv_validate(args),
         SvCommand::Discover(args) => sv_discover(args),
+        SvCommand::Cegar(args) => sv_cegar(args),
     }
 }
 

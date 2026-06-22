@@ -444,6 +444,19 @@ pub fn translate_sv(
     Ok(out)
 }
 
+/// Run sv2v (optional) + the flattened Yosys script and return *just*
+/// the design's BTOR2 text. This is the SV-direct CEGAR one-call
+/// frontend: `mununu sv cegar` and `POST /api/v1/sv/cegar` lift SV to a
+/// single flattened BTOR2 here, then hand it to `cegar_refine_loop` (the
+/// predicate-cube lift operates on one transition system, so the
+/// flattened single-BTOR2 shape — not the per-module split — is the
+/// right input for the cube). Thin wrapper over [`run_sv_flatten_btor2`];
+/// for multi-module *composition* (not single-system CEGAR) use
+/// [`translate_sv_per_module`] instead.
+pub fn sv_to_btor2(content: &str, yopts: &YosysOptions) -> Result<String, AdapterError> {
+    run_sv_flatten_btor2(content, yopts).map(|a| a.btor2)
+}
+
 /// One submodule's translated output, as returned by
 /// [`translate_sv_per_module`]. The `btor2_path` is `Some(..)` when
 /// `yopts.per_module_output_dir` was set (the BTOR2 file persists);
