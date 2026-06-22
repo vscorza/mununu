@@ -4,8 +4,10 @@
 > Phase-A.3 *structural* sanity check (bit-blast reduction; not a
 > property claim — see [Status](#status)). [`validate_m4_cegar.sh`](validate_m4_cegar.sh)
 > is the **M.4 milestone**: full automated predicate-abstraction CEGAR
-> that decides a sound, definite, **pre/post-distinguishing** verdict on
-> the CWE-1245 boot-FSM hazard (see [M.4](#m4--predicate-abstraction-cegar) below).
+> that decides a sound **pre/post-distinguishing** verdict on the CWE-1245
+> boot-FSM hazard — pre_fix = definite hazard, post_fix = the *definite*
+> hazard removed (KleeneBot, not "proven safe"; see
+> [M.4](#m4--predicate-abstraction-cegar) below).
 
 ## M.4 — predicate-abstraction CEGAR
 
@@ -20,19 +22,31 @@ Property: `<> (p5 || p6 || p7)` over the cube `{boot_fsm_ns ∈ {5,6,7}}` —
 default-less `unique casez` leaves 5/6/7 unhandled — CWE-1245).
 
 ```
-pre_fix  (no default arm):     verdict cells T=7 F=1 ⊥=0  → hazard REACHABLE
-post_fix (default → defined):  verdict cells T=0 F=8 ⊥=0  → hazard UNREACHABLE
+pre_fix  (no default arm):       verdict cells T=7 F=1 ⊥=0  → hazard DEFINITE
+post_fix (default holds + reset): verdict cells T=4 F=1 ⊥=3  → hazard INDEFINITE (⊥)
 ```
 
-The undefined-encoding transition is reachable/absorbing in the
-bug-bearing variant and proven unreachable in the fixed variant — the
-pre/post difference is the milestone evidence. Soundness: the must-edges
-are Z3-proved (∀∀, no sampling); `setundef -anyconst` over-approximates
-power-up, so the definite verdict transfers to the concrete reset
-behaviour. The verdict is established over the extracted model; an
-RTL-level counterexample replay under a cycle-accurate simulator is the
-deferred empirical step (M.0–M.2 SBY precedent). This reproduces the
-known caliptra-rtl #150 bug/fix pair via the automated pipeline.
+The undefined-encoding latch is **definitely** present in the bug-bearing
+variant (every cell decided, ⊥=0) and **no longer definite** in the fixed
+variant (≥1 undefined-encoding cell is KleeneBot) — the sound pre/post
+difference is the milestone evidence.
+
+**Soundness (revised 2026-06-22, IR-track P3.4).** The original claim —
+post_fix `T=0`, "hazard UNREACHABLE, fix verified" — was **unsound**: it
+relied on a Skolem-collapsed `<>`→`[]` diamond (one shared `step` label ⇒
+"all step-successors satisfy") that ignored the cube's over-approximating
+may-self-loops. Under the corrected EXISTENTIAL `Control::All` diamond,
+post_fix is genuinely **KleeneBot**, not definite-safe — and rightly so:
+post_fix's `default: boot_fsm_ns = boot_fsm_ps` *holds* the undefined
+encoding, escaping only via the reset window (`boot_fsm_ps <= arc_IDLE ?
+BOOT_IDLE : boot_fsm_ns`). So the `{p5,p6,p7}` cube **cannot soundly prove
+the fixed FSM safe**; it soundly shows the *definite* hazard is gone.
+Must-edges are Z3-proved (∀∀, no sampling); `setundef -anyconst`
+over-approximates power-up. Proving full post_fix safety would need a finer
+abstraction / CEGAR to convergence (out of scope). RTL-level
+counterexample replay under a cycle-accurate simulator remains the deferred
+empirical step. This reproduces the known caliptra-rtl #150 bug/fix pair
+via the automated pipeline (as a sound definite→indefinite distinction).
 
 ```bash
 cargo build -p mununu-cli
