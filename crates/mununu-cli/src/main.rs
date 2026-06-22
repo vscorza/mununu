@@ -2362,6 +2362,7 @@ fn btor2_discover(args: Btor2DiscoverArgs) -> Result<(), String> {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         }
     };
 

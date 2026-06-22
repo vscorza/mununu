@@ -1281,6 +1281,19 @@ fn evaluate_one_property(
         .collect();
     let satisfied = !initial_states.is_empty() && initial_satisfying.len() == initial_states.len();
 
+    // IR-track P3.1 — 3-valued { T, F, ⊥ } summary over the initial
+    // states, derived from the 2-valued `result`. This is the verify
+    // path's bit-blast model (exact for the explicit state space), so
+    // every initial state is definite: T = satisfying, F = not. No
+    // KleeneBot arises here (`unknown_cells = 0`); the predicate-cube
+    // path (P3.3) is what introduces ⊥. Derived, not a second eval —
+    // additive surface with zero verdict change + zero perf cost.
+    let initial_verdict_summary = crate::verify::report::ThreeValuedSummary {
+        true_cells: initial_satisfying.len(),
+        false_cells: initial_states.len() - initial_satisfying.len(),
+        unknown_cells: 0,
+    };
+
     let counterexample = if !satisfied {
         build_counterexample_witness(clts, &result, TRACE_WITNESS_STEP_CAP)
     } else {
@@ -1297,6 +1310,7 @@ fn evaluate_one_property(
         satisfying_states,
         initial_states,
         initial_satisfying,
+        initial_verdict_summary,
         counterexample,
     })
 }
@@ -1850,7 +1864,16 @@ over = "S"
         // The XState adapter consumed only the primary file — the
         // automaton in the composition came from `primary.xstate.json`.
         assert_eq!(report.sources[0].id, "x");
-        assert!(report.property_verdicts[0].satisfied);
+        let v = &report.property_verdicts[0];
+        assert!(v.satisfied);
+        // IR-track P3.1 — the 3-valued summary mirrors the 2-valued
+        // result on the bit-blast path: every initial state is a
+        // definite KleeneT (satisfying `true`), no KleeneBot.
+        let s = &v.initial_verdict_summary;
+        assert_eq!(s.true_cells, v.initial_satisfying.len());
+        assert_eq!(s.true_cells + s.false_cells, v.initial_states.len());
+        assert_eq!(s.unknown_cells, 0, "bit-blast verify path has no ⊥");
+        assert_eq!(s.false_cells, 0, "satisfied ⇒ no violating initial state");
     }
 
     #[test]

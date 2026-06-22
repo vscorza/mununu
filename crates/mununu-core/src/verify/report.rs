@@ -53,6 +53,22 @@ pub struct CompositionInfo {
     pub members: Vec<String>,
 }
 
+/// IR-track P3.1 (2026-06-22) — a 3-valued { KleeneT, KleeneF,
+/// KleeneBot } cell-count summary. Same shape as the cegar
+/// `CegarVerdictSummary` so the UI can reuse the `Trit` renderer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreeValuedSummary {
+    /// States with a definite KleeneT (satisfying) verdict.
+    pub true_cells: usize,
+    /// States with a definite KleeneF (violating) verdict.
+    pub false_cells: usize,
+    /// States with an indefinite KleeneBot (⊥) verdict — "needs
+    /// refinement". Always 0 on the 2-valued bit-blast verify path
+    /// (the explicit-state model is exact); populated by the
+    /// predicate-cube path (IR-track P3.3).
+    pub unknown_cells: usize,
+}
+
 /// Verdict for one property.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyVerdict {
@@ -76,6 +92,14 @@ pub struct PropertyVerdict {
     pub initial_states: Vec<String>,
     /// Subset of `initial_states` that satisfy the formula.
     pub initial_satisfying: Vec<String>,
+    /// IR-track P3.1 (2026-06-22) — 3-valued { T, F, ⊥ } summary over
+    /// the **initial** states. On the 2-valued bit-blast verify path
+    /// the model is exact, so `unknown_cells` is 0 and this mirrors
+    /// `satisfied` (T = satisfying, F = not). The predicate-cube path
+    /// (P3.3) populates `unknown_cells` with genuine KleeneBot cells.
+    /// `#[serde(default)]` so pre-P3 reports still deserialize.
+    #[serde(default)]
+    pub initial_verdict_summary: ThreeValuedSummary,
     /// Witness path from a violating initial state, when the
     /// verdict is unsatisfied and a witness can be constructed. The
     /// orchestrator emits this opportunistically — `None` is also
