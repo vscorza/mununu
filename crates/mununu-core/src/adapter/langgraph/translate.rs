@@ -62,6 +62,7 @@ pub fn to_ir(
             name: sanitise_ident(&n.id),
             is_initial: n.id == entry,
             valuations: None,
+            three_valued: None,
         })
         .collect();
 

@@ -212,6 +212,7 @@ fn to_ir(circuit: &ast::Circuit, options: &AdapterOptions) -> Result<AdapterIR, 
             name: name.clone(),
             is_initial: i == init_state_idx,
             valuations: None,
+            three_valued: None,
         })
         .collect();
 

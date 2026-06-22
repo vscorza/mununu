@@ -200,6 +200,7 @@ fn state_initial(name: &str) -> StateSpec {
         name: name.to_string(),
         is_initial: true,
         valuations: None,
+        three_valued: None,
     }
 }
 
@@ -208,6 +209,7 @@ fn state(name: &str) -> StateSpec {
         name: name.to_string(),
         is_initial: false,
         valuations: None,
+        three_valued: None,
     }
 }
 

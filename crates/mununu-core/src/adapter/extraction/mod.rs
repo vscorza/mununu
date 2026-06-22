@@ -310,6 +310,7 @@ fn build_automaton(
                 name: s.name().to_string(),
                 is_initial,
                 valuations: None,
+                three_valued: None,
             }
         })
         .collect();

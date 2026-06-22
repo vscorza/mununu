@@ -39,6 +39,7 @@
 
 pub mod aiger;
 pub mod btor2;
+pub mod clts_to_ir;
 pub mod crewai;
 pub mod cvc5;
 pub mod domain;
