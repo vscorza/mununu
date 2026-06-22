@@ -323,6 +323,16 @@ struct Btor2CegarArgs {
     /// Example: `--sidecar examples/v6_controllability_kmts/source/amba_arbiter.mununu.json`.
     #[arg(long = "sidecar", value_name = "PATH")]
     sidecar: Option<PathBuf>,
+    /// CTXDSL Phase 2 (2026-06-22) — opt-in: write the final refined
+    /// predicate-cube model + the checked formula to this path as a
+    /// self-contained CTXDSL document. Default off (the cube is dropped at
+    /// loop exit). The emitted CTXDSL carries the cube states' 3-valued
+    /// (`predicates_3v`) labels + transition modality + a `mu_formulas`
+    /// block with the formula. Pass `/dev/stdout` to print to the terminal.
+    ///
+    /// Example: `--emit-ctxdsl /tmp/cegar_model.ctxdsl`.
+    #[arg(long = "emit-ctxdsl", value_name = "PATH")]
+    emit_ctxdsl: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1895,6 +1905,9 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         lift_strategy: LiftStrategy::Eager,
         must_edge_inference,
         may_edge_inference,
+        // CTXDSL Phase 2 — capture the final cube model only when the
+        // `--emit-ctxdsl` flag asks for it.
+        emit_ctxdsl: args.emit_ctxdsl.is_some(),
     };
 
     // R-S8 session 2 (2026-06-08) — parse the `--config-values`
@@ -1952,6 +1965,39 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
         &cegar_opts,
     )
     .map_err(|e| format!("cegar refine loop: {}", e.message))?;
+
+    // CTXDSL Phase 2 (2026-06-22) — opt-in model + formula CTXDSL dump.
+    // When `--emit-ctxdsl <PATH>` is set, the loop captured the final
+    // refined cube `Clts` into `trace.final_clts`; serialize it together
+    // with the checked formula (the original `--formula` string) and write
+    // the document to PATH. Uses stderr for the confirmation so the
+    // `--json` verdict on stdout stays clean.
+    if let Some(emit_path) = &args.emit_ctxdsl {
+        match &trace.final_clts {
+            Some(clts) => {
+                let model_ctxdsl = mununu_core::adapter::clts_to_ir::clts_to_ctxdsl_with_formula(
+                    clts,
+                    "lifted_kmts",
+                    "cegar_model",
+                    "checked_property",
+                    &args.formula,
+                )
+                .map_err(|e| format!("emit ctxdsl: {}", e.message))?;
+                std::fs::write(emit_path, &model_ctxdsl)
+                    .map_err(|e| format!("write ctxdsl to '{}': {e}", emit_path.display()))?;
+                eprintln!(
+                    "Wrote model + formula CTXDSL to {} ({} bytes)",
+                    emit_path.display(),
+                    model_ctxdsl.len()
+                );
+            }
+            None => {
+                eprintln!(
+                    "warning: --emit-ctxdsl set but the CEGAR loop produced no final cube model"
+                );
+            }
+        }
+    }
 
     // #2 (M.4) — surface the final 3-valued verdict the loop reached.
     // Previously the CLI printed only `terminated_with` + the predicate

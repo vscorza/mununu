@@ -865,6 +865,13 @@ pub struct Btor2CegarRequest {
     /// no synthetic init sidecar.
     #[serde(default)]
     pub config_values: Vec<String>,
+    /// CTXDSL Phase 2 (2026-06-22) — opt-in (default `false`): when set, the
+    /// response gains a `ctxdsl` field carrying the final refined cube model
+    /// and the checked formula as a self-contained CTXDSL document (the
+    /// `predicates_3v` Kleene labels, transition modality, and a
+    /// `mu_formulas` block). Mirrors the CLI `--emit-ctxdsl`.
+    #[serde(default)]
+    pub emit_ctxdsl: bool,
 }
 
 /// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace
@@ -887,6 +894,11 @@ pub struct Btor2CegarResponse {
     pub approximant_reuse_enabled: bool,
     /// Soundness / advisory warnings produced during the run.
     pub warnings: Vec<String>,
+    /// CTXDSL Phase 2 (2026-06-22) — the final refined cube model + the
+    /// checked formula as CTXDSL, present only when the request set
+    /// `emit_ctxdsl: true`. Omitted from the JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctxdsl: Option<String>,
 }
 
 /// One CEGAR iteration, viewer-shaped.
