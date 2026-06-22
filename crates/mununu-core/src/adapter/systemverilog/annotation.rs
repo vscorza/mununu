@@ -221,6 +221,43 @@ pub struct SvAnnotation {
     /// (queued); until then, schema-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uf_unwrap: Vec<String>,
+
+    /// IR-track P3.2 (2026-06-22) — predicate-cube declaration for the
+    /// SV **verify** path. Each entry is a `{name, register, value}`
+    /// register-value equality predicate (`register == value`) that
+    /// bounds the abstraction — the same shape the cegar
+    /// `predicate_cube_lift` / API `PredicateSpecRequest` consume.
+    ///
+    /// When non-empty, the verify path (IR-track **P3.3**, NOT yet
+    /// wired) routes this module through `predicate_cube_lift` + the
+    /// 3-valued (`KleeneDom`) evaluator instead of the bit-blast
+    /// `FieldDomain` path — i.e. this is how an SV verify run opts into
+    /// the predicate-cube abstraction. Until P3.3's verify-dispatch
+    /// integration ships, declarations here are accepted + validated by
+    /// the schema but have NO effect on the abstract model (the verify
+    /// path stays bit-blast).
+    ///
+    /// Default empty — preserves the bit-blast behaviour for every
+    /// existing fixture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predicates: Vec<PredicateDeclaration>,
+}
+
+/// IR-track P3.2 (2026-06-22) — one register-value equality predicate
+/// for the predicate-cube verify path. Mirrors the cegar
+/// [`crate::adapter::btor2::kmts_lift::PredicateSpec`] and the API
+/// `PredicateSpecRequest` shape so the sidecar declaration threads
+/// directly into the cube lift once P3.3 wires it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PredicateDeclaration {
+    /// Human-readable predicate name (e.g. `"boot_idle"`).
+    pub name: String,
+    /// BTOR2/register symbol the predicate tests (the same name space
+    /// the `signals[]` entries' `name` field targets).
+    pub register: String,
+    /// Value the predicate checks: the predicate holds iff
+    /// `register == value`.
+    pub value: u64,
 }
 
 /// §Phase 10 §10.2 stage 2 — Memory-cell annotation.
@@ -1297,6 +1334,7 @@ const SV_TOP_KEYS: &[&str] = &[
     "memories",
     "uf_wrap",
     "uf_unwrap",
+    "predicates",
 ];
 const SV_SIGNAL_KEYS: &[&str] = &[
     "name",
@@ -1608,6 +1646,46 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_with_predicate_declarations_round_trips_and_lints_clean() {
+        // IR-track P3.2 — a `predicates` block deserializes into
+        // PredicateDeclaration entries, is NOT flagged as an unknown
+        // root field by the lint (it's in SV_TOP_KEYS), and round-trips
+        // on serialize. Schema-only — no verify wiring yet (P3.3).
+        let json = r#"{
+            "$schema": "mununu_sv_annotation_v1",
+            "module": "boot",
+            "signals": [{ "name": "boot_fsm_ns", "abstraction": "discover" }],
+            "predicates": [
+                { "name": "boot_idle", "register": "boot_fsm_ns", "value": 0 },
+                { "name": "boot_done", "register": "boot_fsm_ns", "value": 7 }
+            ]
+        }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parses");
+        assert_eq!(ann.predicates.len(), 2);
+        assert_eq!(ann.predicates[0].name, "boot_idle");
+        assert_eq!(ann.predicates[0].register, "boot_fsm_ns");
+        assert_eq!(ann.predicates[1].value, 7);
+        // `predicates` is an allowlisted root key → no unknown-field warning.
+        let warnings = lint_annotation_json(json, "boot.mununu.json").expect("lints");
+        assert!(
+            !warnings.iter().any(|w| w.contains("predicates")),
+            "predicates must not warn as unknown; got: {warnings:?}"
+        );
+        // Round-trips on serialize.
+        let out = serde_json::to_string(&ann).expect("serializes");
+        assert!(out.contains("\"predicates\""), "serialized: {out}");
+    }
+
+    #[test]
+    fn sidecar_without_predicates_defaults_empty() {
+        // Back-compat: legacy sidecars (no `predicates` key) load with
+        // an empty predicate set — the bit-blast verify path is unchanged.
+        let json = r#"{ "module": "m", "signals": [] }"#;
+        let ann: SvAnnotation = serde_json::from_str(json).expect("parses");
+        assert!(ann.predicates.is_empty());
+    }
+
+    #[test]
     fn parse_discover_with_discovered_values() {
         let json = r#"{
             "module": "alu",
@@ -1702,6 +1780,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         }
     }
 
@@ -2340,6 +2419,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2407,6 +2487,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2549,6 +2630,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2700,6 +2782,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2798,6 +2881,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(

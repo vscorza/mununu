@@ -118,6 +118,7 @@ mod tests {
             memories: Vec::new(),
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
+            predicates: Vec::new(),
         }
     }
 
