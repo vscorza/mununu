@@ -28,7 +28,10 @@
 use crate::adapter::AdapterError;
 use crate::adapter::SourceFormat;
 use crate::adapter::emit::emit;
-use crate::adapter::ir::{AdapterIR, AutomatonSpec, Metadata, StateSpec, TransitionSpec};
+use crate::adapter::ir::{
+    AdapterIR, AutomatonSpec, Metadata, PropertyFormula, PropertyKind, PropertyRole, PropertySpec,
+    StateSpec, TransitionSpec,
+};
 use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, LabelId};
 use crate::context_dsl::ast::TransitionModalitySpec;
 use std::collections::HashSet;
@@ -49,6 +52,55 @@ pub fn clts_to_ctxdsl(
     automaton_name: &str,
     context_name: &str,
 ) -> Result<String, AdapterError> {
+    let ir = build_ir(clts, automaton_name, context_name, Vec::new());
+    emit(&ir).map(|r| r.ctxdsl)
+}
+
+/// CTXDSL Phase 2 — like [`clts_to_ctxdsl`] but also emits the checked
+/// property as a `mu_formulas { formula <name> { over <automaton>; body =
+/// <formula_body>; } }` block, producing a self-contained "model +
+/// formula" CTXDSL document (the artifact the opt-in `--emit-ctxdsl` /
+/// `emit_ctxdsl` surfaces return for the predicate-cube / CEGAR path).
+///
+/// `formula_body` is the **original** mu-calculus source text (the emitter
+/// writes it verbatim as the `body`), so it must be a string the CTXDSL
+/// parser accepts — pass the user-supplied formula string, not a
+/// re-rendered AST (`mu_calculus::Formula` has no CTXDSL `Display`).
+///
+/// Fidelity note: the emitted document is an inspectable record of the
+/// abstract model + the formula that was checked. Re-verifying it is
+/// subject to the same 2-valued-evaluator-vs-Kleene-label gap the rest of
+/// the predicate-cube path has (the evaluator reads atomic propositions,
+/// not the `predicates_3v` Kleene labels); the artifact is faithful to the
+/// model + formula, not a guaranteed re-runnable proof.
+pub fn clts_to_ctxdsl_with_formula(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+    context_name: &str,
+    formula_name: &str,
+    formula_body: &str,
+) -> Result<String, AdapterError> {
+    let property = PropertySpec {
+        name: formula_name.to_string(),
+        kind: PropertyKind::Safety,
+        formula: PropertyFormula::MuCalculus(formula_body.to_string()),
+        role: PropertyRole::Standalone,
+        over: Some(automaton_name.to_string()),
+        description: None,
+    };
+    let ir = build_ir(clts, automaton_name, context_name, vec![property]);
+    emit(&ir).map(|r| r.ctxdsl)
+}
+
+/// Reconstruct an [`AdapterIR`] from a realized `Clts` plus an optional set
+/// of properties. Shared by [`clts_to_ctxdsl`] (no properties) and
+/// [`clts_to_ctxdsl_with_formula`] (one mu-calculus property).
+fn build_ir(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    automaton_name: &str,
+    context_name: &str,
+    properties: Vec<PropertySpec>,
+) -> AdapterIR {
     let state_name = |s| clts.state_name(s).unwrap_or("state").to_string();
 
     let states: Vec<StateSpec> = clts
@@ -118,7 +170,7 @@ pub fn clts_to_ctxdsl(
         internal_labels: label_names(clts.internal_alphabet()),
     };
 
-    let ir = AdapterIR {
+    AdapterIR {
         metadata: Metadata {
             title: context_name.to_string(),
             source_format: SourceFormat::SystemVerilog,
@@ -129,11 +181,9 @@ pub fn clts_to_ctxdsl(
         signals: Vec::new(),
         automata: vec![automaton],
         compositions: Vec::new(),
-        properties: Vec::new(),
+        properties,
         controller: None,
-    };
-
-    emit(&ir).map(|r| r.ctxdsl)
+    }
 }
 
 /// Map a transition's [`crate::clts::TransitionModality`] to the CTXDSL
@@ -255,5 +305,47 @@ mod tests {
         // Still parses + realizes (sanity).
         let doc = parse(&ctxdsl).expect("parses");
         realize(&doc, &[]).expect("realizes");
+    }
+
+    /// CTXDSL Phase 2 — `clts_to_ctxdsl_with_formula` emits the model AND a
+    /// `mu_formulas` block carrying the checked property, and the whole
+    /// document parses (model + formula round-trip).
+    #[test]
+    fn model_plus_formula_emits_mu_formulas_block_and_parses() {
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        let c0 = b.state_id_or_insert("cube_0").expect("cube_0 id");
+        let c1 = b.state_id_or_insert("cube_1").expect("cube_1 id");
+        b.initial_state_id(c0);
+        let tick = b.labels().intern(["tick"]).expect("tick label");
+        b.transition_ids(c0, &[tick], c1);
+        b.transition_ids(c1, &[tick], c1);
+        b.with_3valued_predicate(c0, "boot_idle", Tristate::KleeneT);
+        let clts = b.build().expect("build clts");
+
+        let formula = "nu X. ([] X)";
+        let ctxdsl = clts_to_ctxdsl_with_formula(
+            &clts,
+            "lifted_kmts",
+            "cegar_model",
+            "checked_property",
+            formula,
+        )
+        .expect("emit ctxdsl + formula");
+
+        assert!(ctxdsl.contains("mu_formulas {"), "{ctxdsl}");
+        assert!(
+            ctxdsl.contains("formula checked_property {"),
+            "named formula block missing:\n{ctxdsl}"
+        );
+        assert!(ctxdsl.contains("over lifted_kmts;"), "{ctxdsl}");
+        assert!(
+            ctxdsl.contains(&format!("body = {formula};")),
+            "verbatim formula body missing:\n{ctxdsl}"
+        );
+        // The model still carries its 3-valued labels alongside the formula.
+        assert!(ctxdsl.contains("predicates_3v {"), "{ctxdsl}");
+        // The whole "model + formula" document parses + realizes.
+        let doc = parse(&ctxdsl).expect("model+formula ctxdsl parses");
+        realize(&doc, &[]).expect("model+formula ctxdsl realizes");
     }
 }

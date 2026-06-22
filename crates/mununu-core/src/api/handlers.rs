@@ -663,6 +663,9 @@ pub async fn btor2_cegar_handler(
         lift_strategy: LiftStrategy::Eager,
         must_edge_inference,
         may_edge_inference,
+        // CTXDSL Phase 2 — capture the final cube model only when the
+        // request opts in via `emit_ctxdsl`.
+        emit_ctxdsl: request.emit_ctxdsl,
     };
 
     // M.6 parity (2026-06-20) — config-values symbolic init is now an API
@@ -717,6 +720,32 @@ pub async fn btor2_cegar_handler(
         value: p.value,
     };
 
+    // CTXDSL Phase 2 (2026-06-22) — opt-in model + formula CTXDSL. When the
+    // request set `emit_ctxdsl`, the loop captured the final refined cube
+    // `Clts` into `trace.final_clts`; serialize it together with the checked
+    // formula (the original request string). Absent ⇒ `None` ⇒ the `ctxdsl`
+    // response field is omitted.
+    let ctxdsl = if request.emit_ctxdsl {
+        match &trace.final_clts {
+            Some(clts) => Some(
+                crate::adapter::clts_to_ir::clts_to_ctxdsl_with_formula(
+                    clts,
+                    "lifted_kmts",
+                    "cegar_model",
+                    "checked_property",
+                    &request.formula,
+                )
+                .map_err(|e| ApiError::BadRequest {
+                    message: format!("emit ctxdsl: {}", e.message),
+                    details: None,
+                })?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let iterations = trace
         .iterations
         .iter()
@@ -744,6 +773,7 @@ pub async fn btor2_cegar_handler(
         lazy_lift_pending: trace.lazy_lift_pending,
         approximant_reuse_enabled: trace.approximant_reuse_enabled,
         warnings: trace.warnings.iter().map(|w| w.message.clone()).collect(),
+        ctxdsl,
     }))
 }
 
@@ -2850,6 +2880,7 @@ members = ["x"]
             must_edge_inference: None,
             may_edge_inference: None,
             config_values: vec![],
+            emit_ctxdsl: false,
         };
 
         let Json(out) = btor2_cegar_handler(Json(request))
@@ -2879,6 +2910,64 @@ members = ["x"]
         );
         // The final predicate set includes at least the bootstrap predicate.
         assert!(!out.final_predicates.is_empty());
+        // CTXDSL Phase 2 — emit_ctxdsl defaulted false ⇒ no ctxdsl field.
+        assert!(
+            out.ctxdsl.is_none(),
+            "ctxdsl must be omitted when emit_ctxdsl=false"
+        );
+    }
+
+    /// CTXDSL Phase 2 (2026-06-22) — `emit_ctxdsl: true` returns the final
+    /// refined cube model + the checked formula as a self-contained CTXDSL
+    /// document in the response's `ctxdsl` field.
+    #[tokio::test]
+    async fn btor2_cegar_handler_emit_ctxdsl_returns_model_and_formula() {
+        use crate::api::models::PredicateSpecRequest;
+        let btor2 = "\
+1 sort bitvec 2
+2 state 2 burst
+3 zero 2
+4 init 2 2 3
+5 const 2 01
+6 sub 2 2 5
+7 next 2 2 6
+";
+        let request = Btor2CegarRequest {
+            content: btor2.to_string(),
+            formula: "nu X. ([] X)".to_string(),
+            predicates: vec![PredicateSpecRequest {
+                name: "burst_zero".to_string(),
+                register: "burst".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec![],
+            predicate_source: None,
+            max_iterations: Some(2),
+            must_edge_inference: None,
+            may_edge_inference: None,
+            config_values: vec![],
+            emit_ctxdsl: true,
+        };
+        let Json(out) = btor2_cegar_handler(Json(request))
+            .await
+            .expect("CEGAR endpoint runs with emit_ctxdsl");
+        let ctxdsl = out
+            .ctxdsl
+            .expect("emit_ctxdsl=true ⇒ response carries the model CTXDSL");
+        assert!(ctxdsl.contains("context "), "ctxdsl:\n{ctxdsl}");
+        assert!(
+            ctxdsl.contains("automaton lifted_kmts {"),
+            "ctxdsl:\n{ctxdsl}"
+        );
+        assert!(ctxdsl.contains("mu_formulas {"), "ctxdsl:\n{ctxdsl}");
+        assert!(
+            ctxdsl.contains("formula checked_property {"),
+            "ctxdsl:\n{ctxdsl}"
+        );
+        assert!(
+            ctxdsl.contains("body = nu X. ([] X);"),
+            "formula body must round-trip verbatim; ctxdsl:\n{ctxdsl}"
+        );
     }
 
     /// M.6 parity (2026-06-20) — the CEGAR endpoint now accepts `config_values`
@@ -2910,6 +2999,7 @@ members = ["x"]
             must_edge_inference: None,
             may_edge_inference: Some("smt-all-pairs".to_string()),
             config_values: vec!["burst=0,1,2,3".to_string()],
+            emit_ctxdsl: false,
         };
         let Json(out) = btor2_cegar_handler(Json(request))
             .await
@@ -2937,6 +3027,7 @@ members = ["x"]
             must_edge_inference: None,
             may_edge_inference: None,
             config_values: vec!["this is not valid".to_string()],
+            emit_ctxdsl: false,
         };
         let err = btor2_cegar_handler(Json(request))
             .await

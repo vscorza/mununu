@@ -245,6 +245,14 @@ pub struct CegarOptions {
     /// with a non-`Off` `must_edge_inference` is not yet wired — see
     /// [`crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs`].
     pub may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference,
+    /// CTXDSL Phase 2 (2026-06-22) — when `true`, the loop captures the
+    /// final refined predicate-cube `Clts` into [`CegarTrace::final_clts`]
+    /// so a caller can serialize the abstract model to CTXDSL via
+    /// [`crate::adapter::clts_to_ir::clts_to_ctxdsl_with_formula`]. Default
+    /// `false`, in which case the cube is dropped at loop exit (no clone
+    /// cost). This is the opt-in behind the `--emit-ctxdsl` CLI flag and
+    /// the API's `emit_ctxdsl` request field.
+    pub emit_ctxdsl: bool,
 }
 
 /// R.5 lazy KMTS sub-item 2.4 (2026-06-04) — selector for the
@@ -297,6 +305,10 @@ impl std::fmt::Debug for CegarOptions {
             // overridden.
             ds.field("must_edge_inference", &self.must_edge_inference);
         }
+        if self.emit_ctxdsl {
+            // emit_ctxdsl default is false; only print when opted in.
+            ds.field("emit_ctxdsl", &true);
+        }
         ds.finish()
     }
 }
@@ -313,6 +325,7 @@ impl Default for CegarOptions {
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         }
     }
 }
@@ -462,6 +475,16 @@ pub struct CegarTrace {
     /// - No classifying transition's source predicate maps to
     ///   a register in the BTOR2 source.
     pub init_refinement_candidates: Vec<String>,
+    /// CTXDSL Phase 2 (2026-06-22) — the final refined predicate-cube
+    /// `Clts` (the abstract model the loop converged/capped on), captured
+    /// only when [`CegarOptions::emit_ctxdsl`] is `true`. A caller pairs
+    /// it with the checked formula and
+    /// [`crate::adapter::clts_to_ir::clts_to_ctxdsl_with_formula`] to
+    /// return the model + formula as inspectable CTXDSL (the opt-in
+    /// `--emit-ctxdsl` / `emit_ctxdsl` surfaces). `None` when the opt-in
+    /// was off — the cube is dropped at loop exit, avoiding the clone.
+    pub final_clts:
+        Option<crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>>,
 }
 
 /// R.5 MVP — Run the CEGAR refinement loop on a BTOR2 fixture +
@@ -514,6 +537,15 @@ pub fn cegar_refine_loop(
     // deterministic ordering in the trace output.
     let mut init_refinement_candidates: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    // CTXDSL Phase 2 (2026-06-22) — when `emit_ctxdsl` is set, hold the
+    // most-recent iteration's lifted cube `Clts` so the final `CegarTrace`
+    // carries the abstract model for CTXDSL serialization. Each iteration
+    // overwrites it, so at any return point it holds the final (latest)
+    // model. Cloned per iteration only under the opt-in; stays `None`
+    // (no clone) otherwise.
+    let mut captured_clts: Option<
+        crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>,
+    > = None;
     // R.5 B.4.a (2026-06-01) — effective iteration cap. Starts as
     // `cegar_opts.max_iterations`; iteration 0's UF-wrap detection
     // may lower it to `SMART_UF_MAX_ITERATIONS` when the smart
@@ -624,6 +656,13 @@ pub fn cegar_refine_loop(
                 )?
             }
         };
+
+        // CTXDSL Phase 2 (2026-06-22) — capture this iteration's cube model
+        // for the opt-in CTXDSL dump. Each iteration overwrites, so at any
+        // return point `captured_clts` holds the final (latest) model.
+        if cegar_opts.emit_ctxdsl {
+            captured_clts = Some(lift_result.clts.clone());
+        }
 
         // R.5 B.3.b (2026-06-01) — soundness warning. After the
         // FIRST lift, check whether the input formula has
@@ -879,6 +918,8 @@ pub fn cegar_refine_loop(
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
                 warnings: warnings.clone(),
                 init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
+                // CTXDSL Phase 2 — final cube model (Some only under emit_ctxdsl).
+                final_clts: captured_clts.take(),
             });
         }
 
@@ -905,6 +946,8 @@ pub fn cegar_refine_loop(
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
                 warnings: warnings.clone(),
                 init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
+                // CTXDSL Phase 2 — final cube model (Some only under emit_ctxdsl).
+                final_clts: captured_clts.take(),
             });
         }
 
@@ -978,6 +1021,8 @@ pub fn cegar_refine_loop(
                 approximant_reuse_enabled: cegar_opts.enable_approximant_reuse,
                 warnings: warnings.clone(),
                 init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
+                // CTXDSL Phase 2 — final cube model (Some only under emit_ctxdsl).
+                final_clts: captured_clts.take(),
             });
         }
 
@@ -1462,6 +1507,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1481,6 +1527,55 @@ mod tests {
         }
         assert!(trace.lazy_lift_pending);
         assert!(!trace.approximant_reuse_enabled);
+        // CTXDSL Phase 2 — emit_ctxdsl defaulted false ⇒ no captured cube.
+        assert!(trace.final_clts.is_none());
+    }
+
+    /// CTXDSL Phase 2 (2026-06-22) — `emit_ctxdsl: true` captures the final
+    /// refined cube `Clts` into the trace; it serializes to a model +
+    /// formula CTXDSL document via `clts_to_ctxdsl_with_formula`.
+    #[test]
+    fn cegar_emit_ctxdsl_captures_final_cube_model() {
+        let formula = parser::parse("true").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            emit_ctxdsl: true,
+            ..Default::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        let clts = trace
+            .final_clts
+            .as_ref()
+            .expect("emit_ctxdsl=true ⇒ final cube model captured");
+        let ctxdsl = crate::adapter::clts_to_ir::clts_to_ctxdsl_with_formula(
+            clts,
+            "lifted_kmts",
+            "cegar_model",
+            "checked_property",
+            "true",
+        )
+        .expect("serialize model + formula");
+        assert!(
+            ctxdsl.contains("automaton lifted_kmts {"),
+            "model automaton missing:\n{ctxdsl}"
+        );
+        assert!(
+            ctxdsl.contains("body = true;"),
+            "formula body missing:\n{ctxdsl}"
+        );
     }
 
     #[test]
@@ -1577,6 +1672,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -1636,6 +1732,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2037,6 +2134,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -2068,6 +2166,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -2163,6 +2262,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace_off = cegar_refine_loop(
             &formula,
@@ -2185,6 +2285,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace_on = cegar_refine_loop(
             &formula,
@@ -2388,6 +2489,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let env_iter0 = Environment::new(2);
         let result_off = cegar_refine_loop(
@@ -2413,6 +2515,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let result_on = cegar_refine_loop(
             &formula,
@@ -2487,6 +2590,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2537,6 +2641,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2674,6 +2779,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2718,6 +2824,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2802,6 +2909,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2888,6 +2996,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -2952,6 +3061,7 @@ mod tests {
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -3017,6 +3127,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let debug_str = format!("{opts:?}");
         assert!(
@@ -3070,6 +3181,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace_result = cegar_refine_loop(
             &formula,
@@ -3125,6 +3237,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -3176,6 +3289,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace = cegar_refine_loop(
             &formula,
@@ -3239,6 +3353,7 @@ mod tests {
 
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
             may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
         };
         let trace_eager = cegar_refine_loop(
             &formula,
