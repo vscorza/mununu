@@ -22,7 +22,7 @@ use serde::Serialize;
 use serde_json::{self, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Write as IoWrite};
+use std::io;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -4346,7 +4346,17 @@ fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
                     use mununu_core::adapter::systemverilog::emit_controller::controller_to_systemverilog;
                     controller_to_systemverilog(controller, &args.automaton, true)
                 }
-                "ctxdsl" => String::new(), // already handled by --emit-dsl
+                // CTXDSL Phase 3 (2026-06-22) — `--output-format ctxdsl`
+                // now emits the controller CTXDSL (routed below to
+                // `--emit-native` / stdout, like xstate / sv), reusing the
+                // same emitter as `--emit-dsl`. Previously this returned an
+                // empty string and silently produced no output.
+                "ctxdsl" => controller_ctxdsl_string(
+                    &args.automaton,
+                    &formula_name,
+                    realized_formula.raw.as_str(),
+                    controller,
+                )?,
                 other => {
                     return Err(format!(
                         "unknown output format '{other}'. Supported: ctxdsl, xstate, systemverilog"
@@ -4707,6 +4717,25 @@ fn write_controller_ctxdsl(
 ) -> Result<(), String> {
     ensure_parent_dir(path)
         .map_err(|err| format!("failed to prepare DSL output directory: {err}"))?;
+    let dsl = controller_ctxdsl_string(automaton, formula, raw_formula, controller)?;
+    std::fs::write(path, dsl).map_err(|err| format!("failed to write controller DSL: {err}"))
+}
+
+/// CTXDSL Phase 3 (2026-06-22) — build the synthesised controller's CTXDSL
+/// as a `String`. Returned by value so both `--emit-dsl <FILE>` and
+/// `--output-format ctxdsl` (which routes to `--emit-native <FILE>` or
+/// stdout) emit byte-for-byte identical controller CTXDSL. This is the
+/// CLI's hand-authored 2-valued emitter; synthesised controllers are Sharp
+/// / 2-valued by construction, so the predicate-cube `clts_to_ir` bridge
+/// (modality + 3-valued labels) is not needed here.
+fn controller_ctxdsl_string(
+    automaton: &str,
+    formula: &str,
+    raw_formula: &str,
+    controller: &Clts,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
 
     let mut ordered_labels: BTreeMap<usize, LabelId<DefaultLabelIdx>> = BTreeMap::new();
     for state in controller.states() {
@@ -4787,43 +4816,39 @@ fn write_controller_ctxdsl(
     let context_ident = sanitize_identifier_cli(&format!("{}_{}_controller", automaton, formula));
     let automaton_ident = format!("{context_ident}_automaton");
 
-    let file = fs::File::create(path)
-        .map_err(|err| format!("failed to create controller DSL file: {err}"))?;
-    let mut writer = io::BufWriter::new(file);
     writeln!(
-        writer,
+        out,
         "// Synthesised controller derived from automaton '{}' and formula '{}'",
         automaton, formula
     )
     .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "context {context_ident} {{")
+    writeln!(out, "context {context_ident} {{")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
 
     if !label_entries.is_empty() {
-        writeln!(writer, "    alphabet {{")
+        writeln!(out, "    alphabet {{")
             .map_err(|err| format!("failed to write controller DSL: {err}"))?;
         for (_, ident, payload) in &label_entries {
             if payload.is_empty() {
-                writeln!(writer, "        label {ident}; // ε")
+                writeln!(out, "        label {ident}; // ε")
                     .map_err(|err| format!("failed to write controller DSL: {err}"))?;
             } else {
                 writeln!(
-                    writer,
+                    out,
                     "        label {ident}; // original symbols: {}",
                     payload.join(", ")
                 )
                 .map_err(|err| format!("failed to write controller DSL: {err}"))?;
             }
         }
-        writeln!(writer, "    }}")
-            .map_err(|err| format!("failed to write controller DSL: {err}"))?;
+        writeln!(out, "    }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
     }
 
-    writeln!(writer, "    automata {{")
+    writeln!(out, "    automata {{")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "        automaton {automaton_ident} {{")
+    writeln!(out, "        automaton {automaton_ident} {{")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "            states {{")
+    writeln!(out, "            states {{")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
     for state in controller.states() {
         let idx = state.index();
@@ -4838,12 +4863,11 @@ fn write_controller_ctxdsl(
             line.push_str(" // original: ");
             line.push_str(raw);
         }
-        writeln!(writer, "{line}")
-            .map_err(|err| format!("failed to write controller DSL: {err}"))?;
+        writeln!(out, "{line}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
     }
-    writeln!(writer, "            }}")
+    writeln!(out, "            }}")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "            transitions {{")
+    writeln!(out, "            transitions {{")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
     for state in controller.states() {
         let source_name = &state_idents[state.index()];
@@ -4871,35 +4895,30 @@ fn write_controller_ctxdsl(
             } else {
                 line.push_str(" // uncontrollable");
             }
-            writeln!(writer, "{line}")
+            writeln!(out, "{line}")
                 .map_err(|err| format!("failed to write controller DSL: {err}"))?;
         }
     }
-    writeln!(writer, "            }}")
+    writeln!(out, "            }}")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "        }}")
-        .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "    }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "    mu_formulas {{")
+    writeln!(out, "        }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
+    writeln!(out, "    }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
+    writeln!(out, "    mu_formulas {{")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
     writeln!(
-        writer,
+        out,
         "        formula {} {{",
         sanitize_identifier_cli(formula)
     )
     .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "            over {automaton_ident};")
+    writeln!(out, "            over {automaton_ident};")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "            body = {raw_formula};")
+    writeln!(out, "            body = {raw_formula};")
         .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "        }}")
-        .map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "    }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writeln!(writer, "}}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
-    writer
-        .flush()
-        .map_err(|err| format!("failed to finalise controller DSL: {err}"))?;
-    Ok(())
+    writeln!(out, "        }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
+    writeln!(out, "    }}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
+    writeln!(out, "}}").map_err(|err| format!("failed to write controller DSL: {err}"))?;
+    Ok(out)
 }
 
 fn sanitize_identifier_cli(value: &str) -> String {
@@ -5288,5 +5307,39 @@ mod sv_discover_tests {
             sk.signals.is_empty(),
             "a pure 1-bit design needs no abstraction entries"
         );
+    }
+}
+
+#[cfg(test)]
+mod controller_ctxdsl_tests {
+    //! CTXDSL Phase 3 (2026-06-22) — the synthesised-controller CTXDSL
+    //! emitter `controller_ctxdsl_string` is shared by `--emit-dsl` and
+    //! `--output-format ctxdsl` (the latter previously emitted nothing).
+    use super::controller_ctxdsl_string;
+    use mununu_core::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, LabelControllability};
+    use mununu_core::context_dsl::parse;
+
+    #[test]
+    fn controller_ctxdsl_string_is_non_empty_and_parses() {
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        let s0 = b.state_id_or_insert("idle").expect("idle id");
+        let s1 = b.state_id_or_insert("active").expect("active id");
+        b.initial_state_id(s0);
+        let go = b.labels().intern(["go"]).expect("go label");
+        b.set_label_controllability(go, LabelControllability::Controllable);
+        b.transition_ids(s0, &[go], s1);
+        b.transition_ids(s1, &[go], s0);
+        let controller = b.build().expect("build controller");
+
+        // formula = NAME, raw_formula = the body text (matches the CLI call).
+        let dsl = controller_ctxdsl_string("plant", "safety", "nu X. (<go> X)", &controller)
+            .expect("emit controller ctxdsl");
+        assert!(!dsl.is_empty(), "controller ctxdsl must be non-empty");
+        assert!(dsl.contains("context "), "{dsl}");
+        assert!(dsl.contains("automaton "), "{dsl}");
+        assert!(dsl.contains("mu_formulas {"), "{dsl}");
+        assert!(dsl.contains("transition "), "{dsl}");
+        // The emitted controller CTXDSL is valid, re-loadable syntax.
+        parse(&dsl).expect("emitted controller ctxdsl parses");
     }
 }
