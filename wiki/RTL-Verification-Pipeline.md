@@ -271,7 +271,7 @@ Based on MITRE CWE-1245, with real CVEs (CVE-2024-21853, CVE-2024-24968). One-ho
 
 ## Limitations
 
-- **Explicit-state only:** state space capped at 2^18 (262K states). No BDD/SAT backend.
+- **Explicit-state only:** state space capped at 2^18 (262K states). No BDD/SAT backend. For wide-register designs that blow this cap, use the [Predicate-Cube CEGAR](Predicate-Cube-CEGAR) engine, which abstracts to `2^(predicate count)` instead of `2^(register bits)`.
 - **Single module:** no submodule hierarchy or multi-clock domains.
 - **Abstraction is manual:** users must annotate which registers to preserve and how.
 - **SMT discovery is combinational-only:** doesn't trace through sequential (clock-edge) dependencies.
@@ -279,6 +279,7 @@ Based on MITRE CWE-1245, with real CVEs (CVE-2024-21853, CVE-2024-24968). One-ho
 
 ## See Also
 
+- [Predicate-Cube CEGAR](Predicate-Cube-CEGAR) — the complementary predicate-abstraction engine for designs too large to bit-blast (3-valued `{T, F, ⊥}` verdicts + automatic refinement)
 - [Adapter Formats — SystemVerilog](Adapter-Formats#systemverilog) — supported SV subset and inline annotations
 - [Hardware Verification Patterns](Hardware-Verification-Patterns) — CTXDSL patterns for common hardware
 - [CLI Reference](CLI-Reference) — `sv preprocess`, `sv emit-btor2-per-module`, `btor2 discover`, `context eval`, `context synth`
