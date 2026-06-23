@@ -236,6 +236,15 @@ Reading: definite verdicts (`T` or `F`) on the abstract transfer to the concrete
 
 This is what makes KMTS the right framework for full-mu-calculus abstraction: a *single* abstract model that is uniformly sound for safety, reachability, liveness, and nested fixpoints, with a clean refinement-on-`⊥` recipe.
 
+**Application to mununu's predicate cube.** The theorem's two premises —
+`R ⊆ γ(R_may)` (may-step accommodation) and `R_must ⊆ ᾱ(R)` (must-step
+preservation) — are discharged for the BTOR2 predicate-cube lift, and the
+evaluator is checked to compute the §4.3 semantics, by two mechanised tests
+(the 2026-06-23 cube-modal audit). The fragment over which a definite cube
+verdict is therefore sound (`Control::All`, bare, unbounded) and the gate on
+out-of-fragment modalities are written up in
+[`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md) §4.9.
+
 ## §5 Compositional KMTS
 
 ### §5.1 Parallel composition — pointwise on may and must

@@ -1,6 +1,6 @@
 # Predicate-Abstraction Recipe — KMTS Lifter Operational Guide
 
-> **Status: planning** until R.5 ships. Practical recipe for predicate seeding, may/must image computation, CEGAR refinement, and operational debugging in mununu's BTOR2 → KMTS lifter. Companions: [`native-sv-abstraction.md`](native-sv-abstraction.md) (architecture; §6 is the design framing), [`kmts-theory.md`](kmts-theory.md) (theoretical foundations), [`predicate-abstraction-worked-example.md`](predicate-abstraction-worked-example.md) (one module carried end to end — RTL → BTOR2 → coarse `KleeneBot` → interpolant → refined `KleeneT`). Sections that reference proposed code are unanchored; sections that reference live code carry inline anchors but do not graduate to `> Source of truth:` until the corresponding roadmap phase ships.
+> **Status: live (R.5 + R.6 shipped, 2026-06).** Practical recipe for predicate seeding, may/must image computation, CEGAR refinement, and operational debugging in mununu's BTOR2 → KMTS lifter. The cube CEGAR loop, the may/must predicate-image, UF wrapping, Craig interpolation, and the controllability-aware lift are all live; the cube-verdict soundness story (§4.9) is anchored to live code. Companions: [`native-sv-abstraction.md`](native-sv-abstraction.md) (architecture; §6 is the design framing), [`kmts-theory.md`](kmts-theory.md) (theoretical foundations), [`predicate-abstraction-worked-example.md`](predicate-abstraction-worked-example.md) (one module carried end to end — RTL → BTOR2 → coarse `KleeneBot` → interpolant → refined `KleeneT`). §4.9 carries a `> Source of truth:` anchor; the fine-grained refinement-heuristic sub-sections (§4.4–§4.8 lemma library, two-axis partitioning) document the intended shape and may still outrun the shipped implementation in places — those retain unanchored caveats.
 
 ## §1 What predicate abstraction is
 
@@ -250,6 +250,61 @@ Every fallback in the refinement loop carries a `// SOUNDNESS:` annotation in th
 - Stall → `KleeneBot` verdict with diagnostic (sound; same as cap-hit but with a different cause).
 
 The architecture doc §6.9 catalogues these as part of the broader soundness story.
+
+### §4.9 The audited-sound cube fragment
+
+> Source of truth: [`predicate_cube_lift`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L1504) + [`evaluate_tri`](../../crates/mununu-core/src/mu_calculus/evaluator.rs#L792) + [`cube_modality_soundness_warnings`](../../crates/mununu-core/src/mu_calculus/mod.rs#L284) — surface: (CLI+API+UI) via `mununu btor2 cegar` / `POST /api/v1/btor2/cegar` / the `/cegar` panel.
+
+A `KleeneT` / `KleeneF` verdict on the predicate cube is only *sound* — i.e.
+guaranteed to transfer to the concrete RTL by the §4.5 preservation theorem
+([`kmts-theory.md`](kmts-theory.md#L216)) — for one fragment of the modal
+mu-calculus: **`Control::All`, bare (label-agnostic), unbounded** modalities.
+This is the slice the `btor2 cegar` / verification path rides on (M.4's
+`<> (p5 || p6 || p7)` is exactly this shape). The fragment is not a limitation
+to apologise for: a synchronous design has *one clock = one step* with the input
+quantified inside the modality (`EX φ` = ∃-input-successor ⊨ φ; `AX φ` = ∀), so
+the bare `<>` / `[]` are the *complete* modal vocabulary for synchronous
+verification. Label-discriminated modalities belong to the asynchronous /
+process-algebra world (the explicit-CLTS path), not the cube.
+
+**The soundness chain is mechanised in CI** (the 2026-06-23 cube-modal audit):
+
+1. **The lift is a sound may/must KMTS** — `may ⊇ concrete` (over-approximation,
+   the §4.5 may-step-accommodation premise) and `must ⊆ concrete`
+   (under-approximation, the must-step-preservation premise). Established by a
+   differential test against an independent concrete oracle
+   ([`simulate_one_step`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs)):
+   [`po1_cube_brackets_concrete_*`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L3076).
+2. **The evaluator computes the §4.3 semantics** — the production `KleeneDom`
+   modal step equals the Bruns–Godefroid 3-valued modal definition for every
+   `{Sharp, MayOnly} × {T, F}` edge configuration. Established by an enumerated
+   conformance test:
+   [`po5_kleene_modal_matches_bruns_godefroid_4_3`](../../crates/mununu-core/src/mu_calculus/evaluator.rs#L4950).
+3. **Compose (1) + (2)**: a sound KMTS in, §4.3 out ⇒ §4.5 transfers a definite
+   cube verdict to the concrete design. This is what makes M.4 *provably* sound,
+   not merely argued.
+
+**Out-of-fragment forms are gated, not silently answered.**
+[`cube_modality_soundness_warnings`](../../crates/mununu-core/src/mu_calculus/mod.rs#L284)
+(wired into the CEGAR loop at
+[`cegar.rs`](../../crates/mununu-core/src/adapter/btor2/cegar.rs#L720), surfaced
+on the `warnings` channel across all three surfaces) emits a soundness warning —
+*not* a hard reject, so V.6's controllability-aware cube keeps working — for:
+
+| Modal form over a cube | Why unsound / unaudited | Obligation |
+|---|---|---|
+| `ctrl = controllable \| environment` | per-player (controller × environment) game semantics is unaudited (de Alfaro–Godefroid–Jagadeesan LICS 2004) | **PO-3 / R.6.8** — gates V.6 *definite* controllability verdicts |
+| bounded `steps = k` | the may/must filter is not applied to bounded modal steps | PO-4 / R.6.3.b |
+| label-specific on a non-cube label | the cube collapses every concrete action onto its own label(s) ⇒ vacuous (`<step>` over a single-`step` cube `==` bare ⇒ no warning) | (expressiveness boundary; no proof possible) |
+
+**Honest verdict semantics (Claims Integrity).** Because `may` over-approximates,
+the cube can return `KleeneBot` where a finer abstraction would decide — and a
+`KleeneBot` is the *correct* sound answer, not a failure. M.4 illustrates the
+discipline: the `{p5, p6, p7}` cube *detects* the CWE-1245 hazard (pre_fix
+`T=7 ⊥=0`, definite) and *shows the fix removes the definite hazard* (post_fix
+`T=4 ⊥=3`), but it does **not** prove the fixed FSM safe — proving safety would
+need a finer abstraction / CEGAR to convergence. A definite-safe claim on the
+coarse cube would be unsound.
 
 ## §5 Port-equality heuristic for compositional tightness
 
