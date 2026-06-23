@@ -120,7 +120,7 @@ Communication fabrics are *the* natural sync-plus-async target. Channels are syn
 
 ### Validation phase
 
-**V.1** ships a small 4-router mesh fixture with one packet flow per router pair, verifying deadlock-freedom and end-to-end liveness under weak fairness. Fixture: [`examples/verify/v1_noc_mesh_4router/`](../../examples/verify/v1_noc_mesh_4router/) (ships with V.1).
+**V.1 (PASS, scoped to a single flow).** Ships a 4-router (2×2) mesh fixture carrying **one** flit from corner R0 to the diagonal corner R3, in two scheduling disciplines (`progress`, `contention`). It verifies **deadlock-freedom** (safety), **end-to-end liveness as possibility** — `AG EF delivered`, the `always_eventually` νμ depth-2 shape, true in both disciplines — and **bounded delivery over a `hops` counter valuation** (`hops <= diameter` invariant + a delivered-at-diameter reachability, both binding through the 2026-06-23 CTXDSL variable-atom path). The discriminating verdict is **strong inevitability** (`AF delivered`): true under `progress`, false under `contention`. mununu imposes no fairness on the abstract stall, so it reports inevitable delivery only for the discipline that actually makes progress — the honest fairness boundary, rather than a Streett-encoded weak-fairness claim the CTXDSL path does not implement. The multi-flit *one-flow-per-router-pair* version (with channel-dependency deadlock and Streett fairness in the R.5.0 parity game) is the parameterized extension the realistic assessment below calls the actual win; it remains future work. Fixture: [`examples/verify/v1_noc_mesh_4router/`](../../examples/verify/v1_noc_mesh_4router/) (ships with V.1).
 
 ### Realistic assessment
 
