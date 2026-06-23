@@ -27,6 +27,7 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 | [Mu-Calculus Reference](Mu-Calculus-Reference) | Fixpoints, modalities, controllability-aware operators, common patterns |
 | [Adapter Formats](Adapter-Formats) | Import from XState, SystemVerilog, TLSF, AIGER, Promela; export controllers |
 | [RTL Verification Pipeline](RTL-Verification-Pipeline) | End-to-end SystemVerilog verification with `.mununu.json` sidecars and SMT discovery |
+| [Predicate-Cube CEGAR](Predicate-Cube-CEGAR) | Predicate-abstraction CEGAR for large RTL: 3-valued `{T, F, ⊥}` verdicts, automatic refinement, the Caliptra CWE-1245 walkthrough |
 | [Agentic Orchestration](Agentic-Orchestration) | Verify multi-agent workflows, MCP tool authorization, and handoff protocols |
 | [Agentic Adapters](Agentic-Adapters) | Native CrewAI + LangGraph JSON parsers — drop a `.crewai.json` / `.langgraph.json` directly into CLI / API / UI |
 | [Verify Project Flow](Verify-Project-Flow) | General N-source verification driven by `verify.toml` (CLI / API / UI wizard) |
