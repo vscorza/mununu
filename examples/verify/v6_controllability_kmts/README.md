@@ -54,6 +54,18 @@ fixture exercising the same code paths that would run on a real
 SYNTCOMP/AMBA fixture if the TLSF → BTOR2 extraction infrastructure
 existed.
 
+**Soundness update (2026-06-23 — PO-3 / R.6.8 CLOSED).** The
+controllability-aware *definite* verdict is now sound. The per-player
+audit (`.claude/reviews/cube-modal-soundness/`) caught and fixed a
+two-pass over-claim, and `evaluate_tri` now routes
+`Control::{Controllable, Environment}` through the de Alfaro–Godefroid–
+Jagadeesan per-player rule (`modal_trit_from_target`). Previously a
+*definite* controllability verdict had to be labelled "unaudited /
+design-pattern demonstration"; that caveat is lifted. V.6's verdicts
+are unchanged by the fix (its demo rests on a conservative `KleeneBot`,
+which was already sound). See [`kmts-theory.md`](../../../docs/design/kmts-theory.md)
+§7.5 (Resolution 2026-06-23).
+
 ## Fixture design
 
 ### Verilog (`source/amba_arbiter.sv`)

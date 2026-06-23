@@ -291,9 +291,9 @@ process-algebra world (the explicit-CLTS path), not the cube.
 on the `warnings` channel across all three surfaces) emits a soundness warning —
 *not* a hard reject, so V.6's controllability-aware cube keeps working — for:
 
-| Modal form over a cube | Why unsound / unaudited | Obligation |
+| Modal form over a cube | Why warned | Obligation |
 |---|---|---|
-| `ctrl = controllable \| environment` | per-player (controller × environment) game semantics is unaudited (de Alfaro–Godefroid–Jagadeesan LICS 2004) | **PO-3 / R.6.8** — gates V.6 *definite* controllability verdicts |
+| `ctrl = controllable \| environment` | semantics is now **sound** (per-player de Alfaro–Godefroid–Jagadeesan LICS 2004 rule, **PO-3 / R.6.8 CLOSED 2026-06-23** — `evaluate_tri` routes the controllability arms through `modal_trit_from_target`); the advisory remains because over a *plain verification* cube the controllability partition is a build-time default (the lone `step` label is `Controllable`-by-default) and is meaningful only over a controllability-aware (R.6.6) cube | none (advisory only; sound) |
 | bounded `steps = k` | the may/must filter is not applied to bounded modal steps | PO-4 / R.6.3.b |
 | label-specific on a non-cube label | the cube collapses every concrete action onto its own label(s) ⇒ vacuous (`<step>` over a single-`step` cube `==` bare ⇒ no warning) | (expressiveness boundary; no proof possible) |
 

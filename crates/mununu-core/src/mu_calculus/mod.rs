@@ -297,10 +297,14 @@ pub fn cube_modality_soundness_warnings(
         if guard.control != Control::All {
             out.push(format!(
                 "{op} modality with ctrl={:?} over a predicate cube: the per-player \
-                 (controller × environment) game semantics is UNAUDITED (PO-3 / R.6.8; \
-                 de Alfaro–Godefroid–Jagadeesan LICS 2004) — this is NOT a sound definite \
-                 controllability verdict. Use a bare {op} for verification, or treat the \
-                 result as a design-pattern demonstration until R.6.8 closes.",
+                 (controller × environment) 3-valued game semantics is SOUND as of \
+                 PO-3 / R.6.8 (de Alfaro–Godefroid–Jagadeesan LICS 2004; evaluate_tri \
+                 routes the controllability arms through the per-player rule). BUT over a \
+                 plain *verification* cube the controllability partition is a build-time \
+                 default (the lone `step` label is Controllable-by-default), so a \
+                 controllability verdict is only MEANINGFUL over a controllability-aware \
+                 (R.6.6) cube with declared controllable inputs. Use a bare {op} for plain \
+                 verification.",
                 guard.control
             ));
         }
@@ -575,10 +579,12 @@ mod tests {
             "alternation-free bare safety is in-fragment"
         );
 
-        // Controllability ⇒ unaudited (PO-3).
+        // Controllability ⇒ semantics SOUND (PO-3 / R.6.8 closed), but the
+        // partition is meaningful only over a controllability-aware cube — still
+        // one advisory warning.
         let w = warn("[ (ctrl = controllable) ] p");
         assert_eq!(w.len(), 1, "one ctrl warning: {w:?}");
-        assert!(w[0].contains("UNAUDITED") && w[0].contains("R.6.8"));
+        assert!(w[0].contains("SOUND") && w[0].contains("R.6.8") && w[0].contains("MEANINGFUL"));
 
         // Bounded ⇒ 3-valued-blind (PO-4).
         let w = warn("< (steps = 5) > p");
