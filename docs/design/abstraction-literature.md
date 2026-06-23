@@ -1281,13 +1281,17 @@ controllability-aware KMTS** track: once a model carries *both*
 controllable labels *and* may/must edges, single-agent Bruns–Godefroid
 (#21) no longer covers it — the per-player rule of this paper does.
 [`kmts-theory.md`](kmts-theory.md) §7 builds the 2×2 (controllability ×
-modality) rule on it. The production verdict path does **not** yet
-implement the per-player game semantics; that audit is the open
-obligation **PO-3 / R.6.8** and gates any *definite* controllability
-verdict (the V.6 milestone). Until it closes,
+modality) rule on it. The production verdict path now **implements** the
+per-player game semantics: **PO-3 / R.6.8 CLOSED 2026-06-23** —
+[`evaluate_tri`](../../crates/mununu-core/src/mu_calculus/evaluator.rs)
+routes `Control::{Controllable, Environment}` through `modal_trit_from_target`
+(the §7.2 per-player rule), so a *definite* controllability verdict is now
+sound (the audit empirically caught + fixed the two-pass over-claim; see
+`.claude/reviews/cube-modal-soundness/`). The advisory in
 [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md) §4.9
 + [`cube_modality_soundness_warnings`](../../crates/mununu-core/src/mu_calculus/mod.rs)
-flag controllability modalities over a cube with a soundness warning.
+now flags only the *structural* caveat (a plain verification cube's
+controllability partition is a build-time default).
 
 ## 30. Shoham & Grumberg, *A Game-Based Framework for CTL Counterexamples and 3-Valued Abstraction-Refinement* (LMCS 2007; CAV 2003 precursor)
 
@@ -1355,7 +1359,7 @@ cover the KMTS pivot's literature anchors and lift verbatim into
 | 26 | McMillan CAV 1998 — Circular AGR | Deferred | n/a | n/a | deferred (§11) |
 | 27 | Cobleigh–Giannakopoulou–Păsăreanu TACAS 2003 — L* AGR | Deferred | n/a | `verify/assumption_learning.rs` (hypothetical) | deferred (§11) |
 | 28 | Cimatti–Tonetta FMCAD 2012 — OCRA contracts | Deferred | n/a | `verify/contract.rs` (hypothetical) | deferred (§11) |
-| 29 | de Alfaro–Godefroid–Jagadeesan LICS 2004 — 3-valued games | Stage 6 (controllability verdict) | [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) (Skolem modal arms) | per-player game audit (PO-3 / R.6.8) | R.6 (audit open) |
+| 29 | de Alfaro–Godefroid–Jagadeesan LICS 2004 — 3-valued games | Stage 6 (controllability verdict) | [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) (`modal_trit_from_target` per-player rule) | per-player game audit (PO-3 / R.6.8 CLOSED 2026-06-23) | R.6 (closed) |
 | 30 | Shoham–Grumberg LMCS 2007 — GKMTS + failure subgame | Stage 6 (refinement) | [`parity_game_3v.rs`](../../crates/mununu-core/src/mu_calculus/parity_game_3v.rs) | `MustHyperOnly` (R.4.5) + `FailureSubgame` (R.5.0) — **live** | R.4.5 / R.5.0 ✓ |
 
 ### Reading order if you only have time for three
