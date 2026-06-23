@@ -1257,13 +1257,68 @@ proof structure.
 
 ---
 
+# Game-based 3-valued abstraction & GKMTS (entries 29–30)
+
+> These two papers extend the KMTS line (entries 19–24) in the two
+> directions the R.4.5 / R.5.0 / R.6 tracks depend on: from systems to
+> *games* (per-player may/must), and from plain KMTS to *generalized*
+> KMTS (hyper-must transitions). Numbered after the AGR block to avoid
+> renumbering the by-number internal cross-references.
+
+## 29. de Alfaro, Godefroid, Jagadeesan, *Three-Valued Abstractions of Games: Uncertainty, but with Precision* (LICS 2004)
+
+**Theoretical core.** Extends may/must (3-valued) abstraction from
+transition systems to two-player *games*, tracking the may/must
+distinction **per player**. A definite abstract game value ("controller
+wins" / "controller loses") transfers to the concrete game — the game
+analogue of the Bruns–Godefroid (#21) preservation theorem. The
+load-bearing asymmetry: a definite *controller win* requires *must*-moves
+for the controller (it can actually force them) and *may*-moves for the
+environment (the abstraction must admit every adversary move).
+
+**Map to mununu.** The governing theorem for the **R.6
+controllability-aware KMTS** track: once a model carries *both*
+controllable labels *and* may/must edges, single-agent Bruns–Godefroid
+(#21) no longer covers it — the per-player rule of this paper does.
+[`kmts-theory.md`](kmts-theory.md) §7 builds the 2×2 (controllability ×
+modality) rule on it. The production verdict path does **not** yet
+implement the per-player game semantics; that audit is the open
+obligation **PO-3 / R.6.8** and gates any *definite* controllability
+verdict (the V.6 milestone). Until it closes,
+[`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md) §4.9
++ [`cube_modality_soundness_warnings`](../../crates/mununu-core/src/mu_calculus/mod.rs)
+flag controllability modalities over a cube with a soundness warning.
+
+## 30. Shoham & Grumberg, *A Game-Based Framework for CTL Counterexamples and 3-Valued Abstraction-Refinement* (LMCS 2007; CAV 2003 precursor)
+
+**Theoretical core.** Casts 3-valued model checking as a game whose
+positions are `(state, subformula)` pairs; the *indefinite* (`⊥`)
+positions are exactly those whose resolution depends on a
+may-but-not-must transition. Introduces **generalized KMTS (GKMTS)** with
+*hyper-must* transitions (a must-edge into a *set* of abstract states),
+which restore the monotonicity of refinement on alternating fixpoints
+that plain KMTS lacks. The *failure subgame* extracted from the
+indefinite positions localizes refinement.
+
+**Map to mununu.** The basis for **R.4.5** (the
+`MustHyperOnly { targets }` GKMTS variant), **R.5.0** (the 3-valued
+parity-game evaluator + `FailureSubgame` extraction at
+[`parity_game_3v.rs`](../../crates/mununu-core/src/mu_calculus/parity_game_3v.rs)),
+and **R.5** (failure-subgame-driven CEGAR). [`kmts-theory.md`](kmts-theory.md)
+§7.4 cites it for hyper-must completeness; the soundness warning at
+[`cegar.rs`](../../crates/mununu-core/src/adapter/btor2/cegar.rs) (B.3.b)
+that flags alternating-fixpoint verdicts on a non-hyper-must cube is the
+practical consequence.
+
+---
+
 ## Cross-reference matrix
 
 This matrix is the contract between this doc and
 [`auto-extraction-architecture.md`](auto-extraction-architecture.md) §2 (stage
 mapping) and §5 (current-vs-proposed comparison). Entries 1–18 cover
-the original pillow-plan / explicit-state pipeline. Entries 19–28 (the
-KMTS + AGR sections appended in the D.0 deliverable of
+the original pillow-plan / explicit-state pipeline. Entries 19–30 (the
+KMTS, AGR, and game-based / GKMTS sections appended in the D.0 deliverable of
 [`you-are-a-formal-vast-lake.md`](../../.claude/plans/you-are-a-formal-vast-lake.md))
 cover the KMTS pivot's literature anchors and lift verbatim into
 [`native-sv-abstraction.md`](native-sv-abstraction.md),
@@ -1300,6 +1355,8 @@ cover the KMTS pivot's literature anchors and lift verbatim into
 | 26 | McMillan CAV 1998 — Circular AGR | Deferred | n/a | n/a | deferred (§11) |
 | 27 | Cobleigh–Giannakopoulou–Păsăreanu TACAS 2003 — L* AGR | Deferred | n/a | `verify/assumption_learning.rs` (hypothetical) | deferred (§11) |
 | 28 | Cimatti–Tonetta FMCAD 2012 — OCRA contracts | Deferred | n/a | `verify/contract.rs` (hypothetical) | deferred (§11) |
+| 29 | de Alfaro–Godefroid–Jagadeesan LICS 2004 — 3-valued games | Stage 6 (controllability verdict) | [`evaluator.rs`](../../crates/mununu-core/src/mu_calculus/evaluator.rs) (Skolem modal arms) | per-player game audit (PO-3 / R.6.8) | R.6 (audit open) |
+| 30 | Shoham–Grumberg LMCS 2007 — GKMTS + failure subgame | Stage 6 (refinement) | [`parity_game_3v.rs`](../../crates/mununu-core/src/mu_calculus/parity_game_3v.rs) | `MustHyperOnly` (R.4.5) + `FailureSubgame` (R.5.0) — **live** | R.4.5 / R.5.0 ✓ |
 
 ### Reading order if you only have time for three
 
