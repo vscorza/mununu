@@ -1756,6 +1756,36 @@ where
 
         let outgoing = self.clts.outgoing(state);
 
+        // IR-track P3.4 (2026-06-22) — VERIFICATION diamond for `Control::All`.
+        // `<a>φ` (a plain, non-controllability-scoped diamond) is the standard
+        // mu-calculus existential: ∃ an `a`-successor satisfying φ. The Skolem
+        // all-same-label-satisfy aggregation below ("the system picks an
+        // action; ALL its nondeterministic outcomes must satisfy") is the
+        // SYNTHESIS reading and is reserved for `Control::{Controllable,
+        // Environment}`.
+        //
+        // SOUNDNESS: applying the synthesis aggregation to `Control::All` was
+        // UNSOUND for any model that labels several distinct successors with the
+        // SAME label — most acutely the predicate-cube lift, which labels every
+        // transition with one shared `step`. That collapsed `<>` into `[]` (all
+        // step-successors required) and manufactured a definite verdict the
+        // KMTS does not justify (e.g. a may-reachable target reported as
+        // definite-False, or — Caliptra M.4 post_fix — a definite-False that
+        // ignored over-approximating may-self-loops). With the per-(kind,
+        // may/must) modality filter from `modal_image`, this plain ∃ yields the
+        // canonical KMTS diamond: `must_bits` = ∃ must-edge into a def-T state;
+        // `may_bits` = ∃ may-edge into a not-False state. Box (`modal_forall`)
+        // already uses plain ∀ for `Control::All`, so only the diamond was
+        // affected.
+        if guard.control == Control::All {
+            return outgoing.iter().any(|t| {
+                modality_filter.allows(t)
+                    && self.guard_matches(state, t, guard)
+                    && guard_parts.is_none_or(|p| p.matches_next(t.target().index()))
+                    && transition_target_in_set_diamond(t, targets)
+            });
+        }
+
         // Group uncontrollable transitions by their label sets (Skolem paradigm)
         let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
             outgoing,
@@ -4847,6 +4877,44 @@ mod modal_trit_draft_tests {
 
         let s0 = clts.state_id("s0").expect("s0").index();
         assert_eq!(result.verdict_at(s0), Trit::True);
+    }
+
+    /// IR-track P3.4 (2026-06-22) — THE SOUNDNESS FIX for `Control::All`
+    /// diamonds: `<>φ` is the standard EXISTENTIAL (∃ a-successor ⊨ φ),
+    /// NOT the Skolem all-same-label-satisfy aggregation. `s0` has TWO
+    /// `step` edges → `s1` (p True) and `s2` (p False). `<>p` at `s0` must
+    /// be True (∃ a `step`-successor with p) — the pre-fix path read it as
+    /// "ALL `step`-successors have p" (same shared label ⇒ one Skolem
+    /// sub-group ⇒ `<>`→`[]`) and returned False. This is the predicate-
+    /// cube scenario in miniature (one shared `step` label, multiple
+    /// targets) that collapsed reachability over the cube.
+    #[test]
+    fn p3_4_all_diamond_is_existential_over_shared_label() {
+        use crate::clts::Tristate;
+        let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        builder.state("s0").state("s1").state("s2").initial("s0");
+        let step = builder.labels().intern(["step"]).expect("intern step");
+        let s0 = builder.state_id_or_insert("s0").expect("s0");
+        let s1 = builder.state_id_or_insert("s1").expect("s1");
+        let s2 = builder.state_id_or_insert("s2").expect("s2");
+        // Two transitions from s0 sharing the SAME label `step`.
+        builder.transition_ids(s0, &[step], s1);
+        builder.transition_ids(s0, &[step], s2);
+        builder.transition_ids(s1, &[step], s1);
+        builder.transition_ids(s2, &[step], s2);
+        builder.with_3valued_predicate(s0, "p".to_string(), Tristate::KleeneF);
+        builder.with_3valued_predicate(s1, "p".to_string(), Tristate::KleeneT);
+        builder.with_3valued_predicate(s2, "p".to_string(), Tristate::KleeneF);
+        let clts = builder.build().expect("build");
+        let env = Environment::new(clts.state_count());
+        let formula = parser::parse("<>p").expect("parse");
+        let result = evaluate_tri(&formula, &clts, &env).expect("evaluate_tri");
+        let s0i = clts.state_id("s0").expect("s0").index();
+        assert_eq!(
+            result.verdict_at(s0i),
+            Trit::True,
+            "Control::All <>p over same-label {{s1(p), s2(¬p)}} is existential ⇒ True"
+        );
     }
 
     // ---- R.6.3 (2026-06-08) — end-to-end through `evaluate_tri` ----
