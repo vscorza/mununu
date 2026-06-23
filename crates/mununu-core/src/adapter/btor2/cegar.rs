@@ -695,6 +695,33 @@ pub fn cegar_refine_loop(
             });
         }
 
+        // PO-2 (cube-modal soundness audit, 2026-06-23) — surface a
+        // soundness warning for any modality form OUTSIDE the audited-sound
+        // cube fragment (controllability `ctrl=…` ⇒ unaudited per-player
+        // game semantics PO-3/R.6.8; bounded `steps=k` ⇒ may/must filter
+        // not applied PO-4/R.6.3.b; label-specific on a non-cube label ⇒
+        // vacuous). Computed once (iteration 0) from the formula + the
+        // cube's actual label symbols. Makes the out-of-fragment boundary
+        // explicit on the `btor2 cegar` / `sv cegar` / `/cegar` surfaces
+        // rather than silently returning an unsound/unaudited/vacuous
+        // verdict. A WARNING, not a reject — V.6's controllability-aware
+        // cube path keeps working (flagged, until R.6.8 closes).
+        if iteration == 0 {
+            let cube_labels: std::collections::HashSet<&str> = lift_result
+                .clts
+                .label_entries()
+                .flatten()
+                .map(|s| s.as_str())
+                .collect();
+            for msg in crate::mu_calculus::cube_modality_soundness_warnings(formula, &cube_labels) {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: crate::adapter::WarningKind::ApproximateTranslation,
+                    location: None,
+                    message: format!("adapter/btor2/cegar (PO-2 cube-modal soundness): {msg}"),
+                });
+            }
+        }
+
         // R.5 B.4.a (2026-06-01) — smart `max_iterations` cap.
         // When the predicate source is WP AND the first lift
         // emits a UF-wrap warning AND `smart_uf_cap` is on

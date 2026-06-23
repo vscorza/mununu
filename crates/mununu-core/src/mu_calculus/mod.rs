@@ -263,6 +263,71 @@ impl Formula {
     }
 }
 
+/// PO-2 (cube-modal soundness audit, 2026-06-23) — scan a formula for
+/// modality forms that fall OUTSIDE the one audited-sound predicate-cube
+/// fragment (`Control::All`, bare/label-agnostic, unbounded — the only
+/// slice the §4.5 preservation theorem covers over a cube; see
+/// `.claude/reviews/cube-modal-soundness/`). Returns one human-readable
+/// soundness warning per offending modality (deduplicated).
+///
+/// `cube_labels` is the set of label symbols the cube actually carries: a
+/// label-specific modality on one of those is sound (it equals the bare
+/// modality), while one on any other label is *vacuous* because the cube
+/// collapses every concrete action onto its own label(s). The `control`
+/// and `bounded` checks are cube-label-independent (out-of-fragment over
+/// any cube).
+///
+/// Used by the CEGAR loop ([`crate::adapter::btor2::cegar`]) to surface a
+/// warning on the `btor2 cegar` / `sv cegar` / `/cegar` cube surfaces,
+/// making the out-of-fragment boundary explicit rather than silently
+/// returning an unsound/unaudited/vacuous verdict.
+pub fn cube_modality_soundness_warnings(
+    formula: &Formula,
+    cube_labels: &std::collections::HashSet<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for node in formula.nodes() {
+        let Node::Modal { kind, guard, .. } = node else {
+            continue;
+        };
+        let op = match kind {
+            ModalKind::Box => "[]",
+            ModalKind::Diamond => "<>",
+        };
+        if guard.control != Control::All {
+            out.push(format!(
+                "{op} modality with ctrl={:?} over a predicate cube: the per-player \
+                 (controller × environment) game semantics is UNAUDITED (PO-3 / R.6.8; \
+                 de Alfaro–Godefroid–Jagadeesan LICS 2004) — this is NOT a sound definite \
+                 controllability verdict. Use a bare {op} for verification, or treat the \
+                 result as a design-pattern demonstration until R.6.8 closes.",
+                guard.control
+            ));
+        }
+        if let Some(k) = guard.max_steps {
+            out.push(format!(
+                "{op} bounded modality (steps={k}) over a predicate cube: the may/must \
+                 (3-valued) filter is NOT applied to bounded modal steps (PO-4 / R.6.3.b), \
+                 so the 3-valued soundness of the bounded verdict is not established. Use an \
+                 unbounded {op} for a sound cube verdict."
+            ));
+        }
+        for lbl in &guard.labels {
+            if !cube_labels.contains(lbl.as_str()) {
+                out.push(format!(
+                    "{op}{{{lbl}}} label-specific modality over a predicate cube: the cube \
+                     collapses every concrete action onto its own label(s) {cube_labels:?}, so \
+                     a modality on '{lbl}' matches no transition and is VACUOUS. Only bare \
+                     (label-agnostic) {op} modalities are sound over a cube."
+                ));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Arena entry describing a single fixpoint variable (name only for now).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormulaVar {
@@ -485,6 +550,50 @@ mod tests {
         let parsed = parser::parse("true").expect("formula parses");
         let root = parsed.root();
         assert!(matches!(parsed.node(root), super::Node::True));
+    }
+
+    /// PO-2 — the cube-modal soundness linter flags out-of-fragment
+    /// modality forms (controllability / bounded / non-cube-label) and
+    /// stays silent on the audited-sound fragment (bare `Control::All`).
+    #[test]
+    fn po2_cube_modality_soundness_warnings() {
+        use super::cube_modality_soundness_warnings;
+        let cube_labels: std::collections::HashSet<&str> = ["step"].into_iter().collect();
+        let warn = |s: &str| {
+            cube_modality_soundness_warnings(&parser::parse(s).expect("parse"), &cube_labels)
+        };
+
+        // Sound fragment: no warnings.
+        assert!(warn("<>p").is_empty(), "bare diamond is in-fragment");
+        assert!(warn("[]p").is_empty(), "bare box is in-fragment");
+        assert!(
+            warn("<step>p").is_empty(),
+            "<step> == bare over a single-`step` cube ⇒ sound"
+        );
+        assert!(
+            warn("nu X. (p && [] X)").is_empty(),
+            "alternation-free bare safety is in-fragment"
+        );
+
+        // Controllability ⇒ unaudited (PO-3).
+        let w = warn("[ (ctrl = controllable) ] p");
+        assert_eq!(w.len(), 1, "one ctrl warning: {w:?}");
+        assert!(w[0].contains("UNAUDITED") && w[0].contains("R.6.8"));
+
+        // Bounded ⇒ 3-valued-blind (PO-4).
+        let w = warn("< (steps = 5) > p");
+        assert_eq!(w.len(), 1, "one bounded warning: {w:?}");
+        assert!(w[0].contains("steps=5") && w[0].contains("R.6.3.b"));
+
+        // Label-specific on a non-cube label ⇒ vacuous.
+        let w = warn("<foo>p");
+        assert_eq!(w.len(), 1, "one label warning: {w:?}");
+        assert!(w[0].contains("VACUOUS") && w[0].contains("foo"));
+
+        // Combined on one node ⇒ both control + bounded fire; dedup keeps
+        // distinct messages.
+        let w = warn("< (steps = 2, ctrl = controllable) > p");
+        assert_eq!(w.len(), 2, "control + bounded both flagged: {w:?}");
     }
 
     #[test]
