@@ -2980,6 +2980,172 @@ mod tests {
         edges
     }
 
+    /// A set of `(src_cube, tgt_cube)` edges, indexed by cube state index.
+    type CubeEdgeSet = std::collections::HashSet<(usize, usize)>;
+
+    /// PO-1 helper (cube-modal soundness audit, 2026-06-23). Lifts `btor2`
+    /// over `predicates` with the SOUND may (`SmtAllPairs`, ∃) + must
+    /// (`SmtPerTargetStandard`, ∀∃) relations, then builds the concrete
+    /// cube→cube transition relation from an INDEPENDENT oracle
+    /// (`simulate_one_step` over every state value × input combo). Returns
+    /// `(may_edges, must_edges, concrete_edges)`. Predicates are equality
+    /// checks on a single state register, so `cube_of(v)` = the bit-pattern
+    /// of which predicate values equal `v`, indexed by `result.predicates`
+    /// (the lifter's own cube-bit order).
+    fn may_must_concrete_brackets(
+        btor2: &str,
+        predicates: Vec<PredicateSpec>,
+        state_sym: &str,
+        state_values: &[u128],
+        inputs: &[(&str, &[u128])],
+    ) -> (CubeEdgeSet, CubeEdgeSet, CubeEdgeSet) {
+        use crate::clts::TransitionModality;
+        let lift_opts = PredicateCubeLiftOptions {
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
+            ..Default::default()
+        };
+        let result = predicate_cube_lift(predicates, btor2, &AdapterOptions::default(), &lift_opts)
+            .expect("predicate_cube_lift");
+        let preds = result.predicates.clone();
+        let cube_of = |v: u128| -> usize {
+            let mut idx = 0usize;
+            for (i, p) in preds.iter().enumerate() {
+                if p.value as u128 == v {
+                    idx |= 1 << i;
+                }
+            }
+            idx
+        };
+
+        // Independent concrete oracle: enumerate every (state, input combo)
+        // and record the cube→cube edge it induces.
+        let file = crate::adapter::btor2::parser::parse(btor2).expect("parse btor2");
+        let mut combos: Vec<std::collections::HashMap<String, u128>> =
+            vec![std::collections::HashMap::new()];
+        for (name, vals) in inputs {
+            let mut next = Vec::new();
+            for base in &combos {
+                for v in *vals {
+                    let mut m = base.clone();
+                    m.insert((*name).to_string(), *v);
+                    next.push(m);
+                }
+            }
+            combos = next;
+        }
+        let mut concrete = std::collections::HashSet::new();
+        for &v in state_values {
+            let regs = std::collections::HashMap::from([(state_sym.to_string(), v)]);
+            for combo in &combos {
+                let nxt = crate::adapter::btor2::bit_blast::simulate_one_step(&file, &regs, combo)
+                    .expect("simulate_one_step");
+                let nv = *nxt.get(state_sym).expect("next-state value present");
+                concrete.insert((cube_of(v), cube_of(nv)));
+            }
+        }
+
+        let may = collect_cube_edges(&result.clts);
+        let mut must = std::collections::HashSet::new();
+        for s in result.clts.states() {
+            for t in result.clts.outgoing(s) {
+                if matches!(
+                    t.modality(),
+                    TransitionModality::Sharp | TransitionModality::MustHyperOnly(_)
+                ) {
+                    must.insert((s.index(), t.target().index()));
+                }
+            }
+        }
+        (may, must, concrete)
+    }
+
+    /// PO-1 (cube-modal soundness audit, 2026-06-23) — the predicate-cube
+    /// lift produces a SOUND KMTS: `may` OVER-approximates and `must`
+    /// UNDER-approximates the concrete BTOR2 relation. These are exactly
+    /// the two premises the §4.5 preservation theorem needs (may-step
+    /// accommodation `R ⊆ γ(R_may)` + must-step preservation
+    /// `R_must ⊆ ᾱ(R)`). With PO-5 (the evaluator computes §4.3 over
+    /// whatever KMTS it is handed) this closes the end-to-end soundness
+    /// chain for the audited-sound fragment: a sound KMTS in, §4.3 out,
+    /// preservation transfers the definite verdict to the concrete design.
+    ///
+    /// Deterministic fixture (1-bit toggle): `may == must == concrete` —
+    /// exact, no over/under gap.
+    #[test]
+    fn po1_cube_brackets_concrete_deterministic_toggle() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_1".into(),
+            register: "cnt_q".into(),
+            value: 1,
+        }];
+        let (may, must, concrete) =
+            may_must_concrete_brackets(ALIASED_TOGGLE_BTOR2, preds, "cnt_d", &[0, 1], &[]);
+
+        assert!(
+            concrete.is_subset(&may),
+            "may must OVER-approximate concrete: may={may:?} concrete={concrete:?}"
+        );
+        assert!(
+            must.is_subset(&concrete),
+            "must must UNDER-approximate concrete: must={must:?} concrete={concrete:?}"
+        );
+        // cube_0 = {cnt=0}, cube_1 = {cnt=1}; toggle ⇒ {0→1, 1→0}, tight.
+        let expected: std::collections::HashSet<(usize, usize)> =
+            [(0, 1), (1, 0)].into_iter().collect();
+        assert_eq!(concrete, expected, "toggle concrete relation");
+        assert_eq!(may, expected, "deterministic ⇒ may has no spurious edges");
+        assert_eq!(
+            must, expected,
+            "deterministic ⇒ every concrete edge is a must"
+        );
+    }
+
+    /// PO-1 — nondeterministic fixture (2-bit down-counter with a free
+    /// `clr` input) under a COARSE predicate `cnt=0`, so `cube_0 =
+    /// {cnt∈1,2,3}` spans three concrete states and the over/under gap is
+    /// real. `may ⊇ concrete`, `must ⊆ concrete`, AND `must ⊊ may`:
+    /// `cube_0→cube_0` is may-only — `cnt=1` decrements only to `0` (it
+    /// cannot stay in {1,2,3}), so the move is possible but not forced.
+    #[test]
+    fn po1_cube_brackets_concrete_nondeterministic_gap() {
+        let preds = vec![PredicateSpec {
+            name: "cnt_is_0".into(),
+            register: "cnt".into(),
+            value: 0,
+        }];
+        let (may, must, concrete) = may_must_concrete_brackets(
+            COUNTER_BTOR2,
+            preds,
+            "cnt",
+            &[0, 1, 2, 3],
+            &[("clr", &[0, 1])],
+        );
+
+        assert!(
+            concrete.is_subset(&may),
+            "may must OVER-approximate concrete: may={may:?} concrete={concrete:?}"
+        );
+        assert!(
+            must.is_subset(&concrete),
+            "must must UNDER-approximate concrete: must={must:?} concrete={concrete:?}"
+        );
+        // The over/under gap: cube_0→cube_0 (cube_0 = {cnt∈1,2,3}).
+        let self_loop_0 = (0usize, 0usize);
+        assert!(
+            may.contains(&self_loop_0),
+            "cube_0→cube_0 IS concretely possible (cnt=2→1): may={may:?}"
+        );
+        assert!(
+            !must.contains(&self_loop_0),
+            "cube_0→cube_0 is NOT forced (cnt=1 decrements only to 0): must={must:?}"
+        );
+        assert!(
+            must.len() < may.len(),
+            "the may/must gap must be non-empty: may={may:?} must={must:?}"
+        );
+    }
+
     #[test]
     fn p1_predicate_cube_lift_resolves_alias_register_eager() {
         // Predicate names the alias `cnt_q`. Pre-P1 this errored with
