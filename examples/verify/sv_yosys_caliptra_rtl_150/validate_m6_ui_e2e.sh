@@ -108,7 +108,7 @@ PY
 import json, sys
 r = json.load(open(sys.argv[1]))
 v = r["verdict"]
-print(f'  {v["true_cells"]}', end="")  # T-cell count to stdout for the caller
+print(f'{v["true_cells"]} {v["unknown_cells"]}')  # "T ⊥" to stdout for the caller
 import sys as _s; _s.stderr.write(
   f'  verdict T={v["true_cells"]} F={v["false_cells"]} ⊥={v["unknown_cells"]} '
   f'| terminated={r["terminated_with"]} | iterations={len(r["iterations"])}\n')
@@ -117,29 +117,36 @@ PY
 
 echo
 echo "--- POST pre_fix (bug-bearing) ---"
-PRE_T="$(post_variant pre_fix | tr -d ' ')"
+read -r PRE_T PRE_BOT < <(post_variant pre_fix)
 echo "--- POST post_fix (fixed) ---"
-POST_T="$(post_variant post_fix | tr -d ' ')"
+read -r POST_T POST_BOT < <(post_variant post_fix)
 
 echo
-echo "pre_fix  True cells (hazard reachable): ${PRE_T}"
-echo "post_fix True cells (hazard reachable): ${POST_T}"
+echo "pre_fix : T=${PRE_T} ⊥=${PRE_BOT}"
+echo "post_fix: T=${POST_T} ⊥=${POST_BOT}"
 
-if [[ -z "${PRE_T}" || -z "${POST_T}" ]]; then
+if [[ -z "${PRE_T}" || -z "${PRE_BOT}" || -z "${POST_T}" || -z "${POST_BOT}" ]]; then
   echo "FAIL: could not parse a verdict from one of the API responses" >&2
   exit 1
 fi
-# Same done-criterion as validate_m4_cegar.sh — but established over the HTTP
-# endpoint the UI panel calls, not the CLI.
-if [[ "${PRE_T}" -ge 1 && "${POST_T}" -eq 0 ]]; then
+# SOUND done-criterion — mirrors validate_m4_cegar.sh (IR-track P3.4, 2026-06-22),
+# but established over the HTTP endpoint the RefinementTracePanel calls.
+# The original M.6 criterion (post_fix True==0, "hazard UNREACHABLE") was UNSOUND:
+# it relied on the Skolem-collapsed `<>`→`[]` diamond. Under the corrected
+# EXISTENTIAL `Control::All` diamond the {p5,p6,p7} cube cannot PROVE the fixed
+# FSM safe — post_fix is genuinely KleeneBot. The milestone is the sound pre/post
+# DISTINCTION (definite hazard → indefinite), now matched bit-for-bit with the
+# CLI verdict (validate_m4_cegar.sh) over the wire.
+if [[ "${PRE_T}" -ge 1 && "${PRE_BOT}" -eq 0 && "${POST_BOT}" -ge 1 ]]; then
   echo
-  echo "=== M.6 API-E2E PASSED ==="
+  echo "=== M.6 API-E2E PASSED (sound pre/post distinction) ==="
   echo "The /api/v1/btor2/cegar endpoint (the RefinementTracePanel's backend)"
   echo "reproduces the M.4 pre/post-distinguishing CWE-1245 verdict over HTTP:"
-  echo "  pre_fix  hazard REACHABLE   (${PRE_T} True cells)"
-  echo "  post_fix hazard UNREACHABLE (0 True cells)"
+  echo "  pre_fix : undefined-encoding latch DEFINITELY present (T=${PRE_T}, ⊥=0) — CWE-1245 detected (sound)."
+  echo "  post_fix: undefined-encoding latch NO LONGER DEFINITE (⊥=${POST_BOT}) — the fix removes the definite hazard."
+  echo "  NOTE: post_fix is KleeneBot, not definite-safe — the {p5,p6,p7} cube cannot soundly PROVE the fixed FSM safe."
 else
-  echo "FAIL: expected pre_fix True>=1 and post_fix True==0; got pre=${PRE_T} post=${POST_T}" >&2
+  echo "FAIL: expected pre(T>=1, ⊥==0) and post(⊥>=1); got pre(T=${PRE_T},⊥=${PRE_BOT}) post(T=${POST_T},⊥=${POST_BOT})" >&2
   exit 1
 fi
 

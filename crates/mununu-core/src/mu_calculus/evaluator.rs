@@ -4917,6 +4917,128 @@ mod modal_trit_draft_tests {
         );
     }
 
+    /// PO-5 (cube-modal soundness audit, 2026-06-23) — the production
+    /// `KleeneDom` modal step computes EXACTLY the Bruns–Godefroid
+    /// standard-KMTS 3-valued modal semantics of `kmts-theory.md` §4.3:
+    ///
+    /// ```text
+    /// ⟦⟨a⟩φ⟧ = T iff ∃ must-edge→(φ=T);  F iff ∀ may-edge→(φ=F);  else ⊥
+    /// ⟦[a]φ⟧  = T iff ∀ may-edge→(φ=T);   F iff ∃ must-edge→(φ=F); else ⊥
+    /// ```
+    ///
+    /// This pins the one audited-sound cell of the cube-modal matrix —
+    /// `Control::All`, bare (label-agnostic) modalities — to the published
+    /// preservation theorem (`kmts-theory.md` §4.5), the slice the M.4 /
+    /// verification path rides on. It turns verdict-by-example (the
+    /// `r6_3_*` / `p3_4_*` cases) into verdict-by-enumeration: every 2-edge
+    /// KMTS over {Sharp, MayOnly} × {T, F} target labels (16 fixtures ×
+    /// {◇, □}) is checked against the §4.3 reference computed inline. All
+    /// three verdicts {T, F, ⊥} are still exercised — ⊥ arises from the
+    /// `MayOnly` edge modality, exactly as the cube produces it.
+    ///
+    /// **Scope: definite (T/F) state predicates only.** The predicate-cube
+    /// lift assigns only `KleeneT`/`KleeneF` to state predicates ("No
+    /// `KleeneBot` values are produced", `adapter/btor2/kmts_lift.rs:19`);
+    /// a cube fixes each predicate. So this enumeration covers the cube's
+    /// actual labelling. `KleeneBot` *state predicates* are out of scope
+    /// (a future predicate-image refinement may introduce them per
+    /// `kmts_lift.rs:33`); the box *may*-side mishandles that corner today
+    /// (returns definite-`F` where §4.3 says `⊥`) — a gated obligation
+    /// recorded in the cube-modal soundness audit, NOT exercised here.
+    /// `MustHyperOnly` (cardinality > 1) is covered by `r6_4_*`.
+    #[test]
+    fn po5_kleene_modal_matches_bruns_godefroid_4_3() {
+        use crate::clts::{TransitionModality, Tristate};
+
+        type Edge = (TransitionModality<DefaultStateIdx>, Tristate);
+
+        fn is_must(m: &TransitionModality<DefaultStateIdx>) -> bool {
+            matches!(
+                m,
+                TransitionModality::Sharp | TransitionModality::MustHyperOnly(_)
+            )
+        }
+
+        // kmts-theory.md §4.3 reference clauses (T-then-F-then-⊥; the T/F
+        // conditions are mutually exclusive on a consistent KMTS).
+        fn ref_diamond(edges: &[Edge]) -> Trit {
+            if edges
+                .iter()
+                .any(|(m, l)| is_must(m) && *l == Tristate::KleeneT)
+            {
+                Trit::True
+            } else if edges.iter().all(|(_, l)| *l == Tristate::KleeneF) {
+                Trit::False
+            } else {
+                Trit::Unknown
+            }
+        }
+        fn ref_box(edges: &[Edge]) -> Trit {
+            if edges.iter().all(|(_, l)| *l == Tristate::KleeneT) {
+                Trit::True
+            } else if edges
+                .iter()
+                .any(|(m, l)| is_must(m) && *l == Tristate::KleeneF)
+            {
+                Trit::False
+            } else {
+                Trit::Unknown
+            }
+        }
+
+        fn build(edges: &[Edge]) -> Clts<DefaultStateIdx, DefaultLabelIdx> {
+            let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+            builder.state("s0").initial("s0");
+            let act = builder.labels().intern(["a"]).expect("intern a");
+            let s0 = builder.state_id_or_insert("s0").expect("s0");
+            // s0's own `p` is irrelevant to ⟨a⟩p / [a]p AT s0 (those read
+            // the targets' `p`); set it so every state has the atom bound.
+            builder.with_3valued_predicate(s0, "p".to_string(), Tristate::KleeneF);
+            for (i, (modality, label)) in edges.iter().enumerate() {
+                let name = format!("t{i}");
+                builder.state(&name);
+                let t = builder.state_id_or_insert(&name).expect("t");
+                builder.with_3valued_predicate(t, "p".to_string(), *label);
+                builder.transition_ids_with_modality(s0, &[act], t, modality.clone());
+            }
+            builder.build().expect("build")
+        }
+
+        let modalities: [TransitionModality<DefaultStateIdx>; 2] =
+            [TransitionModality::Sharp, TransitionModality::MayOnly];
+        // Cube state predicates are definite (T/F); ⊥ is driven by edge
+        // modality, not by ⊥ state labels (see the doc-comment scope note).
+        let labels = [Tristate::KleeneT, Tristate::KleeneF];
+        let diamond = parser::parse("<>p").expect("parse <>p");
+        let boxf = parser::parse("[]p").expect("parse []p");
+
+        for m0 in &modalities {
+            for l0 in &labels {
+                for m1 in &modalities {
+                    for l1 in &labels {
+                        let edges: [Edge; 2] = [(m0.clone(), *l0), (m1.clone(), *l1)];
+                        let clts = build(&edges);
+                        let env = Environment::new(clts.state_count());
+                        let s0 = clts.state_id("s0").expect("s0").index();
+
+                        let d = evaluate_tri(&diamond, &clts, &env).expect("eval <>p");
+                        assert_eq!(
+                            d.verdict_at(s0),
+                            ref_diamond(&edges),
+                            "◇p mismatch vs §4.3 for edges {edges:?}"
+                        );
+                        let b = evaluate_tri(&boxf, &clts, &env).expect("eval []p");
+                        assert_eq!(
+                            b.verdict_at(s0),
+                            ref_box(&edges),
+                            "□p mismatch vs §4.3 for edges {edges:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ---- R.6.3 (2026-06-08) — end-to-end through `evaluate_tri` ----
     //
     // Validates that the production `evaluate_tri` (the cheap 3-valued
