@@ -3011,11 +3011,38 @@ fn build_clts_from_unrolled(
     // Add states from unrolled CLTS and mark initial states
     for state in &unrolled.states {
         let state_name = state.state_name();
-        builder.state(&state_name);
+        let state_id = builder.state_id_or_insert(&state_name);
 
         // Mark as initial if the state's location was initial in the original automaton
         if initial_location_names.contains(&state.location) {
             builder.initial(&state_name);
+        }
+
+        // Variable-binding fix (2026-06-23): emit numeric per-state
+        // valuations from the unrolled `AbstractState`'s integer variable
+        // bindings, so the abstract-states wiring later in this module
+        // (gated on `clts_valuations_are_numeric`) binds `var == value`
+        // formula atoms to actual integer values — the same machinery the
+        // BTOR2 bit-blaster's `build_state_valuations` already feeds. Before
+        // this, hand-authored CTXDSL variable-value atoms fell through the
+        // "predicate-not-found → empty bitset" under-approximation and
+        // silently evaluated false. Only `IntConstant` bindings are emitted
+        // (numeric, i64-parseable); bool / interval / non-constant
+        // abstractions are skipped so the all-numeric gate stays honest.
+        if let Some(state_id) = state_id {
+            let valuation: std::collections::BTreeMap<String, String> = state
+                .variables
+                .iter()
+                .filter_map(|(var, val)| match val {
+                    crate::abstraction::value::AbstractValue::IntConstant(n) => {
+                        Some((var.clone(), n.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !valuation.is_empty() {
+                builder.with_valuation_for_state(state_id, valuation);
+            }
         }
     }
 
