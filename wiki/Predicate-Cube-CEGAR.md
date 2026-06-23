@@ -1,6 +1,6 @@
 # Predicate-Cube CEGAR
 
-> **Source of truth:** [`adapter::btor2::cegar::cegar_refine_loop`](../crates/mununu-core/src/adapter/btor2/cegar.rs), [`adapter::btor2::kmts_lift::predicate_cube_lift`](../crates/mununu-core/src/adapter/btor2/kmts_lift.rs), [`mu_calculus::evaluate_tri`](../crates/mununu-core/src/mu_calculus/evaluator.rs) — surface: CLI+API+UI (`mununu btor2 cegar` / `mununu sv cegar`, `POST /api/v1/btor2/cegar` / `POST /api/v1/sv/cegar`, the `/cegar` panel).
+> **Source of truth:** [`adapter::btor2::cegar::cegar_refine_loop`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/cegar.rs), [`adapter::btor2::kmts_lift::predicate_cube_lift`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/kmts_lift.rs), [`mu_calculus::evaluate_tri`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/mu_calculus/evaluator.rs) — surface: CLI+API+UI (`mununu btor2 cegar` / `mununu sv cegar`, `POST /api/v1/btor2/cegar` / `POST /api/v1/sv/cegar`, the `/cegar` panel).
 
 Predicate-cube CEGAR is mununu's **second RTL verification engine**. Where the
 [RTL Verification Pipeline](RTL-Verification-Pipeline) bit-blasts the design into
@@ -42,7 +42,7 @@ one-call variant that runs sv2v + Yosys for you.
 
 ## CLI
 
-> **Source of truth:** the `btor2 cegar` / `sv cegar` subcommands in [`crates/mununu-cli/src/main.rs`](../crates/mununu-cli/src/main.rs) — surface: CLI.
+> **Source of truth:** the `btor2 cegar` / `sv cegar` subcommands in [`crates/mununu-cli/src/main.rs`](https://github.com/vscorza/mununu/blob/main/crates/mununu-cli/src/main.rs) — surface: CLI.
 
 ```bash
 mununu btor2 cegar <design.btor2> \
@@ -86,7 +86,7 @@ Each cube gets one of three verdicts, and the CLI prints the tally as
 
 ## Soundness — the audited-sound fragment
 
-> **Source of truth:** [`mu_calculus::cube_modality_soundness_warnings`](../crates/mununu-core/src/mu_calculus/mod.rs) — surface: CLI+API+UI (the cegar `warnings` channel). Full write-up: [`docs/design/predicate-abstraction-recipe.md`](../docs/design/predicate-abstraction-recipe.md) §4.9.
+> **Source of truth:** [`mu_calculus::cube_modality_soundness_warnings`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/mu_calculus/mod.rs) — surface: CLI+API+UI (the cegar `warnings` channel). Full write-up: [`docs/design/predicate-abstraction-recipe.md`](https://github.com/vscorza/mununu/blob/main/docs/design/predicate-abstraction-recipe.md) §4.9.
 
 A definite verdict transfers soundly for the fragment the cube path actually
 evaluates: **bare (label-agnostic), single-agent (`Control::All`), unbounded**
@@ -117,7 +117,7 @@ warnings:
 
 ## Worked example — Caliptra boot-FSM (CWE-1245)
 
-> **Runnable:** [`examples/verify/sv_yosys_caliptra_rtl_150/validate_m4_cegar.sh`](../examples/verify/sv_yosys_caliptra_rtl_150/) (requires `yosys` + `sv2v` + `z3` on `PATH`). This is mununu's M.4 milestone — full automated CEGAR on real industrial RTL.
+> **Runnable:** [`examples/verify/sv_yosys_caliptra_rtl_150/validate_m4_cegar.sh`](https://github.com/vscorza/mununu/tree/main/examples/verify/sv_yosys_caliptra_rtl_150/) (requires `yosys` + `sv2v` + `z3` on `PATH`). This is mununu's M.4 milestone — full automated CEGAR on real industrial RTL.
 
 The Caliptra `soc_ifc_boot_fsm` holds its state in a 3-bit `boot_fsm_state_e`
 register with five legal encodings (0–4). The bug-bearing `pre_fix` variant has a
@@ -145,7 +145,7 @@ abstraction / CEGAR to convergence.
 
 ## API + UI
 
-- **API:** `POST /api/v1/btor2/cegar` and `POST /api/v1/sv/cegar` ([`crates/mununu-core/src/api/handlers.rs`](../crates/mununu-core/src/api/handlers.rs)) return the per-iteration trace + the `{T, F, ⊥}` verdict + the `warnings` list.
+- **API:** `POST /api/v1/btor2/cegar` and `POST /api/v1/sv/cegar` ([`crates/mununu-core/src/api/handlers.rs`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs)) return the per-iteration trace + the `{T, F, ⊥}` verdict + the `warnings` list.
 - **UI:** the `/cegar` panel renders the verdict with `KleeneBot` iconography, the per-iteration refinement trace, the final predicate set, and the soundness warnings; it round-trips a predicate edit and re-runs.
 
 ## See Also
@@ -153,5 +153,5 @@ abstraction / CEGAR to convergence.
 - [RTL Verification Pipeline](RTL-Verification-Pipeline) — the complementary bit-blast engine
 - [Mu-Calculus Reference](Mu-Calculus-Reference) — `<>` / `[]`, controllability operators, fixpoints
 - [Adapter Formats](Adapter-Formats) — BTOR2 + SystemVerilog import
-- [`docs/design/predicate-abstraction-recipe.md`](../docs/design/predicate-abstraction-recipe.md) — the full operational recipe (predicate seeding, may/must image, CEGAR, §4.9 soundness)
-- [`docs/design/kmts-theory.md`](../docs/design/kmts-theory.md) — KMTS + 3-valued mu-calculus theory
+- [`docs/design/predicate-abstraction-recipe.md`](https://github.com/vscorza/mununu/blob/main/docs/design/predicate-abstraction-recipe.md) — the full operational recipe (predicate seeding, may/must image, CEGAR, §4.9 soundness)
+- [`docs/design/kmts-theory.md`](https://github.com/vscorza/mununu/blob/main/docs/design/kmts-theory.md) — KMTS + 3-valued mu-calculus theory

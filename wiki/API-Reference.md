@@ -2,7 +2,9 @@
 
 # API Reference
 
-Mununu exposes a REST API for programmatic access to context summarization, controller synthesis, graph generation, and formula verification. The server is built on [Axum](https://github.com/tokio-rs/axum) and listens on a configurable address (default `127.0.0.1:3000`).
+Mununu exposes a REST API for programmatic access to context summarization, controller synthesis, graph generation, formula verification, predicate-abstraction CEGAR, AST extraction, assume/guarantee contracts, and HW/SW codesign. The server is built on [Axum](https://github.com/tokio-rs/axum) and listens on a configurable address (default `127.0.0.1:3000`).
+
+> Source of truth: [`api::server::create_router`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/server.rs) — surface: API. (Route table — the canonical list of live endpoints.)
 
 Start the server with:
 
@@ -10,28 +12,64 @@ Start the server with:
 mununu serve --bind 127.0.0.1:3000
 ```
 
-All request and response bodies use `application/json`. CORS is open by default (`Access-Control-Allow-Origin: *`).
+All request and response bodies use `application/json`. CORS is open by default (`Access-Control-Allow-Origin: *`). The request body limit is 1 MiB and the request timeout is 30 s.
 
 ---
 
 ## Table of Contents
 
+**Health**
 - [GET /api/v1/health](#get-apiv1health)
+
+**Context (CTXDSL) endpoints**
 - [POST /api/v1/context/summarize](#post-apiv1contextsummarize)
 - [POST /api/v1/context/synthesize](#post-apiv1contextsynthesize)
 - [POST /api/v1/context/graphs](#post-apiv1contextgraphs)
 - [POST /api/v1/context/verify](#post-apiv1contextverify)
 - [POST /api/v1/context/import](#post-apiv1contextimport)
-- [POST /api/v1/verify](#post-apiv1verify) — general N-source verify framework
+- [POST /api/v1/context/predicates](#post-apiv1contextpredicates)
+
+**Verification framework (N-source)**
+- [POST /api/v1/verify](#post-apiv1verify)
+- [POST /api/v1/verify/memory-check](#post-apiv1verifymemory-check)
+
+**CEGAR (predicate-abstraction refinement)**
+- [POST /api/v1/btor2/cegar](#post-apiv1btor2cegar)
+- [POST /api/v1/sv/cegar](#post-apiv1svcegar)
+
+**AST extraction**
+- [GET /api/v1/extraction/domains](#get-apiv1extractiondomains)
+- [GET /api/v1/extraction/composition-modes](#get-apiv1extractioncomposition-modes)
+- [POST /api/v1/extraction/propose-composition](#post-apiv1extractionpropose-composition)
+- [POST /api/v1/extraction/extract](#post-apiv1extractionextract)
+- [POST /api/v1/extraction/validate](#post-apiv1extractionvalidate)
+
+**Contracts (assume/guarantee, black-box interfaces)**
+- [POST /api/v1/contract/validate](#post-apiv1contractvalidate)
+- [POST /api/v1/contract/discover](#post-apiv1contractdiscover)
+- [POST /api/v1/contract/query](#post-apiv1contractquery)
+- [POST /api/v1/contract/review](#post-apiv1contractreview)
+
+**HW/SW codesign**
+- [POST /api/v1/codesign/verify](#post-apiv1codesignverify)
+- [POST /api/v1/codesign/reconcile-labels](#post-apiv1codesignreconcile-labels)
+- [POST /api/v1/codesign/emit-chaotic-stub](#post-apiv1codesignemit-chaotic-stub)
+
+**Templates**
 - [GET /api/v1/templates](#get-apiv1templates)
+
+**Reference**
 - [Common Types](#common-types)
 - [Error Responses](#error-responses)
+- [Logging](#logging)
 
 ---
 
 ## GET /api/v1/health
 
 Returns the server health status. Use this for readiness probes and connectivity checks.
+
+> Source of truth: [`api::handlers::health_check`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Response
 
@@ -53,6 +91,8 @@ curl http://localhost:3000/api/v1/health
 ## POST /api/v1/context/summarize
 
 Parse a CTXDSL context (with optional sidecar files) and return a summary of all automata, formulas, and declared controllers. Controllers are synthesized on the fly so the response includes realizability and size metrics.
+
+> Source of truth: [`api::handlers::context_summarize_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 > **Adapter formats:** this endpoint accepts CTXDSL only. To summarize an external format (`.xstate.json`, `.sv`, `.tlsf`, `.aag`/`.aig`, `.pml`, `.espec.json`), first translate via [`POST /api/v1/context/import`](#post-apiv1contextimport) and pass the resulting `ctxdsl` field to this endpoint. The CLI command `mununu context summarize <file> --adapter <format>` does this two-step internally; clients of the HTTP API must do it explicitly. The same convention applies to `/context/verify` and `/context/synthesize`.
 
@@ -123,11 +163,7 @@ curl -X POST http://localhost:3000/api/v1/context/summarize \
   "summary": {
     "context_name": "traffic",
     "automata": [
-      {
-        "name": "light",
-        "states_count": 2,
-        "transitions_count": 2
-      }
+      { "name": "light", "states_count": 2, "transitions_count": 2 }
     ],
     "formulas_count": 0,
     "controllers_count": 0,
@@ -140,7 +176,9 @@ curl -X POST http://localhost:3000/api/v1/context/summarize \
 
 ## POST /api/v1/context/synthesize
 
-Synthesize a controller for a given automaton and mu-calculus formula. The controller restricts the system's controllable transitions so that the formula is satisfied. When the specification is realizable, the response includes the controller serialized as CTXDSL source.
+Synthesize a controller for a given automaton and mu-calculus formula. The controller restricts the system's controllable transitions so that the formula is satisfied. When the specification is realizable, the response includes the controller serialized as CTXDSL source (and, optionally, in a native target format).
+
+> Source of truth: [`api::handlers::context_synthesize_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Request Body
 
@@ -149,7 +187,8 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 | `context` | `FileContent` | Yes | Main CTXDSL file. |
 | `sidecars` | `SidecarFile[]` | No | Sidecar files. Defaults to `[]`. |
 | `automaton` | `string` | Yes | Target automaton name. |
-| `formula` | `string` | Yes | Formula name defined in the context. |
+| `formula` | `string \| null` | One of `formula` / `template_ref` | Formula name defined in the context. Mutually exclusive with `template_ref`. |
+| `template_ref` | `TemplateRef \| null` | One of `formula` / `template_ref` | Instantiate a [property template](Property-Templates) instead of selecting an existing formula. `{"template": "no_deadlock"}` or `{"template": "reachable", "args": {"TARGET": "Idle"}}`. Mutually exclusive with `formula`. |
 | `options` | `SynthesisOptions` | No | Synthesis configuration. |
 
 **SynthesisOptions**
@@ -159,7 +198,7 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 | `minimize` | `boolean` | `false` | Apply bisimulation minimization to the controller. |
 | `diagnostics` | `DiagnosticsOptions` | `{}` | Control diagnostic output. |
 | `extract_strategy` | `boolean` | `false` | **Legacy** — equivalent to `controller_mode: "functional"`. When `controller_mode` is set, that takes precedence. |
-| `controller_mode` | `string \| null` | `null` (= `"projection"` or `"functional"` if `extract_strategy=true`) | Controller extraction mode. One of `"projection"`, `"functional"`, `"permissive"`, `"signature-memory"`, `"product-game"`, `"parity-game"`. Case-insensitive; dashes/underscores interchangeable. Unknown values return `400 Bad Request`. See [Controller Modes](Controller-Modes.md) for the full reference. |
+| `controller_mode` | `string \| null` | `null` (= `"projection"`, or `"functional"` if `extract_strategy=true`) | Controller extraction mode. One of `"projection"`, `"functional"`, `"permissive"`, `"signature-memory"`, `"product-game"`, `"parity-game"`. Case-insensitive; dashes/underscores interchangeable. Unknown values return `400 Bad Request`. See [Controller Modes](Controller-Modes.md) for the full reference. |
 | `output_format` | `string \| null` | `null` | Native controller export format: `"xstate"` or `"systemverilog"`/`"sv"`. When set, the response includes a `controller_native` field. |
 
 **DiagnosticsOptions**
@@ -178,8 +217,9 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 | `success` | `boolean` | `true` on success. |
 | `realizable` | `boolean` | Whether a winning controller exists. |
 | `controller` | `FileContent \| null` | Synthesized controller as CTXDSL. `null` when unrealizable. |
+| `controller_native` | `FileContent \| null` | Controller in the requested native format (`output_format`). Omitted unless requested. |
 | `diagnostics` | `SynthesisDiagnostics` | Diagnostic information. |
-| `counterstrategy` | `CounterstrategyResult \| null` | Environment counterstrategy graph for unrealizable cases. Automatically computed when synthesis fails. See [CounterstrategyResult](#counterstrategyresult) below. |
+| `counterstrategy` | `CounterstrategyResult \| null` | Environment counterstrategy graph for unrealizable cases. Automatically computed when synthesis fails. See the `CounterstrategyResult` table under [POST /api/v1/context/verify](#post-apiv1contextverify). |
 
 **SynthesisDiagnostics**
 
@@ -224,19 +264,12 @@ Synthesize a controller for a given automaton and mu-calculus formula. The contr
 curl -X POST http://localhost:3000/api/v1/context/synthesize \
   -H "Content-Type: application/json" \
   -d '{
-    "context": {
-      "name": "arbiter.ctxdsl",
-      "content": "... CTXDSL source ..."
-    },
+    "context": { "name": "arbiter.ctxdsl", "content": "... CTXDSL source ..." },
     "automaton": "arbiter",
     "formula": "mutual_exclusion",
     "options": {
       "minimize": true,
-      "diagnostics": {
-        "counterexample": true,
-        "deadlock_traces": true,
-        "max_counter_traces": 5
-      }
+      "diagnostics": { "counterexample": true, "deadlock_traces": true, "max_counter_traces": 5 }
     }
   }'
 ```
@@ -257,11 +290,7 @@ curl -X POST http://localhost:3000/api/v1/context/synthesize \
     "counterexample_trace": null,
     "counterstrategy_traces": [],
     "deadlock_traces": [],
-    "minimization": {
-      "removed_states": 3,
-      "removed_transitions": 7,
-      "merged_states": ["s1_s3", "s2_s4"]
-    },
+    "minimization": { "removed_states": 3, "removed_transitions": 7, "merged_states": ["s1_s3", "s2_s4"] },
     "proof_obligations": []
   }
 }
@@ -301,6 +330,8 @@ curl -X POST http://localhost:3000/api/v1/context/synthesize \
 ## POST /api/v1/context/graphs
 
 Generate Cytoscape-compatible graph elements for automata, compositions, and (optionally) synthesized controllers. Returns nodes and edges that can be rendered directly in a Cytoscape.js visualization layer.
+
+> Source of truth: [`api::handlers::context_graphs_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Request Body
 
@@ -348,6 +379,7 @@ Generate Cytoscape-compatible graph elements for automata, compositions, and (op
 | `parent` | `string \| null` | Parent node ID for compound graphs. |
 | `vars` | `string[]` | State variable annotations. |
 | `actions` | `string[]` | Enabled actions. |
+| `valuations` | `{ [name: string]: string } \| null` | Structured per-state variable valuations (e.g. `{is_red: "0", phase: "green"}`). Sourced from adapter side-channels (SV Kripke, BTOR2, extraction). Omitted when empty. |
 
 **GraphElementData (Edge)**
 
@@ -362,6 +394,7 @@ Generate Cytoscape-compatible graph elements for automata, compositions, and (op
 | `action_type` | `string \| null` | `"controllable"` or `"uncontrollable"`. |
 | `guard` | `string \| null` | Guard expression. |
 | `effect` | `string \| null` | Effect expression. |
+| `modality` | `string \| null` | KMTS transition modality: `"sharp"`, `"may_only"`, or `"must_hyper_only"`. Omitted (≡ `"sharp"`) on edges that don't come from a CLTS transition or for the default case. |
 
 **GraphMetadata**
 
@@ -377,10 +410,7 @@ Generate Cytoscape-compatible graph elements for automata, compositions, and (op
 curl -X POST http://localhost:3000/api/v1/context/graphs \
   -H "Content-Type: application/json" \
   -d '{
-    "context": {
-      "name": "traffic.ctxdsl",
-      "content": "... CTXDSL source ..."
-    },
+    "context": { "name": "traffic.ctxdsl", "content": "... CTXDSL source ..." },
     "graph_types": ["dsl", "unrolled"],
     "include_controllers": true,
     "minimize_controllers": true
@@ -404,27 +434,11 @@ curl -X POST http://localhost:3000/api/v1/context/graphs \
       "automaton": "light",
       "graph_type": "dsl",
       "elements": [
-        {
-          "data": { "type": "node", "id": "light_red", "label": "red", "vars": [], "actions": ["go"] },
-          "position": null,
-          "classes": "state initial"
-        },
-        {
-          "data": { "type": "node", "id": "light_green", "label": "green", "vars": [], "actions": ["stop"] },
-          "position": null,
-          "classes": "state"
-        },
-        {
-          "data": { "type": "edge", "id": "light_e0", "source": "light_red", "target": "light_green", "label": "go", "action": "go", "action_type": "controllable" },
-          "position": null,
-          "classes": null
-        }
+        { "data": { "type": "node", "id": "light_red", "label": "red", "vars": [], "actions": ["go"] }, "position": null, "classes": "state initial" },
+        { "data": { "type": "node", "id": "light_green", "label": "green", "vars": [], "actions": ["stop"] }, "position": null, "classes": "state" },
+        { "data": { "type": "edge", "id": "light_e0", "source": "light_red", "target": "light_green", "label": "go", "action": "go", "action_type": "controllable" }, "position": null, "classes": null }
       ],
-      "metadata": {
-        "states_count": 2,
-        "transitions_count": 2,
-        "initial_states": ["red"]
-      }
+      "metadata": { "states_count": 2, "transitions_count": 2, "initial_states": ["red"] }
     }
   ]
 }
@@ -435,6 +449,8 @@ curl -X POST http://localhost:3000/api/v1/context/graphs \
 ## POST /api/v1/context/verify
 
 Evaluate mu-calculus formulas over automata and report which initial states satisfy or violate each formula. When a formula is not satisfied and `counterstrategy` is requested, the response includes the environment's winning region and a Cytoscape graph of the counterstrategy automaton.
+
+> Source of truth: [`api::handlers::context_verify_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Request Body
 
@@ -447,6 +463,9 @@ Evaluate mu-calculus formulas over automata and report which initial states sati
 | `automaton` | `string \| null` | No | Target automaton. `null` uses each formula's declared targets. |
 | `counterstrategy` | `boolean` | No | Compute counterstrategy for failed formulas. Defaults to `false`. |
 | `minimize_counterstrategy` | `boolean` | No | Apply bisimulation minimization to counterstrategy. Defaults to `false`. |
+| `hide` | `string[]` | No | Labels to hide (reclassify as internal) before evaluation. Defaults to `[]`. |
+| `minimize` | `boolean` | No | Apply bisimulation minimization before evaluation. Defaults to `false`. |
+| `stubs` | `SidecarFile[]` | No | Stub `.espec.json` content to compose as sidecars (interface automata). Defaults to `[]`. |
 
 ### Response Body
 
@@ -486,10 +505,7 @@ Evaluate mu-calculus formulas over automata and report which initial states sati
 curl -X POST http://localhost:3000/api/v1/context/verify \
   -H "Content-Type: application/json" \
   -d '{
-    "context": {
-      "name": "arbiter.ctxdsl",
-      "content": "... CTXDSL source ..."
-    },
+    "context": { "name": "arbiter.ctxdsl", "content": "... CTXDSL source ..." },
     "formula": "mutual_exclusion",
     "automaton": "arbiter",
     "counterstrategy": true,
@@ -519,65 +535,50 @@ curl -X POST http://localhost:3000/api/v1/context/verify \
 }
 ```
 
-### Example Response (Not Satisfied, with Counterstrategy)
-
-```json
-{
-  "success": true,
-  "all_satisfied": false,
-  "results": [
-    {
-      "formula_name": "liveness",
-      "automaton": "arbiter",
-      "satisfied": false,
-      "total_states": 6,
-      "satisfying_states": 4,
-      "initial_states": ["idle"],
-      "initial_satisfying": [],
-      "initial_violating": ["idle"],
-      "satisfying_state_names": ["grant1", "grant2", "wait1", "wait2"],
-      "counterstrategy": {
-        "environment_winning_states": ["idle", "reset"],
-        "graph_elements": [
-          { "data": { "type": "node", "id": "cs_idle", "label": "idle", "vars": [], "actions": [] }, "classes": "winning" },
-          { "data": { "type": "edge", "id": "cs_e0", "source": "cs_idle", "target": "cs_reset", "label": "timeout" } }
-        ],
-        "inverted_formula": "mu X . (<tau> true & [grant] false) | (<tau> X)",
-        "minimized": false
-      }
-    }
-  ]
-}
-```
-
 ---
 
 ## POST /api/v1/context/import
 
-Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela, CrewAI, LangGraph) and translate it to CTXDSL.
+Import an external format (XState, SystemVerilog, TLSF, AIGER, BTOR2, Promela, CrewAI, LangGraph, extraction) and translate it to CTXDSL.
 
-> Source of truth: [`api::handlers::context_import_handler`](../crates/mununu-core/src/api/handlers.rs) — surface: API.
+> Source of truth: [`api::handlers::context_import_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Request Body
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `content` | string | Yes | Raw file content in the source format |
-| `format` | string | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"btor2"` (or `"btor"`), `"promela"`, `"xstate"`, `"systemverilog"` (hand-written parser), `"sv-yosys"` (or `"yosys"`, Yosys-driven elaboration), `"extraction"`, `"crewai"`, `"langgraph"` |
-| `filename` | string | No | Original filename (used for extension-based detection if format is `"auto"`) |
-| `additional_sources` | array | No | Extra SV source files to compile alongside the primary input (Yosys path only). Each entry: `{name, content}`. |
+| `content` | `string` | Yes | Raw file content in the source format. |
+| `format` | `string` | No | Format hint: `"auto"` (default), `"tlsf"`, `"aiger"`, `"btor2"` (or `"btor"`), `"promela"`, `"xstate"`, `"systemverilog"` (hand-written parser), `"sv-yosys"` (or `"yosys"`, Yosys-driven elaboration), `"extraction"`, `"crewai"`, `"langgraph"`. |
+| `filename` | `string \| null` | No | Original filename (used for extension-based detection if format is `"auto"`). |
+| `sidecar` | `string \| null` | No | Optional sidecar content (`.mununu.json` for SV, `.espec.json` for extraction). Drives abstraction/property configuration. |
+| `additional_sources` | `FileContent[]` | No | Extra SV source files to compile alongside the primary input (Yosys path). Each entry: `{name, content}`. |
+| `use_sv2v` | `boolean` | No | When `format == "sv-yosys"`, run the `sv2v` preprocessor before Yosys. Required for modern SV dialects. Mirrors the CLI `--preprocessor sv2v`. Defaults to `false`. |
+| `predicates` | `PredicateSpecRequest[]` | No | Predicate set for the controllability-aware predicate-cube lift. Each entry: `{name, register, value}`. When non-empty (with `controllable_inputs`) and `format` produces BTOR2, the predicate-cube lift runs and a KMTS is returned. Mirrors `--predicate NAME:REG=VALUE`. |
+| `controllable_inputs` | `string[]` | No | Names of BTOR2 input symbols the controller drives. Mirrors `--controllable-input`. Enables the controllability-aware lift when combined with `predicates`. |
+| `sv_source_path` | `string \| null` | No | Filesystem path to the original SV source. With a `simulate_reset` sidecar block and a discoverable Verilator, runs a short reset simulation. Mirrors `--sv-source`. |
+| `sidecar_path` | `string \| null` | No | Filesystem path to the sidecar JSON, used to resolve relative `vcd_traces` entries. Mirrors `--sidecar`. |
+
+**PredicateSpecRequest**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | Human-readable predicate name (e.g. `"burst_zero"`). |
+| `register` | `string` | BTOR2 register symbol the predicate is anchored on. |
+| `value` | `number` | Integer value the predicate witnesses (`register == value`). |
 
 ### Response Body
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `success` | boolean | Whether the import succeeded |
-| `ctxdsl` | string | Translated CTXDSL content |
-| `source_format` | string | Detected source format name |
-| `warnings` | string[] | Translation warnings (unsupported constructs, neutral controllability, etc.) |
-| `signal_count` | number | Number of signals/events in the source |
-| `state_count` | number | Number of states (for signal-state encoding) |
-| `property_count` | number | Number of properties translated |
+| `success` | `boolean` | Whether the import succeeded. |
+| `ctxdsl` | `string` | Translated CTXDSL content. |
+| `source_format` | `string` | Detected source format name. |
+| `warnings` | `string[]` | Translation warnings (unsupported constructs, neutral controllability, etc.). |
+| `signal_count` | `number` | Number of signals/events in the source. |
+| `state_count` | `number` | Number of states (for signal-state encoding). |
+| `property_count` | `number` | Number of properties translated. |
+| `state_valuations` | `object \| null` | State valuations for structured predicate matching, when available. |
+| `transition_observations` | `object \| null` | Per-transition Mealy observations, keyed by automaton name, when the adapter emits them. |
 
 ### Example
 
@@ -594,11 +595,42 @@ See [Adapter Formats](Adapter-Formats.md) for details on each supported format.
 
 ---
 
+## POST /api/v1/context/predicates
+
+List the predicate names declared per automaton in a parsed and realized context. Mirrors `mununu context predicates`. Useful for populating predicate pickers in clients before issuing a verify/synthesize request.
+
+> Source of truth: [`api::handlers::context_predicates_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `context` | `FileContent` | Yes | Main CTXDSL file. |
+| `sidecars` | `SidecarFile[]` | No | Sidecar files. Defaults to `[]`. |
+| `automaton` | `string \| null` | No | Filter to a single automaton. `null` returns every automaton. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | `boolean` | `true` on success. |
+| `predicates` | `{ [automaton: string]: string[] }` | Map from automaton name to its declared predicate names. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/context/predicates \
+  -H "Content-Type: application/json" \
+  -d '{ "context": { "name": "m.ctxdsl", "content": "... CTXDSL source ..." } }'
+```
+
+---
+
 ## POST /api/v1/verify
 
 Run the general N-source verification framework against a `verify.toml` manifest. Mirrors `mununu verify` (CLI). See [Verify Project Flow](Verify-Project-Flow.md) for the conceptual model.
 
-> Source of truth: [`api::handlers::verify_project_handler`](../crates/mununu-core/src/api/handlers.rs) — surface: API.
+> Source of truth: [`api::handlers::verify_project_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Request Body
 
@@ -606,17 +638,18 @@ Supply exactly one of `config` (pre-parsed) or `config_toml` (raw verify.toml te
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `config` | object | No | Pre-parsed `VerifyConfig` JSON. Mutually exclusive with `config_toml`. |
-| `config_toml` | string | No | Raw verify.toml text. Parsed server-side via `VerifyConfig::from_toml`. Mutually exclusive with `config`. Convenient for thin clients (UI wizard) that don't bundle a TOML parser. |
-| `base_dir` | string | Yes | Directory the source paths in the config resolve against. Must exist on the server's filesystem. |
+| `config` | `object \| null` | No | Pre-parsed `VerifyConfig` JSON. Mutually exclusive with `config_toml`. |
+| `config_toml` | `string \| null` | No | Raw verify.toml text. Parsed server-side via `VerifyConfig::from_toml`. Mutually exclusive with `config`. Convenient for thin clients (UI wizard) that don't bundle a TOML parser. |
+| `base_dir` | `string` | Yes | Directory the source paths in the config resolve against. Must exist on the server's filesystem. |
+| `cluster_similarity_floor` | `number \| null` | No | R.4 clustered-COI Jaccard similarity floor for the BTOR2 (`sv-yosys`) route. Overrides any value in `config` / `config_toml`. `null` (default) → the recommended `0.5`. |
 
 ### Response Body
 
-`VerifyReport`:
+`VerifyReport` — see [`verify::report::VerifyReport`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/report.rs) for the full shape.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `project` | string | Project name from `[project]`. |
+| `project` | `string` | Project name from `[project]`. |
 | `sources` | `SourceSummary[]` | Per-source diagnostics (`id`, `adapter`, resolved automaton name). |
 | `composition` | `CompositionInfo` | `semantics`, resolved composition `name`, resolved member names. |
 | `property_verdicts` | `PropertyVerdict[]` | One verdict per `[[properties]]` entry. |
@@ -636,15 +669,500 @@ curl -X POST http://localhost:3000/api/v1/verify \
 
 ---
 
+## POST /api/v1/verify/memory-check
+
+Analyze a `verify.toml` config's memory posture and return advisory warnings (over-approximation risks, unbounded counters, large enumeration domains). Mirrors `mununu verify memory-check`. The analysis is **pure** (it inspects only the parsed config), so no `base_dir` is required. The handler is **advisory** — warnings appear in the body but never surface as a 4xx; callers decide whether to gate on them.
+
+> Source of truth: [`api::handlers::memory_check_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+Supply exactly one of `config` or `config_toml`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `config` | `object \| null` | No | Pre-parsed `VerifyConfig` JSON. Mutually exclusive with `config_toml`. |
+| `config_toml` | `string \| null` | No | Raw verify.toml text. Mutually exclusive with `config`. |
+
+### Response Body
+
+`MemoryCheckReport` — see [`verify::memory_check::MemoryCheckReport`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/memory_check.rs) for the full shape (per-source posture entries plus aggregate advisory warnings).
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/verify/memory-check \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg toml "$(cat verify.toml)" '{config_toml: $toml}')"
+```
+
+---
+
+## POST /api/v1/btor2/cegar
+
+Run the CEGAR predicate-abstraction-refinement loop over a BTOR2 design and return the per-iteration refinement trace. Mirrors `mununu btor2 cegar`. See [Predicate-Cube CEGAR](Predicate-Cube-CEGAR.md) for the algorithm and the 3-valued (Kleene) verdict semantics.
+
+> Source of truth: [`api::handlers::btor2_cegar_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `content` | `string` | Yes | BTOR2 source content. |
+| `formula` | `string` | Yes | μ-calculus formula evaluated over the lifted KMTS. |
+| `predicates` | `PredicateSpecRequest[]` | Yes | Initial predicate set (bootstraps the `2^|P|` cube space). At least one entry required. Each: `{name, register, value}`. |
+| `controllable_inputs` | `string[]` | No | R.6.6 controllability split — controller-driven input symbols. Mirrors `--controllable-input`. Defaults to `[]`. |
+| `predicate_source` | `string \| null` | No | Predicate-discovery source: `"wp"` (default) or `"craig"`. |
+| `max_iterations` | `number \| null` | No | Max CEGAR iterations. Defaults to `16`. |
+| `must_edge_inference` | `string \| null` | No | Must-edge inference policy (default `"off"`): `"sampling-confluence"`, `"smt-per-target"`, `"smt-per-target-standard"`, `"smt-hyper-must"`. |
+| `may_edge_inference` | `string \| null` | No | May-edge inference policy (default `"off"`): `"smt-all-pairs"`. |
+| `config_values` | `string[]` | No | R-S8 symbolic-init values, one entry per register as `"REG=v1,v2,..."`. Seeds the predicate-cube initial states. Defaults to `[]`. |
+| `emit_ctxdsl` | `boolean` | No | When `true`, the response `ctxdsl` field carries the final refined cube model + checked formula as a self-contained CTXDSL document. Mirrors `--emit-ctxdsl`. Defaults to `false`. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | `boolean` | `true` on success. |
+| `iterations` | `CegarIterationView[]` | Per-iteration refinement records (iteration 0 = initial evaluation). |
+| `final_predicates` | `PredicateView[]` | Predicate set at termination (initial + every added predicate). |
+| `terminated_with` | `string` | Why the loop stopped: `"converged"`, `"bounded-iterations-reached"`, or `"predicate-source-exhausted"`. |
+| `verdict` | `CegarVerdictSummary` | Cell-count summary of the final 3-valued verdict. |
+| `lazy_lift_pending` | `boolean` | `true` when the eager `predicate_cube_lift` was used. |
+| `approximant_reuse_enabled` | `boolean` | Whether prior-iteration approximants were threaded forward. |
+| `warnings` | `string[]` | Soundness / advisory warnings produced during the run. |
+| `ctxdsl` | `string \| null` | Final refined cube model + formula as CTXDSL, present only when `emit_ctxdsl: true`. |
+
+**CegarIterationView**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `iteration` | `number` | Iteration index. |
+| `predicate_count` | `number` | Predicate-set size at the start of this iteration. |
+| `had_failure_subgame` | `boolean` | `true` iff this iteration's verdict carried `KleeneBot` cells (drove a refinement). |
+| `predicates_added` | `PredicateView[]` | Predicates the source added in response to this iteration. |
+| `game_position_evaluations` | `number` | Proxy counter for game-position evaluations (approximant-reuse diagnostics). |
+| `verdict` | `CegarVerdictSummary` | Cell-count summary of this iteration's 3-valued verdict. |
+
+**CegarVerdictSummary**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `true_cells` | `number` | `KleeneT` (definitely-true) cells. |
+| `false_cells` | `number` | `KleeneF` (definitely-false) cells. |
+| `unknown_cells` | `number` | `KleeneBot` (unknown — needs refinement) cells. |
+
+**PredicateView** — `{ name: string, register: string, value: number }`.
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/btor2/cegar \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "... BTOR2 source ...",
+    "formula": "nu X. ([] X && mu Y. (done || <> Y))",
+    "predicates": [ { "name": "burst_zero", "register": "burst_cnt", "value": 0 } ],
+    "controllable_inputs": ["start"],
+    "max_iterations": 8
+  }'
+```
+
+---
+
+## POST /api/v1/sv/cegar
+
+SV-direct CEGAR (cegar-extraction Stage 2): lift a SystemVerilog design to a single flattened BTOR2 (sv2v + Yosys) in one call, then run the same predicate-abstraction refinement loop as [`/api/v1/btor2/cegar`](#post-apiv1btor2cegar) and return the same response. Mirrors `mununu sv cegar`. Lets an SV workflow run CEGAR without a manual emit-BTOR2-per-module step.
+
+> Source of truth: [`api::handlers::sv_cegar_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+The CEGAR fields (`formula`, `predicates`, `controllable_inputs`, `predicate_source`, `max_iterations`, `must_edge_inference`, `may_edge_inference`, `config_values`, `emit_ctxdsl`) are identical to [`/api/v1/btor2/cegar`](#post-apiv1btor2cegar). Only the source half differs:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source` | `string` | Yes | SystemVerilog primary source content. |
+| `additional_sources` | `FileContent[]` | No | Additional SV source files (multi-file designs / packages / include targets). Defaults to `[]`. |
+| `top` | `string \| null` | No | Top module name. Recommended for multi-module designs; `null` lets Yosys auto-detect. |
+| `use_sv2v` | `boolean` | No | Run sv2v before Yosys (required for modern SV). Mirrors `--preprocess-sv2v`. Defaults to `false`. |
+| `setundef_anyseq` | `boolean` | No | Yosys `setundef -anyseq` (per-cycle havoc on undefined nets). Defaults to `false`. |
+| `setundef_anyconst` | `boolean` | No | Yosys `setundef -anyconst` (one nondeterministic constant per undefined bit — the Caliptra CWE-1245 power-up policy). Defaults to `false`. |
+| `formula` | `string` | Yes | μ-calculus formula (see `/btor2/cegar`). |
+| `predicates` | `PredicateSpecRequest[]` | Yes | Initial predicate set (see `/btor2/cegar`). |
+| _CEGAR fields…_ | | No | `controllable_inputs`, `predicate_source`, `max_iterations`, `must_edge_inference`, `may_edge_inference`, `config_values`, `emit_ctxdsl` — identical to `/btor2/cegar`. |
+
+### Response Body
+
+Identical to [`/api/v1/btor2/cegar`](#post-apiv1btor2cegar) (`Btor2CegarResponse`).
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/sv/cegar \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source": "module counter(...); ... endmodule",
+    "top": "counter",
+    "use_sv2v": true,
+    "formula": "nu X. ([] X && mu Y. (done || <> Y))",
+    "predicates": [ { "name": "burst_zero", "register": "burst_cnt", "value": 0 } ]
+  }'
+```
+
+---
+
+## GET /api/v1/extraction/domains
+
+List the available domain profiles (language + description) for AST extraction. Mirrors `mununu extraction domains`.
+
+> Source of truth: [`api::handlers::extraction_domains_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `profiles` | `DomainProfileInfo[]` | Available domain profiles. |
+
+**DomainProfileInfo** — `{ name: string, language: string, description: string }`.
+
+### Example
+
+```bash
+curl http://localhost:3000/api/v1/extraction/domains
+```
+
+---
+
+## GET /api/v1/extraction/composition-modes
+
+List the supported composition modes (synchronous / asynchronous) that the extraction config's `composition.type` accepts.
+
+> Source of truth: [`api::handlers::extraction_composition_modes_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `modes` | `CompositionModeInfo[]` | Supported composition modes. |
+
+**CompositionModeInfo** — `{ name: string, description: string }`.
+
+### Example
+
+```bash
+curl http://localhost:3000/api/v1/extraction/composition-modes
+```
+
+---
+
+## POST /api/v1/extraction/propose-composition
+
+Scan source code for concurrency idioms and propose `composition.instances[]` / `shared[]` blocks for an extraction config. Output is **suggestion-grade** — the user reviews each finding before promoting it into the config. Mirrors `mununu extraction propose-composition`. An empty `findings` list is the common case, not an error.
+
+> Source of truth: [`api::handlers::extraction_propose_composition_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API. (Requires the `ast-extract` feature.)
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source` | `string` | Yes | Source content to scan. |
+| `language` | `string \| null` | No | Source language: `"typescript"`, `"python"`, or `"rust"`. There is no filename to infer from here, so callers should specify it. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `findings` | `DetectedConcurrency[]` | Detected concurrency findings in source order. See [`concurrency_detect::DetectedConcurrency`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/extraction/ast_extract/concurrency_detect.rs) for the full shape (`kind`, source span, `suggested_instance_names`, `suggested_class_hint`). |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/extraction/propose-composition \
+  -H "Content-Type: application/json" \
+  -d '{ "source": "... TypeScript source ...", "language": "typescript" }'
+```
+
+---
+
+## POST /api/v1/extraction/extract
+
+Run AST-based extraction from source code (TypeScript / Python / Rust) and produce an `.espec.json` extraction spec. Mirrors `mununu extraction extract`.
+
+> Source of truth: [`api::handlers::extraction_extract_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API. (Requires the `ast-extract` feature.)
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `config` | `string` | Yes | Extraction config content (`.extract.json`). |
+| `source` | `string` | Yes | Source code content. |
+| `language` | `string \| null` | No | Source language (`typescript`, `python`, `rust`). Auto-detected if omitted. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | `boolean` | `true` on success. |
+| `espec` | `string` | Generated `.espec.json` content. |
+| `warnings` | `string[]` | Extraction warnings. |
+| `automata` | `ExtractionAutomatonInfo[]` | Extracted automata. |
+
+**ExtractionAutomatonInfo** — `{ id: string, state_count: number, transition_count: number }`.
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/extraction/extract \
+  -H "Content-Type: application/json" \
+  -d '{ "config": "... .extract.json ...", "source": "... source ...", "language": "typescript" }'
+```
+
+See [Compositional Extraction Tutorial](Compositional-Extraction-Tutorial.md) for an end-to-end walkthrough.
+
+---
+
+## POST /api/v1/extraction/validate
+
+Validate an extraction spec against its source code: detect drifted/mismatched anchors and uncovered accesses. Mirrors `mununu extraction validate`.
+
+> Source of truth: [`api::handlers::extraction_validate_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `spec` | `string` | Yes | Extraction spec (`.espec.json`) content. |
+| `source` | `string` | Yes | Source code content to validate against. |
+| `drift_window` | `number` | No | Line window for fuzzy anchor matching. Defaults to `5`. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | `boolean` | `true` on success. |
+| `summary` | `ValidationSummaryApi` | Aggregate counts: `total`, `exact`, `drifted`, `mismatch`, `error`, `uncovered_accesses`. |
+| `anchors` | `AnchorResultApi[]` | Per-anchor results: `id`, `section`, `status`, `line`, `found_line`, `message`. |
+| `uncovered` | `UncoveredAccessApi[]` | Accesses with no covering anchor: `line`, `field`, `content`. |
+| `commit_match` | `boolean \| null` | Whether the spec's recorded commit matches the source, when determinable. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/extraction/validate \
+  -H "Content-Type: application/json" \
+  -d '{ "spec": "... .espec.json ...", "source": "... source ...", "drift_window": 5 }'
+```
+
+---
+
+## POST /api/v1/contract/validate
+
+Validate an assume/guarantee contract set's discharge graph (SCC analysis). Mirrors `mununu contract validate`. The request body **is** a `ContractSet` (no wrapper); the response **is** a `DischargeVerdict`.
+
+> Source of truth: [`api::handlers::contract_validate_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+A [`contract::ContractSet`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/contract/mod.rs) JSON value — clauses (assume/guarantee) plus the discharge edges between them.
+
+### Response Body
+
+A [`contract::discharge::DischargeVerdict`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/contract/discharge.rs) — whether the discharge graph is sound, with any offending cycles / undischarged obligations.
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/contract/validate \
+  -H "Content-Type: application/json" \
+  -d '{ "clauses": [ ... ], "edges": [ ... ] }'
+```
+
+---
+
+## POST /api/v1/contract/discover
+
+Run phase-1 contract discovery on a black-box interface description: classify labels (controllable / uncontrollable), detect fairness gaps, and resolve `@mununu_interface contract://` corpus references. Mirrors `mununu contract discover`. The server still emits structured `tracing::warn!` diagnostics; the response carries the full `Phase1Output` for the UI.
+
+> Source of truth: [`api::handlers::contract_discover_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `interface` | `BlackBoxInterface` | Yes | Black-box interface description. See [`contract::discover::BlackBoxInterface`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/contract/discover.rs). |
+| `force_controllable` | `string[]` | No | Labels to force-classify as controllable. Defaults to `[]`. |
+| `force_uncontrollable` | `string[]` | No | Labels to force-classify as uncontrollable. Defaults to `[]`. |
+| `emit_fairness_gap` | `boolean` | No | Emit fairness-gap markers. Defaults to `false`. |
+| `corpus` | `string \| null` | No | Filesystem path to a contract corpus root used to resolve `contract://` URIs. Mirrors `--corpus`. |
+
+### Response Body
+
+A [`contract::discover::Phase1Output`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/contract/discover.rs) — classified labels, fairness-gap markers, and corpus resolutions.
+
+---
+
+## POST /api/v1/contract/query
+
+Query the contract corpus (Document D task D2) by `<domain>/<name>` plus parameters, and return the ranked candidate list. Mirrors `mununu contract query`.
+
+> Source of truth: [`api::handlers::contract_query_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | `string` | Yes | `<domain>/<name>` identifier, e.g. `"rtl_protocol/axi4_slave"`. A malformed id returns `400`. |
+| `corpus` | `string` | Yes | Filesystem path of the corpus root the server loads. A non-existent path is treated as an empty corpus. |
+| `parameters` | `{ [key: string]: any }` | No | Parameters to match against (numbers, strings, bools). Defaults to `{}`. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `candidates` | `ContractEntry[]` | Ranked matching corpus entries. See [`corpus::ContractEntry`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/corpus/mod.rs). |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/contract/query \
+  -H "Content-Type: application/json" \
+  -d '{ "id": "rtl_protocol/axi4_slave", "corpus": "/srv/corpus", "parameters": { "data_width": 32 } }'
+```
+
+---
+
+## POST /api/v1/contract/review
+
+HITL stage-4 review surface (Document A §A7 / Document D §D.8). Wraps phase-1/phase-2 discovery and adds a flat list of proposed clauses extracted from `@mununu_assume` / `@mununu_guarantee` annotations and resolved corpus references. Mirrors `mununu contract review`. The approve/edit/reject UX lives in the CLI / UI surfaces.
+
+> Source of truth: [`api::handlers::contract_review_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+Same shape as [`/api/v1/contract/discover`](#post-apiv1contractdiscover): `interface`, `force_controllable`, `force_uncontrollable`, `emit_fairness_gap`, `corpus`.
+
+### Response Body
+
+A [`contract::review::ReviewPackage`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/contract/review.rs) — the phase-1 output plus the proposed-clause list for the review UI.
+
+---
+
+## POST /api/v1/codesign/verify
+
+HW/SW codesign verification (Document C task C4). Compose firmware CTXDSL with a register-map sidecar, splice the coupling fragment, realize the composed context, and evaluate a named formula. Returns the verdict plus the composed CTXDSL so the UI can render both. Mirrors `mununu codesign verify`.
+
+> Source of truth: [`api::handlers::codesign_verify_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `register_map` | `RegisterMap` | Yes | Register-map sidecar as a parsed JSON value. Same shape the CLI loads from `register_map.json`. See [`codesign::register_map::RegisterMap`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/codesign/register_map.rs). |
+| `firmware_ctxdsl` | `string` | Yes | Firmware CTXDSL document text. |
+| `formula` | `string` | Yes | Formula name to evaluate in the composed context. |
+| `automaton` | `string \| null` | No | Composition / automaton to evaluate over. Defaults to the codesign composition `<PERIPHERAL>System`. |
+| `peripheral_automaton` | `string \| null` | No | Override for the peripheral automaton name. |
+| `composition_name` | `string \| null` | No | Override for the composition name. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `satisfied` | `boolean` | Whether every initial state satisfies the formula. |
+| `total_states` | `number` | States in the composed automaton/composition. |
+| `satisfying_states` | `number` | States satisfying the formula. |
+| `initial_states` | `string[]` | Initial state names. |
+| `initial_satisfying` | `string[]` | Subset of `initial_states` satisfying the formula. |
+| `composition` | `CodesignCompositionInfo` | `{ peripheral_automaton, composition_name, firmware_members, automaton }`. |
+| `composed_ctxdsl` | `string` | The composed CTXDSL the verifier ran against. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/codesign/verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "register_map": { ... },
+    "firmware_ctxdsl": "context fw { ... }",
+    "formula": "no_enable_mid_transaction"
+  }'
+```
+
+---
+
+## POST /api/v1/codesign/reconcile-labels
+
+HW/SW codesign label-alphabet reconciliation (Document C §C.5 hard gate against silent over-approximation). Refuses to compose `firmware ‖ peripheral` when the two extractions disagree on the rendezvous-label alphabet. Mirrors `mununu codesign reconcile-labels`. **Always returns 200 OK**; the `mismatch` field distinguishes the outcome.
+
+> Source of truth: [`api::handlers::codesign_reconcile_labels_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `firmware_labels` | `string[]` | Yes | Firmware-side rendezvous labels (the C extraction's alphabet). |
+| `peripheral_labels` | `string[]` | Yes | Peripheral-side rendezvous labels (the SV extraction / register-map alphabet). |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `shared` | `string[]` | Shared canonical alphabet (sorted) when the alphabets agree; empty on mismatch. |
+| `mismatch` | `ReconcileMismatch \| null` | `null` when the alphabets reconcile; otherwise `{ firmware_only, peripheral_only }`. See [`codesign::reconcile::ReconcileMismatch`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/codesign/reconcile.rs). |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/codesign/reconcile-labels \
+  -H "Content-Type: application/json" \
+  -d '{ "firmware_labels": ["reg_write_ctrl", "irq_ack"], "peripheral_labels": ["reg_write_ctrl", "irq_raise"] }'
+```
+
+---
+
+## POST /api/v1/codesign/emit-chaotic-stub
+
+Emit a standalone chaotic-stub CTXDSL document from a register-map sidecar. The result has its own `context { … }` wrapper, ready to drop into a `verify.toml` as a `ctxdsl` source. Mirrors `mununu codesign emit-chaotic-stub`.
+
+> Source of truth: [`api::handlers::codesign_emit_chaotic_stub_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `register_map` | `RegisterMap` | Yes | Parsed register-map JSON sidecar. |
+| `peripheral_automaton` | `string \| null` | No | Override for the peripheral automaton name. Defaults to the uppercased peripheral name; the context-block name is always `<AutomatonName>ChaoticStub`. |
+| `strict` | `boolean` | No | When `true`, refuse to emit and return `400` if the register-map validator reports any issue. Defaults to `false`. |
+
+### Response Body
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ctxdsl` | `string` | The standalone chaotic-stub CTXDSL document. |
+| `warnings` | `string[]` | Validation warnings from the register-map validator. Empty when the sidecar is well-formed. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:3000/api/v1/codesign/emit-chaotic-stub \
+  -H "Content-Type: application/json" \
+  -d '{ "register_map": { ... }, "strict": false }'
+```
+
+---
+
 ## GET /api/v1/templates
 
 List available property templates. Templates provide parameterized mu-calculus formula patterns that can be used in `template_ref` fields of verify and synthesize requests.
+
+> Source of truth: [`api::handlers::templates_handler`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs) — surface: API.
 
 ### Query Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `domain` | `string` | No | Filter by domain: `rtl`, `agentic`, `software`, `synthesis`, `universal` |
+| `domain` | `string` | No | Filter by domain: `rtl`, `agentic`, `software`, `synthesis`, `universal`. |
 
 ### Response Body
 
@@ -675,8 +1193,8 @@ With `domain` filter, returns a filtered array of `PropertyTemplate` objects.
 ### Example
 
 ```bash
-curl http://localhost:8080/api/v1/templates
-curl http://localhost:8080/api/v1/templates?domain=rtl
+curl http://localhost:3000/api/v1/templates
+curl http://localhost:3000/api/v1/templates?domain=rtl
 ```
 
 See [Property Templates](Property-Templates) for the full catalog and usage guide.
@@ -687,7 +1205,7 @@ See [Property Templates](Property-Templates) for the full catalog and usage guid
 
 ### FileContent
 
-Used for both the main context and synthesized controller output.
+Used for the main context, sidecars, and synthesized controller output.
 
 ```json
 {
@@ -705,6 +1223,14 @@ Structurally identical to `FileContent`. Sidecars are merged into the main conte
   "name": "properties.ctxdsl",
   "content": "context example_props { mu_formulas { ... } }"
 }
+```
+
+### PredicateSpecRequest
+
+A register-value equality predicate, shared by `/context/import`, `/btor2/cegar`, and `/sv/cegar`.
+
+```json
+{ "name": "burst_zero", "register": "burst_cnt", "value": 0 }
 ```
 
 ---
@@ -725,8 +1251,11 @@ All endpoints return errors in a consistent format:
 
 | HTTP Status | Code | Meaning |
 |-------------|------|---------|
-| 400 | `BAD_REQUEST` | Invalid input: parse errors, unknown formula/automaton names. |
+| 400 | `BAD_REQUEST` | Invalid input: parse errors, unknown formula/automaton names, both/neither of mutually-exclusive fields, malformed identifiers. |
+| 408 | `REQUEST_TIMEOUT` | The request exceeded the server's 30 s timeout. |
 | 500 | `INTERNAL_ERROR` | Server-side failure during realization, synthesis, or evaluation. |
+
+> Note: `/codesign/reconcile-labels` and `/verify/memory-check` are **advisory** — they return 200 OK with the warning/mismatch in the body rather than a 4xx.
 
 ---
 
