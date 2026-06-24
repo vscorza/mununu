@@ -487,6 +487,77 @@ pub struct CegarTrace {
         Option<crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>>,
 }
 
+/// Track I.1 (2026-06-24) — a cube cell that witnesses a non-HOLDS verdict: the
+/// predicate valuation of a cube state whose verdict is `False` (the formula is
+/// falsified there) or `Unknown`/⊥ (the abstraction cannot decide it). The
+/// valuation is decoded from the cube-index bit convention used by
+/// `predicate_cube_lift` — predicate `j` holds in cube `i` iff `(i >> j) & 1 == 1`
+/// (see `kmts_lift.rs` ~line 946) — so it needs no access to the lifted `Clts`.
+///
+/// This turns a bare verdict ("F=4") into something actionable ("falsified at the
+/// cell where `idle=false, err=true`"). It is a *cell* witness, not yet a full
+/// reachability *trace*: the path from init to a falsifying state, and the
+/// sub-formula-level cause (via the parity-game refuter strategy), are the
+/// Track-I.1 follow-up slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessCell {
+    /// The cube-state index in the lifted KMTS.
+    pub cube_index: usize,
+    /// `(predicate-name, holds)` for every predicate, in declaration order.
+    pub valuation: Vec<(String, bool)>,
+}
+
+impl WitnessCell {
+    /// Render as `idle=false, err=true` (declaration order).
+    pub fn render(&self) -> String {
+        self.valuation
+            .iter()
+            .map(|(name, holds)| format!("{name}={holds}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn decode_cube_valuation(index: usize, predicates: &[PredicateSpec]) -> Vec<(String, bool)> {
+    predicates
+        .iter()
+        .enumerate()
+        .map(|(j, p)| (p.name.clone(), (index >> j) & 1 == 1))
+        .collect()
+}
+
+impl CegarTrace {
+    fn witness_cells_for(&self, want: Trit, max: usize) -> Vec<WitnessCell> {
+        let mut out = Vec::new();
+        for i in 0..self.final_verdict.len() {
+            if out.len() >= max {
+                break;
+            }
+            if self.final_verdict.verdict_at(i) == want {
+                out.push(WitnessCell {
+                    cube_index: i,
+                    valuation: decode_cube_valuation(i, &self.final_predicates),
+                });
+            }
+        }
+        out
+    }
+
+    /// Track I.1 — cube cells that **falsify** the formula (definite-`False`),
+    /// each decoded to its predicate valuation. Capped at `max`; pass a large
+    /// value for all. Empty when the property HOLDS or is INDEFINITE everywhere.
+    pub fn violating_cells(&self, max: usize) -> Vec<WitnessCell> {
+        self.witness_cells_for(Trit::False, max)
+    }
+
+    /// Track I.1 — cube cells the abstraction **cannot decide** (`Unknown`/⊥),
+    /// each decoded to its predicate valuation. These are the cells a finer
+    /// predicate set (or CEGAR refinement) would need to resolve. Capped at `max`.
+    pub fn undecided_cells(&self, max: usize) -> Vec<WitnessCell> {
+        self.witness_cells_for(Trit::Unknown, max)
+    }
+}
+
 /// R.5 MVP — Run the CEGAR refinement loop on a BTOR2 fixture +
 /// formula.
 ///
@@ -1471,6 +1542,52 @@ pub fn config_values_to_sidecar_json(entries: &[String]) -> Result<Option<String
 mod tests {
     use super::*;
     use crate::mu_calculus::parser;
+
+    // Track I.1 — a non-HOLDS verdict surfaces the predicate valuation of the
+    // cube cells that falsify the formula (definite-F) or that the abstraction
+    // cannot decide (⊥), decoded from the cube-index bit convention.
+    #[test]
+    fn i1_witness_cells_decode_falsifying_and_undecided_valuations() {
+        use bitvec::prelude::*;
+        // 4 cubes over predicates [idle (bit 0), err (bit 1)]:
+        //   cube0 = F, cube1 = T, cube2 = F, cube3 = ⊥.
+        let must = bitvec![usize, Lsb0; 0, 1, 0, 0];
+        let may = bitvec![usize, Lsb0; 0, 1, 0, 1];
+        let trace = CegarTrace {
+            iterations: Vec::new(),
+            final_verdict: crate::mu_calculus::trit::TritSet::from_parts(must, may),
+            final_predicates: vec![
+                PredicateSpec {
+                    name: "idle".into(),
+                    register: "state_q".into(),
+                    value: 55,
+                },
+                PredicateSpec {
+                    name: "err".into(),
+                    register: "state_q".into(),
+                    value: 41,
+                },
+            ],
+            terminated_with: CegarTermination::Converged,
+            lazy_lift_pending: true,
+            approximant_reuse_enabled: false,
+            warnings: Vec::new(),
+            init_refinement_candidates: Vec::new(),
+            final_clts: None,
+        };
+
+        let viol = trace.violating_cells(10);
+        assert_eq!(viol.len(), 2, "two cube cells falsify the formula");
+        assert_eq!(viol[0].render(), "idle=false, err=false"); // cube0
+        assert_eq!(viol[1].render(), "idle=false, err=true"); // cube2 (the err trap)
+
+        let undec = trace.undecided_cells(10);
+        assert_eq!(undec.len(), 1);
+        assert_eq!(undec[0].render(), "idle=true, err=true"); // cube3
+
+        // The cap is honoured.
+        assert_eq!(trace.violating_cells(1).len(), 1);
+    }
 
     // M.6 parity — the shared `REG=v1,v2,...` parse used by both the CLI
     // `--config-values` flag and the API `config_values` field.

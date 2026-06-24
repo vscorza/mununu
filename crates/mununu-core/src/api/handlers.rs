@@ -810,6 +810,16 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
         value: p.value,
     };
 
+    // Track I.1 — viewer-shape a witness cell (cube index + predicate valuation).
+    // Cap matches the CLI so a large cube does not flood the response; the
+    // `verdict.{false,unknown}_cells` counts carry the full totals.
+    const WITNESS_CELL_CAP: usize = 8;
+    let cell_view =
+        |c: &crate::adapter::btor2::cegar::WitnessCell| crate::api::models::WitnessCellView {
+            cube_index: c.cube_index,
+            valuation: c.valuation.iter().cloned().collect(),
+        };
+
     // CTXDSL Phase 2 (2026-06-22) — opt-in model + formula CTXDSL. When the
     // request set `emit_ctxdsl`, the loop captured the final refined cube
     // `Clts` into `trace.final_clts`; serialize it together with the checked
@@ -863,6 +873,17 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
         lazy_lift_pending: trace.lazy_lift_pending,
         approximant_reuse_enabled: trace.approximant_reuse_enabled,
         warnings: trace.warnings.iter().map(|w| w.message.clone()).collect(),
+        // Track I.1 — surface which cube valuations falsify / can't be decided.
+        violating_cells: trace
+            .violating_cells(WITNESS_CELL_CAP)
+            .iter()
+            .map(&cell_view)
+            .collect(),
+        undecided_cells: trace
+            .undecided_cells(WITNESS_CELL_CAP)
+            .iter()
+            .map(&cell_view)
+            .collect(),
         ctxdsl,
     })
 }

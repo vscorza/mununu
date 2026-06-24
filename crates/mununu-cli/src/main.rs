@@ -2000,6 +2000,26 @@ struct CegarCliParams<'a> {
 /// Run the predicate-abstraction refinement loop over a BTOR2 design
 /// (`content`) and print the trace + 3-valued verdict. `fixture_label` is
 /// the human-facing source identifier echoed in the report (the BTOR2 path
+/// Track I.1 — render a slice of CEGAR witness cells as JSON
+/// (`[{ "cube_index": i, "valuation": { "<pred>": <bool>, … } }, …]`).
+fn cegar_cells_json(
+    cells: &[mununu_core::adapter::btor2::cegar::WitnessCell],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        cells
+            .iter()
+            .map(|c| {
+                let valuation: serde_json::Map<String, serde_json::Value> = c
+                    .valuation
+                    .iter()
+                    .map(|(name, holds)| (name.clone(), serde_json::Value::Bool(*holds)))
+                    .collect();
+                serde_json::json!({ "cube_index": c.cube_index, "valuation": valuation })
+            })
+            .collect(),
+    )
+}
+
 /// for `btor2 cegar`, the SV path for `sv cegar`). Shared by both CLI
 /// handlers so identical CEGAR inputs produce identical output.
 fn run_cegar_cli(
@@ -2216,6 +2236,14 @@ fn run_cegar_cli(
         format!("PROPERTY HOLDS — all {t_cells} cell(s) satisfy the formula")
     };
 
+    // Track I.1 (2026-06-24) — make a non-HOLDS verdict actionable: surface the
+    // predicate valuations of the cube cells that falsify the formula, or that
+    // the abstraction cannot decide. Capped so a large cube does not flood the
+    // output; the count above (`f_cells` / `bot_cells`) is the full total.
+    const WITNESS_CAP: usize = 4;
+    let violating_cells = trace.violating_cells(WITNESS_CAP);
+    let undecided_cells = trace.undecided_cells(WITNESS_CAP);
+
     if params.json {
         let summary = serde_json::json!({
             "fixture": fixture_label,
@@ -2230,6 +2258,8 @@ fn run_cegar_cli(
                 "unknown_cells": bot_cells,
             },
             "outcome": outcome,
+            "violating_cells": cegar_cells_json(&violating_cells),
+            "undecided_cells": cegar_cells_json(&undecided_cells),
             "approximant_reuse_enabled": trace.approximant_reuse_enabled,
             "lazy_lift_pending": trace.lazy_lift_pending,
             "warnings": trace.warnings.iter().map(|w| w.message.clone()).collect::<Vec<_>>(),
@@ -2249,6 +2279,24 @@ fn run_cegar_cli(
         println!("  final predicates:  {}", trace.final_predicates.len());
         println!("  verdict cells:     T={t_cells} F={f_cells} ⊥={bot_cells}");
         println!("  outcome:           {outcome}");
+        // Track I.1 — which cube valuations falsify / can't be decided.
+        if bot_cells > 0 && !undecided_cells.is_empty() {
+            println!("  undecided at:");
+            for w in &undecided_cells {
+                println!("    - {{{}}}", w.render());
+            }
+            if bot_cells > undecided_cells.len() {
+                println!("    … and {} more", bot_cells - undecided_cells.len());
+            }
+        } else if f_cells > 0 && !violating_cells.is_empty() {
+            println!("  falsified at:");
+            for w in &violating_cells {
+                println!("    - {{{}}}", w.render());
+            }
+            if f_cells > violating_cells.len() {
+                println!("    … and {} more", f_cells - violating_cells.len());
+            }
+        }
         if !trace.warnings.is_empty() {
             println!("  warnings:");
             for w in &trace.warnings {
