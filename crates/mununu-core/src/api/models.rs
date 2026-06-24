@@ -957,11 +957,31 @@ pub struct Btor2CegarResponse {
     pub approximant_reuse_enabled: bool,
     /// Soundness / advisory warnings produced during the run.
     pub warnings: Vec<String>,
+    /// Track I.1 (2026-06-24) — cube cells that **falsify** the formula
+    /// (definite-False), each decoded to its predicate valuation. Capped (the
+    /// `verdict.false_cells` count is the full total). Empty unless the outcome
+    /// is VIOLATED. Makes a failing verdict actionable ("falsified where
+    /// `idle=false, err=true`").
+    pub violating_cells: Vec<WitnessCellView>,
+    /// Track I.1 — cube cells the abstraction **cannot decide** (`Unknown`/⊥),
+    /// each decoded to its predicate valuation. Capped (`verdict.unknown_cells`
+    /// is the full total). These are the cells a finer predicate set would need
+    /// to resolve.
+    pub undecided_cells: Vec<WitnessCellView>,
     /// CTXDSL Phase 2 (2026-06-22) — the final refined cube model + the
     /// checked formula as CTXDSL, present only when the request set
     /// `emit_ctxdsl: true`. Omitted from the JSON otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctxdsl: Option<String>,
+}
+
+/// Track I.1 — a cube cell witnessing a non-HOLDS verdict, viewer-shaped:
+/// the cube index plus the predicate valuation (`name → holds`) at that cell.
+#[derive(Debug, Serialize)]
+pub struct WitnessCellView {
+    pub cube_index: usize,
+    /// Predicate valuation at the cell (`name → holds`), keyed by predicate name.
+    pub valuation: std::collections::BTreeMap<String, bool>,
 }
 
 /// One CEGAR iteration, viewer-shaped.
