@@ -1,9 +1,12 @@
 # STS-IR — the frontend-agnostic abstraction seam
 
-> Status: planning (DR0, IR-unification track). Concept + interface design; the stub lives at
-> [`crates/mununu-core/src/adapter/sts_ir.rs`](../../crates/mununu-core/src/adapter/sts_ir.rs).
-> Roadmap context: `.claude/plans/ir-unification-track-plan.md` (P0→P5) and
-> `.claude/plans/state-abstraction-merge-assessment.md`.
+> Status: **IR-track shipped + CLOSED at P3 (2026-06-24).** DR0→P3 shipped: the
+> STS-IR seam ([`crates/mununu-core/src/adapter/sts_ir.rs`](../../crates/mununu-core/src/adapter/sts_ir.rs))
+> + both lift engines consuming it + the unified `eval_node_generic` evaluator +
+> `mununu verify` routing through the predicate-cube / 3-valued path. **P4/P5
+> were evaluated and NOT pursued** — see §8 (the load-bearing verification-path
+> unification was the goal, and it shipped at P1–P3). Roadmap context (local):
+> `.claude/plans/ir-track-p4-p5-scoping-2026-06-23.md`.
 
 ## 1. Why
 
@@ -20,14 +23,16 @@ STS-IR is the **narrow waist** that decouples the abstraction engines from the B
 
 ```
 frontend ──lower──▶ STS-IR ──┬─ Enumerate strategy ─▶ Sharp CLTS ─┐
- (BTOR2 ~1:1;                 └─ SmtImage strategy ──▶ KMTS        ─┴▶ one Clts ─▶ eval_node_generic<D: EvalDomain>
-  C/Promela lower under P5)
+ (BTOR2 ~1:1)                 └─ SmtImage strategy ──▶ KMTS        ─┴▶ one Clts ─▶ eval_node_generic<D: EvalDomain>
 ```
 
 A frontend that can present the two semantics below inherits *both* abstraction policies + the
 KMTS evaluator + CEGAR with no new abstraction code. BTOR2 maps to the IR ~1:1 (it already *is* a
-symbolic transition system); value-rich non-RTL frontends (Promela, a C subset) *lower to* it
-(P4/P5). Discrete frontends keep their direct-CLTS path and never touch this seam.
+symbolic transition system). Value-rich non-RTL frontends (Promela, a C subset) *could* lower to
+it — that was the planned P4/P5 — but P4/P5 were evaluated and **not pursued** (§8): those
+frontends are already fully enumerable, so lowering them yields no verdict gain, and
+`AbstractionType`/`FieldDomain` stay regardless (they are load-bearing for the BTOR2/SV bit-blast
+sidecar path). Discrete frontends keep their direct-CLTS path and never touch this seam.
 
 ## 2. The interface (two semantics over shared metadata)
 
@@ -167,11 +172,11 @@ invisible to callers.
     the hand-written 3v body + `eval_fixpoint_tri` are deleted. Both 2v + 3v now run ONE generic
     body. Gate met (2083/2083 incl. `r3_kleene_baseline`; trit benches no regression). P2.4 next:
     retire the dead per-element `truth_domain`.
-- **P3:** route `mununu verify` SV/BTOR2 through the IR + chosen strategy; migrate SV
-  `bounded_counter` sidecars to predicate sets; carry 3-valued verdicts.
-- **P4/P5:** a non-RTL frontend (Promela, then C-extraction) *lowers to* the IR and inherits the
-  abstraction stack — the flexibility proof and (P5, measurement-gated) the retirement of
-  `AbstractionType` / `FieldDomain` / `state_enum`.
+- **P3 (shipped):** `mununu verify` SV/BTOR2 routes through the IR + chosen strategy (the cube /
+  3-valued path when the sidecar declares `predicates`); 3-valued verdicts carried into
+  `PropertyVerdict` (#123–#125). This is the IR-track's load-bearing payoff — the *verification*
+  path now runs on one IR + one evaluator.
+- **P4/P5 — EVALUATED, NOT PURSUED (2026-06-24).** See §8.
 
 ## 7. Open design questions for the Go/No-Go review
 
@@ -182,5 +187,38 @@ invisible to callers.
    clamping (Ignored / width bounds / OOB sink) is expressible as a policy *over* `StepEval`
    rather than needing more of BTOR2 — or whether the IR must also carry an init/constraint
    accessor. (DR0 omits `init`/constraints; P1 decides if they're needed at the seam.)
-3. **Lowering cost.** P4 will measure the real cost of lowering Promela to `StepEval` +
-   `SmtEncode`; that number gates whether P5 (global `AbstractionType` retirement) is worth it.
+3. **Lowering cost.** *(Resolved 2026-06-24 — see §8.)* The measurement gate found the cost not
+   worth the (nil) verdict benefit; P4/P5 were not pursued.
+
+## 8. Why the IR-track closed at P3 (P4/P5 not pursued, 2026-06-24)
+
+The IR-track's load-bearing goal was to unify the **verification** path onto one
+IR + one evaluator. That shipped: DR0→P3 gave the STS-IR seam, both lift engines
+consuming it, the single generic `eval_node_generic` evaluator, and `mununu verify`
+routing through the predicate-cube / 3-valued path. P4/P5 (lower a value-rich
+non-RTL frontend onto the seam, then retire the legacy abstraction types) were
+the *flexibility-proof* tail. A code-grounded measurement (`docs/design/sts-ir.md`
+§7.3's gate, recorded in `.claude/plans/ir-track-p4-p5-scoping-2026-06-23.md`)
+found them not worth building:
+
+1. **No verdict gain.** Promela (and the C-extraction subset) are already fully
+   enumerable — bounded vars + control states form a finite cross-product
+   (`promela_var_to_domain` → `FieldDomain::with_range`). Lowering them to
+   `StepEval` (the Enumerate strategy) reproduces the *same* explicit enumeration
+   through a different code path; no property verdict changes. The `SmtEncode`
+   (predicate-image) half is inapplicable — these frontends have no bit-vector SMT
+   encoding of their transition relation, and building one is a large lift with
+   marginal real-world need.
+
+2. **P5's deletion is blocked.** `AbstractionType` and `FieldDomain` are **not**
+   dead code awaiting retirement — they are load-bearing for the **BTOR2/SV
+   bit-blast sidecar** bounded-counter path (`bit_blast.rs` `resolve_to_field_domain`,
+   `adapter/sidecar/`, `AbstractionType::Ignored` cone-drop), which the M.1 / M.4 /
+   R46 fixture fleet depends on and which does *not* lower through the seam (BTOR2
+   *is* the IR ~1:1). They stay. Only `state_enum` (one cross-product utility) would
+   be deletable, and only after *both* Promela and C-extraction migrate — a marginal
+   prize for a multi-session, two-frontend migration with no verdict gain.
+
+Net: P4/P5 were a marginal-payoff, partly-blocked architectural exercise that the
+plan's own measurement gate (and the §6.7 anti-gold-plating discipline) rules out.
+The IR-track is **complete at P3**; `AbstractionType` / `FieldDomain` are permanent.
