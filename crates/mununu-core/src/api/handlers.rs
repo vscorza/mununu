@@ -892,6 +892,9 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
                 ends_in_trap: ct.ends_in_trap,
             }
         }),
+        // Track I.1 (undecided-explanation) — registers the failure subgame
+        // flagged as load-bearing for the remaining ⊥ cells (empty ⇒ omitted).
+        refinement_candidates: trace.init_refinement_candidates.clone(),
         ctxdsl,
     })
 }
