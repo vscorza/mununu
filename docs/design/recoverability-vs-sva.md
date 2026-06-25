@@ -147,22 +147,33 @@ open frontend:
   `|->`; `CsrngMainErrorStStable_A` uses `|=> $stable`), so only assertion-free
   immediate `assert(expr)` would survive — which OpenTitan does not write.
 
-The consequence for positioning is clarifying rather than discouraging: mununu's
-differentiated value is **not** re-checking a design's existing SVA (linear
-properties mature BMC/IC3 tools already handle, and which the open toolchain
-can't even hand to mununu without Verific). It is (1) extracting the *model* from
-SV — which works today, V.7-c proves it — and (2) asking the model the branching,
-recoverability, and realizability questions SVA cannot express. The wedge is the
-property class, on the auto-extracted model, not the SVA.
+The consequence is a two-part plan. The differentiated *power* is not re-checking
+a design's existing SVA (linear properties mature BMC/IC3 tools already handle).
+But extracting that SVA is still worth doing — as the *means* to the
+differentiator: the design's own `cover` / reachability properties are exactly the
+seeds for the `EF` → `AG EF` recoverability upgrade (§2, Track I.3), surfaced
+automatically with no hand-authored properties. Since the open frontend can't
+deliver the SVA, the planned mechanism is a **custom SVA → mu-calculus translator**
+that parses the SVA from source and emits mu-calculus bound to the auto-extracted
+model (plan + coverage criteria + tests:
+`.claude/plans/sva-to-mucalculus-translator-2026-06-25.md`). So mununu's value is
+(1) extracting the *model* (works today; V.7-c proves it), (2) ingesting the
+design's SVA via the custom translator for a plug-and-play endpoint, and (3) —
+the differentiator — upgrading the reachability properties to the branching
+recoverability/realizability questions SVA cannot express.
 
 ## 5. Where this leads
 
 - Track B ships the recoverability showcase (V.7) as the worked evidence for §3.
+- The **custom SVA → mu-calculus translator** (phases XL.0–XL.7) is the
+  open-toolchain SVA-extraction path and the host for the I.3 upgrade
+  (`.claude/plans/sva-to-mucalculus-translator-2026-06-25.md`).
 - Track I.3 turns §2's `cover`→`AG EF` gap into an automatic check on extracted
-  designs.
+  designs — implemented as translator phase XL.2 (form + check `AG EF` for each
+  TRUE `cover`/`EF`, with the Track-I countertrace on failure).
 - The Track-H gate (`.claude/plans/sva-auto-h0-gate-verdict-2026-06-25.md`)
-  records §4's spike in full and reframes the H.5 done-criteria around the
-  branching wedge rather than SVA re-extraction.
+  records §4's spike in full; the SVA-extraction criterion is reinstated, now
+  scoped to the translator's coverage tiers + an honest coverage report.
 
 See also [`industrial-value-and-validation-domains.md`](industrial-value-and-validation-domains.md)
 for the broader domain map and [`kmts-theory.md`](kmts-theory.md) for the
