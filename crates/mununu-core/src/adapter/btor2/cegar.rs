@@ -485,6 +485,13 @@ pub struct CegarTrace {
     /// was off — the cube is dropped at loop exit, avoiding the clone.
     pub final_clts:
         Option<crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>>,
+    /// Track I.1 (trace slice, 2026-06-24) — a reachability countertrace for a
+    /// VIOLATED verdict: a path of definite-`False` cube cells from an initial
+    /// cell to a trap (or the farthest reachable failing cell). `None` when no
+    /// initial cell is definite-`False` (the property is not violated at start)
+    /// or the verdict is HOLDS / undecided. See [`CounterTrace`] +
+    /// [`build_counterexample_trace`].
+    pub counterexample: Option<CounterTrace>,
 }
 
 /// Track I.1 (2026-06-24) — a cube cell that witnesses a non-HOLDS verdict: the
@@ -556,6 +563,104 @@ impl CegarTrace {
     pub fn undecided_cells(&self, max: usize) -> Vec<WitnessCell> {
         self.witness_cells_for(Trit::Unknown, max)
     }
+}
+
+/// Track I.1 (trace slice, 2026-06-24) — a concrete reachability *countertrace*
+/// for a VIOLATED verdict: a path of cube cells, all definite-`False`, from an
+/// initial cell to a **trap** (a cell whose every successor stays `False`, so
+/// the violation is locked in) — or, when no trap is reachable inside the
+/// failing region, to the farthest such cell.
+///
+/// Soundness: every cell on the path is definite-`False`, so the property genuinely
+/// fails at each step, and a trap end-cell means it can never recover. The path is
+/// real reachability in the lifted cube. This is a *reachability* witness, not the
+/// sub-formula-level root cause — extracting the precise cause (e.g. the exact state
+/// where an invariant first breaks) is the parity-game refuter-strategy follow-up.
+/// Cube edges all carry the single `step` label, so steps record the cell valuation
+/// (the informative axis), not the label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterTrace {
+    /// Cells from an initial cell to the witness cell, each definite-`False`.
+    pub steps: Vec<WitnessCell>,
+    /// `true` iff the final cell is a trap (all successors stay `False`).
+    pub ends_in_trap: bool,
+}
+
+/// Track I.1 — build a [`CounterTrace`] from the lifted cube + its verdict.
+/// Returns `None` unless an *initial* cube cell is definite-`False` (i.e. the
+/// property is actually violated at start). BFS stays inside the `False` region
+/// (only `False → False` edges), so the path witnesses a persistent failure.
+fn build_counterexample_trace(
+    clts: &crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>,
+    verdict: &TritSet,
+    predicates: &[PredicateSpec],
+) -> Option<CounterTrace> {
+    use crate::clts::StateId;
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let is_false = |idx: usize| verdict.verdict_at(idx) == Trit::False;
+    // Start at an initial cell that is definite-False (else the property is not
+    // violated at start and there is nothing to trace).
+    let start: StateId<crate::clts::DefaultStateIdx> = clts
+        .initial_states()
+        .iter()
+        .copied()
+        .find(|s| is_false(s.index()))?;
+
+    // A trap is a False cell whose every outgoing edge stays in the False region
+    // (a cell with no successors counts — the failure cannot be left).
+    let is_trap = |s: StateId<crate::clts::DefaultStateIdx>| -> bool {
+        is_false(s.index())
+            && clts
+                .outgoing(s)
+                .iter()
+                .all(|t| is_false(t.target().index()))
+    };
+
+    let mut parent: HashMap<usize, usize> = HashMap::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut queue: VecDeque<StateId<crate::clts::DefaultStateIdx>> = VecDeque::new();
+    visited.insert(start.index());
+    queue.push_back(start);
+    let mut trap: Option<StateId<crate::clts::DefaultStateIdx>> = None;
+    let mut farthest = start;
+    while let Some(s) = queue.pop_front() {
+        if trap.is_none() && is_trap(s) {
+            trap = Some(s);
+        }
+        farthest = s; // BFS dequeues in distance order; the last is the farthest.
+        for t in clts.outgoing(s) {
+            let tgt = t.target();
+            if is_false(tgt.index()) && visited.insert(tgt.index()) {
+                parent.insert(tgt.index(), s.index());
+                queue.push_back(tgt);
+            }
+        }
+    }
+
+    let ends_in_trap = trap.is_some();
+    let target = trap.unwrap_or(farthest);
+
+    // Reconstruct the path start → target via parent pointers.
+    let mut idx_path = vec![target.index()];
+    let mut cur = target.index();
+    while let Some(&p) = parent.get(&cur) {
+        idx_path.push(p);
+        cur = p;
+    }
+    idx_path.reverse();
+
+    let steps = idx_path
+        .into_iter()
+        .map(|i| WitnessCell {
+            cube_index: i,
+            valuation: decode_cube_valuation(i, predicates),
+        })
+        .collect();
+    Some(CounterTrace {
+        steps,
+        ends_in_trap,
+    })
 }
 
 /// R.5 MVP — Run the CEGAR refinement loop on a BTOR2 fixture +
@@ -1007,6 +1112,13 @@ pub fn cegar_refine_loop(
                 game_position_evaluations,
                 approximants_at_end,
             });
+            // Track I.1 — countertrace over the converged cube (Some only
+            // when an initial cell is definite-False).
+            let counterexample = build_counterexample_trace(
+                &lift_result.clts,
+                &game_eval.verdicts,
+                &current_predicates,
+            );
             return Ok(CegarTrace {
                 iterations,
                 final_verdict: game_eval.verdicts,
@@ -1018,6 +1130,7 @@ pub fn cegar_refine_loop(
                 init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
                 // CTXDSL Phase 2 — final cube model (Some only under emit_ctxdsl).
                 final_clts: captured_clts.take(),
+                counterexample,
             });
         }
 
@@ -1035,6 +1148,12 @@ pub fn cegar_refine_loop(
                 game_position_evaluations,
                 approximants_at_end,
             });
+            // Track I.1 — countertrace over the capped cube.
+            let counterexample = build_counterexample_trace(
+                &lift_result.clts,
+                &game_eval.verdicts,
+                &current_predicates,
+            );
             return Ok(CegarTrace {
                 iterations,
                 final_verdict: game_eval.verdicts,
@@ -1046,6 +1165,7 @@ pub fn cegar_refine_loop(
                 init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
                 // CTXDSL Phase 2 — final cube model (Some only under emit_ctxdsl).
                 final_clts: captured_clts.take(),
+                counterexample,
             });
         }
 
@@ -1110,6 +1230,12 @@ pub fn cegar_refine_loop(
         });
 
         if added_count == 0 {
+            // Track I.1 — countertrace over the exhausted-source cube.
+            let counterexample = build_counterexample_trace(
+                &lift_result.clts,
+                &game_eval.verdicts,
+                &current_predicates,
+            );
             return Ok(CegarTrace {
                 final_verdict: iterations.last().unwrap().verdict.clone(),
                 final_predicates: current_predicates,
@@ -1121,6 +1247,7 @@ pub fn cegar_refine_loop(
                 init_refinement_candidates: init_refinement_candidates.iter().cloned().collect(),
                 // CTXDSL Phase 2 — final cube model (Some only under emit_ctxdsl).
                 final_clts: captured_clts.take(),
+                counterexample,
             });
         }
 
@@ -1574,6 +1701,7 @@ mod tests {
             warnings: Vec::new(),
             init_refinement_candidates: Vec::new(),
             final_clts: None,
+            counterexample: None,
         };
 
         let viol = trace.violating_cells(10);
@@ -1587,6 +1715,91 @@ mod tests {
 
         // The cap is honoured.
         assert_eq!(trace.violating_cells(1).len(), 1);
+    }
+
+    // Track I.1 (trace slice) — a VIOLATED cube yields a reachability
+    // countertrace: a path of definite-False cells from the initial cell to a
+    // trap (a cell whose every successor stays False). The walk traverses only
+    // F→F edges and never enters the T/⊥ region.
+    #[test]
+    fn i1_counterexample_trace_walks_false_region_to_trap() {
+        use crate::clts::Clts;
+        use bitvec::prelude::*;
+        // 4 cubes over predicates [idle (bit 0), err (bit 1)].
+        // Verdicts: s0=F (init), s1=F, s2=F (trap via self-loop), s3=T.
+        // Edges: s0→s1, s0→s3, s1→s2, s1→s3, s2→s2.
+        let mut builder = Clts::builder();
+        builder
+            .state("s0")
+            .state("s1")
+            .state("s2")
+            .state("s3")
+            .initial("s0");
+        let step = builder.labels().intern(["step"]).expect("label interned");
+        let s0 = builder.state_id_or_insert("s0").unwrap();
+        let s1 = builder.state_id_or_insert("s1").unwrap();
+        let s2 = builder.state_id_or_insert("s2").unwrap();
+        let s3 = builder.state_id_or_insert("s3").unwrap();
+        builder.transition_ids(s0, &[step], s1);
+        builder.transition_ids(s0, &[step], s3);
+        builder.transition_ids(s1, &[step], s2);
+        builder.transition_ids(s1, &[step], s3);
+        builder.transition_ids(s2, &[step], s2); // self-loop → trap
+        let clts = builder.build().expect("clts builds");
+
+        let must = bitvec![usize, Lsb0; 0, 0, 0, 1];
+        let may = bitvec![usize, Lsb0; 0, 0, 0, 1];
+        let verdict = crate::mu_calculus::trit::TritSet::from_parts(must, may);
+        let preds = vec![
+            PredicateSpec {
+                name: "idle".into(),
+                register: "state_q".into(),
+                value: 55,
+            },
+            PredicateSpec {
+                name: "err".into(),
+                register: "state_q".into(),
+                value: 41,
+            },
+        ];
+
+        let trace = build_counterexample_trace(&clts, &verdict, &preds)
+            .expect("an initial F cell yields a countertrace");
+        assert!(trace.ends_in_trap, "the walk reaches the s2 self-loop trap");
+        let rendered: Vec<String> = trace.steps.iter().map(|c| c.render()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "idle=false, err=false".to_string(), // s0 / cube0 (init)
+                "idle=true, err=false".to_string(),  // s1 / cube1
+                "idle=false, err=true".to_string(),  // s2 / cube2 (trap)
+            ]
+        );
+    }
+
+    // Track I.1 — when no initial cell is definite-False (the property is not
+    // violated at start), there is no countertrace.
+    #[test]
+    fn i1_counterexample_trace_none_when_initial_not_false() {
+        use crate::clts::Clts;
+        use bitvec::prelude::*;
+        let mut builder = Clts::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let step = builder.labels().intern(["step"]).expect("label interned");
+        let s0 = builder.state_id_or_insert("s0").unwrap();
+        let s1 = builder.state_id_or_insert("s1").unwrap();
+        builder.transition_ids(s0, &[step], s1);
+        let clts = builder.build().expect("clts builds");
+        // s0 = T (must+may set), s1 = F.
+        let must = bitvec![usize, Lsb0; 1, 0];
+        let may = bitvec![usize, Lsb0; 1, 0];
+        let verdict = crate::mu_calculus::trit::TritSet::from_parts(must, may);
+        let preds = vec![PredicateSpec {
+            name: "idle".into(),
+            register: "state_q".into(),
+            value: 55,
+        }];
+        assert!(build_counterexample_trace(&clts, &verdict, &preds).is_none());
     }
 
     // M.6 parity — the shared `REG=v1,v2,...` parse used by both the CLI

@@ -2260,6 +2260,12 @@ fn run_cegar_cli(
             "outcome": outcome,
             "violating_cells": cegar_cells_json(&violating_cells),
             "undecided_cells": cegar_cells_json(&undecided_cells),
+            // Track I.1 (trace slice) — reachability countertrace for a
+            // violated verdict (null when the property is not violated at init).
+            "counterexample": trace.counterexample.as_ref().map(|ct| serde_json::json!({
+                "steps": cegar_cells_json(&ct.steps),
+                "ends_in_trap": ct.ends_in_trap,
+            })),
             "approximant_reuse_enabled": trace.approximant_reuse_enabled,
             "lazy_lift_pending": trace.lazy_lift_pending,
             "warnings": trace.warnings.iter().map(|w| w.message.clone()).collect::<Vec<_>>(),
@@ -2295,6 +2301,23 @@ fn run_cegar_cli(
             }
             if f_cells > violating_cells.len() {
                 println!("    … and {} more", f_cells - violating_cells.len());
+            }
+        }
+        // Track I.1 (trace slice) — the reachability path from an initial
+        // failing cell to a trap (or the farthest reachable failing cell).
+        if let Some(ct) = &trace.counterexample {
+            let n = ct.steps.len();
+            println!(
+                "  counterexample trace ({n} step{}{}):",
+                if n == 1 { "" } else { "s" },
+                if ct.ends_in_trap {
+                    ", ends in trap"
+                } else {
+                    ""
+                }
+            );
+            for (i, w) in ct.steps.iter().enumerate() {
+                println!("    {i}. {{{}}}", w.render());
             }
         }
         if !trace.warnings.is_empty() {

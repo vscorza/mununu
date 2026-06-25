@@ -884,6 +884,14 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
             .iter()
             .map(&cell_view)
             .collect(),
+        // Track I.1 (trace slice) — the reachability countertrace for a
+        // violated verdict (None when not violated at the initial cell).
+        counterexample: trace.counterexample.as_ref().map(|ct| {
+            crate::api::models::CounterTraceView {
+                steps: ct.steps.iter().map(&cell_view).collect(),
+                ends_in_trap: ct.ends_in_trap,
+            }
+        }),
         ctxdsl,
     })
 }

@@ -968,6 +968,12 @@ pub struct Btor2CegarResponse {
     /// is the full total). These are the cells a finer predicate set would need
     /// to resolve.
     pub undecided_cells: Vec<WitnessCellView>,
+    /// Track I.1 (trace slice, 2026-06-24) — reachability countertrace for a
+    /// VIOLATED verdict: a path of definite-False cube cells from an initial
+    /// cell to a trap (or the farthest reachable failing cell). Omitted from
+    /// the JSON unless the property is actually violated at the initial cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample: Option<CounterTraceView>,
     /// CTXDSL Phase 2 (2026-06-22) — the final refined cube model + the
     /// checked formula as CTXDSL, present only when the request set
     /// `emit_ctxdsl: true`. Omitted from the JSON otherwise.
@@ -982,6 +988,15 @@ pub struct WitnessCellView {
     pub cube_index: usize,
     /// Predicate valuation at the cell (`name → holds`), keyed by predicate name.
     pub valuation: std::collections::BTreeMap<String, bool>,
+}
+
+/// Track I.1 (trace slice) — a reachability countertrace, viewer-shaped: the
+/// ordered sequence of failing cube cells plus whether the path ends in a trap
+/// (a cell whose every successor stays `False`, so the violation is locked in).
+#[derive(Debug, Serialize)]
+pub struct CounterTraceView {
+    pub steps: Vec<WitnessCellView>,
+    pub ends_in_trap: bool,
 }
 
 /// One CEGAR iteration, viewer-shaped.
