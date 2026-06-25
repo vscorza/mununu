@@ -974,6 +974,14 @@ pub struct Btor2CegarResponse {
     /// the JSON unless the property is actually violated at the initial cell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterexample: Option<CounterTraceView>,
+    /// Track I.1 (undecided-explanation slice, 2026-06-24) — when the final
+    /// verdict still carries ⊥ (unknown) cells, the registers the failure
+    /// subgame flagged as load-bearing for those indefinite verdicts (deduped,
+    /// from `CegarTrace::init_refinement_candidates`). The actionable "why
+    /// undecided": adding predicates over these registers — or promoting their
+    /// init policy — may resolve the abstraction. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refinement_candidates: Vec<String>,
     /// CTXDSL Phase 2 (2026-06-22) — the final refined cube model + the
     /// checked formula as CTXDSL, present only when the request set
     /// `emit_ctxdsl: true`. Omitted from the JSON otherwise.

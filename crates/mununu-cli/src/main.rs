@@ -2266,6 +2266,8 @@ fn run_cegar_cli(
                 "steps": cegar_cells_json(&ct.steps),
                 "ends_in_trap": ct.ends_in_trap,
             })),
+            // Track I.1 (undecided-explanation) — load-bearing registers for ⊥ cells.
+            "refinement_candidates": trace.init_refinement_candidates,
             "approximant_reuse_enabled": trace.approximant_reuse_enabled,
             "lazy_lift_pending": trace.lazy_lift_pending,
             "warnings": trace.warnings.iter().map(|w| w.message.clone()).collect::<Vec<_>>(),
@@ -2319,6 +2321,16 @@ fn run_cegar_cli(
             for (i, w) in ct.steps.iter().enumerate() {
                 println!("    {i}. {{{}}}", w.render());
             }
+        }
+        // Track I.1 (undecided-explanation) — when ⊥ cells remain, name the
+        // registers the failure subgame flagged as load-bearing; adding
+        // predicates over them (or promoting their init policy) may resolve it.
+        if bot_cells > 0 && !trace.init_refinement_candidates.is_empty() {
+            println!(
+                "  undecided because the abstraction can't decide {bot_cells} cell(s); \
+                 try predicates over: {}",
+                trace.init_refinement_candidates.join(", ")
+            );
         }
         if !trace.warnings.is_empty() {
             println!("  warnings:");
