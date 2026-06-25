@@ -183,6 +183,276 @@ fn cmp_constraint(bv: &z3::ast::BV, op: CmpOp, value: u64) -> z3::ast::Bool {
     }
 }
 
+// --------------------------------------------------------------------------
+// B.1 — sidecar expr-string parser
+//
+// The MVP sidecar carries a compound predicate as a human-authored string
+// (`"cnt == 0 && en == 1"`), parsed here into a [`PredicateExpr`]. (The
+// structured-JSON form is a Phase-FP option; the string is friendlier to
+// author.) Hand-rolled tokenizer + recursive-descent parser — no external
+// grammar dep, and the supported surface is deliberately small (the §6 scope
+// discipline): comparison atoms + `&&` / `||` / `!` / parentheses, nothing
+// else (no arithmetic — that is the register's job, not the predicate's).
+// --------------------------------------------------------------------------
+
+/// Error parsing a predicate-expression string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateExprParseError {
+    pub message: String,
+}
+
+impl std::fmt::Display for PredicateExprParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "predicate expression parse error: {}", self.message)
+    }
+}
+
+impl std::error::Error for PredicateExprParseError {}
+
+fn perr(message: impl Into<String>) -> PredicateExprParseError {
+    PredicateExprParseError {
+        message: message.into(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Ident(String),
+    Int(u64),
+    Op(CmpOp),
+    And,
+    Or,
+    Not,
+    LParen,
+    RParen,
+}
+
+fn tokenize(s: &str) -> Result<Vec<Token>, PredicateExprParseError> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+            }
+            '&' if chars.get(i + 1) == Some(&'&') => {
+                tokens.push(Token::And);
+                i += 2;
+            }
+            '|' if chars.get(i + 1) == Some(&'|') => {
+                tokens.push(Token::Or);
+                i += 2;
+            }
+            '=' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(Token::Op(CmpOp::Eq));
+                i += 2;
+            }
+            '!' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(Token::Op(CmpOp::Ne));
+                i += 2;
+            }
+            '!' => {
+                tokens.push(Token::Not);
+                i += 1;
+            }
+            '<' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(Token::Op(CmpOp::Le));
+                i += 2;
+            }
+            '<' => {
+                tokens.push(Token::Op(CmpOp::Lt));
+                i += 1;
+            }
+            '>' if chars.get(i + 1) == Some(&'=') => {
+                tokens.push(Token::Op(CmpOp::Ge));
+                i += 2;
+            }
+            '>' => {
+                tokens.push(Token::Op(CmpOp::Gt));
+                i += 1;
+            }
+            '0'..='9' => {
+                let start = i;
+                // 0x-hex or decimal.
+                if c == '0' && matches!(chars.get(i + 1), Some('x') | Some('X')) {
+                    i += 2;
+                    let hex_start = i;
+                    while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                        i += 1;
+                    }
+                    let hex: String = chars[hex_start..i].iter().collect();
+                    if hex.is_empty() {
+                        return Err(perr("empty hex literal after `0x`"));
+                    }
+                    let v = u64::from_str_radix(&hex, 16)
+                        .map_err(|e| perr(format!("bad hex literal `0x{hex}`: {e}")))?;
+                    tokens.push(Token::Int(v));
+                } else {
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let dec: String = chars[start..i].iter().collect();
+                    let v = dec
+                        .parse::<u64>()
+                        .map_err(|e| perr(format!("bad decimal literal `{dec}`: {e}")))?;
+                    tokens.push(Token::Int(v));
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '$'
+                        || chars[i] == '.')
+                {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                tokens.push(Token::Ident(ident));
+            }
+            other => {
+                return Err(perr(format!("unexpected character `{other}`")));
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+struct Parser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+}
+
+impl Parser<'_> {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn parse_or(&mut self) -> Result<PredicateExpr, PredicateExprParseError> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek(), Some(Token::Or)) {
+            self.pos += 1;
+            let rhs = self.parse_and()?;
+            lhs = PredicateExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<PredicateExpr, PredicateExprParseError> {
+        let mut lhs = self.parse_not()?;
+        while matches!(self.peek(), Some(Token::And)) {
+            self.pos += 1;
+            let rhs = self.parse_not()?;
+            lhs = PredicateExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_not(&mut self) -> Result<PredicateExpr, PredicateExprParseError> {
+        if matches!(self.peek(), Some(Token::Not)) {
+            self.pos += 1;
+            let inner = self.parse_not()?;
+            Ok(PredicateExpr::Not(Box::new(inner)))
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<PredicateExpr, PredicateExprParseError> {
+        match self.peek() {
+            Some(Token::LParen) => {
+                self.pos += 1;
+                let e = self.parse_or()?;
+                match self.next() {
+                    Some(Token::RParen) => Ok(e),
+                    _ => Err(perr("expected `)`")),
+                }
+            }
+            Some(Token::Ident(_)) => self.parse_atom(),
+            other => Err(perr(format!(
+                "expected an atom or `(`, found {:?}",
+                other.cloned()
+            ))),
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<PredicateExpr, PredicateExprParseError> {
+        let register = match self.next() {
+            Some(Token::Ident(s)) => s,
+            other => return Err(perr(format!("expected a register name, found {other:?}"))),
+        };
+        let op = match self.next() {
+            Some(Token::Op(o)) => o,
+            other => {
+                return Err(perr(format!(
+                    "expected a comparison operator after `{register}`, found {other:?}"
+                )));
+            }
+        };
+        let value = match self.next() {
+            Some(Token::Int(v)) => v,
+            other => {
+                return Err(perr(format!(
+                    "expected an integer value after `{register} <op>`, found {other:?}"
+                )));
+            }
+        };
+        Ok(PredicateExpr::Cmp {
+            register,
+            op,
+            value,
+        })
+    }
+}
+
+/// Parse a sidecar predicate-expression string into a [`PredicateExpr`].
+///
+/// Grammar (precedence low→high): `||`, `&&`, unary `!`, parentheses, then
+/// comparison atoms `<register> <op> <value>` with `op ∈ { ==, !=, <, <=, >,
+/// >= }`. Registers are identifiers (`[A-Za-z_][A-Za-z0-9_$.]*`; `$`/`.` are
+/// allowed for BTOR2 hierarchical symbol names). Values are decimal or
+/// `0x`-hex integers. `&&` binds tighter than `||`; `!` is unary prefix.
+///
+/// Examples: `cnt == 0 && en == 1`, `!(state == 5) || done >= 1`.
+pub fn parse_predicate_expr(s: &str) -> Result<PredicateExpr, PredicateExprParseError> {
+    let tokens = tokenize(s)?;
+    if tokens.is_empty() {
+        return Err(perr("empty predicate expression"));
+    }
+    let mut parser = Parser {
+        tokens: &tokens,
+        pos: 0,
+    };
+    let expr = parser.parse_or()?;
+    if parser.pos != tokens.len() {
+        return Err(perr(format!(
+            "unexpected trailing tokens starting at {:?}",
+            tokens.get(parser.pos)
+        )));
+    }
+    Ok(expr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +508,114 @@ mod tests {
         };
         assert!(ge.eval(&regs(&[("x", 4)])));
         assert!(!ge.eval(&regs(&[("x", 3)])));
+    }
+
+    #[test]
+    fn parse_simple_atom() {
+        assert_eq!(
+            parse_predicate_expr("cnt == 0").unwrap(),
+            PredicateExpr::eq("cnt", 0)
+        );
+        assert_eq!(
+            parse_predicate_expr("state_q != 41").unwrap(),
+            PredicateExpr::Cmp {
+                register: "state_q".into(),
+                op: CmpOp::Ne,
+                value: 41
+            }
+        );
+    }
+
+    #[test]
+    fn parse_all_comparison_ops_and_hex() {
+        let cases = [
+            ("a == 1", CmpOp::Eq),
+            ("a != 1", CmpOp::Ne),
+            ("a < 1", CmpOp::Lt),
+            ("a <= 1", CmpOp::Le),
+            ("a > 1", CmpOp::Gt),
+            ("a >= 1", CmpOp::Ge),
+        ];
+        for (src, op) in cases {
+            assert_eq!(
+                parse_predicate_expr(src).unwrap(),
+                PredicateExpr::Cmp {
+                    register: "a".into(),
+                    op,
+                    value: 1
+                },
+                "parsing {src}"
+            );
+        }
+        // 0x-hex value.
+        assert_eq!(
+            parse_predicate_expr("x == 0x1f").unwrap(),
+            PredicateExpr::eq("x", 31)
+        );
+    }
+
+    #[test]
+    fn parse_compound_and_precedence() {
+        // idle = cnt == 0 && en == 1
+        assert_eq!(
+            parse_predicate_expr("cnt == 0 && en == 1").unwrap(),
+            PredicateExpr::And(
+                Box::new(PredicateExpr::eq("cnt", 0)),
+                Box::new(PredicateExpr::eq("en", 1)),
+            )
+        );
+        // && binds tighter than ||: a==1 || b==2 && c==3  ==  Or(a, And(b, c))
+        assert_eq!(
+            parse_predicate_expr("a == 1 || b == 2 && c == 3").unwrap(),
+            PredicateExpr::Or(
+                Box::new(PredicateExpr::eq("a", 1)),
+                Box::new(PredicateExpr::And(
+                    Box::new(PredicateExpr::eq("b", 2)),
+                    Box::new(PredicateExpr::eq("c", 3)),
+                )),
+            )
+        );
+        // Parens override precedence + unary !.
+        assert_eq!(
+            parse_predicate_expr("!(state == 5) || done >= 1").unwrap(),
+            PredicateExpr::Or(
+                Box::new(PredicateExpr::Not(Box::new(PredicateExpr::eq("state", 5)))),
+                Box::new(PredicateExpr::Cmp {
+                    register: "done".into(),
+                    op: CmpOp::Ge,
+                    value: 1
+                }),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_round_trips_through_eval() {
+        let e = parse_predicate_expr("cnt == 0 && en == 1").unwrap();
+        assert!(e.eval(&regs(&[("cnt", 0), ("en", 1)])));
+        assert!(!e.eval(&regs(&[("cnt", 1), ("en", 1)])));
+    }
+
+    #[test]
+    fn parse_rejects_malformed() {
+        // Missing value, missing op, trailing op, unclosed paren, empty,
+        // bad char, arithmetic (out of scope).
+        for bad in [
+            "",
+            "cnt ==",
+            "cnt 0",
+            "cnt == 0 &&",
+            "(cnt == 0",
+            "cnt == 0)",
+            "cnt == ", // op then nothing
+            "cnt + 1 == 0",
+            "cnt == 0x",
+        ] {
+            assert!(
+                parse_predicate_expr(bad).is_err(),
+                "expected parse error for {bad:?}"
+            );
+        }
     }
 
     #[test]
