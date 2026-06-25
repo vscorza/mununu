@@ -135,29 +135,17 @@ where
     let mut tgt_constraints: Vec<z3::ast::Bool> = Vec::new();
 
     for (i, pred) in predicates.iter().enumerate() {
-        let Some(&nid) = nid_map.get(pred.register()) else {
-            return SmtMustVerdict::Unknown;
-        };
-        let Some(curr_bv) = view.curr_state(nid) else {
-            return SmtMustVerdict::Unknown;
-        };
-        let Some(next_bv) = view.next_state(nid) else {
-            return SmtMustVerdict::Unknown;
-        };
-
         let src_polarity = (src_bits >> i) & 1 == 1;
         let tgt_polarity = (tgt_bits >> i) & 1 == 1;
-
-        src_constraints.push(build_predicate_constraint(
-            curr_bv,
-            pred.value(),
-            src_polarity,
-        ));
-        tgt_constraints.push(build_predicate_constraint(
-            next_bv,
-            pred.value(),
-            tgt_polarity,
-        ));
+        // B.1 — compound-aware; a missing register stays a conservative Unknown.
+        let (Some(src_c), Some(tgt_c)) = (
+            build_pred_constraint(view, nid_map, pred, false, src_polarity),
+            build_pred_constraint(view, nid_map, pred, true, tgt_polarity),
+        ) else {
+            return SmtMustVerdict::Unknown;
+        };
+        src_constraints.push(src_c);
+        tgt_constraints.push(tgt_c);
     }
 
     let solver = z3::Solver::new();
@@ -195,6 +183,14 @@ where
 pub trait PredicateLike {
     fn register(&self) -> &str;
     fn value(&self) -> u64;
+    /// B.1 — when this predicate is a **compound** (a boolean combination of
+    /// register comparisons rather than the simple `register == value` atom),
+    /// the [`PredicateExpr`] to encode. `None` (the default) ⇒ the simple atom
+    /// path, which uses `register()` / `value()` exactly as before. A compound
+    /// predicate is still one cube dimension; only its truth encoding changes.
+    fn expr(&self) -> Option<&crate::adapter::btor2::predicate_expr::PredicateExpr> {
+        None
+    }
 }
 
 impl PredicateLike for crate::adapter::btor2::kmts_lift::PredicateSpec {
@@ -203,6 +199,48 @@ impl PredicateLike for crate::adapter::btor2::kmts_lift::PredicateSpec {
     }
     fn value(&self) -> u64 {
         self.value
+    }
+}
+
+/// B.1 — build one predicate's constraint over the source (`slot_next ==
+/// false`, `state_curr` BVs) or target (`slot_next == true`, `state_next` BVs)
+/// cube, compound-aware. For a simple predicate (`expr() == None`) this is
+/// exactly [`build_predicate_constraint`] — behaviour-preserving. For a
+/// compound it builds the recursive constraint via
+/// [`crate::adapter::btor2::predicate_expr::PredicateExpr::build_constraint`]
+/// over a register→BV lookup and applies the cube polarity. Returns `None` if
+/// any referenced register is absent from the view (the caller picks the
+/// conservative verdict: `May` for may-checks, `Unknown` for must-checks).
+fn build_pred_constraint<P: PredicateLike>(
+    view: &Btor2SmtView,
+    nid_map: &HashMap<String, Nid>,
+    pred: &P,
+    slot_next: bool,
+    polarity: bool,
+) -> Option<z3::ast::Bool> {
+    match pred.expr() {
+        None => {
+            let nid = *nid_map.get(pred.register())?;
+            let bv = if slot_next {
+                view.next_state(nid)?
+            } else {
+                view.curr_state(nid)?
+            };
+            Some(build_predicate_constraint(bv, pred.value(), polarity))
+        }
+        Some(e) => {
+            let lookup = |reg: &str| -> Option<z3::ast::BV> {
+                let nid = *nid_map.get(reg)?;
+                let bv = if slot_next {
+                    view.next_state(nid)?
+                } else {
+                    view.curr_state(nid)?
+                };
+                Some(bv.clone())
+            };
+            let raw = e.build_constraint(&lookup)?;
+            Some(if polarity { raw } else { raw.not() })
+        }
     }
 }
 
@@ -225,21 +263,23 @@ where
     let mut src = Vec::with_capacity(predicates.len());
     let mut tgt = Vec::with_capacity(predicates.len());
     for (i, pred) in predicates.iter().enumerate() {
-        let nid = *nid_map.get(pred.register())?;
-        let curr_bv = view.curr_state(nid)?;
-        let next_bv = view.next_state(nid)?;
         let src_polarity = (src_bits >> i) & 1 == 1;
         let tgt_polarity = (tgt_bits >> i) & 1 == 1;
-        src.push(build_predicate_constraint(
-            curr_bv,
-            pred.value(),
+        // B.1 — compound-aware (simple atom is the `expr() == None` branch).
+        src.push(build_pred_constraint(
+            view,
+            nid_map,
+            pred,
+            false,
             src_polarity,
-        ));
-        tgt.push(build_predicate_constraint(
-            next_bv,
-            pred.value(),
+        )?);
+        tgt.push(build_pred_constraint(
+            view,
+            nid_map,
+            pred,
+            true,
             tgt_polarity,
-        ));
+        )?);
     }
     Some((src, tgt))
 }
@@ -494,31 +534,18 @@ where
     let mut constraints: Vec<z3::ast::Bool> = Vec::new();
 
     for (i, pred) in predicates.iter().enumerate() {
-        // Unresolved predicate → conservatively include the edge
-        // (over-approximation: never exclude an edge we cannot rule out).
-        let Some(&nid) = nid_map.get(pred.register()) else {
-            return SmtMayVerdict::May;
-        };
-        let Some(curr_bv) = view.curr_state(nid) else {
-            return SmtMayVerdict::May;
-        };
-        let Some(next_bv) = view.next_state(nid) else {
-            return SmtMayVerdict::May;
-        };
-
         let src_polarity = (src_bits >> i) & 1 == 1;
         let tgt_polarity = (tgt_bits >> i) & 1 == 1;
-
-        constraints.push(build_predicate_constraint(
-            curr_bv,
-            pred.value(),
-            src_polarity,
-        ));
-        constraints.push(build_predicate_constraint(
-            next_bv,
-            pred.value(),
-            tgt_polarity,
-        ));
+        // B.1 — compound-aware. An unresolved register → conservatively include
+        // the edge (over-approximation: never exclude an edge we can't rule out).
+        let (Some(src_c), Some(tgt_c)) = (
+            build_pred_constraint(view, nid_map, pred, false, src_polarity),
+            build_pred_constraint(view, nid_map, pred, true, tgt_polarity),
+        ) else {
+            return SmtMayVerdict::May;
+        };
+        constraints.push(src_c);
+        constraints.push(tgt_c);
     }
 
     let solver = z3::Solver::new();
@@ -671,6 +698,132 @@ mod tests {
             );
             SmtMustVerdict::Must
         });
+    }
+
+    // ---- B.1 — compound-predicate SMT-constraint path ----
+    //
+    // A `PredicateLike` whose `expr()` is a compound boolean over several
+    // registers, exercising `build_pred_constraint`'s compound branch.
+    use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+
+    struct CompoundPred {
+        /// Vestigial for a compound (the simple `register()`/`value()` path is
+        /// never taken when `expr()` is `Some`); a representative for display.
+        reg0: String,
+        e: PredicateExpr,
+    }
+    impl PredicateLike for CompoundPred {
+        fn register(&self) -> &str {
+            &self.reg0
+        }
+        fn value(&self) -> u64 {
+            0
+        }
+        fn expr(&self) -> Option<&PredicateExpr> {
+            Some(&self.e)
+        }
+    }
+
+    // a := 0, b := 0 (deterministic). idle = (a == 0 && b == 0).
+    const COMPOUND_DET_BTOR2: &str = "\
+1 sort bitvec 1
+2 state 1 a
+3 state 1 b
+4 zero 1
+5 init 1 2 4
+6 init 1 3 4
+7 next 1 2 4
+8 next 1 3 4
+";
+
+    // a := 0, b := in_b (b is input-driven). idle = (a == 0 && b == 0).
+    const COMPOUND_INPUT_BTOR2: &str = "\
+1 sort bitvec 1
+2 input 1 in_b
+3 state 1 a
+4 state 1 b
+5 zero 1
+6 init 1 3 5
+7 init 1 4 5
+8 next 1 3 5
+9 next 1 4 2
+";
+
+    fn idle_compound() -> PredicateExpr {
+        // a == 0 && b == 0
+        PredicateExpr::And(
+            Box::new(PredicateExpr::Cmp {
+                register: "a".into(),
+                op: CmpOp::Eq,
+                value: 0,
+            }),
+            Box::new(PredicateExpr::Cmp {
+                register: "b".into(),
+                op: CmpOp::Eq,
+                value: 0,
+            }),
+        )
+    }
+
+    #[test]
+    fn compound_predicate_deterministic_proves_must() {
+        let file = parse(COMPOUND_DET_BTOR2).expect("parse compound-det fixture");
+        let preds = vec![CompoundPred {
+            reg0: "a".into(),
+            e: idle_compound(),
+        }];
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode compound-det");
+            let nid_map = build_register_nid_map(&view);
+            // src cube {idle} (bit0=1) → tgt cube {idle} (bit0=1).
+            smt_per_target_must_check(&view, 0b1, 0b1, &preds, &nid_map, 5_000)
+        });
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::Must,
+            "a:=0,b:=0 with idle=(a==0 && b==0), src=tgt={{idle}} must prove Sharp; got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn compound_predicate_honors_every_conjunct() {
+        // b is input-driven, so the `&& b == 0` conjunct must make the must-edge
+        // FAIL (input in_b=1 escapes the target). If the encoder ignored b and
+        // only checked a==0, it would (wrongly) prove Must — see the contrast
+        // assertion below.
+        let file = parse(COMPOUND_INPUT_BTOR2).expect("parse compound-input fixture");
+        let compound = vec![CompoundPred {
+            reg0: "a".into(),
+            e: idle_compound(),
+        }];
+        let compound_verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode compound-input");
+            let nid_map = build_register_nid_map(&view);
+            smt_per_target_must_check(&view, 0b1, 0b1, &compound, &nid_map, 5_000)
+        });
+        assert_eq!(
+            compound_verdict,
+            SmtMustVerdict::NotMust,
+            "idle=(a==0 && b==0) with b:=in_b must reject Sharp (in_b=1 escapes); got {compound_verdict:?}"
+        );
+
+        // Contrast: the simple atom `a == 0` alone IS Must here (a:=0 always),
+        // proving the compound's b-conjunct genuinely changed the verdict.
+        let a_only = vec![PredicateSpec {
+            name: "a_is_zero".into(),
+            register: "a".into(),
+            value: 0,
+        }];
+        let a_only_verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode compound-input");
+            let nid_map = build_register_nid_map(&view);
+            smt_per_target_must_check(&view, 0b1, 0b1, &a_only, &nid_map, 5_000)
+        });
+        assert_eq!(
+            a_only_verdict,
+            SmtMustVerdict::Must,
+            "the simple atom a==0 alone is Must (a:=0); got {a_only_verdict:?}"
+        );
     }
 
     // ---- R.2.5b session-2 follow-up (2026-06-09) ----
