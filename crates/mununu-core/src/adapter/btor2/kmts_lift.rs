@@ -36,6 +36,47 @@
 //! interface those phases plug into; today it ships the enrichment
 //! shape and a fixture-sweep regression so the post-R.3 evaluator
 //! has something to read.
+//!
+//! ## Predicate-cube lift architecture (U.1–U.4 unification, 2026-06-26)
+//!
+//! The predicate-cube path (the R.2.5+ cap-bypassing lift; distinct from
+//! the R.2 post-hoc enrichment above) has **one** public entry and one
+//! shared per-cube body, after the lift-unification refactor:
+//!
+//! - [`lift_predicate_cube`] — the single gated entry the CEGAR loop +
+//!   verify orchestrator call. Runs the compound soundness gate
+//!   ([`ensure_compound_lift_supported`]) once, then dispatches on
+//!   [`LiftStrategy`](crate::adapter::btor2::cegar::LiftStrategy):
+//!   `Eager` → [`predicate_cube_lift`], `Lazy` → [`LazyLift`] +
+//!   [`materialize_clts_from_lazy`].
+//! - [`cube_sampling_edges`] — the ONE per-cube sampling body (canonical
+//!   representative → input-combo enumeration → UF-rep simulate →
+//!   predicate re-evaluation → target cube), shared by the eager
+//!   sampling loop + the lazy [`compute_cube_outgoing_edges`]. Returns
+//!   `(target, LabelDescriptor)` pairs deduped by `(target, descriptor)`,
+//!   which reproduces both effective edge sets. **The eager and lazy
+//!   sampling lifts cannot diverge** — the
+//!   `u1_eager_lazy_differential_equivalence` test asserts they produce
+//!   byte-identical CLTSes.
+//! - [`apply_sampled_must_inference`] — the ONE sampled-target must-edge
+//!   post-pass (`SamplingConfluence` / `SmtPerTarget{,Standard}` /
+//!   `SmtHyperMust`), shared by both paths.
+//!
+//! **Strategy matrix.** The may-relation has two shapes:
+//! - `MayEdgeInference::SmtAllPairs` — sound global all-pairs SMT
+//!   may-relation. **Eager-only** (a global Z3 query, not a per-cube
+//!   one) and the **only** path that honours compound predicates (via
+//!   the `SmtEncode` seam + `PredicateLike::expr`).
+//! - `MayEdgeInference::Off` (sampling) — the per-cube
+//!   [`cube_sampling_edges`] body; simple `register==value` atoms only.
+//!   Runs on both Eager + Lazy and is the eager≡lazy equivalence corpus.
+//!
+//! **Compound rule.** Compound predicates (`compound_exprs`) require
+//! `Eager` + `SmtAllPairs`: the sampling representative inverse can't
+//! realise e.g. `a==0 && b==0`, and the lazy body never consults
+//! `compound_exprs`. [`ensure_compound_lift_supported`] enforces this at
+//! the entry (and via thin defensive copies in `predicate_cube_lift` +
+//! `LazyLift::from_btor2` for the ~39 direct callers).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};

@@ -89,12 +89,44 @@ functions — **DR0 changes no behaviour and rewires no call site**:
   edge." That is exactly `StepEval::step` in a loop bounded by `state_vars()` widths. `bit_blast`
   becomes the *Enumerate edge-strategy* over any `StepEval`, not a BTOR2-specific engine.
 - **`predicate_cube_lift` → `SmtEncode` (SmtImage strategy).** The `MayEdgeInference::SmtAllPairs`
-  block at `kmts_lift.rs:1634` *is* `SmtEncode::may_edges`. Behind the trait it becomes
+  block at `kmts_lift.rs:2119` *is* `SmtEncode::may_edges`. Behind the trait it becomes
   `for (i,j) in sts.may_edges(&predicates, t) { builder.transition(..MayOnly..) }` — the lift no
   longer parses BTOR2 or touches Z3; it consumes an `&dyn SmtEncode`.
 
 Both consumption paths produce the *same* `Clts` (a Sharp CLTS is a degenerate KMTS), fed to the
 one evaluator family (`BoolDom` cheap path / `KleeneDom` sound-abstraction path).
+
+### 4.1 The unified predicate-cube lift entry (U.1–U.4, 2026-06-26)
+
+The predicate-cube lift had **two** implementations with verbatim-duplicated
+per-cube logic — the eager `predicate_cube_lift` and the lazy `LazyLift` +
+`materialize_clts_from_lazy`. The lift-unification refactor consolidated them so
+they share one core and dispatch through one gated entry:
+
+| Concern | Where it lives now |
+|---|---|
+| eager-vs-lazy dispatch + compound gate | one `lift_predicate_cube(predicates, btor2, opts, lift_opts, strategy)` entry |
+| per-cube sampling (representative → simulate → re-evaluate → target cube) | one `cube_sampling_edges()`, shared by the eager loop + lazy `compute_cube_outgoing_edges` |
+| sampled-target must post-pass (4 strategies) | one `apply_sampled_must_inference()`, shared by both |
+| `SmtAllPairs` may + SMT must (compound-aware) | **eager-only** — a global Z3 query, not per-cube |
+
+**Strategy decision.** The may-relation is one of:
+
+- `SmtAllPairs` — sound global all-pairs SMT may-relation (`SmtEncode::may_edges`).
+  Eager-only (global query); the only path that honours **compound predicates**
+  (via `PredicateLike::expr`).
+- `Off` (sampling) — the per-cube `cube_sampling_edges` body; simple
+  `register==value` atoms only; runs on both Eager + Lazy.
+
+**Eager ≡ Lazy guarantee.** On the sampling path the eager and lazy lifts produce
+byte-identical CLTSes — asserted by the `u1_eager_lazy_differential_equivalence`
+test (the permanent anti-divergence guard). `SmtAllPairs` is outside this
+equivalence (it is eager-only-global).
+
+**Compound rule.** Compound predicates require `Eager` + `SmtAllPairs`. The
+sampling representative inverse can't realise `a==0 && b==0`, and the lazy body
+never consults `compound_exprs`; `ensure_compound_lift_supported()` enforces this
+at the entry (and via thin defensive copies in each impl for direct callers).
 
 ## 5. Z3 scope & batching (why `may_edges` is batched, not per-pair)
 
