@@ -17,8 +17,12 @@ This document is the single canonical place describing each optional tool: what 
 | [Yosys](#yosys) | SystemVerilog → BTOR2 pipeline | `brew install yosys` | `apt install yosys` | `MUNUNU_YOSYS_PATH` |
 | [SymbiYosys (sby)](#sby--symbiyosys) | Verification oracle on RTL fixtures | Bundled with Yosys via OSS-CAD-Suite | Bundled with Yosys | `MUNUNU_SBY_PATH` |
 | [CVC5](#cvc5) | Craig interpolation predicate source (`--predicate-source craig`) | `brew install cvc5` | `apt install cvc5` (Debian 12+ / Ubuntu 24.04+) | `MUNUNU_CVC5_PATH` |
+| [Verilator](#verilator) | Reset-state simulation seeding (R-S2b, sidecar `simulate_reset`) | `brew install verilator` | `apt install verilator` | `MUNUNU_VERILATOR_PATH` |
+| [circt-verilog](#circt-verilog) | Alternative extraction frontend (`mununu-extract circt`) | build CIRCT / release tarball | build CIRCT / release tarball | n/a (pipe input) |
 
-All five tools follow the same discovery pattern: the `MUNUNU_<TOOL>_PATH` env var is checked first; if absent, the bare binary name is invoked via `$PATH`. On a per-process basis — mununu does not cache discovery results across CLI invocations.
+Every **discovered** tool above (all but Z3, which is linked, and circt-verilog, which is a pipe-input producer) follows the same discovery pattern: the `MUNUNU_<TOOL>_PATH` env var is checked first; if absent, the bare binary name is invoked via `$PATH`. On a per-process basis — mununu does not cache discovery results across CLI invocations.
+
+**Licensing posture (see [`deny.toml`](../deny.toml) + the `license-check` CI job).** Z3 is linked in-process (MIT — permissive, no contamination). Every other tool here is invoked as a **subprocess** (or, for circt-verilog, consumed as pipe input) — i.e. "mere aggregation", so its license (even Verilator's LGPL-3/Artistic-2) does **not** contaminate mununu's source license. None are bundled into a mununu artifact; contributors install them. The only license-contamination vector — the *linked* Cargo crate graph — is gated by `cargo deny check licenses` (deny-by-default permissive allow-list).
 
 ---
 
@@ -199,6 +203,68 @@ When the Craig path becomes load-bearing for a milestone (e.g. V.3 speculative n
 
 ---
 
+## Verilator
+
+> Source of truth: [`adapter/verilator/mod.rs::locate_verilator`](../crates/mununu-core/src/adapter/verilator/mod.rs#L79) — surface: CLI+API
+
+[Verilator](https://www.veripool.org/verilator/) is an open-source SystemVerilog
+simulator. Mununu invokes it via subprocess for **R-S2b reset-state simulation
+seeding**: when a sidecar declares `simulate_reset`, mununu compiles + runs a short
+concrete simulation through Verilator, captures the post-reset valuation of the
+declared `observe_registers`, and feeds it to the bit-blaster's predicate seeder.
+
+Verilator's own license (LGPL-3.0 / Artistic-2.0) does not affect mununu: it is run
+as a separate process (mere aggregation) and is never bundled.
+
+### macOS
+```bash
+brew install verilator
+# Verify install: verilator --version
+```
+
+### Debian / Ubuntu
+```bash
+apt install verilator
+```
+
+### Discovery
+1. `MUNUNU_VERILATOR_PATH` env var (explicit override).
+2. `verilator` on `$PATH`.
+
+### Missing-tool behaviour
+When a sidecar requests `simulate_reset` but Verilator isn't found, mununu falls back
+gracefully to the other Phase-9 seeding strategies (BTOR2 `init` lines, etc.) — the
+verdict is still computed, just without the simulation-derived seeds.
+
+---
+
+## circt-verilog
+
+> Source of truth: [`mununu-extract/src/circt.rs`](../crates/mununu-extract/src/circt.rs) — surface: CLI (`mununu-extract circt`)
+
+[`circt-verilog`](https://github.com/llvm/circt) (the CIRCT project's slang-based
+Verilog frontend) lowers SystemVerilog to CIRCT MLIR. Unlike the discovered tools
+above, mununu does **not** spawn it — it is a **pipe-input producer**: the user runs
+circt-verilog and pipes its MLIR into the `mununu-extract circt` subcommand, which
+parses the `hw`/`comb`/`seq` dialects into an explicit-state Kripke structure.
+
+```bash
+circt-verilog design.sv | mununu-extract circt --output spec.espec.json
+```
+
+This is an **alternative** extraction frontend (the primary RTL path is
+sv2v → Yosys → BTOR2). Because it's pipe input, there is no `MUNUNU_*_PATH`
+discovery and no in-mununu version check — the user supplies the MLIR. CIRCT is
+Apache-2.0 (with the LLVM exception); as upstream tooling whose output mununu
+consumes, it imposes no obligation on mununu.
+
+> **Note (Track H / XL.1).** The SVA-verification front-end will use the standalone
+> **`slang`** CLI (`slang --ast-json`) as a discovered subprocess (the cvc5 pattern),
+> *not* circt-verilog — see the roadmap XL.0 decision. A `slang` section lands here
+> when XL.1 ships.
+
+---
+
 ## Verifying your install
 
 After installing any of these tools, you can confirm mununu discovers them via:
@@ -218,6 +284,9 @@ sby --help
 
 # CVC5
 cvc5 --version
+
+# Verilator
+verilator --version
 ```
 
 Mununu's discovery layer parses the version strings (or just confirms exit-zero) — there's no semver gating today, but each adapter's tests are pinned to versions known to work. If you hit a "binary not found" error from a mununu CLI subcommand, set the corresponding `MUNUNU_*_PATH` env var to the absolute path of the binary, or ensure it's on `$PATH`.
