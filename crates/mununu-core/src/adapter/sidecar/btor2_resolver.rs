@@ -119,6 +119,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         }
     }
 
