@@ -3480,6 +3480,153 @@ mod tests {
         );
     }
 
+    // U.1 (lift-unification, 2026-06-26) — the eager≡lazy differential guard.
+    // The eager sampling lift (`predicate_cube_lift` with may = sampling) and the
+    // lazy lift (`LazyLift` + `materialize_clts_from_lazy`) MUST produce identical
+    // CLTSes — edge-for-edge, modality-for-modality, 3-valued-label-for-label — for
+    // the same fixture + options, so the two duplicated paths can never silently
+    // diverge. This is the regression net the lift-unification refactor (U.2–U.4)
+    // is built on; it must stay green through every extraction phase. (SmtAllPairs
+    // may is eager-only-global, outside this equivalence; the corpus is
+    // non-controllability — lazy gains controllability parity in U.3.)
+    // (src_index, sorted label payloads, target_index, modality string).
+    type CanonEdge = (usize, Vec<String>, usize, String);
+    // (state_index, predicate name, tristate string).
+    type CanonPred = (usize, String, String);
+    fn canonical_clts(
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> (Vec<CanonEdge>, Vec<CanonPred>) {
+        let modality_str = |m: &crate::clts::TransitionModality<DefaultStateIdx>| -> String {
+            match m {
+                crate::clts::TransitionModality::Sharp => "Sharp".to_string(),
+                crate::clts::TransitionModality::MayOnly => "MayOnly".to_string(),
+                crate::clts::TransitionModality::MustHyperOnly(targets) => {
+                    let mut idx: Vec<usize> = targets.iter().map(|t| t.index()).collect();
+                    idx.sort_unstable();
+                    format!("MustHyper{idx:?}")
+                }
+            }
+        };
+        let mut edges: Vec<CanonEdge> = Vec::new();
+        for s in clts.states() {
+            for t in clts.outgoing(s) {
+                let mut labels: Vec<String> = t
+                    .labels()
+                    .iter()
+                    .filter_map(|l| clts.label_payload(*l).map(|p| p.join("+")))
+                    .collect();
+                labels.sort();
+                edges.push((
+                    s.index(),
+                    labels,
+                    t.target().index(),
+                    modality_str(t.modality()),
+                ));
+            }
+        }
+        edges.sort();
+        edges.dedup();
+        let mut preds: Vec<CanonPred> = Vec::new();
+        for s in clts.states() {
+            for (name, tri) in clts.state_3valued_predicate_entries(s) {
+                preds.push((s.index(), name.to_string(), format!("{tri:?}")));
+            }
+        }
+        preds.sort();
+        (edges, preds)
+    }
+
+    #[test]
+    fn u1_eager_lazy_differential_equivalence() {
+        use crate::adapter::AdapterOptions;
+        // toggle (1 pred), 2-bit wrapping counter (2 preds), input-driven (1 pred,
+        // nondeterministic). All non-controllability, may = sampling.
+        let toggle =
+            "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+        let counter = "1 sort bitvec 2\n2 state 2 r\n3 one 2\n4 add 2 2 3\n5 zero 2\n6 init 2 2 5\n7 next 2 2 4\n";
+        let input_driven = "1 sort bitvec 1\n2 input 1 in_a\n3 state 1 reg_a\n4 zero 1\n5 init 1 3 4\n6 next 1 3 2\n";
+        let fixtures: Vec<(&str, &str, Vec<PredicateSpec>)> = vec![
+            (
+                "toggle",
+                toggle,
+                vec![PredicateSpec {
+                    name: "q1".into(),
+                    register: "q".into(),
+                    value: 1,
+                }],
+            ),
+            (
+                "counter",
+                counter,
+                vec![
+                    PredicateSpec {
+                        name: "r0".into(),
+                        register: "r".into(),
+                        value: 0,
+                    },
+                    PredicateSpec {
+                        name: "r3".into(),
+                        register: "r".into(),
+                        value: 3,
+                    },
+                ],
+            ),
+            (
+                "input_driven",
+                input_driven,
+                vec![PredicateSpec {
+                    name: "a0".into(),
+                    register: "reg_a".into(),
+                    value: 0,
+                }],
+            ),
+        ];
+
+        for must in [
+            MustEdgeInference::Off,
+            MustEdgeInference::SamplingConfluence,
+            MustEdgeInference::SmtPerTarget,
+            MustEdgeInference::SmtPerTargetStandard,
+            MustEdgeInference::SmtHyperMust,
+        ] {
+            for (label, btor2, preds) in &fixtures {
+                let lift_opts = PredicateCubeLiftOptions {
+                    max_cube_count: 1024,
+                    max_input_bits: 8,
+                    must_edge_inference: must,
+                    may_edge_inference: MayEdgeInference::Off,
+                    config_values: std::collections::HashMap::new(),
+                    compound_exprs: std::collections::HashMap::new(),
+                };
+                let eager = predicate_cube_lift(
+                    preds.clone(),
+                    btor2,
+                    &AdapterOptions::default(),
+                    &lift_opts,
+                )
+                .unwrap_or_else(|e| panic!("eager lift {label}/{must:?}: {}", e.message));
+                let mut lazy = LazyLift::from_btor2(
+                    preds.clone(),
+                    btor2,
+                    &AdapterOptions::default(),
+                    &lift_opts,
+                )
+                .unwrap_or_else(|e| panic!("lazy build {label}/{must:?}: {}", e.message));
+                let lazy_result = materialize_clts_from_lazy(
+                    &mut lazy,
+                    crate::adapter::SourceFormat::Btor2,
+                    must,
+                )
+                .unwrap_or_else(|e| panic!("lazy materialize {label}/{must:?}: {}", e.message));
+                assert_eq!(
+                    canonical_clts(&eager.clts),
+                    canonical_clts(&lazy_result.clts),
+                    "eager ≢ lazy for fixture {label}, must = {must:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn predicate_image_mvp_max_input_bits_zero_disables_edges() {
         // Setting max_input_bits = 0 recovers the legacy R.2.5 MVP
