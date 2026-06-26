@@ -1,0 +1,10 @@
+{
+  "$schema": "mununu_sv_annotation_v1",
+  "module": "uart_tx",
+  "compound_predicates": [
+    {
+      "name": "idle",
+      "expr": "bit_cnt_q == 0 && sreg_q == 2047"
+    }
+  ]
+}
