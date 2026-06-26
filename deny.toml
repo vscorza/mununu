@@ -1,0 +1,47 @@
+# cargo-deny configuration — dependency LICENSE gate (roadmap E.5, 2026-06-26).
+#
+# Guards mununu's "Mununu Non-Commercial License" against copyleft contamination
+# in the LINKED Cargo crate graph — the real license-poisoning vector. (The
+# external CLI tools mununu invokes — yosys / sv2v / cvc5 / Verilator / slang /
+# circt-verilog — are SUBPROCESSES = "mere aggregation", so they do not
+# contaminate mununu's license regardless of their own license; see
+# docs/external-tools.md. The only linked native dep, Z3, is MIT.)
+#
+# Run locally:  cargo deny check licenses
+# CI gate:      the `license-check` job in .github/workflows/ci.yml
+#
+# Policy: deny-by-default. Any crate whose SPDX license is NOT in `allow` fails
+# the check. A copyleft crate (GPL/AGPL/LGPL/SSPL) would therefore fail here —
+# which is exactly the protection we want, because GPL forbids the added
+# "non-commercial" restriction mununu's license imposes.
+
+[licenses]
+# Permissive licenses only. Add an entry ONLY after confirming it is genuinely
+# permissive (or weak/file-level copyleft that does not contaminate the larger
+# work, e.g. MPL-2.0 used unmodified).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+# Several allowed licenses above aren't currently used by any crate — that's
+# intentional future-proofing (they're all clearly permissive, so a new dep
+# under one shouldn't break CI). Don't warn about the unused entries, so a
+# genuinely new/unexpected license stands out.
+unused-allowed-license = "allow"
+
+# The workspace's own crates (mununu-core / mununu-cli / mununu-extract) carry
+# `license-file = LICENSE` (the non-SPDX Mununu Non-Commercial License), so they
+# have no SPDX expression for cargo-deny to classify. Skip our own code; this
+# gate is about THIRD-PARTY linked crates.
+[licenses.private]
+ignore = true
