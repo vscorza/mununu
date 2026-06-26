@@ -151,6 +151,17 @@ Per-module image computation cost (worst case): `O(|S^#|^2)` may-queries + `O(|R
 
 Termination is straightforward: the image computation is a fixed-point over the may set seeded by the initial abstract states, iterating until no new abstract state is discovered. Bounded by `2^|P|`.
 
+### §3d The unified lift entry (eager / lazy / compound routing)
+
+> Source of truth: [`lift_predicate_cube`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L1870) + [`ensure_compound_lift_supported`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L1803) — surface: (CLI+API+UI) via `mununu btor2 cegar` / `POST /api/v1/btor2/cegar` / the `/cegar` panel.
+
+Both the may-mode (§3b) and must-mode (§3a) images are reached through **one** gated entry, `lift_predicate_cube(predicates, btor2, opts, lift_opts, strategy)`, which the CEGAR loop and the sv-yosys verify orchestrator call. It runs the compound soundness gate once, then dispatches:
+
+- `LiftStrategy::Eager` → `predicate_cube_lift` (materialises `2^|P|` cubes; the full-fidelity path; the only path that honours **compound predicates** via the `SmtAllPairs` seam).
+- `LiftStrategy::Lazy` → `LazyLift` + `materialize_clts_from_lazy` (per-cube on-demand; **identical CLTS to Eager** on the sampling path — asserted by the `u1_eager_lazy_differential_equivalence` test; does not support compounds).
+
+The two strategies share one per-cube sampling body (`cube_sampling_edges`) and one sampled-target must post-pass (`apply_sampled_must_inference`), so they cannot diverge. **Compound rule:** a non-empty `compound_exprs` requires `Eager` + `may = SmtAllPairs` — the sampling representative inverse can't realise compound atoms (e.g. `a==0 && b==0`), and the lazy body never consults `compound_exprs`; `ensure_compound_lift_supported` rejects the unsupported combinations at the entry.
+
 ## §4 CEGAR loop with two-axis refinement
 
 When the KleeneDomain evaluator returns `KleeneBot` on a property, the abstract model is too coarse to give a definite verdict. CEGAR (Clarke, Grumberg, Jha, Lu, Veith — CAV 2000, *Counterexample-Guided Abstraction Refinement*) responds by extracting a refinement signal from the abstract counterexample and adding predicates to the model. The mununu lifter's CEGAR loop has two distinguishing features: it operates over a 3-valued verdict (instead of the original 2-valued setting), and it refines on *two axes* (predicate set + UF wrapping set) rather than one.
@@ -253,7 +264,7 @@ The architecture doc §6.9 catalogues these as part of the broader soundness sto
 
 ### §4.9 The audited-sound cube fragment
 
-> Source of truth: [`predicate_cube_lift`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L1504) + [`evaluate_tri`](../../crates/mununu-core/src/mu_calculus/evaluator.rs#L792) + [`cube_modality_soundness_warnings`](../../crates/mununu-core/src/mu_calculus/mod.rs#L284) — surface: (CLI+API+UI) via `mununu btor2 cegar` / `POST /api/v1/btor2/cegar` / the `/cegar` panel.
+> Source of truth: [`predicate_cube_lift`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L1918) + [`evaluate_tri`](../../crates/mununu-core/src/mu_calculus/evaluator.rs#L792) + [`cube_modality_soundness_warnings`](../../crates/mununu-core/src/mu_calculus/mod.rs#L284) — surface: (CLI+API+UI) via `mununu btor2 cegar` / `POST /api/v1/btor2/cegar` / the `/cegar` panel.
 
 A `KleeneT` / `KleeneF` verdict on the predicate cube is only *sound* — i.e.
 guaranteed to transfer to the concrete RTL by the §4.5 preservation theorem
@@ -274,7 +285,7 @@ process-algebra world (the explicit-CLTS path), not the cube.
    (under-approximation, the must-step-preservation premise). Established by a
    differential test against an independent concrete oracle
    ([`simulate_one_step`](../../crates/mununu-core/src/adapter/btor2/bit_blast.rs)):
-   [`po1_cube_brackets_concrete_*`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L3076).
+   [`po1_cube_brackets_concrete_*`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L3105).
 2. **The evaluator computes the §4.3 semantics** — the production `KleeneDom`
    modal step equals the Bruns–Godefroid 3-valued modal definition for every
    `{Sharp, MayOnly} × {T, F}` edge configuration. Established by an enumerated
