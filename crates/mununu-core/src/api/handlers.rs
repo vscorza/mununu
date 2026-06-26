@@ -522,6 +522,7 @@ fn run_controllability_aware_lift(
         must_edge_inference: MustEdgeInference::Off,
         may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
+        compound_exprs: std::collections::HashMap::new(),
     };
 
     let lift_result =
