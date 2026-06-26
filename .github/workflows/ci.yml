@@ -57,6 +57,23 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Copyleft gate on the LINKED crate graph (deny.toml). Fails if any
+      # dependency's license isn't in the permissive allow-list — protects the
+      # Mununu Non-Commercial License from GPL/AGPL/LGPL contamination. External
+      # CLI tools (yosys/sv2v/cvc5/Verilator/slang) are subprocesses, not linked,
+      # so they're out of scope here (see docs/external-tools.md).
+      - name: Check dependency licenses
+        run: cargo deny check licenses
+
   unused-deps:
     runs-on: ubuntu-latest
     steps:
