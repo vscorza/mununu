@@ -980,22 +980,23 @@ pub fn cegar_refine_loop(
             }
         }
 
-        // The env passed in must match the lift's state count for
-        // `evaluate_3v_game` to succeed. The MVP requires the caller
-        // to supply a compatible environment — the lift's
-        // state_count equals 2^|predicates| at this stage.
-        if env.state_count() != lift_result.clts.state_count() {
-            return Err(AdapterError {
-                kind: AdapterErrorKind::IrConsistencyError,
-                location: None,
-                message: format!(
-                    "adapter/btor2/cegar: environment state count {} does not match lift state count {} at iteration {iteration}; \
-                     the caller must rebuild Environment after predicate-set changes (R.5 MVP limitation)",
-                    env.state_count(),
-                    lift_result.clts.state_count()
-                ),
-            });
-        }
+        // The evaluator needs an `Environment` sized to the lift's cube
+        // count. The predicate set can change WITHIN this loop in two
+        // ways the caller-supplied `env` cannot anticipate: (1) B.1 3c
+        // appends the sidecar `compound_predicates` above, and (2) CEGAR
+        // refinement grows the predicate set across iterations. Rather
+        // than the prior hard-error ("caller must rebuild Environment"),
+        // rebuild a correctly-sized env whenever the caller's doesn't
+        // match. Safe because the cube-CEGAR formulas are closed
+        // (fixpoints bind their own variables) — the caller's `env`
+        // carries no free-variable bindings, only a state_count, so a
+        // resized empty env is behaviourally identical when sizes match
+        // and is the *correct* env when they don't. (The approximant-reuse
+        // path below already anticipates in-loop cube growth via
+        // `refine_cube_approximant`; this rebuild is the missing half.)
+        let rebuilt_env = (env.state_count() != lift_result.clts.state_count())
+            .then(|| Environment::new(lift_result.clts.state_count()));
+        let eval_env: &Environment = rebuilt_env.as_ref().unwrap_or(env);
 
         // 2. Evaluate. When `capture_approximants` is set, wire an
         //    `on_fixpoint_convergence` callback into the evaluator
@@ -1098,15 +1099,16 @@ pub fn cegar_refine_loop(
                         );
                     }
                 }));
-            evaluate_3v_game_with_options(formula, &lift_result.clts, env, &eval_opts)
+            evaluate_3v_game_with_options(formula, &lift_result.clts, eval_env, &eval_opts)
                 .map_err(eval_err_to_adapter_err)?
         } else if eval_opts.prior_approximants.is_some() {
             // Sub-item 1.3: even without capture, the prior_seed
             // path needs to flow through `with_options`.
-            evaluate_3v_game_with_options(formula, &lift_result.clts, env, &eval_opts)
+            evaluate_3v_game_with_options(formula, &lift_result.clts, eval_env, &eval_opts)
                 .map_err(eval_err_to_adapter_err)?
         } else {
-            evaluate_3v_game(formula, &lift_result.clts, env).map_err(eval_err_to_adapter_err)?
+            evaluate_3v_game(formula, &lift_result.clts, eval_env)
+                .map_err(eval_err_to_adapter_err)?
         };
         let approximants_at_end: Option<HashMap<usize, StoredApproximant>> = captured.map(|h| {
             // B.6.a invariant: by this point `eval_opts` has been
@@ -3947,6 +3949,55 @@ mod tests {
                 .iter()
                 .any(|w| w.message.contains("[B.1 3c compound]")),
             "no compound predicates ⇒ no 3c override warning"
+        );
+    }
+
+    #[test]
+    fn cegar_rebuilds_env_on_in_loop_predicate_growth() {
+        // B.2 (2026-06-26) — regression guard for the env-rebuild fix.
+        // The caller sizes the `Environment` from its EXPLICIT predicate
+        // count, but B.1 3c appends sidecar compound predicates INSIDE the
+        // loop (and CEGAR refinement grows the set across iterations), so
+        // the caller's env can be too small. Pre-fix this hard-errored
+        // ("environment state count N does not match lift state count M");
+        // post-fix the loop rebuilds a correctly-sized env. This is the
+        // exact V.7-b CLI scenario at the lib level: 1 bootstrap predicate
+        // (env sized for 2 cubes) + 1 sidecar compound = 2 predicates =
+        // 4 cubes — a deliberate mismatch.
+        let formula = parser::parse("true").expect("formula parses");
+        let btor2 = "1 sort bitvec 1\n2 input 1 in_b\n3 state 1 a\n4 state 1 b\n5 zero 1\n6 init 1 3 5\n7 init 1 4 5\n8 next 1 3 5\n9 next 1 4 2\n";
+        let sidecar =
+            r#"{"module":"m","compound_predicates":[{"name":"idle","expr":"a == 0 && b == 0"}]}"#;
+        let adapter_options = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        // Deliberately undersized env: 2 cubes for the 1 bootstrap
+        // predicate, but the appended compound grows the lift to 4 cubes.
+        let env = Environment::new(2);
+        let initial = vec![PredicateSpec {
+            name: "busy".into(),
+            register: "a".into(),
+            value: 1,
+        }];
+        let opts = CegarOptions {
+            max_iterations: 2,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
+        };
+        let trace = cegar_refine_loop(&formula, btor2, initial, &env, &adapter_options, &opts)
+            .expect("env-rebuild lets the undersized-env compound run succeed");
+        assert_eq!(
+            trace.final_predicates.len(),
+            2,
+            "bootstrap `busy` + sidecar compound `idle` ⇒ 2 cube-bit predicates"
         );
     }
 }
