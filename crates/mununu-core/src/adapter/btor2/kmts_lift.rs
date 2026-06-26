@@ -961,6 +961,300 @@ pub(crate) fn encode_design_for_lift(
     encode_design_with_theory(file, theory)
 }
 
+/// U.2 (lift-unification, 2026-06-26) — outcome of the shared sampled-target
+/// must-edge inference: how many `MayOnly` edges were promoted to `Sharp`, how
+/// many `MustHyperOnly` edges were emitted, and the soundness/advisory warnings.
+struct MustInferenceOutcome {
+    sharp_promoted: usize,
+    hyper_emitted: usize,
+    warnings: Vec<crate::adapter::AdapterWarning>,
+}
+
+/// U.2 — the single shared implementation of the four sampled-target must-edge
+/// post-passes (`SamplingConfluence`, `SmtPerTarget`, `SmtPerTargetStandard`,
+/// `SmtHyperMust`), previously duplicated verbatim between the eager
+/// `predicate_cube_lift` and the lazy `materialize_clts_from_lazy`. Operates on
+/// the already-collected `sampled_targets_per_source` (the may-edge sampling
+/// pass's output) and promotes/emits must-edges on `builder`.
+///
+/// `source_tag` is substituted into the `[R.2.5b-*]`-tagged warning messages so
+/// each caller's origin is identifiable (the tag prefixes, which tests assert,
+/// are identical across callers).
+///
+/// `controllability_aware` gates the whole pass off (R.6.6): under
+/// controllability-aware mode the promoted edges would carry mismatched
+/// single-`step` labels, so the post-passes are skipped (R.6.6.b follow-up).
+#[allow(clippy::too_many_arguments)]
+fn apply_sampled_must_inference(
+    builder: &mut crate::clts::CltsBuilder<DefaultStateIdx, DefaultLabelIdx>,
+    state_ids: &[crate::clts::StateId<DefaultStateIdx>],
+    sampled_targets_per_source: &[std::collections::BTreeSet<usize>],
+    file: &crate::adapter::btor2::ast::Btor2File,
+    predicates: &[PredicateSpec],
+    label_id: crate::clts::LabelId<DefaultLabelIdx>,
+    must_edge_inference: MustEdgeInference,
+    controllability_aware: bool,
+    source_tag: &str,
+) -> MustInferenceOutcome {
+    use crate::adapter::btor2::smt_must_edge::{
+        SmtMustVerdict, build_register_nid_map, smt_hyper_must_check, smt_per_target_must_check,
+        smt_per_target_must_check_standard,
+    };
+    let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
+    // R.6.6 gate — skip all post-passes under controllability-aware mode.
+    if controllability_aware {
+        return MustInferenceOutcome {
+            sharp_promoted: 0,
+            hyper_emitted: 0,
+            warnings,
+        };
+    }
+    let approx = crate::adapter::WarningKind::ApproximateTranslation;
+    match must_edge_inference {
+        MustEdgeInference::Off => MustInferenceOutcome {
+            sharp_promoted: 0,
+            hyper_emitted: 0,
+            warnings,
+        },
+        // SamplingConfluence — single sampled target ⇒ Sharp; multiple ⇒
+        // MustHyperOnly over the set. SOUNDNESS: sampling-derived (the
+        // canonical-representative cover assumption), not SMT-proved.
+        MustEdgeInference::SamplingConfluence => {
+            let mut sharp = 0usize;
+            let mut hyper = 0usize;
+            for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
+                if targets.is_empty() {
+                    continue;
+                }
+                let src_id = state_ids[src_idx];
+                let target_ids: smallvec::SmallVec<[crate::clts::StateId<DefaultStateIdx>; 4]> =
+                    targets.iter().map(|&i| state_ids[i]).collect();
+                if target_ids.len() == 1 {
+                    builder.transition_ids_with_modality(
+                        src_id,
+                        &[label_id],
+                        target_ids[0],
+                        crate::clts::TransitionModality::Sharp,
+                    );
+                    sharp += 1;
+                } else {
+                    builder.transition_ids_with_modality(
+                        src_id,
+                        &[label_id],
+                        target_ids[0],
+                        crate::clts::TransitionModality::must_hyper(target_ids.clone()),
+                    );
+                    hyper += 1;
+                }
+            }
+            if sharp > 0 || hyper > 0 {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: approx,
+                    message: format!(
+                        "[R.2.5b-sampling-must] {source_tag}: SamplingConfluence post-pass promoted {sharp} edge(s) to Sharp and emitted {hyper} MustHyperOnly edge(s). SOUNDNESS: sampling-derived; SMT-backed must-edge proof is queued for an R.2.5b follow-up session. Verdicts depending on these must-edges should be treated as candidate until the SMT swap lands."
+                    ),
+                    location: None,
+                });
+            }
+            MustInferenceOutcome {
+                sharp_promoted: sharp,
+                hyper_emitted: hyper,
+                warnings,
+            }
+        }
+        // SmtPerTarget — ∀∀ form (stronger than canonical KMTS) per
+        // (src, sampled-target). SOUNDNESS: SMT-proved.
+        MustEdgeInference::SmtPerTarget => {
+            let cfg = z3::Config::new();
+            let sharp = z3::with_z3_config(&cfg, || -> usize {
+                let Ok(view) = encode_design_for_lift(file) else {
+                    return 0;
+                };
+                let nid_map = build_register_nid_map(&view);
+                let mut promoted = 0usize;
+                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let src_id = state_ids[src_idx];
+                    for &tgt_idx in targets {
+                        if matches!(
+                            smt_per_target_must_check(
+                                &view,
+                                src_idx as u64,
+                                tgt_idx as u64,
+                                predicates,
+                                &nid_map,
+                                5_000,
+                            ),
+                            SmtMustVerdict::Must
+                        ) {
+                            builder.transition_ids_with_modality(
+                                src_id,
+                                &[label_id],
+                                state_ids[tgt_idx],
+                                crate::clts::TransitionModality::Sharp,
+                            );
+                            promoted += 1;
+                        }
+                    }
+                }
+                promoted
+            });
+            if sharp > 0 {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: approx,
+                    message: format!(
+                        "[R.2.5b-smt-must] {source_tag}: SmtPerTarget post-pass promoted {sharp} edge(s) to Sharp via Z3 BV-theory must-check (stronger ∀∀ form). The standard ∀∃ form may promote additional edges; see `MustEdgeInference::SmtPerTargetStandard`. Hyper-must inference: see `MustEdgeInference::SmtHyperMust`."
+                    ),
+                    location: None,
+                });
+            }
+            MustInferenceOutcome {
+                sharp_promoted: sharp,
+                hyper_emitted: 0,
+                warnings,
+            }
+        }
+        // SmtPerTargetStandard — ∀∃ form (canonical KMTS must, Bruns–Godefroid).
+        MustEdgeInference::SmtPerTargetStandard => {
+            let cfg = z3::Config::new();
+            let sharp = z3::with_z3_config(&cfg, || -> usize {
+                let Ok(view) = encode_design_for_lift(file) else {
+                    return 0;
+                };
+                let nid_map = build_register_nid_map(&view);
+                let mut promoted = 0usize;
+                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let src_id = state_ids[src_idx];
+                    for &tgt_idx in targets {
+                        if matches!(
+                            smt_per_target_must_check_standard(
+                                &view,
+                                src_idx as u64,
+                                tgt_idx as u64,
+                                predicates,
+                                &nid_map,
+                                5_000,
+                            ),
+                            SmtMustVerdict::Must
+                        ) {
+                            builder.transition_ids_with_modality(
+                                src_id,
+                                &[label_id],
+                                state_ids[tgt_idx],
+                                crate::clts::TransitionModality::Sharp,
+                            );
+                            promoted += 1;
+                        }
+                    }
+                }
+                promoted
+            });
+            if sharp > 0 {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: approx,
+                    message: format!(
+                        "[R.2.5b-smt-must-standard] {source_tag}: SmtPerTargetStandard post-pass promoted {sharp} edge(s) to Sharp via Z3 ∀∃ must-check (canonical KMTS form per Bruns–Godefroid CONCUR 2000). Hyper-must inference: see `MustEdgeInference::SmtHyperMust`."
+                    ),
+                    location: None,
+                });
+            }
+            MustInferenceOutcome {
+                sharp_promoted: sharp,
+                hyper_emitted: 0,
+                warnings,
+            }
+        }
+        // SmtHyperMust — per-target ∀∃ singletons first; if none, full-set
+        // hyper-must over the sampled targets.
+        MustEdgeInference::SmtHyperMust => {
+            let cfg = z3::Config::new();
+            let (sharp, hyper) = z3::with_z3_config(&cfg, || -> (usize, usize) {
+                let Ok(view) = encode_design_for_lift(file) else {
+                    return (0, 0);
+                };
+                let nid_map = build_register_nid_map(&view);
+                let mut sharp = 0usize;
+                let mut hyper = 0usize;
+                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let src_id = state_ids[src_idx];
+                    let src_bits = src_idx as u64;
+                    let mut promoted_singleton = false;
+                    for &tgt_idx in targets {
+                        if matches!(
+                            smt_per_target_must_check_standard(
+                                &view,
+                                src_bits,
+                                tgt_idx as u64,
+                                predicates,
+                                &nid_map,
+                                5_000,
+                            ),
+                            SmtMustVerdict::Must
+                        ) {
+                            builder.transition_ids_with_modality(
+                                src_id,
+                                &[label_id],
+                                state_ids[tgt_idx],
+                                crate::clts::TransitionModality::Sharp,
+                            );
+                            sharp += 1;
+                            promoted_singleton = true;
+                        }
+                    }
+                    if !promoted_singleton && targets.len() > 1 {
+                        let target_bits_set: Vec<u64> = targets.iter().map(|&i| i as u64).collect();
+                        if matches!(
+                            smt_hyper_must_check(
+                                &view,
+                                src_bits,
+                                &target_bits_set,
+                                predicates,
+                                &nid_map,
+                                5_000,
+                            ),
+                            SmtMustVerdict::Must
+                        ) {
+                            let target_ids: smallvec::SmallVec<
+                                [crate::clts::StateId<DefaultStateIdx>; 4],
+                            > = targets.iter().map(|&i| state_ids[i]).collect();
+                            builder.transition_ids_with_modality(
+                                src_id,
+                                &[label_id],
+                                target_ids[0],
+                                crate::clts::TransitionModality::must_hyper(target_ids.clone()),
+                            );
+                            hyper += 1;
+                        }
+                    }
+                }
+                (sharp, hyper)
+            });
+            if sharp > 0 || hyper > 0 {
+                warnings.push(crate::adapter::AdapterWarning {
+                    kind: approx,
+                    message: format!(
+                        "[R.2.5b-smt-must-hyper] {source_tag}: SmtHyperMust post-pass promoted {sharp} edge(s) to Sharp + emitted {hyper} MustHyperOnly edge(s) via Z3 ∀∃ checks. Hyper-must targets = full sampled set (MVP doesn't minimize T)."
+                    ),
+                    location: None,
+                });
+            }
+            MustInferenceOutcome {
+                sharp_promoted: sharp,
+                hyper_emitted: hyper,
+                warnings,
+            }
+        }
+    }
+}
+
 pub fn materialize_clts_from_lazy(
     lazy: &mut LazyLift,
     btor2_source_info_format: SourceFormat,
@@ -1043,258 +1337,22 @@ pub fn materialize_clts_from_lazy(
         }
     }
 
-    // R.2.5b session-1 follow-up (2026-06-06) — SamplingConfluence
-    // post-pass for the lazy materialiser. Same logic as the eager
-    // predicate_cube_lift path: single-target convergence promotes
-    // to Sharp; multi-target convergence emits a MustHyperOnly
-    // edge. SOUNDNESS: sampling-derived; SMT-backed proof is
-    // queued for R.2.5b session 2.
-    if matches!(must_edge_inference, MustEdgeInference::SamplingConfluence) {
-        for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-            if targets.is_empty() {
-                continue;
-            }
-            let src_id = state_ids[src_idx];
-            let target_ids: smallvec::SmallVec<[crate::clts::StateId<DefaultStateIdx>; 4]> =
-                targets.iter().map(|&i| state_ids[i]).collect();
-            if target_ids.len() == 1 {
-                builder.transition_ids_with_modality(
-                    src_id,
-                    &[label_id],
-                    target_ids[0],
-                    TransitionModality::Sharp,
-                );
-                sharp_edges_promoted += 1;
-            } else {
-                builder.transition_ids_with_modality(
-                    src_id,
-                    &[label_id],
-                    target_ids[0],
-                    TransitionModality::must_hyper(target_ids.clone()),
-                );
-                hyper_must_edges_emitted += 1;
-            }
-        }
-        if sharp_edges_promoted > 0 || hyper_must_edges_emitted > 0 {
-            warnings.push(crate::adapter::AdapterWarning {
-                kind: crate::adapter::WarningKind::ApproximateTranslation,
-                message: format!(
-                    "[R.2.5b-sampling-must] materialize_clts_from_lazy: SamplingConfluence post-pass promoted {} edge(s) to Sharp and emitted {} MustHyperOnly edge(s). SOUNDNESS: sampling-derived; SMT-backed must-edge proof is queued for an R.2.5b follow-up session.",
-                    sharp_edges_promoted,
-                    hyper_must_edges_emitted
-                ),
-                location: None,
-            });
-        }
-    }
-
-    // R.2.5b session-2 (2026-06-08) — SmtPerTarget post-pass for
-    // the lazy materialiser. Same shape as the eager
-    // predicate_cube_lift path: SMT-prove the stronger ∀∀
-    // must-edge form per (src, sampled-target) pair; promote
-    // confirmed edges to Sharp. Hyper-must inference is queued
-    // for the session-2 follow-up.
-    if matches!(must_edge_inference, MustEdgeInference::SmtPerTarget) {
-        let cfg = z3::Config::new();
-        let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-            let view = match encode_design_for_lift(lazy.file()) {
-                Ok(v) => v,
-                Err(_) => return 0,
-            };
-            let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-            let mut promoted = 0usize;
-            for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                if targets.is_empty() {
-                    continue;
-                }
-                let src_id = state_ids[src_idx];
-                let src_bits = src_idx as u64;
-                for &tgt_idx in targets {
-                    let tgt_bits = tgt_idx as u64;
-                    let verdict = crate::adapter::btor2::smt_must_edge::smt_per_target_must_check(
-                        &view,
-                        src_bits,
-                        tgt_bits,
-                        &predicates,
-                        &nid_map,
-                        5_000,
-                    );
-                    if matches!(
-                        verdict,
-                        crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                    ) {
-                        let tgt_id = state_ids[tgt_idx];
-                        builder.transition_ids_with_modality(
-                            src_id,
-                            &[label_id],
-                            tgt_id,
-                            TransitionModality::Sharp,
-                        );
-                        promoted += 1;
-                    }
-                }
-            }
-            promoted
-        });
-        sharp_edges_promoted += smt_sharp_promoted;
-        if smt_sharp_promoted > 0 {
-            warnings.push(crate::adapter::AdapterWarning {
-                kind: crate::adapter::WarningKind::ApproximateTranslation,
-                message: format!(
-                    "[R.2.5b-smt-must] materialize_clts_from_lazy: SmtPerTarget post-pass promoted {smt_sharp_promoted} edge(s) to Sharp via Z3 BV-theory must-check (stronger ∀∀ form). Standard ∀∃ form: SmtPerTargetStandard. Hyper-must: SmtHyperMust."
-                ),
-                location: None,
-            });
-        }
-    }
-
-    // R.2.5b session-2 follow-up (2026-06-09) — SmtPerTargetStandard
-    // ∀∃ form in the lazy materialiser. Same shape as the eager
-    // path's SmtPerTargetStandard post-pass.
-    if matches!(must_edge_inference, MustEdgeInference::SmtPerTargetStandard) {
-        let cfg = z3::Config::new();
-        let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-            let view = match encode_design_for_lift(lazy.file()) {
-                Ok(v) => v,
-                Err(_) => return 0,
-            };
-            let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-            let mut promoted = 0usize;
-            for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                if targets.is_empty() {
-                    continue;
-                }
-                let src_id = state_ids[src_idx];
-                let src_bits = src_idx as u64;
-                for &tgt_idx in targets {
-                    let tgt_bits = tgt_idx as u64;
-                    let verdict =
-                        crate::adapter::btor2::smt_must_edge::smt_per_target_must_check_standard(
-                            &view,
-                            src_bits,
-                            tgt_bits,
-                            &predicates,
-                            &nid_map,
-                            5_000,
-                        );
-                    if matches!(
-                        verdict,
-                        crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                    ) {
-                        let tgt_id = state_ids[tgt_idx];
-                        builder.transition_ids_with_modality(
-                            src_id,
-                            &[label_id],
-                            tgt_id,
-                            TransitionModality::Sharp,
-                        );
-                        promoted += 1;
-                    }
-                }
-            }
-            promoted
-        });
-        sharp_edges_promoted += smt_sharp_promoted;
-        if smt_sharp_promoted > 0 {
-            warnings.push(crate::adapter::AdapterWarning {
-                kind: crate::adapter::WarningKind::ApproximateTranslation,
-                message: format!(
-                    "[R.2.5b-smt-must-standard] materialize_clts_from_lazy: SmtPerTargetStandard post-pass promoted {smt_sharp_promoted} edge(s) to Sharp via Z3 ∀∃ must-check (canonical KMTS form per Bruns–Godefroid CONCUR 2000)."
-                ),
-                location: None,
-            });
-        }
-    }
-
-    // R.2.5b session-2 follow-up (2026-06-09) — SmtHyperMust in the
-    // lazy materialiser. Same shape as the eager path: per-target
-    // ∀∃ singletons first, then full-set hyper-must fallback.
-    if matches!(must_edge_inference, MustEdgeInference::SmtHyperMust) {
-        let cfg = z3::Config::new();
-        let (smt_sharp_promoted, smt_hyper_emitted) = z3::with_z3_config(
-            &cfg,
-            || -> (usize, usize) {
-                let view = match encode_design_for_lift(lazy.file()) {
-                    Ok(v) => v,
-                    Err(_) => return (0, 0),
-                };
-                let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-                let mut sharp = 0usize;
-                let mut hyper = 0usize;
-                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let src_id = state_ids[src_idx];
-                    let src_bits = src_idx as u64;
-                    let mut promoted_singleton = false;
-                    for &tgt_idx in targets {
-                        let tgt_bits = tgt_idx as u64;
-                        let verdict = crate::adapter::btor2::smt_must_edge::smt_per_target_must_check_standard(
-                            &view,
-                            src_bits,
-                            tgt_bits,
-                            &predicates,
-                            &nid_map,
-                            5_000,
-                        );
-                        if matches!(
-                            verdict,
-                            crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                        ) {
-                            let tgt_id = state_ids[tgt_idx];
-                            builder.transition_ids_with_modality(
-                                src_id,
-                                &[label_id],
-                                tgt_id,
-                                TransitionModality::Sharp,
-                            );
-                            sharp += 1;
-                            promoted_singleton = true;
-                        }
-                    }
-                    if !promoted_singleton && targets.len() > 1 {
-                        let target_bits_set: Vec<u64> = targets.iter().map(|&i| i as u64).collect();
-                        let verdict = crate::adapter::btor2::smt_must_edge::smt_hyper_must_check(
-                            &view,
-                            src_bits,
-                            &target_bits_set,
-                            &predicates,
-                            &nid_map,
-                            5_000,
-                        );
-                        if matches!(
-                            verdict,
-                            crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                        ) {
-                            let target_ids: smallvec::SmallVec<
-                                [crate::clts::StateId<DefaultStateIdx>; 4],
-                            > = targets.iter().map(|&i| state_ids[i]).collect();
-                            builder.transition_ids_with_modality(
-                                src_id,
-                                &[label_id],
-                                target_ids[0],
-                                TransitionModality::must_hyper(target_ids.clone()),
-                            );
-                            hyper += 1;
-                        }
-                    }
-                }
-                (sharp, hyper)
-            },
-        );
-        sharp_edges_promoted += smt_sharp_promoted;
-        hyper_must_edges_emitted += smt_hyper_emitted;
-        if smt_sharp_promoted > 0 || smt_hyper_emitted > 0 {
-            warnings.push(crate::adapter::AdapterWarning {
-                kind: crate::adapter::WarningKind::ApproximateTranslation,
-                message: format!(
-                    "[R.2.5b-smt-must-hyper] materialize_clts_from_lazy: SmtHyperMust post-pass promoted {smt_sharp_promoted} edge(s) to Sharp + emitted {smt_hyper_emitted} MustHyperOnly edge(s) via Z3 ∀∃ checks."
-                ),
-                location: None,
-            });
-        }
-    }
+    // U.2 — shared sampled-target must-edge inference (was duplicated here +
+    // in predicate_cube_lift). Lazy is not controllability-aware (gate = false).
+    let must_outcome = apply_sampled_must_inference(
+        &mut builder,
+        &state_ids,
+        &sampled_targets_per_source,
+        lazy.file(),
+        &predicates,
+        label_id,
+        must_edge_inference,
+        false,
+        "materialize_clts_from_lazy",
+    );
+    sharp_edges_promoted += must_outcome.sharp_promoted;
+    hyper_must_edges_emitted += must_outcome.hyper_emitted;
+    warnings.extend(must_outcome.warnings);
 
     let clts = builder.build().map_err(|e| AdapterError {
         kind: AdapterErrorKind::IrConsistencyError,
@@ -2137,352 +2195,23 @@ pub fn predicate_cube_lift(
         }
         predicate_image_pending = false;
 
-        // R.2.5b (2026-06-06) — SamplingConfluence post-pass.
-        // For each source cube, inspect the sampled target set:
-        // - Exactly 1 target ⇒ promote to `Sharp` (single
-        //   confluent successor; sampling-derived must-singleton).
-        // - More than 1 target ⇒ emit `MustHyperOnly` with the set
-        //   as the hyper-target collection (sampling-derived
-        //   must-hyper).
-        //
-        // SOUNDNESS: sampling-based, not SMT-proved. The canonical-
-        // representative assumption (the per-cube canonical
-        // register values cover every concrete state in the cube)
-        // is sound for predicate-true cubes (the register is
-        // uniquely fixed) but is an OVER-approximation for
-        // predicate-false cubes (registers may take many values).
-        // The R.2.5b follow-up session will replace this with
-        // a Z3-array-theory query proving must-edges.
-        // R.6.6 (2026-06-08) — when controllability-aware, the post-
-        // pass Sharp/MustHyperOnly promotions would emit edges labelled
-        // with the legacy single-`step` label that mismatches the
-        // controllability-aware dual-label may-edges already in the
-        // CLTS. Such edges DO NOT supersede the may-edges (different
-        // label sets ⇒ different transitions in the builder's view) and
-        // would produce a misshaped model. The MVP gate skips the post-
-        // passes entirely under controllability-aware mode; R.6.6.b
-        // follow-up extends the post-pass to emit per-combo promoted
-        // edges (or aggregate label sets) for soundness preservation
-        // under the synthesis idiom.
-        if !controllability_aware
-            && matches!(
-                lift_opts.must_edge_inference,
-                MustEdgeInference::SamplingConfluence
-            )
-        {
-            for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                if targets.is_empty() {
-                    continue;
-                }
-                let src_id = state_ids[src_idx];
-                let target_ids: smallvec::SmallVec<[crate::clts::StateId<DefaultStateIdx>; 4]> =
-                    targets.iter().map(|&i| state_ids[i]).collect();
-                if target_ids.len() == 1 {
-                    // Single confluent target: promote MayOnly →
-                    // Sharp. The downstream parity-game-3v_build
-                    // coalesces same-target edges with Sharp
-                    // dominating (per Item K's edge-modality merge
-                    // rule), so this Sharp transition supersedes
-                    // the previously-emitted MayOnly to the same
-                    // target.
-                    builder.transition_ids_with_modality(
-                        src_id,
-                        &[label_id],
-                        target_ids[0],
-                        crate::clts::TransitionModality::Sharp,
-                    );
-                    sharp_edges_promoted += 1;
-                } else {
-                    // Multi-target: emit MustHyperOnly with the
-                    // full target set. The transition's `target`
-                    // (StateId field) is the first element by K.2
-                    // convention; the remaining targets are
-                    // accessible via `modality().hyper_targets()`.
-                    builder.transition_ids_with_modality(
-                        src_id,
-                        &[label_id],
-                        target_ids[0],
-                        crate::clts::TransitionModality::must_hyper(target_ids.clone()),
-                    );
-                    hyper_must_edges_emitted += 1;
-                }
-            }
-            // SOUNDNESS warning: the inference is sampling-derived.
-            if sharp_edges_promoted > 0 || hyper_must_edges_emitted > 0 {
-                warnings.push(crate::adapter::AdapterWarning {
-                    kind: crate::adapter::WarningKind::ApproximateTranslation,
-                    message: format!(
-                        "[R.2.5b-sampling-must] predicate_cube_lift: SamplingConfluence post-pass promoted {} edge(s) to Sharp and emitted {} MustHyperOnly edge(s). SOUNDNESS: sampling-derived; SMT-backed must-edge proof is queued for an R.2.5b follow-up session. Verdicts depending on these must-edges should be treated as candidate until the SMT swap lands.",
-                        sharp_edges_promoted,
-                        hyper_must_edges_emitted
-                    ),
-                    location: None,
-                });
-            }
-        }
-
-        // R.2.5b session-2 (2026-06-08) — SmtPerTarget post-pass.
-        // For each (source cube, sampled-target cube) pair, run an
-        // SMT must-edge query via smt_must_edge::smt_per_target_must_check.
-        // On `Must` verdict, promote MayOnly → Sharp. The session-2
-        // MVP only emits per-target Sharp edges; hyper-must inference
-        // via SMT (`∀ s ⊨ src. ∃ input. ∃ t ⊨ T. next ⊨ t`) is queued
-        // for the session-2 follow-up.
-        //
-        // SOUNDNESS: SMT-proved (no sampling). The MVP form
-        // (`∀ state. ∀ input. transition ⟹ next ⊨ tgt`) is STRONGER
-        // than the standard KMTS must-edge — every promoted Sharp
-        // edge is also a standard must-edge, so soundness for
-        // KMTS preservation holds. The MVP simply produces fewer
-        // Sharp edges than the standard `∀ state ∃ input` form
-        // would.
-        // R.6.6 — same gate as the SamplingConfluence post-pass: skip
-        // SmtPerTarget under controllability-aware mode (the promoted
-        // Sharp edges would carry mismatched labels). R.6.6.b follow-up.
-        if !controllability_aware
-            && matches!(
-                lift_opts.must_edge_inference,
-                MustEdgeInference::SmtPerTarget
-            )
-        {
-            let cfg = z3::Config::new();
-            let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-                let view = match encode_design_for_lift(&file) {
-                    Ok(v) => v,
-                    Err(_) => return 0,
-                };
-                let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-                let mut promoted = 0usize;
-                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let src_id = state_ids[src_idx];
-                    let src_bits = src_idx as u64;
-                    for &tgt_idx in targets {
-                        let tgt_bits = tgt_idx as u64;
-                        let verdict =
-                            crate::adapter::btor2::smt_must_edge::smt_per_target_must_check(
-                                &view,
-                                src_bits,
-                                tgt_bits,
-                                &predicates,
-                                &nid_map,
-                                5_000,
-                            );
-                        if matches!(
-                            verdict,
-                            crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                        ) {
-                            // Promote MayOnly → Sharp on the
-                            // (src, label, tgt) triple. The
-                            // builder's edge dedup + Item K's
-                            // edge-modality merge (Sharp dominates
-                            // MayOnly) ensures the upgraded edge
-                            // supersedes the previously-emitted
-                            // MayOnly.
-                            let tgt_id = state_ids[tgt_idx];
-                            builder.transition_ids_with_modality(
-                                src_id,
-                                &[label_id],
-                                tgt_id,
-                                crate::clts::TransitionModality::Sharp,
-                            );
-                            promoted += 1;
-                        }
-                    }
-                }
-                promoted
-            });
-            sharp_edges_promoted += smt_sharp_promoted;
-            if smt_sharp_promoted > 0 {
-                warnings.push(crate::adapter::AdapterWarning {
-                    kind: crate::adapter::WarningKind::ApproximateTranslation,
-                    message: format!(
-                        "[R.2.5b-smt-must] predicate_cube_lift: SmtPerTarget post-pass promoted {smt_sharp_promoted} edge(s) to Sharp via Z3 BV-theory must-check (stronger ∀∀ form). The standard ∀∃ form may promote additional edges; see `MustEdgeInference::SmtPerTargetStandard`. Hyper-must inference: see `MustEdgeInference::SmtHyperMust`."
-                    ),
-                    location: None,
-                });
-            }
-        }
-
-        // R.2.5b session-2 follow-up (2026-06-09) — SmtPerTargetStandard
-        // post-pass: ∀∃ form via Z3 quantifier alternation. Strictly
-        // more permissive than the ∀∀ SmtPerTarget MVP — every ∀∀-Must
-        // is also ∀∃-Must, plus edges where SOME input per concrete
-        // state reaches tgt.
-        //
-        // SOUNDNESS: same R.6.6 gate as SmtPerTarget — skip under
-        // controllability-aware mode (mismatched-label promoted edges
-        // would misshape the model). R.6.6.b follow-up.
-        if !controllability_aware
-            && matches!(
-                lift_opts.must_edge_inference,
-                MustEdgeInference::SmtPerTargetStandard
-            )
-        {
-            let cfg = z3::Config::new();
-            let smt_sharp_promoted = z3::with_z3_config(&cfg, || -> usize {
-                let view = match encode_design_for_lift(&file) {
-                    Ok(v) => v,
-                    Err(_) => return 0,
-                };
-                let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-                let mut promoted = 0usize;
-                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let src_id = state_ids[src_idx];
-                    let src_bits = src_idx as u64;
-                    for &tgt_idx in targets {
-                        let tgt_bits = tgt_idx as u64;
-                        let verdict =
-                            crate::adapter::btor2::smt_must_edge::smt_per_target_must_check_standard(
-                                &view,
-                                src_bits,
-                                tgt_bits,
-                                &predicates,
-                                &nid_map,
-                                5_000,
-                            );
-                        if matches!(
-                            verdict,
-                            crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                        ) {
-                            let tgt_id = state_ids[tgt_idx];
-                            builder.transition_ids_with_modality(
-                                src_id,
-                                &[label_id],
-                                tgt_id,
-                                crate::clts::TransitionModality::Sharp,
-                            );
-                            promoted += 1;
-                        }
-                    }
-                }
-                promoted
-            });
-            sharp_edges_promoted += smt_sharp_promoted;
-            if smt_sharp_promoted > 0 {
-                warnings.push(crate::adapter::AdapterWarning {
-                    kind: crate::adapter::WarningKind::ApproximateTranslation,
-                    message: format!(
-                        "[R.2.5b-smt-must-standard] predicate_cube_lift: SmtPerTargetStandard post-pass promoted {smt_sharp_promoted} edge(s) to Sharp via Z3 ∀∃ must-check (canonical KMTS form per Bruns–Godefroid CONCUR 2000). Hyper-must inference: see `MustEdgeInference::SmtHyperMust`."
-                    ),
-                    location: None,
-                });
-            }
-        }
-
-        // R.2.5b session-2 follow-up (2026-06-09) — SmtHyperMust
-        // post-pass: per source cube, try per-target ∀∃ singleton
-        // checks first; if no singleton proves Must, run the full
-        // hyper-must check over the sampled target set. On Must,
-        // emit a `MustHyperOnly` transition with the full target set
-        // (MVP doesn't minimize T; sub-minimal T inference is a
-        // follow-up).
-        //
-        // SOUNDNESS: same R.6.6 gate. Promoted edges carry the
-        // legacy single-`step` label; controllability-aware mode
-        // skips this post-pass to avoid label mismatch.
-        if !controllability_aware
-            && matches!(
-                lift_opts.must_edge_inference,
-                MustEdgeInference::SmtHyperMust
-            )
-        {
-            let cfg = z3::Config::new();
-            let (smt_sharp_promoted, smt_hyper_emitted) = z3::with_z3_config(
-                &cfg,
-                || -> (usize, usize) {
-                    let view = match encode_design_for_lift(&file) {
-                        Ok(v) => v,
-                        Err(_) => return (0, 0),
-                    };
-                    let nid_map =
-                        crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
-                    let mut sharp = 0usize;
-                    let mut hyper = 0usize;
-                    for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                        if targets.is_empty() {
-                            continue;
-                        }
-                        let src_id = state_ids[src_idx];
-                        let src_bits = src_idx as u64;
-                        // Phase 1: per-target ∀∃ singleton checks.
-                        let mut promoted_singleton = false;
-                        for &tgt_idx in targets {
-                            let tgt_bits = tgt_idx as u64;
-                            let verdict = crate::adapter::btor2::smt_must_edge::smt_per_target_must_check_standard(
-                                &view,
-                                src_bits,
-                                tgt_bits,
-                                &predicates,
-                                &nid_map,
-                                5_000,
-                            );
-                            if matches!(
-                                verdict,
-                                crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                            ) {
-                                let tgt_id = state_ids[tgt_idx];
-                                builder.transition_ids_with_modality(
-                                    src_id,
-                                    &[label_id],
-                                    tgt_id,
-                                    crate::clts::TransitionModality::Sharp,
-                                );
-                                sharp += 1;
-                                promoted_singleton = true;
-                            }
-                        }
-                        // Phase 2: if no singleton promoted, try
-                        // the full-set hyper-must check.
-                        if !promoted_singleton && targets.len() > 1 {
-                            let target_bits_set: Vec<u64> =
-                                targets.iter().map(|&i| i as u64).collect();
-                            let verdict =
-                                crate::adapter::btor2::smt_must_edge::smt_hyper_must_check(
-                                    &view,
-                                    src_bits,
-                                    &target_bits_set,
-                                    &predicates,
-                                    &nid_map,
-                                    5_000,
-                                );
-                            if matches!(
-                                verdict,
-                                crate::adapter::btor2::smt_must_edge::SmtMustVerdict::Must
-                            ) {
-                                let target_ids: smallvec::SmallVec<
-                                    [crate::clts::StateId<DefaultStateIdx>; 4],
-                                > = targets.iter().map(|&i| state_ids[i]).collect();
-                                builder.transition_ids_with_modality(
-                                    src_id,
-                                    &[label_id],
-                                    target_ids[0],
-                                    crate::clts::TransitionModality::must_hyper(target_ids.clone()),
-                                );
-                                hyper += 1;
-                            }
-                        }
-                    }
-                    (sharp, hyper)
-                },
-            );
-            sharp_edges_promoted += smt_sharp_promoted;
-            hyper_must_edges_emitted += smt_hyper_emitted;
-            if smt_sharp_promoted > 0 || smt_hyper_emitted > 0 {
-                warnings.push(crate::adapter::AdapterWarning {
-                    kind: crate::adapter::WarningKind::ApproximateTranslation,
-                    message: format!(
-                        "[R.2.5b-smt-must-hyper] predicate_cube_lift: SmtHyperMust post-pass promoted {smt_sharp_promoted} edge(s) to Sharp + emitted {smt_hyper_emitted} MustHyperOnly edge(s) via Z3 ∀∃ checks. Hyper-must targets = full sampled set (MVP doesn't minimize T)."
-                    ),
-                    location: None,
-                });
-            }
-        }
+        // U.2 — shared sampled-target must-edge inference (was duplicated here +
+        // in materialize_clts_from_lazy). The R.6.6 controllability gate lives
+        // inside the shared fn (skips the post-passes under controllability-aware).
+        let must_outcome = apply_sampled_must_inference(
+            &mut builder,
+            &state_ids,
+            &sampled_targets_per_source,
+            &file,
+            &predicates,
+            label_id,
+            lift_opts.must_edge_inference,
+            controllability_aware,
+            "predicate_cube_lift",
+        );
+        sharp_edges_promoted += must_outcome.sharp_promoted;
+        hyper_must_edges_emitted += must_outcome.hyper_emitted;
+        warnings.extend(must_outcome.warnings);
     }
 
     let clts = builder.build().map_err(|e| AdapterError {
@@ -3478,6 +3207,153 @@ mod tests {
             "expected the SmtAllPairs gate error; got: {}",
             err.message
         );
+    }
+
+    // U.1 (lift-unification, 2026-06-26) — the eager≡lazy differential guard.
+    // The eager sampling lift (`predicate_cube_lift` with may = sampling) and the
+    // lazy lift (`LazyLift` + `materialize_clts_from_lazy`) MUST produce identical
+    // CLTSes — edge-for-edge, modality-for-modality, 3-valued-label-for-label — for
+    // the same fixture + options, so the two duplicated paths can never silently
+    // diverge. This is the regression net the lift-unification refactor (U.2–U.4)
+    // is built on; it must stay green through every extraction phase. (SmtAllPairs
+    // may is eager-only-global, outside this equivalence; the corpus is
+    // non-controllability — lazy gains controllability parity in U.3.)
+    // (src_index, sorted label payloads, target_index, modality string).
+    type CanonEdge = (usize, Vec<String>, usize, String);
+    // (state_index, predicate name, tristate string).
+    type CanonPred = (usize, String, String);
+    fn canonical_clts(
+        clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    ) -> (Vec<CanonEdge>, Vec<CanonPred>) {
+        let modality_str = |m: &crate::clts::TransitionModality<DefaultStateIdx>| -> String {
+            match m {
+                crate::clts::TransitionModality::Sharp => "Sharp".to_string(),
+                crate::clts::TransitionModality::MayOnly => "MayOnly".to_string(),
+                crate::clts::TransitionModality::MustHyperOnly(targets) => {
+                    let mut idx: Vec<usize> = targets.iter().map(|t| t.index()).collect();
+                    idx.sort_unstable();
+                    format!("MustHyper{idx:?}")
+                }
+            }
+        };
+        let mut edges: Vec<CanonEdge> = Vec::new();
+        for s in clts.states() {
+            for t in clts.outgoing(s) {
+                let mut labels: Vec<String> = t
+                    .labels()
+                    .iter()
+                    .filter_map(|l| clts.label_payload(*l).map(|p| p.join("+")))
+                    .collect();
+                labels.sort();
+                edges.push((
+                    s.index(),
+                    labels,
+                    t.target().index(),
+                    modality_str(t.modality()),
+                ));
+            }
+        }
+        edges.sort();
+        edges.dedup();
+        let mut preds: Vec<CanonPred> = Vec::new();
+        for s in clts.states() {
+            for (name, tri) in clts.state_3valued_predicate_entries(s) {
+                preds.push((s.index(), name.to_string(), format!("{tri:?}")));
+            }
+        }
+        preds.sort();
+        (edges, preds)
+    }
+
+    #[test]
+    fn u1_eager_lazy_differential_equivalence() {
+        use crate::adapter::AdapterOptions;
+        // toggle (1 pred), 2-bit wrapping counter (2 preds), input-driven (1 pred,
+        // nondeterministic). All non-controllability, may = sampling.
+        let toggle =
+            "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+        let counter = "1 sort bitvec 2\n2 state 2 r\n3 one 2\n4 add 2 2 3\n5 zero 2\n6 init 2 2 5\n7 next 2 2 4\n";
+        let input_driven = "1 sort bitvec 1\n2 input 1 in_a\n3 state 1 reg_a\n4 zero 1\n5 init 1 3 4\n6 next 1 3 2\n";
+        let fixtures: Vec<(&str, &str, Vec<PredicateSpec>)> = vec![
+            (
+                "toggle",
+                toggle,
+                vec![PredicateSpec {
+                    name: "q1".into(),
+                    register: "q".into(),
+                    value: 1,
+                }],
+            ),
+            (
+                "counter",
+                counter,
+                vec![
+                    PredicateSpec {
+                        name: "r0".into(),
+                        register: "r".into(),
+                        value: 0,
+                    },
+                    PredicateSpec {
+                        name: "r3".into(),
+                        register: "r".into(),
+                        value: 3,
+                    },
+                ],
+            ),
+            (
+                "input_driven",
+                input_driven,
+                vec![PredicateSpec {
+                    name: "a0".into(),
+                    register: "reg_a".into(),
+                    value: 0,
+                }],
+            ),
+        ];
+
+        for must in [
+            MustEdgeInference::Off,
+            MustEdgeInference::SamplingConfluence,
+            MustEdgeInference::SmtPerTarget,
+            MustEdgeInference::SmtPerTargetStandard,
+            MustEdgeInference::SmtHyperMust,
+        ] {
+            for (label, btor2, preds) in &fixtures {
+                let lift_opts = PredicateCubeLiftOptions {
+                    max_cube_count: 1024,
+                    max_input_bits: 8,
+                    must_edge_inference: must,
+                    may_edge_inference: MayEdgeInference::Off,
+                    config_values: std::collections::HashMap::new(),
+                    compound_exprs: std::collections::HashMap::new(),
+                };
+                let eager = predicate_cube_lift(
+                    preds.clone(),
+                    btor2,
+                    &AdapterOptions::default(),
+                    &lift_opts,
+                )
+                .unwrap_or_else(|e| panic!("eager lift {label}/{must:?}: {}", e.message));
+                let mut lazy = LazyLift::from_btor2(
+                    preds.clone(),
+                    btor2,
+                    &AdapterOptions::default(),
+                    &lift_opts,
+                )
+                .unwrap_or_else(|e| panic!("lazy build {label}/{must:?}: {}", e.message));
+                let lazy_result = materialize_clts_from_lazy(
+                    &mut lazy,
+                    crate::adapter::SourceFormat::Btor2,
+                    must,
+                )
+                .unwrap_or_else(|e| panic!("lazy materialize {label}/{must:?}: {}", e.message));
+                assert_eq!(
+                    canonical_clts(&eager.clts),
+                    canonical_clts(&lazy_result.clts),
+                    "eager ≢ lazy for fixture {label}, must = {must:?}"
+                );
+            }
+        }
     }
 
     #[test]
