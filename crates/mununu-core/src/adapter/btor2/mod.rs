@@ -36,7 +36,8 @@ pub use cegar::{
 pub use kmts_lift::{
     EagerLazyLift, KmtsLiftLazy, KmtsLiftOptions, KmtsLiftResult, LazyExpansionEdge, LazyLift,
     LiftedPredicate, NullLazyLift, PredicateCubeLiftOptions, PredicateCubeLiftResult,
-    PredicateSpec, lift_btor2_to_kmts, materialize_clts_from_lazy, predicate_cube_lift,
+    PredicateSpec, lift_btor2_to_kmts, lift_predicate_cube, materialize_clts_from_lazy,
+    predicate_cube_lift,
 };
 
 use super::{AdapterError, AdapterOptions, AdapterOutput, FormatAdapter};

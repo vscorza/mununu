@@ -1036,7 +1036,7 @@ fn dispatch_sv_predicate_cube(
 ) -> Result<(String, Option<crate::adapter::partition::PartitionSummary>), VerifyError> {
     use crate::adapter::btor2::kmts_lift::{
         MayEdgeInference, MustEdgeInference, PredicateCubeLiftOptions, PredicateSpec,
-        predicate_cube_lift,
+        lift_predicate_cube,
     };
 
     let translate_err = |message: String| VerifyError::AdapterTranslationFailed {
@@ -1072,8 +1072,17 @@ fn dispatch_sv_predicate_cube(
         config_values: crate::adapter::btor2::r_s8_encoder::sidecar_config_values(opts),
         compound_exprs: std::collections::HashMap::new(),
     };
-    let result = predicate_cube_lift(predicates, &btor2, opts, &lift_opts)
-        .map_err(|err| translate_err(format!("predicate-cube lift: {}", err.message)))?;
+    // U.4 — route the verify-path lift through the single gated entry
+    // (always Eager for this non-CEGAR path; the entry runs the compound
+    // gate before dispatch).
+    let result = lift_predicate_cube(
+        predicates,
+        &btor2,
+        opts,
+        &lift_opts,
+        crate::adapter::btor2::cegar::LiftStrategy::Eager,
+    )
+    .map_err(|err| translate_err(format!("predicate-cube lift: {}", err.message)))?;
     for w in &result.warnings {
         tracing::warn!(source_id, "{}", w.message);
     }

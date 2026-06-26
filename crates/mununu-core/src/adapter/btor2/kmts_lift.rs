@@ -813,6 +813,17 @@ impl LazyLift {
         // stores them, so the lazy per-cube `compute_cube_outgoing_edges`
         // path binds correctly (same fix as the eager `predicate_cube_lift`).
         resolve_predicate_registers(&file, &mut predicates)?;
+        // U.4 — compound-predicate backstop. The lazy per-cube body samples
+        // simple register==value atoms only and never consults
+        // `compound_exprs`, so compounds on the Lazy strategy are rejected
+        // here (the shared gate also runs at the `lift_predicate_cube` entry,
+        // but this backstop covers any direct `LazyLift::from_btor2` caller).
+        // No-op when `compound_exprs` is empty.
+        ensure_compound_lift_supported(
+            &predicates,
+            lift_opts,
+            crate::adapter::btor2::cegar::LiftStrategy::Lazy,
+        )?;
         let cube_count: usize = 1usize << predicates.len();
         if cube_count > lift_opts.max_cube_count {
             return Err(AdapterError {
@@ -1729,6 +1740,120 @@ fn resolve_predicate_registers(
     Ok(())
 }
 
+/// U.4 (lift-unification, 2026-06-26) — the compound-predicate soundness
+/// gate, shared by the [`lift_predicate_cube`] entry and the defensive
+/// copies in [`predicate_cube_lift`] + [`LazyLift::from_btor2`] (for the
+/// ~39 direct callers that bypass the entry).
+///
+/// Compound predicates (a `compound_exprs` entry keyed by predicate name)
+/// can ONLY be honoured by the eager SmtAllPairs may-relation: the
+/// sampling representative inverse can't realise e.g. `a==0 && b==0`, and
+/// the lazy per-cube body ([`cube_sampling_edges`]) samples simple
+/// `register==value` atoms only — it never consults `compound_exprs`. So
+/// when `compound_exprs` is non-empty this gate enforces:
+///
+/// 1. every key names a predicate in the set (else the expr is orphaned);
+/// 2. `strategy == Eager` (the lazy path can't honour compounds at all);
+/// 3. `may_edge_inference == SmtAllPairs` (sampling is simple-atom-only;
+///    the SMT seam honours compounds via `PredicateLike::expr`).
+///
+/// No-op (`Ok`) when `compound_exprs` is empty — the simple-atom path is
+/// unaffected.
+fn ensure_compound_lift_supported(
+    predicates: &[PredicateSpec],
+    lift_opts: &PredicateCubeLiftOptions,
+    strategy: crate::adapter::btor2::cegar::LiftStrategy,
+) -> Result<(), AdapterError> {
+    use crate::adapter::btor2::cegar::LiftStrategy;
+    if lift_opts.compound_exprs.is_empty() {
+        return Ok(());
+    }
+    let names: std::collections::HashSet<&str> =
+        predicates.iter().map(|p| p.name.as_str()).collect();
+    for key in lift_opts.compound_exprs.keys() {
+        if !names.contains(key.as_str()) {
+            return Err(AdapterError {
+                kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                location: None,
+                message: format!(
+                    "adapter/btor2/lift_predicate_cube: compound_exprs key '{key}' names no predicate in the predicate set"
+                ),
+            });
+        }
+    }
+    if matches!(strategy, LiftStrategy::Lazy) {
+        return Err(AdapterError {
+            kind: crate::adapter::AdapterErrorKind::UnsupportedConstruct,
+            location: None,
+            message: "adapter/btor2/lift_predicate_cube: compound predicates are not supported on \
+                      the Lazy lift strategy (the lazy per-cube body samples simple \
+                      register==value atoms only); use LiftStrategy::Eager with \
+                      may_edge_inference = SmtAllPairs"
+                .to_string(),
+        });
+    }
+    if !matches!(lift_opts.may_edge_inference, MayEdgeInference::SmtAllPairs) {
+        return Err(AdapterError {
+            kind: crate::adapter::AdapterErrorKind::UnsupportedConstruct,
+            location: None,
+            message: "adapter/btor2/lift_predicate_cube: compound predicates require \
+                      may_edge_inference = SmtAllPairs (the sampling representative is sound \
+                      only for simple register==value atoms)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// U.4 (lift-unification, 2026-06-26) — the single gated entry the CEGAR
+/// loop + verify orchestrator call to lift a BTOR2 source through the
+/// predicate-cube path. Owns the eager-vs-lazy dispatch (moved out of
+/// `cegar_refine_loop`) and runs the compound-predicate soundness gate
+/// once via [`ensure_compound_lift_supported`] before dispatch.
+///
+/// - [`LiftStrategy::Eager`] → [`predicate_cube_lift`] (materializes
+///   2^|P| cubes; the default full-fidelity path; the only path that
+///   honours compound predicates via the SmtAllPairs seam).
+/// - [`LiftStrategy::Lazy`] → [`LazyLift`] + [`materialize_clts_from_lazy`]
+///   (per-cube on-demand; produces an identical `Clts` to Eager by U.1's
+///   differential test; does NOT support compounds — the gate rejects
+///   them before dispatch).
+///
+/// The lazy path's must-edge policy is taken from
+/// `lift_opts.must_edge_inference` (the CEGAR loop sets it equal to
+/// `cegar_opts.must_edge_inference`, so no separate parameter is needed —
+/// the two were already kept in lock-step at the cegar call site).
+///
+/// [`LiftStrategy::Eager`]: crate::adapter::btor2::cegar::LiftStrategy::Eager
+/// [`LiftStrategy::Lazy`]: crate::adapter::btor2::cegar::LiftStrategy::Lazy
+pub fn lift_predicate_cube(
+    predicates: Vec<PredicateSpec>,
+    btor2_content: &str,
+    adapter_options: &AdapterOptions,
+    lift_opts: &PredicateCubeLiftOptions,
+    strategy: crate::adapter::btor2::cegar::LiftStrategy,
+) -> Result<PredicateCubeLiftResult, AdapterError> {
+    use crate::adapter::btor2::cegar::LiftStrategy;
+    // U.4 — compound gate runs ONCE at the entry. Each impl keeps a thin
+    // defensive copy for its direct callers; the double-call on this path
+    // is idempotent + cheap.
+    ensure_compound_lift_supported(&predicates, lift_opts, strategy)?;
+    match strategy {
+        LiftStrategy::Eager => {
+            predicate_cube_lift(predicates, btor2_content, adapter_options, lift_opts)
+        }
+        LiftStrategy::Lazy => {
+            let mut lazy =
+                LazyLift::from_btor2(predicates, btor2_content, adapter_options, lift_opts)?;
+            materialize_clts_from_lazy(
+                &mut lazy,
+                crate::adapter::SourceFormat::Btor2,
+                lift_opts.must_edge_inference,
+            )
+        }
+    }
+}
+
 /// R.2.5 — Lift one BTOR2 source through the predicate-cube path.
 ///
 /// **Does NOT call `Btor2Adapter::translate`** — the bit-blaster is
@@ -1806,37 +1931,19 @@ pub fn predicate_cube_lift(
     // unresolvable names still error.
     resolve_predicate_registers(&file, &mut predicates)?;
 
-    // B.1 (increment 3b) — compound-predicate gate. Every `compound_exprs`
-    // key must name a predicate in the list (else the expr is orphaned), and
-    // because the cube→representative-registers *inverse* (the sampling
-    // may-edge path) is only sound for simple atoms, compounds REQUIRE the
-    // all-pairs SMT may-relation. We route compounds exclusively through the
-    // SMT may/must seam (which honours them via `PredicateLike::expr`).
-    if !lift_opts.compound_exprs.is_empty() {
-        let names: std::collections::HashSet<&str> =
-            predicates.iter().map(|p| p.name.as_str()).collect();
-        for key in lift_opts.compound_exprs.keys() {
-            if !names.contains(key.as_str()) {
-                return Err(AdapterError {
-                    kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
-                    location: None,
-                    message: format!(
-                        "adapter/btor2/predicate_cube_lift: compound_exprs key '{key}' names no predicate in the predicate set"
-                    ),
-                });
-            }
-        }
-        if !matches!(lift_opts.may_edge_inference, MayEdgeInference::SmtAllPairs) {
-            return Err(AdapterError {
-                kind: crate::adapter::AdapterErrorKind::UnsupportedConstruct,
-                location: None,
-                message: "adapter/btor2/predicate_cube_lift: compound predicates require \
-                          may_edge_inference = SmtAllPairs (the sampling representative is sound \
-                          only for simple register==value atoms)"
-                    .to_string(),
-            });
-        }
-    }
+    // B.1 (increment 3b) / U.4 — compound-predicate soundness gate.
+    // Defensive call to the shared [`ensure_compound_lift_supported`] for
+    // the ~39 direct callers of `predicate_cube_lift` that bypass the
+    // [`lift_predicate_cube`] entry. No-op when `compound_exprs` is empty;
+    // when present, enforces every key names a predicate + (this eager
+    // path) requires `may_edge_inference = SmtAllPairs` (the sampling
+    // representative is sound only for simple register==value atoms — the
+    // SMT may/must seam honours compounds via `PredicateLike::expr`).
+    ensure_compound_lift_supported(
+        &predicates,
+        lift_opts,
+        crate::adapter::btor2::cegar::LiftStrategy::Eager,
+    )?;
 
     // 2. Cube count check — `2^|P|` must fit `max_cube_count`. For
     //    |P| > 63 the shift overflows so we cap at 63 explicitly.
@@ -3405,6 +3512,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    // U.4 (lift-unification, 2026-06-26) — the gated `lift_predicate_cube`
+    // entry must dispatch Eager vs Lazy to identical CLTSes (the entry-level
+    // analogue of U.1, proving the dispatch itself is correct).
+    #[test]
+    fn u4_lift_predicate_cube_entry_eager_lazy_equivalence() {
+        use crate::adapter::AdapterOptions;
+        use crate::adapter::btor2::cegar::LiftStrategy;
+        let counter = "1 sort bitvec 2\n2 state 2 r\n3 one 2\n4 add 2 2 3\n5 zero 2\n6 init 2 2 5\n7 next 2 2 4\n";
+        let preds = vec![
+            PredicateSpec {
+                name: "r0".into(),
+                register: "r".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "r3".into(),
+                register: "r".into(),
+                value: 3,
+            },
+        ];
+        let lift_opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::SmtPerTarget,
+            may_edge_inference: MayEdgeInference::Off,
+            config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
+        };
+        let eager = lift_predicate_cube(
+            preds.clone(),
+            counter,
+            &AdapterOptions::default(),
+            &lift_opts,
+            LiftStrategy::Eager,
+        )
+        .expect("eager entry");
+        let lazy = lift_predicate_cube(
+            preds,
+            counter,
+            &AdapterOptions::default(),
+            &lift_opts,
+            LiftStrategy::Lazy,
+        )
+        .expect("lazy entry");
+        assert_eq!(
+            canonical_clts(&eager.clts),
+            canonical_clts(&lazy.clts),
+            "lift_predicate_cube entry: Eager ≢ Lazy"
+        );
+    }
+
+    // U.4 — the entry's compound gate rejects Lazy + compounds (the lazy
+    // per-cube body never consults `compound_exprs`).
+    #[test]
+    fn u4_lift_predicate_cube_lazy_rejects_compounds() {
+        use crate::adapter::AdapterOptions;
+        use crate::adapter::btor2::cegar::LiftStrategy;
+        let btor2 = "1 sort bitvec 1\n2 state 1 a\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
+        let mut compound_exprs = std::collections::HashMap::new();
+        compound_exprs.insert(
+            "p".to_string(),
+            crate::adapter::btor2::predicate_expr::PredicateExpr::eq("a", 0),
+        );
+        let opts = PredicateCubeLiftOptions {
+            // Even with SmtAllPairs, Lazy can't honour compounds.
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            compound_exprs,
+            ..Default::default()
+        };
+        let preds = vec![PredicateSpec {
+            name: "p".into(),
+            register: "a".into(),
+            value: 0,
+        }];
+        let err = lift_predicate_cube(
+            preds,
+            btor2,
+            &AdapterOptions::default(),
+            &opts,
+            LiftStrategy::Lazy,
+        )
+        .expect_err("Lazy + compounds must error");
+        assert!(
+            err.message
+                .contains("not supported on the Lazy lift strategy"),
+            "expected the Lazy compound-gate error; got: {}",
+            err.message
+        );
     }
 
     #[test]
