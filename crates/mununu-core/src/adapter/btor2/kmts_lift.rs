@@ -2148,7 +2148,9 @@ pub fn predicate_cube_lift(
             use crate::adapter::sts_ir::{BtorSts, SmtEncode};
             BtorSts::new(&file).may_edges(&cube_preds, 5_000)
         };
-        for (i, j) in may_edges {
+        // Emit MayOnly edges. Keep `may_edges` (borrow) — the SmtHyperMust
+        // branch below reuses it as the per-source candidate target set.
+        for &(i, j) in &may_edges {
             builder.transition_ids_with_modality(
                 state_ids[i],
                 &[step_label],
@@ -2179,25 +2181,70 @@ pub fn predicate_cube_lift(
         // (`!SmtAllPairs`) path below.
         if !matches!(lift_opts.must_edge_inference, MustEdgeInference::Off) {
             use crate::adapter::sts_ir::{BtorSts, SmtEncode};
-            let must_edges = BtorSts::new(&file).must_edges(&cube_preds, 5_000);
-            let promoted = must_edges.len();
-            for (i, j) in must_edges {
-                builder.transition_ids_with_modality(
-                    state_ids[i],
-                    &[step_label],
-                    state_ids[j],
-                    crate::clts::TransitionModality::Sharp,
-                );
-            }
-            sharp_edges_promoted += promoted;
-            if promoted > 0 {
-                warnings.push(crate::adapter::AdapterWarning {
-                    kind: crate::adapter::WarningKind::ApproximateTranslation,
-                    message: format!(
-                        "[P1 #3 may+must] predicate_cube_lift: SmtAllPairs may + SMT must composition promoted {promoted} edge(s) MayOnly → Sharp via the canonical ∀∃ must-relation (Z3-proved; sound under-approximation). The resulting KMTS carries both may (over-approx) and must (under-approx) edges, enabling sound DEFINITE 3-valued verdicts."
-                    ),
-                    location: None,
-                });
+            match lift_opts.must_edge_inference {
+                MustEdgeInference::SmtHyperMust => {
+                    // B.2 (2026-06-26) — GKMTS hyper-must on the SmtAllPairs /
+                    // compound path. The ∀∃ Sharp promotion (the `_` arm
+                    // below) is the *standard* KMTS must, which is non-monotone
+                    // under refinement on alternating fixpoints (νμ) — so a
+                    // refined recoverability verdict over it is only
+                    // soundness-tagged (the B.3.b warning fires when no
+                    // `MustHyperOnly` edges exist). The hyper-must form is
+                    // monotone (Shoham–Grumberg LMCS 2007), so emitting it
+                    // makes compound νμ verdicts clean-sound. Each source's
+                    // candidate target set is its may-successor set; the seam
+                    // proves `∀ s ⊨ src. ∃ input ∃ t ∈ T. reach(t)` and emits
+                    // a `MustHyperOnly(T)` edge only on a definite Must.
+                    let hyper =
+                        BtorSts::new(&file).hyper_must_edges(&cube_preds, &may_edges, 5_000);
+                    let emitted = hyper.len();
+                    for (src, targets) in hyper {
+                        let target_ids: smallvec::SmallVec<
+                            [crate::clts::StateId<DefaultStateIdx>; 4],
+                        > = targets.iter().map(|&t| state_ids[t]).collect();
+                        if let Some(&first) = target_ids.first() {
+                            builder.transition_ids_with_modality(
+                                state_ids[src],
+                                &[step_label],
+                                first,
+                                crate::clts::TransitionModality::must_hyper(target_ids.clone()),
+                            );
+                        }
+                    }
+                    hyper_must_edges_emitted += emitted;
+                    if emitted > 0 {
+                        warnings.push(crate::adapter::AdapterWarning {
+                            kind: crate::adapter::WarningKind::ApproximateTranslation,
+                            message: format!(
+                                "[B.2 may+hyper-must] predicate_cube_lift: SmtAllPairs may + SmtHyperMust composition emitted {emitted} MustHyperOnly edge(s) over per-source may-successor sets (Z3-proved ∀∃ hyper-must; monotone under refinement per Shoham–Grumberg LMCS 2007). Compound/νμ verdicts over this KMTS are clean-sound (no standard-KMTS non-monotonicity tag). Hyper-must targets = full may-successor set (MVP doesn't minimize T)."
+                            ),
+                            location: None,
+                        });
+                    }
+                }
+                _ => {
+                    // P1 #3 — canonical ∀∃ standard per-target must → Sharp.
+                    let must_edges = BtorSts::new(&file).must_edges(&cube_preds, 5_000);
+                    let promoted = must_edges.len();
+                    for (i, j) in must_edges {
+                        builder.transition_ids_with_modality(
+                            state_ids[i],
+                            &[step_label],
+                            state_ids[j],
+                            crate::clts::TransitionModality::Sharp,
+                        );
+                    }
+                    sharp_edges_promoted += promoted;
+                    if promoted > 0 {
+                        warnings.push(crate::adapter::AdapterWarning {
+                            kind: crate::adapter::WarningKind::ApproximateTranslation,
+                            message: format!(
+                                "[P1 #3 may+must] predicate_cube_lift: SmtAllPairs may + SMT must composition promoted {promoted} edge(s) MayOnly → Sharp via the canonical ∀∃ must-relation (Z3-proved; sound under-approximation). The resulting KMTS carries both may (over-approx) and must (under-approx) edges, enabling sound DEFINITE 3-valued verdicts."
+                            ),
+                            location: None,
+                        });
+                    }
+                }
             }
         }
         predicate_image_pending = false;
@@ -3323,6 +3370,58 @@ mod tests {
         assert!(
             sharp >= 2,
             "composed CLTS must carry the promoted Sharp must-edges; got {sharp}"
+        );
+    }
+
+    #[test]
+    fn b2_smt_all_pairs_smt_hyper_must_emits_must_hyper_only() {
+        // B.2 (2026-06-26) — on the SmtAllPairs path, `SmtHyperMust` emits
+        // GKMTS `MustHyperOnly` edges (over each source's may-successor set)
+        // instead of the ∀∃ `Sharp` promotion. This is the monotone must
+        // form that makes compound/νμ verdicts clean-sound (no B.3.b
+        // soundness-tag). On the deterministic toggle q'=!q each source has a
+        // singleton may-successor set, so both states get a hyper-must edge.
+        let toggle =
+            "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+        let preds = vec![PredicateSpec {
+            name: "q_is_1".into(),
+            register: "q".into(),
+            value: 1,
+        }];
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::SmtHyperMust,
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
+        };
+        let lifted = predicate_cube_lift(preds, toggle, &AdapterOptions::default(), &opts)
+            .expect("SmtAllPairs + SmtHyperMust lift");
+        assert!(
+            lifted.hyper_must_edges_emitted > 0,
+            "SmtAllPairs + SmtHyperMust must emit MustHyperOnly edges; got {}",
+            lifted.hyper_must_edges_emitted
+        );
+        // The SmtHyperMust branch emits hyper-must, NOT the ∀∃ Sharp form.
+        assert_eq!(
+            lifted.sharp_edges_promoted, 0,
+            "the SmtHyperMust branch emits MustHyperOnly, not Sharp promotions"
+        );
+        let hyper = lifted
+            .clts
+            .states()
+            .flat_map(|s| lifted.clts.outgoing(s))
+            .filter(|t| {
+                matches!(
+                    t.modality(),
+                    crate::clts::TransitionModality::MustHyperOnly(_)
+                )
+            })
+            .count();
+        assert!(
+            hyper > 0,
+            "the lifted CLTS must carry MustHyperOnly transitions; got {hyper}"
         );
     }
 
