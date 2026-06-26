@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::adapter::AdapterOptions;
 use crate::adapter::btor2::ast::Nid;
-use crate::adapter::btor2::{PredicateCubeLiftOptions, PredicateSpec, predicate_cube_lift};
+use crate::adapter::btor2::{PredicateCubeLiftOptions, PredicateSpec};
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::mu_calculus::{
     ApproximantView, Environment, EvalResult, EvaluationError, EvaluationOptions, FailureSubgame,
@@ -812,27 +812,18 @@ pub fn cegar_refine_loop(
         // path is an end-to-end exercise of the `LazyLift`
         // machinery, surfacing any drift between the eager + lazy
         // per-cube logic as a verdict-equality test failure.
-        let lift_result = match cegar_opts.lift_strategy {
-            LiftStrategy::Eager => predicate_cube_lift(
-                current_predicates.clone(),
-                btor2_content,
-                adapter_options,
-                &lift_opts,
-            )?,
-            LiftStrategy::Lazy => {
-                let mut lazy = crate::adapter::btor2::kmts_lift::LazyLift::from_btor2(
-                    current_predicates.clone(),
-                    btor2_content,
-                    adapter_options,
-                    &lift_opts,
-                )?;
-                crate::adapter::btor2::kmts_lift::materialize_clts_from_lazy(
-                    &mut lazy,
-                    crate::adapter::SourceFormat::Btor2,
-                    cegar_opts.must_edge_inference,
-                )?
-            }
-        };
+        // U.4 (lift-unification, 2026-06-26) — the eager-vs-lazy dispatch +
+        // the compound-predicate soundness gate now live behind the single
+        // `lift_predicate_cube` entry. The Lazy path's must-edge policy is
+        // taken from `lift_opts.must_edge_inference`, which the lift_opts
+        // construction above sets equal to `cegar_opts.must_edge_inference`.
+        let lift_result = crate::adapter::btor2::kmts_lift::lift_predicate_cube(
+            current_predicates.clone(),
+            btor2_content,
+            adapter_options,
+            &lift_opts,
+            cegar_opts.lift_strategy,
+        )?;
 
         // CTXDSL Phase 2 (2026-06-22) — capture this iteration's cube model
         // for the opt-in CTXDSL dump. Each iteration overwrites, so at any
