@@ -705,6 +705,50 @@ pub fn cegar_refine_loop(
     let mut current_predicates = initial_predicates;
     let mut iterations: Vec<CegarIteration> = Vec::new();
     let mut warnings: Vec<crate::adapter::AdapterWarning> = Vec::new();
+
+    // B.1 increment 3c (2026-06-26) — sidecar compound predicates. Read any
+    // `compound_predicates` from the SvAnnotation sidecar, append each as a
+    // cube-bit predicate (its truth decided by the SMT seam via the parsed
+    // expr, NOT register==value), and collect the exprs for
+    // `lift_opts.compound_exprs`. Compounds REQUIRE the eager SmtAllPairs
+    // may-relation (the only compound-aware lift): the sampling representative
+    // can't realise a conjunction and the lazy per-cube body never consults the
+    // expr. So when compounds are present we force `may = SmtAllPairs` +
+    // `strategy = Eager`, warning if that overrides an explicit request.
+    // `ensure_compound_lift_supported` re-checks this at the lift entry.
+    let mut compound_exprs: HashMap<String, crate::adapter::btor2::predicate_expr::PredicateExpr> =
+        HashMap::new();
+    for (spec, expr) in sidecar_compound_predicates(adapter_options) {
+        compound_exprs.insert(spec.name.clone(), expr);
+        current_predicates.push(spec);
+    }
+    let effective_may = if compound_exprs.is_empty() {
+        cegar_opts.may_edge_inference
+    } else {
+        crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs
+    };
+    let effective_strategy = if compound_exprs.is_empty() {
+        cegar_opts.lift_strategy
+    } else {
+        LiftStrategy::Eager
+    };
+    if !compound_exprs.is_empty()
+        && (cegar_opts.may_edge_inference
+            != crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs
+            || cegar_opts.lift_strategy != LiftStrategy::Eager)
+    {
+        warnings.push(crate::adapter::AdapterWarning {
+            kind: crate::adapter::WarningKind::ApproximateTranslation,
+            message: format!(
+                "[B.1 3c compound] {} compound predicate(s) present → forced \
+                 may_edge_inference = SmtAllPairs + lift_strategy = Eager (the only \
+                 compound-aware lift path; the sampling representative can't realise a \
+                 conjunction and the lazy body never consults the expr).",
+                compound_exprs.len()
+            ),
+            location: None,
+        });
+    }
     // R-Y5 (2026-06-08) — register names load-bearing for
     // `KleeneBot` verdicts across iterations. Populated at the
     // failure-subgame consumption point; surfaced in the final
@@ -786,7 +830,9 @@ pub fn cegar_refine_loop(
         // surfaces this through `CegarOptions::may_edge_inference`:
         // `Off` (default) keeps the sampling may-edges; `SmtAllPairs`
         // selects the sound all-pairs SMT may relation.
-        may_edge_inference: cegar_opts.may_edge_inference,
+        // B.1 3c — `effective_may` forces `SmtAllPairs` when compound
+        // predicates are present (the only compound-aware lift).
+        may_edge_inference: effective_may,
         // R-Y7 (2026-06-07) + R-S8 session 2 (2026-06-08) —
         // symbolic-init via predicate cubes. Read the
         // `signals[].config_values` map from the sidecar JSON
@@ -798,7 +844,10 @@ pub fn cegar_refine_loop(
         // lift expands the initial-state set per R-S8's
         // hyper-must initial semantics.
         config_values: crate::adapter::btor2::r_s8_encoder::sidecar_config_values(adapter_options),
-        compound_exprs: std::collections::HashMap::new(),
+        // B.1 3c — compound predicates parsed from the sidecar (empty when none
+        // declared → preserves the simple-atom path). The lift honours these via
+        // the SmtEncode seam's `PredicateLike::expr`.
+        compound_exprs: compound_exprs.clone(),
     };
 
     for iteration in 0..=cegar_opts.max_iterations {
@@ -822,7 +871,8 @@ pub fn cegar_refine_loop(
             btor2_content,
             adapter_options,
             &lift_opts,
-            cegar_opts.lift_strategy,
+            // B.1 3c — `effective_strategy` forces Eager when compounds present.
+            effective_strategy,
         )?;
 
         // CTXDSL Phase 2 (2026-06-22) — capture this iteration's cube model
@@ -1614,6 +1664,69 @@ fn walk_state_cells_proposing(
         if !out.is_empty() {
             break;
         }
+    }
+    out
+}
+
+/// B.1 increment 3c (2026-06-26) — read `compound_predicates` from the
+/// `SvAnnotation` sidecar JSON (`AdapterOptions::sidecar_json`) and return them
+/// as `(PredicateSpec, PredicateExpr)` pairs ready for the predicate-cube lift.
+///
+/// Mirrors [`crate::adapter::btor2::r_s8_encoder::sidecar_config_values`]'s
+/// defensive-skip pattern. Returns an empty Vec when:
+/// - the sidecar JSON is absent or fails to parse as an `SvAnnotation`;
+/// - no `compound_predicates` are declared.
+///
+/// A single malformed `expr` is skipped (with a `tracing::warn!`) rather than
+/// failing the whole lift. Each pair is
+/// `(PredicateSpec { name, register, value: 0 }, expr)` where `register` is the
+/// FIRST register the expr references — a placeholder; the predicate's cube-bit
+/// truth is decided by `expr` via the SMT seam's `PredicateLike::expr`, NOT by
+/// `register == value`. The `name` matches the cube-bit / `compound_exprs` key.
+///
+/// Shared by the CEGAR loop today; the no-sidecar `@mununu`-tag path (Track H
+/// H.3) reuses the same `parse_predicate_expr` → compound-predicate bridge.
+pub fn sidecar_compound_predicates(
+    options: &AdapterOptions,
+) -> Vec<(
+    PredicateSpec,
+    crate::adapter::btor2::predicate_expr::PredicateExpr,
+)> {
+    let Some(json) = &options.sidecar_json else {
+        return Vec::new();
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for decl in &ann.compound_predicates {
+        let expr = match crate::adapter::btor2::predicate_expr::parse_predicate_expr(&decl.expr) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    compound = %decl.name,
+                    expr = %decl.expr,
+                    error = %err,
+                    "sidecar_compound_predicates: skipping malformed compound predicate expr"
+                );
+                continue;
+            }
+        };
+        // Placeholder register = first register the expr references. The expr
+        // (not register==value) drives the cube-bit truth; resolution of the
+        // remaining expr registers follows the same canonical-name assumption
+        // the simple `predicates[]` field already makes.
+        let register = expr.registers().into_iter().next().unwrap_or_default();
+        out.push((
+            PredicateSpec {
+                name: decl.name.clone(),
+                register,
+                value: 0,
+            },
+            expr,
+        ));
     }
     out
 }
@@ -3732,6 +3845,108 @@ mod tests {
         assert_eq!(
             trace_eager.terminated_with, trace_lazy.terminated_with,
             "Lazy strategy MUST produce identical termination state to Eager"
+        );
+    }
+
+    #[test]
+    fn b1_3c_sidecar_compound_predicate_threads_into_cegar() {
+        // B.1 increment 3c (2026-06-26) — a compound predicate declared on the
+        // SvAnnotation sidecar threads end-to-end through cegar_refine_loop:
+        // the cube space gains the `idle` bit, and because compounds require
+        // the eager SmtAllPairs lift, 3c FORCES `may = SmtAllPairs` even though
+        // the CegarOptions request `Off` — without that force, the compound
+        // gate (`ensure_compound_lift_supported`) would error. Fixture mirrors
+        // the kmts_lift b1 fixture: a:=0 always, b:=in_b, so
+        // `idle = (a==0 && b==0)` is the meaningful compound.
+        let formula = parser::parse("true").expect("formula parses");
+        let env = Environment::new(2);
+        let btor2 = "1 sort bitvec 1\n2 input 1 in_b\n3 state 1 a\n4 state 1 b\n5 zero 1\n6 init 1 3 5\n7 init 1 4 5\n8 next 1 3 5\n9 next 1 4 2\n";
+        let sidecar =
+            r#"{"module":"m","compound_predicates":[{"name":"idle","expr":"a == 0 && b == 0"}]}"#;
+        let adapter_options = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let opts = CegarOptions {
+            max_iterations: 2,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            // Deliberately Off — 3c must FORCE SmtAllPairs (else the compound
+            // gate errors). The success of the call below proves the force.
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
+        };
+        // No initial predicates — the sidecar compound is the SOLE cube bit, so
+        // the helper-supplied PredicateSpec is what populates the cube space.
+        let trace = cegar_refine_loop(&formula, btor2, vec![], &env, &adapter_options, &opts)
+            .expect("compound cegar succeeds — 3c forces SmtAllPairs, not the 3b gate error");
+        assert!(
+            trace.final_predicates.iter().any(|p| p.name == "idle"),
+            "the sidecar compound `idle` must thread in as a cube-bit predicate; got {:?}",
+            trace
+                .final_predicates
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            trace
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("[B.1 3c compound]")),
+            "expected the 3c force-SmtAllPairs override warning; got {:?}",
+            trace
+                .warnings
+                .iter()
+                .map(|w| &w.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn b1_3c_no_sidecar_compound_preserves_legacy_path() {
+        // B.1 increment 3c — absent `compound_predicates`, the CEGAR loop is
+        // byte-for-byte the pre-3c path: no forced SmtAllPairs, no override
+        // warning, no synthetic cube bit.
+        let formula = parser::parse("true").expect("formula parses");
+        let env = Environment::new(2);
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let opts = CegarOptions {
+            max_iterations: 2,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            emit_ctxdsl: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &opts,
+        )
+        .expect("legacy cegar succeeds");
+        assert!(
+            !trace
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("[B.1 3c compound]")),
+            "no compound predicates ⇒ no 3c override warning"
         );
     }
 }

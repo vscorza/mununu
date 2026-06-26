@@ -241,6 +241,25 @@ pub struct SvAnnotation {
     /// existing fixture.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub predicates: Vec<PredicateDeclaration>,
+
+    /// B.1 increment 3c (2026-06-26) — boolean-composite predicates for
+    /// the predicate-cube CEGAR path. Each entry is a `{name, expr}` pair
+    /// whose `expr` is a boolean combination of `register == value` /
+    /// relational atoms (e.g. `"cnt == 0 && en == 1"`), parsed by
+    /// [`crate::adapter::btor2::predicate_expr::parse_predicate_expr`].
+    ///
+    /// Unlike the simple `register == value` [`PredicateDeclaration`]s
+    /// above, a compound predicate's cube-bit truth is decided by the
+    /// **eager SMT all-pairs** may-relation (the only compound-aware
+    /// lift). When any `compound_predicates` is present the CEGAR loop
+    /// forces `may_edge_inference = SmtAllPairs` + `LiftStrategy::Eager`
+    /// (and warns if that overrides an explicit request) — the sampling
+    /// representative inverse can't realise a conjunction, and the lazy
+    /// per-cube body never consults the expr.
+    ///
+    /// Default empty — preserves behaviour for every existing fixture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compound_predicates: Vec<CompoundPredicateDecl>,
 }
 
 /// IR-track P3.2 (2026-06-22) — one register-value equality predicate
@@ -258,6 +277,22 @@ pub struct PredicateDeclaration {
     /// Value the predicate checks: the predicate holds iff
     /// `register == value`.
     pub value: u64,
+}
+
+/// B.1 increment 3c (2026-06-26) — one boolean-composite predicate
+/// declaration for the predicate-cube CEGAR path. The
+/// [`crate::adapter::btor2::sidecar_compound_predicates`] helper parses
+/// `expr` into a [`crate::adapter::btor2::predicate_expr::PredicateExpr`]
+/// and pairs it with a placeholder [`crate::adapter::btor2::PredicateSpec`]
+/// (the expr — not `register == value` — drives the cube-bit truth via the
+/// SMT seam's `PredicateLike::expr`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompoundPredicateDecl {
+    /// Predicate name; the cube bit + `compound_exprs` key (e.g. `"idle"`).
+    pub name: String,
+    /// Boolean-expression source, e.g. `"cnt == 0 && en == 1"`. Parsed by
+    /// `parse_predicate_expr`; a malformed expr is skipped with a warning.
+    pub expr: String,
 }
 
 /// §Phase 10 §10.2 stage 2 — Memory-cell annotation.
@@ -1781,6 +1816,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         }
     }
 
@@ -2420,6 +2456,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2488,6 +2525,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2631,6 +2669,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2783,6 +2822,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2882,6 +2922,7 @@ mod tests {
             uf_wrap: Vec::new(),
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
+            compound_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
