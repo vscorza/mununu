@@ -179,6 +179,36 @@ pub trait SmtEncode: SymbolicTransitionSystem {
         predicates: &[P],
         timeout_ms: u32,
     ) -> Vec<(usize, usize)>;
+
+    /// Generalised **GKMTS hyper-must** relation. For each source cube,
+    /// the set of targets `T` (its **may-successor set**, from `may_edges`)
+    /// such that
+    ///
+    /// ```text
+    /// (src, T) ∈ R_hyper-must  ⟺  ∀ s ⊨ src. ∃ inputs, s'. (s, s') ∈ R ∧ ∃ t ∈ T. s' ⊨ t
+    /// ```
+    ///
+    /// A pair is included only when the SMT backend proves the obligation
+    /// (UNSAT of its negation) — sound under-approximation: NotMust /
+    /// Unknown / encoder failure drop the edge (never fabricate a witness).
+    ///
+    /// Unlike [`SmtEncode::must_edges`] (the ∀∃ standard per-target must,
+    /// which is **non-monotone** under refinement on alternating
+    /// fixpoints), the hyper-must form is **monotone** (Shoham–Grumberg
+    /// LMCS 2007 §4), so a definite νμ verdict over a KMTS carrying these
+    /// `MustHyperOnly` edges is sound *under refinement*. The SmtAllPairs /
+    /// compound lift uses this when `MustEdgeInference::SmtHyperMust` is
+    /// requested, giving compound-predicate recoverability (νμ) verdicts
+    /// that are clean-sound rather than soundness-tagged.
+    ///
+    /// Default candidate `T` = the full may-successor set (the coarsest
+    /// sound hyper-must; tightening `T` is a future refinement).
+    fn hyper_must_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        may_edges: &[(usize, usize)],
+        timeout_ms: u32,
+    ) -> Vec<(usize, Vec<usize>)>;
 }
 
 /// The BTOR2 implementation of the STS-IR seam — a thin borrow over a
@@ -336,6 +366,66 @@ impl SmtEncode for BtorSts<'_> {
                     ) {
                         edges.push((i, j));
                     }
+                }
+            }
+            edges
+        })
+    }
+
+    fn hyper_must_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        may_edges: &[(usize, usize)],
+        timeout_ms: u32,
+    ) -> Vec<(usize, Vec<usize>)> {
+        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
+        use crate::adapter::btor2::smt_must_edge::{
+            SmtMustVerdict, build_register_nid_map, smt_hyper_must_check,
+        };
+
+        if predicates.is_empty() {
+            return Vec::new();
+        }
+        // Candidate hyper-must target set per source = its may-successor
+        // set (sorted, deduped). A source with no may-successors gets no
+        // hyper-must edge (an empty T is trivially NotMust).
+        let n_cubes = 1usize << predicates.len();
+        let mut may_succ: Vec<Vec<usize>> = vec![Vec::new(); n_cubes];
+        for &(i, j) in may_edges {
+            if i < n_cubes && j < n_cubes {
+                may_succ[i].push(j);
+            }
+        }
+        for v in &mut may_succ {
+            v.sort_unstable();
+            v.dedup();
+        }
+
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = match encode_design_for_lift(self.file) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            let nid_map = build_register_nid_map(&view);
+            let mut edges = Vec::new();
+            for (src, targets) in may_succ.iter().enumerate() {
+                if targets.is_empty() {
+                    continue;
+                }
+                let target_bits_set: Vec<u64> = targets.iter().map(|&t| t as u64).collect();
+                if matches!(
+                    smt_hyper_must_check(
+                        &view,
+                        src as u64,
+                        &target_bits_set,
+                        predicates,
+                        &nid_map,
+                        timeout_ms,
+                    ),
+                    SmtMustVerdict::Must
+                ) {
+                    edges.push((src, targets.clone()));
                 }
             }
             edges
