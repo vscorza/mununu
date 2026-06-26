@@ -1390,28 +1390,89 @@ pub fn materialize_clts_from_lazy(
     })
 }
 
-/// R.5 lazy KMTS sub-item 2.3 (2026-06-04) — compute one cube's
-/// outgoing may-edges. Currently a DUPLICATE of the per-cube
-/// body in `predicate_cube_lift` (lines ~741–841); a 2.3
-/// follow-up refactors `predicate_cube_lift` to use the same
-/// helper.
+/// U.3 (lift-unification, 2026-06-26) — descriptor for the label-set a
+/// sampled edge carries, returned by [`cube_sampling_edges`] so each
+/// caller interns labels its own way.
 ///
-/// Returns empty Vec when:
-/// - The fixture has no boolean inputs OR the predicate set is
-///   empty (matches the eager lifter's gating).
-/// - All `simulate_one_step` invocations error for this cube
-///   (e.g. BTOR2 references registers the lifter can't resolve).
-fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<LazyExpansionEdge> {
-    // Gating: matches the eager lifter's `if lift_opts.max_input_bits
-    // > 0 && !predicates.is_empty()` check. We allow n_inputs == 0
-    // (n_combos == 1) so a single iteration runs with empty
-    // input_values — the eager lifter does the same.
+/// - `Step` — the single canonical `step` label (the non-controllability
+///   case + every lazy edge). The eager caller maps it to its interned
+///   `step` `LabelId`; the lazy caller maps it to its `step`-named
+///   [`LazyExpansionEdge`].
+/// - `Controllability { env_combo, ctrl_combo }` — the dual-label
+///   (env, ctrl) projection of the input combo (R.6.6). The eager caller
+///   maps it to `[env_label_ids[env_combo], ctrl_label_ids[ctrl_combo]]`
+///   (omitting an axis whose index slice is empty). Only the eager,
+///   controllability-aware path produces this variant.
+///
+/// Derives `Hash`/`Eq`/`Copy` so [`cube_sampling_edges`] can dedup the
+/// returned set by `(target, descriptor)` — the unifying insight that
+/// reproduces BOTH the lazy (target-only) and eager (builder-merge-on-
+/// `(src, labels, tgt)`) effective edge sets from one body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LabelDescriptor {
+    Step,
+    Controllability { env_combo: usize, ctrl_combo: usize },
+}
+
+/// U.3 (lift-unification, 2026-06-26) — borrowed context for the shared
+/// per-cube sampling body [`cube_sampling_edges`]. Borrowed (not owned)
+/// because the eager [`predicate_cube_lift`] CANNOT surrender its `file`:
+/// it is also borrowed by the SmtAllPairs may-path and the U.2
+/// [`apply_sampled_must_inference`] must-pass. The lazy [`LazyLift`]
+/// builds it borrowing from its owned [`LazyLiftContext`]; the eager path
+/// builds it borrowing from its locals.
+///
+/// `pred_register_widths` keys are `String` (not `&str`) so the eager and
+/// lazy maps share one borrowed type — the eager path was migrated from
+/// `&str` keys to `String` keys in U.3 for exactly this.
+struct CubeSamplingCtx<'a> {
+    file: &'a crate::adapter::btor2::ast::Btor2File,
+    pred_register_widths: &'a std::collections::HashMap<String, u32>,
+    boolean_inputs: &'a [String],
+    n_inputs: usize,
+    n_combos: usize,
+    uf_wrapped_nids: &'a std::collections::HashSet<crate::adapter::btor2::ast::Nid>,
+    predicates: &'a [PredicateSpec],
+    cube_count: usize,
+    /// Raw input-bit indices (into `boolean_inputs[..n_inputs]`) that are
+    /// uncontrollable (env). Empty for the non-controllability case.
+    env_input_indices: &'a [usize],
+    /// Raw input-bit indices that are controllable (ctrl). Empty for the
+    /// non-controllability case.
+    ctrl_input_indices: &'a [usize],
+    /// When true, each sampled edge's descriptor is
+    /// `Controllability { env_combo, ctrl_combo }`; when false, every
+    /// descriptor is `Step`. The lazy path always passes false.
+    controllability_aware: bool,
+}
+
+/// U.3 (lift-unification, 2026-06-26) — the ONE per-cube sampling body,
+/// shared by the eager [`predicate_cube_lift`] sampling loop and the lazy
+/// [`compute_cube_outgoing_edges`]. Computes, for one `cube_index`: the
+/// canonical representative register assignment, then for each boolean-
+/// input combo (and each UF representative when Ops are UF-wrapped)
+/// simulates one step and re-evaluates the predicates to a target cube.
+///
+/// Returns `(target_cube, LabelDescriptor)` pairs **deduped by
+/// `(target, descriptor)`**. This dedup reproduces both effective edge
+/// sets: the lazy path (descriptor always `Step` ⟹ dedup by target) and
+/// the eager path (the builder's `(src, labels, tgt)` merge — combo↔
+/// `(env_combo, ctrl_combo)` is a bijection, so distinct labels never
+/// collide and the only collapse is the same target via UF snapshots,
+/// which the builder also merges).
+///
+/// Returns empty Vec when the predicate set is empty (matches both
+/// callers' prior gating) or when every `simulate_one_step` invocation
+/// errors for this cube.
+fn cube_sampling_edges(cube_index: usize, ctx: &CubeSamplingCtx) -> Vec<(usize, LabelDescriptor)> {
+    // Gating: matches the eager lifter's `!predicates.is_empty()` check.
+    // We allow n_inputs == 0 (n_combos == 1) so a single iteration runs
+    // with empty input_values — both callers did the same.
     if ctx.predicates.is_empty() {
         return Vec::new();
     }
 
-    // Build canonical representative for cube_index (mirrors
-    // eager lifter at lines ~742–764).
+    // Build canonical representative for cube_index.
     let mut registers: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
     for (bit, pred) in ctx.predicates.iter().enumerate() {
         let truth = (cube_index >> bit) & 1 == 1;
@@ -1419,6 +1480,10 @@ fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<
         if truth {
             *entry = pred.value as u128;
         }
+        // Predicate-false case leaves *entry at 0. If the predicate's
+        // value is also 0 (i.e. predicate is `register == 0`), the false
+        // case needs a non-zero representative; bump to 1 of the
+        // appropriate width.
         if !truth && pred.value == 0 {
             let width = ctx
                 .pred_register_widths
@@ -1431,12 +1496,14 @@ fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<
         }
     }
 
-    let mut edges: Vec<LazyExpansionEdge> = Vec::new();
-    let mut seen_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut edges: Vec<(usize, LabelDescriptor)> = Vec::new();
+    let mut seen: std::collections::HashSet<(usize, LabelDescriptor)> =
+        std::collections::HashSet::new();
 
-    // Enumerate input combinations + emit MayOnly-equivalent
-    // edges. We dedupe target cubes across input combos +
-    // UF reps so a cube doesn't get the same edge twice.
+    // Enumerate input combinations + emit one (target, descriptor) per
+    // newly-seen pair. Dedup is by (target, descriptor) so the eager
+    // controllability dual-labels and the lazy/eager single-step labels
+    // both reproduce their prior effective edge sets.
     for combo in 0..ctx.n_combos {
         let mut input_values: std::collections::HashMap<String, u128> =
             std::collections::HashMap::new();
@@ -1445,10 +1512,14 @@ fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<
             input_values.insert(name.clone(), v);
         }
 
+        // R.5b multi-value UF enumeration — when at least one Op is
+        // UF-wrapped, enumerate `UfRepresentative::{Zero, Ones}`; else
+        // use plain `simulate_one_step` to keep the no-UF path on its
+        // existing performance profile.
         let next_register_snapshots: Vec<std::collections::HashMap<String, u128>> =
             if ctx.uf_wrapped_nids.is_empty() {
                 match crate::adapter::btor2::bit_blast::simulate_one_step(
-                    &ctx.file,
+                    ctx.file,
                     &registers,
                     &input_values,
                 ) {
@@ -1460,10 +1531,10 @@ fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<
                 let mut snaps = Vec::with_capacity(2);
                 for rep in [UfRepresentative::Zero, UfRepresentative::Ones] {
                     match crate::adapter::btor2::bit_blast::simulate_one_step_with_uf_rep(
-                        &ctx.file,
+                        ctx.file,
                         &registers,
                         &input_values,
-                        &ctx.uf_wrapped_nids,
+                        ctx.uf_wrapped_nids,
                         rep,
                     ) {
                         Ok(v) => snaps.push(v),
@@ -1473,6 +1544,29 @@ fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<
                 snaps
             };
 
+        // Descriptor for this combo. controllability_aware ⟹ project the
+        // combo onto its (env_combo, ctrl_combo); else the single `step`.
+        let descriptor = if ctx.controllability_aware {
+            let mut env_c: usize = 0;
+            for (slot, &raw_idx) in ctx.env_input_indices.iter().enumerate() {
+                if (combo >> raw_idx) & 1 == 1 {
+                    env_c |= 1 << slot;
+                }
+            }
+            let mut ctrl_c: usize = 0;
+            for (slot, &raw_idx) in ctx.ctrl_input_indices.iter().enumerate() {
+                if (combo >> raw_idx) & 1 == 1 {
+                    ctrl_c |= 1 << slot;
+                }
+            }
+            LabelDescriptor::Controllability {
+                env_combo: env_c,
+                ctrl_combo: ctrl_c,
+            }
+        } else {
+            LabelDescriptor::Step
+        };
+
         for next_registers in &next_register_snapshots {
             let mut target_index: usize = 0;
             for (bit, pred) in ctx.predicates.iter().enumerate() {
@@ -1481,16 +1575,49 @@ fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<
                     target_index |= 1 << bit;
                 }
             }
-            if target_index < ctx.cube_count && seen_targets.insert(target_index) {
-                edges.push(LazyExpansionEdge {
-                    label: ctx.label_name.clone(),
-                    target_cube: target_index,
-                });
+            if target_index < ctx.cube_count && seen.insert((target_index, descriptor)) {
+                edges.push((target_index, descriptor));
             }
         }
     }
 
     edges
+}
+
+/// R.5 lazy KMTS sub-item 2.3 (2026-06-04) — compute one cube's outgoing
+/// may-edges. U.3 (2026-06-26): now a thin wrapper over the shared
+/// [`cube_sampling_edges`]. The lazy path is never controllability-aware
+/// (empty env/ctrl index slices + `controllability_aware = false`), so
+/// every descriptor comes back `Step` and maps onto a single-`step`-
+/// labelled [`LazyExpansionEdge`]. The eager [`predicate_cube_lift`]
+/// drives the identical body — U.1's differential test enforces they
+/// can't diverge.
+///
+/// Returns empty Vec when:
+/// - The predicate set is empty (matches the eager lifter's gating).
+/// - All `simulate_one_step` invocations error for this cube
+///   (e.g. BTOR2 references registers the lifter can't resolve).
+fn compute_cube_outgoing_edges(cube_index: usize, ctx: &LazyLiftContext) -> Vec<LazyExpansionEdge> {
+    let sampling_ctx = CubeSamplingCtx {
+        file: &ctx.file,
+        pred_register_widths: &ctx.pred_register_widths,
+        boolean_inputs: &ctx.boolean_inputs,
+        n_inputs: ctx.n_inputs,
+        n_combos: ctx.n_combos,
+        uf_wrapped_nids: &ctx.uf_wrapped_nids,
+        predicates: &ctx.predicates,
+        cube_count: ctx.cube_count,
+        env_input_indices: &[],
+        ctrl_input_indices: &[],
+        controllability_aware: false,
+    };
+    cube_sampling_edges(cube_index, &sampling_ctx)
+        .into_iter()
+        .map(|(target_cube, _descriptor)| LazyExpansionEdge {
+            label: ctx.label_name.clone(),
+            target_cube,
+        })
+        .collect()
 }
 
 /// R.2.5 — Result of lifting one BTOR2 source through the predicate-
@@ -2043,154 +2170,78 @@ pub fn predicate_cube_lift(
             }
         }
 
-        // Collect register widths so we can mask the representative
-        // values to the cell's bit-width.
-        let mut pred_register_widths: std::collections::HashMap<&str, u32> =
+        // Collect register widths so the representative builder in
+        // `cube_sampling_edges` can mask predicate-false values to the
+        // cell's bit-width. U.3 — `String` keys (was `&str`) so the
+        // borrowed `CubeSamplingCtx` shares one map type with the lazy
+        // path's `LazyLiftContext`.
+        let mut pred_register_widths: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
         for line in &file.lines {
             if let crate::adapter::btor2::ast::Node::State { sort, .. } = &line.node
                 && let Some(width) = crate::adapter::btor2::parser::bv_width(&file, *sort)
                 && let Some(name) = symbols.get(&line.nid)
             {
-                pred_register_widths.insert(name.as_str(), width);
+                pred_register_widths.insert(name.clone(), width);
             }
         }
 
+        // U.3 — drive the shared per-cube sampling body. The eager path
+        // borrows its locals into a `CubeSamplingCtx`; `cube_sampling_edges`
+        // returns `(target, LabelDescriptor)` pairs deduped by
+        // `(target, descriptor)`. The eager caller interns each descriptor
+        // into the controllability-aware dual-label set (or the single
+        // `step` label); the lazy caller (`compute_cube_outgoing_edges`)
+        // drives the identical body onto its `LazyExpansionEdge` shape —
+        // U.1's differential test enforces the two can never diverge.
+        //
+        // R.6.6 — the `Controllability { env_combo, ctrl_combo }` descriptor
+        // carries the projection of the input combo; the env labels are
+        // tagged `Uncontrollable`, the ctrl labels `Controllable`, so the
+        // Skolem grouping (group_transitions_by_uncontrollable_labels)
+        // partitions transitions along the controllability axis correctly.
+        let sampling_ctx = CubeSamplingCtx {
+            file: &file,
+            pred_register_widths: &pred_register_widths,
+            boolean_inputs: &boolean_inputs,
+            n_inputs,
+            n_combos,
+            uf_wrapped_nids: &uf_wrapped_nids,
+            predicates: &predicates,
+            cube_count,
+            env_input_indices: &env_input_indices,
+            ctrl_input_indices: &ctrl_input_indices,
+            controllability_aware,
+        };
+
         for (i, &src_id) in state_ids.iter().enumerate() {
-            // Build canonical representative for cube_i.
-            let mut registers: std::collections::HashMap<String, u128> =
-                std::collections::HashMap::new();
-            for (bit, pred) in predicates.iter().enumerate() {
-                let truth = (i >> bit) & 1 == 1;
-                let entry = registers.entry(pred.register.clone()).or_insert(0);
-                if truth {
-                    *entry = pred.value as u128;
-                }
-                // Predicate-false case leaves *entry at 0. If the
-                // predicate's value is also 0 (i.e. predicate is
-                // `register == 0`), the false case needs a non-zero
-                // representative; bump to 1 of the appropriate width.
-                if !truth && pred.value == 0 {
-                    let width = pred_register_widths
-                        .get(pred.register.as_str())
-                        .copied()
-                        .unwrap_or(1);
-                    if width >= 1 {
-                        *entry = 1;
-                    }
-                }
-            }
-
-            // Enumerate input combinations + emit MayOnly edges.
-            for combo in 0..n_combos {
-                let mut input_values: std::collections::HashMap<String, u128> =
-                    std::collections::HashMap::new();
-                for (bit, name) in boolean_inputs.iter().take(n_inputs).enumerate() {
-                    let v = if (combo >> bit) & 1 == 1 { 1 } else { 0 };
-                    input_values.insert(name.clone(), v);
-                }
-                // R.5b consumer wiring — multi-value UF enumeration.
-                // When at least one Op is UF-wrapped, enumerate
-                // `UfRepresentative::{Zero, Ones}` substitutions to
-                // emit multiple may-edges per cube/input combo —
-                // tighter may-side approximation than the zero-only
-                // MVP (each representative routes the next-state
-                // computation through a different downstream cube,
-                // when the wrapped Op's value actually controls a
-                // branching path).
-                //
-                // When no UF wrapping fires, use the plain
-                // `simulate_one_step` to keep the no-UF code path
-                // on its existing performance profile (avoids the
-                // HashSet-membership check per Op).
-                let next_register_snapshots: Vec<std::collections::HashMap<String, u128>> =
-                    if uf_wrapped_nids.is_empty() {
-                        match crate::adapter::btor2::bit_blast::simulate_one_step(
-                            &file,
-                            &registers,
-                            &input_values,
-                        ) {
-                            Ok(v) => vec![v],
-                            Err(_) => continue,
-                        }
-                    } else {
-                        use crate::adapter::btor2::bit_blast::UfRepresentative;
-                        let mut snaps = Vec::with_capacity(2);
-                        for rep in [UfRepresentative::Zero, UfRepresentative::Ones] {
-                            match crate::adapter::btor2::bit_blast::simulate_one_step_with_uf_rep(
-                                &file,
-                                &registers,
-                                &input_values,
-                                &uf_wrapped_nids,
-                                rep,
-                            ) {
-                                Ok(v) => snaps.push(v),
-                                Err(_) => continue,
-                            }
-                        }
-                        snaps
-                    };
-
-                // Emit one may-edge per representative. Duplicate
-                // target cubes get deduplicated via the builder's
-                // transition merging.
-                //
-                // R.6.6 (2026-06-08) — when controllability-aware,
-                // compute the (env_combo, ctrl_combo) projection of
-                // this input combo and emit the transition with a
-                // dual-label set `[env_label, ctrl_label]`. The
-                // Skolem grouping (group_transitions_by_uncontrollable_labels)
-                // then partitions transitions by env_label correctly.
+            for (target_index, descriptor) in cube_sampling_edges(i, &sampling_ctx) {
+                let tgt_id = state_ids[target_index];
                 let labels: smallvec::SmallVec<[crate::clts::LabelId<DefaultLabelIdx>; 4]> =
-                    if controllability_aware {
-                        let mut env_c: usize = 0;
-                        for (slot, &raw_idx) in env_input_indices.iter().enumerate() {
-                            if (combo >> raw_idx) & 1 == 1 {
-                                env_c |= 1 << slot;
+                    match descriptor {
+                        LabelDescriptor::Step => smallvec::smallvec![label_id],
+                        LabelDescriptor::Controllability {
+                            env_combo,
+                            ctrl_combo,
+                        } => {
+                            let mut lbls = smallvec::SmallVec::new();
+                            if !env_input_indices.is_empty() {
+                                lbls.push(env_label_ids[env_combo]);
                             }
-                        }
-                        let mut ctrl_c: usize = 0;
-                        for (slot, &raw_idx) in ctrl_input_indices.iter().enumerate() {
-                            if (combo >> raw_idx) & 1 == 1 {
-                                ctrl_c |= 1 << slot;
+                            if !ctrl_input_indices.is_empty() {
+                                lbls.push(ctrl_label_ids[ctrl_combo]);
                             }
+                            lbls
                         }
-                        let mut lbls = smallvec::SmallVec::new();
-                        if !env_input_indices.is_empty() {
-                            lbls.push(env_label_ids[env_c]);
-                        }
-                        if !ctrl_input_indices.is_empty() {
-                            lbls.push(ctrl_label_ids[ctrl_c]);
-                        }
-                        lbls
-                    } else {
-                        smallvec::smallvec![label_id]
                     };
-
-                for next_registers in &next_register_snapshots {
-                    // Determine the resulting cube index by
-                    // re-evaluating each predicate against the new
-                    // register values.
-                    let mut target_index: usize = 0;
-                    for (bit, pred) in predicates.iter().enumerate() {
-                        let next_v = next_registers.get(&pred.register).copied().unwrap_or(0);
-                        if next_v == pred.value as u128 {
-                            target_index |= 1 << bit;
-                        }
-                    }
-                    if target_index < state_ids.len() {
-                        let tgt_id = state_ids[target_index];
-                        builder.transition_ids_with_modality(
-                            src_id,
-                            &labels,
-                            tgt_id,
-                            crate::clts::TransitionModality::MayOnly,
-                        );
-                        // R.2.5b — record sampled target for the
-                        // post-pass.
-                        sampled_targets_per_source[i].insert(target_index);
-                    }
-                }
+                builder.transition_ids_with_modality(
+                    src_id,
+                    &labels,
+                    tgt_id,
+                    crate::clts::TransitionModality::MayOnly,
+                );
+                // R.2.5b — record sampled target for the must post-pass.
+                sampled_targets_per_source[i].insert(target_index);
             }
         }
         predicate_image_pending = false;
