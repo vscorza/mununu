@@ -798,6 +798,7 @@ pub fn cegar_refine_loop(
         // lift expands the initial-state set per R-S8's
         // hyper-must initial semantics.
         config_values: crate::adapter::btor2::r_s8_encoder::sidecar_config_values(adapter_options),
+        compound_exprs: std::collections::HashMap::new(),
     };
 
     for iteration in 0..=cegar_opts.max_iterations {

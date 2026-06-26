@@ -293,6 +293,49 @@ pub struct PredicateSpec {
     pub value: u64,
 }
 
+/// B.1 (increment 3b) — a predicate paired with its optional compound
+/// expression, the slice element the SMT may/must edge seam consumes.
+/// A `Some` expr makes [`crate::adapter::btor2::smt_must_edge::PredicateLike::expr`]
+/// return it, so 3a's `build_pred_constraint` encodes the compound boolean
+/// instead of the simple `register == value` atom; `None` is the simple atom
+/// (behaviour-preserving). Built by [`cube_predicates`] from a `PredicateSpec`
+/// list + the lift options' `compound_exprs` map, in predicates order (cube
+/// bit `i` = `predicates[i]`).
+pub struct CubePredicate<'a> {
+    spec: &'a PredicateSpec,
+    expr: Option<&'a crate::adapter::btor2::predicate_expr::PredicateExpr>,
+}
+
+impl crate::adapter::btor2::smt_must_edge::PredicateLike for CubePredicate<'_> {
+    fn register(&self) -> &str {
+        &self.spec.register
+    }
+    fn value(&self) -> u64 {
+        self.spec.value
+    }
+    fn expr(&self) -> Option<&crate::adapter::btor2::predicate_expr::PredicateExpr> {
+        self.expr
+    }
+}
+
+/// B.1 — pair each predicate with its compound expr (if its name is in
+/// `compound_exprs`), preserving order so cube bit `i` stays `predicates[i]`.
+fn cube_predicates<'a>(
+    predicates: &'a [PredicateSpec],
+    compound_exprs: &'a std::collections::HashMap<
+        String,
+        crate::adapter::btor2::predicate_expr::PredicateExpr,
+    >,
+) -> Vec<CubePredicate<'a>> {
+    predicates
+        .iter()
+        .map(|spec| CubePredicate {
+            spec,
+            expr: compound_exprs.get(&spec.name),
+        })
+        .collect()
+}
+
 /// R.2.5 — Options for [`predicate_cube_lift`].
 #[derive(Debug, Clone)]
 pub struct PredicateCubeLiftOptions {
@@ -333,6 +376,25 @@ pub struct PredicateCubeLiftOptions {
     /// Default empty preserves the pre-R-Y7 single-initial-cube
     /// behaviour exactly.
     pub config_values: std::collections::HashMap<String, Vec<u64>>,
+    /// B.1 (increment 3b, 2026-06-25) — compound predicates, keyed by
+    /// predicate **name** (the `PredicateSpec::name` of a predicate also
+    /// present in the `predicates` list). When a predicate's name appears
+    /// here, its cube-dimension truth is decided by the
+    /// [`crate::adapter::btor2::predicate_expr::PredicateExpr`] (a boolean
+    /// combination of register comparisons) rather than the simple
+    /// `register == value` atom — see [`CubePredicate`].
+    ///
+    /// **Soundness gate:** because the cube→representative-registers
+    /// *inverse* (the sampling may-edge path) is only sound for simple
+    /// atoms, a non-empty `compound_exprs` REQUIRES
+    /// `may_edge_inference == MayEdgeInference::SmtAllPairs` (the lift
+    /// errors otherwise) — compounds are routed exclusively through the
+    /// SMT may/must edge construction, which honours them via
+    /// `PredicateLike::expr()`.
+    ///
+    /// Default empty preserves the pre-B.1 simple-atom behaviour exactly.
+    pub compound_exprs:
+        std::collections::HashMap<String, crate::adapter::btor2::predicate_expr::PredicateExpr>,
 }
 
 impl Default for PredicateCubeLiftOptions {
@@ -343,6 +405,7 @@ impl Default for PredicateCubeLiftOptions {
             must_edge_inference: MustEdgeInference::Off,
             may_edge_inference: MayEdgeInference::Off,
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         }
     }
 }
@@ -1558,6 +1621,38 @@ pub fn predicate_cube_lift(
     // unresolvable names still error.
     resolve_predicate_registers(&file, &mut predicates)?;
 
+    // B.1 (increment 3b) — compound-predicate gate. Every `compound_exprs`
+    // key must name a predicate in the list (else the expr is orphaned), and
+    // because the cube→representative-registers *inverse* (the sampling
+    // may-edge path) is only sound for simple atoms, compounds REQUIRE the
+    // all-pairs SMT may-relation. We route compounds exclusively through the
+    // SMT may/must seam (which honours them via `PredicateLike::expr`).
+    if !lift_opts.compound_exprs.is_empty() {
+        let names: std::collections::HashSet<&str> =
+            predicates.iter().map(|p| p.name.as_str()).collect();
+        for key in lift_opts.compound_exprs.keys() {
+            if !names.contains(key.as_str()) {
+                return Err(AdapterError {
+                    kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+                    location: None,
+                    message: format!(
+                        "adapter/btor2/predicate_cube_lift: compound_exprs key '{key}' names no predicate in the predicate set"
+                    ),
+                });
+            }
+        }
+        if !matches!(lift_opts.may_edge_inference, MayEdgeInference::SmtAllPairs) {
+            return Err(AdapterError {
+                kind: crate::adapter::AdapterErrorKind::UnsupportedConstruct,
+                location: None,
+                message: "adapter/btor2/predicate_cube_lift: compound predicates require \
+                          may_edge_inference = SmtAllPairs (the sampling representative is sound \
+                          only for simple register==value atoms)"
+                    .to_string(),
+            });
+        }
+    }
+
     // 2. Cube count check — `2^|P|` must fit `max_cube_count`. For
     //    |P| > 63 the shift overflows so we cap at 63 explicitly.
     let p = predicates.len();
@@ -1711,9 +1806,14 @@ pub fn predicate_cube_lift(
         // behaviour-preserving and de-dups the inlined loop onto the
         // single seam implementation `predicate_cube_lift` now shares
         // with `BtorSts::may_edges` and the lazy must-edge passes.
+        // B.1 (increment 3b) — pair each predicate with its compound expr (if
+        // any) so the seam encodes compounds via `PredicateLike::expr`. With no
+        // compounds every expr is None → identical to passing `&predicates`
+        // (behaviour-preserving for the simple SmtAllPairs path).
+        let cube_preds = cube_predicates(&predicates, &lift_opts.compound_exprs);
         let may_edges: Vec<(usize, usize)> = {
             use crate::adapter::sts_ir::{BtorSts, SmtEncode};
-            BtorSts::new(&file).may_edges(&predicates, 5_000)
+            BtorSts::new(&file).may_edges(&cube_preds, 5_000)
         };
         for (i, j) in may_edges {
             builder.transition_ids_with_modality(
@@ -1746,7 +1846,7 @@ pub fn predicate_cube_lift(
         // (`!SmtAllPairs`) path below.
         if !matches!(lift_opts.must_edge_inference, MustEdgeInference::Off) {
             use crate::adapter::sts_ir::{BtorSts, SmtEncode};
-            let must_edges = BtorSts::new(&file).must_edges(&predicates, 5_000);
+            let must_edges = BtorSts::new(&file).must_edges(&cube_preds, 5_000);
             let promoted = must_edges.len();
             for (i, j) in must_edges {
                 builder.transition_ids_with_modality(
@@ -2689,6 +2789,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::Off,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
         assert!(result.is_err());
@@ -3255,6 +3356,7 @@ mod tests {
             must_edge_inference: must,
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
 
         // Baseline: SmtAllPairs may, no must → MayOnly only, zero promotions.
@@ -3297,6 +3399,88 @@ mod tests {
     }
 
     #[test]
+    fn b1_compound_predicate_lifts_via_smt_all_pairs() {
+        // B.1 (3b) — compound predicate flows end-to-end through the lift.
+        // a:=0 (always), b:=in_b. Compound idle=(a==0 && b==0). cube_0 =
+        // {idle false}, cube_1 = {idle true}. Because b can be 1, a non-idle
+        // state can STAY non-idle (in_b=1), so the may-edge cube_0→cube_0
+        // exists ONLY because of the `&& b==0` conjunct — the a==0-only atom
+        // would lack it (a:=0 always ⇒ next a==0 ⇒ never stays non-idle).
+        let btor2 = "1 sort bitvec 1\n2 input 1 in_b\n3 state 1 a\n4 state 1 b\n5 zero 1\n6 init 1 3 5\n7 init 1 4 5\n8 next 1 3 5\n9 next 1 4 2\n";
+        let mut compound_exprs = std::collections::HashMap::new();
+        compound_exprs.insert(
+            "idle".to_string(),
+            crate::adapter::btor2::predicate_expr::PredicateExpr::And(
+                Box::new(crate::adapter::btor2::predicate_expr::PredicateExpr::eq(
+                    "a", 0,
+                )),
+                Box::new(crate::adapter::btor2::predicate_expr::PredicateExpr::eq(
+                    "b", 0,
+                )),
+            ),
+        );
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            config_values: std::collections::HashMap::new(),
+            compound_exprs,
+        };
+        let preds = vec![PredicateSpec {
+            name: "idle".into(),
+            // Placeholder register; the compound expr drives the cube truth.
+            register: "a".into(),
+            value: 0,
+        }];
+        let result = predicate_cube_lift(preds, btor2, &AdapterOptions::default(), &opts)
+            .expect("compound lift via SmtAllPairs");
+        let cube0 = result.clts.state_id("cube_0").expect("cube_0 exists");
+        let targets: Vec<usize> = result
+            .clts
+            .outgoing(cube0)
+            .iter()
+            .map(|t| t.target().index())
+            .collect();
+        assert!(
+            targets.contains(&0),
+            "compound idle=(a==0 && b==0) with b:=in_b must have may-edge cube_0→cube_0 \
+             (in_b=1 keeps it non-idle) — the conjunct the a==0-only atom would miss; got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn b1_compound_predicate_requires_smt_all_pairs() {
+        // The 3b gate: compounds + a non-SmtAllPairs may-source must error,
+        // because the cube→representative-registers inverse (sampling) is sound
+        // only for simple register==value atoms.
+        let btor2 = "1 sort bitvec 1\n2 state 1 a\n3 zero 1\n4 init 1 2 3\n5 next 1 2 3\n";
+        let mut compound_exprs = std::collections::HashMap::new();
+        compound_exprs.insert(
+            "p".to_string(),
+            crate::adapter::btor2::predicate_expr::PredicateExpr::eq("a", 0),
+        );
+        let opts = PredicateCubeLiftOptions {
+            // Sampling (Off) — disallowed when compounds are present.
+            may_edge_inference: MayEdgeInference::Off,
+            compound_exprs,
+            ..Default::default()
+        };
+        let preds = vec![PredicateSpec {
+            name: "p".into(),
+            register: "a".into(),
+            value: 0,
+        }];
+        let err = predicate_cube_lift(preds, btor2, &AdapterOptions::default(), &opts)
+            .expect_err("compound + sampling must error");
+        assert!(
+            err.message.contains("compound predicates require"),
+            "expected the SmtAllPairs gate error; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn predicate_image_mvp_max_input_bits_zero_disables_edges() {
         // Setting max_input_bits = 0 recovers the legacy R.2.5 MVP
         // behaviour (cube states but no edges; predicate_image_pending
@@ -3313,6 +3497,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::Off,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("ok");
@@ -3380,6 +3565,7 @@ mod tests {
             may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -3421,6 +3607,7 @@ mod tests {
             may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -3463,6 +3650,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SmtPerTarget,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -3520,6 +3708,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SmtPerTarget,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -3550,6 +3739,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SmtPerTarget,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -3608,6 +3798,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(
             preds.clone(),
@@ -3643,6 +3834,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SmtPerTarget,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let mvp_result =
             predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &mvp_opts)
@@ -3682,6 +3874,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SmtHyperMust,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("lift succeeds");
@@ -3719,6 +3912,7 @@ mod tests {
                 must_edge_inference: variant,
                 may_edge_inference: Default::default(),
                 config_values: std::collections::HashMap::new(),
+                compound_exprs: std::collections::HashMap::new(),
             };
             let result = predicate_cube_lift(
                 preds.clone(),
@@ -3758,6 +3952,7 @@ mod tests {
                 must_edge_inference: variant,
                 may_edge_inference: Default::default(),
                 config_values: std::collections::HashMap::new(),
+                compound_exprs: std::collections::HashMap::new(),
             };
             let mut lazy = LazyLift::from_btor2(
                 preds.clone(),
@@ -3911,6 +4106,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::SamplingConfluence,
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &adapter_opts, &lift_opts)
             .expect("lift succeeds");
@@ -3987,6 +4183,7 @@ mod tests {
             may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4020,6 +4217,7 @@ mod tests {
             may_edge_inference: Default::default(),
 
             config_values: std::collections::HashMap::new(),
+            compound_exprs: std::collections::HashMap::new(),
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -4106,6 +4304,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::Off,
             may_edge_inference: Default::default(),
             config_values,
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4140,6 +4339,7 @@ mod tests {
             must_edge_inference: MustEdgeInference::Off,
             may_edge_inference: Default::default(),
             config_values,
+            compound_exprs: std::collections::HashMap::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");

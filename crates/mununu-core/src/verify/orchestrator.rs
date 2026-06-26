@@ -1070,6 +1070,7 @@ fn dispatch_sv_predicate_cube(
         must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
         may_edge_inference: MayEdgeInference::SmtAllPairs,
         config_values: crate::adapter::btor2::r_s8_encoder::sidecar_config_values(opts),
+        compound_exprs: std::collections::HashMap::new(),
     };
     let result = predicate_cube_lift(predicates, &btor2, opts, &lift_opts)
         .map_err(|err| translate_err(format!("predicate-cube lift: {}", err.message)))?;

@@ -87,6 +87,7 @@ fn v6_amba_arbiter_lifts_with_controllability_aware_dual_labels() {
         must_edge_inference: MustEdgeInference::Off,
         may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
+        compound_exprs: std::collections::HashMap::new(),
     };
 
     let result = predicate_cube_lift(predicates, AMBA_ARBITER_BTOR2, &adapter_options, &lift_opts)
@@ -161,6 +162,7 @@ fn v6_amba_arbiter_lifts_with_mayonly_transitions_present() {
         must_edge_inference: MustEdgeInference::Off,
         may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
+        compound_exprs: std::collections::HashMap::new(),
     };
 
     let result = predicate_cube_lift(predicates, AMBA_ARBITER_BTOR2, &adapter_options, &lift_opts)
@@ -244,6 +246,7 @@ fn v6_amba_arbiter_controllability_aware_skips_smt_post_pass() {
         must_edge_inference: MustEdgeInference::SmtPerTarget,
         may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
+        compound_exprs: std::collections::HashMap::new(),
     };
 
     let result = predicate_cube_lift(predicates, AMBA_ARBITER_BTOR2, &adapter_options, &lift_opts)

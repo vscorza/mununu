@@ -22,7 +22,8 @@
 //! Neither trait surface names a BTOR2 or Z3 type: state/input structure
 //! is [`StsVar`] (name + width); the concrete step is name-keyed
 //! `HashMap<String, u128>`; the SMT predicate-image is expressed over
-//! [`PredicateSpec`] (a frontend-agnostic `{name, register, value}`) and
+//! [`PredicateSpec`](crate::adapter::btor2::kmts_lift::PredicateSpec) (a
+//! frontend-agnostic `{name, register, value}`) and
 //! returns plain cube-index pairs. A future non-RTL frontend that can
 //! emit these two semantics inherits both abstraction policies + the
 //! KMTS evaluator + CEGAR with no new abstraction code (the P4/P5 goal).
@@ -31,7 +32,7 @@ use std::collections::HashMap;
 
 use crate::adapter::AdapterError;
 use crate::adapter::btor2::ast::{Btor2File, Node};
-use crate::adapter::btor2::kmts_lift::PredicateSpec;
+use crate::adapter::btor2::smt_must_edge::PredicateLike;
 use crate::adapter::btor2::{bit_blast, parser};
 
 /// A typed state or input variable of a symbolic transition system.
@@ -146,7 +147,11 @@ pub trait SmtEncode: SymbolicTransitionSystem {
     /// The must-relation (`∀∀` / `∀∃` / hyper-must) follows the same
     /// shape over the same encoding (`smt_must_edge::smt_per_target_must_*`);
     /// DR0 ships only the may-relation to prove the seam.
-    fn may_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)>;
+    fn may_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        timeout_ms: u32,
+    ) -> Vec<(usize, usize)>;
 
     /// P1 #3 (IR-unification track) — sound under-approximating
     /// **must-relation** over predicate cubes, the canonical ∀∃ KMTS
@@ -169,7 +174,11 @@ pub trait SmtEncode: SymbolicTransitionSystem {
     /// the stricter ∀∀ form and the generalised hyper-must form remain
     /// available directly via `smt_must_edge::smt_per_target_must_check`
     /// / `smt_hyper_must_check` on the sampling-candidate path.
-    fn must_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)>;
+    fn must_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        timeout_ms: u32,
+    ) -> Vec<(usize, usize)>;
 }
 
 /// The BTOR2 implementation of the STS-IR seam — a thin borrow over a
@@ -246,7 +255,11 @@ impl StepEval for BtorSts<'_> {
 }
 
 impl SmtEncode for BtorSts<'_> {
-    fn may_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)> {
+    fn may_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        timeout_ms: u32,
+    ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMayVerdict, build_register_nid_map, smt_per_target_may_check,
@@ -286,7 +299,11 @@ impl SmtEncode for BtorSts<'_> {
         })
     }
 
-    fn must_edges(&self, predicates: &[PredicateSpec], timeout_ms: u32) -> Vec<(usize, usize)> {
+    fn must_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        timeout_ms: u32,
+    ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMustVerdict, build_register_nid_map, smt_per_target_must_check_standard,
@@ -329,6 +346,7 @@ impl SmtEncode for BtorSts<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::btor2::kmts_lift::PredicateSpec;
 
     // A 1-bit register `q` with `q' = en`, plus an input `en`. Exercises
     // both the state/input metadata and the concrete-step delegation.
