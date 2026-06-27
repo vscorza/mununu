@@ -3507,6 +3507,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rel_relational_predicate_lifts_via_smt_all_pairs() {
+        // REL — a relational predicate `stable = (s == s_past)` (the `$stable`
+        // shape) flows end-to-end through predicate_cube_lift. s := in_s (free),
+        // s_past := s (the XL.3b shadow flop). From a stable cube, in_s=0 keeps
+        // it stable and in_s=1 breaks it, so cube_1 has may-edges to BOTH cubes
+        // — a distinction a `register==literal` predicate cannot express. This
+        // exercises the full wiring: resolve, the SmtAllPairs gate, and the SMT
+        // predicate-image honouring a CmpReg leaf.
+        let btor2 = "1 sort bitvec 1\n2 input 1 in_s\n3 state 1 s\n4 state 1 s_past\n5 zero 1\n6 init 1 3 5\n7 init 1 4 5\n8 next 1 3 2\n9 next 1 4 3\n";
+        let mut compound_exprs = std::collections::HashMap::new();
+        compound_exprs.insert(
+            "stable".to_string(),
+            crate::adapter::btor2::predicate_expr::PredicateExpr::eq_reg("s", "s_past"),
+        );
+        let opts = PredicateCubeLiftOptions {
+            max_cube_count: 1024,
+            max_input_bits: 8,
+            must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            config_values: std::collections::HashMap::new(),
+            compound_exprs,
+        };
+        let preds = vec![PredicateSpec {
+            name: "stable".into(),
+            // Placeholder register; the relational CmpReg expr drives the cube bit.
+            register: "s".into(),
+            value: 0,
+        }];
+        let result = predicate_cube_lift(preds, btor2, &AdapterOptions::default(), &opts)
+            .expect("relational lift via SmtAllPairs");
+        assert_eq!(result.clts.state_count(), 2, "|P| = 1 → 2 cubes");
+        let stable_cube = result
+            .clts
+            .state_id("cube_1")
+            .expect("cube_1 (stable=true)");
+        let targets: Vec<usize> = result
+            .clts
+            .outgoing(stable_cube)
+            .iter()
+            .map(|t| t.target().index())
+            .collect();
+        assert!(
+            targets.contains(&1),
+            "stable can stay stable (in_s=0): cube_1→cube_1; got {targets:?}"
+        );
+        assert!(
+            targets.contains(&0),
+            "stable can become unstable (in_s=1): cube_1→cube_0 — the relational \
+             distinction a literal predicate can't make; got {targets:?}"
+        );
+    }
+
     // U.1 (lift-unification, 2026-06-26) — the eager≡lazy differential guard.
     // The eager sampling lift (`predicate_cube_lift` with may = sampling) and the
     // lazy lift (`LazyLift` + `materialize_clts_from_lazy`) MUST produce identical

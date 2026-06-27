@@ -55,11 +55,23 @@ pub enum CmpOp {
 /// audited modal fragment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PredicateExpr {
-    /// `register <op> value` (unsigned comparison).
+    /// `register <op> value` (unsigned comparison against a literal).
     Cmp {
         register: String,
         op: CmpOp,
         value: u64,
+    },
+    /// REL — `lhs <op> rhs` where **both** operands are registers (a
+    /// *relational* predicate, e.g. `state_q == state_q__past` for `$stable`, or
+    /// `data_o == data_i` for dataflow). Like [`PredicateExpr::Cmp`] it is one
+    /// cube bit; the second register is referenced (not a cube dimension), and
+    /// the SMT image picks a consistent value for it. Only the SMT path honours
+    /// it (the literal-based sampler cannot realise a two-register relation —
+    /// the same reason compound predicates are gated to `SmtAllPairs`).
+    CmpReg {
+        lhs: String,
+        op: CmpOp,
+        rhs: String,
     },
     And(Box<PredicateExpr>, Box<PredicateExpr>),
     Or(Box<PredicateExpr>, Box<PredicateExpr>),
@@ -78,6 +90,16 @@ impl PredicateExpr {
         }
     }
 
+    /// A relational `lhs == rhs` atom over two registers (REL). The
+    /// `$stable(x)` / `$changed(x)` translator forms emit `x <op> x__past`.
+    pub fn eq_reg(lhs: impl Into<String>, rhs: impl Into<String>) -> Self {
+        PredicateExpr::CmpReg {
+            lhs: lhs.into(),
+            op: CmpOp::Eq,
+            rhs: rhs.into(),
+        }
+    }
+
     /// Explicit evaluation over a concrete register valuation. Registers absent
     /// from `regs` default to `0` — matching the cube lifter's `.unwrap_or(0)`
     /// convention for next-state registers that no transition wrote.
@@ -89,15 +111,12 @@ impl PredicateExpr {
                 value,
             } => {
                 let lhs = regs.get(register).copied().unwrap_or(0);
-                let rhs = *value as u128;
-                match op {
-                    CmpOp::Eq => lhs == rhs,
-                    CmpOp::Ne => lhs != rhs,
-                    CmpOp::Lt => lhs < rhs,
-                    CmpOp::Le => lhs <= rhs,
-                    CmpOp::Gt => lhs > rhs,
-                    CmpOp::Ge => lhs >= rhs,
-                }
+                cmp_apply(*op, lhs, *value as u128)
+            }
+            PredicateExpr::CmpReg { lhs, op, rhs } => {
+                let l = regs.get(lhs).copied().unwrap_or(0);
+                let r = regs.get(rhs).copied().unwrap_or(0);
+                cmp_apply(*op, l, r)
             }
             PredicateExpr::And(a, b) => a.eval(regs) && b.eval(regs),
             PredicateExpr::Or(a, b) => a.eval(regs) || b.eval(regs),
@@ -118,6 +137,10 @@ impl PredicateExpr {
         match self {
             PredicateExpr::Cmp { register, .. } => {
                 out.insert(register.clone());
+            }
+            PredicateExpr::CmpReg { lhs, rhs, .. } => {
+                out.insert(lhs.clone());
+                out.insert(rhs.clone());
             }
             PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => {
                 a.collect_registers(out);
@@ -147,6 +170,11 @@ impl PredicateExpr {
                 let bv = lookup(register)?;
                 Some(cmp_constraint(&bv, *op, *value))
             }
+            PredicateExpr::CmpReg { lhs, op, rhs } => {
+                let lbv = lookup(lhs)?;
+                let rbv = lookup(rhs)?;
+                Some(cmp_constraint_bv(&lbv, *op, &rbv))
+            }
             PredicateExpr::And(a, b) => {
                 let ca = a.build_constraint(lookup)?;
                 let cb = b.build_constraint(lookup)?;
@@ -159,6 +187,46 @@ impl PredicateExpr {
             }
             PredicateExpr::Not(a) => Some(a.build_constraint(lookup)?.not()),
         }
+    }
+}
+
+/// Apply a comparison operator to two concrete unsigned values (shared by the
+/// `Cmp` literal leaf and the `CmpReg` relational leaf in [`PredicateExpr::eval`]).
+fn cmp_apply(op: CmpOp, lhs: u128, rhs: u128) -> bool {
+    match op {
+        CmpOp::Eq => lhs == rhs,
+        CmpOp::Ne => lhs != rhs,
+        CmpOp::Lt => lhs < rhs,
+        CmpOp::Le => lhs <= rhs,
+        CmpOp::Gt => lhs > rhs,
+        CmpOp::Ge => lhs >= rhs,
+    }
+}
+
+/// Build the Z3 `Bool` for a relational `lhs <op> rhs` atom over two BVs (REL).
+/// Zero-extends the narrower BV to the wider width first (unsigned semantics) so
+/// registers of different widths compare correctly.
+fn cmp_constraint_bv(lhs: &z3::ast::BV, op: CmpOp, rhs: &z3::ast::BV) -> z3::ast::Bool {
+    let (l, r) = match_widths(lhs, rhs);
+    match op {
+        CmpOp::Eq => l.eq(&r),
+        CmpOp::Ne => l.eq(&r).not(),
+        CmpOp::Lt => l.bvult(&r),
+        CmpOp::Le => l.bvule(&r),
+        CmpOp::Gt => l.bvugt(&r),
+        CmpOp::Ge => l.bvuge(&r),
+    }
+}
+
+/// Zero-extend the narrower of two BVs so both share the wider width.
+fn match_widths(a: &z3::ast::BV, b: &z3::ast::BV) -> (z3::ast::BV, z3::ast::BV) {
+    let (wa, wb) = (a.get_size(), b.get_size());
+    if wa < wb {
+        (a.zero_ext(wb - wa), b.clone())
+    } else if wb < wa {
+        (a.clone(), b.zero_ext(wa - wb))
+    } else {
+        (a.clone(), b.clone())
     }
 }
 
@@ -409,31 +477,37 @@ impl Parser<'_> {
                 )));
             }
         };
-        let value = match self.next() {
-            Some(Token::Int(v)) => v,
-            other => {
-                return Err(perr(format!(
-                    "expected an integer value after `{register} <op>`, found {other:?}"
-                )));
-            }
-        };
-        Ok(PredicateExpr::Cmp {
-            register,
-            op,
-            value,
-        })
+        // RHS is an integer literal (→ `Cmp`) or a register name (→ `CmpReg`,
+        // the REL relational form, e.g. `state_q == state_q__past`).
+        match self.next() {
+            Some(Token::Int(value)) => Ok(PredicateExpr::Cmp {
+                register,
+                op,
+                value,
+            }),
+            Some(Token::Ident(rhs)) => Ok(PredicateExpr::CmpReg {
+                lhs: register,
+                op,
+                rhs,
+            }),
+            other => Err(perr(format!(
+                "expected an integer value or a register after `{register} <op>`, found {other:?}"
+            ))),
+        }
     }
 }
 
 /// Parse a sidecar predicate-expression string into a [`PredicateExpr`].
 ///
 /// Grammar (precedence low→high): `||`, `&&`, unary `!`, parentheses, then
-/// comparison atoms `<register> <op> <value>` with `op ∈ { ==, !=, <, <=, >,
+/// comparison atoms `<register> <op> <rhs>` with `op ∈ { ==, !=, <, <=, >,
 /// >= }`. Registers are identifiers (`[A-Za-z_][A-Za-z0-9_$.]*`; `$`/`.` are
-/// allowed for BTOR2 hierarchical symbol names). Values are decimal or
-/// `0x`-hex integers. `&&` binds tighter than `||`; `!` is unary prefix.
+/// allowed for BTOR2 hierarchical symbol names). The `<rhs>` is a decimal or
+/// `0x`-hex integer (→ `Cmp`) **or another register** (→ `CmpReg`, the REL
+/// relational form). `&&` binds tighter than `||`; `!` is unary prefix.
 ///
-/// Examples: `cnt == 0 && en == 1`, `!(state == 5) || done >= 1`.
+/// Examples: `cnt == 0 && en == 1`, `!(state == 5) || done >= 1`,
+/// `state_q == state_q__past` (relational — REL).
 pub fn parse_predicate_expr(s: &str) -> Result<PredicateExpr, PredicateExprParseError> {
     let tokens = tokenize(s)?;
     if tokens.is_empty() {
@@ -594,6 +668,152 @@ mod tests {
         let e = parse_predicate_expr("cnt == 0 && en == 1").unwrap();
         assert!(e.eval(&regs(&[("cnt", 0), ("en", 1)])));
         assert!(!e.eval(&regs(&[("cnt", 1), ("en", 1)])));
+    }
+
+    // --- REL (relational predicates: register == register) ---------------
+
+    #[test]
+    fn parse_relational_atom_to_cmpreg() {
+        // `state_q == state_q__past` ($stable) parses to a CmpReg, not a Cmp.
+        assert_eq!(
+            parse_predicate_expr("state_q == state_q__past").unwrap(),
+            PredicateExpr::eq_reg("state_q", "state_q__past")
+        );
+        assert_eq!(
+            parse_predicate_expr("data_o != data_i").unwrap(),
+            PredicateExpr::CmpReg {
+                lhs: "data_o".into(),
+                op: CmpOp::Ne,
+                rhs: "data_i".into(),
+            }
+        );
+        // Literal RHS still parses to Cmp (no regression).
+        assert_eq!(
+            parse_predicate_expr("state_q == 5").unwrap(),
+            PredicateExpr::eq("state_q", 5)
+        );
+    }
+
+    #[test]
+    fn eval_relational_atom() {
+        let stable = PredicateExpr::eq_reg("x", "x_past");
+        assert!(stable.eval(&regs(&[("x", 7), ("x_past", 7)]))); // $stable true
+        assert!(!stable.eval(&regs(&[("x", 7), ("x_past", 6)]))); // changed
+        // A relational atom inside a compound (the real $stable-under-disable shape).
+        let e = parse_predicate_expr("rst == 0 && state == state_past").unwrap();
+        assert!(e.eval(&regs(&[("rst", 0), ("state", 3), ("state_past", 3)])));
+        assert!(!e.eval(&regs(&[("rst", 0), ("state", 3), ("state_past", 2)])));
+        assert!(!e.eval(&regs(&[("rst", 1), ("state", 3), ("state_past", 3)])));
+    }
+
+    #[test]
+    fn registers_collects_both_sides_of_a_relational_atom() {
+        let e = parse_predicate_expr("a == b && c != a").unwrap();
+        assert_eq!(
+            e.registers(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    // The §4 soundness obligation, extended to REL: eval ≡ SMT for register-vs-
+    // register leaves (the ONLY new proof obligation relational predicates add).
+    #[test]
+    fn relational_eval_matches_smt() {
+        let exprs: Vec<PredicateExpr> = vec![
+            PredicateExpr::eq_reg("a", "b"),
+            PredicateExpr::CmpReg {
+                lhs: "a".into(),
+                op: CmpOp::Ne,
+                rhs: "b".into(),
+            },
+            PredicateExpr::CmpReg {
+                lhs: "a".into(),
+                op: CmpOp::Lt,
+                rhs: "b".into(),
+            },
+            PredicateExpr::CmpReg {
+                lhs: "a".into(),
+                op: CmpOp::Ge,
+                rhs: "b".into(),
+            },
+            // relational leaf combined with a literal leaf + boolean structure
+            PredicateExpr::And(
+                Box::new(PredicateExpr::eq("a", 0)),
+                Box::new(PredicateExpr::eq_reg("a", "b")),
+            ),
+            PredicateExpr::Not(Box::new(PredicateExpr::eq_reg("a", "b"))),
+        ];
+
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            for e in &exprs {
+                for a in 0u64..4 {
+                    for b in 0u64..4 {
+                        let want = e.eval(&regs(&[("a", a as u128), ("b", b as u128)]));
+                        let a_bv = z3::ast::BV::new_const("a", 2);
+                        let b_bv = z3::ast::BV::new_const("b", 2);
+                        let lookup = |name: &str| -> Option<z3::ast::BV> {
+                            match name {
+                                "a" => Some(a_bv.clone()),
+                                "b" => Some(b_bv.clone()),
+                                _ => None,
+                            }
+                        };
+                        let constraint = e.build_constraint(&lookup).expect("all regs present");
+                        let solver = z3::Solver::new();
+                        let a_val = z3::ast::BV::from_u64(a, 2);
+                        let b_val = z3::ast::BV::from_u64(b, 2);
+                        let a_pin = a_bv.eq(&a_val);
+                        let b_pin = b_bv.eq(&b_val);
+                        solver.assert(&a_pin);
+                        solver.assert(&b_pin);
+                        solver.assert(&constraint);
+                        let got = matches!(solver.check(), z3::SatResult::Sat);
+                        assert_eq!(
+                            want, got,
+                            "eval/SMT disagree for {e:?} at a={a}, b={b}: eval={want}, smt={got}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn relational_eval_matches_smt_mismatched_widths() {
+        // a is 2-bit, b is 4-bit → zero-extend a; eval (u128) must agree.
+        let e = PredicateExpr::eq_reg("a", "b");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            for a in 0u64..4 {
+                for b in 0u64..16 {
+                    let want = e.eval(&regs(&[("a", a as u128), ("b", b as u128)]));
+                    let a_bv = z3::ast::BV::new_const("a", 2);
+                    let b_bv = z3::ast::BV::new_const("b", 4);
+                    let lookup = |name: &str| -> Option<z3::ast::BV> {
+                        match name {
+                            "a" => Some(a_bv.clone()),
+                            "b" => Some(b_bv.clone()),
+                            _ => None,
+                        }
+                    };
+                    let constraint = e.build_constraint(&lookup).expect("present");
+                    let solver = z3::Solver::new();
+                    let a_val = z3::ast::BV::from_u64(a, 2);
+                    let b_val = z3::ast::BV::from_u64(b, 4);
+                    let a_pin = a_bv.eq(&a_val);
+                    let b_pin = b_bv.eq(&b_val);
+                    solver.assert(&a_pin);
+                    solver.assert(&b_pin);
+                    solver.assert(&constraint);
+                    let got = matches!(solver.check(), z3::SatResult::Sat);
+                    assert_eq!(
+                        want, got,
+                        "width-mismatch eval/SMT disagree at a={a}, b={b}"
+                    );
+                }
+            }
+        });
     }
 
     #[test]
