@@ -1021,6 +1021,20 @@ pub struct SvVerifyAutoResponse {
     /// Assertions that did not translate (reuses the extract-sva view shape;
     /// `kind` is `None` here).
     pub unsupported: Vec<UnsupportedAssertionView>,
+    /// Model-level diagnostics: state-register count + black-boxed (cut)
+    /// modules. Lets a SKIPPED outcome point at its root cause.
+    pub diagnostics: ModelDiagnosticsView,
+}
+
+/// Model-level lift diagnostics (mirrors
+/// [`crate::adapter::slang::verify_auto::ModelDiagnostics`]).
+#[derive(Debug, Serialize)]
+pub struct ModelDiagnosticsView {
+    /// Number of state register lines in the lifted model.
+    pub state_register_count: usize,
+    /// Modules instantiated without a body, cut to free inputs (registers they
+    /// drive are not modeled as state). Empty for a self-contained design.
+    pub blackboxed_modules: Vec<String>,
 }
 
 /// One property's auto-verification verdict (mirrors `PropertyVerdict`).

@@ -457,6 +457,29 @@ pub fn sv_to_btor2(content: &str, yopts: &YosysOptions) -> Result<String, Adapte
     run_sv_flatten_btor2(content, yopts).map(|a| a.btor2)
 }
 
+/// Like [`sv_to_btor2`] but additionally returns the names of modules the lift
+/// **black-boxed** — instantiated in the design but with no body in the source
+/// set, so Yosys auto-declared them `(* blackbox *)` and `cutpoint -blackbox`
+/// replaced their outputs with free inputs.
+///
+/// This is sound (a free input over-approximates an unknown driver), but a
+/// register hidden behind such a module (e.g. an FSM wrapped in OpenTitan's
+/// `prim_sparse_fsm_flop`) is **not** modeled as a state cell — so it cannot be
+/// abstracted or verified. [`verify_auto`](crate::adapter::slang::verify_auto)
+/// surfaces this list as a diagnostic so the cut is visible rather than silent,
+/// and the user can provide the missing module source.
+pub fn sv_to_btor2_with_blackboxes(
+    content: &str,
+    yopts: &YosysOptions,
+) -> Result<(String, Vec<String>), AdapterError> {
+    let artifacts = run_sv_flatten_btor2(content, yopts)?;
+    let blackboxes: Vec<String> = parse_blackbox_modules(&artifacts.hier_json)
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    Ok((artifacts.btor2, blackboxes))
+}
+
 /// One submodule's translated output, as returned by
 /// [`translate_sv_per_module`]. The `btor2_path` is `Some(..)` when
 /// `yopts.per_module_output_dir` was set (the BTOR2 file persists);

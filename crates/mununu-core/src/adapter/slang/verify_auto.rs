@@ -63,12 +63,62 @@ pub struct PropertyVerdict {
     pub seeded_predicates: Vec<String>,
 }
 
+/// Model-level diagnostics for an automated verification run — what the lift
+/// produced, so a "couldn't verify" outcome is traceable to a root cause
+/// (rather than only a per-property symptom like "atom over non-state signal").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelDiagnostics {
+    /// Number of `state` register lines in the lifted (augmented) BTOR2. A
+    /// suspiciously low / zero count is a strong signal that an FSM or other
+    /// state was cut (see [`Self::blackboxed_modules`]) — properties over the
+    /// cut registers are then SKIPPED rather than verified.
+    pub state_register_count: usize,
+    /// Modules instantiated without a body (auto-black-boxed by Yosys) — their
+    /// outputs were cut to free inputs by `cutpoint -blackbox`. This is a sound
+    /// over-approximation, but a register hidden behind one of these (e.g. an
+    /// FSM wrapped in `prim_sparse_fsm_flop`) is **not** modeled as state, so
+    /// every property over it is SKIPPED. Surfacing the cut here is the
+    /// "stop-silent-cut" half: the cut is no longer invisible. The fix is to
+    /// provide the missing module source(s).
+    pub blackboxed_modules: Vec<String>,
+}
+
 /// Result of an automated SVA verification run.
 #[derive(Debug, Clone, Default)]
 pub struct AutoVerifyReport {
     pub properties: Vec<PropertyVerdict>,
     /// Assertions that did not translate (name, reason), carried from extraction.
     pub unsupported: Vec<(String, String)>,
+    /// Model-level diagnostics — state-register count + black-boxed (cut)
+    /// modules. Lets a SKIPPED / vacuous outcome point at its root cause.
+    pub diagnostics: ModelDiagnostics,
+}
+
+/// The skip reason for a property whose atoms reference non-state signals,
+/// enriched with the model-level root cause when one is evident: a black-boxed
+/// (cut) module whose registers became free inputs, or a model with no state
+/// registers at all. Pure so it can be unit-tested without the toolchain.
+fn unseedable_skip_reason(unseedable: &[String], diag: &ModelDiagnostics) -> String {
+    let base = format!(
+        "atom(s) over non-state signals (combinational/IO — not cube-bindable): {}",
+        unseedable.join(", ")
+    );
+    if !diag.blackboxed_modules.is_empty() {
+        format!(
+            "{base}. Root cause: the lift black-boxed {} module(s) with no body ({}) — \
+             registers they drive were cut to free inputs and are not modeled as state. \
+             Provide the missing module source(s) to model them.",
+            diag.blackboxed_modules.len(),
+            diag.blackboxed_modules.join(", ")
+        )
+    } else if diag.state_register_count == 0 {
+        format!(
+            "{base}. Root cause: the lifted model has no state registers — the design's \
+             state may have been optimized away or cut."
+        )
+    } else {
+        base
+    }
 }
 
 /// Options for [`verify_auto`] beyond the Yosys lift options.
@@ -259,7 +309,7 @@ pub fn verify_auto(
         CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
     };
     use crate::adapter::btor2::shadow::augment_with_past_shadows;
-    use crate::adapter::yosys::sv_to_btor2;
+    use crate::adapter::yosys::sv_to_btor2_with_blackboxes;
     use crate::mu_calculus::Environment;
     use crate::mu_calculus::parser as mu_parser;
     use crate::mu_calculus::trit::Trit;
@@ -286,11 +336,16 @@ pub fn verify_auto(
         return Ok(report);
     }
 
-    // 2. SV → flattened BTOR2, then 3. augment the `__past` shadow flops.
-    let btor2 = sv_to_btor2(primary_content, yosys_opts).map_err(|mut e| {
-        e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
-        e
-    })?;
+    // 2. SV → flattened BTOR2, then 3. augment the `__past` shadow flops. The
+    // lift also reports modules it black-boxed (instantiated, no body) — those
+    // are surfaced in `diagnostics.blackboxed_modules` so a cut FSM (the
+    // `prim_sparse_fsm_flop`-class root cause) is visible, not silent.
+    let (btor2, blackboxed_modules) = sv_to_btor2_with_blackboxes(primary_content, yosys_opts)
+        .map_err(|mut e| {
+            e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
+            e
+        })?;
+    report.diagnostics.blackboxed_modules = blackboxed_modules;
     // Augment only the `__past` shadows whose base resolves to a BTOR2 state
     // cell. A base the lift renamed away (the SVA name not matching the lifted
     // register) would hard-error `augment_with_past_shadows`, aborting the whole
@@ -321,6 +376,13 @@ pub fn verify_auto(
         .filter(|l| matches!(l.node, crate::adapter::btor2::ast::Node::State { .. }))
         .filter_map(|l| symbols.get(&l.nid).cloned())
         .collect();
+    // Total `state` register lines (incl. any unnamed) — a zero/low count is
+    // the headline signal that state was cut or optimized away.
+    report.diagnostics.state_register_count = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, crate::adapter::btor2::ast::Node::State { .. }))
+        .count();
     // Init value of each state cell — pins the cube lift's initial cube to the
     // design's reset state (else it defaults to cube_0 = all-predicates-false).
     let init_values = state_cell_init_values(&file);
@@ -345,16 +407,12 @@ pub fn verify_auto(
 
         let seeded = seed_from_formula(&formula, &state_cells);
         if !seeded.unseedable.is_empty() {
+            let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
                 formula: t.formula.clone(),
-                outcome: VerifyOutcome::Skipped {
-                    reason: format!(
-                        "atom(s) over non-state signals (combinational/IO — not cube-bindable): {}",
-                        seeded.unseedable.join(", ")
-                    ),
-                },
+                outcome: VerifyOutcome::Skipped { reason },
                 seeded_predicates: Vec::new(),
             });
             continue;
@@ -555,6 +613,51 @@ mod tests {
     }
 
     #[test]
+    fn skip_reason_enriched_with_blackboxed_module_root_cause() {
+        // A cut FSM (e.g. csrng's prim_sparse_fsm_flop) → the bare "non-state
+        // signal" symptom is augmented with the actionable root cause.
+        let diag = ModelDiagnostics {
+            state_register_count: 0,
+            blackboxed_modules: vec!["prim_sparse_fsm_flop".to_string()],
+        };
+        let reason = unseedable_skip_reason(&["state_q == 41".to_string()], &diag);
+        assert!(reason.contains("state_q == 41"), "carries the symptom");
+        assert!(
+            reason.contains("prim_sparse_fsm_flop"),
+            "names the cut module: {reason}"
+        );
+        assert!(
+            reason.contains("Provide the missing module source"),
+            "actionable: {reason}"
+        );
+    }
+
+    #[test]
+    fn skip_reason_enriched_when_no_state_registers() {
+        let diag = ModelDiagnostics {
+            state_register_count: 0,
+            blackboxed_modules: Vec::new(),
+        };
+        let reason = unseedable_skip_reason(&["foo == 1".to_string()], &diag);
+        assert!(
+            reason.contains("no state registers"),
+            "root cause: {reason}"
+        );
+    }
+
+    #[test]
+    fn skip_reason_bare_when_model_has_state() {
+        // Genuine IO atom on a healthy model → no misleading root-cause hint.
+        let diag = ModelDiagnostics {
+            state_register_count: 3,
+            blackboxed_modules: Vec::new(),
+        };
+        let reason = unseedable_skip_reason(&["gnt_o != 0".to_string()], &diag);
+        assert!(reason.contains("gnt_o != 0"));
+        assert!(!reason.contains("Root cause"), "no spurious hint: {reason}");
+    }
+
+    #[test]
     fn no_sidecar_when_nothing_to_emit() {
         let empty_refs = std::collections::BTreeSet::new();
         let empty_inits = std::collections::HashMap::new();
@@ -595,6 +698,18 @@ mod tests {
         let report = verify_auto(&sources, &yopts, &VerifyAutoOptions::default())
             .expect("verify_auto runs end-to-end");
         assert_eq!(report.properties.len(), 2, "two assertions verified");
+        // Diagnostics: a self-contained FSM lifts to ≥ 1 state register and
+        // black-boxes nothing.
+        assert!(
+            report.diagnostics.state_register_count >= 1,
+            "FSM lifts to a real state register; got {}",
+            report.diagnostics.state_register_count
+        );
+        assert!(
+            report.diagnostics.blackboxed_modules.is_empty(),
+            "self-contained design cuts nothing; got {:?}",
+            report.diagnostics.blackboxed_modules
+        );
         let by_formula = |needle: &str| -> &VerifyOutcome {
             &report
                 .properties

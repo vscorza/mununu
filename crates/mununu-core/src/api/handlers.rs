@@ -825,6 +825,10 @@ pub async fn sv_verify_auto_handler(
     Ok(Json(SvVerifyAutoResponse {
         properties,
         unsupported,
+        diagnostics: ModelDiagnosticsView {
+            state_register_count: report.diagnostics.state_register_count,
+            blackboxed_modules: report.diagnostics.blackboxed_modules.clone(),
+        },
     }))
 }
 
