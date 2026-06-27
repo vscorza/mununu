@@ -22,6 +22,7 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 | Page | What you will find |
 |------|--------------------|
 | [Getting Started](Getting-Started) | Installation, first example, API server |
+| [External Tools](External-Tools) | Optional toolchain (sv2v, Yosys, CVC5, Verilator, circt-verilog): the linked-vs-subprocess integration model + licensing posture |
 | [CTXDSL Language Reference](CTXDSL-Language-Reference) | Complete DSL syntax: alphabets, automata, transitions, variables, guards, effects |
 | [Composition](Composition) | Synchronous, asynchronous, and hierarchical composition with examples |
 | [Mu-Calculus Reference](Mu-Calculus-Reference) | Fixpoints, modalities, controllability-aware operators, common patterns |
