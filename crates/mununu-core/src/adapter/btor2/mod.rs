@@ -27,6 +27,7 @@ pub mod kmts_lift;
 pub mod parser;
 pub mod predicate_expr;
 pub mod r_s8_encoder;
+pub mod shadow;
 pub mod smt_must_edge;
 pub mod term_backend;
 
@@ -39,6 +40,7 @@ pub use kmts_lift::{
     PredicateSpec, lift_btor2_to_kmts, lift_predicate_cube, materialize_clts_from_lazy,
     predicate_cube_lift,
 };
+pub use shadow::augment_with_past_shadows;
 
 use super::{AdapterError, AdapterOptions, AdapterOutput, FormatAdapter};
 
