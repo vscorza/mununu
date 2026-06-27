@@ -258,10 +258,15 @@ discovery and no in-mununu version check — the user supplies the MLIR. CIRCT i
 Apache-2.0 (with the LLVM exception); as upstream tooling whose output mununu
 consumes, it imposes no obligation on mununu.
 
-> **Note (Track H / XL.1).** The SVA-verification front-end will use the standalone
+> **Note (Track H / slang).** The SVA-verification front-end uses the standalone
 > **`slang`** CLI (`slang --ast-json`) as a discovered subprocess (the cvc5 pattern),
-> *not* circt-verilog — see the roadmap XL.0 decision. A `slang` section lands here
-> when XL.1 ships.
+> *not* circt-verilog — see the roadmap XL.0 decision. The `slang` adapter
+> ([`adapter/slang/mod.rs::locate_slang`](../crates/mununu-core/src/adapter/slang/mod.rs#L48)
+> + the Tier-1 translator in `adapter/slang/translate.rs`) is shipped, but is not
+> yet reachable from a user-facing surface — it is wired into a CLI/API/UI command
+> by the Track-H endpoint (roadmap XL.6). A full `## slang` section with a
+> `> Source of truth:` anchor lands here then (Documentation Traceability requires
+> the anchor to be surface-reachable first).
 
 ---
 

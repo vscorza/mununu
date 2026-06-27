@@ -13,6 +13,7 @@
 //! | `a \|-> b` | `nu X. ((!a \|\| b) && [] X)` (AG(a→b)) |
 //! | `a \|=> b` | `nu X. ((!a \|\| [] b) && [] X)` (AG(a→AX b)) |
 //! | `cover property (b)` | `mu X. (b \|\| <> X)` (EF b) |
+//! | `cover property (b)` **recoverability lens** (XL.2) | `nu Y. ((mu X. (b \|\| <> X)) && [] Y)` (AG EF b) |
 //! | `disable iff (r) P` | gate the body: `(r \|\| body)` (vacuous while disabled) |
 //!
 //! Implication `a → b` is emitted as `!a || b` — the mu-calculus parser has no
@@ -62,6 +63,16 @@ pub struct TranslatedAssertion {
     /// mu-calculus formula; guaranteed to parse via
     /// [`crate::mu_calculus::parser::parse`].
     pub formula: String,
+    /// XL.2 (= Track I.3) recoverability companion — `Some` only for `Cover`
+    /// (`EF φ`) assertions. Carries the `AG EF φ` lens
+    /// `nu Y. ((mu X. (φ || <>X)) && [] Y)`: "from every reachable state, φ is
+    /// still reachable." Surfaces the Track-B recoverability wedge directly from
+    /// the design's own covers — a branching question the SVA author could not
+    /// phrase. Sound at this νμ alternation only on the must-edge path
+    /// (`btor2 cegar --must-edge-inference smt-hyper-must`; cf. the V.7-c csrng
+    /// showcase). Forming it is XL.2; auto-checking it on a TRUE cover and
+    /// attaching the I.1 countertrace is the XL.6 endpoint's job.
+    pub recoverability_companion: Option<String>,
 }
 
 /// An assertion outside the Tier-1 fragment, recorded (never silently dropped).
@@ -122,11 +133,20 @@ pub fn translate_ast_json(json: &str) -> Result<TranslationReport, AdapterError>
             continue;
         };
         match translate_one(spec, kind) {
-            Ok(formula) => report.translated.push(TranslatedAssertion {
-                name,
-                kind,
-                formula,
-            }),
+            Ok(formula) => {
+                // XL.2: a cover's `EF φ` gets its `AG EF φ` recoverability lens.
+                // (Omitted if the companion somehow fails to parse — never ship
+                // a formula the evaluator can't read.)
+                let recoverability_companion = (kind == SvaKind::Cover)
+                    .then(|| recoverability_companion_formula(&formula).ok())
+                    .flatten();
+                report.translated.push(TranslatedAssertion {
+                    name,
+                    kind,
+                    formula,
+                    recoverability_companion,
+                });
+            }
             Err(reason) => report.unsupported.push(UnsupportedAssertion {
                 name,
                 kind: Some(kind),
@@ -176,6 +196,21 @@ fn translate_one(spec: &Value, kind: SvaKind) -> Result<String, String> {
     crate::mu_calculus::parser::parse(&formula)
         .map_err(|e| format!("emitted formula failed to parse ({e:?}): {formula}"))?;
     Ok(formula)
+}
+
+/// XL.2 (= Track I.3): the *recoverability companion* of a cover's `EF φ`.
+///
+/// Wraps the already-formed `EF φ` (`mu X. (φ || <>X)`) into `AG EF φ`
+/// = `nu Y. ((EF φ) && [] Y)` — "from every reachable state, φ is still
+/// reachable." The formula is identical in shape to the one the V.7-c csrng
+/// recoverability showcase checks by hand; this just forms it automatically
+/// from a `cover` assertion. Validated through the mu-calculus parser so a cover
+/// only carries a companion the evaluator can actually run.
+fn recoverability_companion_formula(ef_formula: &str) -> Result<String, String> {
+    let companion = format!("nu Y. (({ef_formula}) && [] Y)");
+    crate::mu_calculus::parser::parse(&companion)
+        .map_err(|e| format!("recoverability companion failed to parse ({e:?}): {companion}"))?;
+    Ok(companion)
 }
 
 /// Translate an `AssertionExpr` into the per-step propositional body (the part
@@ -707,5 +742,67 @@ mod tests {
         });
         let body = property_body(&spec).expect("translates");
         assert_eq!(body, "((!(rst_n)) || a)");
+    }
+
+    #[test]
+    fn xl2_cover_gets_recoverability_companion() {
+        // The Tier-1 fixture's `cover property (a && b)` → EF, plus the AG-EF lens.
+        let report = translate_ast_json(TIER1_JSON).expect("valid ast-json");
+        let cover = report
+            .translated
+            .iter()
+            .find(|t| t.kind == SvaKind::Cover)
+            .expect("fixture has a cover");
+        let companion = cover
+            .recoverability_companion
+            .as_ref()
+            .expect("a cover carries its recoverability companion");
+        // AG EF shape: outer nu over the cover's EF (mu), closed with `[] Y`.
+        assert!(companion.starts_with("nu Y. (("), "got {companion}");
+        assert!(
+            companion.contains(&cover.formula),
+            "companion embeds the EF formula"
+        );
+        assert!(companion.ends_with(") && [] Y)"), "got {companion}");
+        crate::mu_calculus::parser::parse(companion).expect("companion parses");
+    }
+
+    #[test]
+    fn xl2_non_cover_assertions_have_no_companion() {
+        // EF→AG-EF only makes sense for covers; asserts/assumes are AG-shaped.
+        let report = translate_ast_json(TIER1_JSON).expect("valid ast-json");
+        for t in report
+            .translated
+            .iter()
+            .filter(|t| t.kind != SvaKind::Cover)
+        {
+            assert!(
+                t.recoverability_companion.is_none(),
+                "{} ({:?}) must not carry a recoverability companion",
+                t.name,
+                t.kind
+            );
+        }
+    }
+
+    #[test]
+    fn xl2_companion_matches_v7c_recoverability_shape() {
+        // The V.7-c csrng showcase checks `nu Y. ((mu X. (idle || <> X)) && [] Y)`
+        // by hand. XL.2 forms the same AG-EF shape from `cover property (state_q == 55)`.
+        let ef = translate_one(
+            &serde_json::json!({
+                "kind": "Simple",
+                "expr": {"kind": "BinaryOp", "op": "Equality",
+                         "left":  {"kind": "NamedValue", "symbol": "1 state_q", "type": "logic[5:0]"},
+                         "right": {"kind": "IntegerLiteral", "value": "55", "constant": "55"}}
+            }),
+            SvaKind::Cover,
+        )
+        .expect("cover translates");
+        let companion = recoverability_companion_formula(&ef).expect("companion forms + parses");
+        assert_eq!(
+            companion,
+            "nu Y. ((mu X. (((state_q == 55)) || <> X)) && [] Y)"
+        );
     }
 }
