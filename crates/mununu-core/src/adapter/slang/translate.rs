@@ -15,9 +15,22 @@
 //! | `cover property (b)` | `mu X. (b \|\| <> X)` (EF b) |
 //! | `cover property (b)` **recoverability lens** (XL.2) | `nu Y. ((mu X. (b \|\| <> X)) && [] Y)` (AG EF b) |
 //! | `disable iff (r) P` | gate the body: `(r \|\| body)` (vacuous while disabled) |
+//! | **Tier-2 history (XL.3)** `$stable(x)` | `(x == x__past)` |
+//! | `$changed(x)` | `(x != x__past)` |
+//! | `$rose(x)` (1-bit) | `(x && !x__past)` |
+//! | `$fell(x)` (1-bit) | `(!x && x__past)` |
+//! | `$past(x)` (depth 1) | the shadow atom `x__past` (a value; used inside a comparison) |
 //!
 //! Implication `a → b` is emitted as `!a || b` — the mu-calculus parser has no
 //! `->` operator, and the rewrite is exact.
+//!
+//! **Tier-2 shadow registers (XL.3).** `$past`/`$stable`/`$changed`/`$rose`/
+//! `$fell` read a signal's *previous-cycle* value, encoded as an atom over a
+//! 1-step shadow `<sig>__past`. The translator emits the atom and records the
+//! requirement in [`TranslationReport::required_shadows`]; the BTOR2
+//! model-augmentation step (XL.3b) synthesises the shadow flop
+//! (`next(<sig>__past) = <sig>`) so the atom binds. The Tier-2 rewrites are
+//! exact (added flops, no abstraction). `$past` depth > 1 is rejected.
 //!
 //! **Atoms (XL.1b + XL.1c).** A boolean leaf is one of:
 //! - a 1-bit signal (`NamedValue` → identifier atom);
@@ -83,11 +96,26 @@ pub struct UnsupportedAssertion {
     pub reason: String,
 }
 
+/// XL.3 (Tier-2): a base signal whose previous-cycle value a translated
+/// assertion needs. The BTOR2 model-augmentation step (XL.3b) must synthesise a
+/// 1-step shadow flop named `<base>__past` of this width — `next(<base>__past)
+/// = <base>` — so the `<base>__past` atoms the translator emits actually bind.
+/// Reported only for *successfully* translated assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowSignal {
+    pub base: String,
+    pub width: u32,
+}
+
 /// Result of translating a whole `--ast-json` document.
 #[derive(Debug, Clone, Default)]
 pub struct TranslationReport {
     pub translated: Vec<TranslatedAssertion>,
     pub unsupported: Vec<UnsupportedAssertion>,
+    /// XL.3: 1-step `__past` shadow registers the translated formulas reference
+    /// (deduped by base). The XL.3b BTOR2 augmentation consumes this; an empty
+    /// vec means no Tier-2 history was used.
+    pub required_shadows: Vec<ShadowSignal>,
 }
 
 impl TranslationReport {
@@ -140,6 +168,9 @@ pub fn translate_ast_json(json: &str) -> Result<TranslationReport, AdapterError>
                 let recoverability_companion = (kind == SvaKind::Cover)
                     .then(|| recoverability_companion_formula(&formula).ok())
                     .flatten();
+                // XL.3: record the `__past` shadow flops this assertion needs
+                // (only for assertions that actually translated).
+                collect_shadow_signals(spec, &mut report.required_shadows);
                 report.translated.push(TranslatedAssertion {
                     name,
                     kind,
@@ -178,6 +209,39 @@ fn collect_assertions<'a>(node: &'a Value, enclosing: &str, out: &mut Vec<(Strin
         Value::Array(items) => {
             for v in items {
                 collect_assertions(v, enclosing, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// XL.3: walk a (translated) assertion's spec and record every base signal a
+/// Tier-2 history call (`$past`/`$stable`/`$changed`/`$rose`/`$fell`) reads, so
+/// the BTOR2 augmentation knows which `__past` shadow flops to synthesise.
+/// Deduped by base name. Only call on specs that translated successfully.
+fn collect_shadow_signals(node: &Value, out: &mut Vec<ShadowSignal>) {
+    match node {
+        Value::Object(map) => {
+            if map.get("kind").and_then(Value::as_str) == Some("Call")
+                && matches!(
+                    map.get("subroutine").and_then(Value::as_str),
+                    Some("$past" | "$stable" | "$changed" | "$rose" | "$fell")
+                )
+                && let Ok((base, width)) = call_arg_signal(node)
+                && !out.iter().any(|s| s.base == base)
+            {
+                out.push(ShadowSignal {
+                    base: base.to_string(),
+                    width,
+                });
+            }
+            for v in map.values() {
+                collect_shadow_signals(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                collect_shadow_signals(v, out);
             }
         }
         _ => {}
@@ -325,9 +389,52 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
                     .to_string())
             }
         }
-        "Call" => Err("system/subroutine call (e.g. `$onehot0`, `$isunknown`) is \
-                       not in the Tier-1c fragment"
-            .to_string()),
+        // XL.3 (Tier-2 history). `$stable`/`$changed`/`$rose`/`$fell`/`$past`
+        // lower to atoms over a 1-step shadow register `<sig>__past` (the XL.3b
+        // BTOR2 model-augmentation step synthesises that flop). All exact.
+        "Call" => {
+            let sub = expr
+                .get("subroutine")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            match sub {
+                "$stable" | "$changed" => {
+                    let (sig, _w) = call_arg_signal(expr)?;
+                    let shadow = past_shadow_name(sig);
+                    let cmp = if sub == "$stable" { "==" } else { "!=" };
+                    Ok(format!("({sig} {cmp} {shadow})"))
+                }
+                "$rose" | "$fell" => {
+                    let (sig, w) = call_arg_signal(expr)?;
+                    if w != 1 {
+                        return Err(format!(
+                            "{sub}(<{w}-bit>) needs a bit-select; Tier-2 supports \
+                             {sub} on 1-bit signals only"
+                        ));
+                    }
+                    let shadow = past_shadow_name(sig);
+                    Ok(if sub == "$rose" {
+                        format!("({sig} && (!({shadow})))") // 1 now, 0 last cycle
+                    } else {
+                        format!("((!({sig})) && {shadow})") // 0 now, 1 last cycle
+                    })
+                }
+                // `$past(x)` is a value; in boolean position a vector → `!= 0`.
+                "$past" => {
+                    let (sig, w) = call_arg_signal(expr)?;
+                    let shadow = past_shadow_name(sig);
+                    Ok(if w > 1 {
+                        format!("({shadow} != 0)")
+                    } else {
+                        shadow
+                    })
+                }
+                other => Err(format!(
+                    "system/subroutine call `{other}` (e.g. `$onehot0`, `$isunknown`) \
+                     is not in the Tier-1c/Tier-2 fragment"
+                )),
+            }
+        }
         other => Err(format!("unsupported expression kind: {other}")),
     }
 }
@@ -362,6 +469,15 @@ fn compare(expr: &Value, op: &str) -> Result<String, String> {
             return Ok(if op == "!=" { b } else { format!("(!({b}))") });
         }
     }
+    // (4) XL.3 history comparison: `signal OP $past(signal)` (the explicit form
+    // of `$stable`/`$changed`). Gated on at least one side being `$past(...)` so
+    // a general `signalA OP signalB` (which could mask an unbound named constant)
+    // is still conservatively rejected.
+    if (is_past_call(left) || is_past_call(right))
+        && let (Some(l), Some(r)) = (cmp_signal_atom(left), cmp_signal_atom(right))
+    {
+        return Ok(format!("({l} {op} {r})"));
+    }
     Err(format!(
         "comparison must be `signal {op} literal`, `literal {op} signal`, or a \
          `boolean-expr ==/!= 0` form; got left={:?} right={:?}",
@@ -388,6 +504,55 @@ fn reduction_to_cmp(operand: &Value, op: &str, need_all_ones: bool) -> Result<St
         0
     };
     Ok(format!("({sig} {op} {rhs})"))
+}
+
+/// The `__past` shadow-register name for a base signal — the XL.3 naming
+/// contract shared with the BTOR2 model-augmentation step (XL.3b synthesises a
+/// 1-step flop with `next(<base>__past) = <base>` so the atom binds).
+fn past_shadow_name(base: &str) -> String {
+    format!("{base}__past")
+}
+
+/// True if `expr` (modulo `Conversion` peeling) is a `$past(...)` call.
+fn is_past_call(expr: &Value) -> bool {
+    let expr = unwrap(expr);
+    expr.get("kind").and_then(Value::as_str) == Some("Call")
+        && expr.get("subroutine").and_then(Value::as_str) == Some("$past")
+}
+
+/// A comparison operand that resolves to a mu-calc atom name: a plain signal, or
+/// `$past(signal)` → its `__past` shadow. `None` for anything else.
+fn cmp_signal_atom(expr: &Value) -> Option<String> {
+    let expr = unwrap(expr);
+    if is_past_call(expr) {
+        return call_arg_signal(expr)
+            .ok()
+            .map(|(sig, _)| past_shadow_name(sig));
+    }
+    signal_name(expr).ok().map(|s| s.to_string())
+}
+
+/// A Tier-2 history call (`$past`/`$stable`/`$changed`/`$rose`/`$fell`) takes
+/// exactly one signal argument; return its `(name, width)`. Rejects depth>1
+/// `$past` (≥2 args), multi-arg forms, and non-signal arguments.
+fn call_arg_signal(call: &Value) -> Result<(&str, u32), String> {
+    let sub = call
+        .get("subroutine")
+        .and_then(Value::as_str)
+        .unwrap_or("$?");
+    let args = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{sub} without an argument list"))?;
+    if args.len() != 1 {
+        return Err(format!(
+            "{sub} with {} arguments; Tier-2 supports single-signal depth-1 history only",
+            args.len()
+        ));
+    }
+    let arg = unwrap(&args[0]);
+    let sig = signal_name(arg).map_err(|_| format!("{sub} argument is not a plain signal"))?;
+    Ok((sig, signal_width(arg)))
 }
 
 /// `~x` in boolean position: logical-not on a 1-bit operand; a vector `~x` is a
@@ -516,6 +681,10 @@ mod tests {
     // (assert bool / assert |-> / assert |=> / assume / cover). Regenerate via:
     //   slang --ast-json testdata/tier1.ast.json testdata/tier1.sv --single-unit
     const TIER1_JSON: &str = include_str!("testdata/tier1.ast.json");
+    // Frozen `slang --ast-json` snapshot of the 5 Tier-2 history forms
+    // ($stable / $changed / $rose / $fell / $past). Regenerate via:
+    //   slang --ast-json testdata/tier2.ast.json testdata/tier2.sv --single-unit
+    const TIER2_JSON: &str = include_str!("testdata/tier2.ast.json");
 
     #[test]
     fn translates_the_tier1_fixture() {
@@ -804,5 +973,125 @@ mod tests {
             companion,
             "nu Y. ((mu X. (((state_q == 55)) || <> X)) && [] Y)"
         );
+    }
+
+    // --- XL.3 (Tier-2 history) -------------------------------------------
+
+    /// Helper: a `$<sub>(<sig>:<width>)` Call expression for the unit tests.
+    fn history_call(sub: &str, sig: &str, ty: &str) -> Value {
+        serde_json::json!({
+            "kind": "Call", "subroutine": sub,
+            "arguments": [{"kind": "NamedValue", "symbol": format!("1 {sig}"), "type": ty}]
+        })
+    }
+
+    #[test]
+    fn xl3_stable_and_changed_compare_against_shadow() {
+        assert_eq!(
+            bool_expr(&history_call("$stable", "state_q", "logic[5:0]")).unwrap(),
+            "(state_q == state_q__past)"
+        );
+        assert_eq!(
+            bool_expr(&history_call("$changed", "state_q", "logic[5:0]")).unwrap(),
+            "(state_q != state_q__past)"
+        );
+    }
+
+    #[test]
+    fn xl3_rose_fell_one_bit_edges() {
+        assert_eq!(
+            bool_expr(&history_call("$rose", "v", "logic")).unwrap(),
+            "(v && (!(v__past)))"
+        );
+        assert_eq!(
+            bool_expr(&history_call("$fell", "v", "logic")).unwrap(),
+            "((!(v)) && v__past)"
+        );
+    }
+
+    #[test]
+    fn xl3_rose_on_vector_is_rejected() {
+        let err = bool_expr(&history_call("$rose", "bus", "logic[7:0]")).expect_err("reject");
+        assert!(err.contains("1-bit"), "got: {err}");
+    }
+
+    #[test]
+    fn xl3_past_in_comparison_resolves_to_shadow() {
+        // `state_q == $past(state_q)` (the explicit $stable form).
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "Equality",
+            "left":  {"kind": "NamedValue", "symbol": "1 state_q", "type": "logic[5:0]"},
+            "right": history_call("$past", "state_q", "logic[5:0]")
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(state_q == state_q__past)");
+    }
+
+    #[test]
+    fn xl3_past_depth_gt_1_is_rejected() {
+        // `$past(x, 2)` — two arguments → out of Tier-2 (depth-1 only).
+        let call = serde_json::json!({
+            "kind": "Call", "subroutine": "$past",
+            "arguments": [
+                {"kind": "NamedValue", "symbol": "1 x", "type": "logic"},
+                {"kind": "IntegerLiteral", "value": "2", "constant": "2"}
+            ]
+        });
+        let err = bool_expr(&call).expect_err("depth>1 must reject");
+        assert!(err.contains("depth-1"), "got: {err}");
+    }
+
+    #[test]
+    fn xl3_onehot_isunknown_still_rejected() {
+        // Tier-2 only adds the history calls; other system calls stay rejected.
+        let call = serde_json::json!({
+            "kind": "Call", "subroutine": "$onehot0",
+            "arguments": [{"kind": "NamedValue", "symbol": "1 gnt", "type": "logic[7:0]"}]
+        });
+        let err = bool_expr(&call).expect_err("must reject");
+        assert!(
+            err.contains("$onehot0") || err.contains("not in the"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn xl3_tier2_fixture_translates_all_five_and_records_shadows() {
+        let report = translate_ast_json(TIER2_JSON).expect("valid ast-json");
+        assert_eq!(report.total(), 5, "fixture has 5 Tier-2 assertions");
+        assert_eq!(
+            report.unsupported.len(),
+            0,
+            "all 5 should translate; unsupported: {:?}",
+            report.unsupported
+        );
+        for t in &report.translated {
+            crate::mu_calculus::parser::parse(&t.formula)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e:?}", t.name));
+        }
+        // Shadows: state_q (width 6, from $stable/$changed/$past) + v (width 1,
+        // from $rose/$fell), deduped.
+        let mut shadows = report.required_shadows.clone();
+        shadows.sort_by(|a, b| a.base.cmp(&b.base));
+        assert_eq!(
+            shadows,
+            vec![
+                ShadowSignal {
+                    base: "state_q".into(),
+                    width: 6
+                },
+                ShadowSignal {
+                    base: "v".into(),
+                    width: 1
+                },
+            ],
+            "required_shadows must dedup by base + carry width"
+        );
+    }
+
+    #[test]
+    fn xl3_no_shadows_when_no_history() {
+        // The Tier-1 fixture uses no history calls → empty shadow set.
+        let report = translate_ast_json(TIER1_JSON).expect("valid ast-json");
+        assert!(report.required_shadows.is_empty());
     }
 }
