@@ -1,0 +1,606 @@
+//! XL.6b — automated SVA verification (SV source → per-property verdict, no sidecar).
+//!
+//! The headline no-sidecar verify path. Composes the shipped pieces:
+//!
+//! 1. [`extract_sva`](crate::adapter::slang::extract::extract_sva) — slang →
+//!    translated mu-calculus property set (+ `__past` shadow requirements).
+//! 2. [`sv_to_btor2`](crate::adapter::yosys::sv_to_btor2) — SV → flattened BTOR2.
+//! 3. [`augment_with_past_shadows`](crate::adapter::btor2::shadow::augment_with_past_shadows)
+//!    — synthesise the 1-step shadow flops the Tier-2 history formulas reference.
+//! 4. Per property: auto-seed cube predicates from the formula's state-cell atoms
+//!    (the minimal H.1, [`seed_from_formula`]) → [`cegar_refine_loop`] → verdict.
+//!
+//! **Binding.** Each seeded cube predicate is NAMED exactly the formula atom
+//! string, so the evaluator's name-match bridge (the M.4 fix in `evaluator.rs`)
+//! binds the formula's `Node::Predicate` to its cube bit. Simple `reg == value`
+//! atoms seed a [`PredicateSpec`]; relational / compound atoms (`reg == reg`
+//! incl. `$stable`'s `state_q == state_q__past`, `reg != value`, …) seed a
+//! compound predicate via a synthesised `SvAnnotation` sidecar that
+//! [`cegar_refine_loop`] consumes (forcing the SmtAllPairs eager lift).
+//!
+//! **Scope (sound gate).** The cube abstraction binds predicates over **state
+//! cells** only. An atom over a non-state signal (a primary input / pure
+//! combinational output — e.g. an arbiter's `req_i` / `gnt_o`) has no cube
+//! predicate; binding it would fall through to the evaluator's "unknown ⇒ false"
+//! under-approx and silently produce a vacuous verdict. So a property whose atoms
+//! are not all state-cell-resolvable is **Skipped** with a reason — never given a
+//! misleading verdict. (Those combinational/IO properties want the bit-blast
+//! path; a future increment routes them there.)
+
+use std::collections::HashSet;
+
+use crate::adapter::btor2::kmts_lift::{MayEdgeInference, MustEdgeInference, PredicateSpec};
+use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
+use crate::adapter::slang::extract::extract_sva;
+use crate::adapter::slang::translate::SvaKind;
+use crate::adapter::yosys::YosysOptions;
+use crate::adapter::{AdapterError, AdapterErrorKind};
+use crate::mu_calculus::{Formula, Node};
+
+/// Per-property verification outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// No definite-false and no ⊥ cube cells — the property holds on the abstraction.
+    Holds,
+    /// Some cube cells are definite-false (a violation witness exists).
+    Violated { false_cells: usize },
+    /// The verdict carries ⊥ (unknown) cells — the abstraction couldn't decide.
+    Unknown { unknown_cells: usize },
+    /// Not verified, with the reason: an atom over a non-state signal
+    /// (combinational/IO — not cube-bindable), no atoms at all, or an error.
+    Skipped { reason: String },
+}
+
+/// One assertion's auto-verification result.
+#[derive(Debug, Clone)]
+pub struct PropertyVerdict {
+    pub name: String,
+    pub kind: SvaKind,
+    pub formula: String,
+    pub outcome: VerifyOutcome,
+    /// The cube predicates auto-seeded for this property (atom strings) — the
+    /// diagnostic "what was tracked".
+    pub seeded_predicates: Vec<String>,
+}
+
+/// Result of an automated SVA verification run.
+#[derive(Debug, Clone, Default)]
+pub struct AutoVerifyReport {
+    pub properties: Vec<PropertyVerdict>,
+    /// Assertions that did not translate (name, reason), carried from extraction.
+    pub unsupported: Vec<(String, String)>,
+}
+
+/// Options for [`verify_auto`] beyond the Yosys lift options.
+#[derive(Debug, Clone)]
+pub struct VerifyAutoOptions {
+    /// Max CEGAR iterations per property (default 16).
+    pub max_iterations: usize,
+    /// Must-edge inference policy passed to each property's CEGAR run. Default
+    /// `Off`; `SmtHyperMust` gives sound νμ verdicts (the recoverability case).
+    pub must_edge_inference: MustEdgeInference,
+}
+
+impl Default for VerifyAutoOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 16,
+            must_edge_inference: MustEdgeInference::Off,
+        }
+    }
+}
+
+/// Auto-seeded predicates for one formula: simple `reg == value` specs, compound
+/// `(name, expr)` pairs (relational / `!=` / boolean combinations), and the atom
+/// strings that could NOT be seeded (reference a non-state signal).
+#[derive(Debug, Clone, Default)]
+struct Seeded {
+    specs: Vec<PredicateSpec>,
+    compounds: Vec<(String, PredicateExpr)>,
+    unseedable: Vec<String>,
+}
+
+/// The minimal H.1 — derive cube predicates from a formula's `Node::Predicate`
+/// atoms. Each predicate is named exactly the atom string (so the evaluator's
+/// name-match binds the atom to its cube bit). An atom whose registers are not
+/// all in `state_cells` is recorded as unseedable.
+fn seed_from_formula(formula: &Formula, state_cells: &HashSet<String>) -> Seeded {
+    let mut out = Seeded::default();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for node in formula.nodes() {
+        let Node::Predicate(atom) = node else {
+            continue;
+        };
+        if !seen.insert(atom.as_str()) {
+            continue;
+        }
+        match parse_predicate_expr(atom) {
+            Ok(expr) => {
+                if expr.registers().iter().any(|r| !state_cells.contains(r)) {
+                    out.unseedable.push(atom.clone());
+                    continue;
+                }
+                match &expr {
+                    // Simple `reg == value` → a direct PredicateSpec cube bit.
+                    PredicateExpr::Cmp {
+                        register,
+                        op: CmpOp::Eq,
+                        value,
+                    } => out.specs.push(PredicateSpec {
+                        name: atom.clone(),
+                        register: register.clone(),
+                        value: *value,
+                    }),
+                    // Relational / `!=` / boolean combination → compound predicate.
+                    _ => out.compounds.push((atom.clone(), expr)),
+                }
+            }
+            // A bare identifier atom (`parse_predicate_expr` needs an operator):
+            // a 1-bit boolean signal `sig` ≡ `sig == 1`. Seedable iff a state cell.
+            Err(_) => {
+                if state_cells.contains(atom) {
+                    out.specs.push(PredicateSpec {
+                        name: atom.clone(),
+                        register: atom.clone(),
+                        value: 1,
+                    });
+                } else {
+                    out.unseedable.push(atom.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build the synthesised `SvAnnotation` sidecar JSON `cegar_refine_loop` reads:
+/// the compound predicates (`compound_predicates: [{name, expr}]`) PLUS
+/// `signals[].config_values` pinning each referenced register to its design init
+/// value. The config_values pin is load-bearing: without it the cube lift
+/// defaults its initial cube to `cube_0` (all-predicates-false) — generally NOT
+/// the reset state — and a property can falsely report VIOLATED at that
+/// fictitious init. Returns `None` when there is nothing to emit.
+fn synth_sidecar_json(
+    compounds: &[(String, PredicateExpr)],
+    referenced: &std::collections::BTreeSet<String>,
+    init_values: &std::collections::HashMap<String, u64>,
+) -> Option<String> {
+    let compound_decls: Vec<serde_json::Value> = compounds
+        .iter()
+        // `expr` == `name` == the atom string, which `sidecar_compound_predicates`
+        // re-parses via `parse_predicate_expr` (REL handles `reg == reg`).
+        .map(|(name, _)| serde_json::json!({ "name": name, "expr": name }))
+        .collect();
+    let signals: Vec<serde_json::Value> = referenced
+        .iter()
+        .filter_map(|r| {
+            init_values
+                .get(r)
+                .map(|v| serde_json::json!({ "name": r, "config_values": [v] }))
+        })
+        .collect();
+    if compound_decls.is_empty() && signals.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "module": "cegar",
+        "source": "verify_auto.btor2",
+        "compound_predicates": compound_decls,
+        "signals": signals,
+    }))
+    .ok()
+}
+
+/// Init value of every state cell, keyed by symbol — from the BTOR2 `init`
+/// lines, defaulting to 0 (the `setundef -zero` power-up). Used to pin the cube
+/// lift's initial cube to the design's reset state.
+fn state_cell_init_values(
+    file: &crate::adapter::btor2::ast::Btor2File,
+) -> std::collections::HashMap<String, u64> {
+    use crate::adapter::btor2::ast::Node;
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let mut init_of_state: std::collections::HashMap<crate::adapter::btor2::ast::Nid, u64> =
+        std::collections::HashMap::new();
+    for line in &file.lines {
+        if let Node::Init { state, value, .. } = &line.node
+            && let Some(cl) = file.lookup(value.nid())
+            && let Node::Const { sort, value: cv } = &cl.node
+        {
+            init_of_state.insert(*state, const_to_u64(file, *sort, cv));
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for line in &file.lines {
+        if matches!(line.node, Node::State { .. })
+            && let Some(name) = symbols.get(&line.nid)
+        {
+            out.insert(
+                name.clone(),
+                init_of_state.get(&line.nid).copied().unwrap_or(0),
+            );
+        }
+    }
+    out
+}
+
+/// A BTOR2 constant value → `u64` (all-ones needs the sort width).
+fn const_to_u64(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    sort_nid: crate::adapter::btor2::ast::Nid,
+    cv: &crate::adapter::btor2::ast::ConstValue,
+) -> u64 {
+    use crate::adapter::btor2::ast::ConstValue::*;
+    match cv {
+        Zero => 0,
+        One => 1,
+        Ones => {
+            let w = crate::adapter::btor2::parser::bv_width(file, sort_nid).unwrap_or(0);
+            if w == 0 || w >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << w) - 1
+            }
+        }
+        Dec(d) => *d as u64,
+        Bin(b) => u64::from_str_radix(b, 2).unwrap_or(0),
+        Hex(h) => u64::from_str_radix(h, 16).unwrap_or(0),
+    }
+}
+
+/// Verify every translated SVA property in `sources` against the model, with no
+/// sidecar. `sources` is `(file_name, content)`, the first being the primary.
+pub fn verify_auto(
+    sources: &[(String, String)],
+    yosys_opts: &YosysOptions,
+    opts: &VerifyAutoOptions,
+) -> Result<AutoVerifyReport, AdapterError> {
+    use crate::adapter::AdapterOptions;
+    use crate::adapter::btor2::cegar::{
+        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
+    };
+    use crate::adapter::btor2::shadow::augment_with_past_shadows;
+    use crate::adapter::yosys::sv_to_btor2;
+    use crate::mu_calculus::Environment;
+    use crate::mu_calculus::parser as mu_parser;
+    use crate::mu_calculus::trit::Trit;
+
+    let (primary_name, primary_content) = sources.first().ok_or_else(|| AdapterError {
+        kind: AdapterErrorKind::ParseError,
+        message: "adapter/slang/verify_auto: no SV sources provided".to_string(),
+        location: None,
+    })?;
+    let _ = primary_name;
+
+    // 1. Extract + translate the SVA.
+    let extraction = extract_sva(sources)?;
+
+    let mut report = AutoVerifyReport {
+        unsupported: extraction
+            .unsupported
+            .iter()
+            .map(|u| (u.name.clone(), u.reason.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    if extraction.translated.is_empty() {
+        return Ok(report);
+    }
+
+    // 2. SV → flattened BTOR2, then 3. augment the `__past` shadow flops.
+    let btor2 = sv_to_btor2(primary_content, yosys_opts).map_err(|mut e| {
+        e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
+        e
+    })?;
+    let shadow_bases: Vec<&str> = extraction
+        .required_shadows
+        .iter()
+        .map(|s| s.base.as_str())
+        .collect();
+    let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
+
+    // State-cell symbols of the augmented design — the seedable-atom universe.
+    let file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
+        e.message = format!("verify_auto: re-parse augmented BTOR2: {}", e.message);
+        e
+    })?;
+    let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+    let state_cells: HashSet<String> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, crate::adapter::btor2::ast::Node::State { .. }))
+        .filter_map(|l| symbols.get(&l.nid).cloned())
+        .collect();
+    // Init value of each state cell — pins the cube lift's initial cube to the
+    // design's reset state (else it defaults to cube_0 = all-predicates-false).
+    let init_values = state_cell_init_values(&file);
+
+    // 4. Per property: seed → CEGAR → verdict.
+    for t in &extraction.translated {
+        let formula = match mu_parser::parse(&t.formula) {
+            Ok(f) => f,
+            Err(e) => {
+                report.properties.push(PropertyVerdict {
+                    name: t.name.clone(),
+                    kind: t.kind,
+                    formula: t.formula.clone(),
+                    outcome: VerifyOutcome::Skipped {
+                        reason: format!("formula failed to parse: {e:?}"),
+                    },
+                    seeded_predicates: Vec::new(),
+                });
+                continue;
+            }
+        };
+
+        let seeded = seed_from_formula(&formula, &state_cells);
+        if !seeded.unseedable.is_empty() {
+            report.properties.push(PropertyVerdict {
+                name: t.name.clone(),
+                kind: t.kind,
+                formula: t.formula.clone(),
+                outcome: VerifyOutcome::Skipped {
+                    reason: format!(
+                        "atom(s) over non-state signals (combinational/IO — not cube-bindable): {}",
+                        seeded.unseedable.join(", ")
+                    ),
+                },
+                seeded_predicates: Vec::new(),
+            });
+            continue;
+        }
+        let predicate_count = seeded.specs.len() + seeded.compounds.len();
+        if predicate_count == 0 {
+            report.properties.push(PropertyVerdict {
+                name: t.name.clone(),
+                kind: t.kind,
+                formula: t.formula.clone(),
+                outcome: VerifyOutcome::Skipped {
+                    reason: "no state-cell predicate atoms to seed the cube".to_string(),
+                },
+                seeded_predicates: Vec::new(),
+            });
+            continue;
+        }
+
+        let mut seeded_names: Vec<String> = seeded.specs.iter().map(|s| s.name.clone()).collect();
+        seeded_names.extend(seeded.compounds.iter().map(|(n, _)| n.clone()));
+
+        // Compounds present ⇒ force the SmtAllPairs eager lift (the only
+        // compound-aware path); `cegar_refine_loop` re-checks this.
+        let has_compounds = !seeded.compounds.is_empty();
+        let cegar_opts = CegarOptions {
+            max_iterations: opts.max_iterations,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: true,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: opts.must_edge_inference,
+            may_edge_inference: if has_compounds {
+                MayEdgeInference::SmtAllPairs
+            } else {
+                MayEdgeInference::Off
+            },
+            emit_ctxdsl: false,
+        };
+        // Every register the predicates reference — pin each to its init value
+        // (config_values) so the lift's initial cube is the reset state.
+        let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for s in &seeded.specs {
+            referenced.insert(s.register.clone());
+        }
+        for (_, e) in &seeded.compounds {
+            for r in e.registers() {
+                referenced.insert(r);
+            }
+        }
+        let adapter_options = AdapterOptions {
+            sidecar_json: synth_sidecar_json(&seeded.compounds, &referenced, &init_values),
+            ..Default::default()
+        };
+        // Env sized to the cube space: simple specs + the sidecar compounds
+        // `cegar_refine_loop` appends.
+        let env = Environment::new(1usize << predicate_count);
+
+        // The design's initial cube index: evaluate every predicate at the
+        // reset valuation, in the lift's bit order (simple specs first, then the
+        // sidecar compounds `cegar_refine_loop` appends). The verdict AT THIS
+        // cube is the property's answer — sidestepping the lift's `cube_0`
+        // initial-state default (cube_is_admissible can't pin a compound).
+        let init_val_u128: std::collections::HashMap<String, u128> = init_values
+            .iter()
+            .map(|(k, v)| (k.clone(), *v as u128))
+            .collect();
+        let mut init_cube = 0usize;
+        let mut bit = 0u32;
+        for s in &seeded.specs {
+            if init_values.get(&s.register).copied().unwrap_or(0) == s.value {
+                init_cube |= 1 << bit;
+            }
+            bit += 1;
+        }
+        for (_, expr) in &seeded.compounds {
+            if expr.eval(&init_val_u128) {
+                init_cube |= 1 << bit;
+            }
+            bit += 1;
+        }
+
+        let outcome = match cegar_refine_loop(
+            &formula,
+            &btor2,
+            seeded.specs.clone(),
+            &env,
+            &adapter_options,
+            &cegar_opts,
+        ) {
+            Ok(trace) => {
+                let v = &trace.final_verdict;
+                // The verdict at the reset cube is the property's verdict.
+                match v.verdict_at(init_cube) {
+                    Trit::True => VerifyOutcome::Holds,
+                    Trit::False => {
+                        let false_cells = (0..v.len())
+                            .filter(|&i| v.verdict_at(i) == Trit::False)
+                            .count();
+                        VerifyOutcome::Violated { false_cells }
+                    }
+                    Trit::Unknown => {
+                        let unknown_cells = (0..v.len())
+                            .filter(|&i| v.verdict_at(i) == Trit::Unknown)
+                            .count();
+                        VerifyOutcome::Unknown { unknown_cells }
+                    }
+                }
+            }
+            Err(e) => VerifyOutcome::Skipped {
+                reason: format!("CEGAR error: {}", e.message),
+            },
+        };
+
+        report.properties.push(PropertyVerdict {
+            name: t.name.clone(),
+            kind: t.kind,
+            formula: t.formula.clone(),
+            outcome,
+            seeded_predicates: seeded_names,
+        });
+    }
+
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mu_calculus::parser as mu_parser;
+
+    fn cells(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn seeds_simple_state_predicate() {
+        // `nu X. ((state == 5) && [] X)` over a state cell → one simple spec.
+        let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
+        let s = seed_from_formula(&f, &cells(&["state"]));
+        assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
+        assert_eq!(s.specs[0].name, "state == 5");
+        assert_eq!(s.specs[0].register, "state");
+        assert_eq!(s.specs[0].value, 5);
+        assert!(s.compounds.is_empty());
+        assert!(s.unseedable.is_empty());
+    }
+
+    #[test]
+    fn seeds_relational_predicate_as_compound() {
+        // `$stable` shape: `state == state__past` → a compound (REL), both state cells.
+        let f = mu_parser::parse("nu X. ((state == state__past) && [] X)").unwrap();
+        let s = seed_from_formula(&f, &cells(&["state", "state__past"]));
+        assert!(s.specs.is_empty(), "relational atom is not a simple spec");
+        assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
+        assert_eq!(s.compounds[0].0, "state == state__past");
+        assert!(s.unseedable.is_empty());
+        // It serialises into a sidecar cegar can read (compound + init pins).
+        let referenced: std::collections::BTreeSet<String> =
+            ["state".to_string(), "state__past".to_string()]
+                .into_iter()
+                .collect();
+        let inits: std::collections::HashMap<String, u64> =
+            [("state".to_string(), 0), ("state__past".to_string(), 0)]
+                .into_iter()
+                .collect();
+        let json = synth_sidecar_json(&s.compounds, &referenced, &inits).expect("sidecar json");
+        assert!(json.contains("compound_predicates"));
+        assert!(json.contains("state == state__past"));
+        assert!(json.contains("config_values"), "init pins present: {json}");
+    }
+
+    #[test]
+    fn gates_atoms_over_non_state_signals() {
+        // `gnt_o != 0` and `ready_i` over IO signals (not state cells) → unseedable.
+        let f = mu_parser::parse("nu X. (((gnt_o != 0) || ready_i) && [] X)").unwrap();
+        let s = seed_from_formula(&f, &cells(&["state_q"])); // neither IO signal is a state cell
+        assert!(
+            s.unseedable.contains(&"gnt_o != 0".to_string()),
+            "IO comparison atom must be unseedable; got {:?}",
+            s.unseedable
+        );
+        assert!(
+            s.unseedable.contains(&"ready_i".to_string()),
+            "bare IO boolean atom must be unseedable; got {:?}",
+            s.unseedable
+        );
+    }
+
+    #[test]
+    fn bare_one_bit_state_signal_seeds_eq_one() {
+        let f = mu_parser::parse("nu X. (busy && [] X)").unwrap();
+        let s = seed_from_formula(&f, &cells(&["busy"]));
+        assert_eq!(s.specs.len(), 1);
+        assert_eq!(s.specs[0].name, "busy");
+        assert_eq!(s.specs[0].value, 1, "bare boolean state signal ≡ sig == 1");
+    }
+
+    #[test]
+    fn no_sidecar_when_nothing_to_emit() {
+        let empty_refs = std::collections::BTreeSet::new();
+        let empty_inits = std::collections::HashMap::new();
+        assert!(synth_sidecar_json(&[], &empty_refs, &empty_inits).is_none());
+    }
+
+    #[test]
+    fn empty_sources_errors() {
+        let err = verify_auto(&[], &YosysOptions::default(), &VerifyAutoOptions::default())
+            .expect_err("no sources");
+        assert_eq!(err.kind, AdapterErrorKind::ParseError);
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3; run with --ignored"]
+    fn e2e_fsm_holds_and_violated_verdicts() {
+        // A 2-bit FSM reset to 0, cycling 0→1→2→0. Two state-safety properties:
+        //   - `state != 3` HOLDS (the unused encoding is never reached).
+        //   - `state == 1` is VIOLATED (false at the reset state, state 0).
+        // Exercises the full pipeline (slang → sv2v/Yosys → seed → cube → verdict)
+        // and the init-cube-verdict interpretation (the verdict is read at the
+        // reset cube, not the lift's cube_0 default).
+        let sv = "module fsm (input logic clk, input logic rst_n, input logic go);\n\
+                  logic [1:0] state;\n\
+                  always_ff @(posedge clk) begin\n\
+                    if (!rst_n) state <= 2'd0;\n\
+                    else state <= (state == 2'd2) ? 2'd0 : state + 2'd1;\n\
+                  end\n\
+                  ok:  assert property (@(posedge clk) state != 2'd3);\n\
+                  bad: assert property (@(posedge clk) state == 2'd1);\n\
+                  endmodule\n";
+        let sources = vec![("fsm.sv".to_string(), sv.to_string())];
+        let yopts = YosysOptions {
+            top: Some("fsm".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let report = verify_auto(&sources, &yopts, &VerifyAutoOptions::default())
+            .expect("verify_auto runs end-to-end");
+        assert_eq!(report.properties.len(), 2, "two assertions verified");
+        let by_formula = |needle: &str| -> &VerifyOutcome {
+            &report
+                .properties
+                .iter()
+                .find(|p| p.formula.contains(needle))
+                .unwrap_or_else(|| panic!("property containing {needle:?}"))
+                .outcome
+        };
+        assert!(
+            matches!(by_formula("state != 3"), VerifyOutcome::Holds),
+            "`state != 3` should HOLD; got {:?}",
+            by_formula("state != 3")
+        );
+        assert!(
+            matches!(by_formula("state == 1"), VerifyOutcome::Violated { .. }),
+            "`state == 1` should be VIOLATED (false at reset); got {:?}",
+            by_formula("state == 1")
+        );
+    }
+}

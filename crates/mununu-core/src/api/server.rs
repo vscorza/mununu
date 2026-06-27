@@ -121,6 +121,12 @@ fn create_router() -> Router {
             "/api/v1/sv/extract-sva",
             post(handlers::sv_extract_sva_handler),
         )
+        // Track-H no-sidecar verify (XL.6b) — extract SVA + verify each property
+        // against the model. Surface peer of `mununu sv verify-auto` + the UI panel.
+        .route(
+            "/api/v1/sv/verify-auto",
+            post(handlers::sv_verify_auto_handler),
+        )
         .route(
             "/api/v1/verify/memory-check",
             post(handlers::memory_check_handler),

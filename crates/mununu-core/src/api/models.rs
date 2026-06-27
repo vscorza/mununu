@@ -988,6 +988,56 @@ pub struct ShadowSignalView {
     pub width: u32,
 }
 
+/// XL.6b — automated SVA verification endpoint (`POST /api/v1/sv/verify-auto`).
+/// Mirrors the CLI `mununu sv verify-auto`: extract the design's SVA, lift, and
+/// verify each property against the model with no sidecar. slang parses SV
+/// directly, but the verify lift uses sv2v + Yosys, so `top` / `use_sv2v` apply.
+#[derive(Debug, Deserialize)]
+pub struct SvVerifyAutoRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / `include` targets).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the SV → BTOR2 lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys (modern SV). Mirrors `--preprocess-sv2v`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// Max CEGAR iterations per property (default 16).
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Must-edge inference per property (default `"off"`; `"smt-hyper-must"`
+    /// gives sound νμ verdicts).
+    #[serde(default)]
+    pub must_edge_inference: Option<String>,
+}
+
+/// Response for `/api/v1/sv/verify-auto`.
+#[derive(Debug, Serialize)]
+pub struct SvVerifyAutoResponse {
+    pub properties: Vec<PropertyVerdictView>,
+    /// Assertions that did not translate (reuses the extract-sva view shape;
+    /// `kind` is `None` here).
+    pub unsupported: Vec<UnsupportedAssertionView>,
+}
+
+/// One property's auto-verification verdict (mirrors `PropertyVerdict`).
+#[derive(Debug, Serialize)]
+pub struct PropertyVerdictView {
+    pub name: String,
+    /// `"assert"` | `"assume"` | `"cover"`.
+    pub kind: String,
+    pub formula: String,
+    /// `"holds"` | `"violated"` | `"unknown"` | `"skipped"`.
+    pub outcome: String,
+    /// `false_cells` (violated) / `unknown_cells` (unknown) / the skip reason.
+    pub detail: Option<String>,
+    /// The cube predicates auto-seeded for this property (atom strings).
+    pub seeded_predicates: Vec<String>,
+}
+
 /// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace
 /// viewer. Mirrors [`crate::adapter::btor2::cegar::CegarTrace`].
 #[derive(Debug, Serialize)]
