@@ -51,6 +51,7 @@ pub mod microcode;
 pub mod partition;
 pub mod promela;
 pub mod sidecar;
+pub mod slang;
 pub mod state_enum;
 pub mod sts_ir;
 pub mod systemverilog;
