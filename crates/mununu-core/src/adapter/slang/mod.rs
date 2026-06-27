@@ -26,6 +26,7 @@ use crate::adapter::{AdapterError, AdapterErrorKind};
 
 pub mod extract;
 pub mod translate;
+pub mod verify_auto;
 
 /// Handle to a discovered slang binary + its parsed version (diagnostic only;
 /// mununu does not gate on version). Mirrors [`crate::adapter::cvc5::Cvc5Bin`].

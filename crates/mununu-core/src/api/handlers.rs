@@ -738,6 +738,96 @@ pub async fn sv_extract_sva_handler(
     Ok(Json(response))
 }
 
+/// XL.6b — `POST /api/v1/sv/verify-auto`. Extract the design's SVA, lift, and
+/// verify each property against the model with no sidecar (per-property
+/// auto-seeded cube predicates → CEGAR). Surface peer of `mununu sv verify-auto`.
+pub async fn sv_verify_auto_handler(
+    Json(request): Json<SvVerifyAutoRequest>,
+) -> ApiResult<Json<SvVerifyAutoResponse>> {
+    use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+    use crate::adapter::slang::verify_auto::{VerifyAutoOptions, VerifyOutcome, verify_auto};
+    use crate::adapter::yosys::YosysOptions;
+
+    let mut sources: Vec<(String, String)> = vec![("top.sv".to_string(), request.source.clone())];
+    for f in &request.additional_sources {
+        sources.push((f.name.clone(), f.content.clone()));
+    }
+    let yopts = YosysOptions {
+        top: request.top.clone(),
+        additional_sources: request
+            .additional_sources
+            .iter()
+            .map(|f| (f.name.clone(), f.content.clone()))
+            .collect(),
+        use_sv2v: request.use_sv2v,
+        ..Default::default()
+    };
+    let must_edge_inference = match request.must_edge_inference.as_deref() {
+        Some("sampling-confluence") => MustEdgeInference::SamplingConfluence,
+        Some("smt-per-target") => MustEdgeInference::SmtPerTarget,
+        Some("smt-per-target-standard") => MustEdgeInference::SmtPerTargetStandard,
+        Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
+        _ => MustEdgeInference::Off,
+    };
+    let opts = VerifyAutoOptions {
+        max_iterations: request.max_iterations.unwrap_or(16),
+        must_edge_inference,
+    };
+
+    let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
+        message: format!("verify-auto: {}", e.message),
+        details: None,
+    })?;
+
+    let kind_str = |k: crate::adapter::slang::translate::SvaKind| -> String {
+        use crate::adapter::slang::translate::SvaKind;
+        match k {
+            SvaKind::Assert => "assert".to_string(),
+            SvaKind::Assume => "assume".to_string(),
+            SvaKind::Cover => "cover".to_string(),
+        }
+    };
+    let properties = report
+        .properties
+        .iter()
+        .map(|p| {
+            let (outcome, detail) = match &p.outcome {
+                VerifyOutcome::Holds => ("holds".to_string(), None),
+                VerifyOutcome::Violated { false_cells } => (
+                    "violated".to_string(),
+                    Some(format!("{false_cells} cell(s)")),
+                ),
+                VerifyOutcome::Unknown { unknown_cells } => (
+                    "unknown".to_string(),
+                    Some(format!("{unknown_cells} cell(s)")),
+                ),
+                VerifyOutcome::Skipped { reason } => ("skipped".to_string(), Some(reason.clone())),
+            };
+            PropertyVerdictView {
+                name: p.name.clone(),
+                kind: kind_str(p.kind),
+                formula: p.formula.clone(),
+                outcome,
+                detail,
+                seeded_predicates: p.seeded_predicates.clone(),
+            }
+        })
+        .collect();
+    let unsupported = report
+        .unsupported
+        .iter()
+        .map(|(name, reason)| UnsupportedAssertionView {
+            name: name.clone(),
+            kind: None,
+            reason: reason.clone(),
+        })
+        .collect();
+    Ok(Json(SvVerifyAutoResponse {
+        properties,
+        unsupported,
+    }))
+}
+
 /// Shared parameters for the CEGAR run/report logic, sourced identically
 /// from [`Btor2CegarRequest`] (raw BTOR2) and [`SvCegarRequest`] (SV
 /// lifted to BTOR2 first).

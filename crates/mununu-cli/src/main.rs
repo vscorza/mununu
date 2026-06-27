@@ -958,6 +958,17 @@ enum SvCommand {
     /// No model verification yet (that is `sv verify-auto`). Surface peer of
     /// `POST /api/v1/sv/extract-sva` + the extraction-tab SVA panel.
     ExtractSva(SvExtractSvaArgs),
+    /// Automated SVA verification — no sidecar (Track-H, XL.6b).
+    ///
+    /// The headline no-sidecar verify: extract the design's SVA (slang) → lift
+    /// SV → BTOR2 (sv2v + Yosys) → synthesize `$past` shadow flops → for each
+    /// translated property, auto-seed cube predicates from the formula's
+    /// state-cell atoms and run the predicate-abstraction refinement loop,
+    /// printing a per-property verdict. Properties whose atoms reference
+    /// non-state signals (combinational/IO) are reported skipped (the cube path
+    /// can't bind them) — never given a misleading verdict. Surface peer of
+    /// `POST /api/v1/sv/verify-auto` + the extraction-tab verify-auto panel.
+    VerifyAuto(SvVerifyAutoArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1141,6 +1152,34 @@ struct SvExtractSvaArgs {
     /// Repeatable.
     #[arg(long = "source", value_name = "FILE")]
     sources: Vec<PathBuf>,
+    /// Print a JSON report instead of the human-readable summary.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct SvVerifyAutoArgs {
+    /// Primary SystemVerilog source file (.sv / .v).
+    #[arg(value_name = "SV_FILE")]
+    file: PathBuf,
+    /// Additional SV sources (packages, `include` targets), staged alongside
+    /// the primary input. Repeatable.
+    #[arg(long = "source", value_name = "FILE")]
+    sources: Vec<PathBuf>,
+    /// Top module for the SV → BTOR2 Yosys lift (auto-detect when omitted).
+    #[arg(long = "top", value_name = "NAME")]
+    top: Option<String>,
+    /// Run sv2v before Yosys. Required for modern SV (`import pkg::*;`, structs,
+    /// interfaces) — essentially all real OpenTitan / Caliptra / ibex RTL.
+    #[arg(long = "preprocess-sv2v")]
+    preprocess_sv2v: bool,
+    /// Max CEGAR iterations per property.
+    #[arg(long, default_value_t = 16)]
+    max_iterations: usize,
+    /// Must-edge inference policy per property. `smt-hyper-must` gives sound νμ
+    /// verdicts (the recoverability case); default `off`.
+    #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
+    must_edge_inference: MustEdgeInferenceArg,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -2107,6 +2146,144 @@ fn render_extract_sva_json(report: &mununu_core::adapter::slang::translate::Tran
         "unsupported": unsupported,
         "required_shadows": required_shadows,
     });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// XL.6b — `mununu sv verify-auto`: extract SVA, lift, and verify each property
+/// against the model with no sidecar.
+fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
+    use mununu_core::adapter::btor2::kmts_lift::MustEdgeInference;
+    use mununu_core::adapter::slang::verify_auto::{VerifyAutoOptions, verify_auto};
+
+    let primary_name = args
+        .file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("Invalid SV source path: {}", args.file.display()))?;
+    let primary = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read SV source '{}': {e}", args.file.display()))?;
+    let mut sources: Vec<(String, String)> = vec![(primary_name.to_string(), primary)];
+    let mut additional: Vec<(String, String)> = Vec::new();
+    for src in &args.sources {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid additional source path: {}", src.display()))?;
+        let body = std::fs::read_to_string(src)
+            .map_err(|e| format!("Failed to read additional source '{}': {e}", src.display()))?;
+        sources.push((name.to_string(), body.clone()));
+        additional.push((name.to_string(), body));
+    }
+
+    let yopts = mununu_core::adapter::yosys::YosysOptions {
+        top: args.top.clone(),
+        additional_sources: additional,
+        primary_source_path: Some(args.file.display().to_string()),
+        use_sv2v: args.preprocess_sv2v,
+        ..Default::default()
+    };
+    let must_edge_inference = match args.must_edge_inference {
+        MustEdgeInferenceArg::Off => MustEdgeInference::Off,
+        MustEdgeInferenceArg::SamplingConfluence => MustEdgeInference::SamplingConfluence,
+        MustEdgeInferenceArg::SmtPerTarget => MustEdgeInference::SmtPerTarget,
+        MustEdgeInferenceArg::SmtPerTargetStandard => MustEdgeInference::SmtPerTargetStandard,
+        MustEdgeInferenceArg::SmtHyperMust => MustEdgeInference::SmtHyperMust,
+    };
+    let opts = VerifyAutoOptions {
+        max_iterations: args.max_iterations,
+        must_edge_inference,
+    };
+
+    let report = verify_auto(&sources, &yopts, &opts)
+        .map_err(|e| format!("sv verify-auto: {}", e.message))?;
+
+    if args.json {
+        render_verify_auto_json(&report);
+    } else {
+        render_verify_auto_text(&report);
+    }
+    Ok(())
+}
+
+fn verify_outcome_str(outcome: &mununu_core::adapter::slang::verify_auto::VerifyOutcome) -> String {
+    use mununu_core::adapter::slang::verify_auto::VerifyOutcome;
+    match outcome {
+        VerifyOutcome::Holds => "HOLDS".to_string(),
+        VerifyOutcome::Violated { false_cells } => format!("VIOLATED ({false_cells} cell(s))"),
+        VerifyOutcome::Unknown { unknown_cells } => {
+            format!("UNKNOWN/\u{22a5} ({unknown_cells} cell(s))")
+        }
+        VerifyOutcome::Skipped { reason } => format!("skipped — {reason}"),
+    }
+}
+
+fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::AutoVerifyReport) {
+    println!(
+        "verify-auto: {} propert{} verified, {} unsupported assertion(s)",
+        report.properties.len(),
+        if report.properties.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        report.unsupported.len()
+    );
+    for p in &report.properties {
+        println!(
+            "  [{}] {}: {}",
+            sva_kind_str(p.kind),
+            p.name,
+            verify_outcome_str(&p.outcome)
+        );
+        println!("        formula: {}", p.formula);
+        if !p.seeded_predicates.is_empty() {
+            println!("        predicates: {}", p.seeded_predicates.join(", "));
+        }
+    }
+    for (name, reason) in &report.unsupported {
+        println!("  [unsupported] {name}: {reason}");
+    }
+}
+
+fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::AutoVerifyReport) {
+    use mununu_core::adapter::slang::verify_auto::VerifyOutcome;
+    let props: Vec<serde_json::Value> = report
+        .properties
+        .iter()
+        .map(|p| {
+            let (status, detail) = match &p.outcome {
+                VerifyOutcome::Holds => ("holds", serde_json::Value::Null),
+                VerifyOutcome::Violated { false_cells } => (
+                    "violated",
+                    serde_json::json!({ "false_cells": false_cells }),
+                ),
+                VerifyOutcome::Unknown { unknown_cells } => (
+                    "unknown",
+                    serde_json::json!({ "unknown_cells": unknown_cells }),
+                ),
+                VerifyOutcome::Skipped { reason } => {
+                    ("skipped", serde_json::json!({ "reason": reason }))
+                }
+            };
+            serde_json::json!({
+                "name": p.name,
+                "kind": sva_kind_str(p.kind),
+                "formula": p.formula,
+                "outcome": status,
+                "detail": detail,
+                "seeded_predicates": p.seeded_predicates,
+            })
+        })
+        .collect();
+    let unsupported: Vec<serde_json::Value> = report
+        .unsupported
+        .iter()
+        .map(|(name, reason)| serde_json::json!({ "name": name, "reason": reason }))
+        .collect();
+    let out = serde_json::json!({ "properties": props, "unsupported": unsupported });
     println!(
         "{}",
         serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
@@ -3570,6 +3747,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Discover(args) => sv_discover(args),
         SvCommand::Cegar(args) => sv_cegar(args),
         SvCommand::ExtractSva(args) => sv_extract_sva(args),
+        SvCommand::VerifyAuto(args) => sv_verify_auto(args),
     }
 }
 
