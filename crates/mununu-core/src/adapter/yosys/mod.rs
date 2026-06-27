@@ -458,26 +458,86 @@ pub fn sv_to_btor2(content: &str, yopts: &YosysOptions) -> Result<String, Adapte
 }
 
 /// Like [`sv_to_btor2`] but additionally returns the names of modules the lift
-/// **black-boxed** — instantiated in the design but with no body in the source
-/// set, so Yosys auto-declared them `(* blackbox *)` and `cutpoint -blackbox`
-/// replaced their outputs with free inputs.
+/// could **not model** because they were instantiated with no body in the
+/// source set. Two flavours, both reported:
 ///
-/// This is sound (a free input over-approximates an unknown driver), but a
-/// register hidden behind such a module (e.g. an FSM wrapped in OpenTitan's
-/// `prim_sparse_fsm_flop`) is **not** modeled as a state cell — so it cannot be
-/// abstracted or verified. [`verify_auto`](crate::adapter::slang::verify_auto)
-/// surfaces this list as a diagnostic so the cut is visible rather than silent,
-/// and the user can provide the missing module source.
+/// 1. Modules Yosys auto-declared `(* blackbox *)`, whose outputs
+///    `cutpoint -blackbox` replaced with free inputs.
+/// 2. **Undefined-module cells** — an instance whose module type has no
+///    definition (e.g. OpenTitan's `prim_sparse_fsm_flop`, instantiated by the
+///    `PRIM_FLOP_SPARSE_FSM` macro). Yosys leaves these as dangling cell
+///    references (not blackbox *modules*), so `flatten` cannot inline them and
+///    any register they drive vanishes from the lifted model entirely.
+///
+/// Both are sound (an unmodeled driver becomes free / undefined, never a
+/// fabricated definite value), but a register hidden behind one is **not**
+/// modeled as a state cell, so it cannot be abstracted or verified.
+/// [`verify_auto`](crate::adapter::slang::verify_auto) surfaces this list as a
+/// diagnostic so the cut is visible rather than silent, and the user can
+/// provide the missing module source.
 pub fn sv_to_btor2_with_blackboxes(
     content: &str,
     yopts: &YosysOptions,
 ) -> Result<(String, Vec<String>), AdapterError> {
     let artifacts = run_sv_flatten_btor2(content, yopts)?;
-    let blackboxes: Vec<String> = parse_blackbox_modules(&artifacts.hier_json)
-        .into_iter()
-        .map(|b| b.name)
-        .collect();
-    Ok((artifacts.btor2, blackboxes))
+    let mut names: std::collections::BTreeSet<String> =
+        parse_blackbox_modules(&artifacts.hier_json)
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+    names.extend(parse_undefined_module_cells(&artifacts.hier_json));
+    Ok((artifacts.btor2, names.into_iter().collect()))
+}
+
+/// Scan the pre-flatten hierarchy JSON for cells whose `type` references a
+/// module with no definition in the design (instantiated, no body) and is not a
+/// Yosys built-in (`$...`) cell. These dangling cell references are NOT declared
+/// blackbox *modules*, so [`parse_blackbox_modules`] misses them, yet they are
+/// the dominant real-world "cut FSM" cause (OpenTitan's `prim_sparse_fsm_flop`).
+/// Names are de-mangled of sv2v's parameter-specialisation suffix for
+/// readability and returned sorted + deduped.
+fn parse_undefined_module_cells(hier_json: &str) -> Vec<String> {
+    let root: serde_json::Value = match serde_json::from_str(hier_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(modules) = root.get("modules").and_then(|m| m.as_object()) else {
+        return Vec::new();
+    };
+    let defined: std::collections::HashSet<&str> = modules.keys().map(String::as_str).collect();
+    let mut undefined: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for body in modules.values() {
+        let Some(cells) = body.get("cells").and_then(|c| c.as_object()) else {
+            continue;
+        };
+        for cell in cells.values() {
+            if let Some(ty) = cell.get("type").and_then(|t| t.as_str())
+                && !ty.starts_with('$')
+                && !defined.contains(ty)
+            {
+                undefined.insert(strip_sv2v_mangle(ty).to_string());
+            }
+        }
+    }
+    undefined.into_iter().collect()
+}
+
+/// Strip sv2v's parameter-specialisation suffix (`_<HEX>_<HEX>`, two trailing
+/// uppercase-hex groups of ≥ 4 chars) from a mangled module name, so e.g.
+/// `prim_sparse_fsm_flop_B4CDB_707CE` reads as `prim_sparse_fsm_flop` in
+/// diagnostics. Conservative: only strips when both trailing groups match the
+/// exact sv2v shape; otherwise returns the name unchanged.
+fn strip_sv2v_mangle(name: &str) -> &str {
+    let is_hex4 = |s: &str| s.len() >= 4 && s.chars().all(|c| c.is_ascii_hexdigit());
+    if let Some((head, last)) = name.rsplit_once('_')
+        && is_hex4(last)
+        && let Some((stem, mid)) = head.rsplit_once('_')
+        && is_hex4(mid)
+        && !stem.is_empty()
+    {
+        return stem;
+    }
+    name
 }
 
 /// One submodule's translated output, as returned by
@@ -2630,5 +2690,52 @@ endmodule
             "error should name sv2v; got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn strip_sv2v_mangle_demangles_param_suffix() {
+        // sv2v's `_<HEX>_<HEX>` parameter-specialisation suffix is stripped.
+        assert_eq!(
+            strip_sv2v_mangle("prim_sparse_fsm_flop_B4CDB_707CE"),
+            "prim_sparse_fsm_flop"
+        );
+        // A plain module name is untouched.
+        assert_eq!(
+            strip_sv2v_mangle("prim_sparse_fsm_flop"),
+            "prim_sparse_fsm_flop"
+        );
+        // A name with only one trailing hex group is untouched (not the sv2v shape).
+        assert_eq!(strip_sv2v_mangle("foo_DEAD"), "foo_DEAD");
+    }
+
+    #[test]
+    fn parse_undefined_module_cells_finds_dangling_instance() {
+        // A module that instantiates an undefined cell type (the csrng
+        // prim_sparse_fsm_flop shape) — yosys leaves it as a dangling cell, not
+        // a blackbox module, so it must be found via the cell scan.
+        let hier = r#"{
+          "modules": {
+            "top": {
+              "cells": {
+                "u_state_regs": { "type": "prim_sparse_fsm_flop_B4CDB_707CE" },
+                "an_and": { "type": "$and" },
+                "u_sub": { "type": "defined_sub" }
+              }
+            },
+            "defined_sub": { "cells": {} }
+          }
+        }"#;
+        let found = parse_undefined_module_cells(hier);
+        assert_eq!(
+            found,
+            vec!["prim_sparse_fsm_flop".to_string()],
+            "only the undefined, non-builtin, de-mangled cell type is reported"
+        );
+    }
+
+    #[test]
+    fn parse_undefined_module_cells_empty_for_self_contained() {
+        let hier = r#"{"modules":{"top":{"cells":{"a":{"type":"$dff"},"b":{"type":"sub"}}},"sub":{"cells":{}}}}"#;
+        assert!(parse_undefined_module_cells(hier).is_empty());
     }
 }

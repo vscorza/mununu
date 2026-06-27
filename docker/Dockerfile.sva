@@ -1,0 +1,64 @@
+# SVA-verification validation image — extends `mununu-dev` with the external
+# SystemVerilog toolchain (slang + sv2v + yosys) so the slang-gated
+# `verify-auto` / `extract-sva` e2e tests (normally `#[ignore]`d because the
+# tools are contributor-installed, not bundled) can run end-to-end. The Rust
+# toolchain, libz3 (linked), and the cargo cache volume all come from
+# `mununu-dev`; this image only adds the EDA front-ends.
+#
+# Why a separate image: per the project's "subprocess tools are not bundled"
+# policy, slang/sv2v/yosys stay out of `mununu-dev` (the build/test image). This
+# image is opt-in, for reproducing the SVA e2e validation on any host (including
+# Intel macOS, where slang ships no native prebuilt — this Linux/x86_64 image
+# runs natively there).
+#
+# Build (mununu-dev must exist first — see docs/dev-container.md):
+#   docker build -f docker/Dockerfile.dev -t mununu-dev .
+#   docker build -f docker/Dockerfile.sva -t mununu-sva .
+#
+# Run the slang-gated e2e tests (mount source + warm cargo cache volume):
+#   docker volume create mununu-target   # once
+#   docker run --rm -v "$(pwd)":/work -v mununu-target:/cargo-target \
+#     mununu-sva cargo test -p mununu-core --lib --all-features -- --ignored
+FROM mununu-dev:latest
+
+# Pin the toolchain versions for reproducibility.
+ARG SLANG_VERSION=v11.0
+ARG SV2V_VERSION=v0.0.13
+
+# libz3-dev (z3-sys links system libz3; some base images predate
+# `mununu-dev`'s libz3-dev layer, so install it here too) + unzip for the
+# sv2v release archive. yosys comes from oss-cad-suite below — the Debian
+# `yosys` package (0.23) is too old for the lift's `cutpoint -blackbox`.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libz3-dev \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# yosys (recent, with `cutpoint -blackbox`) from the sibling RTL image's
+# oss-cad-suite. Reuses the locally-built `hw-verif:latest` (the same
+# toolchain `target-executor` uses for Verilator) rather than re-downloading
+# the ~1GB suite. The binaries are self-contained (rpath to its own lib), so
+# only PATH needs prepending — no global LD_LIBRARY_PATH (which would shadow
+# the system libz3 the Rust binary loads).
+COPY --from=hw-verif:latest /opt/oss-cad-suite /opt/oss-cad-suite
+ENV PATH="/opt/oss-cad-suite/bin:${PATH}"
+
+# slang (SystemVerilog elaboration → --ast-json) — Linux x86_64 prebuilt.
+RUN curl -fsSL -o /tmp/slang.tar.gz \
+        "https://github.com/MikePopoloski/slang/releases/download/${SLANG_VERSION}/slang-linux-x86_64.tar.gz" \
+    && mkdir -p /tmp/slang && tar xzf /tmp/slang.tar.gz -C /tmp/slang \
+    && find /tmp/slang -name slang -type f -exec cp {} /usr/local/bin/slang \; \
+    && chmod +x /usr/local/bin/slang \
+    && rm -rf /tmp/slang /tmp/slang.tar.gz \
+    && slang --version
+
+# sv2v (SystemVerilog-2017 → Verilog-2005 normaliser) — Linux prebuilt.
+RUN curl -fsSL -o /tmp/sv2v.zip \
+        "https://github.com/zachjs/sv2v/releases/download/${SV2V_VERSION}/sv2v-Linux.zip" \
+    && mkdir -p /tmp/sv2v && unzip -q /tmp/sv2v.zip -d /tmp/sv2v \
+    && find /tmp/sv2v -name sv2v -type f -exec cp {} /usr/local/bin/sv2v \; \
+    && chmod +x /usr/local/bin/sv2v \
+    && rm -rf /tmp/sv2v /tmp/sv2v.zip \
+    && sv2v --version
+
+WORKDIR /work

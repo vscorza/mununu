@@ -73,11 +73,12 @@ pub struct ModelDiagnostics {
     /// state was cut (see [`Self::blackboxed_modules`]) — properties over the
     /// cut registers are then SKIPPED rather than verified.
     pub state_register_count: usize,
-    /// Modules instantiated without a body (auto-black-boxed by Yosys) — their
-    /// outputs were cut to free inputs by `cutpoint -blackbox`. This is a sound
-    /// over-approximation, but a register hidden behind one of these (e.g. an
-    /// FSM wrapped in `prim_sparse_fsm_flop`) is **not** modeled as state, so
-    /// every property over it is SKIPPED. Surfacing the cut here is the
+    /// Modules instantiated without a body — either auto-black-boxed by Yosys
+    /// (outputs cut to free inputs by `cutpoint -blackbox`) or left as a
+    /// dangling undefined-module cell (e.g. an FSM wrapped in OpenTitan's
+    /// `prim_sparse_fsm_flop`, whose register then vanishes from the lift).
+    /// Both are sound, but a register hidden behind one is **not** modeled as
+    /// state, so every property over it is SKIPPED. Surfacing it here is the
     /// "stop-silent-cut" half: the cut is no longer invisible. The fix is to
     /// provide the missing module source(s).
     pub blackboxed_modules: Vec<String>,
@@ -110,9 +111,9 @@ fn unseedable_skip_reason(unseedable: &[String], diag: &ModelDiagnostics) -> Str
     );
     if !diag.blackboxed_modules.is_empty() {
         format!(
-            "{base}. Root cause: the lift black-boxed {} module(s) with no body ({}) — \
-             registers they drive were cut to free inputs and are not modeled as state. \
-             Provide the missing module source(s) to model them.",
+            "{base}. Root cause: {} module(s) instantiated with no body ({}) — \
+             registers they drive are not modeled as state. Provide the missing \
+             module source(s) to model them.",
             diag.blackboxed_modules.len(),
             diag.blackboxed_modules.join(", ")
         )
@@ -772,6 +773,122 @@ mod tests {
             ungated.properties[0].outcome
         );
         assert!(ungated.diagnostics.gated_resets.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_csrng_real_sva_verdict_breakdown() {
+        // Real OpenTitan csrng_main_sm SVA end-to-end through verify-auto. Reads
+        // the vendored fixtures: the csrng sources from the M.2 fixture + the
+        // STANDARD prim_assert macros from the M.0 prim_arbiter fixture (the
+        // csrng dir's own prim_assert.sv is the dummy variant that drops all
+        // SVA — the XL.0 gotcha). Prints the verdict breakdown; this is the
+        // honest measurement of "how many real csrng SVA does verify-auto
+        // prove?" — see the diagnostics for the root cause of any SKIP.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let csrng = root.join("m2_opentitan_csrng_main_sm/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let sources = vec![
+            (
+                "csrng_main_sm.sv".to_string(),
+                read(csrng.join("csrng_main_sm.sv")),
+            ),
+            ("csrng_pkg.sv".to_string(), read(csrng.join("csrng_pkg.sv"))),
+            (
+                "prim_assert.sv".to_string(),
+                read(prim.join("prim_assert.sv")),
+            ),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read(prim.join("prim_assert_standard_macros.svh")),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read(prim.join("prim_assert_sec_cm.svh")),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read(prim.join("prim_flop_macros.sv")),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("csrng_main_sm".to_string()),
+            use_sv2v: true,
+            // The lift (sv2v + Yosys) resolves `\`include`s and packages from
+            // `additional_sources` (staged + used as the sv2v include path);
+            // `sources` itself only feeds slang's extraction.
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on csrng");
+
+        eprintln!("\n=== csrng_main_sm verify-auto breakdown ===");
+        eprintln!(
+            "translated: {}   unsupported: {}",
+            report.properties.len(),
+            report.unsupported.len()
+        );
+        eprintln!(
+            "diagnostics: state_registers={}  blackboxed={:?}  gated_resets={:?}",
+            report.diagnostics.state_register_count,
+            report.diagnostics.blackboxed_modules,
+            report.diagnostics.gated_resets,
+        );
+        let (mut holds, mut violated, mut unknown, mut skipped) = (0, 0, 0, 0);
+        for p in &report.properties {
+            eprintln!("  [{:?}] {}: {:?}", p.kind, p.name, p.outcome);
+            match p.outcome {
+                VerifyOutcome::Holds => holds += 1,
+                VerifyOutcome::Violated { .. } => violated += 1,
+                VerifyOutcome::Unknown { .. } => unknown += 1,
+                VerifyOutcome::Skipped { .. } => skipped += 1,
+            }
+        }
+        eprintln!("HOLDS={holds} VIOLATED={violated} UNKNOWN={unknown} SKIPPED={skipped}");
+        for (n, r) in &report.unsupported {
+            eprintln!("  unsupported {n}: {r}");
+        }
+
+        // Honest invariant: the real OpenTitan SVA is in-fragment and
+        // translates (the `$stable` / `|=>` / `|->` + enum + disable-iff forms).
+        // Whether a property reaches a DEFINITE verdict depends on whether its
+        // state survives the lift — the diagnostics above attribute any SKIP.
+        assert!(
+            report.properties.len() >= 2,
+            "both csrng ASSERTs (CsrngMainErrorStStable_A, CsrngMainErrorOutput_A) translate"
+        );
+        // The csrng FSM is wrapped in `prim_sparse_fsm_flop` (body not in the
+        // source set), so it is cut and the lift has no state registers. The
+        // diagnostic must NAME the cut module (undefined-module-cell detection)
+        // rather than only reporting "no state registers" — that is the
+        // actionable root cause (provide the flop's source).
+        assert!(
+            report
+                .diagnostics
+                .blackboxed_modules
+                .iter()
+                .any(|m| m.contains("prim_sparse_fsm_flop")),
+            "the cut prim_sparse_fsm_flop should be named in diagnostics; got {:?}",
+            report.diagnostics.blackboxed_modules
+        );
+        // Reset-gating fires on the macro's `disable iff (rst_ni)`.
+        assert_eq!(
+            report.diagnostics.gated_resets,
+            vec!["rst_ni=1".to_string()]
+        );
     }
 
     #[test]
