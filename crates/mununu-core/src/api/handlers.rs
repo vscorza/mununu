@@ -772,6 +772,7 @@ pub async fn sv_verify_auto_handler(
     let opts = VerifyAutoOptions {
         max_iterations: request.max_iterations.unwrap_or(16),
         must_edge_inference,
+        gate_reset: request.gate_reset.unwrap_or(true),
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
@@ -828,6 +829,7 @@ pub async fn sv_verify_auto_handler(
         diagnostics: ModelDiagnosticsView {
             state_register_count: report.diagnostics.state_register_count,
             blackboxed_modules: report.diagnostics.blackboxed_modules.clone(),
+            gated_resets: report.diagnostics.gated_resets.clone(),
         },
     }))
 }

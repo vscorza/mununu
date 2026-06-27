@@ -31,8 +31,8 @@ use std::collections::HashSet;
 
 use crate::adapter::btor2::kmts_lift::{MayEdgeInference, MustEdgeInference, PredicateSpec};
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
-use crate::adapter::slang::extract::extract_sva;
-use crate::adapter::slang::translate::SvaKind;
+use crate::adapter::slang::extract::extract_sva_with_options;
+use crate::adapter::slang::translate::{SvaKind, TranslateOptions};
 use crate::adapter::yosys::YosysOptions;
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::mu_calculus::{Formula, Node};
@@ -81,6 +81,11 @@ pub struct ModelDiagnostics {
     /// "stop-silent-cut" half: the cut is no longer invisible. The fix is to
     /// provide the missing module source(s).
     pub blackboxed_modules: Vec<String>,
+    /// Reset inputs that were pinned inactive at the model level so the body is
+    /// verified only while not in reset (the `disable iff` guards were dropped
+    /// from the formulas). Empty when reset-gating is off or no `disable iff`
+    /// reset was recognized. Each entry is `"<signal>=<inactive_value>"`.
+    pub gated_resets: Vec<String>,
 }
 
 /// Result of an automated SVA verification run.
@@ -129,6 +134,14 @@ pub struct VerifyAutoOptions {
     /// Must-edge inference policy passed to each property's CEGAR run. Default
     /// `Off`; `SmtHyperMust` gives sound νμ verdicts (the recoverability case).
     pub must_edge_inference: MustEdgeInference,
+    /// When `true` (default), `disable iff (reset)` guards are dropped from the
+    /// formulas and the recognized reset inputs are pinned inactive at the
+    /// model level (so the body is verified only while not in reset, matching
+    /// SVA `disable iff` semantics). This removes the otherwise-unbindable
+    /// reset-input atom that would force a SKIP. The dominant idiom in real
+    /// SVA, so it is on by default; set `false` to keep the guard and leave
+    /// the reset free.
+    pub gate_reset: bool,
 }
 
 impl Default for VerifyAutoOptions {
@@ -136,6 +149,7 @@ impl Default for VerifyAutoOptions {
         Self {
             max_iterations: 16,
             must_edge_inference: MustEdgeInference::Off,
+            gate_reset: true,
         }
     }
 }
@@ -321,8 +335,15 @@ pub fn verify_auto(
     })?;
     let _ = primary_name;
 
-    // 1. Extract + translate the SVA.
-    let extraction = extract_sva(sources)?;
+    // 1. Extract + translate the SVA. When reset-gating, the `disable iff`
+    // guards are dropped from the formulas and the recognized reset signals are
+    // reported (we pin them inactive in the lift below).
+    let extraction = extract_sva_with_options(
+        sources,
+        &TranslateOptions {
+            gate_reset: opts.gate_reset,
+        },
+    )?;
 
     let mut report = AutoVerifyReport {
         unsupported: extraction
@@ -335,6 +356,19 @@ pub fn verify_auto(
     if extraction.translated.is_empty() {
         return Ok(report);
     }
+
+    // Reset inputs to pin inactive (reset-gating) — applied to the lifted BTOR2
+    // below via `pin_inputs_to_constants`. Empty when gating is off or no
+    // `disable iff` reset was recognized.
+    let reset_pins: Vec<(String, u64)> = if opts.gate_reset {
+        extraction
+            .reset_signals
+            .iter()
+            .map(|rs| (rs.signal.clone(), rs.inactive_value))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // 2. SV → flattened BTOR2, then 3. augment the `__past` shadow flops. The
     // lift also reports modules it black-boxed (instantiated, no body) — those
@@ -363,6 +397,15 @@ pub fn verify_auto(
         .filter(|b| crate::adapter::btor2::parser::resolve_state_by_symbol(&pre_file, b).is_some())
         .collect();
     let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
+
+    // Pin recognized reset inputs inactive so the (un-guarded) bodies are
+    // verified only while not in reset (the model-level half of reset-gating).
+    // `gated_resets` records only the resets actually found + pinned in the
+    // BTOR2 — a recognized reset that the lift renamed/optimized away is left
+    // unpinned rather than misreported.
+    let (btor2, pinned_resets) =
+        crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &reset_pins);
+    report.diagnostics.gated_resets = pinned_resets;
 
     // State-cell symbols of the augmented design — the seedable-atom universe.
     let file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
@@ -619,6 +662,7 @@ mod tests {
         let diag = ModelDiagnostics {
             state_register_count: 0,
             blackboxed_modules: vec!["prim_sparse_fsm_flop".to_string()],
+            gated_resets: Vec::new(),
         };
         let reason = unseedable_skip_reason(&["state_q == 41".to_string()], &diag);
         assert!(reason.contains("state_q == 41"), "carries the symptom");
@@ -637,6 +681,7 @@ mod tests {
         let diag = ModelDiagnostics {
             state_register_count: 0,
             blackboxed_modules: Vec::new(),
+            gated_resets: Vec::new(),
         };
         let reason = unseedable_skip_reason(&["foo == 1".to_string()], &diag);
         assert!(
@@ -651,6 +696,7 @@ mod tests {
         let diag = ModelDiagnostics {
             state_register_count: 3,
             blackboxed_modules: Vec::new(),
+            gated_resets: Vec::new(),
         };
         let reason = unseedable_skip_reason(&["gnt_o != 0".to_string()], &diag);
         assert!(reason.contains("gnt_o != 0"));
@@ -669,6 +715,63 @@ mod tests {
         let err = verify_auto(&[], &YosysOptions::default(), &VerifyAutoOptions::default())
             .expect_err("no sources");
         assert_eq!(err.kind, AdapterErrorKind::ParseError);
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3; run with --ignored"]
+    fn e2e_reset_gating_turns_a_skip_into_a_verdict() {
+        // A 2-bit FSM cycling 0→1→2→0, with an active-low-reset-guarded
+        // assertion `disable iff (!rst_n) state != 3`. With reset-gating ON
+        // (default) the guard is dropped, rst_n is pinned inactive, and the
+        // body `state != 3` is a state-cell property → HOLDS. With gating OFF
+        // the `!rst_n` IO atom is unbindable → SKIPPED. This is the headline
+        // before/after that the reset-gating fix delivers.
+        let sv = "module fsm (input logic clk, input logic rst_n);\n\
+                  logic [1:0] state;\n\
+                  always_ff @(posedge clk) begin\n\
+                    if (!rst_n) state <= 2'd0;\n\
+                    else state <= (state == 2'd2) ? 2'd0 : state + 2'd1;\n\
+                  end\n\
+                  ok: assert property (@(posedge clk) disable iff (!rst_n) state != 2'd3);\n\
+                  endmodule\n";
+        let sources = vec![("fsm.sv".to_string(), sv.to_string())];
+        let yopts = YosysOptions {
+            top: Some("fsm".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+
+        // Reset-gating ON (default): the guard is dropped + rst_n pinned.
+        let gated = verify_auto(&sources, &yopts, &VerifyAutoOptions::default())
+            .expect("verify_auto runs with reset-gating");
+        assert_eq!(gated.properties.len(), 1);
+        assert!(
+            matches!(gated.properties[0].outcome, VerifyOutcome::Holds),
+            "reset-gated `state != 3` should HOLD; got {:?}",
+            gated.properties[0].outcome
+        );
+        assert_eq!(
+            gated.diagnostics.gated_resets,
+            vec!["rst_n=1".to_string()],
+            "active-low reset pinned inactive"
+        );
+
+        // Reset-gating OFF: the `!rst_n` IO atom is unbindable → SKIPPED.
+        let ungated = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                gate_reset: false,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs without reset-gating");
+        assert!(
+            matches!(ungated.properties[0].outcome, VerifyOutcome::Skipped { .. }),
+            "without gating the reset atom forces a SKIP; got {:?}",
+            ungated.properties[0].outcome
+        );
+        assert!(ungated.diagnostics.gated_resets.is_empty());
     }
 
     #[test]
