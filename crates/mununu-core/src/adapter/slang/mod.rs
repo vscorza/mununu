@@ -24,6 +24,8 @@ use std::process::Command;
 
 use crate::adapter::{AdapterError, AdapterErrorKind};
 
+pub mod translate;
+
 /// Handle to a discovered slang binary + its parsed version (diagnostic only;
 /// mununu does not gate on version). Mirrors [`crate::adapter::cvc5::Cvc5Bin`].
 #[derive(Debug, Clone)]
@@ -108,7 +110,13 @@ pub fn run_ast_json(
     include_dirs: &[PathBuf],
 ) -> Result<String, AdapterError> {
     let mut cmd = Command::new(&bin.path);
-    cmd.arg("--ast-json").arg("-").arg("--single-unit");
+    // `--quiet` suppresses slang's "Top level design units" / build-summary
+    // banner so stdout is *pure* JSON (the `-` sink). Without it the banner
+    // prefixes the JSON and downstream `serde_json` parsing fails at column 1.
+    cmd.arg("--ast-json")
+        .arg("-")
+        .arg("--quiet")
+        .arg("--single-unit");
     for d in include_dirs {
         cmd.arg("-I").arg(d);
     }
