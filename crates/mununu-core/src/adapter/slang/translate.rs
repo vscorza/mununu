@@ -136,6 +136,13 @@ pub fn translate_ast_json(json: &str) -> Result<TranslationReport, AdapterError>
     let mut found: Vec<(String, &Value)> = Vec::new();
     collect_assertions(&root, "design", &mut found);
 
+    // XL.6b follow-up — enum-constant resolution. slang keeps an enum-member
+    // reference (e.g. `MainSmError`) as a `NamedValue`, NOT folded to its value,
+    // so `state_q == MainSmError` reads as signal-vs-signal. Map every enum
+    // member to its integer value so the pre-pass can rewrite those references
+    // to integer literals (enum-typed FSMs are ubiquitous in real RTL).
+    let enum_values = collect_enum_values(&root);
+
     let mut report = TranslationReport::default();
     for (idx, (module, node)) in found.iter().enumerate() {
         let name = format!("{module}_sva_{idx}");
@@ -160,6 +167,9 @@ pub fn translate_ast_json(json: &str) -> Result<TranslationReport, AdapterError>
             });
             continue;
         };
+        // Rewrite enum-member references to integer literals before translating.
+        let spec = resolve_enum_refs(spec, &enum_values);
+        let spec = &spec;
         match translate_one(spec, kind) {
             Ok(formula) => {
                 // XL.2: a cover's `EF φ` gets its `AG EF φ` recoverability lens.
@@ -212,6 +222,68 @@ fn collect_assertions<'a>(node: &'a Value, enclosing: &str, out: &mut Vec<(Strin
             }
         }
         _ => {}
+    }
+}
+
+/// XL.6b follow-up — collect every enum member's integer value (`name → value`)
+/// from the `--ast-json` `EnumValue` nodes (`value` is an SV literal like
+/// `6'b101001`). Lets [`resolve_enum_refs`] fold enum-member references in
+/// comparisons (`state_q == MainSmError`) to integer literals.
+fn collect_enum_values(node: &Value) -> std::collections::HashMap<String, i64> {
+    fn walk(n: &Value, out: &mut std::collections::HashMap<String, i64>) {
+        match n {
+            Value::Object(m) => {
+                if m.get("kind").and_then(Value::as_str) == Some("EnumValue")
+                    && let Some(name) = m.get("name").and_then(Value::as_str)
+                    && let Some(v) = m
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .and_then(parse_sv_literal)
+                {
+                    out.entry(name.to_string()).or_insert(v);
+                }
+                for v in m.values() {
+                    walk(v, out);
+                }
+            }
+            Value::Array(a) => {
+                for v in a {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    walk(node, &mut out);
+    out
+}
+
+/// XL.6b follow-up — deep-clone an expression tree, replacing every `NamedValue`
+/// referencing an enum member (by name, in `enums`) with an `IntegerLiteral` of
+/// its value. A signal *of* an enum type (e.g. `state_q`) is not an enum-member
+/// name, so it is left untouched — only the constants fold.
+fn resolve_enum_refs(node: &Value, enums: &std::collections::HashMap<String, i64>) -> Value {
+    match node {
+        Value::Object(m) => {
+            if m.get("kind").and_then(Value::as_str) == Some("NamedValue")
+                && let Some(sym) = m.get("symbol").and_then(Value::as_str)
+                && let Some(&v) = enums.get(sym.rsplit(' ').next().unwrap_or(sym))
+            {
+                return serde_json::json!({
+                    "kind": "IntegerLiteral",
+                    "constant": v.to_string(),
+                    "value": v.to_string(),
+                });
+            }
+            let mut obj = serde_json::Map::new();
+            for (k, v) in m {
+                obj.insert(k.clone(), resolve_enum_refs(v, enums));
+            }
+            Value::Object(obj)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|v| resolve_enum_refs(v, enums)).collect()),
+        other => other.clone(),
     }
 }
 
@@ -1085,6 +1157,43 @@ mod tests {
                 },
             ],
             "required_shadows must dedup by base + carry width"
+        );
+    }
+
+    #[test]
+    fn enum_member_comparison_resolves_to_literal() {
+        // `state_q == MainSmError` where MainSmError is an enum member with value
+        // 6'b101001 (=41). The package's EnumValue node carries the value; the
+        // pre-pass folds the NamedValue reference to `41` so it translates.
+        let doc = serde_json::json!({
+            "members": [
+                {"kind": "EnumValue", "name": "MainSmError", "value": "6'b101001"}
+            ],
+            "body": {
+                "kind": "ConcurrentAssertion",
+                "assertionKind": "Assert",
+                "propertySpec": {
+                    "kind": "Simple",
+                    "expr": {
+                        "kind": "BinaryOp", "op": "Equality",
+                        "left":  {"kind": "NamedValue", "symbol": "1 state_q", "type": "csrng_pkg::main_sm_state_e"},
+                        "right": {"kind": "NamedValue", "symbol": "2 MainSmError", "type": "csrng_pkg::main_sm_state_e"}
+                    }
+                }
+            }
+        });
+        let report = translate_ast_json(&doc.to_string()).expect("valid");
+        assert_eq!(
+            report.unsupported.len(),
+            0,
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.translated.len(), 1);
+        assert!(
+            report.translated[0].formula.contains("state_q == 41"),
+            "enum member must fold to its value (41); got {}",
+            report.translated[0].formula
         );
     }
 

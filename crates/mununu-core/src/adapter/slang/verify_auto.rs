@@ -291,10 +291,21 @@ pub fn verify_auto(
         e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
         e
     })?;
+    // Augment only the `__past` shadows whose base resolves to a BTOR2 state
+    // cell. A base the lift renamed away (the SVA name not matching the lifted
+    // register) would hard-error `augment_with_past_shadows`, aborting the whole
+    // run; instead we skip it here and the properties that need its `__past`
+    // atom are SKIPPED below (the atom finds no state cell). Graceful per-design
+    // degradation, not an abort.
+    let pre_file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
+        e.message = format!("verify_auto: parse lifted BTOR2: {}", e.message);
+        e
+    })?;
     let shadow_bases: Vec<&str> = extraction
         .required_shadows
         .iter()
         .map(|s| s.base.as_str())
+        .filter(|b| crate::adapter::btor2::parser::resolve_state_by_symbol(&pre_file, b).is_some())
         .collect();
     let btor2 = augment_with_past_shadows(&btor2, &shadow_bases)?;
 
