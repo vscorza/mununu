@@ -1,4 +1,4 @@
-//! XL.1b — Tier-1 SVA → mu-calculus translation over slang's `--ast-json`.
+//! XL.1b/XL.1c — Tier-1 SVA → mu-calculus translation over slang's `--ast-json`.
 //!
 //! Walks the JSON [`crate::adapter::slang::run_ast_json`] produces, finds every
 //! `ConcurrentAssertion`, and translates the Tier-1 fragment to a mu-calculus
@@ -18,12 +18,24 @@
 //! Implication `a → b` is emitted as `!a || b` — the mu-calculus parser has no
 //! `->` operator, and the rewrite is exact.
 //!
-//! **Atoms.** A boolean leaf is a signal (`NamedValue` → identifier atom) or a
-//! comparison (`sig == k`, parsed as a comparison predicate). Boolean structure
-//! (`!`, `&&`, `||`) recurses. Anything outside this fragment — reductions,
-//! arithmetic, indexing, sequences (`##`, `[*n]`), `$past`, etc. — is **rejected
-//! with a reason, never silently dropped** (claims-integrity), and every emitted
-//! formula is validated through the mu-calculus parser as a safety net.
+//! **Atoms (XL.1b + XL.1c).** A boolean leaf is one of:
+//! - a 1-bit signal (`NamedValue` → identifier atom);
+//! - a multi-bit signal in boolean position (vector → `(sig != 0)`, the implicit
+//!   reduction-or SV applies to a vector condition);
+//! - a comparison `sig OP k` (`==`/`!=`/`<`/`>`/`<=`/`>=` against an integer);
+//! - a **reduction** (XL.1c): `|x`→`(x != 0)`, `~|x`→`(x == 0)`, `&x`→`(x == 2^W-1)`,
+//!   `~&x`→`(x != 2^W-1)` (width `W` from the operand's slang type);
+//! - a **compare-to-zero of a boolean expr** (XL.1c): `bexpr !== '0`→`bexpr`,
+//!   `bexpr === '0`→`!bexpr` — this is how OpenTitan's `` `ASSERT `` macro encodes
+//!   `disable iff ((!rst_ni) !== '0)`.
+//!
+//! Every XL.1c rewrite above is **exact** (semantics-preserving), so it adds no
+//! new soundness regime over XL.1b. Boolean structure (`!`, `&&`, `||`) recurses.
+//! Anything outside the fragment — bit-arithmetic, bit-select indexing (`sig[i]`),
+//! reduction-xor/xnor (parity), system calls (`$onehot0`, `$isunknown`),
+//! sequences (`##`, `[*n]`), `$past`, etc. — is **rejected with a reason, never
+//! silently dropped** (claims-integrity), and every emitted formula is validated
+//! through the mu-calculus parser as a safety net.
 //!
 //! [XL.0]: ../../../../.claude/plans/measurements/XL-0-sva-parser-spike-2026-06-26.md
 
@@ -207,16 +219,36 @@ fn simple_bool(spec: &Value) -> Result<String, String> {
 
 /// Translate a boolean `Expression` into mu-calculus atom/connective text.
 fn bool_expr(expr: &Value) -> Result<String, String> {
+    let expr = unwrap(expr);
     let k = expr.get("kind").and_then(Value::as_str).unwrap_or("?");
     match k {
-        "NamedValue" => signal_name(expr).map(|s| s.to_string()),
+        // A bare signal in boolean position: 1-bit → identifier atom; a vector
+        // is implicitly reduction-or'd by SV in a condition → `(sig != 0)`.
+        "NamedValue" => {
+            let name = signal_name(expr)?;
+            if signal_width(expr) > 1 {
+                Ok(format!("({name} != 0)"))
+            } else {
+                Ok(name.to_string())
+            }
+        }
         "UnaryOp" => {
             let op = expr.get("op").and_then(Value::as_str).unwrap_or("?");
-            if op == "LogicalNot" {
-                let inner = bool_expr(child(expr, "operand")?)?;
-                Ok(format!("(!({inner}))"))
-            } else {
-                Err(format!("unsupported unary op: {op}"))
+            let operand = unwrap(child(expr, "operand")?);
+            match op {
+                "LogicalNot" => Ok(format!("(!({}))", bool_expr(operand)?)),
+                // XL.1c reductions over a vector — exact rewrites to comparisons.
+                "BitwiseOr" => reduction_to_cmp(operand, "!=", false), //  |x  → x != 0
+                "BitwiseNor" => reduction_to_cmp(operand, "==", false), // ~|x  → x == 0
+                "BitwiseAnd" => reduction_to_cmp(operand, "==", true), //  &x  → x == all-ones
+                "BitwiseNand" => reduction_to_cmp(operand, "!=", true), // ~&x → x != all-ones
+                // `~x` (full bitwise-not): logical-not on a 1-bit operand only.
+                "BitwiseNot" => bitwise_not(operand),
+                "BitwiseXor" | "BitwiseXnor" => Err(format!(
+                    "reduction-{} (parity) is not expressible as a propositional atom",
+                    if op == "BitwiseXor" { "xor" } else { "xnor" }
+                )),
+                other => Err(format!("unsupported unary op: {other}")),
             }
         }
         "BinaryOp" => {
@@ -232,33 +264,156 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
                     let r = bool_expr(child(expr, "right")?)?;
                     Ok(format!("({l} || {r})"))
                 }
-                // Comparison atoms: only `signal OP literal` (the form the
-                // mu-calculus parser accepts as a comparison predicate).
-                "Equality" | "CaseEquality" => comparison(expr, "=="),
-                "Inequality" | "CaseInequality" => comparison(expr, "!="),
-                "LessThan" => comparison(expr, "<"),
-                "GreaterThan" => comparison(expr, ">"),
-                "LessThanEqual" => comparison(expr, "<="),
-                "GreaterThanEqual" => comparison(expr, ">="),
+                "Equality" | "CaseEquality" => compare(expr, "=="),
+                "Inequality" | "CaseInequality" => compare(expr, "!="),
+                "LessThan" => compare(expr, "<"),
+                "GreaterThan" => compare(expr, ">"),
+                "LessThanEqual" => compare(expr, "<="),
+                "GreaterThanEqual" => compare(expr, ">="),
                 other => Err(format!("unsupported binary op: {other}")),
             }
         }
+        // Bit-select `sig[i]` — distinguish constant (needs a bit-level model
+        // predicate; H.1 seeding) from dynamic (index is a signal; not a
+        // propositional atom at all). Both rejected, never silently dropped.
+        "ElementSelect" => {
+            let selector = unwrap(child(expr, "selector")?);
+            if sv_integer(selector).is_some() {
+                Err(
+                    "constant bit-select `sig[k]` needs a bit-level model predicate \
+                     (H.1 auto-seeding); not a Tier-1c atom"
+                        .to_string(),
+                )
+            } else {
+                Err("dynamic bit-select `sig[idx]` (index is a signal) is not \
+                     expressible as a propositional atom"
+                    .to_string())
+            }
+        }
+        "Call" => Err("system/subroutine call (e.g. `$onehot0`, `$isunknown`) is \
+                       not in the Tier-1c fragment"
+            .to_string()),
         other => Err(format!("unsupported expression kind: {other}")),
     }
 }
 
-/// `signal OP literal` → a comparison atom; rejects non-atomic operands so the
-/// emitted atom stays in the parser's `identifier OP value` shape.
-fn comparison(expr: &Value, op: &str) -> Result<String, String> {
-    let lhs = signal_name(child(expr, "left")?)
-        .map_err(|_| "comparison LHS is not a plain signal".to_string())?;
-    let rhs = integer_literal(child(expr, "right")?)
-        .ok_or_else(|| "comparison RHS is not an integer literal".to_string())?;
-    Ok(format!("{lhs} {op} {rhs}"))
+/// Restructured comparison handler (XL.1c). Accepts, in order:
+/// 1. `signal OP literal` → `(sig OP lit)`;
+/// 2. `literal OP signal` → `(sig OP' lit)` with the operator flipped;
+/// 3. `bool-expr ==/!= 0`  → `!bexpr` / `bexpr` (exact, since `bool != 0 ≡ bool`).
+fn compare(expr: &Value, op: &str) -> Result<String, String> {
+    let left = unwrap(child(expr, "left")?);
+    let right = unwrap(child(expr, "right")?);
+
+    // (1) signal OP literal
+    if let (Ok(sig), Some(lit)) = (signal_name(left), sv_integer(right)) {
+        return Ok(format!("({sig} {op} {lit})"));
+    }
+    // (2) literal OP signal  → flip to signal OP' literal
+    if let (Some(lit), Ok(sig)) = (sv_integer(left), signal_name(right)) {
+        return Ok(format!("({sig} {} {lit})", flip_op(op)));
+    }
+    // (3) boolean-expr ==/!= 0
+    if matches!(op, "==" | "!=") {
+        let other = if sv_integer(right) == Some(0) {
+            Some(left)
+        } else if sv_integer(left) == Some(0) {
+            Some(right)
+        } else {
+            None
+        };
+        if let Some(other) = other {
+            let b = bool_expr(other)?;
+            return Ok(if op == "!=" { b } else { format!("(!({b}))") });
+        }
+    }
+    Err(format!(
+        "comparison must be `signal {op} literal`, `literal {op} signal`, or a \
+         `boolean-expr ==/!= 0` form; got left={:?} right={:?}",
+        left.get("kind").and_then(Value::as_str),
+        right.get("kind").and_then(Value::as_str),
+    ))
 }
 
-/// Extract the signal name from a `NamedValue` (`"symbol": "<id> name"`).
+/// A reduction over a single vector signal → an exact comparison atom.
+/// `need_all_ones` selects the `&`/`~&` RHS (`2^W - 1` from the operand width)
+/// versus the `|`/`~|` RHS (`0`).
+fn reduction_to_cmp(operand: &Value, op: &str, need_all_ones: bool) -> Result<String, String> {
+    let sig = signal_name(operand)
+        .map_err(|_| format!("reduction `{op}` over a non-signal operand (only `OP signal`)"))?;
+    let rhs: i64 = if need_all_ones {
+        let w = signal_width(operand);
+        if w == 0 || w >= 63 {
+            return Err(format!(
+                "reduction-and/nand width {w} unusable for an all-ones i64 literal"
+            ));
+        }
+        (1i64 << w) - 1
+    } else {
+        0
+    };
+    Ok(format!("({sig} {op} {rhs})"))
+}
+
+/// `~x` in boolean position: logical-not on a 1-bit operand; a vector `~x` is a
+/// value transform, not a boolean, so it is rejected.
+fn bitwise_not(operand: &Value) -> Result<String, String> {
+    if signal_width(operand) == 1 {
+        Ok(format!("(!({}))", bool_expr(operand)?))
+    } else {
+        Err(format!(
+            "bitwise-not `~` over a {}-bit vector is a value transform, not a boolean",
+            signal_width(operand)
+        ))
+    }
+}
+
+/// Peel slang `Conversion` (width-cast) wrappers to the underlying expression.
+fn unwrap(mut e: &Value) -> &Value {
+    while e.get("kind").and_then(Value::as_str) == Some("Conversion") {
+        match e.get("operand") {
+            Some(o) => e = o,
+            None => break,
+        }
+    }
+    e
+}
+
+/// Bit-width of an expression from its slang `type` string. `logic[7:0]`→8,
+/// `logic`/`bit`/`reg`→1, unknown→1 (the safe scalar default).
+fn signal_width(expr: &Value) -> u32 {
+    let Some(ty) = expr.get("type").and_then(Value::as_str) else {
+        return 1;
+    };
+    match (ty.find('['), ty.find(']')) {
+        (Some(l), Some(r)) if r > l => {
+            let inner = &ty[l + 1..r];
+            if let Some((hi, lo)) = inner.split_once(':')
+                && let (Ok(hi), Ok(lo)) = (hi.trim().parse::<i64>(), lo.trim().parse::<i64>())
+            {
+                return (hi - lo).unsigned_abs() as u32 + 1;
+            }
+            1
+        }
+        _ => 1,
+    }
+}
+
+/// Flip a comparison operator (for the `literal OP signal` normalisation).
+fn flip_op(op: &str) -> &str {
+    match op {
+        "<" => ">",
+        ">" => "<",
+        "<=" => ">=",
+        ">=" => "<=",
+        other => other,
+    }
+}
+
+/// Extract the signal name from a `NamedValue` (`"symbol": "<id> name"`),
+/// peeling `Conversion` wrappers first.
 fn signal_name(expr: &Value) -> Result<&str, String> {
+    let expr = unwrap(expr);
     if expr.get("kind").and_then(Value::as_str) != Some("NamedValue") {
         return Err("expected a NamedValue signal reference".to_string());
     }
@@ -270,20 +425,47 @@ fn signal_name(expr: &Value) -> Result<&str, String> {
     Ok(sym.rsplit(' ').next().unwrap_or(sym))
 }
 
-/// Extract a non-negative decimal value from an integer-literal expression.
-fn integer_literal(expr: &Value) -> Option<u64> {
+/// Parse an integer-literal expression to its value. Handles plain decimal,
+/// based (`8'd5`, `4'hF`, `3'o7`, `1'b0`) and unbased-unsized (`'0`/`'1`,
+/// serialised by slang as `1'b0`/`1'b1`) forms. `Conversion`-wrapped literals
+/// are peeled first.
+fn sv_integer(expr: &Value) -> Option<i64> {
+    let expr = unwrap(expr);
     let k = expr.get("kind").and_then(Value::as_str)?;
     if !k.contains("IntegerLiteral") {
         return None;
     }
-    // slang serialises the constant as `"constant": "<width>'<base><digits>"` or
-    // a plain value; accept the first run of decimal digits.
     let raw = expr
         .get("constant")
         .or_else(|| expr.get("value"))
         .and_then(Value::as_str)?;
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u64>().ok()
+    parse_sv_literal(raw)
+}
+
+/// Parse SystemVerilog integer-literal text. `"8"`→8, `"8'd5"`→5, `"1'b0"`→0,
+/// `"4'hff"`→255, `"3'b101"`→5. Returns `None` for X/Z digits or malformed text.
+fn parse_sv_literal(raw: &str) -> Option<i64> {
+    let s: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .collect();
+    let Some(tick) = s.find('\'') else {
+        return s.parse::<i64>().ok();
+    };
+    // After the tick: optional signedness (`s`/`S`), then a base char, then digits.
+    let rest = &s[tick + 1..];
+    let rest = rest.strip_prefix(['s', 'S']).unwrap_or(rest);
+    let mut chars = rest.chars();
+    let base = chars.next()?;
+    let digits: String = chars.collect();
+    let radix = match base.to_ascii_lowercase() {
+        'b' => 2,
+        'o' => 8,
+        'd' => 10,
+        'h' => 16,
+        _ => return None,
+    };
+    i64::from_str_radix(&digits, radix).ok()
 }
 
 fn child<'a>(node: &'a Value, key: &str) -> Result<&'a Value, String> {
@@ -375,14 +557,98 @@ mod tests {
 
     #[test]
     fn unsupported_construct_is_recorded_not_dropped() {
-        // A reduction-or `|req` (UnaryOp other than LogicalNot) is out of Tier-1.
+        // Reduction-xor `^x` (parity) is out of the fragment — not expressible
+        // as a propositional atom, so it must be rejected (never dropped).
         let spec = serde_json::json!({
             "kind": "Simple",
-            "expr": {"kind": "UnaryOp", "op": "ReductionOr",
-                     "operand": {"kind": "NamedValue", "symbol": "1 req"}}
+            "expr": {"kind": "UnaryOp", "op": "BitwiseXor",
+                     "operand": {"kind": "NamedValue", "symbol": "1 req", "type": "logic[7:0]"}}
         });
         let err = translate_one(&spec, SvaKind::Assert).expect_err("must reject");
-        assert!(err.contains("unsupported unary op"), "got: {err}");
+        assert!(err.contains("parity"), "got: {err}");
+    }
+
+    #[test]
+    fn xl1c_reduction_or_becomes_nonzero_comparison() {
+        // `|gnt_o |-> ready_i` — the reduction-or LHS → `(gnt_o != 0)`.
+        let spec = serde_json::json!({
+            "kind": "Binary",
+            "op": "OverlappedImplication",
+            "left": {"kind": "Simple", "expr":
+                {"kind": "UnaryOp", "op": "BitwiseOr",
+                 "operand": {"kind": "NamedValue", "symbol": "1 gnt_o", "type": "logic[7:0]"}}},
+            "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 ready_i"}}
+        });
+        let f = translate_one(&spec, SvaKind::Assert).expect("translates");
+        assert!(f.contains("(gnt_o != 0)"), "reduction-or → != 0; got {f}");
+        assert!(f.contains("ready_i"));
+        crate::mu_calculus::parser::parse(&f).expect("parses");
+    }
+
+    #[test]
+    fn xl1c_reduction_and_uses_operand_width_all_ones() {
+        // `&x` over logic[7:0] → `(x == 255)`.
+        let expr = serde_json::json!({
+            "kind": "UnaryOp", "op": "BitwiseAnd",
+            "operand": {"kind": "NamedValue", "symbol": "1 x", "type": "logic[7:0]"}
+        });
+        assert_eq!(bool_expr(&expr).unwrap(), "(x == 255)");
+        // `~&x` → `(x != 255)`.
+        let nand = serde_json::json!({
+            "kind": "UnaryOp", "op": "BitwiseNand",
+            "operand": {"kind": "NamedValue", "symbol": "1 x", "type": "logic[2:0]"}
+        });
+        assert_eq!(bool_expr(&nand).unwrap(), "(x != 7)");
+    }
+
+    #[test]
+    fn xl1c_disable_iff_macro_form_translates() {
+        // The OpenTitan `ASSERT` macro encodes `disable iff ((!rst_ni) !== '0)`:
+        //   condition = CaseInequality((!rst_ni), '0)  →  `(!(rst_ni))`.
+        let spec = serde_json::json!({
+            "kind": "DisableIff",
+            "condition": {
+                "kind": "BinaryOp", "op": "CaseInequality",
+                "left": {"kind": "UnaryOp", "op": "LogicalNot",
+                         "operand": {"kind": "NamedValue", "symbol": "1 rst_ni", "type": "logic"}},
+                "right": {"kind": "UnbasedUnsizedIntegerLiteral", "value": "1'b0"}
+            },
+            "expr": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 a"}}
+        });
+        let body = property_body(&spec).expect("translates");
+        assert_eq!(body, "((!(rst_ni)) || a)");
+    }
+
+    #[test]
+    fn xl1c_sv_literal_parsing() {
+        assert_eq!(parse_sv_literal("8"), Some(8));
+        assert_eq!(parse_sv_literal("1'b0"), Some(0)); // the `'0` form (was the digit-filter bug)
+        assert_eq!(parse_sv_literal("8'd5"), Some(5));
+        assert_eq!(parse_sv_literal("4'hff"), Some(255));
+        assert_eq!(parse_sv_literal("3'b101"), Some(5));
+        assert_eq!(parse_sv_literal("16'sd42"), Some(42));
+        assert_eq!(parse_sv_literal("garbage"), None);
+    }
+
+    #[test]
+    fn xl1c_signal_width_from_type() {
+        let mk = |t: &str| serde_json::json!({"kind": "NamedValue", "symbol": "1 s", "type": t});
+        assert_eq!(signal_width(&mk("logic[7:0]")), 8);
+        assert_eq!(signal_width(&mk("logic[2:0]")), 3);
+        assert_eq!(signal_width(&mk("logic")), 1);
+        assert_eq!(signal_width(&mk("bit")), 1);
+    }
+
+    #[test]
+    fn xl1c_dynamic_bit_select_is_rejected_with_reason() {
+        // `req_i[idx_o]` — selector is a signal → dynamic, not a Tier-1c atom.
+        let expr = serde_json::json!({
+            "kind": "ElementSelect",
+            "selector": {"kind": "NamedValue", "symbol": "1 idx_o", "type": "logic[2:0]"},
+            "value": {"kind": "NamedValue", "symbol": "2 req_i", "type": "logic[7:0]"}
+        });
+        let err = bool_expr(&expr).expect_err("dynamic index must reject");
+        assert!(err.contains("dynamic bit-select"), "got: {err}");
     }
 
     #[test]
@@ -405,11 +671,26 @@ mod tests {
         for u in &report.unsupported {
             eprintln!("  unsupported {}: {}", u.name, u.reason);
         }
-        // Real OpenTitan SVA: the boolean-implication properties translate; the
-        // reduction-/index-/comparison-heavy ones are honestly reported
-        // unsupported (Tier-1 fragment). At least the 13 `ASSERT`s are seen, and
-        // some translate, none silently dropped.
-        assert!(report.total() >= 13, "all 13 `ASSERT`s should be seen");
+        // Real OpenTitan SVA. XL.1c lifts the reduction-or / disable-iff-macro
+        // properties (`|gnt_o |-> ready_i`, etc.); the bit-arithmetic, dynamic
+        // bit-select, and `$onehot0`/`$isunknown` ones stay honestly unsupported.
+        assert!(
+            report.total() >= 13,
+            "all 13 concurrent assertions should be seen"
+        );
+        assert!(
+            report.translated.len() >= 6,
+            "XL.1c should translate the 6 reduction/comparison ASSERTs \
+             (GntImpliesReady/Valid, ReqAndReadyImplyGrant, ReqImpliesValid, \
+             ReadyAndValidImplyGrant, NoReadyValidNoGrant); got {} translated, \
+             unsupported: {:?}",
+            report.translated.len(),
+            report
+                .unsupported
+                .iter()
+                .map(|u| &u.reason)
+                .collect::<Vec<_>>()
+        );
         for t in &report.translated {
             crate::mu_calculus::parser::parse(&t.formula).expect("translated formula parses");
         }
