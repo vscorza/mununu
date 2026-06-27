@@ -13,7 +13,9 @@
 
 use std::path::PathBuf;
 
-use crate::adapter::slang::translate::{TranslationReport, translate_ast_json};
+use crate::adapter::slang::translate::{
+    TranslateOptions, TranslationReport, translate_ast_json_with_options,
+};
 use crate::adapter::slang::{locate_slang, run_ast_json};
 use crate::adapter::{AdapterError, AdapterErrorKind};
 
@@ -27,6 +29,16 @@ use crate::adapter::{AdapterError, AdapterErrorKind};
 /// `UnsupportedConstruct` error — the feature degrades, it never panics), or
 /// slang emits no AST.
 pub fn extract_sva(sources: &[(String, String)]) -> Result<TranslationReport, AdapterError> {
+    extract_sva_with_options(sources, &TranslateOptions::default())
+}
+
+/// Like [`extract_sva`] but honoring [`TranslateOptions`] — e.g. `gate_reset`
+/// to drop `disable iff` guards so the verify-auto consumer can pin the reset
+/// input inactive at the model level.
+pub fn extract_sva_with_options(
+    sources: &[(String, String)],
+    opts: &TranslateOptions,
+) -> Result<TranslationReport, AdapterError> {
     if sources.is_empty() {
         return Err(AdapterError {
             kind: AdapterErrorKind::ParseError,
@@ -61,7 +73,7 @@ pub fn extract_sva(sources: &[(String, String)]) -> Result<TranslationReport, Ad
     // The staging dir doubles as the include search path.
     let include_dirs = vec![dir.path().to_path_buf()];
     let json = run_ast_json(&bin, &files, &include_dirs)?;
-    translate_ast_json(&json)
+    translate_ast_json_with_options(&json, opts)
     // `dir` drops here → temp files removed.
 }
 

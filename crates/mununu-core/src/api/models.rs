@@ -1012,6 +1012,11 @@ pub struct SvVerifyAutoRequest {
     /// gives sound νμ verdicts).
     #[serde(default)]
     pub must_edge_inference: Option<String>,
+    /// Reset-gating: drop recognized `disable iff (reset)` guards and pin the
+    /// reset input inactive at the model level (default `true`). Set `false`
+    /// to keep the guard and leave the reset free.
+    #[serde(default)]
+    pub gate_reset: Option<bool>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.
@@ -1035,6 +1040,10 @@ pub struct ModelDiagnosticsView {
     /// Modules instantiated without a body, cut to free inputs (registers they
     /// drive are not modeled as state). Empty for a self-contained design.
     pub blackboxed_modules: Vec<String>,
+    /// Reset inputs pinned inactive at the model level (`"<signal>=<value>"`),
+    /// with their `disable iff` guards dropped from the formulas. Empty when
+    /// reset-gating is off or no `disable iff` reset was recognized.
+    pub gated_resets: Vec<String>,
 }
 
 /// One property's auto-verification verdict (mirrors `PropertyVerdict`).

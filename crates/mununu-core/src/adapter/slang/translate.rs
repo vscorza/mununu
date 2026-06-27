@@ -107,6 +107,19 @@ pub struct ShadowSignal {
     pub width: u32,
 }
 
+/// A reset signal recognized in a `disable iff (...)` guard: the input to pin
+/// to verify the running (post-reset) design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetSignal {
+    /// The reset input signal name (matches the lifted BTOR2 input).
+    pub signal: String,
+    /// The value that makes the disable condition FALSE — i.e. reset *inactive*
+    /// (the design running). `1` for active-low (`disable iff (!rst_n)`); `0`
+    /// for active-high (`disable iff (rst)`). Pin the input here so the body is
+    /// verified only while not in reset, matching `disable iff` semantics.
+    pub inactive_value: u64,
+}
+
 /// Result of translating a whole `--ast-json` document.
 #[derive(Debug, Clone, Default)]
 pub struct TranslationReport {
@@ -116,6 +129,25 @@ pub struct TranslationReport {
     /// (deduped by base). The XL.3b BTOR2 augmentation consumes this; an empty
     /// vec means no Tier-2 history was used.
     pub required_shadows: Vec<ShadowSignal>,
+    /// Reset signals recognized in `disable iff` guards (deduped). Always
+    /// recorded; whether the guard is dropped from the formula is controlled by
+    /// [`TranslateOptions::gate_reset`]. The verify-auto path pins these inputs
+    /// inactive at the model level.
+    pub reset_signals: Vec<ResetSignal>,
+}
+
+/// Options controlling translation.
+#[derive(Debug, Clone, Default)]
+pub struct TranslateOptions {
+    /// When `true`, a recognizable `disable iff (reset)` guard is **dropped**
+    /// from the property body — the consumer is expected to pin the reset input
+    /// inactive at the model level instead (the general form of V.7-c's
+    /// `connect -set rst_ni 1'b1`). Dropping the guard removes the otherwise
+    /// unbindable reset-input atom, so the body becomes a pure state-cell
+    /// property. When `false` (default), the guard is kept as
+    /// `(reset_cond || body)`. Either way, detected resets are recorded in
+    /// [`TranslationReport::reset_signals`].
+    pub gate_reset: bool,
 }
 
 impl TranslationReport {
@@ -127,6 +159,15 @@ impl TranslationReport {
 
 /// Translate every concurrent assertion in a slang `--ast-json` document.
 pub fn translate_ast_json(json: &str) -> Result<TranslationReport, AdapterError> {
+    translate_ast_json_with_options(json, &TranslateOptions::default())
+}
+
+/// Translate every concurrent assertion, honoring [`TranslateOptions`] (e.g.
+/// `gate_reset` to drop `disable iff` guards for model-level reset pinning).
+pub fn translate_ast_json_with_options(
+    json: &str,
+    opts: &TranslateOptions,
+) -> Result<TranslationReport, AdapterError> {
     let root: Value = serde_json::from_str(json).map_err(|e| AdapterError {
         kind: AdapterErrorKind::ParseError,
         message: format!("adapter/slang/translate: --ast-json is not valid JSON: {e}"),
@@ -170,7 +211,7 @@ pub fn translate_ast_json(json: &str) -> Result<TranslationReport, AdapterError>
         // Rewrite enum-member references to integer literals before translating.
         let spec = resolve_enum_refs(spec, &enum_values);
         let spec = &spec;
-        match translate_one(spec, kind) {
+        match translate_one(spec, kind, opts, &mut report.reset_signals) {
             Ok(formula) => {
                 // XL.2: a cover's `EF φ` gets its `AG EF φ` recoverability lens.
                 // (Omitted if the companion somehow fails to parse — never ship
@@ -322,8 +363,13 @@ fn collect_shadow_signals(node: &Value, out: &mut Vec<ShadowSignal>) {
 
 /// Translate one assertion's `propertySpec` to a full mu-calculus formula, then
 /// validate it parses. `Err(reason)` for any out-of-fragment construct.
-fn translate_one(spec: &Value, kind: SvaKind) -> Result<String, String> {
-    let body = property_body(spec)?;
+fn translate_one(
+    spec: &Value,
+    kind: SvaKind,
+    opts: &TranslateOptions,
+    reset_signals: &mut Vec<ResetSignal>,
+) -> Result<String, String> {
+    let body = property_body(spec, opts, reset_signals)?;
     let formula = match kind {
         SvaKind::Assert | SvaKind::Assume => format!("nu X. (({body}) && [] X)"),
         SvaKind::Cover => format!("mu X. (({body}) || <> X)"),
@@ -349,17 +395,94 @@ fn recoverability_companion_formula(ef_formula: &str) -> Result<String, String> 
     Ok(companion)
 }
 
+/// Recognize a `disable iff` condition that is a single (possibly negated,
+/// possibly `!= 0`-wrapped) reset signal, and return the signal + the value
+/// that makes the condition FALSE (reset inactive). Returns `None` for complex
+/// conditions — those are left as a kept guard rather than gated, so we never
+/// silently mis-pin a multi-signal disable condition.
+///
+/// Recognized shapes (the dominant SVA idioms):
+/// - `rst` (1-bit `NamedValue`) → active-high; inactive value `0`.
+/// - `!rst_n` (`LogicalNot`/`BitwiseNot` of a 1-bit signal) → active-low;
+///   inactive value `1`.
+/// - `(<lhs>) !== '0` (`Inequality`/`CaseInequality` with a `0` RHS — the
+///   OpenTitan ``ASSERT`` macro form) → same polarity as `<lhs>`.
+fn extract_reset_signal(cond: &Value) -> Option<ResetSignal> {
+    let cond = unwrap(cond);
+    let kind = cond.get("kind").and_then(Value::as_str)?;
+    match kind {
+        "NamedValue" => {
+            if signal_width(cond) != 1 {
+                return None;
+            }
+            let name = signal_name(cond).ok()?;
+            Some(ResetSignal {
+                signal: name.to_string(),
+                inactive_value: 0,
+            })
+        }
+        "UnaryOp" => {
+            let op = cond.get("op").and_then(Value::as_str)?;
+            if !matches!(op, "LogicalNot" | "BitwiseNot") {
+                return None;
+            }
+            let operand = unwrap(child(cond, "operand").ok()?);
+            if operand.get("kind").and_then(Value::as_str)? != "NamedValue"
+                || signal_width(operand) != 1
+            {
+                return None;
+            }
+            let name = signal_name(operand).ok()?;
+            Some(ResetSignal {
+                signal: name.to_string(),
+                inactive_value: 1,
+            })
+        }
+        // `(<lhs>) !== '0` — the `!= 0` wrapper preserves the LHS's truth, so
+        // the reset polarity is the LHS's.
+        "BinaryOp" => {
+            let op = cond.get("op").and_then(Value::as_str)?;
+            if !matches!(op, "Inequality" | "CaseInequality") {
+                return None;
+            }
+            let right = unwrap(child(cond, "right").ok()?);
+            if sv_integer(right) != Some(0) {
+                return None;
+            }
+            extract_reset_signal(child(cond, "left").ok()?)
+        }
+        _ => None,
+    }
+}
+
 /// Translate an `AssertionExpr` into the per-step propositional body (the part
 /// inside `nu X. (BODY && []X)` / `mu X. (BODY || <>X)`).
-fn property_body(spec: &Value) -> Result<String, String> {
+fn property_body(
+    spec: &Value,
+    opts: &TranslateOptions,
+    reset_signals: &mut Vec<ResetSignal>,
+) -> Result<String, String> {
     let k = spec.get("kind").and_then(Value::as_str).unwrap_or("?");
     match k {
         // `@(posedge clk) P` — one CLTS step is one clock edge; strip the clock.
-        "Clocking" => property_body(child(spec, "expr")?),
+        "Clocking" => property_body(child(spec, "expr")?, opts, reset_signals),
         // `disable iff (r) P` — vacuously true while disabled: `(r || body)`.
+        // When `gate_reset` and the condition is a recognizable single-signal
+        // reset, drop the guard (consumer pins the reset inactive at the model
+        // level) and record the reset signal. Detected resets are recorded
+        // regardless of gating.
         "DisableIff" => {
-            let cond = bool_expr(child(spec, "condition")?)?;
-            let inner = property_body(child(spec, "expr")?)?;
+            let cond_node = child(spec, "condition")?;
+            let inner = property_body(child(spec, "expr")?, opts, reset_signals)?;
+            if let Some(rs) = extract_reset_signal(cond_node) {
+                if !reset_signals.contains(&rs) {
+                    reset_signals.push(rs);
+                }
+                if opts.gate_reset {
+                    return Ok(inner);
+                }
+            }
+            let cond = bool_expr(cond_node)?;
             Ok(format!("({cond} || {inner})"))
         }
         // `a |-> b` / `a |=> b` — left/right are boolean (Tier-1 `Simple`).
@@ -812,7 +935,13 @@ mod tests {
             "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
             "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}
         });
-        let f = translate_one(&spec, SvaKind::Assert).expect("translates");
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
         assert_eq!(f, "nu X. (((!(a) || b)) && [] X)");
         crate::mu_calculus::parser::parse(&f).expect("parses");
     }
@@ -826,7 +955,13 @@ mod tests {
             "left":  {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "1 a"}},
             "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 b"}}
         });
-        let f = translate_one(&spec, SvaKind::Assert).expect("translates");
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
         assert!(f.contains("[] b"), "|=> must put b under a next ([]): {f}");
         crate::mu_calculus::parser::parse(&f).expect("parses");
     }
@@ -840,7 +975,13 @@ mod tests {
             "expr": {"kind": "UnaryOp", "op": "BitwiseXor",
                      "operand": {"kind": "NamedValue", "symbol": "1 req", "type": "logic[7:0]"}}
         });
-        let err = translate_one(&spec, SvaKind::Assert).expect_err("must reject");
+        let err = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect_err("must reject");
         assert!(err.contains("parity"), "got: {err}");
     }
 
@@ -855,7 +996,13 @@ mod tests {
                  "operand": {"kind": "NamedValue", "symbol": "1 gnt_o", "type": "logic[7:0]"}}},
             "right": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 ready_i"}}
         });
-        let f = translate_one(&spec, SvaKind::Assert).expect("translates");
+        let f = translate_one(
+            &spec,
+            SvaKind::Assert,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
+        )
+        .expect("translates");
         assert!(f.contains("(gnt_o != 0)"), "reduction-or → != 0; got {f}");
         assert!(f.contains("ready_i"));
         crate::mu_calculus::parser::parse(&f).expect("parses");
@@ -891,7 +1038,8 @@ mod tests {
             },
             "expr": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 a"}}
         });
-        let body = property_body(&spec).expect("translates");
+        let body = property_body(&spec, &TranslateOptions::default(), &mut Vec::new())
+            .expect("translates");
         assert_eq!(body, "((!(rst_ni)) || a)");
     }
 
@@ -981,8 +1129,69 @@ mod tests {
                           "operand": {"kind": "NamedValue", "symbol": "1 rst_n"}},
             "expr": {"kind": "Simple", "expr": {"kind": "NamedValue", "symbol": "2 a"}}
         });
-        let body = property_body(&spec).expect("translates");
+        let body = property_body(&spec, &TranslateOptions::default(), &mut Vec::new())
+            .expect("translates");
         assert_eq!(body, "((!(rst_n)) || a)");
+
+        // With reset-gating the guard is dropped and the reset is recorded.
+        let mut resets = Vec::new();
+        let gated = property_body(&spec, &TranslateOptions { gate_reset: true }, &mut resets)
+            .expect("translates");
+        assert_eq!(gated, "a", "gate_reset drops the disable-iff guard");
+        assert_eq!(
+            resets,
+            vec![ResetSignal {
+                signal: "rst_n".to_string(),
+                inactive_value: 1,
+            }],
+            "active-low reset recorded with inactive value 1"
+        );
+    }
+
+    #[test]
+    fn extract_reset_signal_recognizes_common_idioms() {
+        // active-high `disable iff (rst)` → inactive value 0.
+        let active_high = serde_json::json!({"kind": "NamedValue", "symbol": "1 rst"});
+        assert_eq!(
+            extract_reset_signal(&active_high),
+            Some(ResetSignal {
+                signal: "rst".to_string(),
+                inactive_value: 0
+            })
+        );
+        // active-low `disable iff (!rst_n)` → inactive value 1.
+        let active_low = serde_json::json!({
+            "kind": "UnaryOp", "op": "LogicalNot",
+            "operand": {"kind": "NamedValue", "symbol": "1 rst_n"}
+        });
+        assert_eq!(
+            extract_reset_signal(&active_low),
+            Some(ResetSignal {
+                signal: "rst_n".to_string(),
+                inactive_value: 1
+            })
+        );
+        // OpenTitan macro `(!rst_ni) !== '0` → same polarity as the LHS (1).
+        let macro_form = serde_json::json!({
+            "kind": "BinaryOp", "op": "CaseInequality",
+            "left": {"kind": "UnaryOp", "op": "LogicalNot",
+                     "operand": {"kind": "NamedValue", "symbol": "1 rst_ni", "type": "logic"}},
+            "right": {"kind": "UnbasedUnsizedIntegerLiteral", "value": "1'b0"}
+        });
+        assert_eq!(
+            extract_reset_signal(&macro_form),
+            Some(ResetSignal {
+                signal: "rst_ni".to_string(),
+                inactive_value: 1
+            })
+        );
+        // A multi-signal condition is NOT recognized (left as a kept guard).
+        let complex = serde_json::json!({
+            "kind": "BinaryOp", "op": "LogicalOr",
+            "left": {"kind": "NamedValue", "symbol": "1 rst"},
+            "right": {"kind": "NamedValue", "symbol": "2 clr"}
+        });
+        assert_eq!(extract_reset_signal(&complex), None);
     }
 
     #[test]
@@ -1038,6 +1247,8 @@ mod tests {
                          "right": {"kind": "IntegerLiteral", "value": "55", "constant": "55"}}
             }),
             SvaKind::Cover,
+            &TranslateOptions::default(),
+            &mut Vec::new(),
         )
         .expect("cover translates");
         let companion = recoverability_companion_formula(&ef).expect("companion forms + parses");

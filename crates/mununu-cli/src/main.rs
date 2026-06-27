@@ -1180,6 +1180,11 @@ struct SvVerifyAutoArgs {
     /// verdicts (the recoverability case); default `off`.
     #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
     must_edge_inference: MustEdgeInferenceArg,
+    /// Disable reset-gating: keep `disable iff (reset)` guards in the formulas
+    /// and leave the reset input free (by default the guard is dropped and the
+    /// reset is pinned inactive so the running design is verified).
+    #[arg(long = "no-gate-reset")]
+    no_gate_reset: bool,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -2195,6 +2200,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
     let opts = VerifyAutoOptions {
         max_iterations: args.max_iterations,
         must_edge_inference,
+        gate_reset: !args.no_gate_reset,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)
@@ -2239,6 +2245,12 @@ fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::Au
         println!(
             "  black-boxed (cut to free inputs — provide source to model): {}",
             report.diagnostics.blackboxed_modules.join(", ")
+        );
+    }
+    if !report.diagnostics.gated_resets.is_empty() {
+        println!(
+            "  reset-gated (pinned inactive): {}",
+            report.diagnostics.gated_resets.join(", ")
         );
     }
     for p in &report.properties {
@@ -2299,6 +2311,7 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
         "diagnostics": {
             "state_register_count": report.diagnostics.state_register_count,
             "blackboxed_modules": report.diagnostics.blackboxed_modules,
+            "gated_resets": report.diagnostics.gated_resets,
         },
     });
     println!(

@@ -25,6 +25,7 @@ pub mod cegar;
 pub mod dep_graph;
 pub mod kmts_lift;
 pub mod parser;
+pub mod pin;
 pub mod predicate_expr;
 pub mod r_s8_encoder;
 pub mod shadow;
