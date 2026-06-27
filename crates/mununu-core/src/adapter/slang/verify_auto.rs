@@ -73,11 +73,12 @@ pub struct ModelDiagnostics {
     /// state was cut (see [`Self::blackboxed_modules`]) — properties over the
     /// cut registers are then SKIPPED rather than verified.
     pub state_register_count: usize,
-    /// Modules instantiated without a body (auto-black-boxed by Yosys) — their
-    /// outputs were cut to free inputs by `cutpoint -blackbox`. This is a sound
-    /// over-approximation, but a register hidden behind one of these (e.g. an
-    /// FSM wrapped in `prim_sparse_fsm_flop`) is **not** modeled as state, so
-    /// every property over it is SKIPPED. Surfacing the cut here is the
+    /// Modules instantiated without a body — either auto-black-boxed by Yosys
+    /// (outputs cut to free inputs by `cutpoint -blackbox`) or left as a
+    /// dangling undefined-module cell (e.g. an FSM wrapped in OpenTitan's
+    /// `prim_sparse_fsm_flop`, whose register then vanishes from the lift).
+    /// Both are sound, but a register hidden behind one is **not** modeled as
+    /// state, so every property over it is SKIPPED. Surfacing it here is the
     /// "stop-silent-cut" half: the cut is no longer invisible. The fix is to
     /// provide the missing module source(s).
     pub blackboxed_modules: Vec<String>,
@@ -110,9 +111,9 @@ fn unseedable_skip_reason(unseedable: &[String], diag: &ModelDiagnostics) -> Str
     );
     if !diag.blackboxed_modules.is_empty() {
         format!(
-            "{base}. Root cause: the lift black-boxed {} module(s) with no body ({}) — \
-             registers they drive were cut to free inputs and are not modeled as state. \
-             Provide the missing module source(s) to model them.",
+            "{base}. Root cause: {} module(s) instantiated with no body ({}) — \
+             registers they drive are not modeled as state. Provide the missing \
+             module source(s) to model them.",
             diag.blackboxed_modules.len(),
             diag.blackboxed_modules.join(", ")
         )
@@ -868,6 +869,25 @@ mod tests {
         assert!(
             report.properties.len() >= 2,
             "both csrng ASSERTs (CsrngMainErrorStStable_A, CsrngMainErrorOutput_A) translate"
+        );
+        // The csrng FSM is wrapped in `prim_sparse_fsm_flop` (body not in the
+        // source set), so it is cut and the lift has no state registers. The
+        // diagnostic must NAME the cut module (undefined-module-cell detection)
+        // rather than only reporting "no state registers" — that is the
+        // actionable root cause (provide the flop's source).
+        assert!(
+            report
+                .diagnostics
+                .blackboxed_modules
+                .iter()
+                .any(|m| m.contains("prim_sparse_fsm_flop")),
+            "the cut prim_sparse_fsm_flop should be named in diagnostics; got {:?}",
+            report.diagnostics.blackboxed_modules
+        );
+        // Reset-gating fires on the macro's `disable iff (rst_ni)`.
+        assert_eq!(
+            report.diagnostics.gated_resets,
+            vec!["rst_ni=1".to_string()]
         );
     }
 
