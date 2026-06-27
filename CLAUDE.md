@@ -55,6 +55,22 @@ For CI-exact reproduction inside the pinned dev container, see [`docs/dev-contai
 
 The `security-audit` CI job runs `cargo audit`. The `dependency-check` job is non-blocking.
 
+### SVA-verification e2e validation (slang) `[REFERENCE]` (added 2026-06-27)
+
+The SVA front-end (`mununu sv extract-sva` / `mununu sv verify-auto`) shells out to **slang** (SystemVerilog elaboration), **sv2v**, and **yosys**. Per the subprocess-tools-are-not-bundled policy, these are NOT in `mununu-dev`, so the slang-gated end-to-end tests are `#[ignore]`d and do not run in `make ci`. Their mechanisms are covered by non-ignored unit tests; the `#[ignore]` tests validate the full chain when the tools are present.
+
+**Run them in the `mununu-sva` image** (`docker/Dockerfile.sva` — extends `mununu-dev` with pinned slang + sv2v + yosys):
+
+```bash
+docker build -f docker/Dockerfile.dev -t mununu-dev .     # once (or on toolchain bump)
+docker build -f docker/Dockerfile.sva -t mununu-sva .     # once
+docker volume create mununu-target                        # once (warm cargo cache)
+docker run --rm -v "$(pwd)":/work -v mununu-target:/cargo-target \
+  mununu-sva cargo test -p mununu-core --lib --all-features e2e_ -- --ignored --nocapture
+```
+
+**Host caveat.** slang ships prebuilts only for `linux-x86_64` and `macos-arm64`. On an Intel (x86_64) macOS host there is no native slang binary, and the workspace's `z3-sys` link also differs from the dev image — so the Linux `mununu-sva` image (which runs natively on x86_64 hosts) is the supported way to run these tests there. The `e2e_csrng_real_sva_verdict_breakdown` test reads only vendored fixtures (`examples/verify/m2_opentitan_csrng_main_sm` + the standard prim_assert macros from `examples/verify/m0_opentitan_prim_arbiter`), so it is fully reproducible.
+
 ### Pre-push workspace check (added 2026-06-08)
 
 **Rule.** Before `git push`, when a commit touches a field of a struct with multiple construction sites (`OriginalTransition`, `TransitionSpec`, `SignalAnnotation`, `CegarOptions`, `PredicateCubeLiftOptions`, `TransitionDecl`, etc.), run the CI-equivalent workspace check:
