@@ -946,6 +946,18 @@ enum SvCommand {
     /// then `btor2 cegar`" two-step. Surface peer of the API
     /// `POST /api/v1/sv/cegar` and the extraction-tab SV → CEGAR flow.
     Cegar(SvCegarArgs),
+    /// Extract SystemVerilog Assertions and translate them to mu-calculus
+    /// (Track-H SVA front-end, XL.6a).
+    ///
+    /// Runs the open-source `slang` parser (`slang --ast-json`) over the SV
+    /// source, finds every `assert` / `assume` / `cover property`, and
+    /// translates the supported Tier-1/Tier-2 fragment to mu-calculus formulas
+    /// the verifier can check — emitting each cover's `AG EF` recoverability
+    /// companion and the `$past` shadow registers the formulas need. Anything
+    /// outside the fragment is reported unsupported, never silently dropped.
+    /// No model verification yet (that is `sv verify-auto`). Surface peer of
+    /// `POST /api/v1/sv/extract-sva` + the extraction-tab SVA panel.
+    ExtractSva(SvExtractSvaArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1116,6 +1128,22 @@ struct SvCegarArgs {
     /// CTXDSL to this path (stderr confirmation; stdout stays clean).
     #[arg(long = "emit-ctxdsl", value_name = "PATH")]
     emit_ctxdsl: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct SvExtractSvaArgs {
+    /// Primary SystemVerilog source file (.sv / .v).
+    #[arg(value_name = "SV_FILE")]
+    file: PathBuf,
+    /// Additional SV sources (packages, `include` targets — e.g. the standard
+    /// OpenTitan `prim_assert` macros; the dummy-macro variant silently drops
+    /// all SVA). Staged alongside the primary input + on the include path.
+    /// Repeatable.
+    #[arg(long = "source", value_name = "FILE")]
+    sources: Vec<PathBuf>,
+    /// Print a JSON report instead of the human-readable summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1975,6 +2003,114 @@ fn sv_cegar(args: SvCegarArgs) -> Result<(), String> {
             json: args.json,
         },
     )
+}
+
+/// XL.6a — `mununu sv extract-sva`: run the slang SVA front-end over an SV
+/// source set and print the translated mu-calculus property set.
+fn sv_extract_sva(args: SvExtractSvaArgs) -> Result<(), String> {
+    let primary_name = args
+        .file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("Invalid SV source path: {}", args.file.display()))?;
+    let primary = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read SV source '{}': {e}", args.file.display()))?;
+    let mut sources: Vec<(String, String)> = vec![(primary_name.to_string(), primary)];
+    for src in &args.sources {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid additional source path: {}", src.display()))?;
+        let body = std::fs::read_to_string(src)
+            .map_err(|e| format!("Failed to read additional source '{}': {e}", src.display()))?;
+        sources.push((name.to_string(), body));
+    }
+
+    let report = mununu_core::adapter::slang::extract::extract_sva(&sources)
+        .map_err(|e| format!("sv extract-sva: {}", e.message))?;
+
+    if args.json {
+        render_extract_sva_json(&report);
+    } else {
+        render_extract_sva_text(&report);
+    }
+    Ok(())
+}
+
+fn sva_kind_str(kind: mununu_core::adapter::slang::translate::SvaKind) -> &'static str {
+    use mununu_core::adapter::slang::translate::SvaKind;
+    match kind {
+        SvaKind::Assert => "assert",
+        SvaKind::Assume => "assume",
+        SvaKind::Cover => "cover",
+    }
+}
+
+fn render_extract_sva_text(report: &mununu_core::adapter::slang::translate::TranslationReport) {
+    println!(
+        "SVA extraction: {} translated, {} unsupported (of {} concurrent assertions)",
+        report.translated.len(),
+        report.unsupported.len(),
+        report.total()
+    );
+    for t in &report.translated {
+        println!("  [{}] {}: {}", sva_kind_str(t.kind), t.name, t.formula);
+        if let Some(c) = &t.recoverability_companion {
+            println!("        recoverability (AG EF): {c}");
+        }
+    }
+    for u in &report.unsupported {
+        let kind = u.kind.map(sva_kind_str).unwrap_or("?");
+        println!("  [unsupported {}] {}: {}", kind, u.name, u.reason);
+    }
+    if !report.required_shadows.is_empty() {
+        let shadows: Vec<String> = report
+            .required_shadows
+            .iter()
+            .map(|s| format!("{}({})", s.base, s.width))
+            .collect();
+        println!("  required __past shadow registers: {}", shadows.join(", "));
+    }
+}
+
+fn render_extract_sva_json(report: &mununu_core::adapter::slang::translate::TranslationReport) {
+    let translated: Vec<serde_json::Value> = report
+        .translated
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "kind": sva_kind_str(t.kind),
+                "formula": t.formula,
+                "recoverability_companion": t.recoverability_companion,
+            })
+        })
+        .collect();
+    let unsupported: Vec<serde_json::Value> = report
+        .unsupported
+        .iter()
+        .map(|u| {
+            serde_json::json!({
+                "name": u.name,
+                "kind": u.kind.map(sva_kind_str),
+                "reason": u.reason,
+            })
+        })
+        .collect();
+    let required_shadows: Vec<serde_json::Value> = report
+        .required_shadows
+        .iter()
+        .map(|s| serde_json::json!({ "base": s.base, "width": s.width }))
+        .collect();
+    let out = serde_json::json!({
+        "translated": translated,
+        "unsupported": unsupported,
+        "required_shadows": required_shadows,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+    );
 }
 
 /// Shared CEGAR parameters for the CLI handlers. Both `btor2 cegar`
@@ -3433,6 +3569,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Validate(args) => sv_validate(args),
         SvCommand::Discover(args) => sv_discover(args),
         SvCommand::Cegar(args) => sv_cegar(args),
+        SvCommand::ExtractSva(args) => sv_extract_sva(args),
     }
 }
 

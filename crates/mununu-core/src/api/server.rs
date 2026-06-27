@@ -114,6 +114,13 @@ fn create_router() -> Router {
         // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow
         // run CEGAR without a manual emit-btor2-per-module step.
         .route("/api/v1/sv/cegar", post(handlers::sv_cegar_handler))
+        // Track-H SVA front-end (XL.6a) — slang extracts + translates the
+        // design's SVA to mu-calculus. Surface peer of `mununu sv extract-sva`
+        // and the extraction-tab SVA panel. No verification (that is verify-auto).
+        .route(
+            "/api/v1/sv/extract-sva",
+            post(handlers::sv_extract_sva_handler),
+        )
         .route(
             "/api/v1/verify/memory-check",
             post(handlers::memory_check_handler),

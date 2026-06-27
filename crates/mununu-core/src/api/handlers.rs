@@ -677,6 +677,67 @@ pub async fn sv_cegar_handler(
     Ok(Json(run_cegar_build_response(params)?))
 }
 
+/// XL.6a — `POST /api/v1/sv/extract-sva`. Runs the slang SVA front-end over the
+/// SV source(s) and returns the translated mu-calculus property set (formulas +
+/// recoverability companions + honestly-recorded unsupported assertions + the
+/// `__past` shadows the formulas need). No model verification (that is
+/// `/sv/verify-auto`). Surface peer of the CLI `mununu sv extract-sva`.
+pub async fn sv_extract_sva_handler(
+    Json(request): Json<SvExtractSvaRequest>,
+) -> ApiResult<Json<SvExtractSvaResponse>> {
+    use crate::adapter::slang::extract::extract_sva;
+    use crate::adapter::slang::translate::SvaKind;
+
+    fn kind_str(k: SvaKind) -> String {
+        match k {
+            SvaKind::Assert => "assert".to_string(),
+            SvaKind::Assume => "assume".to_string(),
+            SvaKind::Cover => "cover".to_string(),
+        }
+    }
+
+    let mut sources: Vec<(String, String)> = vec![("top.sv".to_string(), request.source.clone())];
+    for f in &request.additional_sources {
+        sources.push((f.name.clone(), f.content.clone()));
+    }
+
+    let report = extract_sva(&sources).map_err(|e| ApiError::BadRequest {
+        message: format!("SVA extraction (slang): {}", e.message),
+        details: None,
+    })?;
+
+    let response = SvExtractSvaResponse {
+        translated: report
+            .translated
+            .iter()
+            .map(|t| TranslatedAssertionView {
+                name: t.name.clone(),
+                kind: kind_str(t.kind),
+                formula: t.formula.clone(),
+                recoverability_companion: t.recoverability_companion.clone(),
+            })
+            .collect(),
+        unsupported: report
+            .unsupported
+            .iter()
+            .map(|u| UnsupportedAssertionView {
+                name: u.name.clone(),
+                kind: u.kind.map(kind_str),
+                reason: u.reason.clone(),
+            })
+            .collect(),
+        required_shadows: report
+            .required_shadows
+            .iter()
+            .map(|s| ShadowSignalView {
+                base: s.base.clone(),
+                width: s.width,
+            })
+            .collect(),
+    };
+    Ok(Json(response))
+}
+
 /// Shared parameters for the CEGAR run/report logic, sourced identically
 /// from [`Btor2CegarRequest`] (raw BTOR2) and [`SvCegarRequest`] (SV
 /// lifted to BTOR2 first).

@@ -18,6 +18,7 @@ This document is the single canonical place describing each optional tool: what 
 | [SymbiYosys (sby)](#sby--symbiyosys) | Verification oracle on RTL fixtures | Bundled with Yosys via OSS-CAD-Suite | Bundled with Yosys | `MUNUNU_SBY_PATH` |
 | [CVC5](#cvc5) | Craig interpolation predicate source (`--predicate-source craig`) | `brew install cvc5` | `apt install cvc5` (Debian 12+ / Ubuntu 24.04+) | `MUNUNU_CVC5_PATH` |
 | [Verilator](#verilator) | Reset-state simulation seeding (R-S2b, sidecar `simulate_reset`) | `brew install verilator` | `apt install verilator` | `MUNUNU_VERILATOR_PATH` |
+| [slang](#slang) | SVA front-end (`sv extract-sva` / `POST /api/v1/sv/extract-sva`) | release tarball / build from source | release tarball / build from source | `MUNUNU_SLANG_PATH` |
 | [circt-verilog](#circt-verilog) | Alternative extraction frontend (`mununu-extract circt`) | build CIRCT / release tarball | build CIRCT / release tarball | n/a (pipe input) |
 
 Every **discovered** tool above (all but Z3, which is linked, and circt-verilog, which is a pipe-input producer) follows the same discovery pattern: the `MUNUNU_<TOOL>_PATH` env var is checked first; if absent, the bare binary name is invoked via `$PATH`. On a per-process basis — mununu does not cache discovery results across CLI invocations.
@@ -258,15 +259,65 @@ discovery and no in-mununu version check — the user supplies the MLIR. CIRCT i
 Apache-2.0 (with the LLVM exception); as upstream tooling whose output mununu
 consumes, it imposes no obligation on mununu.
 
-> **Note (Track H / slang).** The SVA-verification front-end uses the standalone
-> **`slang`** CLI (`slang --ast-json`) as a discovered subprocess (the cvc5 pattern),
-> *not* circt-verilog — see the roadmap XL.0 decision. The `slang` adapter
-> ([`adapter/slang/mod.rs::locate_slang`](../crates/mununu-core/src/adapter/slang/mod.rs#L48)
-> + the Tier-1 translator in `adapter/slang/translate.rs`) is shipped, but is not
-> yet reachable from a user-facing surface — it is wired into a CLI/API/UI command
-> by the Track-H endpoint (roadmap XL.6). A full `## slang` section with a
-> `> Source of truth:` anchor lands here then (Documentation Traceability requires
-> the anchor to be surface-reachable first).
+---
+
+## slang
+
+> Source of truth: [`adapter/slang/mod.rs::locate_slang`](../crates/mununu-core/src/adapter/slang/mod.rs#L48) — surface: CLI+API
+
+[slang](https://github.com/MikePopoloski/slang) is an open-source, full-featured
+SystemVerilog-2017 compiler front-end (MIT-licensed). Mununu uses it as a **discovered
+subprocess** (the cvc5 / sv2v / Yosys pattern) to parse **SystemVerilog Assertions** out
+of RTL: `slang --ast-json` serialises the elaborated design — including `assert` /
+`assume` / `cover property` — as a structured AST, which mununu's Tier-1/Tier-2 translator
+([`adapter/slang/translate.rs`](../crates/mununu-core/src/adapter/slang/translate.rs))
+lowers to mu-calculus formulas the verifier can check.
+
+slang is the right choice (the roadmap XL.0 decision) over circt-verilog because it runs a
+**real SV preprocessor**: OpenTitan's `` `ASSERT `` macros and `` `include `` directives
+expand correctly, which tree-sitter (no preprocessor) and sv2v (drops concurrent
+assertions) cannot do.
+
+Used by:
+- `mununu sv extract-sva` (CLI) and `POST /api/v1/sv/extract-sva` (API) — the SVA
+  front-end: extract + translate a design's assertions to mu-calculus (Tier-1 boolean /
+  `|->` / `|=>` / `disable iff` / `cover`, the XL.1c reductions, the XL.2 `EF`→`AG EF`
+  recoverability companion, and the XL.3 Tier-2 history `$past`/`$stable`/`$rose`/`$fell`).
+
+### macOS / Linux
+The [slang releases](https://github.com/MikePopoloski/slang/releases) page ships pre-built
+Linux x86_64 and macOS arm64 binaries. Download, extract, and either copy `slang` to
+`/usr/local/bin/` or set `MUNUNU_SLANG_PATH` to the extracted binary.
+
+### Build from source
+```bash
+git clone https://github.com/MikePopoloski/slang
+cd slang
+cmake -B build && cmake --build build --target slang_driver -j
+# The produced binary at build/bin/slang; copy to $PATH or set MUNUNU_SLANG_PATH.
+```
+
+### Discovery
+1. `MUNUNU_SLANG_PATH` env var (explicit override).
+2. `slang` on `$PATH`.
+
+A successful probe parses the version from `slang --version` (diagnostic only; mununu does
+not gate on the version).
+
+### Missing-tool behaviour
+
+When SVA extraction is requested but slang isn't found at runtime, mununu returns a
+structured error naming the missing tool + the install instructions. The SVA-extraction
+feature degrades gracefully — model verification and mununu-annotation properties are
+unaffected (they don't need slang). This is the cvc5 precedent.
+
+### Pattern B (deployment)
+
+slang is **not** bundled in mununu artifacts or installed by `docker/Dockerfile.dev`;
+contributors install it locally per the above, and CI uses the Linux prebuilt. This
+mirrors the subprocess discipline for sv2v / Yosys / SBY / CVC5 — all contributor-installed,
+none linked. As a subprocess whose output mununu consumes, slang's MIT license imposes no
+obligation on mununu ("mere aggregation"; see the licensing posture above).
 
 ---
 
