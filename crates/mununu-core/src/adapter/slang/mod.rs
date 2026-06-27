@@ -24,6 +24,7 @@ use std::process::Command;
 
 use crate::adapter::{AdapterError, AdapterErrorKind};
 
+pub mod extract;
 pub mod translate;
 
 /// Handle to a discovered slang binary + its parsed version (diagnostic only;

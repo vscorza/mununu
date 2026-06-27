@@ -937,6 +937,57 @@ pub struct SvCegarRequest {
     pub emit_ctxdsl: bool,
 }
 
+/// XL.6a — SVA-extraction endpoint (`POST /api/v1/sv/extract-sva`). Mirrors the
+/// CLI `mununu sv extract-sva`: runs the slang SVA front-end over the SV
+/// source(s) and returns the translated mu-calculus property set. slang is a
+/// full SV-2017 parser, so no sv2v / Yosys / `top` is needed; no model
+/// verification happens here (that is `/sv/verify-auto`).
+#[derive(Debug, Deserialize)]
+pub struct SvExtractSvaRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / `include` targets — e.g. the standard
+    /// OpenTitan `prim_assert` macros), staged alongside + on the include path.
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+}
+
+/// Response for `/api/v1/sv/extract-sva` — mirrors
+/// [`crate::adapter::slang::translate::TranslationReport`].
+#[derive(Debug, Serialize)]
+pub struct SvExtractSvaResponse {
+    pub translated: Vec<TranslatedAssertionView>,
+    pub unsupported: Vec<UnsupportedAssertionView>,
+    pub required_shadows: Vec<ShadowSignalView>,
+}
+
+/// A successfully translated assertion (mirrors `TranslatedAssertion`).
+#[derive(Debug, Serialize)]
+pub struct TranslatedAssertionView {
+    pub name: String,
+    /// `"assert"` | `"assume"` | `"cover"`.
+    pub kind: String,
+    /// mu-calculus formula (parses via the evaluator's parser).
+    pub formula: String,
+    /// XL.2 `AG EF` recoverability companion — `Some` only for covers.
+    pub recoverability_companion: Option<String>,
+}
+
+/// An assertion outside the supported fragment (mirrors `UnsupportedAssertion`).
+#[derive(Debug, Serialize)]
+pub struct UnsupportedAssertionView {
+    pub name: String,
+    pub kind: Option<String>,
+    pub reason: String,
+}
+
+/// A `__past` shadow register a translated formula needs (mirrors `ShadowSignal`).
+#[derive(Debug, Serialize)]
+pub struct ShadowSignalView {
+    pub base: String,
+    pub width: u32,
+}
+
 /// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace
 /// viewer. Mirrors [`crate::adapter::btor2::cegar::CegarTrace`].
 #[derive(Debug, Serialize)]
