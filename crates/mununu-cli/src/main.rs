@@ -2231,6 +2231,16 @@ fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::Au
         },
         report.unsupported.len()
     );
+    println!(
+        "  model: {} state register(s)",
+        report.diagnostics.state_register_count
+    );
+    if !report.diagnostics.blackboxed_modules.is_empty() {
+        println!(
+            "  black-boxed (cut to free inputs — provide source to model): {}",
+            report.diagnostics.blackboxed_modules.join(", ")
+        );
+    }
     for p in &report.properties {
         println!(
             "  [{}] {}: {}",
@@ -2283,7 +2293,14 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
         .iter()
         .map(|(name, reason)| serde_json::json!({ "name": name, "reason": reason }))
         .collect();
-    let out = serde_json::json!({ "properties": props, "unsupported": unsupported });
+    let out = serde_json::json!({
+        "properties": props,
+        "unsupported": unsupported,
+        "diagnostics": {
+            "state_register_count": report.diagnostics.state_register_count,
+            "blackboxed_modules": report.diagnostics.blackboxed_modules,
+        },
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
