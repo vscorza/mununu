@@ -664,21 +664,66 @@ fn compare(expr: &Value, op: &str) -> Result<String, String> {
             return Ok(if op == "!=" { b } else { format!("(!({b}))") });
         }
     }
-    // (4) XL.3 history comparison: `signal OP $past(signal)` (the explicit form
-    // of `$stable`/`$changed`). Gated on at least one side being `$past(...)` so
-    // a general `signalA OP signalB` (which could mask an unbound named constant)
-    // is still conservatively rejected.
-    if (is_past_call(left) || is_past_call(right))
-        && let (Some(l), Some(r)) = (cmp_signal_atom(left), cmp_signal_atom(right))
-    {
+    // (4) H.D — relational `signal OP signal` (both genuine signals, incl the
+    // XL.3 `$past` history form). The enum/parameter pre-pass has already folded
+    // every named *constant* to a literal (caught by (1)/(2)), so a surviving
+    // `NamedValue` here is a real register / input / wire — emit a relational
+    // predicate (it lowers to `PredicateExpr::CmpReg`). Widening the *translation*
+    // here is sound regardless of what the operands resolve to: binding is the
+    // cube path's job — REL + H.A bind a state↔state relation; a free-input or
+    // combinational operand is SKIPPED there (never mis-verdicted). (Pre-H.D this
+    // was gated on a `$past` side, which left e.g. `cnt_q >= cfg_detect_timer_i`
+    // and `data_o == data_i` untranslatable.)
+    if let (Some(l), Some(r)) = (cmp_signal_atom(left), cmp_signal_atom(right)) {
         return Ok(format!("({l} {op} {r})"));
     }
+    // (5) H.D — negation-peel for 1-bit boolean eq/ne: `(!x) == y` ≡ `x != y`,
+    // `(!x) != y` ≡ `x == y` (and the `(!x) ==/!= literal` forms). Peel a 1-bit
+    // `!signal` on either side and flip the eq/ne operator, then re-resolve the
+    // other side as a signal atom or a literal. Only valid for `==`/`!=` over a
+    // 1-bit operand (for a multi-bit `x`, `!x` means `x == 0`, not a simple flip).
+    if matches!(op, "==" | "!=") {
+        let flipped = if op == "==" { "!=" } else { "==" };
+        let resolve = |e: &Value| -> Option<String> {
+            cmp_signal_atom(e).or_else(|| sv_integer(e).map(|n| n.to_string()))
+        };
+        if let Some(inner) = logical_not_signal(left)
+            && let Some(other) = resolve(right)
+        {
+            return Ok(format!("({inner} {flipped} {other})"));
+        }
+        if let Some(inner) = logical_not_signal(right)
+            && let Some(other) = resolve(left)
+        {
+            return Ok(format!("({inner} {flipped} {other})"));
+        }
+    }
     Err(format!(
-        "comparison must be `signal {op} literal`, `literal {op} signal`, or a \
-         `boolean-expr ==/!= 0` form; got left={:?} right={:?}",
+        "comparison must be `signal {op} literal`, `literal {op} signal`, a relational \
+         `signal {op} signal`, a 1-bit `!signal ==/!= …`, or a `boolean-expr ==/!= 0` \
+         form; got left={:?} right={:?} (an arithmetic operand like `== x + 1` needs \
+         predicate-arithmetic, not yet supported)",
         left.get("kind").and_then(Value::as_str),
         right.get("kind").and_then(Value::as_str),
     ))
+}
+
+/// H.D — if `expr` is a 1-bit `!signal` (`UnaryOp{op: LogicalNot, operand:
+/// NamedValue}`), return the inner signal's name. The 1-bit gate keeps the
+/// peel-and-flip equivalence `(!x) == y ≡ x != y` exact: for a multi-bit operand
+/// `!x` means `x == 0`, which is not a plain operator flip.
+fn logical_not_signal(expr: &Value) -> Option<String> {
+    let expr = unwrap(expr);
+    if expr.get("kind").and_then(Value::as_str)? != "UnaryOp"
+        || expr.get("op").and_then(Value::as_str)? != "LogicalNot"
+    {
+        return None;
+    }
+    let operand = unwrap(expr.get("operand")?);
+    if signal_width(operand) != 1 {
+        return None;
+    }
+    signal_name(operand).ok().map(|s| s.to_string())
 }
 
 /// A reduction over a single vector signal → an exact comparison atom.
@@ -1307,6 +1352,82 @@ mod tests {
             "right": history_call("$past", "state_q", "logic[5:0]")
         });
         assert_eq!(bool_expr(&cmp).unwrap(), "(state_q == state_q__past)");
+    }
+
+    #[test]
+    fn hd_relational_signal_ge_signal_translates() {
+        // H.D — `cnt_q >= cfg_detect_timer_i` (NamedValue >= NamedValue) was
+        // unsupported pre-H.D; now translates to a relational atom (→ CmpReg).
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "GreaterThanEqual",
+            "left":  {"kind": "NamedValue", "symbol": "1 cnt_q", "type": "logic[15:0]"},
+            "right": {"kind": "NamedValue", "symbol": "2 cfg_detect_timer_i", "type": "logic[15:0]"}
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(cnt_q >= cfg_detect_timer_i)");
+    }
+
+    #[test]
+    fn hd_relational_signal_eq_signal_translates() {
+        // H.D — general dataflow equality `data_o == data_i` (no `$past` side).
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "Equality",
+            "left":  {"kind": "NamedValue", "symbol": "1 data_o", "type": "logic[7:0]"},
+            "right": {"kind": "NamedValue", "symbol": "2 data_i", "type": "logic[7:0]"}
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(data_o == data_i)");
+    }
+
+    #[test]
+    fn hd_negation_caseeq_peels_to_inequality() {
+        // H.D — 1-bit `(!x) === y` ≡ `x != y` (peel `!`, flip `==`→`!=`).
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "CaseEquality",
+            "left":  {"kind": "UnaryOp", "op": "LogicalNot",
+                      "operand": {"kind": "NamedValue", "symbol": "1 x", "type": "logic"}},
+            "right": {"kind": "NamedValue", "symbol": "2 y", "type": "logic"}
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(x != y)");
+    }
+
+    #[test]
+    fn hd_negation_caseneq_peels_to_equality() {
+        // H.D — 1-bit `(!x) !== 1` ≡ `x == 1` (peel `!`, flip `!=`→`==`; literal RHS).
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "CaseInequality",
+            "left":  {"kind": "UnaryOp", "op": "LogicalNot",
+                      "operand": {"kind": "NamedValue", "symbol": "1 x", "type": "logic"}},
+            "right": {"kind": "IntegerLiteral", "value": "1", "constant": "1"}
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(x == 1)");
+    }
+
+    #[test]
+    fn hd_negation_peel_requires_one_bit_operand() {
+        // A multi-bit `!bus` means `bus == 0`, NOT a simple operator flip — so
+        // the negation-peel must NOT fire on it. The comparison stays rejected
+        // (honest) rather than silently becoming the unsound `(bus != y)`.
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "CaseEquality",
+            "left":  {"kind": "UnaryOp", "op": "LogicalNot",
+                      "operand": {"kind": "NamedValue", "symbol": "1 bus", "type": "logic[7:0]"}},
+            "right": {"kind": "NamedValue", "symbol": "2 y", "type": "logic"}
+        });
+        bool_expr(&cmp).expect_err("multi-bit !bus must not peel-and-flip");
+    }
+
+    #[test]
+    fn hd_arithmetic_rhs_still_unsupported_with_clear_reason() {
+        // H.D — `cnt == cnt + 1` (arithmetic RHS) stays unsupported: the
+        // predicate layer is arithmetic-free; the error must say so.
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "Equality",
+            "left":  {"kind": "NamedValue", "symbol": "1 cnt", "type": "logic[3:0]"},
+            "right": {"kind": "BinaryOp", "op": "Add",
+                      "left":  {"kind": "NamedValue", "symbol": "1 cnt", "type": "logic[3:0]"},
+                      "right": {"kind": "IntegerLiteral", "value": "1", "constant": "1"}}
+        });
+        let err = bool_expr(&cmp).expect_err("arithmetic RHS must reject");
+        assert!(err.contains("arithmetic"), "got: {err}");
     }
 
     #[test]
