@@ -1367,6 +1367,46 @@ mod tests {
                 );
             }
         }
+        // H.D (translation widening) — `signal >= signal` and 1-bit `!x === y`
+        // now translate (pre-H.D: 7 unsupported; now only the arithmetic-RHS
+        // `cnt == cnt + 1` form remains, which needs predicate-arithmetic).
+        // sva_15 is the lone arithmetic holdout.
+        assert!(
+            report.properties.len() >= 15,
+            "H.D translates ≥15 of 16 (was 9); got {} translated",
+            report.properties.len()
+        );
+        assert!(
+            report.unsupported.len() <= 2,
+            "only the arithmetic-RHS form(s) remain unsupported after H.D; got {:?}",
+            report.unsupported
+        );
+        assert!(
+            report
+                .unsupported
+                .iter()
+                .all(|(_, r)| r.contains("arithmetic")),
+            "every remaining unsupported is the arithmetic-operand case; got {:?}",
+            report.unsupported
+        );
+        // The negation-peel (`!trigger_i === trigger_active` → `trigger_i !=
+        // trigger_active`) and the relational `signal >= signal` both reach the
+        // property set now (they SKIP on combinational/input-in-compound
+        // operands — the honest residual — but they TRANSLATE).
+        assert!(
+            report
+                .properties
+                .iter()
+                .any(|p| p.formula.contains("trigger_i != trigger_active")),
+            "H.D negation-peel produced the relational `trigger_i != trigger_active`"
+        );
+        assert!(
+            report
+                .properties
+                .iter()
+                .any(|p| p.formula.contains("cnt_q >= cfg_")),
+            "H.D translated a `signal >= signal` (cnt_q >= cfg_*_timer_i)"
+        );
         // SOUNDNESS — no spurious counterexample (combinational outputs like
         // `event_detected_o` are excluded by the strict resolver, not mis-bound).
         assert!(
