@@ -103,6 +103,27 @@ pub fn build_register_nid_map(view: &Btor2SmtView) -> HashMap<String, Nid> {
     map
 }
 
+/// H.B — like [`build_register_nid_map`] but also maps **input** symbols to
+/// their NID, so a predicate over a primary input can be admitted as a free
+/// cube dimension (see `docs/design/free-input-atoms.md`). A free-input
+/// predicate is constrained on the **source** cube (the current-cycle input,
+/// pinned) and left **free** on the **target** (the next-cycle input is not a
+/// variable of the one-step relation) — that source-pin / target-free shape is
+/// realized in [`build_pred_constraint`]. State symbols take precedence on a
+/// name collision. State-only callers keep using [`build_register_nid_map`], so
+/// their behaviour is unchanged.
+pub fn build_register_nid_map_with_inputs(view: &Btor2SmtView) -> HashMap<String, Nid> {
+    let mut map = build_register_nid_map(view);
+    for sig in &view.signals {
+        if sig.kind == SignalKind::Input
+            && let Some(symbol) = &sig.symbol
+        {
+            map.entry(symbol.clone()).or_insert(sig.nid);
+        }
+    }
+    map
+}
+
 /// R.2.5b session 2 — run the SMT must-edge query for one
 /// (source-cube, target-cube) pair.
 ///
@@ -221,6 +242,18 @@ fn build_pred_constraint<P: PredicateLike>(
     match pred.expr() {
         None => {
             let nid = *nid_map.get(pred.register())?;
+            // H.B — free-input predicate: the NID is a primary input, not a
+            // state cell. Pin the current-cycle input on the source cube; leave
+            // the target free (the next-cycle input is not a variable of the
+            // one-step relation, so the input dimension is unconstrained on the
+            // target → the edge enumeration reaches every input flavour of the
+            // successor — the "for all input sequences" over-approximation).
+            if let Some(in_bv) = view.inputs.get(&nid) {
+                if slot_next {
+                    return Some(z3::ast::Bool::from_bool(true));
+                }
+                return Some(build_predicate_constraint(in_bv, pred.value(), polarity));
+            }
             let bv = if slot_next {
                 view.next_state(nid)?
             } else {
@@ -695,6 +728,67 @@ mod tests {
                 !nid_map.contains_key("in_a"),
                 "input in_a must NOT appear; got keys: {:?}",
                 nid_map.keys().collect::<Vec<_>>()
+            );
+            SmtMustVerdict::Must
+        });
+    }
+
+    // ---- H.B — free-input predicate (source-pin / target-free) ----
+
+    #[test]
+    fn build_register_nid_map_with_inputs_includes_inputs() {
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse fixture");
+        run_check(|| {
+            let view = encode_design(&file).expect("encode fixture");
+            let map = build_register_nid_map_with_inputs(&view);
+            assert!(map.contains_key("reg_a"), "state still mapped");
+            assert!(
+                map.contains_key("in_a"),
+                "input now mapped; got {:?}",
+                map.keys().collect::<Vec<_>>()
+            );
+            SmtMustVerdict::Must
+        });
+    }
+
+    #[test]
+    fn free_input_pred_source_pins_target_is_free() {
+        // H.B: an input predicate `in_a == 1` constrains the CURRENT input on
+        // the source cube (so `in_a==1` ∧ `in_a==0` is UNSAT) and is FREE on the
+        // target cube (the next-cycle input is not a one-step variable).
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse fixture");
+        run_check(|| {
+            let view = encode_design(&file).expect("encode fixture");
+            let map = build_register_nid_map_with_inputs(&view);
+            let pred = PredicateSpec {
+                name: "in".into(),
+                register: "in_a".into(),
+                value: 1,
+            };
+            let src_true =
+                build_pred_constraint(&view, &map, &pred, false, true).expect("source builds");
+            let src_false =
+                build_pred_constraint(&view, &map, &pred, false, false).expect("source builds");
+            let tgt = build_pred_constraint(&view, &map, &pred, true, true).expect("target builds");
+
+            // Source pins the input: in_a==1 ∧ in_a==0 is unsatisfiable.
+            let s1 = z3::Solver::new();
+            s1.assert(&src_true);
+            s1.assert(&src_false);
+            assert_eq!(
+                s1.check(),
+                z3::SatResult::Unsat,
+                "source input pred pins the current-cycle input"
+            );
+
+            // Target is free: it imposes nothing even with the input pinned to 0.
+            let s2 = z3::Solver::new();
+            s2.assert(&tgt);
+            s2.assert(&src_false);
+            assert_eq!(
+                s2.check(),
+                z3::SatResult::Sat,
+                "target input pred is free (next-cycle input unconstrained)"
             );
             SmtMustVerdict::Must
         });
