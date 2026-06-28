@@ -87,6 +87,12 @@ pub struct ModelDiagnostics {
     /// from the formulas). Empty when reset-gating is off or no `disable iff`
     /// reset was recognized. Each entry is `"<signal>=<inactive_value>"`.
     pub gated_resets: Vec<String>,
+    /// Flop-primitive modules that were cut (instantiated with no body) and for
+    /// which verify-auto auto-injected a behavioral stub so the register
+    /// survives the lift (H.C — e.g. OpenTitan's `prim_sparse_fsm_flop`). The
+    /// stub is an exact behavioral model of the flop datapath; auto-injection is
+    /// reported here so it is never silent.
+    pub auto_provided_stubs: Vec<String>,
 }
 
 /// Result of an automated SVA verification run.
@@ -143,6 +149,14 @@ pub struct VerifyAutoOptions {
     /// SVA, so it is on by default; set `false` to keep the guard and leave
     /// the reset free.
     pub gate_reset: bool,
+    /// When `true` (default), if the first lift cuts a known flop primitive
+    /// (instantiated with no body — e.g. OpenTitan's `prim_sparse_fsm_flop`),
+    /// verify-auto injects a behavioral stub for it and re-lifts, so the
+    /// register survives and its state atoms become bindable (H.C). The stub is
+    /// an exact behavioral model of the flop datapath; the auto-injection is
+    /// reported in `diagnostics.auto_provided_stubs`. Set `false` to leave cut
+    /// flops cut (reported in `blackboxed_modules`).
+    pub auto_stub_flops: bool,
 }
 
 impl Default for VerifyAutoOptions {
@@ -151,6 +165,7 @@ impl Default for VerifyAutoOptions {
             max_iterations: 16,
             must_edge_inference: MustEdgeInference::Off,
             gate_reset: true,
+            auto_stub_flops: true,
         }
     }
 }
@@ -167,9 +182,16 @@ struct Seeded {
 
 /// The minimal H.1 — derive cube predicates from a formula's `Node::Predicate`
 /// atoms. Each predicate is named exactly the atom string (so the evaluator's
-/// name-match binds the atom to its cube bit). An atom whose registers are not
-/// all in `state_cells` is recorded as unseedable.
-fn seed_from_formula(formula: &Formula, state_cells: &HashSet<String>) -> Seeded {
+/// name-match binds the atom to its cube bit). An atom whose registers do not
+/// all resolve to a state cell (per `is_state`) is recorded as unseedable.
+///
+/// `is_state(name)` returns true when `name` resolves to a lifted state cell —
+/// either directly (the symbol is on a `state` line) or via the BTOR2
+/// alias-resolution BFS (H.A: a `uext`/`Output` alias whose register Yosys'
+/// `flatten` left unnamed on the `state` line). The lift's
+/// `resolve_predicate_registers` canonicalises the same alias, so a name the
+/// seeder accepts here also binds downstream.
+fn seed_from_formula(formula: &Formula, is_state: impl Fn(&str) -> bool) -> Seeded {
     let mut out = Seeded::default();
     let mut seen: HashSet<&str> = HashSet::new();
     for node in formula.nodes() {
@@ -181,7 +203,7 @@ fn seed_from_formula(formula: &Formula, state_cells: &HashSet<String>) -> Seeded
         }
         match parse_predicate_expr(atom) {
             Ok(expr) => {
-                if expr.registers().iter().any(|r| !state_cells.contains(r)) {
+                if expr.registers().iter().any(|r| !is_state(r)) {
                     out.unseedable.push(atom.clone());
                     continue;
                 }
@@ -203,7 +225,7 @@ fn seed_from_formula(formula: &Formula, state_cells: &HashSet<String>) -> Seeded
             // A bare identifier atom (`parse_predicate_expr` needs an operator):
             // a 1-bit boolean signal `sig` ≡ `sig == 1`. Seedable iff a state cell.
             Err(_) => {
-                if state_cells.contains(atom) {
+                if is_state(atom) {
                     out.specs.push(PredicateSpec {
                         name: atom.clone(),
                         register: atom.clone(),
@@ -375,11 +397,33 @@ pub fn verify_auto(
     // lift also reports modules it black-boxed (instantiated, no body) — those
     // are surfaced in `diagnostics.blackboxed_modules` so a cut FSM (the
     // `prim_sparse_fsm_flop`-class root cause) is visible, not silent.
-    let (btor2, blackboxed_modules) = sv_to_btor2_with_blackboxes(primary_content, yosys_opts)
-        .map_err(|mut e| {
+    let (mut btor2, mut blackboxed_modules) =
+        sv_to_btor2_with_blackboxes(primary_content, yosys_opts).map_err(|mut e| {
             e.message = format!("verify_auto: SV → BTOR2: {}", e.message);
             e
         })?;
+    // H.C — if the first lift cut a known flop primitive, inject a behavioral
+    // stub for it and re-lift so the register survives (e.g. OpenTitan's
+    // `prim_sparse_fsm_flop`). Only stubs ACTUALLY-cut modules (no collision
+    // with designs that provide their own body).
+    if opts.auto_stub_flops {
+        let stubs = crate::adapter::slang::prim_stubs::stubs_for_cut_modules(&blackboxed_modules);
+        if !stubs.is_empty() {
+            let mut yopts2 = yosys_opts.clone();
+            yopts2.additional_sources.extend(stubs.iter().cloned());
+            let (b2, bb2) =
+                sv_to_btor2_with_blackboxes(primary_content, &yopts2).map_err(|mut e| {
+                    e.message = format!("verify_auto: SV → BTOR2 (with flop stubs): {}", e.message);
+                    e
+                })?;
+            btor2 = b2;
+            blackboxed_modules = bb2;
+            report.diagnostics.auto_provided_stubs = stubs
+                .iter()
+                .map(|(name, _)| name.trim_end_matches(".sv").to_string())
+                .collect();
+        }
+    }
     report.diagnostics.blackboxed_modules = blackboxed_modules;
     // Augment only the `__past` shadows whose base resolves to a BTOR2 state
     // cell. A base the lift renamed away (the SVA name not matching the lifted
@@ -431,6 +475,21 @@ pub fn verify_auto(
     // design's reset state (else it defaults to cube_0 = all-predicates-false).
     let init_values = state_cell_init_values(&file);
 
+    // H.A — a name is cube-bindable if it is a state-cell symbol directly OR a
+    // value-identical alias of one (`resolve_state_alias`): a `uext`/`sext`-0
+    // rename, or the async-reset register mux that `async2sync` puts around the
+    // state (e.g. `state_q` over the auto-stubbed flop). The strict resolver
+    // rejects combinational *functions* of state (an `eq`/`or` output like
+    // `main_sm_err_o`) — binding those to the state's value would be a spurious
+    // verdict. The reset-mux edge is followed only when the reset is pinned
+    // (gated_resets non-empty), which makes the register value equal the state.
+    let reset_pinned = !report.diagnostics.gated_resets.is_empty();
+    let resolves_to_state = |name: &str| -> bool {
+        state_cells.contains(name)
+            || crate::adapter::btor2::parser::resolve_state_alias(&file, name, reset_pinned)
+                .is_some()
+    };
+
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
         let formula = match mu_parser::parse(&t.formula) {
@@ -449,7 +508,7 @@ pub fn verify_auto(
             }
         };
 
-        let seeded = seed_from_formula(&formula, &state_cells);
+        let seeded = seed_from_formula(&formula, resolves_to_state);
         if !seeded.unseedable.is_empty() {
             let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
@@ -597,7 +656,7 @@ mod tests {
     fn seeds_simple_state_predicate() {
         // `nu X. ((state == 5) && [] X)` over a state cell → one simple spec.
         let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
-        let s = seed_from_formula(&f, &cells(&["state"]));
+        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n));
         assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
         assert_eq!(s.specs[0].name, "state == 5");
         assert_eq!(s.specs[0].register, "state");
@@ -610,7 +669,7 @@ mod tests {
     fn seeds_relational_predicate_as_compound() {
         // `$stable` shape: `state == state__past` → a compound (REL), both state cells.
         let f = mu_parser::parse("nu X. ((state == state__past) && [] X)").unwrap();
-        let s = seed_from_formula(&f, &cells(&["state", "state__past"]));
+        let s = seed_from_formula(&f, |n| cells(&["state", "state__past"]).contains(n));
         assert!(s.specs.is_empty(), "relational atom is not a simple spec");
         assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
         assert_eq!(s.compounds[0].0, "state == state__past");
@@ -634,7 +693,7 @@ mod tests {
     fn gates_atoms_over_non_state_signals() {
         // `gnt_o != 0` and `ready_i` over IO signals (not state cells) → unseedable.
         let f = mu_parser::parse("nu X. (((gnt_o != 0) || ready_i) && [] X)").unwrap();
-        let s = seed_from_formula(&f, &cells(&["state_q"])); // neither IO signal is a state cell
+        let s = seed_from_formula(&f, |n| cells(&["state_q"]).contains(n)); // neither IO signal is a state cell
         assert!(
             s.unseedable.contains(&"gnt_o != 0".to_string()),
             "IO comparison atom must be unseedable; got {:?}",
@@ -650,7 +709,7 @@ mod tests {
     #[test]
     fn bare_one_bit_state_signal_seeds_eq_one() {
         let f = mu_parser::parse("nu X. (busy && [] X)").unwrap();
-        let s = seed_from_formula(&f, &cells(&["busy"]));
+        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n));
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "busy");
         assert_eq!(s.specs[0].value, 1, "bare boolean state signal ≡ sig == 1");
@@ -664,6 +723,7 @@ mod tests {
             state_register_count: 0,
             blackboxed_modules: vec!["prim_sparse_fsm_flop".to_string()],
             gated_resets: Vec::new(),
+            auto_provided_stubs: Vec::new(),
         };
         let reason = unseedable_skip_reason(&["state_q == 41".to_string()], &diag);
         assert!(reason.contains("state_q == 41"), "carries the symptom");
@@ -683,6 +743,7 @@ mod tests {
             state_register_count: 0,
             blackboxed_modules: Vec::new(),
             gated_resets: Vec::new(),
+            auto_provided_stubs: Vec::new(),
         };
         let reason = unseedable_skip_reason(&["foo == 1".to_string()], &diag);
         assert!(
@@ -698,6 +759,7 @@ mod tests {
             state_register_count: 3,
             blackboxed_modules: Vec::new(),
             gated_resets: Vec::new(),
+            auto_provided_stubs: Vec::new(),
         };
         let reason = unseedable_skip_reason(&["gnt_o != 0".to_string()], &diag);
         assert!(reason.contains("gnt_o != 0"));
@@ -858,36 +920,72 @@ mod tests {
             }
         }
         eprintln!("HOLDS={holds} VIOLATED={violated} UNKNOWN={unknown} SKIPPED={skipped}");
+        eprintln!(
+            "auto_provided_stubs: {:?}",
+            report.diagnostics.auto_provided_stubs
+        );
         for (n, r) in &report.unsupported {
             eprintln!("  unsupported {n}: {r}");
         }
 
-        // Honest invariant: the real OpenTitan SVA is in-fragment and
-        // translates (the `$stable` / `|=>` / `|->` + enum + disable-iff forms).
-        // Whether a property reaches a DEFINITE verdict depends on whether its
-        // state survives the lift — the diagnostics above attribute any SKIP.
         assert!(
             report.properties.len() >= 2,
             "both csrng ASSERTs (CsrngMainErrorStStable_A, CsrngMainErrorOutput_A) translate"
         );
-        // The csrng FSM is wrapped in `prim_sparse_fsm_flop` (body not in the
-        // source set), so it is cut and the lift has no state registers. The
-        // diagnostic must NAME the cut module (undefined-module-cell detection)
-        // rather than only reporting "no state registers" — that is the
-        // actionable root cause (provide the flop's source).
+        // H.C — the FSM's `prim_sparse_fsm_flop` (no body in the source set) is
+        // auto-stubbed with a behavioral model, so it is NO LONGER reported as
+        // cut and the state register survives.
         assert!(
             report
                 .diagnostics
-                .blackboxed_modules
+                .auto_provided_stubs
                 .iter()
                 .any(|m| m.contains("prim_sparse_fsm_flop")),
-            "the cut prim_sparse_fsm_flop should be named in diagnostics; got {:?}",
+            "prim_sparse_fsm_flop should be auto-stubbed; got stubs={:?} blackboxed={:?}",
+            report.diagnostics.auto_provided_stubs,
             report.diagnostics.blackboxed_modules
+        );
+        assert!(
+            report.diagnostics.state_register_count >= 1,
+            "with the flop stubbed, the FSM state register survives; got {}",
+            report.diagnostics.state_register_count
         );
         // Reset-gating fires on the macro's `disable iff (rst_ni)`.
         assert_eq!(
             report.diagnostics.gated_resets,
             vec!["rst_ni=1".to_string()]
+        );
+        // H.A — `state_q` (a `uext`-0 alias of the async-reset register mux)
+        // now binds, so the pure-state `$stable` property reaches a verdict
+        // instead of SKIP. (Here ⊥: the auto-seeded predicate set is too coarse
+        // to decide `state_q==Error |=> $stable(state_q)`.)
+        assert!(
+            report.properties.iter().any(|p| {
+                p.formula.contains("state_q == state_q__past")
+                    && !matches!(p.outcome, VerifyOutcome::Skipped { .. })
+            }),
+            "the $stable state property should bind + reach a verdict; got {:?}",
+            report
+                .properties
+                .iter()
+                .map(|p| &p.outcome)
+                .collect::<Vec<_>>()
+        );
+        // SOUNDNESS — no spurious counterexample. A combinational output like
+        // `main_sm_err_o` must NOT be mis-bound to the state register (which
+        // would wrongly report VIOLATED); the strict alias resolver excludes it,
+        // so it is honestly SKIPPED instead.
+        assert!(
+            !report
+                .properties
+                .iter()
+                .any(|p| matches!(p.outcome, VerifyOutcome::Violated { .. })),
+            "no spurious VIOLATED from over-resolving a combinational output; got {:?}",
+            report
+                .properties
+                .iter()
+                .map(|p| &p.outcome)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -991,6 +1089,32 @@ mod tests {
             report.diagnostics.blackboxed_modules.is_empty(),
             "no prim_flop primitive to cut; got {:?}",
             report.diagnostics.blackboxed_modules
+        );
+        // H.A — the state atoms (`state_q == k`, `cnt_q == k`) now BIND (via the
+        // value-alias resolver), so they no longer appear in any SKIP reason;
+        // only the genuine IO/config antecedents (`cfg_enable_i`, `trigger_*`,
+        // `cnt_clr`, `event_detected_*`) remain unbindable (the H.B frontier).
+        for p in &report.properties {
+            if let VerifyOutcome::Skipped { reason } = &p.outcome {
+                assert!(
+                    !reason.contains("state_q ==") && !reason.contains("cnt_q =="),
+                    "state atoms should bind, not appear in a SKIP reason; got: {reason}"
+                );
+            }
+        }
+        // SOUNDNESS — no spurious counterexample (combinational outputs like
+        // `event_detected_o` are excluded by the strict resolver, not mis-bound).
+        assert!(
+            !report
+                .properties
+                .iter()
+                .any(|p| matches!(p.outcome, VerifyOutcome::Violated { .. })),
+            "no spurious VIOLATED; got {:?}",
+            report
+                .properties
+                .iter()
+                .map(|p| &p.outcome)
+                .collect::<Vec<_>>()
         );
     }
 

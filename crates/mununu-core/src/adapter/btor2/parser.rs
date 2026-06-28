@@ -565,6 +565,105 @@ pub fn resolve_state_by_symbol(file: &Btor2File, symbol: &str) -> Option<Nid> {
     best.map(|(nid, _)| nid)
 }
 
+/// H.A — resolve a signal name to the state cell it is a **value-identical
+/// alias** of, or `None` when it is not such an alias.
+///
+/// Stricter than [`resolve_state_by_symbol`], which finds *any* state in the
+/// signal's cone. A combinational function of state (an `eq`/`or` output flag
+/// such as `main_sm_err_o`) is in a state's cone but is NOT value-equal to it,
+/// so binding it to the state's value yields a spurious verdict. This resolver
+/// follows only value-preserving edges and returns `None` for anything else,
+/// so the verify-auto seeder binds a name only when reading the state cell's
+/// value is correct.
+///
+/// Followed edges:
+/// - the state itself; an `output` of a passthrough; `uext`/`sext` by 0 (a
+///   Yosys rename);
+/// - when `allow_reset_mux` is set, an `ite(cond, A, B)` where exactly one of
+///   `A`/`B` resolves to a state via passthrough and the other is a constant —
+///   the async-reset register mux that `async2sync` emits (`q = !rst ? state :
+///   resetval`). The constant (reset-value) branch is taken only during reset,
+///   which the verify-auto path pins inactive, so the register's value equals
+///   the state then. Pass `false` when the reset is not pinned.
+pub fn resolve_state_alias(file: &Btor2File, symbol: &str, allow_reset_mux: bool) -> Option<Nid> {
+    let start = file.lines.iter().find_map(|l| match &l.node {
+        Node::State {
+            symbol: Some(s), ..
+        }
+        | Node::Op {
+            symbol: Some(s), ..
+        }
+        | Node::Output {
+            symbol: Some(s), ..
+        } if s == symbol => Some(l.nid),
+        _ => None,
+    })?;
+    let mut visited = std::collections::HashSet::new();
+    follow_state_alias(file, start, allow_reset_mux, &mut visited)
+}
+
+fn follow_state_alias(
+    file: &Btor2File,
+    nid: Nid,
+    allow_reset_mux: bool,
+    visited: &mut std::collections::HashSet<Nid>,
+) -> Option<Nid> {
+    use crate::adapter::btor2::ast::Op;
+    if !visited.insert(nid) {
+        return None;
+    }
+    let line = file.lookup(nid)?;
+    match &line.node {
+        Node::State { .. } => Some(nid),
+        Node::Output { signal, .. } => {
+            follow_state_alias(file, signal.nid(), allow_reset_mux, visited)
+        }
+        Node::Op { op, args, .. } => match op {
+            // `uext`/`sext` by 0 = a pure rename (same width, same value).
+            Op::Uext | Op::Sext if line.immediates.first() == Some(&0) && args.len() == 1 => {
+                follow_state_alias(file, args[0].nid(), allow_reset_mux, visited)
+            }
+            // Async-reset register mux: exactly one branch is the state (via
+            // passthrough), the other a constant (the reset value).
+            Op::Ite if allow_reset_mux && args.len() == 3 => {
+                let then_nid = args[1].nid();
+                let else_nid = args[2].nid();
+                let then_state =
+                    follow_state_alias(file, then_nid, allow_reset_mux, &mut visited.clone());
+                let else_state =
+                    follow_state_alias(file, else_nid, allow_reset_mux, &mut visited.clone());
+                match (then_state, else_state) {
+                    (Some(s), None) if resolves_to_const(file, else_nid) => Some(s),
+                    (None, Some(s)) if resolves_to_const(file, then_nid) => Some(s),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// True when `nid` is a constant, or a `uext`/`sext`-by-0 passthrough of one
+/// (the shape `async2sync` gives a reset value).
+fn resolves_to_const(file: &Btor2File, nid: Nid) -> bool {
+    use crate::adapter::btor2::ast::Op;
+    match file.lookup(nid).map(|l| (&l.node, l)) {
+        Some((Node::Const { .. }, _)) => true,
+        Some((
+            Node::Op {
+                op: Op::Uext | Op::Sext,
+                args,
+                ..
+            },
+            l,
+        )) if l.immediates.first() == Some(&0) && args.len() == 1 => {
+            resolves_to_const(file, args[0].nid())
+        }
+        _ => false,
+    }
+}
+
 /// BFS backward from a set of starting operands until a `State` node
 /// is reached. Returns `(state_nid, distance)` where `distance`
 /// counts Op hops (starting at 1 for direct operands of the seed).
@@ -814,6 +913,34 @@ mod tests {
                    5 ite 1 2 4 3\n6 output 5 tx\n";
         let file = parse(src).expect("parse");
         assert_eq!(resolve_state_by_symbol(&file, "tx"), Some(4));
+    }
+
+    #[test]
+    fn resolve_state_alias_follows_reset_mux_and_uext0() {
+        // bit_cnt_q = uext-0(ite(rst_n, state5, const3)) — the async-reset
+        // register mux + a Yosys `uext _ _ 0` rename, the shape `async2sync`
+        // emits. It is value-identical to state 5 while reset is inactive.
+        let src = "1 sort bitvec 1\n2 sort bitvec 4\n3 const 2 0000\n4 input 1 rst_n\n\
+                   5 state 2\n6 ite 2 4 5 3\n7 uext 2 6 0 bit_cnt_q\n";
+        let file = parse(src).expect("parse");
+        // Reset-mux following on (reset pinned): resolves to the state.
+        assert_eq!(resolve_state_alias(&file, "bit_cnt_q", true), Some(5));
+        // Reset-mux following off: the `ite` is not a pure passthrough → None.
+        assert_eq!(resolve_state_alias(&file, "bit_cnt_q", false), None);
+    }
+
+    #[test]
+    fn resolve_state_alias_rejects_combinational_function() {
+        // err_o = output(eq(state, const)) — a combinational FUNCTION of state,
+        // not a value-identical alias. `resolve_state_alias` must return None
+        // (binding it to the state's value would be a spurious verdict — the
+        // csrng `main_sm_err_o` soundness case), even though the looser
+        // `resolve_state_by_symbol` finds the state in its cone.
+        let src = "1 sort bitvec 1\n2 sort bitvec 4\n3 const 2 0101\n\
+                   4 state 2\n5 eq 1 4 3\n6 output 5 err_o\n";
+        let file = parse(src).expect("parse");
+        assert_eq!(resolve_state_alias(&file, "err_o", true), None);
+        assert_eq!(resolve_state_by_symbol(&file, "err_o"), Some(4));
     }
 
     #[test]

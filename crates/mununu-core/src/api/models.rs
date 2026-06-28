@@ -1017,6 +1017,11 @@ pub struct SvVerifyAutoRequest {
     /// to keep the guard and leave the reset free.
     #[serde(default)]
     pub gate_reset: Option<bool>,
+    /// Auto-inject behavioral stubs for cut flop primitives (e.g. OpenTitan's
+    /// `prim_sparse_fsm_flop`) so the register survives the lift (default
+    /// `true`). Set `false` to leave cut flops reported as black-boxed.
+    #[serde(default)]
+    pub auto_stub_flops: Option<bool>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.
@@ -1044,6 +1049,9 @@ pub struct ModelDiagnosticsView {
     /// with their `disable iff` guards dropped from the formulas. Empty when
     /// reset-gating is off or no `disable iff` reset was recognized.
     pub gated_resets: Vec<String>,
+    /// Cut flop-primitive modules for which a behavioral stub was auto-injected
+    /// so the register survives the lift (e.g. `prim_sparse_fsm_flop`).
+    pub auto_provided_stubs: Vec<String>,
 }
 
 /// One property's auto-verification verdict (mirrors `PropertyVerdict`).
