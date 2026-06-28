@@ -1185,6 +1185,11 @@ struct SvVerifyAutoArgs {
     /// reset is pinned inactive so the running design is verified).
     #[arg(long = "no-gate-reset")]
     no_gate_reset: bool,
+    /// Disable auto-injection of behavioral stubs for cut flop primitives
+    /// (e.g. OpenTitan's `prim_sparse_fsm_flop`). By default a cut flop is
+    /// stubbed so its register survives the lift; pass this to leave it cut.
+    #[arg(long = "no-auto-stub-flops")]
+    no_auto_stub_flops: bool,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -2201,6 +2206,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         max_iterations: args.max_iterations,
         must_edge_inference,
         gate_reset: !args.no_gate_reset,
+        auto_stub_flops: !args.no_auto_stub_flops,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)
@@ -2245,6 +2251,12 @@ fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::Au
         println!(
             "  black-boxed (cut to free inputs — provide source to model): {}",
             report.diagnostics.blackboxed_modules.join(", ")
+        );
+    }
+    if !report.diagnostics.auto_provided_stubs.is_empty() {
+        println!(
+            "  auto-stubbed flop primitives (behavioral model injected): {}",
+            report.diagnostics.auto_provided_stubs.join(", ")
         );
     }
     if !report.diagnostics.gated_resets.is_empty() {
@@ -2312,6 +2324,7 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
             "state_register_count": report.diagnostics.state_register_count,
             "blackboxed_modules": report.diagnostics.blackboxed_modules,
             "gated_resets": report.diagnostics.gated_resets,
+            "auto_provided_stubs": report.diagnostics.auto_provided_stubs,
         },
     });
     println!(
