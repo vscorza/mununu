@@ -892,6 +892,109 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_sysrst_detect_real_sva_verdict_breakdown() {
+        // Real OpenTitan sysrst_ctrl_detect — the contrast to csrng: its state
+        // (`state_q` FSM, `cnt_q` counter, `trigger_active_q`) is in PLAIN
+        // `always_ff` (NO prim_flop wrapper), so it SURVIVES the lift. This
+        // isolates the *second* real-RTL blocker from the flop-cut: SVA whose
+        // antecedents reference IO / config / combinational signals
+        // (`cfg_enable_i`, `trigger_event`, `cnt_en`) — those atoms are not
+        // cube-bindable. Prints the breakdown.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let sysrst = root.join("r46_sysrst_detect_k5/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        // Standard prim_assert macros (the fixture's own prim_assert.sv is the
+        // dummy that drops all SVA).
+        let sources = vec![
+            (
+                "sysrst_ctrl_detect.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_detect.sv")),
+            ),
+            (
+                "sysrst_ctrl_pkg.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_pkg.sv")),
+            ),
+            (
+                "prim_assert.sv".to_string(),
+                read(prim.join("prim_assert.sv")),
+            ),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read(prim.join("prim_assert_standard_macros.svh")),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read(prim.join("prim_assert_sec_cm.svh")),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read(prim.join("prim_flop_macros.sv")),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("sysrst_ctrl_detect".to_string()),
+            use_sv2v: true,
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on sysrst_ctrl_detect");
+
+        eprintln!("\n=== sysrst_ctrl_detect verify-auto breakdown ===");
+        eprintln!(
+            "translated: {}   unsupported: {}",
+            report.properties.len(),
+            report.unsupported.len()
+        );
+        eprintln!(
+            "diagnostics: state_registers={}  blackboxed={:?}  gated_resets={:?}",
+            report.diagnostics.state_register_count,
+            report.diagnostics.blackboxed_modules,
+            report.diagnostics.gated_resets,
+        );
+        let (mut holds, mut violated, mut unknown, mut skipped) = (0, 0, 0, 0);
+        for p in &report.properties {
+            eprintln!("  [{:?}] {}: {:?}", p.kind, p.name, p.outcome);
+            match p.outcome {
+                VerifyOutcome::Holds => holds += 1,
+                VerifyOutcome::Violated { .. } => violated += 1,
+                VerifyOutcome::Unknown { .. } => unknown += 1,
+                VerifyOutcome::Skipped { .. } => skipped += 1,
+            }
+        }
+        eprintln!("HOLDS={holds} VIOLATED={violated} UNKNOWN={unknown} SKIPPED={skipped}");
+        for (n, r) in &report.unsupported {
+            eprintln!("  unsupported {n}: {r}");
+        }
+
+        // The state survives the lift (no prim_flop cut) — the contrast to
+        // csrng. Whatever the per-property outcomes, the model is non-empty.
+        assert!(
+            report.diagnostics.state_register_count >= 1,
+            "plain always_ff state survives the lift (no flop-cut); got {} state registers",
+            report.diagnostics.state_register_count
+        );
+        assert!(
+            report.diagnostics.blackboxed_modules.is_empty(),
+            "no prim_flop primitive to cut; got {:?}",
+            report.diagnostics.blackboxed_modules
+        );
+    }
+
+    #[test]
     #[ignore = "requires slang + sv2v + Yosys + z3; run with --ignored"]
     fn e2e_fsm_holds_and_violated_verdicts() {
         // A 2-bit FSM reset to 0, cycling 0→1→2→0. Two state-safety properties:
