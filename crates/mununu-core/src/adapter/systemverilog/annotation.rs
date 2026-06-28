@@ -260,6 +260,35 @@ pub struct SvAnnotation {
     /// Default empty — preserves behaviour for every existing fixture.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compound_predicates: Vec<CompoundPredicateDecl>,
+
+    /// H.E.2 (combinational outputs, 2026-06-28) — **derived combinational
+    /// predicates**: `signal == value` atoms whose `signal` is a *combinational
+    /// node* (an `eq`/`or`/… output of state, e.g. csrng's `main_sm_err_o`), NOT
+    /// a cube dimension. The cube lift labels each per cube via SMT (Approach B,
+    /// free-input-atoms.md §4) — KleeneT/F where the cube pins the signal,
+    /// KleeneBot where it doesn't — writing the label into
+    /// `state_3valued_predicates` so the evaluator binds the formula atom by
+    /// name. These do NOT enlarge the cube space. Like compounds, they require
+    /// the eager SmtAllPairs lift (the labeling pass is SMT-based).
+    ///
+    /// Default empty — preserves behaviour for every existing fixture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub combinational_predicates: Vec<CombinationalPredicateDecl>,
+}
+
+/// H.E.2 (2026-06-28) — one derived combinational predicate declaration for the
+/// predicate-cube path. [`crate::adapter::btor2::sidecar_combinational_predicates`]
+/// reads these into [`crate::adapter::btor2::kmts_lift::PredicateCubeLiftOptions::derived_predicates`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CombinationalPredicateDecl {
+    /// Predicate name = the formula atom string (the `state_3valued_predicates`
+    /// key the evaluator binds by name), e.g. `"main_sm_err_o"`.
+    pub name: String,
+    /// The combinational node's symbol in the lifted BTOR2 (its own `Op` symbol).
+    pub signal: String,
+    /// Value the predicate checks: it holds iff `signal == value` (bare boolean
+    /// atom ⇒ `value = 1`).
+    pub value: u64,
 }
 
 /// IR-track P3.2 (2026-06-22) — one register-value equality predicate
@@ -1817,6 +1846,7 @@ mod tests {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
+            combinational_predicates: Vec::new(),
         }
     }
 
@@ -2457,6 +2487,7 @@ mod tests {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
+            combinational_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2526,6 +2557,7 @@ mod tests {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
+            combinational_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2670,6 +2702,7 @@ mod tests {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
+            combinational_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2823,6 +2856,7 @@ mod tests {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
+            combinational_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(
@@ -2923,6 +2957,7 @@ mod tests {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
+            combinational_predicates: Vec::new(),
         };
         let json = serde_json::to_string(&ann).expect("serialize");
         assert!(

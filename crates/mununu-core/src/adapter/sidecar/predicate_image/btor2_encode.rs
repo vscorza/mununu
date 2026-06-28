@@ -82,9 +82,9 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-/// A signal exposed by the encoded design — state cell or input.
-/// Carries the human-readable symbol (when the BTOR2 file declared
-/// one) and the bit-width.
+/// A signal exposed by the encoded design — state cell, input, or
+/// (H.E.1) a named **combinational** node. Carries the human-readable
+/// symbol (when the BTOR2 file declared one) and the bit-width.
 #[derive(Debug, Clone)]
 pub struct EncodedSignal {
     pub nid: Nid,
@@ -97,6 +97,12 @@ pub struct EncodedSignal {
 pub enum SignalKind {
     State,
     Input,
+    /// H.E.1 — a named combinational node (an `Op`/output that is neither
+    /// a `state` cell nor an `input`). Its current-cycle Z3 BV is in
+    /// [`Btor2SmtView::signal_bvs`]; its value is a *determined function* of
+    /// (state, inputs), so the predicate-image labels it per cube (Approach B,
+    /// free-input-atoms.md §4) rather than treating it as a free cube dimension.
+    Combinational,
 }
 
 /// Output of [`encode_design`]. Holds the Z3 bit-vector handles for
@@ -127,8 +133,17 @@ pub struct Btor2SmtView {
     /// `state_curr_arr` over `s_next`.
     pub state_next_arr: HashMap<Nid, z3::ast::Array>,
     /// Per-signal metadata for callers that need to round-trip
-    /// names / widths back to the sidecar.
+    /// names / widths back to the sidecar. Includes State, Input, and
+    /// (H.E.1) named Combinational nodes.
     pub signals: Vec<EncodedSignal>,
+    /// H.E.1 — current-cycle Z3 BV of **every** node the encode walk
+    /// computed (the retained backend cache), keyed by NID. A combinational
+    /// signal's value is `signal_bvs[nid]` over `state_curr` + `inputs`. The
+    /// per-cube combinational-label pass (H.E.2) reads these to decide each
+    /// derived predicate's KleeneT/F/Bot label per cube. State/input nodes are
+    /// also present (their curr BV); `state_curr`/`inputs` remain the canonical
+    /// maps for those.
+    pub signal_bvs: HashMap<Nid, z3::ast::BV>,
     /// The conjoined transition relation `T(s, s') = ⋀ s_next == next(...)`.
     pub transition: z3::ast::Bool,
 }
@@ -142,6 +157,14 @@ impl Btor2SmtView {
     /// Look up the current-step BV for a state-cell NID.
     pub fn curr_state(&self, nid: Nid) -> Option<&z3::ast::BV> {
         self.state_curr.get(&nid)
+    }
+
+    /// H.E.1 — look up the current-step BV for ANY node by NID (state cell,
+    /// input, or combinational signal), from the retained encode cache. The
+    /// per-cube combinational-label pass uses this to read a derived predicate's
+    /// signal value.
+    pub fn curr_signal(&self, nid: Nid) -> Option<&z3::ast::BV> {
+        self.signal_bvs.get(&nid)
     }
 
     /// Bit-width of a signal by NID.
@@ -293,6 +316,7 @@ pub fn encode_design_with_theory(
         state_next_arr,
         inputs,
         signals,
+        signal_bvs: HashMap::new(),
         transition: z3::ast::Bool::from_bool(true),
     };
     let mut backend = Z3Backend::from_view(file, &view);
@@ -310,6 +334,41 @@ pub fn encode_design_with_theory(
         },
     })?;
     view.transition = backend.transition(&view)?;
+
+    // H.E.1 — retain the backend's per-node BV cache (current-cycle value of
+    // every walked node) so the per-cube combinational-label pass (H.E.2) can
+    // read a derived predicate's signal value, and register each *named*
+    // combinational node (an Op/output that is neither a state cell nor an
+    // input) as a `SignalKind::Combinational` signal so the nid-map builder +
+    // seeder classifier can discover it. Behaviour-preserving: existing callers
+    // read only `state_curr`/`state_next`/`inputs` + State/Input `signals`.
+    let cache = std::mem::take(&mut backend.cache);
+    // Register each named combinational node — an `Op` carrying its OWN symbol
+    // that is neither a state cell nor an input. NB: read the Op line's own
+    // `symbol` field, NOT `collect_symbols` (whose pass-2 traces Op symbols back
+    // to the *state* nid they alias — the wrong target for a genuine
+    // combinational node like `main_sm_err_o`).
+    for line in &file.lines {
+        let Node::Op {
+            symbol: Some(name), ..
+        } = &line.node
+        else {
+            continue;
+        };
+        let nid = line.nid;
+        if view.state_curr.contains_key(&nid) || view.inputs.contains_key(&nid) {
+            continue;
+        }
+        if let Some(bv) = cache.get(&nid) {
+            view.signals.push(EncodedSignal {
+                nid,
+                width: bv.get_size(),
+                symbol: Some(name.clone()),
+                kind: SignalKind::Combinational,
+            });
+        }
+    }
+    view.signal_bvs = cache;
     Ok(view)
 }
 
@@ -1214,6 +1273,48 @@ mod tests {
             assert_eq!(view.state_next_arr.len(), 1);
             // The BV input registers are still present.
             assert!(view.inputs.values().count() >= 3, "we + addr + wdata");
+        });
+    }
+
+    // H.E.1 — a named combinational node `g = q & en` (NID 4). The encode must
+    // retain its current-cycle BV in `signal_bvs` and register it as a
+    // `SignalKind::Combinational` signal.
+    const COMB_BTOR2: &str =
+        "1 sort bitvec 1\n2 state 1 q\n3 input 1 en\n4 and 1 2 3 g\n5 next 1 2 3\n";
+
+    #[test]
+    fn h_e_1_retains_combinational_signal_bv_and_metadata() {
+        let file = parse(COMB_BTOR2).expect("parse combinational fixture");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design_with_theory(&file, Theory::BvOnly).expect("encode");
+            // The combinational node `g` (NID 4) has a retained current-cycle BV.
+            assert!(
+                view.curr_signal(4).is_some(),
+                "combinational node g (nid 4) must be in signal_bvs"
+            );
+            // It is registered as a Combinational signal with its symbol + width.
+            let g = view
+                .signals
+                .iter()
+                .find(|s| s.symbol.as_deref() == Some("g"))
+                .expect("g registered in signals");
+            assert_eq!(g.kind, SignalKind::Combinational);
+            assert_eq!(g.nid, 4);
+            assert_eq!(g.width, 1);
+            // State / input nodes keep their canonical kinds (not reclassified).
+            assert!(
+                view.signals
+                    .iter()
+                    .any(|s| s.symbol.as_deref() == Some("q") && s.kind == SignalKind::State),
+                "q stays State"
+            );
+            assert!(
+                view.signals
+                    .iter()
+                    .any(|s| s.symbol.as_deref() == Some("en") && s.kind == SignalKind::Input),
+                "en stays Input"
+            );
         });
     }
 

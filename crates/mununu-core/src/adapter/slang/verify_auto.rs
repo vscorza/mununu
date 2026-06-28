@@ -192,6 +192,12 @@ struct Seeded {
     /// across **all** of its initial polarities. See
     /// `docs/design/free-input-atoms.md`. Empty ⇒ the pre-H.B state-only shape.
     input_registers: HashSet<String>,
+    /// H.E (combinational outputs) — **derived** combinational predicates: a
+    /// simple atom whose register is a combinational node (e.g. csrng's
+    /// `main_sm_err_o`), NOT a cube dimension. The lift labels each per cube via
+    /// SMT (Approach B). Threaded to `cegar_refine_loop` through the synthesised
+    /// sidecar's `combinational_predicates`. Empty ⇒ the pre-H.E shape.
+    derived: Vec<PredicateSpec>,
 }
 
 /// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
@@ -224,6 +230,7 @@ fn seed_from_formula(
     formula: &Formula,
     is_state: impl Fn(&str) -> bool,
     is_input: impl Fn(&str) -> bool,
+    is_combinational: impl Fn(&str) -> bool,
 ) -> Seeded {
     let mut out = Seeded::default();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -252,6 +259,14 @@ fn seed_from_formula(
                     } else if is_input(register) {
                         out.input_registers.insert(register.clone());
                         out.specs.push(PredicateSpec {
+                            name: atom.clone(),
+                            register: register.clone(),
+                            value: *value,
+                        });
+                    } else if is_combinational(register) {
+                        // H.E — a determined combinational signal: a derived
+                        // per-cube label, NOT a cube dimension.
+                        out.derived.push(PredicateSpec {
                             name: atom.clone(),
                             register: register.clone(),
                             value: *value,
@@ -288,6 +303,14 @@ fn seed_from_formula(
                         register: atom.clone(),
                         value: 1,
                     });
+                } else if is_combinational(atom) {
+                    // H.E — bare combinational boolean `sig` ≡ `sig == 1`,
+                    // labeled per cube (derived), not a dimension.
+                    out.derived.push(PredicateSpec {
+                        name: atom.clone(),
+                        register: atom.clone(),
+                        value: 1,
+                    });
                 } else {
                     out.unseedable.push(atom.clone());
                 }
@@ -306,6 +329,7 @@ fn seed_from_formula(
 /// fictitious init. Returns `None` when there is nothing to emit.
 fn synth_sidecar_json(
     compounds: &[(String, PredicateExpr)],
+    derived: &[PredicateSpec],
     referenced: &std::collections::BTreeSet<String>,
     init_values: &std::collections::HashMap<String, u64>,
 ) -> Option<String> {
@@ -315,6 +339,13 @@ fn synth_sidecar_json(
         // re-parses via `parse_predicate_expr` (REL handles `reg == reg`).
         .map(|(name, _)| serde_json::json!({ "name": name, "expr": name }))
         .collect();
+    // H.E — derived combinational predicates: `cegar_refine_loop` reads these
+    // into `lift_opts.derived_predicates`; the lift labels each per cube via the
+    // SMT `combinational_labels` pass (NOT a cube dimension).
+    let combinational_decls: Vec<serde_json::Value> = derived
+        .iter()
+        .map(|d| serde_json::json!({ "name": d.name, "signal": d.register, "value": d.value }))
+        .collect();
     let signals: Vec<serde_json::Value> = referenced
         .iter()
         .filter_map(|r| {
@@ -323,13 +354,14 @@ fn synth_sidecar_json(
                 .map(|v| serde_json::json!({ "name": r, "config_values": [v] }))
         })
         .collect();
-    if compound_decls.is_empty() && signals.is_empty() {
+    if compound_decls.is_empty() && combinational_decls.is_empty() && signals.is_empty() {
         return None;
     }
     serde_json::to_string(&serde_json::json!({
         "module": "cegar",
         "source": "verify_auto.btor2",
         "compound_predicates": compound_decls,
+        "combinational_predicates": combinational_decls,
         "signals": signals,
     }))
     .ok()
@@ -583,6 +615,27 @@ pub fn verify_auto(
         .collect();
     let is_input = |name: &str| -> bool { input_symbols.contains(name) };
 
+    // H.E (combinational outputs) — named combinational nodes: an `Op` carrying
+    // its OWN symbol that is neither a state cell (incl. value-alias, checked via
+    // `resolves_to_state` precedence below) nor an input. A simple atom over one
+    // of these (csrng's `main_sm_err_o`, sysrst's `trigger_active` /
+    // `event_detected_*` / `cnt_clr`) is admitted as a DERIVED per-cube label
+    // (Approach B), not a cube dimension. `is_state` is consulted first in the
+    // seeder, so a state value-alias (which is also an Op with a symbol) binds as
+    // state, not combinational.
+    let combinational_symbols: HashSet<String> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            crate::adapter::btor2::ast::Node::Op {
+                symbol: Some(s), ..
+            } => Some(s.clone()),
+            _ => None,
+        })
+        .filter(|s| !state_cells.contains(s) && !input_symbols.contains(s))
+        .collect();
+    let is_combinational = |name: &str| -> bool { combinational_symbols.contains(name) };
+
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
         let formula = match mu_parser::parse(&t.formula) {
@@ -601,7 +654,7 @@ pub fn verify_auto(
             }
         };
 
-        let seeded = seed_from_formula(&formula, resolves_to_state, is_input);
+        let seeded = seed_from_formula(&formula, resolves_to_state, is_input, is_combinational);
         if !seeded.unseedable.is_empty() {
             let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
@@ -614,13 +667,14 @@ pub fn verify_auto(
             continue;
         }
         let predicate_count = seeded.specs.len() + seeded.compounds.len();
-        if predicate_count == 0 {
+        if predicate_count == 0 && seeded.derived.is_empty() {
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
                 formula: t.formula.clone(),
                 outcome: VerifyOutcome::Skipped {
-                    reason: "no state-cell predicate atoms to seed the cube".to_string(),
+                    reason: "no state-cell / combinational predicate atoms to seed the cube"
+                        .to_string(),
                 },
                 seeded_predicates: Vec::new(),
             });
@@ -629,6 +683,7 @@ pub fn verify_auto(
 
         let mut seeded_names: Vec<String> = seeded.specs.iter().map(|s| s.name.clone()).collect();
         seeded_names.extend(seeded.compounds.iter().map(|(n, _)| n.clone()));
+        seeded_names.extend(seeded.derived.iter().map(|d| d.name.clone()));
 
         // Compounds OR free inputs ⇒ force the SmtAllPairs eager lift.
         // Compounds: the only compound-aware may path. Free inputs (H.B): the
@@ -639,6 +694,10 @@ pub fn verify_auto(
         // `cegar_refine_loop` re-checks the compound gate.
         let has_compounds = !seeded.compounds.is_empty();
         let has_inputs = !seeded.input_registers.is_empty();
+        // H.E — derived combinational predicates are labeled per cube by the
+        // SMT `combinational_labels` pass, which also requires the SmtAllPairs
+        // eager lift (precise state edges + the encoded view).
+        let has_derived = !seeded.derived.is_empty();
         let cegar_opts = CegarOptions {
             max_iterations: opts.max_iterations,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -648,7 +707,7 @@ pub fn verify_auto(
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if has_compounds || has_inputs {
+            may_edge_inference: if has_compounds || has_inputs || has_derived {
                 MayEdgeInference::SmtAllPairs
             } else {
                 MayEdgeInference::Off
@@ -667,7 +726,12 @@ pub fn verify_auto(
             }
         }
         let adapter_options = AdapterOptions {
-            sidecar_json: synth_sidecar_json(&seeded.compounds, &referenced, &init_values),
+            sidecar_json: synth_sidecar_json(
+                &seeded.compounds,
+                &seeded.derived,
+                &referenced,
+                &init_values,
+            ),
             ..Default::default()
         };
         // Env sized to the cube space: simple specs + the sidecar compounds
@@ -775,7 +839,7 @@ mod tests {
     fn seeds_simple_state_predicate() {
         // `nu X. ((state == 5) && [] X)` over a state cell → one simple spec.
         let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n), |_| false);
+        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n), |_| false, |_| false);
         assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
         assert_eq!(s.specs[0].name, "state == 5");
         assert_eq!(s.specs[0].register, "state");
@@ -792,6 +856,7 @@ mod tests {
             &f,
             |n| cells(&["state", "state__past"]).contains(n),
             |_| false,
+            |_| false,
         );
         assert!(s.specs.is_empty(), "relational atom is not a simple spec");
         assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
@@ -806,7 +871,8 @@ mod tests {
             [("state".to_string(), 0), ("state__past".to_string(), 0)]
                 .into_iter()
                 .collect();
-        let json = synth_sidecar_json(&s.compounds, &referenced, &inits).expect("sidecar json");
+        let json =
+            synth_sidecar_json(&s.compounds, &[], &referenced, &inits).expect("sidecar json");
         assert!(json.contains("compound_predicates"));
         assert!(json.contains("state == state__past"));
         assert!(json.contains("config_values"), "init pins present: {json}");
@@ -818,7 +884,12 @@ mod tests {
         let f = mu_parser::parse("nu X. (((gnt_o != 0) || ready_i) && [] X)").unwrap();
         // Neither IO signal is a state cell, and (here) none is a free input
         // either → both unseedable.
-        let s = seed_from_formula(&f, |n| cells(&["state_q"]).contains(n), |_| false);
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state_q"]).contains(n),
+            |_| false,
+            |_| false,
+        );
         assert!(
             s.unseedable.contains(&"gnt_o != 0".to_string()),
             "IO comparison atom must be unseedable; got {:?}",
@@ -834,7 +905,7 @@ mod tests {
     #[test]
     fn bare_one_bit_state_signal_seeds_eq_one() {
         let f = mu_parser::parse("nu X. (busy && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n), |_| false);
+        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n), |_| false, |_| false);
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "busy");
         assert_eq!(s.specs[0].value, 1, "bare boolean state signal ≡ sig == 1");
@@ -852,6 +923,7 @@ mod tests {
             &f,
             |n| cells(&["state"]).contains(n),
             |n| cells(&["cfg_enable_i"]).contains(n),
+            |_| false,
         );
         assert!(
             s.unseedable.is_empty(),
@@ -873,7 +945,12 @@ mod tests {
     #[test]
     fn h_b_bare_input_boolean_seeds_eq_one_as_free() {
         let f = mu_parser::parse("nu X. (trigger_i && [] X)").unwrap();
-        let s = seed_from_formula(&f, |_| false, |n| cells(&["trigger_i"]).contains(n));
+        let s = seed_from_formula(
+            &f,
+            |_| false,
+            |n| cells(&["trigger_i"]).contains(n),
+            |_| false,
+        );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "trigger_i");
         assert_eq!(s.specs[0].value, 1, "bare boolean input ≡ sig == 1");
@@ -907,7 +984,12 @@ mod tests {
         // `cfg_enable_i != 0` (a Ne, routed to the compound branch) over an
         // input is unseedable even though the same atom as `== 0` would seed.
         let f = mu_parser::parse("nu X. ((cfg_enable_i != 0) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |_| false, |n| cells(&["cfg_enable_i"]).contains(n));
+        let s = seed_from_formula(
+            &f,
+            |_| false,
+            |n| cells(&["cfg_enable_i"]).contains(n),
+            |_| false,
+        );
         assert!(s.specs.is_empty());
         assert!(s.compounds.is_empty());
         assert!(
@@ -915,6 +997,56 @@ mod tests {
             "input inside a compound is unseedable: {:?}",
             s.unseedable
         );
+    }
+
+    #[test]
+    fn h_e_admits_combinational_bare_atom_as_derived() {
+        // csrng `main_sm_err_o` — a combinational output, neither state nor input
+        // — is admitted as a DERIVED per-cube label (Approach B), not a spec.
+        let f = mu_parser::parse("nu X. (main_sm_err_o && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |_| false,
+            |_| false,
+            |n| cells(&["main_sm_err_o"]).contains(n),
+        );
+        assert!(s.specs.is_empty(), "combinational is not a cube dimension");
+        assert!(s.compounds.is_empty());
+        assert!(s.unseedable.is_empty(), "not skipped: {:?}", s.unseedable);
+        assert_eq!(s.derived.len(), 1, "one derived combinational predicate");
+        assert_eq!(s.derived[0].name, "main_sm_err_o");
+        assert_eq!(s.derived[0].value, 1, "bare boolean ≡ == 1");
+    }
+
+    #[test]
+    fn h_e_admits_combinational_eq_value_as_derived() {
+        let f = mu_parser::parse("nu X. ((err_code == 3) && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |_| false,
+            |_| false,
+            |n| cells(&["err_code"]).contains(n),
+        );
+        assert_eq!(s.derived.len(), 1);
+        assert_eq!(s.derived[0].register, "err_code");
+        assert_eq!(s.derived[0].value, 3);
+        assert!(s.specs.is_empty() && s.unseedable.is_empty());
+    }
+
+    #[test]
+    fn h_e_state_takes_precedence_over_combinational() {
+        // A name classified as BOTH state and combinational binds as STATE (a
+        // value-alias of state is also an Op-with-symbol; `is_state` is checked
+        // first), so it stays a cube dimension, never a derived label.
+        let f = mu_parser::parse("nu X. (sig && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["sig"]).contains(n),
+            |_| false,
+            |n| cells(&["sig"]).contains(n),
+        );
+        assert_eq!(s.specs.len(), 1, "state precedence → a cube dimension");
+        assert!(s.derived.is_empty());
     }
 
     #[test]
@@ -972,7 +1104,7 @@ mod tests {
     fn no_sidecar_when_nothing_to_emit() {
         let empty_refs = std::collections::BTreeSet::new();
         let empty_inits = std::collections::HashMap::new();
-        assert!(synth_sidecar_json(&[], &empty_refs, &empty_inits).is_none());
+        assert!(synth_sidecar_json(&[], &[], &empty_refs, &empty_inits).is_none());
     }
 
     #[test]
