@@ -19,13 +19,20 @@
 //! [`cegar_refine_loop`] consumes (forcing the SmtAllPairs eager lift).
 //!
 //! **Scope (sound gate).** The cube abstraction binds predicates over **state
-//! cells** only. An atom over a non-state signal (a primary input / pure
-//! combinational output — e.g. an arbiter's `req_i` / `gnt_o`) has no cube
-//! predicate; binding it would fall through to the evaluator's "unknown ⇒ false"
-//! under-approx and silently produce a vacuous verdict. So a property whose atoms
-//! are not all state-cell-resolvable is **Skipped** with a reason — never given a
-//! misleading verdict. (Those combinational/IO properties want the bit-blast
-//! path; a future increment routes them there.)
+//! cells** and (H.B) over primary **inputs** as *free* cube dimensions. A simple
+//! `input == value` atom (an arbiter's `req_i`, sysrst's `cfg_enable_i` /
+//! `trigger_*`) becomes a free dimension whose source-pin / target-free shape the
+//! SMT may/must seam realises (`build_register_nid_map_with_inputs`), and whose
+//! verdict is read across every initial environment value — the "for all input
+//! sequences" over-approximation (see `docs/design/free-input-atoms.md`).
+//!
+//! What is still **Skipped** (never given a misleading verdict): an atom over a
+//! pure **combinational output** (an `eq`/`or` function of state like csrng's
+//! `main_sm_err_o` — case 4 of the design doc; needs the signal-node mapping a
+//! follow-up adds), and an input inside a *compound* (the compound SMT branch
+//! reads state BVs, not `view.inputs`). Those properties are reported Skipped
+//! with a reason — binding them would fall through to the evaluator's
+//! "unknown ⇒ false" under-approx and silently produce a vacuous verdict.
 
 use std::collections::HashSet;
 
@@ -172,18 +179,24 @@ impl Default for VerifyAutoOptions {
 
 /// Auto-seeded predicates for one formula: simple `reg == value` specs, compound
 /// `(name, expr)` pairs (relational / `!=` / boolean combinations), and the atom
-/// strings that could NOT be seeded (reference a non-state signal).
+/// strings that could NOT be seeded (reference a non-state, non-input signal).
 #[derive(Debug, Clone, Default)]
 struct Seeded {
     specs: Vec<PredicateSpec>,
     compounds: Vec<(String, PredicateExpr)>,
     unseedable: Vec<String>,
+    /// H.B (free-input atoms) — the subset of `specs` registers that are
+    /// primary **inputs** (not state cells). An input predicate is a *free*
+    /// cube dimension: the environment picks its value each cycle, so it is
+    /// NOT pinned at init (the env is free at cycle 0) and the verdict is read
+    /// across **all** of its initial polarities. See
+    /// `docs/design/free-input-atoms.md`. Empty ⇒ the pre-H.B state-only shape.
+    input_registers: HashSet<String>,
 }
 
-/// The minimal H.1 — derive cube predicates from a formula's `Node::Predicate`
-/// atoms. Each predicate is named exactly the atom string (so the evaluator's
-/// name-match binds the atom to its cube bit). An atom whose registers do not
-/// all resolve to a state cell (per `is_state`) is recorded as unseedable.
+/// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
+/// `Node::Predicate` atoms. Each predicate is named exactly the atom string (so
+/// the evaluator's name-match binds the atom to its cube bit).
 ///
 /// `is_state(name)` returns true when `name` resolves to a lifted state cell —
 /// either directly (the symbol is on a `state` line) or via the BTOR2
@@ -191,7 +204,27 @@ struct Seeded {
 /// `flatten` left unnamed on the `state` line). The lift's
 /// `resolve_predicate_registers` canonicalises the same alias, so a name the
 /// seeder accepts here also binds downstream.
-fn seed_from_formula(formula: &Formula, is_state: impl Fn(&str) -> bool) -> Seeded {
+///
+/// `is_input(name)` (H.B) returns true when `name` is a primary **input** of
+/// the lifted BTOR2. A **simple** `input == value` / bare-input atom is admitted
+/// as a *free* cube dimension (its register is recorded in
+/// [`Seeded::input_registers`]); the SMT may/must seam realises the source-pin /
+/// target-free shape (`build_register_nid_map_with_inputs`). State takes
+/// precedence — `is_state` is consulted first — so a name that is both never
+/// double-classifies.
+///
+/// **Scope.** Inputs are admitted only inside a *simple* atom (the compound SMT
+/// branch reads `state_curr`/`state_next` BVs, not `view.inputs`, so a compound
+/// referencing an input would mis-encode). A compound (`!=`, relational, boolean)
+/// still requires **all-state** registers; an input inside a compound is
+/// unseedable. A non-state non-input register (a pure combinational function of
+/// state — the strict resolver's reject case) is unseedable too — never given a
+/// misleading verdict.
+fn seed_from_formula(
+    formula: &Formula,
+    is_state: impl Fn(&str) -> bool,
+    is_input: impl Fn(&str) -> bool,
+) -> Seeded {
     let mut out = Seeded::default();
     let mut seen: HashSet<&str> = HashSet::new();
     for node in formula.nodes() {
@@ -202,30 +235,54 @@ fn seed_from_formula(formula: &Formula, is_state: impl Fn(&str) -> bool) -> Seed
             continue;
         }
         match parse_predicate_expr(atom) {
-            Ok(expr) => {
-                if expr.registers().iter().any(|r| !is_state(r)) {
-                    out.unseedable.push(atom.clone());
-                    continue;
+            Ok(expr) => match &expr {
+                // Simple `reg == value` → a direct PredicateSpec cube bit, over
+                // a state cell OR (H.B) a free input.
+                PredicateExpr::Cmp {
+                    register,
+                    op: CmpOp::Eq,
+                    value,
+                } => {
+                    if is_state(register) {
+                        out.specs.push(PredicateSpec {
+                            name: atom.clone(),
+                            register: register.clone(),
+                            value: *value,
+                        });
+                    } else if is_input(register) {
+                        out.input_registers.insert(register.clone());
+                        out.specs.push(PredicateSpec {
+                            name: atom.clone(),
+                            register: register.clone(),
+                            value: *value,
+                        });
+                    } else {
+                        out.unseedable.push(atom.clone());
+                    }
                 }
-                match &expr {
-                    // Simple `reg == value` → a direct PredicateSpec cube bit.
-                    PredicateExpr::Cmp {
-                        register,
-                        op: CmpOp::Eq,
-                        value,
-                    } => out.specs.push(PredicateSpec {
-                        name: atom.clone(),
-                        register: register.clone(),
-                        value: *value,
-                    }),
-                    // Relational / `!=` / boolean combination → compound predicate.
-                    _ => out.compounds.push((atom.clone(), expr)),
+                // Relational / `!=` / boolean combination → compound predicate.
+                // The compound SMT branch reads state BVs only, so every
+                // referenced register must be a state cell.
+                _ => {
+                    if expr.registers().iter().all(|r| is_state(r)) {
+                        out.compounds.push((atom.clone(), expr));
+                    } else {
+                        out.unseedable.push(atom.clone());
+                    }
                 }
-            }
+            },
             // A bare identifier atom (`parse_predicate_expr` needs an operator):
-            // a 1-bit boolean signal `sig` ≡ `sig == 1`. Seedable iff a state cell.
+            // a 1-bit boolean signal `sig` ≡ `sig == 1`. Seedable as a state
+            // cell or (H.B) a free input.
             Err(_) => {
                 if is_state(atom) {
+                    out.specs.push(PredicateSpec {
+                        name: atom.clone(),
+                        register: atom.clone(),
+                        value: 1,
+                    });
+                } else if is_input(atom) {
+                    out.input_registers.insert(atom.clone());
                     out.specs.push(PredicateSpec {
                         name: atom.clone(),
                         register: atom.clone(),
@@ -332,6 +389,26 @@ fn const_to_u64(
         Bin(b) => u64::from_str_radix(b, 2).unwrap_or(0),
         Hex(h) => u64::from_str_radix(h, 16).unwrap_or(0),
     }
+}
+
+/// H.B — the set of initial cube indices: the pinned-state `base` cube ⊗ every
+/// combination of the free-input bit positions. The environment is free at cycle
+/// 0, so each free-input dimension ranges over both polarities. An empty
+/// `free_bits` returns `[base]` (the pre-H.B single reset cube), so state-only
+/// properties read exactly one cube. Bit `free_bits[k]` is toggled by bit `k` of
+/// the combination index.
+fn free_input_init_cubes(base: usize, free_bits: &[u32]) -> Vec<usize> {
+    (0..(1usize << free_bits.len()))
+        .map(|combo| {
+            let mut c = base;
+            for (k, &b) in free_bits.iter().enumerate() {
+                if (combo >> k) & 1 == 1 {
+                    c |= 1 << b;
+                }
+            }
+            c
+        })
+        .collect()
 }
 
 /// Verify every translated SVA property in `sources` against the model, with no
@@ -490,6 +567,22 @@ pub fn verify_auto(
                 .is_some()
     };
 
+    // H.B (free-input atoms) — primary-input symbols of the lifted design. A
+    // simple atom over one of these is admitted as a *free* cube dimension (the
+    // env picks any value each cycle), so the dominant real-SVA blocker — IO /
+    // config antecedents like sysrst's `cfg_enable_i` / `trigger_*` / `cnt_clr`
+    // — is verifiable instead of SKIPPED. `is_input` is consulted only after
+    // `is_state` (state precedence), so a register that is both never
+    // double-classifies. A reset input pinned by reset-gating is NOT a free
+    // input (it was rewritten to a constant), so it never appears here.
+    let input_symbols: HashSet<String> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, crate::adapter::btor2::ast::Node::Input { .. }))
+        .filter_map(|l| symbols.get(&l.nid).cloned())
+        .collect();
+    let is_input = |name: &str| -> bool { input_symbols.contains(name) };
+
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
         let formula = match mu_parser::parse(&t.formula) {
@@ -508,7 +601,7 @@ pub fn verify_auto(
             }
         };
 
-        let seeded = seed_from_formula(&formula, resolves_to_state);
+        let seeded = seed_from_formula(&formula, resolves_to_state, is_input);
         if !seeded.unseedable.is_empty() {
             let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
@@ -537,9 +630,15 @@ pub fn verify_auto(
         let mut seeded_names: Vec<String> = seeded.specs.iter().map(|s| s.name.clone()).collect();
         seeded_names.extend(seeded.compounds.iter().map(|(n, _)| n.clone()));
 
-        // Compounds present ⇒ force the SmtAllPairs eager lift (the only
-        // compound-aware path); `cegar_refine_loop` re-checks this.
+        // Compounds OR free inputs ⇒ force the SmtAllPairs eager lift.
+        // Compounds: the only compound-aware may path. Free inputs (H.B): the
+        // sampling may path is state-oriented (it builds a canonical
+        // representative over state registers and ignores `view.inputs`), so it
+        // cannot realise the source-pin / target-free input shape — only the
+        // SmtAllPairs seam (over `build_register_nid_map_with_inputs`) can.
+        // `cegar_refine_loop` re-checks the compound gate.
         let has_compounds = !seeded.compounds.is_empty();
+        let has_inputs = !seeded.input_registers.is_empty();
         let cegar_opts = CegarOptions {
             max_iterations: opts.max_iterations,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -549,7 +648,7 @@ pub fn verify_auto(
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if has_compounds {
+            may_edge_inference: if has_compounds || has_inputs {
                 MayEdgeInference::SmtAllPairs
             } else {
                 MayEdgeInference::Off
@@ -575,29 +674,43 @@ pub fn verify_auto(
         // `cegar_refine_loop` appends.
         let env = Environment::new(1usize << predicate_count);
 
-        // The design's initial cube index: evaluate every predicate at the
+        // The design's initial cube index(es): evaluate every predicate at the
         // reset valuation, in the lift's bit order (simple specs first, then the
-        // sidecar compounds `cegar_refine_loop` appends). The verdict AT THIS
-        // cube is the property's answer — sidestepping the lift's `cube_0`
+        // sidecar compounds `cegar_refine_loop` appends). The verdict AT THE
+        // RESET CUBE is the property's answer — sidestepping the lift's `cube_0`
         // initial-state default (cube_is_admissible can't pin a compound).
+        //
+        // H.B — a free-input spec's bit is NOT pinned at init (the environment
+        // is free at cycle 0). Its bit position is collected in
+        // `free_input_bits` and the verdict is read across ALL of its initial
+        // polarities (the product of every free-input bit), then combined
+        // conjunctively: the property holds at reset iff it holds under every
+        // initial environment input.
         let init_val_u128: std::collections::HashMap<String, u128> = init_values
             .iter()
             .map(|(k, v)| (k.clone(), *v as u128))
             .collect();
-        let mut init_cube = 0usize;
+        let mut base_init_cube = 0usize;
+        let mut free_input_bits: Vec<u32> = Vec::new();
         let mut bit = 0u32;
         for s in &seeded.specs {
-            if init_values.get(&s.register).copied().unwrap_or(0) == s.value {
-                init_cube |= 1 << bit;
+            if seeded.input_registers.contains(&s.register) {
+                // Free input dimension — left unset in the base; enumerated below.
+                free_input_bits.push(bit);
+            } else if init_values.get(&s.register).copied().unwrap_or(0) == s.value {
+                base_init_cube |= 1 << bit;
             }
             bit += 1;
         }
         for (_, expr) in &seeded.compounds {
             if expr.eval(&init_val_u128) {
-                init_cube |= 1 << bit;
+                base_init_cube |= 1 << bit;
             }
             bit += 1;
         }
+        // All initial cubes = base ⊗ every combination of the free-input bits.
+        // No free inputs ⇒ a single cube, identical to the pre-H.B single-read.
+        let init_cubes = free_input_init_cubes(base_init_cube, &free_input_bits);
 
         let outcome = match cegar_refine_loop(
             &formula,
@@ -609,21 +722,27 @@ pub fn verify_auto(
         ) {
             Ok(trace) => {
                 let v = &trace.final_verdict;
-                // The verdict at the reset cube is the property's verdict.
-                match v.verdict_at(init_cube) {
-                    Trit::True => VerifyOutcome::Holds,
-                    Trit::False => {
-                        let false_cells = (0..v.len())
-                            .filter(|&i| v.verdict_at(i) == Trit::False)
-                            .count();
-                        VerifyOutcome::Violated { false_cells }
-                    }
-                    Trit::Unknown => {
-                        let unknown_cells = (0..v.len())
-                            .filter(|&i| v.verdict_at(i) == Trit::Unknown)
-                            .count();
-                        VerifyOutcome::Unknown { unknown_cells }
-                    }
+                // Combine the verdict over every initial input flavour (H.B):
+                // a violation under SOME env input is a violation (False
+                // dominates); else an undecided flavour makes it ⊥; else Holds.
+                // With no free inputs `init_cubes == [base_init_cube]`, so this
+                // is exactly the pre-H.B single-cube read.
+                let any_false = init_cubes.iter().any(|&ic| v.verdict_at(ic) == Trit::False);
+                let any_unknown = init_cubes
+                    .iter()
+                    .any(|&ic| v.verdict_at(ic) == Trit::Unknown);
+                if any_false {
+                    let false_cells = (0..v.len())
+                        .filter(|&i| v.verdict_at(i) == Trit::False)
+                        .count();
+                    VerifyOutcome::Violated { false_cells }
+                } else if any_unknown {
+                    let unknown_cells = (0..v.len())
+                        .filter(|&i| v.verdict_at(i) == Trit::Unknown)
+                        .count();
+                    VerifyOutcome::Unknown { unknown_cells }
+                } else {
+                    VerifyOutcome::Holds
                 }
             }
             Err(e) => VerifyOutcome::Skipped {
@@ -656,7 +775,7 @@ mod tests {
     fn seeds_simple_state_predicate() {
         // `nu X. ((state == 5) && [] X)` over a state cell → one simple spec.
         let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n));
+        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n), |_| false);
         assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
         assert_eq!(s.specs[0].name, "state == 5");
         assert_eq!(s.specs[0].register, "state");
@@ -669,7 +788,11 @@ mod tests {
     fn seeds_relational_predicate_as_compound() {
         // `$stable` shape: `state == state__past` → a compound (REL), both state cells.
         let f = mu_parser::parse("nu X. ((state == state__past) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["state", "state__past"]).contains(n));
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state", "state__past"]).contains(n),
+            |_| false,
+        );
         assert!(s.specs.is_empty(), "relational atom is not a simple spec");
         assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
         assert_eq!(s.compounds[0].0, "state == state__past");
@@ -693,7 +816,9 @@ mod tests {
     fn gates_atoms_over_non_state_signals() {
         // `gnt_o != 0` and `ready_i` over IO signals (not state cells) → unseedable.
         let f = mu_parser::parse("nu X. (((gnt_o != 0) || ready_i) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["state_q"]).contains(n)); // neither IO signal is a state cell
+        // Neither IO signal is a state cell, and (here) none is a free input
+        // either → both unseedable.
+        let s = seed_from_formula(&f, |n| cells(&["state_q"]).contains(n), |_| false);
         assert!(
             s.unseedable.contains(&"gnt_o != 0".to_string()),
             "IO comparison atom must be unseedable; got {:?}",
@@ -709,10 +834,87 @@ mod tests {
     #[test]
     fn bare_one_bit_state_signal_seeds_eq_one() {
         let f = mu_parser::parse("nu X. (busy && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n));
+        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n), |_| false);
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "busy");
         assert_eq!(s.specs[0].value, 1, "bare boolean state signal ≡ sig == 1");
+        assert!(s.input_registers.is_empty(), "no free inputs here");
+    }
+
+    #[test]
+    fn h_b_admits_simple_input_atom_as_free_dimension() {
+        // sysrst shape: `!cfg_enable_i |=> state == Idle` translates (after the
+        // disable-iff / |=> lowering) to a formula referencing the INPUT
+        // `cfg_enable_i` and the STATE `state`. Here we drive the seeder with
+        // `state` as a state cell and `cfg_enable_i` as a free input.
+        let f = mu_parser::parse("nu X. ((cfg_enable_i == 0) && ((state == 1) && [] X))").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state"]).contains(n),
+            |n| cells(&["cfg_enable_i"]).contains(n),
+        );
+        assert!(
+            s.unseedable.is_empty(),
+            "both atoms seed: {:?}",
+            s.unseedable
+        );
+        assert_eq!(s.specs.len(), 2, "one state + one input simple spec");
+        assert!(
+            s.input_registers.contains("cfg_enable_i"),
+            "the input register is recorded as a free dimension: {:?}",
+            s.input_registers
+        );
+        assert!(
+            !s.input_registers.contains("state"),
+            "the state register is NOT a free dimension"
+        );
+    }
+
+    #[test]
+    fn h_b_bare_input_boolean_seeds_eq_one_as_free() {
+        let f = mu_parser::parse("nu X. (trigger_i && [] X)").unwrap();
+        let s = seed_from_formula(&f, |_| false, |n| cells(&["trigger_i"]).contains(n));
+        assert_eq!(s.specs.len(), 1);
+        assert_eq!(s.specs[0].name, "trigger_i");
+        assert_eq!(s.specs[0].value, 1, "bare boolean input ≡ sig == 1");
+        assert!(s.input_registers.contains("trigger_i"));
+    }
+
+    #[test]
+    fn free_input_init_cubes_no_free_bits_is_single_base() {
+        // No free inputs → exactly the base reset cube (pre-H.B behaviour).
+        assert_eq!(free_input_init_cubes(0b101, &[]), vec![0b101]);
+    }
+
+    #[test]
+    fn free_input_init_cubes_enumerates_every_flavour() {
+        // base = bit2 set (a pinned state predicate); free input dims at bits 0
+        // and 1 → 4 flavours, each keeping bit2 and toggling {0,1}.
+        let cubes = free_input_init_cubes(0b100, &[0, 1]);
+        let got: std::collections::HashSet<usize> = cubes.into_iter().collect();
+        let want: std::collections::HashSet<usize> =
+            [0b100, 0b101, 0b110, 0b111].into_iter().collect();
+        assert_eq!(
+            got, want,
+            "all 2^|free| initial input flavours, base preserved"
+        );
+    }
+
+    #[test]
+    fn h_b_input_inside_compound_is_unseedable() {
+        // An input inside a compound (`!=`, relational, boolean) is NOT admitted
+        // — the compound SMT branch reads state BVs only, not `view.inputs`. So
+        // `cfg_enable_i != 0` (a Ne, routed to the compound branch) over an
+        // input is unseedable even though the same atom as `== 0` would seed.
+        let f = mu_parser::parse("nu X. ((cfg_enable_i != 0) && [] X)").unwrap();
+        let s = seed_from_formula(&f, |_| false, |n| cells(&["cfg_enable_i"]).contains(n));
+        assert!(s.specs.is_empty());
+        assert!(s.compounds.is_empty());
+        assert!(
+            s.unseedable.contains(&"cfg_enable_i != 0".to_string()),
+            "input inside a compound is unseedable: {:?}",
+            s.unseedable
+        );
     }
 
     #[test]
@@ -782,13 +984,26 @@ mod tests {
 
     #[test]
     #[ignore = "requires slang + sv2v + Yosys + z3; run with --ignored"]
-    fn e2e_reset_gating_turns_a_skip_into_a_verdict() {
+    fn e2e_reset_handled_by_gating_or_as_free_input() {
         // A 2-bit FSM cycling 0→1→2→0, with an active-low-reset-guarded
-        // assertion `disable iff (!rst_n) state != 3`. With reset-gating ON
-        // (default) the guard is dropped, rst_n is pinned inactive, and the
-        // body `state != 3` is a state-cell property → HOLDS. With gating OFF
-        // the `!rst_n` IO atom is unbindable → SKIPPED. This is the headline
-        // before/after that the reset-gating fix delivers.
+        // assertion `disable iff (!rst_n) state != 3`. Two SOUND paths to a
+        // verdict, exercised here:
+        //
+        //   * Reset-gating ON (default) — the `disable iff` guard is dropped and
+        //     rst_n is pinned inactive, so the body `state != 3` is a pure
+        //     state-cell property → HOLDS. (`gated_resets = ["rst_n=1"]`.)
+        //   * Reset-gating OFF — the guard is KEPT, so the formula carries the
+        //     `!rst_n` vacuity disjunct, and (H.B) rst_n — a primary input — is
+        //     admitted as a FREE cube dimension. The verdict is read across both
+        //     reset flavours: rst_n low ⇒ the disjunct is vacuously true; rst_n
+        //     high ⇒ `state != 3` (the FSM never reaches 3) → HOLDS, soundly,
+        //     with no reset assumption. (`gated_resets` empty.)
+        //
+        // Pre-H.B the un-gated `!rst_n` atom was unbindable → SKIPPED; H.B's
+        // free-input admission subsumes that skip with a sound verdict. Both
+        // paths are sound for this property; they differ only in mechanism (pin
+        // the reset vs. treat it as a free environment input), visible in the
+        // diagnostics.
         let sv = "module fsm (input logic clk, input logic rst_n);\n\
                   logic [1:0] state;\n\
                   always_ff @(posedge clk) begin\n\
@@ -819,7 +1034,10 @@ mod tests {
             "active-low reset pinned inactive"
         );
 
-        // Reset-gating OFF: the `!rst_n` IO atom is unbindable → SKIPPED.
+        // Reset-gating OFF: the `!rst_n` atom is a primary input, admitted by
+        // H.B as a free cube dimension. The kept `disable iff` disjunct makes
+        // reset cycles vacuous, so the property is verified across all reset
+        // sequences → still HOLDS, soundly, with no reset assumption.
         let ungated = verify_auto(
             &sources,
             &yopts,
@@ -830,11 +1048,16 @@ mod tests {
         )
         .expect("verify_auto runs without reset-gating");
         assert!(
-            matches!(ungated.properties[0].outcome, VerifyOutcome::Skipped { .. }),
-            "without gating the reset atom forces a SKIP; got {:?}",
+            matches!(ungated.properties[0].outcome, VerifyOutcome::Holds),
+            "H.B admits the reset as a free input; the un-gated property still \
+             HOLDS soundly (the `!rst_n` disjunct keeps reset cycles vacuous); \
+             got {:?}",
             ungated.properties[0].outcome
         );
-        assert!(ungated.diagnostics.gated_resets.is_empty());
+        assert!(
+            ungated.diagnostics.gated_resets.is_empty(),
+            "no reset was pinned in the un-gated run"
+        );
     }
 
     #[test]
@@ -912,6 +1135,8 @@ mod tests {
         let (mut holds, mut violated, mut unknown, mut skipped) = (0, 0, 0, 0);
         for p in &report.properties {
             eprintln!("  [{:?}] {}: {:?}", p.kind, p.name, p.outcome);
+            eprintln!("      formula: {}", p.formula);
+            eprintln!("      seeded:  {:?}", p.seeded_predicates);
             match p.outcome {
                 VerifyOutcome::Holds => holds += 1,
                 VerifyOutcome::Violated { .. } => violated += 1,
@@ -1066,6 +1291,8 @@ mod tests {
         let (mut holds, mut violated, mut unknown, mut skipped) = (0, 0, 0, 0);
         for p in &report.properties {
             eprintln!("  [{:?}] {}: {:?}", p.kind, p.name, p.outcome);
+            eprintln!("      formula: {}", p.formula);
+            eprintln!("      seeded:  {:?}", p.seeded_predicates);
             match p.outcome {
                 VerifyOutcome::Holds => holds += 1,
                 VerifyOutcome::Violated { .. } => violated += 1,
@@ -1091,14 +1318,52 @@ mod tests {
             report.diagnostics.blackboxed_modules
         );
         // H.A — the state atoms (`state_q == k`, `cnt_q == k`) now BIND (via the
-        // value-alias resolver), so they no longer appear in any SKIP reason;
-        // only the genuine IO/config antecedents (`cfg_enable_i`, `trigger_*`,
-        // `cnt_clr`, `event_detected_*`) remain unbindable (the H.B frontier).
+        // value-alias resolver), so they no longer appear in any SKIP reason.
         for p in &report.properties {
             if let VerifyOutcome::Skipped { reason } = &p.outcome {
                 assert!(
                     !reason.contains("state_q ==") && !reason.contains("cnt_q =="),
                     "state atoms should bind, not appear in a SKIP reason; got: {reason}"
+                );
+            }
+        }
+        // H.B (free-input atoms) — the headline real-RTL win. `sva_0` is a
+        // `cfg_enable_i |=> state_q == 0`-style property: a config INPUT
+        // antecedent (`cfg_enable_i`) + a state consequent (`state_q == 0`).
+        // Pre-H.B the `cfg_enable_i` atom was unbindable → the property SKIPPED;
+        // H.B admits it as a free cube dimension, so it reaches a sound HOLDS
+        // (read across both cfg_enable_i flavours). This is the first
+        // free-input-antecedent verdict on real OpenTitan RTL.
+        let sva0 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "sysrst_ctrl_detect_sva_0")
+            .expect("sva_0 present");
+        assert!(
+            sva0.formula.contains("cfg_enable_i"),
+            "sva_0 references the config input cfg_enable_i; got {}",
+            sva0.formula
+        );
+        assert!(
+            sva0.seeded_predicates.iter().any(|s| s == "cfg_enable_i"),
+            "the free input cfg_enable_i is admitted as a cube dimension (H.B); got {:?}",
+            sva0.seeded_predicates
+        );
+        assert!(
+            matches!(sva0.outcome, VerifyOutcome::Holds),
+            "the cfg_enable_i |=> state_q==0 property reaches a sound HOLDS via the \
+             free-input dimension; got {:?}",
+            sva0.outcome
+        );
+        // The only remaining SKIPs are pure combinational signals (case 4 of the
+        // design doc — `event_detected_*`, `trigger_*`, `cnt_clr`), never a
+        // primary input: H.B closed the free-input antecedents; combinational
+        // outputs await the signal-node mapping follow-up.
+        for p in &report.properties {
+            if let VerifyOutcome::Skipped { reason } = &p.outcome {
+                assert!(
+                    !reason.contains("cfg_enable_i"),
+                    "no free-input antecedent should remain skipped after H.B; got: {reason}"
                 );
             }
         }

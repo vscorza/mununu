@@ -292,7 +292,7 @@ impl SmtEncode for BtorSts<'_> {
     ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
-            SmtMayVerdict, build_register_nid_map, smt_per_target_may_check,
+            SmtMayVerdict, build_register_nid_map_with_inputs, smt_per_target_may_check,
         };
 
         if predicates.is_empty() {
@@ -311,7 +311,11 @@ impl SmtEncode for BtorSts<'_> {
                 // predicate_cube_lift fallback.
                 Err(_) => return Vec::new(),
             };
-            let nid_map = build_register_nid_map(&view);
+            // H.B — map inputs too, so a free-input predicate resolves and
+            // its source-pin / target-free edge shape (in `build_pred_constraint`)
+            // fires. State symbols still take precedence on a name collision, so
+            // state-only predicate sets get the identical map + identical edges.
+            let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
             for i in 0..n_cubes {
                 for j in 0..n_cubes {
@@ -336,7 +340,7 @@ impl SmtEncode for BtorSts<'_> {
     ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
-            SmtMustVerdict, build_register_nid_map, smt_per_target_must_check_standard,
+            SmtMustVerdict, build_register_nid_map_with_inputs, smt_per_target_must_check_standard,
         };
 
         if predicates.is_empty() {
@@ -354,7 +358,11 @@ impl SmtEncode for BtorSts<'_> {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
-            let nid_map = build_register_nid_map(&view);
+            // H.B — inputs mapped too (state precedence on collision). An
+            // input source-pin lands on a copy disjoint from the universally-
+            // quantified transition inputs, so the must-check is effectively
+            // ∀-over-inputs: sound (never fabricates a must-edge), possibly weak.
+            let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
             for i in 0..n_cubes {
                 for j in 0..n_cubes {
@@ -380,7 +388,7 @@ impl SmtEncode for BtorSts<'_> {
     ) -> Vec<(usize, Vec<usize>)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
-            SmtMustVerdict, build_register_nid_map, smt_hyper_must_check,
+            SmtMustVerdict, build_register_nid_map_with_inputs, smt_hyper_must_check,
         };
 
         if predicates.is_empty() {
@@ -407,7 +415,8 @@ impl SmtEncode for BtorSts<'_> {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
-            let nid_map = build_register_nid_map(&view);
+            // H.B — inputs mapped too (state precedence on collision).
+            let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
             for (src, targets) in may_succ.iter().enumerate() {
                 if targets.is_empty() {
@@ -602,5 +611,79 @@ mod tests {
         for e in &must {
             assert!(may.contains(e), "must-edge {e:?} must also be a may-edge");
         }
+    }
+
+    // H.B (free-input atoms) — `reg_a' = in_a`, with a free input `in_a`.
+    const FREE_INPUT_BTOR2: &str =
+        "1 sort bitvec 1\n2 input 1 in_a\n3 state 1 reg_a\n4 zero 1\n5 init 1 3 4\n6 next 1 3 2\n";
+
+    #[test]
+    fn btor_sts_may_edges_admit_free_input_predicate_source_pin_target_free() {
+        // H.B increment 2 — admit a predicate over a primary INPUT as a cube
+        // dimension. Cube bits: bit0 = `reg_a == 0` (state), bit1 = `in_a == 0`
+        // (free input). Cube index = (in_a_bit << 1) | reg_a_bit, polarity 1 =
+        // predicate holds.
+        //
+        // Transition `reg_a' = in_a` means the next reg_a equals the *source*
+        // input. The two soundness properties this proves:
+        //   (1) SOURCE PIN is effective — a source with `in_a == 0` reaches
+        //       `reg_a' == 0` (p0' true); a source with `in_a == 1` reaches
+        //       `reg_a' == 1` (p0' false). Different source-input polarities
+        //       give different successors ⇒ the source input genuinely drives
+        //       the transition (shared existential with the relation).
+        //   (2) TARGET is FREE — from any source, BOTH next-input flavours of
+        //       the successor get a may-edge (the next-cycle input is not a
+        //       variable of the one-step relation). The "for all input
+        //       sequences" over-approximation.
+        let file = parser::parse(FREE_INPUT_BTOR2).expect("parse free-input fixture");
+        let sts = BtorSts::new(&file);
+        let preds = vec![
+            PredicateSpec {
+                name: "reg_a == 0".into(),
+                register: "reg_a".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "in_a == 0".into(),
+                register: "in_a".into(),
+                value: 0,
+            },
+        ];
+        let edges: std::collections::HashSet<(usize, usize)> =
+            sts.may_edges(&preds, 5_000).into_iter().collect();
+
+        // cube 0: reg_a=1,in_a=1  → reg_a'=1 (p0'=F) → tgts {0 (in_a'=1), 2 (in_a'=0)}
+        // cube 1: reg_a=0,in_a=1  → reg_a'=1 (p0'=F) → tgts {0, 2}
+        // cube 2: reg_a=1,in_a=0  → reg_a'=0 (p0'=T) → tgts {1 (in_a'=1), 3 (in_a'=0)}
+        // cube 3: reg_a=0,in_a=0  → reg_a'=0 (p0'=T) → tgts {1, 3}
+        let expected: std::collections::HashSet<(usize, usize)> = [
+            (0, 0),
+            (0, 2),
+            (1, 0),
+            (1, 2),
+            (2, 1),
+            (2, 3),
+            (3, 1),
+            (3, 3),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            edges, expected,
+            "free-input may-relation must be source-pinned + target-free: {edges:?}"
+        );
+
+        // (2) explicit: source cube 2 (in_a=0) reaches BOTH in_a' flavours of
+        // the reg_a'=0 successor — cube 1 (in_a'=1) AND cube 3 (in_a'=0).
+        assert!(
+            edges.contains(&(2, 1)) && edges.contains(&(2, 3)),
+            "target input dimension must be free (both next-input flavours reached)"
+        );
+        // (1) explicit: a source with in_a=1 (cube 0) never reaches reg_a'=0
+        // (no edge into a p0'=true cube), proving the source pin is effective.
+        assert!(
+            !edges.contains(&(0, 1)) && !edges.contains(&(0, 3)),
+            "source in_a=1 must NOT reach reg_a'==0 — the source input pin is load-bearing"
+        );
     }
 }

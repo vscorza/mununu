@@ -157,3 +157,52 @@ This is the path to the first **definite** verify-auto verdict on real RTL: with
 H.A + H.C shipped, sysrst's `!cfg_enable_i |=> state==Idle` and csrng's
 `state==Error |-> main_sm_err_o` are exactly the case-3 / case-4 properties this
 unblocks.
+
+## 7. Implementation status
+
+**Increment 1 — SMT-layer foundation (shipped, #176).**
+[`build_register_nid_map_with_inputs`](../../crates/mununu-core/src/adapter/btor2/smt_must_edge.rs)
+maps input symbols to their NID alongside state (state precedence on collision),
+and [`build_pred_constraint`](../../crates/mununu-core/src/adapter/btor2/smt_must_edge.rs)
+realises the source-pin / target-free shape for an input predicate (the source
+pins the current-cycle input BV; the target returns `true`, leaving the next-cycle
+input free). Dormant until increment 2 wired a caller.
+
+**Increment 2 — cube-layer wiring (shipped).** Three seams:
+
+1. The STS-IR SMT seam (`BtorSts::{may,must,hyper_must}_edges` in
+   [`sts_ir.rs`](../../crates/mununu-core/src/adapter/sts_ir.rs)) consumes
+   `build_register_nid_map_with_inputs`. Behaviour-preserving for every existing
+   state-only predicate set (input map entries sit unused).
+2. The verify-auto seeder
+   ([`seed_from_formula`](../../crates/mununu-core/src/adapter/slang/verify_auto.rs))
+   admits a **simple** `input == value` / bare-input atom as a free cube
+   dimension (recorded in `Seeded::input_registers`), and forces
+   `MayEdgeInference::SmtAllPairs` when any free input is present (the sampling
+   may-path is state-oriented and cannot realise source-pin / target-free).
+3. The verify-auto init/verdict read
+   ([`free_input_init_cubes`](../../crates/mununu-core/src/adapter/slang/verify_auto.rs))
+   leaves free-input dimensions unpinned at init and reads the verdict across
+   **all** initial input flavours, combined conjunctively (a violation under some
+   env input ⇒ Violated; an undecided flavour ⇒ Unknown; else Holds).
+
+**Validated (mununu-sva docker image).**
+
+- **sysrst_ctrl_detect** — `sva_0` reaches a sound **HOLDS** (pre-H.B: every
+  translated property SKIPPED; this is the first real-OpenTitan IO-antecedent
+  verdict). No spurious VIOLATED.
+- **csrng_main_sm** — unchanged (its atoms are state + a combinational output;
+  no free inputs), a clean no-regression anchor.
+- **Reset-as-free-input** — an un-gated `disable iff (!rst_n) state != 3` property
+  now HOLDS soundly without reset-gating: `rst_n` (a primary input) is admitted as
+  a free dimension and the kept `!rst_n` disjunct makes reset cycles vacuous.
+
+**Still skipped (the case-4 follow-up).** A predicate over a pure **combinational
+output** — `is_input` is `false` for it (not a BTOR2 `Node::Input`) and the strict
+alias resolver rejects it (not a value-alias of state) — is honestly SKIPPED, not
+given a misleading verdict. sysrst's `trigger_active` / `cnt_clr` /
+`event_detected_*` and csrng's `main_sm_err_o` are this case. Admitting them needs
+the §4 signal-node mapping (map the output's BTOR2 node so the predicate-image
+determines its value); not yet wired. An input inside a *compound* predicate is
+also skipped (the compound SMT branch reads `state_curr`/`state_next` BVs, not
+`view.inputs`).
