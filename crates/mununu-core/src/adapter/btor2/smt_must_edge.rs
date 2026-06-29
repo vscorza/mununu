@@ -311,10 +311,9 @@ fn term_target_bv<'a>(
 /// of `build_pred_constraint` collapse:
 /// - a **state** atom → `state_curr` / `state_next` (identical to the per-kind
 ///   path by construction — a register leaf's primed value IS `state_next`);
-/// - a **free input** atom → `inputs` / fresh `i'` (the per-kind path returned
-///   the literal `true` on the target; for the `∃` may-check the fresh,
-///   otherwise-unconstrained `i'` is equivalent — see
-///   [`smt_per_target_may_check_uniform`]);
+/// - a **free input** atom → `inputs` on the source (pinned), `true` on the
+///   target (FREE — the H.B design's "environment picks any next input"),
+///   identical to `build_pred_constraint`'s input branch for both may and must;
 /// - a **compound** → `PredicateExpr::build_constraint` over the same uniform
 ///   term lookup;
 /// - a **combinational** node (out-of-fragment for the per-kind path → `None` →
@@ -332,20 +331,41 @@ fn build_pred_constraint_uniform<P: PredicateLike>(
     slot_next: bool,
     polarity: bool,
 ) -> Option<z3::ast::Bool> {
-    let term_bv = |reg: &str| -> Option<z3::ast::BV> {
-        let nid = *nid_map.get(reg)?;
-        if slot_next {
-            term_target_bv(view, primed, nid).cloned()
-        } else {
-            term_source_bv(view, nid).cloned()
-        }
-    };
     match pred.expr() {
         None => {
-            let bv = term_bv(pred.register())?;
-            Some(build_predicate_constraint(&bv, pred.value(), polarity))
+            let nid = *nid_map.get(pred.register())?;
+            // H.B design (free-input-atoms.md §"Transition semantics"): a free
+            // input's TARGET dimension is FREE ("the environment picks any next
+            // input"); the must keeps the pinned input on the SOURCE and leaves
+            // it existential on the target — a sound under-approximation. Encode
+            // that as the literal `true` on the target, identical to
+            // `build_pred_constraint`'s input branch (and `∃`-equivalent on the
+            // may-check). The nested-`∀i'` treatment is needed only for a
+            // *combinational function* of a next input (g(s',i')), which is not a
+            // cube dimension today — H.U.1d / a later combinational-target step.
+            if slot_next && view.inputs.contains_key(&nid) {
+                return Some(z3::ast::Bool::from_bool(true));
+            }
+            let bv = if slot_next {
+                term_target_bv(view, primed, nid)?
+            } else {
+                term_source_bv(view, nid)?
+            };
+            Some(build_predicate_constraint(bv, pred.value(), polarity))
         }
         Some(e) => {
+            // Compounds are state-only (the lift's compound gate enforces
+            // `expr.registers().all(is_state)`), so every leaf resolves to a
+            // state cell — `state_curr` / `state_next` via the uniform lookup,
+            // identical to `build_pred_constraint`'s compound branch.
+            let term_bv = |reg: &str| -> Option<z3::ast::BV> {
+                let nid = *nid_map.get(reg)?;
+                if slot_next {
+                    term_target_bv(view, primed, nid).cloned()
+                } else {
+                    term_source_bv(view, nid).cloned()
+                }
+            };
             let raw = e.build_constraint(&term_bv)?;
             Some(if polarity { raw } else { raw.not() })
         }
@@ -637,6 +657,165 @@ where
     }
     solver.assert(&universal);
 
+    match solver.check() {
+        z3::SatResult::Unsat => SmtMustVerdict::Must,
+        z3::SatResult::Sat => SmtMustVerdict::NotMust,
+        z3::SatResult::Unknown => SmtMustVerdict::Unknown,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// H.U.1c (2026-06-29) — uniform must / hyper-must, on the uniform image.
+// ─────────────────────────────────────────────────────────────────────
+
+/// H.U.1c — uniform variant of [`build_src_tgt_constraints`]: builds the source
+/// (current-cycle) + target (next-cycle) per-predicate constraints with the
+/// uniform rule ([`build_pred_constraint_uniform`]). `None` if any predicate's
+/// register is unresolved (caller → `Unknown`), matching the per-kind helper.
+fn build_src_tgt_constraints_uniform<P>(
+    view: &Btor2SmtView,
+    primed: &PrimedEnv,
+    src_bits: u64,
+    tgt_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+) -> Option<(Vec<z3::ast::Bool>, Vec<z3::ast::Bool>)>
+where
+    P: PredicateLike,
+{
+    let mut src = Vec::with_capacity(predicates.len());
+    let mut tgt = Vec::with_capacity(predicates.len());
+    for (i, pred) in predicates.iter().enumerate() {
+        let src_polarity = (src_bits >> i) & 1 == 1;
+        let tgt_polarity = (tgt_bits >> i) & 1 == 1;
+        src.push(build_pred_constraint_uniform(
+            view,
+            primed,
+            nid_map,
+            pred,
+            false,
+            src_polarity,
+        )?);
+        tgt.push(build_pred_constraint_uniform(
+            view,
+            primed,
+            nid_map,
+            pred,
+            true,
+            tgt_polarity,
+        )?);
+    }
+    Some((src, tgt))
+}
+
+/// H.U.1c — uniform variant of [`smt_per_target_must_check_standard`]. Identical
+/// `∀∃` query (`src ∧ ∀[inputs, state_next]. ¬(transition ∧ tgt)`, UNSAT ⇒ Must),
+/// built with the uniform rule.
+///
+/// **Behaviour-identical to the per-kind path on every existing cube dimension**
+/// (state / free-input / state-compound): a state target's BV is `state_next`
+/// (the same const the per-kind `next_state` returns), a free-input target is
+/// `true` (target-free, the H.B design), and a state-compound's leaves are
+/// `state_next` — so `build_pred_constraint_uniform` produces the *same* Z3 terms
+/// as `build_pred_constraint`. The primed cache + the `∀ bound` are therefore
+/// untouched relative to the per-kind path (the `∀ bound` stays `inputs +
+/// state_next`; the next-cycle `i'` is referenced by no existing target
+/// constraint). The new precision — a combinational-of-state target read from
+/// the primed cache — is latent until such a predicate is routed as a cube
+/// dimension (H.U.2). The `uniform_must_matches_per_kind` differential pins the
+/// equivalence.
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub(crate) fn smt_per_target_must_check_uniform<P>(
+    view: &Btor2SmtView,
+    primed: &PrimedEnv,
+    src_bits: u64,
+    tgt_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMustVerdict
+where
+    P: PredicateLike,
+{
+    let Some((src_constraints, tgt_constraints)) =
+        build_src_tgt_constraints_uniform(view, primed, src_bits, tgt_bits, predicates, nid_map)
+    else {
+        return SmtMustVerdict::Unknown;
+    };
+    let tgt_conj = conj_bool(&tgt_constraints);
+    let inner_body = z3::ast::Bool::and(&[&view.transition, &tgt_conj]).not();
+    let bound_bvs = universal_bound_bvs(view);
+    let bound_refs: Vec<&dyn z3::ast::Ast> =
+        bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+    for c in &src_constraints {
+        solver.assert(c);
+    }
+    solver.assert(&universal);
+    match solver.check() {
+        z3::SatResult::Unsat => SmtMustVerdict::Must,
+        z3::SatResult::Sat => SmtMustVerdict::NotMust,
+        z3::SatResult::Unknown => SmtMustVerdict::Unknown,
+    }
+}
+
+/// H.U.1c — uniform variant of [`smt_hyper_must_check`] (GKMTS hyper-must over a
+/// target SET). Same disjunction-of-targets `∀∃` encoding, built with the
+/// uniform rule; behaviour-identical to the per-kind path on existing cube
+/// dimensions (see [`smt_per_target_must_check_uniform`]).
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub(crate) fn smt_hyper_must_check_uniform<P>(
+    view: &Btor2SmtView,
+    primed: &PrimedEnv,
+    src_bits: u64,
+    target_bits_set: &[u64],
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMustVerdict
+where
+    P: PredicateLike,
+{
+    if target_bits_set.is_empty() {
+        return SmtMustVerdict::NotMust;
+    }
+    let Some((src_constraints, _placeholder)) =
+        build_src_tgt_constraints_uniform(view, primed, src_bits, 0, predicates, nid_map)
+    else {
+        return SmtMustVerdict::Unknown;
+    };
+    let mut tgt_disjuncts: Vec<z3::ast::Bool> = Vec::with_capacity(target_bits_set.len());
+    for &tgt_bits in target_bits_set {
+        let Some((_, tgt_constraints)) = build_src_tgt_constraints_uniform(
+            view, primed, src_bits, tgt_bits, predicates, nid_map,
+        ) else {
+            return SmtMustVerdict::Unknown;
+        };
+        tgt_disjuncts.push(conj_bool(&tgt_constraints));
+    }
+    let tgt_disjuncts_refs: Vec<&z3::ast::Bool> = tgt_disjuncts.iter().collect();
+    let any_tgt = z3::ast::Bool::or(&tgt_disjuncts_refs);
+    let inner_body = z3::ast::Bool::and(&[&view.transition, &any_tgt]).not();
+    let bound_bvs = universal_bound_bvs(view);
+    let bound_refs: Vec<&dyn z3::ast::Ast> =
+        bound_bvs.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+    let universal = z3::ast::forall_const(&bound_refs, &[], &inner_body);
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+    for c in &src_constraints {
+        solver.assert(c);
+    }
+    solver.assert(&universal);
     match solver.check() {
         z3::SatResult::Unsat => SmtMustVerdict::Must,
         z3::SatResult::Sat => SmtMustVerdict::NotMust,
@@ -1475,5 +1654,105 @@ mod tests {
                 e: idle_compound(),
             }],
         );
+    }
+
+    /// H.U.1c differential — the uniform must
+    /// ([`smt_per_target_must_check_uniform`]) must produce the SAME verdict as
+    /// the per-kind [`smt_per_target_must_check_standard`] for EVERY cube pair.
+    /// The `BtorSts::must_edges` cutover guard.
+    fn assert_uniform_must_matches<P: PredicateLike + Sync>(src: &str, preds: &[P]) {
+        let file = parse(src).expect("parse");
+        let n = 1u64 << preds.len();
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            for sb in 0..n {
+                for tb in 0..n {
+                    let per_kind =
+                        smt_per_target_must_check_standard(&view, sb, tb, preds, &nid_map, 5_000);
+                    let uniform = smt_per_target_must_check_uniform(
+                        &view, &primed, sb, tb, preds, &nid_map, 5_000,
+                    );
+                    assert_eq!(
+                        per_kind, uniform,
+                        "uniform must ≠ per-kind must (src={src:?} sb={sb} tb={tb})"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn uniform_must_matches_per_kind_state_input_compound() {
+        assert_uniform_must_matches(
+            DETERMINISTIC_ZERO_BTOR2,
+            &[PredicateSpec {
+                name: "p".into(),
+                register: "reg_a".into(),
+                value: 0,
+            }],
+        );
+        assert_uniform_must_matches(
+            INPUT_DRIVEN_BTOR2,
+            &[
+                PredicateSpec {
+                    name: "p".into(),
+                    register: "reg_a".into(),
+                    value: 0,
+                },
+                PredicateSpec {
+                    name: "q".into(),
+                    register: "in_a".into(),
+                    value: 1,
+                },
+            ],
+        );
+        assert_uniform_must_matches(
+            COMPOUND_DET_BTOR2,
+            &[CompoundPred {
+                reg0: "a".into(),
+                e: idle_compound(),
+            }],
+        );
+        assert_uniform_must_matches(
+            COMPOUND_INPUT_BTOR2,
+            &[CompoundPred {
+                reg0: "a".into(),
+                e: idle_compound(),
+            }],
+        );
+    }
+
+    #[test]
+    fn uniform_hyper_must_matches_per_kind() {
+        // Hyper-must over several target SETs; uniform == per-kind on a state +
+        // input fixture (the `BtorSts::hyper_must_edges` cutover guard).
+        let file = parse(INPUT_DRIVEN_BTOR2).expect("parse");
+        let preds = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            let target_sets: &[&[u64]] = &[&[0b0], &[0b1], &[0b0, 0b1]];
+            for sb in 0..2u64 {
+                for ts in target_sets {
+                    let per_kind = smt_hyper_must_check(&view, sb, ts, &preds, &nid_map, 5_000);
+                    let uniform = smt_hyper_must_check_uniform(
+                        &view, &primed, sb, ts, &preds, &nid_map, 5_000,
+                    );
+                    assert_eq!(
+                        per_kind, uniform,
+                        "uniform hyper-must ≠ per-kind (sb={sb} ts={ts:?})"
+                    );
+                }
+            }
+        });
     }
 }

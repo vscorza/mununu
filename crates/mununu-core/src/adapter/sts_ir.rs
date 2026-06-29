@@ -369,17 +369,21 @@ impl SmtEncode for BtorSts<'_> {
     ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
-            SmtMustVerdict, build_register_nid_map_with_inputs, smt_per_target_must_check_standard,
+            SmtMustVerdict, build_register_nid_map_with_inputs, smt_per_target_must_check_uniform,
         };
+        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_primed;
 
         if predicates.is_empty() {
             return Vec::new();
         }
-        // Mirrors `may_edges` exactly — same faithful memory-aware encode,
-        // same cube encoding, same all-pairs sweep — but runs the ∀∃
-        // standard must-check and keeps a pair only on a definite `Must`
-        // (UNSAT) verdict. NotMust / Unknown / encoder failure drop the
-        // edge (sound under-approximation: never fabricate a must-witness).
+        // H.U.1c — mirrors `may_edges`: same encode + the next-cycle node cache
+        // (`encode_primed`) built ONCE, then the uniform ∀∃ must-check per pair
+        // (`smt_per_target_must_check_uniform`). BEHAVIOUR-IDENTICAL to the
+        // per-kind `smt_per_target_must_check_standard` on every existing cube
+        // dimension (state target = `state_next`; free-input target = free; state
+        // compound leaves = `state_next`) — the uniform builder produces the same
+        // Z3 terms. Keeps a pair only on a definite `Must` (UNSAT); NotMust /
+        // Unknown / encoder failure drop it (sound under-approximation).
         let n_cubes = 1usize << predicates.len();
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
@@ -387,17 +391,17 @@ impl SmtEncode for BtorSts<'_> {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
-            // H.B — inputs mapped too (state precedence on collision). An
-            // input source-pin lands on a copy disjoint from the universally-
-            // quantified transition inputs, so the must-check is effectively
-            // ∀-over-inputs: sound (never fabricates a must-edge), possibly weak.
+            let primed = match encode_primed(self.file, &view) {
+                Ok(p) => p,
+                Err(_) => return Vec::new(),
+            };
             let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
             for i in 0..n_cubes {
                 for j in 0..n_cubes {
                     if matches!(
-                        smt_per_target_must_check_standard(
-                            &view, i as u64, j as u64, predicates, &nid_map, timeout_ms,
+                        smt_per_target_must_check_uniform(
+                            &view, &primed, i as u64, j as u64, predicates, &nid_map, timeout_ms,
                         ),
                         SmtMustVerdict::Must
                     ) {
@@ -417,8 +421,9 @@ impl SmtEncode for BtorSts<'_> {
     ) -> Vec<(usize, Vec<usize>)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
-            SmtMustVerdict, build_register_nid_map_with_inputs, smt_hyper_must_check,
+            SmtMustVerdict, build_register_nid_map_with_inputs, smt_hyper_must_check_uniform,
         };
+        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_primed;
 
         if predicates.is_empty() {
             return Vec::new();
@@ -444,6 +449,13 @@ impl SmtEncode for BtorSts<'_> {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
+            // H.U.1c — uniform hyper-must over the next-cycle node cache (built
+            // once); behaviour-identical to the per-kind `smt_hyper_must_check`
+            // on existing cube dimensions.
+            let primed = match encode_primed(self.file, &view) {
+                Ok(p) => p,
+                Err(_) => return Vec::new(),
+            };
             // H.B — inputs mapped too (state precedence on collision).
             let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
@@ -453,8 +465,9 @@ impl SmtEncode for BtorSts<'_> {
                 }
                 let target_bits_set: Vec<u64> = targets.iter().map(|&t| t as u64).collect();
                 if matches!(
-                    smt_hyper_must_check(
+                    smt_hyper_must_check_uniform(
                         &view,
+                        &primed,
                         src as u64,
                         &target_bits_set,
                         predicates,
