@@ -103,19 +103,34 @@ pub fn build_register_nid_map(view: &Btor2SmtView) -> HashMap<String, Nid> {
     map
 }
 
-/// H.B — like [`build_register_nid_map`] but also maps **input** symbols to
-/// their NID, so a predicate over a primary input can be admitted as a free
-/// cube dimension (see `docs/design/free-input-atoms.md`). A free-input
-/// predicate is constrained on the **source** cube (the current-cycle input,
-/// pinned) and left **free** on the **target** (the next-cycle input is not a
-/// variable of the one-step relation) — that source-pin / target-free shape is
-/// realized in [`build_pred_constraint`]. State symbols take precedence on a
-/// name collision. State-only callers keep using [`build_register_nid_map`], so
-/// their behaviour is unchanged.
+/// H.B / H.U.1d — like [`build_register_nid_map`] but also maps **input** and
+/// **combinational** signal symbols to their NID, so a predicate over a primary
+/// input (free cube dimension, `docs/design/free-input-atoms.md`) or over a
+/// combinational node (the uniform predicate-image term path) resolves.
+///
+/// - **Inputs** (H.B): source-pinned / target-free (the next-cycle input is not a
+///   one-step variable) — realized in [`build_pred_constraint_uniform`].
+/// - **Combinational** (H.U.1d): resolved to the combinational node's NID, whose
+///   current-/next-cycle BVs are [`Btor2SmtView::signal_bvs`] / the primed cache;
+///   the uniform rule then treats it as a determined-function-of-state cube
+///   dimension. Latent until the seeder routes a combinational atom as a cube
+///   dimension (H.U.2) — extending the map here is behaviour-preserving for
+///   state/input predicate sets (the extra entries go unused).
+///
+/// **State takes precedence**, then input, then combinational, on a name
+/// collision (`or_insert`). State-only callers use [`build_register_nid_map`],
+/// so their behaviour is unchanged.
 pub fn build_register_nid_map_with_inputs(view: &Btor2SmtView) -> HashMap<String, Nid> {
     let mut map = build_register_nid_map(view);
     for sig in &view.signals {
         if sig.kind == SignalKind::Input
+            && let Some(symbol) = &sig.symbol
+        {
+            map.entry(symbol.clone()).or_insert(sig.nid);
+        }
+    }
+    for sig in &view.signals {
+        if sig.kind == SignalKind::Combinational
             && let Some(symbol) = &sig.symbol
         {
             map.entry(symbol.clone()).or_insert(sig.nid);
@@ -1753,6 +1768,85 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    // ---- H.U.1d — combinational signal resolution + cube-dimension handling ----
+
+    // `reg` stuck at 0 (next = reg); `g = not(reg)` is a combinational-of-state
+    // op named `g` (so g ≡ 1 forever). A second combinational `h = not(reg)`
+    // carries NO own symbol but is named `h_out` on an `output` line.
+    const COMB_FIXTURE: &str = "\
+1 sort bitvec 1
+2 state 1 reg
+3 zero 1
+4 init 1 2 3
+5 next 1 2 2
+6 not 1 2 g
+7 not 1 2
+8 output 7 h_out
+";
+
+    #[test]
+    fn nid_map_resolves_combinational_op_and_output_symbols() {
+        let file = parse(COMB_FIXTURE).expect("parse comb fixture");
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode");
+            let map = build_register_nid_map_with_inputs(&view);
+            // Op-symbol combinational (`g`, nid 6) resolves.
+            assert_eq!(
+                map.get("g"),
+                Some(&6),
+                "op-symbol combinational `g` resolves"
+            );
+            // Output-line-only combinational (`h_out`, the `not` at nid 7) resolves
+            // (H.U.1d output-line registration).
+            assert_eq!(
+                map.get("h_out"),
+                Some(&7),
+                "output-line combinational `h_out` resolves to its driving node"
+            );
+            // State still resolves + takes precedence (no regression).
+            assert_eq!(map.get("reg"), Some(&2));
+        });
+    }
+
+    #[test]
+    fn uniform_combinational_as_cube_dimension_may_and_must() {
+        // `g = not(reg)` with `reg` stuck → g ≡ 1. As a CUBE DIMENSION via the
+        // uniform image: {g==1}→{g==0} is NOT a may-edge (g never changes), and
+        // {g==1}→{g==1} IS a must-edge (g stays 1) — the new capability the
+        // per-kind path lacked (it returned conservative May / Unknown for a
+        // combinational register name absent from its nid-map).
+        let file = parse(COMB_FIXTURE).expect("parse");
+        let preds = vec![PredicateSpec {
+            name: "g".into(),
+            register: "g".into(),
+            value: 1,
+        }];
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            // may {g}→{g}: g stays 1 ⇒ May.
+            assert_eq!(
+                smt_per_target_may_check_uniform(&view, &primed, 0b1, 0b1, &preds, &nid_map, 5_000),
+                SmtMayVerdict::May
+            );
+            // may {g}→{¬g}: g cannot become 0 ⇒ NotMay (precise).
+            assert_eq!(
+                smt_per_target_may_check_uniform(&view, &primed, 0b1, 0b0, &preds, &nid_map, 5_000),
+                SmtMayVerdict::NotMay
+            );
+            // must {g}→{g}: from every g==1 state, the (only) successor has g==1 ⇒ Must.
+            assert_eq!(
+                smt_per_target_must_check_uniform(
+                    &view, &primed, 0b1, 0b1, &preds, &nid_map, 5_000
+                ),
+                SmtMustVerdict::Must
+            );
         });
     }
 }
