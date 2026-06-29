@@ -1753,14 +1753,14 @@ mod tests {
 
         // `state != 3` — the oracle proves HOLDS on the lifted design; the
         // verify_auto verdict must agree.
-        let o_safe = ag_state_atom(&file, "state", CmpOp::Ne, 3, 1024, 8)
+        let o_safe = ag_state_atom(&file, "state", CmpOp::Ne, 3, 1024, 8, false)
             .expect("oracle binds lifted `state`");
         assert_eq!(o_safe, AgOracle::Holds, "oracle: encoding 3 unreachable");
         gate("state != 3", &o_safe);
 
         // `state == 1` — false at the reset state → the oracle finds the violation.
-        let o_bad =
-            ag_state_atom(&file, "state", CmpOp::Eq, 1, 1024, 8).expect("oracle ag(state==1)");
+        let o_bad = ag_state_atom(&file, "state", CmpOp::Eq, 1, 1024, 8, false)
+            .expect("oracle ag(state==1)");
         assert!(
             matches!(o_bad, AgOracle::Violated(_)),
             "oracle: state==1 violated at reset"
@@ -1771,10 +1771,140 @@ mod tests {
         // state is always 0. The oracle proves HOLDS; verify_auto must agree.
         let ante = OracleAtom::new("state", CmpOp::Eq, 2);
         let cons = OracleAtom::new("state", CmpOp::Eq, 0);
-        let o_imp =
-            ag_implies_next(&file, &ante, &cons, 1024, 8).expect("oracle ag(state==2 |=> 0)");
+        let o_imp = ag_implies_next(&file, &ante, &cons, 1024, 8, false)
+            .expect("oracle ag(state==2 |=> 0)");
         assert_eq!(o_imp, AgOracle::Holds, "oracle: 2 always steps to 0");
         gate("state == 2", &o_imp);
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + yosys — run in the mununu-sva image"]
+    fn e2e_oracle_gates_sysrst_real_rtl_verdict() {
+        // H.O.0.3b — gate the ONE definite REAL-OpenTitan verdict against the
+        // concrete oracle: sysrst_ctrl_detect sva_0, `cfg_enable_i |=> state_q
+        // == 0`, which verify_auto reports HOLDS (a config-INPUT antecedent + a
+        // state consequent — exactly `ag_implies_next`'s fragment).
+        //
+        // The oracle must answer verify_auto's GATED question, so we pin the SAME
+        // reset verify_auto pinned (`diagnostics.gated_resets`) before enumerating
+        // — otherwise the oracle would explore reset-active states verify_auto
+        // excluded and could "refute" a verdict that is correct under the gated
+        // semantics. Pinning happens at the BTOR2 level (`pin_inputs_to_constants`),
+        // so the oracle needs no reset awareness.
+        //
+        // Honest boundary: sysrst has WIDE config inputs (`cfg_detect_timer_i`)
+        // the oracle cannot exhaustively enumerate, so its reachability is
+        // BOUNDED → it can soundly REFUTE a (shallow) spurious HOLDS but cannot
+        // CONFIRM a real-RTL HOLDS. Confirming real-RTL verdicts is H.O.1's
+        // (external BTOR2 model checker) domain. This test proves the oracle
+        // BINDS real-RTL atoms (state_q via value-alias resolution; cfg_enable_i
+        // as a 1-bit input) and provides a sound refutation guard.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let sysrst = root.join("r46_sysrst_detect_k5/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let sources = vec![
+            (
+                "sysrst_ctrl_detect.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_detect.sv")),
+            ),
+            (
+                "sysrst_ctrl_pkg.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_pkg.sv")),
+            ),
+            (
+                "prim_assert.sv".to_string(),
+                read(prim.join("prim_assert.sv")),
+            ),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read(prim.join("prim_assert_standard_macros.svh")),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read(prim.join("prim_assert_sec_cm.svh")),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read(prim.join("prim_flop_macros.sv")),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("sysrst_ctrl_detect".to_string()),
+            use_sv2v: true,
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on sysrst_ctrl_detect");
+
+        let sva0 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "sysrst_ctrl_detect_sva_0")
+            .expect("sva_0 present");
+        assert!(
+            matches!(sva0.outcome, VerifyOutcome::Holds),
+            "precondition: verify_auto reports sva_0 HOLDS; got {:?}",
+            sva0.outcome
+        );
+
+        // Lift the base BTOR2 + pin the SAME resets verify_auto pinned.
+        let (btor2, _bb) =
+            crate::adapter::yosys::sv_to_btor2_with_blackboxes(&sources[0].1, &yopts)
+                .expect("sv → btor2");
+        let pins: Vec<(String, u64)> = report
+            .diagnostics
+            .gated_resets
+            .iter()
+            .filter_map(|g| {
+                let (n, v) = g.split_once('=')?;
+                Some((n.to_string(), v.trim().parse::<u64>().ok()?))
+            })
+            .collect();
+        eprintln!("\n=== H.O.0.3b sysrst gate: pinning resets {pins:?} ===");
+        let (pinned, _) = crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &pins);
+        let file = crate::adapter::btor2::parser::parse(&pinned).expect("parse pinned btor2");
+
+        // The oracle for sva_0's exact shape:
+        //   formula: nu X. (((!((!(cfg_enable_i))) || [] (state_q == 0))) && [] X)
+        //   = (!cfg_enable_i) |=> (state_q == 0)   — "while DISABLED, stay idle".
+        // The antecedent is `cfg_enable_i == 0` (the double-negation in the
+        // formula resolves to `!a = cfg_enable_i`, so the SVA antecedent
+        // `a = !cfg_enable_i`). Getting this polarity wrong checks a different
+        // property and yields a bogus contradiction.
+        let ante = OracleAtom::new("cfg_enable_i", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state_q", CmpOp::Eq, 0);
+        // reset_pinned = true: rst_ni is pinned to a constant above, so following
+        // the async-reset register mux to `state_q`'s state cell is sound (the mux
+        // always selects the state branch) — the same condition the verify-auto
+        // seeder resolves `state_q` under.
+        let oracle = ag_implies_next(&file, &ante, &cons, 100_000, 8, true)
+            .expect("oracle binds real-RTL state_q (resolution) + cfg_enable_i (input)");
+        eprintln!("sysrst sva_0 `!cfg_enable_i |=> state_q == 0` oracle: {oracle:?}");
+
+        // Soundness gate: verify_auto's HOLDS must not be contradicted. On a
+        // genuinely-holding property the oracle returns Holds (if the design fits
+        // the cap) or Inconclusive (bounded) — never Violated.
+        assert!(
+            spurious_verdict(Trit::True, &oracle).is_none(),
+            "verify_auto sva_0 HOLDS contradicted by the concrete oracle: {oracle:?}"
+        );
+        assert!(
+            matches!(oracle, AgOracle::Holds | AgOracle::Inconclusive),
+            "no reachable violation of a genuinely-holding property; got {oracle:?}"
+        );
     }
 
     // ---- H.O.0.2 — oracle differential vs the cube verdict --------------------
@@ -1945,7 +2075,8 @@ mod tests {
 
         // The oracle side (H.O.0.1) — concrete bounded reachability, no abstraction.
         let file = crate::adapter::btor2::parser::parse(btor2).expect("oracle parses btor2");
-        let oracle = ag_state_atom(&file, signal, op, value as u128, 1024, 8).expect("oracle runs");
+        let oracle =
+            ag_state_atom(&file, signal, op, value as u128, 1024, 8, false).expect("oracle runs");
 
         // The spurious-verdict guard.
         if let Some(reason) = spurious_verdict(cube, &oracle) {
