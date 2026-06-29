@@ -1689,4 +1689,275 @@ mod tests {
             by_formula("state == 1")
         );
     }
+
+    // ---- H.O.0.2 — oracle differential vs the cube verdict --------------------
+    //
+    // The 2026-06-29 soundness review's headline gap: nothing independently
+    // checks that a DEFINITE verify-auto verdict is correct, and a spurious
+    // `HOLDS` (silently claiming a property holds) is the dangerous case. These
+    // tests drive the SAME cube path verify_auto uses — `seed_from_formula` →
+    // `synth_sidecar_json` → `cegar_refine_loop`, read at the reset cube — on a
+    // hand-built BTOR2 FSM, and cross-check every DEFINITE cube verdict against
+    // the concrete bounded-reachability oracle (`concrete_oracle::ag_state_atom`,
+    // H.O.0.1).
+    //
+    // Invariant (the actual guard `cube_vs_oracle` enforces):
+    //   cube-HOLDS    ⟹ oracle is NOT Violated   (else: SPURIOUS HOLDS)
+    //   cube-VIOLATED ⟹ oracle is NOT Holds       (else: SPURIOUS VIOLATED)
+    //   cube-⊥        ⟹ anything                  (sound coarsening)
+    //
+    // No slang: the cube path runs directly on inline BTOR2, so the differential
+    // executes in `make ci` (not behind the slang `#[ignore]` gate). The seeding
+    // + reset-cube logic mirrors verify_auto's per-property block (the
+    // `for t in ...` loop above) — keep them in sync when that block changes.
+    use crate::adapter::AdapterOptions;
+    use crate::adapter::btor2::cegar::{
+        CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
+    };
+    use crate::adapter::btor2::concrete_oracle::{AgOracle, ag_state_atom};
+    use crate::mu_calculus::Environment;
+    use crate::mu_calculus::trit::Trit;
+
+    /// A 2-bit FSM cycling 0→1→2→0 (caps at 2, never reaches 3), reset to 0,
+    /// input-free. Same design as `concrete_oracle`'s CYCLE_FSM, so the cube
+    /// path and the oracle observe one model.
+    const DIFF_CYCLE_FSM: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 state
+4 zero 2
+5 one 2
+6 constd 2 2
+7 eq 1 3 6
+8 add 2 3 5
+9 ite 2 7 4 8
+10 next 2 3 9
+11 init 2 3 4
+";
+
+    /// Drive the cube path for `AG (signal op value)` exactly as verify_auto's
+    /// default does (seed → synth sidecar → `cegar_refine_loop` → verdict at the
+    /// reset cube), AND the concrete oracle for the same atom; assert the
+    /// soundness invariant and return both verdicts for the caller to pin.
+    fn cube_vs_oracle(
+        btor2: &str,
+        init_values: &[(&str, u64)],
+        signal: &str,
+        op: CmpOp,
+        value: u64,
+    ) -> (Trit, AgOracle) {
+        let op_s = match op {
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        };
+        let atom = format!("{signal} {op_s} {value}");
+        let formula = mu_parser::parse(&format!("nu X. (({atom}) && [] X)")).unwrap();
+
+        // Seed as verify_auto: the atom's register is our single state cell;
+        // no free inputs, no combinational signals.
+        let seeded = seed_from_formula(&formula, |r| r == signal, |_| false, |_| None);
+
+        // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs
+        // iff a compound / input / derived predicate is present).
+        let has_smt_seam = !seeded.compounds.is_empty()
+            || !seeded.input_registers.is_empty()
+            || !seeded.derived.is_empty();
+        let cegar_opts = CegarOptions {
+            max_iterations: 16,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: true,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: MustEdgeInference::Off,
+            may_edge_inference: if has_smt_seam {
+                MayEdgeInference::SmtAllPairs
+            } else {
+                MayEdgeInference::Off
+            },
+            emit_ctxdsl: false,
+        };
+
+        let init_u64: std::collections::HashMap<String, u64> = init_values
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for s in &seeded.specs {
+            referenced.insert(s.register.clone());
+        }
+        for (_, e) in &seeded.compounds {
+            for r in e.registers() {
+                referenced.insert(r);
+            }
+        }
+        let adapter_options = AdapterOptions {
+            sidecar_json: synth_sidecar_json(
+                &seeded.compounds,
+                &seeded.derived,
+                &referenced,
+                &init_u64,
+            ),
+            ..Default::default()
+        };
+
+        // Reset cube index: bit order = simple specs, then compounds (the order
+        // `cegar_refine_loop` assembles `current_predicates`).
+        let predicate_count = seeded.specs.len() + seeded.compounds.len();
+        let env = Environment::new(1usize << predicate_count);
+        let init_u128: std::collections::HashMap<String, u128> = init_u64
+            .iter()
+            .map(|(k, v)| (k.clone(), *v as u128))
+            .collect();
+        let mut base_init_cube = 0usize;
+        let mut free_input_bits: Vec<u32> = Vec::new();
+        let mut bit = 0u32;
+        for s in &seeded.specs {
+            if seeded.input_registers.contains(&s.register) {
+                free_input_bits.push(bit);
+            } else if init_u64.get(&s.register).copied().unwrap_or(0) == s.value {
+                base_init_cube |= 1 << bit;
+            }
+            bit += 1;
+        }
+        for (_, expr) in &seeded.compounds {
+            if expr.eval(&init_u128) {
+                base_init_cube |= 1 << bit;
+            }
+            bit += 1;
+        }
+        let init_cubes = free_input_init_cubes(base_init_cube, &free_input_bits);
+
+        let trace = cegar_refine_loop(
+            &formula,
+            btor2,
+            seeded.specs.clone(),
+            &env,
+            &adapter_options,
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        let v = &trace.final_verdict;
+        let cube = if init_cubes.iter().any(|&ic| v.verdict_at(ic) == Trit::False) {
+            Trit::False
+        } else if init_cubes
+            .iter()
+            .any(|&ic| v.verdict_at(ic) == Trit::Unknown)
+        {
+            Trit::Unknown
+        } else {
+            Trit::True
+        };
+
+        // The oracle side (H.O.0.1) — concrete bounded reachability, no abstraction.
+        let file = crate::adapter::btor2::parser::parse(btor2).expect("oracle parses btor2");
+        let oracle = ag_state_atom(&file, signal, op, value as u128, 1024, 8).expect("oracle runs");
+
+        // The spurious-verdict guard.
+        if let Some(reason) = spurious_verdict(cube, &oracle) {
+            panic!("{reason} for `AG {atom}` (cube={cube:?}, oracle={oracle:?})");
+        }
+        (cube, oracle)
+    }
+
+    /// The H.O.0.2 soundness invariant, as a pure predicate so it can be
+    /// negative-control-tested. Returns `Some(reason)` iff the cube verdict and
+    /// the concrete oracle *contradict* — a definite cube verdict the oracle
+    /// refutes. `None` means consistent (including every cube-⊥, the sound
+    /// coarsening, and every case the oracle can't conclude).
+    fn spurious_verdict(cube: Trit, oracle: &AgOracle) -> Option<&'static str> {
+        match (cube, oracle) {
+            // cube proved HOLDS, but a reachable state violates → spurious HOLDS
+            // (the dangerous case the review flagged).
+            (Trit::True, AgOracle::Violated(_)) => Some("SPURIOUS HOLDS"),
+            // cube refuted, but full concrete enumeration found no violation →
+            // spurious VIOLATED. (A *bounded* `Inconclusive` is NOT a
+            // contradiction — the oracle simply couldn't confirm.)
+            (Trit::False, AgOracle::Holds) => Some("SPURIOUS VIOLATED"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn differential_ag_holds_agrees_with_oracle() {
+        // `AG state != 3` — 3 is the unreachable encoding of the 0→1→2→0 FSM.
+        // The cube proves HOLDS; the oracle confirms (full enumeration).
+        let (cube, oracle) = cube_vs_oracle(DIFF_CYCLE_FSM, &[("state", 0)], "state", CmpOp::Ne, 3);
+        assert_eq!(cube, Trit::True, "cube proves AG state != 3");
+        assert_eq!(oracle, AgOracle::Holds, "oracle confirms 3 unreachable");
+    }
+
+    #[test]
+    fn differential_ag_violated_agrees_with_oracle() {
+        // `AG state == 1` — false at the reset state (state 0) → VIOLATED at the
+        // reset cube, independent of edges (νX ≤ body).
+        let (cube, oracle) = cube_vs_oracle(DIFF_CYCLE_FSM, &[("state", 0)], "state", CmpOp::Eq, 1);
+        assert_eq!(
+            cube,
+            Trit::False,
+            "cube refutes AG state == 1 at the reset cube"
+        );
+        assert!(
+            matches!(oracle, AgOracle::Violated(_)),
+            "oracle finds the violation"
+        );
+    }
+
+    #[test]
+    fn differential_ag_bottom_is_sound_no_spurious_holds() {
+        // `AG state != 1` — state 1 IS reachable (0→1), so the property is FALSE.
+        // The single-predicate cube is too coarse to refute it (no must-edge
+        // under the default must-Off policy) → the SOUND answer is ⊥, NOT a
+        // spurious HOLDS. A regression to a spurious HOLDS here trips
+        // `cube_vs_oracle`'s invariant. This is the H.O.0.2 headline guard.
+        let (cube, oracle) = cube_vs_oracle(DIFF_CYCLE_FSM, &[("state", 0)], "state", CmpOp::Ne, 1);
+        assert_eq!(
+            cube,
+            Trit::Unknown,
+            "coarse cube is appropriately ⊥, not a spurious HOLDS"
+        );
+        assert!(
+            matches!(oracle, AgOracle::Violated(_)),
+            "oracle: state 1 is reachable"
+        );
+    }
+
+    #[test]
+    fn differential_guard_catches_spurious_verdicts() {
+        // Negative control: prove the invariant is LIVE (not vacuously passing).
+        // The two contradictory pairs must be flagged; every consistent pair
+        // (incl. cube-⊥ and the bounded-`Inconclusive` escape) must not.
+        let witness: std::collections::BTreeMap<String, u128> =
+            [("state".to_string(), 1u128)].into_iter().collect();
+        // Contradictions → flagged.
+        assert_eq!(
+            spurious_verdict(Trit::True, &AgOracle::Violated(witness.clone())),
+            Some("SPURIOUS HOLDS")
+        );
+        assert_eq!(
+            spurious_verdict(Trit::False, &AgOracle::Holds),
+            Some("SPURIOUS VIOLATED")
+        );
+        // Consistent → not flagged.
+        assert_eq!(spurious_verdict(Trit::True, &AgOracle::Holds), None);
+        assert_eq!(
+            spurious_verdict(Trit::False, &AgOracle::Violated(witness)),
+            None
+        );
+        assert_eq!(spurious_verdict(Trit::Unknown, &AgOracle::Holds), None);
+        assert_eq!(
+            spurious_verdict(Trit::Unknown, &AgOracle::Inconclusive),
+            None
+        );
+        // A bounded oracle can't conclude true: cube-False + Inconclusive is NOT
+        // a contradiction (the oracle just didn't reach the violation).
+        assert_eq!(spurious_verdict(Trit::False, &AgOracle::Inconclusive), None);
+        // cube-True + Inconclusive is also fine — no violation was *found*.
+        assert_eq!(spurious_verdict(Trit::True, &AgOracle::Inconclusive), None);
+    }
 }
