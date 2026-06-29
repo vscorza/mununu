@@ -368,6 +368,35 @@ pub fn encode_design_with_theory(
             });
         }
     }
+    // H.U.1d — also register a combinational node named only on an `output` line
+    // (a top-level combinational output port whose driving Op carries no symbol
+    // of its own). The output's symbol aliases the driven signal node; if that
+    // node is combinational (in the cache, neither a state cell nor an input),
+    // expose it as a `Combinational` signal under the output-port name so a
+    // predicate can reference it. An Op that already carries its own symbol is
+    // registered above; this adds the output alias (a nid may have multiple
+    // names — every entry resolves through the nid-map).
+    for line in &file.lines {
+        let Node::Output {
+            symbol: Some(name),
+            signal,
+        } = &line.node
+        else {
+            continue;
+        };
+        let nid = signal.nid();
+        if view.state_curr.contains_key(&nid) || view.inputs.contains_key(&nid) {
+            continue;
+        }
+        if let Some(bv) = cache.get(&nid) {
+            view.signals.push(EncodedSignal {
+                nid,
+                width: bv.get_size(),
+                symbol: Some(name.clone()),
+                kind: SignalKind::Combinational,
+            });
+        }
+    }
     view.signal_bvs = cache;
     Ok(view)
 }
