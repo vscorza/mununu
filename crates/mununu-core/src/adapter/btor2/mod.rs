@@ -22,6 +22,7 @@
 pub mod ast;
 pub mod bit_blast;
 pub mod cegar;
+pub mod concrete_oracle;
 pub mod dep_graph;
 pub mod kmts_lift;
 pub mod parser;
