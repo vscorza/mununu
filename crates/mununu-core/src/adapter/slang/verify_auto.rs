@@ -1690,6 +1690,93 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires slang + sv2v + yosys — run in the mununu-sva image"]
+    fn e2e_oracle_gates_verify_auto_verdicts() {
+        // H.O.0.3 — the differential on REAL SV-lifted BTOR2 (not inline). Lift
+        // the inline FSM the SAME way verify_auto does, then cross-check every
+        // DEFINITE verify_auto outcome against the concrete oracle via
+        // `spurious_verdict`. Proves the oracle (a) binds the *lifted* register
+        // through `resolve_state_alias` (the symbol survives sv2v + yosys) and
+        // (b) gates the verdict on a real lift — incl. the `|=>` (AX) fragment.
+        let sv = "module fsm (input logic clk, input logic rst_n, input logic go);\n\
+                  logic [1:0] state;\n\
+                  always_ff @(posedge clk) begin\n\
+                    if (!rst_n) state <= 2'd0;\n\
+                    else state <= (state == 2'd2) ? 2'd0 : state + 2'd1;\n\
+                  end\n\
+                  ok:  assert property (@(posedge clk) state != 2'd3);\n\
+                  bad: assert property (@(posedge clk) state == 2'd1);\n\
+                  imp: assert property (@(posedge clk) state == 2'd2 |=> state == 2'd0);\n\
+                  endmodule\n";
+        let sources = vec![("fsm.sv".to_string(), sv.to_string())];
+        let yopts = YosysOptions {
+            top: Some("fsm".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+
+        let report = verify_auto(&sources, &yopts, &VerifyAutoOptions::default())
+            .expect("verify_auto runs end-to-end");
+
+        // The SAME BTOR2 verify_auto evaluates: single module, no `disable iff`
+        // ⇒ no flop stubs / shadows / reset pins, so the lift output is the
+        // model under test.
+        let (btor2, _bb) =
+            crate::adapter::yosys::sv_to_btor2_with_blackboxes(sv, &yopts).expect("sv → btor2");
+        let file = crate::adapter::btor2::parser::parse(&btor2).expect("parse lifted btor2");
+
+        let trit_of = |o: &VerifyOutcome| match o {
+            VerifyOutcome::Holds => Some(Trit::True),
+            VerifyOutcome::Violated { .. } => Some(Trit::False),
+            VerifyOutcome::Unknown { .. } => Some(Trit::Unknown),
+            VerifyOutcome::Skipped { .. } => None,
+        };
+        let outcome = |needle: &str| -> &VerifyOutcome {
+            &report
+                .properties
+                .iter()
+                .find(|p| p.formula.contains(needle))
+                .unwrap_or_else(|| panic!("property containing {needle:?}"))
+                .outcome
+        };
+        // Gate one property: if verify_auto returned a DEFINITE verdict, the
+        // oracle must not contradict it (the H.O.0.3 e2e assertion).
+        let gate = |needle: &str, oracle: &AgOracle| {
+            if let Some(t) = trit_of(outcome(needle)) {
+                assert!(
+                    spurious_verdict(t, oracle).is_none(),
+                    "verify_auto `{needle}` verdict {t:?} contradicts the concrete oracle {oracle:?}"
+                );
+            }
+        };
+
+        // `state != 3` — the oracle proves HOLDS on the lifted design; the
+        // verify_auto verdict must agree.
+        let o_safe = ag_state_atom(&file, "state", CmpOp::Ne, 3, 1024, 8)
+            .expect("oracle binds lifted `state`");
+        assert_eq!(o_safe, AgOracle::Holds, "oracle: encoding 3 unreachable");
+        gate("state != 3", &o_safe);
+
+        // `state == 1` — false at the reset state → the oracle finds the violation.
+        let o_bad =
+            ag_state_atom(&file, "state", CmpOp::Eq, 1, 1024, 8).expect("oracle ag(state==1)");
+        assert!(
+            matches!(o_bad, AgOracle::Violated(_)),
+            "oracle: state==1 violated at reset"
+        );
+        gate("state == 1", &o_bad);
+
+        // `state == 2 |=> state == 0` — the AX fragment: from state 2 the next
+        // state is always 0. The oracle proves HOLDS; verify_auto must agree.
+        let ante = OracleAtom::new("state", CmpOp::Eq, 2);
+        let cons = OracleAtom::new("state", CmpOp::Eq, 0);
+        let o_imp =
+            ag_implies_next(&file, &ante, &cons, 1024, 8).expect("oracle ag(state==2 |=> 0)");
+        assert_eq!(o_imp, AgOracle::Holds, "oracle: 2 always steps to 0");
+        gate("state == 2", &o_imp);
+    }
+
     // ---- H.O.0.2 — oracle differential vs the cube verdict --------------------
     //
     // The 2026-06-29 soundness review's headline gap: nothing independently
@@ -1714,7 +1801,9 @@ mod tests {
     use crate::adapter::btor2::cegar::{
         CegarOptions, LiftStrategy, PredicateSource, cegar_refine_loop,
     };
-    use crate::adapter::btor2::concrete_oracle::{AgOracle, ag_state_atom};
+    use crate::adapter::btor2::concrete_oracle::{
+        AgOracle, OracleAtom, ag_implies_next, ag_state_atom,
+    };
     use crate::mu_calculus::Environment;
     use crate::mu_calculus::trit::Trit;
 
