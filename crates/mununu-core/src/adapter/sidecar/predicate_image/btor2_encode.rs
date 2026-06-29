@@ -372,6 +372,80 @@ pub fn encode_design_with_theory(
     Ok(view)
 }
 
+/// H.U.0 — the "next-cycle node cache": every Op/Const node's value evaluated
+/// over `(s', i')`, where `s'` is the view's `state_next` BVs and `i'` are FRESH
+/// next-cycle input consts. This is the primed projection of the netlist the
+/// uniform predicate-image (H.U) reads for the TARGET side of a may/must edge —
+/// the same role `signal_bvs` (current cache, over `(s, i)`) plays for the
+/// SOURCE side. Built by a second [`walk_design`] over a [`Z3Backend`] whose
+/// `state_curr` is bound to `state_next` and whose `inputs` are the fresh `i'`.
+///
+/// **Spike (H.U.0).** Test-only for now — consumed solely by the
+/// `uniform_image_spike` go/no-go validation; H.U.1 promotes it to the
+/// production predicate-image path.
+#[cfg(test)]
+pub(crate) struct PrimedEnv {
+    /// Primed value of every walked Op/Const node, keyed by nid (over `(s', i')`).
+    pub cache: HashMap<Nid, z3::ast::BV>,
+    /// Fresh next-cycle input consts, keyed by the input's nid.
+    pub inputs: HashMap<Nid, z3::ast::BV>,
+}
+
+/// H.U.0 — build the [`PrimedEnv`] for `view`. Reuses the view's `state_next`
+/// BVs as the register valuations and declares one fresh `in_prime_<sym>` const
+/// per input, then re-walks the design so every node is re-evaluated at the next
+/// cycle. A register leaf's primed value is exactly `state_next[reg]` (so a
+/// state-only predicate's target constraint matches the per-kind path's
+/// `next_state` by construction); a combinational node gets a real next-cycle
+/// term; an input maps to its fresh `i'`.
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope** (it allocates Z3 consts).
+#[cfg(test)]
+pub(crate) fn encode_primed(
+    file: &Btor2File,
+    view: &Btor2SmtView,
+) -> Result<PrimedEnv, EncodeError> {
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let mut primed_inputs: HashMap<Nid, z3::ast::BV> = HashMap::new();
+    for (nid, bv) in &view.inputs {
+        let label = symbols
+            .get(nid)
+            .cloned()
+            .unwrap_or_else(|| format!("in{nid}"));
+        primed_inputs.insert(
+            *nid,
+            z3::ast::BV::new_const(format!("in_prime_{label}").as_str(), bv.get_size()),
+        );
+    }
+    // Synthetic view whose CURRENT step is the original's NEXT step + fresh
+    // inputs. `Z3Backend::from_view` clones `state_curr` + `inputs` from it, so
+    // the walk evaluates every node over `(s', i')`. `state_next` / arrays are
+    // carried unchanged (unused by the walk); the transition is a placeholder.
+    let primed_view = Btor2SmtView {
+        state_curr: view.state_next.clone(),
+        state_next: view.state_next.clone(),
+        state_curr_arr: view.state_next_arr.clone(),
+        state_next_arr: view.state_next_arr.clone(),
+        inputs: primed_inputs.clone(),
+        signals: view.signals.clone(),
+        signal_bvs: HashMap::new(),
+        transition: z3::ast::Bool::from_bool(true),
+    };
+    let mut backend = Z3Backend::from_view(file, &primed_view);
+    walk_design(file, &mut backend).map_err(|e| match e {
+        WalkError::Backend(inner) => inner,
+        WalkError::NonBitvecSort(nid) => EncodeError::ArraySortUnsupportedInBvOnly { nid },
+        WalkError::Unevaluated(nid) => EncodeError::UnsupportedOperator {
+            nid,
+            op_name: "uninitialized-init-value",
+        },
+    })?;
+    Ok(PrimedEnv {
+        cache: std::mem::take(&mut backend.cache),
+        inputs: primed_inputs,
+    })
+}
+
 /// §Phase 10 stage 3.c.1 — resolve the index + element bit-widths of
 /// an array sort. Thin alias over [`crate::adapter::btor2::parser::array_widths`]
 /// (the canonical implementation, shared with the `walk_design` driver);

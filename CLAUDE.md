@@ -20,7 +20,8 @@
 12. [Code Reuse, Dead Code, Performance, Security](#code-reuse-dead-code-performance-security) `[RULE]`
 13. [Available Agents and Skills](#available-agents-and-skills) `[REFERENCE]`
 14. [Private Files Policy](#private-files-policy) `[RULE]`
-15. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
+15. [Reasoning & Recommendation Honesty](#reasoning--recommendation-honesty) `[RULE]`
+16. [Reference Docs Index](#reference-docs-index) `[REFERENCE]`
 
 ---
 
@@ -359,6 +360,20 @@ Sensitive or unpublished materials live in the sibling private repo, not here: `
 **Extraction-framework boundary.** Tool capabilities (adapter code, validation logic, provenance checking, JSON schema) belong in `mununu`. Private content (actual specs referencing CVEs, generated CTXDSL containing vulnerability details, repo-specific CI policy) belongs in `mununu-private`.
 
 **Rule.** Before adding any file to `mununu/` that you would not want publicly visible, move it to `mununu-private/` instead. Add the path to `mununu/.gitignore` as a safety net. `.gitignore` already excludes `/paper/`, `/artifact/`, `/examples/syntcomp/`, `/examples/scalable/`, and `/tutorial/`. If you add a new sensitive directory, add it to `.gitignore` immediately.
+
+## Reasoning & Recommendation Honesty
+
+**Rule.** Never justify a decision, recommendation, or deferral with an argument that mimics human limitations the agent does not have. In particular, do **not** invoke "the session is long," "end of session," "to be safe after a marathon," "I'm running low on steam," or any fatigue/attention-erosion framing as a reason to stop, defer, or hedge. The agent does not tire; turn N is produced at the same capability as turn 1. There is no quality decay that accumulates with wall-clock or turn count.
+
+**Why.** Such framing is both false and load-bearing in the wrong direction: it dresses up a non-reason as a reason, which corrupts the actual cost/benefit the user is trying to weigh. (Incident 2026-06-29: a soundness-critical spike was deferred citing "rushing at the tail of a marathon" — a borrowed human failure mode. The genuine factors were intrinsic task difficulty and context-degradation, the latter of which actually argued for doing the work *while context was warm*, not deferring it.)
+
+**The genuine session-linked factors — name these instead, when they truly apply:**
+
+- **Context degradation** — long context gets summarized; earlier-established invariants (exact decisions, constraints, quantifier directions) can be lost or distorted. This argues for doing dependent work *while the relevant context is still fresh*, not for deferring it to a "fresh session" that must re-derive everything.
+- **Token / compute cost** — a longer session spends more. This is a real budget axis and is the **user's** to weigh; surface it as a cost, do not assume it as a stop condition.
+- **Intrinsic task difficulty / soundness-criticality** — some work (e.g. SMT quantifier placement) demands care *regardless of when it is done*. The correct response is procedural rigor (differential tests, oracles, validation), not postponement. "This is hard and must be validated" is a real reason; "this is hard and the session is long" is not.
+
+**How to apply.** When tempted to defer or hedge, state the *actual* reason. If the only reason is genuinely "the user should make this call," say exactly that — do not pad it with a fabricated fatigue rationale. Build/cache state (warm `target/`, warm docker volumes) typically *improves* over a session, so longer-running work is often cheaper to iterate, not riskier.
 
 ## Reference Docs Index
 
