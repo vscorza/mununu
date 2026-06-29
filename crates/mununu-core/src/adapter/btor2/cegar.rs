@@ -722,15 +722,24 @@ pub fn cegar_refine_loop(
         compound_exprs.insert(spec.name.clone(), expr);
         current_predicates.push(spec);
     }
-    let effective_may = if compound_exprs.is_empty() {
-        cegar_opts.may_edge_inference
-    } else {
+    // H.E.2 — derived combinational predicates (labeled per cube via SMT, NOT
+    // cube dimensions). They do NOT go into `current_predicates` (the cube index
+    // is unchanged); the lift writes their per-cube label into
+    // `state_3valued_predicates`. Like compounds, they require the eager
+    // SmtAllPairs lift (the labeling pass is SMT-based).
+    let derived_predicates = sidecar_combinational_predicates(adapter_options);
+    // SmtAllPairs + Eager are forced when EITHER compound OR derived predicates
+    // are present (both are SMT-seam-only paths).
+    let smt_seam_required = !compound_exprs.is_empty() || !derived_predicates.is_empty();
+    let effective_may = if smt_seam_required {
         crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs
-    };
-    let effective_strategy = if compound_exprs.is_empty() {
-        cegar_opts.lift_strategy
     } else {
+        cegar_opts.may_edge_inference
+    };
+    let effective_strategy = if smt_seam_required {
         LiftStrategy::Eager
+    } else {
+        cegar_opts.lift_strategy
     };
     if !compound_exprs.is_empty()
         && (cegar_opts.may_edge_inference
@@ -848,6 +857,11 @@ pub fn cegar_refine_loop(
         // declared → preserves the simple-atom path). The lift honours these via
         // the SmtEncode seam's `PredicateLike::expr`.
         compound_exprs: compound_exprs.clone(),
+        // H.E.2 — derived combinational predicates parsed from the sidecar
+        // (empty when none declared). The lift labels each per cube via the
+        // SmtEncode seam's `combinational_labels` pass and writes the label into
+        // `state_3valued_predicates` (NOT a cube dimension).
+        derived_predicates: derived_predicates.clone(),
     };
 
     for iteration in 0..=cegar_opts.max_iterations {
@@ -1731,6 +1745,31 @@ pub fn sidecar_compound_predicates(
         ));
     }
     out
+}
+
+/// H.E.2 (2026-06-28) — read `combinational_predicates` from the SvAnnotation
+/// sidecar into derived-label [`PredicateSpec`]s (`name` = the formula atom,
+/// `register` = the combinational signal's symbol, `value`). The cube lift
+/// labels each per cube via the SMT `combinational_labels` pass — they are NOT
+/// cube dimensions, so they never enter `current_predicates` / the cube index.
+/// Empty when there is no sidecar or no `combinational_predicates` declared.
+pub fn sidecar_combinational_predicates(options: &AdapterOptions) -> Vec<PredicateSpec> {
+    let Some(json) = &options.sidecar_json else {
+        return Vec::new();
+    };
+    let Ok(ann) =
+        serde_json::from_str::<crate::adapter::systemverilog::annotation::SvAnnotation>(json)
+    else {
+        return Vec::new();
+    };
+    ann.combinational_predicates
+        .iter()
+        .map(|d| PredicateSpec {
+            name: d.name.clone(),
+            register: d.signal.clone(),
+            value: d.value,
+        })
+        .collect()
 }
 
 /// Parse `--config-values`-style `REG=v1,v2,...` entries into the synthetic

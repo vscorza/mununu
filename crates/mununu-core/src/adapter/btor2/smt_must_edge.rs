@@ -600,6 +600,91 @@ where
     }
 }
 
+/// H.E.2 — the per-cube label of a **derived combinational predicate**
+/// (`signal == value`, where `signal` is a combinational node, NOT a cube
+/// dimension). Approach B (free-input-atoms.md §4): a combinational signal's
+/// value is a *determined function* of (state, inputs), so rather than make it a
+/// free cube dimension we LABEL it per cube — KleeneT/F where the cube pins it,
+/// KleeneBot where it doesn't.
+///
+/// `cube_bits` + `cube_predicates` define the cube C (its *dimension*
+/// predicates, over state + free inputs); `signal_nid` is the combinational
+/// node's NID (its current-cycle BV is `view.curr_signal(signal_nid)`).
+///
+/// Decides, over all concrete states ⊨ C (current cycle):
+/// - `UNSAT(C ∧ signal != value)` → `KleeneT` (always `value` in C);
+/// - `UNSAT(C ∧ signal == value)` → `KleeneF` (never `value` in C);
+/// - else → `KleeneBot` (the cube doesn't pin it — honest).
+///
+/// **Soundness:** a definite KleeneT/F is a sound label (standard 3-valued
+/// preservation); a dimension predicate whose constraint can't be built is
+/// *omitted*, which only widens C (a superset) — KleeneT/F over a superset still
+/// hold on the cube (subset), and the widening can only push toward KleeneBot,
+/// never toward a false-definite. Timeout → conservative `KleeneBot`.
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub fn smt_combinational_label<P: PredicateLike>(
+    view: &Btor2SmtView,
+    cube_bits: u64,
+    cube_predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    signal_nid: Nid,
+    value: u64,
+    timeout_ms: u32,
+) -> crate::clts::Tristate {
+    use crate::clts::Tristate;
+    let Some(sig) = view.curr_signal(signal_nid) else {
+        return Tristate::KleeneBot;
+    };
+    // Cube C = conjunction of the dimension predicates at this cube's polarities,
+    // over the current cycle. A predicate whose constraint can't be built is
+    // omitted (sound — only widens C; see the doc note).
+    let mut cube: Vec<z3::ast::Bool> = Vec::new();
+    for (b, pred) in cube_predicates.iter().enumerate() {
+        let polarity = (cube_bits >> b) & 1 == 1;
+        if let Some(c) = build_pred_constraint(view, nid_map, pred, false, polarity) {
+            cube.push(c);
+        }
+    }
+    let val_bv = z3::ast::BV::from_u64(value, sig.get_size());
+    let eq = sig.eq(&val_bv);
+
+    let check = |extra: &z3::ast::Bool| -> z3::SatResult {
+        let solver = z3::Solver::new();
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", timeout_ms);
+        solver.set_params(&params);
+        for c in &cube {
+            solver.assert(c);
+        }
+        solver.assert(extra);
+        solver.check()
+    };
+
+    // SOUNDNESS GUARD (H.E.2, 2026-06-28) — empty/unreachable cube. If the cube's
+    // own dimension constraints are UNSAT (no concrete state satisfies them), then
+    // BOTH `C ∧ signal == value` and `C ∧ signal != value` are trivially UNSAT, and
+    // the `KleeneF` check below would fire SPURIOUSLY — a definite label on an empty
+    // cube. That spurious definite is what fabricated the VIOLATED on shipped
+    // OpenTitan SVA (the `!trigger_active` antecedents). An empty cube has no
+    // states, so its label is meaningless: return KleeneBot (honest "undetermined").
+    // A definite KleeneT/F is only emitted for a NON-empty cube below, where it is
+    // a sound fact over that cube's concrete states.
+    if matches!(check(&z3::ast::Bool::from_bool(true)), z3::SatResult::Unsat) {
+        return Tristate::KleeneBot;
+    }
+    // never == value?  UNSAT(C ∧ signal == value) → KleeneF.
+    if matches!(check(&eq), z3::SatResult::Unsat) {
+        return Tristate::KleeneF;
+    }
+    // always == value?  UNSAT(C ∧ signal != value) → KleeneT.
+    if matches!(check(&eq.not()), z3::SatResult::Unsat) {
+        return Tristate::KleeneT;
+    }
+    // Both satisfiable (mixed), or undecided → honest KleeneBot.
+    Tristate::KleeneBot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

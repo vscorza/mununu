@@ -507,6 +507,53 @@ fn trace_to_state(file: &Btor2File, args: &[crate::adapter::btor2::ast::Operand]
 /// declaring a more specific `drives` value. Multiple candidates
 /// reaching the *same* state are deduplicated — only distinct state
 /// NIDs trigger the ambiguity guard.
+/// H.E (combinational classification, 2026-06-28) — does the combinational cone
+/// rooted at `start` reach a primary `Input`? Traverses the transitive fan-in
+/// (following `Op` args + side-effect operands), stopping at `State` cells and
+/// `Const` leaves — a register's *current* value is state, not a primary input,
+/// so states are cone leaves and are NOT recursed through.
+///
+/// Splits combinational signals for the predicate-cube path: **input-dependent**
+/// ones (`trigger_active = (trigger_i == 0)` → reaches `trigger_i`) must route
+/// through the FREE-INPUT machinery (source-pin / target-free, so the may/must
+/// edges respect the signal's value), while **state-only** ones
+/// (`event_detected_o = f(state_q)`) are sound as derived per-cube labels.
+/// Treating an input-dependent combinational as a state-determined label is
+/// unsound (it produced the spurious VIOLATED on sysrst sva_6 / sva_9).
+pub fn cone_reaches_input(file: &Btor2File, start: Nid) -> bool {
+    let mut seen: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    let mut work: Vec<Nid> = vec![start];
+    while let Some(nid) = work.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::Input { .. } => return true,
+            // State cells + constants are cone leaves.
+            Node::State { .. } | Node::Const { .. } | Node::Sort { .. } => {}
+            Node::Op { args, .. } => {
+                for a in args {
+                    work.push(a.nid());
+                }
+            }
+            Node::Init { value, .. } | Node::Next { value, .. } => work.push(value.nid()),
+            Node::Bad { signal }
+            | Node::Constraint { signal }
+            | Node::Fair { signal }
+            | Node::Output { signal, .. } => work.push(signal.nid()),
+            Node::Justice { signals } => {
+                for s in signals {
+                    work.push(s.nid());
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn resolve_state_by_symbol(file: &Btor2File, symbol: &str) -> Option<Nid> {
     let mut best: Option<(Nid, usize)> = None;
     let mut tied: bool = false;
@@ -988,5 +1035,29 @@ mod tests {
                    6 ite 1 2 5 3\n7 uext 1 6 0 winner\n";
         let file = parse(src).expect("parse");
         assert_eq!(resolve_state_by_symbol(&file, "winner"), Some(4));
+    }
+
+    #[test]
+    fn cone_reaches_input_distinguishes_input_dependent_from_state_only() {
+        // `trig_active = !in_a` (nid 5) — combinational of the INPUT in_a.
+        // `err = (q == 0)` via `eq` (nid 7) — combinational of the STATE q only.
+        let src = "1 sort bitvec 1\n\
+                   2 input 1 in_a\n\
+                   3 state 1 q\n\
+                   4 zero 1\n\
+                   5 not 1 2 trig_active\n\
+                   6 eq 1 3 4 err\n\
+                   7 next 1 3 3\n";
+        let file = parse(src).expect("parse");
+        // input-dependent: `trig_active` (nid 5) reaches the input `in_a`.
+        assert!(
+            cone_reaches_input(&file, 5),
+            "trig_active = !in_a is input-dependent"
+        );
+        // state-only: `err` (nid 6) reaches only the state cell `q`, no input.
+        assert!(
+            !cone_reaches_input(&file, 6),
+            "err = (q == 0) is state-only"
+        );
     }
 }
