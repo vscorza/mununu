@@ -1,4 +1,4 @@
-//! H.O.0 — internal exact oracle for verify-auto verdicts (increment 1).
+//! H.O.0 — internal exact oracle for verify-auto verdicts.
 //!
 //! The 2026-06-29 soundness review found we have **no independent check** that a
 //! DEFINITE verify-auto verdict is correct — and a spurious `HOLDS` (silently
@@ -8,16 +8,22 @@
 //! own exact one-step semantics, no abstraction), so a cube-path `HOLDS` that the
 //! concrete design contradicts is caught.
 //!
-//! **Scope (increment 1).** The `AG (signal ⋈ value)` fragment over a **state
-//! register** signal — input-independent, exactly where a spurious HOLDS on the
-//! state-predicate cube core would surface. Combinational / input atoms (which
-//! need input quantification) and the `|=>` (`AX`) shape are later increments
-//! (H.O.0.2+). The reachability is **sound for finding violations** always, and
-//! **sound for concluding AG-true** only when the full input space was
-//! enumerated (`!bounded`); a `bounded` result never concludes true.
+//! **Fragment.** Two property shapes over state-register / 1-bit-input atoms:
+//! - [`ag_state_atom`] — `AG (signal ⋈ value)` over a state register (or a
+//!   value-alias of one, resolved like the verify-auto seeder; H.O.0.3).
+//! - [`ag_implies_next`] — `AG (ante → AX cons)`, the SVA `ante |=> cons` shape,
+//!   with a state / 1-bit-input antecedent and a state-register consequent
+//!   (H.O.0.3).
+//!
+//! Combinational *functions* of state/input (which need full node evaluation)
+//! are out of fragment and error rather than mis-bind. The reachability is
+//! **sound for finding violations** always, and **sound for concluding AG-true**
+//! only when the full input space was enumerated (`!bounded`); a `bounded`
+//! result never concludes true.
 //!
 //! Not wired into the production path — a validation oracle, consumed by the
-//! verify-auto e2e/regression tests (`AgOracle` ⟷ the cube verdict).
+//! verify-auto differential + e2e tests (H.O.0.2 / H.O.0.3): `AgOracle` ⟷ the
+//! cube verdict via `spurious_verdict`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -50,22 +56,6 @@ pub enum AgOracle {
     /// No violation found, but enumeration was bounded — inconclusive for TRUE
     /// (the oracle can refute a cube-HOLDS but not confirm it here).
     Inconclusive,
-}
-
-/// State-cell symbols of the design.
-fn state_cells(file: &Btor2File) -> Vec<(String, u32)> {
-    let symbols = parser::collect_symbols(file);
-    file.lines
-        .iter()
-        .filter_map(|l| match &l.node {
-            Node::State { sort, .. } => {
-                let name = symbols.get(&l.nid)?.clone();
-                let w = bv_width(file, *sort).unwrap_or(0);
-                Some((name, w))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 /// Init value of each state cell (from BTOR2 `init` lines, default 0 — the
@@ -198,10 +188,24 @@ fn cmp_holds(op: CmpOp, lhs: u128, rhs: u128) -> bool {
     }
 }
 
-/// Concrete `AG (signal ⋈ value)` oracle over a **state-register** signal. The
-/// signal must be a state cell (input-independent); a non-state signal returns an
-/// error (out of increment-1 scope). Reads each reachable state's register value
-/// directly — no abstraction.
+/// H.O.0.3 — resolve a user-facing signal name to the canonical state-cell
+/// SYMBOL the reachability maps key against. Mirrors how the verify-auto seeder
+/// binds (`resolve_state_alias`, the strict value-alias resolver): a direct
+/// state symbol resolves to itself; a `uext`/`sext`-by-0 or `output` rename of a
+/// state cell resolves to that cell; a combinational *function* of state does
+/// NOT resolve (binding it to a state's value would read the wrong value).
+/// Reset-mux aliases are NOT followed (`allow_reset_mux = false`): the oracle
+/// does not pin reset, so the register equals the state only when reset is
+/// inactive, which the free-input enumeration does not guarantee.
+fn resolve_signal_symbol(file: &Btor2File, signal: &str) -> Option<String> {
+    let nid = parser::resolve_state_alias(file, signal, false)?;
+    parser::collect_symbols(file).get(&nid).cloned()
+}
+
+/// Concrete `AG (signal ⋈ value)` oracle over a **state-register** signal (or a
+/// value-alias of one — H.O.0.3 resolution). Reads each reachable state's
+/// register value directly — no abstraction. A signal that does not resolve to a
+/// state cell returns an error (out of the AG-state-atom fragment).
 pub fn ag_state_atom(
     file: &Btor2File,
     signal: &str,
@@ -210,21 +214,124 @@ pub fn ag_state_atom(
     max_states: usize,
     max_input_bits: usize,
 ) -> Result<AgOracle, AdapterError> {
-    if !state_cells(file).iter().any(|(n, _)| n == signal) {
-        return Err(AdapterError {
-            kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
-            location: None,
-            message: format!(
-                "concrete_oracle::ag_state_atom: `{signal}` is not a state cell \
-                 (increment 1 covers state-register safety atoms only)"
-            ),
-        });
-    }
+    let cell = resolve_signal_symbol(file, signal).ok_or_else(|| AdapterError {
+        kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+        location: None,
+        message: format!(
+            "concrete_oracle::ag_state_atom: `{signal}` does not resolve to a state cell \
+             (the AG(state-atom) fragment requires a state register or a value-alias of one)"
+        ),
+    })?;
     let reach = reachable_register_states(file, max_states, max_input_bits)?;
     for st in &reach.states {
-        let v = st.get(signal).copied().unwrap_or(0);
+        let v = st.get(&cell).copied().unwrap_or(0);
         if !cmp_holds(op, v, value) {
             return Ok(AgOracle::Violated(st.clone()));
+        }
+    }
+    if reach.bounded {
+        Ok(AgOracle::Inconclusive)
+    } else {
+        Ok(AgOracle::Holds)
+    }
+}
+
+/// One `signal ⋈ value` comparison atom over a state register or a primary
+/// input — the building block of the `|=>` fragment (H.O.0.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleAtom {
+    pub signal: String,
+    pub op: CmpOp,
+    pub value: u128,
+}
+
+impl OracleAtom {
+    pub fn new(signal: impl Into<String>, op: CmpOp, value: u128) -> Self {
+        Self {
+            signal: signal.into(),
+            op,
+            value,
+        }
+    }
+}
+
+/// Concrete `AG (ante → AX cons)` oracle — the SVA `ante |=> cons` shape, where
+/// the consequent is checked one cycle later, at every successor.
+///
+/// `ante` may be a **state register** (value-alias resolved) OR a **1-bit
+/// primary input** (read from the current cycle's input combination). `cons`
+/// must be a **state register** — it is evaluated at the NEXT state. Concrete,
+/// no abstraction: at every reachable state, for every enumerated 1-bit input
+/// combination, if the antecedent holds then every one-step successor must
+/// satisfy the consequent.
+///
+/// - `Violated(s)` — a reachable state `s` whose successor breaks the consequent
+///   (a real concrete counterexample, sound even under a bounded enumeration).
+/// - `Holds` — full enumeration, no break.
+/// - `Inconclusive` — enumeration was bounded (wide inputs / cap) and no break
+///   was found, so AG-true cannot be concluded.
+///
+/// Out-of-fragment signals error: a consequent that is not a state cell, or an
+/// antecedent that is neither a state cell nor a 1-bit primary input (e.g. a
+/// combinational function of state, deferred to a later increment).
+pub fn ag_implies_next(
+    file: &Btor2File,
+    ante: &OracleAtom,
+    cons: &OracleAtom,
+    max_states: usize,
+    max_input_bits: usize,
+) -> Result<AgOracle, AdapterError> {
+    let err = |m: String| AdapterError {
+        kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
+        location: None,
+        message: m,
+    };
+    // Consequent: a state cell (checked at the next state).
+    let cons_cell = resolve_signal_symbol(file, &cons.signal).ok_or_else(|| {
+        err(format!(
+            "concrete_oracle::ag_implies_next: consequent `{}` does not resolve to a state cell",
+            cons.signal
+        ))
+    })?;
+    // Antecedent: a state cell OR a 1-bit primary input.
+    let (bool_ins, _has_wide) = boolean_inputs(file);
+    let ante_cell = resolve_signal_symbol(file, &ante.signal);
+    let ante_is_input = bool_ins.iter().any(|n| n == &ante.signal);
+    if ante_cell.is_none() && !ante_is_input {
+        return Err(err(format!(
+            "concrete_oracle::ag_implies_next: antecedent `{}` is neither a state cell nor a \
+             1-bit primary input (out of the |=> fragment)",
+            ante.signal
+        )));
+    }
+
+    let reach = reachable_register_states(file, max_states, max_input_bits)?;
+    let n_in = bool_ins.len().min(max_input_bits);
+    let n_combos: usize = 1usize << n_in;
+
+    for st in &reach.states {
+        let regs: HashMap<String, u128> = st.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for combo in 0..n_combos {
+            let inputs: HashMap<String, u128> = bool_ins
+                .iter()
+                .take(n_in)
+                .enumerate()
+                .map(|(b, name)| (name.clone(), ((combo >> b) & 1) as u128))
+                .collect();
+            // Antecedent value at (state, inputs).
+            let ante_val = match &ante_cell {
+                Some(cell) => regs.get(cell).copied().unwrap_or(0),
+                None => inputs.get(&ante.signal).copied().unwrap_or(0),
+            };
+            if !cmp_holds(ante.op, ante_val, ante.value) {
+                continue;
+            }
+            // Consequent at the NEXT state (this specific input assignment).
+            let next = bit_blast::simulate_one_step(file, &regs, &inputs)?;
+            let cons_val = next.get(&cons_cell).copied().unwrap_or(0);
+            if !cmp_holds(cons.op, cons_val, cons.value) {
+                return Ok(AgOracle::Violated(st.clone()));
+            }
         }
     }
     if reach.bounded {
@@ -305,5 +412,104 @@ mod tests {
     fn non_state_signal_is_rejected() {
         let file = parse(CYCLE_FSM).expect("parse");
         assert!(ag_state_atom(&file, "not_a_state", CmpOp::Eq, 0, 64, 8).is_err());
+    }
+
+    // ---- H.O.0.3 — `|=>` (AX) oracle + signal resolution -------------------
+
+    // A 1-bit FSM `q` with a 1-bit input `en`: next(q) = en ? 1 : q. Reset 0.
+    // Reachable {0,1}; `en` high forces q to 1 next cycle.
+    const GATED_FSM: &str = "\
+1 sort bitvec 1
+2 state 1 q
+3 input 1 en
+4 one 1
+5 ite 1 3 4 2
+6 next 1 2 5
+7 zero 1
+8 init 1 2 7
+";
+
+    // A 2-bit state `st_internal` stuck at 0, exposed under the value-alias name
+    // `st_alias` (a `uext`-by-0 rename — what Yosys' flatten emits).
+    const ALIAS_FSM: &str = "\
+1 sort bitvec 2
+2 state 1 st_internal
+3 zero 1
+4 next 1 2 3
+5 init 1 2 3
+6 uext 1 2 0 st_alias
+";
+
+    #[test]
+    fn ag_implies_next_holds() {
+        let file = parse(CYCLE_FSM).expect("parse");
+        // AG (state == 0 |=> state == 1) — from 0 the next state is always 1.
+        let ante = OracleAtom::new("state", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state", CmpOp::Eq, 1);
+        assert_eq!(
+            ag_implies_next(&file, &ante, &cons, 64, 8).unwrap(),
+            AgOracle::Holds
+        );
+    }
+
+    #[test]
+    fn ag_implies_next_violated() {
+        let file = parse(CYCLE_FSM).expect("parse");
+        // AG (state == 0 |=> state == 2) — from 0 the next is 1, not 2 → VIOLATED.
+        let ante = OracleAtom::new("state", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state", CmpOp::Eq, 2);
+        match ag_implies_next(&file, &ante, &cons, 64, 8).unwrap() {
+            AgOracle::Violated(st) => assert_eq!(st["state"], 0),
+            other => panic!("expected Violated(state=0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ag_implies_next_input_antecedent_holds() {
+        let file = parse(GATED_FSM).expect("parse");
+        // AG (en |=> q == 1) — whenever `en` is high, q is 1 next cycle.
+        let ante = OracleAtom::new("en", CmpOp::Eq, 1);
+        let cons = OracleAtom::new("q", CmpOp::Eq, 1);
+        assert_eq!(
+            ag_implies_next(&file, &ante, &cons, 64, 8).unwrap(),
+            AgOracle::Holds
+        );
+    }
+
+    #[test]
+    fn ag_implies_next_input_antecedent_violated() {
+        let file = parse(GATED_FSM).expect("parse");
+        // AG (en |=> q == 0) — `en` high forces q to 1, contradicting q == 0.
+        let ante = OracleAtom::new("en", CmpOp::Eq, 1);
+        let cons = OracleAtom::new("q", CmpOp::Eq, 0);
+        assert!(matches!(
+            ag_implies_next(&file, &ante, &cons, 64, 8).unwrap(),
+            AgOracle::Violated(_)
+        ));
+    }
+
+    #[test]
+    fn ag_implies_next_rejects_input_consequent() {
+        let file = parse(GATED_FSM).expect("parse");
+        // The consequent must be a state cell; an input consequent is out of
+        // the |=> fragment (it has no "next state" value).
+        let ante = OracleAtom::new("q", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("en", CmpOp::Eq, 1);
+        assert!(ag_implies_next(&file, &ante, &cons, 64, 8).is_err());
+    }
+
+    #[test]
+    fn resolve_signal_follows_value_alias() {
+        let file = parse(ALIAS_FSM).expect("parse");
+        // `st_alias` is a uext-0 rename of the state `st_internal` (stuck at 0).
+        // The oracle binds it to the underlying cell and reads its real value.
+        assert_eq!(
+            resolve_signal_symbol(&file, "st_alias").as_deref(),
+            Some("st_internal")
+        );
+        assert_eq!(
+            ag_state_atom(&file, "st_alias", CmpOp::Eq, 0, 64, 8).unwrap(),
+            AgOracle::Holds
+        );
     }
 }
