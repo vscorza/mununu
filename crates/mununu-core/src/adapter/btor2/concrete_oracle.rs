@@ -194,18 +194,25 @@ fn cmp_holds(op: CmpOp, lhs: u128, rhs: u128) -> bool {
 /// state symbol resolves to itself; a `uext`/`sext`-by-0 or `output` rename of a
 /// state cell resolves to that cell; a combinational *function* of state does
 /// NOT resolve (binding it to a state's value would read the wrong value).
-/// Reset-mux aliases are NOT followed (`allow_reset_mux = false`): the oracle
-/// does not pin reset, so the register equals the state only when reset is
-/// inactive, which the free-input enumeration does not guarantee.
-fn resolve_signal_symbol(file: &Btor2File, signal: &str) -> Option<String> {
-    let nid = parser::resolve_state_alias(file, signal, false)?;
+///
+/// `allow_reset_mux` (H.O.0.3b) controls whether an async-reset register mux
+/// `ite(rst, state, resetval)` is followed to its state branch. Pass `true`
+/// **only when the design's reset input is pinned inactive** (e.g. the caller
+/// ran `pin_inputs_to_constants` to match verify_auto's reset-gating): then the
+/// mux always selects the state branch, so the register's value equals the
+/// state's and binding is sound — the same condition under which the verify-auto
+/// seeder follows it. Pass `false` when reset is a free input (the register only
+/// equals the state while reset is inactive, which free enumeration breaks).
+fn resolve_signal_symbol(file: &Btor2File, signal: &str, allow_reset_mux: bool) -> Option<String> {
+    let nid = parser::resolve_state_alias(file, signal, allow_reset_mux)?;
     parser::collect_symbols(file).get(&nid).cloned()
 }
 
 /// Concrete `AG (signal ⋈ value)` oracle over a **state-register** signal (or a
 /// value-alias of one — H.O.0.3 resolution). Reads each reachable state's
 /// register value directly — no abstraction. A signal that does not resolve to a
-/// state cell returns an error (out of the AG-state-atom fragment).
+/// state cell returns an error (out of the AG-state-atom fragment). See
+/// [`resolve_signal_symbol`] for `reset_pinned`.
 pub fn ag_state_atom(
     file: &Btor2File,
     signal: &str,
@@ -213,8 +220,9 @@ pub fn ag_state_atom(
     value: u128,
     max_states: usize,
     max_input_bits: usize,
+    reset_pinned: bool,
 ) -> Result<AgOracle, AdapterError> {
-    let cell = resolve_signal_symbol(file, signal).ok_or_else(|| AdapterError {
+    let cell = resolve_signal_symbol(file, signal, reset_pinned).ok_or_else(|| AdapterError {
         kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
         location: None,
         message: format!(
@@ -273,13 +281,15 @@ impl OracleAtom {
 ///
 /// Out-of-fragment signals error: a consequent that is not a state cell, or an
 /// antecedent that is neither a state cell nor a 1-bit primary input (e.g. a
-/// combinational function of state, deferred to a later increment).
+/// combinational function of state, deferred to a later increment). See
+/// [`resolve_signal_symbol`] for `reset_pinned`.
 pub fn ag_implies_next(
     file: &Btor2File,
     ante: &OracleAtom,
     cons: &OracleAtom,
     max_states: usize,
     max_input_bits: usize,
+    reset_pinned: bool,
 ) -> Result<AgOracle, AdapterError> {
     let err = |m: String| AdapterError {
         kind: crate::adapter::AdapterErrorKind::IrConsistencyError,
@@ -287,7 +297,7 @@ pub fn ag_implies_next(
         message: m,
     };
     // Consequent: a state cell (checked at the next state).
-    let cons_cell = resolve_signal_symbol(file, &cons.signal).ok_or_else(|| {
+    let cons_cell = resolve_signal_symbol(file, &cons.signal, reset_pinned).ok_or_else(|| {
         err(format!(
             "concrete_oracle::ag_implies_next: consequent `{}` does not resolve to a state cell",
             cons.signal
@@ -295,7 +305,7 @@ pub fn ag_implies_next(
     })?;
     // Antecedent: a state cell OR a 1-bit primary input.
     let (bool_ins, _has_wide) = boolean_inputs(file);
-    let ante_cell = resolve_signal_symbol(file, &ante.signal);
+    let ante_cell = resolve_signal_symbol(file, &ante.signal, reset_pinned);
     let ante_is_input = bool_ins.iter().any(|n| n == &ante.signal);
     if ante_cell.is_none() && !ante_is_input {
         return Err(err(format!(
@@ -383,7 +393,7 @@ mod tests {
         let file = parse(CYCLE_FSM).expect("parse");
         // AG (state != 3) — 3 is unreachable → HOLDS (full enumeration).
         assert_eq!(
-            ag_state_atom(&file, "state", CmpOp::Ne, 3, 64, 8).unwrap(),
+            ag_state_atom(&file, "state", CmpOp::Ne, 3, 64, 8, false).unwrap(),
             AgOracle::Holds
         );
     }
@@ -392,7 +402,7 @@ mod tests {
     fn ag_violated_for_reachable_value() {
         let file = parse(CYCLE_FSM).expect("parse");
         // AG (state != 1) — 1 IS reachable → VIOLATED, with the witness.
-        match ag_state_atom(&file, "state", CmpOp::Ne, 1, 64, 8).unwrap() {
+        match ag_state_atom(&file, "state", CmpOp::Ne, 1, 64, 8, false).unwrap() {
             AgOracle::Violated(st) => assert_eq!(st["state"], 1),
             other => panic!("expected Violated(state=1), got {other:?}"),
         }
@@ -403,7 +413,7 @@ mod tests {
         let file = parse(CYCLE_FSM).expect("parse");
         // AG (state <= 2) — every reachable state ≤ 2 → HOLDS.
         assert_eq!(
-            ag_state_atom(&file, "state", CmpOp::Le, 2, 64, 8).unwrap(),
+            ag_state_atom(&file, "state", CmpOp::Le, 2, 64, 8, false).unwrap(),
             AgOracle::Holds
         );
     }
@@ -411,7 +421,7 @@ mod tests {
     #[test]
     fn non_state_signal_is_rejected() {
         let file = parse(CYCLE_FSM).expect("parse");
-        assert!(ag_state_atom(&file, "not_a_state", CmpOp::Eq, 0, 64, 8).is_err());
+        assert!(ag_state_atom(&file, "not_a_state", CmpOp::Eq, 0, 64, 8, false).is_err());
     }
 
     // ---- H.O.0.3 — `|=>` (AX) oracle + signal resolution -------------------
@@ -447,7 +457,7 @@ mod tests {
         let ante = OracleAtom::new("state", CmpOp::Eq, 0);
         let cons = OracleAtom::new("state", CmpOp::Eq, 1);
         assert_eq!(
-            ag_implies_next(&file, &ante, &cons, 64, 8).unwrap(),
+            ag_implies_next(&file, &ante, &cons, 64, 8, false).unwrap(),
             AgOracle::Holds
         );
     }
@@ -458,7 +468,7 @@ mod tests {
         // AG (state == 0 |=> state == 2) — from 0 the next is 1, not 2 → VIOLATED.
         let ante = OracleAtom::new("state", CmpOp::Eq, 0);
         let cons = OracleAtom::new("state", CmpOp::Eq, 2);
-        match ag_implies_next(&file, &ante, &cons, 64, 8).unwrap() {
+        match ag_implies_next(&file, &ante, &cons, 64, 8, false).unwrap() {
             AgOracle::Violated(st) => assert_eq!(st["state"], 0),
             other => panic!("expected Violated(state=0), got {other:?}"),
         }
@@ -471,7 +481,7 @@ mod tests {
         let ante = OracleAtom::new("en", CmpOp::Eq, 1);
         let cons = OracleAtom::new("q", CmpOp::Eq, 1);
         assert_eq!(
-            ag_implies_next(&file, &ante, &cons, 64, 8).unwrap(),
+            ag_implies_next(&file, &ante, &cons, 64, 8, false).unwrap(),
             AgOracle::Holds
         );
     }
@@ -483,7 +493,7 @@ mod tests {
         let ante = OracleAtom::new("en", CmpOp::Eq, 1);
         let cons = OracleAtom::new("q", CmpOp::Eq, 0);
         assert!(matches!(
-            ag_implies_next(&file, &ante, &cons, 64, 8).unwrap(),
+            ag_implies_next(&file, &ante, &cons, 64, 8, false).unwrap(),
             AgOracle::Violated(_)
         ));
     }
@@ -495,7 +505,7 @@ mod tests {
         // the |=> fragment (it has no "next state" value).
         let ante = OracleAtom::new("q", CmpOp::Eq, 0);
         let cons = OracleAtom::new("en", CmpOp::Eq, 1);
-        assert!(ag_implies_next(&file, &ante, &cons, 64, 8).is_err());
+        assert!(ag_implies_next(&file, &ante, &cons, 64, 8, false).is_err());
     }
 
     #[test]
@@ -504,11 +514,11 @@ mod tests {
         // `st_alias` is a uext-0 rename of the state `st_internal` (stuck at 0).
         // The oracle binds it to the underlying cell and reads its real value.
         assert_eq!(
-            resolve_signal_symbol(&file, "st_alias").as_deref(),
+            resolve_signal_symbol(&file, "st_alias", false).as_deref(),
             Some("st_internal")
         );
         assert_eq!(
-            ag_state_atom(&file, "st_alias", CmpOp::Eq, 0, 64, 8).unwrap(),
+            ag_state_atom(&file, "st_alias", CmpOp::Eq, 0, 64, 8, false).unwrap(),
             AgOracle::Holds
         );
     }
