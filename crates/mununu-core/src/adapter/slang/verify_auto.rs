@@ -180,6 +180,19 @@ impl Default for VerifyAutoOptions {
 /// Auto-seeded predicates for one formula: simple `reg == value` specs, compound
 /// `(name, expr)` pairs (relational / `!=` / boolean combinations), and the atom
 /// strings that could NOT be seeded (reference a non-state, non-input signal).
+/// H.E — how a combinational signal's value is determined, deciding how it binds:
+/// - `InputDependent` — its cone reaches a primary input (`trigger_active =
+///   !trigger_i`). Routed through the FREE-INPUT path (a free cube dimension,
+///   source-pin / target-free), so the may/must edges respect it. Treating it as
+///   a state-cube label is unsound (the sysrst sva_6 / sva_9 spurious VIOLATED).
+/// - `StateOnly` — a pure function of state (`event_detected_o = f(state_q)`).
+///   Sound as a derived per-cube 3-valued label (Approach B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CombKind {
+    InputDependent,
+    StateOnly,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Seeded {
     specs: Vec<PredicateSpec>,
@@ -230,10 +243,57 @@ fn seed_from_formula(
     formula: &Formula,
     is_state: impl Fn(&str) -> bool,
     is_input: impl Fn(&str) -> bool,
-    is_combinational: impl Fn(&str) -> bool,
+    combinational_kind: impl Fn(&str) -> Option<CombKind>,
 ) -> Seeded {
     let mut out = Seeded::default();
     let mut seen: HashSet<&str> = HashSet::new();
+    // Route one simple `register == value` (or bare-boolean ≡ `== 1`) atom by
+    // the provenance of its register:
+    // - state cell → cube dimension (H.A);
+    // - free input → cube dimension, free at init (H.B);
+    // - input-dependent combinational → cube dimension via the free-input path
+    //   (H.E: source-pin / target-free, recorded in `input_registers`);
+    // - state-only combinational → derived per-cube label (H.E Approach B);
+    // - otherwise → unseedable (never a misleading verdict).
+    let seed_simple = |out: &mut Seeded, atom: &str, register: &str, value: u64| {
+        if is_state(register) {
+            out.specs.push(PredicateSpec {
+                name: atom.to_string(),
+                register: register.to_string(),
+                value,
+            });
+        } else if is_input(register) {
+            out.input_registers.insert(register.to_string());
+            out.specs.push(PredicateSpec {
+                name: atom.to_string(),
+                register: register.to_string(),
+                value,
+            });
+        } else {
+            match combinational_kind(register) {
+                Some(CombKind::StateOnly) => {
+                    // Sound: a combinational function of STATE only. Its value at
+                    // every cube (including must/may targets) is determined by
+                    // that cube's own state dimensions, so a derived per-cube
+                    // 3-valued label (NOT a cube dimension) is sound.
+                    out.derived.push(PredicateSpec {
+                        name: atom.to_string(),
+                        register: register.to_string(),
+                        value,
+                    });
+                }
+                // DEFERRED (sound SKIP): a combinational function of a FREE INPUT
+                // (`trigger_active = !trigger_i`). Neither the static label nor a
+                // free cube dimension is sound for the MUST relation here — the
+                // next-cycle value is `f(state_next, next_input)`, not freely both
+                // flavours, so `target-free` fabricates must-edges (the sysrst
+                // sva_6/sva_9 spurious VIOLATED). The sound fix needs the
+                // next-cycle combinational cache (compute the value at source AND
+                // target); until then SKIP, never a misleading verdict.
+                Some(CombKind::InputDependent) | None => out.unseedable.push(atom.to_string()),
+            }
+        }
+    };
     for node in formula.nodes() {
         let Node::Predicate(atom) = node else {
             continue;
@@ -243,38 +303,12 @@ fn seed_from_formula(
         }
         match parse_predicate_expr(atom) {
             Ok(expr) => match &expr {
-                // Simple `reg == value` → a direct PredicateSpec cube bit, over
-                // a state cell OR (H.B) a free input.
+                // Simple `reg == value` → routed by `seed_simple`.
                 PredicateExpr::Cmp {
                     register,
                     op: CmpOp::Eq,
                     value,
-                } => {
-                    if is_state(register) {
-                        out.specs.push(PredicateSpec {
-                            name: atom.clone(),
-                            register: register.clone(),
-                            value: *value,
-                        });
-                    } else if is_input(register) {
-                        out.input_registers.insert(register.clone());
-                        out.specs.push(PredicateSpec {
-                            name: atom.clone(),
-                            register: register.clone(),
-                            value: *value,
-                        });
-                    } else if is_combinational(register) {
-                        // H.E — a determined combinational signal: a derived
-                        // per-cube label, NOT a cube dimension.
-                        out.derived.push(PredicateSpec {
-                            name: atom.clone(),
-                            register: register.clone(),
-                            value: *value,
-                        });
-                    } else {
-                        out.unseedable.push(atom.clone());
-                    }
-                }
+                } => seed_simple(&mut out, atom, register, *value),
                 // Relational / `!=` / boolean combination → compound predicate.
                 // The compound SMT branch reads state BVs only, so every
                 // referenced register must be a state cell.
@@ -287,34 +321,8 @@ fn seed_from_formula(
                 }
             },
             // A bare identifier atom (`parse_predicate_expr` needs an operator):
-            // a 1-bit boolean signal `sig` ≡ `sig == 1`. Seedable as a state
-            // cell or (H.B) a free input.
-            Err(_) => {
-                if is_state(atom) {
-                    out.specs.push(PredicateSpec {
-                        name: atom.clone(),
-                        register: atom.clone(),
-                        value: 1,
-                    });
-                } else if is_input(atom) {
-                    out.input_registers.insert(atom.clone());
-                    out.specs.push(PredicateSpec {
-                        name: atom.clone(),
-                        register: atom.clone(),
-                        value: 1,
-                    });
-                } else if is_combinational(atom) {
-                    // H.E — bare combinational boolean `sig` ≡ `sig == 1`,
-                    // labeled per cube (derived), not a dimension.
-                    out.derived.push(PredicateSpec {
-                        name: atom.clone(),
-                        register: atom.clone(),
-                        value: 1,
-                    });
-                } else {
-                    out.unseedable.push(atom.clone());
-                }
-            }
+            // a 1-bit boolean signal `sig` ≡ `sig == 1`.
+            Err(_) => seed_simple(&mut out, atom, atom, 1),
         }
     }
     out
@@ -616,25 +624,38 @@ pub fn verify_auto(
     let is_input = |name: &str| -> bool { input_symbols.contains(name) };
 
     // H.E (combinational outputs) — named combinational nodes: an `Op` carrying
-    // its OWN symbol that is neither a state cell (incl. value-alias, checked via
-    // `resolves_to_state` precedence below) nor an input. A simple atom over one
-    // of these (csrng's `main_sm_err_o`, sysrst's `trigger_active` /
-    // `event_detected_*` / `cnt_clr`) is admitted as a DERIVED per-cube label
-    // (Approach B), not a cube dimension. `is_state` is consulted first in the
-    // seeder, so a state value-alias (which is also an Op with a symbol) binds as
-    // state, not combinational.
-    let combinational_symbols: HashSet<String> = file
-        .lines
-        .iter()
-        .filter_map(|l| match &l.node {
-            crate::adapter::btor2::ast::Node::Op {
-                symbol: Some(s), ..
-            } => Some(s.clone()),
-            _ => None,
+    // its OWN symbol that is neither a state cell (incl. value-alias, via
+    // `resolves_to_state` precedence in the seeder) nor an input. Each is
+    // classified by its CONE (`cone_reaches_input`):
+    // - **input-dependent** (`trigger_active = !trigger_i`) → routed through the
+    //   FREE-INPUT path (a free cube dimension, source-pin / target-free) so the
+    //   may/must edges respect it — SOUND (treating it as a state-cube label is
+    //   what produced the sysrst sva_6 / sva_9 spurious VIOLATED);
+    // - **state-only** (`event_detected_o = f(state_q)`) → a DERIVED per-cube
+    //   3-valued label (Approach B).
+    // `is_state` is consulted first in the seeder, so a state value-alias (also
+    // an Op with a symbol) binds as state, not combinational.
+    let combinational_nid: std::collections::HashMap<String, crate::adapter::btor2::ast::Nid> =
+        file.lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                crate::adapter::btor2::ast::Node::Op {
+                    symbol: Some(s), ..
+                } if !state_cells.contains(s) && !input_symbols.contains(s) => {
+                    Some((s.clone(), l.nid))
+                }
+                _ => None,
+            })
+            .collect();
+    let combinational_kind = |name: &str| -> Option<CombKind> {
+        combinational_nid.get(name).map(|&nid| {
+            if crate::adapter::btor2::parser::cone_reaches_input(&file, nid) {
+                CombKind::InputDependent
+            } else {
+                CombKind::StateOnly
+            }
         })
-        .filter(|s| !state_cells.contains(s) && !input_symbols.contains(s))
-        .collect();
-    let is_combinational = |name: &str| -> bool { combinational_symbols.contains(name) };
+    };
 
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
@@ -654,7 +675,7 @@ pub fn verify_auto(
             }
         };
 
-        let seeded = seed_from_formula(&formula, resolves_to_state, is_input, is_combinational);
+        let seeded = seed_from_formula(&formula, resolves_to_state, is_input, combinational_kind);
         if !seeded.unseedable.is_empty() {
             let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
@@ -839,7 +860,7 @@ mod tests {
     fn seeds_simple_state_predicate() {
         // `nu X. ((state == 5) && [] X)` over a state cell → one simple spec.
         let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n), |_| false, |_| false);
+        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n), |_| false, |_| None);
         assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
         assert_eq!(s.specs[0].name, "state == 5");
         assert_eq!(s.specs[0].register, "state");
@@ -856,7 +877,7 @@ mod tests {
             &f,
             |n| cells(&["state", "state__past"]).contains(n),
             |_| false,
-            |_| false,
+            |_| None,
         );
         assert!(s.specs.is_empty(), "relational atom is not a simple spec");
         assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
@@ -884,12 +905,7 @@ mod tests {
         let f = mu_parser::parse("nu X. (((gnt_o != 0) || ready_i) && [] X)").unwrap();
         // Neither IO signal is a state cell, and (here) none is a free input
         // either → both unseedable.
-        let s = seed_from_formula(
-            &f,
-            |n| cells(&["state_q"]).contains(n),
-            |_| false,
-            |_| false,
-        );
+        let s = seed_from_formula(&f, |n| cells(&["state_q"]).contains(n), |_| false, |_| None);
         assert!(
             s.unseedable.contains(&"gnt_o != 0".to_string()),
             "IO comparison atom must be unseedable; got {:?}",
@@ -905,7 +921,7 @@ mod tests {
     #[test]
     fn bare_one_bit_state_signal_seeds_eq_one() {
         let f = mu_parser::parse("nu X. (busy && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n), |_| false, |_| false);
+        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n), |_| false, |_| None);
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "busy");
         assert_eq!(s.specs[0].value, 1, "bare boolean state signal ≡ sig == 1");
@@ -923,7 +939,7 @@ mod tests {
             &f,
             |n| cells(&["state"]).contains(n),
             |n| cells(&["cfg_enable_i"]).contains(n),
-            |_| false,
+            |_| None,
         );
         assert!(
             s.unseedable.is_empty(),
@@ -949,7 +965,7 @@ mod tests {
             &f,
             |_| false,
             |n| cells(&["trigger_i"]).contains(n),
-            |_| false,
+            |_| None,
         );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "trigger_i");
@@ -988,7 +1004,7 @@ mod tests {
             &f,
             |_| false,
             |n| cells(&["cfg_enable_i"]).contains(n),
-            |_| false,
+            |_| None,
         );
         assert!(s.specs.is_empty());
         assert!(s.compounds.is_empty());
@@ -1008,7 +1024,12 @@ mod tests {
             &f,
             |_| false,
             |_| false,
-            |n| cells(&["main_sm_err_o"]).contains(n),
+            // state-only combinational → derived label
+            |n| {
+                cells(&["main_sm_err_o"])
+                    .contains(n)
+                    .then_some(CombKind::StateOnly)
+            },
         );
         assert!(s.specs.is_empty(), "combinational is not a cube dimension");
         assert!(s.compounds.is_empty());
@@ -1025,7 +1046,11 @@ mod tests {
             &f,
             |_| false,
             |_| false,
-            |n| cells(&["err_code"]).contains(n),
+            |n| {
+                cells(&["err_code"])
+                    .contains(n)
+                    .then_some(CombKind::StateOnly)
+            },
         );
         assert_eq!(s.derived.len(), 1);
         assert_eq!(s.derived[0].register, "err_code");
@@ -1043,10 +1068,44 @@ mod tests {
             &f,
             |n| cells(&["sig"]).contains(n),
             |_| false,
-            |n| cells(&["sig"]).contains(n),
+            |n| cells(&["sig"]).contains(n).then_some(CombKind::StateOnly),
         );
         assert_eq!(s.specs.len(), 1, "state precedence → a cube dimension");
         assert!(s.derived.is_empty());
+    }
+
+    #[test]
+    fn h_e_input_dependent_combinational_is_skipped_soundly() {
+        // `trigger_active = !trigger_i` — combinational of a FREE INPUT. DEFERRED:
+        // neither a derived state-cube label nor a free dimension is sound for the
+        // MUST relation (the next-cycle value f(state_next, next_input) isn't
+        // freely both flavours → target-free fabricates must-edges). So it is
+        // SKIPPED (never a misleading verdict) until the next-cycle-cache fix.
+        let f = mu_parser::parse("nu X. ((trigger_active && (state == 2)) && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state"]).contains(n),
+            |_| false,
+            |n| {
+                cells(&["trigger_active"])
+                    .contains(n)
+                    .then_some(CombKind::InputDependent)
+            },
+        );
+        assert!(s.derived.is_empty(), "not a derived label");
+        assert!(
+            !s.input_registers.contains("trigger_active"),
+            "NOT routed as a free dimension (unsound for must)"
+        );
+        assert!(
+            !s.specs.iter().any(|p| p.register == "trigger_active"),
+            "not a cube dimension"
+        );
+        assert!(
+            s.unseedable.contains(&"trigger_active".to_string()),
+            "input-dependent combinational is soundly SKIPPED: {:?}",
+            s.unseedable
+        );
     }
 
     #[test]
@@ -1539,8 +1598,25 @@ mod tests {
                 .any(|p| p.formula.contains("cnt_q >= cfg_")),
             "H.D translated a `signal >= signal` (cnt_q >= cfg_*_timer_i)"
         );
-        // SOUNDNESS — no spurious counterexample (combinational outputs like
-        // `event_detected_o` are excluded by the strict resolver, not mis-bound).
+        // SOUNDNESS — no spurious counterexample. This is the H.E soundness
+        // anchor: an INPUT-DEPENDENT combinational antecedent (`trigger_active =
+        // !trigger_i`, etc.) is SKIPPED (its register reaches a free input via
+        // `cone_reaches_input`, so it is deferred to the next-cycle-cache
+        // must-edge fix), NEVER bound as a state-cube label or free dimension —
+        // both of which fabricated a VIOLATED on these shipped OpenTitan
+        // assertions. `sva_6` (`DetectStDropOut`: `state==DetectSt && !trigger_active
+        // && cfg |=> state==IdleSt`) is the canonical case it must not VIOLATE.
+        let sva6 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "sysrst_ctrl_detect_sva_6")
+            .expect("sva_6 present");
+        assert!(
+            matches!(sva6.outcome, VerifyOutcome::Skipped { .. }),
+            "sva_6's input-dependent combinational `trigger_active` is soundly \
+             SKIPPED (deferred), not a spurious VIOLATED; got {:?}",
+            sva6.outcome
+        );
         assert!(
             !report
                 .properties
