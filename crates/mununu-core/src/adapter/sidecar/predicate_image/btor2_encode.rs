@@ -380,10 +380,9 @@ pub fn encode_design_with_theory(
 /// SOURCE side. Built by a second [`walk_design`] over a [`Z3Backend`] whose
 /// `state_curr` is bound to `state_next` and whose `inputs` are the fresh `i'`.
 ///
-/// **Spike (H.U.0).** Test-only for now — consumed solely by the
-/// `uniform_image_spike` go/no-go validation; H.U.1 promotes it to the
-/// production predicate-image path.
-#[cfg(test)]
+/// **H.U.1a (2026-06-29).** Promoted to production: the uniform may-edge path
+/// (`smt_must_edge::smt_per_target_may_check_uniform`, via the STS-IR seam)
+/// reads it for an edge's target side.
 pub(crate) struct PrimedEnv {
     /// Primed value of every walked Op/Const node, keyed by nid (over `(s', i')`).
     pub cache: HashMap<Nid, z3::ast::BV>,
@@ -400,7 +399,6 @@ pub(crate) struct PrimedEnv {
 /// term; an input maps to its fresh `i'`.
 ///
 /// **Caller must hold a [`z3::with_z3_config`] scope** (it allocates Z3 consts).
-#[cfg(test)]
 pub(crate) fn encode_primed(
     file: &Btor2File,
     view: &Btor2SmtView,

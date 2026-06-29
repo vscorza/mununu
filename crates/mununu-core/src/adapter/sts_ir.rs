@@ -308,8 +308,9 @@ impl SmtEncode for BtorSts<'_> {
     ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
-            SmtMayVerdict, build_register_nid_map_with_inputs, smt_per_target_may_check,
+            SmtMayVerdict, build_register_nid_map_with_inputs, smt_per_target_may_check_uniform,
         };
+        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_primed;
 
         if predicates.is_empty() {
             return Vec::new();
@@ -327,17 +328,29 @@ impl SmtEncode for BtorSts<'_> {
                 // predicate_cube_lift fallback.
                 Err(_) => return Vec::new(),
             };
-            // H.B — map inputs too, so a free-input predicate resolves and
-            // its source-pin / target-free edge shape (in `build_pred_constraint`)
-            // fires. State symbols still take precedence on a name collision, so
-            // state-only predicate sets get the identical map + identical edges.
+            // H.U.1a — the uniform predicate-image. Build the next-cycle node
+            // cache (`encode_primed`: every node re-evaluated over `(s', i')`)
+            // ONCE, then run the uniform may-check (`term over (s,i)` source /
+            // `(s', i')` target) per pair. May-EQUIVALENT to the per-kind
+            // `smt_per_target_may_check` on state / input / compound predicates
+            // (a fresh `i'` target ≡ the per-kind target-free under the `∃`
+            // may-query); only combinational-of-state targets gain precision,
+            // and none are routed as cube dimensions yet. Primed-encode failure
+            // → no edges (sound, mirrors the encode fallback).
+            let primed = match encode_primed(self.file, &view) {
+                Ok(p) => p,
+                Err(_) => return Vec::new(),
+            };
+            // H.B — map inputs too, so a free-input predicate resolves. State
+            // symbols take precedence on a name collision, so state-only
+            // predicate sets get the identical map + identical edges.
             let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
             for i in 0..n_cubes {
                 for j in 0..n_cubes {
                     if matches!(
-                        smt_per_target_may_check(
-                            &view, i as u64, j as u64, predicates, &nid_map, timeout_ms,
+                        smt_per_target_may_check_uniform(
+                            &view, &primed, i as u64, j as u64, predicates, &nid_map, timeout_ms,
                         ),
                         SmtMayVerdict::May
                     ) {

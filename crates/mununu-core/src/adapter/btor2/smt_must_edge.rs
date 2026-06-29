@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 
 use crate::adapter::btor2::ast::Nid;
-use crate::adapter::sidecar::predicate_image::btor2_encode::{Btor2SmtView, SignalKind};
+use crate::adapter::sidecar::predicate_image::btor2_encode::{Btor2SmtView, PrimedEnv, SignalKind};
 
 /// Verdict from a single SMT must-edge query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +274,140 @@ fn build_pred_constraint<P: PredicateLike>(
             let raw = e.build_constraint(&lookup)?;
             Some(if polarity { raw } else { raw.not() })
         }
+    }
+}
+
+/// H.U.1a — **the uniform rule, source side.** A term's value over the current
+/// cycle `(s, i)`: a state leaf (`state_curr`), an input leaf (`inputs`), or a
+/// combinational op (`signal_bvs`, the encoder's per-node cache). One lookup, no
+/// per-atom-kind branch (cf. [`build_pred_constraint`]'s three branches).
+fn term_source_bv(view: &Btor2SmtView, nid: Nid) -> Option<&z3::ast::BV> {
+    view.state_curr
+        .get(&nid)
+        .or_else(|| view.inputs.get(&nid))
+        .or_else(|| view.signal_bvs.get(&nid))
+}
+
+/// H.U.1a — **the uniform rule, target side.** A term's value over the NEXT
+/// cycle `(s', i')`: a state leaf (`state_next`), an input leaf (the fresh `i'`
+/// of [`PrimedEnv`]), or a combinational op (the primed node cache). Same shape
+/// as [`term_source_bv`], over the primed projection.
+fn term_target_bv<'a>(
+    view: &'a Btor2SmtView,
+    primed: &'a PrimedEnv,
+    nid: Nid,
+) -> Option<&'a z3::ast::BV> {
+    view.state_next
+        .get(&nid)
+        .or_else(|| primed.inputs.get(&nid))
+        .or_else(|| primed.cache.get(&nid))
+}
+
+/// H.U.1a — uniform variant of [`build_pred_constraint`]: ONE rule for every
+/// atom kind. A predicate's register name resolves to a term nid (`nid_map`),
+/// and the term's value is taken over the current cycle (`slot_next == false`,
+/// [`term_source_bv`]) or the next cycle (`slot_next == true`,
+/// [`term_target_bv`] over the primed cache `(s', i')`). The per-kind branches
+/// of `build_pred_constraint` collapse:
+/// - a **state** atom → `state_curr` / `state_next` (identical to the per-kind
+///   path by construction — a register leaf's primed value IS `state_next`);
+/// - a **free input** atom → `inputs` / fresh `i'` (the per-kind path returned
+///   the literal `true` on the target; for the `∃` may-check the fresh,
+///   otherwise-unconstrained `i'` is equivalent — see
+///   [`smt_per_target_may_check_uniform`]);
+/// - a **compound** → `PredicateExpr::build_constraint` over the same uniform
+///   term lookup;
+/// - a **combinational** node (out-of-fragment for the per-kind path → `None` →
+///   conservative `May`) → its real `(s, i)` / `(s', i')` term — the new
+///   capability, latent until a combinational predicate is routed as a cube
+///   dimension (H.U.2).
+///
+/// Returns `None` if a referenced register is absent from `nid_map` OR has no
+/// term BV (caller picks the conservative verdict), matching `build_pred_constraint`.
+fn build_pred_constraint_uniform<P: PredicateLike>(
+    view: &Btor2SmtView,
+    primed: &PrimedEnv,
+    nid_map: &HashMap<String, Nid>,
+    pred: &P,
+    slot_next: bool,
+    polarity: bool,
+) -> Option<z3::ast::Bool> {
+    let term_bv = |reg: &str| -> Option<z3::ast::BV> {
+        let nid = *nid_map.get(reg)?;
+        if slot_next {
+            term_target_bv(view, primed, nid).cloned()
+        } else {
+            term_source_bv(view, nid).cloned()
+        }
+    };
+    match pred.expr() {
+        None => {
+            let bv = term_bv(pred.register())?;
+            Some(build_predicate_constraint(&bv, pred.value(), polarity))
+        }
+        Some(e) => {
+            let raw = e.build_constraint(&term_bv)?;
+            Some(if polarity { raw } else { raw.not() })
+        }
+    }
+}
+
+/// H.U.1a — uniform variant of [`smt_per_target_may_check`]. Identical `∃`
+/// query (`SAT(transition ∧ src ∧ tgt)`) but builds each constraint with the
+/// uniform rule ([`build_pred_constraint_uniform`]) — the target side reads the
+/// primed node cache instead of the per-kind `next_state` / `true` branches.
+///
+/// **May-equivalent to the per-kind path on every existing predicate kind.** For
+/// a state atom the target BV is `state_next` (identical). For a free input the
+/// per-kind path used the literal `true` on the target, whereas this uses the
+/// fresh `i'` BV — but `i'` appears in NO other constraint and NOT in the
+/// transition, so `∃ i'. (i' == value)` is always satisfiable ⟺ the per-kind
+/// `true`; the `∃` verdict is unchanged. For a state-register compound the
+/// primed leaf BVs are `state_next` (identical). The combinational case is the
+/// only behavioural difference (precise vs conservative `May`), and no caller
+/// passes a combinational predicate as a cube dimension yet, so the production
+/// may-edge set is unchanged — validated by the full lift / e2e suites + the
+/// `uniform_may_matches_per_kind` differential.
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+pub(crate) fn smt_per_target_may_check_uniform<P>(
+    view: &Btor2SmtView,
+    primed: &PrimedEnv,
+    src_bits: u64,
+    tgt_bits: u64,
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMayVerdict
+where
+    P: PredicateLike,
+{
+    let mut constraints: Vec<z3::ast::Bool> = Vec::new();
+    for (i, pred) in predicates.iter().enumerate() {
+        let src_polarity = (src_bits >> i) & 1 == 1;
+        let tgt_polarity = (tgt_bits >> i) & 1 == 1;
+        let (Some(src_c), Some(tgt_c)) = (
+            build_pred_constraint_uniform(view, primed, nid_map, pred, false, src_polarity),
+            build_pred_constraint_uniform(view, primed, nid_map, pred, true, tgt_polarity),
+        ) else {
+            return SmtMayVerdict::May;
+        };
+        constraints.push(src_c);
+        constraints.push(tgt_c);
+    }
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+    solver.assert(&view.transition);
+    for c in &constraints {
+        solver.assert(c);
+    }
+    match solver.check() {
+        z3::SatResult::Sat => SmtMayVerdict::May,
+        z3::SatResult::Unsat => SmtMayVerdict::NotMay,
+        z3::SatResult::Unknown => SmtMayVerdict::May,
     }
 }
 
@@ -690,7 +824,7 @@ mod tests {
     use super::*;
     use crate::adapter::btor2::kmts_lift::PredicateSpec;
     use crate::adapter::btor2::parser::parse;
-    use crate::adapter::sidecar::predicate_image::btor2_encode::encode_design;
+    use crate::adapter::sidecar::predicate_image::btor2_encode::{encode_design, encode_primed};
 
     /// R.2.5b session 2 — deterministic transition `reg_a := 0`
     /// (input is dropped). Predicate `p:reg_a==0`. A transition
@@ -1265,6 +1399,81 @@ mod tests {
             to_not_p,
             SmtMayVerdict::NotMay,
             "reg_a:=0 can NEVER reach reg_a==1, so src{{p}}→tgt{{¬p}} is excluded"
+        );
+    }
+
+    /// H.U.1a differential — the uniform may-check
+    /// ([`smt_per_target_may_check_uniform`]) must produce the SAME verdict as
+    /// the per-kind [`smt_per_target_may_check`] for EVERY cube pair. This is the
+    /// guard on the `BtorSts::may_edges` cutover: it certifies the uniform image
+    /// is may-preserving across atom kinds, so the production may-edge set (and
+    /// every cube verdict built on it) is unchanged.
+    fn assert_uniform_may_matches<P: PredicateLike + Sync>(src: &str, preds: &[P]) {
+        let file = parse(src).expect("parse");
+        let n = 1u64 << preds.len();
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            for sb in 0..n {
+                for tb in 0..n {
+                    let per_kind = smt_per_target_may_check(&view, sb, tb, preds, &nid_map, 5_000);
+                    let uniform = smt_per_target_may_check_uniform(
+                        &view, &primed, sb, tb, preds, &nid_map, 5_000,
+                    );
+                    assert_eq!(
+                        per_kind, uniform,
+                        "uniform may ≠ per-kind may (src={src:?} sb={sb} tb={tb})"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn uniform_may_matches_per_kind_state_input_compound() {
+        // State, deterministic transition.
+        assert_uniform_may_matches(
+            DETERMINISTIC_ZERO_BTOR2,
+            &[PredicateSpec {
+                name: "p".into(),
+                register: "reg_a".into(),
+                value: 0,
+            }],
+        );
+        // State + a FREE INPUT predicate together (the case where the per-kind
+        // path uses target-free `true` and the uniform path uses a fresh `i'`).
+        assert_uniform_may_matches(
+            INPUT_DRIVEN_BTOR2,
+            &[
+                PredicateSpec {
+                    name: "p".into(),
+                    register: "reg_a".into(),
+                    value: 0,
+                },
+                PredicateSpec {
+                    name: "q".into(),
+                    register: "in_a".into(),
+                    value: 1,
+                },
+            ],
+        );
+        // Compound over state (deterministic).
+        assert_uniform_may_matches(
+            COMPOUND_DET_BTOR2,
+            &[CompoundPred {
+                reg0: "a".into(),
+                e: idle_compound(),
+            }],
+        );
+        // Compound over an input-driven register.
+        assert_uniform_may_matches(
+            COMPOUND_INPUT_BTOR2,
+            &[CompoundPred {
+                reg0: "a".into(),
+                e: idle_compound(),
+            }],
         );
     }
 }
