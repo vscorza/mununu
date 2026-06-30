@@ -272,24 +272,26 @@ fn seed_from_formula(
         } else {
             match combinational_kind(register) {
                 Some(CombKind::StateOnly) => {
-                    // Sound: a combinational function of STATE only. Its value at
-                    // every cube (including must/may targets) is determined by
-                    // that cube's own state dimensions, so a derived per-cube
-                    // 3-valued label (NOT a cube dimension) is sound.
-                    out.derived.push(PredicateSpec {
+                    // H.U.2 — a combinational function of STATE only is a
+                    // determined function of state, so the uniform predicate-image
+                    // handles it as a CUBE DIMENSION (resolved to the combinational
+                    // node via the H.U.1d nid-map; its value over `(s,i)` /
+                    // `(s',i')` from the signal cache + primed cache). This
+                    // subsumes the retired H.E derived-label pass. The init-cube
+                    // bit for this dimension is computed by observing the signal at
+                    // the reset state (see the init-cube section below).
+                    out.specs.push(PredicateSpec {
                         name: atom.to_string(),
                         register: register.to_string(),
                         value,
                     });
                 }
                 // DEFERRED (sound SKIP): a combinational function of a FREE INPUT
-                // (`trigger_active = !trigger_i`). Neither the static label nor a
-                // free cube dimension is sound for the MUST relation here — the
-                // next-cycle value is `f(state_next, next_input)`, not freely both
-                // flavours, so `target-free` fabricates must-edges (the sysrst
-                // sva_6/sva_9 spurious VIOLATED). The sound fix needs the
-                // next-cycle combinational cache (compute the value at source AND
-                // target); until then SKIP, never a misleading verdict.
+                // (`trigger_active = !trigger_i`). Its next-cycle value is
+                // `f(state_next, next_input)`, so as a cube TARGET it needs the
+                // nested `∀ i'` the uniform must does not yet build (H.U.0 finding);
+                // a free cube dimension would fabricate must-edges. SKIP until that
+                // lands, never a misleading verdict.
                 Some(CombKind::InputDependent) | None => out.unseedable.push(atom.to_string()),
             }
         }
@@ -635,7 +637,7 @@ pub fn verify_auto(
     //   3-valued label (Approach B).
     // `is_state` is consulted first in the seeder, so a state value-alias (also
     // an Op with a symbol) binds as state, not combinational.
-    let combinational_nid: std::collections::HashMap<String, crate::adapter::btor2::ast::Nid> =
+    let mut combinational_nid: std::collections::HashMap<String, crate::adapter::btor2::ast::Nid> =
         file.lines
             .iter()
             .filter_map(|l| match &l.node {
@@ -647,6 +649,23 @@ pub fn verify_auto(
                 _ => None,
             })
             .collect();
+    // H.U.1d/H.U.2 — also map a combinational signal named only on an `output`
+    // line (a top-level combinational output port whose driving Op carries no own
+    // symbol — e.g. `assign bad = (state == 3)`). Mirrors the SMT view's
+    // output-line registration so the seeder classifier + the cegar nid-map agree.
+    // `resolves_to_state` / `is_input` are consulted first in the seeder, so an
+    // output that aliases a state cell still binds as state.
+    for l in &file.lines {
+        if let crate::adapter::btor2::ast::Node::Output {
+            symbol: Some(s),
+            signal,
+        } = &l.node
+            && !state_cells.contains(s)
+            && !input_symbols.contains(s)
+        {
+            combinational_nid.entry(s.clone()).or_insert(signal.nid());
+        }
+    }
     let combinational_kind = |name: &str| -> Option<CombKind> {
         combinational_nid.get(name).map(|&nid| {
             if crate::adapter::btor2::parser::cone_reaches_input(&file, nid) {
@@ -719,6 +738,16 @@ pub fn verify_auto(
         // SMT `combinational_labels` pass, which also requires the SmtAllPairs
         // eager lift (precise state edges + the encoded view).
         let has_derived = !seeded.derived.is_empty();
+        // H.U.2 — a combinational-of-state spec (register present in
+        // `combinational_nid`, not a state cell) is a cube dimension over a
+        // *determined function of state*. The sampling may-path is state-register
+        // oriented (its canonical representative cannot realise a combinational
+        // node's value), so it MUST use the SmtAllPairs seam — exactly like
+        // compounds and free inputs.
+        let has_combinational = seeded
+            .specs
+            .iter()
+            .any(|s| combinational_nid.contains_key(&s.register));
         let cegar_opts = CegarOptions {
             max_iterations: opts.max_iterations,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -728,7 +757,7 @@ pub fn verify_auto(
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if has_compounds || has_inputs || has_derived {
+            may_edge_inference: if has_compounds || has_inputs || has_derived || has_combinational {
                 MayEdgeInference::SmtAllPairs
             } else {
                 MayEdgeInference::Off
@@ -775,6 +804,35 @@ pub fn verify_auto(
             .iter()
             .map(|(k, v)| (k.clone(), *v as u128))
             .collect();
+        // H.U.2 — a combinational-of-state spec's register is neither a state cell
+        // (present in `init_values`) nor a free input, so its reset-cube value is
+        // not in `init_values`. OBSERVE the signal's value at the reset register
+        // state (combinational-of-state has no input dependence → empty inputs)
+        // and augment a local map, so the init-cube bit below is correct.
+        let mut init_for_cube = init_values.clone();
+        let comb_names: Vec<String> = seeded
+            .specs
+            .iter()
+            .filter(|s| {
+                !init_for_cube.contains_key(&s.register)
+                    && !seeded.input_registers.contains(&s.register)
+            })
+            .map(|s| s.register.clone())
+            .collect();
+        if !comb_names.is_empty()
+            && let Ok(outcome) = crate::adapter::btor2::bit_blast::simulate_one_step_observe(
+                &file,
+                &init_val_u128,
+                &std::collections::HashMap::new(),
+                &comb_names,
+            )
+        {
+            for n in &comb_names {
+                if let Some(&v) = outcome.observed.get(n) {
+                    init_for_cube.insert(n.clone(), v as u64);
+                }
+            }
+        }
         let mut base_init_cube = 0usize;
         let mut free_input_bits: Vec<u32> = Vec::new();
         let mut bit = 0u32;
@@ -782,7 +840,7 @@ pub fn verify_auto(
             if seeded.input_registers.contains(&s.register) {
                 // Free input dimension — left unset in the base; enumerated below.
                 free_input_bits.push(bit);
-            } else if init_values.get(&s.register).copied().unwrap_or(0) == s.value {
+            } else if init_for_cube.get(&s.register).copied().unwrap_or(0) == s.value {
                 base_init_cube |= 1 << bit;
             }
             bit += 1;
@@ -1016,31 +1074,35 @@ mod tests {
     }
 
     #[test]
-    fn h_e_admits_combinational_bare_atom_as_derived() {
-        // csrng `main_sm_err_o` — a combinational output, neither state nor input
-        // — is admitted as a DERIVED per-cube label (Approach B), not a spec.
+    fn h_u_admits_combinational_bare_atom_as_cube_dim() {
+        // csrng `main_sm_err_o` — a combinational-of-state output — is admitted as
+        // a CUBE DIMENSION (H.U.2: the uniform image resolves it via the
+        // combinational nid-map + reads its term over `(s,i)` / `(s',i')`), NOT a
+        // derived per-cube label.
         let f = mu_parser::parse("nu X. (main_sm_err_o && [] X)").unwrap();
         let s = seed_from_formula(
             &f,
             |_| false,
             |_| false,
-            // state-only combinational → derived label
             |n| {
                 cells(&["main_sm_err_o"])
                     .contains(n)
                     .then_some(CombKind::StateOnly)
             },
         );
-        assert!(s.specs.is_empty(), "combinational is not a cube dimension");
+        assert_eq!(
+            s.specs.len(),
+            1,
+            "combinational-of-state is a cube dimension"
+        );
+        assert_eq!(s.specs[0].name, "main_sm_err_o");
+        assert_eq!(s.specs[0].value, 1, "bare boolean ≡ == 1");
         assert!(s.compounds.is_empty());
         assert!(s.unseedable.is_empty(), "not skipped: {:?}", s.unseedable);
-        assert_eq!(s.derived.len(), 1, "one derived combinational predicate");
-        assert_eq!(s.derived[0].name, "main_sm_err_o");
-        assert_eq!(s.derived[0].value, 1, "bare boolean ≡ == 1");
     }
 
     #[test]
-    fn h_e_admits_combinational_eq_value_as_derived() {
+    fn h_u_admits_combinational_eq_value_as_cube_dim() {
         let f = mu_parser::parse("nu X. ((err_code == 3) && [] X)").unwrap();
         let s = seed_from_formula(
             &f,
@@ -1052,17 +1114,16 @@ mod tests {
                     .then_some(CombKind::StateOnly)
             },
         );
-        assert_eq!(s.derived.len(), 1);
-        assert_eq!(s.derived[0].register, "err_code");
-        assert_eq!(s.derived[0].value, 3);
-        assert!(s.specs.is_empty() && s.unseedable.is_empty());
+        assert_eq!(s.specs.len(), 1);
+        assert_eq!(s.specs[0].register, "err_code");
+        assert_eq!(s.specs[0].value, 3);
+        assert!(s.compounds.is_empty() && s.unseedable.is_empty());
     }
 
     #[test]
-    fn h_e_state_takes_precedence_over_combinational() {
-        // A name classified as BOTH state and combinational binds as STATE (a
-        // value-alias of state is also an Op-with-symbol; `is_state` is checked
-        // first), so it stays a cube dimension, never a derived label.
+    fn h_u_state_takes_precedence_over_combinational() {
+        // A name classified as BOTH state and combinational binds as STATE
+        // (`is_state` is checked first) — still a cube dimension either way.
         let f = mu_parser::parse("nu X. (sig && [] X)").unwrap();
         let s = seed_from_formula(
             &f,
@@ -1070,8 +1131,7 @@ mod tests {
             |_| false,
             |n| cells(&["sig"]).contains(n).then_some(CombKind::StateOnly),
         );
-        assert_eq!(s.specs.len(), 1, "state precedence → a cube dimension");
-        assert!(s.derived.is_empty());
+        assert_eq!(s.specs.len(), 1, "a cube dimension");
     }
 
     #[test]
@@ -1092,7 +1152,6 @@ mod tests {
                     .then_some(CombKind::InputDependent)
             },
         );
-        assert!(s.derived.is_empty(), "not a derived label");
         assert!(
             !s.input_registers.contains("trigger_active"),
             "NOT routed as a free dimension (unsound for must)"

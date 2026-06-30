@@ -2034,6 +2034,58 @@ mod tests {
         assert!(trace.final_clts.is_none());
     }
 
+    // H.U.2 — `reg` stuck at 0; `g = not(reg)` is a combinational-of-state signal
+    // (always 1). `AG (g == 1)` over this combinational CUBE DIMENSION must HOLD —
+    // the end-to-end exercise of the uniform combinational path through CEGAR
+    // (no slang, so no combinational-signal inlining; the predicate genuinely
+    // targets the combinational node `g`).
+    const COMB_CUBE_BTOR2: &str = "\
+1 sort bitvec 1
+2 state 1 reg
+3 zero 1
+4 init 1 2 3
+5 next 1 2 2
+6 not 1 2 g
+";
+
+    #[test]
+    fn cegar_combinational_of_state_cube_dimension_holds() {
+        let formula = parser::parse("nu X. ((g == 1) && [] X)").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "g == 1".into(),
+            register: "g".into(),
+            value: 1,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            max_iterations: 16,
+            // A combinational cube dimension requires the SmtAllPairs may relation
+            // (the sampling representative is state-register oriented).
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs,
+            ..Default::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            COMB_CUBE_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        // `g` at the reset state (reg = 0) is `not(0) = 1`, so the reset cube is
+        // {g == 1} = cube index 1 (the predicate-true cube). `g` never changes
+        // (reg stuck), so AG(g==1) HOLDS there.
+        assert_eq!(
+            trace.final_verdict.verdict_at(1),
+            Trit::True,
+            "AG(g==1) holds at the reset cube {{g==1}} (g is the constant-1 \
+             combinational-of-state output of a stuck reg)"
+        );
+        // The opposite cube {g==0} is unreachable / vacuously false for the body.
+        assert_eq!(trace.final_verdict.verdict_at(0), Trit::False);
+    }
+
     /// CTXDSL Phase 2 (2026-06-22) — `emit_ctxdsl: true` captures the final
     /// refined cube `Clts` into the trace; it serializes to a model +
     /// formula CTXDSL document via `clts_to_ctxdsl_with_formula`.
