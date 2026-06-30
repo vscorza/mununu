@@ -928,41 +928,85 @@ where
     }
 }
 
-/// H.E.2 — the per-cube label of a **derived combinational predicate**
-/// (`signal == value`, where `signal` is a combinational node, NOT a cube
-/// dimension). Approach B (free-input-atoms.md §4): a combinational signal's
-/// value is a *determined function* of (state, inputs), so rather than make it a
-/// free cube dimension we LABEL it per cube — KleeneT/F where the cube pins it,
-/// KleeneBot where it doesn't.
+/// H.E.2 / H.F — the per-cube 3-valued label of a **derived predicate**: a
+/// combinational-of-input atom (`signal == value`, `signal` a combinational node)
+/// OR (H.F) a *relational* whose operands include an input / combinational signal
+/// (`cnt_q >= cfg_detect_timer_i`, `trigger_i != trigger_active`). Neither is a
+/// sound cube *dimension* (its next-cycle value depends on the demonic next
+/// input), so it is LABELLED per cube — KleeneT/F where the cube + the design's
+/// combinational logic pin it, KleeneBot where the free input swings it.
 ///
-/// `cube_bits` + `cube_predicates` define the cube C (its *dimension*
-/// predicates, over state + free inputs); `signal_nid` is the combinational
-/// node's NID (its current-cycle BV is `view.curr_signal(signal_nid)`).
+/// `cube_bits` + `cube_predicates` define the cube C (its dimension predicates,
+/// over state + free inputs); `derived` is the predicate to label, evaluated at
+/// the **current cycle** via the uniform source lookup ([`term_source_bv`]:
+/// state_curr ∪ inputs ∪ combinational signal cache) — so a relational with an
+/// input or combinational operand resolves (the legacy `build_pred_constraint`
+/// compound lookup reads `curr_state` only and could not).
 ///
 /// Decides, over all concrete states ⊨ C (current cycle):
-/// - `UNSAT(C ∧ signal != value)` → `KleeneT` (always `value` in C);
-/// - `UNSAT(C ∧ signal == value)` → `KleeneF` (never `value` in C);
-/// - else → `KleeneBot` (the cube doesn't pin it — honest).
+/// - `UNSAT(C ∧ ¬derived)` → `KleeneT` (derived always holds in C — e.g.
+///   `trigger_i != trigger_active` when `trigger_active = ~trigger_i`);
+/// - `UNSAT(C ∧ derived)` → `KleeneF` (never holds in C);
+/// - else → `KleeneBot` (the cube doesn't pin it — honest; e.g. `cnt_q >= cfg_*`
+///   with both operands free).
 ///
 /// **Soundness:** a definite KleeneT/F is a sound label (standard 3-valued
-/// preservation); a dimension predicate whose constraint can't be built is
-/// *omitted*, which only widens C (a superset) — KleeneT/F over a superset still
-/// hold on the cube (subset), and the widening can only push toward KleeneBot,
-/// never toward a false-definite. Timeout → conservative `KleeneBot`.
+/// preservation); the empty-cube guard prevents a vacuous definite. Timeout or an
+/// unresolvable operand → conservative `KleeneBot`.
 ///
 /// **Caller must hold a [`z3::with_z3_config`] scope.**
+///
+/// Resolve a derived predicate's operand NAME to its current-cycle source BV:
+/// state / input via `nid_map` (→ `state_curr` / `inputs`), or a combinational
+/// signal via the encoder's `view.signals` symbol table (→ `curr_signal`). The
+/// combinational case MUST go through `view.signals` (not `nid_map` +
+/// `term_source_bv`): an `output`-line symbol's NID differs from its driving
+/// node's NID, and only `view.signals` maps the symbol to the node that owns a
+/// `signal_bvs` entry — `nid_map` alone misses it, which would drop a definite
+/// combinational label to KleeneBot.
+fn derived_source_bv<'a>(
+    view: &'a Btor2SmtView,
+    nid_map: &HashMap<String, Nid>,
+    name: &str,
+) -> Option<&'a z3::ast::BV> {
+    if let Some(&nid) = nid_map.get(name)
+        && let Some(bv) = view.state_curr.get(&nid).or_else(|| view.inputs.get(&nid))
+    {
+        return Some(bv);
+    }
+    view.signals
+        .iter()
+        .find(|s| s.symbol.as_deref() == Some(name))
+        .and_then(|s| view.curr_signal(s.nid))
+}
+
 pub fn smt_combinational_label<P: PredicateLike>(
     view: &Btor2SmtView,
     cube_bits: u64,
     cube_predicates: &[P],
     nid_map: &HashMap<String, Nid>,
-    signal_nid: Nid,
-    value: u64,
+    derived: &P,
     timeout_ms: u32,
 ) -> crate::clts::Tristate {
     use crate::clts::Tristate;
-    let Some(sig) = view.curr_signal(signal_nid) else {
-        return Tristate::KleeneBot;
+    // The derived predicate's CURRENT-cycle constraint. `None` (an operand absent
+    // from the design) → honest KleeneBot.
+    let pred_bool = match derived.expr() {
+        Some(e) => {
+            let lookup = |reg: &str| -> Option<z3::ast::BV> {
+                derived_source_bv(view, nid_map, reg).cloned()
+            };
+            match e.build_constraint(&lookup) {
+                Some(b) => b,
+                None => return Tristate::KleeneBot,
+            }
+        }
+        None => {
+            let Some(bv) = derived_source_bv(view, nid_map, derived.register()) else {
+                return Tristate::KleeneBot;
+            };
+            build_predicate_constraint(bv, derived.value(), true)
+        }
     };
     // Cube C = conjunction of the dimension predicates at this cube's polarities,
     // over the current cycle. A predicate whose constraint can't be built is
@@ -974,8 +1018,7 @@ pub fn smt_combinational_label<P: PredicateLike>(
             cube.push(c);
         }
     }
-    let val_bv = z3::ast::BV::from_u64(value, sig.get_size());
-    let eq = sig.eq(&val_bv);
+    let eq = pred_bool;
 
     let check = |extra: &z3::ast::Bool| -> z3::SatResult {
         let solver = z3::Solver::new();

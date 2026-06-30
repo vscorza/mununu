@@ -493,7 +493,6 @@ impl SmtEncode for BtorSts<'_> {
         use crate::adapter::btor2::smt_must_edge::{
             build_register_nid_map_with_inputs, smt_combinational_label,
         };
-        use crate::adapter::sidecar::predicate_image::btor2_encode::SignalKind;
         use crate::clts::Tristate;
 
         if derived.is_empty() {
@@ -517,35 +516,22 @@ impl SmtEncode for BtorSts<'_> {
                 }
             };
             let nid_map = build_register_nid_map_with_inputs(&view);
-            // Resolve each derived predicate's signal name → its combinational
-            // node NID (own-symbol match in the view's Combinational signals).
-            let derived_nids: Vec<Option<_>> = derived
-                .iter()
-                .map(|d| {
-                    view.signals
-                        .iter()
-                        .find(|s| {
-                            s.kind == SignalKind::Combinational
-                                && s.symbol.as_deref() == Some(d.register())
-                        })
-                        .map(|s| s.nid)
-                })
-                .collect();
+            // Each derived predicate (a combinational-of-input atom OR an H.F
+            // relational over input/combinational operands) is labelled per cube
+            // by `smt_combinational_label`, which resolves its operands through
+            // `nid_map` (state ∪ inputs ∪ combinational) + the uniform source
+            // lookup. No separate combinational-NID resolution is needed.
             let mut out = Vec::with_capacity(n_cubes * derived.len());
             for i in 0..n_cubes {
                 for (d_idx, d) in derived.iter().enumerate() {
-                    let label = match derived_nids[d_idx] {
-                        Some(nid) => smt_combinational_label(
-                            &view,
-                            i as u64,
-                            cube_predicates,
-                            &nid_map,
-                            nid,
-                            d.value(),
-                            timeout_ms,
-                        ),
-                        None => Tristate::KleeneBot,
-                    };
+                    let label = smt_combinational_label(
+                        &view,
+                        i as u64,
+                        cube_predicates,
+                        &nid_map,
+                        d,
+                        timeout_ms,
+                    );
                     out.push((i, d_idx, label));
                 }
             }

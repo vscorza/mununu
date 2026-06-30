@@ -718,16 +718,22 @@ pub fn cegar_refine_loop(
     // `ensure_compound_lift_supported` re-checks this at the lift entry.
     let mut compound_exprs: HashMap<String, crate::adapter::btor2::predicate_expr::PredicateExpr> =
         HashMap::new();
-    for (spec, expr) in sidecar_compound_predicates(adapter_options) {
+    // H.E.2 — derived predicates (labeled per cube via SMT, NOT cube dimensions):
+    // the simple combinational-of-input atoms (`combinational_predicates`) PLUS
+    // (H.F) the relational/compound ones whose operands include an input or
+    // combinational signal (`compound_predicates` with `derived = true`). They do
+    // NOT enter `current_predicates` (the cube index is unchanged); the lift writes
+    // their per-cube label into `state_3valued_predicates`, resolving any relational
+    // expr through `compound_exprs`.
+    let mut derived_predicates = sidecar_combinational_predicates(adapter_options);
+    for (spec, expr, is_derived) in sidecar_compound_predicates(adapter_options) {
         compound_exprs.insert(spec.name.clone(), expr);
-        current_predicates.push(spec);
+        if is_derived {
+            derived_predicates.push(spec); // H.F — a derived label, not a dimension
+        } else {
+            current_predicates.push(spec); // B.1 — a cube dimension
+        }
     }
-    // H.E.2 — derived combinational predicates (labeled per cube via SMT, NOT
-    // cube dimensions). They do NOT go into `current_predicates` (the cube index
-    // is unchanged); the lift writes their per-cube label into
-    // `state_3valued_predicates`. Like compounds, they require the eager
-    // SmtAllPairs lift (the labeling pass is SMT-based).
-    let derived_predicates = sidecar_combinational_predicates(adapter_options);
     // SmtAllPairs + Eager are forced when EITHER compound OR derived predicates
     // are present (both are SMT-seam-only paths).
     let smt_seam_required = !compound_exprs.is_empty() || !derived_predicates.is_empty();
@@ -1707,6 +1713,7 @@ pub fn sidecar_compound_predicates(
 ) -> Vec<(
     PredicateSpec,
     crate::adapter::btor2::predicate_expr::PredicateExpr,
+    bool, // H.F — `derived`: true ⇒ a per-cube label (not a cube dimension).
 )> {
     let Some(json) = &options.sidecar_json else {
         return Vec::new();
@@ -1742,6 +1749,7 @@ pub fn sidecar_compound_predicates(
                 value: 0,
             },
             expr,
+            decl.derived,
         ));
     }
     out

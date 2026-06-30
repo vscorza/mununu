@@ -26,13 +26,19 @@
 //! verdict is read across every initial environment value — the "for all input
 //! sequences" over-approximation (see `docs/design/free-input-atoms.md`).
 //!
+//! A relational compound carrying an **input** operand (sysrst's
+//! `cnt_q >= cfg_*_timer_i`) BINDS as a derived RELATIONAL label (H.F): the
+//! per-cube 3-valued labeller resolves each operand over the uniform source
+//! image (state ∪ inputs ∪ combinational), so the property reaches an honest ⊥
+//! rather than skipping. Combinational-of-input *antecedents*
+//! (`trigger_active = !trigger_i`) likewise bind as derived ⊥-labels (H.E).
+//!
 //! What is still **Skipped** (never given a misleading verdict): an atom over a
-//! pure **combinational output** (an `eq`/`or` function of state like csrng's
-//! `main_sm_err_o` — case 4 of the design doc; needs the signal-node mapping a
-//! follow-up adds), and an input inside a *compound* (the compound SMT branch
-//! reads state BVs, not `view.inputs`). Those properties are reported Skipped
-//! with a reason — binding them would fall through to the evaluator's
-//! "unknown ⇒ false" under-approx and silently produce a vacuous verdict.
+//! pure **combinational output** that is a function of state (an `eq`/`or` of
+//! state like csrng's `main_sm_err_o` — case 4 of the design doc; needs the
+//! signal-node mapping a follow-up adds). Such an atom is reported Skipped with
+//! a reason — binding it would fall through to the evaluator's "unknown ⇒ false"
+//! under-approx and silently produce a vacuous verdict.
 
 use std::collections::HashSet;
 
@@ -211,6 +217,13 @@ struct Seeded {
     /// SMT (Approach B). Threaded to `cegar_refine_loop` through the synthesised
     /// sidecar's `combinational_predicates`. Empty ⇒ the pre-H.E shape.
     derived: Vec<PredicateSpec>,
+    /// H.F — **relational** derived predicates: a `PredicateExpr` (`cnt_q >=
+    /// cfg_detect_timer_i`, `trigger_i != trigger_active`) whose operands include
+    /// an input or combinational signal, so it is NOT a sound cube dimension. Like
+    /// [`Seeded::derived`] it is labelled per cube via SMT, but it carries a full
+    /// expr (not `register == value`). Threaded through the synthesised sidecar's
+    /// `compound_predicates` with `derived = true`. Empty ⇒ the pre-H.F shape.
+    derived_relational: Vec<(String, PredicateExpr)>,
 }
 
 /// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
@@ -325,13 +338,31 @@ fn seed_from_formula(
                     op: CmpOp::Eq,
                     value,
                 } => seed_simple(&mut out, atom, register, *value),
-                // Relational / `!=` / boolean combination → compound predicate.
-                // The compound SMT branch reads state BVs only, so every
-                // referenced register must be a state cell.
+                // Relational / `!=` / boolean combination.
                 _ => {
-                    if expr.registers().iter().all(|r| is_state(r)) {
+                    let regs = expr.registers();
+                    if regs.iter().all(|r| is_state(r)) {
+                        // All-state → a cube DIMENSION (B.1 compound). The SMT
+                        // dimension path reads state BVs.
                         out.compounds.push((atom.clone(), expr));
+                    } else if regs
+                        .iter()
+                        .all(|r| is_state(r) || is_input(r) || combinational_kind(r).is_some())
+                    {
+                        // H.F — a relational with an input / combinational operand
+                        // (`cnt_q >= cfg_detect_timer_i`, `trigger_i !=
+                        // trigger_active`). Its value depends on the demonic input,
+                        // so it is NOT a sound cube dimension (the same reason a
+                        // combinational-of-input atom isn't). Route it to a DERIVED
+                        // per-cube 3-valued label: the SMT labeller decides
+                        // KleeneT/F where the design's logic pins it (e.g.
+                        // `trigger_i != ~trigger_i` ≡ true → HOLDS), KleeneBot where
+                        // a free operand swings it. Sound (a pure observation; a
+                        // KleeneBot atom is ⊥, never a spurious verdict).
+                        out.derived_relational.push((atom.clone(), expr));
                     } else {
+                        // An operand resolves to nothing in the lifted design —
+                        // cannot label it. Honest SKIP.
                         out.unseedable.push(atom.clone());
                     }
                 }
@@ -354,15 +385,24 @@ fn seed_from_formula(
 fn synth_sidecar_json(
     compounds: &[(String, PredicateExpr)],
     derived: &[PredicateSpec],
+    derived_relational: &[(String, PredicateExpr)],
     referenced: &std::collections::BTreeSet<String>,
     init_values: &std::collections::HashMap<String, u64>,
 ) -> Option<String> {
-    let compound_decls: Vec<serde_json::Value> = compounds
+    let mut compound_decls: Vec<serde_json::Value> = compounds
         .iter()
         // `expr` == `name` == the atom string, which `sidecar_compound_predicates`
         // re-parses via `parse_predicate_expr` (REL handles `reg == reg`).
         .map(|(name, _)| serde_json::json!({ "name": name, "expr": name }))
         .collect();
+    // H.F — relational derived predicates ride the SAME `compound_predicates`
+    // field tagged `derived: true`, so `cegar_refine_loop` routes them to the
+    // per-cube label path (not the cube index). `expr` == `name` as above.
+    compound_decls.extend(
+        derived_relational
+            .iter()
+            .map(|(name, _)| serde_json::json!({ "name": name, "expr": name, "derived": true })),
+    );
     // H.E — derived combinational predicates: `cegar_refine_loop` reads these
     // into `lift_opts.derived_predicates`; the lift labels each per cube via the
     // SMT `combinational_labels` pass (NOT a cube dimension).
@@ -721,7 +761,8 @@ pub fn verify_auto(
             continue;
         }
         let predicate_count = seeded.specs.len() + seeded.compounds.len();
-        if predicate_count == 0 && seeded.derived.is_empty() {
+        if predicate_count == 0 && seeded.derived.is_empty() && seeded.derived_relational.is_empty()
+        {
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
@@ -738,6 +779,7 @@ pub fn verify_auto(
         let mut seeded_names: Vec<String> = seeded.specs.iter().map(|s| s.name.clone()).collect();
         seeded_names.extend(seeded.compounds.iter().map(|(n, _)| n.clone()));
         seeded_names.extend(seeded.derived.iter().map(|d| d.name.clone()));
+        seeded_names.extend(seeded.derived_relational.iter().map(|(n, _)| n.clone()));
 
         // Compounds OR free inputs ⇒ force the SmtAllPairs eager lift.
         // Compounds: the only compound-aware may path. Free inputs (H.B): the
@@ -748,10 +790,10 @@ pub fn verify_auto(
         // `cegar_refine_loop` re-checks the compound gate.
         let has_compounds = !seeded.compounds.is_empty();
         let has_inputs = !seeded.input_registers.is_empty();
-        // H.E — derived combinational predicates are labeled per cube by the
-        // SMT `combinational_labels` pass, which also requires the SmtAllPairs
-        // eager lift (precise state edges + the encoded view).
-        let has_derived = !seeded.derived.is_empty();
+        // H.E / H.F — derived predicates (simple combinational-of-input atoms +
+        // relational ones) are labeled per cube by the SMT `combinational_labels`
+        // pass, which requires the SmtAllPairs eager lift.
+        let has_derived = !seeded.derived.is_empty() || !seeded.derived_relational.is_empty();
         // H.U.2 — a combinational-of-state spec (register present in
         // `combinational_nid`, not a state cell) is a cube dimension over a
         // *determined function of state*. The sampling may-path is state-register
@@ -799,10 +841,19 @@ pub fn verify_auto(
                 referenced.insert(r);
             }
         }
+        // H.F — pin the state operands of relational derived predicates too (the
+        // input operands have no `init_values` entry, so they are silently skipped
+        // for config_values — correct, a free input has no reset value).
+        for (_, e) in &seeded.derived_relational {
+            for r in e.registers() {
+                referenced.insert(r);
+            }
+        }
         let adapter_options = AdapterOptions {
             sidecar_json: synth_sidecar_json(
                 &seeded.compounds,
                 &seeded.derived,
+                &seeded.derived_relational,
                 &referenced,
                 &init_values,
             ),
@@ -975,7 +1026,7 @@ mod tests {
                 .into_iter()
                 .collect();
         let json =
-            synth_sidecar_json(&s.compounds, &[], &referenced, &inits).expect("sidecar json");
+            synth_sidecar_json(&s.compounds, &[], &[], &referenced, &inits).expect("sidecar json");
         assert!(json.contains("compound_predicates"));
         assert!(json.contains("state == state__past"));
         assert!(json.contains("config_values"), "init pins present: {json}");
@@ -1076,11 +1127,11 @@ mod tests {
     }
 
     #[test]
-    fn h_b_input_inside_compound_is_unseedable() {
-        // An input inside a compound (`!=`, relational, boolean) is NOT admitted
-        // — the compound SMT branch reads state BVs only, not `view.inputs`. So
-        // `cfg_enable_i != 0` (a Ne, routed to the compound branch) over an
-        // input is unseedable even though the same atom as `== 0` would seed.
+    fn h_f_input_inside_compound_binds_as_derived_relational() {
+        // H.F supersedes the H.B deferral: an input inside a compound (`!=`,
+        // relational, boolean) is NO LONGER unseedable. `cfg_enable_i != 0` (a Ne
+        // over an input, routed to the compound branch) now binds as a derived
+        // per-cube 3-valued label (sound; ⊥ where the input swings it).
         let f = mu_parser::parse("nu X. ((cfg_enable_i != 0) && [] X)").unwrap();
         let s = seed_from_formula(
             &f,
@@ -1089,10 +1140,20 @@ mod tests {
             |_| None,
         );
         assert!(s.specs.is_empty());
-        assert!(s.compounds.is_empty());
         assert!(
-            s.unseedable.contains(&"cfg_enable_i != 0".to_string()),
-            "input inside a compound is unseedable: {:?}",
+            s.compounds.is_empty(),
+            "not a cube dimension (input operand)"
+        );
+        assert!(
+            s.derived_relational
+                .iter()
+                .any(|(n, _)| n == "cfg_enable_i != 0"),
+            "input inside a compound now binds as a derived relational label: {:?}",
+            s.derived_relational
+        );
+        assert!(
+            !s.unseedable.iter().any(|a| a.contains("cfg_enable_i")),
+            "no longer unseedable: {:?}",
             s.unseedable
         );
     }
@@ -1197,6 +1258,56 @@ mod tests {
     }
 
     #[test]
+    fn h_f_relational_with_input_operand_routed_to_derived_relational() {
+        // `cnt_q >= cfg_detect_timer_i` — `cnt_q` state, `cfg_detect_timer_i` a
+        // free input. The relational's value depends on the demonic input, so it
+        // is NOT a sound cube dimension; H.F routes it to a derived per-cube
+        // 3-valued label (carrying its PredicateExpr), not unseedable.
+        let f = mu_parser::parse("nu X. ((cnt_q >= cfg_detect_timer_i) && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["cnt_q"]).contains(n),
+            |n| n == "cfg_detect_timer_i",
+            |_| None,
+        );
+        assert!(
+            s.compounds.is_empty(),
+            "not a cube dimension (has a non-state operand): {:?}",
+            s.compounds
+        );
+        assert!(
+            s.derived_relational
+                .iter()
+                .any(|(n, _)| n == "cnt_q >= cfg_detect_timer_i"),
+            "relational-with-input routed to derived_relational: {:?}",
+            s.derived_relational
+        );
+        assert!(
+            !s.unseedable.iter().any(|a| a.contains("cnt_q")),
+            "no longer skipped: {:?}",
+            s.unseedable
+        );
+    }
+
+    #[test]
+    fn h_f_relational_with_unresolvable_operand_is_skipped() {
+        // An operand that resolves to nothing in the design (not state / input /
+        // combinational) → cannot label it → honest SKIP, not a derived label.
+        let f = mu_parser::parse("nu X. ((cnt_q >= mystery_signal) && [] X)").unwrap();
+        let s = seed_from_formula(&f, |n| cells(&["cnt_q"]).contains(n), |_| false, |_| None);
+        assert!(
+            s.derived_relational.is_empty(),
+            "{:?}",
+            s.derived_relational
+        );
+        assert!(
+            s.unseedable.iter().any(|a| a.contains("mystery_signal")),
+            "unresolvable operand ⇒ SKIP: {:?}",
+            s.unseedable
+        );
+    }
+
+    #[test]
     fn skip_reason_enriched_with_blackboxed_module_root_cause() {
         // A cut FSM (e.g. csrng's prim_sparse_fsm_flop) → the bare "non-state
         // signal" symptom is augmented with the actionable root cause.
@@ -1251,7 +1362,7 @@ mod tests {
     fn no_sidecar_when_nothing_to_emit() {
         let empty_refs = std::collections::BTreeSet::new();
         let empty_inits = std::collections::HashMap::new();
-        assert!(synth_sidecar_json(&[], &[], &empty_refs, &empty_inits).is_none());
+        assert!(synth_sidecar_json(&[], &[], &[], &empty_refs, &empty_inits).is_none());
     }
 
     #[test]
@@ -1637,19 +1748,63 @@ mod tests {
         );
         // After H.E.r2, the simple combinational-of-input antecedents
         // (`trigger_active`, `event_detected_*`, `cnt_clr`) BIND as derived
-        // ⊥-labels (HOLDS-or-honest-⊥). The only remaining SKIPs are the
-        // RELATIONAL-with-input compounds (`cnt_q >= cfg_*_timer_i`, sva_5/7/10/11)
-        // — an input operand inside a compound, which the compound SMT path does
-        // not yet admit (H.F). Never a free-input *simple* antecedent: H.B closed
-        // those (`cfg_enable_i`).
+        // ⊥-labels (HOLDS-or-honest-⊥). H.F then closed the last residual: the
+        // RELATIONAL-with-input compounds (`cnt_q >= cfg_*_timer_i`, sva_5/7/10/11
+        // — an input operand inside a compound) are now admitted as derived
+        // RELATIONAL labels, so they reach an honest ⊥ instead of SKIPPING. Net
+        // effect: every translated property binds — SKIPPED is 0.
+        assert_eq!(
+            skipped, 0,
+            "H.F: every translated property binds (relational-with-input compounds \
+             now reach a verdict instead of SKIPPING); got SKIPPED={skipped}"
+        );
+        // No free-input antecedent (H.B) and no relational-with-input compound
+        // (H.F) remains skipped.
         for p in &report.properties {
             if let VerifyOutcome::Skipped { reason } = &p.outcome {
                 assert!(
-                    !reason.contains("cfg_enable_i"),
-                    "no free-input antecedent should remain skipped after H.B; got: {reason}"
+                    !reason.contains("cfg_enable_i") && !reason.contains("cnt_q >= cfg_"),
+                    "no free-input / relational-with-input atom should remain skipped \
+                     after H.B + H.F; got: {reason}"
                 );
             }
         }
+        // H.F — sva_5/7/10/11 are the relational-with-input compounds
+        // (`cnt_q >= cfg_*_timer_i`). Pre-H.F they SKIPPED ("input operand inside
+        // a compound"); now they bind as derived relational labels and reach an
+        // honest ⊥ (Unknown) — never a spurious verdict.
+        for name in [
+            "sysrst_ctrl_detect_sva_5",
+            "sysrst_ctrl_detect_sva_7",
+            "sysrst_ctrl_detect_sva_10",
+            "sysrst_ctrl_detect_sva_11",
+        ] {
+            let p = report
+                .properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} present"));
+            assert!(
+                matches!(p.outcome, VerifyOutcome::Unknown { .. }),
+                "{name} (relational-with-input compound) binds and reaches an honest \
+                 ⊥, not a SKIP; got {:?}",
+                p.outcome
+            );
+        }
+        // H.F — sva_2/3 are `trigger_i != trigger_active` where
+        // `trigger_active = !trigger_i` (1-bit). `b != !b` is a tautology over the
+        // combinational relation, so the derived relational label is definite-True
+        // at every cube and the property reaches a sound HOLDS.
+        let sva2 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "gen_low_level_sva_sva_2")
+            .expect("sva_2 present");
+        assert!(
+            matches!(sva2.outcome, VerifyOutcome::Holds),
+            "sva_2 (`trigger_i != !trigger_i` tautology) reaches a sound HOLDS; got {:?}",
+            sva2.outcome
+        );
         // H.D (translation widening) — `signal >= signal` and 1-bit `!x === y`
         // now translate (pre-H.D: 7 unsupported; now only the arithmetic-RHS
         // `cnt == cnt + 1` form remains, which needs predicate-arithmetic).
@@ -2114,6 +2269,7 @@ mod tests {
             sidecar_json: synth_sidecar_json(
                 &seeded.compounds,
                 &seeded.derived,
+                &seeded.derived_relational,
                 &referenced,
                 &init_u64,
             ),

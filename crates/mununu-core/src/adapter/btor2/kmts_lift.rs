@@ -1823,8 +1823,14 @@ fn ensure_compound_lift_supported(
     if lift_opts.compound_exprs.is_empty() {
         return Ok(());
     }
-    let names: std::collections::HashSet<&str> =
-        predicates.iter().map(|p| p.name.as_str()).collect();
+    // A compound_exprs key may name either a cube DIMENSION (`predicates`) or —
+    // H.F — a relational DERIVED label (`derived_predicates`, labelled per cube,
+    // not a cube index bit). Both legitimately carry a `PredicateExpr`.
+    let names: std::collections::HashSet<&str> = predicates
+        .iter()
+        .chain(lift_opts.derived_predicates.iter())
+        .map(|p| p.name.as_str())
+        .collect();
     for key in lift_opts.compound_exprs.keys() {
         if !names.contains(key.as_str()) {
             return Err(AdapterError {
@@ -2098,11 +2104,13 @@ pub fn predicate_cube_lift(
     if !lift_opts.derived_predicates.is_empty() {
         use crate::adapter::sts_ir::{BtorSts, SmtEncode};
         let cube_preds = cube_predicates(&predicates, &lift_opts.compound_exprs);
-        let empty_exprs: std::collections::HashMap<
-            String,
-            crate::adapter::btor2::predicate_expr::PredicateExpr,
-        > = std::collections::HashMap::new();
-        let derived_cube = cube_predicates(&lift_opts.derived_predicates, &empty_exprs);
+        // H.F — a derived predicate may be relational (`cnt_q >= cfg_*`); its
+        // `PredicateExpr` lives in `compound_exprs` (keyed by name, disjoint from
+        // the dimension keys), so the labeller resolves it. Simple
+        // combinational-of-input atoms have no entry → `expr() == None` (the
+        // signal⋈value labeller branch).
+        let derived_cube =
+            cube_predicates(&lift_opts.derived_predicates, &lift_opts.compound_exprs);
         let labels = BtorSts::new(&file).combinational_labels(&cube_preds, &derived_cube, 5_000);
         for (cube_idx, d_idx, label) in labels {
             if let (Some(&sid), Some(d)) = (
