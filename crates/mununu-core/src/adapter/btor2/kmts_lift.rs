@@ -436,6 +436,19 @@ pub struct PredicateCubeLiftOptions {
     /// Default empty preserves the pre-B.1 simple-atom behaviour exactly.
     pub compound_exprs:
         std::collections::HashMap<String, crate::adapter::btor2::predicate_expr::PredicateExpr>,
+    /// H.E.2 (combinational outputs, 2026-06-28) — **derived combinational
+    /// predicates**: `register == value` atoms whose `register` is a
+    /// *combinational node* (an `eq`/`or`/… output of state, e.g. csrng's
+    /// `main_sm_err_o`), NOT a cube dimension. Approach B
+    /// (free-input-atoms.md §4): rather than make a determined signal a free
+    /// dimension, the lift LABELS it per cube via
+    /// [`crate::adapter::sts_ir::SmtEncode::combinational_labels`] — KleeneT/F
+    /// where the cube pins it, KleeneBot where it doesn't — writing the label
+    /// into `state_3valued_predicates` (keyed by the predicate `name`, so the
+    /// evaluator binds the formula atom). These do NOT enlarge the cube space
+    /// (`2^|predicates|` is unchanged). Default empty preserves pre-H.E
+    /// behaviour.
+    pub derived_predicates: Vec<PredicateSpec>,
 }
 
 impl Default for PredicateCubeLiftOptions {
@@ -447,6 +460,7 @@ impl Default for PredicateCubeLiftOptions {
             may_edge_inference: MayEdgeInference::Off,
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         }
     }
 }
@@ -2074,6 +2088,32 @@ pub fn predicate_cube_lift(
         }
     }
 
+    // H.E.2 — derived combinational predicate labels (Approach B). A
+    // combinational atom is NOT a cube dimension; its per-cube KleeneT/F/Bot
+    // label is decided by SMT (`combinational_labels`) over the cube's dimension
+    // predicates + the signal's encoded BV, then written into
+    // `state_3valued_predicates` keyed by the predicate name (the evaluator binds
+    // the formula atom by name). Independent of the may/must edge policy; the
+    // cube space is unchanged (these are labels, not dimensions).
+    if !lift_opts.derived_predicates.is_empty() {
+        use crate::adapter::sts_ir::{BtorSts, SmtEncode};
+        let cube_preds = cube_predicates(&predicates, &lift_opts.compound_exprs);
+        let empty_exprs: std::collections::HashMap<
+            String,
+            crate::adapter::btor2::predicate_expr::PredicateExpr,
+        > = std::collections::HashMap::new();
+        let derived_cube = cube_predicates(&lift_opts.derived_predicates, &empty_exprs);
+        let labels = BtorSts::new(&file).combinational_labels(&cube_preds, &derived_cube, 5_000);
+        for (cube_idx, d_idx, label) in labels {
+            if let (Some(&sid), Some(d)) = (
+                state_ids.get(cube_idx),
+                lift_opts.derived_predicates.get(d_idx),
+            ) {
+                builder.with_3valued_predicate(sid, &d.name, label);
+            }
+        }
+    }
+
     // R.2.5 predicate-image MVP — emit MayOnly edges between cubes.
     //
     // For each cube_i, build a "canonical representative" concrete
@@ -2765,6 +2805,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
         assert!(result.is_err());
@@ -3332,6 +3373,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
 
         // Baseline: SmtAllPairs may, no must → MayOnly only, zero promotions.
@@ -3395,6 +3437,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let lifted = predicate_cube_lift(preds, toggle, &AdapterOptions::default(), &opts)
             .expect("SmtAllPairs + SmtHyperMust lift");
@@ -3453,6 +3496,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             config_values: std::collections::HashMap::new(),
             compound_exprs,
+            derived_predicates: Vec::new(),
         };
         let preds = vec![PredicateSpec {
             name: "idle".into(),
@@ -3491,6 +3535,7 @@ mod tests {
             // Sampling (Off) — disallowed when compounds are present.
             may_edge_inference: MayEdgeInference::Off,
             compound_exprs,
+            derived_predicates: Vec::new(),
             ..Default::default()
         };
         let preds = vec![PredicateSpec {
@@ -3529,6 +3574,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             config_values: std::collections::HashMap::new(),
             compound_exprs,
+            derived_predicates: Vec::new(),
         };
         let preds = vec![PredicateSpec {
             name: "stable".into(),
@@ -3677,6 +3723,7 @@ mod tests {
                     may_edge_inference: MayEdgeInference::Off,
                     config_values: std::collections::HashMap::new(),
                     compound_exprs: std::collections::HashMap::new(),
+                    derived_predicates: Vec::new(),
                 };
                 let eager = predicate_cube_lift(
                     preds.clone(),
@@ -3734,6 +3781,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::Off,
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let eager = lift_predicate_cube(
             preds.clone(),
@@ -3774,6 +3822,7 @@ mod tests {
             // Even with SmtAllPairs, Lazy can't honour compounds.
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             compound_exprs,
+            derived_predicates: Vec::new(),
             ..Default::default()
         };
         let preds = vec![PredicateSpec {
@@ -3815,6 +3864,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("ok");
@@ -3883,6 +3933,7 @@ mod tests {
 
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -3925,6 +3976,7 @@ mod tests {
 
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -3968,6 +4020,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4026,6 +4079,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4057,6 +4111,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -4116,6 +4171,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(
             preds.clone(),
@@ -4152,6 +4208,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let mvp_result =
             predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &mvp_opts)
@@ -4192,6 +4249,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("lift succeeds");
@@ -4230,6 +4288,7 @@ mod tests {
                 may_edge_inference: Default::default(),
                 config_values: std::collections::HashMap::new(),
                 compound_exprs: std::collections::HashMap::new(),
+                derived_predicates: Vec::new(),
             };
             let result = predicate_cube_lift(
                 preds.clone(),
@@ -4270,6 +4329,7 @@ mod tests {
                 may_edge_inference: Default::default(),
                 config_values: std::collections::HashMap::new(),
                 compound_exprs: std::collections::HashMap::new(),
+                derived_predicates: Vec::new(),
             };
             let mut lazy = LazyLift::from_btor2(
                 preds.clone(),
@@ -4424,6 +4484,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &adapter_opts, &lift_opts)
             .expect("lift succeeds");
@@ -4501,6 +4562,7 @@ mod tests {
 
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4535,6 +4597,7 @@ mod tests {
 
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -4622,6 +4685,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values,
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4657,6 +4721,7 @@ mod tests {
             may_edge_inference: Default::default(),
             config_values,
             compound_exprs: std::collections::HashMap::new(),
+            derived_predicates: Vec::new(),
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");

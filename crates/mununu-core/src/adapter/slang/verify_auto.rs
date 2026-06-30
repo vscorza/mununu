@@ -205,6 +205,12 @@ struct Seeded {
     /// across **all** of its initial polarities. See
     /// `docs/design/free-input-atoms.md`. Empty ⇒ the pre-H.B state-only shape.
     input_registers: HashSet<String>,
+    /// H.E (combinational outputs) — **derived** combinational predicates: a
+    /// simple atom whose register is a combinational node (e.g. csrng's
+    /// `main_sm_err_o`), NOT a cube dimension. The lift labels each per cube via
+    /// SMT (Approach B). Threaded to `cegar_refine_loop` through the synthesised
+    /// sidecar's `combinational_predicates`. Empty ⇒ the pre-H.E shape.
+    derived: Vec<PredicateSpec>,
 }
 
 /// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
@@ -280,13 +286,27 @@ fn seed_from_formula(
                         value,
                     });
                 }
-                // DEFERRED (sound SKIP): a combinational function of a FREE INPUT
-                // (`trigger_active = !trigger_i`). Its next-cycle value is
-                // `f(state_next, next_input)`, so as a cube TARGET it needs the
-                // nested `∀ i'` the uniform must does not yet build (H.U.0 finding);
-                // a free cube dimension would fabricate must-edges. SKIP until that
-                // lands, never a misleading verdict.
-                Some(CombKind::InputDependent) | None => out.unseedable.push(atom.to_string()),
+                // H.E.r2 (combinational-input-atoms.md §6.1) — a combinational
+                // function of a FREE INPUT (`trigger_active = !trigger_i`,
+                // `main_sm_err_o = f(state, enable_i)`). It is NOT a sound cube
+                // dimension (target-free fabricates must-edges; §5.1 / H.U.0), so
+                // route it to a DERIVED 3-valued label: per cube the labeller
+                // (`smt_combinational_label`) decides KleeneT/F where the cube pins
+                // the signal, KleeneBot where the free input swings it (the generic
+                // case for combinational-of-input). SOUND — a pure observation, no
+                // edge change (§6.1 Prop 3) — and a `⊥` atom can never produce a
+                // spurious VIOLATED (in Kleene `⊥ ∨ []C` is `T` or `⊥`, never `F`);
+                // for the `AG(A→AX C)` safety shape with the atom in the antecedent
+                // it yields a DEFINITE HOLDS via `⊥ ∨ []C = T` when the consequent
+                // carries the property.
+                Some(CombKind::InputDependent) => out.derived.push(PredicateSpec {
+                    name: atom.to_string(),
+                    register: register.to_string(),
+                    value,
+                }),
+                // Unresolvable combinational (no nid in the lifted design): cannot
+                // label what we cannot resolve — honest SKIP.
+                None => out.unseedable.push(atom.to_string()),
             }
         }
     };
@@ -333,6 +353,7 @@ fn seed_from_formula(
 /// fictitious init. Returns `None` when there is nothing to emit.
 fn synth_sidecar_json(
     compounds: &[(String, PredicateExpr)],
+    derived: &[PredicateSpec],
     referenced: &std::collections::BTreeSet<String>,
     init_values: &std::collections::HashMap<String, u64>,
 ) -> Option<String> {
@@ -342,6 +363,13 @@ fn synth_sidecar_json(
         // re-parses via `parse_predicate_expr` (REL handles `reg == reg`).
         .map(|(name, _)| serde_json::json!({ "name": name, "expr": name }))
         .collect();
+    // H.E — derived combinational predicates: `cegar_refine_loop` reads these
+    // into `lift_opts.derived_predicates`; the lift labels each per cube via the
+    // SMT `combinational_labels` pass (NOT a cube dimension).
+    let combinational_decls: Vec<serde_json::Value> = derived
+        .iter()
+        .map(|d| serde_json::json!({ "name": d.name, "signal": d.register, "value": d.value }))
+        .collect();
     let signals: Vec<serde_json::Value> = referenced
         .iter()
         .filter_map(|r| {
@@ -350,13 +378,14 @@ fn synth_sidecar_json(
                 .map(|v| serde_json::json!({ "name": r, "config_values": [v] }))
         })
         .collect();
-    if compound_decls.is_empty() && signals.is_empty() {
+    if compound_decls.is_empty() && combinational_decls.is_empty() && signals.is_empty() {
         return None;
     }
     serde_json::to_string(&serde_json::json!({
         "module": "cegar",
         "source": "verify_auto.btor2",
         "compound_predicates": compound_decls,
+        "combinational_predicates": combinational_decls,
         "signals": signals,
     }))
     .ok()
@@ -692,7 +721,7 @@ pub fn verify_auto(
             continue;
         }
         let predicate_count = seeded.specs.len() + seeded.compounds.len();
-        if predicate_count == 0 {
+        if predicate_count == 0 && seeded.derived.is_empty() {
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
@@ -708,6 +737,7 @@ pub fn verify_auto(
 
         let mut seeded_names: Vec<String> = seeded.specs.iter().map(|s| s.name.clone()).collect();
         seeded_names.extend(seeded.compounds.iter().map(|(n, _)| n.clone()));
+        seeded_names.extend(seeded.derived.iter().map(|d| d.name.clone()));
 
         // Compounds OR free inputs ⇒ force the SmtAllPairs eager lift.
         // Compounds: the only compound-aware may path. Free inputs (H.B): the
@@ -718,6 +748,10 @@ pub fn verify_auto(
         // `cegar_refine_loop` re-checks the compound gate.
         let has_compounds = !seeded.compounds.is_empty();
         let has_inputs = !seeded.input_registers.is_empty();
+        // H.E — derived combinational predicates are labeled per cube by the
+        // SMT `combinational_labels` pass, which also requires the SmtAllPairs
+        // eager lift (precise state edges + the encoded view).
+        let has_derived = !seeded.derived.is_empty();
         // H.U.2 — a combinational-of-state spec (register present in
         // `combinational_nid`, not a state cell) is a cube dimension over a
         // *determined function of state*. The sampling may-path is state-register
@@ -736,8 +770,24 @@ pub fn verify_auto(
             enable_approximant_reuse: false,
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
-            must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if has_compounds || has_inputs || has_combinational {
+            // SOUNDNESS (H.E.r2, combinational-input-atoms.md §6.1): a property
+            // carrying a derived ⊥-label combinational-of-input atom is a SAFETY
+            // property whose verdict rides on `[]C` over the MAY relation (Kleene
+            // `⊥ ∨ []C = T` when the consequent holds). The MUST relation is not
+            // needed for it, and an under-approximating must-edge is the unsound
+            // direction here: with `must=Off` the box is only KleeneT / KleeneBot
+            // (never KleeneF), so no spurious VIOLATED is possible — exactly the
+            // sound "safety + over-approximation" recipe (CLAUDE.md §Soundness).
+            // (An empirical spurious VIOLATED under `SmtHyperMust` — btormc proves
+            // sysrst sva_6 SAFE on the lifted model — exposed a separate must-edge
+            // imprecision tracked for the must path; it does not affect the
+            // may-only verdict this forces here.)
+            must_edge_inference: if has_derived {
+                MustEdgeInference::Off
+            } else {
+                opts.must_edge_inference
+            },
+            may_edge_inference: if has_compounds || has_inputs || has_derived || has_combinational {
                 MayEdgeInference::SmtAllPairs
             } else {
                 MayEdgeInference::Off
@@ -756,7 +806,12 @@ pub fn verify_auto(
             }
         }
         let adapter_options = AdapterOptions {
-            sidecar_json: synth_sidecar_json(&seeded.compounds, &referenced, &init_values),
+            sidecar_json: synth_sidecar_json(
+                &seeded.compounds,
+                &seeded.derived,
+                &referenced,
+                &init_values,
+            ),
             ..Default::default()
         };
         // Env sized to the cube space: simple specs + the sidecar compounds
@@ -925,7 +980,8 @@ mod tests {
             [("state".to_string(), 0), ("state__past".to_string(), 0)]
                 .into_iter()
                 .collect();
-        let json = synth_sidecar_json(&s.compounds, &referenced, &inits).expect("sidecar json");
+        let json =
+            synth_sidecar_json(&s.compounds, &[], &referenced, &inits).expect("sidecar json");
         assert!(json.contains("compound_predicates"));
         assert!(json.contains("state == state__past"));
         assert!(json.contains("config_values"), "init pins present: {json}");
@@ -1109,12 +1165,12 @@ mod tests {
     }
 
     #[test]
-    fn h_e_input_dependent_combinational_is_skipped_soundly() {
-        // `trigger_active = !trigger_i` — combinational of a FREE INPUT. DEFERRED:
-        // neither a derived state-cube label nor a free dimension is sound for the
-        // MUST relation (the next-cycle value f(state_next, next_input) isn't
-        // freely both flavours → target-free fabricates must-edges). So it is
-        // SKIPPED (never a misleading verdict) until the next-cycle-cache fix.
+    fn h_e_r2_input_dependent_combinational_routed_to_derived_label() {
+        // `trigger_active = !trigger_i` — combinational of a FREE INPUT. H.E.r2
+        // routes it to a DERIVED 3-valued label, NOT a cube dimension and NOT a
+        // free dimension (both unsound for the must relation). The per-cube
+        // labeller decides KleeneT/F where the cube pins it, KleeneBot where the
+        // free input swings it — sound, and never a spurious VIOLATED.
         let f = mu_parser::parse("nu X. ((trigger_active && (state == 2)) && [] X)").unwrap();
         let s = seed_from_formula(
             &f,
@@ -1135,9 +1191,14 @@ mod tests {
             "not a cube dimension"
         );
         assert!(
-            s.unseedable.contains(&"trigger_active".to_string()),
-            "input-dependent combinational is soundly SKIPPED: {:?}",
+            !s.unseedable.contains(&"trigger_active".to_string()),
+            "no longer skipped: {:?}",
             s.unseedable
+        );
+        assert!(
+            s.derived.iter().any(|p| p.register == "trigger_active"),
+            "input-dependent combinational is routed to the derived ⊥-label: {:?}",
+            s.derived
         );
     }
 
@@ -1196,7 +1257,7 @@ mod tests {
     fn no_sidecar_when_nothing_to_emit() {
         let empty_refs = std::collections::BTreeSet::new();
         let empty_inits = std::collections::HashMap::new();
-        assert!(synth_sidecar_json(&[], &empty_refs, &empty_inits).is_none());
+        assert!(synth_sidecar_json(&[], &[], &empty_refs, &empty_inits).is_none());
     }
 
     #[test]
@@ -1406,8 +1467,7 @@ mod tests {
         );
         // H.A — `state_q` (a `uext`-0 alias of the async-reset register mux)
         // now binds, so the pure-state `$stable` property reaches a verdict
-        // instead of SKIP. (Here ⊥: the auto-seeded predicate set is too coarse
-        // to decide `state_q==Error |=> $stable(state_q)`.)
+        // instead of SKIP.
         assert!(
             report.properties.iter().any(|p| {
                 p.formula.contains("state_q == state_q__past")
@@ -1420,10 +1480,12 @@ mod tests {
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
         );
-        // SOUNDNESS — no spurious counterexample. A combinational output like
-        // `main_sm_err_o` must NOT be mis-bound to the state register (which
-        // would wrongly report VIOLATED); the strict alias resolver excludes it,
-        // so it is honestly SKIPPED instead.
+        // SOUNDNESS — no spurious counterexample. H.E.r2: the combinational-of-
+        // input output `main_sm_err_o` now BINDS as a derived 3-valued ⊥-label
+        // (NOT mis-bound to the state register); at the `state_q==41` error cube
+        // the label is a sound definite-true, so `state_q==41 |=> main_sm_err_o`
+        // reaches HOLDS via Kleene `F ∨ T = T`. Never a spurious VIOLATED (the
+        // must relation is forced Off for derived-label properties).
         assert!(
             !report
                 .properties
@@ -1579,10 +1641,13 @@ mod tests {
              free-input dimension; got {:?}",
             sva0.outcome
         );
-        // The only remaining SKIPs are pure combinational signals (case 4 of the
-        // design doc — `event_detected_*`, `trigger_*`, `cnt_clr`), never a
-        // primary input: H.B closed the free-input antecedents; combinational
-        // outputs await the signal-node mapping follow-up.
+        // After H.E.r2, the simple combinational-of-input antecedents
+        // (`trigger_active`, `event_detected_*`, `cnt_clr`) BIND as derived
+        // ⊥-labels (HOLDS-or-honest-⊥). The only remaining SKIPs are the
+        // RELATIONAL-with-input compounds (`cnt_q >= cfg_*_timer_i`, sva_5/7/10/11)
+        // — an input operand inside a compound, which the compound SMT path does
+        // not yet admit (H.F). Never a free-input *simple* antecedent: H.B closed
+        // those (`cfg_enable_i`).
         for p in &report.properties {
             if let VerifyOutcome::Skipped { reason } = &p.outcome {
                 assert!(
@@ -1631,23 +1696,26 @@ mod tests {
                 .any(|p| p.formula.contains("cnt_q >= cfg_")),
             "H.D translated a `signal >= signal` (cnt_q >= cfg_*_timer_i)"
         );
-        // SOUNDNESS — no spurious counterexample. This is the H.E soundness
-        // anchor: an INPUT-DEPENDENT combinational antecedent (`trigger_active =
-        // !trigger_i`, etc.) is SKIPPED (its register reaches a free input via
-        // `cone_reaches_input`, so it is deferred to the next-cycle-cache
-        // must-edge fix), NEVER bound as a state-cube label or free dimension —
-        // both of which fabricated a VIOLATED on these shipped OpenTitan
-        // assertions. `sva_6` (`DetectStDropOut`: `state==DetectSt && !trigger_active
-        // && cfg |=> state==IdleSt`) is the canonical case it must not VIOLATE.
+        // SOUNDNESS — no spurious counterexample. H.E.r2 (combinational-input-
+        // atoms.md §6.1): an INPUT-DEPENDENT combinational antecedent
+        // (`trigger_active = !trigger_i`, etc.) now BINDS as a derived 3-valued
+        // ⊥-label and the property reaches an honest `⊥` (Unknown) — NOT a SKIP,
+        // and NEVER a VIOLATED. `sva_6` (`DetectStDropOut`: `state==DetectSt &&
+        // !trigger_active && cfg |=> state==IdleSt`) is the canonical case: btormc
+        // proves it SAFE on the lifted model, so the `⊥` is honest (the may-only
+        // abstraction is too coarse to prove it), not a missed violation. The
+        // must relation is forced Off for derived-label properties (the sound
+        // "safety + over-approximation" recipe), so the box is only KleeneT /
+        // KleeneBot — a spurious VIOLATED is impossible here.
         let sva6 = report
             .properties
             .iter()
             .find(|p| p.name == "sysrst_ctrl_detect_sva_6")
             .expect("sva_6 present");
         assert!(
-            matches!(sva6.outcome, VerifyOutcome::Skipped { .. }),
-            "sva_6's input-dependent combinational `trigger_active` is soundly \
-             SKIPPED (deferred), not a spurious VIOLATED; got {:?}",
+            matches!(sva6.outcome, VerifyOutcome::Unknown { .. }),
+            "sva_6's input-dependent combinational `trigger_active` BINDS as a ⊥-label \
+             and reaches an honest ⊥ (not a SKIP, not a spurious VIOLATED); got {:?}",
             sva6.outcome
         );
         assert!(
@@ -2014,8 +2082,10 @@ mod tests {
         let seeded = seed_from_formula(&formula, |r| r == signal, |_| false, |_| None);
 
         // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs
-        // iff a compound / input predicate is present).
-        let has_smt_seam = !seeded.compounds.is_empty() || !seeded.input_registers.is_empty();
+        // iff a compound / input / derived predicate is present).
+        let has_smt_seam = !seeded.compounds.is_empty()
+            || !seeded.input_registers.is_empty()
+            || !seeded.derived.is_empty();
         let cegar_opts = CegarOptions {
             max_iterations: 16,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -2047,7 +2117,12 @@ mod tests {
             }
         }
         let adapter_options = AdapterOptions {
-            sidecar_json: synth_sidecar_json(&seeded.compounds, &referenced, &init_u64),
+            sidecar_json: synth_sidecar_json(
+                &seeded.compounds,
+                &seeded.derived,
+                &referenced,
+                &init_u64,
+            ),
             ..Default::default()
         };
 
