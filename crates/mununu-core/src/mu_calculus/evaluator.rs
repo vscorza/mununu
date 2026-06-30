@@ -1074,11 +1074,15 @@ trait EvalDomain {
     fn top<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation;
     /// All-False (`Node::False` + μ/Least fixpoint init).
     fn bottom<S: IdStorage, L: IdStorage>(ctx: &EvalContext<'_, S, L>) -> Self::Valuation;
-    /// Lift the shared `predicate_bits` output (already OOB-masked) into a
-    /// `Valuation` (identity for 2v; `TritSet::from_predicate` for 3v).
+    /// Lift the shared `predicate_bits` output into a `Valuation`. `must` is the
+    /// definitely-true (KleeneT) bitset (already OOB-masked); `may` is the
+    /// possibly-true (KleeneT ∪ KleeneBot) bitset. For the 2v domain `must == may`
+    /// and only `must` is used; the 3v domain builds `TritSet::from_parts(must,
+    /// may | oob)` so a `KleeneBot` state is `⊥` (may-but-not-must), not False.
     fn from_predicate<S: IdStorage, L: IdStorage>(
         ctx: &EvalContext<'_, S, L>,
-        bits: BitVec<usize, Lsb0>,
+        must: BitVec<usize, Lsb0>,
+        may: BitVec<usize, Lsb0>,
     ) -> Self::Valuation;
     /// Bound fixpoint-variable lookup: the binding's value if present, else
     /// `bottom`.
@@ -1185,10 +1189,12 @@ impl EvalDomain for BoolDom {
     #[inline]
     fn from_predicate<S: IdStorage, L: IdStorage>(
         _ctx: &EvalContext<'_, S, L>,
-        bits: BitVec<usize, Lsb0>,
+        must: BitVec<usize, Lsb0>,
+        _may: BitVec<usize, Lsb0>,
     ) -> Self::Valuation {
-        // `predicate_bits` already applied the OOB mask — identity here.
-        bits
+        // 2-valued: `must` is the truth set (already OOB-masked). `may` is
+        // identical here (the 2v domain has no KleeneBot) — ignored.
+        must
     }
 
     #[inline]
@@ -1333,11 +1339,16 @@ impl EvalDomain for KleeneDom {
     #[inline]
     fn from_predicate<S: IdStorage, L: IdStorage>(
         ctx: &EvalContext<'_, S, L>,
-        bits: BitVec<usize, Lsb0>,
+        must: BitVec<usize, Lsb0>,
+        mut may: BitVec<usize, Lsb0>,
     ) -> Self::Valuation {
-        // `predicate_bits` already masked OOB out (that is the must bitset);
-        // `from_predicate` sets OOB in may, giving Unknown at the OOB sink.
-        super::trit::TritSet::from_predicate(bits, &ctx.oob_bits)
+        // 3-valued: `must` = KleeneT (OOB-masked); `may` = KleeneT ∪ KleeneBot.
+        // OOB is Unknown (may-but-not-must), so OR it into `may`. A KleeneBot
+        // state is then (must=0, may=1) = ⊥ — the fix for the M.4-era bug where
+        // a derived `KleeneBot` label collapsed to definite-False (its negation
+        // a spurious definite-True antecedent → spurious VIOLATED).
+        may.bitor_assign(ctx.oob_bits.as_bitslice());
+        super::trit::TritSet::from_parts(must, may)
     }
 
     #[inline]
@@ -1510,8 +1521,8 @@ where
             Node::True => D::top(self),
             Node::False => D::bottom(self),
             Node::Predicate(name) => {
-                let bits = self.predicate_bits(name)?;
-                D::from_predicate(self, bits)
+                let (must, may) = self.predicate_bits(name)?;
+                D::from_predicate(self, must, may)
             }
             Node::Variable(var) => D::from_binding(self, bindings.get(var)),
             Node::Not(inner) => {
@@ -2790,44 +2801,56 @@ where
         Ok(source.clone())
     }
 
-    fn predicate_bits(&mut self, name: &str) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
-        // First check pre-computed predicates
+    /// Evaluate an atomic predicate to a `(must, may)` bitset pair: `must` =
+    /// definitely-true states (KleeneT), `may` = possibly-true states
+    /// (KleeneT ∪ KleeneBot). The 2v caller uses `must`; the 3v caller builds
+    /// `TritSet::from_parts(must, may | oob)`. All paths but the 3-valued
+    /// labelling are definite, so `may == must` there.
+    // The `(must, may)` pair is a clear, local return shape; a named alias would
+    // obscure rather than clarify this single private helper.
+    #[allow(clippy::type_complexity)]
+    fn predicate_bits(
+        &mut self,
+        name: &str,
+    ) -> Result<(BitVec<usize, Lsb0>, BitVec<usize, Lsb0>), EvaluationError> {
+        // First check pre-computed predicates (definite).
         if let Some(bits) = self.env.predicate(name) {
             let mut out = self.clone_bitvec(bits)?;
             // OOB-as-bottom invariant: pre-computed bitsets may include OOB if
             // the predicate-map population didn't mask it. Re-mask defensively.
             out.bitand_assign(self.not_oob_bits.as_bitslice());
-            return Ok(out);
+            return Ok((out.clone(), out));
         }
 
-        // Check cache for on-demand evaluation results (already OOB-masked when stored)
+        // Check cache for on-demand evaluation results (already OOB-masked when
+        // stored; these are definite, so may == must).
         if let Some(bits) = self.expression_eval_cache.get(name).cloned() {
-            return Ok(bits);
+            return Ok((bits.clone(), bits));
         }
 
-        // M.4 verdict-binding fix (Option 1) — predicate-cube-lifted models
-        // (`adapter::btor2::predicate_cube_lift`, the BTOR2 CEGAR path)
-        // record each predicate's per-state truth in
-        // `Clts::state_3valued_predicates`, keyed by the predicate's
-        // display name. The `env.predicate` map above never sees those
-        // labels, so before this bridge a formula's bare `Node::Predicate`
-        // fell through to the "unknown ⇒ false" fallback, collapsing any
-        // safety formula `νX.((¬p…) ∧ [−]X)` to `νX.[−]X` (a vacuous
-        // PROPERTY HOLDS). When the CLTS carries a 3-valued labelling that
-        // mentions `name`, build the must-bitset of states where the
-        // predicate is definitely `KleeneT`.
+        // M.4 verdict-binding fix — predicate-cube-lifted models
+        // (`adapter::btor2::predicate_cube_lift`, the BTOR2 CEGAR path) record
+        // each predicate's per-state truth in `Clts::state_3valued_predicates`,
+        // keyed by the predicate's display name. The `env.predicate` map above
+        // never sees those labels. When the CLTS carries a 3-valued labelling
+        // that mentions `name`, build BOTH the must-bitset (states where the
+        // predicate is definitely `KleeneT`) and the may-bitset (KleeneT ∪
+        // KleeneBot — states where it is not definitely-false).
         //
-        // SOUNDNESS: a `KleeneBot` (or absent) label at a state leaves its
-        // bit 0 — treated as not-definitely-true, the same under-approx the
-        // fallback uses (sound for universal / box modalities). Cube
-        // predicates are definite at every cube cell, so this must-bitset
-        // is exact on the CEGAR path; the under-approx only bites
-        // hypothetical KleeneBot labels. Legacy / bit-blast CLTSes have no
-        // 3-valued labelling (`has_3valued_predicates() == false`), so this
-        // block is inert for them — purely additive.
+        // SOUNDNESS (H.E.r2 root-cause fix): a `KleeneBot` label must yield `⊥`
+        // (must=0, may=1), NOT definite-False. The prior code returned only the
+        // must-bitset, so a `KleeneBot` derived combinational label collapsed to
+        // definite-False — and its negation to a spurious definite-True
+        // antecedent, producing a spurious VIOLATED once a must-edge gave the
+        // consequent box a definite-False (sysrst sva_6, btormc-proved SAFE).
+        // Returning `may` separately restores the Kleene `⊥` so `¬⊥ = ⊥` and the
+        // safety implication is `⊥`, not `False`. Legacy / bit-blast CLTSes have
+        // no 3-valued labelling (`has_3valued_predicates() == false`), so this
+        // block is inert for them.
         if self.clts.has_3valued_predicates() {
             use crate::clts::Tristate;
-            let mut bits = self.alloc_bitvec(false)?;
+            let mut must = self.alloc_bitvec(false)?;
+            let mut may = self.alloc_bitvec(false)?;
             let mut mentioned = false;
             for i in 0..self.env.state_count() {
                 let Some(sid) = StateId::<S>::from_index(i) else {
@@ -2836,31 +2859,38 @@ where
                 match self.clts.state_3valued_predicate(sid, name) {
                     Some(Tristate::KleeneT) => {
                         mentioned = true;
-                        bits.set(i, true);
+                        must.set(i, true);
+                        may.set(i, true);
                     }
-                    Some(_) => mentioned = true,
+                    // KleeneBot → may but not must (⊥). KleeneF → neither.
+                    Some(Tristate::KleeneBot) => {
+                        mentioned = true;
+                        may.set(i, true);
+                    }
+                    Some(Tristate::KleeneF) => mentioned = true,
                     None => {}
                 }
             }
-            // Only treat `name` as a cube predicate when the labelling
-            // actually mentions it; otherwise fall through so genuine
-            // unknown atoms keep the existing on-demand / false behaviour.
+            // Only treat `name` as a cube predicate when the labelling actually
+            // mentions it; otherwise fall through so genuine unknown atoms keep
+            // the existing on-demand / false behaviour. Not cached here (the
+            // Valuation is memoized at the node level; caching only `must` would
+            // drop the `may` half on a re-read).
             if mentioned {
-                bits.bitand_assign(self.not_oob_bits.as_bitslice());
-                let cached = bits.clone();
-                self.expression_eval_cache.insert(name.to_string(), cached);
-                return Ok(bits);
+                must.bitand_assign(self.not_oob_bits.as_bitslice());
+                may.bitand_assign(self.not_oob_bits.as_bitslice());
+                return Ok((must, may));
             }
         }
 
-        // Try on-demand evaluation if abstract states are available
+        // Try on-demand evaluation if abstract states are available (definite).
         if self.env.has_abstract_states()
             && let Some(mut bits) = self.evaluate_expression_on_demand(name)?
         {
             bits.bitand_assign(self.not_oob_bits.as_bitslice());
             let cached = bits.clone();
             self.expression_eval_cache.insert(name.to_string(), cached);
-            return Ok(bits);
+            return Ok((bits.clone(), bits));
         }
 
         // SOUNDNESS: under-approx — unknown predicate assumed false (empty bitset).
@@ -2869,7 +2899,8 @@ where
         // (diamond/mu) modalities: a predicate that should be true but is missing
         // could cause a reachable liveness witness to be missed.
         // (The empty bitset is already OOB-clear; no extra masking needed.)
-        self.alloc_bitvec(false)
+        let empty = self.alloc_bitvec(false)?;
+        Ok((empty.clone(), empty))
     }
 
     /// Evaluates a variable expression on-demand over abstract states.
@@ -4969,6 +5000,78 @@ mod modal_trit_draft_tests {
             .modal_trit_from_target(ModalKind::Diamond, &controllable_guard(), &target_s1_true())
             .expect("ref");
         assert_eq!(reference.verdict_at(s0i), Trit::Unknown);
+    }
+
+    /// H.E.r2 root-cause regression — a `KleeneBot` 3-valued predicate label must
+    /// evaluate to `⊥` (Unknown), NOT definite-False. The prior `predicate_bits`
+    /// returned only the must (KleeneT) bitset, so a `KleeneBot` derived label
+    /// collapsed to (must=0, may=0) = False; its negation was a spurious
+    /// definite-True. The fix returns a `(must, may)` pair so `KleeneBot` is
+    /// (must=0, may=1) = ⊥.
+    #[test]
+    fn kleene_bot_predicate_label_is_unknown_not_false() {
+        use crate::clts::Tristate;
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        b.state("s0").initial("s0");
+        let act = b.labels().intern(["act"]).expect("act");
+        let s0 = b.state_id_or_insert("s0").expect("s0");
+        b.transition_ids(s0, &[act], s0); // self-loop so modalities are non-vacuous
+        b.with_3valued_predicate(s0, "g".to_string(), Tristate::KleeneBot);
+        let clts = b.build().expect("build");
+        let env = Environment::new(clts.state_count());
+        let s0i = clts.state_id("s0").expect("s0").index();
+
+        let f = parser::parse("g").expect("parse");
+        let r = evaluate_tri(&f, &clts, &env).expect("eval");
+        assert_eq!(
+            r.verdict_at(s0i),
+            Trit::Unknown,
+            "a KleeneBot label is ⊥, not definite-False"
+        );
+        let nf = parser::parse("!(g)").expect("parse");
+        let nr = evaluate_tri(&nf, &clts, &env).expect("eval");
+        assert_eq!(
+            nr.verdict_at(s0i),
+            Trit::Unknown,
+            "¬⊥ = ⊥, not definite-True (the spurious-antecedent half of the bug)"
+        );
+    }
+
+    /// H.E.r2 root-cause regression — the exact sysrst sva_6 shape: a derived
+    /// `KleeneBot` label `g` under a negation in a safety antecedent, with a
+    /// Sharp must-edge whose target fails the consequent. Pre-fix this returned a
+    /// spurious VIOLATED (g→False ⇒ ¬g→True ⇒ A→True ⇒ ¬A→False ⇒ `False ∨ []c`
+    /// with `[]c`=False ⇒ False). Post-fix g=⊥ ⇒ ¬g=⊥ ⇒ A=⊥ ⇒ ¬A=⊥ ⇒
+    /// `⊥ ∨ []c` = ⊥ ⇒ Unknown. btormc independently proves the real sva_6 SAFE,
+    /// so ⊥ is the honest verdict, never a counterexample.
+    #[test]
+    fn kleene_bot_antecedent_safety_is_unknown_not_violated() {
+        use crate::clts::Tristate;
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        b.state("s0").state("s1").initial("s0");
+        let act = b.labels().intern(["act"]).expect("act");
+        let s0 = b.state_id_or_insert("s0").expect("s0");
+        let s1 = b.state_id_or_insert("s1").expect("s1");
+        b.transition_ids(s0, &[act], s1); // Sharp must-edge s0→s1
+        b.transition_ids(s1, &[act], s1); // s1 self-loop (non-vacuous box)
+        b.with_3valued_predicate(s0, "d".to_string(), Tristate::KleeneT);
+        b.with_3valued_predicate(s0, "g".to_string(), Tristate::KleeneBot);
+        b.with_3valued_predicate(s0, "c".to_string(), Tristate::KleeneF);
+        b.with_3valued_predicate(s1, "d".to_string(), Tristate::KleeneF);
+        b.with_3valued_predicate(s1, "g".to_string(), Tristate::KleeneBot);
+        b.with_3valued_predicate(s1, "c".to_string(), Tristate::KleeneF);
+        let clts = b.build().expect("build");
+        let env = Environment::new(clts.state_count());
+        let s0i = clts.state_id("s0").expect("s0").index();
+
+        // AG((d ∧ ¬g) → AX c) = νX.((¬(d ∧ ¬g) ∨ []c) ∧ []X).
+        let f = parser::parse("nu X. ((!((d) && (!(g))) || [] (c)) && [] X)").expect("parse");
+        let r = evaluate_tri(&f, &clts, &env).expect("eval");
+        assert_eq!(
+            r.verdict_at(s0i),
+            Trit::Unknown,
+            "KleeneBot `g` under negation ⇒ A=⊥ ⇒ (⊥ ∨ []c)=⊥; NOT a spurious VIOLATED"
+        );
     }
 
     /// IR-track P3.4 (2026-06-22) — THE SOUNDNESS FIX for `Control::All`

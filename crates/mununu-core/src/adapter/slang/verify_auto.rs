@@ -770,23 +770,17 @@ pub fn verify_auto(
             enable_approximant_reuse: false,
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
-            // SOUNDNESS (H.E.r2, combinational-input-atoms.md §6.1): a property
-            // carrying a derived ⊥-label combinational-of-input atom is a SAFETY
-            // property whose verdict rides on `[]C` over the MAY relation (Kleene
-            // `⊥ ∨ []C = T` when the consequent holds). The MUST relation is not
-            // needed for it, and an under-approximating must-edge is the unsound
-            // direction here: with `must=Off` the box is only KleeneT / KleeneBot
-            // (never KleeneF), so no spurious VIOLATED is possible — exactly the
-            // sound "safety + over-approximation" recipe (CLAUDE.md §Soundness).
-            // (An empirical spurious VIOLATED under `SmtHyperMust` — btormc proves
-            // sysrst sva_6 SAFE on the lifted model — exposed a separate must-edge
-            // imprecision tracked for the must path; it does not affect the
-            // may-only verdict this forces here.)
-            must_edge_inference: if has_derived {
-                MustEdgeInference::Off
-            } else {
-                opts.must_edge_inference
-            },
+            // Derived-label properties now use the caller's must-edge policy like
+            // any other. The H.E.r2 `must=Off`-for-derived band-aid is RETIRED:
+            // its purpose was to dodge a spurious VIOLATED on a derived ⊥-label
+            // safety property under `SmtHyperMust`, but the real cause was the
+            // 3-valued evaluator collapsing a `KleeneBot` derived label to
+            // definite-False (its negation a spurious definite-True antecedent).
+            // That is fixed at the root in `mu_calculus::evaluator::predicate_bits`
+            // (a `KleeneBot` label now yields `⊥`, so `¬⊥ = ⊥` and the safety
+            // implication is `⊥`, never a spurious `False`). With the root fix the
+            // must relation is sound for these properties too.
+            must_edge_inference: opts.must_edge_inference,
             may_edge_inference: if has_compounds || has_inputs || has_derived || has_combinational {
                 MayEdgeInference::SmtAllPairs
             } else {
