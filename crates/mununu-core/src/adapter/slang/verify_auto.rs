@@ -205,12 +205,6 @@ struct Seeded {
     /// across **all** of its initial polarities. See
     /// `docs/design/free-input-atoms.md`. Empty ⇒ the pre-H.B state-only shape.
     input_registers: HashSet<String>,
-    /// H.E (combinational outputs) — **derived** combinational predicates: a
-    /// simple atom whose register is a combinational node (e.g. csrng's
-    /// `main_sm_err_o`), NOT a cube dimension. The lift labels each per cube via
-    /// SMT (Approach B). Threaded to `cegar_refine_loop` through the synthesised
-    /// sidecar's `combinational_predicates`. Empty ⇒ the pre-H.E shape.
-    derived: Vec<PredicateSpec>,
 }
 
 /// The minimal H.1 (+ H.B) — derive cube predicates from a formula's
@@ -339,7 +333,6 @@ fn seed_from_formula(
 /// fictitious init. Returns `None` when there is nothing to emit.
 fn synth_sidecar_json(
     compounds: &[(String, PredicateExpr)],
-    derived: &[PredicateSpec],
     referenced: &std::collections::BTreeSet<String>,
     init_values: &std::collections::HashMap<String, u64>,
 ) -> Option<String> {
@@ -349,13 +342,6 @@ fn synth_sidecar_json(
         // re-parses via `parse_predicate_expr` (REL handles `reg == reg`).
         .map(|(name, _)| serde_json::json!({ "name": name, "expr": name }))
         .collect();
-    // H.E — derived combinational predicates: `cegar_refine_loop` reads these
-    // into `lift_opts.derived_predicates`; the lift labels each per cube via the
-    // SMT `combinational_labels` pass (NOT a cube dimension).
-    let combinational_decls: Vec<serde_json::Value> = derived
-        .iter()
-        .map(|d| serde_json::json!({ "name": d.name, "signal": d.register, "value": d.value }))
-        .collect();
     let signals: Vec<serde_json::Value> = referenced
         .iter()
         .filter_map(|r| {
@@ -364,14 +350,13 @@ fn synth_sidecar_json(
                 .map(|v| serde_json::json!({ "name": r, "config_values": [v] }))
         })
         .collect();
-    if compound_decls.is_empty() && combinational_decls.is_empty() && signals.is_empty() {
+    if compound_decls.is_empty() && signals.is_empty() {
         return None;
     }
     serde_json::to_string(&serde_json::json!({
         "module": "cegar",
         "source": "verify_auto.btor2",
         "compound_predicates": compound_decls,
-        "combinational_predicates": combinational_decls,
         "signals": signals,
     }))
     .ok()
@@ -707,7 +692,7 @@ pub fn verify_auto(
             continue;
         }
         let predicate_count = seeded.specs.len() + seeded.compounds.len();
-        if predicate_count == 0 && seeded.derived.is_empty() {
+        if predicate_count == 0 {
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
@@ -723,7 +708,6 @@ pub fn verify_auto(
 
         let mut seeded_names: Vec<String> = seeded.specs.iter().map(|s| s.name.clone()).collect();
         seeded_names.extend(seeded.compounds.iter().map(|(n, _)| n.clone()));
-        seeded_names.extend(seeded.derived.iter().map(|d| d.name.clone()));
 
         // Compounds OR free inputs ⇒ force the SmtAllPairs eager lift.
         // Compounds: the only compound-aware may path. Free inputs (H.B): the
@@ -734,10 +718,6 @@ pub fn verify_auto(
         // `cegar_refine_loop` re-checks the compound gate.
         let has_compounds = !seeded.compounds.is_empty();
         let has_inputs = !seeded.input_registers.is_empty();
-        // H.E — derived combinational predicates are labeled per cube by the
-        // SMT `combinational_labels` pass, which also requires the SmtAllPairs
-        // eager lift (precise state edges + the encoded view).
-        let has_derived = !seeded.derived.is_empty();
         // H.U.2 — a combinational-of-state spec (register present in
         // `combinational_nid`, not a state cell) is a cube dimension over a
         // *determined function of state*. The sampling may-path is state-register
@@ -757,7 +737,7 @@ pub fn verify_auto(
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if has_compounds || has_inputs || has_derived || has_combinational {
+            may_edge_inference: if has_compounds || has_inputs || has_combinational {
                 MayEdgeInference::SmtAllPairs
             } else {
                 MayEdgeInference::Off
@@ -776,12 +756,7 @@ pub fn verify_auto(
             }
         }
         let adapter_options = AdapterOptions {
-            sidecar_json: synth_sidecar_json(
-                &seeded.compounds,
-                &seeded.derived,
-                &referenced,
-                &init_values,
-            ),
+            sidecar_json: synth_sidecar_json(&seeded.compounds, &referenced, &init_values),
             ..Default::default()
         };
         // Env sized to the cube space: simple specs + the sidecar compounds
@@ -950,8 +925,7 @@ mod tests {
             [("state".to_string(), 0), ("state__past".to_string(), 0)]
                 .into_iter()
                 .collect();
-        let json =
-            synth_sidecar_json(&s.compounds, &[], &referenced, &inits).expect("sidecar json");
+        let json = synth_sidecar_json(&s.compounds, &referenced, &inits).expect("sidecar json");
         assert!(json.contains("compound_predicates"));
         assert!(json.contains("state == state__past"));
         assert!(json.contains("config_values"), "init pins present: {json}");
@@ -1222,7 +1196,7 @@ mod tests {
     fn no_sidecar_when_nothing_to_emit() {
         let empty_refs = std::collections::BTreeSet::new();
         let empty_inits = std::collections::HashMap::new();
-        assert!(synth_sidecar_json(&[], &[], &empty_refs, &empty_inits).is_none());
+        assert!(synth_sidecar_json(&[], &empty_refs, &empty_inits).is_none());
     }
 
     #[test]
@@ -2040,10 +2014,8 @@ mod tests {
         let seeded = seed_from_formula(&formula, |r| r == signal, |_| false, |_| None);
 
         // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs
-        // iff a compound / input / derived predicate is present).
-        let has_smt_seam = !seeded.compounds.is_empty()
-            || !seeded.input_registers.is_empty()
-            || !seeded.derived.is_empty();
+        // iff a compound / input predicate is present).
+        let has_smt_seam = !seeded.compounds.is_empty() || !seeded.input_registers.is_empty();
         let cegar_opts = CegarOptions {
             max_iterations: 16,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -2075,12 +2047,7 @@ mod tests {
             }
         }
         let adapter_options = AdapterOptions {
-            sidecar_json: synth_sidecar_json(
-                &seeded.compounds,
-                &seeded.derived,
-                &referenced,
-                &init_u64,
-            ),
+            sidecar_json: synth_sidecar_json(&seeded.compounds, &referenced, &init_u64),
             ..Default::default()
         };
 
