@@ -523,7 +523,6 @@ fn run_controllability_aware_lift(
         may_edge_inference: Default::default(),
         config_values: std::collections::HashMap::new(),
         compound_exprs: std::collections::HashMap::new(),
-        derived_predicates: Vec::new(),
     };
 
     let lift_result =

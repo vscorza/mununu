@@ -209,22 +209,6 @@ pub trait SmtEncode: SymbolicTransitionSystem {
         may_edges: &[(usize, usize)],
         timeout_ms: u32,
     ) -> Vec<(usize, Vec<usize>)>;
-
-    /// H.E.2 — per-cube labels for **derived combinational predicates** (Approach
-    /// B). `cube_predicates` are the cube *dimensions* (state + free inputs,
-    /// indices `0..2^|cube_predicates|`); `derived` are the combinational
-    /// predicates to label (their `register()` names a combinational node, NOT a
-    /// dimension). Returns `(cube_index, derived_index, label)` for every (cube,
-    /// derived) pair: KleeneT/F where the cube pins the signal, KleeneBot where it
-    /// doesn't (or on encoder failure / timeout — the conservative, honest
-    /// label). The lift writes these into `state_3valued_predicates` so the
-    /// evaluator binds the formula atom by name.
-    fn combinational_labels<P: PredicateLike + Sync>(
-        &self,
-        cube_predicates: &[P],
-        derived: &[P],
-        timeout_ms: u32,
-    ) -> Vec<(usize, usize, crate::clts::Tristate)>;
 }
 
 /// The BTOR2 implementation of the STS-IR seam — a thin borrow over a
@@ -482,76 +466,6 @@ impl SmtEncode for BtorSts<'_> {
             edges
         })
     }
-
-    fn combinational_labels<P: PredicateLike + Sync>(
-        &self,
-        cube_predicates: &[P],
-        derived: &[P],
-        timeout_ms: u32,
-    ) -> Vec<(usize, usize, crate::clts::Tristate)> {
-        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
-        use crate::adapter::btor2::smt_must_edge::{
-            build_register_nid_map_with_inputs, smt_combinational_label,
-        };
-        use crate::adapter::sidecar::predicate_image::btor2_encode::SignalKind;
-        use crate::clts::Tristate;
-
-        if derived.is_empty() {
-            return Vec::new();
-        }
-        let n_cubes = 1usize << cube_predicates.len();
-        let cfg = z3::Config::new();
-        z3::with_z3_config(&cfg, || {
-            let view = match encode_design_for_lift(self.file) {
-                Ok(v) => v,
-                // Encoder failure → every derived predicate is conservatively
-                // KleeneBot in every cube (honest "couldn't determine").
-                Err(_) => {
-                    let mut out = Vec::with_capacity(n_cubes * derived.len());
-                    for i in 0..n_cubes {
-                        for d in 0..derived.len() {
-                            out.push((i, d, Tristate::KleeneBot));
-                        }
-                    }
-                    return out;
-                }
-            };
-            let nid_map = build_register_nid_map_with_inputs(&view);
-            // Resolve each derived predicate's signal name → its combinational
-            // node NID (own-symbol match in the view's Combinational signals).
-            let derived_nids: Vec<Option<_>> = derived
-                .iter()
-                .map(|d| {
-                    view.signals
-                        .iter()
-                        .find(|s| {
-                            s.kind == SignalKind::Combinational
-                                && s.symbol.as_deref() == Some(d.register())
-                        })
-                        .map(|s| s.nid)
-                })
-                .collect();
-            let mut out = Vec::with_capacity(n_cubes * derived.len());
-            for i in 0..n_cubes {
-                for (d_idx, d) in derived.iter().enumerate() {
-                    let label = match derived_nids[d_idx] {
-                        Some(nid) => smt_combinational_label(
-                            &view,
-                            i as u64,
-                            cube_predicates,
-                            &nid_map,
-                            nid,
-                            d.value(),
-                            timeout_ms,
-                        ),
-                        None => Tristate::KleeneBot,
-                    };
-                    out.push((i, d_idx, label));
-                }
-            }
-            out
-        })
-    }
 }
 
 #[cfg(test)]
@@ -796,46 +710,6 @@ mod tests {
         assert!(
             !edges.contains(&(0, 1)) && !edges.contains(&(0, 3)),
             "source in_a=1 must NOT reach reg_a'==0 — the source input pin is load-bearing"
-        );
-    }
-
-    // H.E.2 — a state-only combinational signal `g = !q` (NID 3). With cube
-    // dimension `q == 1`, the derived label `g == 1` is DETERMINED per cube:
-    // q==1 ⇒ g==0 (KleeneF for g==1); q==0 ⇒ g==1 (KleeneT).
-    const COMB_LABEL_BTOR2: &str =
-        "1 sort bitvec 1\n2 state 1 q\n3 not 1 2 g\n4 zero 1\n5 init 1 2 4\n6 next 1 2 2\n";
-
-    #[test]
-    fn btor_sts_combinational_labels_determined_by_state_cube() {
-        use crate::clts::Tristate;
-        let file = parser::parse(COMB_LABEL_BTOR2).expect("parse combinational-label fixture");
-        let sts = BtorSts::new(&file);
-        let cube_preds = vec![PredicateSpec {
-            name: "q == 1".into(),
-            register: "q".into(),
-            value: 1,
-        }];
-        let derived = vec![PredicateSpec {
-            name: "g == 1".into(),
-            register: "g".into(), // the combinational node's own symbol
-            value: 1,
-        }];
-        let labels: std::collections::HashMap<(usize, usize), Tristate> = sts
-            .combinational_labels(&cube_preds, &derived, 5_000)
-            .into_iter()
-            .map(|(c, d, t)| ((c, d), t))
-            .collect();
-        // cube 0 = (q==1 false ⇒ q==0) ⇒ g = !0 = 1 ⇒ g==1 is KleeneT.
-        assert_eq!(
-            labels.get(&(0, 0)),
-            Some(&Tristate::KleeneT),
-            "q==0 ⇒ g==1 true"
-        );
-        // cube 1 = (q==1 true) ⇒ g = !1 = 0 ⇒ g==1 is KleeneF.
-        assert_eq!(
-            labels.get(&(1, 0)),
-            Some(&Tristate::KleeneF),
-            "q==1 ⇒ g==1 false"
         );
     }
 }

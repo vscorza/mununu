@@ -2803,7 +2803,6 @@ fn btor2_discover(args: Btor2DiscoverArgs) -> Result<(), String> {
             uf_unwrap: Vec::new(),
             predicates: Vec::new(),
             compound_predicates: Vec::new(),
-            combinational_predicates: Vec::new(),
         }
     };
 
