@@ -346,7 +346,112 @@ input-dependence question analysed here.
 
 ---
 
-## 7. Conclusion
+## 7. Complexity and computational cost
+
+The treatments differ not only in soundness reach (§6) but in how they scale. This
+section fixes a cost model and places each approach in it, so the decision weighs
+precision against compute.
+
+### 7.1 Parameters
+
+| symbol | meaning | typical anchor value |
+|---|---|---|
+| `n = \|P\|` | number of cube predicates (dimensions) | ~3–8 |
+| `K` | number of *reachable* abstract cubes (≤ `2ⁿ`, usually far fewer) | ~tens |
+| `E` | candidate (source,label,target) edge triples examined | `O(K² · \|labels\|)` |
+| `m` | combinational-of-input atoms in the property | ~1–3 |
+| `W` | total primary-input bit-width (the `i′` the env controls) | tens–hundreds |
+| `R` | state-register bit-width (the BTOR2 `state` cone) | tens |
+
+The unit cost is a single SMT solve over the lifted BTOR2 transition. The shipped
+edge inference is quantifier-free bit-vector (`QF_BV`): NP-complete, but the solves
+are over one transition unrolling and are individually cheap in practice (the
+anchors' must passes complete in well under a second per
+[`smt_must_edge.rs`](../../crates/mununu-core/src/adapter/btor2/smt_must_edge.rs)).
+The cost question is therefore (a) how many solves, and (b) whether any solve leaves
+`QF_BV` for the quantified fragment.
+
+### 7.2 Baseline (shipped) costs
+
+- **may** `c →◇ c′` — one `∃` solve (a `QF_BV` SAT) per examined cube pair:
+  `O(E)` solves.
+- **must** per-target — `SmtPerTarget` is a `QF_BV` validity check
+  (`∀s∀i. transition ⟹ next⊨tgt`, discharged as one UNSAT); `SmtPerTargetStandard`
+  is the `∀∃` form, discharged with a single quantifier instantiation over the
+  source. Both are `O(E)` solves and stay effectively in `QF_BV` because the only
+  universal is the source state, eliminated by the UNSAT framing.
+
+So the abstraction's baseline is `O(E)` `QF_BV` solves, with `E = O(K² · \|labels\|)`
+and `K ≤ 2ⁿ`. The dominant blow-up axis is `n` (the cube dimension count): each
+added predicate at most doubles `K`, hence quadruples `E`.
+
+### 7.3 Derived ⊥-label (§6.1) — cheap, additive, no dimension growth
+
+The label is computed **per cube, per combinational atom**, by two `QF_BV` UNSAT
+checks (`is it constant 1?` / `is it constant 0?`):
+
+- **Solves added:** `2 · K · m` `QF_BV` solves — *additive*, run once after the
+  cubes are built. No new edge queries.
+- **Cube count:** **unchanged.** A derived label is *not* a cube dimension, so `n`
+  and `K` (and therefore the `O(E)` edge cost) are untouched. This is the key
+  scaling property: the ⊥-label adds precision at the source position for the price
+  of `O(K·m)` extra cheap solves and **zero** exponential growth.
+- **Fragment:** stays in `QF_BV` (each check is a one-cycle constancy query over the
+  cube's state constraint plus the free input — no quantifier alternation).
+
+Cost class: **linear in `K·m`, no change to the exponential base.** This is the
+inexpensive treatment.
+
+### 7.4 Nested-∀i′ hyper-must (§6.2) — quantifier alternation + target-set search
+
+Two cost sources compound:
+
+1. **Quantifier alternation.** The query `∀(s,i)∈γ(c). ∀i′. ∃c′∈T. (δ(s,i),i′)∈γ(c′)`
+   has a genuine `∀i′` *inside* the existential transition choice that cannot be
+   removed by the UNSAT framing (unlike the source `∀s`, which can). It leaves
+   `QF_BV` for **quantified BV (BV with one alternation)**. For finite bit-vectors
+   this is decidable, but Z3 discharges it by bit-blasting / instantiating the `∀i′`
+   — worst case `2ᵂ` instantiations in `W` input bits, or a symbolic QBF-style
+   search. In theory quantified BV is far harder than `QF_BV` (the alternation is
+   the source of the jump); in practice cost is governed by `W` (the input
+   cone of the combinational signal, often a handful of bits, not the full `W`) and
+   Z3's quantifier engine.
+2. **Target-set enumeration.** By Proposition 5 a singleton target fails; the sound
+   object is a *set* `T`. Enumerating/searching candidate `T ⊆ 𝔹ⁿ` is the GKMTS
+   cost — bounded by the cubes actually reachable from `c` under any `i′`
+   (`\|T\| ≤ K`), but each candidate `T` is itself a hyper-must solve.
+
+If, instead of a derived label, the combinational atom is admitted as a **cube
+dimension** (so target position is decided by the cube structure), `n` grows by `m`
+and `K` (hence `E`) grows by up to `2ᵐ` — the exponential axis the ⊥-label avoided.
+
+Cost class: **a quantifier-alternation solve per source cube (governed by the
+combinational signal's input-cone width), plus up to `2ᵐ` cube blow-up if realised
+as dimensions.** This is the expensive, complete treatment.
+
+### 7.5 Summary table
+
+| treatment | solves added | solve fragment | cube-count (`K`) impact | reach |
+|---|---|---|---|---|
+| skip (status quo) | 0 | — | none | none |
+| derived ⊥-label (§6.1) | `2·K·m` (`QF_BV`) | `QF_BV` | **none** | source position; definite via Kleene `⊥∨T=T` |
+| nested-∀i′ hyper-must (§6.2) | `O(K·\|T\|)` per atom | **quantified BV** (∀i′) | `×2ᵐ` if dimensions | source **and** target position |
+
+### 7.6 What to measure before committing to §6.2
+
+The §6.2 cost is the one with a phase change (`QF_BV` → quantified BV). Before
+implementing it, measure on the anchors: (a) the input-cone width of each target
+combinational signal (the effective `W` the `∀i′` bit-blasts over — `event_detected_pulse_o`'s
+cone, not all of `sysrst`'s inputs); (b) Z3 wall-clock for one nested-∀i′ solve at
+that width; (c) the reachable target-set size `\|T\|`. If the input cone is small
+(a few bits) the `2ᵂ` instantiation is negligible and the hyper-must is affordable;
+if it is wide, the quantified-BV solve, not the cube count, becomes the bottleneck —
+and the ⊥-label (which never leaves `QF_BV`) is the pragmatic floor. The H.O oracle
+bounds correctness independently of which is chosen.
+
+---
+
+## 8. Conclusion
 
 The dominant remaining gap on both real-RTL anchors is the **combinational-of-input
 atom**, not the relational or arithmetic forms the roadmap originally flagged. The
