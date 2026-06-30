@@ -2206,4 +2206,218 @@ mod tests {
         // cube-True + Inconclusive is also fine — no violation was *found*.
         assert_eq!(spurious_verdict(Trit::True, &AgOracle::Inconclusive), None);
     }
+
+    // ---- H.O.1c — external BTOR2-MC oracle differential (btormc) ---------------
+    //
+    // H.O.0's concrete oracle is enumeration-bounded: on a design with wide inputs
+    // it can REFUTE a spurious cube-HOLDS but is forced to `Inconclusive` and
+    // cannot CONFIRM a real-RTL HOLDS (H.O.0.3b). H.O.1 adds the external SYMBOLIC
+    // oracle: emit the property as a BTOR2 `bad` monitor (H.O.1b) and let
+    // `btormc --kind` (H.O.1a) decide it — `unsat` ⇒ SAFE/HOLDS (a real
+    // k-induction proof, no enumeration), `sat` ⇒ VIOLATED. These tests are
+    // `#[ignore]`d (need btormc — run in `mununu-sva`); the pure differential
+    // logic (`spurious_verdict_mc`) is make-ci unit-tested below.
+    use crate::adapter::btor2::bad_monitor::{
+        emit_ag_implies_next_monitor, emit_ag_state_atom_monitor,
+    };
+    use crate::adapter::btormc::{DEFAULT_KMAX, McVerdict, locate_btormc, run_btormc};
+
+    /// MC analog of [`spurious_verdict`]: `Some(reason)` iff a DEFINITE cube
+    /// verdict and the external model checker *contradict*. `McVerdict::Unknown`
+    /// (bounded — no CEX and no proof) never contradicts.
+    fn spurious_verdict_mc(cube: Trit, mc: McVerdict) -> Option<&'static str> {
+        match (cube, mc) {
+            (Trit::True, McVerdict::Violated) => Some("SPURIOUS HOLDS"),
+            (Trit::False, McVerdict::Safe) => Some("SPURIOUS VIOLATED"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn mc_guard_catches_spurious_verdicts() {
+        // make-ci negative control (pure logic; no btormc). Proves the MC
+        // soundness invariant is LIVE: contradictions flagged, everything
+        // consistent — including every `Unknown` — not flagged.
+        assert_eq!(
+            spurious_verdict_mc(Trit::True, McVerdict::Violated),
+            Some("SPURIOUS HOLDS")
+        );
+        assert_eq!(
+            spurious_verdict_mc(Trit::False, McVerdict::Safe),
+            Some("SPURIOUS VIOLATED")
+        );
+        assert_eq!(spurious_verdict_mc(Trit::True, McVerdict::Safe), None);
+        assert_eq!(spurious_verdict_mc(Trit::False, McVerdict::Violated), None);
+        assert_eq!(spurious_verdict_mc(Trit::Unknown, McVerdict::Safe), None);
+        assert_eq!(
+            spurious_verdict_mc(Trit::Unknown, McVerdict::Violated),
+            None
+        );
+        assert_eq!(spurious_verdict_mc(Trit::True, McVerdict::Unknown), None);
+        assert_eq!(spurious_verdict_mc(Trit::False, McVerdict::Unknown), None);
+    }
+
+    // A btormc-compatible 2-bit FSM cycling 0→1→2→0 (caps at 2, never 3) with an
+    // irrelevant WIDE (8-bit) input `w`. The wide input forces the internal
+    // oracle's enumeration BOUNDED (→ Inconclusive); btormc decides symbolically
+    // (w is irrelevant to the FSM). Init const (nid 5) precedes the state (nid 6)
+    // so btormc's `init state_nid > val_nid` rule holds.
+    const WIDE_INPUT_FSM: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 sort bitvec 8
+4 input 3 w
+5 zero 2
+6 state 2 cnt
+7 one 2
+8 constd 2 2
+9 eq 1 6 8
+10 add 2 6 7
+11 ite 2 9 5 10
+12 next 2 6 11
+13 init 2 6 5
+";
+
+    #[test]
+    #[ignore = "requires btormc (MUNUNU_BTORMC_PATH or $PATH); run with --ignored in mununu-sva"]
+    fn e2e_btormc_decides_beyond_the_internal_oracle_cap() {
+        // The H.O.1 payoff, deterministic: the internal oracle is Inconclusive
+        // (the wide input caps enumeration), btormc returns a DEFINITE Safe.
+        let file = crate::adapter::btor2::parser::parse(WIDE_INPUT_FSM).unwrap();
+        let internal = ag_state_atom(&file, "cnt", CmpOp::Ne, 3, 256, 8, false).unwrap();
+        assert_eq!(
+            internal,
+            AgOracle::Inconclusive,
+            "wide input ⇒ bounded enumeration ⇒ internal oracle cannot confirm"
+        );
+
+        let bin = locate_btormc().expect("btormc present");
+        let monitor =
+            emit_ag_state_atom_monitor(WIDE_INPUT_FSM, "cnt", CmpOp::Ne, 3, false).unwrap();
+        let mc = run_btormc(&bin, &monitor, DEFAULT_KMAX).unwrap();
+        assert_eq!(
+            mc,
+            McVerdict::Safe,
+            "btormc proves AG(cnt != 3) symbolically, beyond the enumeration cap"
+        );
+        // A cube-HOLDS on this property is CONFIRMED (no spurious-HOLDS).
+        assert!(spurious_verdict_mc(Trit::True, mc).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires slang+sv2v+yosys+btormc (mununu-sva); run with --ignored"]
+    fn e2e_btormc_confirms_sysrst_real_rtl_verdict() {
+        // H.O.1c real-RTL payoff: the external MC CONFIRMS the one definite
+        // real-OpenTitan verdict (sysrst sva_0, `!cfg_enable_i |=> state_q == 0`,
+        // which verify_auto reports HOLDS) where the internal oracle is forced to
+        // `Inconclusive` (sysrst's wide `cfg_detect_timer_i` exceeds the cap;
+        // H.O.0.3b). Same lift + reset-pin as `e2e_oracle_gates_sysrst_real_rtl_verdict`.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let sysrst = root.join("r46_sysrst_detect_k5/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let sources = vec![
+            (
+                "sysrst_ctrl_detect.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_detect.sv")),
+            ),
+            (
+                "sysrst_ctrl_pkg.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_pkg.sv")),
+            ),
+            (
+                "prim_assert.sv".to_string(),
+                read(prim.join("prim_assert.sv")),
+            ),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read(prim.join("prim_assert_standard_macros.svh")),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read(prim.join("prim_assert_sec_cm.svh")),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read(prim.join("prim_flop_macros.sv")),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("sysrst_ctrl_detect".to_string()),
+            use_sv2v: true,
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on sysrst_ctrl_detect");
+        let sva0 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "sysrst_ctrl_detect_sva_0")
+            .expect("sva_0 present");
+        assert!(
+            matches!(sva0.outcome, VerifyOutcome::Holds),
+            "precondition: verify_auto reports sva_0 HOLDS; got {:?}",
+            sva0.outcome
+        );
+
+        // Lift the base BTOR2 + pin the SAME resets verify_auto pinned.
+        let (btor2, _bb) =
+            crate::adapter::yosys::sv_to_btor2_with_blackboxes(&sources[0].1, &yopts)
+                .expect("sv → btor2");
+        let pins: Vec<(String, u64)> = report
+            .diagnostics
+            .gated_resets
+            .iter()
+            .filter_map(|g| {
+                let (n, v) = g.split_once('=')?;
+                Some((n.to_string(), v.trim().parse::<u64>().ok()?))
+            })
+            .collect();
+        let (pinned, _) = crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &pins);
+
+        // sva_0 = `(!cfg_enable_i) |=> (state_q == 0)`. Emit its `bad` monitor on
+        // the pinned BTOR2 (reset_pinned = true: the async-reset mux to state_q is
+        // sound under the pin). btormc decides it symbolically.
+        let ante = OracleAtom::new("cfg_enable_i", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state_q", CmpOp::Eq, 0);
+        let monitor = emit_ag_implies_next_monitor(&pinned, &ante, &cons, true)
+            .expect("emit |=> monitor on real-RTL (binds state_q + cfg_enable_i)");
+
+        let bin = locate_btormc().expect("btormc present");
+        let mc = run_btormc(&bin, &monitor, 60).expect("btormc runs on the sysrst monitor");
+        eprintln!("\n=== H.O.1c sysrst sva_0 external-MC verdict: {mc:?} ===");
+
+        // Soundness gate (always): verify_auto's HOLDS (Trit::True) must not be
+        // contradicted — btormc must NOT return Violated.
+        assert!(
+            spurious_verdict_mc(Trit::True, mc).is_none(),
+            "verify_auto sva_0 HOLDS contradicted by btormc: {mc:?}"
+        );
+        assert_ne!(
+            mc,
+            McVerdict::Violated,
+            "no reachable violation of a genuinely-holding property"
+        );
+        // The H.O.1 payoff: btormc reaches a DEFINITE Safe where the internal
+        // oracle is Inconclusive — the real-RTL CONFIRMATION H.O.0 could not give.
+        // Observed `Safe` in the mununu-sva image (btormc 3.2.4, k-induction closes
+        // within kmax=60); this asserts that confirmation does not regress.
+        assert_eq!(
+            mc,
+            McVerdict::Safe,
+            "btormc confirms sysrst sva_0 HOLDS (the real-RTL confirmation beyond H.O.0's cap)"
+        );
+    }
 }
