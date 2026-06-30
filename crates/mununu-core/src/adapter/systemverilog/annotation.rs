@@ -322,6 +322,12 @@ pub struct CompoundPredicateDecl {
     /// Boolean-expression source, e.g. `"cnt == 0 && en == 1"`. Parsed by
     /// `parse_predicate_expr`; a malformed expr is skipped with a warning.
     pub expr: String,
+    /// H.F — when `true`, this compound is a DERIVED 3-valued LABEL (its operands
+    /// include an input/combinational signal, so it is not a sound cube dimension;
+    /// the lift labels it per cube via the SMT seam), NOT a cube dimension.
+    /// `false` (the default, the all-state B.1 case) → a cube dimension.
+    #[serde(default)]
+    pub derived: bool,
 }
 
 /// §Phase 10 §10.2 stage 2 — Memory-cell annotation.
