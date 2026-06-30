@@ -1,0 +1,433 @@
+//! H.O.1b (2026-06-29) — emit the H.O safety fragment as a BTOR2 `bad` monitor.
+//!
+//! The external model checker ([`crate::adapter::btormc`], H.O.1a) decides a
+//! BTOR2 `bad` property: a reachable `bad` ⇒ VIOLATED, an unreachable one (proven
+//! by k-induction) ⇒ SAFE. This module turns the same safety fragment the
+//! internal oracle ([`crate::adapter::btor2::concrete_oracle`]) checks — `AG`
+//! over a state/input atom, and the `ante |=> cons` implication — into that
+//! `bad` line. A `bad` monitors the property's NEGATION (the violation), so:
+//!
+//! - **`AG (signal ⋈ value)`** → `bad = !(signal ⋈ value)` (the negated
+//!   comparison). A reachable state breaking the invariant makes `bad` true.
+//! - **`ante |=> cons`** (= `AG (ante → AX cons)`) → a 1-bit latch
+//!   `mununu_ante_prev` (init 0, `next = ante`) plus
+//!   `bad = mununu_ante_prev && !(cons)`. When the antecedent held last cycle and
+//!   the consequent fails now, `bad` fires — the standard `|=>` safety-monitor
+//!   construction.
+//!
+//! The augmentation works at the BTOR2 **text** level (append lines with fresh
+//! NIDs above the current max), mirroring
+//! [`crate::adapter::btor2::shadow::augment_with_past_shadows`] and
+//! [`crate::adapter::btor2::pin`] so it composes with anything that re-parses the
+//! text (bit-blast, the lift, the model checker).
+//!
+//! **btormc input-ordering note.** `btormc` enforces that an `init sid state val`
+//! line has `state_nid > val_nid` (the init value's const is declared before the
+//! state). Yosys' `write_btor` output satisfies this, so real lifted designs feed
+//! straight into [`crate::adapter::btormc::run_btormc`]. This emitter only ever
+//! APPENDS lines (its own `init` for the latch puts `zero` before the state by
+//! construction), so it never breaks a compatible input — but it does not rewrite
+//! a pre-existing btormc-incompatible `init` either (mununu's own parser is
+//! lenient about that ordering; some hand-written fixtures rely on it). The H.O.1c
+//! real-RTL e2e runs the model checker on yosys-lifted designs, which are
+//! btormc-compatible by construction.
+//!
+//! Signal resolution mirrors the internal oracle
+//! ([`crate::adapter::btor2::concrete_oracle`]): a state signal resolves through
+//! [`parser::resolve_state_alias`] (following a `uext`/`sext`-0 rename, or an
+//! async-reset register mux when `reset_pinned`); the `|=>` antecedent may also be
+//! a 1-bit primary input. The comparison node carries the trailing symbol
+//! `mununu_bad`, so the H.O.1b differential can `observe` it via
+//! [`crate::adapter::btor2::bit_blast::simulate_one_step_observe`] and confirm —
+//! WITHOUT any external tool — that the emitted `bad` fires exactly when the
+//! internal oracle reports a violation.
+
+use crate::adapter::btor2::ast::{Nid, Node, Sort};
+use crate::adapter::btor2::concrete_oracle::OracleAtom;
+use crate::adapter::btor2::parser;
+use crate::adapter::btor2::predicate_expr::CmpOp;
+use crate::adapter::{AdapterError, AdapterErrorKind};
+
+/// The trailing symbol placed on the node `bad` references, so callers can
+/// `observe` the monitor's truth value by name (the H.O.1b differential, and
+/// diagnostics).
+pub const BAD_COND_SYMBOL: &str = "mununu_bad";
+
+/// The 1-bit latch synthesised for the `|=>` monitor (holds the previous cycle's
+/// antecedent truth).
+pub const ANTE_PREV_SYMBOL: &str = "mununu_ante_prev";
+
+fn err(message: String) -> AdapterError {
+    AdapterError {
+        kind: AdapterErrorKind::UnsupportedConstruct,
+        message,
+        location: None,
+    }
+}
+
+/// BTOR2 keyword for an *unsigned* comparison (the internal oracle compares
+/// `u128`, so unsigned is the matching semantics).
+fn btor2_cmp_keyword(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "eq",
+        CmpOp::Ne => "neq",
+        CmpOp::Lt => "ult",
+        CmpOp::Le => "ulte",
+        CmpOp::Gt => "ugt",
+        CmpOp::Ge => "ugte",
+    }
+}
+
+/// The negation of a comparison — `bad` watches the invariant's *violation*.
+fn negate_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Ne,
+        CmpOp::Ne => CmpOp::Eq,
+        CmpOp::Lt => CmpOp::Ge,
+        CmpOp::Le => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Le,
+        CmpOp::Ge => CmpOp::Lt,
+    }
+}
+
+/// Find an existing `sort bitvec 1` line, or append one. Returns its NID.
+fn find_or_make_bool_sort(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    next_nid: &mut Nid,
+    appended: &mut Vec<String>,
+) -> Nid {
+    for line in &file.lines {
+        if let Node::Sort {
+            sort: Sort::BitVec { width: 1 },
+        } = &line.node
+        {
+            return line.nid;
+        }
+    }
+    let nid = *next_nid;
+    *next_nid += 1;
+    appended.push(format!("{nid} sort bitvec 1"));
+    nid
+}
+
+/// Resolve a STATE signal (value-alias / reset-mux aware) to `(value_nid,
+/// sort_nid)`. `None` when it is not a state cell.
+fn state_nid_and_sort(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    signal: &str,
+    reset_pinned: bool,
+) -> Option<(Nid, Nid)> {
+    let nid = parser::resolve_state_alias(file, signal, reset_pinned)?;
+    match file.lookup(nid).map(|l| &l.node) {
+        Some(Node::State { sort, .. }) => Some((nid, *sort)),
+        _ => None,
+    }
+}
+
+/// Resolve a 1-bit (or any) primary-input signal to `(nid, sort_nid)`.
+fn input_nid_and_sort(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    signal: &str,
+) -> Option<(Nid, Nid)> {
+    let symbols = parser::collect_symbols(file);
+    file.lines.iter().find_map(|l| match &l.node {
+        Node::Input { sort, .. } if symbols.get(&l.nid).map(String::as_str) == Some(signal) => {
+            Some((l.nid, *sort))
+        }
+        _ => None,
+    })
+}
+
+/// H.O.1b — append a `bad` monitor for `AG (signal ⋈ value)`.
+///
+/// `signal` must resolve to a state register (value-alias / reset-mux aware, like
+/// the internal oracle). The emitted `bad` is the negated comparison
+/// `!(signal ⋈ value)`; the comparison node carries [`BAD_COND_SYMBOL`].
+pub fn emit_ag_state_atom_monitor(
+    content: &str,
+    signal: &str,
+    op: CmpOp,
+    value: u128,
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
+    let file = parser::parse(content).map_err(|mut e| {
+        e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
+        e
+    })?;
+
+    let (sig_nid, sig_sort) = state_nid_and_sort(&file, signal, reset_pinned).ok_or_else(|| {
+        err(format!(
+            "adapter/btor2/bad_monitor: `{signal}` does not resolve to a state cell \
+             (the AG(state-atom) monitor requires a state register or a value-alias of one)"
+        ))
+    })?;
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut appended: Vec<String> = Vec::new();
+    let bool_sort = find_or_make_bool_sort(&file, &mut next_nid, &mut appended);
+
+    let value_const = next_nid;
+    next_nid += 1;
+    appended.push(format!("{value_const} constd {sig_sort} {value}"));
+
+    // bad = !(signal ⋈ value) = (signal <negated-⋈> value); named for `observe`.
+    let bad_kw = btor2_cmp_keyword(negate_cmp(op));
+    let bad_cond = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{bad_cond} {bad_kw} {bool_sort} {sig_nid} {value_const} {BAD_COND_SYMBOL}"
+    ));
+
+    let bad_line = next_nid;
+    appended.push(format!("{bad_line} bad {bad_cond}"));
+
+    Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
+}
+
+/// H.O.1b — append a `bad` monitor for `ante |=> cons` (= `AG (ante → AX cons)`).
+///
+/// `cons` must resolve to a state register; `ante` may be a state register OR a
+/// 1-bit primary input. Synthesises the latch [`ANTE_PREV_SYMBOL`] (init 0,
+/// `next = (ante ⋈ value)`) and emits `bad = mununu_ante_prev && !(cons ⋈ value)`,
+/// with the `and` node carrying [`BAD_COND_SYMBOL`].
+pub fn emit_ag_implies_next_monitor(
+    content: &str,
+    ante: &OracleAtom,
+    cons: &OracleAtom,
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
+    let file = parser::parse(content).map_err(|mut e| {
+        e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
+        e
+    })?;
+
+    // Consequent: a state cell (checked at the next cycle, via the latch).
+    let (cons_nid, cons_sort) =
+        state_nid_and_sort(&file, &cons.signal, reset_pinned).ok_or_else(|| {
+            err(format!(
+                "adapter/btor2/bad_monitor: consequent `{}` does not resolve to a state cell",
+                cons.signal
+            ))
+        })?;
+    // Antecedent: a state cell OR a primary input.
+    let (ante_nid, ante_sort) = state_nid_and_sort(&file, &ante.signal, reset_pinned)
+        .or_else(|| input_nid_and_sort(&file, &ante.signal))
+        .ok_or_else(|| {
+            err(format!(
+                "adapter/btor2/bad_monitor: antecedent `{}` is neither a state cell nor a \
+                 primary input (out of the |=> fragment)",
+                ante.signal
+            ))
+        })?;
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut appended: Vec<String> = Vec::new();
+    let bool_sort = find_or_make_bool_sort(&file, &mut next_nid, &mut appended);
+
+    // ante holds (positive comparison) — latched into mununu_ante_prev.
+    let ante_const = next_nid;
+    next_nid += 1;
+    appended.push(format!("{ante_const} constd {ante_sort} {}", ante.value));
+    let ante_cmp = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{ante_cmp} {} {bool_sort} {ante_nid} {ante_const}",
+        btor2_cmp_keyword(ante.op)
+    ));
+
+    // cons fails (negated comparison), evaluated at the current cycle.
+    let cons_const = next_nid;
+    next_nid += 1;
+    appended.push(format!("{cons_const} constd {cons_sort} {}", cons.value));
+    let cons_fail = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{cons_fail} {} {bool_sort} {cons_nid} {cons_const}",
+        btor2_cmp_keyword(negate_cmp(cons.op))
+    ));
+
+    // mununu_ante_prev latch: init 0, next = ante_cmp. (`init` requires the state
+    // NID > the value NID, so `zero` is emitted before the state.)
+    let zero_bool = next_nid;
+    next_nid += 1;
+    appended.push(format!("{zero_bool} zero {bool_sort}"));
+    let ante_prev = next_nid;
+    next_nid += 1;
+    appended.push(format!("{ante_prev} state {bool_sort} {ANTE_PREV_SYMBOL}"));
+    let ante_prev_init = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{ante_prev_init} init {bool_sort} {ante_prev} {zero_bool}"
+    ));
+    let ante_prev_next = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{ante_prev_next} next {bool_sort} {ante_prev} {ante_cmp}"
+    ));
+
+    // bad = ante_prev && cons_fail; named for `observe`.
+    let bad_cond = next_nid;
+    next_nid += 1;
+    appended.push(format!(
+        "{bad_cond} and {bool_sort} {ante_prev} {cons_fail} {BAD_COND_SYMBOL}"
+    ));
+    let bad_line = next_nid;
+    appended.push(format!("{bad_line} bad {bad_cond}"));
+
+    Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::btor2::bit_blast;
+    use crate::adapter::btor2::concrete_oracle::{
+        AgOracle, ag_implies_next, ag_state_atom, reachable_register_states,
+    };
+    use std::collections::HashMap;
+
+    // 2-bit FSM cycling 0→1→2→0 (never 3); deterministic (input-free). Same shape
+    // as concrete_oracle's CYCLE_FSM so the monitor + the oracle see one design.
+    const CYCLE_FSM: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 state
+4 zero 2
+5 one 2
+6 constd 2 2
+7 eq 1 3 6
+8 add 2 3 5
+9 ite 2 7 4 8
+10 next 2 3 9
+11 init 2 3 4
+";
+
+    /// Is `mununu_bad` true at any reachable state of the augmented design?
+    /// (Re-enumerates, so any synthesised latch state is included.)
+    fn bad_is_reachable(augmented: &str) -> bool {
+        let file = parser::parse(augmented).expect("augmented btor2 parses");
+        let reach = reachable_register_states(&file, 256, 8).expect("reach");
+        let observe = vec![BAD_COND_SYMBOL.to_string()];
+        for st in &reach.states {
+            let regs: HashMap<String, u128> = st.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            let out = bit_blast::simulate_one_step_observe(&file, &regs, &HashMap::new(), &observe)
+                .expect("observe step");
+            if out.observed.get(BAD_COND_SYMBOL).copied().unwrap_or(0) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn state_atom_monitor_parses_and_has_one_bad() {
+        let out = emit_ag_state_atom_monitor(CYCLE_FSM, "state", CmpOp::Ne, 3, false).unwrap();
+        let file = parser::parse(&out).expect("parses");
+        let bads = file
+            .lines
+            .iter()
+            .filter(|l| matches!(l.node, Node::Bad { .. }))
+            .count();
+        assert_eq!(bads, 1, "exactly one bad monitor");
+    }
+
+    #[test]
+    fn state_atom_monitor_matches_oracle_holds() {
+        // AG(state != 3): 3 unreachable → oracle Holds → bad must NOT be reachable.
+        assert_eq!(
+            ag_state_atom(
+                &parser::parse(CYCLE_FSM).unwrap(),
+                "state",
+                CmpOp::Ne,
+                3,
+                256,
+                8,
+                false
+            )
+            .unwrap(),
+            AgOracle::Holds
+        );
+        let out = emit_ag_state_atom_monitor(CYCLE_FSM, "state", CmpOp::Ne, 3, false).unwrap();
+        assert!(!bad_is_reachable(&out), "Holds ⇒ bad unreachable");
+    }
+
+    #[test]
+    fn state_atom_monitor_matches_oracle_violated() {
+        // AG(state != 1): 1 reachable → oracle Violated → bad must be reachable.
+        assert!(matches!(
+            ag_state_atom(
+                &parser::parse(CYCLE_FSM).unwrap(),
+                "state",
+                CmpOp::Ne,
+                1,
+                256,
+                8,
+                false
+            )
+            .unwrap(),
+            AgOracle::Violated(_)
+        ));
+        let out = emit_ag_state_atom_monitor(CYCLE_FSM, "state", CmpOp::Ne, 1, false).unwrap();
+        assert!(bad_is_reachable(&out), "Violated ⇒ bad reachable");
+    }
+
+    #[test]
+    fn implies_next_monitor_matches_oracle_holds() {
+        // AG(state==0 |=> state==1): from 0 the next is always 1 → Holds → no bad.
+        let ante = OracleAtom::new("state", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state", CmpOp::Eq, 1);
+        assert_eq!(
+            ag_implies_next(
+                &parser::parse(CYCLE_FSM).unwrap(),
+                &ante,
+                &cons,
+                256,
+                8,
+                false
+            )
+            .unwrap(),
+            AgOracle::Holds
+        );
+        let out = emit_ag_implies_next_monitor(CYCLE_FSM, &ante, &cons, false).unwrap();
+        assert!(!bad_is_reachable(&out), "Holds ⇒ bad unreachable");
+    }
+
+    #[test]
+    fn implies_next_monitor_matches_oracle_violated() {
+        // AG(state==0 |=> state==2): from 0 the next is 1, not 2 → Violated → bad.
+        let ante = OracleAtom::new("state", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state", CmpOp::Eq, 2);
+        assert!(matches!(
+            ag_implies_next(
+                &parser::parse(CYCLE_FSM).unwrap(),
+                &ante,
+                &cons,
+                256,
+                8,
+                false
+            )
+            .unwrap(),
+            AgOracle::Violated(_)
+        ));
+        let out = emit_ag_implies_next_monitor(CYCLE_FSM, &ante, &cons, false).unwrap();
+        assert!(bad_is_reachable(&out), "Violated ⇒ bad reachable");
+    }
+
+    #[test]
+    fn implies_next_synthesises_the_latch() {
+        let ante = OracleAtom::new("state", CmpOp::Eq, 0);
+        let cons = OracleAtom::new("state", CmpOp::Eq, 1);
+        let out = emit_ag_implies_next_monitor(CYCLE_FSM, &ante, &cons, false).unwrap();
+        let file = parser::parse(&out).expect("parses");
+        let symbols = parser::collect_symbols(&file);
+        assert!(
+            symbols.values().any(|s| s == ANTE_PREV_SYMBOL),
+            "the |=> monitor latches the antecedent"
+        );
+    }
+
+    #[test]
+    fn non_state_signal_is_rejected() {
+        assert!(emit_ag_state_atom_monitor(CYCLE_FSM, "nope", CmpOp::Eq, 0, false).is_err());
+    }
+}

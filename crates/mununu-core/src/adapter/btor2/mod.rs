@@ -20,6 +20,7 @@
 //! - Multi-clock designs.
 
 pub mod ast;
+pub mod bad_monitor;
 pub mod bit_blast;
 pub mod cegar;
 pub mod concrete_oracle;
