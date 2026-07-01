@@ -256,6 +256,16 @@ impl<'a> Parser<'a> {
                 if let Some(rhs) = self.parse_comparison_rhs() {
                     full.push(' ');
                     full.push_str(&rhs);
+                    // H.G — an arithmetic-addend RHS `<reg> + <int>`
+                    // (`cnt_q == cnt_q__past + 1`, sysrst `CntIncr_A`). Only when
+                    // the RHS is a register (identifier), consume an optional
+                    // ` + <int>` so the atom string carries the full arithmetic
+                    // relational for `parse_predicate_expr` (→ `CmpRegAddend`).
+                    if rhs.starts_with(is_ident_start)
+                        && let Some(addend) = self.try_consume_addend()
+                    {
+                        full.push_str(&addend);
+                    }
                     return Ok(self.builder.push_node(Node::Predicate(full)));
                 }
                 // No valid RHS — fall back to predicate-only. The leading
@@ -331,6 +341,35 @@ impl<'a> Parser<'a> {
             return Some("false".to_string());
         }
         self.parse_identifier()
+    }
+
+    /// H.G — after a comparison RHS register, optionally consume ` + <int>` (the
+    /// arithmetic addend of `cnt_q == cnt_q__past + 1`). Returns the canonical
+    /// ` + <digits>` suffix to append to the predicate atom string (so
+    /// `parse_predicate_expr` reads a `CmpRegAddend`), or `None` if no `+ <int>`
+    /// follows (position restored). Only `+` (a single constant addend) — no
+    /// general arithmetic.
+    fn try_consume_addend(&mut self) -> Option<String> {
+        let save = self.pos;
+        self.skip_whitespace();
+        if self.peek_char() != Some('+') {
+            self.pos = save;
+            return None;
+        }
+        self.consume_char(); // '+'
+        self.skip_whitespace();
+        let dstart = self.pos;
+        let mut has_digit = false;
+        while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
+            self.consume_char();
+            has_digit = true;
+        }
+        if !has_digit {
+            self.pos = save;
+            return None;
+        }
+        let digits = self.input[dstart..self.pos].to_string();
+        Some(format!(" + {digits}"))
     }
 
     /// Parses a modal guard up to the provided closing delimiter.
@@ -910,6 +949,25 @@ mod tests {
         let formula = parse("p").unwrap();
         assert!(matches!(formula.node(formula.root()), Node::Predicate(_)));
         assert_eq!(predicate_name(&formula, formula.root()), "p");
+    }
+
+    #[test]
+    fn parses_arithmetic_addend_predicate() {
+        // H.G — `cnt_q == cnt_q__past + 1` must parse as ONE predicate atom
+        // carrying the arithmetic addend (previously the `+ 1` was left dangling,
+        // so `[] (cnt_q == cnt_q__past + 1)` failed with "expected `)`").
+        let formula = parse("cnt_q == cnt_q__past + 1").unwrap();
+        assert_eq!(
+            predicate_name(&formula, formula.root()),
+            "cnt_q == cnt_q__past + 1"
+        );
+        // Inside a box + fixpoint (sva_15's exact shape) it parses end-to-end.
+        parse("nu X. (((!((cnt_en && (!(cnt_clr)))) || [] (cnt_q == cnt_q__past + 1))) && [] X)")
+            .expect("sva_15-shaped formula parses");
+        // A literal RHS keeps its own `+`-free form; a `+` after a literal is NOT
+        // consumed as an addend (only after an identifier RHS).
+        let lit = parse("cnt_q == 3").unwrap();
+        assert_eq!(predicate_name(&lit, lit.root()), "cnt_q == 3");
     }
 
     #[test]

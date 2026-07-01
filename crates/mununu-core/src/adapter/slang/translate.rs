@@ -677,6 +677,18 @@ fn compare(expr: &Value, op: &str) -> Result<String, String> {
     if let (Some(l), Some(r)) = (cmp_signal_atom(left), cmp_signal_atom(right)) {
         return Ok(format!("({l} {op} {r})"));
     }
+    // (4b) H.G — arithmetic relational `signal OP (signal + literal)` — the sole
+    // arithmetic form (`cnt_q == $past(cnt_q) + 1`, sysrst `CntIncr_A`). Lowers to
+    // `PredicateExpr::CmpRegAddend`, whose SMT encoding is BV `bvadd` at the
+    // register width (wraps exactly as the RTL `+`). The addend base may be a
+    // `$past` shadow; the addend itself is a non-negative literal. Binding is the
+    // cube path's job (routed SMT-only there); the translation is sound
+    // regardless of what the operands resolve to.
+    if let Some(l) = cmp_signal_atom(left)
+        && let Some((r, addend)) = add_signal_literal(right)
+    {
+        return Ok(format!("({l} {op} {r} + {addend})"));
+    }
     // (5) H.D — negation-peel for 1-bit boolean eq/ne: `(!x) == y` ≡ `x != y`,
     // `(!x) != y` ≡ `x == y` (and the `(!x) ==/!= literal` forms). Peel a 1-bit
     // `!signal` on either side and flip the eq/ne operator, then re-resolve the
@@ -770,6 +782,33 @@ fn cmp_signal_atom(expr: &Value) -> Option<String> {
             .map(|(sig, _)| past_shadow_name(sig));
     }
     signal_name(expr).ok().map(|s| s.to_string())
+}
+
+/// H.G — if `expr` is `signal + literal` (or `literal + signal`), return the
+/// signal atom (a plain name or a `$past` shadow) and the non-negative literal
+/// addend. The base of the `CmpRegAddend` arithmetic relational (the sole
+/// arithmetic form the translator accepts, `== $past(cnt) + 1`). Slang names the
+/// `+` binary operator `"Add"`.
+fn add_signal_literal(expr: &Value) -> Option<(String, u64)> {
+    let expr = unwrap(expr);
+    if expr.get("kind").and_then(Value::as_str) != Some("BinaryOp")
+        || expr.get("op").and_then(Value::as_str) != Some("Add")
+    {
+        return None;
+    }
+    let l = unwrap(expr.get("left")?);
+    let r = unwrap(expr.get("right")?);
+    if let (Some(sig), Some(lit)) = (cmp_signal_atom(l), sv_integer(r))
+        && lit >= 0
+    {
+        return Some((sig, lit as u64));
+    }
+    if let (Some(lit), Some(sig)) = (sv_integer(l), cmp_signal_atom(r))
+        && lit >= 0
+    {
+        return Some((sig, lit as u64));
+    }
+    None
 }
 
 /// A Tier-2 history call (`$past`/`$stable`/`$changed`/`$rose`/`$fell`) takes
@@ -1367,6 +1406,38 @@ mod tests {
     }
 
     #[test]
+    fn hg_arithmetic_addend_translates() {
+        // H.G — `cnt_q == $past(cnt_q) + 1` (sysrst `CntIncr_A`), previously
+        // rejected as "arithmetic operand not supported". Now translates to the
+        // arithmetic relational atom (→ `PredicateExpr::CmpRegAddend`, BV `+`).
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "Equality",
+            "left":  {"kind": "NamedValue", "symbol": "1 cnt_q", "type": "logic[31:0]"},
+            "right": {
+                "kind": "BinaryOp", "op": "Add",
+                "left":  history_call("$past", "cnt_q", "logic[31:0]"),
+                "right": {"kind": "IntegerLiteral", "value": "1", "constant": "1"}
+            }
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(cnt_q == cnt_q__past + 1)");
+    }
+
+    #[test]
+    fn hg_arithmetic_addend_plain_register_base() {
+        // H.G — the base need not be `$past`: `x == y + 2` also translates.
+        let cmp = serde_json::json!({
+            "kind": "BinaryOp", "op": "Equality",
+            "left":  {"kind": "NamedValue", "symbol": "1 x", "type": "logic[7:0]"},
+            "right": {
+                "kind": "BinaryOp", "op": "Add",
+                "left":  {"kind": "NamedValue", "symbol": "2 y", "type": "logic[7:0]"},
+                "right": {"kind": "IntegerLiteral", "value": "2", "constant": "2"}
+            }
+        });
+        assert_eq!(bool_expr(&cmp).unwrap(), "(x == y + 2)");
+    }
+
+    #[test]
     fn hd_relational_signal_eq_signal_translates() {
         // H.D — general dataflow equality `data_o == data_i` (no `$past` side).
         let cmp = serde_json::json!({
@@ -1416,17 +1487,30 @@ mod tests {
     }
 
     #[test]
-    fn hd_arithmetic_rhs_still_unsupported_with_clear_reason() {
-        // H.D — `cnt == cnt + 1` (arithmetic RHS) stays unsupported: the
-        // predicate layer is arithmetic-free; the error must say so.
-        let cmp = serde_json::json!({
+    fn hg_nonlinear_arithmetic_still_unsupported_with_clear_reason() {
+        // H.G supports the `reg + const` addend (`hg_arithmetic_addend_translates`).
+        // NON-linear / non-constant arithmetic stays unsupported: a `reg * const`
+        // (Multiply, not Add) and a `reg + reg` (two-register addend, no literal)
+        // both fall through to the honest reject — the predicate layer carries
+        // only a constant addend, not general arithmetic.
+        let mul = serde_json::json!({
+            "kind": "BinaryOp", "op": "Equality",
+            "left":  {"kind": "NamedValue", "symbol": "1 cnt", "type": "logic[3:0]"},
+            "right": {"kind": "BinaryOp", "op": "Multiply",
+                      "left":  {"kind": "NamedValue", "symbol": "1 cnt", "type": "logic[3:0]"},
+                      "right": {"kind": "IntegerLiteral", "value": "2", "constant": "2"}}
+        });
+        let err = bool_expr(&mul).expect_err("multiply RHS must reject");
+        assert!(err.contains("arithmetic"), "got: {err}");
+
+        let two_reg = serde_json::json!({
             "kind": "BinaryOp", "op": "Equality",
             "left":  {"kind": "NamedValue", "symbol": "1 cnt", "type": "logic[3:0]"},
             "right": {"kind": "BinaryOp", "op": "Add",
-                      "left":  {"kind": "NamedValue", "symbol": "1 cnt", "type": "logic[3:0]"},
-                      "right": {"kind": "IntegerLiteral", "value": "1", "constant": "1"}}
+                      "left":  {"kind": "NamedValue", "symbol": "1 a", "type": "logic[3:0]"},
+                      "right": {"kind": "NamedValue", "symbol": "2 b", "type": "logic[3:0]"}}
         });
-        let err = bool_expr(&cmp).expect_err("arithmetic RHS must reject");
+        let err = bool_expr(&two_reg).expect_err("two-register addend must reject");
         assert!(err.contains("arithmetic"), "got: {err}");
     }
 
