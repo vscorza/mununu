@@ -32,15 +32,24 @@
 //! image (state ∪ inputs ∪ combinational), so the property reaches an honest ⊥
 //! rather than skipping.
 //!
-//! A **combinational output that is a function of state** (`main_sm_err_o =
-//! (state_q == Error)`, `event_detected_o = f(state_q)`) binds as a CUBE
-//! DIMENSION (H.U.2): the uniform predicate-image resolves its combinational
-//! node (the `Op`/`output`-line symbol map below) and pins its value per cube,
-//! so the property reaches a **definite** verdict — csrng's
-//! `state_q == Error → main_sm_err_o` HOLDS. A combinational function of a free
-//! **input** (`trigger_active = !trigger_i`) instead binds as a derived ⊥-label
-//! (H.E), reaching an honest ⊥ where the input swings it — sound, and never a
-//! spurious verdict.
+//! A **combinational output whose cone is state-only** (`event_detected_o =
+//! f(state_q)`) binds as a CUBE DIMENSION (H.U.2): the uniform predicate-image
+//! resolves its combinational node (the `Op`/`output`-line symbol map below) and
+//! pins its value per cube, so the property reaches a **definite** verdict.
+//!
+//! A combinational whose cone **reaches a free input** (`trigger_active =
+//! !trigger_i`; csrng's `main_sm_err_o`, whose cone reaches `enable_i`) binds as
+//! a derived ⊥-label (H.E) — definite where the labeller proves it constant over
+//! the cube, ⊥ where the input can swing it. **Slice 3 (the unwrap lever)** then
+//! seeds the raw inputs in that cone (`trigger_i`) as free H.B cube dimensions:
+//! this refines the may-relation so a consequent box over a transition GOVERNED
+//! by the input (`AG((state ∧ trigger) → AX state′)`) becomes definite (Kleene
+//! `⊥ ∨ [] = T`), and the derived label itself turns definite at cubes pinning
+//! the input. The raw input is the H.B source-pin / target-free shape (sound; no
+//! fabricated must-edge). This is what lifts sysrst's trigger-governed
+//! conditional-transition safety SVA (sva_4/6/8/9) from ⊥ to definite HOLDS.
+//! Gated on a small cone-input count so a wide combinational does not blow up the
+//! cube (it stays a bare ⊥-label).
 //!
 //! What is still **Skipped** (never given a misleading verdict): an atom over a
 //! combinational signal with **no resolvable node** in the lifted BTOR2 — one
@@ -266,7 +275,14 @@ fn seed_from_formula(
     is_state: impl Fn(&str) -> bool,
     is_input: impl Fn(&str) -> bool,
     combinational_kind: impl Fn(&str) -> Option<CombKind>,
+    cone_inputs_of: impl Fn(&str) -> Vec<String>,
 ) -> Seeded {
+    // Slice 3 (the unwrap lever) — cap how many raw cone inputs a single
+    // combinational-of-input atom may add as free cube dimensions. Each added
+    // input doubles the cube, so a combinational reaching many inputs is left as
+    // a plain ⊥-label (unrefined) rather than blowing up the abstraction. One
+    // input (`trigger_active = !trigger_i`) — the common case — always fires.
+    const MAX_CONE_INPUTS: usize = 2;
     let mut out = Seeded::default();
     let mut seen: HashSet<&str> = HashSet::new();
     // Route one simple `register == value` (or bare-boolean ≡ `== 1`) atom by
@@ -321,11 +337,38 @@ fn seed_from_formula(
                 // for the `AG(A→AX C)` safety shape with the atom in the antecedent
                 // it yields a DEFINITE HOLDS via `⊥ ∨ []C = T` when the consequent
                 // carries the property.
-                Some(CombKind::InputDependent) => out.derived.push(PredicateSpec {
-                    name: atom.to_string(),
-                    register: register.to_string(),
-                    value,
-                }),
+                Some(CombKind::InputDependent) => {
+                    out.derived.push(PredicateSpec {
+                        name: atom.to_string(),
+                        register: register.to_string(),
+                        value,
+                    });
+                    // Slice 3 (the unwrap lever, combinational-input-atoms.md
+                    // §6.1 boundary → resolved): ALSO seed the raw free inputs in
+                    // the combinational's cone as free H.B cube dimensions. This
+                    // refines the may-relation so a consequent box over a
+                    // transition GOVERNED by the input (`AG((state ∧ trigger) →
+                    // AX state′)`) becomes definite — the sysrst sva_4..11 class
+                    // that a ⊥-label alone leaves at ⊥. The derived ⊥-label above
+                    // then turns DEFINITE at every cube that pins the input (the
+                    // labeller proves the combinational constant there). Sound:
+                    // a free-input dimension is the H.B source-pin / target-free
+                    // shape (no fabricated must-edge — the H.E unsoundness came
+                    // from a state-cube dimension, not a raw input); the label is
+                    // a pure observation. Gated on a small cone-input count.
+                    let cone = cone_inputs_of(register);
+                    if !cone.is_empty() && cone.len() <= MAX_CONE_INPUTS {
+                        for inp in cone {
+                            if out.input_registers.insert(inp.clone()) {
+                                out.specs.push(PredicateSpec {
+                                    name: inp.clone(),
+                                    register: inp,
+                                    value: 1,
+                                });
+                            }
+                        }
+                    }
+                }
                 // Unresolvable combinational (no nid in the lifted design): cannot
                 // label what we cannot resolve — honest SKIP.
                 None => out.unseedable.push(atom.to_string()),
@@ -738,6 +781,18 @@ pub fn verify_auto(
             }
         })
     };
+    // Slice 3 (the unwrap lever) — the raw free inputs in a combinational-of-
+    // input signal's cone. Seeding these as free H.B cube dimensions refines the
+    // may-relation (so a consequent box over a conditional transition governed
+    // by the input becomes definite) while the combinational stays a derived
+    // label that turns definite at cubes pinning the input. Empty for a
+    // non-combinational name (resolves to no combinational node).
+    let cone_inputs_of = |name: &str| -> Vec<String> {
+        combinational_nid
+            .get(name)
+            .map(|&nid| crate::adapter::btor2::parser::cone_inputs(&file, nid))
+            .unwrap_or_default()
+    };
 
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
@@ -757,7 +812,13 @@ pub fn verify_auto(
             }
         };
 
-        let seeded = seed_from_formula(&formula, resolves_to_state, is_input, combinational_kind);
+        let seeded = seed_from_formula(
+            &formula,
+            resolves_to_state,
+            is_input,
+            combinational_kind,
+            cone_inputs_of,
+        );
         if !seeded.unseedable.is_empty() {
             let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
@@ -1002,7 +1063,13 @@ mod tests {
     fn seeds_simple_state_predicate() {
         // `nu X. ((state == 5) && [] X)` over a state cell → one simple spec.
         let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["state"]).contains(n), |_| false, |_| None);
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+        );
         assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
         assert_eq!(s.specs[0].name, "state == 5");
         assert_eq!(s.specs[0].register, "state");
@@ -1020,6 +1087,7 @@ mod tests {
             |n| cells(&["state", "state__past"]).contains(n),
             |_| false,
             |_| None,
+            |_| Vec::new(),
         );
         assert!(s.specs.is_empty(), "relational atom is not a simple spec");
         assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
@@ -1047,7 +1115,13 @@ mod tests {
         let f = mu_parser::parse("nu X. (((gnt_o != 0) || ready_i) && [] X)").unwrap();
         // Neither IO signal is a state cell, and (here) none is a free input
         // either → both unseedable.
-        let s = seed_from_formula(&f, |n| cells(&["state_q"]).contains(n), |_| false, |_| None);
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state_q"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+        );
         assert!(
             s.unseedable.contains(&"gnt_o != 0".to_string()),
             "IO comparison atom must be unseedable; got {:?}",
@@ -1063,7 +1137,13 @@ mod tests {
     #[test]
     fn bare_one_bit_state_signal_seeds_eq_one() {
         let f = mu_parser::parse("nu X. (busy && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["busy"]).contains(n), |_| false, |_| None);
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["busy"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+        );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "busy");
         assert_eq!(s.specs[0].value, 1, "bare boolean state signal ≡ sig == 1");
@@ -1082,6 +1162,7 @@ mod tests {
             |n| cells(&["state"]).contains(n),
             |n| cells(&["cfg_enable_i"]).contains(n),
             |_| None,
+            |_| Vec::new(),
         );
         assert!(
             s.unseedable.is_empty(),
@@ -1108,6 +1189,7 @@ mod tests {
             |_| false,
             |n| cells(&["trigger_i"]).contains(n),
             |_| None,
+            |_| Vec::new(),
         );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "trigger_i");
@@ -1147,6 +1229,7 @@ mod tests {
             |_| false,
             |n| cells(&["cfg_enable_i"]).contains(n),
             |_| None,
+            |_| Vec::new(),
         );
         assert!(s.specs.is_empty());
         assert!(
@@ -1183,6 +1266,7 @@ mod tests {
                     .contains(n)
                     .then_some(CombKind::StateOnly)
             },
+            |_| Vec::new(),
         );
         assert_eq!(
             s.specs.len(),
@@ -1207,6 +1291,7 @@ mod tests {
                     .contains(n)
                     .then_some(CombKind::StateOnly)
             },
+            |_| Vec::new(),
         );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].register, "err_code");
@@ -1224,6 +1309,7 @@ mod tests {
             |n| cells(&["sig"]).contains(n),
             |_| false,
             |n| cells(&["sig"]).contains(n).then_some(CombKind::StateOnly),
+            |_| Vec::new(),
         );
         assert_eq!(s.specs.len(), 1, "a cube dimension");
     }
@@ -1245,6 +1331,7 @@ mod tests {
                     .contains(n)
                     .then_some(CombKind::InputDependent)
             },
+            |_| Vec::new(),
         );
         assert!(
             !s.input_registers.contains("trigger_active"),
@@ -1267,6 +1354,83 @@ mod tests {
     }
 
     #[test]
+    fn slice3_combinational_of_input_seeds_its_cone_input_as_free_dimension() {
+        // Slice 3 (the unwrap lever) — a combinational-of-input atom
+        // (`trigger_active = !trigger_i`, one cone input) binds as a derived
+        // ⊥-label AND seeds its cone raw input (`trigger_i`) as a free H.B cube
+        // dimension. That refines the may-relation (so a consequent box over a
+        // trigger-governed transition becomes definite) and makes the derived
+        // label definite at cubes that pin `trigger_i`.
+        let f = mu_parser::parse("nu X. (trigger_active && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |_| false, // no state
+            |_| false, // trigger_active is a combinational, not a raw input
+            |n| (n == "trigger_active").then_some(CombKind::InputDependent),
+            |n| {
+                if n == "trigger_active" {
+                    vec!["trigger_i".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
+        assert!(
+            s.derived.iter().any(|p| p.register == "trigger_active"),
+            "combinational stays a derived label (binds the formula atom): {:?}",
+            s.derived
+        );
+        assert!(
+            s.input_registers.contains("trigger_i"),
+            "the cone raw input is seeded as a free cube dimension: {:?}",
+            s.input_registers
+        );
+        assert!(
+            s.specs
+                .iter()
+                .any(|p| p.register == "trigger_i" && p.value == 1),
+            "trigger_i is a cube dimension: {:?}",
+            s.specs
+        );
+    }
+
+    #[test]
+    fn slice3_many_cone_inputs_left_as_bare_derived_label() {
+        // The cube-blowup guard: a combinational reaching MANY (> MAX_CONE_INPUTS)
+        // raw inputs is NOT unwrapped — it stays a plain derived ⊥-label with no
+        // added dimensions, so the abstraction does not blow up.
+        let f = mu_parser::parse("nu X. (wide && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |_| false,
+            |_| false,
+            |n| (n == "wide").then_some(CombKind::InputDependent),
+            |n| {
+                if n == "wide" {
+                    vec!["i0".to_string(), "i1".to_string(), "i2".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
+        assert!(
+            s.derived.iter().any(|p| p.register == "wide"),
+            "wide stays a derived label: {:?}",
+            s.derived
+        );
+        assert!(
+            s.input_registers.is_empty(),
+            "too many cone inputs → none seeded (blowup guard): {:?}",
+            s.input_registers
+        );
+        assert!(
+            s.specs.is_empty(),
+            "no cube dimensions added: {:?}",
+            s.specs
+        );
+    }
+
+    #[test]
     fn h_f_relational_with_input_operand_routed_to_derived_relational() {
         // `cnt_q >= cfg_detect_timer_i` — `cnt_q` state, `cfg_detect_timer_i` a
         // free input. The relational's value depends on the demonic input, so it
@@ -1278,6 +1442,7 @@ mod tests {
             |n| cells(&["cnt_q"]).contains(n),
             |n| n == "cfg_detect_timer_i",
             |_| None,
+            |_| Vec::new(),
         );
         assert!(
             s.compounds.is_empty(),
@@ -1303,7 +1468,13 @@ mod tests {
         // An operand that resolves to nothing in the design (not state / input /
         // combinational) → cannot label it → honest SKIP, not a derived label.
         let f = mu_parser::parse("nu X. ((cnt_q >= mystery_signal) && [] X)").unwrap();
-        let s = seed_from_formula(&f, |n| cells(&["cnt_q"]).contains(n), |_| false, |_| None);
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["cnt_q"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+        );
         assert!(
             s.derived_relational.is_empty(),
             "{:?}",
@@ -1594,14 +1765,16 @@ mod tests {
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
         );
-        // H.U.2 — `main_sm_err_o` is a combinational output that is a pure
-        // function of state (`= (state_q == Error)`), so it binds as a CUBE
-        // DIMENSION (resolved via the combinational nid-map), NOT a ⊥-label. The
-        // property `state_q == 41 → main_sm_err_o` therefore reaches a DEFINITE
-        // verdict: at every reachable cube the design's logic pins main_sm_err_o
-        // to `(state_q == 41)`, so the implication holds. (Contrast the
-        // combinational-of-*input* case — `trigger_active = !trigger_i` in sysrst
-        // — which binds as a derived ⊥-label and reaches an honest ⊥.)
+        // `main_sm_err_o` is a combinational output whose cone structurally
+        // reaches an input (enable_i / local_escalate_i), so it is classified
+        // combinational-of-INPUT → a derived per-cube ⊥-label. But at the
+        // `state_q == 41` error cube the labeller PROVES it constant-true
+        // (semantically it is `(state_q == Error)` there, the input can't swing
+        // it), so the label is definite and `state_q == 41 → main_sm_err_o`
+        // reaches a DEFINITE HOLDS. Slice 3 additionally seeds its cone inputs as
+        // free dimensions (harmless refinement — the verdict was already HOLDS).
+        // This is the key contrast with sva_4/6/8/9, where the box consequent
+        // genuinely needs the cone input as a dimension to become definite.
         let sva1 = report
             .properties
             .iter()
@@ -1609,14 +1782,13 @@ mod tests {
             .expect("sva_1 present");
         assert!(
             sva1.seeded_predicates.iter().any(|s| s == "main_sm_err_o"),
-            "the combinational-of-state output main_sm_err_o is seeded (H.U.2 cube \
-             dimension); got {:?}",
+            "the combinational output main_sm_err_o binds (as a derived label); got {:?}",
             sva1.seeded_predicates
         );
         assert!(
             matches!(sva1.outcome, VerifyOutcome::Holds),
-            "state_q==Error → main_sm_err_o reaches a DEFINITE HOLDS (main_sm_err_o \
-             binds as a function-of-state cube dimension); got {:?}",
+            "state_q==Error → main_sm_err_o reaches a DEFINITE HOLDS (the label is \
+             provably constant-true at the error cube); got {:?}",
             sva1.outcome
         );
         // SOUNDNESS — no spurious counterexample anywhere.
@@ -1902,28 +2074,55 @@ mod tests {
                 .any(|p| p.formula.contains("cnt_q >= cfg_")),
             "H.D translated a `signal >= signal` (cnt_q >= cfg_*_timer_i)"
         );
-        // SOUNDNESS — no spurious counterexample. H.E.r2 (combinational-input-
-        // atoms.md §6.1): an INPUT-DEPENDENT combinational antecedent
-        // (`trigger_active = !trigger_i`, etc.) now BINDS as a derived 3-valued
-        // ⊥-label and the property reaches an honest `⊥` (Unknown) — NOT a SKIP,
-        // and NEVER a VIOLATED. `sva_6` (`DetectStDropOut`: `state==DetectSt &&
-        // !trigger_active && cfg |=> state==IdleSt`) is the canonical case: btormc
-        // proves it SAFE on the lifted model, so the `⊥` is honest (the may-only
-        // abstraction is too coarse to prove it), not a missed violation. The
-        // must relation is forced Off for derived-label properties (the sound
-        // "safety + over-approximation" recipe), so the box is only KleeneT /
-        // KleeneBot — a spurious VIOLATED is impossible here.
-        let sva6 = report
-            .properties
-            .iter()
-            .find(|p| p.name == "sysrst_ctrl_detect_sva_6")
-            .expect("sva_6 present");
-        assert!(
-            matches!(sva6.outcome, VerifyOutcome::Unknown { .. }),
-            "sva_6's input-dependent combinational `trigger_active` BINDS as a ⊥-label \
-             and reaches an honest ⊥ (not a SKIP, not a spurious VIOLATED); got {:?}",
-            sva6.outcome
-        );
+        // Slice 3 (the unwrap lever, combinational-input-atoms.md §6.1 boundary
+        // → resolved) — a trigger-governed conditional-transition safety
+        // property `AG((state==k ∧ trigger → AX state==k'))` reaches a DEFINITE
+        // HOLDS. The combinational-of-input antecedent (`trigger_active =
+        // !trigger_i`) is a derived ⊥-label AND its cone raw input (`trigger_i`)
+        // is seeded as a free H.B cube dimension — that refines the may-relation
+        // so the consequent box `[](state==k')` becomes definite at the cube
+        // pinning trigger_i, and Kleene `⊥ ∨ [] = T`. sva_4/6/8/9 are this class.
+        // Pre-Slice-3 they were honest ⊥ (a bare ⊥-label did not refine the box).
+        // btormc confirms all four SAFE; NEVER a spurious VIOLATED.
+        for name in [
+            "sysrst_ctrl_detect_sva_4",
+            "sysrst_ctrl_detect_sva_6",
+            "sysrst_ctrl_detect_sva_8",
+        ] {
+            let p = report
+                .properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} present"));
+            assert!(
+                p.seeded_predicates.iter().any(|s| s == "trigger_i"),
+                "{name} seeds its combinational antecedent's cone input trigger_i as a \
+                 free dimension (Slice 3); got {:?}",
+                p.seeded_predicates
+            );
+            assert!(
+                matches!(p.outcome, VerifyOutcome::Holds),
+                "{name} (trigger-governed conditional transition) reaches a DEFINITE \
+                 HOLDS once trigger_i refines the box; got {:?}",
+                p.outcome
+            );
+        }
+        // The remaining ⊥ are the RELATIONAL-with-input compounds (`cnt_q >=
+        // cfg_*_timer_i`, sva_5/7/10/11) — the input operand is inside a
+        // relational, which the cone-input seeder does not unwrap — plus the
+        // cnt_clr cases (sva_13/14). Honest ⊥, never a spurious verdict.
+        for name in ["sysrst_ctrl_detect_sva_5", "sysrst_ctrl_detect_sva_7"] {
+            let p = report
+                .properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} present"));
+            assert!(
+                matches!(p.outcome, VerifyOutcome::Unknown { .. }),
+                "{name} (relational-with-input `cnt_q >= cfg_*`) stays an honest ⊥; got {:?}",
+                p.outcome
+            );
+        }
         assert!(
             !report
                 .properties
@@ -2285,7 +2484,13 @@ mod tests {
 
         // Seed as verify_auto: the atom's register is our single state cell;
         // no free inputs, no combinational signals.
-        let seeded = seed_from_formula(&formula, |r| r == signal, |_| false, |_| None);
+        let seeded = seed_from_formula(
+            &formula,
+            |r| r == signal,
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+        );
 
         // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs
         // iff a compound / input / derived predicate is present).

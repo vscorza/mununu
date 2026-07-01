@@ -554,6 +554,56 @@ pub fn cone_reaches_input(file: &Btor2File, start: Nid) -> bool {
     false
 }
 
+/// Collect the *symbols* of every primary input reachable in the combinational
+/// cone of `start`. The dual of [`cone_reaches_input`] (which only reports
+/// existence): the returned names are the raw free inputs a
+/// combinational-of-input signal `g(s,i)` depends on.
+///
+/// The verify-auto seeder uses this to seed those raw inputs as free H.B cube
+/// dimensions (refining the may-relation so a consequent box over a
+/// conditional transition becomes definite), while the combinational itself
+/// stays a derived per-cube label (now definite at cubes that pin the input).
+/// Deterministic (sorted, deduped). An input with no symbol is skipped (it is
+/// not seedable by name).
+pub fn cone_inputs(file: &Btor2File, start: Nid) -> Vec<String> {
+    let symbols = collect_symbols(file);
+    let mut seen: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    let mut inputs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut work: Vec<Nid> = vec![start];
+    while let Some(nid) = work.pop() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        let Some(line) = file.lookup(nid) else {
+            continue;
+        };
+        match &line.node {
+            Node::Input { .. } => {
+                if let Some(s) = symbols.get(&nid) {
+                    inputs.insert(s.clone());
+                }
+            }
+            Node::State { .. } | Node::Const { .. } | Node::Sort { .. } => {}
+            Node::Op { args, .. } => {
+                for a in args {
+                    work.push(a.nid());
+                }
+            }
+            Node::Init { value, .. } | Node::Next { value, .. } => work.push(value.nid()),
+            Node::Bad { signal }
+            | Node::Constraint { signal }
+            | Node::Fair { signal }
+            | Node::Output { signal, .. } => work.push(signal.nid()),
+            Node::Justice { signals } => {
+                for s in signals {
+                    work.push(s.nid());
+                }
+            }
+        }
+    }
+    inputs.into_iter().collect()
+}
+
 pub fn resolve_state_by_symbol(file: &Btor2File, symbol: &str) -> Option<Nid> {
     let mut best: Option<(Nid, usize)> = None;
     let mut tied: bool = false;
