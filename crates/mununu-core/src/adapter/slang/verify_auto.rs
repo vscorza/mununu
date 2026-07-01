@@ -30,14 +30,23 @@
 //! `cnt_q >= cfg_*_timer_i`) BINDS as a derived RELATIONAL label (H.F): the
 //! per-cube 3-valued labeller resolves each operand over the uniform source
 //! image (state ∪ inputs ∪ combinational), so the property reaches an honest ⊥
-//! rather than skipping. Combinational-of-input *antecedents*
-//! (`trigger_active = !trigger_i`) likewise bind as derived ⊥-labels (H.E).
+//! rather than skipping.
+//!
+//! A **combinational output that is a function of state** (`main_sm_err_o =
+//! (state_q == Error)`, `event_detected_o = f(state_q)`) binds as a CUBE
+//! DIMENSION (H.U.2): the uniform predicate-image resolves its combinational
+//! node (the `Op`/`output`-line symbol map below) and pins its value per cube,
+//! so the property reaches a **definite** verdict — csrng's
+//! `state_q == Error → main_sm_err_o` HOLDS. A combinational function of a free
+//! **input** (`trigger_active = !trigger_i`) instead binds as a derived ⊥-label
+//! (H.E), reaching an honest ⊥ where the input swings it — sound, and never a
+//! spurious verdict.
 //!
 //! What is still **Skipped** (never given a misleading verdict): an atom over a
-//! pure **combinational output** that is a function of state (an `eq`/`or` of
-//! state like csrng's `main_sm_err_o` — case 4 of the design doc; needs the
-//! signal-node mapping a follow-up adds). Such an atom is reported Skipped with
-//! a reason — binding it would fall through to the evaluator's "unknown ⇒ false"
+//! combinational signal with **no resolvable node** in the lifted BTOR2 — one
+//! Yosys `flatten`/`opt` dropped, leaving no `state` / `input` / `Op` / `output`
+//! symbol to map. It is reported Skipped with a reason — labelling what we
+//! cannot resolve would fall through to the evaluator's "unknown ⇒ false"
 //! under-approx and silently produce a vacuous verdict.
 
 use std::collections::HashSet;
@@ -1585,12 +1594,32 @@ mod tests {
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
         );
-        // SOUNDNESS — no spurious counterexample. H.E.r2: the combinational-of-
-        // input output `main_sm_err_o` now BINDS as a derived 3-valued ⊥-label
-        // (NOT mis-bound to the state register); at the `state_q==41` error cube
-        // the label is a sound definite-true, so `state_q==41 |=> main_sm_err_o`
-        // reaches HOLDS via Kleene `F ∨ T = T`. Never a spurious VIOLATED (the
-        // must relation is forced Off for derived-label properties).
+        // H.U.2 — `main_sm_err_o` is a combinational output that is a pure
+        // function of state (`= (state_q == Error)`), so it binds as a CUBE
+        // DIMENSION (resolved via the combinational nid-map), NOT a ⊥-label. The
+        // property `state_q == 41 → main_sm_err_o` therefore reaches a DEFINITE
+        // verdict: at every reachable cube the design's logic pins main_sm_err_o
+        // to `(state_q == 41)`, so the implication holds. (Contrast the
+        // combinational-of-*input* case — `trigger_active = !trigger_i` in sysrst
+        // — which binds as a derived ⊥-label and reaches an honest ⊥.)
+        let sva1 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "csrng_main_sm_sva_1")
+            .expect("sva_1 present");
+        assert!(
+            sva1.seeded_predicates.iter().any(|s| s == "main_sm_err_o"),
+            "the combinational-of-state output main_sm_err_o is seeded (H.U.2 cube \
+             dimension); got {:?}",
+            sva1.seeded_predicates
+        );
+        assert!(
+            matches!(sva1.outcome, VerifyOutcome::Holds),
+            "state_q==Error → main_sm_err_o reaches a DEFINITE HOLDS (main_sm_err_o \
+             binds as a function-of-state cube dimension); got {:?}",
+            sva1.outcome
+        );
+        // SOUNDNESS — no spurious counterexample anywhere.
         assert!(
             !report
                 .properties
@@ -1805,6 +1834,34 @@ mod tests {
             "sva_2 (`trigger_i != !trigger_i` tautology) reaches a sound HOLDS; got {:?}",
             sva2.outcome
         );
+        // H.U.2 — a combinational output that is a function of STATE
+        // (`event_detected_o` / `event_detected_pulse_o` = f(state_q)) binds as a
+        // CUBE DIMENSION and reaches a DEFINITE verdict: sva_1
+        // (`cfg_enable_i → ¬event_detected_o ∧ ¬event_detected_pulse_o`) and
+        // sva_12 (`event_pulse → AX ¬event_pulse`) both HOLD. The still-⊥ props
+        // (sva_4..11) are ⊥ from their combinational-of-*input* antecedents
+        // (`trigger_active`/`cnt_q >= cfg_*`), NOT from any combinational binding
+        // gap — every combinational atom binds (SKIPPED is 0, asserted above).
+        for name in ["sysrst_ctrl_detect_sva_1", "sysrst_ctrl_detect_sva_12"] {
+            let p = report
+                .properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} present"));
+            assert!(
+                p.seeded_predicates
+                    .iter()
+                    .any(|s| s.contains("event_detected")),
+                "{name} seeds a combinational-of-state event_detected_* output; got {:?}",
+                p.seeded_predicates
+            );
+            assert!(
+                matches!(p.outcome, VerifyOutcome::Holds),
+                "{name} reaches a DEFINITE HOLDS (event_detected_* binds as a \
+                 function-of-state cube dimension); got {:?}",
+                p.outcome
+            );
+        }
         // H.D (translation widening) — `signal >= signal` and 1-bit `!x === y`
         // now translate (pre-H.D: 7 unsupported; now only the arithmetic-RHS
         // `cnt == cnt + 1` form remains, which needs predicate-arithmetic).
