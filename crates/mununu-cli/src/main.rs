@@ -2280,6 +2280,41 @@ fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::Au
     for (name, reason) in &report.unsupported {
         println!("  [unsupported] {name}: {reason}");
     }
+    // H.J — provenance notes: the abstraction / scoping decisions that shaped
+    // the verdicts (config concretizations, reset-gating, cut modules, posture).
+    if !report.notes.is_empty() {
+        println!("\nNotes (decisions that shaped these verdicts):");
+        for n in &report.notes {
+            println!("  {} [{}] {}", note_level_glyph(n.level), n.kind, n.summary);
+            if !n.detail.is_empty() {
+                println!("        {}", n.detail);
+            }
+            if !n.items.is_empty() {
+                println!("        · {}", n.items.join(", "));
+            }
+        }
+    }
+}
+
+/// A glyph for a note's severity — a scope/soundness caveat stands out from an
+/// informational note in the CLI.
+fn note_level_glyph(level: mununu_core::adapter::slang::verify_auto::NoteLevel) -> &'static str {
+    use mununu_core::adapter::slang::verify_auto::NoteLevel;
+    match level {
+        NoteLevel::Info => "ℹ",
+        NoteLevel::ScopeCaveat => "⚠ scope",
+        NoteLevel::SoundnessCaveat => "⚠ soundness",
+    }
+}
+
+/// Machine-stable kebab string for a note's severity (JSON + API parity).
+fn note_level_str(level: mununu_core::adapter::slang::verify_auto::NoteLevel) -> &'static str {
+    use mununu_core::adapter::slang::verify_auto::NoteLevel;
+    match level {
+        NoteLevel::Info => "info",
+        NoteLevel::ScopeCaveat => "scope-caveat",
+        NoteLevel::SoundnessCaveat => "soundness-caveat",
+    }
 }
 
 fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::AutoVerifyReport) {
@@ -2317,6 +2352,19 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
         .iter()
         .map(|(name, reason)| serde_json::json!({ "name": name, "reason": reason }))
         .collect();
+    let notes: Vec<serde_json::Value> = report
+        .notes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "kind": n.kind,
+                "level": note_level_str(n.level),
+                "summary": n.summary,
+                "detail": n.detail,
+                "items": n.items,
+            })
+        })
+        .collect();
     let out = serde_json::json!({
         "properties": props,
         "unsupported": unsupported,
@@ -2326,6 +2374,7 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
             "gated_resets": report.diagnostics.gated_resets,
             "auto_provided_stubs": report.diagnostics.auto_provided_stubs,
         },
+        "notes": notes,
     });
     println!(
         "{}",

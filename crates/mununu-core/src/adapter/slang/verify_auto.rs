@@ -126,6 +126,42 @@ pub struct ModelDiagnostics {
     pub auto_provided_stubs: Vec<String>,
 }
 
+/// Severity of a [`VerificationNote`] — how it bears on the verdict's trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteLevel {
+    /// Informational — the decision does not narrow soundness (e.g. the
+    /// abstraction posture, the coverage summary).
+    Info,
+    /// The verdict's **scope** is narrowed by a deliberate restriction (e.g. a
+    /// config input pinned to a constant → "for these values, not all configs").
+    ScopeCaveat,
+    /// A soundness-relevant cut (e.g. a black-boxed module → state not modeled →
+    /// properties over it are SKIPPED, not verified).
+    SoundnessCaveat,
+}
+
+/// A human-facing note explaining one abstraction / scoping decision the
+/// verify-auto pipeline made, so a verdict's SCOPE and CAVEATS are explicit
+/// rather than silent or buried in raw diagnostics. Rendered on every surface
+/// (CLI text + JSON, API, UI). `kind` is an open kebab-case category so new
+/// note types (per-property provenance, oracle status, …) slot in without a
+/// schema change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationNote {
+    /// Machine-stable category, kebab-case (e.g. `"config-concretization"`,
+    /// `"reset-gating"`, `"blackbox-cut"`, `"abstraction-posture"`).
+    pub kind: String,
+    /// Severity for UX styling + honest framing.
+    pub level: NoteLevel,
+    /// One-line human summary.
+    pub summary: String,
+    /// Longer explanation: the WHY + the soundness / scope implication.
+    pub detail: String,
+    /// Structured operands, where relevant (e.g. `["cfg_detect_timer_i=7"]`,
+    /// `["prim_sparse_fsm_flop"]`). Empty when the note has no operands.
+    pub items: Vec<String>,
+}
+
 /// Result of an automated SVA verification run.
 #[derive(Debug, Clone, Default)]
 pub struct AutoVerifyReport {
@@ -135,6 +171,11 @@ pub struct AutoVerifyReport {
     /// Model-level diagnostics — state-register count + black-boxed (cut)
     /// modules. Lets a SKIPPED / vacuous outcome point at its root cause.
     pub diagnostics: ModelDiagnostics,
+    /// H.J — human-facing provenance notes: every abstraction / scoping decision
+    /// the run made (config concretizations, reset-gating, flop stubs, cut
+    /// modules, the abstraction posture, the coverage summary), so the verdict's
+    /// scope and caveats are explicit on every surface. Built by [`build_notes`].
+    pub notes: Vec<VerificationNote>,
 }
 
 /// The skip reason for a property whose atoms reference non-state signals,
@@ -162,6 +203,143 @@ fn unseedable_skip_reason(unseedable: &[String], diag: &ModelDiagnostics) -> Str
     } else {
         base
     }
+}
+
+/// A short human label for the must-edge inference posture (used in the
+/// abstraction-posture note).
+fn must_edge_inference_label(mode: MustEdgeInference) -> &'static str {
+    match mode {
+        MustEdgeInference::Off => "off (may-only over-approximation)",
+        MustEdgeInference::SamplingConfluence => "sampling-confluence",
+        MustEdgeInference::SmtPerTarget => "SMT ∀∀ per-target",
+        MustEdgeInference::SmtPerTargetStandard => "SMT ∀∃ per-target (canonical KMTS)",
+        MustEdgeInference::SmtHyperMust => "SMT ∀∃ hyper-must (GKMTS, sound νμ)",
+    }
+}
+
+/// H.J — build the human-facing provenance notes from a completed run's
+/// diagnostics + the abstraction posture + the coverage tally + any config
+/// concretizations applied. Pure (no toolchain) so it is unit-testable; called
+/// at the end of [`verify_auto`]. `applied_config_values` are the user-requested
+/// `config_values` that actually pinned a signal this run (H.J.b); empty when no
+/// concretization was requested.
+fn build_notes(
+    report: &AutoVerifyReport,
+    must_edge_inference: MustEdgeInference,
+    applied_config_values: &[(String, u64)],
+) -> Vec<VerificationNote> {
+    let d = &report.diagnostics;
+    let mut notes = Vec::new();
+
+    // Coverage summary (Info) — the honest at-a-glance tally.
+    let (mut holds, mut violated, mut unknown, mut skipped) = (0usize, 0usize, 0usize, 0usize);
+    for p in &report.properties {
+        match p.outcome {
+            VerifyOutcome::Holds => holds += 1,
+            VerifyOutcome::Violated { .. } => violated += 1,
+            VerifyOutcome::Unknown { .. } => unknown += 1,
+            VerifyOutcome::Skipped { .. } => skipped += 1,
+        }
+    }
+    notes.push(VerificationNote {
+        kind: "coverage-summary".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "{} assertion(s): {holds} definite (HOLDS), {violated} violated, {unknown} unknown (⊥), {skipped} skipped; {} untranslatable",
+            report.properties.len(),
+            report.unsupported.len(),
+        ),
+        detail: "A definite verdict transfers to the RTL (see abstraction-posture); ⊥ means the \
+                 abstraction is too coarse to decide — an honest 'don't know', not a violation."
+            .into(),
+        items: Vec::new(),
+    });
+
+    // Config concretization (ScopeCaveat) — H.J.b; present only when the user
+    // pinned config inputs to constants.
+    if !applied_config_values.is_empty() {
+        notes.push(VerificationNote {
+            kind: "config-concretization".into(),
+            level: NoteLevel::ScopeCaveat,
+            summary: format!(
+                "{} config input(s) pinned to constants — verdicts hold for THESE values, not all configurations.",
+                applied_config_values.len()
+            ),
+            detail: "A wide config input (e.g. a timer threshold) was fixed to a representative \
+                     constant so comparisons against it become decidable. The verdicts below are \
+                     therefore scoped to this configuration; a different config value could change \
+                     them. Re-run with other values to cover more of the configuration space."
+                .into(),
+            items: applied_config_values
+                .iter()
+                .map(|(sig, v)| format!("{sig}={v}"))
+                .collect(),
+        });
+    }
+
+    // Abstraction posture (Info).
+    notes.push(VerificationNote {
+        kind: "abstraction-posture".into(),
+        level: NoteLevel::Info,
+        summary: "KMTS may-over-approximation — a definite HOLDS on a safety property is sound."
+            .into(),
+        detail: format!(
+            "A definite HOLDS transfers to the concrete RTL (safety + over-approximation = sound); \
+             a definite VIOLATED is a real reachable counterexample class. Must-edge inference: {}.",
+            must_edge_inference_label(must_edge_inference),
+        ),
+        items: Vec::new(),
+    });
+
+    // Reset gating (Info).
+    if !d.gated_resets.is_empty() {
+        notes.push(VerificationNote {
+            kind: "reset-gating".into(),
+            level: NoteLevel::Info,
+            summary: format!("{} reset(s) pinned inactive.", d.gated_resets.len()),
+            detail: "The `disable iff (!rst)` guards were dropped and the reset input pinned to \
+                     its inactive value, so the body is verified only while out of reset (the \
+                     standard formal reset discipline)."
+                .into(),
+            items: d.gated_resets.clone(),
+        });
+    }
+
+    // Flop stubs (Info).
+    if !d.auto_provided_stubs.is_empty() {
+        notes.push(VerificationNote {
+            kind: "flop-stub".into(),
+            level: NoteLevel::Info,
+            summary: format!(
+                "{} flop primitive(s) behaviorally stubbed.",
+                d.auto_provided_stubs.len()
+            ),
+            detail: "A cut flop primitive (no body in the source set) was auto-replaced with an \
+                     EXACT behavioral model of its datapath, so the register it drives survives \
+                     the lift (no soundness loss — the stub is functionally identical)."
+                .into(),
+            items: d.auto_provided_stubs.clone(),
+        });
+    }
+
+    // Black-boxed / cut modules (SoundnessCaveat).
+    if !d.blackboxed_modules.is_empty() {
+        notes.push(VerificationNote {
+            kind: "blackbox-cut".into(),
+            level: NoteLevel::SoundnessCaveat,
+            summary: format!(
+                "{} module(s) cut (no body) — state behind them is not modeled.",
+                d.blackboxed_modules.len()
+            ),
+            detail: "Registers driven by a cut module become free inputs, so properties over them \
+                     are SKIPPED (never given a verdict), not verified. Provide the missing module \
+                     source(s) to model that state."
+                .into(),
+            items: d.blackboxed_modules.clone(),
+        });
+    }
+
+    notes
 }
 
 /// Options for [`verify_auto`] beyond the Yosys lift options.
@@ -615,6 +793,7 @@ pub fn verify_auto(
         ..Default::default()
     };
     if extraction.translated.is_empty() {
+        report.notes = build_notes(&report, opts.must_edge_inference, &[]);
         return Ok(report);
     }
 
@@ -1060,6 +1239,10 @@ pub fn verify_auto(
         });
     }
 
+    // H.J — provenance notes: surface every abstraction/scoping decision this run
+    // made (posture, reset-gating, flop stubs, cut modules, coverage). Config
+    // concretizations (H.J.b) will pass the applied pins here.
+    report.notes = build_notes(&report, opts.must_edge_inference, &[]);
     Ok(report)
 }
 
@@ -1070,6 +1253,77 @@ mod tests {
 
     fn cells(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn build_notes_surfaces_every_decision() {
+        // H.J.a — the provenance notes cover the coverage tally, the abstraction
+        // posture, and each model-level decision (reset-gating, flop stubs, cut
+        // modules), plus a config-concretization ScopeCaveat when pins are given.
+        let report = AutoVerifyReport {
+            properties: vec![
+                PropertyVerdict {
+                    name: "p_holds".into(),
+                    kind: SvaKind::Assert,
+                    formula: "nu X. (a && [] X)".into(),
+                    outcome: VerifyOutcome::Holds,
+                    seeded_predicates: vec!["a".into()],
+                },
+                PropertyVerdict {
+                    name: "p_unknown".into(),
+                    kind: SvaKind::Assert,
+                    formula: "nu X. (b && [] X)".into(),
+                    outcome: VerifyOutcome::Unknown { unknown_cells: 2 },
+                    seeded_predicates: vec!["b".into()],
+                },
+            ],
+            unsupported: vec![("u".into(), "reason".into())],
+            diagnostics: ModelDiagnostics {
+                state_register_count: 3,
+                blackboxed_modules: vec!["prim_sparse_fsm_flop".into()],
+                gated_resets: vec!["rst_ni=1".into()],
+                auto_provided_stubs: vec!["prim_flop".into()],
+            },
+            notes: Vec::new(),
+        };
+        let notes = build_notes(
+            &report,
+            MustEdgeInference::SmtHyperMust,
+            &[("cfg_detect_timer_i".into(), 7)],
+        );
+        let kinds: Vec<&str> = notes.iter().map(|n| n.kind.as_str()).collect();
+        for expected in [
+            "coverage-summary",
+            "config-concretization",
+            "abstraction-posture",
+            "reset-gating",
+            "flop-stub",
+            "blackbox-cut",
+        ] {
+            assert!(
+                kinds.contains(&expected),
+                "missing note {expected}; got {kinds:?}"
+            );
+        }
+        // The scope caveat carries the pinned value + is a ScopeCaveat.
+        let cc = notes
+            .iter()
+            .find(|n| n.kind == "config-concretization")
+            .unwrap();
+        assert_eq!(cc.level, NoteLevel::ScopeCaveat);
+        assert!(cc.items.contains(&"cfg_detect_timer_i=7".to_string()));
+        // The cut module is a SoundnessCaveat; coverage tallies 1 HOLDS + 1 ⊥.
+        let bc = notes.iter().find(|n| n.kind == "blackbox-cut").unwrap();
+        assert_eq!(bc.level, NoteLevel::SoundnessCaveat);
+        let cov = notes.iter().find(|n| n.kind == "coverage-summary").unwrap();
+        assert!(cov.summary.contains("1 definite") && cov.summary.contains("1 unknown"));
+        // No pins ⇒ no config-concretization note.
+        let notes_no_pins = build_notes(&report, MustEdgeInference::Off, &[]);
+        assert!(
+            !notes_no_pins
+                .iter()
+                .any(|n| n.kind == "config-concretization")
+        );
     }
 
     #[test]

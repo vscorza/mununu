@@ -825,6 +825,24 @@ pub async fn sv_verify_auto_handler(
             reason: reason.clone(),
         })
         .collect();
+    let notes = report
+        .notes
+        .iter()
+        .map(|n| crate::api::models::VerificationNoteView {
+            kind: n.kind.clone(),
+            level: match n.level {
+                crate::adapter::slang::verify_auto::NoteLevel::Info => "info",
+                crate::adapter::slang::verify_auto::NoteLevel::ScopeCaveat => "scope-caveat",
+                crate::adapter::slang::verify_auto::NoteLevel::SoundnessCaveat => {
+                    "soundness-caveat"
+                }
+            }
+            .to_string(),
+            summary: n.summary.clone(),
+            detail: n.detail.clone(),
+            items: n.items.clone(),
+        })
+        .collect();
     Ok(Json(SvVerifyAutoResponse {
         properties,
         unsupported,
@@ -834,6 +852,7 @@ pub async fn sv_verify_auto_handler(
             gated_resets: report.diagnostics.gated_resets.clone(),
             auto_provided_stubs: report.diagnostics.auto_provided_stubs.clone(),
         },
+        notes,
     }))
 }
 
