@@ -393,14 +393,27 @@ fn seed_from_formula(
                 // Relational / `!=` / boolean combination.
                 _ => {
                     let regs = expr.registers();
-                    if regs.iter().all(|r| is_state(r)) {
+                    let resolvable = regs
+                        .iter()
+                        .all(|r| is_state(r) || is_input(r) || combinational_kind(r).is_some());
+                    if expr.has_addend() {
+                        // H.G — an arithmetic relational (`cnt_q == cnt_q__past + 1`,
+                        // sva_15). Its `CmpRegAddend` leaf is SMT-only (a `width==0`
+                        // production leaf must NOT be `eval`'d, and the all-state
+                        // compound path evals dimensions at the init cube). Route it
+                        // to the DERIVED relational label path (`build_constraint`
+                        // only, BV `bvadd` at the real register width). Sound — a
+                        // pure per-cube observation, like any derived relational.
+                        if resolvable {
+                            out.derived_relational.push((atom.clone(), expr));
+                        } else {
+                            out.unseedable.push(atom.clone());
+                        }
+                    } else if regs.iter().all(|r| is_state(r)) {
                         // All-state → a cube DIMENSION (B.1 compound). The SMT
                         // dimension path reads state BVs.
                         out.compounds.push((atom.clone(), expr));
-                    } else if regs
-                        .iter()
-                        .all(|r| is_state(r) || is_input(r) || combinational_kind(r).is_some())
-                    {
+                    } else if resolvable {
                         // H.F — a relational with an input / combinational operand
                         // (`cnt_q >= cfg_detect_timer_i`, `trigger_i !=
                         // trigger_active`). Its value depends on the demonic input,
@@ -2034,27 +2047,40 @@ mod tests {
                 p.outcome
             );
         }
-        // H.D (translation widening) — `signal >= signal` and 1-bit `!x === y`
-        // now translate (pre-H.D: 7 unsupported; now only the arithmetic-RHS
-        // `cnt == cnt + 1` form remains, which needs predicate-arithmetic).
-        // sva_15 is the lone arithmetic holdout.
-        assert!(
-            report.properties.len() >= 15,
-            "H.D translates ≥15 of 16 (was 9); got {} translated",
+        // H.D translation widening (`signal >= signal`, 1-bit `!x === y`) + H.G
+        // arithmetic-addend predicate (`cnt_q == $past(cnt_q) + 1`, CntIncr_A):
+        // ALL 16 sysrst SVA now translate — 0 unsupported (pre-H.D: 7 unsupported;
+        // pre-H.G: sva_15 was the lone arithmetic holdout).
+        assert_eq!(
+            report.properties.len(),
+            16,
+            "H.D + H.G translate all 16 sysrst SVA; got {} translated",
             report.properties.len()
         );
         assert!(
-            report.unsupported.len() <= 2,
-            "only the arithmetic-RHS form(s) remain unsupported after H.D; got {:?}",
+            report.unsupported.is_empty(),
+            "H.G closes the last arithmetic holdout — 0 unsupported; got {:?}",
             report.unsupported
         );
+        // H.G — sva_15 (`cnt_en && !cnt_clr |=> cnt_q == cnt_q__past + 1`) now
+        // BINDS (was unsupported): its arithmetic relational lowers to a
+        // `CmpRegAddend` derived label (BV `bvadd`), so it reaches a verdict — an
+        // honest ⊥ here (config-timer-entangled, like sva_5/7/10/11/13/14), never
+        // unsupported and never a spurious verdict.
+        let sva15 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "sysrst_ctrl_detect_sva_15")
+            .expect("sva_15 present (translated)");
         assert!(
-            report
-                .unsupported
-                .iter()
-                .all(|(_, r)| r.contains("arithmetic")),
-            "every remaining unsupported is the arithmetic-operand case; got {:?}",
-            report.unsupported
+            sva15.formula.contains("cnt_q__past + 1"),
+            "sva_15 carries the arithmetic-addend atom; got {}",
+            sva15.formula
+        );
+        assert!(
+            !matches!(sva15.outcome, VerifyOutcome::Skipped { .. }),
+            "sva_15 binds to a verdict (not SKIP/unsupported); got {:?}",
+            sva15.outcome
         );
         // The negation-peel (`!trigger_i === trigger_active` → `trigger_i !=
         // trigger_active`) and the relational `signal >= signal` both reach the
@@ -2083,7 +2109,12 @@ mod tests {
         // so the consequent box `[](state==k')` becomes definite at the cube
         // pinning trigger_i, and Kleene `⊥ ∨ [] = T`. sva_4/6/8/9 are this class.
         // Pre-Slice-3 they were honest ⊥ (a bare ⊥-label did not refine the box).
-        // btormc confirms all four SAFE; NEVER a spurious VIOLATED.
+        // Soundness rests on the safety + may-over-approximation argument (a
+        // definite HOLDS on the KMTS may-relation transfers to the concrete);
+        // NEVER a spurious VIOLATED. Independent external confirmation is partial:
+        // sva_6 (DetectStDropOut) was checked SAFE by the btormc oracle (H.E/H.O
+        // work); sva_4/8/9 are not yet per-property oracle-confirmed — a btormc
+        // (H.O.1) sweep is the pending confirmation step.
         for name in [
             "sysrst_ctrl_detect_sva_4",
             "sysrst_ctrl_detect_sva_6",

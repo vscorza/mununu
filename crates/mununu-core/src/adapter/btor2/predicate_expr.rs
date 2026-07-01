@@ -73,6 +73,34 @@ pub enum PredicateExpr {
         op: CmpOp,
         rhs: String,
     },
+    /// H.G — arithmetic relational `lhs <op> (rhs + addend)` over two registers
+    /// with a **constant** addend, in unsigned bit-vector arithmetic **mod
+    /// 2^width** (the register width — so it wraps exactly as the RTL's `+` does).
+    /// The one arithmetic form the translator needs (`cnt_q == $past(cnt_q) + 1`,
+    /// sysrst sva_15 `CntIncr_A`). No general arithmetic — a single `+const`
+    /// keeps the predicate layer inside the audited modal fragment.
+    ///
+    /// **SMT-primary.** Production routes this SMT-only (a derived relational
+    /// label, like [`PredicateExpr::CmpReg`]-with-an-input): [`build_constraint`]
+    /// does BV `bvadd` at the operand's real width (sound). [`eval`] is the
+    /// differential-test reference and computes `mod 2^width` from the embedded
+    /// `width`; a `width == 0` leaf must never be `eval`'d (production never does
+    /// — it uses `build_constraint`). The `predicate_expr_eval_matches_smt`
+    /// differential (the §4 PO) sets `width` explicitly and checks the two agree,
+    /// including at the wraparound boundary.
+    ///
+    /// [`build_constraint`]: PredicateExpr::build_constraint
+    /// [`eval`]: PredicateExpr::eval
+    CmpRegAddend {
+        lhs: String,
+        op: CmpOp,
+        rhs: String,
+        addend: u64,
+        /// Modulus width for `eval` (the register width). `0` ⇒ SMT-only
+        /// (`build_constraint` uses the operand's real BV width); `eval` on a
+        /// `width == 0` leaf is a caller error (production never evals it).
+        width: u32,
+    },
     And(Box<PredicateExpr>, Box<PredicateExpr>),
     Or(Box<PredicateExpr>, Box<PredicateExpr>),
     Not(Box<PredicateExpr>),
@@ -100,6 +128,38 @@ impl PredicateExpr {
         }
     }
 
+    /// H.G — an arithmetic relational `lhs <op> (rhs + addend)` (`width == 0` ⇒
+    /// SMT-only; `eval` requires a nonzero `width`). The `cnt == $past(cnt) + 1`
+    /// (`CntIncr_A`) translator form.
+    pub fn cmp_reg_addend(
+        lhs: impl Into<String>,
+        op: CmpOp,
+        rhs: impl Into<String>,
+        addend: u64,
+        width: u32,
+    ) -> Self {
+        PredicateExpr::CmpRegAddend {
+            lhs: lhs.into(),
+            op,
+            rhs: rhs.into(),
+            addend,
+            width,
+        }
+    }
+
+    /// True if the expression contains an arithmetic-addend leaf
+    /// ([`PredicateExpr::CmpRegAddend`]). The seeder routes such an expression
+    /// SMT-only (a derived relational label), since `eval` on a `width == 0`
+    /// production leaf is invalid.
+    pub fn has_addend(&self) -> bool {
+        match self {
+            PredicateExpr::CmpRegAddend { .. } => true,
+            PredicateExpr::Cmp { .. } | PredicateExpr::CmpReg { .. } => false,
+            PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => a.has_addend() || b.has_addend(),
+            PredicateExpr::Not(a) => a.has_addend(),
+        }
+    }
+
     /// Explicit evaluation over a concrete register valuation. Registers absent
     /// from `regs` default to `0` — matching the cube lifter's `.unwrap_or(0)`
     /// convention for next-state registers that no transition wrote.
@@ -117,6 +177,31 @@ impl PredicateExpr {
                 let l = regs.get(lhs).copied().unwrap_or(0);
                 let r = regs.get(rhs).copied().unwrap_or(0);
                 cmp_apply(*op, l, r)
+            }
+            PredicateExpr::CmpRegAddend {
+                lhs,
+                op,
+                rhs,
+                addend,
+                width,
+            } => {
+                let l = regs.get(lhs).copied().unwrap_or(0);
+                let r = regs.get(rhs).copied().unwrap_or(0);
+                // `mod 2^width` to match the BV `bvadd` in `build_constraint`
+                // (wraps exactly as the RTL). A `width == 0` leaf is SMT-only and
+                // must not be `eval`'d — debug-assert, and fall back to unmasked
+                // (correct away from the wrap boundary) in release.
+                debug_assert!(
+                    *width > 0,
+                    "eval on a width==0 CmpRegAddend (SMT-only leaf) — production must use build_constraint"
+                );
+                let sum = r.wrapping_add(*addend as u128);
+                let sum = if *width == 0 || *width >= 128 {
+                    sum
+                } else {
+                    sum & ((1u128 << *width) - 1)
+                };
+                cmp_apply(*op, l, sum)
             }
             PredicateExpr::And(a, b) => a.eval(regs) && b.eval(regs),
             PredicateExpr::Or(a, b) => a.eval(regs) || b.eval(regs),
@@ -138,7 +223,8 @@ impl PredicateExpr {
             PredicateExpr::Cmp { register, .. } => {
                 out.insert(register.clone());
             }
-            PredicateExpr::CmpReg { lhs, rhs, .. } => {
+            PredicateExpr::CmpReg { lhs, rhs, .. }
+            | PredicateExpr::CmpRegAddend { lhs, rhs, .. } => {
                 out.insert(lhs.clone());
                 out.insert(rhs.clone());
             }
@@ -174,6 +260,24 @@ impl PredicateExpr {
                 let lbv = lookup(lhs)?;
                 let rbv = lookup(rhs)?;
                 Some(cmp_constraint_bv(&lbv, *op, &rbv))
+            }
+            PredicateExpr::CmpRegAddend {
+                lhs,
+                op,
+                rhs,
+                addend,
+                ..
+            } => {
+                // `lhs <op> (rhs + addend)` in BV — `bvadd` wraps at `rhs`'s real
+                // width (the RTL semantics). `width` is the eval-side modulus
+                // only; here the operand BVs carry the authoritative width.
+                let lbv = lookup(lhs)?;
+                let rbv = lookup(rhs)?;
+                let w = rbv.get_size();
+                let mask: u64 = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let addend_bv = z3::ast::BV::from_u64(*addend & mask, w);
+                let sum = rbv.bvadd(&addend_bv);
+                Some(cmp_constraint_bv(&lbv, *op, &sum))
             }
             PredicateExpr::And(a, b) => {
                 let ca = a.build_constraint(lookup)?;
@@ -291,6 +395,9 @@ enum Token {
     And,
     Or,
     Not,
+    /// H.G — `+` for the arithmetic-addend RHS (`rhs + const`), the sole
+    /// arithmetic form (`cnt == $past(cnt) + 1`).
+    Plus,
     LParen,
     RParen,
 }
@@ -332,6 +439,10 @@ fn tokenize(s: &str) -> Result<Vec<Token>, PredicateExprParseError> {
             }
             '!' => {
                 tokens.push(Token::Not);
+                i += 1;
+            }
+            '+' => {
+                tokens.push(Token::Plus);
                 i += 1;
             }
             '<' if chars.get(i + 1) == Some(&'=') => {
@@ -485,11 +596,32 @@ impl Parser<'_> {
                 op,
                 value,
             }),
-            Some(Token::Ident(rhs)) => Ok(PredicateExpr::CmpReg {
-                lhs: register,
-                op,
-                rhs,
-            }),
+            Some(Token::Ident(rhs)) => {
+                // H.G — `rhs + const` → CmpRegAddend (`cnt == $past(cnt) + 1`);
+                // bare `rhs` → CmpReg (REL). width=0 ⇒ SMT-only (resolved at
+                // build_constraint from the operand BV; see CmpRegAddend docs).
+                if matches!(self.peek(), Some(Token::Plus)) {
+                    self.pos += 1; // consume `+`
+                    match self.next() {
+                        Some(Token::Int(addend)) => Ok(PredicateExpr::CmpRegAddend {
+                            lhs: register,
+                            op,
+                            rhs,
+                            addend,
+                            width: 0,
+                        }),
+                        other => Err(perr(format!(
+                            "expected an integer addend after `{register} <op> {rhs} +`, found {other:?}"
+                        ))),
+                    }
+                } else {
+                    Ok(PredicateExpr::CmpReg {
+                        lhs: register,
+                        op,
+                        rhs,
+                    })
+                }
+            }
             other => Err(perr(format!(
                 "expected an integer value or a register after `{register} <op>`, found {other:?}"
             ))),
@@ -777,6 +909,102 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn arithmetic_addend_eval_matches_smt() {
+        // H.G — the §4 PO for the arithmetic leaf: `a <op> (b + k) mod 2^width`
+        // must agree between `eval` (embedded width) and `build_constraint` (BV
+        // `bvadd`) across ALL 2-bit assignments, INCLUDING the wraparound
+        // boundary (width=2 → `b=3, +1` wraps to `0`). This is the guard that
+        // makes the arithmetic predicate sound.
+        const W: u32 = 2; // 2-bit → wraps at 4
+        let exprs: Vec<PredicateExpr> = vec![
+            PredicateExpr::cmp_reg_addend("a", CmpOp::Eq, "b", 1, W),
+            PredicateExpr::cmp_reg_addend("a", CmpOp::Ne, "b", 1, W),
+            PredicateExpr::cmp_reg_addend("a", CmpOp::Ge, "b", 1, W),
+            PredicateExpr::cmp_reg_addend("a", CmpOp::Lt, "b", 2, W),
+            PredicateExpr::And(
+                Box::new(PredicateExpr::eq("a", 0)),
+                Box::new(PredicateExpr::cmp_reg_addend("a", CmpOp::Eq, "b", 1, W)),
+            ),
+            PredicateExpr::Not(Box::new(PredicateExpr::cmp_reg_addend(
+                "a",
+                CmpOp::Eq,
+                "b",
+                1,
+                W,
+            ))),
+        ];
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            for e in &exprs {
+                for a in 0u64..4 {
+                    for b in 0u64..4 {
+                        let want = e.eval(&regs(&[("a", a as u128), ("b", b as u128)]));
+                        let a_bv = z3::ast::BV::new_const("a", W);
+                        let b_bv = z3::ast::BV::new_const("b", W);
+                        let lookup = |name: &str| -> Option<z3::ast::BV> {
+                            match name {
+                                "a" => Some(a_bv.clone()),
+                                "b" => Some(b_bv.clone()),
+                                _ => None,
+                            }
+                        };
+                        let constraint = e.build_constraint(&lookup).expect("all regs present");
+                        let solver = z3::Solver::new();
+                        let a_val = z3::ast::BV::from_u64(a, W);
+                        let b_val = z3::ast::BV::from_u64(b, W);
+                        let a_pin = a_bv.eq(&a_val);
+                        let b_pin = b_bv.eq(&b_val);
+                        solver.assert(&a_pin);
+                        solver.assert(&b_pin);
+                        solver.assert(&constraint);
+                        let got = matches!(solver.check(), z3::SatResult::Sat);
+                        assert_eq!(
+                            want, got,
+                            "eval/SMT disagree for {e:?} at a={a}, b={b}: eval={want}, smt={got}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn parse_arithmetic_addend() {
+        // H.G — `cnt == cnt_past + 1` parses to a `CmpRegAddend` (width=0, filled
+        // by build_constraint from the operand BV in production).
+        let e = parse_predicate_expr("cnt == cnt_past + 1").expect("parse arithmetic addend");
+        assert_eq!(
+            e,
+            PredicateExpr::cmp_reg_addend("cnt", CmpOp::Eq, "cnt_past", 1, 0)
+        );
+        assert!(e.has_addend());
+        // a bare relational is still CmpReg (no addend)
+        let rel = parse_predicate_expr("cnt >= cnt_past").expect("parse rel");
+        assert!(!rel.has_addend());
+        assert_eq!(
+            rel,
+            PredicateExpr::CmpReg {
+                lhs: "cnt".into(),
+                op: CmpOp::Ge,
+                rhs: "cnt_past".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn eval_addend_wraps_at_width() {
+        // width=2: `3 + 1 = 0 (mod 4)`, so `cnt == cnt_past + 1` is TRUE at
+        // cnt=0, cnt_past=3 (the wrap) — matching the RTL BV `+`.
+        let e = PredicateExpr::cmp_reg_addend("cnt", CmpOp::Eq, "cnt_past", 1, 2);
+        assert!(
+            e.eval(&regs(&[("cnt", 0), ("cnt_past", 3)])),
+            "3+1 wraps to 0 at width 2"
+        );
+        assert!(!e.eval(&regs(&[("cnt", 0), ("cnt_past", 2)])), "2+1=3 != 0");
+        assert!(e.eval(&regs(&[("cnt", 3), ("cnt_past", 2)])), "2+1=3");
     }
 
     #[test]
