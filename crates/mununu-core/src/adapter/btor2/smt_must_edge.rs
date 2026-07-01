@@ -345,6 +345,7 @@ fn build_pred_constraint_uniform<P: PredicateLike>(
     pred: &P,
     slot_next: bool,
     polarity: bool,
+    pin_input_target: bool,
 ) -> Option<z3::ast::Bool> {
     match pred.expr() {
         None => {
@@ -355,10 +356,16 @@ fn build_pred_constraint_uniform<P: PredicateLike>(
             // it existential on the target — a sound under-approximation. Encode
             // that as the literal `true` on the target, identical to
             // `build_pred_constraint`'s input branch (and `∃`-equivalent on the
-            // may-check). The nested-`∀i'` treatment is needed only for a
-            // *combinational function* of a next input (g(s',i')), which is not a
-            // cube dimension today — H.U.1d / a later combinational-target step.
-            if slot_next && view.inputs.contains_key(&nid) {
+            // may-check).
+            //
+            // `pin_input_target` overrides this for the nested-∀i′ hyper-must
+            // (combinational-input-atoms.md §6.2): there the next input `i′` is
+            // NOT free — it is universally quantified, so a target predicate over
+            // an input (or a combinational function `g(s′,i′)` of one) must be
+            // PINNED to its actual next-cycle value (`primed.inputs` / the primed
+            // node cache) via `term_target_bv`. Leaving it free is exactly the
+            // §5.1 target-free unsoundness the nested query exists to fix.
+            if !pin_input_target && slot_next && view.inputs.contains_key(&nid) {
                 return Some(z3::ast::Bool::from_bool(true));
             }
             let bv = if slot_next {
@@ -422,8 +429,8 @@ where
         let src_polarity = (src_bits >> i) & 1 == 1;
         let tgt_polarity = (tgt_bits >> i) & 1 == 1;
         let (Some(src_c), Some(tgt_c)) = (
-            build_pred_constraint_uniform(view, primed, nid_map, pred, false, src_polarity),
-            build_pred_constraint_uniform(view, primed, nid_map, pred, true, tgt_polarity),
+            build_pred_constraint_uniform(view, primed, nid_map, pred, false, src_polarity, false),
+            build_pred_constraint_uniform(view, primed, nid_map, pred, true, tgt_polarity, false),
         ) else {
             return SmtMayVerdict::May;
         };
@@ -679,6 +686,126 @@ where
     }
 }
 
+/// Nested-∀i′ hyper-must (combinational-input-atoms.md §6.2) — the sound
+/// treatment of a **combinational-of-input** (or raw-input) predicate in
+/// **target position**, where the shipped `smt_hyper_must_check` is unsound
+/// because it leaves the next input free (target-free, refuted by §5.1).
+///
+/// **Semantics.** The hyper-must edge `src →□ T` (`T` a target *set*) holds iff
+///
+/// ```text
+/// ∀ (s,i) ∈ γ(src).  ∀ i′.  ∃ c′ ∈ T.  (δ(s,i), i′) ∈ γ(c′)
+/// ```
+///
+/// — for every source pair in the cube AND every *next* input `i′`, the
+/// determined successor `(δ(s,i), i′)` lands in some target cube of `T`. The
+/// next input `i′` is **universally** quantified, nested inside the transition
+/// (§5.2: an existential `i′` is angelic and unsound). A target predicate that
+/// reads `i′` — an input, or a combinational `g(s′,i′)` — is therefore pinned to
+/// its actual next-cycle value via the `PrimedEnv` (`pin_input_target = true`),
+/// not left free.
+///
+/// **Why a target *set* (Proposition 5).** A singleton `T = {c′}` forces
+/// `g(s′,i′) = c′(p)` for *all* `i′`; if `g` genuinely depends on `i′` no
+/// singleton is reached for every `i′`, so the set must include both polarities.
+///
+/// **Encoding.** The must condition is `∀(s,i). ∀i′. ⋁_{c′∈T} succ∈γ(c′)`, whose
+/// negation is *fully existential* — no quantifier alternation is needed:
+///
+/// ```text
+/// SAT?  src(state_curr, inputs) ∧ transition ∧ ⋀_{c′∈T} ¬(succ ∈ γ(c′))
+/// ```
+///
+/// where `succ ∈ γ(c′)` is built with the uniform rule over the primed image
+/// `(state_next, i′)`. SAT ⇒ some `(s,i,i′)` escapes every `c′` ⇒ `NotMust`;
+/// UNSAT ⇒ `Must` (Proposition 4 — a sound GKMTS hyper-must under-approximation).
+///
+/// **Caller must hold a [`z3::with_z3_config`] scope.**
+///
+/// Slice 1 of the nested-∀i′ track: the SMT core + its Prop 1/4/5 differential
+/// guards. It is exercised by the tests below but not yet wired into the
+/// production `MustEdgeInference` dispatch (a follow-up slice adds a
+/// `SmtNestedHyperMust` variant + the target-position seeder routing), so it is
+/// dead in non-test builds until then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn smt_nested_hyper_must_check<P>(
+    view: &Btor2SmtView,
+    primed: &PrimedEnv,
+    src_bits: u64,
+    target_bits_set: &[u64],
+    predicates: &[P],
+    nid_map: &HashMap<String, Nid>,
+    timeout_ms: u32,
+) -> SmtMustVerdict
+where
+    P: PredicateLike,
+{
+    if target_bits_set.is_empty() {
+        // No candidate target — no witness can cover the demonic i′.
+        return SmtMustVerdict::NotMust;
+    }
+
+    // Source constraints: (s,i) ⊨ src, over the current-cycle image. These are
+    // asserted at top level (the source pair is existential in the negation).
+    let mut src_constraints = Vec::with_capacity(predicates.len());
+    for (i, pred) in predicates.iter().enumerate() {
+        let src_polarity = (src_bits >> i) & 1 == 1;
+        let Some(c) =
+            build_pred_constraint_uniform(view, primed, nid_map, pred, false, src_polarity, false)
+        else {
+            return SmtMustVerdict::Unknown;
+        };
+        src_constraints.push(c);
+    }
+
+    // For each candidate target cube c′: ¬(successor ∈ γ(c′)), i.e. NOT all of
+    // c′'s predicates hold at (state_next, i′). The target side PINS the next
+    // input (`pin_input_target = true`), so an input / combinational-of-input
+    // target reads its real primed value rather than the (unsound) `true`.
+    let mut not_in_any: Vec<z3::ast::Bool> = Vec::with_capacity(target_bits_set.len());
+    for &tgt_bits in target_bits_set {
+        let mut tgt = Vec::with_capacity(predicates.len());
+        for (i, pred) in predicates.iter().enumerate() {
+            let tgt_polarity = (tgt_bits >> i) & 1 == 1;
+            let Some(c) = build_pred_constraint_uniform(
+                view,
+                primed,
+                nid_map,
+                pred,
+                true,
+                tgt_polarity,
+                true,
+            ) else {
+                return SmtMustVerdict::Unknown;
+            };
+            tgt.push(c);
+        }
+        not_in_any.push(conj_bool(&tgt).not());
+    }
+
+    let solver = z3::Solver::new();
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms);
+    solver.set_params(&params);
+
+    for c in &src_constraints {
+        solver.assert(c);
+    }
+    // Links state_curr + inputs → state_next (= δ(s,i)); the primed cache is a
+    // function of the SAME state_next consts, so the (s,i)→s′→(s′,i′) chain is
+    // connected.
+    solver.assert(&view.transition);
+    for n in &not_in_any {
+        solver.assert(n);
+    }
+
+    match solver.check() {
+        z3::SatResult::Unsat => SmtMustVerdict::Must,
+        z3::SatResult::Sat => SmtMustVerdict::NotMust,
+        z3::SatResult::Unknown => SmtMustVerdict::Unknown,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // H.U.1c (2026-06-29) — uniform must / hyper-must, on the uniform image.
 // ─────────────────────────────────────────────────────────────────────
@@ -710,6 +837,7 @@ where
             pred,
             false,
             src_polarity,
+            false,
         )?);
         tgt.push(build_pred_constraint_uniform(
             view,
@@ -718,6 +846,7 @@ where
             pred,
             true,
             tgt_polarity,
+            false,
         )?);
     }
     Some((src, tgt))
@@ -1187,6 +1316,188 @@ mod tests {
             );
             SmtMustVerdict::Must
         });
+    }
+
+    // ---- Nested-∀i′ hyper-must (combinational-input-atoms.md §6.2) ----
+
+    /// The Proposition 1/5 refutation system: one self-looping state
+    /// (`reg_a := 0`, irrelevant) + a free input `in_a`. The predicate
+    /// `p ≡ (in_a == 1)` is input-dependent — its value at the *next* cube is
+    /// decided by the demonic next input `i′`, exactly the combinational-of-input
+    /// target case (`g(s,i) = i`).
+    const INPUT_TARGET_BTOR2: &str = "\
+1 sort bitvec 1
+2 input 1 in_a
+3 state 1 reg_a
+4 zero 1
+5 init 1 3 4
+6 next 1 3 4
+";
+
+    #[test]
+    fn nested_hyper_must_singleton_input_target_rejects_must() {
+        // Proposition 5: a SINGLETON target set over an input-dependent target
+        // predicate is not a must — the demonic next input i′ escapes it. Here
+        // src = {p} (in_a==1), singleton T = [{p}]: the next input i′=0 sends the
+        // successor to {¬p}, so the singleton hyper-must fails.
+        let file = parse(INPUT_TARGET_BTOR2).expect("parse input-target fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "in_a".into(),
+            value: 1,
+        }];
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            smt_nested_hyper_must_check(&view, &primed, 0b1, &[0b1], &predicates, &nid_map, 5_000)
+        });
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::NotMust,
+            "a singleton input-dependent target is not a hyper-must (Prop 5); got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn nested_hyper_must_target_set_both_polarities_proves_must() {
+        // Proposition 4: the target SET {{¬p},{p}} covers every demonic i′ — for
+        // ANY next input the successor lands in one of the two cubes — so the
+        // hyper-must holds. This is the sound GKMTS hyper-must the ⊥-label could
+        // not express as a definite witness.
+        let file = parse(INPUT_TARGET_BTOR2).expect("parse input-target fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "in_a".into(),
+            value: 1,
+        }];
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            // T = [{¬p} = 0b0, {p} = 0b1].
+            smt_nested_hyper_must_check(
+                &view,
+                &primed,
+                0b1,
+                &[0b0, 0b1],
+                &predicates,
+                &nid_map,
+                5_000,
+            )
+        });
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::Must,
+            "a target set covering both polarities proves the hyper-must (Prop 4); got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn nested_hyper_must_target_free_shortcut_would_be_unsound() {
+        // Direct guard on the §5.1 unsoundness the nested query fixes: the SAME
+        // singleton {p} query, if the target input were left FREE (the H.B
+        // target-free shortcut), would fabricate a must. `smt_hyper_must_check`
+        // (which uses the target-free per-kind builder) reports Must here — the
+        // fabricated edge. The nested check (pinned i′) correctly reports NotMust.
+        // Their disagreement IS the bug §6.2 closes; this pins it so a future
+        // refactor cannot silently route this case through the unsound path.
+        let file = parse(INPUT_TARGET_BTOR2).expect("parse input-target fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "in_a".into(),
+            value: 1,
+        }];
+        let (nested, target_free) = z3::with_z3_config(&z3::Config::new(), || {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            let nested = smt_nested_hyper_must_check(
+                &view,
+                &primed,
+                0b1,
+                &[0b1],
+                &predicates,
+                &nid_map,
+                5_000,
+            );
+            let target_free =
+                smt_hyper_must_check(&view, 0b1, &[0b1], &predicates, &nid_map, 5_000);
+            (nested, target_free)
+        });
+        assert_eq!(
+            nested,
+            SmtMustVerdict::NotMust,
+            "the nested (pinned-i′) check is sound: singleton input target is NotMust; got {nested:?}"
+        );
+        assert_eq!(
+            target_free,
+            SmtMustVerdict::Must,
+            "the shipped target-free check fabricates the must here (the §5.1 unsoundness the \
+             nested query exists to fix); got {target_free:?}"
+        );
+    }
+
+    #[test]
+    fn nested_hyper_must_state_only_singleton_matches_standard() {
+        // A pure-STATE target does not depend on i′, so a SINGLETON target set
+        // already proves the must — the nested query degrades to the standard
+        // must on state predicates (differential vs
+        // smt_per_target_must_check_standard on deterministic reg_a := 0).
+        let file = parse(DETERMINISTIC_ZERO_BTOR2).expect("parse deterministic fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let (nested, standard) = z3::with_z3_config(&z3::Config::new(), || {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            let nested = smt_nested_hyper_must_check(
+                &view,
+                &primed,
+                0b1,
+                &[0b1],
+                &predicates,
+                &nid_map,
+                5_000,
+            );
+            let standard =
+                smt_per_target_must_check_standard(&view, 0b1, 0b1, &predicates, &nid_map, 5_000);
+            (nested, standard)
+        });
+        assert_eq!(
+            nested,
+            SmtMustVerdict::Must,
+            "a state-only singleton hyper-must proves Must; got {nested:?}"
+        );
+        assert_eq!(
+            nested, standard,
+            "nested degrades to standard on a state-only target; nested={nested:?} standard={standard:?}"
+        );
+    }
+
+    #[test]
+    fn nested_hyper_must_empty_target_set_is_not_must() {
+        // An empty candidate set can cover no successor — trivially NotMust.
+        let file = parse(INPUT_TARGET_BTOR2).expect("parse input-target fixture");
+        let predicates = vec![PredicateSpec {
+            name: "p".into(),
+            register: "in_a".into(),
+            value: 1,
+        }];
+        let verdict = run_check(|| {
+            let view = encode_design(&file).expect("encode");
+            let primed = encode_primed(&file, &view).expect("primed");
+            let nid_map = build_register_nid_map_with_inputs(&view);
+            smt_nested_hyper_must_check(&view, &primed, 0b1, &[], &predicates, &nid_map, 5_000)
+        });
+        assert_eq!(
+            verdict,
+            SmtMustVerdict::NotMust,
+            "empty target set is NotMust; got {verdict:?}"
+        );
     }
 
     // ---- H.B — free-input predicate (source-pin / target-free) ----
