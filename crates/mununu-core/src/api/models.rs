@@ -1034,6 +1034,28 @@ pub struct SvVerifyAutoResponse {
     /// Model-level diagnostics: state-register count + black-boxed (cut)
     /// modules. Lets a SKIPPED outcome point at its root cause.
     pub diagnostics: ModelDiagnosticsView,
+    /// H.J — human-facing provenance notes: every abstraction / scoping decision
+    /// the run made (config concretizations, reset-gating, flop stubs, cut
+    /// modules, the abstraction posture, the coverage summary), so a verdict's
+    /// scope and caveats are explicit in the payload.
+    #[serde(default)]
+    pub notes: Vec<VerificationNoteView>,
+}
+
+/// One provenance note (mirrors
+/// [`crate::adapter::slang::verify_auto::VerificationNote`]).
+#[derive(Debug, Serialize)]
+pub struct VerificationNoteView {
+    /// Machine-stable kebab category (e.g. `"config-concretization"`).
+    pub kind: String,
+    /// `"info"` | `"scope-caveat"` | `"soundness-caveat"`.
+    pub level: String,
+    /// One-line human summary.
+    pub summary: String,
+    /// Longer explanation (the why + the soundness/scope implication).
+    pub detail: String,
+    /// Structured operands (e.g. `["cfg_detect_timer_i=7"]`).
+    pub items: Vec<String>,
 }
 
 /// Model-level lift diagnostics (mirrors
