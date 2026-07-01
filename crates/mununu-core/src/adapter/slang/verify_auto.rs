@@ -217,6 +217,44 @@ fn must_edge_inference_label(mode: MustEdgeInference) -> &'static str {
     }
 }
 
+/// H.J.b — token-aware substitution of concretized config inputs with their
+/// constants in a formula string. Each **whole-identifier** occurrence of a
+/// pinned signal name becomes its value (`cnt_q >= cfg_detect_timer_i` →
+/// `cnt_q >= 7` with `{cfg_detect_timer_i: 7}`), so a relational-with-wide-input
+/// atom lowers to a decidable state-vs-constant `Cmp`. Identifier chars match the
+/// mu-parser (alnum, `_`, `$`, `.`); non-identifier text is preserved. Only the
+/// signals actually pinned in the BTOR2 are substituted, so the formula and the
+/// pinned model agree. Empty config ⇒ the string is returned unchanged. Pure +
+/// unit-tested.
+fn substitute_config_in_formula(formula: &str, config: &[(String, u64)]) -> String {
+    if config.is_empty() {
+        return formula.to_string();
+    }
+    let map: std::collections::HashMap<&str, u64> =
+        config.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$' || c == '.';
+    let chars: Vec<char> = formula.chars().collect();
+    let mut out = String::with_capacity(formula.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if is_ident(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_ident(chars[i]) {
+                i += 1;
+            }
+            let tok: String = chars[start..i].iter().collect();
+            match map.get(tok.as_str()) {
+                Some(v) => out.push_str(&v.to_string()),
+                None => out.push_str(&tok),
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// H.J — build the human-facing provenance notes from a completed run's
 /// diagnostics + the abstraction posture + the coverage tally + any config
 /// concretizations applied. Pure (no toolchain) so it is unit-testable; called
@@ -366,6 +404,17 @@ pub struct VerifyAutoOptions {
     /// reported in `diagnostics.auto_provided_stubs`. Set `false` to leave cut
     /// flops cut (reported in `blackboxed_modules`).
     pub auto_stub_flops: bool,
+    /// H.J.b — user-supplied config concretization: pin a (typically wide, e.g. a
+    /// timer threshold) input to a **constant** so comparisons against it become
+    /// decidable. Each entry `signal → value` is pinned in the lifted BTOR2 (via
+    /// `pin_inputs_to_constants`, like reset-gating) AND substituted into every
+    /// formula atom (`cnt_q >= cfg_detect_timer_i` → `cnt_q >= 7`), turning a
+    /// relational-with-wide-input into a decidable state-vs-constant comparison.
+    /// **Scope-reduced:** the verdicts then hold FOR THESE values, not all
+    /// configurations — surfaced as a `config-concretization` ScopeCaveat note.
+    /// Default empty ⇒ no concretization, no behaviour change. Only signals that
+    /// are actual inputs are pinned; the rest are ignored (and not reported).
+    pub config_values: std::collections::HashMap<String, u64>,
 }
 
 impl Default for VerifyAutoOptions {
@@ -375,6 +424,7 @@ impl Default for VerifyAutoOptions {
             must_edge_inference: MustEdgeInference::Off,
             gate_reset: true,
             auto_stub_flops: true,
+            config_values: std::collections::HashMap::new(),
         }
     }
 }
@@ -869,6 +919,30 @@ pub fn verify_auto(
         crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &reset_pins);
     report.diagnostics.gated_resets = pinned_resets;
 
+    // H.J.b — pin user-supplied config inputs to constants (scope-reduced
+    // concretization; same mechanism as reset-gating). Only signals that are
+    // actual inputs are pinned; `pinned_configs` is the applied set, which drives
+    // both the per-property formula substitution below and the
+    // `config-concretization` ScopeCaveat note. Sorted for a deterministic order.
+    let config_pins: Vec<(String, u64)> = {
+        let mut v: Vec<(String, u64)> = opts
+            .config_values
+            .iter()
+            .map(|(k, val)| (k.clone(), *val))
+            .collect();
+        v.sort();
+        v
+    };
+    let (btor2, pinned_configs) =
+        crate::adapter::btor2::pin::pin_inputs_to_constants(&btor2, &config_pins);
+    let applied_config_values: Vec<(String, u64)> = pinned_configs
+        .iter()
+        .filter_map(|s| {
+            let (n, val) = s.split_once('=')?;
+            Some((n.to_string(), val.trim().parse::<u64>().ok()?))
+        })
+        .collect();
+
     // State-cell symbols of the augmented design — the seedable-atom universe.
     let file = crate::adapter::btor2::parser::parse(&btor2).map_err(|mut e| {
         e.message = format!("verify_auto: re-parse augmented BTOR2: {}", e.message);
@@ -988,13 +1062,19 @@ pub fn verify_auto(
 
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
-        let formula = match mu_parser::parse(&t.formula) {
+        // H.J.b — substitute the concretized config inputs (`cfg_* → const`) so a
+        // relational-with-wide-input atom becomes a decidable state-vs-constant
+        // comparison. The substituted string is BOTH parsed and reported (the
+        // verdict shows `cnt_q >= 7`, consistent with the config-concretization
+        // note). No-op when no config was pinned.
+        let formula_str = substitute_config_in_formula(&t.formula, &applied_config_values);
+        let formula = match mu_parser::parse(&formula_str) {
             Ok(f) => f,
             Err(e) => {
                 report.properties.push(PropertyVerdict {
                     name: t.name.clone(),
                     kind: t.kind,
-                    formula: t.formula.clone(),
+                    formula: formula_str.clone(),
                     outcome: VerifyOutcome::Skipped {
                         reason: format!("formula failed to parse: {e:?}"),
                     },
@@ -1016,7 +1096,7 @@ pub fn verify_auto(
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
-                formula: t.formula.clone(),
+                formula: formula_str.clone(),
                 outcome: VerifyOutcome::Skipped { reason },
                 seeded_predicates: Vec::new(),
             });
@@ -1028,7 +1108,7 @@ pub fn verify_auto(
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
-                formula: t.formula.clone(),
+                formula: formula_str.clone(),
                 outcome: VerifyOutcome::Skipped {
                     reason: "no state-cell / combinational predicate atoms to seed the cube"
                         .to_string(),
@@ -1233,16 +1313,16 @@ pub fn verify_auto(
         report.properties.push(PropertyVerdict {
             name: t.name.clone(),
             kind: t.kind,
-            formula: t.formula.clone(),
+            formula: formula_str.clone(),
             outcome,
             seeded_predicates: seeded_names,
         });
     }
 
     // H.J — provenance notes: surface every abstraction/scoping decision this run
-    // made (posture, reset-gating, flop stubs, cut modules, coverage). Config
-    // concretizations (H.J.b) will pass the applied pins here.
-    report.notes = build_notes(&report, opts.must_edge_inference, &[]);
+    // made (config concretizations, posture, reset-gating, flop stubs, cut
+    // modules, coverage).
+    report.notes = build_notes(&report, opts.must_edge_inference, &applied_config_values);
     Ok(report)
 }
 
@@ -1253,6 +1333,35 @@ mod tests {
 
     fn cells(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn substitute_config_in_formula_is_token_aware() {
+        // H.J.b — a pinned config input is substituted with its constant, whole
+        // identifiers only (so a prefix like `cfg_detect_timer` inside another
+        // name is NOT touched), and the rest of the formula is preserved.
+        let cfg = [("cfg_detect_timer_i".to_string(), 7u64)];
+        assert_eq!(
+            substitute_config_in_formula("nu X. ((cnt_q >= cfg_detect_timer_i) && [] X)", &cfg),
+            "nu X. ((cnt_q >= 7) && [] X)"
+        );
+        // Whole-identifier: a name that merely CONTAINS the config name is not
+        // substituted; a bound var / keyword is untouched.
+        assert_eq!(
+            substitute_config_in_formula("cfg_detect_timer_i_extra == 1", &cfg),
+            "cfg_detect_timer_i_extra == 1"
+        );
+        // Empty config ⇒ unchanged.
+        assert_eq!(
+            substitute_config_in_formula("cnt_q >= cfg_detect_timer_i", &[]),
+            "cnt_q >= cfg_detect_timer_i"
+        );
+        // The arithmetic-addend form survives + substitutes its own operands.
+        let cfg2 = [("thr".to_string(), 3u64)];
+        assert_eq!(
+            substitute_config_in_formula("cnt == cnt_past + 1 && x >= thr", &cfg2),
+            "cnt == cnt_past + 1 && x >= 3"
+        );
     }
 
     #[test]
@@ -2070,6 +2179,145 @@ mod tests {
                 .iter()
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_sysrst_config_concretization_flips_timer_relationals() {
+        // H.J.b — pinning the wide config timers to constants (the harness's
+        // DEB=1, DET=7) turns `cnt_q >= cfg_*_timer_i` into a decidable
+        // `cnt_q >= const`, so the config-timer ⊥ (sva_5/7/10/11/13/14) can reach
+        // definite verdicts FOR THOSE VALUES. Prints the delta; asserts the
+        // config-concretization note is present, the formula shows the constant,
+        // and there is NO spurious VIOLATED (sound-for-that-config).
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let sysrst = root.join("r46_sysrst_detect_k5/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let sources = vec![
+            (
+                "sysrst_ctrl_detect.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_detect.sv")),
+            ),
+            (
+                "sysrst_ctrl_pkg.sv".to_string(),
+                read(sysrst.join("sysrst_ctrl_pkg.sv")),
+            ),
+            (
+                "prim_assert.sv".to_string(),
+                read(prim.join("prim_assert.sv")),
+            ),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read(prim.join("prim_assert_standard_macros.svh")),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read(prim.join("prim_assert_sec_cm.svh")),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read(prim.join("prim_flop_macros.sv")),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("sysrst_ctrl_detect".to_string()),
+            use_sv2v: true,
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let mut config_values = std::collections::HashMap::new();
+        config_values.insert("cfg_debounce_timer_i".to_string(), 1u64);
+        config_values.insert("cfg_detect_timer_i".to_string(), 7u64);
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                config_values,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on sysrst with config concretization");
+
+        eprintln!("\n=== sysrst config-concretization breakdown (DEB=1, DET=7) ===");
+        let (mut holds, mut violated, mut unknown, mut skipped) = (0, 0, 0, 0);
+        for p in &report.properties {
+            eprintln!("  {}: {:?}", p.name, p.outcome);
+            match p.outcome {
+                VerifyOutcome::Holds => holds += 1,
+                VerifyOutcome::Violated { .. } => violated += 1,
+                VerifyOutcome::Unknown { .. } => unknown += 1,
+                VerifyOutcome::Skipped { .. } => skipped += 1,
+            }
+        }
+        eprintln!("HOLDS={holds} VIOLATED={violated} UNKNOWN={unknown} SKIPPED={skipped}");
+        for n in &report.notes {
+            eprintln!("  note [{}] {}: {}", n.kind, n.summary, n.items.join(", "));
+        }
+
+        // The config-concretization note is present, is a ScopeCaveat, and names
+        // both pinned timers with their values.
+        let cc = report
+            .notes
+            .iter()
+            .find(|n| n.kind == "config-concretization")
+            .expect("config-concretization note present");
+        assert_eq!(cc.level, NoteLevel::ScopeCaveat);
+        assert!(cc.items.contains(&"cfg_detect_timer_i=7".to_string()));
+        assert!(cc.items.contains(&"cfg_debounce_timer_i=1".to_string()));
+        // The concretized relational atom shows the CONSTANT (substituted), not
+        // the free config name.
+        let sva7 = report
+            .properties
+            .iter()
+            .find(|p| p.name == "sysrst_ctrl_detect_sva_7")
+            .expect("sva_7 present");
+        assert!(
+            sva7.formula.contains("cnt_q >= 7") && !sva7.formula.contains("cfg_detect_timer_i"),
+            "sva_7 formula shows the concretized threshold: {}",
+            sva7.formula
+        );
+        // SOUND — pinning is a restriction (a specific config), so no spurious
+        // VIOLATED. The four config-timer relationals flip ⊥ → HOLDS (for these
+        // values); HOLDS 9 → 12.
+        assert_eq!(violated, 0, "no spurious VIOLATED under concretization");
+        assert_eq!(
+            skipped, 0,
+            "every property still binds under concretization; got SKIPPED={skipped}"
+        );
+        for name in [
+            "sysrst_ctrl_detect_sva_5",  // EnterDetectSt: cnt_q >= cfg_debounce
+            "sysrst_ctrl_detect_sva_7",  // EnterStableSt: cnt_q >= cfg_detect
+            "sysrst_ctrl_detect_sva_10", // DetectedOut
+            "sysrst_ctrl_detect_sva_11", // DetectedPulseOut
+        ] {
+            let p = report
+                .properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} present"));
+            assert!(
+                matches!(p.outcome, VerifyOutcome::Holds),
+                "{name} (config-timer relational) reaches HOLDS once the timer is \
+                 concretized; got {:?}",
+                p.outcome
+            );
+        }
+        assert_eq!(
+            holds, 12,
+            "config concretization lifts sysrst 9 → 12 HOLDS (sva_5/7/10/11); got {holds}"
+        );
+        // The residual ⊥ are the non-timer cases: sva_12 (pulse), sva_13/14
+        // (counter monotonicity/reset — H.H), sva_15 (arithmetic H.G binds to ⊥).
+        assert_eq!(
+            unknown, 4,
+            "the non-timer residual ⊥ remain; got UNKNOWN={unknown}"
         );
     }
 

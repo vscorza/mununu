@@ -1190,6 +1190,13 @@ struct SvVerifyAutoArgs {
     /// stubbed so its register survives the lift; pass this to leave it cut.
     #[arg(long = "no-auto-stub-flops")]
     no_auto_stub_flops: bool,
+    /// H.J.b — config concretization: pin a wide config input to a constant so
+    /// comparisons against it become decidable (e.g. a timer threshold).
+    /// Repeatable; format `SIGNAL=VALUE` (e.g. `--config-value
+    /// cfg_detect_timer_i=7`). Verdicts are then SCOPED to these values (shown as
+    /// a `config-concretization` note). Only actual inputs are pinned.
+    #[arg(long = "config-value", value_name = "SIGNAL=VALUE")]
+    config_value: Vec<String>,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -2202,11 +2209,22 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         MustEdgeInferenceArg::SmtPerTargetStandard => MustEdgeInference::SmtPerTargetStandard,
         MustEdgeInferenceArg::SmtHyperMust => MustEdgeInference::SmtHyperMust,
     };
+    // H.J.b — parse `SIGNAL=VALUE` config concretization entries; malformed
+    // entries are skipped (the pipeline only pins actual inputs).
+    let config_values: std::collections::HashMap<String, u64> = args
+        .config_value
+        .iter()
+        .filter_map(|e| {
+            let (name, val) = e.split_once('=')?;
+            Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
+        })
+        .collect();
     let opts = VerifyAutoOptions {
         max_iterations: args.max_iterations,
         must_edge_inference,
         gate_reset: !args.no_gate_reset,
         auto_stub_flops: !args.no_auto_stub_flops,
+        config_values,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)

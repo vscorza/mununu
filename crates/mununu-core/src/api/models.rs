@@ -1022,6 +1022,12 @@ pub struct SvVerifyAutoRequest {
     /// `true`). Set `false` to leave cut flops reported as black-boxed.
     #[serde(default)]
     pub auto_stub_flops: Option<bool>,
+    /// H.J.b — config concretization: pin wide config inputs to constants so
+    /// comparisons against them become decidable. Each entry `"signal=value"`
+    /// (e.g. `"cfg_detect_timer_i=7"`). The verdicts are then SCOPED to these
+    /// values (surfaced as a `config-concretization` note). Default empty.
+    #[serde(default)]
+    pub config_values: Vec<String>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.

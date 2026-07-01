@@ -770,11 +770,22 @@ pub async fn sv_verify_auto_handler(
         Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
         _ => MustEdgeInference::Off,
     };
+    // H.J.b — parse `"signal=value"` config concretization entries; malformed
+    // entries are skipped (the pipeline only pins actual inputs anyway).
+    let config_values: std::collections::HashMap<String, u64> = request
+        .config_values
+        .iter()
+        .filter_map(|e| {
+            let (name, val) = e.split_once('=')?;
+            Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
+        })
+        .collect();
     let opts = VerifyAutoOptions {
         max_iterations: request.max_iterations.unwrap_or(16),
         must_edge_inference,
         gate_reset: request.gate_reset.unwrap_or(true),
         auto_stub_flops: request.auto_stub_flops.unwrap_or(true),
+        config_values,
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
