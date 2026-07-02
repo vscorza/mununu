@@ -2705,6 +2705,151 @@ mod tests {
 
     #[test]
     #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_onehot0_state_invariant_holds() {
+        // One-hot-support demonstrator (STATE case): a one-hot-encoded FSM whose
+        // security invariant `$onehot0(state_q)` (at-most-one bit set — the
+        // fault-detection property) translates to a value-set predicate over the
+        // STATE register, i.e. ONE compound cube dimension. `$onehot0` (not
+        // `$onehot`) because reset-gating starts `state_q` at the BTOR2 init `000`
+        // (at-most-one-hot ✓; exactly-one would spuriously fail at `000`). The FSM
+        // only ever drives one-hot values, so the invariant HOLDS.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        const SV: &str = r#"module onehot_fsm (input logic clk, input logic rst_ni, input logic go_i);
+  localparam logic [2:0] S0 = 3'b001, S1 = 3'b010, S2 = 3'b100;
+  logic [2:0] state_q, state_d;
+  always_comb begin
+    state_d = state_q;
+    unique case (state_q)
+      S0: if (go_i) state_d = S1;
+      S1: state_d = S2;
+      S2: state_d = S0;
+      default: state_d = S0;
+    endcase
+  end
+  always_ff @(posedge clk or negedge rst_ni) begin
+    if (!rst_ni) state_q <= S0;
+    else         state_q <= state_d;
+  end
+  OneHotState_A: assert property (@(posedge clk) disable iff (!rst_ni) $onehot0(state_q));
+endmodule
+"#;
+        let sources = vec![("onehot_fsm.sv".to_string(), SV.to_string())];
+        let yopts = YosysOptions {
+            top: Some("onehot_fsm".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on onehot_fsm");
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        let p = report
+            .properties
+            .iter()
+            .find(|p| p.formula.contains("state_q == 1"))
+            .expect("the $onehot0(state_q) property is present + translated");
+        // The translation is the value-set predicate over the state register.
+        assert!(
+            p.formula.contains("state_q == 1")
+                && p.formula.contains("state_q == 2")
+                && p.formula.contains("state_q == 4"),
+            "$onehot0(state_q) expands to the power-of-two value set: {}",
+            p.formula
+        );
+        assert!(
+            matches!(p.outcome, VerifyOutcome::Holds),
+            "the one-hot state invariant HOLDS; got {:?}",
+            p.outcome
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_opentitan_prim_onehot_check_holds() {
+        // One-hot-support demonstrator (real OpenTitan, INPUT case): the hardened
+        // `prim_onehot_check.sv` raises `err_o` iff its input `oh_i` is not one-hot0.
+        // Its inline `Onehot0Check_A, !$onehot0(oh_i) |-> err_o` exercises the new
+        // `$onehot0` translator support end-to-end and reaches a definite HOLDS —
+        // `onehot0(oh_i) ∨ err_o` is a per-cube tautology the SMT labeller confirms.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        use std::path::PathBuf;
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/verify/opentitan_prim_onehot_check/source");
+        let read = |n: &str| {
+            std::fs::read_to_string(src.join(n)).unwrap_or_else(|e| panic!("read {n}: {e}"))
+        };
+        let sources = vec![
+            (
+                "prim_onehot_check_wrapper.sv".to_string(),
+                read("prim_onehot_check_wrapper.sv"),
+            ),
+            (
+                "prim_onehot_check.sv".to_string(),
+                read("prim_onehot_check.sv"),
+            ),
+            ("prim_assert.sv".to_string(), read("prim_assert.sv")),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read("prim_assert_standard_macros.svh"),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read("prim_assert_sec_cm.svh"),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read("prim_flop_macros.sv"),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("prim_onehot_check_wrapper".to_string()),
+            use_sv2v: true,
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on prim_onehot_check");
+        assert!(
+            report.unsupported.is_empty(),
+            "unsupported: {:?}",
+            report.unsupported
+        );
+        let p = report
+            .properties
+            .iter()
+            .find(|p| p.formula.contains("oh_i == 1"))
+            .expect("the $onehot0(oh_i) check is present + translated");
+        assert!(
+            p.formula.contains("oh_i == 8"),
+            "$onehot0(oh_i) expands over the 4-bit power-of-two value set: {}",
+            p.formula
+        );
+        assert!(
+            matches!(p.outcome, VerifyOutcome::Holds),
+            "the OpenTitan one-hot0 check HOLDS; got {:?}",
+            p.outcome
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
     fn e2e_counter_bound_flips_saturating_monotonicity() {
         // H.H demonstrator — the bound-seeding mechanism isolated from any
         // antecedent co-blocker. A counter rises to K then HOLDS at K
