@@ -742,11 +742,30 @@ fn compare(expr: &Value, op: &str) -> Result<String, String> {
             return Ok(format!("({inner} {flipped} {other})"));
         }
     }
+    // (6) 1-bit boolean equality/inequality where a plain-signal / literal form did
+    // not match — e.g. a reduction operand (`(|oh_i) != en_i`, prim_onehot_check's
+    // EnableCheck) or a boolean sub-expression. Both operands are 1-bit booleans, so
+    // `a != b ≡ a XOR b` and `a == b ≡ a XNOR b`, expanded into the propositional
+    // fragment via `bool_expr` (which handles the reduction `|x → (x != 0)`). Guarded
+    // to 1-bit both sides: for a multi-bit operand `bool_expr` reduction-ORs it,
+    // which would change an `==`'s meaning.
+    if matches!(op, "==" | "!=")
+        && signal_width(left) == 1
+        && signal_width(right) == 1
+        && let (Ok(a), Ok(b)) = (bool_expr(left), bool_expr(right))
+    {
+        return Ok(if op == "!=" {
+            format!("(({a} && (!({b}))) || ((!({a})) && {b}))") // a XOR b
+        } else {
+            format!("(({a} && {b}) || ((!({a})) && (!({b}))))") // a XNOR b
+        });
+    }
     Err(format!(
         "comparison must be `signal {op} literal`, `literal {op} signal`, a relational \
-         `signal {op} signal`, a 1-bit `!signal ==/!= …`, or a `boolean-expr ==/!= 0` \
-         form; got left={:?} right={:?} (an arithmetic operand like `== x + 1` needs \
-         predicate-arithmetic, not yet supported)",
+         `signal {op} signal`, a 1-bit `!signal ==/!= …`, a 1-bit boolean `==/!=` (incl. \
+         a reduction operand), or a `boolean-expr ==/!= 0` form; got left={:?} right={:?} \
+         (an arithmetic operand like `== x + 1` needs predicate-arithmetic, not yet \
+         supported)",
         left.get("kind").and_then(Value::as_str),
         right.get("kind").and_then(Value::as_str),
     ))
@@ -1506,17 +1525,27 @@ mod tests {
     }
 
     #[test]
-    fn hd_negation_peel_requires_one_bit_operand() {
-        // A multi-bit `!bus` means `bus == 0`, NOT a simple operator flip — so
-        // the negation-peel must NOT fire on it. The comparison stays rejected
-        // (honest) rather than silently becoming the unsound `(bus != y)`.
+    fn hd_negation_peel_multibit_lowers_via_boolexpr_not_unsound_flip() {
+        // A multi-bit `!bus` means `bus == 0`, NOT a simple operator flip. The 1-bit
+        // negation-peel (case 5) does NOT fire on it; instead the 1-bit boolean
+        // comparison (case 6) handles `(!bus) == y` via `bool_expr`, which correctly
+        // lowers `!bus → !(bus != 0)` (i.e. `bus == 0`). Crucially it must NOT become
+        // the unsound `(bus != y)` peel-flip. (`!bus` is a 1-bit LogicalNot result.)
         let cmp = serde_json::json!({
             "kind": "BinaryOp", "op": "CaseEquality",
-            "left":  {"kind": "UnaryOp", "op": "LogicalNot",
+            "left":  {"kind": "UnaryOp", "op": "LogicalNot", "type": "logic",
                       "operand": {"kind": "NamedValue", "symbol": "1 bus", "type": "logic[7:0]"}},
             "right": {"kind": "NamedValue", "symbol": "2 y", "type": "logic"}
         });
-        bool_expr(&cmp).expect_err("multi-bit !bus must not peel-and-flip");
+        let s = bool_expr(&cmp).expect("(!bus) == y lowers via the boolean-comparison case");
+        assert!(
+            s.contains("bus != 0"),
+            "multi-bit !bus lowered as bus==0 (`!(bus != 0)`): {s}"
+        );
+        assert!(
+            !s.contains("bus != y") && !s.contains("bus == y"),
+            "no unsound peel-flip to a direct bus↔y comparison: {s}"
+        );
     }
 
     #[test]
@@ -1598,6 +1627,33 @@ mod tests {
             err.contains("$isunknown") || err.contains("not in the"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn reduction_operand_in_1bit_comparison_expands_to_xor() {
+        // prim_onehot_check EnableCheck shape: `(|oh_i) != en_i`. A reduction operand
+        // in a 1-bit `!=` expands to XOR over the propositional fragment (the
+        // reduction itself lowers `|oh_i → (oh_i != 0)`).
+        let ne = serde_json::json!({
+            "left": {
+                "kind": "UnaryOp", "op": "BitwiseOr", "type": "logic",
+                "operand": {"kind": "NamedValue", "symbol": "1 oh_i", "type": "logic[3:0]"}
+            },
+            "right": {"kind": "NamedValue", "symbol": "2 en_i", "type": "logic"}
+        });
+        let xor = compare(&ne, "!=").expect("(|oh_i) != en_i translates");
+        assert!(xor.contains("oh_i != 0"), "reduction lowered: {xor}");
+        assert!(
+            xor.contains("&&") && xor.contains("||"),
+            "!= is an XOR expansion: {xor}"
+        );
+        // `==` is the XNOR (same terms, opposite polarity structure).
+        let xnor = compare(&ne, "==").expect("(|oh_i) == en_i translates");
+        assert!(
+            xnor.contains("oh_i != 0") && xnor.contains("&&") && xnor.contains("||"),
+            "== is an XNOR expansion: {xnor}"
+        );
+        assert_ne!(xor, xnor, "XOR and XNOR expansions differ");
     }
 
     #[test]

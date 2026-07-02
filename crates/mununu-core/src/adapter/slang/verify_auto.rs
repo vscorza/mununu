@@ -2850,6 +2850,64 @@ endmodule
 
     #[test]
     #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_reduction_or_in_comparison_translates() {
+        // Reduction-OR-in-comparison: `(|v_i) == nonzero` — a reduction operand
+        // inside a 1-bit comparison — now TRANSLATES (→ an XNOR over `v_i != 0` and
+        // `nonzero`) instead of being rejected as unsupported. It reaches the
+        // abstraction and a modeled verdict (not SKIPPED). The verdict here is an
+        // honest ⊥: the XNOR splits into two independent derived labels (`v_i != 0`
+        // and `nonzero`, both the same function of the input `v_i`) and the per-label
+        // abstraction doesn't see they are correlated — the SAME cone-completeness /
+        // correlation limit as the sysrst cnt_clr residual, which the R-F5 BDD track
+        // (joint symbolic evaluation) addresses. This test guards the TRANSLATION
+        // (never regress to unsupported) and will tighten to HOLDS once the engine
+        // resolves the correlation.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        const SV: &str = r#"module redor_demo (input logic clk, input logic rst_ni, input logic [1:0] v_i);
+  logic nonzero;
+  assign nonzero = |v_i;
+  RedOr_A: assert property (@(posedge clk) disable iff (!rst_ni) (|v_i) == nonzero);
+endmodule
+"#;
+        let sources = vec![("redor_demo.sv".to_string(), SV.to_string())];
+        let yopts = YosysOptions {
+            top: Some("redor_demo".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on redor_demo");
+        assert!(
+            report.unsupported.is_empty(),
+            "reduction-in-comparison translates (nothing unsupported): {:?}",
+            report.unsupported
+        );
+        let p = report
+            .properties
+            .iter()
+            .find(|p| p.formula.contains("v_i != 0"))
+            .expect("the reduction `(|v_i)` lowered to `v_i != 0`");
+        // Reaches a MODELED verdict (definite or honest ⊥), never SKIPPED/unsupported.
+        assert!(
+            matches!(
+                p.outcome,
+                VerifyOutcome::Holds | VerifyOutcome::Unknown { .. }
+            ),
+            "reduction-in-comparison reaches the abstraction (not SKIPPED); got {:?}\n  {}",
+            p.outcome,
+            p.formula
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
     fn e2e_counter_bound_flips_saturating_monotonicity() {
         // H.H demonstrator — the bound-seeding mechanism isolated from any
         // antecedent co-blocker. A counter rises to K then HOLDS at K
