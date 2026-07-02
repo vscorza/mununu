@@ -1197,6 +1197,15 @@ struct SvVerifyAutoArgs {
     /// a `config-concretization` note). Only actual inputs are pinned.
     #[arg(long = "config-value", value_name = "SIGNAL=VALUE")]
     config_value: Vec<String>,
+    /// H.H — counter upper bound: seed a `SIGNAL <= VALUE` cube-partition to refine
+    /// a counter-monotonicity property (`cnt_q >= $past(cnt_q)`) whose ⊥ is the
+    /// abstract 32-bit wraparound. Repeatable; format `SIGNAL<=VALUE` (e.g.
+    /// `--counter-bound cnt_q<=7`; the `SIGNAL=VALUE` spelling is also accepted).
+    /// Sound (a partition, not an assumption); needs `--must-edge-inference` on.
+    /// Bounds are also auto-derived from `--config-value`; a manual bound overrides
+    /// the inferred one. Shown as a `counter-bound` note.
+    #[arg(long = "counter-bound", value_name = "SIGNAL<=VALUE")]
+    counter_bound: Vec<String>,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -2219,12 +2228,23 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
             Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
         })
         .collect();
+    // H.H — parse `SIGNAL<=VALUE` (or `SIGNAL=VALUE`) counter-bound entries; both
+    // spellings mean the inclusive upper bound `SIGNAL <= VALUE`.
+    let counter_bounds: std::collections::HashMap<String, u64> = args
+        .counter_bound
+        .iter()
+        .filter_map(|e| {
+            let (name, val) = e.split_once("<=").or_else(|| e.split_once('='))?;
+            Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
+        })
+        .collect();
     let opts = VerifyAutoOptions {
         max_iterations: args.max_iterations,
         must_edge_inference,
         gate_reset: !args.no_gate_reset,
         auto_stub_flops: !args.no_auto_stub_flops,
         config_values,
+        counter_bounds,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)

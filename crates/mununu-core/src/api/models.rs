@@ -1028,6 +1028,16 @@ pub struct SvVerifyAutoRequest {
     /// values (surfaced as a `config-concretization` note). Default empty.
     #[serde(default)]
     pub config_values: Vec<String>,
+    /// H.H — counter upper bounds: seed a `signal <= value` cube-partition to
+    /// refine a counter-monotonicity property (`cnt_q >= $past(cnt_q)`) whose ⊥ is
+    /// caused by the abstract 32-bit wraparound. Each entry `"signal<=value"` (the
+    /// `"signal=value"` spelling is also accepted, same meaning). Sound (a
+    /// partition, not an assumption — the must-edges verify it); requires
+    /// `must_edge_inference` on. Bounds are also auto-derived from `config_values`;
+    /// a manual entry here overrides the inferred one. Surfaced as a `counter-bound`
+    /// note. Default empty.
+    #[serde(default)]
+    pub counter_bounds: Vec<String>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.

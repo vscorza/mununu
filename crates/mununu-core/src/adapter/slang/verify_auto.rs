@@ -265,6 +265,7 @@ fn build_notes(
     report: &AutoVerifyReport,
     must_edge_inference: MustEdgeInference,
     applied_config_values: &[(String, u64)],
+    counter_bounds: &[String],
 ) -> Vec<VerificationNote> {
     let d = &report.diagnostics;
     let mut notes = Vec::new();
@@ -312,6 +313,31 @@ fn build_notes(
                 .iter()
                 .map(|(sig, v)| format!("{sig}={v}"))
                 .collect(),
+        });
+    }
+
+    // Counter-bound seeding (Info) — H.H; present only when a bound `X <= K` was
+    // seeded (user-supplied or config-inferred). A HOLDS it unlocks is PROVEN (the
+    // bound is a sound partition the SMT must-edges verify), so no scope caveat
+    // beyond the config-concretization one above.
+    if !counter_bounds.is_empty() {
+        notes.push(VerificationNote {
+            kind: "counter-bound".into(),
+            level: NoteLevel::Info,
+            summary: format!(
+                "{} counter-bound predicate(s) seeded to refine monotonicity properties.",
+                counter_bounds.len()
+            ),
+            detail: "A monotonicity/increment property over a counter (`cnt_q >= $past(cnt_q)`) is \
+                     ⊥ only because the abstraction admits the 32-bit wraparound. Seeding an upper \
+                     bound `X <= K` PARTITIONS the state space (it does not assume the bound — the \
+                     must-edges verify the reachable cubes stay bounded), excluding the wraparound \
+                     state so the verdict can become definite. Sound regardless of K: a wrong bound \
+                     only leaves the property at ⊥, never mis-verdicts. (config-inferred) bounds come \
+                     from a counter's comparison against a pinned config threshold; (user-supplied) \
+                     from --counter-bound / counter_bounds."
+                .into(),
+            items: counter_bounds.to_vec(),
         });
     }
 
@@ -415,6 +441,22 @@ pub struct VerifyAutoOptions {
     /// Default empty ⇒ no concretization, no behaviour change. Only signals that
     /// are actual inputs are pinned; the rest are ignored (and not reported).
     pub config_values: std::collections::HashMap<String, u64>,
+    /// H.H — user-supplied counter upper bounds: `register → K` seeds a compound
+    /// cube dimension `register <= K`, which PARTITIONS the abstract state into
+    /// `{register<=K}` / `{register>K}` (it does NOT assume the bound — the SMT
+    /// must-edges verify whether the reachable cubes stay bounded). This excludes
+    /// the abstract 32-bit wraparound state that leaves counter-monotonicity
+    /// properties (`cnt_q >= $past(cnt_q)`) at ⊥. **Sound regardless of K:** the
+    /// partition never mis-verdicts (a wrong K just leaves the property at honest
+    /// ⊥). Bounds are ALSO auto-derived from config concretization (a counter
+    /// compared against a pinned config `cnt_q >= cfg_detect_timer_i`, cfg=7,
+    /// yields `cnt_q <= 7`); a manual entry here overrides the config-inferred one.
+    /// Requires `must_edge_inference` ON for the box modality to close. Default
+    /// empty ⇒ only the config-inferred bounds fire (none without concretization).
+    /// Surfaced as a `counter-bound` note. Only counter registers (a state cell
+    /// appearing in a self-relational `$past` atom) are bounded; other registers
+    /// are ignored.
+    pub counter_bounds: std::collections::HashMap<String, u64>,
 }
 
 impl Default for VerifyAutoOptions {
@@ -425,6 +467,7 @@ impl Default for VerifyAutoOptions {
             gate_reset: true,
             auto_stub_flops: true,
             config_values: std::collections::HashMap::new(),
+            counter_bounds: std::collections::HashMap::new(),
         }
     }
 }
@@ -668,6 +711,157 @@ fn seed_from_formula(
     out
 }
 
+/// Every register name referenced by a property's seeded predicates (specs +
+/// compound + derived-relational operands). Used to detect counters and to decide
+/// whether a counter's `$past` shadow is present (so it, too, gets bounded).
+fn referenced_registers(seeded: &Seeded) -> std::collections::BTreeSet<String> {
+    let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for s in &seeded.specs {
+        all.insert(s.register.clone());
+    }
+    for (_, e) in &seeded.compounds {
+        for r in e.registers() {
+            all.insert(r);
+        }
+    }
+    for (_, e) in &seeded.derived_relational {
+        for r in e.registers() {
+            all.insert(r);
+        }
+    }
+    all
+}
+
+/// H.H — the counter registers referenced by a property's seeded predicates: a
+/// state register `X` whose `$past` shadow `X__past` is ALSO referenced (a
+/// self-relational monotonicity / increment atom — `cnt_q >= cnt_q__past` (sva_13)
+/// or `cnt_q == cnt_q__past + 1` (sva_15)). These are exactly the registers whose
+/// abstract 32-bit wraparound leaves the property at ⊥ — the ones a bound predicate
+/// refines. Restricting the bound-seed to these avoids adding useless cube
+/// dimensions to unrelated properties.
+fn counter_registers_in(seeded: &Seeded) -> std::collections::BTreeSet<String> {
+    let all = referenced_registers(seeded);
+    let mut counters = std::collections::BTreeSet::new();
+    for name in &all {
+        if let Some(base) = name.strip_suffix("__past")
+            && all.contains(base)
+        {
+            counters.insert(base.to_string());
+        }
+    }
+    counters
+}
+
+/// H.H — auto-derive counter upper bounds from config concretization. Scans EVERY
+/// translated property's ORIGINAL formula for a relational atom comparing a register
+/// `R` against a pinned config register `C` (`cnt_q >= cfg_detect_timer_i`); the
+/// pinned value `V = config[C]` becomes a candidate bound `R <= V` (a counter counts
+/// up to the threshold it is compared against). GLOBAL across properties because the
+/// property that NEEDS the bound (sva_13, `cnt_q >= cnt_q__past`) does not itself
+/// reference the config — the comparison lives in a sibling property (sva_5,
+/// `cnt_q >= cfg_detect_timer_i`). The widest value wins on collision (the loosest
+/// sound partition). Empty when no config was concretized.
+fn config_inferred_counter_bounds(
+    translated: &[crate::adapter::slang::translate::TranslatedAssertion],
+    applied_config_values: &[(String, u64)],
+) -> std::collections::HashMap<String, u64> {
+    let mut bounds: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    if applied_config_values.is_empty() {
+        return bounds;
+    }
+    let cfg: std::collections::HashMap<&str, u64> = applied_config_values
+        .iter()
+        .map(|(n, v)| (n.as_str(), *v))
+        .collect();
+    for t in translated {
+        let Ok(formula) = crate::mu_calculus::parser::parse(&t.formula) else {
+            continue;
+        };
+        for node in formula.nodes() {
+            let Node::Predicate(atom) = node else {
+                continue;
+            };
+            let Ok(PredicateExpr::CmpReg { lhs, rhs, .. }) = parse_predicate_expr(atom) else {
+                continue;
+            };
+            // One operand is a pinned config register; the other is the register
+            // it bounds. (Either order — the comparison direction does not matter
+            // for a sound partition.)
+            let (reg, v) = if let Some(&v) = cfg.get(rhs.as_str()) {
+                (lhs, v)
+            } else if let Some(&v) = cfg.get(lhs.as_str()) {
+                (rhs, v)
+            } else {
+                continue;
+            };
+            let e = bounds.entry(reg).or_insert(v);
+            if v > *e {
+                *e = v;
+            }
+        }
+    }
+    bounds
+}
+
+/// H.H — seed a bound compound `X <= K` for each counter register `X`, manual bound
+/// (`opts.counter_bounds`) winning over the config-inferred one. Returns the applied
+/// `(register, bound, provenance)` triples for the `counter-bound` note. **Sound
+/// regardless of K:** the bound is a cube-dimension PARTITION (`{X<=K}` / `{X>K}`),
+/// not an assumption — the SMT must-edges verify whether the reachable cubes stay
+/// bounded, so a wrong K only leaves the property at honest ⊥, never mis-verdicts.
+/// Dedups against compounds already present (an identical `X <= K` atom from the
+/// formula itself).
+fn seed_counter_bounds(
+    seeded: &mut Seeded,
+    counters: &std::collections::BTreeSet<String>,
+    manual: &std::collections::HashMap<String, u64>,
+    config_inferred: &std::collections::HashMap<String, u64>,
+) -> Vec<(String, u64, &'static str)> {
+    let referenced = referenced_registers(seeded);
+    let mut applied = Vec::new();
+    for reg in counters {
+        let (k, provenance) = if let Some(&k) = manual.get(reg) {
+            (k, "user-supplied")
+        } else if let Some(&k) = config_inferred.get(reg) {
+            (k, "config-inferred")
+        } else {
+            continue;
+        };
+        // Bound BOTH the counter and its `$past` shadow (when present): the
+        // monotonicity/increment relational (`cnt_q >= cnt_q__past`) excludes the
+        // abstract wraparound state only when BOTH operands are bounded — bounding
+        // `cnt_q` alone leaves the state `(cnt_q=0, cnt_q__past=2^32-1)` reachable,
+        // so the relation stays ⊥.
+        let shadow = format!("{reg}__past");
+        let mut targets = vec![reg.clone()];
+        if referenced.contains(&shadow) {
+            targets.push(shadow);
+        }
+        let mut added_any = false;
+        for target in targets {
+            let name = format!("{target} <= {k}");
+            if seeded.compounds.iter().any(|(n, _)| n == &name) {
+                continue;
+            }
+            seeded.compounds.push((
+                name,
+                PredicateExpr::Cmp {
+                    register: target,
+                    op: CmpOp::Le,
+                    value: k,
+                },
+            ));
+            added_any = true;
+        }
+        // Only report a bound that actually seeded a new compound this call — so
+        // the note does not double-count and re-seeding is a true no-op.
+        if added_any {
+            applied.push((reg.clone(), k, provenance));
+        }
+    }
+    applied
+}
+
 /// Build the synthesised `SvAnnotation` sidecar JSON `cegar_refine_loop` reads:
 /// the compound predicates (`compound_predicates: [{name, expr}]`) PLUS
 /// `signals[].config_values` pinning each referenced register to its design init
@@ -843,7 +1037,7 @@ pub fn verify_auto(
         ..Default::default()
     };
     if extraction.translated.is_empty() {
-        report.notes = build_notes(&report, opts.must_edge_inference, &[]);
+        report.notes = build_notes(&report, opts.must_edge_inference, &[], &[]);
         return Ok(report);
     }
 
@@ -1060,6 +1254,18 @@ pub fn verify_auto(
             .unwrap_or_default()
     };
 
+    // H.H — auto-derive counter upper bounds from the concretized config (a
+    // counter compared against a pinned config threshold, `cnt_q >=
+    // cfg_detect_timer_i` with cfg=7, yields `cnt_q <= 7`). Global across
+    // properties: the property that NEEDS the bound (sva_13) doesn't reference the
+    // config; the comparison lives in a sibling (sva_5). Empty without config.
+    let config_inferred_bounds =
+        config_inferred_counter_bounds(&extraction.translated, &applied_config_values);
+    // Accumulates the applied bound descriptions for the report-level counter-bound
+    // note (sorted, deduped across properties).
+    let mut counter_bound_items: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
         // H.J.b — substitute the concretized config inputs (`cfg_* → const`) so a
@@ -1084,13 +1290,28 @@ pub fn verify_auto(
             }
         };
 
-        let seeded = seed_from_formula(
+        let mut seeded = seed_from_formula(
             &formula,
             resolves_to_state,
             is_input,
             combinational_kind,
             cone_inputs_of,
         );
+        // H.H — seed a bound compound `X <= K` for each counter register (a state
+        // cell whose `$past` shadow is also present, i.e. a self-relational
+        // monotonicity / increment atom). The bound is a sound cube-dimension
+        // PARTITION (not an assumption); with must-edges on it excludes the abstract
+        // wraparound state that leaves `cnt_q >= $past(cnt_q)` at ⊥. Manual bounds
+        // override the config-inferred ones. No-op when no counter / no bound.
+        let counters = counter_registers_in(&seeded);
+        for (reg, k, provenance) in seed_counter_bounds(
+            &mut seeded,
+            &counters,
+            &opts.counter_bounds,
+            &config_inferred_bounds,
+        ) {
+            counter_bound_items.insert(format!("{reg} <= {k} ({provenance})"));
+        }
         if !seeded.unseedable.is_empty() {
             let reason = unseedable_skip_reason(&seeded.unseedable, &report.diagnostics);
             report.properties.push(PropertyVerdict {
@@ -1322,7 +1543,13 @@ pub fn verify_auto(
     // H.J — provenance notes: surface every abstraction/scoping decision this run
     // made (config concretizations, posture, reset-gating, flop stubs, cut
     // modules, coverage).
-    report.notes = build_notes(&report, opts.must_edge_inference, &applied_config_values);
+    let counter_bound_items_vec: Vec<String> = counter_bound_items.into_iter().collect();
+    report.notes = build_notes(
+        &report,
+        opts.must_edge_inference,
+        &applied_config_values,
+        &counter_bound_items_vec,
+    );
     Ok(report)
 }
 
@@ -1365,6 +1592,130 @@ mod tests {
     }
 
     #[test]
+    fn counter_registers_detects_past_shadow() {
+        // H.H — a state register whose `$past` shadow is also referenced is a
+        // counter (the self-relational monotonicity/increment atom). A register
+        // without its shadow present is NOT flagged.
+        let mut seeded = Seeded::default();
+        // sva_13 shape: `cnt_q >= cnt_q__past` (a CmpReg compound).
+        seeded.compounds.push((
+            "cnt_q >= cnt_q__past".to_string(),
+            PredicateExpr::CmpReg {
+                lhs: "cnt_q".into(),
+                op: CmpOp::Ge,
+                rhs: "cnt_q__past".into(),
+            },
+        ));
+        // A plain state atom over an unrelated register — no shadow, not a counter.
+        seeded.specs.push(PredicateSpec {
+            name: "state_q == 0".into(),
+            register: "state_q".into(),
+            value: 0,
+        });
+        let counters = counter_registers_in(&seeded);
+        assert_eq!(
+            counters.into_iter().collect::<Vec<_>>(),
+            vec!["cnt_q".to_string()]
+        );
+    }
+
+    #[test]
+    fn seed_counter_bounds_manual_overrides_config_and_dedups() {
+        // H.H — manual bound wins over config-inferred; the bound becomes a `<= K`
+        // compound on BOTH the counter and its `$past` shadow; a bound already
+        // present as a compound is not duplicated.
+        let counters: std::collections::BTreeSet<String> =
+            ["cnt_q".to_string()].into_iter().collect();
+        let manual: std::collections::HashMap<String, u64> =
+            [("cnt_q".to_string(), 15u64)].into_iter().collect();
+        let config: std::collections::HashMap<String, u64> =
+            [("cnt_q".to_string(), 7u64)].into_iter().collect();
+
+        // The monotonicity relational makes `cnt_q__past` a referenced register, so
+        // the shadow is bounded alongside the counter.
+        let mono = || {
+            (
+                "cnt_q >= cnt_q__past".to_string(),
+                PredicateExpr::CmpReg {
+                    lhs: "cnt_q".into(),
+                    op: CmpOp::Ge,
+                    rhs: "cnt_q__past".into(),
+                },
+            )
+        };
+        let mut seeded = Seeded::default();
+        seeded.compounds.push(mono());
+        let applied = seed_counter_bounds(&mut seeded, &counters, &manual, &config);
+        // Manual 15 wins over config-inferred 7; the note reports the base once.
+        assert_eq!(applied, vec![("cnt_q".to_string(), 15, "user-supplied")]);
+        // BOTH operands of the relational are bounded.
+        assert!(seeded.compounds.iter().any(|(n, _)| n == "cnt_q <= 15"));
+        assert!(
+            seeded
+                .compounds
+                .iter()
+                .any(|(n, _)| n == "cnt_q__past <= 15")
+        );
+
+        // Re-seeding is idempotent (both `<= 15` compounds already exist).
+        let again = seed_counter_bounds(&mut seeded, &counters, &manual, &config);
+        assert!(again.is_empty());
+        assert_eq!(
+            seeded
+                .compounds
+                .iter()
+                .filter(|(n, _)| n == "cnt_q <= 15")
+                .count(),
+            1
+        );
+
+        // With no manual entry, the config-inferred bound is used.
+        let mut seeded2 = Seeded::default();
+        seeded2.compounds.push(mono());
+        let applied2 = seed_counter_bounds(
+            &mut seeded2,
+            &counters,
+            &std::collections::HashMap::new(),
+            &config,
+        );
+        assert_eq!(applied2, vec![("cnt_q".to_string(), 7, "config-inferred")]);
+        assert!(
+            seeded2
+                .compounds
+                .iter()
+                .any(|(n, _)| n == "cnt_q__past <= 7")
+        );
+    }
+
+    #[test]
+    fn config_inferred_bounds_from_sibling_comparison() {
+        // H.H — the bound for the counter comes from a SIBLING property's
+        // comparison against a pinned config threshold (the monotonicity property
+        // itself never names the config). Global scan across the property set.
+        let translated = vec![
+            crate::adapter::slang::translate::TranslatedAssertion {
+                name: "m_sva_5".into(),
+                kind: SvaKind::Assert,
+                // `cnt_q >= cfg_detect_timer_i` — the comparison that reveals the bound.
+                formula: "nu X. ((cnt_q >= cfg_detect_timer_i) && [] X)".into(),
+                recoverability_companion: None,
+            },
+            crate::adapter::slang::translate::TranslatedAssertion {
+                name: "m_sva_13".into(),
+                kind: SvaKind::Assert,
+                // The monotonicity property — needs the bound but never names cfg.
+                formula: "nu X. ((cnt_q >= cnt_q__past) && [] X)".into(),
+                recoverability_companion: None,
+            },
+        ];
+        let bounds =
+            config_inferred_counter_bounds(&translated, &[("cfg_detect_timer_i".into(), 7)]);
+        assert_eq!(bounds.get("cnt_q"), Some(&7));
+        // No config pinned ⇒ no inferred bounds.
+        assert!(config_inferred_counter_bounds(&translated, &[]).is_empty());
+    }
+
+    #[test]
     fn build_notes_surfaces_every_decision() {
         // H.J.a — the provenance notes cover the coverage tally, the abstraction
         // posture, and each model-level decision (reset-gating, flop stubs, cut
@@ -1399,11 +1750,13 @@ mod tests {
             &report,
             MustEdgeInference::SmtHyperMust,
             &[("cfg_detect_timer_i".into(), 7)],
+            &["cnt_q <= 7 (config-inferred)".to_string()],
         );
         let kinds: Vec<&str> = notes.iter().map(|n| n.kind.as_str()).collect();
         for expected in [
             "coverage-summary",
             "config-concretization",
+            "counter-bound",
             "abstraction-posture",
             "reset-gating",
             "flop-stub",
@@ -1414,6 +1767,14 @@ mod tests {
                 "missing note {expected}; got {kinds:?}"
             );
         }
+        // The counter-bound note is Info (a HOLDS it unlocks is proven) + carries
+        // the seeded bound.
+        let cb = notes.iter().find(|n| n.kind == "counter-bound").unwrap();
+        assert_eq!(cb.level, NoteLevel::Info);
+        assert!(
+            cb.items
+                .contains(&"cnt_q <= 7 (config-inferred)".to_string())
+        );
         // The scope caveat carries the pinned value + is a ScopeCaveat.
         let cc = notes
             .iter()
@@ -1426,12 +1787,12 @@ mod tests {
         assert_eq!(bc.level, NoteLevel::SoundnessCaveat);
         let cov = notes.iter().find(|n| n.kind == "coverage-summary").unwrap();
         assert!(cov.summary.contains("1 definite") && cov.summary.contains("1 unknown"));
-        // No pins ⇒ no config-concretization note.
-        let notes_no_pins = build_notes(&report, MustEdgeInference::Off, &[]);
+        // No pins / no bounds ⇒ no config-concretization or counter-bound note.
+        let notes_no_pins = build_notes(&report, MustEdgeInference::Off, &[], &[]);
         assert!(
             !notes_no_pins
                 .iter()
-                .any(|n| n.kind == "config-concretization")
+                .any(|n| n.kind == "config-concretization" || n.kind == "counter-bound")
         );
     }
 
@@ -2314,10 +2675,129 @@ mod tests {
             "config concretization lifts sysrst 9 → 12 HOLDS (sva_5/7/10/11); got {holds}"
         );
         // The residual ⊥ are the non-timer cases: sva_12 (pulse), sva_13/14
-        // (counter monotonicity/reset — H.H), sva_15 (arithmetic H.G binds to ⊥).
+        // (counter monotonicity/reset), sva_15 (arithmetic). H.H NOTE: the
+        // counter-bound `cnt_q <= 7` is auto-seeded here (the counter-bound note
+        // fires, asserted below), but it does NOT flip sva_13/14/15 — their ⊥ is
+        // co-dominated by the `cnt_clr` combinational-input ANTECEDENT (a separate
+        // cone-unwrap lever), not the counter bound. The bound is necessary infra
+        // (it excludes the abstract wraparound) but not sufficient for THIS fixture.
+        // The demonstrator `e2e_counter_bound_flips_saturating_monotonicity` below
+        // isolates a property where the bound alone flips ⊥ → HOLDS.
         assert_eq!(
             unknown, 4,
-            "the non-timer residual ⊥ remain; got UNKNOWN={unknown}"
+            "the non-timer residual ⊥ remain (bound is inert here — cnt_clr antecedent co-blocks); got UNKNOWN={unknown}"
+        );
+        // H.H — the counter-bound note fires (auto-inferred `cnt_q <= 7` from the
+        // sibling `cnt_q >= cfg_detect_timer_i` comparison), even though it does not
+        // move a verdict on this fixture.
+        let cb = report
+            .notes
+            .iter()
+            .find(|n| n.kind == "counter-bound")
+            .expect("counter-bound note present (config-inferred)");
+        assert_eq!(cb.level, NoteLevel::Info);
+        assert!(
+            cb.items.iter().any(|i| i.contains("cnt_q <= 7")),
+            "counter-bound note names the inferred bound; got {:?}",
+            cb.items
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_counter_bound_flips_saturating_monotonicity() {
+        // H.H demonstrator — the bound-seeding mechanism isolated from any
+        // antecedent co-blocker. A counter rises to K then HOLDS at K
+        // (`cnt_d = (cnt_q == K) ? K : cnt_q + 1`). Its UNCONDITIONAL monotonicity
+        // `cnt_q >= $past(cnt_q)` is concretely TRUE (the counter never decreases),
+        // but ABSTRACTLY ⊥: the predicate cube `{cnt_q >= cnt_q__past}` includes the
+        // UNREACHABLE high state `cnt_q = 2^W-1` (> K), whose "increment elsewhere"
+        // successor wraps to 0 — a may-edge to a `cnt_q >= cnt_q__past = false` cube
+        // with no must-witness, so the box is ⊥. Seeding `cnt_q <= K` (+ its `$past`
+        // shadow) EXCLUDES that unreachable state from the cube, removing the
+        // spurious may-edge → the verdict becomes a definite HOLDS. This is the
+        // sound bound-partition lever the roadmap's H.H targets, on a property where
+        // the bound alone is sufficient.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        const SV: &str = r#"module sat_hold_counter (input logic clk, input logic rst_ni);
+  localparam int unsigned W = 5;
+  localparam logic [W-1:0] K = 5'd7;
+  logic [W-1:0] cnt_q, cnt_d;
+  assign cnt_d = (cnt_q == K) ? K : (cnt_q + 1'b1);
+  always_ff @(posedge clk or negedge rst_ni) begin
+    if (!rst_ni) cnt_q <= '0;
+    else         cnt_q <= cnt_d;
+  end
+  MonoCnt_A: assert property (@(posedge clk) disable iff (!rst_ni) cnt_q >= $past(cnt_q));
+endmodule
+"#;
+        let sources = vec![("sat_hold_counter.sv".to_string(), SV.to_string())];
+        let yopts = YosysOptions {
+            top: Some("sat_hold_counter".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let mono = |report: &AutoVerifyReport| -> VerifyOutcome {
+            report
+                .properties
+                .iter()
+                .find(|p| p.formula.contains("cnt_q__past"))
+                .unwrap_or_else(|| {
+                    panic!("monotonicity property present; got {:?}", report.properties)
+                })
+                .outcome
+                .clone()
+        };
+
+        // Without a bound — the abstraction FAILS to prove monotonicity: the cube
+        // `{cnt_q >= cnt_q__past}` includes the unreachable high state, so the
+        // abstract successor can wrap. Depending on the must-edge witness this is a
+        // spurious VIOLATED or a ⊥ — either way NOT a definite HOLDS.
+        let base = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on the saturating counter (no bound)");
+        eprintln!("no-bound monotonicity: {:?}", mono(&base));
+        assert!(
+            !matches!(mono(&base), VerifyOutcome::Holds),
+            "without a bound the abstract wraparound prevents a HOLDS; got {:?}",
+            mono(&base)
+        );
+
+        // With the bound — the spurious wraparound cube is excluded → HOLDS.
+        let mut counter_bounds = std::collections::HashMap::new();
+        counter_bounds.insert("cnt_q".to_string(), 7u64);
+        let bounded = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                counter_bounds,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs on the saturating counter (bounded)");
+        eprintln!("bounded monotonicity: {:?}", mono(&bounded));
+        assert!(
+            matches!(mono(&bounded), VerifyOutcome::Holds),
+            "the counter bound flips monotonicity ⊥ → HOLDS; got {:?}",
+            mono(&bounded)
+        );
+        // The counter-bound note is present + names the user-supplied bound.
+        let cb = bounded
+            .notes
+            .iter()
+            .find(|n| n.kind == "counter-bound")
+            .expect("counter-bound note present");
+        assert!(
+            cb.items.iter().any(|i| i.contains("cnt_q <= 7")),
+            "counter-bound note names the bound; got {:?}",
+            cb.items
         );
     }
 
