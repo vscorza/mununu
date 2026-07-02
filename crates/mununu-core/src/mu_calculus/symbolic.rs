@@ -1,190 +1,416 @@
-//! R-F5 — symbolic (BDD-backed) abstraction spike.
+//! R-F5 — symbolic (BDD-backed) abstraction engine.
 //!
-//! The predicate-cube abstraction currently materializes 2^|P| explicit cube states
-//! and builds the may/must transition relation with O(2^2|P|) SMT queries (see
-//! `adapter/btor2/kmts_lift.rs`). This module is the de-risking spike for the
-//! symbolic alternative (R-F5): represent state sets and the transition relation as
-//! BDDs (via OxiDD) and evaluate the mu-calculus by fixpoint image/preimage, so the
-//! cube space is never enumerated.
+//! The explicit predicate-cube path materializes `2^|P|` cube states and builds the
+//! may/must transition relation with `O(2^2|P|)` SMT queries (`adapter/btor2/kmts_lift.rs`).
+//! The symbolic alternative represents state sets and the transition relation as BDDs
+//! (via OxiDD) and evaluates the mu-calculus by fixpoint image/preimage, so the cube
+//! space is never enumerated. See `docs/design/post-rf5-architecture.md`.
 //!
-//! Spike scope (this file): validate the OxiDD dependency + the BDD encoding of a
-//! 3-valued (Kleene) state set as a `(must, may)` BDD pair, and the box preimage via
-//! the fused relational product `∃next. R ∧ φ` — checked **cell-for-cell against the
-//! explicit `evaluate_tri` evaluator** on hand-built KMTSes. This proves the
-//! semantics + encoding before the full port (R-F5.1: BDD-backed `TritSet`; R-F5.2:
-//! symbolic modal step in the evaluator; R-F5.3: symbolic edge construction from
-//! BTOR2, the actual O(2^2|P|)-SMT-avoidance win).
+//! Shipped:
+//! - **R-F5.0** — the de-risking spike: symbolic KMTS + box preimage + νX fixpoint,
+//!   validated cell-for-cell against the explicit `evaluate_tri` (see the tests).
+//! - **R-F5.1** — [`SymbolicContext`] (the present/next BDD-var frame + minterm /
+//!   set / rename helpers) and [`TritBdd`] (the BDD-backed counterpart of
+//!   [`crate::mu_calculus::trit::TritSet`] — a `(must, may)` BDD pair with the pure
+//!   boolean ops and a `TritSet` bridge), with an **exhaustive `TritBdd ≡ TritSet`
+//!   differential**.
+//!
+//! Planned: R-F5.2 (symbolic modal step in the evaluator), R-F5.3 (symbolic edge
+//! construction from BTOR2 — the `O(2^2|P|)`-SMT-avoidance win), R-F5.4 (verify-auto
+//! wiring).
 //!
 //! 3-valued box semantics (Bruns–Godefroid; mirrors `evaluator::modal_trit_core`):
 //! for `[]φ`, `must = ∀ may-successors. φ.must` and `may = ∀ must-successors. φ.may`
 //! — as preimages, `box.must = ¬∃next. R_may ∧ ¬φ.must[next]` and
 //! `box.may = ¬∃next. R_must ∧ ¬φ.may[next]`.
 
+use oxidd::bdd::{self, BDDFunction, BDDManagerRef};
+use oxidd::{BooleanFunction, FunctionSubst, Manager, ManagerRef, Subst, VarNo};
+
+use crate::mu_calculus::trit::{Trit, TritSet};
+
+/// The BDD variable frame for a symbolic abstraction over `n` predicate bits: `n`
+/// present-state vars `x` and `n` next-state vars `x'`, plus the constants and the
+/// helpers a symbolic engine needs (minterms, set construction, present→next rename,
+/// the next-var cube for quantification). One `SymbolicContext` owns one OxiDD
+/// manager; all BDDs built through it share that manager's unique table.
+///
+/// A concrete state / cube index `i ∈ 0..2^n` corresponds to the minterm over the
+/// present vars whose bit `b` is set iff `(i >> b) & 1 == 1`.
+pub struct SymbolicContext {
+    _manager: BDDManagerRef,
+    present: Vec<BDDFunction>,
+    next: Vec<BDDFunction>,
+    present_varnos: Vec<VarNo>,
+    next_cube: BDDFunction,
+    tt: BDDFunction,
+    ff: BDDFunction,
+}
+
+impl SymbolicContext {
+    /// Build a context over `num_vars` present + `num_vars` next boolean variables.
+    pub fn new(num_vars: usize) -> Self {
+        let manager = bdd::new_manager(1 << 16, 1 << 16, 1);
+        let (present, next, tt, ff) = manager.with_manager_exclusive(|m| {
+            let vars = m.add_vars(2 * num_vars as VarNo);
+            let present: Vec<_> = (0..num_vars)
+                .map(|i| BDDFunction::var(m, vars.start + i as VarNo).unwrap())
+                .collect();
+            let next: Vec<_> = (0..num_vars)
+                .map(|i| BDDFunction::var(m, vars.start + (num_vars + i) as VarNo).unwrap())
+                .collect();
+            (present, next, BDDFunction::t(m), BDDFunction::f(m))
+        });
+        let present_varnos: Vec<VarNo> = (0..num_vars as VarNo).collect();
+        let mut next_cube = tt.clone();
+        for v in &next {
+            next_cube = next_cube.and(v).unwrap();
+        }
+        Self {
+            _manager: manager,
+            present,
+            next,
+            present_varnos,
+            next_cube,
+            tt,
+            ff,
+        }
+    }
+
+    /// Number of present (= next) variables.
+    pub fn num_vars(&self) -> usize {
+        self.present.len()
+    }
+
+    /// The always-true BDD `⊤`.
+    pub fn top(&self) -> &BDDFunction {
+        &self.tt
+    }
+
+    /// The always-false BDD `⊥` (the empty set).
+    pub fn bottom(&self) -> &BDDFunction {
+        &self.ff
+    }
+
+    /// The cube of next-state variables (to quantify them out in a preimage).
+    pub fn next_cube(&self) -> &BDDFunction {
+        &self.next_cube
+    }
+
+    fn minterm(idx: usize, vars: &[BDDFunction], tt: &BDDFunction) -> BDDFunction {
+        let mut m = tt.clone();
+        for (b, v) in vars.iter().enumerate() {
+            let lit = if (idx >> b) & 1 == 1 {
+                v.clone()
+            } else {
+                v.not().unwrap()
+            };
+            m = m.and(&lit).unwrap();
+        }
+        m
+    }
+
+    /// The present-var minterm for state index `idx`.
+    pub fn present_minterm(&self, idx: usize) -> BDDFunction {
+        Self::minterm(idx, &self.present, &self.tt)
+    }
+
+    /// The next-var minterm for state index `idx`.
+    pub fn next_minterm(&self, idx: usize) -> BDDFunction {
+        Self::minterm(idx, &self.next, &self.tt)
+    }
+
+    /// The characteristic BDD (over present vars) of an explicit set of state indices.
+    pub fn set_from_indices(&self, indices: impl IntoIterator<Item = usize>) -> BDDFunction {
+        let mut s = self.ff.clone();
+        for i in indices {
+            s = s.or(&self.present_minterm(i)).unwrap();
+        }
+        s
+    }
+
+    /// Does state `idx` belong to the set `f`? (its present-minterm implies `f`.)
+    pub fn holds_at(&self, f: &BDDFunction, idx: usize) -> bool {
+        let mt = self.present_minterm(idx);
+        mt.and(f).unwrap() == mt
+    }
+
+    /// Rename a present-var function to the next-var frame (for a preimage).
+    pub fn to_next(&self, f: &BDDFunction) -> BDDFunction {
+        let subst = Subst::new(self.present_varnos.clone(), self.next.clone());
+        f.substitute(&subst).unwrap()
+    }
+}
+
+/// A 3-valued state set as a `(must, may)` BDD pair over the present-state vars, with
+/// the KMTS invariant `must ⊑ may`. The BDD-backed counterpart of
+/// [`crate::mu_calculus::trit::TritSet`]: the pure boolean ops (`and`/`or`/`not`) and
+/// convergence check (`eq_set`) mirror `TritSet` exactly (an exhaustive differential
+/// pins the equivalence), but the representation is symbolic — a set of `2^|P|` cubes
+/// is one BDD, not a `2^|P|`-bit vector.
+#[derive(Clone)]
+pub struct TritBdd {
+    must: BDDFunction,
+    may: BDDFunction,
+}
+
+impl TritBdd {
+    /// `(must, may)` directly (debug-asserts `must ⊑ may`).
+    pub fn from_parts(must: BDDFunction, may: BDDFunction) -> Self {
+        debug_assert!(
+            must.and(&may).unwrap() == must,
+            "TritBdd invariant must ⊑ may"
+        );
+        Self { must, may }
+    }
+
+    /// `True` everywhere.
+    pub fn all_true(ctx: &SymbolicContext) -> Self {
+        Self {
+            must: ctx.tt.clone(),
+            may: ctx.tt.clone(),
+        }
+    }
+
+    /// `False` everywhere.
+    pub fn all_false(ctx: &SymbolicContext) -> Self {
+        Self {
+            must: ctx.ff.clone(),
+            may: ctx.ff.clone(),
+        }
+    }
+
+    pub fn must(&self) -> &BDDFunction {
+        &self.must
+    }
+
+    pub fn may(&self) -> &BDDFunction {
+        &self.may
+    }
+
+    /// Kleene conjunction (truth-meet): `(must ∧ must, may ∧ may)`.
+    pub fn and(&self, other: &Self) -> Self {
+        Self {
+            must: self.must.and(&other.must).unwrap(),
+            may: self.may.and(&other.may).unwrap(),
+        }
+    }
+
+    /// Kleene disjunction (truth-join): `(must ∨ must, may ∨ may)`.
+    pub fn or(&self, other: &Self) -> Self {
+        Self {
+            must: self.must.or(&other.must).unwrap(),
+            may: self.may.or(&other.may).unwrap(),
+        }
+    }
+
+    /// Kleene negation: swap and complement — `must' = ¬may`, `may' = ¬must` (so the
+    /// `must ⊑ may` invariant is preserved, exactly as `TritSet::not`).
+    pub fn not(&self) -> Self {
+        Self {
+            must: self.may.not().unwrap(),
+            may: self.must.not().unwrap(),
+        }
+    }
+
+    /// Structural equality on both BDDs — the fixpoint convergence test. (ROBDDs are
+    /// canonical, so this is exact set equality, O(1) on the shared manager.)
+    pub fn eq_set(&self, other: &Self) -> bool {
+        self.must == other.must && self.may == other.may
+    }
+
+    /// The trit verdict at state `idx`.
+    pub fn verdict_at(&self, ctx: &SymbolicContext, idx: usize) -> Trit {
+        if ctx.holds_at(&self.must, idx) {
+            Trit::True
+        } else if ctx.holds_at(&self.may, idx) {
+            Trit::Unknown
+        } else {
+            Trit::False
+        }
+    }
+
+    /// Bridge from the explicit `TritSet` (`state_count` states over `ctx`'s vars).
+    pub fn from_trit_set(ctx: &SymbolicContext, ts: &TritSet, state_count: usize) -> Self {
+        let mut must = ctx.ff.clone();
+        let mut may = ctx.ff.clone();
+        for i in 0..state_count {
+            match ts.verdict_at(i) {
+                Trit::True => {
+                    let m = ctx.present_minterm(i);
+                    must = must.or(&m).unwrap();
+                    may = may.or(&m).unwrap();
+                }
+                Trit::Unknown => {
+                    may = may.or(&ctx.present_minterm(i)).unwrap();
+                }
+                Trit::False => {}
+            }
+        }
+        Self { must, may }
+    }
+
+    /// Bridge to the explicit `TritSet` over `state_count` states (for differential
+    /// testing + interop with the explicit evaluator).
+    pub fn to_trit_set(&self, ctx: &SymbolicContext, state_count: usize) -> TritSet {
+        use bitvec::prelude::*;
+        let mut must = bitvec![usize, Lsb0; 0; state_count];
+        let mut may = bitvec![usize, Lsb0; 0; state_count];
+        for i in 0..state_count {
+            if ctx.holds_at(&self.must, i) {
+                must.set(i, true);
+            }
+            if ctx.holds_at(&self.may, i) {
+                may.set(i, true);
+            }
+        }
+        TritSet::from_parts(must, may)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use oxidd::bdd::{self, BDDFunction};
-    use oxidd::{
-        BooleanFunction, BooleanFunctionQuant, BooleanOperator, FunctionSubst, Manager, ManagerRef,
-        Subst, VarNo,
-    };
+    use super::*;
+    use oxidd::{BooleanFunctionQuant, BooleanOperator};
 
     use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, TransitionModality, Tristate};
     use crate::mu_calculus::evaluator::{Environment, evaluate_tri};
     use crate::mu_calculus::parser;
-    use crate::mu_calculus::trit::Trit;
 
-    /// A 3-valued state set as a `(must, may)` BDD pair over the present-state vars,
-    /// with the KMTS invariant `must ⊑ may`.
-    struct TritBdd {
-        must: BDDFunction,
-        may: BDDFunction,
+    // ---- R-F5.1: TritBdd ≡ TritSet differential ---------------------------------
+
+    /// The `code`-th trit-set over `n` states in base-3 (digit 0=False, 1=⊥, 2=True).
+    fn trit_set_from_base3(code: usize, n: usize) -> TritSet {
+        use bitvec::prelude::*;
+        let mut must = bitvec![usize, Lsb0; 0; n];
+        let mut may = bitvec![usize, Lsb0; 0; n];
+        let mut c = code;
+        for i in 0..n {
+            let d = c % 3;
+            c /= 3;
+            if d == 2 {
+                must.set(i, true);
+                may.set(i, true);
+            } else if d == 1 {
+                may.set(i, true);
+            }
+        }
+        TritSet::from_parts(must, may)
     }
 
-    /// A minimal symbolic KMTS over `k` present- + `k` next-state boolean vars.
+    /// Exhaustively check that `TritBdd`'s and/or/not agree with `TritSet` on every
+    /// trit-set (and every pair) over a small state count.
+    #[test]
+    fn tritbdd_matches_tritset_exhaustive() {
+        let n = 2; // 2 predicate bits → 4 states → 3^4 = 81 trit-sets
+        let ctx = SymbolicContext::new(n);
+        let states = 1usize << n;
+        let total = 3usize.pow(states as u32); // one of {F, ⊥, T} per state
+        let sets: Vec<TritSet> = (0..total).map(|c| trit_set_from_base3(c, states)).collect();
+
+        for a in &sets {
+            let ta = TritBdd::from_trit_set(&ctx, a, states);
+            // round-trip
+            assert!(
+                ta.to_trit_set(&ctx, states).eq_set(a),
+                "TritBdd round-trips through TritSet"
+            );
+            // not (TritBdd inherent .not() vs TritSet's `!` operator)
+            assert!(
+                ta.not().to_trit_set(&ctx, states).eq_set(&!a.clone()),
+                "not() agrees"
+            );
+            for b in &sets {
+                let tb = TritBdd::from_trit_set(&ctx, b, states);
+                assert!(
+                    ta.and(&tb)
+                        .to_trit_set(&ctx, states)
+                        .eq_set(&a.clone().and(b)),
+                    "and() agrees"
+                );
+                assert!(
+                    ta.or(&tb)
+                        .to_trit_set(&ctx, states)
+                        .eq_set(&a.clone().or(b)),
+                    "or() agrees"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tritbdd_eq_set_is_canonical() {
+        let ctx = SymbolicContext::new(2);
+        let a = TritBdd::from_trit_set(&ctx, &trit_set_from_base3(17, 4), 4);
+        let a2 = TritBdd::from_trit_set(&ctx, &trit_set_from_base3(17, 4), 4);
+        let b = TritBdd::from_trit_set(&ctx, &trit_set_from_base3(18, 4), 4);
+        assert!(a.eq_set(&a2), "same content ⇒ eq_set (ROBDD canonical)");
+        assert!(!a.eq_set(&b), "different content ⇒ not eq_set");
+    }
+
+    // ---- R-F5.0 spike: symbolic fixpoint ≡ evaluate_tri -------------------------
+
+    /// A minimal symbolic KMTS built on a [`SymbolicContext`]: a may/must relation
+    /// (over present+next vars) from an explicit edge list `(src, dst, is_must)`.
     struct SymKmts {
-        _manager: bdd::BDDManagerRef,
-        present: Vec<BDDFunction>,
-        next: Vec<BDDFunction>,
-        present_varnos: Vec<VarNo>,
-        next_cube: BDDFunction,
-        tt: BDDFunction,
-        ff: BDDFunction,
+        ctx: SymbolicContext,
         r_may: BDDFunction,
         r_must: BDDFunction,
     }
 
     impl SymKmts {
-        /// Build from `state_bits` and an edge list `(src, dst, is_must)`. `R_may` =
-        /// all edges; `R_must` = the `is_must` (Sharp) edges only (`must ⊆ may`).
         fn new(state_bits: usize, edges: &[(usize, usize, bool)]) -> Self {
-            let manager = bdd::new_manager(1 << 16, 1 << 16, 1);
-            let (present, next, tt, ff) = manager.with_manager_exclusive(|m| {
-                let vars = m.add_vars(2 * state_bits as VarNo);
-                let mut present = Vec::with_capacity(state_bits);
-                let mut next = Vec::with_capacity(state_bits);
-                for i in 0..state_bits {
-                    present.push(BDDFunction::var(m, vars.start + i as VarNo).unwrap());
-                }
-                for i in 0..state_bits {
-                    next.push(BDDFunction::var(m, vars.start + (state_bits + i) as VarNo).unwrap());
-                }
-                (present, next, BDDFunction::t(m), BDDFunction::f(m))
-            });
-            let present_varnos: Vec<VarNo> = (0..state_bits as VarNo).collect();
-            // Cube of the next-state vars (to quantify them out in the preimage).
-            let mut next_cube = tt.clone();
-            for v in &next {
-                next_cube = next_cube.and(v).unwrap();
-            }
-
-            let minterm = |idx: usize, vars: &[BDDFunction], tt: &BDDFunction| -> BDDFunction {
-                let mut m = tt.clone();
-                for (b, v) in vars.iter().enumerate() {
-                    let lit = if (idx >> b) & 1 == 1 {
-                        v.clone()
-                    } else {
-                        v.not().unwrap()
-                    };
-                    m = m.and(&lit).unwrap();
-                }
-                m
-            };
-
-            // R(present, next) = ⋁ over edges of (src@present ∧ dst@next).
-            let mut r_may = ff.clone();
-            let mut r_must = ff.clone();
+            let ctx = SymbolicContext::new(state_bits);
+            let mut r_may = ctx.bottom().clone();
+            let mut r_must = ctx.bottom().clone();
             for &(src, dst, is_must) in edges {
-                let e = minterm(src, &present, &tt)
-                    .and(&minterm(dst, &next, &tt))
+                let e = ctx
+                    .present_minterm(src)
+                    .and(&ctx.next_minterm(dst))
                     .unwrap();
                 r_may = r_may.or(&e).unwrap();
                 if is_must {
                     r_must = r_must.or(&e).unwrap();
                 }
             }
-
-            SymKmts {
-                _manager: manager,
-                present,
-                next,
-                present_varnos,
-                next_cube,
-                tt,
-                ff,
-                r_may,
-                r_must,
-            }
+            SymKmts { ctx, r_may, r_must }
         }
 
-        fn present_minterm(&self, idx: usize) -> BDDFunction {
-            let mut m = self.tt.clone();
-            for (b, v) in self.present.iter().enumerate() {
-                let lit = if (idx >> b) & 1 == 1 {
-                    v.clone()
-                } else {
-                    v.not().unwrap()
-                };
-                m = m.and(&lit).unwrap();
-            }
-            m
-        }
-
-        /// Is state `idx` in the set `f`? (its present-minterm implies `f`.)
-        fn holds_at(&self, f: &BDDFunction, idx: usize) -> bool {
-            let mt = self.present_minterm(idx);
-            mt.and(f).unwrap() == mt
-        }
-
-        /// Rename a present-var function to the next-var frame.
-        fn to_next(&self, f: &BDDFunction) -> BDDFunction {
-            let subst = Subst::new(self.present_varnos.clone(), self.next.clone());
-            f.substitute(&subst).unwrap()
-        }
-
-        /// 3-valued box preimage of `phi` (over present vars).
+        /// 3-valued box preimage of `phi`.
         fn box_pre(&self, phi: &TritBdd) -> TritBdd {
             // box.must = ¬∃next. R_may ∧ ¬φ.must[next]
-            let must_next = self.to_next(&phi.must);
-            let ex_may = self
+            let must_next = self.ctx.to_next(phi.must());
+            let box_must = self
                 .r_may
                 .apply_exists(
                     BooleanOperator::And,
                     &must_next.not().unwrap(),
-                    &self.next_cube,
+                    self.ctx.next_cube(),
                 )
+                .unwrap()
+                .not()
                 .unwrap();
-            let box_must = ex_may.not().unwrap();
             // box.may = ¬∃next. R_must ∧ ¬φ.may[next]
-            let may_next = self.to_next(&phi.may);
-            let ex_must = self
+            let may_next = self.ctx.to_next(phi.may());
+            let box_may = self
                 .r_must
                 .apply_exists(
                     BooleanOperator::And,
                     &may_next.not().unwrap(),
-                    &self.next_cube,
+                    self.ctx.next_cube(),
                 )
+                .unwrap()
+                .not()
                 .unwrap();
-            let box_may = ex_must.not().unwrap();
-            TritBdd {
-                must: box_must,
-                may: box_may,
-            }
+            TritBdd::from_parts(box_must, box_may)
         }
 
         /// Greatest fixpoint `νX. (p ∧ []X)` — the AGp safety verdict.
         fn nu_p_and_box(&self, p: &TritBdd) -> TritBdd {
-            let mut x = TritBdd {
-                must: self.tt.clone(),
-                may: self.tt.clone(),
-            };
+            let mut x = TritBdd::all_true(&self.ctx);
             loop {
-                let bx = self.box_pre(&x);
-                // truth-meet `p ⊓ box` = (must∧must, may∧may).
-                let next = TritBdd {
-                    must: p.must.and(&bx.must).unwrap(),
-                    may: p.may.and(&bx.may).unwrap(),
-                };
-                if next.must == x.must && next.may == x.may {
+                let next = p.and(&self.box_pre(&x));
+                if next.eq_set(&x) {
                     return next;
                 }
                 x = next;
@@ -192,8 +418,6 @@ mod tests {
         }
     }
 
-    /// Build the explicit KMTS twin, evaluate `nu X. p and [] X`, and return the
-    /// per-state trit verdicts (index 0..n).
     fn explicit_verdicts(edges: &[(usize, usize, bool)], p: &[Tristate], n: usize) -> Vec<Trit> {
         let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
         for i in 0..n {
@@ -229,11 +453,10 @@ mod tests {
         n: usize,
     ) -> Vec<Trit> {
         let k = SymKmts::new(state_bits, edges);
-        // Atomic predicate `p` as a (must, may) BDD pair over present vars.
-        let mut p_must = k.ff.clone();
-        let mut p_may = k.ff.clone();
+        let mut p_must = k.ctx.bottom().clone();
+        let mut p_may = k.ctx.bottom().clone();
         for (i, &verdict) in p.iter().enumerate() {
-            let mt = k.present_minterm(i);
+            let mt = k.ctx.present_minterm(i);
             match verdict {
                 Tristate::KleeneT => {
                     p_must = p_must.or(&mt).unwrap();
@@ -245,26 +468,11 @@ mod tests {
                 Tristate::KleeneF => {}
             }
         }
-        let pbdd = TritBdd {
-            must: p_must,
-            may: p_may,
-        };
+        let pbdd = TritBdd::from_parts(p_must, p_may);
         let x = k.nu_p_and_box(&pbdd);
-        (0..n)
-            .map(|i| {
-                if k.holds_at(&x.must, i) {
-                    Trit::True
-                } else if k.holds_at(&x.may, i) {
-                    Trit::Unknown
-                } else {
-                    Trit::False
-                }
-            })
-            .collect()
+        (0..n).map(|i| x.verdict_at(&k.ctx, i)).collect()
     }
 
-    /// Sharp-only KMTS: a p-true 2-cycle {s0,s1} + a p-false self-loop s2.
-    /// `AGp` is definitely true on the cycle, false at s2.
     #[test]
     fn spike_sharp_only_matches_evaluate_tri() {
         let edges = &[(0, 1, true), (1, 0, true), (2, 2, true)];
@@ -279,9 +487,6 @@ mod tests {
         assert_eq!(sym, exp, "symbolic == evaluate_tri (Sharp-only)");
     }
 
-    /// Add a `MayOnly` edge s0→s2 (to a p-false state). The may-edge poisons the box:
-    /// s0 → ⊥, and via the s0↔s1 cycle s1 → ⊥ too; s2 stays False. This exercises the
-    /// may/must SPLIT (the whole point of the 3-valued domain).
     #[test]
     fn spike_may_edge_bottoms_match_evaluate_tri() {
         let edges = &[(0, 1, true), (1, 0, true), (2, 2, true), (0, 2, false)];
@@ -298,26 +503,10 @@ mod tests {
 
     #[test]
     fn oxidd_smoke_boolean_algebra() {
-        let manager = bdd::new_manager(1 << 12, 1 << 12, 1);
-        let (x, y, tt, ff) = manager.with_manager_exclusive(|m| {
-            let vars = m.add_vars(2);
-            (
-                BDDFunction::var(m, vars.start).unwrap(),
-                BDDFunction::var(m, vars.start + 1).unwrap(),
-                BDDFunction::t(m),
-                BDDFunction::f(m),
-            )
-        });
+        let ctx = SymbolicContext::new(1);
+        let x = ctx.present_minterm(1); // the var is true
         let nx = x.not().unwrap();
-        assert!(x.and(&nx).unwrap() == ff, "x ∧ ¬x = ⊥");
-        assert!(x.or(&nx).unwrap() == tt, "x ∨ ¬x = ⊤");
-        let and = x.and(&y).unwrap();
-        let or = x.or(&y).unwrap();
-        assert!(and != or, "x ∧ y ≠ x ∨ y for distinct vars");
-        let ny = y.not().unwrap();
-        assert!(
-            and.not().unwrap() == nx.or(&ny).unwrap(),
-            "De Morgan: ¬(x ∧ y) = ¬x ∨ ¬y"
-        );
+        assert!(x.and(&nx).unwrap() == *ctx.bottom(), "x ∧ ¬x = ⊥");
+        assert!(x.or(&nx).unwrap() == *ctx.top(), "x ∨ ¬x = ⊤");
     }
 }
