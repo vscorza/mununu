@@ -18,6 +18,7 @@ pub mod parity_game_3v_solve3v;
 pub mod parity_game_3v_subgame;
 pub mod parser;
 pub mod simplify;
+pub mod symbolic;
 pub mod trit;
 
 pub use evaluator::{
