@@ -780,12 +780,23 @@ pub async fn sv_verify_auto_handler(
             Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
         })
         .collect();
+    // H.H — parse `"signal<=value"` (or `"signal=value"`) counter-bound entries;
+    // both spellings mean the inclusive upper bound `signal <= value`.
+    let counter_bounds: std::collections::HashMap<String, u64> = request
+        .counter_bounds
+        .iter()
+        .filter_map(|e| {
+            let (name, val) = e.split_once("<=").or_else(|| e.split_once('='))?;
+            Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
+        })
+        .collect();
     let opts = VerifyAutoOptions {
         max_iterations: request.max_iterations.unwrap_or(16),
         must_edge_inference,
         gate_reset: request.gate_reset.unwrap_or(true),
         auto_stub_flops: request.auto_stub_flops.unwrap_or(true),
         config_values,
+        counter_bounds,
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
