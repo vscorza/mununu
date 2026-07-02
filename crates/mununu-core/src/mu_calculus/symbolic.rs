@@ -19,11 +19,16 @@
 //!   recursive [`SymbolicKmts::evaluate`] running the mu-calculus by BDD
 //!   image/preimage + μ/ν fixpoint — the symbolic counterpart of `evaluate_tri`,
 //!   validated against it cell-for-cell across box/diamond/μ/ν/nested/boolean over
-//!   several KMTSes (unguarded fragment; guards/controllability/step-bounds are
-//!   R-F5.2b).
+//!   several KMTSes.
+//! - **R-F5.2b** — guarded modalities: **label** guards + **current/next
+//!   state-variable** guards (`req_cur`/`forb_cur`/`req_next`/`forb_next`) as a
+//!   RESTRICTED relation `R ∧ label_conjunct ∧ cur_ok(x) ∧ next_ok(x')`, validated
+//!   vs `evaluate_tri`. Controllability (`ctrl`) and step-bounds (`steps`) are an
+//!   honest error (R-F5.2c).
 //!
-//! Planned: R-F5.2b (guarded modalities), R-F5.3 (symbolic edge construction from
-//! BTOR2 — the `O(2^2|P|)`-SMT-avoidance win), R-F5.4 (verify-auto wiring).
+//! Planned: R-F5.2c (controllability + step-bounded modalities), R-F5.3 (symbolic
+//! edge construction from BTOR2 — the `O(2^2|P|)`-SMT-avoidance win), R-F5.4
+//! (verify-auto wiring).
 //!
 //! 3-valued box semantics (Bruns–Godefroid; mirrors `evaluator::modal_trit_core`):
 //! for `[]φ`, `must = ∀ may-successors. φ.must` and `may = ∀ must-successors. φ.may`
@@ -285,6 +290,12 @@ pub struct SymbolicKmts {
     r_may: BDDFunction,
     r_must: BDDFunction,
     labels: std::collections::HashMap<String, TritBdd>,
+    /// R-F5.2b — per transition-label the `(x, x')` relation of edges carrying it
+    /// (only the labels named in the formula's guards), for label-guarded modalities.
+    label_edges: std::collections::HashMap<String, BDDFunction>,
+    /// R-F5.2b — per state-variable the present-var set of states carrying it (only
+    /// the variables named in the formula's guards), for `req_*` / `forb_*` guards.
+    state_var: std::collections::HashMap<String, BDDFunction>,
     state_count: usize,
 }
 
@@ -308,9 +319,39 @@ impl SymbolicKmts {
         let ctx = SymbolicContext::new(num_vars);
         let sids: Vec<_> = clts.states().collect();
 
-        // Transition relation.
+        // R-F5.2b — the label / state-variable names the formula's guards reference.
+        let mut needed_labels = std::collections::BTreeSet::new();
+        let mut needed_vars = std::collections::BTreeSet::new();
+        for node in formula.nodes() {
+            if let Node::Modal { guard, .. } = node {
+                for l in &guard.labels {
+                    needed_labels.insert(l.clone());
+                }
+                for v in guard
+                    .current
+                    .required
+                    .iter()
+                    .chain(&guard.current.forbidden)
+                    .chain(&guard.next.required)
+                    .chain(&guard.next.forbidden)
+                {
+                    needed_vars.insert(v.clone());
+                }
+            }
+        }
+        let carries = |t: &crate::clts::Transition<S, L>, name: &str| -> bool {
+            t.labels()
+                .iter()
+                .any(|lid| clts.label_bitset(*lid).is_some_and(|b| b.test(name)))
+        };
+
+        // Transition relation (+ per-needed-label edge relations).
         let mut r_may = ctx.ff.clone();
         let mut r_must = ctx.ff.clone();
+        let mut label_edges: std::collections::HashMap<String, BDDFunction> = needed_labels
+            .iter()
+            .map(|l| (l.clone(), ctx.ff.clone()))
+            .collect();
         for &sid in &sids {
             let i = sid.index();
             for t in clts.outgoing(sid) {
@@ -326,7 +367,26 @@ impl SymbolicKmts {
                         return Err("R-F5.2 does not yet support MustHyperOnly edges".into());
                     }
                 }
+                for l in &needed_labels {
+                    if carries(t, l) {
+                        let slot = label_edges.get_mut(l).unwrap();
+                        *slot = slot.or(&e).unwrap();
+                    }
+                }
             }
+        }
+
+        // R-F5.2b — the present-var state set for each needed state-variable.
+        let mut state_var: std::collections::HashMap<String, BDDFunction> =
+            std::collections::HashMap::new();
+        for v in &needed_vars {
+            let mut set = ctx.ff.clone();
+            for &sid in &sids {
+                if clts.state_variable_bitset(sid).contains(v.as_str()) {
+                    set = set.or(&ctx.present_minterm(sid.index())).unwrap();
+                }
+            }
+            state_var.insert(v.clone(), set);
         }
 
         // AP labels for every predicate the formula names.
@@ -362,8 +422,48 @@ impl SymbolicKmts {
             r_may,
             r_must,
             labels,
+            label_edges,
+            state_var,
             state_count,
         })
+    }
+
+    /// R-F5.2b — the may/must relations RESTRICTED to a guard's matching transitions:
+    /// `R ∧ (⋀ label_edges[l]) ∧ cur_ok(x) ∧ next_ok(x')`, where `cur_ok` /
+    /// `next_ok` are the `req_*`/`forb_*` state-variable filters over present / next
+    /// vars. A required label / variable absent from the model contributes `⊥` (no
+    /// edge matches → the modal is vacuous there), exactly as the explicit filter.
+    fn guarded_relations(&self, guard: &crate::mu_calculus::Guard) -> (BDDFunction, BDDFunction) {
+        let var_set = |name: &str| -> BDDFunction {
+            self.state_var
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| self.ctx.ff.clone())
+        };
+        let mut c = self.ctx.tt.clone();
+        for l in &guard.labels {
+            let le = self
+                .label_edges
+                .get(l)
+                .cloned()
+                .unwrap_or_else(|| self.ctx.ff.clone());
+            c = c.and(&le).unwrap();
+        }
+        for v in &guard.current.required {
+            c = c.and(&var_set(v)).unwrap();
+        }
+        for v in &guard.current.forbidden {
+            c = c.and(&var_set(v).not().unwrap()).unwrap();
+        }
+        for v in &guard.next.required {
+            c = c.and(&self.ctx.to_next(&var_set(v))).unwrap();
+        }
+        for v in &guard.next.forbidden {
+            c = c
+                .and(&self.ctx.to_next(&var_set(v).not().unwrap()))
+                .unwrap();
+        }
+        (self.r_may.and(&c).unwrap(), self.r_must.and(&c).unwrap())
     }
 
     /// The `SymbolicContext` (for reading verdicts).
@@ -376,12 +476,12 @@ impl SymbolicKmts {
         self.state_count
     }
 
-    /// 3-valued box preimage of `phi` (Bruns–Godefroid).
-    fn box_pre(&self, phi: &TritBdd) -> TritBdd {
+    /// 3-valued box preimage of `phi` over the given may/must relations
+    /// (Bruns–Godefroid). `box.must` uses `R_may`, `box.may` uses `R_must`.
+    fn box_pre(&self, phi: &TritBdd, r_may: &BDDFunction, r_must: &BDDFunction) -> TritBdd {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
         let must_next = self.ctx.to_next(phi.must());
-        let box_must = self
-            .r_may
+        let box_must = r_may
             .apply_exists(
                 BooleanOperator::And,
                 &must_next.not().unwrap(),
@@ -391,8 +491,7 @@ impl SymbolicKmts {
             .not()
             .unwrap();
         let may_next = self.ctx.to_next(phi.may());
-        let box_may = self
-            .r_must
+        let box_may = r_must
             .apply_exists(
                 BooleanOperator::And,
                 &may_next.not().unwrap(),
@@ -404,17 +503,16 @@ impl SymbolicKmts {
         TritBdd::from_parts(box_must, box_may)
     }
 
-    /// 3-valued diamond preimage of `phi`.
-    fn diamond_pre(&self, phi: &TritBdd) -> TritBdd {
+    /// 3-valued diamond preimage of `phi` over the given may/must relations.
+    /// `dia.must` uses `R_must`, `dia.may` uses `R_may`.
+    fn diamond_pre(&self, phi: &TritBdd, r_may: &BDDFunction, r_must: &BDDFunction) -> TritBdd {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
         let must_next = self.ctx.to_next(phi.must());
-        let dia_must = self
-            .r_must
+        let dia_must = r_must
             .apply_exists(BooleanOperator::And, &must_next, self.ctx.next_cube())
             .unwrap();
         let may_next = self.ctx.to_next(phi.may());
-        let dia_may = self
-            .r_may
+        let dia_may = r_may
             .apply_exists(BooleanOperator::And, &may_next, self.ctx.next_cube())
             .unwrap();
         TritBdd::from_parts(dia_must, dia_may)
@@ -435,7 +533,7 @@ impl SymbolicKmts {
         id: crate::mu_calculus::NodeId,
         bindings: &mut std::collections::HashMap<crate::mu_calculus::FormulaVarId, TritBdd>,
     ) -> Result<TritBdd, String> {
-        use crate::mu_calculus::{Guard, ModalKind, Node};
+        use crate::mu_calculus::{Control, Guard, ModalKind, Node};
         Ok(match f.node(id) {
             Node::True => TritBdd::all_true(&self.ctx),
             Node::False => TritBdd::all_false(&self.ctx),
@@ -460,17 +558,28 @@ impl SymbolicKmts {
                 guard,
                 target,
             } => {
-                if *guard != Guard::default() {
+                // R-F5.2b supports label + current/next state-variable guards.
+                // Controllability (Skolem/synthesis) and step-bounds are R-F5.2c.
+                if guard.control != Control::All {
                     return Err(
-                        "R-F5.2 supports unguarded modalities only (label/controllability/\
-                         step-bound guards are R-F5.2b)"
+                        "R-F5.2b does not support controllability guards (`ctrl`) — R-F5.2c".into(),
+                    );
+                }
+                if guard.max_steps.is_some() {
+                    return Err(
+                        "R-F5.2b does not support step-bounded modalities (`steps`) — R-F5.2c"
                             .into(),
                     );
                 }
                 let phi = self.eval_node(f, *target, bindings)?;
+                let (r_may, r_must) = if *guard == Guard::default() {
+                    (self.r_may.clone(), self.r_must.clone())
+                } else {
+                    self.guarded_relations(guard)
+                };
                 match kind {
-                    ModalKind::Box => self.box_pre(&phi),
-                    ModalKind::Diamond => self.diamond_pre(&phi),
+                    ModalKind::Box => self.box_pre(&phi, &r_may, &r_must),
+                    ModalKind::Diamond => self.diamond_pre(&phi, &r_may, &r_must),
                 }
             }
             Node::Mu { var, body } => self.fixpoint(f, *var, *body, bindings, false)?,
@@ -848,14 +957,108 @@ mod tests {
         }
     }
 
+    // ---- R-F5.2b: guarded modalities (labels + current/next state-vars) ---------
+
+    #[allow(clippy::type_complexity)]
+    fn build_guarded_clts(
+        edges: &[(usize, &str, usize, bool)],
+        preds: &[(&str, &[Tristate])],
+        vars: &[(&str, &[usize])],
+        n: usize,
+    ) -> Clts<DefaultStateIdx, DefaultLabelIdx> {
+        let mut b = Clts::builder();
+        for i in 0..n {
+            b.state(format!("s{i}"));
+        }
+        b.initial("s0");
+        let ids: Vec<_> = (0..n)
+            .map(|i| b.state_id_or_insert(format!("s{i}")).unwrap())
+            .collect();
+        let mut label_ids = std::collections::HashMap::new();
+        for &(_, lname, _, _) in edges {
+            label_ids
+                .entry(lname.to_string())
+                .or_insert_with(|| b.labels().intern([lname]).unwrap());
+        }
+        for (name, verdicts) in preds {
+            for (i, &v) in verdicts.iter().enumerate() {
+                b.with_3valued_predicate(ids[i], *name, v);
+            }
+        }
+        for (i, &id) in ids.iter().enumerate() {
+            let vs: Vec<&str> = vars
+                .iter()
+                .filter(|(_, sts)| sts.contains(&i))
+                .map(|(name, _)| *name)
+                .collect();
+            if !vs.is_empty() {
+                b.with_variables_for_state(id, vs);
+            }
+        }
+        for &(src, lname, dst, is_must) in edges {
+            let lid = label_ids[lname];
+            let m = if is_must {
+                TransitionModality::Sharp
+            } else {
+                TransitionModality::MayOnly
+            };
+            b.transition_ids_with_modality(ids[src], &[lid], ids[dst], m);
+        }
+        b.build().expect("guarded clts builds")
+    }
+
     #[test]
-    fn rf5_2_guarded_modality_is_rejected() {
-        let clts = build_clts(&[(0, 0, true)], &[("p", &[Tristate::KleeneT])], 1);
-        let formula = parser::parse("[ labels = {step} ] p").expect("parses");
-        let sym = SymbolicKmts::from_clts(&clts, &formula).expect("model");
+    fn rf5_2b_guarded_modalities_match_tri() {
+        use Tristate::{KleeneBot as B, KleeneF as F, KleeneT as T};
+        // s0 --a--> s1, s1 --b--> s2, s0 --a(MayOnly)--> s2, s2 --a--> s2.
+        // vars: `hot` on {s1,s2}, `cold` on {s0}. preds p, q.
+        let k = build_guarded_clts(
+            &[
+                (0, "a", 1, true),
+                (1, "b", 2, true),
+                (0, "a", 2, false),
+                (2, "a", 2, true),
+            ],
+            &[("p", &[T, T, F]), ("q", &[F, B, T])],
+            &[("hot", &[1, 2]), ("cold", &[0])],
+            3,
+        );
+        let formulas = [
+            "[ labels = {a} ] p",
+            "< labels = {a} > p",
+            "[ labels = {b} ] p",
+            "< labels = {b} > q",
+            "[ req_next = {hot} ] p",
+            "< req_next = {hot} > q",
+            "[ req_cur = {cold} ] p",
+            "[ forb_next = {hot} ] p",
+            "[ labels = {a}, req_next = {hot} ] p",
+            "nu X. p and [ labels = {a} ] X",
+            "mu X. q or < labels = {a} > X",
+            // unguarded still works alongside guarded
+            "nu X. p and [] X",
+        ];
+        for f in &formulas {
+            assert_symbolic_matches_tri(&k, f);
+        }
+    }
+
+    #[test]
+    fn rf5_2c_control_and_step_guards_are_rejected() {
+        let clts = build_guarded_clts(&[(0, "a", 0, true)], &[("p", &[Tristate::KleeneT])], &[], 1);
+        // Controllability guard — R-F5.2c.
+        let ctrl = parser::parse("[ ctrl = controllable ] p").expect("parses");
+        let sym = SymbolicKmts::from_clts(&clts, &ctrl).expect("model");
         assert!(
-            sym.evaluate(&formula).is_err(),
-            "guarded modality is R-F5.2b — must be an honest error, not a wrong verdict"
+            sym.evaluate(&ctrl).is_err(),
+            "controllability guard must be an honest error (R-F5.2c), not a wrong verdict"
+        );
+        // Step-bounded modality — R-F5.2c.
+        let steps = parser::parse("< ( steps <= 2 ) > p").expect("parses");
+        let sym2 = SymbolicKmts::from_clts(&clts, &steps).expect("model");
+        assert!(
+            sym2.evaluate(&steps).is_err(),
+            "step-bounded modality must be an honest error (R-F5.2c)"
         );
     }
 }
