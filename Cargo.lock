@@ -36,6 +36,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -409,6 +415,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "derive-where"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "dhat"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -429,6 +446,15 @@ name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
+
+[[package]]
+name = "document-features"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
+dependencies = [
+ "litrs",
+]
 
 [[package]]
 name = "either"
@@ -465,12 +491,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "float-cmp"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "spin",
 ]
 
 [[package]]
@@ -653,6 +694,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hugealloc"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "542733215a252c27c674e5d875a910d7de509cb74123d0bdbaa050f871ec84c2"
+dependencies = [
+ "allocator-api2",
+ "libc",
+ "sptr",
+]
+
+[[package]]
 name = "hyper"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -707,6 +759,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "is_sorted"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357376465c37db3372ef6a00585d336ed3d0f11d4345eef77ebcb05865392b21"
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -756,10 +814,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
+name = "linear-hashtbl"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11269ceb6867559e0fce487ff8148933040c7ac091ee4ecc904821f1db1e0fa"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "litrs"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "lock_api"
@@ -871,6 +941,7 @@ dependencies = [
  "criterion",
  "dhat",
  "itoa",
+ "oxidd",
  "proptest",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
@@ -904,6 +975,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "nanorand"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e3d189da485332e96ba8a5ef646a311871abd7915bf06ac848a9117f19cf6e4"
 
 [[package]]
 name = "normalize-line-endings"
@@ -955,6 +1032,157 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "oxidd"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c984e2c820ff1306f7bd10ac166a542c69cce2d87331eb4caa1b78ca381e5c0b"
+dependencies = [
+ "cfg-if",
+ "derive-where",
+ "document-features",
+ "oxidd-cache",
+ "oxidd-core",
+ "oxidd-derive",
+ "oxidd-dump",
+ "oxidd-manager-index",
+ "oxidd-reorder",
+ "oxidd-rules-bdd",
+ "oxidd-rules-mtbdd",
+ "oxidd-rules-tdd",
+ "oxidd-rules-zbdd",
+ "rustc-hash",
+]
+
+[[package]]
+name = "oxidd-cache"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea87b04767bd71ec9a0f0f1b95b3e1be822365d611ae692734bf84dffdc1aae9"
+dependencies = [
+ "allocator-api2",
+ "document-features",
+ "hugealloc",
+ "oxidd-core",
+ "parking_lot",
+]
+
+[[package]]
+name = "oxidd-core"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4ce8a17e276f5df5a9a2aabdc0fd1ccf2b3b73bc3b5ef7627f26f6ecc9afee3"
+dependencies = [
+ "nanorand",
+]
+
+[[package]]
+name = "oxidd-derive"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cb7e36aee287b5ad1921fb98050a1b9e5771bf5d34381f24b0548083aefeb3"
+dependencies = [
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "oxidd-dump"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "675fcc8144350309a3b94a4a3522d953472c29df06b783fe0dfafbc6b1d39b4b"
+dependencies = [
+ "document-features",
+ "fixedbitset",
+ "is_sorted",
+ "memchr",
+ "oxidd-core",
+ "oxidd-derive",
+ "rustc-hash",
+]
+
+[[package]]
+name = "oxidd-manager-index"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1339eb2952e23d62d3421f444fdf36d7f36b6a63707ae3d4fef1d1bfb007a47"
+dependencies = [
+ "crossbeam-utils",
+ "derive-where",
+ "fixedbitset",
+ "linear-hashtbl",
+ "oxidd-core",
+ "parking_lot",
+ "rayon",
+ "rustc-hash",
+]
+
+[[package]]
+name = "oxidd-reorder"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6863dd156fb2713ad1f6b7528d08da3cc675ae27e24b6e9a0df9d0fea8d9a839"
+dependencies = [
+ "flume",
+ "is_sorted",
+ "oxidd-core",
+ "rayon",
+ "smallvec",
+]
+
+[[package]]
+name = "oxidd-rules-bdd"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c56b5465552bdc2c1f38c433f8751703d1561396f4be16315999cc47eed6e2ce"
+dependencies = [
+ "document-features",
+ "fixedbitset",
+ "oxidd-core",
+ "oxidd-derive",
+ "oxidd-dump",
+]
+
+[[package]]
+name = "oxidd-rules-mtbdd"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49740035de417b58fad2fe420b5539081604e601c266841f3092ca8bb5db1da7"
+dependencies = [
+ "document-features",
+ "fixedbitset",
+ "oxidd-core",
+ "oxidd-derive",
+ "oxidd-dump",
+]
+
+[[package]]
+name = "oxidd-rules-tdd"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb13c585037127f6066e3ca928e96bdc21df19a41b0242dfcb9e95faf723558c"
+dependencies = [
+ "document-features",
+ "oxidd-core",
+ "oxidd-derive",
+ "oxidd-dump",
+]
+
+[[package]]
+name = "oxidd-rules-zbdd"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "917c941a721e884817a5b510ff818cb6d7033216817c0fd1e0b154f4cc7cfe5b"
+dependencies = [
+ "document-features",
+ "fixedbitset",
+ "oxidd-core",
+ "oxidd-derive",
+ "oxidd-dump",
+]
 
 [[package]]
 name = "page_size"
@@ -1088,6 +1316,29 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "proc-macro-error"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
+dependencies = [
+ "proc-macro-error-attr",
+ "proc-macro2",
+ "quote",
+ "version_check",
+]
+
+[[package]]
+name = "proc-macro-error-attr"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1be40180e52ecc98ad80b184934baf3d0d29f979574e439af5a55274b35f869"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "version_check",
 ]
 
 [[package]]
@@ -1476,6 +1727,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
+name = "sptr"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
+
+[[package]]
 name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1834,6 +2100,12 @@ name = "vcd"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4505774fc84de82eb04caa74d859342b0daa376f4c6df45149593245dd62c004"
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wait-timeout"
