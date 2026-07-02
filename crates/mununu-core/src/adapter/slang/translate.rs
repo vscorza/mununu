@@ -45,11 +45,13 @@
 //!
 //! Every XL.1c rewrite above is **exact** (semantics-preserving), so it adds no
 //! new soundness regime over XL.1b. Boolean structure (`!`, `&&`, `||`) recurses.
-//! Anything outside the fragment — bit-arithmetic, bit-select indexing (`sig[i]`),
-//! reduction-xor/xnor (parity), system calls (`$onehot0`, `$isunknown`),
-//! sequences (`##`, `[*n]`), `$past`, etc. — is **rejected with a reason, never
-//! silently dropped** (claims-integrity), and every emitted formula is validated
-//! through the mu-calculus parser as a safety net.
+//! `$onehot0(x)` / `$onehot(x)` expand to the exact value-set predicate
+//! `x ∈ {0,1,2,4,…}` / `x ∈ {1,2,4,…}` (one `Or`-of-`Cmp` atom). Anything still
+//! outside the fragment — bit-arithmetic, bit-select indexing (`sig[i]`),
+//! reduction-or/xor (`|x`, `^x`), system calls (`$isunknown`, `$countones`),
+//! sequences (`##`, `[*n]`), etc. — is **rejected with a reason, never silently
+//! dropped** (claims-integrity), and every emitted formula is validated through the
+//! mu-calculus parser as a safety net.
 //!
 //! [XL.0]: ../../../../.claude/plans/measurements/XL-0-sva-parser-spike-2026-06-26.md
 
@@ -624,8 +626,38 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
                         shadow
                     })
                 }
+                // `$onehot0(x)` / `$onehot(x)` — expand to a value-set predicate over
+                // the single signal `x`: at-most-one / exactly-one bit set means
+                // `x ∈ {0,1,2,4,…,2^(w-1)}` / `x ∈ {1,2,4,…,2^(w-1)}`. This is one
+                // `Or`-of-`Cmp` atom (a single cube dimension, NOT w dimensions), so
+                // it lands squarely in the supported predicate fragment. Exact — the
+                // disjunction is the definition of one-hot. The common secure use is a
+                // one-hot STATE encoding (a cube dimension over `state_q`); an input
+                // one-hot vector binds via the derived-label path.
+                "$onehot0" | "$onehot" => {
+                    let (sig, w) = call_arg_signal(expr)?;
+                    // Cap the width: the expansion is w (+1) terms, and each
+                    // `sig == 2^k` is a value comparison the abstraction must track.
+                    // 32 covers realistic one-hot vectors (state encodings, N-way
+                    // selects); wider is rejected honestly rather than emitting a
+                    // huge disjunction.
+                    if w == 0 || w > 32 {
+                        return Err(format!(
+                            "{sub}(<{w}-bit>) — one-hot expansion supports 1..=32-bit \
+                             operands (a {w}-bit one-hot enumerates too many values)"
+                        ));
+                    }
+                    let mut terms: Vec<String> = Vec::new();
+                    if sub == "$onehot0" {
+                        terms.push(format!("({sig} == 0)"));
+                    }
+                    for k in 0..w {
+                        terms.push(format!("({sig} == {})", 1u64 << k));
+                    }
+                    Ok(format!("({})", terms.join(" || ")))
+                }
                 other => Err(format!(
-                    "system/subroutine call `{other}` (e.g. `$onehot0`, `$isunknown`) \
+                    "system/subroutine call `{other}` (e.g. `$isunknown`, `$countones`) \
                      is not in the Tier-1c/Tier-2 fragment"
                 )),
             }
@@ -1180,8 +1212,9 @@ mod tests {
             eprintln!("  unsupported {}: {}", u.name, u.reason);
         }
         // Real OpenTitan SVA. XL.1c lifts the reduction-or / disable-iff-macro
-        // properties (`|gnt_o |-> ready_i`, etc.); the bit-arithmetic, dynamic
-        // bit-select, and `$onehot0`/`$isunknown` ones stay honestly unsupported.
+        // properties (`|gnt_o |-> ready_i`, etc.) and `$onehot0(gnt_o)` now expands
+        // to a value-set predicate; the bit-arithmetic and dynamic bit-select ones
+        // (and `$isunknown`) stay honestly unsupported.
         assert!(
             report.total() >= 13,
             "all 13 concurrent assertions should be seen"
@@ -1529,15 +1562,40 @@ mod tests {
     }
 
     #[test]
-    fn xl3_onehot_isunknown_still_rejected() {
-        // Tier-2 only adds the history calls; other system calls stay rejected.
-        let call = serde_json::json!({
+    fn onehot_expands_isunknown_still_rejected() {
+        // `$onehot0` / `$onehot` now expand to a value-set predicate; other system
+        // calls (`$isunknown`, `$countones`, …) stay rejected.
+        let oh0 = serde_json::json!({
             "kind": "Call", "subroutine": "$onehot0",
             "arguments": [{"kind": "NamedValue", "symbol": "1 gnt", "type": "logic[7:0]"}]
         });
-        let err = bool_expr(&call).expect_err("must reject");
+        let s0 = bool_expr(&oh0).expect("$onehot0 now translates");
+        // at-most-one bit set ≡ 0 plus each power of two up to 2^7.
+        assert!(s0.contains("gnt == 0"), "onehot0 includes zero: {s0}");
         assert!(
-            err.contains("$onehot0") || err.contains("not in the"),
+            s0.contains("gnt == 1") && s0.contains("gnt == 128"),
+            "onehot0 spans the powers of two: {s0}"
+        );
+
+        let oh = serde_json::json!({
+            "kind": "Call", "subroutine": "$onehot",
+            "arguments": [{"kind": "NamedValue", "symbol": "1 gnt", "type": "logic[7:0]"}]
+        });
+        let s1 = bool_expr(&oh).expect("$onehot now translates");
+        // exactly-one bit set ≡ the powers of two, NO zero term.
+        assert!(!s1.contains("gnt == 0"), "onehot excludes zero: {s1}");
+        assert!(
+            s1.contains("gnt == 1") && s1.contains("gnt == 128"),
+            "onehot spans the powers of two: {s1}"
+        );
+
+        let unk = serde_json::json!({
+            "kind": "Call", "subroutine": "$isunknown",
+            "arguments": [{"kind": "NamedValue", "symbol": "1 gnt", "type": "logic[7:0]"}]
+        });
+        let err = bool_expr(&unk).expect_err("$isunknown must reject");
+        assert!(
+            err.contains("$isunknown") || err.contains("not in the"),
             "got: {err}"
         );
     }
