@@ -23,6 +23,15 @@ SV Source → sv2v → Yosys (hierarchy, no flatten) → BTOR2 (per module) → 
 
 Requires `yosys` (and `sv2v` for SV-2017 constructs) on `PATH`. Steps 2-4 are iterative — refine annotations and properties based on verification results.
 
+> **This page = the explicit bit-blast engine.** The BTOR2 IR also feeds the
+> **predicate-cube** abstraction (states = predicate cubes, not register bit-blast),
+> with automatic CEGAR refinement and 3-valued (`KleeneT`/`KleeneF`/`KleeneBot`)
+> verdicts — see [Predicate-Cube CEGAR](Predicate-Cube-CEGAR). Both the bit-blast and
+> predicate-cube paths flow through the same frontend-agnostic **STS-IR seam** and the
+> one 3-valued evaluator. For the whole architecture — explicit vs symbolic (BDD, R-F5)
+> engines, the IR layering, and how over/under/⊥ approximation + may/must edges operate —
+> see [`docs/design/post-rf5-architecture.md`](https://github.com/vscorza/mununu/blob/main/docs/design/post-rf5-architecture.md).
+
 ---
 
 ## Quick Start

@@ -128,6 +128,19 @@ sampling representative inverse can't realise `a==0 && b==0`, and the lazy body
 never consults `compound_exprs`; `ensure_compound_lift_supported()` enforces this
 at the entry (and via thin defensive copies in each impl for direct callers).
 
+### 4.2 The third consumer — symbolic (BDD) engine (R-F5, planned)
+
+The seam admits a **third** strategy beyond `StepEval` (Enumerate) and `SmtEncode`
+(explicit predicate-cube): a **symbolic** engine that builds the may/must transition
+relation as BDDs and evaluates the mu-calculus by fixpoint image/preimage, never
+materialising the `2^|P|` cube states. It is the R-F5 track: R-F5.0 (the OxiDD spike,
+`mu_calculus/symbolic.rs`) is shipped and validated cell-for-cell against
+`evaluate_tri`; R-F5.1–.4 (BDD `TritSet`, symbolic modal step, symbolic relation
+construction from BTOR2, verify-auto wiring) are planned. It plugs into the *same*
+seam — the symbolic relation-builder consumes the transition-system view, not BTOR2
+directly. Full picture:
+[`docs/design/post-rf5-architecture.md`](post-rf5-architecture.md).
+
 ## 5. Z3 scope & batching (why `may_edges` is batched, not per-pair)
 
 Z3 calls must run inside a `z3::with_z3_config` scope, and the efficient pattern builds the

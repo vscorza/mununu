@@ -6,6 +6,8 @@
 
 Mununu's verdicts are correct **for the model**. Whether they transfer to the real system depends entirely on the abstraction the user (or adapter) picks. The [`Soundness Guarantees`](../CLAUDE.md#soundness-guarantees) section of CLAUDE.md states the soundness directions; this doc gives the **per-subsystem recipe** — *which* mununu primitive to reach for, *when*, and what each primitive preserves.
 
+For how the abstraction fits the wider engine picture — the frontend-agnostic STS-IR seam, the **explicit vs symbolic (BDD, R-F5)** engines, the IR layering, and how over/under/⊥ approximation and may/must edges operate end-to-end — see [`docs/design/post-rf5-architecture.md`](design/post-rf5-architecture.md).
+
 Use this doc when:
 
 - You are authoring an adapter and have to decide how to encode a multi-bit register, a memory region, or a wide-arithmetic operator.

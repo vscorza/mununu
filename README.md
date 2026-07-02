@@ -143,6 +143,46 @@ context handshake {
 
 ## Architecture
 
+Mununu verifies by three orthogonal choices: **abstraction** (explicit-state vs
+predicate cubes), **engine** (explicit enumeration vs symbolic BDD), and **domain**
+(2-valued for exact models vs 3-valued Kleene may/must for sound abstraction). All
+paths flow through a frontend-agnostic transition-system seam (STS-IR) into one
+3-valued verdict vocabulary — `True` / `False` / `⊥` (abstraction too coarse to
+decide, never a false claim).
+
+```mermaid
+flowchart TD
+  subgraph FE["Frontends"]
+    SV["SystemVerilog + SVA"]
+    OTH["XState / TLSF / AIGER / Promela /<br/>CTXDSL / microcode / agentic"]
+  end
+
+  SV -->|"slang --ast-json"| TR["SVA translator<br/>→ mu-calculus formula + predicate atoms"]
+  SV -->|"sv2v + yosys (no flatten)"| B2["BTOR2 IR"]
+
+  B2 --> STS["STS-IR seam<br/>StsVar + StepEval + SmtEncode<br/>(hides BTOR2 / Z3)"]
+
+  STS -->|"StepEval::step"| ENUM["Explicit-Enumerate<br/>Sharp CLTS"]
+  STS -->|"SmtEncode::may_edges + must"| CUBE["Explicit predicate-cube lift"]
+  STS -->|"symbolic relation build (planned, R-F5)"| SYM["Symbolic predicate-cube (BDD)"]
+
+  ENUM --> CLTS["Clts (K)MTS<br/>states + may/must transitions + 3-valued labels"]
+  CUBE --> CLTS
+  OTH --> CLTS
+
+  CLTS --> EVX["Explicit evaluator<br/>(BoolDom / KleeneDom over BitVec)"]
+  SYM --> EVS["Symbolic evaluator (planned)<br/>BDD image/preimage fixpoint"]
+
+  EVX --> V["3-valued verdict:<br/>True / False / ⊥"]
+  EVS --> V
+```
+
+The full design — predicate abstraction, explicit & symbolic model checking, the IR
+layering, and how over/under/⊥ approximation and may/must edges operate — is in
+[`docs/design/post-rf5-architecture.md`](docs/design/post-rf5-architecture.md).
+
+Source layout:
+
 ```
 src/
 ├── adapter/        # Format adapters (TLSF, AIGER, Promela, XState, SystemVerilog, extraction)
