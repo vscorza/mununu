@@ -1,6 +1,6 @@
 # Native SV → KMTS Architecture
 
-> **Status: planning.** This document describes a unified replacement for mununu's SystemVerilog extraction pipeline. The current native-parser path (§2) is documented here for context and slated for removal (§9). The proposed pipeline (§3–§7) and the validation milestones (§10) are not yet implemented; planning sub-sections do not carry `> Source of truth:` anchors. Sections that document existing code (§2, §5.1 baseline, §9 removal inventory) do anchor live symbols. Companion docs once shipped: [`kmts-theory.md`](kmts-theory.md), [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md), [`abstraction-literature.md`](abstraction-literature.md).
+> **Status: planning.** This document describes a unified replacement for mununu's SystemVerilog extraction pipeline. The current native-parser path (§2) is documented here for context and slated for removal (§9). The proposed pipeline (§3–§7) and the validation milestones (§10) are not yet implemented; planning sub-sections do not carry `> Source of truth:` anchors. Sections that document existing code (§2, §5.1 baseline, §9 removal inventory) do anchor live symbols. Companion docs once shipped: [`kmts-theory.md`](kmts-theory.md), [`predicate-abstraction-recipe.md`](predicate-abstraction-recipe.md), [`abstraction-literature.md`](abstraction-literature.md), [`post-rf5-architecture.md`](post-rf5-architecture.md) (the end-to-end engine picture: explicit vs symbolic, IR layering, may/must + over/under/⊥ approximation).
 
 ## §1 Context
 

@@ -40,6 +40,23 @@ SystemVerilog ──sv2v──► Verilog ──Yosys (no flatten)──► BTOR
 `mununu btor2 cegar` consumes a BTOR2 file directly; `mununu sv cegar` is the
 one-call variant that runs sv2v + Yosys for you.
 
+### Explicit vs symbolic engine (R-F5)
+
+The predicate-cube abstraction has two possible **engines** — the representation of the
+cube state space + transition relation, independent of the abstraction itself:
+
+- **Explicit (shipped)** — materialises `2^|P|` cube states in a `Clts` and builds the
+  may/must edges with SMT (`SmtEncode`). Fine at small `|P|`; the edge computation is
+  `O(2^2|P|)` SMT queries, which is the scaling wall.
+- **Symbolic / BDD (R-F5, planned)** — represents cube sets + the transition relation as
+  BDDs and runs the fixpoint by image/preimage (`∃x'. R(x,x') ∧ φ(x')`), never
+  enumerating cubes. The `evaluate_tri` verdict is the ground truth either way (the
+  symbolic path is validated cell-for-cell against it).
+
+Both engines share the same 3-valued semantics and soundness (below). See
+[the post-R-F5 architecture](https://github.com/vscorza/mununu/blob/main/docs/design/post-rf5-architecture.md)
+for the full picture (IR layering, may/must edges, over/under/⊥ approximation).
+
 ## CLI
 
 > **Source of truth:** the `btor2 cegar` / `sv cegar` subcommands in [`crates/mununu-cli/src/main.rs`](https://github.com/vscorza/mununu/blob/main/crates/mununu-cli/src/main.rs) — surface: CLI.
@@ -155,3 +172,4 @@ abstraction / CEGAR to convergence.
 - [Adapter Formats](Adapter-Formats) — BTOR2 + SystemVerilog import
 - [`docs/design/predicate-abstraction-recipe.md`](https://github.com/vscorza/mununu/blob/main/docs/design/predicate-abstraction-recipe.md) — the full operational recipe (predicate seeding, may/must image, CEGAR, §4.9 soundness)
 - [`docs/design/kmts-theory.md`](https://github.com/vscorza/mununu/blob/main/docs/design/kmts-theory.md) — KMTS + 3-valued mu-calculus theory
+- [`docs/design/post-rf5-architecture.md`](https://github.com/vscorza/mununu/blob/main/docs/design/post-rf5-architecture.md) — the whole picture: explicit vs symbolic engines, IR layering, may/must + over/under/⊥ approximation
