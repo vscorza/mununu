@@ -75,9 +75,10 @@ fn spec_to_expr(
 ///
 /// `must_semantics` selects the must-edge form ([`MustSemantics::ForallExists`]
 /// is the canonical KMTS must-edge and the right default). The formula must be
-/// in the audited-sound **bare** fragment (`True`/`False`, predicates,
-/// `!`/`&&`/`||`, bare `[]`/`<>`, `mu`/`nu`); a guarded / controllability /
-/// step-bounded modality is a hard error.
+/// in the audited-sound fragment (`True`/`False`, predicates, `!`/`&&`/`||`,
+/// `mu`/`nu`, `[]`/`<>` — bare or guarded by `req_cur`/`forb_cur`/`req_next`/
+/// `forb_next` state predicates, R-F5.5c); a label / controllability / step-bounded
+/// guard is a hard error (out-of-fragment over a predicate cube).
 pub fn symbolic_cube_verdicts(
     btor2_content: &str,
     predicates: &[PredicateSpec],
