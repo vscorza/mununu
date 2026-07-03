@@ -186,12 +186,15 @@ enum EngineArg {
     /// directly from the BTOR2 (no per-cube-pair SMT) and evaluate the formula
     /// by BDD image/preimage + μ/ν fixpoint. Orders of magnitude faster at large
     /// `|P|` (≈10 ms at `|P|=12` where the explicit SMT path takes ~29 min).
+    /// Runs the CEGAR refinement loop (WP predicate discovery on ⊥, rebuilding
+    /// the relation each iteration; `--max-iterations 0` = single-shot).
     ///
-    /// **Single-shot** (2026-07-03): evaluates at the given `--predicate` set
-    /// with no CEGAR refinement, and handles only simple `NAME:REG=VALUE`
-    /// (equality) predicates — sidecar compound / inequality predicates and
-    /// refinement-under-symbolic are follow-ups. The bare `[]`/`<>` fragment
-    /// only (guarded / controllability / step-bounded modalities error).
+    /// **Scope:** simple `--predicate NAME:REG=VALUE` equalities + non-derived
+    /// `--sidecar` `compound_predicates` (`cnt >= 2`, relational); the bare
+    /// `[]`/`<>` fragment only (guarded / controllability / step-bounded
+    /// modalities error). Derived/combinational (per-cube SMT label) predicates
+    /// and the Clts-only optimisations (failure-subgame precision, approximant
+    /// reuse, CTXDSL emit) are still `--engine explicit` only.
     Symbolic,
 }
 
@@ -2513,10 +2516,13 @@ fn run_symbolic_cegar_cli(
     formula: &mununu_core::mu_calculus::Formula,
     sidecar: Option<&Path>,
     config_values: &[String],
+    max_iterations: usize,
     json: bool,
 ) -> Result<(), String> {
     use mununu_core::adapter::btor2::symbolic_bitblast::MustSemantics;
-    use mununu_core::adapter::btor2::symbolic_engine::symbolic_cube_verdicts_from_options;
+    use mununu_core::adapter::btor2::symbolic_engine::{
+        SymbolicCegarTermination, symbolic_cegar_refine,
+    };
 
     // The simple `--predicate NAME:REG=VALUE` equalities plus any non-derived
     // `compound_predicates` (e.g. `cnt >= 2`) declared in the `--sidecar`. The
@@ -2528,20 +2534,28 @@ fn run_symbolic_cegar_cli(
             .map_err(|e| format!("Failed to read sidecar '{}': {e}", p.display()))?;
         options.sidecar_json = Some(sidecar_content);
     }
-    let verdicts = symbolic_cube_verdicts_from_options(
+    // R-F5.5b — the symbolic CEGAR loop (WP refinement on ⊥, rebuilding the BDD
+    // relation each iteration; no per-cube-pair SMT). `--max-iterations 0` gives
+    // the single-shot behaviour.
+    let result = symbolic_cegar_refine(
         content,
         predicates,
         &options,
         formula,
         MustSemantics::ForallExists,
+        max_iterations,
     )
     .map_err(|e| format!("symbolic cube engine: {}", e.message))?;
 
-    let (t, f, b) = (
-        verdicts.definite_true,
-        verdicts.definite_false,
-        verdicts.bottom,
-    );
+    let v = &result.final_verdicts;
+    let (t, f, b) = (v.definite_true, v.definite_false, v.bottom);
+    let terminated = match result.terminated_with {
+        SymbolicCegarTermination::Converged => "converged",
+        SymbolicCegarTermination::BoundedIterationsReached => "bounded-iterations-reached",
+        SymbolicCegarTermination::PredicateSourceExhausted => "predicate-source-exhausted",
+    };
+    // iteration 0 is the initial evaluation; the rest are refinements.
+    let refinements = result.iterations.len().saturating_sub(1);
     let outcome = if b > 0 {
         format!("INDEFINITE — {b} cell(s) need a finer predicate set")
     } else if f > 0 {
@@ -2554,8 +2568,10 @@ fn run_symbolic_cegar_cli(
         let summary = serde_json::json!({
             "fixture": fixture_label,
             "engine": "symbolic",
-            "final_predicate_count": verdicts.num_predicates,
-            "feasible_cube_count": verdicts.cube_verdicts.len(),
+            "refinement_iterations": refinements,
+            "terminated_with": terminated,
+            "final_predicate_count": v.num_predicates,
+            "feasible_cube_count": v.cube_verdicts.len(),
             "verdict": {
                 "true_cells": t,
                 "false_cells": f,
@@ -2569,13 +2585,15 @@ fn run_symbolic_cegar_cli(
                 .map_err(|e| format!("serialize summary: {e}"))?
         );
     } else {
-        println!("Symbolic predicate-cube evaluation (R-F5, single-shot)");
-        println!("  fixture:           {fixture_label}");
-        println!("  engine:            symbolic (BDD relation, no per-cube-pair SMT)");
-        println!("  predicates:        {}", verdicts.num_predicates);
-        println!("  feasible cubes:    {}", verdicts.cube_verdicts.len());
-        println!("  verdict cells:     T={t} F={f} ⊥={b}");
-        println!("  outcome:           {outcome}");
+        println!("Symbolic predicate-cube CEGAR (R-F5)");
+        println!("  fixture:              {fixture_label}");
+        println!("  engine:               symbolic (BDD relation, no per-cube-pair SMT)");
+        println!("  refinement iterations:{refinements}");
+        println!("  terminated_with:      {terminated}");
+        println!("  final predicates:     {}", v.num_predicates);
+        println!("  feasible cubes:       {}", v.cube_verdicts.len());
+        println!("  verdict cells:        T={t} F={f} ⊥={b}");
+        println!("  outcome:              {outcome}");
     }
     Ok(())
 }
@@ -2646,6 +2664,7 @@ fn run_cegar_cli(
             &formula,
             params.sidecar,
             params.config_values,
+            params.max_iterations,
             params.json,
         );
     }

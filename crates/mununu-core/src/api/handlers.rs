@@ -910,7 +910,7 @@ fn run_symbolic_cegar_response(
     use crate::adapter::AdapterOptions;
     use crate::adapter::btor2::cegar::config_values_to_sidecar_json;
     use crate::adapter::btor2::symbolic_bitblast::MustSemantics;
-    use crate::adapter::btor2::symbolic_engine::symbolic_cube_verdicts_from_options;
+    use crate::adapter::btor2::symbolic_engine::{SymbolicCegarTermination, symbolic_cegar_refine};
 
     // Build the same config-values synthetic sidecar the explicit path uses, so
     // any non-derived `compound_predicates` become cube dimensions (R-F5.5a).
@@ -927,22 +927,51 @@ fn run_symbolic_cegar_response(
         sidecar_json,
         ..AdapterOptions::default()
     };
-    let verdicts = symbolic_cube_verdicts_from_options(
+    // R-F5.5b — the symbolic CEGAR loop (WP refinement on ⊥; no per-cube-pair SMT).
+    let max_iterations = params.max_iterations.unwrap_or(16);
+    let result = symbolic_cegar_refine(
         params.btor2_content,
         predicates,
         &options,
         formula,
         MustSemantics::ForallExists,
+        max_iterations,
     )
     .map_err(|e| ApiError::BadRequest {
         message: format!("symbolic cube engine: {}", e.message),
         details: None,
     })?;
 
+    let iterations = result
+        .iterations
+        .iter()
+        .map(|it| CegarIterationView {
+            iteration: it.iteration,
+            predicate_count: it.predicate_count,
+            had_failure_subgame: it.bottom > 0,
+            // The symbolic MVP does not track which predicate closed each ⊥.
+            predicates_added: Vec::new(),
+            game_position_evaluations: 0,
+            verdict: CegarVerdictSummary {
+                true_cells: it.definite_true,
+                false_cells: it.definite_false,
+                unknown_cells: it.bottom,
+            },
+        })
+        .collect();
+    let terminated_with = match result.terminated_with {
+        SymbolicCegarTermination::Converged => "converged",
+        SymbolicCegarTermination::BoundedIterationsReached => "bounded-iterations-reached",
+        SymbolicCegarTermination::PredicateSourceExhausted => "predicate-source-exhausted",
+    }
+    .to_string();
+    let v = &result.final_verdicts;
+
     Ok(Btor2CegarResponse {
         success: true,
-        iterations: Vec::new(),
-        final_predicates: predicates
+        iterations,
+        final_predicates: result
+            .final_predicates
             .iter()
             .map(|p| PredicateView {
                 name: p.name.clone(),
@@ -950,17 +979,17 @@ fn run_symbolic_cegar_response(
                 value: p.value,
             })
             .collect(),
-        terminated_with: "symbolic-single-shot".to_string(),
+        terminated_with,
         verdict: CegarVerdictSummary {
-            true_cells: verdicts.definite_true,
-            false_cells: verdicts.definite_false,
-            unknown_cells: verdicts.bottom,
+            true_cells: v.definite_true,
+            false_cells: v.definite_false,
+            unknown_cells: v.bottom,
         },
         lazy_lift_pending: false,
         approximant_reuse_enabled: false,
         warnings: vec![
-            "engine=symbolic (R-F5): single-shot, no CEGAR refinement; simple \
-             equality predicates + bare []/<> fragment only"
+            "engine=symbolic (R-F5): BDD relation + WP refinement, no per-cube-pair SMT; \
+             simple + non-derived-compound predicates + bare []/<> fragment only"
                 .to_string(),
         ],
         violating_cells: Vec::new(),
@@ -3327,12 +3356,14 @@ members = ["x"]
         );
     }
 
-    /// R-F5.4.2b (2026-07-03) — `engine: "symbolic"` runs the R-F5 BDD engine
-    /// single-shot (no CEGAR refinement) and returns the same
-    /// [`Btor2CegarResponse`] shape: empty iterations, `terminated_with =
-    /// "symbolic-single-shot"`, and the `{T,F,⊥}` verdict over the feasible cubes.
+    /// R-F5.4.2b + R-F5.5b — `engine: "symbolic"` runs the R-F5 BDD engine with
+    /// the symbolic CEGAR loop and returns the standard [`Btor2CegarResponse`]
+    /// shape: per-iteration records, a `terminated_with` reason, and the
+    /// `{T,F,⊥}` verdict over the feasible cubes. `EF(cnt==0)` on this
+    /// monotone counter is definite everywhere (T at cnt==0, F elsewhere), so
+    /// it converges at iteration 0.
     #[tokio::test]
-    async fn btor2_cegar_handler_symbolic_engine_single_shot() {
+    async fn btor2_cegar_handler_symbolic_engine_cegar() {
         use crate::api::models::PredicateSpecRequest;
         // 2-bit saturating counter with an enable.
         let btor2 = "\
@@ -3371,19 +3402,19 @@ members = ["x"]
             .expect("symbolic CEGAR endpoint should run");
 
         assert!(out.success);
-        assert!(
-            out.iterations.is_empty(),
-            "symbolic single-shot performs no refinement iterations"
-        );
-        assert_eq!(out.terminated_with, "symbolic-single-shot");
+        // The loop records at least the initial evaluation (iteration 0).
+        assert!(!out.iterations.is_empty(), "loop records iteration 0");
+        assert_eq!(out.iterations[0].iteration, 0);
+        // Definite everywhere ⇒ converged, no ⊥.
+        assert_eq!(out.terminated_with, "converged");
+        assert_eq!(out.verdict.unknown_cells, 0);
         // One predicate (cnt==0) ⇒ 2 feasible cubes ({cnt==0}, {cnt!=0}).
         let total = out.verdict.true_cells + out.verdict.false_cells + out.verdict.unknown_cells;
         assert_eq!(total, 2, "verdict covers both feasible cubes; got {total}");
-        // EF(cnt==0) holds at the cnt==0 cube ⇒ at least one definite-true cell.
         assert!(out.verdict.true_cells >= 1);
         assert!(
             out.warnings.iter().any(|w| w.contains("symbolic")),
-            "symbolic path surfaces its single-shot caveat"
+            "symbolic path surfaces its caveat"
         );
     }
 

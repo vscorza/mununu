@@ -55,10 +55,14 @@ cube state space + transition relation, independent of the abstraction itself:
   enumerating cube pairs or issuing per-cube-pair SMT. Orders of magnitude faster at large
   `|P|` (≈10 ms at `|P|=12`, where the explicit SMT path issues ~16.7M queries / ~29 min).
   The `evaluate_tri` verdict is the ground truth either way — the symbolic path is
-  validated cell-for-cell against it. **Current scope (R-F5.4.2b):** *single-shot* (no
-  CEGAR refinement), simple `NAME:REG=VALUE` equality predicates, and the bare `[]`/`<>`
-  fragment only. Source of truth:
-  [`adapter::btor2::symbolic_engine::symbolic_cube_verdicts`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/symbolic_engine.rs).
+  validated cell-for-cell against it. Runs the **CEGAR refinement loop** (WP predicate
+  discovery on ⊥, rebuilding the BDD relation each iteration — still no per-cube-pair SMT;
+  `--max-iterations 0` = single-shot). **Current scope (R-F5.5a/b):** simple
+  `NAME:REG=VALUE` equalities + non-derived `--sidecar` `compound_predicates` (`cnt >= 2`,
+  relational), and the bare `[]`/`<>` fragment only. Derived/combinational predicates and
+  the Clts-only optimisations (failure-subgame precision, approximant reuse, CTXDSL emit)
+  remain `--engine explicit` only. Source of truth:
+  [`adapter::btor2::symbolic_engine::symbolic_cegar_refine`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/symbolic_engine.rs).
 
 Both engines share the same 3-valued semantics and soundness (below). See
 [the post-R-F5 architecture](https://github.com/vscorza/mununu/blob/main/docs/design/post-rf5-architecture.md)
@@ -90,7 +94,7 @@ Key flags:
 | `--max-iterations` | CEGAR refinement cap (default 16) |
 | `--controllable-input` | mark an input as controller-chosen (synthesis / controllability-aware lift) |
 | `--emit-ctxdsl <PATH>` | dump the refined cube model as CTXDSL |
-| `--engine` | `explicit` (default, SMT edges + CEGAR) \| `symbolic` (R-F5 BDD relation, single-shot, no per-cube-pair SMT — orders of magnitude faster at large `\|P\|`) |
+| `--engine` | `explicit` (default, SMT edges + CEGAR) \| `symbolic` (R-F5 BDD relation + CEGAR loop, no per-cube-pair SMT — orders of magnitude faster at large `\|P\|`; handles equality + non-derived sidecar compound predicates) |
 
 `mununu sv cegar <design.sv> --formula … --predicate …` accepts the same property
 flags and runs sv2v + Yosys internally.
