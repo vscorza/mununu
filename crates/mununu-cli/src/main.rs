@@ -1246,6 +1246,14 @@ struct SvVerifyAutoArgs {
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
+    /// R-F5.5d (2026-07-03) — predicate-cube engine: `explicit` (default) or
+    /// `symbolic` (R-F5 BDD relation + CEGAR loop, no per-cube-pair SMT — orders
+    /// of magnitude faster at large `|P|`, the FSM-cone residual). Symbolic
+    /// supports cube-dimension predicates (equality + non-derived compounds) +
+    /// the bare `[]`/`<>` fragment; a derived predicate or guarded modality
+    /// `Skipped`s that property.
+    #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
+    engine: EngineArg,
 }
 
 #[derive(Args, Debug)]
@@ -2284,6 +2292,9 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         auto_stub_flops: !args.no_auto_stub_flops,
         config_values,
         counter_bounds,
+        // R-F5.5d — `--engine symbolic` routes every property through the R-F5
+        // BDD CEGAR loop (no per-cube-pair SMT).
+        symbolic_engine: args.engine == EngineArg::Symbolic,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)

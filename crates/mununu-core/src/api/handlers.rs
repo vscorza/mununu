@@ -799,6 +799,12 @@ pub async fn sv_verify_auto_handler(
         auto_stub_flops: request.auto_stub_flops.unwrap_or(true),
         config_values,
         counter_bounds,
+        // R-F5.5d — `engine: "symbolic"` routes properties through the R-F5 BDD
+        // CEGAR loop (no per-cube-pair SMT).
+        symbolic_engine: request
+            .engine
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case("symbolic")),
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {

@@ -166,8 +166,31 @@ impl BddBitBlaster {
 
         let total_bits: u32 = leaf_specs.iter().map(|(_, _, _, w)| *w).sum();
 
-        // Allocate the manager + one BDD variable per leaf bit.
-        let manager = bdd::new_manager(1 << 16, 1 << 16, 1);
+        // R-F5.5d guard — the bit-blaster has no cone-of-influence restriction
+        // yet: it builds BDDs over EVERY register+input bit of the design. On a
+        // real design (the full sysrst_ctrl_detect, ~hundreds of bits: wide
+        // config timers × 5 detectors) that OoMs the BDD manager. Bail with a
+        // clean error above a conservative bit cap so a caller (e.g.
+        // `sv verify-auto --engine symbolic`) degrades to a `Skipped` property
+        // rather than a mid-construction OoM panic. The R-F5.6 scaling follow-up
+        // (COI restriction — only bit-blast the predicate cone — + variable
+        // ordering) lifts this to real designs.
+        const MAX_BITBLAST_BITS: u32 = 40;
+        if total_bits > MAX_BITBLAST_BITS {
+            return Err(format!(
+                "symbolic bit-blaster: design has {total_bits} register+input bits \
+                 (> {MAX_BITBLAST_BITS}) — no cone-of-influence restriction yet (R-F5.6), \
+                 so bit-blasting the full design would exhaust BDD memory; use `--engine explicit`"
+            ));
+        }
+
+        // Allocate the manager + one BDD variable per leaf bit. 2M inner nodes
+        // (~32 MB arena, index manager) + a 512K apply cache — comfortably above
+        // the toy fixtures' need and sized for a moderate (≤ `MAX_BITBLAST_BITS`)
+        // design; the manager is dropped per `BddBitBlaster`, so at most one
+        // arena is live at a time. Larger designs are rejected by the bit cap
+        // above (they need the R-F5.6 COI restriction, not just more nodes).
+        let manager = bdd::new_manager(1 << 21, 1 << 19, 1);
         let (all_vars, var_base, tt, ff) = manager.with_manager_exclusive(|m| {
             let range = m.add_vars(total_bits as VarNo);
             let vars: Vec<BDDFunction> = (0..total_bits)

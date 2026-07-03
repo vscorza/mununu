@@ -1050,6 +1050,11 @@ pub struct SvVerifyAutoRequest {
     /// note. Default empty.
     #[serde(default)]
     pub counter_bounds: Vec<String>,
+    /// R-F5.5d (2026-07-03) — predicate-cube engine: `"explicit"` (default) or
+    /// `"symbolic"` (R-F5 BDD relation + CEGAR loop, no per-cube-pair SMT).
+    /// Mirrors the CLI `--engine`.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.
