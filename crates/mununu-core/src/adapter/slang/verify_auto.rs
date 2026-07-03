@@ -763,6 +763,120 @@ fn counter_registers_in(seeded: &Seeded) -> std::collections::BTreeSet<String> {
 }
 
 /// H.H — auto-derive counter upper bounds from config concretization. Scans EVERY
+/// H.5-GR1 — the outcome of scanning the SV source(s) for `@mununu_*` property
+/// annotations (the mununu-exclusive properties an author adds beyond the design's
+/// own SVA — recoverability, realizability, assume-guarantee liveness). The
+/// `guarantees` are appended to the translated property set and verified uniformly;
+/// `assumes` and `skipped` are surfaced as a provenance note.
+#[derive(Debug, Default)]
+struct AnnotationScan {
+    /// `@mununu_guarantee <mu-calculus>` properties that parsed, as
+    /// `TranslatedAssertion`s ready to merge into `extraction.translated`.
+    guarantees: Vec<crate::adapter::slang::translate::TranslatedAssertion>,
+    /// `@mununu_assume <body>` bodies (verbatim) — recorded for provenance. A
+    /// `<signal> = <value>` assume can be applied via the existing config
+    /// concretization; a temporal `GF ...` fairness assume is documented future
+    /// work (mununu has no native fairness-constrained model checking).
+    assumes: Vec<String>,
+    /// `@mununu_guarantee` bodies that did NOT parse — surfaced, never silently
+    /// dropped.
+    skipped: Vec<String>,
+}
+
+/// H.5-GR1 — scan the SV source(s) for `@mununu_guarantee` / `@mununu_assume`
+/// property annotations and turn each guarantee into a verifiable property. Reuses
+/// the existing [`crate::mununu_annotations::extract_from_sv_source`] scanner and
+/// the [`crate::mu_calculus::parser`] — no new grammar. A guarantee body is a
+/// mu-calculus formula (the same string form the SVA translator emits and the
+/// per-property loop parses); box-`F` liveness (`μY.(φ ∨ []Y)`) is expressible
+/// directly, unlike the LTL translator's existential-`F`. Bodies that do not parse
+/// are recorded in `skipped`, never silently dropped.
+fn scan_annotation_properties(sources: &[(String, String)]) -> AnnotationScan {
+    use crate::adapter::slang::translate::TranslatedAssertion;
+    use crate::mununu_annotations::{MununuTag, extract_from_sv_source};
+
+    let mut scan = AnnotationScan::default();
+    let mut idx = 0usize;
+    for (_name, content) in sources {
+        for ann in extract_from_sv_source(content) {
+            match ann.tag {
+                MununuTag::Guarantee => {
+                    let body = ann.value.trim();
+                    if body.is_empty() {
+                        scan.skipped
+                            .push("@mununu_guarantee with an empty body".to_string());
+                        continue;
+                    }
+                    match crate::mu_calculus::parser::parse(body) {
+                        Ok(_) => {
+                            scan.guarantees.push(TranslatedAssertion {
+                                name: format!("ann_guarantee_{idx}"),
+                                kind: SvaKind::Assert,
+                                formula: body.to_string(),
+                                recoverability_companion: None,
+                            });
+                            idx += 1;
+                        }
+                        Err(e) => scan.skipped.push(format!(
+                            "@mununu_guarantee `{body}` did not parse as a mu-calculus formula: {e}"
+                        )),
+                    }
+                }
+                MununuTag::Assume => scan.assumes.push(ann.value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    scan
+}
+
+/// H.5-GR1 — the provenance note for an [`AnnotationScan`]: how many
+/// `@mununu_guarantee` properties were merged, which `@mununu_assume` bodies were
+/// seen, and any guarantee bodies that failed to parse (surfaced, never dropped).
+/// `None` when the source carried no `@mununu` property annotations.
+fn annotation_note(scan: &AnnotationScan) -> Option<VerificationNote> {
+    if scan.guarantees.is_empty() && scan.assumes.is_empty() && scan.skipped.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for g in &scan.guarantees {
+        items.push(format!("guarantee {}: {}", g.name, g.formula));
+    }
+    for a in &scan.assumes {
+        items.push(format!("assume: {a}"));
+    }
+    for s in &scan.skipped {
+        items.push(format!("skipped: {s}"));
+    }
+    Some(VerificationNote {
+        kind: "annotation-properties".into(),
+        level: if scan.skipped.is_empty() {
+            NoteLevel::Info
+        } else {
+            NoteLevel::ScopeCaveat
+        },
+        summary: format!(
+            "{} `@mununu_guarantee` propert{} verified alongside the design's SVA{}.",
+            scan.guarantees.len(),
+            if scan.guarantees.len() == 1 { "y" } else { "ies" },
+            if scan.skipped.is_empty() {
+                String::new()
+            } else {
+                format!("; {} unparsable, skipped", scan.skipped.len())
+            }
+        ),
+        detail: "`@mununu_guarantee <mu-calculus>` / `@mununu_assume <body>` annotations carry the \
+                 mununu-exclusive properties an author adds beyond the design's own SVA (e.g. \
+                 assume-guarantee liveness the SVA fragment cannot express). Guarantee bodies are \
+                 mu-calculus formulas parsed by the same parser as the translated SVA and verified \
+                 through the same pipeline. `@mununu_assume` of the form `<signal> = <value>` can be \
+                 applied via config concretization; a temporal (`GF …`) fairness assume is not yet \
+                 checkable (no native fairness-constrained model checking) and is recorded here."
+            .into(),
+        items,
+    })
+}
+
 /// translated property's ORIGINAL formula for a relational atom comparing a register
 /// `R` against a pinned config register `C` (`cnt_q >= cfg_detect_timer_i`); the
 /// pinned value `V = config[C]` becomes a candidate bound `R <= V` (a counter counts
@@ -1059,12 +1173,22 @@ pub fn verify_auto(
     // 1. Extract + translate the SVA. When reset-gating, the `disable iff`
     // guards are dropped from the formulas and the recognized reset signals are
     // reported (we pin them inactive in the lift below).
-    let extraction = extract_sva_with_options(
+    let mut extraction = extract_sva_with_options(
         sources,
         &TranslateOptions {
             gate_reset: opts.gate_reset,
         },
     )?;
+
+    // H.5-GR1 — merge any `@mununu_guarantee` annotation properties (the
+    // mununu-exclusive properties an author adds beyond the design's own SVA)
+    // into the translated set, so they are verified through the same pipeline.
+    // Merged BEFORE the empty-check so a design with no SVA but annotation-only
+    // properties still verifies.
+    let ann_scan = scan_annotation_properties(sources);
+    extraction
+        .translated
+        .extend(ann_scan.guarantees.iter().cloned());
 
     let mut report = AutoVerifyReport {
         unsupported: extraction
@@ -1076,6 +1200,9 @@ pub fn verify_auto(
     };
     if extraction.translated.is_empty() {
         report.notes = build_notes(&report, opts.must_edge_inference, &[], &[]);
+        if let Some(n) = annotation_note(&ann_scan) {
+            report.notes.push(n);
+        }
         return Ok(report);
     }
 
@@ -1609,6 +1736,9 @@ pub fn verify_auto(
         &applied_config_values,
         &counter_bound_items_vec,
     );
+    if let Some(n) = annotation_note(&ann_scan) {
+        report.notes.push(n);
+    }
     Ok(report)
 }
 
@@ -1619,6 +1749,65 @@ mod tests {
 
     fn cells(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn src(content: &str) -> Vec<(String, String)> {
+        vec![("design.sv".to_string(), content.to_string())]
+    }
+
+    /// H.5-GR1 — a `@mununu_guarantee` with a valid mu-calculus body is merged as
+    /// a verifiable property whose formula is the body verbatim (the same string
+    /// form the SVA translator emits and the per-property loop parses).
+    #[test]
+    fn h5_gr1_annotation_guarantee_merges_as_property() {
+        let sv = "// @mununu_guarantee nu X. (p and [] X)\nmodule m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert_eq!(scan.guarantees.len(), 1);
+        assert_eq!(scan.guarantees[0].formula, "nu X. (p and [] X)");
+        assert_eq!(scan.guarantees[0].kind, SvaKind::Assert);
+        assert!(scan.skipped.is_empty());
+        // The stored formula re-parses (it is the exact string the loop feeds mu-calc).
+        assert!(mu_parser::parse(&scan.guarantees[0].formula).is_ok());
+    }
+
+    /// The box-`F` liveness the LTL translator's existential-`F` cannot express
+    /// (`AG(active → AF done)`) is a plain mu-calculus body — it parses and merges.
+    #[test]
+    fn h5_gr1_annotation_carries_box_f_liveness() {
+        let sv = r#"(* mununu_guarantee = "nu X. ((not active or mu Y. (done or [] Y)) and [] X)" *)
+module uart_tx(); endmodule"#;
+        let scan = scan_annotation_properties(&src(sv));
+        assert_eq!(scan.guarantees.len(), 1);
+        assert!(mu_parser::parse(&scan.guarantees[0].formula).is_ok());
+    }
+
+    /// A guarantee body that does not parse is recorded in `skipped`, never
+    /// silently dropped, and never merged as a property.
+    #[test]
+    fn h5_gr1_unparsable_guarantee_is_skipped_not_dropped() {
+        let sv = "// @mununu_guarantee this is )) not a formula\nmodule m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert!(scan.guarantees.is_empty());
+        assert_eq!(scan.skipped.len(), 1);
+        assert!(scan.skipped[0].contains("did not parse"));
+        // The provenance note surfaces the skip as a scope caveat.
+        let note = annotation_note(&scan).expect("note present");
+        assert_eq!(note.kind, "annotation-properties");
+        assert!(matches!(note.level, NoteLevel::ScopeCaveat));
+    }
+
+    /// `@mununu_assume` bodies are recorded for provenance (not verified as a
+    /// guarantee); a source with no `@mununu` property annotations yields no note.
+    #[test]
+    fn h5_gr1_assume_recorded_and_empty_source_has_no_note() {
+        let sv = "// @mununu_assume tick_baud_x16 = 1\nmodule m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert!(scan.guarantees.is_empty());
+        assert_eq!(scan.assumes, vec!["tick_baud_x16 = 1".to_string()]);
+        assert!(annotation_note(&scan).is_some());
+
+        let plain = scan_annotation_properties(&src("module m(); endmodule"));
+        assert!(annotation_note(&plain).is_none());
     }
 
     /// R-F5.5d — `symbolic_final_verdict` projects the symbolic engine's per-cube
