@@ -69,7 +69,18 @@
 //! predicate — **construction cost, not the `O(2^2|P|)` per-cube-pair SMT** the
 //! explicit path pays. Validated cell-for-cell against a brute-force concrete
 //! may-relation (`simulate_one_step` over every register + input assignment).
-//! `R_must` (∀x∃i / ∀x∀i via `apply_forall`) is the next slice (R-F5.3d).
+//!
+//! # R-F5.3d — the must relation
+//!
+//! [`BddBitBlaster::abstract_relation`] additionally computes `R_must` under a
+//! [`MustSemantics`]: `∀x. (A(x,p) → ∃i. A'(x,i,p'))` (the canonical KMTS
+//! `∀∃` must-edge — every concrete state in the source cube has *some* input
+//! landing in the target) or the stricter `∀(x∪i). (A → A')` (`∀∀`,
+//! deterministic-into-target). Built with OxiDD `exists` / `forall` over the
+//! input / register cubes — again no per-cube-pair SMT. Validated cell-for-cell
+//! against the brute-force concrete must-relation, plus the KMTS invariant
+//! `R_must ⊆ R_may` over feasible cubes. R-F5.4 then wires the `AbstractRelation`
+//! (may + must) into a symbolic KMTS engine behind `--engine symbolic`.
 
 use std::collections::HashMap;
 
@@ -500,6 +511,35 @@ impl BddBitBlaster {
         &self,
         predicates: &[PredicateExpr],
     ) -> Result<AbstractRelation, String> {
+        self.abstract_relation(predicates, None)
+    }
+
+    /// R-F5.3c/d — build the abstract may (and optionally must) transition
+    /// relation over predicate cubes, symbolically. `R_may` is always computed;
+    /// `R_must` is computed iff `must` is `Some`.
+    ///
+    /// With `A(x,p) = ⋀_i (p_i ⟺ ⟦P_i⟧(x))` and
+    /// `A'(x,i,p') = ⋀_i (p'_i ⟺ ⟦P_i⟧(next(x,i)))`:
+    ///
+    /// ```text
+    /// R_may(p, p')  = ∃ (x ∪ i). A ∧ A'                         (some x, some i)
+    /// R_must_∀∃     = ∀ x. ( A(x,p) → ∃ i. A'(x,i,p') )         (every x, some i)
+    /// R_must_∀∀     = ∀ (x ∪ i). ( A(x,p) → A'(x,i,p') )        (every x, every i)
+    /// ```
+    ///
+    /// The `∀∃` form is the canonical KMTS must-edge (Bruns–Godefroid; the
+    /// explicit path's [`MustEdgeInference::SmtPerTargetStandard`]); `∀∀` is
+    /// the stricter deterministic-into-target form ([`MustEdgeInference::SmtPerTarget`]).
+    /// `⟦P_i⟧(next(x,i))` is the R-F5.3b predicate BDD with every register bit
+    /// substituted by that register's bit-blasted next-state function.
+    ///
+    /// [`MustEdgeInference::SmtPerTargetStandard`]: super::kmts_lift::MustEdgeInference::SmtPerTargetStandard
+    /// [`MustEdgeInference::SmtPerTarget`]: super::kmts_lift::MustEdgeInference::SmtPerTarget
+    pub fn abstract_relation(
+        &self,
+        predicates: &[PredicateExpr],
+        must: Option<MustSemantics>,
+    ) -> Result<AbstractRelation, String> {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
 
         let k = predicates.len();
@@ -534,15 +574,21 @@ impl BddBitBlaster {
             }
         }
 
-        // The cube of all register + input vars, to be quantified out.
-        let mut xi_cube = self.tt.clone();
+        // Cubes: register vars, input vars, and their union.
+        let mut reg_cube = self.tt.clone();
+        let mut input_cube = self.tt.clone();
         for cell in &self.cells {
             for v in &cell.vars {
-                xi_cube = xi_cube.and(v).unwrap();
+                if cell.is_state {
+                    reg_cube = reg_cube.and(v).unwrap();
+                } else {
+                    input_cube = input_cube.and(v).unwrap();
+                }
             }
         }
+        let xi_cube = reg_cube.and(&input_cube).unwrap();
 
-        // A(x, p) ∧ A'(x, i, p'), then ∃(x ∪ i).
+        // A(x, p) and A'(x, i, p').
         let mut a = self.tt.clone();
         let mut a_prime = self.tt.clone();
         for (i, expr) in predicates.iter().enumerate() {
@@ -560,23 +606,70 @@ impl BddBitBlaster {
             a_prime = a_prime.and(&iff_next).unwrap();
         }
 
+        // R_may = ∃(x ∪ i). A ∧ A'   (fused relational product).
         let r_may = a
             .apply_exists(BooleanOperator::And, &a_prime, &xi_cube)
             .unwrap();
+
+        // R_must, when requested. `A → φ` is `¬A ∨ φ`; a vacuously-empty cube
+        // (unsatisfiable predicate combination) yields `¬A ≡ ⊤` there, so the
+        // ∀ makes it a must-edge to every cube — which matches the vacuous
+        // truth of "for all (zero) states in an empty cube …".
+        let r_must = match must {
+            None => None,
+            Some(MustSemantics::ForallExists) => {
+                // ∀x. ( A(x,p) → ∃i. A'(x,i,p') )
+                let exists_i = a_prime.exists(&input_cube).unwrap();
+                Some(
+                    a.not()
+                        .unwrap()
+                        .or(&exists_i)
+                        .unwrap()
+                        .forall(&reg_cube)
+                        .unwrap(),
+                )
+            }
+            Some(MustSemantics::ForallForall) => {
+                // ∀(x ∪ i). ( A(x,p) → A'(x,i,p') )
+                Some(
+                    a.not()
+                        .unwrap()
+                        .or(&a_prime)
+                        .unwrap()
+                        .forall(&xi_cube)
+                        .unwrap(),
+                )
+            }
+        };
 
         Ok(AbstractRelation {
             num_predicates: k,
             present,
             next,
             r_may,
+            r_must,
             tt: self.tt.clone(),
         })
     }
 }
 
-/// R-F5.3c — the abstract may (and, later, must) transition relation over
-/// predicate cubes, as BDDs over `2k` predicate variables. A cube is an index
-/// in `0..2^k`; bit `i` of the index is the truth of predicate `P_i`.
+/// R-F5.3d — which under-approximating must-edge semantics to compute for the
+/// abstract relation. Mirrors the explicit path's must-edge options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MustSemantics {
+    /// `∀x∈c. ∃i. next(x,i)∈c'` — the canonical KMTS must-edge (every concrete
+    /// state in the source cube has *some* input that lands in the target).
+    /// The more permissive of the two; the sound `[]`/`<>` under-approximation.
+    ForallExists,
+    /// `∀x∈c. ∀i. next(x,i)∈c'` — stricter: *every* input lands in the target
+    /// (deterministic into the target cube). Every `∀∀` must-edge is also a
+    /// `∀∃` must-edge.
+    ForallForall,
+}
+
+/// R-F5.3c/d — the abstract may + must transition relation over predicate
+/// cubes, as BDDs over `2k` predicate variables. A cube is an index in
+/// `0..2^k`; bit `i` of the index is the truth of predicate `P_i`.
 pub struct AbstractRelation {
     num_predicates: usize,
     /// Present-cube predicate variables `p_0..p_{k-1}`.
@@ -585,6 +678,8 @@ pub struct AbstractRelation {
     next: Vec<BDDFunction>,
     /// The may relation as a BDD over `(p, p')`.
     r_may: BDDFunction,
+    /// The must relation over `(p, p')`, when a [`MustSemantics`] was requested.
+    r_must: Option<BDDFunction>,
     tt: BDDFunction,
 }
 
@@ -597,6 +692,11 @@ impl AbstractRelation {
     /// The may relation BDD over the present + next predicate variables.
     pub fn may(&self) -> &BDDFunction {
         &self.r_may
+    }
+
+    /// The must relation BDD, or `None` if no [`MustSemantics`] was requested.
+    pub fn must(&self) -> Option<&BDDFunction> {
+        self.r_must.as_ref()
     }
 
     /// The complete-assignment minterm for a cube index over the given
@@ -617,11 +717,26 @@ impl AbstractRelation {
     /// Is `present_cube → next_cube` a may-edge? (its full `(p, p')` minterm
     /// implies `R_may`).
     pub fn may_holds(&self, present_cube: usize, next_cube: usize) -> bool {
+        self.holds(&self.r_may, present_cube, next_cube)
+    }
+
+    /// Is `present_cube → next_cube` a must-edge? Panics if no [`MustSemantics`]
+    /// was requested when the relation was built.
+    pub fn must_holds(&self, present_cube: usize, next_cube: usize) -> bool {
+        let r_must = self
+            .r_must
+            .as_ref()
+            .expect("must_holds called on a relation built without a MustSemantics");
+        self.holds(r_must, present_cube, next_cube)
+    }
+
+    /// Does the `(present_cube, next_cube)` pair belong to relation `r`?
+    fn holds(&self, r: &BDDFunction, present_cube: usize, next_cube: usize) -> bool {
         let mt = self
             .cube_minterm(present_cube, &self.present)
             .and(&self.cube_minterm(next_cube, &self.next))
             .unwrap();
-        mt.and(&self.r_may).unwrap() == mt
+        mt.and(r).unwrap() == mt
     }
 }
 
@@ -1290,5 +1405,206 @@ mod tests {
             &[("cnt", 2), ("acc", 2)],
             &[("en", 1)],
         );
+    }
+
+    // ---- R-F5.3d: abstract must relation vs brute-force concrete must-edges ----
+
+    /// Build the symbolic abstract must relation under `semantics` and assert it
+    /// equals the brute-force concrete must-relation. `∀∃`: `ci → cj` is a
+    /// must-edge iff *every* concrete state in `ci` has *some* input landing in
+    /// `cj`. `∀∀`: every state, under *every* input, lands in `cj`. An empty
+    /// (unsatisfiable) source cube is vacuously a must-edge to every cube — the
+    /// symbolic `∀` and the brute-force `.all()` over zero states agree.
+    fn assert_must_relation_matches_bruteforce(
+        src: &str,
+        predicates: &[PredicateExpr],
+        states: &[(&str, u32)],
+        inputs: &[(&str, u32)],
+        semantics: MustSemantics,
+    ) {
+        let file = parser::parse(src).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let rel = bb
+            .abstract_relation(predicates, Some(semantics))
+            .expect("build must relation");
+        let k = predicates.len();
+
+        let cube_of = |regs: &HashMap<String, u128>| -> usize {
+            let mut c = 0usize;
+            for (i, p) in predicates.iter().enumerate() {
+                if p.eval(regs) {
+                    c |= 1 << i;
+                }
+            }
+            c
+        };
+
+        let total_state_bits: u32 = states.iter().map(|(_, w)| *w).sum();
+        let total_input_bits: u32 = inputs.iter().map(|(_, w)| *w).sum();
+        assert!(
+            total_state_bits + total_input_bits <= 14,
+            "keep the sweep small"
+        );
+
+        // Per concrete state: the set of next-cubes reachable over all inputs,
+        // grouped by the state's present cube.
+        let mut by_cube: HashMap<usize, Vec<std::collections::HashSet<usize>>> = HashMap::new();
+        for scombo in 0..(1u128 << total_state_bits) {
+            let mut regs: HashMap<String, u128> = HashMap::new();
+            let mut off = 0u32;
+            for (name, w) in states {
+                let mask = (1u128 << w) - 1;
+                regs.insert((*name).to_string(), (scombo >> off) & mask);
+                off += w;
+            }
+            let present_cube = cube_of(&regs);
+            let mut reach: std::collections::HashSet<usize> = Default::default();
+            for icombo in 0..(1u128 << total_input_bits) {
+                let mut inps: HashMap<String, u128> = HashMap::new();
+                let mut ioff = 0u32;
+                for (name, w) in inputs {
+                    let mask = (1u128 << w) - 1;
+                    inps.insert((*name).to_string(), (icombo >> ioff) & mask);
+                    ioff += w;
+                }
+                let next = simulate_one_step(&file, &regs, &inps).expect("concrete step");
+                let mut regs_next = regs.clone();
+                regs_next.extend(next);
+                reach.insert(cube_of(&regs_next));
+            }
+            by_cube.entry(present_cube).or_default().push(reach);
+        }
+
+        for ci in 0..(1usize << k) {
+            let reaches = by_cube.get(&ci).map(|v| v.as_slice()).unwrap_or(&[]);
+            for cj in 0..(1usize << k) {
+                let expected = match semantics {
+                    MustSemantics::ForallExists => reaches.iter().all(|r| r.contains(&cj)),
+                    MustSemantics::ForallForall => {
+                        reaches.iter().all(|r| r.len() == 1 && r.contains(&cj))
+                    }
+                };
+                assert_eq!(
+                    rel.must_holds(ci, cj),
+                    expected,
+                    "must-edge {ci} -> {cj} ({semantics:?}) disagrees with brute force"
+                );
+            }
+        }
+    }
+
+    const SATURATING_COUNTER_BTOR2: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 input 2 en
+5 one 1
+6 ones 1
+7 add 1 3 5
+8 eq 2 3 6
+9 ite 1 8 3 7
+10 ite 1 4 9 3
+11 next 1 3 10
+"#;
+
+    const TWO_REGISTER_BTOR2: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 state 1 acc
+5 input 2 en
+6 one 1
+7 add 1 3 6
+8 ite 1 5 3 4
+9 next 1 3 7
+10 next 1 4 8
+"#;
+
+    #[test]
+    fn rf5_3d_must_relation_saturating_counter() {
+        let predicates = [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ];
+        for sem in [MustSemantics::ForallExists, MustSemantics::ForallForall] {
+            assert_must_relation_matches_bruteforce(
+                SATURATING_COUNTER_BTOR2,
+                &predicates,
+                &[("cnt", 2)],
+                &[("en", 1)],
+                sem,
+            );
+        }
+    }
+
+    #[test]
+    fn rf5_3d_must_relation_two_registers_relational_predicate() {
+        let predicates = [
+            PredicateExpr::CmpReg {
+                lhs: "cnt".to_string(),
+                op: CmpOp::Eq,
+                rhs: "acc".to_string(),
+            },
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+            PredicateExpr::eq("acc", 0),
+        ];
+        for sem in [MustSemantics::ForallExists, MustSemantics::ForallForall] {
+            assert_must_relation_matches_bruteforce(
+                TWO_REGISTER_BTOR2,
+                &predicates,
+                &[("cnt", 2), ("acc", 2)],
+                &[("en", 1)],
+                sem,
+            );
+        }
+    }
+
+    /// The KMTS invariant `R_must ⊆ R_may` over **feasible** source cubes: every
+    /// must-edge out of a satisfiable cube is a may-edge (for both semantics).
+    /// An infeasible (unsatisfiable) cube is excluded — it is vacuously a
+    /// must-edge to every cube yet has no may-edge, and the downstream lift
+    /// never materialises such a cube as an abstract state.
+    #[test]
+    fn rf5_3d_must_subseteq_may_over_feasible_cubes() {
+        let predicates = [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ];
+        let file = parser::parse(SATURATING_COUNTER_BTOR2).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        for sem in [MustSemantics::ForallExists, MustSemantics::ForallForall] {
+            let rel = bb
+                .abstract_relation(&predicates, Some(sem))
+                .expect("relation");
+            let k = rel.num_predicates();
+            for ci in 0..(1usize << k) {
+                // A feasible cube has at least one may-out-edge (every concrete
+                // state steps somewhere); an infeasible cube has none.
+                let feasible = (0..(1usize << k)).any(|cj| rel.may_holds(ci, cj));
+                if !feasible {
+                    continue;
+                }
+                for cj in 0..(1usize << k) {
+                    if rel.must_holds(ci, cj) {
+                        assert!(
+                            rel.may_holds(ci, cj),
+                            "must ⊄ may: {ci} -> {cj} ({sem:?}) is a must-edge but not a may-edge"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
