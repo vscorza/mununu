@@ -907,16 +907,30 @@ fn run_symbolic_cegar_response(
     predicates: &[crate::adapter::btor2::kmts_lift::PredicateSpec],
     formula: &crate::mu_calculus::Formula,
 ) -> Result<Btor2CegarResponse, ApiError> {
+    use crate::adapter::AdapterOptions;
+    use crate::adapter::btor2::cegar::config_values_to_sidecar_json;
     use crate::adapter::btor2::symbolic_bitblast::MustSemantics;
-    use crate::adapter::btor2::symbolic_engine::symbolic_cube_verdicts;
+    use crate::adapter::btor2::symbolic_engine::symbolic_cube_verdicts_from_options;
 
-    // Simple equality predicates only (compound predicates are an explicit-path
-    // sidecar feature); empty compound map.
-    let compound = std::collections::HashMap::new();
-    let verdicts = symbolic_cube_verdicts(
+    // Build the same config-values synthetic sidecar the explicit path uses, so
+    // any non-derived `compound_predicates` become cube dimensions (R-F5.5a).
+    // The cegar request has no explicit sidecar field, so today this is
+    // equality-only unless config-values embed a compound — parity with the
+    // explicit API path.
+    let sidecar_json = config_values_to_sidecar_json(params.config_values).map_err(|message| {
+        ApiError::BadRequest {
+            message,
+            details: None,
+        }
+    })?;
+    let options = AdapterOptions {
+        sidecar_json,
+        ..AdapterOptions::default()
+    };
+    let verdicts = symbolic_cube_verdicts_from_options(
         params.btor2_content,
         predicates,
-        &compound,
+        &options,
         formula,
         MustSemantics::ForallExists,
     )

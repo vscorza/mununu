@@ -2505,23 +2505,33 @@ fn cegar_cells_json(
 /// per-cube-pair SMT), single-shot at the given predicate set. Prints the same
 /// `{T, F, ⊥}` verdict-cell tally + outcome shape as the explicit path (minus
 /// the refinement-iteration fields, which do not apply).
+#[allow(clippy::too_many_arguments)]
 fn run_symbolic_cegar_cli(
     content: &str,
     fixture_label: &str,
     predicates: &[mununu_core::adapter::btor2::PredicateSpec],
     formula: &mununu_core::mu_calculus::Formula,
+    sidecar: Option<&Path>,
+    config_values: &[String],
     json: bool,
 ) -> Result<(), String> {
     use mununu_core::adapter::btor2::symbolic_bitblast::MustSemantics;
-    use mununu_core::adapter::btor2::symbolic_engine::symbolic_cube_verdicts;
-    use std::collections::HashMap;
+    use mununu_core::adapter::btor2::symbolic_engine::symbolic_cube_verdicts_from_options;
 
-    // CLI predicates are simple `NAME:REG=VALUE` equalities ⇒ empty compound map.
-    let compound = HashMap::new();
-    let verdicts = symbolic_cube_verdicts(
+    // The simple `--predicate NAME:REG=VALUE` equalities plus any non-derived
+    // `compound_predicates` (e.g. `cnt >= 2`) declared in the `--sidecar`. The
+    // sidecar overrides the `--config-values` synthetic one (matches the
+    // explicit path). Derived/combinational compounds are rejected downstream.
+    let mut options = build_adapter_options_with_config_values(config_values)?;
+    if let Some(p) = sidecar {
+        let sidecar_content = std::fs::read_to_string(p)
+            .map_err(|e| format!("Failed to read sidecar '{}': {e}", p.display()))?;
+        options.sidecar_json = Some(sidecar_content);
+    }
+    let verdicts = symbolic_cube_verdicts_from_options(
         content,
         predicates,
-        &compound,
+        &options,
         formula,
         MustSemantics::ForallExists,
     )
@@ -2544,7 +2554,7 @@ fn run_symbolic_cegar_cli(
         let summary = serde_json::json!({
             "fixture": fixture_label,
             "engine": "symbolic",
-            "final_predicate_count": predicates.len(),
+            "final_predicate_count": verdicts.num_predicates,
             "feasible_cube_count": verdicts.cube_verdicts.len(),
             "verdict": {
                 "true_cells": t,
@@ -2562,7 +2572,7 @@ fn run_symbolic_cegar_cli(
         println!("Symbolic predicate-cube evaluation (R-F5, single-shot)");
         println!("  fixture:           {fixture_label}");
         println!("  engine:            symbolic (BDD relation, no per-cube-pair SMT)");
-        println!("  predicates:        {}", predicates.len());
+        println!("  predicates:        {}", verdicts.num_predicates);
         println!("  feasible cubes:    {}", verdicts.cube_verdicts.len());
         println!("  verdict cells:     T={t} F={f} ⊥={b}");
         println!("  outcome:           {outcome}");
@@ -2625,14 +2635,17 @@ fn run_cegar_cli(
     // R-F5.4.2b — the symbolic engine short-circuits the explicit lift + CEGAR
     // loop: it builds the may/must relation as BDDs directly from the BTOR2 and
     // evaluates the formula by BDD image/preimage, avoiding the `O(2^2|P|)` SMT.
-    // Single-shot at the given predicate set (no refinement); simple equality
-    // predicates only (sidecar compound predicates are an explicit-path feature).
+    // Single-shot at the given predicate set (no refinement). Simple equality
+    // `--predicate`s plus any non-derived `compound_predicates` (e.g. `cnt >= 2`)
+    // from the `--sidecar` (R-F5.5a).
     if params.engine == EngineArg::Symbolic {
         return run_symbolic_cegar_cli(
             content,
             fixture_label,
             &initial_predicates,
             &formula,
+            params.sidecar,
+            params.config_values,
             params.json,
         );
     }
