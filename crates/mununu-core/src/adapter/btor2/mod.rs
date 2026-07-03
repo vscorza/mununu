@@ -33,6 +33,7 @@ pub mod r_s8_encoder;
 pub mod shadow;
 pub mod smt_must_edge;
 pub mod symbolic_bitblast;
+pub mod symbolic_engine;
 pub mod term_backend;
 /// H.U.0 — uniform predicate-image spike (go/no-go validation; test-only).
 #[cfg(test)]

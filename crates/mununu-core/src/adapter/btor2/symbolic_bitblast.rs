@@ -639,16 +639,20 @@ impl BddBitBlaster {
             .apply_exists(BooleanOperator::And, &a_prime, &xi_cube)
             .unwrap();
 
+        // The FEASIBLE present cubes `∃x. A(x,p)` — the cubes some concrete
+        // register state inhabits. Used to restrict `R_must` (below) and to
+        // scope the verdict tally (R-F5.4.2) to materialisable abstract states.
+        let feasible_present = a.exists(&reg_cube).unwrap();
+
         // R_must, when requested. `A → φ` is `¬A ∨ φ`.
         //
         // A vacuously-empty (unsatisfiable) source cube yields `¬A ≡ ⊤` there,
         // so the ∀ would make it a must-edge to *every* cube — breaking the KMTS
         // invariant `R_must ⊆ R_may` (an empty cube has no may-edge). We
-        // intersect with the FEASIBLE present cubes `∃x. A(x,p)`: must-edges
-        // only leave inhabited abstract states (the lift never materialises an
-        // infeasible cube), so `R_must ⊆ R_may` holds globally over the whole
-        // `2^k` cube space — which the R-F5.4.1 evaluator relies on
-        // (`box.must ⊆ box.may`).
+        // intersect with `feasible_present`: must-edges only leave inhabited
+        // abstract states (the lift never materialises an infeasible cube), so
+        // `R_must ⊆ R_may` holds globally over the whole `2^k` cube space —
+        // which the R-F5.4.1 evaluator relies on (`box.must ⊆ box.may`).
         let r_must = must.map(|sem| {
             let raw = match sem {
                 MustSemantics::ForallExists => {
@@ -671,12 +675,12 @@ impl BddBitBlaster {
                         .unwrap()
                 }
             };
-            let feasible_present = a.exists(&reg_cube).unwrap();
             raw.and(&feasible_present).unwrap()
         });
 
         Ok(AbstractRelation {
             num_predicates: k,
+            feasible_present,
             present,
             next,
             present_varnos,
@@ -708,6 +712,9 @@ pub enum MustSemantics {
 /// `0..2^k`; bit `i` of the index is the truth of predicate `P_i`.
 pub struct AbstractRelation {
     num_predicates: usize,
+    /// The feasible present cubes `∃x. A(x,p)` — a BDD over the present
+    /// predicate vars marking the cubes inhabited by some concrete state.
+    feasible_present: BDDFunction,
     /// Present-cube predicate variables `p_0..p_{k-1}`.
     present: Vec<BDDFunction>,
     /// Next-cube predicate variables `p'_0..p'_{k-1}`.
@@ -729,6 +736,20 @@ impl AbstractRelation {
     /// Number of predicates `k` (so `2^k` cubes).
     pub fn num_predicates(&self) -> usize {
         self.num_predicates
+    }
+
+    /// Is cube `cube` feasible — inhabited by at least one concrete state?
+    /// Infeasible cubes are never materialised as abstract states.
+    pub fn is_feasible(&self, cube: usize) -> bool {
+        let mt = self.cube_minterm(cube, &self.present);
+        mt.and(&self.feasible_present).unwrap() == mt
+    }
+
+    /// The feasible cube indices, ascending.
+    pub fn feasible_cubes(&self) -> Vec<usize> {
+        (0..(1usize << self.num_predicates))
+            .filter(|&c| self.is_feasible(c))
+            .collect()
     }
 
     /// The may relation BDD over the present + next predicate variables.
