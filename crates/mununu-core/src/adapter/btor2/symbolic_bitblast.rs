@@ -77,10 +77,26 @@
 //! `∀∃` must-edge — every concrete state in the source cube has *some* input
 //! landing in the target) or the stricter `∀(x∪i). (A → A')` (`∀∀`,
 //! deterministic-into-target). Built with OxiDD `exists` / `forall` over the
-//! input / register cubes — again no per-cube-pair SMT. Validated cell-for-cell
-//! against the brute-force concrete must-relation, plus the KMTS invariant
-//! `R_must ⊆ R_may` over feasible cubes. R-F5.4 then wires the `AbstractRelation`
-//! (may + must) into a symbolic KMTS engine behind `--engine symbolic`.
+//! input / register cubes — again no per-cube-pair SMT. Must-edges are
+//! restricted to **feasible** source cubes (`∧ ∃x. A(x,p)`) so `R_must ⊆ R_may`
+//! holds globally over the whole `2^k` cube space (an infeasible cube is
+//! vacuously a ∀-must-edge to everything but has no may-edge; the lift never
+//! materialises it). Validated cell-for-cell against the brute-force concrete
+//! must-relation + the `R_must ⊆ R_may` invariant.
+//!
+//! # R-F5.4.1 — the symbolic mu-calculus evaluator
+//!
+//! [`AbstractRelation::evaluate`] runs the mu-calculus directly over
+//! `R_may` / `R_must` by BDD image/preimage (box/diamond via
+//! `apply_exists(And,…)` on the predicate-var frame) + μ/ν Kleene fixpoint over
+//! the `(must, may)` [`TritBdd`], never materialising cube states. It is the
+//! `SymbolicKmts` counterpart sourced from the BTOR2-derived relation rather
+//! than a `Clts`; an atomic proposition `P_i`'s characteristic set is simply the
+//! present predicate var `p_i`. Supports the audited-sound **bare** fragment
+//! (`True`/`False`, predicates, `!`/`&&`/`||`, bare `[]`/`<>`, `mu`/`nu`);
+//! guards / controllability / step-bounds are an honest error. Validated
+//! cell-for-cell against `evaluate_tri` on the equivalent explicit cube-KMTS
+//! (nested νμ included). R-F5.4.2 then wires this behind `--engine symbolic`.
 
 use std::collections::HashMap;
 
@@ -92,6 +108,12 @@ use crate::adapter::btor2::bit_blast::eval_const_value;
 use crate::adapter::btor2::parser::bv_width;
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
 use crate::adapter::btor2::term_backend::{BvTermBackend, WalkError, walk_design};
+// R-F5.4.1 — the symbolic mu-calculus evaluator reuses the (must, may) `TritBdd`
+// pair + the crate `Trit` verdict; the mu-calculus `Node` is aliased to avoid a
+// clash with the BTOR2 `Node` above.
+use crate::mu_calculus::symbolic::TritBdd;
+use crate::mu_calculus::trit::Trit;
+use crate::mu_calculus::{Control, Formula, FormulaVarId, Guard, ModalKind, Node as MuNode};
 
 /// A bit-vector of BDDs, LSB-first: index `b` is the BDD for bit `b`. Every
 /// node's value carries exactly `width` bits.
@@ -545,7 +567,7 @@ impl BddBitBlaster {
         let k = predicates.len();
 
         // Allocate 2k fresh predicate vars at the bottom of the order: p_i then p'_i.
-        let (present, next) = self._manager.with_manager_exclusive(|m| {
+        let (present, next, present_varnos) = self._manager.with_manager_exclusive(|m| {
             let range = m.add_vars(2 * k as VarNo);
             let present: Vec<BDDFunction> = (0..k)
                 .map(|i| BDDFunction::var(m, range.start + i as VarNo).unwrap())
@@ -553,8 +575,14 @@ impl BddBitBlaster {
             let next: Vec<BDDFunction> = (0..k)
                 .map(|i| BDDFunction::var(m, range.start + (k + i) as VarNo).unwrap())
                 .collect();
-            (present, next)
+            let present_varnos: Vec<VarNo> = (0..k as VarNo).map(|i| range.start + i).collect();
+            (present, next, present_varnos)
         });
+        // The cube of next predicate vars (to quantify out in a preimage).
+        let mut next_cube = self.tt.clone();
+        for v in &next {
+            next_cube = next_cube.and(v).unwrap();
+        }
 
         // The present→next substitution: each register bit var ↦ its
         // bit-blasted next-state function. Registers without a `Next` line
@@ -611,44 +639,52 @@ impl BddBitBlaster {
             .apply_exists(BooleanOperator::And, &a_prime, &xi_cube)
             .unwrap();
 
-        // R_must, when requested. `A → φ` is `¬A ∨ φ`; a vacuously-empty cube
-        // (unsatisfiable predicate combination) yields `¬A ≡ ⊤` there, so the
-        // ∀ makes it a must-edge to every cube — which matches the vacuous
-        // truth of "for all (zero) states in an empty cube …".
-        let r_must = match must {
-            None => None,
-            Some(MustSemantics::ForallExists) => {
-                // ∀x. ( A(x,p) → ∃i. A'(x,i,p') )
-                let exists_i = a_prime.exists(&input_cube).unwrap();
-                Some(
+        // R_must, when requested. `A → φ` is `¬A ∨ φ`.
+        //
+        // A vacuously-empty (unsatisfiable) source cube yields `¬A ≡ ⊤` there,
+        // so the ∀ would make it a must-edge to *every* cube — breaking the KMTS
+        // invariant `R_must ⊆ R_may` (an empty cube has no may-edge). We
+        // intersect with the FEASIBLE present cubes `∃x. A(x,p)`: must-edges
+        // only leave inhabited abstract states (the lift never materialises an
+        // infeasible cube), so `R_must ⊆ R_may` holds globally over the whole
+        // `2^k` cube space — which the R-F5.4.1 evaluator relies on
+        // (`box.must ⊆ box.may`).
+        let r_must = must.map(|sem| {
+            let raw = match sem {
+                MustSemantics::ForallExists => {
+                    // ∀x. ( A(x,p) → ∃i. A'(x,i,p') )
+                    let exists_i = a_prime.exists(&input_cube).unwrap();
                     a.not()
                         .unwrap()
                         .or(&exists_i)
                         .unwrap()
                         .forall(&reg_cube)
-                        .unwrap(),
-                )
-            }
-            Some(MustSemantics::ForallForall) => {
-                // ∀(x ∪ i). ( A(x,p) → A'(x,i,p') )
-                Some(
+                        .unwrap()
+                }
+                MustSemantics::ForallForall => {
+                    // ∀(x ∪ i). ( A(x,p) → A'(x,i,p') )
                     a.not()
                         .unwrap()
                         .or(&a_prime)
                         .unwrap()
                         .forall(&xi_cube)
-                        .unwrap(),
-                )
-            }
-        };
+                        .unwrap()
+                }
+            };
+            let feasible_present = a.exists(&reg_cube).unwrap();
+            raw.and(&feasible_present).unwrap()
+        });
 
         Ok(AbstractRelation {
             num_predicates: k,
             present,
             next,
+            present_varnos,
+            next_cube,
             r_may,
             r_must,
             tt: self.tt.clone(),
+            ff: self.ff.clone(),
         })
     }
 }
@@ -676,11 +712,17 @@ pub struct AbstractRelation {
     present: Vec<BDDFunction>,
     /// Next-cube predicate variables `p'_0..p'_{k-1}`.
     next: Vec<BDDFunction>,
+    /// Variable numbers of the present predicate vars (for the present→next
+    /// rename in a preimage).
+    present_varnos: Vec<VarNo>,
+    /// The cube of next-cube predicate vars, to quantify out in a preimage.
+    next_cube: BDDFunction,
     /// The may relation as a BDD over `(p, p')`.
     r_may: BDDFunction,
     /// The must relation over `(p, p')`, when a [`MustSemantics`] was requested.
     r_must: Option<BDDFunction>,
     tt: BDDFunction,
+    ff: BDDFunction,
 }
 
 impl AbstractRelation {
@@ -737,6 +779,202 @@ impl AbstractRelation {
             .and(&self.cube_minterm(next_cube, &self.next))
             .unwrap();
         mt.and(r).unwrap() == mt
+    }
+
+    // ---- R-F5.4.1: the symbolic mu-calculus evaluator over the relation ----
+
+    /// `⊤` / `⊥` as `TritBdd`s over the present predicate vars (built directly
+    /// from the manager's constants, since we have no `SymbolicContext`).
+    fn tb_top(&self) -> TritBdd {
+        TritBdd::from_parts(self.tt.clone(), self.tt.clone())
+    }
+    fn tb_bot(&self) -> TritBdd {
+        TritBdd::from_parts(self.ff.clone(), self.ff.clone())
+    }
+
+    /// Rename a present-var function to the next-var frame (for a preimage).
+    fn to_next(&self, f: &BDDFunction) -> BDDFunction {
+        f.substitute(&Subst::new(self.present_varnos.clone(), self.next.clone()))
+            .unwrap()
+    }
+
+    /// 3-valued box preimage of `phi` (Bruns–Godefroid): `box.must` uses
+    /// `R_may`, `box.may` uses `R_must`. Mirrors [`crate::mu_calculus::symbolic`]'s
+    /// `SymbolicKmts::box_pre` on this relation's own predicate-var frame.
+    fn box_pre(&self, phi: &TritBdd, r_must: &BDDFunction) -> TritBdd {
+        use oxidd::{BooleanFunctionQuant, BooleanOperator};
+        let must_next = self.to_next(phi.must());
+        let box_must = self
+            .r_may
+            .apply_exists(
+                BooleanOperator::And,
+                &must_next.not().unwrap(),
+                &self.next_cube,
+            )
+            .unwrap()
+            .not()
+            .unwrap();
+        let may_next = self.to_next(phi.may());
+        let box_may = r_must
+            .apply_exists(
+                BooleanOperator::And,
+                &may_next.not().unwrap(),
+                &self.next_cube,
+            )
+            .unwrap()
+            .not()
+            .unwrap();
+        TritBdd::from_parts(box_must, box_may)
+    }
+
+    /// 3-valued diamond preimage of `phi`: `dia.must` uses `R_must`, `dia.may`
+    /// uses `R_may`.
+    fn diamond_pre(&self, phi: &TritBdd, r_must: &BDDFunction) -> TritBdd {
+        use oxidd::{BooleanFunctionQuant, BooleanOperator};
+        let must_next = self.to_next(phi.must());
+        let dia_must = r_must
+            .apply_exists(BooleanOperator::And, &must_next, &self.next_cube)
+            .unwrap();
+        let may_next = self.to_next(phi.may());
+        let dia_may = self
+            .r_may
+            .apply_exists(BooleanOperator::And, &may_next, &self.next_cube)
+            .unwrap();
+        TritBdd::from_parts(dia_must, dia_may)
+    }
+
+    /// R-F5.4.1 — evaluate a mu-calculus `formula` symbolically over this
+    /// abstract relation, returning a `(must, may)` verdict over the present
+    /// predicate cubes. `pred_names[i]` names predicate `P_i` (the atomic
+    /// proposition `P_i` holds exactly on the cubes where bit `i` is set —
+    /// i.e. its characteristic set is the present var `p_i`).
+    ///
+    /// Supports the **audited-sound bare fragment** the cube path evaluates:
+    /// `True`/`False`, predicates, `!`/`&&`/`||`, bare `[]`/`<>`, `mu`/`nu`.
+    /// A guarded / controllability / step-bounded modality is an honest error
+    /// (as in [`crate::mu_calculus::symbolic`]'s `SymbolicKmts`). Requires a
+    /// relation built *with* a [`MustSemantics`] (the modal steps read
+    /// `R_must`).
+    pub fn evaluate(&self, formula: &Formula, pred_names: &[String]) -> Result<TritBdd, String> {
+        let r_must = self.r_must.as_ref().ok_or_else(|| {
+            "AbstractRelation::evaluate requires a must relation — build with a MustSemantics"
+                .to_string()
+        })?;
+        let name_to_idx: HashMap<&str, usize> = pred_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        let mut bindings: HashMap<FormulaVarId, TritBdd> = HashMap::new();
+        self.eval_node(formula, formula.root(), &name_to_idx, r_must, &mut bindings)
+    }
+
+    fn eval_node(
+        &self,
+        f: &Formula,
+        id: crate::mu_calculus::NodeId,
+        names: &HashMap<&str, usize>,
+        r_must: &BDDFunction,
+        bindings: &mut HashMap<FormulaVarId, TritBdd>,
+    ) -> Result<TritBdd, String> {
+        Ok(match f.node(id) {
+            MuNode::True => self.tb_top(),
+            MuNode::False => self.tb_bot(),
+            MuNode::Predicate(name) => match names.get(name.as_str()) {
+                // The AP's characteristic set is the present predicate var; the
+                // cube valuation is definite (Sharp), so must = may = p_i.
+                Some(&i) => TritBdd::from_parts(self.present[i].clone(), self.present[i].clone()),
+                None => self.tb_bot(),
+            },
+            MuNode::Variable(v) => bindings
+                .get(v)
+                .cloned()
+                .ok_or_else(|| format!("unbound fixpoint variable {v:?}"))?,
+            MuNode::Not(n) => self.eval_node(f, *n, names, r_must, bindings)?.not(),
+            MuNode::And(a, b) => {
+                let av = self.eval_node(f, *a, names, r_must, bindings)?;
+                let bv = self.eval_node(f, *b, names, r_must, bindings)?;
+                av.and(&bv)
+            }
+            MuNode::Or(a, b) => {
+                let av = self.eval_node(f, *a, names, r_must, bindings)?;
+                let bv = self.eval_node(f, *b, names, r_must, bindings)?;
+                av.or(&bv)
+            }
+            MuNode::Modal {
+                kind,
+                guard,
+                target,
+            } => {
+                if guard.control != Control::All {
+                    return Err(
+                        "symbolic cube evaluator: controllability guards (`ctrl`) unsupported"
+                            .into(),
+                    );
+                }
+                if guard.max_steps.is_some() {
+                    return Err(
+                        "symbolic cube evaluator: step-bounded modalities (`steps`) unsupported"
+                            .into(),
+                    );
+                }
+                if *guard != Guard::default() {
+                    return Err(
+                        "symbolic cube evaluator: label / state-var guards unsupported (bare `[]`/`<>` only)".into(),
+                    );
+                }
+                let phi = self.eval_node(f, *target, names, r_must, bindings)?;
+                match kind {
+                    ModalKind::Box => self.box_pre(&phi, r_must),
+                    ModalKind::Diamond => self.diamond_pre(&phi, r_must),
+                }
+            }
+            MuNode::Mu { var, body } => {
+                self.fixpoint(f, *var, *body, names, r_must, bindings, false)?
+            }
+            MuNode::Nu { var, body } => {
+                self.fixpoint(f, *var, *body, names, r_must, bindings, true)?
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fixpoint(
+        &self,
+        f: &Formula,
+        var: FormulaVarId,
+        body: crate::mu_calculus::NodeId,
+        names: &HashMap<&str, usize>,
+        r_must: &BDDFunction,
+        bindings: &mut HashMap<FormulaVarId, TritBdd>,
+        greatest: bool,
+    ) -> Result<TritBdd, String> {
+        let mut x = if greatest {
+            self.tb_top()
+        } else {
+            self.tb_bot()
+        };
+        loop {
+            bindings.insert(var, x.clone());
+            let next = self.eval_node(f, body, names, r_must, bindings)?;
+            if next.eq_set(&x) {
+                bindings.remove(&var);
+                return Ok(next);
+            }
+            x = next;
+        }
+    }
+
+    /// The trit verdict of an evaluated formula at cube `cube`.
+    pub fn verdict_at(&self, verdict: &TritBdd, cube: usize) -> Trit {
+        let mt = self.cube_minterm(cube, &self.present);
+        if mt.and(verdict.must()).unwrap() == mt {
+            Trit::True
+        } else if mt.and(verdict.may()).unwrap() == mt {
+            Trit::Unknown
+        } else {
+            Trit::False
+        }
     }
 }
 
@@ -1476,13 +1714,19 @@ mod tests {
         }
 
         for ci in 0..(1usize << k) {
-            let reaches = by_cube.get(&ci).map(|v| v.as_slice()).unwrap_or(&[]);
             for cj in 0..(1usize << k) {
-                let expected = match semantics {
-                    MustSemantics::ForallExists => reaches.iter().all(|r| r.contains(&cj)),
-                    MustSemantics::ForallForall => {
-                        reaches.iter().all(|r| r.len() == 1 && r.contains(&cj))
-                    }
+                // An infeasible source cube (no concrete state maps to it) has
+                // NO must-edge — the relation restricts must-edges to feasible
+                // sources so `R_must ⊆ R_may` holds globally. A feasible cube
+                // uses the ∀∃ / ∀∀ definition over its inhabitants.
+                let expected = match by_cube.get(&ci) {
+                    None => false,
+                    Some(reaches) => match semantics {
+                        MustSemantics::ForallExists => reaches.iter().all(|r| r.contains(&cj)),
+                        MustSemantics::ForallForall => {
+                            reaches.iter().all(|r| r.len() == 1 && r.contains(&cj))
+                        }
+                    },
                 };
                 assert_eq!(
                     rel.must_holds(ci, cj),
@@ -1606,5 +1850,181 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- R-F5.4.1: symbolic cube evaluator ≡ evaluate_tri ----
+
+    /// Build the abstract relation, materialise the equivalent explicit
+    /// cube-KMTS (feasible cubes as states, may/must edges + definite cube AP
+    /// labels), and assert the symbolic evaluator agrees with `evaluate_tri`
+    /// on every `formula_str` at every feasible cube.
+    fn assert_symbolic_eval_matches_tri(
+        src: &str,
+        predicates: &[PredicateExpr],
+        names: &[&str],
+        states: &[(&str, u32)],
+        formulas: &[&str],
+    ) {
+        use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, TransitionModality, Tristate};
+        use crate::mu_calculus::evaluator::{Environment, evaluate_tri};
+
+        let file = parser::parse(src).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let rel = bb
+            .abstract_relation(predicates, Some(MustSemantics::ForallExists))
+            .expect("relation");
+
+        let cube_of = |regs: &HashMap<String, u128>| -> usize {
+            let mut c = 0usize;
+            for (i, p) in predicates.iter().enumerate() {
+                if p.eval(regs) {
+                    c |= 1 << i;
+                }
+            }
+            c
+        };
+
+        // Feasible cubes: those inhabited by at least one concrete register state.
+        let total_state_bits: u32 = states.iter().map(|(_, w)| *w).sum();
+        let mut feasible_set: std::collections::BTreeSet<usize> = Default::default();
+        for scombo in 0..(1u128 << total_state_bits) {
+            let mut regs: HashMap<String, u128> = HashMap::new();
+            let mut off = 0u32;
+            for (name, w) in states {
+                let mask = (1u128 << w) - 1;
+                regs.insert((*name).to_string(), (scombo >> off) & mask);
+                off += w;
+            }
+            feasible_set.insert(cube_of(&regs));
+        }
+        let feasible: Vec<usize> = feasible_set.into_iter().collect();
+        let n = feasible.len();
+
+        // Explicit cube-KMTS over the feasible cubes.
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        for j in 0..n {
+            b.state(format!("c{j}"));
+        }
+        b.initial("c0");
+        let step = b.labels().intern(["step"]).unwrap();
+        let ids: Vec<_> = (0..n)
+            .map(|j| b.state_id_or_insert(format!("c{j}")).unwrap())
+            .collect();
+        for (j, &ci) in feasible.iter().enumerate() {
+            for (i, nm) in names.iter().enumerate() {
+                let v = if (ci >> i) & 1 == 1 {
+                    Tristate::KleeneT
+                } else {
+                    Tristate::KleeneF
+                };
+                b.with_3valued_predicate(ids[j], *nm, v);
+            }
+        }
+        for (j, &ci) in feasible.iter().enumerate() {
+            for (l, &cj) in feasible.iter().enumerate() {
+                if rel.must_holds(ci, cj) {
+                    b.transition_ids_with_modality(
+                        ids[j],
+                        &[step],
+                        ids[l],
+                        TransitionModality::Sharp,
+                    );
+                } else if rel.may_holds(ci, cj) {
+                    b.transition_ids_with_modality(
+                        ids[j],
+                        &[step],
+                        ids[l],
+                        TransitionModality::MayOnly,
+                    );
+                }
+            }
+        }
+        let clts = b.build().expect("clts builds");
+
+        let names_owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let env = Environment::new(clts.state_count());
+        for formula_str in formulas {
+            let formula = crate::mu_calculus::parser::parse(formula_str).expect("formula parses");
+            let tri = evaluate_tri(&formula, &clts, &env).expect("evaluate_tri");
+            let sym = rel
+                .evaluate(&formula, &names_owned)
+                .expect("symbolic evaluate");
+            for (j, &ci) in feasible.iter().enumerate() {
+                assert_eq!(
+                    rel.verdict_at(&sym, ci),
+                    tri.verdict_at(j),
+                    "cube {ci} (state c{j}), formula `{formula_str}`"
+                );
+            }
+        }
+    }
+
+    /// The full unguarded fragment (bare `[]`/`<>`, boolean ops, nested νμ) on
+    /// the saturating counter, predicates `p = (cnt == 0)`, `q = (cnt ≥ 2)`.
+    #[test]
+    fn rf5_4_1_symbolic_eval_matches_tri_saturating_counter() {
+        let predicates = [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ];
+        let formulas = [
+            "[] p",
+            "<> p",
+            "[] q",
+            "<> q",
+            "not q",
+            "p or q",
+            "p and q",
+            "nu X. p and [] X",                   // AG p
+            "mu X. q or <> X",                    // EF q
+            "nu X. (not p) and [] X",             // AG ¬p
+            "nu Y. (mu X. (q or <> X)) and [] Y", // AG EF q (nested νμ)
+        ];
+        assert_symbolic_eval_matches_tri(
+            SATURATING_COUNTER_BTOR2,
+            &predicates,
+            &["p", "q"],
+            &[("cnt", 2)],
+            &formulas,
+        );
+    }
+
+    /// Two registers stepping together, with a relational predicate — exercises
+    /// a KMTS with `MayOnly` edges (input nondeterminism) so the `⊥` verdicts
+    /// are non-trivial.
+    #[test]
+    fn rf5_4_1_symbolic_eval_matches_tri_two_registers() {
+        let predicates = [
+            PredicateExpr::CmpReg {
+                lhs: "cnt".to_string(),
+                op: CmpOp::Eq,
+                rhs: "acc".to_string(),
+            },
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+            PredicateExpr::eq("acc", 0),
+        ];
+        let formulas = [
+            "[] p",
+            "<> p",
+            "<> (p and q)",
+            "nu X. p and [] X",
+            "mu X. r or <> X",
+            "nu Y. (mu X. (p or <> X)) and [] Y",
+        ];
+        assert_symbolic_eval_matches_tri(
+            TWO_REGISTER_BTOR2,
+            &predicates,
+            &["p", "q", "r"],
+            &[("cnt", 2), ("acc", 2)],
+            &formulas,
+        );
     }
 }
