@@ -872,6 +872,14 @@ pub struct Btor2CegarRequest {
     /// `mu_formulas` block). Mirrors the CLI `--emit-ctxdsl`.
     #[serde(default)]
     pub emit_ctxdsl: bool,
+    /// R-F5.4.2b (2026-07-03) — predicate-cube engine: `"explicit"` (default,
+    /// SMT edges + CEGAR refinement) or `"symbolic"` (R-F5 BDD relation,
+    /// single-shot, no per-cube-pair SMT). Mirrors the CLI `--engine`. The
+    /// symbolic path handles only simple equality predicates + the bare
+    /// `[]`/`<>` fragment, and does not refine (`iterations` is empty,
+    /// `terminated_with` is `"symbolic-single-shot"`).
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
@@ -935,6 +943,10 @@ pub struct SvCegarRequest {
     /// CTXDSL Phase 2 — opt-in CTXDSL of the final refined model + formula.
     #[serde(default)]
     pub emit_ctxdsl: bool,
+    /// R-F5.4.2b (2026-07-03) — predicate-cube engine: `"explicit"` (default)
+    /// or `"symbolic"` (R-F5 BDD relation, single-shot). Mirrors `--engine`.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 /// XL.6a — SVA-extraction endpoint (`POST /api/v1/sv/extract-sva`). Mirrors the

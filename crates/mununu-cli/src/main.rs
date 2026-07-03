@@ -172,6 +172,29 @@ enum MayEdgeInferenceArg {
     SmtAllPairs,
 }
 
+/// R-F5.4.2b (2026-07-03) — which predicate-cube engine evaluates the
+/// property. Mirrors the two edge-construction strategies.
+#[derive(Clone, Debug, Copy, clap::ValueEnum, Default, PartialEq, Eq)]
+enum EngineArg {
+    /// Explicit predicate-cube lift + CEGAR refinement loop (default): the
+    /// may/must edges are built with SMT (`O(2^2|P|)` at `--may/must-edge-inference`
+    /// = smt), which is the scaling wall at large `|P|`. Supports the full
+    /// refinement loop, `--predicate-source`, sidecar compound predicates, etc.
+    #[default]
+    Explicit,
+    /// R-F5 symbolic engine: build the may/must transition relation as BDDs
+    /// directly from the BTOR2 (no per-cube-pair SMT) and evaluate the formula
+    /// by BDD image/preimage + μ/ν fixpoint. Orders of magnitude faster at large
+    /// `|P|` (≈10 ms at `|P|=12` where the explicit SMT path takes ~29 min).
+    ///
+    /// **Single-shot** (2026-07-03): evaluates at the given `--predicate` set
+    /// with no CEGAR refinement, and handles only simple `NAME:REG=VALUE`
+    /// (equality) predicates — sidecar compound / inequality predicates and
+    /// refinement-under-symbolic are follow-ups. The bare `[]`/`<>` fragment
+    /// only (guarded / controllability / step-bounded modalities error).
+    Symbolic,
+}
+
 /// R.2.5b session-1 follow-up (2026-06-06) — must-edge inference
 /// selector for `mununu btor2 cegar`. Mirrors the values of
 /// [`mununu_core::adapter::btor2::kmts_lift::MustEdgeInference`].
@@ -276,6 +299,12 @@ struct Btor2CegarArgs {
     /// human-readable format.
     #[arg(long)]
     json: bool,
+    /// R-F5.4.2b (2026-07-03) — predicate-cube engine: `explicit` (default,
+    /// SMT edges + CEGAR refinement) or `symbolic` (R-F5 BDD relation, no
+    /// per-cube-pair SMT; single-shot at the given predicate set). `symbolic`
+    /// is orders of magnitude faster at large `|P|`.
+    #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
+    engine: EngineArg,
     /// R.6.6 / V.6 (2026-06-09) — name of a BTOR2 input symbol the
     /// controller drives. Repeated to declare multiple controllable
     /// inputs. When non-empty, the predicate-cube lifter partitions
@@ -1139,6 +1168,11 @@ struct SvCegarArgs {
     /// CTXDSL to this path (stderr confirmation; stdout stays clean).
     #[arg(long = "emit-ctxdsl", value_name = "PATH")]
     emit_ctxdsl: Option<PathBuf>,
+    /// R-F5.4.2b (2026-07-03) — predicate-cube engine: `explicit` (default,
+    /// SMT edges + CEGAR refinement) or `symbolic` (R-F5 BDD relation,
+    /// single-shot, no per-cube-pair SMT). See `mununu btor2 cegar --help`.
+    #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
+    engine: EngineArg,
 }
 
 #[derive(Args, Debug)]
@@ -2010,6 +2044,7 @@ fn btor2_cegar(args: Btor2CegarArgs) -> Result<(), String> {
             sidecar: args.sidecar.as_deref(),
             emit_ctxdsl: args.emit_ctxdsl.as_deref(),
             json: args.json,
+            engine: args.engine,
         },
     )
 }
@@ -2066,6 +2101,7 @@ fn sv_cegar(args: SvCegarArgs) -> Result<(), String> {
             sidecar: args.sidecar.as_deref(),
             emit_ctxdsl: args.emit_ctxdsl.as_deref(),
             json: args.json,
+            engine: args.engine,
         },
     )
 }
@@ -2438,6 +2474,7 @@ struct CegarCliParams<'a> {
     sidecar: Option<&'a Path>,
     emit_ctxdsl: Option<&'a Path>,
     json: bool,
+    engine: EngineArg,
 }
 
 /// Run the predicate-abstraction refinement loop over a BTOR2 design
@@ -2461,6 +2498,76 @@ fn cegar_cells_json(
             })
             .collect(),
     )
+}
+
+/// R-F5.4.2b — the `--engine symbolic` path: evaluate the property over the
+/// predicate-cube abstraction via the R-F5 symbolic BDD relation (no
+/// per-cube-pair SMT), single-shot at the given predicate set. Prints the same
+/// `{T, F, ⊥}` verdict-cell tally + outcome shape as the explicit path (minus
+/// the refinement-iteration fields, which do not apply).
+fn run_symbolic_cegar_cli(
+    content: &str,
+    fixture_label: &str,
+    predicates: &[mununu_core::adapter::btor2::PredicateSpec],
+    formula: &mununu_core::mu_calculus::Formula,
+    json: bool,
+) -> Result<(), String> {
+    use mununu_core::adapter::btor2::symbolic_bitblast::MustSemantics;
+    use mununu_core::adapter::btor2::symbolic_engine::symbolic_cube_verdicts;
+    use std::collections::HashMap;
+
+    // CLI predicates are simple `NAME:REG=VALUE` equalities ⇒ empty compound map.
+    let compound = HashMap::new();
+    let verdicts = symbolic_cube_verdicts(
+        content,
+        predicates,
+        &compound,
+        formula,
+        MustSemantics::ForallExists,
+    )
+    .map_err(|e| format!("symbolic cube engine: {}", e.message))?;
+
+    let (t, f, b) = (
+        verdicts.definite_true,
+        verdicts.definite_false,
+        verdicts.bottom,
+    );
+    let outcome = if b > 0 {
+        format!("INDEFINITE — {b} cell(s) need a finer predicate set")
+    } else if f > 0 {
+        format!("PROPERTY VIOLATED — {f} cell(s) falsify the formula")
+    } else {
+        format!("PROPERTY HOLDS — all {t} cell(s) satisfy the formula")
+    };
+
+    if json {
+        let summary = serde_json::json!({
+            "fixture": fixture_label,
+            "engine": "symbolic",
+            "final_predicate_count": predicates.len(),
+            "feasible_cube_count": verdicts.cube_verdicts.len(),
+            "verdict": {
+                "true_cells": t,
+                "false_cells": f,
+                "unknown_cells": b,
+            },
+            "outcome": outcome,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .map_err(|e| format!("serialize summary: {e}"))?
+        );
+    } else {
+        println!("Symbolic predicate-cube evaluation (R-F5, single-shot)");
+        println!("  fixture:           {fixture_label}");
+        println!("  engine:            symbolic (BDD relation, no per-cube-pair SMT)");
+        println!("  predicates:        {}", predicates.len());
+        println!("  feasible cubes:    {}", verdicts.cube_verdicts.len());
+        println!("  verdict cells:     T={t} F={f} ⊥={b}");
+        println!("  outcome:           {outcome}");
+    }
+    Ok(())
 }
 
 /// for `btor2 cegar`, the SV path for `sv cegar`). Shared by both CLI
@@ -2514,6 +2621,21 @@ fn run_cegar_cli(
     // Parse the μ-calculus formula.
     let formula =
         mu_parser::parse(params.formula).map_err(|e| format!("formula parse error: {e:?}"))?;
+
+    // R-F5.4.2b — the symbolic engine short-circuits the explicit lift + CEGAR
+    // loop: it builds the may/must relation as BDDs directly from the BTOR2 and
+    // evaluates the formula by BDD image/preimage, avoiding the `O(2^2|P|)` SMT.
+    // Single-shot at the given predicate set (no refinement); simple equality
+    // predicates only (sidecar compound predicates are an explicit-path feature).
+    if params.engine == EngineArg::Symbolic {
+        return run_symbolic_cegar_cli(
+            content,
+            fixture_label,
+            &initial_predicates,
+            &formula,
+            params.json,
+        );
+    }
 
     // Build the environment with state_count = 2^|predicates|.
     let cube_count = 1usize << initial_predicates.len();

@@ -618,6 +618,7 @@ pub async fn btor2_cegar_handler(
         may_edge_inference: request.may_edge_inference.as_deref(),
         config_values: &request.config_values,
         emit_ctxdsl: request.emit_ctxdsl,
+        engine: request.engine.as_deref(),
     };
     Ok(Json(run_cegar_build_response(params)?))
 }
@@ -674,6 +675,7 @@ pub async fn sv_cegar_handler(
         may_edge_inference: request.may_edge_inference.as_deref(),
         config_values: &request.config_values,
         emit_ctxdsl: request.emit_ctxdsl,
+        engine: request.engine.as_deref(),
     };
     Ok(Json(run_cegar_build_response(params)?))
 }
@@ -892,6 +894,67 @@ struct CegarRunParams<'a> {
     may_edge_inference: Option<&'a str>,
     config_values: &'a [String],
     emit_ctxdsl: bool,
+    engine: Option<&'a str>,
+}
+
+/// R-F5.4.2b — the `engine=symbolic` path: evaluate the property over the
+/// predicate-cube abstraction via the R-F5 symbolic BDD relation (no
+/// per-cube-pair SMT), single-shot at the given predicate set. Returns the same
+/// [`Btor2CegarResponse`] shape as the explicit path (empty `iterations`,
+/// `terminated_with = "symbolic-single-shot"`, the `{T,F,⊥}` verdict summary).
+fn run_symbolic_cegar_response(
+    params: &CegarRunParams<'_>,
+    predicates: &[crate::adapter::btor2::kmts_lift::PredicateSpec],
+    formula: &crate::mu_calculus::Formula,
+) -> Result<Btor2CegarResponse, ApiError> {
+    use crate::adapter::btor2::symbolic_bitblast::MustSemantics;
+    use crate::adapter::btor2::symbolic_engine::symbolic_cube_verdicts;
+
+    // Simple equality predicates only (compound predicates are an explicit-path
+    // sidecar feature); empty compound map.
+    let compound = std::collections::HashMap::new();
+    let verdicts = symbolic_cube_verdicts(
+        params.btor2_content,
+        predicates,
+        &compound,
+        formula,
+        MustSemantics::ForallExists,
+    )
+    .map_err(|e| ApiError::BadRequest {
+        message: format!("symbolic cube engine: {}", e.message),
+        details: None,
+    })?;
+
+    Ok(Btor2CegarResponse {
+        success: true,
+        iterations: Vec::new(),
+        final_predicates: predicates
+            .iter()
+            .map(|p| PredicateView {
+                name: p.name.clone(),
+                register: p.register.clone(),
+                value: p.value,
+            })
+            .collect(),
+        terminated_with: "symbolic-single-shot".to_string(),
+        verdict: CegarVerdictSummary {
+            true_cells: verdicts.definite_true,
+            false_cells: verdicts.definite_false,
+            unknown_cells: verdicts.bottom,
+        },
+        lazy_lift_pending: false,
+        approximant_reuse_enabled: false,
+        warnings: vec![
+            "engine=symbolic (R-F5): single-shot, no CEGAR refinement; simple \
+             equality predicates + bare []/<> fragment only"
+                .to_string(),
+        ],
+        violating_cells: Vec::new(),
+        undecided_cells: Vec::new(),
+        counterexample: None,
+        refinement_candidates: Vec::new(),
+        ctxdsl: None,
+    })
 }
 
 /// Run the predicate-abstraction refinement loop over a BTOR2 design and
@@ -922,6 +985,14 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
         message: format!("formula parse error: {e:?}"),
         details: None,
     })?;
+
+    // R-F5.4.2b — the symbolic engine short-circuits the explicit lift + CEGAR
+    // loop: build the may/must relation as BDDs directly (no per-cube-pair SMT)
+    // and evaluate. Single-shot at the given predicate set; simple equality
+    // predicates + the bare `[]`/`<>` fragment only.
+    if matches!(params.engine, Some(e) if e.eq_ignore_ascii_case("symbolic")) {
+        return run_symbolic_cegar_response(&params, &predicates, &formula);
+    }
 
     // Environment is sized to the cube space (2^|predicates|), matching the
     // CLI `btor2 cegar` bootstrap.
@@ -3205,6 +3276,7 @@ members = ["x"]
             may_edge_inference: None,
             config_values: vec![],
             emit_ctxdsl: false,
+            engine: None,
         };
 
         let Json(out) = btor2_cegar_handler(Json(request))
@@ -3241,6 +3313,66 @@ members = ["x"]
         );
     }
 
+    /// R-F5.4.2b (2026-07-03) — `engine: "symbolic"` runs the R-F5 BDD engine
+    /// single-shot (no CEGAR refinement) and returns the same
+    /// [`Btor2CegarResponse`] shape: empty iterations, `terminated_with =
+    /// "symbolic-single-shot"`, and the `{T,F,⊥}` verdict over the feasible cubes.
+    #[tokio::test]
+    async fn btor2_cegar_handler_symbolic_engine_single_shot() {
+        use crate::api::models::PredicateSpecRequest;
+        // 2-bit saturating counter with an enable.
+        let btor2 = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 input 2 en
+5 one 1
+6 ones 1
+7 add 1 3 5
+8 eq 2 3 6
+9 ite 1 8 3 7
+10 ite 1 4 9 3
+11 next 1 3 10
+";
+        let request = Btor2CegarRequest {
+            content: btor2.to_string(),
+            formula: "mu X. p or <> X".to_string(), // EF (cnt==0), bare diamond
+            predicates: vec![PredicateSpecRequest {
+                name: "p".to_string(),
+                register: "cnt".to_string(),
+                value: 0,
+            }],
+            controllable_inputs: vec![],
+            predicate_source: None,
+            max_iterations: None,
+            must_edge_inference: None,
+            may_edge_inference: None,
+            config_values: vec![],
+            emit_ctxdsl: false,
+            engine: Some("symbolic".to_string()),
+        };
+
+        let Json(out) = btor2_cegar_handler(Json(request))
+            .await
+            .expect("symbolic CEGAR endpoint should run");
+
+        assert!(out.success);
+        assert!(
+            out.iterations.is_empty(),
+            "symbolic single-shot performs no refinement iterations"
+        );
+        assert_eq!(out.terminated_with, "symbolic-single-shot");
+        // One predicate (cnt==0) ⇒ 2 feasible cubes ({cnt==0}, {cnt!=0}).
+        let total = out.verdict.true_cells + out.verdict.false_cells + out.verdict.unknown_cells;
+        assert_eq!(total, 2, "verdict covers both feasible cubes; got {total}");
+        // EF(cnt==0) holds at the cnt==0 cube ⇒ at least one definite-true cell.
+        assert!(out.verdict.true_cells >= 1);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("symbolic")),
+            "symbolic path surfaces its single-shot caveat"
+        );
+    }
+
     /// CTXDSL Phase 2 (2026-06-22) — `emit_ctxdsl: true` returns the final
     /// refined cube model + the checked formula as a self-contained CTXDSL
     /// document in the response's `ctxdsl` field.
@@ -3271,6 +3403,7 @@ members = ["x"]
             may_edge_inference: None,
             config_values: vec![],
             emit_ctxdsl: true,
+            engine: None,
         };
         let Json(out) = btor2_cegar_handler(Json(request))
             .await
@@ -3324,6 +3457,7 @@ members = ["x"]
             may_edge_inference: Some("smt-all-pairs".to_string()),
             config_values: vec!["burst=0,1,2,3".to_string()],
             emit_ctxdsl: false,
+            engine: None,
         };
         let Json(out) = btor2_cegar_handler(Json(request))
             .await
@@ -3352,6 +3486,7 @@ members = ["x"]
             may_edge_inference: None,
             config_values: vec!["this is not valid".to_string()],
             emit_ctxdsl: false,
+            engine: None,
         };
         let err = btor2_cegar_handler(Json(request))
             .await
@@ -3380,6 +3515,7 @@ members = ["x"]
             may_edge_inference: None,
             config_values: vec![],
             emit_ctxdsl: false,
+            engine: None,
         };
         let err = sv_cegar_handler(Json(request))
             .await
@@ -3434,6 +3570,7 @@ endmodule
             may_edge_inference: None,
             config_values: vec![],
             emit_ctxdsl: false,
+            engine: None,
         };
         let Json(out) = sv_cegar_handler(Json(request))
             .await
