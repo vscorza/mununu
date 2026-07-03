@@ -48,14 +48,33 @@
 //! R-F5.3a `eq_bits` / `uge` gadgets at a common (zero-extended) width, so the
 //! BDD matches `PredicateExpr::eval` bit-for-bit — the differential oracle.
 //! This is the bridge to predicate cubes: each `P_i` is one BDD, so a cube is
-//! the conjunction of the `⟦P_i⟧` / `¬⟦P_i⟧`. R-F5.3c then builds the abstract
-//! may/must relation from these + the bit-blasted next-state functions by
-//! existentially quantifying the register bits.
+//! the conjunction of the `⟦P_i⟧` / `¬⟦P_i⟧`.
+//!
+//! # R-F5.3c — the abstract may relation (the H.H.c unblock)
+//!
+//! [`BddBitBlaster::abstract_may_relation`] builds the abstract **may**
+//! transition relation over predicate cubes as one BDD over `2k` predicate
+//! variables — `p_i` (present) and `p'_i` (next):
+//!
+//! ```text
+//! A(x, p)      = ⋀_i (p_i  ⟺ ⟦P_i⟧(x))
+//! A'(x, i, p') = ⋀_i (p'_i ⟺ ⟦P_i⟧(next(x, i)))
+//! R_may(p, p') = ∃ (x ∪ i). A(x, p) ∧ A'(x, i, p')
+//! ```
+//!
+//! `⟦P_i⟧(next(x, i))` is the R-F5.3b predicate BDD with every register bit
+//! `substitute`d by that register's bit-blasted next-state function (held
+//! registers keep their present var; inputs stay free and are quantified out
+//! by the `apply_exists`). This is one `substitute` + one `apply_exists` per
+//! predicate — **construction cost, not the `O(2^2|P|)` per-cube-pair SMT** the
+//! explicit path pays. Validated cell-for-cell against a brute-force concrete
+//! may-relation (`simulate_one_step` over every register + input assignment).
+//! `R_must` (∀x∃i / ∀x∀i via `apply_forall`) is the next slice (R-F5.3d).
 
 use std::collections::HashMap;
 
 use oxidd::bdd::{self, BDDFunction, BDDManagerRef};
-use oxidd::{BooleanFunction, Manager, ManagerRef, VarNo};
+use oxidd::{BooleanFunction, FunctionSubst, Manager, ManagerRef, Subst, VarNo};
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
 use crate::adapter::btor2::bit_blast::eval_const_value;
@@ -67,12 +86,16 @@ use crate::adapter::btor2::term_backend::{BvTermBackend, WalkError, walk_design}
 /// node's value carries exactly `width` bits.
 type BitVec = Vec<BDDFunction>;
 
-/// A register or input cell: its BTOR2 NID + symbol + the fresh BDD variables
-/// standing for its bits (LSB-first). The bit-blaster restricts these to
-/// concrete values for the differential.
+/// A register or input cell: its symbol, whether it is a `state` (vs `input`),
+/// the fresh BDD variables standing for its bits (LSB-first), and their
+/// variable numbers. The bit-blaster restricts these to concrete values for
+/// the differential; R-F5.3c substitutes register vars with next-state
+/// functions via the [`VarNo`]s.
 struct Cell {
     symbol: String,
+    is_state: bool,
     vars: BitVec,
+    varnos: Vec<VarNo>,
 }
 
 /// A BDD bit-blaster over one BTOR2 file. Owns one OxiDD manager; every node's
@@ -95,40 +118,48 @@ impl BddBitBlaster {
     /// collect the per-register next-state functions.
     pub fn build(file: &Btor2File) -> Result<Self, String> {
         // Pass 1 — collect register + input cells with their widths.
-        let mut leaf_specs: Vec<(Nid, String, u32)> = Vec::new();
+        let mut leaf_specs: Vec<(Nid, String, bool, u32)> = Vec::new();
         for line in &file.lines {
-            let (sort, symbol, tag) = match &line.node {
-                Node::State { sort, symbol } => (*sort, symbol.clone(), "state"),
-                Node::Input { sort, symbol } => (*sort, symbol.clone(), "input"),
+            let (sort, symbol, is_state, tag) = match &line.node {
+                Node::State { sort, symbol } => (*sort, symbol.clone(), true, "state"),
+                Node::Input { sort, symbol } => (*sort, symbol.clone(), false, "input"),
                 _ => continue,
             };
             let width = bv_width(file, sort)
                 .ok_or_else(|| format!("NID {}: {tag} has non-bitvec sort", line.nid))?;
             let symbol = symbol.unwrap_or_else(|| format!("{tag}_{}", line.nid));
-            leaf_specs.push((line.nid, symbol, width));
+            leaf_specs.push((line.nid, symbol, is_state, width));
         }
 
-        let total_bits: u32 = leaf_specs.iter().map(|(_, _, w)| *w).sum();
+        let total_bits: u32 = leaf_specs.iter().map(|(_, _, _, w)| *w).sum();
 
         // Allocate the manager + one BDD variable per leaf bit.
         let manager = bdd::new_manager(1 << 16, 1 << 16, 1);
-        let (all_vars, tt, ff) = manager.with_manager_exclusive(|m| {
+        let (all_vars, var_base, tt, ff) = manager.with_manager_exclusive(|m| {
             let range = m.add_vars(total_bits as VarNo);
             let vars: Vec<BDDFunction> = (0..total_bits)
                 .map(|i| BDDFunction::var(m, range.start + i as VarNo).unwrap())
                 .collect();
-            (vars, BDDFunction::t(m), BDDFunction::f(m))
+            (vars, range.start, BDDFunction::t(m), BDDFunction::f(m))
         });
 
         // Slice the flat variable pool out per cell, LSB-first.
         let mut env: HashMap<Nid, BitVec> = HashMap::new();
         let mut cells: Vec<Cell> = Vec::new();
         let mut cursor = 0usize;
-        for (nid, symbol, width) in leaf_specs {
+        for (nid, symbol, is_state, width) in leaf_specs {
             let vars: BitVec = all_vars[cursor..cursor + width as usize].to_vec();
+            let varnos: Vec<VarNo> = (0..width as usize)
+                .map(|b| var_base + (cursor + b) as VarNo)
+                .collect();
             cursor += width as usize;
             env.insert(nid, vars.clone());
-            cells.push(Cell { symbol, vars });
+            cells.push(Cell {
+                symbol,
+                is_state,
+                vars,
+                varnos,
+            });
         }
 
         let mut blaster = BddBitBlaster {
@@ -441,6 +472,156 @@ impl BddBitBlaster {
     pub fn eval_predicate_at(&self, bdd: &BDDFunction, assignment: &HashMap<String, u128>) -> bool {
         let mt = self.minterm_for(assignment);
         mt.and(bdd).unwrap() == mt
+    }
+
+    // ---- R-F5.3c: the abstract may relation over predicate cubes ----
+
+    /// R-F5.3c — build the abstract **may** transition relation over predicate
+    /// cubes, symbolically, without the `O(2^2|P|)` SMT the explicit path uses.
+    ///
+    /// Given predicates `P_0..P_{k-1}`, this returns an [`AbstractRelation`]
+    /// whose `R_may` is a BDD over `2k` fresh predicate variables — `p_i`
+    /// (present cube) and `p'_i` (next cube) — such that cube `c → c'` is a
+    /// may-edge iff *some* concrete state in `c` can, under *some* input, step
+    /// to a concrete state in `c'`:
+    ///
+    /// ```text
+    /// A(x, p)      = ⋀_i (p_i  ⟺ ⟦P_i⟧(x))
+    /// A'(x, i, p') = ⋀_i (p'_i ⟺ ⟦P_i⟧(next(x, i)))
+    /// R_may(p, p') = ∃ (x ∪ i). A(x, p) ∧ A'(x, i, p')
+    /// ```
+    ///
+    /// `⟦P_i⟧(next(x, i))` is the R-F5.3b predicate BDD with every register bit
+    /// substituted by that register's bit-blasted next-state function (held
+    /// registers keep their present var; inputs stay free and are quantified
+    /// out). The whole relation is one `substitute` + one `apply_exists` per
+    /// predicate — construction cost, not per-cube-pair SMT.
+    pub fn abstract_may_relation(
+        &self,
+        predicates: &[PredicateExpr],
+    ) -> Result<AbstractRelation, String> {
+        use oxidd::{BooleanFunctionQuant, BooleanOperator};
+
+        let k = predicates.len();
+
+        // Allocate 2k fresh predicate vars at the bottom of the order: p_i then p'_i.
+        let (present, next) = self._manager.with_manager_exclusive(|m| {
+            let range = m.add_vars(2 * k as VarNo);
+            let present: Vec<BDDFunction> = (0..k)
+                .map(|i| BDDFunction::var(m, range.start + i as VarNo).unwrap())
+                .collect();
+            let next: Vec<BDDFunction> = (0..k)
+                .map(|i| BDDFunction::var(m, range.start + (k + i) as VarNo).unwrap())
+                .collect();
+            (present, next)
+        });
+
+        // The present→next substitution: each register bit var ↦ its
+        // bit-blasted next-state function. Registers without a `Next` line
+        // (held) and inputs are absent ⇒ left free (identity), which is the
+        // correct next value for a held register and keeps inputs quantifiable.
+        let mut sub_vars: Vec<VarNo> = Vec::new();
+        let mut sub_repl: Vec<BDDFunction> = Vec::new();
+        for cell in &self.cells {
+            if !cell.is_state {
+                continue;
+            }
+            if let Some(next_fn) = self.next_funcs.get(&cell.symbol) {
+                for (vn, f) in cell.varnos.iter().zip(next_fn.iter()) {
+                    sub_vars.push(*vn);
+                    sub_repl.push(f.clone());
+                }
+            }
+        }
+
+        // The cube of all register + input vars, to be quantified out.
+        let mut xi_cube = self.tt.clone();
+        for cell in &self.cells {
+            for v in &cell.vars {
+                xi_cube = xi_cube.and(v).unwrap();
+            }
+        }
+
+        // A(x, p) ∧ A'(x, i, p'), then ∃(x ∪ i).
+        let mut a = self.tt.clone();
+        let mut a_prime = self.tt.clone();
+        for (i, expr) in predicates.iter().enumerate() {
+            let pred = self.predicate_bdd(expr)?; // ⟦P_i⟧(x)
+            let pred_next = if sub_vars.is_empty() {
+                pred.clone()
+            } else {
+                pred.substitute(&Subst::new(sub_vars.clone(), sub_repl.clone()))
+                    .unwrap()
+            };
+            // p_i ⟺ pred  and  p'_i ⟺ pred_next  (via XNOR).
+            let iff_present = self.xor(&present[i], &pred).not().unwrap();
+            let iff_next = self.xor(&next[i], &pred_next).not().unwrap();
+            a = a.and(&iff_present).unwrap();
+            a_prime = a_prime.and(&iff_next).unwrap();
+        }
+
+        let r_may = a
+            .apply_exists(BooleanOperator::And, &a_prime, &xi_cube)
+            .unwrap();
+
+        Ok(AbstractRelation {
+            num_predicates: k,
+            present,
+            next,
+            r_may,
+            tt: self.tt.clone(),
+        })
+    }
+}
+
+/// R-F5.3c — the abstract may (and, later, must) transition relation over
+/// predicate cubes, as BDDs over `2k` predicate variables. A cube is an index
+/// in `0..2^k`; bit `i` of the index is the truth of predicate `P_i`.
+pub struct AbstractRelation {
+    num_predicates: usize,
+    /// Present-cube predicate variables `p_0..p_{k-1}`.
+    present: Vec<BDDFunction>,
+    /// Next-cube predicate variables `p'_0..p'_{k-1}`.
+    next: Vec<BDDFunction>,
+    /// The may relation as a BDD over `(p, p')`.
+    r_may: BDDFunction,
+    tt: BDDFunction,
+}
+
+impl AbstractRelation {
+    /// Number of predicates `k` (so `2^k` cubes).
+    pub fn num_predicates(&self) -> usize {
+        self.num_predicates
+    }
+
+    /// The may relation BDD over the present + next predicate variables.
+    pub fn may(&self) -> &BDDFunction {
+        &self.r_may
+    }
+
+    /// The complete-assignment minterm for a cube index over the given
+    /// predicate variables (`vars[i]` true iff bit `i` of `cube` is set).
+    fn cube_minterm(&self, cube: usize, vars: &[BDDFunction]) -> BDDFunction {
+        let mut m = self.tt.clone();
+        for (i, v) in vars.iter().enumerate() {
+            let lit = if (cube >> i) & 1 == 1 {
+                v.clone()
+            } else {
+                v.not().unwrap()
+            };
+            m = m.and(&lit).unwrap();
+        }
+        m
+    }
+
+    /// Is `present_cube → next_cube` a may-edge? (its full `(p, p')` minterm
+    /// implies `R_may`).
+    pub fn may_holds(&self, present_cube: usize, next_cube: usize) -> bool {
+        let mt = self
+            .cube_minterm(present_cube, &self.present)
+            .and(&self.cube_minterm(next_cube, &self.next))
+            .unwrap();
+        mt.and(&self.r_may).unwrap() == mt
     }
 }
 
@@ -967,5 +1148,147 @@ mod tests {
             Box::new(PredicateExpr::Not(Box::new(b_ge_5))),
         );
         assert_predicate_matches_eval(&bb, &compound);
+    }
+
+    // ---- R-F5.3c: abstract may relation vs brute-force concrete may-edges ----
+
+    /// Build the symbolic abstract may relation and assert it equals the
+    /// brute-force concrete may-relation: for every present cube `ci` and next
+    /// cube `cj`, `ci → cj` is symbolically a may-edge iff *some* concrete
+    /// state in `ci` steps (under *some* input) to a concrete state in `cj`.
+    /// The brute force enumerates every (register, input) assignment and runs
+    /// the concrete `simulate_one_step` — fully independent of the symbolic path.
+    fn assert_may_relation_matches_bruteforce(
+        src: &str,
+        predicates: &[PredicateExpr],
+        states: &[(&str, u32)],
+        inputs: &[(&str, u32)],
+    ) {
+        let file = parser::parse(src).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let rel = bb
+            .abstract_may_relation(predicates)
+            .expect("build may relation");
+        let k = predicates.len();
+
+        let cube_of = |regs: &HashMap<String, u128>| -> usize {
+            let mut c = 0usize;
+            for (i, p) in predicates.iter().enumerate() {
+                if p.eval(regs) {
+                    c |= 1 << i;
+                }
+            }
+            c
+        };
+
+        let total_state_bits: u32 = states.iter().map(|(_, w)| *w).sum();
+        let total_input_bits: u32 = inputs.iter().map(|(_, w)| *w).sum();
+        assert!(
+            total_state_bits + total_input_bits <= 14,
+            "keep the sweep small"
+        );
+
+        let mut expected: std::collections::HashSet<(usize, usize)> = Default::default();
+        for scombo in 0..(1u128 << total_state_bits) {
+            let mut regs: HashMap<String, u128> = HashMap::new();
+            let mut off = 0u32;
+            for (name, w) in states {
+                let mask = (1u128 << w) - 1;
+                regs.insert((*name).to_string(), (scombo >> off) & mask);
+                off += w;
+            }
+            let present_cube = cube_of(&regs);
+            for icombo in 0..(1u128 << total_input_bits) {
+                let mut inps: HashMap<String, u128> = HashMap::new();
+                let mut ioff = 0u32;
+                for (name, w) in inputs {
+                    let mask = (1u128 << w) - 1;
+                    inps.insert((*name).to_string(), (icombo >> ioff) & mask);
+                    ioff += w;
+                }
+                let next = simulate_one_step(&file, &regs, &inps).expect("concrete step");
+                // Held registers keep their current value (BTOR2 convention).
+                let mut regs_next = regs.clone();
+                regs_next.extend(next);
+                expected.insert((present_cube, cube_of(&regs_next)));
+            }
+        }
+
+        for ci in 0..(1usize << k) {
+            for cj in 0..(1usize << k) {
+                assert_eq!(
+                    rel.may_holds(ci, cj),
+                    expected.contains(&(ci, cj)),
+                    "may-edge {ci} -> {cj} disagrees with brute force"
+                );
+            }
+        }
+    }
+
+    /// 2-bit saturating counter with an enable, predicates `{cnt == 0, cnt ≥ 2}`.
+    /// Exercises the single-register substitution path.
+    #[test]
+    fn rf5_3c_may_relation_saturating_counter() {
+        let src = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 input 2 en
+5 one 1
+6 ones 1
+7 add 1 3 5
+8 eq 2 3 6
+9 ite 1 8 3 7
+10 ite 1 4 9 3
+11 next 1 3 10
+"#;
+        let predicates = [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ];
+        assert_may_relation_matches_bruteforce(src, &predicates, &[("cnt", 2)], &[("en", 1)]);
+    }
+
+    /// Two 2-bit registers stepping together, with a **relational** predicate
+    /// `cnt == acc` plus `cnt ≥ 2` and `acc == 0`. Exercises substitution over
+    /// two registers that each carry a next-state function, and a `CmpReg`.
+    #[test]
+    fn rf5_3c_may_relation_two_registers_relational_predicate() {
+        // cnt' = (cnt + 1) mod 4 ; acc' = en ? cnt : acc
+        let src = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 state 1 acc
+5 input 2 en
+6 one 1
+7 add 1 3 6
+8 ite 1 5 3 4
+9 next 1 3 7
+10 next 1 4 8
+"#;
+        let predicates = [
+            PredicateExpr::CmpReg {
+                lhs: "cnt".to_string(),
+                op: CmpOp::Eq,
+                rhs: "acc".to_string(),
+            },
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+            PredicateExpr::eq("acc", 0),
+        ];
+        assert_may_relation_matches_bruteforce(
+            src,
+            &predicates,
+            &[("cnt", 2), ("acc", 2)],
+            &[("en", 1)],
+        );
     }
 }
