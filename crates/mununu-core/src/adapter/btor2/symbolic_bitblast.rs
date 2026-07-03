@@ -37,9 +37,20 @@
 //! `concat/slice/uext/sext`, and `ite`. Multiplication, division, variable
 //! shifts, signed compares, and array ops are rejected with a clear error —
 //! they are later R-F5.3 slices (the FSM+counter residual the H.H.c ceiling
-//! needs does not use them). R-F5.3b then lifts predicate BDDs over these
-//! register-bit functions; R-F5.3c builds the abstract relation by existential
-//! quantification.
+//! needs does not use them).
+//!
+//! # R-F5.3b — predicate BDDs
+//!
+//! [`BddBitBlaster::predicate_bdd`] compiles a
+//! [`PredicateExpr`](crate::adapter::btor2::predicate_expr::PredicateExpr) into
+//! a single BDD over the register-bit variables — the characteristic function
+//! of the register valuations that satisfy the predicate. Comparisons reuse the
+//! R-F5.3a `eq_bits` / `uge` gadgets at a common (zero-extended) width, so the
+//! BDD matches `PredicateExpr::eval` bit-for-bit — the differential oracle.
+//! This is the bridge to predicate cubes: each `P_i` is one BDD, so a cube is
+//! the conjunction of the `⟦P_i⟧` / `¬⟦P_i⟧`. R-F5.3c then builds the abstract
+//! may/must relation from these + the bit-blasted next-state functions by
+//! existentially quantifying the register bits.
 
 use std::collections::HashMap;
 
@@ -49,6 +60,7 @@ use oxidd::{BooleanFunction, Manager, ManagerRef, VarNo};
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
 use crate::adapter::btor2::bit_blast::eval_const_value;
 use crate::adapter::btor2::parser::bv_width;
+use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
 use crate::adapter::btor2::term_backend::{BvTermBackend, WalkError, walk_design};
 
 /// A bit-vector of BDDs, LSB-first: index `b` is the BDD for bit `b`. Every
@@ -306,6 +318,129 @@ impl BddBitBlaster {
             .collect();
         let (_, cout) = self.add_bits(a, &not_b, self.tt.clone(), width);
         cout
+    }
+
+    // ---- R-F5.3b: predicate BDDs over the register-bit variables ----
+
+    /// The BDD variable vector for a register/input symbol, LSB-first, or
+    /// `None` if the symbol names no cell.
+    pub fn register_bits(&self, name: &str) -> Option<&BitVec> {
+        self.cells
+            .iter()
+            .find(|c| c.symbol == name)
+            .map(|c| &c.vars)
+    }
+
+    /// Zero-extend a bit-vector to `width` bits (high bits become `⊥`).
+    fn zero_extend(&self, bits: &[BDDFunction], width: usize) -> BitVec {
+        (0..width)
+            .map(|i| bits.get(i).cloned().unwrap_or_else(|| self.ff.clone()))
+            .collect()
+    }
+
+    /// A constant bit-vector of `value` at `width` bits, LSB-first.
+    fn const_bits(&self, value: u128, width: usize) -> BitVec {
+        (0..width)
+            .map(|b| {
+                if b < 128 && (value >> b) & 1 == 1 {
+                    self.tt.clone()
+                } else {
+                    self.ff.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// An unsigned comparison of two equal-width bit-vectors, as a 1-bit BDD.
+    /// Mirrors [`crate::adapter::btor2::predicate_expr`]'s `cmp_apply` (unsigned).
+    fn cmp_bits(&self, a: &[BDDFunction], op: CmpOp, b: &[BDDFunction], width: u32) -> BDDFunction {
+        match op {
+            CmpOp::Eq => self.eq_bits(a, b).swap_remove(0),
+            CmpOp::Ne => self.eq_bits(a, b).swap_remove(0).not().unwrap(),
+            CmpOp::Ge => self.uge(a, b, width),
+            CmpOp::Lt => self.uge(a, b, width).not().unwrap(),
+            CmpOp::Le => self.uge(b, a, width), // a ≤ b ⟺ b ≥ a
+            CmpOp::Gt => self.uge(b, a, width).not().unwrap(), // a > b ⟺ ¬(b ≥ a)
+        }
+    }
+
+    /// R-F5.3b — compile a [`PredicateExpr`] into a single BDD over the
+    /// present-state register-bit variables: the characteristic function of the
+    /// set of concrete register valuations that satisfy the predicate.
+    ///
+    /// This is the bridge from the register-bit BDDs (R-F5.3a) to predicate
+    /// cubes: each predicate `P_i` becomes one BDD `⟦P_i⟧(x)` over the leaf
+    /// vars, so a cube (an assignment to the `|P|` predicates) is the
+    /// conjunction of the `⟦P_i⟧` / `¬⟦P_i⟧`. R-F5.3c then builds the abstract
+    /// may/must relation from these + the bit-blasted next-state functions.
+    ///
+    /// Comparisons are **unsigned** and evaluated at a common width (operands
+    /// zero-extended), so the BDD matches [`PredicateExpr::eval`]'s `u128`
+    /// semantics bit-for-bit — including when a literal exceeds the register
+    /// width. `And`/`Or`/`Not` map to the BDD boolean ops.
+    pub fn predicate_bdd(&self, expr: &PredicateExpr) -> Result<BDDFunction, String> {
+        let unknown = |r: &str| format!("predicate references unknown register `{r}`");
+        match expr {
+            PredicateExpr::Cmp {
+                register,
+                op,
+                value,
+            } => {
+                let reg = self
+                    .register_bits(register)
+                    .ok_or_else(|| unknown(register))?;
+                // Compare at max(reg width, 64) so a u64 literal wider than the
+                // register keeps its high bits (reg's zero-extend to those bits
+                // is `0`, matching `eval`'s unmasked u128 comparison).
+                let w = reg.len().max(64);
+                let a = self.zero_extend(reg, w);
+                let b = self.const_bits(*value as u128, w);
+                Ok(self.cmp_bits(&a, *op, &b, w as u32))
+            }
+            PredicateExpr::CmpReg { lhs, op, rhs } => {
+                let l = self.register_bits(lhs).ok_or_else(|| unknown(lhs))?;
+                let r = self.register_bits(rhs).ok_or_else(|| unknown(rhs))?;
+                let w = l.len().max(r.len());
+                let a = self.zero_extend(l, w);
+                let b = self.zero_extend(r, w);
+                Ok(self.cmp_bits(&a, *op, &b, w as u32))
+            }
+            PredicateExpr::CmpRegAddend {
+                lhs,
+                op,
+                rhs,
+                addend,
+                width: _,
+            } => {
+                let l = self.register_bits(lhs).ok_or_else(|| unknown(lhs))?;
+                let r = self.register_bits(rhs).ok_or_else(|| unknown(rhs))?;
+                // sum = (rhs + addend) mod 2^(rhs width) — wraps exactly as the
+                // RTL `+` (the `bvadd` in `build_constraint`; the `width` field
+                // is `eval`'s modulus and equals the rhs register width here).
+                let rw = r.len();
+                let addend_bits = self.const_bits(*addend as u128, rw);
+                let (sum, _) = self.add_bits(r, &addend_bits, self.ff.clone(), rw as u32);
+                let w = l.len().max(rw);
+                let a = self.zero_extend(l, w);
+                let b = self.zero_extend(&sum, w);
+                Ok(self.cmp_bits(&a, *op, &b, w as u32))
+            }
+            PredicateExpr::And(a, b) => {
+                Ok(self.predicate_bdd(a)?.and(&self.predicate_bdd(b)?).unwrap())
+            }
+            PredicateExpr::Or(a, b) => {
+                Ok(self.predicate_bdd(a)?.or(&self.predicate_bdd(b)?).unwrap())
+            }
+            PredicateExpr::Not(a) => Ok(self.predicate_bdd(a)?.not().unwrap()),
+        }
+    }
+
+    /// Evaluate a predicate BDD (over the register vars) at a concrete register
+    /// assignment: `true` iff the assignment's minterm implies the BDD. The
+    /// differential counterpart of [`PredicateExpr::eval`].
+    pub fn eval_predicate_at(&self, bdd: &BDDFunction, assignment: &HashMap<String, u128>) -> bool {
+        let mt = self.minterm_for(assignment);
+        mt.and(bdd).unwrap() == mt
     }
 }
 
@@ -679,5 +814,158 @@ mod tests {
 18 next 1 4 17
 "#;
         assert_matches_simulator(src, &[("x", 3), ("y", 3)], &["x"], &["y"]);
+    }
+
+    // ---- R-F5.3b: predicate BDDs vs `PredicateExpr::eval` ----
+
+    /// Two 3-bit registers `a`, `b` with no transition logic — enough to hang
+    /// predicate BDDs on the register-bit vars.
+    fn two_register_blaster() -> BddBitBlaster {
+        let src = r#"
+1 sort bitvec 3
+2 state 1 a
+3 state 1 b
+"#;
+        let file = parser::parse(src).expect("parse");
+        BddBitBlaster::build(&file).expect("build")
+    }
+
+    /// Exhaustively check that `predicate_bdd(expr)`, restricted to every
+    /// (a, b) assignment, equals `expr.eval(regs)`.
+    fn assert_predicate_matches_eval(bb: &BddBitBlaster, expr: &PredicateExpr) {
+        let bdd = bb.predicate_bdd(expr).expect("compile predicate");
+        for a in 0..8u128 {
+            for b in 0..8u128 {
+                let regs: HashMap<String, u128> = [("a".to_string(), a), ("b".to_string(), b)]
+                    .into_iter()
+                    .collect();
+                assert_eq!(
+                    bb.eval_predicate_at(&bdd, &regs),
+                    expr.eval(&regs),
+                    "predicate {expr:?} disagrees with eval at a={a} b={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rf5_3b_predicate_bdd_matches_eval_comparisons() {
+        let bb = two_register_blaster();
+        for op in [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+        ] {
+            for value in 0..9u64 {
+                // value 0..8 in range; value 8 exceeds the 3-bit register width.
+                assert_predicate_matches_eval(
+                    &bb,
+                    &PredicateExpr::Cmp {
+                        register: "a".to_string(),
+                        op,
+                        value,
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rf5_3b_predicate_bdd_matches_eval_literal_exceeds_width() {
+        // A literal wider than the register: `a == 9` is always false, `a < 9`
+        // always true — the zero-extend-to-common-width path must reproduce
+        // `eval`'s unmasked u128 comparison.
+        let bb = two_register_blaster();
+        for (op, value) in [
+            (CmpOp::Eq, 9u64),
+            (CmpOp::Lt, 9),
+            (CmpOp::Ge, 8),
+            (CmpOp::Gt, 7),
+        ] {
+            assert_predicate_matches_eval(
+                &bb,
+                &PredicateExpr::Cmp {
+                    register: "a".to_string(),
+                    op,
+                    value,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn rf5_3b_predicate_bdd_matches_eval_register_relations() {
+        let bb = two_register_blaster();
+        for op in [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+        ] {
+            assert_predicate_matches_eval(
+                &bb,
+                &PredicateExpr::CmpReg {
+                    lhs: "a".to_string(),
+                    op,
+                    rhs: "b".to_string(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn rf5_3b_predicate_bdd_matches_eval_addend_wraps() {
+        // `a == (b + k) mod 8` for every addend k — exercises the wrap boundary.
+        let bb = two_register_blaster();
+        for addend in 0..8u64 {
+            assert_predicate_matches_eval(
+                &bb,
+                &PredicateExpr::CmpRegAddend {
+                    lhs: "a".to_string(),
+                    op: CmpOp::Eq,
+                    rhs: "b".to_string(),
+                    addend,
+                    width: 3,
+                },
+            );
+        }
+        // A relational inequality with an addend too.
+        assert_predicate_matches_eval(
+            &bb,
+            &PredicateExpr::CmpRegAddend {
+                lhs: "a".to_string(),
+                op: CmpOp::Ge,
+                rhs: "b".to_string(),
+                addend: 2,
+                width: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn rf5_3b_predicate_bdd_matches_eval_boolean_combinators() {
+        let bb = two_register_blaster();
+        let a_lt_b = PredicateExpr::CmpReg {
+            lhs: "a".to_string(),
+            op: CmpOp::Lt,
+            rhs: "b".to_string(),
+        };
+        let a_eq_3 = PredicateExpr::eq("a", 3);
+        let b_ge_5 = PredicateExpr::Cmp {
+            register: "b".to_string(),
+            op: CmpOp::Ge,
+            value: 5,
+        };
+        // (a < b ∧ a == 3) ∨ ¬(b ≥ 5)
+        let compound = PredicateExpr::Or(
+            Box::new(PredicateExpr::And(Box::new(a_lt_b), Box::new(a_eq_3))),
+            Box::new(PredicateExpr::Not(Box::new(b_ge_5))),
+        );
+        assert_predicate_matches_eval(&bb, &compound);
     }
 }
