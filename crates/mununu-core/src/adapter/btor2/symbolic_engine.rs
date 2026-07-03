@@ -350,4 +350,83 @@ mod tests {
             );
         }
     }
+
+    /// A `w`-bit saturating-free counter `r` with an enable: `r' = en ? r+1 : r`,
+    /// plus `k` mutually-exclusive equality predicates `r == 0 .. r == k-1`.
+    fn counter_btor2(w: u32) -> String {
+        format!(
+            "\n1 sort bitvec {w}\n2 sort bitvec 1\n3 state 1 r\n4 input 2 en\n5 one 1\n6 add 1 3 5\n7 ite 1 4 6 3\n8 next 1 3 7\n"
+        )
+    }
+
+    fn eq_predicates(k: usize) -> (Vec<PredicateSpec>, HashMap<String, PredicateExpr>) {
+        let specs = (0..k)
+            .map(|i| PredicateSpec {
+                name: format!("p{i}"),
+                register: "r".to_string(),
+                value: i as u64,
+            })
+            .collect();
+        (specs, HashMap::new())
+    }
+
+    /// R-F5.4.3 — scaling measurement: the symbolic engine builds the abstract
+    /// relation + evaluates at `|P|` up to 12 (a `2^24`-cube-pair space) in well
+    /// under the explicit `SmtAllPairs` path's `O(2^2|P|)` SMT wall (the H.H.c
+    /// "29 min, no output" at `|P| ≈ 12`). This test asserts completion + a
+    /// consistent tally at each `|P|`, and prints the wall-clock so the win is
+    /// visible with `--nocapture`. The bound (30 s) only trips on a catastrophic
+    /// BDD blow-up — it is not a micro-benchmark.
+    #[test]
+    fn rf5_4_3_symbolic_scales_past_the_smt_wall() {
+        use std::time::Instant;
+        let formula = crate::mu_calculus::parser::parse("mu X. p0 or <> X").expect("formula");
+
+        for &k in &[4usize, 8, 12] {
+            let w = 12u32; // 4096 concrete states — plenty to inhabit the k cubes
+            let btor2 = counter_btor2(w);
+            let (specs, compound) = eq_predicates(k);
+
+            let start = Instant::now();
+            let got = symbolic_cube_verdicts(
+                &btor2,
+                &specs,
+                &compound,
+                &formula,
+                MustSemantics::ForallExists,
+            )
+            .expect("symbolic verdicts");
+            let elapsed = start.elapsed();
+
+            // k mutually-exclusive eq-predicates ⇒ k singleton cubes + the
+            // all-false cube = k+1 feasible cubes.
+            assert_eq!(
+                got.cube_verdicts.len(),
+                k + 1,
+                "|P|={k}: expected {} feasible cubes",
+                k + 1
+            );
+            assert_eq!(
+                got.definite_true + got.definite_false + got.bottom,
+                got.cube_verdicts.len(),
+                "|P|={k}: tally covers every feasible cube"
+            );
+            // p0 (r==0) is definitely satisfied by `mu X. p0 or <> X`.
+            assert!(got.definite_true >= 1, "|P|={k}: EF(r==0) holds at r==0");
+
+            eprintln!(
+                "R-F5.4.3  |P|={k:>2}  ({} cube-pairs for the explicit SMT path)  \
+                 symbolic: {:>8.3?}  T={} F={} ⊥={}",
+                1u64 << (2 * k),
+                elapsed,
+                got.definite_true,
+                got.definite_false,
+                got.bottom
+            );
+            assert!(
+                elapsed.as_secs() < 30,
+                "|P|={k}: symbolic path took {elapsed:?} — investigate BDD blow-up"
+            );
+        }
+    }
 }
