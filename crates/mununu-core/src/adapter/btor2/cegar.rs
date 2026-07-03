@@ -1513,6 +1513,31 @@ fn craig_interpolation_predicates(
 /// register is already covered, OR when the BTOR2 file fails to
 /// parse — the CEGAR loop then terminates with
 /// `CegarTermination::PredicateSourceExhausted`.
+/// R-F5.5b (2026-07-03) — the WP predicate-discovery step for the **symbolic**
+/// CEGAR loop. The symbolic path detects ⊥ cubes but does not build the explicit
+/// parity-game failure subgame; [`weakest_precondition_predicates`] only uses the
+/// subgame as a non-empty *trigger* (it proposes predicates from the current
+/// predicates' cone-of-influence + BTOR2 constants, not from the specific
+/// classifying transition), so a minimal placeholder subgame is sufficient.
+/// Returns the next batch of candidate predicates (capped, same as the explicit
+/// loop); empty ⇒ the predicate source is exhausted.
+pub fn wp_refine_predicates(
+    current_predicates: &[PredicateSpec],
+    btor2_content: &str,
+) -> Vec<PredicateSpec> {
+    let trigger = FailureSubgame {
+        positions: Vec::new(),
+        classifying_transitions: vec![(
+            0,
+            0,
+            crate::mu_calculus::parity_game_3v::OwningPlayer::Unknown,
+        )],
+        root: None,
+        subgame_extraction_complete: false,
+    };
+    weakest_precondition_predicates(&trigger, current_predicates, btor2_content)
+}
+
 fn weakest_precondition_predicates(
     subgame: &FailureSubgame,
     current_predicates: &[PredicateSpec],

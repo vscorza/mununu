@@ -141,6 +141,24 @@ pub fn symbolic_cube_verdicts_from_options(
     formula: &Formula,
     must_semantics: MustSemantics,
 ) -> Result<SymbolicCubeVerdicts, AdapterError> {
+    let (predicates, compound) = derive_sidecar_compounds(initial_predicates, options)?;
+    symbolic_cube_verdicts(
+        btor2_content,
+        &predicates,
+        &compound,
+        formula,
+        must_semantics,
+    )
+}
+
+/// Derive the full cube-dimension predicate set (initial + non-derived sidecar
+/// `compound_predicates`) + the compound-expr map. A derived/combinational
+/// compound (per-cube SMT label) is a hard error — the symbolic path has no
+/// per-cube-label computation yet.
+fn derive_sidecar_compounds(
+    initial_predicates: &[PredicateSpec],
+    options: &crate::adapter::AdapterOptions,
+) -> Result<(Vec<PredicateSpec>, HashMap<String, PredicateExpr>), AdapterError> {
     let mut predicates = initial_predicates.to_vec();
     let mut compound: HashMap<String, PredicateExpr> = HashMap::new();
     for (spec, expr, is_derived) in
@@ -153,18 +171,137 @@ pub fn symbolic_cube_verdicts_from_options(
                 spec.name
             )));
         }
-        // A non-derived compound is a cube dimension whose truth the compound
-        // expr decides (not `register == value`); its name keys the expr map.
         compound.insert(spec.name.clone(), expr);
         predicates.push(spec);
     }
-    symbolic_cube_verdicts(
-        btor2_content,
-        &predicates,
-        &compound,
-        formula,
-        must_semantics,
-    )
+    Ok((predicates, compound))
+}
+
+/// R-F5.5b — how a [`symbolic_cegar_refine`] run terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolicCegarTermination {
+    /// No ⊥ cube remains — every feasible cube has a definite verdict.
+    Converged,
+    /// The iteration / cube-count cap was reached with ⊥ cubes still present.
+    BoundedIterationsReached,
+    /// WP proposed no new predicate (cone-of-influence exhausted) with ⊥ present.
+    PredicateSourceExhausted,
+}
+
+/// R-F5.5b — one refinement-iteration record (verdict summary at the start of
+/// the iteration, before any predicate for it was added).
+#[derive(Debug, Clone)]
+pub struct SymbolicCegarIteration {
+    pub iteration: usize,
+    pub predicate_count: usize,
+    pub definite_true: usize,
+    pub definite_false: usize,
+    pub bottom: usize,
+}
+
+/// R-F5.5b — the result of a symbolic CEGAR refinement run.
+#[derive(Debug, Clone)]
+pub struct SymbolicCegarResult {
+    /// Per-iteration verdict records (iteration 0 = the initial evaluation).
+    pub iterations: Vec<SymbolicCegarIteration>,
+    /// Predicate set at termination (initial + sidecar compounds + WP-added).
+    pub final_predicates: Vec<PredicateSpec>,
+    /// The final 3-valued verdict tally.
+    pub final_verdicts: SymbolicCubeVerdicts,
+    pub terminated_with: SymbolicCegarTermination,
+}
+
+/// Cube-count cap for the symbolic refinement loop: the per-iteration verdict
+/// tally enumerates `2^|P|` cubes, so `|P|` is bounded to keep that tractable
+/// (`2^16 = 65 536`). The symbolic *relation* stays compact regardless; only the
+/// tally enumerates — a fully-symbolic feasible-cube count (BDD `SatCount`) is a
+/// later optimisation.
+const MAX_SYMBOLIC_CUBE_BITS: usize = 16;
+
+/// R-F5.5b — symbolic CEGAR refinement loop. Evaluates the property over the
+/// predicate-cube abstraction symbolically (no per-cube-pair SMT); on a ⊥
+/// verdict, discovers a separating predicate via WP
+/// ([`crate::adapter::btor2::cegar::wp_refine_predicates`]), adds it, and
+/// re-evaluates — rebuilding the `AbstractRelation` each iteration (cheap; still
+/// no SMT). Terminates on convergence (no ⊥), the iteration / cube-count cap, or
+/// WP exhaustion.
+///
+/// `max_iterations = 0` reproduces the single-shot behaviour (evaluate once, no
+/// refinement). Compound predicates are derived from the sidecar exactly as
+/// [`symbolic_cube_verdicts_from_options`].
+pub fn symbolic_cegar_refine(
+    btor2_content: &str,
+    initial_predicates: &[PredicateSpec],
+    options: &crate::adapter::AdapterOptions,
+    formula: &Formula,
+    must_semantics: MustSemantics,
+    max_iterations: usize,
+) -> Result<SymbolicCegarResult, AdapterError> {
+    let (mut predicates, compound) = derive_sidecar_compounds(initial_predicates, options)?;
+    let mut iterations: Vec<SymbolicCegarIteration> = Vec::new();
+    let mut iter = 0usize;
+
+    loop {
+        let verdicts = symbolic_cube_verdicts(
+            btor2_content,
+            &predicates,
+            &compound,
+            formula,
+            must_semantics,
+        )?;
+        iterations.push(SymbolicCegarIteration {
+            iteration: iter,
+            predicate_count: predicates.len(),
+            definite_true: verdicts.definite_true,
+            definite_false: verdicts.definite_false,
+            bottom: verdicts.bottom,
+        });
+
+        // Converged — every feasible cube is definite.
+        if verdicts.bottom == 0 {
+            return Ok(SymbolicCegarResult {
+                iterations,
+                final_predicates: predicates,
+                final_verdicts: verdicts,
+                terminated_with: SymbolicCegarTermination::Converged,
+            });
+        }
+        // Iteration cap.
+        if iter >= max_iterations {
+            return Ok(SymbolicCegarResult {
+                iterations,
+                final_predicates: predicates,
+                final_verdicts: verdicts,
+                terminated_with: SymbolicCegarTermination::BoundedIterationsReached,
+            });
+        }
+        // Discover a refining predicate (WP over the current predicate cone).
+        let proposed =
+            crate::adapter::btor2::cegar::wp_refine_predicates(&predicates, btor2_content);
+        let fresh: Vec<PredicateSpec> = proposed
+            .into_iter()
+            .filter(|p| !predicates.iter().any(|q| q.name == p.name))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(SymbolicCegarResult {
+                iterations,
+                final_predicates: predicates,
+                final_verdicts: verdicts,
+                terminated_with: SymbolicCegarTermination::PredicateSourceExhausted,
+            });
+        }
+        // Cube-count cap — don't grow the predicate set past the tally bound.
+        if predicates.len() + fresh.len() > MAX_SYMBOLIC_CUBE_BITS {
+            return Ok(SymbolicCegarResult {
+                iterations,
+                final_predicates: predicates,
+                final_verdicts: verdicts,
+                terminated_with: SymbolicCegarTermination::BoundedIterationsReached,
+            });
+        }
+        predicates.extend(fresh);
+        iter += 1;
+    }
 }
 
 #[cfg(test)]
@@ -557,5 +694,89 @@ mod tests {
             "expected a derived-predicate rejection, got: {}",
             err.message
         );
+    }
+
+    // ---- R-F5.5b: symbolic CEGAR refinement loop ----
+
+    /// `EF(cnt == 3)` on the saturating counter: the `{cnt != 3}` cubes are ⊥
+    /// (they *may* reach cnt==3 via `en=1`, but not *must* — input
+    /// nondeterminism), so the initial verdict carries ⊥. The refinement loop
+    /// must record iterations, only ever grow the predicate set, and terminate
+    /// with a valid reason (this ⊥ is a genuine thoroughness gap, so it does not
+    /// converge — WP exhausts / caps).
+    #[test]
+    fn rf5_5b_symbolic_refine_terminates_and_grows_predicates() {
+        use crate::adapter::AdapterOptions;
+        let options = AdapterOptions::default();
+        let initial = vec![PredicateSpec {
+            name: "top".to_string(),
+            register: "cnt".to_string(),
+            value: 3,
+        }];
+        let formula = crate::mu_calculus::parser::parse("mu X. top or <> X").expect("formula");
+
+        let result = symbolic_cegar_refine(
+            SAT_COUNTER,
+            &initial,
+            &options,
+            &formula,
+            MustSemantics::ForallExists,
+            8,
+        )
+        .expect("symbolic refine");
+
+        assert!(!result.iterations.is_empty());
+        assert_eq!(result.iterations[0].iteration, 0);
+        assert!(
+            result.iterations[0].bottom >= 1,
+            "EF(cnt==3) starts with ⊥ cubes"
+        );
+        // Predicate count is non-decreasing (predicates are only ever added).
+        for w in result.iterations.windows(2) {
+            assert!(
+                w[1].predicate_count >= w[0].predicate_count,
+                "predicate set must not shrink"
+            );
+        }
+        // The final verdict summary matches the last iteration record.
+        assert_eq!(
+            result.final_verdicts.bottom,
+            result.iterations.last().unwrap().bottom
+        );
+        // Converged ⇒ no ⊥ remains; otherwise ⊥ persists (thoroughness gap).
+        match result.terminated_with {
+            SymbolicCegarTermination::Converged => {
+                assert_eq!(result.final_verdicts.bottom, 0)
+            }
+            SymbolicCegarTermination::BoundedIterationsReached
+            | SymbolicCegarTermination::PredicateSourceExhausted => {}
+        }
+    }
+
+    /// `max_iterations = 0` reproduces the single-shot behaviour: exactly one
+    /// evaluation, no refinement, the predicate set unchanged.
+    #[test]
+    fn rf5_5b_symbolic_refine_single_shot_when_max_zero() {
+        use crate::adapter::AdapterOptions;
+        let options = AdapterOptions::default();
+        let initial = vec![PredicateSpec {
+            name: "top".to_string(),
+            register: "cnt".to_string(),
+            value: 3,
+        }];
+        let formula = crate::mu_calculus::parser::parse("mu X. top or <> X").expect("formula");
+
+        let result = symbolic_cegar_refine(
+            SAT_COUNTER,
+            &initial,
+            &options,
+            &formula,
+            MustSemantics::ForallExists,
+            0,
+        )
+        .expect("symbolic refine single-shot");
+
+        assert_eq!(result.iterations.len(), 1, "single-shot = one evaluation");
+        assert_eq!(result.final_predicates.len(), 1, "no predicate added");
     }
 }
