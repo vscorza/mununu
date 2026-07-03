@@ -45,13 +45,20 @@ one-call variant that runs sv2v + Yosys for you.
 The predicate-cube abstraction has two possible **engines** — the representation of the
 cube state space + transition relation, independent of the abstraction itself:
 
-- **Explicit (shipped)** — materialises `2^|P|` cube states in a `Clts` and builds the
+- **Explicit (default)** — materialises `2^|P|` cube states in a `Clts` and builds the
   may/must edges with SMT (`SmtEncode`). Fine at small `|P|`; the edge computation is
-  `O(2^2|P|)` SMT queries, which is the scaling wall.
-- **Symbolic / BDD (R-F5, planned)** — represents cube sets + the transition relation as
-  BDDs and runs the fixpoint by image/preimage (`∃x'. R(x,x') ∧ φ(x')`), never
-  enumerating cubes. The `evaluate_tri` verdict is the ground truth either way (the
-  symbolic path is validated cell-for-cell against it).
+  `O(2^2|P|)` SMT queries, which is the scaling wall. Supports the full CEGAR refinement
+  loop, `--predicate-source`, sidecar compound predicates, etc.
+- **Symbolic / BDD (R-F5, shipped — opt-in via `--engine symbolic`)** — represents cube
+  sets + the transition relation as BDDs (bit-blasted straight from the BTOR2 transition
+  function) and runs the fixpoint by image/preimage (`∃x'. R(x,x') ∧ φ(x')`), never
+  enumerating cube pairs or issuing per-cube-pair SMT. Orders of magnitude faster at large
+  `|P|` (≈10 ms at `|P|=12`, where the explicit SMT path issues ~16.7M queries / ~29 min).
+  The `evaluate_tri` verdict is the ground truth either way — the symbolic path is
+  validated cell-for-cell against it. **Current scope (R-F5.4.2b):** *single-shot* (no
+  CEGAR refinement), simple `NAME:REG=VALUE` equality predicates, and the bare `[]`/`<>`
+  fragment only. Source of truth:
+  [`adapter::btor2::symbolic_engine::symbolic_cube_verdicts`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/symbolic_engine.rs).
 
 Both engines share the same 3-valued semantics and soundness (below). See
 [the post-R-F5 architecture](https://github.com/vscorza/mununu/blob/main/docs/design/post-rf5-architecture.md)
@@ -83,6 +90,7 @@ Key flags:
 | `--max-iterations` | CEGAR refinement cap (default 16) |
 | `--controllable-input` | mark an input as controller-chosen (synthesis / controllability-aware lift) |
 | `--emit-ctxdsl <PATH>` | dump the refined cube model as CTXDSL |
+| `--engine` | `explicit` (default, SMT edges + CEGAR) \| `symbolic` (R-F5 BDD relation, single-shot, no per-cube-pair SMT — orders of magnitude faster at large `\|P\|`) |
 
 `mununu sv cegar <design.sv> --formula … --predicate …` accepts the same property
 flags and runs sv2v + Yosys internally.
