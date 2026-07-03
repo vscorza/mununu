@@ -124,6 +124,49 @@ pub fn symbolic_cube_verdicts(
     })
 }
 
+/// R-F5.5a (2026-07-03) — like [`symbolic_cube_verdicts`], but derives the
+/// compound cube-dimension predicates from an [`AdapterOptions`] sidecar (the
+/// `compound_predicates` block, e.g. `cnt >= 2`) rather than taking an explicit
+/// `compound_exprs` map. This is the surface entry point the CLI (`--sidecar`)
+/// and API use so `--engine symbolic` handles inequality / relational
+/// predicates — the real sysrst `cnt_clr` / H.H counter-bound residual.
+///
+/// **Derived / combinational** compound predicates (H.E.2/H.F — per-cube SMT
+/// labels, not cube dimensions) are a hard error: the symbolic path has no
+/// per-cube-label computation yet; those cases must use `--engine explicit`.
+pub fn symbolic_cube_verdicts_from_options(
+    btor2_content: &str,
+    initial_predicates: &[PredicateSpec],
+    options: &crate::adapter::AdapterOptions,
+    formula: &Formula,
+    must_semantics: MustSemantics,
+) -> Result<SymbolicCubeVerdicts, AdapterError> {
+    let mut predicates = initial_predicates.to_vec();
+    let mut compound: HashMap<String, PredicateExpr> = HashMap::new();
+    for (spec, expr, is_derived) in
+        crate::adapter::btor2::cegar::sidecar_compound_predicates(options)
+    {
+        if is_derived {
+            return Err(ir_err(format!(
+                "the derived/combinational predicate `{}` (a per-cube SMT label, not a cube \
+                 dimension) is not supported by the symbolic engine yet — use `--engine explicit`",
+                spec.name
+            )));
+        }
+        // A non-derived compound is a cube dimension whose truth the compound
+        // expr decides (not `register == value`); its name keys the expr map.
+        compound.insert(spec.name.clone(), expr);
+        predicates.push(spec);
+    }
+    symbolic_cube_verdicts(
+        btor2_content,
+        &predicates,
+        &compound,
+        formula,
+        must_semantics,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +471,91 @@ mod tests {
                 "|P|={k}: symbolic path took {elapsed:?} — investigate BDD blow-up"
             );
         }
+    }
+
+    // ---- R-F5.5a: compound predicates from the sidecar ----
+
+    /// A sidecar `compound_predicates` inequality (`cnt >= 2`) becomes a cube
+    /// dimension under `symbolic_cube_verdicts_from_options`, and the verdicts
+    /// match `evaluate_tri` — the real inequality-predicate residual under
+    /// `--engine symbolic`.
+    #[test]
+    fn rf5_5a_symbolic_from_options_derives_sidecar_compound() {
+        use crate::adapter::AdapterOptions;
+        let sidecar =
+            r#"{"module":"m","compound_predicates":[{"name":"cnt_hi","expr":"cnt >= 2"}]}"#;
+        let options = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let initial = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "cnt".to_string(),
+            value: 0,
+        }];
+        let formula_str = "mu X. cnt_hi or <> X"; // EF (cnt >= 2)
+        let formula = crate::mu_calculus::parser::parse(formula_str).expect("formula");
+        let got = symbolic_cube_verdicts_from_options(
+            SAT_COUNTER,
+            &initial,
+            &options,
+            &formula,
+            MustSemantics::ForallExists,
+        )
+        .expect("symbolic verdicts from sidecar");
+
+        // Oracle over the same predicate set [cnt==0, cnt>=2] in the same order.
+        let exprs = [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ];
+        let want = tri_oracle(
+            SAT_COUNTER,
+            &exprs,
+            &["p", "cnt_hi"],
+            &[("cnt", 2)],
+            formula_str,
+        );
+        assert_eq!(
+            got.cube_verdicts, want,
+            "sidecar-compound path ≠ evaluate_tri"
+        );
+        // cnt ∈ {0,1,2,3} ⇒ 3 feasible cubes ({p}, {neither}, {cnt_hi}).
+        assert_eq!(got.cube_verdicts.len(), 3);
+    }
+
+    /// A **derived** compound predicate (per-cube SMT label) is rejected — the
+    /// symbolic engine has no per-cube-label path yet.
+    #[test]
+    fn rf5_5a_symbolic_from_options_rejects_derived_predicate() {
+        use crate::adapter::AdapterOptions;
+        let sidecar = r#"{"module":"m","compound_predicates":[{"name":"d","expr":"cnt >= 2","derived":true}]}"#;
+        let options = AdapterOptions {
+            sidecar_json: Some(sidecar.to_string()),
+            ..Default::default()
+        };
+        let initial = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "cnt".to_string(),
+            value: 0,
+        }];
+        let formula = crate::mu_calculus::parser::parse("[] p").expect("formula");
+        let err = symbolic_cube_verdicts_from_options(
+            SAT_COUNTER,
+            &initial,
+            &options,
+            &formula,
+            MustSemantics::ForallExists,
+        )
+        .expect_err("derived compound must be rejected");
+        assert!(
+            err.message.contains("derived"),
+            "expected a derived-predicate rejection, got: {}",
+            err.message
+        );
     }
 }
