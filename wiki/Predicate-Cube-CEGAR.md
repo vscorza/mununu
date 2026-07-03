@@ -57,11 +57,15 @@ cube state space + transition relation, independent of the abstraction itself:
   The `evaluate_tri` verdict is the ground truth either way — the symbolic path is
   validated cell-for-cell against it. Runs the **CEGAR refinement loop** (WP predicate
   discovery on ⊥, rebuilding the BDD relation each iteration — still no per-cube-pair SMT;
-  `--max-iterations 0` = single-shot). **Current scope (R-F5.5a/b):** simple
+  `--max-iterations 0` = single-shot). **Current scope (R-F5.5a/b/c):** simple
   `NAME:REG=VALUE` equalities + non-derived `--sidecar` `compound_predicates` (`cnt >= 2`,
-  relational), and the bare `[]`/`<>` fragment only. Derived/combinational predicates and
-  the Clts-only optimisations (failure-subgame precision, approximant reuse, CTXDSL emit)
-  remain `--engine explicit` only. Source of truth:
+  relational), and the `[]`/`<>` fragment including modalities guarded by
+  `req_cur`/`forb_cur`/`req_next`/`forb_next` state predicates (R-F5.5c). Label,
+  controllability (`ctrl`), and step-bounded (`steps`) guards remain out-of-fragment over a
+  predicate cube (an honest error — see `cube_modality_soundness_warnings`).
+  Derived/combinational predicates and the Clts-only optimisations (failure-subgame
+  precision, approximant reuse, CTXDSL emit) remain `--engine explicit` only. Source of
+  truth:
   [`adapter::btor2::symbolic_engine::symbolic_cegar_refine`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/symbolic_engine.rs).
 
 Both engines share the same 3-valued semantics and soundness (below). See

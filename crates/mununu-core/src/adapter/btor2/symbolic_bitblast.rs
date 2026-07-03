@@ -92,11 +92,15 @@
 //! the `(must, may)` [`TritBdd`], never materialising cube states. It is the
 //! `SymbolicKmts` counterpart sourced from the BTOR2-derived relation rather
 //! than a `Clts`; an atomic proposition `P_i`'s characteristic set is simply the
-//! present predicate var `p_i`. Supports the audited-sound **bare** fragment
-//! (`True`/`False`, predicates, `!`/`&&`/`||`, bare `[]`/`<>`, `mu`/`nu`);
-//! guards / controllability / step-bounds are an honest error. Validated
+//! present predicate var `p_i`. Supports the audited-sound fragment
+//! (`True`/`False`, predicates, `!`/`&&`/`||`, `mu`/`nu`, bare `[]`/`<>`, and —
+//! R-F5.5c — `req_cur`/`forb_cur`/`req_next`/`forb_next` state-predicate-guarded
+//! modalities); label / controllability / step-bounded guards remain an honest
+//! error (out-of-fragment over a predicate cube per
+//! [`crate::mu_calculus::cube_modality_soundness_warnings`]). Validated
 //! cell-for-cell against `evaluate_tri` on the equivalent explicit cube-KMTS
-//! (nested νμ included). R-F5.4.2 then wires this behind `--engine symbolic`.
+//! (nested νμ + guarded modalities included). R-F5.4.2 then wires this behind
+//! `--engine symbolic`.
 
 use std::collections::HashMap;
 
@@ -845,11 +849,15 @@ impl AbstractRelation {
     /// 3-valued box preimage of `phi` (Bruns–Godefroid): `box.must` uses
     /// `R_may`, `box.may` uses `R_must`. Mirrors [`crate::mu_calculus::symbolic`]'s
     /// `SymbolicKmts::box_pre` on this relation's own predicate-var frame.
-    fn box_pre(&self, phi: &TritBdd, r_must: &BDDFunction) -> TritBdd {
+    ///
+    /// `r_may` / `r_must` are passed explicitly (rather than reading
+    /// `self.r_may`) so a guarded modality can supply the guard-restricted
+    /// relations from [`Self::guarded_relations`] (R-F5.5c). A bare modality
+    /// passes `&self.r_may` and the relation's own `r_must`.
+    fn box_pre(&self, phi: &TritBdd, r_may: &BDDFunction, r_must: &BDDFunction) -> TritBdd {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
         let must_next = self.to_next(phi.must());
-        let box_must = self
-            .r_may
+        let box_must = r_may
             .apply_exists(
                 BooleanOperator::And,
                 &must_next.not().unwrap(),
@@ -872,19 +880,67 @@ impl AbstractRelation {
     }
 
     /// 3-valued diamond preimage of `phi`: `dia.must` uses `R_must`, `dia.may`
-    /// uses `R_may`.
-    fn diamond_pre(&self, phi: &TritBdd, r_must: &BDDFunction) -> TritBdd {
+    /// uses `R_may`. `r_may` / `r_must` are passed explicitly for the same
+    /// guard-restriction reason as [`Self::box_pre`] (R-F5.5c).
+    fn diamond_pre(&self, phi: &TritBdd, r_may: &BDDFunction, r_must: &BDDFunction) -> TritBdd {
         use oxidd::{BooleanFunctionQuant, BooleanOperator};
         let must_next = self.to_next(phi.must());
         let dia_must = r_must
             .apply_exists(BooleanOperator::And, &must_next, &self.next_cube)
             .unwrap();
         let may_next = self.to_next(phi.may());
-        let dia_may = self
-            .r_may
+        let dia_may = r_may
             .apply_exists(BooleanOperator::And, &may_next, &self.next_cube)
             .unwrap();
         TritBdd::from_parts(dia_must, dia_may)
+    }
+
+    /// R-F5.5c — the may/must relations RESTRICTED to a guard's matching
+    /// transitions: `R ∧ cur_ok(x) ∧ next_ok(x')`, where `cur_ok` / `next_ok`
+    /// are the `req_*` / `forb_*` state-predicate filters over the present /
+    /// next predicate vars. Each guard predicate names a `P_i` in `names`; its
+    /// characteristic set is the present var `present[i]` (current) or its
+    /// `to_next` image (next). Mirrors [`crate::mu_calculus::symbolic`]'s
+    /// `SymbolicKmts::guarded_relations` on this relation's cube frame.
+    ///
+    /// A required predicate absent from `names` (not part of the cube's
+    /// abstraction) contributes `⊥` (no cube matches → the modal is vacuous
+    /// there), exactly as the explicit `guard_matches` filter; a forbidden
+    /// absent predicate is vacuously satisfied (no constraint, since `¬⊥ = ⊤`).
+    ///
+    /// Label / controllability / step-bounded guards are NOT handled here —
+    /// they are rejected up front in [`Self::eval_node`] as out-of-fragment
+    /// over a predicate cube (see
+    /// [`crate::mu_calculus::cube_modality_soundness_warnings`]).
+    fn guarded_relations(
+        &self,
+        guard: &Guard,
+        names: &HashMap<&str, usize>,
+        r_must: &BDDFunction,
+    ) -> (BDDFunction, BDDFunction) {
+        // `present[i]` if the predicate is in the cube's set; `ff` otherwise
+        // (a required-but-absent predicate makes the guard vacuous; a
+        // forbidden-but-absent one is vacuously satisfied since `¬ff = tt`).
+        let pred_set = |name: &str| -> BDDFunction {
+            match names.get(name) {
+                Some(&i) => self.present[i].clone(),
+                None => self.ff.clone(),
+            }
+        };
+        let mut c = self.tt.clone();
+        for v in &guard.current.required {
+            c = c.and(&pred_set(v)).unwrap();
+        }
+        for v in &guard.current.forbidden {
+            c = c.and(&pred_set(v).not().unwrap()).unwrap();
+        }
+        for v in &guard.next.required {
+            c = c.and(&self.to_next(&pred_set(v))).unwrap();
+        }
+        for v in &guard.next.forbidden {
+            c = c.and(&self.to_next(&pred_set(v).not().unwrap())).unwrap();
+        }
+        (self.r_may.and(&c).unwrap(), r_must.and(&c).unwrap())
     }
 
     /// R-F5.4.1 — evaluate a mu-calculus `formula` symbolically over this
@@ -893,10 +949,13 @@ impl AbstractRelation {
     /// proposition `P_i` holds exactly on the cubes where bit `i` is set —
     /// i.e. its characteristic set is the present var `p_i`).
     ///
-    /// Supports the **audited-sound bare fragment** the cube path evaluates:
-    /// `True`/`False`, predicates, `!`/`&&`/`||`, bare `[]`/`<>`, `mu`/`nu`.
-    /// A guarded / controllability / step-bounded modality is an honest error
-    /// (as in [`crate::mu_calculus::symbolic`]'s `SymbolicKmts`). Requires a
+    /// Supports the **audited-sound fragment** the cube path evaluates:
+    /// `True`/`False`, predicates, `!`/`&&`/`||`, `mu`/`nu`, bare `[]`/`<>`, and
+    /// (R-F5.5c) modalities guarded by `req_cur`/`forb_cur`/`req_next`/`forb_next`
+    /// state predicates (each names a `P_i` in `pred_names`; see
+    /// [`Self::guarded_relations`]). A label / controllability / step-bounded
+    /// modality remains an honest error — out-of-fragment over a predicate cube
+    /// (see [`crate::mu_calculus::cube_modality_soundness_warnings`]). Requires a
     /// relation built *with* a [`MustSemantics`] (the modal steps read
     /// `R_must`).
     pub fn evaluate(&self, formula: &Formula, pred_names: &[String]) -> Result<TritBdd, String> {
@@ -950,6 +1009,11 @@ impl AbstractRelation {
                 guard,
                 target,
             } => {
+                // Out-of-fragment over a predicate cube (see
+                // `cube_modality_soundness_warnings`): controllability needs a
+                // player partition the plain verification cube lacks; a bounded
+                // step is not may/must-filtered; a label guard is vacuous because
+                // the cube collapses every concrete action onto its own label.
                 if guard.control != Control::All {
                     return Err(
                         "symbolic cube evaluator: controllability guards (`ctrl`) unsupported"
@@ -962,15 +1026,24 @@ impl AbstractRelation {
                             .into(),
                     );
                 }
-                if *guard != Guard::default() {
+                if !guard.labels.is_empty() {
                     return Err(
-                        "symbolic cube evaluator: label / state-var guards unsupported (bare `[]`/`<>` only)".into(),
+                        "symbolic cube evaluator: label guards unsupported over a predicate cube \
+                         (the cube carries no label structure — use `req_cur`/`req_next` state \
+                         guards, or a bare `[]`/`<>`)"
+                            .into(),
                     );
                 }
+                // R-F5.5c — the sound in-fragment guards over a cube are the
+                // `req_cur`/`forb_cur`/`req_next`/`forb_next` state-predicate
+                // filters. `guarded_relations` returns `(r_may, r_must)`
+                // unchanged for a bare (all-empty) guard, so this path is a
+                // no-op for `[]`/`<>`.
+                let (gr_may, gr_must) = self.guarded_relations(guard, names, r_must);
                 let phi = self.eval_node(f, *target, names, r_must, bindings)?;
                 match kind {
-                    ModalKind::Box => self.box_pre(&phi, r_must),
-                    ModalKind::Diamond => self.diamond_pre(&phi, r_must),
+                    ModalKind::Box => self.box_pre(&phi, &gr_may, &gr_must),
+                    ModalKind::Diamond => self.diamond_pre(&phi, &gr_may, &gr_must),
                 }
             }
             MuNode::Mu { var, body } => {
@@ -1955,14 +2028,26 @@ mod tests {
             .map(|j| b.state_id_or_insert(format!("c{j}")).unwrap())
             .collect();
         for (j, &ci) in feasible.iter().enumerate() {
+            let mut set_vars: Vec<&str> = Vec::new();
             for (i, nm) in names.iter().enumerate() {
-                let v = if (ci >> i) & 1 == 1 {
+                let held = (ci >> i) & 1 == 1;
+                let v = if held {
                     Tristate::KleeneT
                 } else {
                     Tristate::KleeneF
                 };
                 b.with_3valued_predicate(ids[j], *nm, v);
+                if held {
+                    set_vars.push(*nm);
+                }
             }
+            // R-F5.5c — also populate the 2-valued state-variable bitset. The cube
+            // AP labels are definite (KleeneT/KleeneF), so this is consistent with
+            // the 3-valued map above and a no-op for the unguarded fragment. It is
+            // required for guarded modalities: `evaluate_tri`'s `GuardPartitions`
+            // reads `state_variable_bitset` (not `state_3valued_predicates`) when
+            // matching `req_cur`/`forb_cur`/`req_next`/`forb_next`.
+            b.with_variables_for_state(ids[j], set_vars);
         }
         for (j, &ci) in feasible.iter().enumerate() {
             for (l, &cj) in feasible.iter().enumerate() {
@@ -2070,5 +2155,110 @@ mod tests {
             &[("cnt", 2), ("acc", 2)],
             &formulas,
         );
+    }
+
+    /// R-F5.5c — modalities guarded by `req_cur`/`forb_cur`/`req_next`/`forb_next`
+    /// state predicates agree cell-for-cell with `evaluate_tri` on the explicit
+    /// cube-KMTS (the guard filters modal steps by source/target cube exactly as
+    /// the explicit `guard_matches`). Saturating counter, `p = (cnt == 0)`,
+    /// `q = (cnt ≥ 2)`.
+    #[test]
+    fn rf5_5c_symbolic_eval_matches_tri_guarded_saturating_counter() {
+        let predicates = [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ];
+        let formulas = [
+            // next-state guards
+            "[ req_next = {q} ] p",
+            "< req_next = {q} > p",
+            "[ forb_next = {q} ] p",
+            "< forb_next = {p} > q",
+            // current-state guards
+            "[ req_cur = {p} ] q",
+            "< req_cur = {q} > p",
+            // combined next guards (require q, forbid p in the target)
+            "[ req_next = {q}, forb_next = {p} ] p",
+            // guarded modality inside a fixpoint
+            "nu X. p and [ req_next = {q} ] X",
+            "mu X. q or < req_next = {p} > X",
+            // nested νμ with a guarded outer box
+            "nu Y. (mu X. (q or <> X)) and [ req_cur = {p} ] Y",
+            // unguarded still works alongside guarded
+            "nu X. p and [] X",
+        ];
+        assert_symbolic_eval_matches_tri(
+            SATURATING_COUNTER_BTOR2,
+            &predicates,
+            &["p", "q"],
+            &[("cnt", 2)],
+            &formulas,
+        );
+    }
+
+    /// R-F5.5c — the same guarded fragment over a KMTS carrying `MayOnly` edges
+    /// (two registers, relational predicate), so guarded verdicts include
+    /// non-trivial `⊥`s that must still match `evaluate_tri`.
+    #[test]
+    fn rf5_5c_symbolic_eval_matches_tri_guarded_two_registers() {
+        let predicates = [
+            PredicateExpr::CmpReg {
+                lhs: "cnt".to_string(),
+                op: CmpOp::Eq,
+                rhs: "acc".to_string(),
+            },
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+            PredicateExpr::eq("acc", 0),
+        ];
+        let formulas = [
+            "[ req_next = {q} ] p",
+            "< req_next = {r} > p",
+            "[ forb_next = {p} ] q",
+            "[ req_cur = {r} ] p",
+            "nu X. p and [ req_next = {q} ] X",
+            "mu X. r or < req_next = {p} > X",
+            "nu Y. (mu X. (p or <> X)) and [ req_cur = {r} ] Y",
+        ];
+        assert_symbolic_eval_matches_tri(
+            TWO_REGISTER_BTOR2,
+            &predicates,
+            &["p", "q", "r"],
+            &[("cnt", 2), ("acc", 2)],
+            &formulas,
+        );
+    }
+
+    /// R-F5.5c — label / controllability / step-bounded guards are out-of-fragment
+    /// over a predicate cube (see `cube_modality_soundness_warnings`) and are an
+    /// honest error, never a wrong/vacuous verdict.
+    #[test]
+    fn rf5_5c_label_control_step_guards_are_rejected() {
+        let predicates = [PredicateExpr::eq("cnt", 0)];
+        let file = parser::parse(SATURATING_COUNTER_BTOR2).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let rel = bb
+            .abstract_relation(&predicates, Some(MustSemantics::ForallExists))
+            .expect("relation");
+        let names = ["p".to_string()];
+
+        for (formula_str, why) in [
+            ("[ ctrl = controllable ] p", "controllability guard"),
+            ("< ( steps <= 2 ) > p", "step-bounded modality"),
+            ("[ labels = {step} ] p", "label guard"),
+        ] {
+            let formula = crate::mu_calculus::parser::parse(formula_str).expect("formula parses");
+            assert!(
+                rel.evaluate(&formula, &names).is_err(),
+                "{why} must be an honest error over a cube, not a verdict: `{formula_str}`"
+            );
+        }
     }
 }
