@@ -2380,6 +2380,25 @@ fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::Au
         if !p.seeded_predicates.is_empty() {
             println!("        predicates: {}", p.seeded_predicates.join(", "));
         }
+        // D1.8b — the exact engine's stall-lasso counterexample (reset → prefix →
+        // repeating ¬p cycle), present only for a Violated bare `AF p`.
+        if let Some(cex) = &p.counterexample {
+            println!("        counterexample (stall lasso):");
+            let render_state = |st: &[(String, u64)]| {
+                st.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            for st in &cex.prefix {
+                println!("          -> {}", render_state(st));
+            }
+            for (i, st) in cex.cycle.iter().enumerate() {
+                let marker = if i == 0 { "(*)" } else { "   " };
+                println!("          {marker} {}", render_state(st));
+            }
+            println!("          (cycle repeats forever - the property is avoided)");
+        }
     }
     for (name, reason) in &report.unsupported {
         println!("  [unsupported] {name}: {reason}");
@@ -2441,6 +2460,22 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
                     ("skipped", serde_json::json!({ "reason": reason }))
                 }
             };
+            // D1.8b — stall-lasso counterexample; each state is an ordered list of
+            // [register, value] pairs so the register order is preserved in JSON.
+            let counterexample = p.counterexample.as_ref().map(|c| {
+                let states = |v: &[Vec<(String, u64)>]| -> Vec<serde_json::Value> {
+                    v.iter()
+                        .map(|st| {
+                            serde_json::Value::Array(
+                                st.iter()
+                                    .map(|(k, val)| serde_json::json!([k, val]))
+                                    .collect(),
+                            )
+                        })
+                        .collect()
+                };
+                serde_json::json!({ "prefix": states(&c.prefix), "cycle": states(&c.cycle) })
+            });
             serde_json::json!({
                 "name": p.name,
                 "kind": sva_kind_str(p.kind),
@@ -2448,6 +2483,7 @@ fn render_verify_auto_json(report: &mununu_core::adapter::slang::verify_auto::Au
                 "outcome": status,
                 "detail": detail,
                 "seeded_predicates": p.seeded_predicates,
+                "counterexample": counterexample,
             })
         })
         .collect();

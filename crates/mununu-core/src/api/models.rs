@@ -1122,6 +1122,27 @@ pub struct PropertyVerdictView {
     pub detail: Option<String>,
     /// The cube predicates auto-seeded for this property (atom strings).
     pub seeded_predicates: Vec<String>,
+    /// D1.8b — a concrete stall-lasso counterexample, present only for a Violated
+    /// bare `AF p` decided by the exact engine (`engine: "exact-symbolic"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample: Option<CounterexampleView>,
+}
+
+/// D1.8b — a stall-lasso counterexample for the API (mirrors `ExactCounterexample`):
+/// reset → `prefix` → repeating `cycle`, each state an ordered list of register cells.
+#[derive(Debug, Serialize)]
+pub struct CounterexampleView {
+    /// States from the reset state up to (excluding) the cycle entry.
+    pub prefix: Vec<Vec<CexCellView>>,
+    /// The repeating stall cycle; the last state steps back to `cycle[0]`.
+    pub cycle: Vec<Vec<CexCellView>>,
+}
+
+/// One register's concrete value in a counterexample state.
+#[derive(Debug, Serialize)]
+pub struct CexCellView {
+    pub register: String,
+    pub value: u64,
 }
 
 /// U.0 — CEGAR refinement trace, JSON-shaped for the refinement-trace
