@@ -1515,6 +1515,19 @@ impl ExactModel {
         self.eval_node(formula, formula.root(), atoms, &mut bindings)
     }
 
+    /// Evaluate a specific sub-node `id` of `formula` to its state-set BDD (fresh
+    /// bindings). D1.8b uses it to get the target-predicate BDD of a detected `AF p`.
+    /// Sound only when `id` has no free fixpoint variables (the `AF` target doesn't).
+    pub fn eval_at(
+        &self,
+        formula: &Formula,
+        id: crate::mu_calculus::NodeId,
+        atoms: &HashMap<&str, BDDFunction>,
+    ) -> Result<BDDFunction, String> {
+        let mut bindings: HashMap<FormulaVarId, BDDFunction> = HashMap::new();
+        self.eval_node(formula, id, atoms, &mut bindings)
+    }
+
     fn eval_node(
         &self,
         f: &Formula,
@@ -1669,6 +1682,20 @@ pub fn exact_symbolic_verdict(
     btor2_content: &str,
     formula: &Formula,
 ) -> Result<ExactVerdict, String> {
+    exact_symbolic_verdict_with_witness(btor2_content, formula).map(|(v, _)| v)
+}
+
+/// D1.8b — like [`exact_symbolic_verdict`], but on a `Violated` verdict for a bare
+/// `AF p`-shaped property (`μX. (p ∨ [] X)`) it also returns a concrete
+/// [`StallLasso`] counterexample: the reachable `¬p` stall witnessing that liveness
+/// fails from the reset state. The witness is `None` when the verdict is `Holds`,
+/// when `formula` is not that shape, or when the stall is not reachable *at* the
+/// initial state (a reachable-but-not-initial stall — the `AG AF` case — is a future
+/// extension of [`BddBitBlaster::exact_stall_lasso`]).
+pub fn exact_symbolic_verdict_with_witness(
+    btor2_content: &str,
+    formula: &Formula,
+) -> Result<(ExactVerdict, Option<StallLasso>), String> {
     use crate::adapter::sts_ir::SymbolicTransitionSystem;
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
@@ -1708,11 +1735,50 @@ pub fn exact_symbolic_verdict(
     let init = bb.initial_state_bdd(&file);
     // Holds iff init ⊆ sat, i.e. no initial state violates φ.
     let violating = init.and(&sat.not().unwrap()).unwrap();
-    Ok(if violating == *exact.ff() {
-        ExactVerdict::Holds
+    if violating == *exact.ff() {
+        return Ok((ExactVerdict::Holds, None));
+    }
+    // Violated — attach a stall lasso when the property is a bare `AF p`. The target
+    // `p` is evaluated from the same atom set; `exact_stall_lasso` returns None if the
+    // stall is not reachable at the initial state (so the witness is best-effort).
+    let witness = detect_af_target(formula)
+        .and_then(|p_id| exact.eval_at(formula, p_id, &atoms).ok())
+        .and_then(|p_bdd| bb.exact_stall_lasso(&file, &p_bdd));
+    Ok((ExactVerdict::Violated, witness))
+}
+
+/// D1.8b — detect the bare `AF p` shape `μX. (p ∨ [] X)` and return the node id of
+/// its target `p` (the non-recursive disjunct), or `None` when the root is not that
+/// shape. Both disjunct orders are accepted; the modality must be a bare `[]` (no
+/// guard) over the fixpoint variable.
+fn detect_af_target(formula: &Formula) -> Option<crate::mu_calculus::NodeId> {
+    use crate::mu_calculus::NodeId;
+    let MuNode::Mu { var, body } = formula.node(formula.root()) else {
+        return None;
+    };
+    let MuNode::Or(a, b) = formula.node(*body) else {
+        return None;
+    };
+    let is_box_var = |id: NodeId| -> bool {
+        match formula.node(id) {
+            MuNode::Modal {
+                kind: ModalKind::Box,
+                guard,
+                target,
+            } => {
+                *guard == Guard::default()
+                    && matches!(formula.node(*target), MuNode::Variable(v) if v == var)
+            }
+            _ => false,
+        }
+    };
+    if is_box_var(*a) {
+        Some(*b)
+    } else if is_box_var(*b) {
+        Some(*a)
     } else {
-        ExactVerdict::Violated
-    })
+        None
+    }
 }
 
 /// D1.8 — a **stall lasso**: the concrete counterexample witness for a `Violated`
@@ -2973,6 +3039,28 @@ mod tests {
             .expect("predicate cnt==0");
         // cnt==0 holds at the initial state, so AF(cnt==0) holds ⇒ no stall witness.
         assert!(bb.exact_stall_lasso(&file, &p).is_none());
+    }
+
+    /// D1.8b — the verdict entry point also yields the stall lasso for a Violated
+    /// bare `AF p`, and `None` when it holds.
+    #[test]
+    fn d1_8b_verdict_with_witness_af_violated() {
+        let af = crate::mu_calculus::parser::parse("mu X. ((cnt == 3) or [] X)").expect("parse");
+        let (v, w) =
+            exact_symbolic_verdict_with_witness(RESET_COUNTER_BTOR2, &af).expect("verdict");
+        assert_eq!(v, ExactVerdict::Violated);
+        let lasso = w.expect("Violated AF ⇒ a stall lasso witness");
+        assert!(!lasso.cycle.is_empty());
+        for st in lasso.prefix.iter().chain(lasso.cycle.iter()) {
+            assert_ne!(st.get("cnt"), Some(&3), "every stall state is ¬(cnt==3)");
+        }
+
+        // `AF (cnt==0)` holds at reset (cnt is already 0) ⇒ no witness.
+        let holds = crate::mu_calculus::parser::parse("mu X. ((cnt == 0) or [] X)").expect("parse");
+        let (v2, w2) =
+            exact_symbolic_verdict_with_witness(RESET_COUNTER_BTOR2, &holds).expect("verdict");
+        assert_eq!(v2, ExactVerdict::Holds);
+        assert!(w2.is_none());
     }
 
     /// D1.4 — `resolve_predicate_expr_registers` rewrites every register name in a

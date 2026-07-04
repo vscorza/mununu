@@ -842,6 +842,25 @@ pub async fn sv_verify_auto_handler(
                 ),
                 VerifyOutcome::Skipped { reason } => ("skipped".to_string(), Some(reason.clone())),
             };
+            // D1.8b — carry the exact engine's stall-lasso counterexample.
+            let counterexample = p.counterexample.as_ref().map(|c| {
+                let states = |v: &[Vec<(String, u64)>]| -> Vec<Vec<CexCellView>> {
+                    v.iter()
+                        .map(|st| {
+                            st.iter()
+                                .map(|(register, value)| CexCellView {
+                                    register: register.clone(),
+                                    value: *value,
+                                })
+                                .collect()
+                        })
+                        .collect()
+                };
+                CounterexampleView {
+                    prefix: states(&c.prefix),
+                    cycle: states(&c.cycle),
+                }
+            });
             PropertyVerdictView {
                 name: p.name.clone(),
                 kind: kind_str(p.kind),
@@ -849,6 +868,7 @@ pub async fn sv_verify_auto_handler(
                 outcome,
                 detail,
                 seeded_predicates: p.seeded_predicates.clone(),
+                counterexample,
             }
         })
         .collect();

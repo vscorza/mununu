@@ -92,6 +92,41 @@ pub struct PropertyVerdict {
     /// The cube predicates auto-seeded for this property (atom strings) — the
     /// diagnostic "what was tracked".
     pub seeded_predicates: Vec<String>,
+    /// D1.8b — a concrete stall-lasso counterexample, present only when the exact
+    /// engine (`--engine exact-symbolic`) reports a bare `AF p` property `Violated`
+    /// and the stall is reachable at the reset state. `None` otherwise.
+    pub counterexample: Option<ExactCounterexample>,
+}
+
+/// D1.8b — a concrete stall-lasso counterexample for a `Violated` liveness property
+/// from the exact engine: a `prefix` from the reset state into a repeating `cycle`,
+/// each state a list of `(register, value)` pairs in register order. The cycle
+/// witnesses that the property is avoided forever (the "stall").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCounterexample {
+    /// States from the reset state up to (excluding) the cycle entry.
+    pub prefix: Vec<Vec<(String, u64)>>,
+    /// The repeating stall cycle; the last state steps back to `cycle[0]`.
+    pub cycle: Vec<Vec<(String, u64)>>,
+}
+
+/// Convert an engine [`StallLasso`](crate::adapter::btor2::symbolic_bitblast::StallLasso)
+/// (register→value maps, `u128`) into the surface [`ExactCounterexample`] (ordered
+/// `(name, u64)` pairs; state-register values fit in `u64` under the exact engine's
+/// bit-blast cap).
+fn exact_counterexample_from_lasso(
+    lasso: crate::adapter::btor2::symbolic_bitblast::StallLasso,
+) -> ExactCounterexample {
+    let conv = |states: Vec<std::collections::BTreeMap<String, u128>>| {
+        states
+            .into_iter()
+            .map(|st| st.into_iter().map(|(k, v)| (k, v as u64)).collect())
+            .collect()
+    };
+    ExactCounterexample {
+        prefix: conv(lasso.prefix),
+        cycle: conv(lasso.cycle),
+    }
 }
 
 /// Model-level diagnostics for an automated verification run — what the lift
@@ -1477,6 +1512,7 @@ pub fn verify_auto(
                         reason: format!("formula failed to parse: {e:?}"),
                     },
                     seeded_predicates: Vec::new(),
+                    counterexample: None,
                 });
                 continue;
             }
@@ -1495,26 +1531,35 @@ pub fn verify_auto(
         // property) where the cube path returns Unknown; bounded by BDD size
         // (build errors above the bit cap ⇒ Skipped).
         if opts.exact_symbolic {
-            let outcome = match crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict(
-                &btor2, &formula,
-            ) {
-                Ok(crate::adapter::btor2::symbolic_bitblast::ExactVerdict::Holds) => {
-                    VerifyOutcome::Holds
-                }
-                Ok(crate::adapter::btor2::symbolic_bitblast::ExactVerdict::Violated) => {
-                    // A definite full-state counterexample (not a cube tally).
-                    VerifyOutcome::Violated { false_cells: 1 }
-                }
-                Err(e) => VerifyOutcome::Skipped {
-                    reason: format!("exact symbolic MC: {e}"),
-                },
+            use crate::adapter::btor2::symbolic_bitblast::{
+                ExactVerdict, exact_symbolic_verdict_with_witness,
             };
+            let (outcome, counterexample) =
+                match exact_symbolic_verdict_with_witness(&btor2, &formula) {
+                    Ok((ExactVerdict::Holds, _)) => (VerifyOutcome::Holds, None),
+                    Ok((ExactVerdict::Violated, witness)) => {
+                        // A definite full-state counterexample (not a cube tally); for
+                        // a bare `AF p` the witness carries the concrete stall lasso
+                        // (D1.8b) — reset → prefix → ¬p cycle.
+                        (
+                            VerifyOutcome::Violated { false_cells: 1 },
+                            witness.map(exact_counterexample_from_lasso),
+                        )
+                    }
+                    Err(e) => (
+                        VerifyOutcome::Skipped {
+                            reason: format!("exact symbolic MC: {e}"),
+                        },
+                        None,
+                    ),
+                };
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
                 kind: t.kind,
                 formula: formula_str.clone(),
                 outcome,
                 seeded_predicates: Vec::new(),
+                counterexample,
             });
             continue;
         }
@@ -1549,6 +1594,7 @@ pub fn verify_auto(
                 formula: formula_str.clone(),
                 outcome: VerifyOutcome::Skipped { reason },
                 seeded_predicates: Vec::new(),
+                counterexample: None,
             });
             continue;
         }
@@ -1564,6 +1610,7 @@ pub fn verify_auto(
                         .to_string(),
                 },
                 seeded_predicates: Vec::new(),
+                counterexample: None,
             });
             continue;
         }
@@ -1788,6 +1835,7 @@ pub fn verify_auto(
             formula: formula_str.clone(),
             outcome,
             seeded_predicates: seeded_names,
+            counterexample: None,
         });
     }
 
@@ -2131,6 +2179,7 @@ module uart_tx(); endmodule"#;
                     formula: "nu X. (a && [] X)".into(),
                     outcome: VerifyOutcome::Holds,
                     seeded_predicates: vec!["a".into()],
+                    counterexample: None,
                 },
                 PropertyVerdict {
                     name: "p_unknown".into(),
@@ -2138,6 +2187,7 @@ module uart_tx(); endmodule"#;
                     formula: "nu X. (b && [] X)".into(),
                     outcome: VerifyOutcome::Unknown { unknown_cells: 2 },
                     seeded_predicates: vec!["b".into()],
+                    counterexample: None,
                 },
             ],
             unsupported: vec![("u".into(), "reason".into())],
