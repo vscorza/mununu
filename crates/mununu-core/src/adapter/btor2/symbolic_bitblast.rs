@@ -1320,6 +1320,102 @@ impl BvTermBackend for BddBitBlaster {
     }
 }
 
+/// D1 — the EXACT (full-state, 2-valued) transition model for symbolic
+/// μ-calculus model checking, with NO predicate abstraction. The state is the
+/// register-bit valuation itself; inputs are free (nondeterminism). A formula's
+/// satisfying set is a single [`BDDFunction`] over the register-bit vars, and the
+/// modal pre-image substitutes each state bit by its next-state function then
+/// quantifies the input bits (`∃` for `⟨⟩`, `∀` for `[]`). Because there is no
+/// abstraction the verdict is 2-valued and definite (no `⊥`); the cost is bounded
+/// by BDD size, not by the `2^|Registers|` explicit-state cap. Reuses the exact
+/// same substitution [`BddBitBlaster::abstract_relation`] builds, applied to the
+/// formula BDD directly rather than to predicate vars.
+pub struct ExactModel {
+    /// State-bit varno → its next-state function. Held registers (no `Next` line)
+    /// are omitted (identity ⇒ held value); inputs are never state, never
+    /// substituted (they remain free to be quantified).
+    sub_vars: Vec<VarNo>,
+    sub_repl: Vec<BDDFunction>,
+    /// The cube of input-bit vars, quantified in the modal pre-image.
+    input_cube: BDDFunction,
+    tt: BDDFunction,
+    ff: BDDFunction,
+}
+
+impl BddBitBlaster {
+    /// Build the [`ExactModel`] for full-state 2-valued μ-calculus MC (D1). Pinned
+    /// inputs (config concretization / reset-gating) are already constants in the
+    /// bit-blasted design, so the `∃`/`∀` over the *remaining* free inputs is exact
+    /// for the pinned model.
+    pub fn exact_model(&self) -> ExactModel {
+        // State bit → next-state function (the same sub the abstract relation uses).
+        let mut sub_vars: Vec<VarNo> = Vec::new();
+        let mut sub_repl: Vec<BDDFunction> = Vec::new();
+        for cell in &self.cells {
+            if !cell.is_state {
+                continue;
+            }
+            if let Some(next_fn) = self.next_funcs.get(&cell.symbol) {
+                for (vn, f) in cell.varnos.iter().zip(next_fn.iter()) {
+                    sub_vars.push(*vn);
+                    sub_repl.push(f.clone());
+                }
+            }
+        }
+        // The input-bit cube to quantify in the modal pre-image.
+        let mut input_cube = self.tt.clone();
+        for cell in &self.cells {
+            if !cell.is_state {
+                for v in &cell.vars {
+                    input_cube = input_cube.and(v).unwrap();
+                }
+            }
+        }
+        ExactModel {
+            sub_vars,
+            sub_repl,
+            input_cube,
+            tt: self.tt.clone(),
+            ff: self.ff.clone(),
+        }
+    }
+}
+
+impl ExactModel {
+    /// `⊤` / `⊥` over the state-var frame (for fixpoint seeds + tests).
+    pub fn tt(&self) -> &BDDFunction {
+        &self.tt
+    }
+    pub fn ff(&self) -> &BDDFunction {
+        &self.ff
+    }
+
+    /// `φ` pushed one step forward: each state bit ↦ its next-state function ⇒ a
+    /// BDD over `(state, input)` = "the successor of this state under this input
+    /// satisfies `φ`". Simultaneous substitution ⇒ the concrete next-state
+    /// relation.
+    fn to_next(&self, phi: &BDDFunction) -> BDDFunction {
+        if self.sub_vars.is_empty() {
+            phi.clone()
+        } else {
+            phi.substitute(&Subst::new(self.sub_vars.clone(), self.sub_repl.clone()))
+                .unwrap()
+        }
+    }
+
+    /// `⟨⟩φ` — some successor (over some input) satisfies `φ`: `∃i. to_next(φ)`.
+    pub fn diamond_pre(&self, phi: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        self.to_next(phi).exists(&self.input_cube).unwrap()
+    }
+
+    /// `[]φ` — all successors (over every input) satisfy `φ`: `∀i. to_next(φ)`.
+    pub fn box_pre(&self, phi: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        self.to_next(phi).forall(&self.input_cube).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1963,6 +2059,128 @@ mod tests {
                 &[("cnt", 2), ("tb", 1)],
                 &[("setb", 1)],
                 sem,
+            );
+        }
+    }
+
+    // ---- D1.1: exact full-state 2-valued modal pre-image vs brute force ----
+
+    /// The `ExactModel`'s `box_pre`/`diamond_pre` over the exact (input-
+    /// nondeterministic) concrete relation, checked cell-for-cell against a
+    /// brute-force concrete pre-image. `φ` is the satisfying set of `pred` (a
+    /// full-state BDD via `predicate_bdd`); the brute force enumerates every
+    /// `(state, input)`, simulates one step, and forms `{x : ∃i. pred(next(x,i))}`
+    /// (⟨⟩) and `{x : ∀i. pred(next(x,i))}` ([]) as BDDs of state minterms. BDD
+    /// equality is exact (ROBDD canonical).
+    fn assert_exact_modal_matches_bruteforce(
+        src: &str,
+        pred: &PredicateExpr,
+        states: &[(&str, u32)],
+        inputs: &[(&str, u32)],
+    ) {
+        let file = parser::parse(src).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let exact = bb.exact_model();
+        let phi = bb.predicate_bdd(pred).expect("phi bdd");
+        let dia = exact.diamond_pre(&phi);
+        let boxed = exact.box_pre(&phi);
+
+        // The minterm BDD (over state vars) for one register valuation.
+        let state_minterm = |regs: &HashMap<String, u128>| -> BDDFunction {
+            let mut m = bb.tt.clone();
+            for cell in &bb.cells {
+                if !cell.is_state {
+                    continue;
+                }
+                let val = regs.get(&cell.symbol).copied().unwrap_or(0);
+                for (b, var) in cell.vars.iter().enumerate() {
+                    let lit = if (val >> b) & 1 == 1 {
+                        var.clone()
+                    } else {
+                        var.not().unwrap()
+                    };
+                    m = m.and(&lit).unwrap();
+                }
+            }
+            m
+        };
+
+        let total_state_bits: u32 = states.iter().map(|(_, w)| *w).sum();
+        let total_input_bits: u32 = inputs.iter().map(|(_, w)| *w).sum();
+        assert!(
+            total_state_bits + total_input_bits <= 14,
+            "keep the sweep small"
+        );
+
+        let mut expected_dia = bb.ff.clone();
+        let mut expected_box = bb.ff.clone();
+        for scombo in 0..(1u128 << total_state_bits) {
+            let mut regs: HashMap<String, u128> = HashMap::new();
+            let mut off = 0u32;
+            for (name, w) in states {
+                let mask = (1u128 << w) - 1;
+                regs.insert((*name).to_string(), (scombo >> off) & mask);
+                off += w;
+            }
+            let mut any = false;
+            let mut all = true;
+            for icombo in 0..(1u128 << total_input_bits) {
+                let mut inps: HashMap<String, u128> = HashMap::new();
+                let mut ioff = 0u32;
+                for (name, w) in inputs {
+                    let mask = (1u128 << w) - 1;
+                    inps.insert((*name).to_string(), (icombo >> ioff) & mask);
+                    ioff += w;
+                }
+                let next = simulate_one_step(&file, &regs, &inps).expect("concrete step");
+                let mut regs_next = regs.clone();
+                regs_next.extend(next);
+                let sat = pred.eval(&regs_next);
+                any = any || sat;
+                all = all && sat;
+            }
+            let m = state_minterm(&regs);
+            if any {
+                expected_dia = expected_dia.or(&m).unwrap();
+            }
+            if all {
+                expected_box = expected_box.or(&m).unwrap();
+            }
+        }
+        assert!(
+            dia == expected_dia,
+            "diamond_pre disagrees with brute force"
+        );
+        assert!(boxed == expected_box, "box_pre disagrees with brute force");
+    }
+
+    #[test]
+    fn d1_1_exact_modal_gated_counter() {
+        // The gated counter (cnt gated by untracked tb) — the exact model sees tb,
+        // so the pre-image is precise where predicate abstraction was ⊥.
+        assert_exact_modal_matches_bruteforce(
+            GATED_COUNTER_BTOR2,
+            &PredicateExpr::eq("cnt", 0),
+            &[("cnt", 2), ("tb", 1)],
+            &[("setb", 1)],
+        );
+    }
+
+    #[test]
+    fn d1_1_exact_modal_saturating_counter() {
+        for pred in [
+            PredicateExpr::eq("cnt", 0),
+            PredicateExpr::Cmp {
+                register: "cnt".to_string(),
+                op: CmpOp::Ge,
+                value: 2,
+            },
+        ] {
+            assert_exact_modal_matches_bruteforce(
+                SATURATING_COUNTER_BTOR2,
+                &pred,
+                &[("cnt", 2)],
+                &[("en", 1)],
             );
         }
     }
