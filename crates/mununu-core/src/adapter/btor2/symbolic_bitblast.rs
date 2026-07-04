@@ -2723,6 +2723,37 @@ mod tests {
         );
     }
 
+    /// D1.7 — the exact engine DEGRADES GRACEFULLY on a design too large to
+    /// bit-blast. `BddBitBlaster::build` rejects a design whose register+input
+    /// bit count exceeds `MAX_BITBLAST_BITS` (40) with a clean `Err` — and does so
+    /// BEFORE allocating the BDD manager, so there is no OoM / hang. `build` is the
+    /// first thing `exact_symbolic_verdict` calls, so the whole exact path returns
+    /// `Err` (which `verify_auto`'s exact branch maps to a `Skipped` property, per
+    /// `e2e_sysrst`-style graceful degradation). This locks that OoM-safety
+    /// guarantee for the exact path as a fast, non-docker regression.
+    #[test]
+    fn d1_7_exact_verdict_over_bit_cap_degrades_gracefully() {
+        // One 48-bit register (48 > 40 register+input bits), no inputs. The
+        // formula is immaterial: the cap fires in `build`, before atom
+        // resolution or fixpoint evaluation.
+        const WIDE_BTOR2: &str = r#"
+1 sort bitvec 48
+2 sort bitvec 1
+3 state 1 wide
+4 one 1
+5 add 1 3 4
+6 next 1 3 5
+"#;
+        let formula = crate::mu_calculus::parser::parse("(wide == 0)").expect("formula parses");
+        let err = exact_symbolic_verdict(WIDE_BTOR2, &formula)
+            .expect_err("48-bit design exceeds MAX_BITBLAST_BITS (40) → clean Err, not OoM");
+        assert!(
+            err.contains("register+input bits") && err.contains("48"),
+            "the error must name the bit count + cap so a caller can degrade to \
+             Skipped; got: {err}"
+        );
+    }
+
     /// D1.4 — `resolve_predicate_expr_registers` rewrites every register name in a
     /// `PredicateExpr` tree through the resolver (idempotent on names it doesn't
     /// remap).
