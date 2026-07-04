@@ -1,27 +1,48 @@
 #!/usr/bin/env bash
-# Pre-commit hook — SCOPED VARIANT (2026-06-03).
+# Pre-commit hook — SCOPED VARIANT (2026-07-04).
 #
-# Replaces the prior full-workspace `make ci` invocation with a per-crate
-# scoped test pass. Rationale: `make ci` runs the full workspace nextest
-# (1900+ tests, 30–60 min wall-clock on this hardware) on EVERY commit,
-# which is excessive when most commits touch one or two crates. The
-# scoped variant runs only the tests for touched crates + their
-# downstream consumers.
+# Runs a fast, per-crate check on commit; CI (full nextest sweep + full
+# clippy) is the exhaustive merge gate, and the pre-push hook
+# (scripts/pre-push) adds a cross-crate build check + doctests before a
+# push leaves the machine.
 #
-# Safety net: the pre-push hook (`scripts/pre-push`) runs the full
-# `make ci` before pushing to remote, so cross-crate drift is still
-# caught locally before it lands on GitHub. CI is the final gate.
+# Speed design (why this is fast):
+#   - Scope clippy + tests to the ACTUALLY-touched crates. A mununu-core
+#     change no longer drags mununu-cli + mununu-extract's full test
+#     suites into every commit (that expansion compiled 6 test binaries;
+#     the common core edit now compiles ~1).
+#   - clippy runs on lib+bins (NOT --all-targets), so the crate's test
+#     code is compiled ONCE — by `cargo test` — instead of twice (once by
+#     `clippy --all-targets` for lint, again by `cargo test` to run).
+#     Test-code BUILD errors are still caught (by `cargo test`); only
+#     test-code LINT is deferred to CI's `clippy --workspace --all-targets`.
+#   - A single cheap `cargo check --workspace` (lib+bins, no test compile)
+#     catches cross-crate BUILD drift ("this core change broke cli's
+#     build"). Cross-crate TEST runs are CI's job.
 #
-# Doc-only commits (no `crates/` files touched) skip the test phase
-# entirely — only fmt + machete + the workspace-wide doctest run.
+# Doc-only commits (no crates/ or root Rust touched) skip the compile/test
+# phase entirely.
 #
-# When in doubt, run `make ci` manually before committing — the scoped
-# hook errs on the side of speed, not exhaustiveness.
+# Force the exhaustive local check (full make ci) with:
+#   MUNUNU_PRECOMMIT_FULL=1 git commit ...
+#
+# When in doubt on a big cross-cutting change, run `make ci` manually.
 
 set -e
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+
+if [ "${MUNUNU_PRECOMMIT_FULL:-}" = "1" ]; then
+    echo "Pre-commit (FULL): MUNUNU_PRECOMMIT_FULL=1 — running full-workspace make ci..."
+    make ci
+    echo "Testing API module..."
+    cargo test --lib api --features api
+    echo "Checking for unused dependencies (cargo machete)..."
+    cargo machete
+    echo "All pre-commit checks passed (full sweep)."
+    exit 0
+fi
 
 # Test-runner selection — see the Makefile `test:` target for the full
 # rationale. Short version: on macOS, nextest's one-process-per-test model
@@ -60,35 +81,13 @@ run_pkg_tests() {
 STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
 TOUCHED_CRATES=$(echo "$STAGED" | grep -oE '^crates/[^/]+' | sort -u || true)
 
-# The mununu workspace dep graph (Cargo.toml `[workspace] members = [".",
-# "crates/mununu-core", "crates/mununu-cli", "crates/mununu-extract"]`):
-# - mununu-core: no workspace deps
-# - mununu-cli: depends on mununu-core
-# - mununu-extract: depends on mununu-core
-# - "." (root package "mununu"): umbrella crate with src/lib.rs + src/main.rs;
-#   depends on mununu-core
-#
-# Expansion rules:
-# - mununu-core touched ⇒ all 3 sub-crates need testing (they all
-#   consume mununu-core's API).
-# - Root Cargo.toml / Cargo.lock / src/ changes ⇒ all 4 packages
-#   need testing (dep graph or shared sources may have shifted).
-# - mununu-cli OR mununu-extract alone ⇒ scoped to that crate.
-if echo "$TOUCHED_CRATES" | grep -q 'crates/mununu-core'; then
-    TOUCHED_CRATES="crates/mununu-core
-crates/mununu-cli
-crates/mununu-extract"
-fi
-# Root package touched? Includes root Cargo.toml/Cargo.lock changes
-# (dep graph shift) or root src/*.rs (umbrella crate sources).
+# Root package (`.` workspace member, package name `mununu`) touched? Its
+# src/*.rs or the root Cargo.toml/Cargo.lock (dep-graph shift). Handled as
+# an extra crate in the loop below; the cross-crate `cargo check
+# --workspace` guards downstream build impact either way.
 ROOT_TOUCHED=0
 if echo "$STAGED" | grep -qE '^(src/.*\.rs|Cargo\.toml|Cargo\.lock)$'; then
     ROOT_TOUCHED=1
-    # Conservative: expand to all sub-crates too since the root's
-    # dep graph touches them all.
-    TOUCHED_CRATES="crates/mununu-core
-crates/mununu-cli
-crates/mununu-extract"
 fi
 
 # Always-run cheap checks (no compilation cost).
@@ -98,11 +97,9 @@ cargo fmt --all -- --check
 echo "Checking for unused dependencies (cargo machete)..."
 cargo machete
 
-# When no crate files AND no root sources are staged (e.g. doc-only
-# / plan / README / CI config / scripts changes), skip the compile/
-# test phase entirely. The pre-push hook (cross-crate build check +
-# doctests) and CI (full nextest sweep) still run before the change
-# lands.
+# When no crate files AND no root sources are staged (e.g. doc-only /
+# plan / README / CI config / scripts changes), skip the compile/test
+# phase entirely.
 if [ -z "$TOUCHED_CRATES" ] && [ $ROOT_TOUCHED -eq 0 ]; then
     echo "No Rust sources or Cargo manifests touched; skipping scoped test phase."
     echo "Pre-push (build check + doctests) and CI (full test sweep) run before this lands."
@@ -111,38 +108,41 @@ if [ -z "$TOUCHED_CRATES" ] && [ $ROOT_TOUCHED -eq 0 ]; then
 fi
 
 echo ""
-echo "Scoped test phase — touched crates:"
+echo "Scoped phase — touched crates:"
 echo "$TOUCHED_CRATES" | sed 's/^/  - /'
+[ $ROOT_TOUCHED -eq 1 ] && echo "  - . (root package mununu)"
 echo ""
 
-# Per-crate clippy (with -D warnings, matches the workspace lint rule).
-for crate_path in $TOUCHED_CRATES; do
-    crate=$(basename "$crate_path")
-    echo "Running cargo clippy for $crate..."
-    cargo clippy -p "$crate" --all-targets -- -D warnings
-done
+# Cross-crate BUILD net: catches "a change here broke a consumer crate's
+# build" without compiling/running any crate's test suite. Cheap (lib+bins
+# type-check only). Full cross-crate TEST coverage is CI's job.
+echo "Running cargo check --workspace (cross-crate build)..."
+cargo check --workspace
 
-# Per-crate tests (runner selected above: macOS → cargo test, else nextest).
+# Per touched crate: clippy on lib+bins (fast — no test-binary compile;
+# test-code lint is CI's full `clippy --workspace --all-targets`), then run
+# that crate's tests (this is where the crate's test code is compiled —
+# once — and executed).
 for crate_path in $TOUCHED_CRATES; do
     crate=$(basename "$crate_path")
+    echo "Running cargo clippy for $crate (lib+bins)..."
+    cargo clippy -p "$crate" -- -D warnings
     echo "Running tests for $crate (runner: $TEST_RUNNER)..."
     run_pkg_tests "$crate"
 done
 
-# Root package (`.` workspace member, package name `mununu`) — test
-# only when root src/ or Cargo.toml was touched. The per-crate loop
-# above doesn't cover it because root isn't under `crates/`.
+# Root package (`.` = package `mununu`) — not under crates/, so the loop
+# above doesn't cover it.
 if [ $ROOT_TOUCHED -eq 1 ]; then
-    echo "Running cargo clippy for root package (mununu)..."
-    cargo clippy -p mununu --all-targets -- -D warnings
+    echo "Running cargo clippy for root package (mununu) (lib+bins)..."
+    cargo clippy -p mununu -- -D warnings
     echo "Running tests for root package (mununu) (runner: $TEST_RUNNER)..."
     run_pkg_tests mununu
 fi
 
-# Workspace-wide doctests. Fast — doctests compile + run quickly per
-# item. Kept workspace-scoped because a downstream crate's doctest can
-# fail on an upstream API change even if the upstream test suite
-# passes.
+# Workspace-wide doctests. Doctests compile + run quickly per item, and a
+# downstream crate's doctest can fail on an upstream API change even when
+# the upstream test suite passes — so keep this workspace-scoped.
 echo "Running cargo test --workspace --doc..."
 cargo test --workspace --doc
 
@@ -153,4 +153,5 @@ cargo test --lib api --features api
 
 echo ""
 echo "All pre-commit checks passed."
-echo "NOTE: pre-push runs a cross-crate build check + doctests; CI (nextest) is the full test gate."
+echo "NOTE: pre-commit is scoped to touched crates; CI (nextest) is the full test gate."
+echo "Force the exhaustive local sweep with MUNUNU_PRECOMMIT_FULL=1 git commit."
