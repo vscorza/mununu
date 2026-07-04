@@ -1131,7 +1131,13 @@ fn symbolic_final_verdict(
     let n = 1usize << k;
     let mut must = bitvec![usize, Lsb0; 0; n];
     let mut may = bitvec![usize, Lsb0; 0; n];
+    // `symbolic_cube_verdicts` tallies ONLY feasible cubes. Every other cube
+    // stays absent from `cube_verdicts`. Track which cubes were tallied so the
+    // untallied (infeasible) ones can be projected to ⊥ below — NOT left at
+    // `must=0, may=0`, which `TritSet::verdict_at` reads as a definite-False.
+    let mut tallied = bitvec![usize, Lsb0; 0; n];
     for (cube, trit) in &result.final_verdicts.cube_verdicts {
+        tallied.set(*cube, true);
         match trit {
             crate::mu_calculus::trit::Trit::True => {
                 must.set(*cube, true);
@@ -1141,6 +1147,18 @@ fn symbolic_final_verdict(
                 may.set(*cube, true);
             }
             crate::mu_calculus::trit::Trit::False => {}
+        }
+    }
+    // SOUNDNESS (R-F5.5d projection fix): an infeasible cube — one no concrete
+    // state inhabits, hence absent from the feasible-cube tally — is VACUOUS,
+    // not a definite violation. Projecting it to ⊥ (`may=1, must=0`) prevents an
+    // infeasible `init_cube` from reading as a spurious VIOLATED via
+    // `TritSet::verdict_at` (which maps `must=0, may=0` → `Trit::False`).
+    // Feasible cubes that genuinely evaluate to False stay `must=0, may=0` (a
+    // real violation is preserved) because they ARE tallied.
+    for c in 0..n {
+        if !tallied[c] {
+            may.set(c, true);
         }
     }
     crate::mu_calculus::trit::TritSet::from_parts(must, may)
@@ -1808,6 +1826,48 @@ module uart_tx(); endmodule"#;
 
         let plain = scan_annotation_properties(&src("module m(); endmodule"));
         assert!(annotation_note(&plain).is_none());
+    }
+
+    /// R-F5.5d projection SOUNDNESS fix — an infeasible cube (absent from the
+    /// symbolic feasible-cube tally) must project to ⊥, NOT a spurious
+    /// definite-False. Regression for the unsound VIOLATED verify-auto returned
+    /// on `AG AF` (the symbolic tally covers only feasible cubes; an infeasible
+    /// `init_cube` was reading as `must=0,may=0` → `Trit::False` → VIOLATED).
+    #[test]
+    fn rf5_5d_symbolic_final_verdict_infeasible_cube_is_bottom_not_false() {
+        use crate::adapter::btor2::symbolic_engine::{
+            SymbolicCegarResult, SymbolicCegarTermination, SymbolicCubeVerdicts,
+        };
+        use crate::mu_calculus::trit::Trit;
+        // 2 predicates → 4 cubes; only 0,1 are feasible + tallied. Cubes 2,3 are
+        // infeasible and absent from the tally.
+        let result = SymbolicCegarResult {
+            iterations: Vec::new(),
+            final_predicates: Vec::new(),
+            final_verdicts: SymbolicCubeVerdicts {
+                num_predicates: 2,
+                cube_verdicts: vec![(0, Trit::Unknown), (1, Trit::True)],
+                definite_true: 1,
+                definite_false: 0,
+                bottom: 1,
+            },
+            terminated_with: SymbolicCegarTermination::Converged,
+        };
+        let ts = symbolic_final_verdict(&result);
+        // Feasible cubes keep their verdict.
+        assert_eq!(ts.verdict_at(0), Trit::Unknown);
+        assert_eq!(ts.verdict_at(1), Trit::True);
+        // Infeasible (untallied) cubes are ⊥, never a spurious definite-False.
+        assert_eq!(
+            ts.verdict_at(2),
+            Trit::Unknown,
+            "infeasible cube 2 must project to ⊥, not False"
+        );
+        assert_eq!(
+            ts.verdict_at(3),
+            Trit::Unknown,
+            "infeasible cube 3 must project to ⊥, not False"
+        );
     }
 
     /// R-F5.5d — `symbolic_final_verdict` projects the symbolic engine's per-cube

@@ -1928,6 +1928,78 @@ mod tests {
         }
     }
 
+    /// Gated counter: `cnt` decrements only when the *untracked* register `tb`
+    /// is 1, else holds; `tb' = setb` (free input). Mirrors uart_tx's `bit_cnt_q`
+    /// gated by the `tick_baud_q` register. The predicate set is only `cnt == 0`
+    /// (so `tb` is untracked). With the state `(cnt=1, tb=1)` FORCED to `cnt=0`
+    /// regardless of input, the `∀∃` must-edge `{cnt≠0} → {cnt≠0}` must NOT hold
+    /// (that state escapes). This is the exact structure where the verify-auto
+    /// symbolic engine returned an (apparently unsound) definite verdict on
+    /// `AG AF (bit_cnt==0)` — the brute-force oracle is ground truth.
+    const GATED_COUNTER_BTOR2: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 state 2 tb
+5 input 2 setb
+6 one 1
+7 zero 1
+8 eq 2 3 7
+9 not 2 8
+10 and 2 4 9
+11 sub 1 3 6
+12 ite 1 10 11 3
+13 next 1 3 12
+14 next 2 4 5
+"#;
+
+    #[test]
+    fn rf5_soundness_gated_counter_must_relation_matches_bruteforce() {
+        let predicates = [PredicateExpr::eq("cnt", 0)];
+        for sem in [MustSemantics::ForallExists, MustSemantics::ForallForall] {
+            assert_must_relation_matches_bruteforce(
+                GATED_COUNTER_BTOR2,
+                &predicates,
+                &[("cnt", 2), ("tb", 1)],
+                &[("setb", 1)],
+                sem,
+            );
+        }
+    }
+
+    /// Evaluate `AG AF (cnt==0)` over the gated counter and print the per-cube
+    /// verdict. `c1 = {cnt≠0}` has may-edges to both `c0` and `c1` but (per the
+    /// brute-force-verified relation) NO must-edge, so `AF (cnt==0)` at `c1` must
+    /// be ⊥ (`must=false`, `may=true`), hence `AG AF` is ⊥ — NOT a definite
+    /// VIOLATED. If this prints `False` at a feasible cube, the evaluation is the
+    /// unsoundness source; if `⊥`, the verify-auto VIOLATED comes from elsewhere
+    /// (pinning / shadow / compound / final-verdict projection).
+    #[test]
+    fn rf5_soundness_gated_counter_ag_af_is_bottom_not_violated() {
+        let predicates = [PredicateExpr::eq("cnt", 0)];
+        let file = parser::parse(GATED_COUNTER_BTOR2).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let rel = bb
+            .abstract_relation(&predicates, Some(MustSemantics::ForallExists))
+            .expect("rel");
+        let names = ["done".to_string()];
+        let formula = crate::mu_calculus::parser::parse("nu X. ((mu Y. (done or [] Y)) and [] X)")
+            .expect("formula");
+        let v = rel.evaluate(&formula, &names).expect("eval");
+        for c in rel.feasible_cubes() {
+            let verdict = rel.verdict_at(&v, c);
+            eprintln!("AG AF (cnt==0) @ cube {c}: {verdict:?}");
+            // No feasible cube may be definite-False: the concrete design can
+            // always eventually reach cnt==0 (or stay), so a definite VIOLATED
+            // would be unsound. ⊥ or True are acceptable.
+            assert_ne!(
+                verdict,
+                crate::mu_calculus::trit::Trit::False,
+                "cube {c}: AG AF (cnt==0) is definite-False — unsound over the gated counter"
+            );
+        }
+    }
+
     /// The KMTS invariant `R_must ⊆ R_may` over **feasible** source cubes: every
     /// must-edge out of a satisfiable cube is a may-edge (for both semantics).
     /// An infeasible (unsatisfiable) cube is excluded — it is vacuously a
