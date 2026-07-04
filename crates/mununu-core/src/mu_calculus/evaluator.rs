@@ -4835,6 +4835,159 @@ mod modal_trit_draft_tests {
         }
     }
 
+    // ---- R.6.8 / PO-3: exhaustive per-player soundness audit ----
+
+    /// An INDEPENDENT transcription of the modal verdict rule, written from the
+    /// definitions (`kmts-theory.md` §4.3 for `Control::All`; §7.2 + the de
+    /// Alfaro–Godefroid–Jagadeesan LICS 2004 per-player rule for the
+    /// controllability arms) — NOT from [`modal_trit_core`]. The controllability
+    /// arms use the two-concretisation framing (the definite/`must` game reads the
+    /// establisher on `R_must` and the refuter on `R_may`; the possible/`may` game
+    /// swaps them), structurally distinct from `modal_trit_core`'s fused
+    /// `∀env … ∧ (∃ctrl … ∨ ¬has_ctrl)` form, so exhaustive agreement validates the
+    /// production implementation rather than a shared encoding.
+    fn spec_oracle(kind: ModalKind, control: Control, edges: &[EdgeFacts]) -> Trit {
+        // KMTS target readings (ledger §1): ⟦φ⟧(t)=T ⟺ reaches_must; =F ⟺ !reaches_may.
+        let def_true = |e: &EdgeFacts| e.reaches_must;
+        let not_false = |e: &EdgeFacts| e.reaches_may;
+        let is_env = |e: &&EdgeFacts| !e.controllable;
+        let is_ctrl = |e: &&EdgeFacts| e.controllable;
+        let has_ctrl = edges.iter().any(|e| e.controllable);
+
+        match control {
+            // §4.3 single-agent Kleene modal. R_may = all edges; R_must = must-edges.
+            Control::All => match kind {
+                ModalKind::Diamond => {
+                    // T iff ∃ must-edge with φ=T; F iff ∀ may-edge with φ=F.
+                    if edges.iter().any(|e| e.is_must && def_true(e)) {
+                        Trit::True
+                    } else if edges.iter().all(|e| !not_false(e)) {
+                        Trit::False
+                    } else {
+                        Trit::Unknown
+                    }
+                }
+                ModalKind::Box => {
+                    // T iff ∀ may-edge with φ=T; F iff ∃ must-edge with φ=F.
+                    if edges.iter().all(def_true) {
+                        Trit::True
+                    } else if edges.iter().any(|e| e.is_must && !not_false(e)) {
+                        Trit::False
+                    } else {
+                        Trit::Unknown
+                    }
+                }
+            },
+            // §7.2 controller-predecessor. Establisher = controller (controllable
+            // edges); refuter = environment. Per-player: establisher on R_must,
+            // refuter on R_may. `kind` is subsumed (reaches_* are kind-aware upstream).
+            Control::Controllable => {
+                // Definite-T (must game): every environment MAY-move good, and the
+                // controller has a MUST-move good (or has no controllable choice).
+                let def_t = edges.iter().filter(is_env).all(def_true)
+                    && (edges
+                        .iter()
+                        .any(|e| e.controllable && e.is_must && def_true(e))
+                        || !has_ctrl);
+                // Possible-T (may game): no environment MUST-move definitely bad, and
+                // optimistically some controllable MAY-move good (or no ctrl choice).
+                let poss_t = edges
+                    .iter()
+                    .filter(|e| !e.controllable && e.is_must)
+                    .all(not_false)
+                    && (edges.iter().any(|e| e.controllable && not_false(e)) || !has_ctrl);
+                trit_of(def_t, poss_t)
+            }
+            // §7.2 environment perspective — the De Morgan dual: ∃ uncontrollable OR
+            // ∀ controllable.
+            Control::Environment => {
+                let def_t = edges
+                    .iter()
+                    .any(|e| !e.controllable && e.is_must && def_true(e))
+                    || (has_ctrl && edges.iter().filter(is_ctrl).all(def_true));
+                let poss_t = edges.iter().any(|e| !e.controllable && not_false(e))
+                    || (has_ctrl
+                        && edges
+                            .iter()
+                            .filter(|e| e.controllable && e.is_must)
+                            .all(not_false));
+                trit_of(def_t, poss_t)
+            }
+        }
+    }
+
+    fn trit_of(def_t: bool, poss_t: bool) -> Trit {
+        if def_t {
+            Trit::True
+        } else if poss_t {
+            Trit::Unknown
+        } else {
+            Trit::False
+        }
+    }
+
+    /// R.6.8 / PO-3 (per-player preservation audit) — the done-criterion's
+    /// **exhaustive** validation, discharging the gap the closure left open (it
+    /// rested on 9 hand-picked spot-checks + one over-claim corner regression).
+    ///
+    /// `modal_trit_core`'s value depends only on WHICH of the 12 achievable edge
+    /// types are present (its quantifiers are set-valued, and a transition's
+    /// `reaches_must ⟹ reaches_may` since `must_set ⊆ may_set`, so those are the
+    /// only `(reaches_must, reaches_may)` combos any lifter can produce — including
+    /// hyper-must edges under the kind-aware forcing-set readers). Enumerating all
+    /// `2^12` type-subsets × {Box, Diamond} × {All, Controllable, Environment} is
+    /// therefore a *complete* check that the production per-player rule
+    /// (`modal_trit_from_target` → `modal_trit_core`) realises the §7.2 rule.
+    ///
+    // SOUNDNESS: this test is the R.6.8 gate. Exhaustive agreement of
+    // `modal_trit_core` (production) with `spec_oracle` (an independent
+    // from-the-definition transcription) over every achievable edge configuration
+    // is the mechanised per-player preservation argument of de Alfaro–Godefroid–
+    // Jagadeesan LICS 2004 / kmts-theory §7.3 — the argument the §7.5 closure
+    // asserted but had only spot-checked. A DEFINITE controllability verdict may be
+    // claimed sound because this holds.
+    #[test]
+    fn r6_8_modal_trit_core_matches_spec_oracle_exhaustively() {
+        // The 12 achievable edge types: controllable × is_must × φ-target.
+        let edge_types: Vec<EdgeFacts> = [false, true]
+            .iter()
+            .flat_map(|&controllable| {
+                [false, true].iter().flat_map(move |&is_must| {
+                    [Trit::False, Trit::Unknown, Trit::True]
+                        .iter()
+                        .map(move |&target| edge(controllable, is_must, target))
+                })
+            })
+            .collect();
+        assert_eq!(edge_types.len(), 12);
+
+        let controls = [Control::All, Control::Controllable, Control::Environment];
+        let kinds = [ModalKind::Diamond, ModalKind::Box];
+
+        let mut checked = 0usize;
+        for mask in 0u32..(1 << 12) {
+            let edges: Vec<EdgeFacts> = (0..12)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| edge_types[i])
+                .collect();
+            for &control in &controls {
+                for &kind in &kinds {
+                    assert_eq!(
+                        modal_trit_core(kind, control, &edges),
+                        spec_oracle(kind, control, &edges),
+                        "per-player rule mismatch: kind={kind:?} control={control:?} edges={edges:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            (1usize << 12) * 6,
+            "exhaustive over 2^12 subsets × 6 corners"
+        );
+    }
+
     // ---- Integration tests: through a real KMTS Clts + EvalContext ----
 
     fn ctx<'a>(
