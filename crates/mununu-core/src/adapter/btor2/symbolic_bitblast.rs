@@ -1414,6 +1414,108 @@ impl ExactModel {
         use oxidd::BooleanFunctionQuant;
         self.to_next(phi).forall(&self.input_cube).unwrap()
     }
+
+    /// D1.2 — evaluate a **2-valued** μ-calculus `formula` over the exact model,
+    /// returning the BDD of states that satisfy it. No abstraction ⇒ the answer is
+    /// definite (no `⊥`); the whole modal-μ fragment is decided exactly, bounded
+    /// only by BDD size. `atoms` maps each predicate-atom name to its full-state
+    /// BDD (the caller builds these via [`BddBitBlaster::predicate_bdd`]); an
+    /// unresolved atom is `⊥` (empty set), never silently true.
+    ///
+    /// Modalities are **bare** `[]`/`<>` in D1.2 (the fragment the liveness
+    /// showcase uses). Guarded / controllability / step-bounded modalities are an
+    /// honest error — state-predicate guards over the exact relation are a D1.2b
+    /// follow-up (they mirror [`AbstractRelation::guarded_relations`], 2-valued).
+    pub fn evaluate(
+        &self,
+        formula: &Formula,
+        atoms: &HashMap<&str, BDDFunction>,
+    ) -> Result<BDDFunction, String> {
+        let mut bindings: HashMap<FormulaVarId, BDDFunction> = HashMap::new();
+        self.eval_node(formula, formula.root(), atoms, &mut bindings)
+    }
+
+    fn eval_node(
+        &self,
+        f: &Formula,
+        id: crate::mu_calculus::NodeId,
+        atoms: &HashMap<&str, BDDFunction>,
+        bindings: &mut HashMap<FormulaVarId, BDDFunction>,
+    ) -> Result<BDDFunction, String> {
+        Ok(match f.node(id) {
+            MuNode::True => self.tt.clone(),
+            MuNode::False => self.ff.clone(),
+            MuNode::Predicate(name) => atoms
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_else(|| self.ff.clone()),
+            MuNode::Variable(v) => bindings
+                .get(v)
+                .cloned()
+                .ok_or_else(|| format!("unbound fixpoint variable {v:?}"))?,
+            MuNode::Not(n) => self.eval_node(f, *n, atoms, bindings)?.not().unwrap(),
+            MuNode::And(a, b) => {
+                let av = self.eval_node(f, *a, atoms, bindings)?;
+                let bv = self.eval_node(f, *b, atoms, bindings)?;
+                av.and(&bv).unwrap()
+            }
+            MuNode::Or(a, b) => {
+                let av = self.eval_node(f, *a, atoms, bindings)?;
+                let bv = self.eval_node(f, *b, atoms, bindings)?;
+                av.or(&bv).unwrap()
+            }
+            MuNode::Modal {
+                kind,
+                guard,
+                target,
+            } => {
+                if *guard != Guard::default() {
+                    return Err(
+                        "exact μ-calculus MC (D1.2): only bare `[]`/`<>` modalities are supported \
+                         yet — guarded / controllability / step-bounded modalities are a D1.2b \
+                         follow-up"
+                            .into(),
+                    );
+                }
+                let phi = self.eval_node(f, *target, atoms, bindings)?;
+                match kind {
+                    ModalKind::Box => self.box_pre(&phi),
+                    ModalKind::Diamond => self.diamond_pre(&phi),
+                }
+            }
+            MuNode::Mu { var, body } => self.fixpoint(f, *var, *body, atoms, bindings, false)?,
+            MuNode::Nu { var, body } => self.fixpoint(f, *var, *body, atoms, bindings, true)?,
+        })
+    }
+
+    /// Kleene iteration for a least (`greatest=false`, from `⊥`) or greatest
+    /// (`greatest=true`, from `⊤`) fixpoint. Convergence is exact set equality —
+    /// ROBDDs are canonical, so `==` is the fixpoint test, and over a finite state
+    /// space it converges in ≤ |states| steps (the iteration *is* the ranking).
+    fn fixpoint(
+        &self,
+        f: &Formula,
+        var: FormulaVarId,
+        body: crate::mu_calculus::NodeId,
+        atoms: &HashMap<&str, BDDFunction>,
+        bindings: &mut HashMap<FormulaVarId, BDDFunction>,
+        greatest: bool,
+    ) -> Result<BDDFunction, String> {
+        let mut x = if greatest {
+            self.tt.clone()
+        } else {
+            self.ff.clone()
+        };
+        loop {
+            bindings.insert(var, x.clone());
+            let next = self.eval_node(f, body, atoms, bindings)?;
+            if next == x {
+                bindings.remove(&var);
+                return Ok(next);
+            }
+            x = next;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2183,6 +2285,192 @@ mod tests {
                 &[("en", 1)],
             );
         }
+    }
+
+    // ---- D1.2: exact full-state 2-valued μ-evaluator vs evaluate_tri ----
+
+    /// The exact `ExactModel::evaluate` (2-valued, full-state BDD) agrees with the
+    /// reference `evaluate_tri` on the equivalent **Sharp concrete** Kripke
+    /// structure (states = concrete register valuations, Sharp edges over every
+    /// input). Both are exact ⇒ definite; a state is in the exact set iff
+    /// `evaluate_tri` returns `True` there. Includes `AF`/`AG AF` — the liveness
+    /// the *abstraction* path answers ⊥ but the exact path decides.
+    fn assert_exact_eval_matches_tri(
+        src: &str,
+        predicates: &[(&str, PredicateExpr)],
+        states: &[(&str, u32)],
+        inputs: &[(&str, u32)],
+        formulas: &[&str],
+    ) {
+        use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, TransitionModality, Tristate};
+        use crate::mu_calculus::evaluator::{Environment, evaluate_tri};
+        use crate::mu_calculus::trit::Trit;
+
+        let file = parser::parse(src).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let exact = bb.exact_model();
+        let atoms: HashMap<&str, BDDFunction> = predicates
+            .iter()
+            .map(|(n, e)| (*n, bb.predicate_bdd(e).expect("pred bdd")))
+            .collect();
+
+        let total_state_bits: u32 = states.iter().map(|(_, w)| *w).sum();
+        let total_input_bits: u32 = inputs.iter().map(|(_, w)| *w).sum();
+        assert!(
+            total_state_bits + total_input_bits <= 14,
+            "keep the sweep small"
+        );
+        let n = 1usize << total_state_bits;
+
+        let decode = |combo: u128| -> HashMap<String, u128> {
+            let mut regs = HashMap::new();
+            let mut off = 0u32;
+            for (name, w) in states {
+                let mask = (1u128 << w) - 1;
+                regs.insert((*name).to_string(), (combo >> off) & mask);
+                off += w;
+            }
+            regs
+        };
+        let encode = |regs: &HashMap<String, u128>| -> usize {
+            let mut combo = 0usize;
+            let mut off = 0u32;
+            for (name, w) in states {
+                let v = regs.get(*name).copied().unwrap_or(0) as usize;
+                combo |= (v & ((1usize << w) - 1)) << off;
+                off += w;
+            }
+            combo
+        };
+
+        // Explicit Sharp Kripke structure over the 2^bits concrete states.
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        for j in 0..n {
+            b.state(format!("s{j}"));
+        }
+        b.initial("s0");
+        let step = b.labels().intern(["step"]).unwrap();
+        let ids: Vec<_> = (0..n)
+            .map(|j| b.state_id_or_insert(format!("s{j}")).unwrap())
+            .collect();
+        for (j, &id) in ids.iter().enumerate() {
+            let regs = decode(j as u128);
+            for (name, e) in predicates {
+                let v = if e.eval(&regs) {
+                    Tristate::KleeneT
+                } else {
+                    Tristate::KleeneF
+                };
+                b.with_3valued_predicate(id, *name, v);
+            }
+        }
+        for (j, &id) in ids.iter().enumerate() {
+            let regs = decode(j as u128);
+            for icombo in 0..(1u128 << total_input_bits) {
+                let mut inps = HashMap::new();
+                let mut ioff = 0u32;
+                for (name, w) in inputs {
+                    let mask = (1u128 << w) - 1;
+                    inps.insert((*name).to_string(), (icombo >> ioff) & mask);
+                    ioff += w;
+                }
+                let next = simulate_one_step(&file, &regs, &inps).expect("step");
+                let mut regs_next = regs.clone();
+                regs_next.extend(next);
+                let jt = encode(&regs_next);
+                b.transition_ids_with_modality(id, &[step], ids[jt], TransitionModality::Sharp);
+            }
+        }
+        let clts = b.build().expect("clts builds");
+
+        let state_minterm = |regs: &HashMap<String, u128>| -> BDDFunction {
+            let mut m = bb.tt.clone();
+            for cell in &bb.cells {
+                if !cell.is_state {
+                    continue;
+                }
+                let val = regs.get(&cell.symbol).copied().unwrap_or(0);
+                for (bit, var) in cell.vars.iter().enumerate() {
+                    let lit = if (val >> bit) & 1 == 1 {
+                        var.clone()
+                    } else {
+                        var.not().unwrap()
+                    };
+                    m = m.and(&lit).unwrap();
+                }
+            }
+            m
+        };
+
+        let env = Environment::new(clts.state_count());
+        for fs in formulas {
+            let formula = crate::mu_calculus::parser::parse(fs).expect("formula parses");
+            let tri = evaluate_tri(&formula, &clts, &env).expect("evaluate_tri");
+            let ex = exact.evaluate(&formula, &atoms).expect("exact evaluate");
+            for j in 0..n {
+                let regs = decode(j as u128);
+                let m = state_minterm(&regs);
+                let in_exact = m.and(&ex).unwrap() == m;
+                let tri_true = tri.verdict_at(j) == Trit::True;
+                assert_eq!(
+                    in_exact,
+                    tri_true,
+                    "formula `{fs}` at s{j} ({regs:?}): exact∈={in_exact} tri={:?}",
+                    tri.verdict_at(j)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn d1_2_exact_eval_gated_counter_matches_tri() {
+        // `cnt` gated by untracked `tb`: AF(cnt==0) is definite-False at states that
+        // can loop with tb=0 (setb kept 0), definite elsewhere — the exact path
+        // decides it where abstraction was ⊥.
+        assert_exact_eval_matches_tri(
+            GATED_COUNTER_BTOR2,
+            &[("p", PredicateExpr::eq("cnt", 0))],
+            &[("cnt", 2), ("tb", 1)],
+            &[("setb", 1)],
+            &[
+                "[] p",
+                "<> p",
+                "not p",
+                "nu X. (p and [] X)",                   // AG p
+                "mu X. (p or <> X)",                    // EF p
+                "mu X. (p or [] X)",                    // AF p  (the liveness)
+                "nu X. ((mu Y. (p or [] Y)) and [] X)", // AG AF p
+                "nu Y. ((mu X. (p or <> X)) and [] Y)", // AG EF p
+            ],
+        );
+    }
+
+    #[test]
+    fn d1_2_exact_eval_saturating_counter_matches_tri() {
+        assert_exact_eval_matches_tri(
+            SATURATING_COUNTER_BTOR2,
+            &[
+                ("p", PredicateExpr::eq("cnt", 0)),
+                (
+                    "q",
+                    PredicateExpr::Cmp {
+                        register: "cnt".to_string(),
+                        op: CmpOp::Ge,
+                        value: 2,
+                    },
+                ),
+            ],
+            &[("cnt", 2)],
+            &[("en", 1)],
+            &[
+                "[] q",
+                "<> q",
+                "p or q",
+                "mu X. (q or [] X)",                    // AF q
+                "nu X. ((mu Y. (q or [] Y)) and [] X)", // AG AF q
+                "nu Y. ((mu X. (q or <> X)) and [] Y)", // AG EF q
+            ],
+        );
     }
 
     /// Evaluate `AG AF (cnt==0)` over the gated counter and print the per-cube
