@@ -1,13 +1,15 @@
 # Post-R-F5 architecture — predicate abstraction, explicit & symbolic model checking
 
-> Status: planning — describes the target architecture once the R-F5 symbolic track
-> is deployed. R-F5.0 (the OxiDD spike, `mu_calculus/symbolic.rs`) has shipped; R-F5.1–.4
-> are planned (see [`.claude/plans/r-f5-symbolic-bdd-track.md`] — gitignored). Sections
-> tagged **(planned)** are not yet in `main`; everything else describes shipped code.
+> Concept + design note — an architecture/theory overview, exempt from the
+> `Source of truth:` anchor rule per CLAUDE.md §Documentation Traceability. Every
+> named symbol below is a real, greppable artifact.
 >
-> Concept + design note — exempt from the `Source of truth:` anchor rule per
-> CLAUDE.md §Documentation Traceability, but every named symbol below is a real
-> artifact you can grep for.
+> Status (as-built): the R-F5 symbolic track has **shipped** — R-F5.0 (the OxiDD
+> spike, `mu_calculus/symbolic.rs`) through R-F5.5 (symbolic CEGAR loop, `--engine
+> symbolic` on `sv verify-auto`, and state-predicate-guarded modalities in the cube
+> evaluator). The remaining item is **R-F5.6** — a cone-of-influence restriction for
+> large designs; the symbolic engine is bit-count-capped until then. The few sections
+> still tagged **(planned)** below name that residual gap, not the whole track.
 
 ## 0. TL;DR
 
@@ -49,7 +51,8 @@ flowchart LR
 - **Domain** is chosen by soundness need: 2-valued for exact/Sharp models, 3-valued
   (Kleene) whenever the abstraction carries a may/must split.
 
-R-F5 fills in the **Symbolic** cell of Axis 2. The other cells already ship.
+R-F5 fills in the **Symbolic** cell of Axis 2 — now shipped alongside the other cells,
+selectable per run via `--engine symbolic`.
 
 ---
 
@@ -68,14 +71,14 @@ flowchart TD
   B2 --> STS["STS-IR seam<br/>StsVar + StepEval + SmtEncode<br/>(BtorSts wraps Btor2File; hides Z3/NID)"]
 
   STS -->|"StepEval::step"| ENUM["Explicit-Enumerate strategy<br/>(bit_blast) — Sharp CLTS"]
-  STS -->|"SmtEncode::may_edges + must"| CUBE["Explicit predicate-cube lift<br/>(kmts_lift::predicate_cube_lift)"]
-  STS -->|"symbolic relation build (planned)"| SYM["Symbolic predicate-cube (BDD)<br/>(mu_calculus/symbolic.rs — R-F5)"]
+  STS -->|"SmtEncode::may_edges + must<br/>(--engine explicit, default)"| CUBE["Explicit predicate-cube lift<br/>(kmts_lift::predicate_cube_lift)"]
+  STS -->|"BDD relation build (--engine symbolic)"| SYM["Symbolic predicate-cube (BDD)<br/>(symbolic_bitblast::BddBitBlaster<br/>→ AbstractRelation)"]
 
   ENUM --> CLTS["Clts (K)MTS<br/>states + may/must transitions + 3-valued labels"]
   CUBE --> CLTS
 
   CLTS --> EVX["Explicit evaluator<br/>evaluate / evaluate_tri<br/>(BoolDom / KleeneDom over BitVec)"]
-  SYM --> EVS["Symbolic evaluator (planned)<br/>BDD image/preimage fixpoint<br/>(TritBdd = must/may BDD pair)"]
+  SYM --> EVS["Symbolic evaluator<br/>SymbolicKmts::evaluate — BDD image/preimage fixpoint<br/>(TritBdd = must/may BDD pair)"]
 
   OTH --> CLTS
 
@@ -107,7 +110,7 @@ flowchart TD
   L2["<b>L2 STS-IR seam</b> — frontend-agnostic transition system<br/>StsVar, SymbolicTransitionSystem, StepEval, SmtEncode<br/>impl: BtorSts&lt;'a&gt;(&amp;'a Btor2File)"]
   L3["<b>L3 Predicate layer</b> — the abstraction<br/>PredicateSpec {name, register, value}<br/>PredicateExpr {Cmp, CmpReg, CmpRegAddend, And, Or, Not}"]
   L4A["<b>L4a Automata IR (explicit)</b><br/>Clts / Transition / TransitionModality / Tristate labels"]
-  L4B["<b>L4b Symbolic IR (planned, R-F5)</b><br/>SymbolicRelation {r_may, r_must : Bdd}<br/>state-AP labels as Bdd"]
+  L4B["<b>L4b Symbolic IR (R-F5)</b><br/>SymbolicKmts / AbstractRelation {r_may, r_must : Bdd}<br/>state-AP labels as Bdd (TritBdd)"]
   L5A["<b>L5a Verdict (explicit)</b><br/>TritSet {must_true, may_true : BitVec}"]
   L5B["<b>L5b Verdict (symbolic, R-F5)</b><br/>TritBdd {must, may : Bdd}"]
 
@@ -185,20 +188,28 @@ pub enum Tristate { KleeneT, KleeneF, KleeneBot }  // per-(state, AP) 3-valued l
 //              and state_3valued_predicates: Option<BTreeMap<(StateId, String), Tristate>>.
 ```
 
-### L4b / L5b — Symbolic IR (planned, R-F5)
+### L4b / L5b — Symbolic IR (R-F5)
 
 The BDD twin of L4a/L5a. State sets and the transition relation are OxiDD BDDs over the
 predicate-bit variables (present `x` and next `x'`):
 
 ```rust
 // A 3-valued state set (the symbolic TritSet): a pair of BDDs over present vars, must ⊑ may.
+// (mu_calculus/symbolic.rs) — bridges losslessly to/from the explicit TritSet.
 struct TritBdd { must: BDDFunction, may: BDDFunction }
 
-// The symbolic transition relation (R-F5.2/.3): two BDDs over present+next vars.
-struct SymbolicRelation { r_may: BDDFunction, r_must: BDDFunction }
+// The symbolic KMTS built from a Clts: the may/must relation + AP labels as BDDs.
+// (mu_calculus/symbolic.rs) — SymbolicKmts::from_clts / ::evaluate.
+struct SymbolicKmts { /* r_may, r_must, per-label edges + state-var BDDs */ }
+
+// The BTOR2-derived abstract relation, built directly by the BDD bit-blaster
+// (adapter/btor2/symbolic_bitblast.rs::BddBitBlaster::abstract_relation).
+struct AbstractRelation { /* r_may, r_must : BDDFunction over present+next preds */ }
 ```
 
 `R_must ⊆ R_may` mirrors `Sharp ⊆ may`; a hyper-must is a disjunction over its target set.
+`SymbolicKmts` is the general path (any `Clts`); `AbstractRelation` is the BTOR2
+predicate-cube path that builds the relation once, without per-cube-pair SMT (§5).
 
 ### L5a — Verdict (`TritSet`)
 
@@ -277,9 +288,9 @@ flowchart TB
     ex4["Verdict: TritSet (must/may BitVec)"]
     ex1 --> ex2 --> ex3 --> ex4
   end
-  subgraph SY["Symbolic engine (R-F5, planned)"]
+  subgraph SY["Symbolic engine (R-F5, shipped)"]
     sy1["No cube enumeration — vars = predicate bits"]
-    sy2["Build R_may / R_must as BDDs<br/>(R-F5.3: from BTOR2, once — not per pair)"]
+    sy2["Build R_may / R_must as BDDs<br/>(BddBitBlaster, from BTOR2, once — not per pair)"]
     sy3["Fixpoint: BDD image/preimage<br/>∃x'. R(x,x') ∧ φ(x')  via apply_exists(And,…)"]
     sy4["Verdict: TritBdd (must/may BDD)"]
     sy1 --> sy2 --> sy3 --> sy4
@@ -404,29 +415,43 @@ engines. Swapping the engine changes cost, not correctness.
 
 ```mermaid
 flowchart LR
-  subgraph SHIP["Shipped"]
+  subgraph SHIP["Shipped (R-F5.0 – .5)"]
     d1["STS-IR seam (StsVar / StepEval / SmtEncode / BtorSts)"]
     d2["Predicate layer (PredicateSpec / PredicateExpr)"]
     d3["Explicit engines: Enumerate + predicate-cube lift"]
     d4["Clts KMTS (Sharp / MayOnly / MustHyperOnly + Tristate)"]
     d5["Explicit evaluator (BoolDom / KleeneDom, TritSet)"]
-    d6["R-F5.0 spike: OxiDD BDD box-preimage + νX fixpoint,<br/>validated cell-for-cell vs evaluate_tri"]
+    d6["R-F5.0–.2 symbolic engine: SymbolicContext / TritBdd /<br/>SymbolicKmts — BDD image/preimage νμ fixpoint,<br/>validated cell-for-cell vs evaluate_tri"]
+    d7["R-F5.2b guarded modalities (label + current/next state)"]
+    d8["R-F5.3 symbolic R_may/R_must from BTOR2<br/>(BddBitBlaster → AbstractRelation, built once — not per pair)"]
+    d9["R-F5.4 --engine symbolic on btor2/sv cegar (CLI + API)"]
+    d10["R-F5.5 symbolic CEGAR loop + verify-auto wiring +<br/>compound-predicate cube dims"]
   end
-  subgraph PLAN["Planned (R-F5.1 – .4)"]
-    p1["R-F5.1 BDD-backed TritSet (TritBdd)"]
-    p2["R-F5.2 symbolic modal step in the evaluator"]
-    p3["R-F5.3 symbolic R_may/R_must from BTOR2<br/>(the O(2^2P)-SMT-avoidance win — hard/open)"]
-    p4["R-F5.4 wire into verify-auto; parity; make default once faster"]
+  subgraph PLAN["Remaining"]
+    p1["R-F5.6 cone-of-influence restriction<br/>(symbolic engine is bit-count-capped today)"]
+    p2["Out-of-fragment over cubes (honest errors, not planned):<br/>controllability (ctrl) + step-bounded (steps) modalities;<br/>MustHyperOnly edges on the symbolic path"]
   end
   SHIP --> PLAN
 ```
 
-**The open risk lives in R-F5.3.** Building `R_may`/`R_must` as BDDs directly from the
-BTOR2 predicate definitions (rather than `O(2^2|P|)` SMT queries) may require bit-blasting
-word-level arithmetic to BDDs (which can blow up differently), keeping SMT but calling it
-`O(construction)` instead of per-pair, or a hybrid — an open, measurement-driven question.
-The R-F5.0 spike deliberately validated the *evaluation* side (given a symbolic relation)
-and left *construction* to R-F5.3.
+**What shipped (R-F5.0–.5).** The symbolic engine is selectable via `--engine symbolic`
+on `btor2 cegar`, `sv cegar`, and `sv verify-auto` (CLI + API). It bit-blasts the BTOR2
+design to BDDs (`BddBitBlaster`), builds `R_may`/`R_must` as an `AbstractRelation`
+**once** — a single `substitute` + `apply_exists` per predicate, the
+`O(2^2|P|)`-SMT-avoidance win, no per-cube-pair SMT — and evaluates the mu-calculus by
+BDD image/preimage in `SymbolicKmts`. Every symbolic verdict is validated cell-for-cell
+against the explicit `evaluate_tri` in the test suite, including nested νμ and guarded
+modalities. This resolved the R-F5.0 spike's open question — the spike validated the
+*evaluation* side (given a symbolic relation) and R-F5.3 delivered the *construction*
+side via BDD bit-blasting.
+
+**The remaining item is R-F5.6 (cone-of-influence).** `BddBitBlaster` currently
+bit-blasts the whole design, so the symbolic engine is gated by a bit-count cap
+(`MAX_SYMBOLIC_CUBE_BITS`) and skips designs above it (real sysrst RTL hits the cap).
+Restricting the bit-blast to the predicate cone-of-influence is the scaling work that
+lifts the cap. Independently, controllability (`ctrl`) and step-bounded (`steps`)
+modalities, and `MustHyperOnly` edges on the symbolic path, are **honest errors** (out of
+the predicate-cube fragment) rather than planned features — see `mu_calculus/symbolic.rs`.
 
 ---
 
@@ -437,7 +462,12 @@ and left *construction* to R-F5.3.
 - [`docs/design/native-sv-abstraction.md`](native-sv-abstraction.md) — the SV predicate-
   abstraction pipeline (§6 KMTS recipe, §6.10 UF abstraction).
 - [`docs/abstraction.md`](../abstraction.md) — per-subsystem abstraction recipe.
-- `crates/mununu-core/src/mu_calculus/symbolic.rs` — the R-F5.0 spike.
+- `crates/mununu-core/src/mu_calculus/symbolic.rs` — `SymbolicContext` / `TritBdd` /
+  `SymbolicKmts` (the BDD engine + symbolic mu-calculus evaluator).
+- `crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs` — `BddBitBlaster` /
+  `AbstractRelation` (symbolic `R_may`/`R_must` from BTOR2, built once).
+- `crates/mununu-core/src/adapter/btor2/symbolic_engine.rs` — `symbolic_cube_verdicts`
+  / `symbolic_cegar_refine` (the symbolic predicate-cube + CEGAR entry points).
 - `crates/mununu-core/src/mu_calculus/trit.rs` — `Trit` / `TritSet`.
 - `crates/mununu-core/src/clts/mod.rs` — `Clts` / `Transition` / `TransitionModality` /
   `Tristate`.
