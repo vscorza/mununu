@@ -1812,6 +1812,40 @@ fn is_box_over_var(
     )
 }
 
+/// D1.8c — build the sound μ-calculus formula that verifies the GR(1) response
+/// property `GF assume → GF guarantee` over the **exact** engine. `assume` and
+/// `guarantee` are predicate expressions (e.g. `"req == 1"`).
+///
+/// The property FAILS iff the system has a reachable **bad cycle** — a cycle that
+/// hits `assume` infinitely often (`GF assume`) yet avoids `guarantee` forever
+/// (`FG ¬guarantee`). The generated formula is `¬EF badcycle`, where
+///
+/// ```text
+/// badcycle = νZ. μY. ((assume ∧ ¬guarantee ∧ ◇Z) ∨ (¬guarantee ∧ ◇Y))
+/// EF X     = μW. (X ∨ ◇W)
+/// ```
+///
+/// `badcycle` is the Emerson–Lei fair-cycle set — an infinite `¬guarantee` path
+/// recurring through `assume` — and `◇` is `∃input` in the exact model, so this reads
+/// "∃ a bad input sequence". Fed to [`exact_symbolic_verdict`] (or a
+/// `@mununu_guarantee` annotation on the exact-symbolic verify-auto path), the exact
+/// engine reports **Holds** iff the reset state cannot reach any bad cycle — i.e. the
+/// GR(1) property genuinely holds on all paths (a *definite*, sound liveness verdict
+/// where the existential LTL `GF` translation `AG EF` and predicate abstraction do
+/// not).
+///
+/// Scope: a single `assume`/`guarantee` pair (the GR(1) response core). Generalised
+/// (Streett) multi-fairness `⋀ GF aᵢ → ⋀ GF bⱼ` is a future extension.
+pub fn gr1_response_formula(assume: &str, guarantee: &str) -> String {
+    // badcycle = νZ. μY. ((A ∧ ¬B ∧ ◇Z) ∨ (¬B ∧ ◇Y))
+    let bad = format!(
+        "nu Z. (mu Y. (((({assume}) and (not ({guarantee}))) and <> Z) \
+         or ((not ({guarantee})) and <> Y)))"
+    );
+    // ¬EF badcycle = ¬ μW. (badcycle ∨ ◇W)
+    format!("not (mu W. (({bad}) or <> W))")
+}
+
 /// D1.8 — a **stall lasso**: the concrete counterexample witness for a `Violated`
 /// `AF p` (all-paths-eventually-`p`) property from the exact engine. `AF p` fails
 /// exactly when some initial state can avoid `p` forever — reach a `¬p` cycle
@@ -3278,6 +3312,64 @@ mod tests {
         for st in &lasso.cycle {
             assert_ne!(st.get("cnt"), Some(&1));
         }
+    }
+
+    /// D1.8c — the generated GR(1) response formula `GF a → GF b` gives the correct
+    /// **definite** verdict over the exact engine on hand-verified models. Validates
+    /// the soundness-critical alternating-fixpoint structure of `gr1_response_formula`
+    /// against known GR(1) truth.
+    #[test]
+    fn d1_8c_gr1_response_formula_verdicts() {
+        let formula = crate::mu_calculus::parser::parse(&gr1_response_formula("s == 0", "s == 1"))
+            .expect("gr1 formula parses");
+
+        // TOGGLE: forced s0⇄s1. Every path hits s==0 and s==1 infinitely, so
+        // `GF(s==0) → GF(s==1)` HOLDS (no ¬(s==1) cycle exists).
+        const TOGGLE: &str = r#"
+1 sort bitvec 1
+2 state 1 s
+3 not 1 2
+4 next 1 2 3
+5 zero 1
+6 init 1 2 5
+"#;
+        assert_eq!(
+            exact_symbolic_verdict(TOGGLE, &formula).expect("verdict"),
+            ExactVerdict::Holds,
+            "forced toggle: GF(s==0) → GF(s==1) holds"
+        );
+
+        // STAYLOOP: s0 (s==0, ¬(s==1)) self-loops under `stay`, else advances to s1.
+        // `stay=1` forever keeps s==0 (assume recurs) and never reaches s==1 — a
+        // reachable assume-recurring guarantee-avoiding cycle ⇒ VIOLATED.
+        const STAYLOOP: &str = r#"
+1 sort bitvec 1
+2 state 1 s
+3 input 1 stay
+4 zero 1
+5 one 1
+6 eq 1 2 4
+7 ite 1 3 4 5
+8 ite 1 6 7 4
+9 next 1 2 8
+10 init 1 2 4
+"#;
+        assert_eq!(
+            exact_symbolic_verdict(STAYLOOP, &formula).expect("verdict"),
+            ExactVerdict::Violated,
+            "stay-loop: an assume-recurring, guarantee-avoiding cycle is reachable"
+        );
+
+        // Vacuous: an unsatisfiable assume (`s == 3` over a 1-bit register) makes
+        // `GF assume` false, so `GF assume → GF guarantee` holds trivially — no bad
+        // cycle can recur through an unreachable assume.
+        let vacuous = crate::mu_calculus::parser::parse(&gr1_response_formula("s == 3", "s == 1"))
+            .expect("parse");
+        assert_eq!(
+            exact_symbolic_verdict(STAYLOOP, &vacuous).expect("verdict"),
+            ExactVerdict::Holds,
+            "unsatisfiable assume ⇒ GF assume → GF guarantee holds vacuously"
+        );
     }
 
     /// D1.4 — `resolve_predicate_expr_registers` rewrites every register name in a
