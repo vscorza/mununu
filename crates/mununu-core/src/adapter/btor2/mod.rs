@@ -30,6 +30,7 @@ pub mod parser;
 pub mod pin;
 pub mod predicate_expr;
 pub mod r_s8_encoder;
+pub mod reset_init;
 pub mod shadow;
 pub mod smt_must_edge;
 pub mod symbolic_bitblast;
