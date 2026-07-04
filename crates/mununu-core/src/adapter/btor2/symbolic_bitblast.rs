@@ -154,6 +154,15 @@ impl BddBitBlaster {
     /// bind the leaves, walk every `Const`/`Op` node into a BDD vector, and
     /// collect the per-register next-state functions.
     pub fn build(file: &Btor2File) -> Result<Self, String> {
+        // D1.4 — resolve each state/input to its user-visible name via
+        // `collect_symbols`, which walks Yosys's `uext _ NID 0 NAME` alias ops
+        // back to the underlying (often unnamed) state cell. Without this, the
+        // flattened yosys BTOR2 leaves registers unnamed (`state_<nid>`), so a
+        // predicate over a real register name (`bit_cnt_q`) never binds. For a
+        // directly-named state/input the resolved name equals the raw symbol, so
+        // this is a no-op there; the alias resolution matches what the cube path's
+        // external `resolve_predicate_registers` already relies on.
+        let symbols = crate::adapter::btor2::parser::collect_symbols(file);
         // Pass 1 — collect register + input cells with their widths.
         let mut leaf_specs: Vec<(Nid, String, bool, u32)> = Vec::new();
         for line in &file.lines {
@@ -164,7 +173,11 @@ impl BddBitBlaster {
             };
             let width = bv_width(file, sort)
                 .ok_or_else(|| format!("NID {}: {tag} has non-bitvec sort", line.nid))?;
-            let symbol = symbol.unwrap_or_else(|| format!("{tag}_{}", line.nid));
+            let symbol = symbols
+                .get(&line.nid)
+                .cloned()
+                .or(symbol)
+                .unwrap_or_else(|| format!("{tag}_{}", line.nid));
             leaf_specs.push((line.nid, symbol, is_state, width));
         }
 
@@ -1574,6 +1587,55 @@ pub enum ExactVerdict {
     Violated,
 }
 
+/// D1.4 — rewrite every register name in a [`PredicateExpr`] through `resolve`
+/// (the `BtorSts::resolve_register` alias→canonical map), so an atom over a
+/// user-visible name binds against the bit-blasted state cell.
+fn resolve_predicate_expr_registers(
+    expr: &PredicateExpr,
+    resolve: &impl Fn(&str) -> String,
+) -> PredicateExpr {
+    match expr {
+        PredicateExpr::Cmp {
+            register,
+            op,
+            value,
+        } => PredicateExpr::Cmp {
+            register: resolve(register),
+            op: *op,
+            value: *value,
+        },
+        PredicateExpr::CmpReg { lhs, op, rhs } => PredicateExpr::CmpReg {
+            lhs: resolve(lhs),
+            op: *op,
+            rhs: resolve(rhs),
+        },
+        PredicateExpr::CmpRegAddend {
+            lhs,
+            op,
+            rhs,
+            addend,
+            width,
+        } => PredicateExpr::CmpRegAddend {
+            lhs: resolve(lhs),
+            op: *op,
+            rhs: resolve(rhs),
+            addend: *addend,
+            width: *width,
+        },
+        PredicateExpr::And(a, b) => PredicateExpr::And(
+            Box::new(resolve_predicate_expr_registers(a, resolve)),
+            Box::new(resolve_predicate_expr_registers(b, resolve)),
+        ),
+        PredicateExpr::Or(a, b) => PredicateExpr::Or(
+            Box::new(resolve_predicate_expr_registers(a, resolve)),
+            Box::new(resolve_predicate_expr_registers(b, resolve)),
+        ),
+        PredicateExpr::Not(a) => {
+            PredicateExpr::Not(Box::new(resolve_predicate_expr_registers(a, resolve)))
+        }
+    }
+}
+
 /// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
 /// BTOR2, bit-blast it, evaluate `formula` over the exact model (2-valued, no
 /// abstraction), and return the initial-state verdict. Atoms in `formula` are
@@ -1586,10 +1648,21 @@ pub fn exact_symbolic_verdict(
     btor2_content: &str,
     formula: &Formula,
 ) -> Result<ExactVerdict, String> {
+    use crate::adapter::sts_ir::SymbolicTransitionSystem;
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
     let bb = BddBitBlaster::build(&file)?;
     let exact = bb.exact_model();
+
+    // Register-name resolution: a user-visible name (`bit_cnt_q`) maps to the
+    // canonical state-cell name the bit-blast binds against (`bit_cnt_d` after
+    // yosys async2sync/flatten aliasing) — the same `BtorSts::resolve_register`
+    // the cube path uses. Idempotent on names that are already canonical.
+    let sts = crate::adapter::sts_ir::BtorSts::new(&file);
+    let resolve = |name: &str| -> String {
+        sts.resolve_register(name)
+            .unwrap_or_else(|| name.to_string())
+    };
 
     // Resolve each distinct formula atom to its full-state BDD.
     let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
@@ -1600,6 +1673,7 @@ pub fn exact_symbolic_verdict(
             }
             let expr = parse_predicate_expr(name)
                 .map_err(|e| format!("exact MC: atom `{name}` is not a predicate: {e}"))?;
+            let expr = resolve_predicate_expr_registers(&expr, &resolve);
             let bdd = bb.predicate_bdd(&expr)?;
             resolved.push((name.clone(), bdd));
         }
@@ -2628,12 +2702,73 @@ mod tests {
         );
     }
 
-    // NOTE (D1.3b/D1.5 follow-up): the real-RTL uart_tx `AG AF (bit_cnt_q==0)`
-    // flip (tick-free → VIOLATED / tick-pinned → HOLDS) needs the cube lift's
-    // register-name resolution (`BtorSts::resolve_register`) — the flattened yosys
-    // BTOR2 emits registers *unnamed*, so a raw `bit_cnt_q` atom does not bind. It
-    // lands with the verify-auto `--engine exact-symbolic` wiring (D1.5), which
-    // already resolves names, alongside the docker validation.
+    /// D1.4 — `resolve_predicate_expr_registers` rewrites every register name in a
+    /// `PredicateExpr` tree through the resolver (idempotent on names it doesn't
+    /// remap).
+    #[test]
+    fn d1_4_resolve_predicate_expr_registers_rewrites() {
+        let remap = |n: &str| -> String {
+            if n == "cnt_q" {
+                "cnt_d".to_string()
+            } else {
+                n.to_string()
+            }
+        };
+        let expr = PredicateExpr::And(
+            Box::new(PredicateExpr::eq("cnt_q", 0)),
+            Box::new(PredicateExpr::CmpReg {
+                lhs: "cnt_q".to_string(),
+                op: CmpOp::Eq,
+                rhs: "acc".to_string(),
+            }),
+        );
+        let out = resolve_predicate_expr_registers(&expr, &remap);
+        match out {
+            PredicateExpr::And(a, b) => {
+                assert!(matches!(*a, PredicateExpr::Cmp { register, .. } if register == "cnt_d"));
+                assert!(
+                    matches!(*b, PredicateExpr::CmpReg { lhs, rhs, .. } if lhs == "cnt_d" && rhs == "acc")
+                );
+            }
+            _ => panic!("expected And"),
+        }
+    }
+
+    /// D1.4 (docker-gated) — the real-RTL name-resolution win: `exact_symbolic_verdict`
+    /// **binds** a predicate over the user-visible register `bit_cnt_q` on real
+    /// OpenTitan `uart_tx` (whose flattened yosys BTOR2 names the cell `bit_cnt_d`)
+    /// and returns a **definite** verdict — no `⊥`, no "unknown register". The
+    /// binding rides `collect_symbols` (cell naming) + `resolve_register` (atom
+    /// rewrite). The *meaningful* liveness flip needs verify-auto's reset/init
+    /// gating (the flattened `clk2fflogic` BTOR2 does not constrain init to reset,
+    /// so a raw `AG AF` sees unreachable stuck states) — that lands in D1.5.
+    /// `#[ignore]`; the SV is read at run time so `make ci` only compiles it.
+    #[test]
+    #[ignore = "needs sv2v + yosys — run in the mununu-sva docker image"]
+    fn e2e_d1_4_uart_tx_binds_real_register_name() {
+        use crate::adapter::yosys::{YosysOptions, sv_to_btor2_with_blackboxes};
+
+        let sv = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/verify/m1_opentitan_uart_tx/source/uart_tx.sv"
+        ))
+        .expect("read uart_tx.sv");
+        let yopts = YosysOptions {
+            top: Some("uart_tx".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let (btor2, _bb) = sv_to_btor2_with_blackboxes(&sv, &yopts).expect("extract uart_tx");
+        let formula = crate::mu_calculus::parser::parse(
+            "nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)",
+        )
+        .expect("formula parses");
+        // The point: `bit_cnt_q` resolves + binds (no "unknown register" error) and
+        // the exact engine returns a definite verdict (never ⊥).
+        let v = exact_symbolic_verdict(&btor2, &formula)
+            .expect("bit_cnt_q binds via name resolution + yields a definite verdict");
+        assert!(matches!(v, ExactVerdict::Holds | ExactVerdict::Violated));
+    }
 
     /// Evaluate `AG AF (cnt==0)` over the gated counter and print the per-cube
     /// verdict. `c1 = {cnt≠0}` has may-edges to both `c0` and `c1` but (per the
