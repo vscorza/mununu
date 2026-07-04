@@ -25,10 +25,18 @@
 //!   RESTRICTED relation `R ∧ label_conjunct ∧ cur_ok(x) ∧ next_ok(x')`, validated
 //!   vs `evaluate_tri`. Controllability (`ctrl`) and step-bounds (`steps`) are an
 //!   honest error (R-F5.2c).
+//! - **R-F5.3** — symbolic edge construction from BTOR2 (the `O(2^2|P|)`-SMT-avoidance
+//!   win): `adapter/btor2/symbolic_bitblast.rs`'s `BddBitBlaster` builds `R_may`/`R_must`
+//!   as an `AbstractRelation` once, without per-cube-pair SMT.
+//! - **R-F5.4** — `--engine symbolic` on `btor2 cegar` / `sv cegar` / `sv verify-auto`
+//!   (CLI + API); `adapter/btor2/symbolic_engine.rs::symbolic_cube_verdicts`.
+//! - **R-F5.5** — the symbolic CEGAR loop (`symbolic_cegar_refine`), verify-auto wiring,
+//!   compound-predicate cube dims, and state-predicate-guarded modalities in the cube
+//!   evaluator.
 //!
-//! Planned: R-F5.2c (controllability + step-bounded modalities), R-F5.3 (symbolic
-//! edge construction from BTOR2 — the `O(2^2|P|)`-SMT-avoidance win), R-F5.4
-//! (verify-auto wiring).
+//! Remaining: R-F5.2c (controllability + step-bounded modalities — currently honest
+//! errors, out of the predicate-cube fragment) and R-F5.6 (cone-of-influence restriction
+//! so the bit-blast is not capped by whole-design bit count).
 //!
 //! 3-valued box semantics (Bruns–Godefroid; mirrors `evaluator::modal_trit_core`):
 //! for `[]φ`, `must = ∀ may-successors. φ.must` and `may = ∀ must-successors. φ.may`

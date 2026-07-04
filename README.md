@@ -163,15 +163,15 @@ flowchart TD
   B2 --> STS["STS-IR seam<br/>StsVar + StepEval + SmtEncode<br/>(hides BTOR2 / Z3)"]
 
   STS -->|"StepEval::step"| ENUM["Explicit-Enumerate<br/>Sharp CLTS"]
-  STS -->|"SmtEncode::may_edges + must"| CUBE["Explicit predicate-cube lift"]
-  STS -->|"symbolic relation build (planned, R-F5)"| SYM["Symbolic predicate-cube (BDD)"]
+  STS -->|"SmtEncode::may_edges + must<br/>(--engine explicit, default)"| CUBE["Explicit predicate-cube lift"]
+  STS -->|"BDD relation build<br/>(--engine symbolic)"| SYM["Symbolic predicate-cube (BDD)<br/>BddBitBlaster → AbstractRelation"]
 
   ENUM --> CLTS["Clts (K)MTS<br/>states + may/must transitions + 3-valued labels"]
   CUBE --> CLTS
   OTH --> CLTS
 
   CLTS --> EVX["Explicit evaluator<br/>(BoolDom / KleeneDom over BitVec)"]
-  SYM --> EVS["Symbolic evaluator (planned)<br/>BDD image/preimage fixpoint"]
+  SYM --> EVS["Symbolic evaluator<br/>SymbolicKmts: BDD image/preimage fixpoint"]
 
   EVX --> V["3-valued verdict:<br/>True / False / ⊥"]
   EVS --> V
@@ -181,23 +181,43 @@ The full design — predicate abstraction, explicit & symbolic model checking, t
 layering, and how over/under/⊥ approximation and may/must edges operate — is in
 [`docs/design/post-rf5-architecture.md`](docs/design/post-rf5-architecture.md).
 
-Source layout:
+Source layout — a Cargo workspace (Edition 2024) of three crates:
 
 ```
-src/
-├── adapter/        # Format adapters (TLSF, AIGER, Promela, XState, SystemVerilog, extraction)
-├── clts/           # Core CLTS data structure (builder, label store, state management)
-├── composition/    # Synchronous, asynchronous, and superset composition
-├── context/        # CLTS registry, synthesis, mu-calculus evaluation engine
-├── context_dsl/    # DSL lexer, parser, AST, realization, incremental loading
-├── mu_calculus/    # Formula parsing, fixpoint evaluation, simplification
-├── ltl/            # LTL to mu-calculus translation
-├── guard/          # Guard expression parsing
-├── abstraction/    # State variable abstraction (value domains, unrolling)
-├── api/            # REST API server (axum-based, optional feature)
-├── persistence/    # CLTS disk serialization
-└── main.rs         # CLI entry point
+crates/
+├── mununu-core/     # lib: verification engine, adapters, composition, IR, shared types
+├── mununu-cli/      # bin: `mununu` — CLI + HTTP API server (main.rs, loader.rs)
+└── mununu-extract/  # bin: `mununu-extract` — tree-sitter / LLVM / CIRCT AST extraction
 ```
+
+Inside `mununu-core/src/`:
+
+```
+├── adapter/         # Format adapters + RTL frontends (see below)
+├── abstraction/     # State-variable abstraction (value domains, unrolling)
+├── clts/            # Core CLTS / (K)MTS data structure (builder, label store, modality)
+├── codesign/        # HW/SW codesign extraction (register-map rendezvous)
+├── composition/     # Synchronous, asynchronous, and superset composition
+├── context/         # CLTS registry, synthesis, mu-calculus evaluation engine
+├── context_dsl/     # CTXDSL lexer, parser, AST, realization, incremental loading
+├── contract/        # Black-box module contracts (chaotic-stub, cyclic discharge)
+├── guard/           # Guard expression parsing
+├── llvm_ir/         # LLVM IR extraction matchers
+├── ltl/             # LTL → mu-calculus translation
+├── mu_calculus/     # Formula parsing, fixpoint evaluation; symbolic.rs (BDD engine)
+├── mununu_annotations/  # Sidecar annotation schema (SvAnnotation, predicate decls)
+├── persistence/     # CLTS disk serialization
+├── verify/          # N-source verify framework (verify.toml orchestrator)
+└── api/             # REST API server (axum-based, optional `api` feature)
+```
+
+The `adapter/` module carries the format adapters and the RTL pipeline: `systemverilog/`,
+`slang/`, `yosys/` (SV frontends — SVA translation + sv2v/yosys → BTOR2); `btor2/`,
+`btormc/` (BTOR2 IR, predicate-cube lift, model-checker oracle); `cvc5/`, `verilator/`
+(Craig interpolation, reset-state seeding); `tlsf/`, `aiger/`, `promela/`, `xstate/`
+(classic formats); `crewai/`, `langgraph/`, `microcode/` (agentic + microcode);
+`extraction/`, `sidecar/`, `vcd/`, `partition/`; and `sts_ir.rs`, the frontend-agnostic
+STS-IR seam.
 
 ## How It Compares
 
@@ -234,7 +254,7 @@ cargo build --release --features api
 
 ### Optional external tools
 
-Several mununu pipelines invoke external tools via subprocess. **All are optional** — mununu functions without them and emits a structured warning when an invoked pipeline requires a missing tool. The currently-supported external tools are sv2v (SystemVerilog normalisation), Yosys (SV → BTOR2), SymbiYosys (verification oracle), and CVC5 (Craig interpolation for the R.5 CEGAR loop). See [`docs/external-tools.md`](docs/external-tools.md) for per-platform install instructions and discovery env vars.
+Several mununu pipelines invoke external tools via subprocess. **All are optional** — mununu functions without them and emits a structured warning when an invoked pipeline requires a missing tool. Each is discovered via a `locate_*` helper (a `MUNUNU_<TOOL>_PATH` env var, then `$PATH`). The currently-invoked tools are slang (SVA front-end for `sv extract-sva` / `sv verify-auto`), sv2v (SystemVerilog normalisation), Yosys (SV → BTOR2), CVC5 (Craig interpolation for the CEGAR loop), btormc (BTOR2 model-checker oracle), and Verilator (reset-state simulation seeding). See [`docs/external-tools.md`](docs/external-tools.md) for the canonical list, per-platform install instructions, and discovery env vars.
 
 ## Web UI
 
