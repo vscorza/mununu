@@ -1393,19 +1393,35 @@ impl BddBitBlaster {
         }
     }
 
-    /// D1.3 — the BDD of the design's **initial states**, from the BTOR2 `init`
-    /// lines: each `init <state> <value>` pins that register's bits to `value`
-    /// (`⋀ state_bit ⟺ value_bit`). Registers without an `init` line are left
-    /// unconstrained (any value) — the sound "undefined reset" over-approximation.
-    /// A property `Holds` iff every initial state satisfies it.
+    /// D1.3/D1.5 — the BDD of the design's **initial state**: EVERY state register
+    /// is pinned to its reset value — its BTOR2 `init <state> <value>` bits, or **0
+    /// when it has no `init` line** (the `setundef -zero` model convention Yosys +
+    /// verify-auto's `state_cell_init_values` use). Pinning the undefined-reset
+    /// registers to 0 (rather than leaving them free) is what keeps `AG …` from
+    /// seeing unreachable stuck states: the verdict is checked from the *actual*
+    /// modelled reset state, not an over-broad free-init set. `Holds` iff that
+    /// initial state satisfies the property.
     pub fn initial_state_bdd(&self, file: &Btor2File) -> BDDFunction {
-        // State-line nid → the symbol `build()` assigned it (defaulting the same
-        // way, so it matches the cell's symbol).
+        // State-line nid → the value operand of its `init` line (if any).
+        let mut init_value_nid: HashMap<Nid, Nid> = HashMap::new();
+        for line in &file.lines {
+            if let Node::Init { state, value, .. } = &line.node {
+                init_value_nid.insert(*state, value.nid());
+            }
+        }
+        // State-line nid → the symbol `build()` assigned it. MUST use the SAME
+        // `collect_symbols` alias resolution `build()` uses (D1.4), else the cell
+        // lookup below misses on flattened yosys output (cell = `bit_cnt_d`, raw
+        // State symbol = none → `state_<nid>`) and the register is left
+        // unconstrained — a silently over-broad init.
+        let symbols = crate::adapter::btor2::parser::collect_symbols(file);
         let mut sym_of_nid: HashMap<Nid, String> = HashMap::new();
         for line in &file.lines {
             if let Node::State { symbol, .. } = &line.node {
-                let sym = symbol
-                    .clone()
+                let sym = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .or_else(|| symbol.clone())
                     .unwrap_or_else(|| format!("state_{}", line.nid));
                 sym_of_nid.insert(line.nid, sym);
             }
@@ -1419,21 +1435,26 @@ impl BddBitBlaster {
 
         let mut init = self.tt.clone();
         for line in &file.lines {
-            if let Node::Init { state, value, .. } = &line.node {
-                let Some(sym) = sym_of_nid.get(state) else {
-                    continue;
-                };
-                let Some(cell) = cell_of_sym.get(sym.as_str()) else {
-                    continue;
-                };
-                let Some(value_bits) = self.env.get(&value.nid()) else {
-                    continue; // value not bit-blasted (unreachable for a const init)
-                };
-                for (var, val) in cell.vars.iter().zip(value_bits.iter()) {
-                    // state_bit ⟺ value_bit  =  ¬(state_bit XOR value_bit)
-                    let iff = self.xor(var, val).not().unwrap();
-                    init = init.and(&iff).unwrap();
-                }
+            if !matches!(line.node, Node::State { .. }) {
+                continue;
+            }
+            let Some(sym) = sym_of_nid.get(&line.nid) else {
+                continue;
+            };
+            let Some(cell) = cell_of_sym.get(sym.as_str()) else {
+                continue;
+            };
+            // Reset-value bits: the `init` line's value BDD, or all-`⊥` (every bit
+            // 0) for a register with no `init` line.
+            let value_bits: Vec<BDDFunction> = init_value_nid
+                .get(&line.nid)
+                .and_then(|vn| self.env.get(vn))
+                .cloned()
+                .unwrap_or_else(|| vec![self.ff.clone(); cell.vars.len()]);
+            for (var, val) in cell.vars.iter().zip(value_bits.iter()) {
+                // state_bit ⟺ value_bit  =  ¬(state_bit XOR value_bit)
+                let iff = self.xor(var, val).not().unwrap();
+                init = init.and(&iff).unwrap();
             }
         }
         init
@@ -2734,18 +2755,20 @@ mod tests {
         }
     }
 
-    /// D1.4 (docker-gated) — the real-RTL name-resolution win: `exact_symbolic_verdict`
-    /// **binds** a predicate over the user-visible register `bit_cnt_q` on real
-    /// OpenTitan `uart_tx` (whose flattened yosys BTOR2 names the cell `bit_cnt_d`)
-    /// and returns a **definite** verdict — no `⊥`, no "unknown register". The
-    /// binding rides `collect_symbols` (cell naming) + `resolve_register` (atom
-    /// rewrite). The *meaningful* liveness flip needs verify-auto's reset/init
-    /// gating (the flattened `clk2fflogic` BTOR2 does not constrain init to reset,
-    /// so a raw `AG AF` sees unreachable stuck states) — that lands in D1.5.
+    /// D1 HEADLINE (docker-gated) — exact ROBDD μ-calculus MC decides on real
+    /// OpenTitan `uart_tx` the `AF`-liveness that predicate abstraction returns ⊥
+    /// for: `AG AF (bit_cnt_q == 0)` — the transmit bit counter always eventually
+    /// returns to idle — is **Holds** (definite), from the correct 0-reset init.
+    /// The `bit_cnt_q` atom binds via `collect_symbols` (cell naming) +
+    /// `resolve_register` (atom rewrite: `bit_cnt_q → bit_cnt_d`); the init pins
+    /// every register to its reset value (0 default), so the verdict is checked
+    /// from the actual reset state, not an over-broad free-init set. Companion
+    /// verdicts confirm soundness on the design: `AG EF` (recoverability) + `EF` +
+    /// `AG (bit_cnt < 12)` (a real bounded-counter safety invariant) all Holds.
     /// `#[ignore]`; the SV is read at run time so `make ci` only compiles it.
     #[test]
     #[ignore = "needs sv2v + yosys — run in the mununu-sva docker image"]
-    fn e2e_d1_4_uart_tx_binds_real_register_name() {
+    fn e2e_d1_uart_tx_exact_liveness_verdict() {
         use crate::adapter::yosys::{YosysOptions, sv_to_btor2_with_blackboxes};
 
         let sv = std::fs::read_to_string(concat!(
@@ -2759,15 +2782,36 @@ mod tests {
             ..Default::default()
         };
         let (btor2, _bb) = sv_to_btor2_with_blackboxes(&sv, &yopts).expect("extract uart_tx");
-        let formula = crate::mu_calculus::parser::parse(
-            "nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)",
-        )
-        .expect("formula parses");
-        // The point: `bit_cnt_q` resolves + binds (no "unknown register" error) and
-        // the exact engine returns a definite verdict (never ⊥).
-        let v = exact_symbolic_verdict(&btor2, &formula)
-            .expect("bit_cnt_q binds via name resolution + yields a definite verdict");
-        assert!(matches!(v, ExactVerdict::Holds | ExactVerdict::Violated));
+        let verdict = |f: &str| -> ExactVerdict {
+            let ff = crate::mu_calculus::parser::parse(f).expect("formula parses");
+            exact_symbolic_verdict(&btor2, &ff).expect("definite verdict, binds")
+        };
+
+        // THE HEADLINE: `AG AF (bit_cnt_q == 0)` — the transmit counter always
+        // eventually returns to idle — is decided **Holds** (definite liveness) on
+        // real OpenTitan RTL. The predicate-abstraction path answers this ⊥ (no
+        // ranking); exact ROBDD MC decides it, from the correct 0-reset init.
+        assert_eq!(
+            verdict("nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)"),
+            ExactVerdict::Holds,
+            "AG AF (bit_cnt_q==0) holds on uart_tx"
+        );
+        // Companion sanity: `AG EF` (recoverability) holds; `EF (bit_cnt==0)` holds
+        // trivially (0 at reset); `AG (bit_cnt < 12)` is a real bounded-counter
+        // safety invariant — the exact engine proves it definitely.
+        assert_eq!(
+            verdict("nu Y. ((mu X. ((bit_cnt_q == 0) or <> X)) and [] Y)"),
+            ExactVerdict::Holds,
+        );
+        assert_eq!(
+            verdict("mu Y. ((bit_cnt_q == 0) or <> Y)"),
+            ExactVerdict::Holds,
+        );
+        assert_eq!(
+            verdict("nu X. ((bit_cnt_q < 12) and [] X)"),
+            ExactVerdict::Holds,
+            "the transmit bit counter is bounded (never ≥ 12)"
+        );
     }
 
     /// Evaluate `AG AF (cnt==0)` over the gated counter and print the per-cube
