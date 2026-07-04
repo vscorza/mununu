@@ -1738,47 +1738,78 @@ pub fn exact_symbolic_verdict_with_witness(
     if violating == *exact.ff() {
         return Ok((ExactVerdict::Holds, None));
     }
-    // Violated — attach a stall lasso when the property is a bare `AF p`. The target
-    // `p` is evaluated from the same atom set; `exact_stall_lasso` returns None if the
-    // stall is not reachable at the initial state (so the witness is best-effort).
+    // Violated — attach a stall lasso when the property is a liveness shape (bare
+    // `AF p` or `AG AF p`). The target `p` is evaluated from the same atom set;
+    // `exact_reachable_stall_lasso` finds a stall reachable from reset (subsuming the
+    // stall-at-reset case), so it covers both shapes. Best-effort: `None` if the shape
+    // isn't recognised or no stall is reachable.
     let witness = detect_af_target(formula)
         .and_then(|p_id| exact.eval_at(formula, p_id, &atoms).ok())
-        .and_then(|p_bdd| bb.exact_stall_lasso(&file, &p_bdd));
+        .and_then(|p_bdd| bb.exact_reachable_stall_lasso(&file, &p_bdd));
     Ok((ExactVerdict::Violated, witness))
 }
 
-/// D1.8b — detect the bare `AF p` shape `μX. (p ∨ [] X)` and return the node id of
-/// its target `p` (the non-recursive disjunct), or `None` when the root is not that
-/// shape. Both disjunct orders are accepted; the modality must be a bare `[]` (no
-/// guard) over the fixpoint variable.
+/// D1.8b/b-2 — detect a liveness shape and return the node id of its target `p`.
+/// Recognised (both disjunct/conjunct orders; modalities must be bare `[]`):
+/// - bare `AF p` = `μX. (p ∨ [] X)`,
+/// - `AG AF p` = `νY. ((μX. (p ∨ [] X)) ∧ [] Y)`.
+///
+/// `None` for any other shape.
 fn detect_af_target(formula: &Formula) -> Option<crate::mu_calculus::NodeId> {
-    use crate::mu_calculus::NodeId;
-    let MuNode::Mu { var, body } = formula.node(formula.root()) else {
+    let root = formula.root();
+    // Bare `AF p`.
+    if let Some(p) = af_target_at(formula, root) {
+        return Some(p);
+    }
+    // `AG AF p` = `νY. (AF_p ∧ [] Y)`: strip the `AG` wrapper, then match `AF p`.
+    let MuNode::Nu { var, body } = formula.node(root) else {
+        return None;
+    };
+    let MuNode::And(a, b) = formula.node(*body) else {
+        return None;
+    };
+    let af = if is_box_over_var(formula, *a, var) {
+        *b
+    } else if is_box_over_var(formula, *b, var) {
+        *a
+    } else {
+        return None;
+    };
+    af_target_at(formula, af)
+}
+
+/// Match `μX. (p ∨ [] X)` at `node` → the node id of `p` (the non-recursive disjunct).
+fn af_target_at(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+) -> Option<crate::mu_calculus::NodeId> {
+    let MuNode::Mu { var, body } = formula.node(node) else {
         return None;
     };
     let MuNode::Or(a, b) = formula.node(*body) else {
         return None;
     };
-    let is_box_var = |id: NodeId| -> bool {
-        match formula.node(id) {
-            MuNode::Modal {
-                kind: ModalKind::Box,
-                guard,
-                target,
-            } => {
-                *guard == Guard::default()
-                    && matches!(formula.node(*target), MuNode::Variable(v) if v == var)
-            }
-            _ => false,
-        }
-    };
-    if is_box_var(*a) {
+    if is_box_over_var(formula, *a, var) {
         Some(*b)
-    } else if is_box_var(*b) {
+    } else if is_box_over_var(formula, *b, var) {
         Some(*a)
     } else {
         None
     }
+}
+
+/// Is `node` a bare `[] v` (unguarded box over the fixpoint variable `v`)?
+fn is_box_over_var(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+    v: &crate::mu_calculus::FormulaVarId,
+) -> bool {
+    matches!(
+        formula.node(node),
+        MuNode::Modal { kind: ModalKind::Box, guard, target }
+            if *guard == Guard::default()
+                && matches!(formula.node(*target), MuNode::Variable(w) if w == v)
+    )
 }
 
 /// D1.8 — a **stall lasso**: the concrete counterexample witness for a `Violated`
@@ -1818,8 +1849,93 @@ impl BddBitBlaster {
     /// [`eval_step`]: BddBitBlaster::eval_step
     pub fn exact_stall_lasso(&self, file: &Btor2File, p: &BDDFunction) -> Option<StallLasso> {
         let exact = self.exact_model();
+        let stall = self.eg_not_p(&exact, p);
+        // A stall state that is also initial ⇒ AF p is violated from reset.
+        let init = self.initial_state_bdd(file);
+        let bad = init.and(&stall).unwrap();
+        if bad == self.ff {
+            return None;
+        }
+        let s = self.pick_state_assignment(&bad);
+        Some(self.walk_stall_cycle(&exact, &stall, s, Vec::new()))
+    }
+
+    /// D1.8b-2 — extract a [`StallLasso`] witnessing that `AG AF p` is **Violated**:
+    /// a `¬p` stall is *reachable* from the reset state (not necessarily at reset).
+    /// Generalises [`exact_stall_lasso`] (which requires the stall *at* reset): the
+    /// lasso's `prefix` is now the reset→stall reach path followed by the `¬p` cycle.
+    /// `None` when no stall is reachable (`AG AF p` holds).
+    ///
+    /// Layered reachability: `L_0 = EG¬p`, `L_k = L_{k-1} ∨ ◇L_{k-1}` (states that can
+    /// reach a stall in ≤ k steps). `init ∩ L_∞ ≠ ∅` iff a stall is reachable. The
+    /// reach phase descends the layers — each step lands one layer closer via a
+    /// concrete [`eval_step`] — then the shared cycle walk closes the `¬p` cycle.
+    ///
+    /// [`exact_stall_lasso`]: BddBitBlaster::exact_stall_lasso
+    /// [`eval_step`]: BddBitBlaster::eval_step
+    pub fn exact_reachable_stall_lasso(
+        &self,
+        file: &Btor2File,
+        p: &BDDFunction,
+    ) -> Option<StallLasso> {
+        let exact = self.exact_model();
+        let stall = self.eg_not_p(&exact, p);
+        if stall == self.ff {
+            return None;
+        }
+        // Reach layers: L_0 = stall, L_k = L_{k-1} ∨ ◇L_{k-1}.
+        let mut layers = vec![stall.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.diamond_pre(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let can_reach = layers.last().unwrap().clone();
+        let init = self.initial_state_bdd(file);
+        let bad = init.and(&can_reach).unwrap();
+        if bad == self.ff {
+            return None;
+        }
+        // Reach phase: from an initial state that can reach a stall, descend one layer
+        // per step until inside the stall, recording the reset→stall prefix.
+        let mut s = self.pick_state_assignment(&bad);
+        let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if self.state_minterm(&s).and(&stall).unwrap() != self.ff {
+                break; // reached the stall
+            }
+            prefix.push(s.clone());
+            // s ∈ L_k \ L_{k-1} (k minimal) ⇒ s ∈ ◇L_{k-1}: a successor lands in L_{k-1}.
+            let k = (1..layers.len())
+                .find(|&k| self.state_minterm(&s).and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(1);
+            let good = self
+                .state_minterm(&s)
+                .and(&exact.to_next(&layers[k - 1]))
+                .unwrap();
+            if good == self.ff {
+                return Some(StallLasso {
+                    prefix,
+                    cycle: Vec::new(),
+                });
+            }
+            let full = self.pick_full_assignment(&good);
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            s = ns;
+        }
+        Some(self.walk_stall_cycle(&exact, &stall, s, prefix))
+    }
+
+    /// `stall = EG ¬p = νZ. (¬p ∧ ◇Z)` over the exact model — the states with an
+    /// infinite `p`-avoiding path (`¬⟦AF p⟧`). Greatest fixpoint from ⊤.
+    fn eg_not_p(&self, exact: &ExactModel, p: &BDDFunction) -> BDDFunction {
         let not_p = p.not().unwrap();
-        // stall = EG ¬p = νZ. (¬p ∧ ◇Z), greatest fixpoint from ⊤.
         let mut stall = self.tt.clone();
         loop {
             let next = not_p.and(&exact.diamond_pre(&stall)).unwrap();
@@ -1828,37 +1944,41 @@ impl BddBitBlaster {
             }
             stall = next;
         }
-        // A stall state that is also initial ⇒ AF p is violated from reset.
-        let init = self.initial_state_bdd(file);
-        let bad = init.and(&stall).unwrap();
-        if bad == self.ff {
-            return None;
-        }
-        // Walk a concrete ¬p path inside `stall` until a state repeats. The path
-        // visits distinct stall states until the first revisit, so it terminates;
-        // the cap is a defence against a non-total (deadlocking) model.
-        let mut s = self.pick_state_assignment(&bad);
-        let mut seen: Vec<BTreeMap<String, u128>> = Vec::new();
+        stall
+    }
+
+    /// Walk a concrete `¬p` path inside `stall` from `s` until a state repeats — the
+    /// cycle. `prefix` (the already-walked reach path) is prepended to the result; any
+    /// pre-cycle stall states join it. Each step greedily picks a stall-preserving
+    /// input and advances via [`eval_step`]. Bounded by the stall's size; a deadlock
+    /// yields an open (cycle-less) lasso.
+    ///
+    /// [`eval_step`]: BddBitBlaster::eval_step
+    fn walk_stall_cycle(
+        &self,
+        exact: &ExactModel,
+        stall: &BDDFunction,
+        mut s: BTreeMap<String, u128>,
+        mut prefix: Vec<BTreeMap<String, u128>>,
+    ) -> StallLasso {
+        let mut cyc: Vec<BTreeMap<String, u128>> = Vec::new();
         for _ in 0..1_000_000 {
-            if let Some(j) = seen.iter().position(|prev| *prev == s) {
-                let cycle = seen.split_off(j);
-                return Some(StallLasso {
-                    prefix: seen,
-                    cycle,
-                });
+            if let Some(j) = cyc.iter().position(|prev| *prev == s) {
+                let cycle = cyc.split_off(j);
+                prefix.extend(cyc); // pre-cycle stall states → prefix
+                return StallLasso { prefix, cycle };
             }
-            seen.push(s.clone());
-            // Over state = s (fixed) with inputs free, the successors-in-stall set is
+            cyc.push(s.clone());
+            // The successors-in-stall set for state = s (inputs free) is
             // `state_minterm(s) ∧ to_next(stall)` — non-empty because s ∈ stall =
             // ¬p ∧ ◇stall guarantees a stall-successor under some input.
-            let good = self.state_minterm(&s).and(&exact.to_next(&stall)).unwrap();
+            let good = self.state_minterm(&s).and(&exact.to_next(stall)).unwrap();
             if good == self.ff {
-                // Non-total model (deadlock): no stall-preserving successor. Return
-                // the path so far as an open prefix (no closing cycle).
-                return Some(StallLasso {
-                    prefix: seen,
+                prefix.extend(cyc);
+                return StallLasso {
+                    prefix,
                     cycle: Vec::new(),
-                });
+                };
             }
             // Pick a full (state = s, input) assignment, step concretely, and keep
             // held registers (no `Next` line) at their current value.
@@ -1869,7 +1989,11 @@ impl BddBitBlaster {
             }
             s = ns;
         }
-        None
+        prefix.extend(cyc);
+        StallLasso {
+            prefix,
+            cycle: Vec::new(),
+        }
     }
 
     /// The minterm fixing only the STATE bits to `state` (input bits left free).
@@ -3061,6 +3185,99 @@ mod tests {
             exact_symbolic_verdict_with_witness(RESET_COUNTER_BTOR2, &holds).expect("verdict");
         assert_eq!(v2, ExactVerdict::Holds);
         assert!(w2.is_none());
+    }
+
+    // D1.8b-2 — a counter where the stall is REACHABLE but not initial: from cnt=0 the
+    // next state is forced to 1 (so `AF (cnt==1)` HOLDS at reset), but `cnt=2`/`cnt=3`
+    // can hold under `!go` forever (a `¬(cnt==1)` stall), reachable via 0→1→2. So
+    // `AG AF (cnt==1)` is Violated by a reachable-not-initial stall.
+    const REACH_STALL_BTOR2: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 input 2 go
+5 zero 1
+6 one 1
+7 eq 2 3 5
+8 add 1 3 6
+9 ite 1 4 8 3
+10 ite 1 7 6 9
+11 next 1 3 10
+12 init 1 3 5
+"#;
+
+    /// D1.8b-2 — `exact_reachable_stall_lasso` finds a stall reachable from reset that
+    /// `exact_stall_lasso` (stall-at-reset only) misses. The lasso's cycle is `¬p`; the
+    /// prefix is the reset→stall reach path (and MAY pass through a `p` state — the
+    /// point of `AG AF p` is that `p` holds only finitely).
+    #[test]
+    fn d1_8b2_reachable_stall_lasso() {
+        let file = parser::parse(REACH_STALL_BTOR2).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let p = bb
+            .predicate_bdd(&PredicateExpr::eq("cnt", 1))
+            .expect("predicate cnt==1");
+
+        // Stall-at-reset finds nothing: from cnt=0 every path reaches cnt=1.
+        assert!(
+            bb.exact_stall_lasso(&file, &p).is_none(),
+            "AF(cnt==1) holds at reset — no stall AT reset"
+        );
+
+        // Reachable-stall finds the AG-AF witness.
+        let lasso = bb
+            .exact_reachable_stall_lasso(&file, &p)
+            .expect("a ¬(cnt==1) stall is reachable from reset");
+        assert!(
+            !lasso.cycle.is_empty(),
+            "the reachable stall must close a cycle"
+        );
+        assert_eq!(
+            lasso.prefix.first().and_then(|st| st.get("cnt")),
+            Some(&0),
+            "the lasso starts at the reset state"
+        );
+        // The CYCLE avoids p forever (only the prefix may touch p finitely).
+        for st in &lasso.cycle {
+            assert_ne!(st.get("cnt"), Some(&1), "the stall cycle is ¬(cnt==1)");
+        }
+        // Self-validate every edge (incl. the closing edge) via the concrete simulator.
+        let step_exists = |from: &BTreeMap<String, u128>, to: &BTreeMap<String, u128>| -> bool {
+            (0..=1u128).any(|go| {
+                let mut asg: HashMap<String, u128> =
+                    from.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                asg.insert("go".to_string(), go);
+                bb.eval_step(&asg).get("cnt").copied().unwrap_or(0) == *to.get("cnt").unwrap()
+            })
+        };
+        let mut path: Vec<&BTreeMap<String, u128>> =
+            lasso.prefix.iter().chain(lasso.cycle.iter()).collect();
+        path.push(&lasso.cycle[0]);
+        for w in path.windows(2) {
+            assert!(
+                step_exists(w[0], w[1]),
+                "lasso edge {:?} -> {:?} must be a real transition",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// D1.8b-2 — the verdict entry point surfaces the reachable-stall witness for a
+    /// Violated `AG AF p`.
+    #[test]
+    fn d1_8b2_verdict_with_witness_ag_af_violated() {
+        let ag_af =
+            crate::mu_calculus::parser::parse("nu Y. ((mu X. ((cnt == 1) or [] X)) and [] Y)")
+                .expect("parse");
+        let (v, w) =
+            exact_symbolic_verdict_with_witness(REACH_STALL_BTOR2, &ag_af).expect("verdict");
+        assert_eq!(v, ExactVerdict::Violated, "AG AF(cnt==1) is Violated");
+        let lasso = w.expect("Violated AG AF ⇒ a reachable-stall witness");
+        assert!(!lasso.cycle.is_empty());
+        for st in &lasso.cycle {
+            assert_ne!(st.get("cnt"), Some(&1));
+        }
     }
 
     /// D1.4 — `resolve_predicate_expr_registers` rewrites every register name in a
