@@ -805,6 +805,12 @@ pub async fn sv_verify_auto_handler(
             .engine
             .as_deref()
             .is_some_and(|e| e.eq_ignore_ascii_case("symbolic")),
+        // D1.6 — `engine: "exact-symbolic"` decides each property exactly over the
+        // full bit-blasted state (definite verdict, never ⊥).
+        exact_symbolic: request
+            .engine
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case("exact-symbolic")),
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {

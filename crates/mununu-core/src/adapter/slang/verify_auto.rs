@@ -466,6 +466,14 @@ pub struct VerifyAutoOptions {
     /// derived/combinational predicate or a guarded modality errors → the
     /// property is `Skipped` with the reason. Mirrors the CLI/API `--engine`.
     pub symbolic_engine: bool,
+    /// D1.6 (2026-07-04) — run each property through **exact** full-state symbolic
+    /// MC (`--engine exact-symbolic`): the μ-calculus is decided EXACTLY over the
+    /// reset-gated btor2's bit-blasted state (no predicate abstraction), so the
+    /// verdict is a **definite** 2-valued Holds/Violated — never ⊥. Decides
+    /// `AF`-liveness (and any μ-calculus property) where the cube path returns
+    /// Unknown; bounded by BDD size (a design over the bit cap ⇒ `Skipped`). Takes
+    /// precedence over `symbolic_engine`. Mirrors the CLI/API `--engine`.
+    pub exact_symbolic: bool,
 }
 
 impl Default for VerifyAutoOptions {
@@ -478,6 +486,7 @@ impl Default for VerifyAutoOptions {
             config_values: std::collections::HashMap::new(),
             counter_bounds: std::collections::HashMap::new(),
             symbolic_engine: false,
+            exact_symbolic: false,
         }
     }
 }
@@ -1473,6 +1482,43 @@ pub fn verify_auto(
             }
         };
 
+        // D1.6 — exact full-state symbolic MC (`--engine exact-symbolic`): decide
+        // the property EXACTLY over the reset-gated btor2's bit-blasted state — no
+        // predicate abstraction, so a **definite** 2-valued verdict (never ⊥). Runs
+        // BEFORE cube seeding: the exact engine binds the formula's atoms directly
+        // (register-name resolution), so it needs no cube and must NOT be gated
+        // behind cube-seeding success — deciding a property the cube path cannot
+        // seed is exactly this engine's purpose. The btor2 here is reset-gated
+        // (reset input pinned inactive) and `$past`-shadow-augmented; the init is
+        // the modelled reset state (`initial_state_bdd`: every register pinned to
+        // its `init` value or 0). Decides `AF`-liveness (and any μ-calculus
+        // property) where the cube path returns Unknown; bounded by BDD size
+        // (build errors above the bit cap ⇒ Skipped).
+        if opts.exact_symbolic {
+            let outcome = match crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict(
+                &btor2, &formula,
+            ) {
+                Ok(crate::adapter::btor2::symbolic_bitblast::ExactVerdict::Holds) => {
+                    VerifyOutcome::Holds
+                }
+                Ok(crate::adapter::btor2::symbolic_bitblast::ExactVerdict::Violated) => {
+                    // A definite full-state counterexample (not a cube tally).
+                    VerifyOutcome::Violated { false_cells: 1 }
+                }
+                Err(e) => VerifyOutcome::Skipped {
+                    reason: format!("exact symbolic MC: {e}"),
+                },
+            };
+            report.properties.push(PropertyVerdict {
+                name: t.name.clone(),
+                kind: t.kind,
+                formula: formula_str.clone(),
+                outcome,
+                seeded_predicates: Vec::new(),
+            });
+            continue;
+        }
+
         let mut seeded = seed_from_formula(
             &formula,
             resolves_to_state,
@@ -1680,7 +1726,8 @@ pub fn verify_auto(
         // selected engine. The explicit path runs `cegar_refine_loop`; the
         // symbolic path runs the R-F5 BDD CEGAR loop and projects its per-cube
         // verdicts into the same `TritSet` shape (over `2^|final P|`, same cube
-        // indexing), so the init-cube read below is identical.
+        // indexing), so the init-cube read below is identical. (The
+        // `--engine exact-symbolic` path returned early above, before seeding.)
         let final_verdict_res: Result<
             crate::mu_calculus::trit::TritSet,
             crate::adapter::AdapterError,
@@ -4576,6 +4623,78 @@ endmodule
             "the full sysrst design exceeds the symbolic bit-blast cap → every property \
              degrades to a Skipped (bit-cap) verdict GRACEFULLY (no OoM panic); the R-F5.6 \
              COI restriction is what lets the symbolic engine scale to real designs"
+        );
+    }
+
+    /// D1.6 — the `--engine exact-symbolic` **surface route**, end-to-end through
+    /// `verify_auto` on real OpenTitan RTL. A `@mununu_guarantee` annotation carries
+    /// the headline `AG AF (bit_cnt_q == 0)` liveness property; `verify_auto` with
+    /// `exact_symbolic: true` must route it through the exact full-state ROBDD MC
+    /// (`exact_symbolic_verdict`) — the same engine `e2e_d1_uart_tx_exact_liveness_verdict`
+    /// exercises directly — and return a **definite Holds**, where the predicate-cube
+    /// path answers this ⊥ (no ranking for `AF`).
+    ///
+    /// This validates the CLI/API `--engine exact-symbolic` wiring, not the D1 thesis
+    /// itself (that is the direct test's job): the annotation guarantee flows through
+    /// scan → merge → the hoisted exact branch (which runs BEFORE cube seeding, so it
+    /// is never gated behind a seeding skip). The btor2 here is reset-gated +
+    /// `$past`-shadow-augmented (unlike the direct test's raw btor2); reset-gating
+    /// pins the reset input inactive, so a genuinely-holding liveness property stays
+    /// Holds.
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_d1_6_verify_auto_exact_symbolic_route_uart_tx() {
+        use std::path::PathBuf;
+        let src_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/verify/m1_opentitan_uart_tx/source/uart_tx.sv");
+        let uart_tx = std::fs::read_to_string(&src_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", src_path.display()));
+        // Carry the AG AF liveness property as a source annotation — verify_auto's
+        // scan_annotation_properties reads the ORIGINAL source (not the elaborated
+        // output), parses the body via the mu-calculus parser, and merges it as
+        // `ann_guarantee_0`.
+        let annotated = format!(
+            "// @mununu_guarantee nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)\n{uart_tx}"
+        );
+        let sources = vec![("uart_tx.sv".to_string(), annotated)];
+        let yopts = YosysOptions {
+            top: Some("uart_tx".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                exact_symbolic: true,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs with --engine exact-symbolic");
+
+        let guarantee = report
+            .properties
+            .iter()
+            .find(|p| p.name.contains("ann_guarantee"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the @mununu_guarantee property must appear in the report; got: {:?}",
+                    report
+                        .properties
+                        .iter()
+                        .map(|p| &p.name)
+                        .collect::<Vec<_>>()
+                )
+            });
+        eprintln!(
+            "\n=== D1.6 verify_auto --engine exact-symbolic on uart_tx ===\n  {} ({}): {:?}",
+            guarantee.name, guarantee.formula, guarantee.outcome
+        );
+        assert!(
+            matches!(guarantee.outcome, VerifyOutcome::Holds),
+            "AG AF (bit_cnt_q==0) must be decided Holds by the exact-symbolic route \
+             through verify_auto; got {:?}",
+            guarantee.outcome
         );
     }
 }

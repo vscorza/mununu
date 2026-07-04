@@ -67,8 +67,20 @@ cube state space + transition relation, independent of the abstraction itself:
   precision, approximant reuse, CTXDSL emit) remain `--engine explicit` only. Source of
   truth:
   [`adapter::btor2::symbolic_engine::symbolic_cegar_refine`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/symbolic_engine.rs).
+- **Exact symbolic MC (D1, shipped — `sv verify-auto --engine exact-symbolic` only)** — *not*
+  a predicate-cube engine: it drops the abstraction entirely and decides the μ-calculus
+  **exactly** over the full bit-blasted state by ROBDD μ/ν fixpoint from the reset init.
+  Because the state is exact (no may/must split), every verdict is **definite** — 2-valued
+  `Holds` / `Violated`, never ⊥. This decides `AF`-liveness (and any μ-calculus property)
+  where *both* cube engines return Unknown: over the exact finite state the least-fixpoint
+  iteration **is** the ranking, so no ranking/fairness infrastructure is needed. Bounded by
+  BDD size — a design too large to bit-blast makes the property `Skipped` (graceful, no OoM).
+  Exposed only on `sv verify-auto` (the surface that supplies a reset-gated model). Source of
+  truth:
+  [`adapter::btor2::symbolic_bitblast::exact_symbolic_verdict`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs)
+  — surface: CLI+API+UI.
 
-Both engines share the same 3-valued semantics and soundness (below). See
+The two cube engines share the same 3-valued semantics and soundness (below). See
 [the post-R-F5 architecture](https://github.com/vscorza/mununu/blob/main/docs/design/post-rf5-architecture.md)
 for the full picture (IR layering, may/must edges, over/under/⊥ approximation).
 
