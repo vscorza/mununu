@@ -12,19 +12,23 @@
 # So the default pre-push now runs the parts that are CHEAP and catch
 # the drift a per-crate pre-commit can miss:
 #   - fmt --check              (workspace formatting)
-#   - clippy --workspace       (cross-crate lint; this COMPILES the whole
-#                               workspace, so cross-crate type/build drift
-#                               is still caught locally before push)
+#   - check --workspace        (cross-crate BUILD check — catches "core
+#                               change broke cli's build" drift, without
+#                               the cost of compiling every test binary)
 #   - test --workspace --doc   (doctests — the class that has bitten us
 #                               repeatedly; the `cargo test --tests`
 #                               compilation phase does NOT cover them)
 #   - test --lib api           (the api-feature build, mirrors CI)
 #   - cargo machete            (unused deps)
 #
-# What's dropped from the default: RUNNING the lib/integration test
-# suite (`cargo test --workspace`). CI owns that. The pre-commit hook
-# (scripts/pre-commit) already scope-tests the touched crates + their
-# downstream consumers, so affected tests still run locally on commit.
+# What's dropped from the default:
+#   - RUNNING the lib/integration test suite (`cargo test --workspace`).
+#     CI owns it; pre-commit (scripts/pre-commit) already scope-tests the
+#     touched crates + their downstream consumers on every commit.
+#   - LINTING (clippy). pre-commit runs `clippy -p <touched> --all-targets`
+#     (expanding to the whole workspace when mununu-core is touched), and
+#     CI runs the full `clippy --workspace --all-targets` — a feature
+#     branch cannot merge without it.
 #
 # Force the old full-workspace test sweep with:
 #   MUNUNU_PREPUSH_FULL=1 git push
@@ -53,8 +57,16 @@ fi
 echo "Pre-push: cargo fmt --check (workspace)..."
 cargo fmt --all -- --check
 
-echo "Pre-push: cargo clippy --workspace (cross-crate compile + lint)..."
-cargo clippy --workspace --all-targets -- -D warnings
+# Cross-crate BUILD check (not lint). `check --workspace` compiles every
+# crate's lib+bins for type-checking — catching the "a change in
+# mununu-core broke mununu-cli's build" drift a per-crate pre-commit can
+# miss — WITHOUT the cost of `--all-targets` (which cold-compiles every
+# integration-test binary just to look at it, ~13 min on this hardware).
+# Lint is already covered: pre-commit runs `clippy -p <touched>
+# --all-targets` (expanding to the whole workspace when mununu-core is
+# touched), and CI runs the full `clippy --workspace --all-targets`.
+echo "Pre-push: cargo check --workspace (cross-crate build)..."
+cargo check --workspace
 
 echo "Pre-push: cargo test --workspace --doc (doctests)..."
 cargo test --workspace --doc
