@@ -102,7 +102,7 @@
 //! (nested νμ + guarded modalities included). R-F5.4.2 then wires this behind
 //! `--engine symbolic`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use oxidd::bdd::{self, BDDFunction, BDDManagerRef};
 use oxidd::{BooleanFunction, FunctionSubst, Manager, ManagerRef, Subst, VarNo};
@@ -1473,8 +1473,8 @@ impl ExactModel {
     /// `φ` pushed one step forward: each state bit ↦ its next-state function ⇒ a
     /// BDD over `(state, input)` = "the successor of this state under this input
     /// satisfies `φ`". Simultaneous substitution ⇒ the concrete next-state
-    /// relation.
-    fn to_next(&self, phi: &BDDFunction) -> BDDFunction {
+    /// relation. `pub` so the D1.8 lasso extractor can pick a `φ`-preserving input.
+    pub fn to_next(&self, phi: &BDDFunction) -> BDDFunction {
         if self.sub_vars.is_empty() {
             phi.clone()
         } else {
@@ -1713,6 +1713,153 @@ pub fn exact_symbolic_verdict(
     } else {
         ExactVerdict::Violated
     })
+}
+
+/// D1.8 — a **stall lasso**: the concrete counterexample witness for a `Violated`
+/// `AF p` (all-paths-eventually-`p`) property from the exact engine. `AF p` fails
+/// exactly when some initial state can avoid `p` forever — reach a `¬p` cycle
+/// staying in `¬p` (the "stall"). The lasso is that path: a `prefix` from the
+/// initial state to the cycle entry, then the repeating `cycle`. Each state is a
+/// concrete valuation of the state registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallLasso {
+    /// States from the initial state up to (excluding) the cycle entry. Empty when
+    /// the initial state is itself on the cycle.
+    pub prefix: Vec<BTreeMap<String, u128>>,
+    /// The repeating `¬p` cycle; `cycle[0]` is the state the last one steps back to.
+    /// Empty only in the (guarded) non-total-model deadlock case.
+    pub cycle: Vec<BTreeMap<String, u128>>,
+}
+
+impl BddBitBlaster {
+    /// D1.8 — extract a [`StallLasso`] witnessing that `AF p` is **Violated** from the
+    /// design's initial state, or `None` when `AF p` holds (no reachable stall).
+    ///
+    /// `p` is the target-predicate BDD (build it with [`predicate_bdd`], over state
+    /// registers). The method computes `stall = EG ¬p = νZ. (¬p ∧ ◇Z)` — the states
+    /// with an infinite `p`-avoiding path, exactly `¬⟦AF p⟧` — over the exact model.
+    /// If the initial state ([`initial_state_bdd`]) lies in `stall`, it walks a
+    /// concrete path inside `stall`: at each step it greedily picks (from the BDD) an
+    /// input whose successor stays in `stall`, advances with the concrete
+    /// [`eval_step`] simulator, and stops when a state repeats — the cycle. Bounded by
+    /// the stall's size, so it terminates.
+    ///
+    /// The witness is **self-validating**: replay it through `eval_step` and confirm
+    /// every state is `¬p` and the cycle closes.
+    ///
+    /// [`predicate_bdd`]: BddBitBlaster::predicate_bdd
+    /// [`initial_state_bdd`]: BddBitBlaster::initial_state_bdd
+    /// [`eval_step`]: BddBitBlaster::eval_step
+    pub fn exact_stall_lasso(&self, file: &Btor2File, p: &BDDFunction) -> Option<StallLasso> {
+        let exact = self.exact_model();
+        let not_p = p.not().unwrap();
+        // stall = EG ¬p = νZ. (¬p ∧ ◇Z), greatest fixpoint from ⊤.
+        let mut stall = self.tt.clone();
+        loop {
+            let next = not_p.and(&exact.diamond_pre(&stall)).unwrap();
+            if next == stall {
+                break;
+            }
+            stall = next;
+        }
+        // A stall state that is also initial ⇒ AF p is violated from reset.
+        let init = self.initial_state_bdd(file);
+        let bad = init.and(&stall).unwrap();
+        if bad == self.ff {
+            return None;
+        }
+        // Walk a concrete ¬p path inside `stall` until a state repeats. The path
+        // visits distinct stall states until the first revisit, so it terminates;
+        // the cap is a defence against a non-total (deadlocking) model.
+        let mut s = self.pick_state_assignment(&bad);
+        let mut seen: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if let Some(j) = seen.iter().position(|prev| *prev == s) {
+                let cycle = seen.split_off(j);
+                return Some(StallLasso {
+                    prefix: seen,
+                    cycle,
+                });
+            }
+            seen.push(s.clone());
+            // Over state = s (fixed) with inputs free, the successors-in-stall set is
+            // `state_minterm(s) ∧ to_next(stall)` — non-empty because s ∈ stall =
+            // ¬p ∧ ◇stall guarantees a stall-successor under some input.
+            let good = self.state_minterm(&s).and(&exact.to_next(&stall)).unwrap();
+            if good == self.ff {
+                // Non-total model (deadlock): no stall-preserving successor. Return
+                // the path so far as an open prefix (no closing cycle).
+                return Some(StallLasso {
+                    prefix: seen,
+                    cycle: Vec::new(),
+                });
+            }
+            // Pick a full (state = s, input) assignment, step concretely, and keep
+            // held registers (no `Next` line) at their current value.
+            let full = self.pick_full_assignment(&good);
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            s = ns;
+        }
+        None
+    }
+
+    /// The minterm fixing only the STATE bits to `state` (input bits left free).
+    fn state_minterm(&self, state: &BTreeMap<String, u128>) -> BDDFunction {
+        let mut mt = self.tt.clone();
+        for cell in &self.cells {
+            if !cell.is_state {
+                continue;
+            }
+            let v = state.get(&cell.symbol).copied().unwrap_or(0);
+            for (b, var) in cell.vars.iter().enumerate() {
+                let lit = if (v >> b) & 1 == 1 {
+                    var.clone()
+                } else {
+                    var.not().unwrap()
+                };
+                mt = mt.and(&lit).unwrap();
+            }
+        }
+        mt
+    }
+
+    /// Greedily pick one satisfying STATE assignment from a non-empty `set` (state
+    /// registers only; inputs left free).
+    fn pick_state_assignment(&self, set: &BDDFunction) -> BTreeMap<String, u128> {
+        self.pick_assignment(set, true).into_iter().collect()
+    }
+
+    /// Greedily pick one satisfying FULL assignment (state + input) from `set`.
+    fn pick_full_assignment(&self, set: &BDDFunction) -> HashMap<String, u128> {
+        self.pick_assignment(set, false)
+    }
+
+    /// Greedy minterm pick: for each selected cell's bits, keep the value that leaves
+    /// the residual set non-empty. `state_only` restricts to state cells.
+    fn pick_assignment(&self, set: &BDDFunction, state_only: bool) -> HashMap<String, u128> {
+        let mut cur = set.clone();
+        let mut out: HashMap<String, u128> = HashMap::new();
+        for cell in &self.cells {
+            if state_only && !cell.is_state {
+                continue;
+            }
+            let mut val = 0u128;
+            for (b, var) in cell.vars.iter().enumerate() {
+                let with1 = cur.and(var).unwrap();
+                if with1 != self.ff {
+                    cur = with1;
+                    val |= 1u128 << b;
+                } else {
+                    cur = cur.and(&var.not().unwrap()).unwrap();
+                }
+            }
+            out.insert(cell.symbol.clone(), val);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -2752,6 +2899,80 @@ mod tests {
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
         );
+    }
+
+    /// D1.8 — the stall-lasso witness for a `Violated` `AF (cnt==3)` on the reset
+    /// counter. `en=0` holds `cnt`, so from the reset state (`cnt=0`) there is a
+    /// `¬(cnt==3)` path that never reaches 3 — `AF (cnt==3)` fails, and the witness
+    /// is a concrete lasso. The test is **self-validating**: it replays every lasso
+    /// edge through the concrete `eval_step` simulator (there must be an input
+    /// realising each step) and confirms every state is `¬p` and the cycle closes.
+    #[test]
+    fn d1_8_exact_stall_lasso_reset_counter() {
+        let file = parser::parse(RESET_COUNTER_BTOR2).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let p = bb
+            .predicate_bdd(&PredicateExpr::eq("cnt", 3))
+            .expect("predicate cnt==3");
+
+        let lasso = bb
+            .exact_stall_lasso(&file, &p)
+            .expect("AF(cnt==3) is Violated on the reset counter → a stall lasso exists");
+        assert!(!lasso.cycle.is_empty(), "the stall must close into a cycle");
+
+        // The witness starts at the reset state (cnt = 0).
+        let first = lasso
+            .prefix
+            .first()
+            .or_else(|| lasso.cycle.first())
+            .expect("non-empty lasso");
+        assert_eq!(
+            first.get("cnt"),
+            Some(&0),
+            "lasso starts at the reset state"
+        );
+
+        // Every lasso state avoids p (cnt != 3).
+        for st in lasso.prefix.iter().chain(lasso.cycle.iter()) {
+            assert_ne!(st.get("cnt"), Some(&3), "every stall state is ¬(cnt==3)");
+        }
+
+        // Self-validate: every consecutive edge (including the cycle's closing edge
+        // back to cycle[0]) is realised by SOME concrete input via eval_step.
+        let step_exists = |from: &BTreeMap<String, u128>, to: &BTreeMap<String, u128>| -> bool {
+            (0..=1u128).any(|en| {
+                let mut asg: HashMap<String, u128> =
+                    from.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                asg.insert("en".to_string(), en);
+                let next = bb.eval_step(&asg);
+                next.get("cnt").copied().unwrap_or(0) == *to.get("cnt").unwrap()
+            })
+        };
+        let mut path: Vec<&BTreeMap<String, u128>> =
+            lasso.prefix.iter().chain(lasso.cycle.iter()).collect();
+        // Close the loop: the last cycle state steps back to cycle[0].
+        path.push(&lasso.cycle[0]);
+        for w in path.windows(2) {
+            assert!(
+                step_exists(w[0], w[1]),
+                "lasso edge {:?} -> {:?} must be a real transition",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// D1.8 — `AF (cnt==0)` HOLDS on the reset counter from cnt=0 (it's already 0),
+    /// so there is no stall and no lasso.
+    #[test]
+    fn d1_8_exact_stall_lasso_none_when_af_holds() {
+        let file = parser::parse(RESET_COUNTER_BTOR2).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let p = bb
+            .predicate_bdd(&PredicateExpr::eq("cnt", 0))
+            .expect("predicate cnt==0");
+        // cnt==0 holds at the initial state, so AF(cnt==0) holds ⇒ no stall witness.
+        assert!(bb.exact_stall_lasso(&file, &p).is_none());
     }
 
     /// D1.4 — `resolve_predicate_expr_registers` rewrites every register name in a
