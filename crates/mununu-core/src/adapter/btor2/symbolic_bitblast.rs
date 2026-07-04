@@ -110,7 +110,7 @@ use oxidd::{BooleanFunction, FunctionSubst, Manager, ManagerRef, Subst, VarNo};
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
 use crate::adapter::btor2::bit_blast::eval_const_value;
 use crate::adapter::btor2::parser::bv_width;
-use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
 use crate::adapter::btor2::term_backend::{BvTermBackend, WalkError, walk_design};
 // R-F5.4.1 — the symbolic mu-calculus evaluator reuses the (must, may) `TritBdd`
 // pair + the crate `Trit` verdict; the mu-calculus `Node` is aliased to avoid a
@@ -1379,6 +1379,52 @@ impl BddBitBlaster {
             ff: self.ff.clone(),
         }
     }
+
+    /// D1.3 — the BDD of the design's **initial states**, from the BTOR2 `init`
+    /// lines: each `init <state> <value>` pins that register's bits to `value`
+    /// (`⋀ state_bit ⟺ value_bit`). Registers without an `init` line are left
+    /// unconstrained (any value) — the sound "undefined reset" over-approximation.
+    /// A property `Holds` iff every initial state satisfies it.
+    pub fn initial_state_bdd(&self, file: &Btor2File) -> BDDFunction {
+        // State-line nid → the symbol `build()` assigned it (defaulting the same
+        // way, so it matches the cell's symbol).
+        let mut sym_of_nid: HashMap<Nid, String> = HashMap::new();
+        for line in &file.lines {
+            if let Node::State { symbol, .. } = &line.node {
+                let sym = symbol
+                    .clone()
+                    .unwrap_or_else(|| format!("state_{}", line.nid));
+                sym_of_nid.insert(line.nid, sym);
+            }
+        }
+        let cell_of_sym: HashMap<&str, &Cell> = self
+            .cells
+            .iter()
+            .filter(|c| c.is_state)
+            .map(|c| (c.symbol.as_str(), c))
+            .collect();
+
+        let mut init = self.tt.clone();
+        for line in &file.lines {
+            if let Node::Init { state, value, .. } = &line.node {
+                let Some(sym) = sym_of_nid.get(state) else {
+                    continue;
+                };
+                let Some(cell) = cell_of_sym.get(sym.as_str()) else {
+                    continue;
+                };
+                let Some(value_bits) = self.env.get(&value.nid()) else {
+                    continue; // value not bit-blasted (unreachable for a const init)
+                };
+                for (var, val) in cell.vars.iter().zip(value_bits.iter()) {
+                    // state_bit ⟺ value_bit  =  ¬(state_bit XOR value_bit)
+                    let iff = self.xor(var, val).not().unwrap();
+                    init = init.and(&iff).unwrap();
+                }
+            }
+        }
+        init
+    }
 }
 
 impl ExactModel {
@@ -1516,6 +1562,62 @@ impl ExactModel {
             x = next;
         }
     }
+}
+
+/// D1.3 — the definite verdict of exact symbolic model checking: a property
+/// `Holds` iff every initial state satisfies it, else it is `Violated` (there is a
+/// reachable-from-init counterexample class). 2-valued — the exact engine never
+/// returns `⊥`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactVerdict {
+    Holds,
+    Violated,
+}
+
+/// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
+/// BTOR2, bit-blast it, evaluate `formula` over the exact model (2-valued, no
+/// abstraction), and return the initial-state verdict. Atoms in `formula` are
+/// register-comparison predicates (`(reg op val)`) resolved via
+/// [`parse_predicate_expr`] → [`BddBitBlaster::predicate_bdd`]; an atom that does
+/// not parse is an error (never silently `⊥`). Bounded by BDD size, not by the
+/// explicit-state cap: decides the whole modal-μ fragment (safety, `AG EF`,
+/// `AF`-liveness, GR(1)) exactly, where predicate abstraction may return `⊥`.
+pub fn exact_symbolic_verdict(
+    btor2_content: &str,
+    formula: &Formula,
+) -> Result<ExactVerdict, String> {
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
+    let bb = BddBitBlaster::build(&file)?;
+    let exact = bb.exact_model();
+
+    // Resolve each distinct formula atom to its full-state BDD.
+    let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
+    for node in formula.nodes() {
+        if let MuNode::Predicate(name) = node {
+            if resolved.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let expr = parse_predicate_expr(name)
+                .map_err(|e| format!("exact MC: atom `{name}` is not a predicate: {e}"))?;
+            let bdd = bb.predicate_bdd(&expr)?;
+            resolved.push((name.clone(), bdd));
+        }
+    }
+    let atoms: HashMap<&str, BDDFunction> = resolved
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.clone()))
+        .collect();
+
+    let sat = exact.evaluate(formula, &atoms)?;
+    let init = bb.initial_state_bdd(&file);
+    // Holds iff init ⊆ sat, i.e. no initial state violates φ.
+    let violating = init.and(&sat.not().unwrap()).unwrap();
+    Ok(if violating == *exact.ff() {
+        ExactVerdict::Holds
+    } else {
+        ExactVerdict::Violated
+    })
 }
 
 #[cfg(test)]
@@ -2472,6 +2574,66 @@ mod tests {
             ],
         );
     }
+
+    // ---- D1.3: init-state verdict + the exact_symbolic_verdict entry point ----
+
+    /// A 2-bit wrapping up-counter with an enable, RESET to 0 via a BTOR2 `init`
+    /// line — so `initial_state_bdd` pins `cnt == 0` and the verdict is a real
+    /// initial-state check.
+    const RESET_COUNTER_BTOR2: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 input 2 en
+5 one 1
+6 zero 1
+7 add 1 3 5
+8 ite 1 4 7 3
+9 next 1 3 8
+10 init 1 3 6
+"#;
+
+    #[test]
+    fn d1_3_exact_verdict_reset_counter() {
+        // Verdicts are AT the initial state (cnt == 0), computed exactly.
+        let cases = [
+            ("(cnt == 0)", ExactVerdict::Holds), // init is 0
+            ("not (cnt == 0)", ExactVerdict::Violated),
+            ("[] (cnt == 0)", ExactVerdict::Violated), // successor cnt=1 possible
+            ("mu X. ((cnt == 3) or <> X)", ExactVerdict::Holds), // EF cnt==3 (reachable)
+            ("mu X. ((cnt == 3) or [] X)", ExactVerdict::Violated), // AF cnt==3 (en=0 stalls at 0)
+            (
+                "nu Y. ((mu X. ((cnt == 0) or <> X)) and [] Y)", // AG EF cnt==0 (wraps back)
+                ExactVerdict::Holds,
+            ),
+        ];
+        for (fs, expected) in cases {
+            let formula = crate::mu_calculus::parser::parse(fs).expect("formula parses");
+            let v = exact_symbolic_verdict(RESET_COUNTER_BTOR2, &formula).expect("verdict");
+            assert_eq!(v, expected, "formula `{fs}`");
+        }
+    }
+
+    /// Without an `init` line the initial-state set is unconstrained (every state),
+    /// so `Holds` means the property holds from EVERY state. `AG AF (cnt==0)` on
+    /// the *saturating* counter is `Violated` (cnt saturates at 3 and never returns
+    /// to 0) — a definite verdict the abstraction path could only give as ⊥.
+    #[test]
+    fn d1_3_exact_verdict_no_init_is_global() {
+        let f = crate::mu_calculus::parser::parse("nu X. ((mu Y. ((cnt == 0) or [] Y)) and [] X)")
+            .expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SATURATING_COUNTER_BTOR2, &f).expect("verdict"),
+            ExactVerdict::Violated,
+        );
+    }
+
+    // NOTE (D1.3b/D1.5 follow-up): the real-RTL uart_tx `AG AF (bit_cnt_q==0)`
+    // flip (tick-free → VIOLATED / tick-pinned → HOLDS) needs the cube lift's
+    // register-name resolution (`BtorSts::resolve_register`) — the flattened yosys
+    // BTOR2 emits registers *unnamed*, so a raw `bit_cnt_q` atom does not bind. It
+    // lands with the verify-auto `--engine exact-symbolic` wiring (D1.5), which
+    // already resolves names, alongside the docker validation.
 
     /// Evaluate `AG AF (cnt==0)` over the gated counter and print the per-cube
     /// verdict. `c1 = {cnt≠0}` has may-edges to both `c0` and `c1` but (per the
