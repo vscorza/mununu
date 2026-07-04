@@ -1,32 +1,81 @@
 #!/usr/bin/env bash
-# Pre-push hook (2026-06-03) — full-workspace safety net before push.
+# Pre-push hook (2026-07-04) — TRIMMED local gate before push.
 #
-# The pre-commit hook (scripts/pre-commit) is per-crate scoped for
-# speed. Pre-push runs the full `make ci` so cross-crate drift gets
-# caught locally before it hits GitHub. CI is the final gate; this
-# is the local mirror.
+# History: pre-push previously ran the full `make ci`
+# (`cargo test --workspace`, 1900+ tests, ~30–60 min wall-clock on this
+# hardware, magnified by the backgrounded hook's lowered scheduling
+# priority). That full test sweep is ~100% redundant with GitHub CI,
+# which runs the same nextest workspace sweep on a dedicated, full-
+# priority runner — and a feature branch cannot reach `main` without
+# passing it.
 #
-# Cost: ~30–60 min wall-clock on this hardware (1900+ tests). Run
-# once per push (batched commits → one pre-push), not once per
-# commit, so the amortized cost is lower than running it on every
-# commit.
+# So the default pre-push now runs the parts that are CHEAP and catch
+# the drift a per-crate pre-commit can miss:
+#   - fmt --check              (workspace formatting)
+#   - check --workspace        (cross-crate BUILD check — catches "core
+#                               change broke cli's build" drift, without
+#                               the cost of compiling every test binary)
+#   - test --workspace --doc   (doctests — the class that has bitten us
+#                               repeatedly; the `cargo test --tests`
+#                               compilation phase does NOT cover them)
+#   - test --lib api           (the api-feature build, mirrors CI)
+#   - cargo machete            (unused deps)
 #
-# To bypass (rare; e.g. emergency hotfix), use `git push --no-verify`.
-# The user must authorize the bypass per CLAUDE.md's Git Operations
-# section.
+# What's dropped from the default:
+#   - RUNNING the lib/integration test suite (`cargo test --workspace`).
+#     CI owns it; pre-commit (scripts/pre-commit) already scope-tests the
+#     touched crates + their downstream consumers on every commit.
+#   - LINTING (clippy). pre-commit runs `clippy -p <touched> --all-targets`
+#     (expanding to the whole workspace when mununu-core is touched), and
+#     CI runs the full `clippy --workspace --all-targets` — a feature
+#     branch cannot merge without it.
+#
+# Force the old full-workspace test sweep with:
+#   MUNUNU_PREPUSH_FULL=1 git push
+#
+# To bypass entirely (rare; e.g. re-pushing a SHA the hook already
+# validated after a silent-upload, or an emergency hotfix), use
+# `git push --no-verify`. The user must authorize the bypass per
+# CLAUDE.md's Git Operations section.
 
 set -e
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-echo "Pre-push: running full-workspace make ci..."
-make ci
+if [ "${MUNUNU_PREPUSH_FULL:-}" = "1" ]; then
+    echo "Pre-push (FULL): MUNUNU_PREPUSH_FULL=1 — running full-workspace make ci..."
+    make ci
+    echo "Pre-push: testing API module..."
+    cargo test --lib api --features api
+    echo "Pre-push: checking for unused dependencies (cargo machete)..."
+    cargo machete
+    echo "All pre-push checks passed (full sweep)."
+    exit 0
+fi
 
-echo "Pre-push: testing API module..."
+echo "Pre-push: cargo fmt --check (workspace)..."
+cargo fmt --all -- --check
+
+# Cross-crate BUILD check (not lint). `check --workspace` compiles every
+# crate's lib+bins for type-checking — catching the "a change in
+# mununu-core broke mununu-cli's build" drift a per-crate pre-commit can
+# miss — WITHOUT the cost of `--all-targets` (which cold-compiles every
+# integration-test binary just to look at it, ~13 min on this hardware).
+# Lint is already covered: pre-commit runs `clippy -p <touched>
+# --all-targets` (expanding to the whole workspace when mununu-core is
+# touched), and CI runs the full `clippy --workspace --all-targets`.
+echo "Pre-push: cargo check --workspace (cross-crate build)..."
+cargo check --workspace
+
+echo "Pre-push: cargo test --workspace --doc (doctests)..."
+cargo test --workspace --doc
+
+echo "Pre-push: testing API module (api feature)..."
 cargo test --lib api --features api
 
 echo "Pre-push: checking for unused dependencies (cargo machete)..."
 cargo machete
 
-echo "All pre-push checks passed."
+echo "All pre-push checks passed (trimmed; full lib/integration test suite runs in CI)."
+echo "Force the full local sweep with MUNUNU_PREPUSH_FULL=1 git push."

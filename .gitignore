@@ -3,6 +3,10 @@
 **/target/
 *.pdb
 
+# Machine-local cargo build config (lld linker path, optional sccache) —
+# host-specific (Homebrew lld path, Intel vs Apple Silicon), never committed.
+.cargo/config.toml
+
 # IDE
 .vscode/
 .idea/
