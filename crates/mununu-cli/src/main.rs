@@ -196,6 +196,15 @@ enum EngineArg {
     /// and the Clts-only optimisations (failure-subgame precision, approximant
     /// reuse, CTXDSL emit) are still `--engine explicit` only.
     Symbolic,
+    /// D1 exact symbolic MC: decide the μ-calculus EXACTLY over the full
+    /// bit-blasted state (no predicate abstraction), by ROBDD μ/ν fixpoint from the
+    /// reset init. The verdict is **definite** (2-valued Holds/Violated, never ⊥) —
+    /// it decides `AF`-liveness (and any μ-calculus property) where the abstraction
+    /// engines return Unknown: over the exact finite state the fixpoint IS the
+    /// ranking, so no ranking/fairness infra is needed. Bounded by BDD size (a
+    /// design too large to bit-blast ⇒ the property is `Skipped`). Verify-auto only
+    /// (the surface that supplies a reset-gated model).
+    ExactSymbolic,
 }
 
 /// R.2.5b session-1 follow-up (2026-06-06) — must-edge inference
@@ -1251,7 +1260,11 @@ struct SvVerifyAutoArgs {
     /// of magnitude faster at large `|P|`, the FSM-cone residual). Symbolic
     /// supports cube-dimension predicates (equality + non-derived compounds) +
     /// the bare `[]`/`<>` fragment; a derived predicate or guarded modality
-    /// `Skipped`s that property.
+    /// `Skipped`s that property. D1.6 (2026-07-04) — `exact-symbolic` decides
+    /// each property EXACTLY over the reset-gated design's full bit-blasted state
+    /// (no predicate abstraction, so a **definite** 2-valued verdict, never ⊥) —
+    /// it decides `AF`-liveness where both cube engines return Unknown; bounded by
+    /// BDD size (a design too large to bit-blast ⇒ the property is `Skipped`).
     #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
     engine: EngineArg,
 }
@@ -2295,6 +2308,9 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         // R-F5.5d — `--engine symbolic` routes every property through the R-F5
         // BDD CEGAR loop (no per-cube-pair SMT).
         symbolic_engine: args.engine == EngineArg::Symbolic,
+        // D1.6 — `--engine exact-symbolic` decides each property exactly over the
+        // full bit-blasted state (definite verdict, never ⊥).
+        exact_symbolic: args.engine == EngineArg::ExactSymbolic,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)
@@ -2660,6 +2676,18 @@ fn run_cegar_cli(
     // Parse the μ-calculus formula.
     let formula =
         mu_parser::parse(params.formula).map_err(|e| format!("formula parse error: {e:?}"))?;
+
+    // D1.6 — exact symbolic MC is a verify-auto-only engine: it needs the
+    // reset-gated model + reset init that `sv verify-auto` builds. The raw
+    // `btor2 cegar` / `sv cegar` surfaces are cube-CEGAR (trace output).
+    if params.engine == EngineArg::ExactSymbolic {
+        return Err(
+            "--engine exact-symbolic is available on `sv verify-auto` only (it decides the \
+             property exactly over the reset-gated model verify-auto builds). Use `--engine \
+             explicit` or `symbolic` here."
+                .to_string(),
+        );
+    }
 
     // R-F5.4.2b — the symbolic engine short-circuits the explicit lift + CEGAR
     // loop: it builds the may/must relation as BDDs directly from the BTOR2 and
