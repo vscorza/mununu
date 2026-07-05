@@ -295,12 +295,26 @@ fn substitute_config_in_formula(formula: &str, config: &[(String, u64)]) -> Stri
 /// concretizations applied. Pure (no toolchain) so it is unit-testable; called
 /// at the end of [`verify_auto`]. `applied_config_values` are the user-requested
 /// `config_values` that actually pinned a signal this run (H.J.b); empty when no
-/// concretization was requested.
+/// concretization was requested. `posture` (A.3) makes the abstraction-posture
+/// note honest about the may-relation the run actually used, rather than
+/// hardcoding "may-over-approximation".
+enum NotePosture {
+    /// Exact-symbolic engine: the full bit-blasted state, no abstraction — a
+    /// definite HOLDS/VIOLATED is sound and there is no `⊥`.
+    Exact,
+    /// Predicate-cube path. `sampling_may_props` names the properties decided with
+    /// the sampling may-edges (`may=off`), which UNDER-approximate the may-relation
+    /// (unsound for the `AG` box / branching shapes); empty ⇒ every property used
+    /// the sound `SmtAllPairs` may-relation.
+    Cube { sampling_may_props: Vec<String> },
+}
+
 fn build_notes(
     report: &AutoVerifyReport,
     must_edge_inference: MustEdgeInference,
     applied_config_values: &[(String, u64)],
     counter_bounds: &[String],
+    posture: &NotePosture,
 ) -> Vec<VerificationNote> {
     let d = &report.diagnostics;
     let mut notes = Vec::new();
@@ -376,19 +390,55 @@ fn build_notes(
         });
     }
 
-    // Abstraction posture (Info).
-    notes.push(VerificationNote {
-        kind: "abstraction-posture".into(),
-        level: NoteLevel::Info,
-        summary: "KMTS may-over-approximation — a definite HOLDS on a safety property is sound."
-            .into(),
-        detail: format!(
-            "A definite HOLDS transfers to the concrete RTL (safety + over-approximation = sound); \
-             a definite VIOLATED is a real reachable counterexample class. Must-edge inference: {}.",
-            must_edge_inference_label(must_edge_inference),
-        ),
-        items: Vec::new(),
-    });
+    // Abstraction posture — A.3: honest about the may-relation actually used.
+    match posture {
+        NotePosture::Exact => notes.push(VerificationNote {
+            kind: "abstraction-posture".into(),
+            level: NoteLevel::Info,
+            summary: "Exact-symbolic model checking — no abstraction, so a definite verdict is sound and there is no ⊥."
+                .into(),
+            detail: "Each property is decided over the full bit-blasted state space by ROBDD \
+                     fixpoint; a definite HOLDS or VIOLATED transfers to the concrete RTL, and no \
+                     property is left ⊥ (the predicate abstraction that would produce ⊥ is not used)."
+                .into(),
+            items: Vec::new(),
+        }),
+        NotePosture::Cube { sampling_may_props } if sampling_may_props.is_empty() => {
+            notes.push(VerificationNote {
+                kind: "abstraction-posture".into(),
+                level: NoteLevel::Info,
+                summary: "KMTS may-over-approximation — a definite HOLDS on a safety property is sound."
+                    .into(),
+                detail: format!(
+                    "The may-relation over-approximates the concrete transitions (SMT all-pairs), so \
+                     a definite HOLDS transfers to the concrete RTL (safety + over-approximation = \
+                     sound); a definite VIOLATED is a real reachable counterexample class. Must-edge \
+                     inference: {}.",
+                    must_edge_inference_label(must_edge_inference),
+                ),
+                items: Vec::new(),
+            });
+        }
+        NotePosture::Cube { sampling_may_props } => notes.push(VerificationNote {
+            kind: "abstraction-posture".into(),
+            level: NoteLevel::SoundnessCaveat,
+            summary: format!(
+                "{} propert(y/ies) used sampling may-edges (may=off), which under-approximate the \
+                 may-relation — a definite HOLDS among them is NOT guaranteed sound.",
+                sampling_may_props.len()
+            ),
+            detail: format!(
+                "Sampling may-edges (one representative per cube + a capped input set) can miss \
+                 concrete transitions, violating the KMTS `concrete ⊆ may` precondition; for a \
+                 branching/box shape (AG, AG EF) a definite HOLDS decided this way is candidate, not \
+                 proven. Re-run the listed properties with `--may-edge-inference smt-all-pairs`, or \
+                 `--engine exact-symbolic`. Every other property used the sound SMT all-pairs \
+                 may-relation. Must-edge inference: {}.",
+                must_edge_inference_label(must_edge_inference),
+            ),
+            items: sampling_may_props.clone(),
+        }),
+    }
 
     // Reset gating (Info).
     if !d.gated_resets.is_empty() {
@@ -1261,7 +1311,15 @@ pub fn verify_auto(
         ..Default::default()
     };
     if extraction.translated.is_empty() {
-        report.notes = build_notes(&report, opts.must_edge_inference, &[], &[]);
+        // No properties: the posture note is informational; reflect the engine.
+        let posture = if opts.exact_symbolic {
+            NotePosture::Exact
+        } else {
+            NotePosture::Cube {
+                sampling_may_props: Vec::new(),
+            }
+        };
+        report.notes = build_notes(&report, opts.must_edge_inference, &[], &[], &posture);
         if let Some(n) = annotation_note(&ann_scan) {
             report.notes.push(n);
         }
@@ -1505,6 +1563,10 @@ pub fn verify_auto(
     // note (sorted, deduped across properties).
     let mut counter_bound_items: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    // A.3 — names of properties decided with the sampling `may=off` may-relation
+    // (an under-approximation, unsound for the `AG` box); drives the
+    // abstraction-posture note. Empty ⇒ every property used the sound SmtAllPairs may.
+    let mut sampling_may_props: Vec<String> = Vec::new();
 
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
@@ -1656,6 +1718,14 @@ pub fn verify_auto(
             .specs
             .iter()
             .any(|s| combinational_nid.contains_key(&s.register));
+        // A.3 — the sound may-relation (SmtAllPairs) is used when the property
+        // references inputs / compounds / derived / combinational atoms; a
+        // pure-state property falls back to the sampling may (may=off), recorded
+        // for the abstraction-posture note.
+        let sound_may = has_compounds || has_inputs || has_derived || has_combinational;
+        if !sound_may {
+            sampling_may_props.push(t.name.clone());
+        }
         let cegar_opts = CegarOptions {
             max_iterations: opts.max_iterations,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -1675,7 +1745,7 @@ pub fn verify_auto(
             // implication is `⊥`, never a spurious `False`). With the root fix the
             // must relation is sound for these properties too.
             must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if has_compounds || has_inputs || has_derived || has_combinational {
+            may_edge_inference: if sound_may {
                 MayEdgeInference::SmtAllPairs
             } else {
                 MayEdgeInference::Off
@@ -1856,11 +1926,20 @@ pub fn verify_auto(
     // made (config concretizations, posture, reset-gating, flop stubs, cut
     // modules, coverage).
     let counter_bound_items_vec: Vec<String> = counter_bound_items.into_iter().collect();
+    // A.3 — the exact-symbolic engine (per-property branch above) and the
+    // predicate-cube path both reach this single note build; pick the posture the
+    // run actually used.
+    let posture = if opts.exact_symbolic {
+        NotePosture::Exact
+    } else {
+        NotePosture::Cube { sampling_may_props }
+    };
     report.notes = build_notes(
         &report,
         opts.must_edge_inference,
         &applied_config_values,
         &counter_bound_items_vec,
+        &posture,
     );
     if let Some(n) = annotation_note(&ann_scan) {
         report.notes.push(n);
@@ -2217,6 +2296,9 @@ module uart_tx(); endmodule"#;
             MustEdgeInference::SmtHyperMust,
             &[("cfg_detect_timer_i".into(), 7)],
             &["cnt_q <= 7 (config-inferred)".to_string()],
+            &NotePosture::Cube {
+                sampling_may_props: Vec::new(),
+            },
         );
         let kinds: Vec<&str> = notes.iter().map(|n| n.kind.as_str()).collect();
         for expected in [
@@ -2254,12 +2336,81 @@ module uart_tx(); endmodule"#;
         let cov = notes.iter().find(|n| n.kind == "coverage-summary").unwrap();
         assert!(cov.summary.contains("1 definite") && cov.summary.contains("1 unknown"));
         // No pins / no bounds ⇒ no config-concretization or counter-bound note.
-        let notes_no_pins = build_notes(&report, MustEdgeInference::Off, &[], &[]);
+        // With an all-`SmtAllPairs` (empty sampling) cube posture, the note is the
+        // sound over-approximation Info.
+        let ap = notes
+            .iter()
+            .find(|n| n.kind == "abstraction-posture")
+            .unwrap();
+        assert_eq!(ap.level, NoteLevel::Info);
+        assert!(
+            ap.summary.contains("may-over-approximation"),
+            "{}",
+            ap.summary
+        );
+        let notes_no_pins = build_notes(
+            &report,
+            MustEdgeInference::Off,
+            &[],
+            &[],
+            &NotePosture::Cube {
+                sampling_may_props: Vec::new(),
+            },
+        );
         assert!(
             !notes_no_pins
                 .iter()
                 .any(|n| n.kind == "config-concretization" || n.kind == "counter-bound")
         );
+    }
+
+    #[test]
+    fn abstraction_posture_note_reflects_may_relation() {
+        // A.3 — the abstraction-posture note is honest about the may-relation the
+        // run actually used, rather than hardcoding "may-over-approximation".
+        let report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "recover".into(),
+                kind: SvaKind::Assert,
+                formula: "nu Y. ((mu X. (idle || <> X)) && [] Y)".into(),
+                outcome: VerifyOutcome::Holds,
+                seeded_predicates: vec!["idle".into()],
+                counterexample: None,
+            }],
+            unsupported: Vec::new(),
+            diagnostics: ModelDiagnostics {
+                state_register_count: 1,
+                blackboxed_modules: Vec::new(),
+                gated_resets: Vec::new(),
+                auto_provided_stubs: Vec::new(),
+            },
+            notes: Vec::new(),
+        };
+        let ap = |posture: &NotePosture| {
+            build_notes(&report, MustEdgeInference::SmtHyperMust, &[], &[], posture)
+                .into_iter()
+                .find(|n| n.kind == "abstraction-posture")
+                .unwrap()
+        };
+        // Sampling may=off on a (branching) property → SoundnessCaveat naming it,
+        // NOT the hardcoded "HOLDS is sound".
+        let caveat = ap(&NotePosture::Cube {
+            sampling_may_props: vec!["recover".into()],
+        });
+        assert_eq!(caveat.level, NoteLevel::SoundnessCaveat);
+        assert!(caveat.items.contains(&"recover".to_string()));
+        assert!(caveat.summary.contains("may=off"), "{}", caveat.summary);
+        // All-SmtAllPairs cube → the sound over-approximation Info.
+        let sound = ap(&NotePosture::Cube {
+            sampling_may_props: Vec::new(),
+        });
+        assert_eq!(sound.level, NoteLevel::Info);
+        assert!(sound.summary.contains("may-over-approximation"));
+        // Exact engine → Info, and it does not claim a may-over-approximation.
+        let exact = ap(&NotePosture::Exact);
+        assert_eq!(exact.level, NoteLevel::Info);
+        assert!(exact.summary.contains("Exact"), "{}", exact.summary);
+        assert!(!exact.summary.contains("may-over-approximation"));
     }
 
     #[test]
