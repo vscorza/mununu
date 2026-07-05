@@ -5055,16 +5055,16 @@ endmodule
     /// `AG EF MainSmIdle` (`nu Y. ((mu X. ((state_q == 55) or <> X)) and [] Y)`) —
     /// "from every reachable state, can the FSM get back to idle?" — is a
     /// there-exists-a-path (`EF`) property SVA structurally cannot phrase. Its
-    /// verdict flips on a single explicit environment assumption:
-    ///   - `local_escalate_i` FREE           → VIOLATED: a local security escalation
-    ///     latches the FSM in the terminal `MainSmError` trap (SEC_CM design;
-    ///     `CsrngMainErrorStStable_A`), so idle is unreachable.
-    ///   - assume `G !local_escalate_i` (=0)  → HOLDS: with no escalation the FSM
-    ///     always cycles back to idle.
-    /// Both verdicts are 2-valued definite (the exact engine has no ⊥). The example
-    /// at `examples/verify/v8_csrng_escalation_recoverability/` reproduces this via
-    /// the CLI. Regression-critical: the frozen-register bug (fixed) made BOTH sides
-    /// a vacuous HOLDS, erasing the flip.
+    /// verdict flips on a single explicit environment assumption. With
+    /// `local_escalate_i` FREE the verdict is VIOLATED — a local security escalation
+    /// latches the FSM in the terminal `MainSmError` trap (SEC_CM design;
+    /// `CsrngMainErrorStStable_A`), so idle is unreachable. Under the assumption
+    /// `G !local_escalate_i` (`=0`) the verdict is HOLDS — with no escalation the FSM
+    /// always cycles back to idle. Both verdicts are 2-valued definite (the exact
+    /// engine has no ⊥). The example at
+    /// `examples/verify/v8_csrng_escalation_recoverability/` reproduces this via the
+    /// CLI. Regression-critical: the frozen-register bug (fixed) made BOTH sides a
+    /// vacuous HOLDS, erasing the flip.
     #[test]
     #[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
     fn e2e_h5gr1_csrng_recoverability_escalation_flip() {
