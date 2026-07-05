@@ -1,0 +1,6 @@
+build/
+source/logs/
+source/*.btor
+source/*.elab.v
+source/sv2v.err
+source/yosys.log

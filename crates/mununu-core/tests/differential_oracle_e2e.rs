@@ -176,8 +176,13 @@ fn assert_monotone(
 /// the mununu-exclusive liveness properties prepended as `@mununu_guarantee` comments.
 struct CorpusDesign {
     name: &'static str,
-    /// (filename, path-relative-to `examples/verify/`) — read untouched from disk.
-    sources: &'static [(&'static str, &'static str)],
+    /// Example directory under `examples/verify/`; every source lives in `<dir>/source/`.
+    dir: &'static str,
+    /// Source filenames in `<dir>/source/`, read UNTOUCHED from disk. `files[0]` is the
+    /// primary DUT (gets the `@mununu_guarantee` annotations); the rest — the
+    /// `prim_assert.sv` macro shim + the byte-exact upstream package/submodule closure —
+    /// are the additional_sources fed to sv2v/yosys.
+    files: &'static [&'static str],
     top: &'static str,
     /// `@mununu_guarantee <mu-formula>` lines prepended to the PRIMARY source.
     annotations: &'static [&'static str],
@@ -186,28 +191,35 @@ struct CorpusDesign {
     ledger: &'static [(&'static str, LedgerVerdict)],
 }
 
-/// Run one corpus design through `verify-auto` and enforce the monotone ledger on every
-/// recorded property. Returns the list of ⊥→definite improvements (empty in steady state).
-fn check_corpus_design(d: &CorpusDesign) -> Vec<(String, LedgerVerdict)> {
+/// Run one corpus design through `verify-auto` (exact-symbolic, untouched sources + the
+/// prepended `@mununu_guarantee` liveness annotations) and return the OBSERVED verdict for
+/// every ledger property, in ledger order. No monotone check here — this is the raw
+/// oracle read that both the strict ledger gate and the observation census share. Panics
+/// only on a SETUP failure (verify_auto errored, or a ledger property is absent from the
+/// report) — never on a verdict fact, so a definite/⊥ outcome is always returned, not raised.
+fn run_corpus_verdicts(
+    d: &CorpusDesign,
+    exact: bool,
+) -> Vec<(&'static str, LedgerVerdict, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
-    let read = |rel: &str| {
-        let p = root.join(rel);
+    let read = |file: &str| {
+        let p = root.join(d.dir).join("source").join(file);
         std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
     };
     // Prepend the mununu-exclusive annotations to the primary source (source stays
     // untouched on disk; only this in-memory copy carries the added properties).
-    let (primary_name, primary_rel) = d.sources[0];
+    let primary_name = d.files[0];
     let mut primary = String::new();
     for ann in d.annotations {
         primary.push_str("// @mununu_guarantee ");
         primary.push_str(ann);
         primary.push('\n');
     }
-    primary.push_str(&read(primary_rel));
+    primary.push_str(&read(primary_name));
 
     let mut sources = vec![(primary_name.to_string(), primary)];
-    for (name, rel) in &d.sources[1..] {
-        sources.push((name.to_string(), read(rel)));
+    for file in &d.files[1..] {
+        sources.push((file.to_string(), read(file)));
     }
     let yopts = YosysOptions {
         top: Some(d.top.to_string()),
@@ -220,31 +232,60 @@ fn check_corpus_design(d: &CorpusDesign) -> Vec<(String, LedgerVerdict)> {
         &sources,
         &yopts,
         &VerifyAutoOptions {
-            exact_symbolic: true,
+            // exact-symbolic (ROBDD, 2-valued, ≤40 bits) vs the explicit predicate-cube
+            // CEGAR engine (abstraction-based, no hard bit cap) — the fallback the exact
+            // engine's own bit-cap Skip message recommends.
+            exact_symbolic: exact,
             config_values,
             ..Default::default()
         },
     )
     .unwrap_or_else(|e| panic!("{}: verify_auto failed: {}", d.name, e.message));
 
+    d.ledger
+        .iter()
+        .map(|(needle, _)| {
+            let prop = report
+                .properties
+                .iter()
+                .find(|p| p.name.contains(needle) || p.formula.contains(needle))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: ledger property `{needle}` not in the report; got {:?}",
+                        d.name,
+                        report
+                            .properties
+                            .iter()
+                            .map(|p| &p.name)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            (
+                *needle,
+                outcome_verdict(&prop.outcome),
+                outcome_detail(&prop.outcome),
+            )
+        })
+        .collect()
+}
+
+/// A one-line cause for a non-definite outcome (empty for a definite Holds/Violated) — the
+/// "why is this ⊥" the census surfaces so the mitigation path is actionable.
+fn outcome_detail(o: &VerifyOutcome) -> String {
+    match o {
+        VerifyOutcome::Holds | VerifyOutcome::Violated { .. } => String::new(),
+        VerifyOutcome::Unknown { unknown_cells } => format!("Unknown ({unknown_cells} cells)"),
+        VerifyOutcome::Skipped { reason } => format!("Skipped: {reason}"),
+    }
+}
+
+/// Run one corpus design and enforce the monotone ledger on every recorded property.
+/// Returns the list of ⊥→definite improvements (empty in steady state).
+fn check_corpus_design(d: &CorpusDesign) -> Vec<(String, LedgerVerdict)> {
     let mut improvements = Vec::new();
-    for (needle, recorded) in d.ledger {
-        let prop = report
-            .properties
-            .iter()
-            .find(|p| p.name.contains(needle) || p.formula.contains(needle))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{}: ledger property `{needle}` not in the report; got {:?}",
-                    d.name,
-                    report
-                        .properties
-                        .iter()
-                        .map(|p| &p.name)
-                        .collect::<Vec<_>>()
-                )
-            });
-        let current = outcome_verdict(&prop.outcome);
+    for ((needle, current, _), (_, recorded)) in
+        run_corpus_verdicts(d, true).into_iter().zip(d.ledger)
+    {
         if let Some(up) = assert_monotone(d.name, needle, *recorded, current) {
             improvements.push((format!("{}.{needle}", d.name), up));
         }
@@ -255,23 +296,265 @@ fn check_corpus_design(d: &CorpusDesign) -> Vec<(String, LedgerVerdict)> {
 /// The corpus. Grows by adding a `CorpusDesign` entry (untouched source + a ledger).
 /// Seeded with uart_tx; the verification-prospector backlog (≥15 designs) feeds the
 /// expansion. csrng's recoverability flip lives in the v8 example + its own e2e test.
-const CORPUS: &[CorpusDesign] = &[CorpusDesign {
-    name: "uart_tx",
-    sources: &[("uart_tx.sv", "m1_opentitan_uart_tx/source/uart_tx.sv")],
-    top: "uart_tx",
-    annotations: &[
-        // AG AF (a transmission always completes) — VIOLATED (a persistent write / stalled
-        // tick holds the counter non-zero forever); AG EF (recoverability) — HOLDS.
-        "nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)",
-        "nu Y. ((mu X. ((bit_cnt_q == 0) or <> X)) and [] Y)",
-    ],
-    config: &[],
-    ledger: &[
-        // Recorded definite verdicts — must be preserved (a flip = a soundness/precision bug).
-        ("(mu Y. ((bit_cnt_q == 0) or [] Y))", LedgerVerdict::False), // AG AF: VIOLATED
-        ("(mu X. ((bit_cnt_q == 0) or <> X))", LedgerVerdict::True),  // AG EF: HOLDS
-    ],
-}];
+const CORPUS: &[CorpusDesign] = &[
+    CorpusDesign {
+        name: "uart_tx",
+        dir: "m1_opentitan_uart_tx",
+        files: &["uart_tx.sv"],
+        top: "uart_tx",
+        annotations: &[
+            // AG AF (a transmission always completes) — VIOLATED (a persistent write / stalled
+            // tick holds the counter non-zero forever); AG EF (recoverability) — HOLDS.
+            "nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)",
+            "nu Y. ((mu X. ((bit_cnt_q == 0) or <> X)) and [] Y)",
+        ],
+        config: &[("rst_ni", 1)], // gate reset (see edn note) for a meaningful recoverability verdict
+        ledger: &[
+            // Recorded definite verdicts — must be preserved (a flip = a soundness/precision bug).
+            ("(mu Y. ((bit_cnt_q == 0) or [] Y))", LedgerVerdict::False), // AG AF: VIOLATED
+            ("(mu X. ((bit_cnt_q == 0) or <> X))", LedgerVerdict::True),  // AG EF: HOLDS
+        ],
+    },
+    // ---- verification-prospector tranche 1 (OpenTitan Apache-2.0). Every `files` entry is
+    // BYTE-EXACT upstream at commit 558921c (the DUT + its full package/submodule closure);
+    // only `prim_assert.sv` is a local synthesis-macro shim. Enum symbols in the atoms are
+    // folded to their integer values by the slang frontend's `resolve_enum_refs`. Ledgers
+    // seeded `Indefinite` and calibrated to the OBSERVED exact-symbolic verdict — a definite
+    // observation locks it (a later flip = a soundness/precision bug). ----
+    //
+    // edn_main_sm — 9-bit sparse FSM, csrng sibling. `AG EF Idle` recoverability. Multiple
+    // terminal traps (Error via local_escalate_i, RejectCsrngEntropy via csrng_ack_err_i —
+    // edn_main_sm.sv:179,188) make recovery VIOLATED even without escalation (unlike csrng,
+    // whose only obstruction is local_escalate_i — see the csrng flip below).
+    CorpusDesign {
+        name: "edn_main_sm",
+        dir: "dc_opentitan_edn_main_sm",
+        files: &[
+            "edn_main_sm.sv",
+            "prim_assert.sv",
+            "edn_pkg.sv",
+            "entropy_src_pkg.sv",
+            "prim_util_pkg.sv",
+            "csrng_pkg.sv",
+            "csrng_reg_pkg.sv",
+        ],
+        top: "edn_main_sm",
+        // Idle = 9'b011000001 = 193 (enum symbols are NOT folded in the @mununu_guarantee
+        // mu-formula path — only in the design's own SVA — so the atom uses the integer).
+        annotations: &["nu Y. ((mu X. ((state_q == 193) or <> X)) and [] Y)"],
+        // rst_ni pinned INACTIVE (active-low → 1). The prim_assert shim strips the design's
+        // `disable iff (!rst_ni)` SVA that auto reset-gating relies on, so WITHOUT this pin
+        // reset is a free input that trivially "recovers" to Idle (a reset-trivial False-True).
+        // Pinning makes recoverability MEANINGFUL: recovery must happen via the FSM, not reset.
+        // Verified: free escalate ⇒ VIOLATED (the Error trap, edn_main_sm.sv:179 is terminal);
+        // EF(AG Error) confirms a permanently-stuck Error is reachable.
+        config: &[("rst_ni", 1)],
+        ledger: &[("(state_q == 193)", LedgerVerdict::False)], // VIOLATED (Error/Reject traps)
+    },
+    // prim_esc_receiver — single-clock 5-state escalation FSM ({Idle,Check,PingResp,EscResp,
+    // SigInt}). `AG EF Idle` recoverability.
+    CorpusDesign {
+        name: "prim_esc_receiver",
+        dir: "dc_opentitan_prim_esc_receiver",
+        // prim_count.sv (the timeout counter submodule) is vendored too, else it stays a
+        // chaotic blackbox that unsoundly frees the timeout→esc_req path.
+        files: &[
+            "prim_esc_receiver.sv",
+            "prim_assert.sv",
+            "prim_esc_pkg.sv",
+            "prim_count.sv",
+            "prim_count_pkg.sv",
+            "prim_util_pkg.sv",
+        ],
+        top: "prim_esc_receiver",
+        annotations: &["nu Y. ((mu X. ((state_q == 0) or <> X)) and [] Y)"], // Idle = 0
+        config: &[],
+        ledger: &[("(state_q == 0)", LedgerVerdict::Indefinite)],
+    },
+    // aes_ctr_fsm — 3-state AES counter-mode FSM (reg `aes_ctr_cs`; CTR_IDLE/CTR_INCR/
+    // CTR_ERROR). `AG EF CTR_IDLE` recoverability.
+    CorpusDesign {
+        name: "aes_ctr_fsm",
+        dir: "dc_opentitan_aes_ctr_fsm",
+        files: &[
+            "aes_ctr_fsm.sv",
+            "prim_assert.sv",
+            "aes_pkg.sv",
+            "aes_reg_pkg.sv",
+            "prim_util_pkg.sv",
+        ],
+        top: "aes_ctr_fsm",
+        annotations: &["nu Y. ((mu X. ((aes_ctr_cs == 14) or <> X)) and [] Y)"], // CTR_IDLE = 5'b01110 = 14
+        config: &[("rst_ni", 1)], // gate reset (see edn note) — else recovery is reset-trivial
+        ledger: &[("(aes_ctr_cs == 14)", LedgerVerdict::False)], // VIOLATED (CTR_ERROR trap)
+    },
+    // rom_ctrl_fsm — 8-state ROM-integrity FSM (mubi-tagged enum; `Done` = {6'b100000,
+    // MuBi4True=4'h6} = 518). `AG EF Done` completion-recoverability. NOTE: the full design
+    // is 834 register+input bits (the ROM address/data path dominates) — over the exact
+    // engine's 40-bit cap, so this is a documented ⊥ pending cone-of-influence (R-F5.6).
+    CorpusDesign {
+        name: "rom_ctrl_fsm",
+        dir: "dc_opentitan_rom_ctrl_fsm",
+        files: &[
+            "rom_ctrl_fsm.sv",
+            "prim_assert.sv",
+            "rom_ctrl_pkg.sv",
+            "prim_mubi_pkg.sv",
+            "prim_util_pkg.sv",
+        ],
+        top: "rom_ctrl_fsm",
+        annotations: &["nu Y. ((mu X. ((state_q == 518) or <> X)) and [] Y)"], // Done = 518
+        config: &[],
+        ledger: &[("(state_q == 518)", LedgerVerdict::Indefinite)],
+    },
+    // prim_count — dual-redundant hardened counter (primary `cnt_o`, ResetValue 0).
+    // `AG EF (cnt_o == 0)` clear-recoverability via `clr_i`.
+    CorpusDesign {
+        name: "prim_count",
+        dir: "dc_opentitan_prim_count",
+        files: &["prim_count.sv", "prim_assert.sv", "prim_count_pkg.sv"],
+        top: "prim_count",
+        annotations: &["nu Y. ((mu X. ((cnt_o == 0) or <> X)) and [] Y)"],
+        config: &[("rst_ni", 1)], // gate reset (see edn note) — else recovery is reset-trivial
+        ledger: &[("(cnt_o == 0)", LedgerVerdict::True)], // HOLDS (clearable via clr_i)
+    },
+    // ---- tranche 2 (OpenTitan Apache-2.0, byte-exact upstream at 558921c). All reset-gated
+    // (rst_ni=1). The large control FSMs (usbdev/aes_cipher/otbn) are expected ⊥ (bit-cap >40)
+    // pending cone-of-influence — informative census members, not failures. ----
+    // prim_arbiter_ppc — round-robin arbiter; the `mask` register is its only state (resets 0).
+    // AG EF (mask==0): the priority mask is always returnable to the reset round-robin phase.
+    CorpusDesign {
+        name: "prim_arbiter_ppc",
+        dir: "dc_opentitan_prim_arbiter_ppc",
+        files: &["prim_arbiter_ppc.sv", "prim_assert.sv", "prim_util_pkg.sv"],
+        top: "prim_arbiter_ppc",
+        annotations: &["nu Y. ((mu X. ((mask == 0) or <> X)) and [] Y)"],
+        config: &[("rst_ni", 1)],
+        ledger: &[("(mask == 0)", LedgerVerdict::Indefinite)],
+    },
+    // prim_arbiter_tree — round-robin arbiter; `prio_mask_q` state (resets 0). AG EF prio_mask==0.
+    CorpusDesign {
+        name: "prim_arbiter_tree",
+        dir: "dc_opentitan_prim_arbiter_tree",
+        files: &["prim_arbiter_tree.sv", "prim_assert.sv"],
+        top: "prim_arbiter_tree",
+        annotations: &["nu Y. ((mu X. ((prio_mask_q == 0) or <> X)) and [] Y)"],
+        config: &[("rst_ni", 1)],
+        ledger: &[("(prio_mask_q == 0)", LedgerVerdict::Indefinite)],
+    },
+    // prim_packer_fifo — AG EF (depth_o==0): the packer FIFO is always drainable to empty.
+    CorpusDesign {
+        name: "prim_packer_fifo",
+        dir: "dc_opentitan_prim_packer_fifo",
+        files: &["prim_packer_fifo.sv", "prim_assert.sv"],
+        top: "prim_packer_fifo",
+        annotations: &["nu Y. ((mu X. ((depth_o == 0) or <> X)) and [] Y)"],
+        config: &[("rst_ni", 1)],
+        ledger: &[("(depth_o == 0)", LedgerVerdict::Indefinite)],
+    },
+    // prim_esc_sender — 5-state escalation-sender FSM (Idle=0). AG EF Idle recoverability.
+    CorpusDesign {
+        name: "prim_esc_sender",
+        dir: "dc_opentitan_prim_esc_sender",
+        files: &["prim_esc_sender.sv", "prim_assert.sv", "prim_esc_pkg.sv"],
+        top: "prim_esc_sender",
+        annotations: &["nu Y. ((mu X. ((state_q == 0) or <> X)) and [] Y)"], // Idle = 0
+        config: &[("rst_ni", 1)],
+        ledger: &[("(state_q == 0)", LedgerVerdict::True)], // HOLDS (esc_sender recovers to Idle)
+    },
+    // usbdev_linkstate — 6-state USB link FSM (LinkDisconnected=0). AG EF LinkDisconnected.
+    // Large (12-bit inactivity timers) — expected ⊥ (bit-cap) pending COI.
+    CorpusDesign {
+        name: "usbdev_linkstate",
+        dir: "dc_opentitan_usbdev_linkstate",
+        files: &["usbdev_linkstate.sv", "prim_assert.sv"],
+        top: "usbdev_linkstate",
+        annotations: &["nu Y. ((mu X. ((link_state_q == 0) or <> X)) and [] Y)"], // LinkDisconnected = 0
+        config: &[("rst_ni", 1)],
+        ledger: &[("(link_state_q == 0)", LedgerVerdict::Indefinite)],
+    },
+    // aes_cipher_control_fsm — 7-state AES cipher-core FSM (CIPHER_CTRL_IDLE=6'b001001=9).
+    // Large (aes_reg_pkg datapath) — expected ⊥ (bit-cap) pending COI.
+    CorpusDesign {
+        name: "aes_cipher_control_fsm",
+        dir: "dc_opentitan_aes_cipher_control_fsm",
+        files: &[
+            "aes_cipher_control_fsm.sv",
+            "prim_assert.sv",
+            "aes_pkg.sv",
+            "aes_reg_pkg.sv",
+            "prim_util_pkg.sv",
+        ],
+        top: "aes_cipher_control_fsm",
+        annotations: &["nu Y. ((mu X. ((aes_cipher_ctrl_cs == 9) or <> X)) and [] Y)"], // CIPHER_CTRL_IDLE = 9
+        config: &[("rst_ni", 1)],
+        ledger: &[("(aes_cipher_ctrl_cs == 9)", LedgerVerdict::Indefinite)],
+    },
+    // otbn_start_stop_control — OTBN secure-wipe start/stop FSM. Big closure (lc_ctrl/otp/secded)
+    // — expected ⊥ (bit-cap) pending COI. Placeholder atom (state_q==0) — never evaluated while
+    // bit-capped; the entry demonstrates the pipeline elaborates the full closure.
+    CorpusDesign {
+        name: "otbn_start_stop_control",
+        dir: "dc_opentitan_otbn_start_stop_control",
+        files: &[
+            "otbn_start_stop_control.sv",
+            "prim_assert.sv",
+            "otbn_pkg.sv",
+            "otp_ctrl_pkg.sv",
+            "lc_ctrl_pkg.sv",
+            "lc_ctrl_reg_pkg.sv",
+            "lc_ctrl_state_pkg.sv",
+            "prim_mubi_pkg.sv",
+            "prim_secded_pkg.sv",
+            "prim_trivium_pkg.sv",
+            "prim_util_pkg.sv",
+        ],
+        top: "otbn_start_stop_control",
+        annotations: &["nu Y. ((mu X. ((state_q == 0) or <> X)) and [] Y)"],
+        config: &[("rst_ni", 1)],
+        ledger: &[("(state_q == 0)", LedgerVerdict::Indefinite)],
+    },
+    // csrng_main_sm — sparse command FSM (MainSmIdle = 6'b110111 = 55). AG EF Idle
+    // recoverability, VIOLATED: beyond local_escalate_i, an unsupported command drives the FSM
+    // to the terminal MainSmError trap (csrng_main_sm.sv:122 `default: state_d = MainSmError`),
+    // so with the command inputs free, recovery fails. The CLEAN escalation flip (escalate-free
+    // ⇒ VIOLATED, local_escalate_i=0 ⇒ HOLDS) needs the input-concretized setup of the shipped
+    // v8_csrng_escalation_recoverability example (which pins acmd_i/flag0_i); here the design is
+    // exercised with all command inputs free — the honest unconstrained recoverability verdict.
+    CorpusDesign {
+        name: "csrng_main_sm",
+        dir: "dc_opentitan_csrng_main_sm",
+        files: &[
+            "csrng_main_sm.sv",
+            "prim_assert.sv",
+            "csrng_pkg.sv",
+            "csrng_reg_pkg.sv",
+            "entropy_src_pkg.sv",
+            "prim_util_pkg.sv",
+        ],
+        top: "csrng_main_sm",
+        annotations: &["nu Y. ((mu X. ((state_q == 55) or <> X)) and [] Y)"], // MainSmIdle = 55
+        config: &[("rst_ni", 1)],
+        ledger: &[("(state_q == 55)", LedgerVerdict::False)], // VIOLATED (MainSmError trap, inputs free)
+    },
+    // prim_fifo_sync — synchronous FIFO; AG EF (depth_o==0) drainability. Data storage +
+    // pointers — expected ⊥ (bit-cap) pending COI. prim_fifo_assert.svh is a `include`d
+    // header (staged so the include resolves, never compiled as a top-level source).
+    CorpusDesign {
+        name: "prim_fifo_sync",
+        dir: "dc_opentitan_prim_fifo_sync",
+        files: &[
+            "prim_fifo_sync.sv",
+            "prim_assert.sv",
+            "prim_fifo_assert.svh",
+            "prim_util_pkg.sv",
+        ],
+        top: "prim_fifo_sync",
+        annotations: &["nu Y. ((mu X. ((depth_o == 0) or <> X)) and [] Y)"],
+        config: &[("rst_ni", 1)],
+        ledger: &[("(depth_o == 0)", LedgerVerdict::Indefinite)],
+    },
+];
 
 #[test]
 #[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
@@ -288,4 +571,107 @@ fn diff_corpus_monotone_verdict_ledger() {
             eprintln!("  {prop}: {v:?}");
         }
     }
+}
+
+/// One catch_unwind wrapper around a corpus run under a given engine.
+fn observe_engine(
+    d: &CorpusDesign,
+    exact: bool,
+) -> Result<Vec<(&'static str, LedgerVerdict, String)>, String> {
+    std::panic::catch_unwind(|| run_corpus_verdicts(d, exact)).map_err(|e| {
+        e.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string panic>".to_string())
+    })
+}
+
+/// Verdict CENSUS over the whole corpus — a non-failing diagnostic that runs every design
+/// under `catch_unwind`, so one docker pass surfaces EVERY design's observed verdict (or its
+/// setup error) without one failure aborting the batch. Each design runs under the exact
+/// engine first; any property the exact engine leaves ⊥ (its 40-bit cap) is retried under the
+/// EXPLICIT predicate-cube CEGAR engine — the mitigation the exact engine's own Skip message
+/// recommends — and the fallback verdict is shown. Prints per-design T/F/⊥ lines plus a tally
+/// for each engine, the raw input for the "how many T/F/⊥, why the ⊥s, and the path forward"
+/// census. Never asserts (a wrong verdict is caught by the strict ledger gate above).
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn diff_corpus_verdict_census() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    // The explicit-engine ⊥-fallback is OPT-IN (`MUNUNU_CENSUS_EXPLICIT=1`): the explicit CEGAR
+    // on the big closures (otbn) can run tens of minutes, so the default census is exact-only
+    // and fast. Set the env var for the full "path forward" comparison.
+    let want_explicit = std::env::var_os("MUNUNU_CENSUS_EXPLICIT").is_some();
+
+    let (mut t, mut f, mut bot, mut err) = (0u32, 0u32, 0u32, 0u32);
+    // How many exact-engine ⊥s the explicit engine rescued to a definite verdict.
+    let (mut rescued, mut still_bot) = (0u32, 0u32);
+    eprintln!(
+        "\n================ corpus verdict census (exact engine; explicit fallback for ⊥) ================"
+    );
+    for d in CORPUS {
+        let exact = observe_engine(d, true);
+        // Only pay for the explicit pass if opted in AND the exact pass left something ⊥.
+        let needs_fallback = want_explicit
+            && matches!(&exact, Ok(props) if props.iter().any(|(_, v, _)| *v == LedgerVerdict::Indefinite));
+        let explicit = if needs_fallback {
+            Some(observe_engine(d, false))
+        } else {
+            None
+        };
+
+        match &exact {
+            Ok(props) => {
+                for (i, (needle, v, detail)) in props.iter().enumerate() {
+                    match v {
+                        LedgerVerdict::True => t += 1,
+                        LedgerVerdict::False => f += 1,
+                        LedgerVerdict::Indefinite => bot += 1,
+                    }
+                    // For a ⊥, look up the explicit-engine fallback verdict for the same property.
+                    let fb = if *v == LedgerVerdict::Indefinite {
+                        match &explicit {
+                            Some(Ok(ex)) => match ex.get(i) {
+                                Some((_, ev, _)) if *ev != LedgerVerdict::Indefinite => {
+                                    rescued += 1;
+                                    format!("  [explicit ⇒ {ev:?}]")
+                                }
+                                Some((_, _, edetail)) => {
+                                    still_bot += 1;
+                                    format!("  [explicit ⇒ ⊥: {edetail}]")
+                                }
+                                None => String::new(),
+                            },
+                            Some(Err(e)) => {
+                                still_bot += 1;
+                                format!("  [explicit ⇒ ERROR: {}]", e.lines().next().unwrap_or(""))
+                            }
+                            None => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    eprintln!("  {:32} {needle:34} -> {v:?}  {detail}{fb}", d.name);
+                }
+            }
+            Err(msg) => {
+                err += 1;
+                let first = msg.lines().next().unwrap_or(msg);
+                eprintln!("  {:32} {:34} -> ERROR: {first}", d.name, "");
+            }
+        }
+    }
+    std::panic::set_hook(prev);
+    eprintln!(
+        "---------------------------------------------------------------------------------------------"
+    );
+    eprintln!("  exact:  True={t}  False={f}  Indefinite(⊥)={bot}  setup-error={err}");
+    eprintln!(
+        "  explicit fallback on the {bot} exact-⊥:  rescued→definite={rescued}  still-⊥={still_bot}"
+    );
+    eprintln!(
+        "=============================================================================================\n"
+    );
 }
