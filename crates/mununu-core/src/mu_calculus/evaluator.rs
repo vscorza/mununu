@@ -1576,7 +1576,14 @@ where
         modal_node_id: NodeId,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
         if let Some(bound) = guard.max_steps {
-            return self.eval_modal_bounded(kind, guard, target_set, bound);
+            // 2-valued path: no may/must split, so every edge is admitted (`All`).
+            return self.eval_modal_bounded(
+                kind,
+                guard,
+                target_set,
+                bound,
+                TransitionModalityFilter::All,
+            );
         }
 
         let mut result = self.alloc_bitvec(false)?;
@@ -1638,14 +1645,25 @@ where
         guard: &Guard,
         target_set: &BitVec<usize, Lsb0>,
         bound: u32,
+        // PO-4 / R.6.3.b (A.1, 2026-07-05) — the transition-modality filter, threaded
+        // through the bounded family so a `steps=k` modality is 3-valued-aware. The
+        // 2-valued path passes `All` (unchanged); the 3-valued `modal_bits_from_target`
+        // passes `MustOnly` for the definite side, matching the unbounded case
+        // (Diamond: must=MustOnly/may=All; Box: must=All/may=MustOnly). On a Sharp-only
+        // KMTS every filter admits every edge, so Sharp fixtures are unaffected.
+        modality_filter: TransitionModalityFilter,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
         // When scope is zero steps we still rely on the already-evaluated target set,
         // so we do not need to re-evaluate the target node.
         let mut result = self.alloc_bitvec(false)?;
         for state in self.clts.states() {
             let satisfies = match kind {
-                ModalKind::Diamond => self.modal_exists_bounded(state, guard, target_set, bound),
-                ModalKind::Box => self.modal_forall_bounded(state, guard, target_set, bound),
+                ModalKind::Diamond => {
+                    self.modal_exists_bounded(state, guard, target_set, bound, modality_filter)
+                }
+                ModalKind::Box => {
+                    self.modal_forall_bounded(state, guard, target_set, bound, modality_filter)
+                }
             };
             if satisfies {
                 result.set(state.index(), true);
@@ -2268,6 +2286,11 @@ where
         guard: &Guard,
         targets: &BitVec<usize, Lsb0>,
         bound: u32,
+        // PO-4 / R.6.3.b (A.1) — the modality filter for each step of the bounded
+        // reachability. `MustOnly` ⇒ only `must`-edges (Sharp ∪ MustHyperOnly) are
+        // traversed (the definite `<>` lower bound); `All` ⇒ every edge (the possible
+        // upper bound).
+        modality_filter: TransitionModalityFilter,
     ) -> bool {
         if bound == 0 {
             return self.guard_zero_step_allowed(guard)
@@ -2281,15 +2304,15 @@ where
 
         let outgoing = self.clts.outgoing(state);
 
-        // Group uncontrollable transitions by their label sets (Skolem paradigm)
-        // R.6.3 — bounded variants are documented in `modal_bits_from_target`
-        // as deferred to R.6.3.b; pass `All` to preserve pre-R.6.3 semantics.
+        // Group uncontrollable transitions by their label sets (Skolem paradigm).
+        // A.1: thread the modality filter (was hardcoded `All`) so bounded steps are
+        // 3-valued-aware.
         let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
             outgoing,
             guard,
             state,
             None, // No guard_parts for bounded version
-            TransitionModalityFilter::All,
+            modality_filter,
         );
 
         // For each group of transitions sharing the same uncontrollable labels, check if at least one can satisfy
@@ -2327,7 +2350,13 @@ where
                                 return true;
                             }
                             if bound > 1 {
-                                self.modal_exists_bounded(trans.target(), guard, targets, bound - 1)
+                                self.modal_exists_bounded(
+                                    trans.target(),
+                                    guard,
+                                    targets,
+                                    bound - 1,
+                                    modality_filter,
+                                )
                             } else {
                                 false
                             }
@@ -2343,7 +2372,13 @@ where
                             return true;
                         }
                         if bound > 1 {
-                            self.modal_exists_bounded(trans.target(), guard, targets, bound - 1)
+                            self.modal_exists_bounded(
+                                trans.target(),
+                                guard,
+                                targets,
+                                bound - 1,
+                                modality_filter,
+                            )
                         } else {
                             false
                         }
@@ -2375,6 +2410,11 @@ where
                 if !self.guard_matches(state, transition, guard) {
                     continue;
                 }
+                // A.1 — the diamond ranges only over filter-admitted edges (must-edges
+                // when `MustOnly`) for the definite lower bound.
+                if !modality_filter.allows(transition) {
+                    continue;
+                }
                 // Check if this controllable transition is in an uncontrollable group
                 // Phase 3: Use label IDs directly as keys (no string conversion)
                 let uncontrollable_label_ids = self.extract_uncontrollable_label_ids(transition);
@@ -2390,7 +2430,13 @@ where
                         return true;
                     }
                     if bound > 1
-                        && self.modal_exists_bounded(transition.target(), guard, targets, bound - 1)
+                        && self.modal_exists_bounded(
+                            transition.target(),
+                            guard,
+                            targets,
+                            bound - 1,
+                            modality_filter,
+                        )
                     {
                         return true;
                     }
@@ -2424,6 +2470,11 @@ where
                 if !self.guard_matches(current, transition, guard) {
                     continue;
                 }
+                // A.1 — the diamond BFS ranges only over filter-admitted edges
+                // (must-edges under `MustOnly`) for the definite lower bound.
+                if !modality_filter.allows(transition) {
+                    continue;
+                }
                 let next = transition.target();
                 let next_depth = depth + 1;
                 if bit_is_set(targets, next.index()) {
@@ -2447,6 +2498,11 @@ where
         guard: &Guard,
         targets: &BitVec<usize, Lsb0>,
         bound: u32,
+        // PO-4 / R.6.3.b (A.1) — the modality filter. For a box (`∀`) the filter
+        // restricts which edges the `∀` ranges over: `MustOnly` ignores `MayOnly`
+        // escaping edges (a `may`-side box holds iff every MUST-edge stays good);
+        // `All` requires every edge (the `must`-side box).
+        modality_filter: TransitionModalityFilter,
     ) -> bool {
         if bound == 0 {
             return self.guard_zero_step_allowed(guard)
@@ -2459,20 +2515,25 @@ where
         }
 
         if matches!(guard.control, Control::Controllable) {
-            return self.modal_forall_bounded_controllable(state, guard, targets, bound);
+            return self.modal_forall_bounded_controllable(
+                state,
+                guard,
+                targets,
+                bound,
+                modality_filter,
+            );
         }
 
         let outgoing = self.clts.outgoing(state);
 
-        // Group uncontrollable transitions by their label sets (Skolem paradigm)
-        // R.6.3 — bounded variants are documented in `modal_bits_from_target`
-        // as deferred to R.6.3.b; pass `All` to preserve pre-R.6.3 semantics.
+        // Group uncontrollable transitions by their label sets (Skolem paradigm).
+        // A.1: thread the modality filter (was hardcoded `All`).
         let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
             outgoing,
             guard,
             state,
             None, // No guard_parts for bounded version
-            TransitionModalityFilter::All,
+            modality_filter,
         );
 
         // For each group of uncontrollable transitions, ALL must satisfy
@@ -2483,7 +2544,13 @@ where
                     return false;
                 }
                 if bound > 1
-                    && !self.modal_forall_bounded(trans.target(), guard, targets, bound - 1)
+                    && !self.modal_forall_bounded(
+                        trans.target(),
+                        guard,
+                        targets,
+                        bound - 1,
+                        modality_filter,
+                    )
                 {
                     return false;
                 }
@@ -2495,6 +2562,11 @@ where
         for transition in outgoing {
             if transition.is_controllable(self.clts) {
                 if !self.guard_matches(state, transition, guard) {
+                    continue;
+                }
+                // A.1 — a box `∀` does not range over a filter-excluded edge (a `MayOnly`
+                // edge under `MustOnly`), so it does not constrain the verdict.
+                if !modality_filter.allows(transition) {
                     continue;
                 }
                 // Check if this controllable transition is in an uncontrollable group
@@ -2517,6 +2589,7 @@ where
                             guard,
                             targets,
                             bound - 1,
+                            modality_filter,
                         )
                     {
                         return false;
@@ -2539,6 +2612,11 @@ where
                 }
                 for transition in self.clts.outgoing(current) {
                     if !self.guard_matches(current, transition, guard) {
+                        continue;
+                    }
+                    // A.1 — same filter as the grouped path: a box `∀` skips
+                    // filter-excluded edges rather than requiring them to stay good.
+                    if !modality_filter.allows(transition) {
                         continue;
                     }
                     let next = transition.target();
@@ -2565,10 +2643,20 @@ where
         guard: &Guard,
         targets: &BitVec<usize, Lsb0>,
         bound: u32,
+        // A.1 — modality filter; fixed for the whole call, so the memo (keyed by
+        // state × remaining) stays valid.
+        modality_filter: TransitionModalityFilter,
     ) -> bool {
         let state_count = self.clts.state_count();
         let mut memo = vec![vec![None; (bound + 1) as usize]; state_count];
-        self.modal_forall_bounded_controllable_rec(state, guard, targets, bound, &mut memo)
+        self.modal_forall_bounded_controllable_rec(
+            state,
+            guard,
+            targets,
+            bound,
+            &mut memo,
+            modality_filter,
+        )
     }
 
     fn modal_forall_bounded_controllable_rec(
@@ -2578,6 +2666,7 @@ where
         targets: &BitVec<usize, Lsb0>,
         remaining: u32,
         memo: &mut Vec<Vec<Option<bool>>>,
+        modality_filter: TransitionModalityFilter,
     ) -> bool {
         let idx = state.index();
         if let Some(value) = memo[idx][remaining as usize] {
@@ -2595,13 +2684,13 @@ where
             let outgoing = self.clts.outgoing(state);
 
             // Group uncontrollable transitions by their label sets (Skolem paradigm).
-            // R.6.3 — bounded variant, see modal_bits_from_target's comment.
+            // A.1 — thread the modality filter (was hardcoded `All`).
             let uncontrollable_groups = self.group_transitions_by_uncontrollable_labels(
                 outgoing,
                 guard,
                 state,
                 None, // No guard_parts for bounded version
-                TransitionModalityFilter::All,
+                modality_filter,
             );
 
             // For each group of uncontrollable transitions, ALL must satisfy
@@ -2615,6 +2704,7 @@ where
                             targets,
                             remaining - 1,
                             memo,
+                            modality_filter,
                         );
                     if !next_ok {
                         memo[idx][remaining as usize] = Some(false);
@@ -2630,6 +2720,10 @@ where
                 if !self.guard_matches(state, transition, guard) {
                     continue;
                 }
+                // A.1 — the controllable `∃` witness must be a filter-admitted edge.
+                if !modality_filter.allows(transition) {
+                    continue;
+                }
                 if transition.is_controllable(self.clts) {
                     let next = transition.target();
                     let next_ok = bit_is_set(targets, next.index())
@@ -2639,6 +2733,7 @@ where
                             targets,
                             remaining - 1,
                             memo,
+                            modality_filter,
                         );
                     ctrl_seen = true;
                     if next_ok {
@@ -3053,15 +3148,13 @@ where
         modality_filter: TransitionModalityFilter,
     ) -> Result<BitVec<usize, Lsb0>, EvaluationError> {
         if let Some(bound) = guard.max_steps {
-            // R.6.3 — bounded variants do not yet thread the
-            // modality filter; per the kmts-theory §7.5 implementation-
-            // status boundary, bounded modalities are deferred to an
-            // R.6.3.b follow-up. For Sharp-only fixtures this is safe
-            // (no MayOnly transitions exist); on KMTSes with MayOnly
-            // edges + a bounded modality the result is the pre-R.6.3
-            // modality-blind verdict (over-claims must_bits for
-            // Diamond, under-claims may_bits for Box).
-            return self.eval_modal_bounded(kind, guard, target_set, bound);
+            // PO-4 / R.6.3.b (A.1, 2026-07-05) — the bounded family now threads the
+            // modality filter, so a bounded modality is 3-valued-aware: the must-side
+            // pass filters to `must`-edges (Diamond) / the may-side to `must`-edges
+            // (Box), exactly as the unbounded two-pass. On a Sharp-only KMTS this is a
+            // no-op (every filter admits every edge). Closes the pre-R.6.3 modality-blind
+            // gap (over-claimed must_bits for Diamond, under-claimed may_bits for Box).
+            return self.eval_modal_bounded(kind, guard, target_set, bound, modality_filter);
         }
 
         let mut result = self.alloc_bitvec(false)?;
@@ -5153,6 +5246,88 @@ mod modal_trit_draft_tests {
             .modal_trit_from_target(ModalKind::Diamond, &controllable_guard(), &target_s1_true())
             .expect("ref");
         assert_eq!(reference.verdict_at(s0i), Trit::Unknown);
+    }
+
+    /// PO-4 / R.6.3.b (A.1, 2026-07-05) — a **bounded** modality (`steps=k`) is now
+    /// 3-valued-aware: the definite side filters to `must`-edges, matching the
+    /// unbounded two-pass. Before A.1 the bounded family was modality-blind (passed
+    /// `All`), so on a KMTS with a `MayOnly` edge it over-claimed `must_bits` for a
+    /// bounded `<>` (a may-only witness read as a definite reach) and under-claimed
+    /// `may_bits` for a bounded `[]`.
+    #[test]
+    fn po4_bounded_modality_is_three_valued_aware() {
+        use crate::clts::Tristate;
+
+        // DIAMOND — the ONLY edge to the `p`-True state is `MayOnly`, so
+        // `<steps<=1> p` is ⊥ (may-reachable, not must-reachable), NOT definite-True.
+        let mut b = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        b.state("s0").state("s1").initial("s0");
+        let act = b.labels().intern(["act"]).expect("act");
+        b.set_label_controllability(act, LabelControllability::Controllable);
+        let s0 = b.state_id_or_insert("s0").expect("s0");
+        let s1 = b.state_id_or_insert("s1").expect("s1");
+        b.transition_ids_with_modality(s0, &[act], s1, TransitionModality::MayOnly);
+        b.transition_ids(s1, &[act], s1); // s1 Sharp self-loop (non-vacuous)
+        b.with_3valued_predicate(s0, "p".to_string(), Tristate::KleeneF);
+        b.with_3valued_predicate(s1, "p".to_string(), Tristate::KleeneT);
+        let clts = b.build().expect("build");
+        let env = Environment::new(clts.state_count());
+        let s0i = clts.state_id("s0").expect("s0").index();
+
+        let bounded = evaluate_tri(
+            &parser::parse("< ( steps <= 1 ) > p").expect("parse"),
+            &clts,
+            &env,
+        )
+        .expect("eval");
+        assert_eq!(
+            bounded.verdict_at(s0i),
+            Trit::Unknown,
+            "bounded `<steps<=1> p` over a MayOnly-only edge is ⊥ (may, not must), not \
+             definite-True — the pre-A.1 modality-blind over-claim"
+        );
+        // Cross-check: since `p` is False at `s0`, the 0-step case is empty, so
+        // `<steps<=1>` collapses to one step = the unbounded `<>` verdict.
+        let unbounded =
+            evaluate_tri(&parser::parse("<> p").expect("parse"), &clts, &env).expect("eval");
+        assert_eq!(
+            bounded.verdict_at(s0i),
+            unbounded.verdict_at(s0i),
+            "bounded (steps<=1) must equal the unbounded `<>` when `p` is False at the source"
+        );
+
+        // BOX — `s0` has a `Sharp` edge to `p`-True `s1` AND a `MayOnly` edge to
+        // `p`-False `s2`. `[steps<=1] p` is ⊥: the must-side (∀ may-edge good) fails on
+        // the MayOnly→s2 edge; the may-side (∀ must-edge good) holds (only the Sharp→s1).
+        let mut bb = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        bb.state("s0").state("s1").state("s2").initial("s0");
+        let a2 = bb.labels().intern(["a2"]).expect("a2");
+        bb.set_label_controllability(a2, LabelControllability::Controllable);
+        let s0b = bb.state_id_or_insert("s0").expect("s0");
+        let s1b = bb.state_id_or_insert("s1").expect("s1");
+        let s2b = bb.state_id_or_insert("s2").expect("s2");
+        bb.transition_ids(s0b, &[a2], s1b); // Sharp → p-True
+        bb.transition_ids_with_modality(s0b, &[a2], s2b, TransitionModality::MayOnly); // MayOnly → p-False
+        bb.transition_ids(s1b, &[a2], s1b);
+        bb.transition_ids(s2b, &[a2], s2b);
+        bb.with_3valued_predicate(s1b, "p".to_string(), Tristate::KleeneT);
+        bb.with_3valued_predicate(s2b, "p".to_string(), Tristate::KleeneF);
+        let cltsb = bb.build().expect("build");
+        let envb = Environment::new(cltsb.state_count());
+        let s0bi = cltsb.state_id("s0").expect("s0").index();
+
+        let boxed = evaluate_tri(
+            &parser::parse("[ ( steps <= 1 ) ] p").expect("parse"),
+            &cltsb,
+            &envb,
+        )
+        .expect("eval");
+        assert_eq!(
+            boxed.verdict_at(s0bi),
+            Trit::Unknown,
+            "bounded `[steps<=1] p` with a MayOnly bad-edge is ⊥ (may-side ranges over \
+             must-edges only), not the pre-A.1 definite-False under-claim"
+        );
     }
 
     /// H.E.r2 root-cause regression — a `KleeneBot` 3-valued predicate label must

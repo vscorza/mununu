@@ -566,16 +566,25 @@ impl SymbolicKmts {
                 guard,
                 target,
             } => {
-                // R-F5.2b supports label + current/next state-variable guards.
-                // Controllability (Skolem/synthesis) and step-bounds are R-F5.2c.
+                // The symbolic evaluator supports the SOUND in-fragment guards: label +
+                // current/next state-variable guards (R-F5.2b/5c, `guarded_relations`).
+                // Controllability (`ctrl`) and step-bounds (`steps`) are DELIBERATELY
+                // kept as honest errors — they are OUT-of-fragment over a predicate cube
+                // (ctrl = a build-time default partition, not a real game; steps = not
+                // may/must-filtered — the PO-4 gap), so evaluating them would return an
+                // unsound/vacuous verdict. This mirrors the soundness boundary the cube
+                // path draws via `cube_modality_soundness_warnings` (mu_calculus/mod.rs).
                 if guard.control != Control::All {
                     return Err(
-                        "R-F5.2b does not support controllability guards (`ctrl`) — R-F5.2c".into(),
+                        "symbolic evaluator: controllability guards (`ctrl`) are out-of-fragment \
+                         over a predicate cube — use a bare `[]`/`<>` modality"
+                            .into(),
                     );
                 }
                 if guard.max_steps.is_some() {
                     return Err(
-                        "R-F5.2b does not support step-bounded modalities (`steps`) — R-F5.2c"
+                        "symbolic evaluator: step-bounded modalities (`steps`) are out-of-fragment \
+                         over a predicate cube — use an unbounded `[]`/`<>` modality"
                             .into(),
                     );
                 }
