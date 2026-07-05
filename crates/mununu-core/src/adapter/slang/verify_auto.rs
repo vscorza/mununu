@@ -1313,6 +1313,19 @@ pub fn verify_auto(
         }
     }
     report.diagnostics.blackboxed_modules = blackboxed_modules;
+
+    // Inject `init` lines at the post-reset state so a reset-gated async-reset
+    // FSM starts in its real reset state (e.g. an OpenTitan sparse-FSM's non-zero
+    // `MainSmIdle = 6'b110111`) rather than the init-less power-on default 0.
+    // Zero is an illegal sparse encoding: the FSM's `default` arm traps it into
+    // its error state, so without this the reset-gated model starts in a state
+    // the real design never occupies, silently corrupting every reset-dependent
+    // verdict (recoverability `AG EF idle`, liveness-from-reset). Runs on the
+    // reset-FREE BTOR2 (before the pin below) so it can assert the reset to
+    // derive the post-reset state; no-op unless reset-gating is on (`reset_pins`
+    // non-empty) and the design carries no authoritative `init` line.
+    btor2 = crate::adapter::btor2::reset_init::inject_reset_init(&btor2, &reset_pins)?;
+
     // Augment only the `__past` shadows whose base resolves to a BTOR2 state
     // cell. A base the lift renamed away (the SVA name not matching the lifted
     // register) would hard-error `augment_with_past_shadows`, aborting the whole
@@ -4745,6 +4758,83 @@ endmodule
             "AG AF (bit_cnt_q==0) must be decided Holds by the exact-symbolic route \
              through verify_auto; got {:?}",
             guarantee.outcome
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + yosys (mununu-sva image)"]
+    fn e2e_reset_gated_sparse_fsm_inits_at_reset_value() {
+        // Regression for the reset-gated async-reset init fix (reset_init.rs).
+        // OpenTitan csrng_main_sm's FSM resets — via prim_sparse_fsm_flop's
+        // ResetValue — to MainSmIdle = 6'b110111 = 55, a NON-ZERO sparse
+        // encoding. Yosys `async2sync` lifts the async reset to a next-state mux
+        // with no BTOR2 `init` line, and verify-auto pins the reset inactive.
+        // Without `inject_reset_init` the model would power up at 0 (an ILLEGAL
+        // sparse encoding → the FSM's `default` arm traps to MainSmError), so the
+        // init-state probe `(state_q == 55)` would be VIOLATED. With the fix the
+        // reset-gated model starts at MainSmIdle, so it HOLDS — the faithful
+        // post-reset state, decided exactly by the exact-symbolic engine (which
+        // reads the injected `init` line).
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let csrng = root.join("m2_opentitan_csrng_main_sm/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        // The @mununu_guarantee carries the init-state probe; the standard
+        // prim_assert macros come from the M.0 fixture (the csrng dir's own
+        // prim_assert.sv is the dummy variant).
+        let annotated = format!(
+            "// @mununu_guarantee (state_q == 55)\n{}",
+            read(csrng.join("csrng_main_sm.sv"))
+        );
+        let sources = vec![
+            ("csrng_main_sm.sv".to_string(), annotated),
+            ("csrng_pkg.sv".to_string(), read(csrng.join("csrng_pkg.sv"))),
+            (
+                "prim_assert.sv".to_string(),
+                read(prim.join("prim_assert.sv")),
+            ),
+            (
+                "prim_assert_standard_macros.svh".to_string(),
+                read(prim.join("prim_assert_standard_macros.svh")),
+            ),
+            (
+                "prim_assert_sec_cm.svh".to_string(),
+                read(prim.join("prim_assert_sec_cm.svh")),
+            ),
+            (
+                "prim_flop_macros.sv".to_string(),
+                read(prim.join("prim_flop_macros.sv")),
+            ),
+        ];
+        let yopts = YosysOptions {
+            top: Some("csrng_main_sm".to_string()),
+            use_sv2v: true,
+            additional_sources: sources[1..].to_vec(),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                exact_symbolic: true,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs exact-symbolic on csrng_main_sm");
+        let probe = report
+            .properties
+            .iter()
+            .find(|p| p.name.contains("ann_guarantee"))
+            .expect("the @mununu_guarantee init probe is present");
+        assert!(
+            matches!(probe.outcome, VerifyOutcome::Holds),
+            "reset-gated csrng must init at MainSmIdle (state_q==55), not the \
+             power-on default 0 — the reset-init fix; got {:?} for `{}`",
+            probe.outcome,
+            probe.formula
         );
     }
 }
