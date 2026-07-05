@@ -177,6 +177,26 @@ impl BddBitBlaster {
     /// bind the leaves, walk every `Const`/`Op` node into a BDD vector, and
     /// collect the per-register next-state functions.
     pub fn build(file: &Btor2File) -> Result<Self, String> {
+        Self::build_with_keep(file, None)
+    }
+
+    /// R-F5.6 — build the exact bit-blaster, optionally restricted to a cone-of-influence
+    /// KEEP-SET of leaf NIDs. A leaf (register/input) whose NID is NOT in `keep` is PINNED to
+    /// a constant 0: it uses ZERO BDD variables, never appears in the state/input frame, and
+    /// (for a register) never transitions — so `total_bits` (the bit cap) counts only the
+    /// property's cone. `keep = None` bit-blasts the full design (the pre-R-F5.6 behaviour).
+    ///
+    /// SOUNDNESS: an out-of-cone leaf cannot influence any atom (the cone is closed under the
+    /// data-flow dependency relation AND `constraint`/`fair`/`justice` coupling — see
+    /// [`crate::adapter::btor2::dep_graph::cone_leaf_nids`]), so pinning it to any fixed value
+    /// is verdict-preserving for the FULL mu-calculus over the atoms — an EXACT reduction, not
+    /// an over/under-approximation. The dep graph over-approximates influence (spurious edges
+    /// keep MORE), so the cone is a superset of the true cone: it can never drop a relevant
+    /// leaf. `keep = None` is unchanged from before.
+    pub fn build_with_keep(
+        file: &Btor2File,
+        keep: Option<&std::collections::HashSet<Nid>>,
+    ) -> Result<Self, String> {
         // D1.4 — resolve each state/input to its user-visible name via
         // `collect_symbols`, which walks Yosys's `uext _ NID 0 NAME` alias ops
         // back to the underlying (often unnamed) state cell. Without this, the
@@ -201,32 +221,36 @@ impl BddBitBlaster {
             leaf_specs.push((line.nid, symbol, is_state, width));
         }
 
-        let total_bits: u32 = leaf_specs.iter().map(|(_, _, _, w)| *w).sum();
+        // R-F5.6 — a leaf is KEPT (a BDD variable) iff no keep-set is given, or its NID is in
+        // the property cone. Out-of-cone leaves are pinned to constant 0 (zero variables).
+        let is_kept = |nid: Nid| keep.is_none_or(|k| k.contains(&nid));
 
-        // R-F5.5d guard — the bit-blaster has no cone-of-influence restriction
-        // yet: it builds BDDs over EVERY register+input bit of the design. On a
-        // real design (the full sysrst_ctrl_detect, ~hundreds of bits: wide
-        // config timers × 5 detectors) that OoMs the BDD manager. Bail with a
-        // clean error above a conservative bit cap so a caller (e.g.
-        // `sv verify-auto --engine symbolic`) degrades to a `Skipped` property
-        // rather than a mid-construction OoM panic. The R-F5.6 scaling follow-up
-        // (COI restriction — only bit-blast the predicate cone — + variable
-        // ordering) lifts this to real designs.
+        // The bit cap now counts only the KEPT (cone) bits.
+        let total_bits: u32 = leaf_specs
+            .iter()
+            .filter(|(nid, _, _, _)| is_kept(*nid))
+            .map(|(_, _, _, w)| *w)
+            .sum();
+
+        // R-F5.6 guard — the bit-blaster builds BDDs over every KEPT register+input bit. With
+        // the cone-of-influence keep-set the frame is the property's cone; without one it is
+        // the whole design. On a real design whose CONE is still wide (hundreds of bits) the
+        // BDD manager would OoM, so bail with a clean error above a conservative cap and let a
+        // caller (`sv verify-auto`) degrade to a `Skipped` property rather than panic.
         const MAX_BITBLAST_BITS: u32 = 40;
         if total_bits > MAX_BITBLAST_BITS {
             return Err(format!(
                 "symbolic bit-blaster: design has {total_bits} register+input bits \
-                 (> {MAX_BITBLAST_BITS}) — no cone-of-influence restriction yet (R-F5.6), \
-                 so bit-blasting the full design would exhaust BDD memory; use `--engine explicit`"
+                 (> {MAX_BITBLAST_BITS}) after cone-of-influence restriction (R-F5.6) — the \
+                 property's cone is too wide to bit-blast; use `--engine explicit`"
             ));
         }
 
-        // Allocate the manager + one BDD variable per leaf bit. 2M inner nodes
+        // Allocate the manager + one BDD variable per KEPT leaf bit. 2M inner nodes
         // (~32 MB arena, index manager) + a 512K apply cache — comfortably above
         // the toy fixtures' need and sized for a moderate (≤ `MAX_BITBLAST_BITS`)
-        // design; the manager is dropped per `BddBitBlaster`, so at most one
-        // arena is live at a time. Larger designs are rejected by the bit cap
-        // above (they need the R-F5.6 COI restriction, not just more nodes).
+        // cone; the manager is dropped per `BddBitBlaster`, so at most one
+        // arena is live at a time.
         let manager = bdd::new_manager(1 << 21, 1 << 19, 1);
         let (all_vars, var_base, tt, ff) = manager.with_manager_exclusive(|m| {
             let range = m.add_vars(total_bits as VarNo);
@@ -236,23 +260,32 @@ impl BddBitBlaster {
             (vars, range.start, BDDFunction::t(m), BDDFunction::f(m))
         });
 
-        // Slice the flat variable pool out per cell, LSB-first.
+        // Slice the flat variable pool out per KEPT cell (LSB-first); PIN each out-of-cone
+        // leaf to a constant-0 BitVec (env only — never a `Cell`, so it is invisible to the
+        // init BDD, the input cube, and the next-state substitution).
         let mut env: HashMap<Nid, BitVec> = HashMap::new();
         let mut cells: Vec<Cell> = Vec::new();
         let mut cursor = 0usize;
         for (nid, symbol, is_state, width) in leaf_specs {
-            let vars: BitVec = all_vars[cursor..cursor + width as usize].to_vec();
-            let varnos: Vec<VarNo> = (0..width as usize)
-                .map(|b| var_base + (cursor + b) as VarNo)
-                .collect();
-            cursor += width as usize;
-            env.insert(nid, vars.clone());
-            cells.push(Cell {
-                symbol,
-                is_state,
-                vars,
-                varnos,
-            });
+            if is_kept(nid) {
+                let vars: BitVec = all_vars[cursor..cursor + width as usize].to_vec();
+                let varnos: Vec<VarNo> = (0..width as usize)
+                    .map(|b| var_base + (cursor + b) as VarNo)
+                    .collect();
+                cursor += width as usize;
+                env.insert(nid, vars.clone());
+                cells.push(Cell {
+                    symbol,
+                    is_state,
+                    vars,
+                    varnos,
+                });
+            } else {
+                // Pinned: constant 0, zero BDD variables. `walk_design` resolves the leaf to
+                // this constant; downstream ops over it fold to constants (kept BDDs stay in
+                // the cone frame). Not pushed to `cells`.
+                env.insert(nid, vec![ff.clone(); width as usize]);
+            }
         }
 
         let mut blaster = BddBitBlaster {
@@ -277,7 +310,8 @@ impl BddBitBlaster {
         // symbol. AR-GO-1 / #242 drift guard: this MUST resolve identically to the cell
         // naming in Pass 1 (both via `resolve_cell_symbol`) — else `next_funcs.get(&cell.symbol)`
         // in `exact_model()` misses and the register is silently frozen at its init value
-        // (the #242 soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS).
+        // (the #242 soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Pinned
+        // (out-of-cone) registers are SKIPPED — they are constants and must not transition.
         let mut nid_symbol: HashMap<Nid, String> = HashMap::new();
         for line in &file.lines {
             if let Node::State { symbol, .. } = &line.node {
@@ -287,6 +321,9 @@ impl BddBitBlaster {
         }
         for line in &file.lines {
             if let Node::Next { state, value, .. } = &line.node {
+                if !is_kept(*state) {
+                    continue; // pinned register — stays constant, no next-state function
+                }
                 let Some(sym) = nid_symbol.get(state) else {
                     continue;
                 };
@@ -1134,11 +1171,14 @@ impl BvTermBackend for BddBitBlaster {
     type Error = String;
 
     fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<Self::Value, Self::Error> {
-        // Reuse the concrete constant semantics, then splat to per-bit BDDs.
+        // Reuse the concrete constant semantics, then splat to per-bit BDDs. `bv.bits` is a
+        // `u128`, so bit `b ≥ 128` is 0 (and `>> b` would PANIC): guard it. A const wider than
+        // 128 bits only occurs OUT of the property cone (cone widths are ≤ the bit cap), where
+        // the truncated value is verdict-irrelevant; a cone const is ≤ cap bits < 128.
         let bv = eval_const_value(value, width)?;
         Ok((0..width as usize)
             .map(|b| {
-                if (bv.bits >> b) & 1 == 1 {
+                if b < 128 && (bv.bits >> b) & 1 == 1 {
                     self.tt.clone()
                 } else {
                     self.ff.clone()
@@ -1691,6 +1731,26 @@ fn resolve_predicate_expr_registers(
     }
 }
 
+/// R-F5.6 — collect every register name a [`PredicateExpr`] references (already resolved to
+/// canonical cell names). These are the seed atoms for the cone-of-influence keep-set that
+/// restricts the exact bit-blaster to the property's cone.
+fn collect_predicate_registers(expr: &PredicateExpr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        PredicateExpr::Cmp { register, .. } => {
+            out.insert(register.clone());
+        }
+        PredicateExpr::CmpReg { lhs, rhs, .. } | PredicateExpr::CmpRegAddend { lhs, rhs, .. } => {
+            out.insert(lhs.clone());
+            out.insert(rhs.clone());
+        }
+        PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => {
+            collect_predicate_registers(a, out);
+            collect_predicate_registers(b, out);
+        }
+        PredicateExpr::Not(a) => collect_predicate_registers(a, out),
+    }
+}
+
 /// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
 /// BTOR2, bit-blast it, evaluate `formula` over the exact model (2-valued, no
 /// abstraction), and return the initial-state verdict. Atoms in `formula` are
@@ -1720,8 +1780,6 @@ pub fn exact_symbolic_verdict_with_witness(
     use crate::adapter::sts_ir::SymbolicTransitionSystem;
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
-    let bb = BddBitBlaster::build(&file)?;
-    let exact = bb.exact_model();
 
     // Register-name resolution: a user-visible name (`bit_cnt_q`) maps to the
     // canonical state-cell name the bit-blast binds against (`bit_cnt_d` after
@@ -1733,19 +1791,36 @@ pub fn exact_symbolic_verdict_with_witness(
             .unwrap_or_else(|| name.to_string())
     };
 
-    // Resolve each distinct formula atom to its full-state BDD.
-    let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
+    // R-F5.6 — resolve each distinct formula atom to a canonical [`PredicateExpr`] BEFORE
+    // building the bit-blaster, and collect the register names they reference. Those seed the
+    // cone-of-influence keep-set so the bit-blaster bit-blasts only the property's cone
+    // (out-of-cone registers/inputs pinned to constants) instead of the whole design — the
+    // R-F5.6 scaling fix. An atom-free formula (no seeds) keeps the full-design behaviour.
+    let mut exprs: Vec<(String, PredicateExpr)> = Vec::new();
+    let mut seed_regs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node in formula.nodes() {
         if let MuNode::Predicate(name) = node {
-            if resolved.iter().any(|(n, _)| n == name) {
+            if exprs.iter().any(|(n, _)| n == name) {
                 continue;
             }
             let expr = parse_predicate_expr(name)
                 .map_err(|e| format!("exact MC: atom `{name}` is not a predicate: {e}"))?;
             let expr = resolve_predicate_expr_registers(&expr, &resolve);
-            let bdd = bb.predicate_bdd(&expr)?;
-            resolved.push((name.clone(), bdd));
+            collect_predicate_registers(&expr, &mut seed_regs);
+            exprs.push((name.clone(), expr));
         }
+    }
+    let seed_atoms: Vec<String> = seed_regs.into_iter().collect();
+    let keep_set = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let bb = BddBitBlaster::build_with_keep(&file, keep_set.as_ref())?;
+    let exact = bb.exact_model();
+
+    // Resolve each atom's full-state BDD against the (cone-restricted) bit-blaster.
+    let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
+    for (name, expr) in &exprs {
+        let bdd = bb.predicate_bdd(expr)?;
+        resolved.push((name.clone(), bdd));
     }
     let atoms: HashMap<&str, BDDFunction> = resolved
         .iter()
@@ -3210,6 +3285,49 @@ mod tests {
             err.contains("register+input bits") && err.contains("48"),
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
+        );
+    }
+
+    /// R-F5.6 — cone-of-influence restriction lifts the bit cap when the property's cone is
+    /// small even though the FULL design is over 40 bits. `fsm` (2-bit) cycles 1→2→3→0→…; `wide`
+    /// (45-bit) is an out-of-cone counter `fsm` never reads. The full build hits the cap (47 >
+    /// 40), but `exact_symbolic_verdict` restricts to the cone of `fsm == 0` = {fsm} (pinning
+    /// `wide` to a constant) and DECIDES `EF (fsm == 0)` = Holds. Locks that (a) COI is wired
+    /// into the exact path, and (b) pinning the out-of-cone datapath is verdict-preserving —
+    /// the whole point of R-F5.6, as a fast non-docker regression.
+    #[test]
+    fn rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath() {
+        const FSM_PLUS_WIDE_CTR: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 45
+3 state 1 fsm
+4 one 1
+5 add 1 3 4
+6 next 1 3 5
+7 zero 1
+8 init 1 3 4
+9 state 2 wide
+10 one 2
+11 add 2 9 10
+12 next 2 9 11
+"#;
+        // The full design is 2 + 45 = 47 bits — over the cap.
+        let file = parser::parse(FSM_PLUS_WIDE_CTR).expect("parse");
+        let full_err = BddBitBlaster::build(&file).err();
+        assert!(
+            full_err.as_ref().is_some_and(|e| e.contains("47")),
+            "full 47-bit build must still hit the cap; got {full_err:?}",
+        );
+        // The exact verdict restricts to the {fsm} cone (2 bits), pinning `wide` → decidable.
+        // `fsm` inits to 1 and cycles to 0, so `EF (fsm == 0)` holds from the initial state.
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((fsm == 0) or <> Y)").expect("formula");
+        let verdict = exact_symbolic_verdict(FSM_PLUS_WIDE_CTR, &formula)
+            .expect("COI restricts to the 2-bit fsm cone ⇒ decidable, not capped");
+        assert_eq!(
+            verdict,
+            ExactVerdict::Holds,
+            "fsm cycles to 0 ⇒ EF(fsm==0) holds; the 45-bit out-of-cone `wide` is pinned",
         );
     }
 

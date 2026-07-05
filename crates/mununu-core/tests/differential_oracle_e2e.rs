@@ -368,8 +368,8 @@ const CORPUS: &[CorpusDesign] = &[
         ],
         top: "prim_esc_receiver",
         annotations: &["nu Y. ((mu X. ((state_q == 0) or <> X)) and [] Y)"], // Idle = 0
-        config: &[],
-        ledger: &[("(state_q == 0)", LedgerVerdict::Indefinite)],
+        config: &[("rst_ni", 1)], // gate reset (see edn note) — else recovery is reset-trivial
+        ledger: &[("(state_q == 0)", LedgerVerdict::True)], // HOLDS via COI (recovers to Idle)
     },
     // aes_ctr_fsm — 3-state AES counter-mode FSM (reg `aes_ctr_cs`; CTR_IDLE/CTR_INCR/
     // CTR_ERROR). `AG EF CTR_IDLE` recoverability.
@@ -389,9 +389,9 @@ const CORPUS: &[CorpusDesign] = &[
         ledger: &[("(aes_ctr_cs == 14)", LedgerVerdict::False)], // VIOLATED (CTR_ERROR trap)
     },
     // rom_ctrl_fsm — 8-state ROM-integrity FSM (mubi-tagged enum; `Done` = {6'b100000,
-    // MuBi4True=4'h6} = 518). `AG EF Done` completion-recoverability. NOTE: the full design
-    // is 834 register+input bits (the ROM address/data path dominates) — over the exact
-    // engine's 40-bit cap, so this is a documented ⊥ pending cone-of-influence (R-F5.6).
+    // MuBi4True=4'h6} = 518). `AG EF Done` completion-recoverability. The full design is 834
+    // register+input bits, but R-F5.6 cone-of-influence restricts the exact engine to the FSM
+    // cone → VIOLATED (the glitch-reachable Invalid trap is terminal). Was a bit-cap ⊥ pre-COI.
     CorpusDesign {
         name: "rom_ctrl_fsm",
         dir: "dc_opentitan_rom_ctrl_fsm",
@@ -405,7 +405,7 @@ const CORPUS: &[CorpusDesign] = &[
         top: "rom_ctrl_fsm",
         annotations: &["nu Y. ((mu X. ((state_q == 518) or <> X)) and [] Y)"], // Done = 518
         config: &[],
-        ledger: &[("(state_q == 518)", LedgerVerdict::Indefinite)],
+        ledger: &[("(state_q == 518)", LedgerVerdict::False)], // VIOLATED via COI (Invalid trap)
     },
     // prim_count — dual-redundant hardened counter (primary `cnt_o`, ResetValue 0).
     // `AG EF (cnt_o == 0)` clear-recoverability via `clr_i`.
@@ -419,8 +419,8 @@ const CORPUS: &[CorpusDesign] = &[
         ledger: &[("(cnt_o == 0)", LedgerVerdict::True)], // HOLDS (clearable via clr_i)
     },
     // ---- tranche 2 (OpenTitan Apache-2.0, byte-exact upstream at 558921c). All reset-gated
-    // (rst_ni=1). The large control FSMs (usbdev/aes_cipher/otbn) are expected ⊥ (bit-cap >40)
-    // pending cone-of-influence — informative census members, not failures. ----
+    // (rst_ni=1). R-F5.6 cone-of-influence restricts the exact engine to each property's cone,
+    // so the large control FSMs (usbdev/aes_cipher/otbn) DECIDE (they were bit-cap ⊥ pre-COI). ----
     // prim_arbiter_ppc — round-robin arbiter; the `mask` register is its only state (resets 0).
     // AG EF (mask==0): the priority mask is always returnable to the reset round-robin phase.
     CorpusDesign {
@@ -462,8 +462,8 @@ const CORPUS: &[CorpusDesign] = &[
         config: &[("rst_ni", 1)],
         ledger: &[("(state_q == 0)", LedgerVerdict::True)], // HOLDS (esc_sender recovers to Idle)
     },
-    // usbdev_linkstate — 6-state USB link FSM (LinkDisconnected=0). AG EF LinkDisconnected.
-    // Large (12-bit inactivity timers) — expected ⊥ (bit-cap) pending COI.
+    // usbdev_linkstate — 6-state USB link FSM (LinkDisconnected=0). AG EF LinkDisconnected —
+    // HOLDS via COI (the link is always disconnectable; the 12-bit timers are pruned).
     CorpusDesign {
         name: "usbdev_linkstate",
         dir: "dc_opentitan_usbdev_linkstate",
@@ -471,10 +471,10 @@ const CORPUS: &[CorpusDesign] = &[
         top: "usbdev_linkstate",
         annotations: &["nu Y. ((mu X. ((link_state_q == 0) or <> X)) and [] Y)"], // LinkDisconnected = 0
         config: &[("rst_ni", 1)],
-        ledger: &[("(link_state_q == 0)", LedgerVerdict::Indefinite)],
+        ledger: &[("(link_state_q == 0)", LedgerVerdict::True)], // HOLDS via COI (link always disconnectable)
     },
     // aes_cipher_control_fsm — 7-state AES cipher-core FSM (CIPHER_CTRL_IDLE=6'b001001=9).
-    // Large (aes_reg_pkg datapath) — expected ⊥ (bit-cap) pending COI.
+    // AG EF CIPHER_CTRL_IDLE — VIOLATED via COI (the aes_reg_pkg datapath is pruned).
     CorpusDesign {
         name: "aes_cipher_control_fsm",
         dir: "dc_opentitan_aes_cipher_control_fsm",
@@ -488,11 +488,9 @@ const CORPUS: &[CorpusDesign] = &[
         top: "aes_cipher_control_fsm",
         annotations: &["nu Y. ((mu X. ((aes_cipher_ctrl_cs == 9) or <> X)) and [] Y)"], // CIPHER_CTRL_IDLE = 9
         config: &[("rst_ni", 1)],
-        ledger: &[("(aes_cipher_ctrl_cs == 9)", LedgerVerdict::Indefinite)],
+        ledger: &[("(aes_cipher_ctrl_cs == 9)", LedgerVerdict::False)], // VIOLATED via COI (cipher error trap)
     },
     // otbn_start_stop_control — OTBN secure-wipe start/stop FSM. Big closure (lc_ctrl/otp/secded)
-    // — expected ⊥ (bit-cap) pending COI. Placeholder atom (state_q==0) — never evaluated while
-    // bit-capped; the entry demonstrates the pipeline elaborates the full closure.
     CorpusDesign {
         name: "otbn_start_stop_control",
         dir: "dc_opentitan_otbn_start_stop_control",
@@ -510,9 +508,11 @@ const CORPUS: &[CorpusDesign] = &[
             "prim_util_pkg.sv",
         ],
         top: "otbn_start_stop_control",
-        annotations: &["nu Y. ((mu X. ((state_q == 0) or <> X)) and [] Y)"],
+        // Halt = 8'b00000001 = 1 (the idle/done state; reset state is Initial=167). AG EF Halt
+        // = the secure-wipe FSM always returns to idle.
+        annotations: &["nu Y. ((mu X. ((state_q == 1) or <> X)) and [] Y)"],
         config: &[("rst_ni", 1)],
-        ledger: &[("(state_q == 0)", LedgerVerdict::Indefinite)],
+        ledger: &[("(state_q == 1)", LedgerVerdict::False)], // VIOLATED via COI (Locked trap)
     },
     // csrng_main_sm — sparse command FSM (MainSmIdle = 6'b110111 = 55). AG EF Idle
     // recoverability, VIOLATED: beyond local_escalate_i, an unsupported command drives the FSM
@@ -538,7 +538,8 @@ const CORPUS: &[CorpusDesign] = &[
         ledger: &[("(state_q == 55)", LedgerVerdict::False)], // VIOLATED (MainSmError trap, inputs free)
     },
     // prim_fifo_sync — synchronous FIFO; AG EF (depth_o==0) drainability. Data storage +
-    // pointers — expected ⊥ (bit-cap) pending COI. prim_fifo_assert.svh is a `include`d
+    // pointers — ⊥ because the drainability cone hits an unsupported Mul op (not bit-cap).
+    // prim_fifo_assert.svh is a `include`d
     // header (staged so the include resolves, never compiled as a top-level source).
     CorpusDesign {
         name: "prim_fifo_sync",
