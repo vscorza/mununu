@@ -49,41 +49,16 @@ pub struct SlangBin {
 /// SVA-extraction feature degrades; model verification + mununu-annotation
 /// properties are unaffected), the cvc5 precedent.
 pub fn locate_slang() -> Result<SlangBin, AdapterError> {
-    let path = if let Ok(p) = std::env::var("MUNUNU_SLANG_PATH") {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from("slang")
-    };
-
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/slang: failed to invoke `{} --version`: {e}. Set \
-                 MUNUNU_SLANG_PATH or install slang \
-                 (https://github.com/MikePopoloski/slang — Linux + macOS-arm64 prebuilts \
-                 on the releases page; build from source elsewhere). See docs/external-tools.md.",
-                path.display()
-            ),
-            location: None,
-        })?;
-
-    if !output.status.success() {
-        return Err(AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/slang: `{} --version` exited with status {}",
-                path.display(),
-                output.status
-            ),
-            location: None,
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = parse_slang_version(&stdout).unwrap_or_else(|| "<unparseable>".to_string());
+    // AR-GO-2 — shared locate body; see `crate::adapter::locate_tool`.
+    let (path, version) = crate::adapter::locate_tool(
+        "MUNUNU_SLANG_PATH",
+        "slang",
+        "slang",
+        "Set MUNUNU_SLANG_PATH or install slang \
+         (https://github.com/MikePopoloski/slang — Linux + macOS-arm64 prebuilts on the \
+         releases page; build from source elsewhere). See docs/external-tools.md.",
+        parse_slang_version,
+    )?;
     Ok(SlangBin { path, version })
 }
 

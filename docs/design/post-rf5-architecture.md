@@ -66,24 +66,26 @@ flowchart TD
   end
 
   SV -->|"slang --ast-json"| TR["SVA translator<br/>(adapter/slang/translate.rs)<br/>→ mu-calculus formula + predicate atoms"]
-  SV -->|"sv2v + yosys (no flatten)"| B2["BTOR2 IR<br/>(Btor2File / Node)"]
+  SV -->|"sv2v + yosys (flatten + async2sync)"| B2["BTOR2 IR<br/>(Btor2File / Node)"]
 
   B2 --> STS["STS-IR seam<br/>StsVar + StepEval + SmtEncode<br/>(BtorSts wraps Btor2File; hides Z3/NID)"]
 
-  STS -->|"StepEval::step"| ENUM["Explicit-Enumerate strategy<br/>(bit_blast) — Sharp CLTS"]
-  STS -->|"SmtEncode::may_edges + must<br/>(--engine explicit, default)"| CUBE["Explicit predicate-cube lift<br/>(kmts_lift::predicate_cube_lift)"]
-  STS -->|"BDD relation build (--engine symbolic)"| SYM["Symbolic predicate-cube (BDD)<br/>(symbolic_bitblast::BddBitBlaster<br/>→ AbstractRelation)"]
+  STS -->|"StepEval::step (via bit_blast primitive)"| ENUM["Explicit-Enumerate strategy<br/>(bit_blast) — Sharp CLTS"]
+  STS -->|"SmtEncode::may_edges + must (opt-in SmtAllPairs);<br/>sampling default reaches Btor2File directly<br/>(--engine explicit, default)"| CUBE["Explicit predicate-cube lift<br/>(kmts_lift::predicate_cube_lift)"]
+  B2 -->|"BDD relation build (--engine symbolic; reads Btor2File)"| SYM["Symbolic predicate-cube (BDD)<br/>(symbolic_bitblast::BddBitBlaster<br/>→ AbstractRelation)"]
+  B2 -->|"full-state bit-blast (--engine exact-symbolic; reads Btor2File)"| EXACT["Exact-symbolic MC<br/>(symbolic_bitblast::exact_symbolic_verdict<br/>→ ExactModel, 2-valued definite)"]
 
   ENUM --> CLTS["Clts (K)MTS<br/>states + may/must transitions + 3-valued labels"]
   CUBE --> CLTS
 
   CLTS --> EVX["Explicit evaluator<br/>evaluate / evaluate_tri<br/>(BoolDom / KleeneDom over BitVec)"]
-  SYM --> EVS["Symbolic evaluator<br/>SymbolicKmts::evaluate — BDD image/preimage fixpoint<br/>(TritBdd = must/may BDD pair)"]
+  SYM --> EVS["Symbolic evaluator<br/>AbstractRelation::evaluate — BDD image/preimage fixpoint<br/>(TritBdd = must/may BDD pair)"]
 
   OTH --> CLTS
 
   EVX --> V["Verdict"]
   EVS --> V
+  EXACT --> V
 
   V --> VA["3-valued per-state:<br/>True / False / ⊥ (Unknown)"]
 ```
@@ -91,12 +93,24 @@ flowchart TD
 **Reading the diagram.**
 - Non-SV frontends build a `Clts` directly and always use the explicit evaluator.
 - The SV frontend forks: the **SVA translator** produces the *property* (a mu-calculus
-  formula); the **sv2v→yosys→BTOR2** path produces the *model*.
-- The BTOR2 model is consumed through the **STS-IR seam**, never directly — that's the
-  frontend-agnostic waist.
-- Three engine strategies consume the seam. The first two produce an explicit `Clts`;
-  the symbolic one (R-F5) builds BDDs and is evaluated by a symbolic fixpoint.
-- All paths converge on the same 3-valued verdict vocabulary.
+  formula); the **sv2v→yosys→BTOR2** path produces the *model* (yosys *flattens* +
+  `async2sync`; the separate `SvModuleHierarchy` discovery pass is the "no-flatten" one).
+- **Four** engine strategies consume the model: explicit-enumerate, explicit
+  predicate-cube (`--engine explicit`, default), symbolic predicate-cube
+  (`--engine symbolic`), and full-state exact-symbolic (`--engine exact-symbolic`,
+  `sv verify-auto` only — 2-valued definite, never ⊥).
+- **STS-IR seam adoption is partial (as-built, 2026-07-05 AR audit).** The seam
+  (`BtorSts`) is the canonical waist for the opt-in `SmtAllPairs`/compound/derived
+  slice + register-name resolution, but the *default* sampling cube path and both BDD
+  engines (symbolic + exact) reach `Btor2File`/z3 directly. The single-de-duplicated-
+  predicate-image goal is not yet met — see `measurements/AR-architecture-review.md`
+  (the "full seam adoption" NO-GO-for-now item). #242 (a frozen register from two
+  drifting symbol-resolution paths) was a symptom.
+- The live symbolic evaluator is `AbstractRelation::evaluate`;
+  `SymbolicKmts::evaluate` (§5) is the R-F5.0 spike / general-CLTS path, validated
+  against `evaluate_tri` but not on a production caller.
+- All paths converge on the same verdict vocabulary (2-valued for exact/Sharp;
+  3-valued Kleene for the abstraction paths).
 
 ---
 

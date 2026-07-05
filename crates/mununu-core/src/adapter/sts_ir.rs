@@ -1,16 +1,20 @@
 //! Symbolic Transition System IR — the frontend-agnostic abstraction seam.
 //!
-//! > Status: planning / P0 canonical seam (IR-unification track). Design:
-//! > `docs/design/sts-ir.md`. This module defines the *interface* the two
-//! > abstraction engines need from a symbolic transition system, plus one
-//! > implementation ([`BtorSts`]) that wraps a parsed BTOR2 file by
-//! > delegating to existing, already-shipped functions. **No existing
-//! > call site is rewired yet** — `bit_blast` and `predicate_cube_lift`
-//! > still talk to BTOR2 directly; P1 reroutes them onto this seam. P0
-//! > makes the seam the *canonical, faithful* interface: register-name
-//! > resolution ([`SymbolicTransitionSystem::resolve_register`], the home
-//! > of the DR1 #1 blocker fix) and a memory-aware SMT encode (array
-//! > theory), so P1 can consume it without behaviour drift.
+//! > Status (as-built, 2026-07-05 AR audit): the canonical seam, **partially
+//! > adopted**. Design: `docs/design/sts-ir.md`. This module defines the *interface*
+//! > the abstraction engines need from a symbolic transition system, plus one
+//! > implementation ([`BtorSts`]) wrapping a parsed BTOR2 file. **Live call sites:**
+//! > the eager predicate-cube lift routes its opt-in `SmtAllPairs` may/must/hyper-must
+//! > edges + `combinational_labels` + register-name resolution through this seam
+//! > (`kmts_lift.rs`); the exact engine uses it for `resolve_register`. **Still
+//! > bypassing the seam** (the IR-unification P1 goal, un-finished — see
+//! > `measurements/AR-architecture-review.md`, the "full seam adoption" NO-GO-for-now
+//! > item): the *default* sampling cube path (`cube_sampling_edges` +
+//! > `smt_must_edge::*`), `bit_blast` (uses the shared step *primitive*, not the trait
+//! > type), and both BDD engines (`BddBitBlaster` reads `Btor2File` directly). So the
+//! > seam is canonical + faithful, but the "single de-duplicated predicate image" goal
+//! > is not yet met — three predicate-image implementations coexist (#242 was a
+//! > symptom of two symbol-resolution paths drifting).
 //!
 //! The seam is two traits over a shared metadata trait:
 //!
@@ -276,12 +280,12 @@ impl SymbolicTransitionSystem for BtorSts<'_> {
     }
 
     fn resolve_register(&self, name: &str) -> Option<String> {
-        // BFS-backward from any node carrying `name` (direct state match,
-        // or an Op / Output alias) to the nearest state cell, then return
-        // that cell's own symbol — the name the SMT view + predicate-image
-        // bind against. Mirrors the sidecar resolver's `drives` path.
-        let nid = parser::resolve_state_by_symbol(self.file, name)?;
-        parser::collect_symbols(self.file).get(&nid).cloned()
+        // AR-GO-1 — the LOOSE resolution ("nearest state in the signal's cone"), made
+        // explicit. BFS-backward from any node carrying `name` (direct state match, or an
+        // Op / Output alias) to the nearest state cell, then return that cell's own symbol
+        // — the name the SMT view + predicate-image bind against. Mirrors the sidecar
+        // resolver's `drives` path.
+        parser::resolve_to_canonical_name(self.file, name, parser::ResolveStrictness::Loose)
     }
 }
 

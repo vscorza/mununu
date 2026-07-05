@@ -101,41 +101,15 @@ pub enum McVerdict {
 /// is absent or the version probe fails — callers fall back gracefully (the
 /// oracle is simply unavailable).
 pub fn locate_btormc() -> Result<BtormcBin, AdapterError> {
-    let path = if let Ok(p) = std::env::var("MUNUNU_BTORMC_PATH") {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from("btormc")
-    };
-
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/btormc: failed to invoke `{} --version`: {e}. \
-                 Set MUNUNU_BTORMC_PATH or install btormc (oss-cad-suite, or the \
-                 Homebrew `yosys` formula which bundles the btor2tools).",
-                path.display()
-            ),
-            location: None,
-        })?;
-
-    if !output.status.success() {
-        return Err(AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/btormc: `{} --version` exited with status {}",
-                path.display(),
-                output.status
-            ),
-            location: None,
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = parse_btormc_version(&stdout).unwrap_or_else(|| "<unparseable>".to_string());
-
+    // AR-GO-2 — shared locate body; see `crate::adapter::locate_tool`.
+    let (path, version) = crate::adapter::locate_tool(
+        "MUNUNU_BTORMC_PATH",
+        "btormc",
+        "btormc",
+        "Set MUNUNU_BTORMC_PATH or install btormc (oss-cad-suite, or the Homebrew \
+         `yosys` formula which bundles the btor2tools).",
+        parse_btormc_version,
+    )?;
     Ok(BtormcBin { path, version })
 }
 

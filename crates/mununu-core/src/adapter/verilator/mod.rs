@@ -77,42 +77,15 @@ pub struct VerilatorBin {
 /// the predicate-seeding-pipeline wiring; the pattern is the same
 /// optional-subprocess fallback CVC5 / Craig interpolation uses).
 pub fn locate_verilator() -> Result<VerilatorBin, AdapterError> {
-    let path = if let Ok(p) = std::env::var("MUNUNU_VERILATOR_PATH") {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from("verilator")
-    };
-
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/verilator: failed to invoke `{} --version`: {e}. \
-                 Set MUNUNU_VERILATOR_PATH or install verilator ≥ 4.0 \
-                 (Homebrew: `brew install verilator`; Debian: \
-                 `apt install verilator`).",
-                path.display()
-            ),
-            location: None,
-        })?;
-
-    if !output.status.success() {
-        return Err(AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/verilator: `{} --version` exited with status {}",
-                path.display(),
-                output.status
-            ),
-            location: None,
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = parse_verilator_version(&stdout).unwrap_or_else(|| "<unparseable>".to_string());
-
+    // AR-GO-2 — shared locate body; see `crate::adapter::locate_tool`.
+    let (path, version) = crate::adapter::locate_tool(
+        "MUNUNU_VERILATOR_PATH",
+        "verilator",
+        "verilator",
+        "Set MUNUNU_VERILATOR_PATH or install verilator ≥ 4.0 (Homebrew: \
+         `brew install verilator`; Debian: `apt install verilator`).",
+        parse_verilator_version,
+    )?;
     Ok(VerilatorBin { path, version })
 }
 
