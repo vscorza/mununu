@@ -438,6 +438,52 @@ impl fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// AR-GO-2 — the shared "locate + version-probe a `--version` subprocess tool" body.
+/// The per-tool `locate_*` wrappers (`slang`/`btormc`/`cvc5`/`verilator`) were
+/// copy-paste-identical modulo the env var, default binary, adapter tag, install hint,
+/// and version parser; this factors their common env-or-default → `--version` →
+/// status-check body so they cannot drift. Returns `(resolved path, parsed version)`;
+/// a missing binary or a failed probe is `Err(UnsupportedConstruct)` so callers degrade
+/// gracefully (the tool is simply unavailable).
+pub(crate) fn locate_tool(
+    env_var: &str,
+    default_bin: &str,
+    adapter_tag: &str,
+    install_hint: &str,
+    parse_version: impl Fn(&str) -> Option<String>,
+) -> Result<(std::path::PathBuf, String), AdapterError> {
+    use std::path::PathBuf;
+    use std::process::Command;
+    let path = std::env::var(env_var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(default_bin));
+    let output = Command::new(&path)
+        .arg("--version")
+        .output()
+        .map_err(|e| AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            message: format!(
+                "adapter/{adapter_tag}: failed to invoke `{} --version`: {e}. {install_hint}",
+                path.display()
+            ),
+            location: None,
+        })?;
+    if !output.status.success() {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            message: format!(
+                "adapter/{adapter_tag}: `{} --version` exited with status {}",
+                path.display(),
+                output.status
+            ),
+            location: None,
+        });
+    }
+    let version = parse_version(&String::from_utf8_lossy(&output.stdout))
+        .unwrap_or_else(|| "<unparseable>".to_string());
+    Ok((path, version))
+}
+
 /// Detect the source format from a file extension.
 pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");

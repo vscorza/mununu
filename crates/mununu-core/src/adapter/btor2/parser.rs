@@ -741,6 +741,41 @@ fn follow_state_alias(
     }
 }
 
+/// AR-GO-1 — the strictness of the reverse `name → state-cell` resolution: whether an
+/// alias name resolves to a state cell only via a **value-identical** alias
+/// ([`Strict`](ResolveStrictness::Strict) — the sound oracle path) or via the looser
+/// "nearest state in the signal's cone" BFS ([`Loose`](ResolveStrictness::Loose) — the
+/// lift / predicate path). The two are genuinely different and both correct for their
+/// caller; making the choice an explicit parameter of one entry keeps the divergence
+/// **visible** rather than a silent structural duplication (the #242-family hazard: two
+/// resolution paths that can quietly disagree).
+pub enum ResolveStrictness {
+    /// Value-identical alias only ([`resolve_state_alias`]); `allow_reset_mux` widens
+    /// it to an async-reset next-mux.
+    Strict { allow_reset_mux: bool },
+    /// Nearest state in the signal's cone ([`resolve_state_by_symbol`]).
+    Loose,
+}
+
+/// Resolve a user-visible `name` to the canonical state-cell symbol the bit-blast / SMT
+/// view binds against, under an explicit [`ResolveStrictness`]. Both the strict oracle
+/// path (`concrete_oracle::resolve_signal_symbol`) and the loose lift path
+/// (`BtorSts::resolve_register`) route through this, so the strict-vs-loose choice is a
+/// named argument, not two look-alike wrappers that can drift.
+pub fn resolve_to_canonical_name(
+    file: &Btor2File,
+    name: &str,
+    strictness: ResolveStrictness,
+) -> Option<String> {
+    let nid = match strictness {
+        ResolveStrictness::Strict { allow_reset_mux } => {
+            resolve_state_alias(file, name, allow_reset_mux)?
+        }
+        ResolveStrictness::Loose => resolve_state_by_symbol(file, name)?,
+    };
+    collect_symbols(file).get(&nid).cloned()
+}
+
 /// True when `nid` is a constant, or a `uext`/`sext`-by-0 passthrough of one
 /// (the shape `async2sync` gives a reset value).
 fn resolves_to_const(file: &Btor2File, nid: Nid) -> bool {

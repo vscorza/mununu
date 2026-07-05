@@ -75,41 +75,15 @@ pub struct Cvc5Bin {
 /// are expected to fall back gracefully (see sub-item 3.4 for the
 /// CEGAR-loop wiring).
 pub fn locate_cvc5() -> Result<Cvc5Bin, AdapterError> {
-    let path = if let Ok(p) = std::env::var("MUNUNU_CVC5_PATH") {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from("cvc5")
-    };
-
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/cvc5: failed to invoke `{} --version`: {e}. \
-                 Set MUNUNU_CVC5_PATH or install cvc5 ≥ 1.0 (Homebrew: \
-                 `brew install cvc5`; Debian: `apt install cvc5`).",
-                path.display()
-            ),
-            location: None,
-        })?;
-
-    if !output.status.success() {
-        return Err(AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/cvc5: `{} --version` exited with status {}",
-                path.display(),
-                output.status
-            ),
-            location: None,
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = parse_cvc5_version(&stdout).unwrap_or_else(|| "<unparseable>".to_string());
-
+    // AR-GO-2 — shared locate body; see `crate::adapter::locate_tool`.
+    let (path, version) = crate::adapter::locate_tool(
+        "MUNUNU_CVC5_PATH",
+        "cvc5",
+        "cvc5",
+        "Set MUNUNU_CVC5_PATH or install cvc5 ≥ 1.0 (Homebrew: `brew install cvc5`; \
+         Debian: `apt install cvc5`).",
+        parse_cvc5_version,
+    )?;
     Ok(Cvc5Bin { path, version })
 }
 

@@ -204,8 +204,12 @@ fn cmp_holds(op: CmpOp, lhs: u128, rhs: u128) -> bool {
 /// seeder follows it. Pass `false` when reset is a free input (the register only
 /// equals the state while reset is inactive, which free enumeration breaks).
 fn resolve_signal_symbol(file: &Btor2File, signal: &str, allow_reset_mux: bool) -> Option<String> {
-    let nid = parser::resolve_state_alias(file, signal, allow_reset_mux)?;
-    parser::collect_symbols(file).get(&nid).cloned()
+    // AR-GO-1 — the STRICT (value-identical-alias) resolution, made explicit.
+    parser::resolve_to_canonical_name(
+        file,
+        signal,
+        parser::ResolveStrictness::Strict { allow_reset_mux },
+    )
 }
 
 /// Concrete `AG (signal ⋈ value)` oracle over a **state-register** signal (or a
