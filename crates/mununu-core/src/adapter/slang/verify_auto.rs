@@ -5049,4 +5049,96 @@ endmodule
             probe.formula
         );
     }
+
+    /// H.5-GR1 — the assume-guarantee liveness showcase on real OpenTitan RTL,
+    /// decided by the exact-symbolic engine. The recoverability property
+    /// `AG EF MainSmIdle` (`nu Y. ((mu X. ((state_q == 55) or <> X)) and [] Y)`) —
+    /// "from every reachable state, can the FSM get back to idle?" — is a
+    /// there-exists-a-path (`EF`) property SVA structurally cannot phrase. Its
+    /// verdict flips on a single explicit environment assumption. With
+    /// `local_escalate_i` FREE the verdict is VIOLATED — a local security escalation
+    /// latches the FSM in the terminal `MainSmError` trap (SEC_CM design;
+    /// `CsrngMainErrorStStable_A`), so idle is unreachable. Under the assumption
+    /// `G !local_escalate_i` (`=0`) the verdict is HOLDS — with no escalation the FSM
+    /// always cycles back to idle. Both verdicts are 2-valued definite (the exact
+    /// engine has no ⊥). The example at
+    /// `examples/verify/v8_csrng_escalation_recoverability/` reproduces this via the
+    /// CLI. Regression-critical: the frozen-register bug (fixed) made BOTH sides a
+    /// vacuous HOLDS, erasing the flip.
+    #[test]
+    #[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+    fn e2e_h5gr1_csrng_recoverability_escalation_flip() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+        let csrng = root.join("m2_opentitan_csrng_main_sm/source");
+        let prim = root.join("m0_opentitan_prim_arbiter/source");
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        };
+        let outcome = |cfg: &[(&str, u64)]| -> VerifyOutcome {
+            let sm = read(csrng.join("csrng_main_sm.sv"));
+            let annotated = format!(
+                "// @mununu_guarantee nu Y. ((mu X. ((state_q == 55) or <> X)) and [] Y)\n{sm}"
+            );
+            let sources = vec![
+                ("csrng_main_sm.sv".to_string(), annotated),
+                ("csrng_pkg.sv".to_string(), read(csrng.join("csrng_pkg.sv"))),
+                (
+                    "prim_assert.sv".to_string(),
+                    read(prim.join("prim_assert.sv")),
+                ),
+                (
+                    "prim_assert_standard_macros.svh".to_string(),
+                    read(prim.join("prim_assert_standard_macros.svh")),
+                ),
+                (
+                    "prim_assert_sec_cm.svh".to_string(),
+                    read(prim.join("prim_assert_sec_cm.svh")),
+                ),
+                (
+                    "prim_flop_macros.sv".to_string(),
+                    read(prim.join("prim_flop_macros.sv")),
+                ),
+            ];
+            let yopts = YosysOptions {
+                top: Some("csrng_main_sm".to_string()),
+                use_sv2v: true,
+                additional_sources: sources[1..].to_vec(),
+                ..Default::default()
+            };
+            let config_values: HashMap<String, u64> =
+                cfg.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            let report = verify_auto(
+                &sources,
+                &yopts,
+                &VerifyAutoOptions {
+                    exact_symbolic: true,
+                    config_values,
+                    ..Default::default()
+                },
+            )
+            .expect("verify_auto exact-symbolic on csrng_main_sm");
+            report
+                .properties
+                .iter()
+                .find(|p| p.name.contains("ann_guarantee"))
+                .map(|p| p.outcome.clone())
+                .expect("the @mununu_guarantee recoverability property is present")
+        };
+
+        // No assumption: a security escalation wedges the FSM in MainSmError.
+        let free = outcome(&[]);
+        assert!(
+            matches!(free, VerifyOutcome::Violated { .. }),
+            "AG EF idle must be VIOLATED with local_escalate_i free (escalation → \
+             MainSmError trap); got {free:?}"
+        );
+        // Under the no-escalation assumption: the FSM always recovers to idle.
+        let assumed = outcome(&[("local_escalate_i", 0)]);
+        assert!(
+            matches!(assumed, VerifyOutcome::Holds),
+            "AG EF idle must HOLD under the assumption G !local_escalate_i; got {assumed:?}"
+        );
+    }
 }
