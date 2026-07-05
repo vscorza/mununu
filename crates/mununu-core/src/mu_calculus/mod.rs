@@ -206,6 +206,29 @@ impl Formula {
         depth
     }
 
+    /// Number of `Box` (`[]`) modalities anywhere in the formula.
+    ///
+    /// A box quantifies universally over successors, so it is evaluated
+    /// against the **may** relation. When the may relation is an
+    /// under-approximation (the sampling `MayEdgeInference::Off` path), a
+    /// missing may-successor makes `[]φ` vacuously easier to satisfy — a
+    /// definite `KleeneT` on a box property is then unsound. Callers use this
+    /// to decide whether to emit an A.4 sampling-may soundness warning.
+    pub fn box_modality_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    Node::Modal {
+                        kind: ModalKind::Box,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
     /// Returns true if the subtree rooted at `id` contains a fixpoint of the
     /// opposite kind. `looking_for_nu = true` means we're inside a mu and
     /// looking for a nu (and vice versa).
@@ -672,5 +695,37 @@ mod tests {
     fn mu_obligations_single_for_pure_reachability() {
         let f = parser::parse("mu X. (p || <> X)").unwrap();
         assert_eq!(f.mu_obligations().len(), 1);
+    }
+
+    #[test]
+    fn box_modality_count_counts_only_boxes() {
+        // A.4 (2026-07-05) — counts `[]` nodes; ignores `<>` and non-modal nodes.
+        assert_eq!(parser::parse("true").unwrap().box_modality_count(), 0);
+        assert_eq!(
+            parser::parse("mu X. (p || <> X)")
+                .unwrap()
+                .box_modality_count(),
+            0
+        );
+        assert_eq!(
+            parser::parse("nu X. (p && [] X)")
+                .unwrap()
+                .box_modality_count(),
+            1
+        );
+        // GR(1)-like: one outer [] plus two diamonds → box count = 1.
+        assert_eq!(
+            parser::parse("nu X. ((mu Y1. (A || <> Y1)) && (mu Y2. (B || <> Y2)) && [] X)")
+                .unwrap()
+                .box_modality_count(),
+            1
+        );
+        // Two nested boxes → count = 2.
+        assert_eq!(
+            parser::parse("nu X. ((nu Y. (p && [] Y)) && [] X)")
+                .unwrap()
+                .box_modality_count(),
+            2
+        );
     }
 }

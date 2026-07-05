@@ -1282,6 +1282,38 @@ pub fn verify_auto(
     })?;
     let _ = primary_name;
 
+    // A.6 (soundness-ledger, 2026-07-05) — reject `--engine exact-symbolic` with
+    // `--no-gate-reset`. The exact full-state engine is built for the reset-GATED
+    // regime: the reset input is pinned inactive and the initial state is the
+    // modeled reset state (`init` = the post-reset value injected by
+    // `inject_reset_init`, or 0). With reset-gating OFF, that injection is a no-op
+    // (no `init` line), so the engine starts from the power-on default 0 — an
+    // illegal sparse encoding the real design never occupies — and it does not
+    // explore the async reset (a runtime `state_q_next = rst_ni ? FSM : ResetValue`
+    // next-mux) as a firing transition. The result is a *spurious VIOLATED*
+    // (idle unreachable) presented with the exact engine's 2-valued *definite*
+    // authority — a confident wrong answer. Modeling a freed reset soundly needs a
+    // universal (havoc) initial state + reset-as-transition semantics the exact
+    // engine does not have; until then reject the combination rather than emit an
+    // unsound verdict. Free-reset reachability is available on the cube engine
+    // (drop `--engine exact-symbolic`), whose over-approximating may-relation
+    // soundly includes the reset edge.
+    if opts.exact_symbolic && !opts.gate_reset {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::UnsupportedConstruct,
+            message:
+                "adapter/slang/verify_auto (A.6): `--engine exact-symbolic` is not sound with \
+                      `--no-gate-reset`. The exact engine models the post-reset state space (reset \
+                      pinned inactive, init = the modeled reset state); with reset-gating off it \
+                      starts from the illegal power-on default 0 and does not fire the freed async \
+                      reset as a transition, yielding a spurious (but definite-looking) VIOLATED. \
+                      For free-reset reachability, use the cube engine (drop `--engine \
+                      exact-symbolic`); to use the exact engine, keep reset-gating on."
+                    .to_string(),
+            location: None,
+        });
+    }
+
     // 1. Extract + translate the SVA. When reset-gating, the `disable iff`
     // guards are dropped from the formulas and the recognized reset signals are
     // reported (we pin them inactive in the lift below).
@@ -2003,6 +2035,32 @@ module uart_tx(); endmodule"#;
 
     /// `@mununu_assume` bodies are recorded for provenance (not verified as a
     /// guarantee); a source with no `@mununu` property annotations yields no note.
+    #[test]
+    fn a6_exact_symbolic_with_free_reset_is_rejected() {
+        // A.6 (2026-07-05) — `--engine exact-symbolic` + `--no-gate-reset` is an
+        // unsound combination and MUST be rejected before any elaboration. The
+        // reject fires right after the sources check, so it needs no slang (this
+        // is a non-ignored unit test): the exact engine models the post-reset
+        // state space and would emit a definite-looking but spurious VIOLATED on a
+        // freed reset.
+        let err = verify_auto(
+            &src("module m(); endmodule"),
+            &YosysOptions::default(),
+            &VerifyAutoOptions {
+                exact_symbolic: true,
+                gate_reset: false,
+                ..Default::default()
+            },
+        )
+        .expect_err("exact-symbolic + no-gate-reset must be rejected");
+        assert_eq!(err.kind, AdapterErrorKind::UnsupportedConstruct);
+        assert!(
+            err.message.contains("(A.6)") && err.message.contains("exact-symbolic"),
+            "A.6 reject must name the unsound combination; got: {}",
+            err.message
+        );
+    }
+
     #[test]
     fn h5_gr1_assume_recorded_and_empty_source_has_no_note() {
         let sv = "// @mununu_assume tick_baud_x16 = 1\nmodule m(); endmodule";
