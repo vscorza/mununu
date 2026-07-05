@@ -90,6 +90,17 @@ inference rather than sampling:
 
 > Source of truth: [`MustEdgeInference::SmtHyperMust`](../../crates/mununu-core/src/adapter/btor2/kmts_lift.rs#L547) — surface: CLI (`--must-edge-inference smt-hyper-must`)
 
+Symmetrically, the outer `AG` box quantifies over *may*-edges (an
+over-approximation), so a sound `AG EF` also requires the may-relation to
+over-approximate the concrete transitions. The default sampling may-edges
+(`MayEdgeInference::Off`) record only sampled transitions and therefore
+**under**-approximate — unsound for the box. The sound may-relation is
+`--may-edge-inference smt-all-pairs`, or the exact-symbolic engine, which drops the
+abstraction entirely and is the recommended path for recoverability (§3.2).
+verify-auto selects the SMT may-relation automatically when a property references
+inputs or combinational atoms; a hand-run `btor2 cegar` on pure-state atoms must
+request it explicitly.
+
 The verdict, soundness, and the audited modal fragment it holds over
 (`Control::All`, bare `<>`/`[]`, unbounded) are developed in
 [`kmts-theory.md`](kmts-theory.md) §7.
@@ -99,26 +110,35 @@ The verdict, soundness, and the audited modal fragment it holds over
 > Source of truth: [`examples/verify/v7_csrng_recoverability/validate.sh`](../../examples/verify/v7_csrng_recoverability/) — surface: CLI
 
 V.7-c runs `always_recoverable` with `good = (state_q == MainSmIdle)` on the real
-OpenTitan `csrng_main_sm` FSM (vendored under the M.2 fixture), via
-`sv2v → yosys → btor2 cegar … --must-edge-inference smt-hyper-must`. The verdict
-is *definite both ways and depends on reset*, which is the honest and interesting
-result:
+OpenTitan `csrng_main_sm` FSM (vendored under the M.2 fixture), decided by the
+**exact-symbolic engine** — the full bit-blasted state, no abstraction, so a
+definite two-valued verdict with no `⊥`. The verdict is definite both ways and
+depends on reset, which is the honest and interesting result:
 
-- **Reset available** (`rst_ni` a free input): `AG EF idle` is **definite-TRUE**
-  — asserting reset returns the FSM to `MainSmIdle` from any state.
-- **Reset held inactive** (`connect -set rst_ni 1'b1`): `AG EF idle` is
-  **definite-FALSE** (`T=0 / F=4`) — `MainSmError` and the unreachable sparse
-  encodings become permanent traps once reset is withheld.
+- **Normal operation** (init = `MainSmIdle`, verified out of reset): `AG EF idle`
+  is **HOLDS** — the running FSM always returns to idle; it never wedges.
+- **Fault premise** (FSM forced into `MainSmError`, reset withheld): `AG EF idle`
+  is **VIOLATED** — from the hardened error state, idle is unreachable without
+  reset; the error state is a permanent trap.
 
-This is a branching question SVA cannot phrase, answered with sound definite
-verdicts on production RTL. The Track-I countertrace surfaces the trap directly:
-the reset-held run reports `counterexample trace (1 step, ends in trap):
-{idle=false, err=false}` — the initial cube is itself the trap.
+Recovery from a fault therefore depends on reset — exactly the SEC_CM design intent
+(the flop's `state_q_next = rst_ni ? state_d : MainSmIdle` mux). This is a branching
+question SVA cannot phrase, answered with sound definite verdicts on production RTL.
+
+> Soundness note (2026-07-05). An earlier version decided this over the
+> predicate-cube path with the default sampling may-edges (`may=off`), which
+> under-approximate the may-relation and are unsound for the outer `AG` box — that
+> produced a spurious reset-dependent flip (`T=0 F=244 ⊥=12`) not matching the RTL.
+> The exact-symbolic engine has no such abstraction and is the authoritative sound
+> path here; on the predicate-cube path a sound may-relation
+> (`--may-edge-inference smt-all-pairs`) is required and must be verified per
+> property.
 
 > Claims-integrity: V.7-c is a *design-pattern demonstration* on real RTL, not a
-> vulnerability finding — the reset-dependence it surfaces is intended SEC_CM
-> behaviour. The only finding-grade anchor mununu has is the Caliptra
-> `soc_ifc_boot_fsm` CWE-1245 pair.
+> vulnerability finding — the reset-dependence is intended SEC_CM behaviour. The
+> fault premise forces the flop's reset value to `MainSmError` to model a
+> fault-injected error state; the error self-loop under test is unchanged. The only
+> finding-grade anchor mununu has is the Caliptra `soc_ifc_boot_fsm` CWE-1245 pair.
 
 ## 4. A second finding: extracting existing SVA is itself blocked (open toolchain)
 

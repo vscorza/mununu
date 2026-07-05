@@ -1,90 +1,92 @@
 #!/usr/bin/env bash
-# validate.sh — V.7-c recoverability showcase on OpenTitan csrng_main_sm.
+# validate.sh — V.7-c recoverability of OpenTitan csrng_main_sm (AG EF idle),
+# decided SOUNDLY by the exact-symbolic engine.
 #
-# Asks a branching-time question SVA cannot state: "from every reachable state,
-# can the FSM still get back to MainSmIdle?" — i.e. recoverability,
+# The branching-time question SVA cannot state: "from every reachable state, can
+# the FSM still get back to MainSmIdle?" — recoverability,
 #     always_recoverable = nu Y. ((mu X. (idle || <> X)) && [] Y)   (AG EF idle)
-# over a predicate abstraction of the real RTL, with idle = (state_q == MainSmIdle)
-# and err = (state_q == MainSmError), via the predicate-cube CEGAR path with
-# SMT-proved (hyper-)must edges.
+# with idle = (state_q == MainSmIdle = 6'b110111 = 55).
 #
-# The verdict depends entirely on whether reset is available, and that is the
-# honest, interesting result — NOT a bug. csrng's recovery story rests on reset,
-# exactly as its SEC_CM sparse-FSM-plus-alert design intends:
+# SOUNDNESS NOTE (2026-07-05). An earlier version of this example evaluated the
+# property over the PREDICATE-CUBE path (`btor2 cegar`) with the DEFAULT
+# `may=off` (sampling) may-edges. Sampling under-approximates the may-relation
+# (one representative per cube + a capped input set), which violates the KMTS
+# `concrete ⊆ may` precondition and is UNSOUND for this branching property: it
+# produced a spurious reset-dependent "flip" that does not match the RTL (where
+# MainSmError self-loops and is a permanent trap without reset). See
+# `mununu-private/.../recoverability-soundness-findings.md`. This script now uses
+# the EXACT-SYMBOLIC engine (full bit-blasted state, no abstraction, no ⊥), which
+# decides the property definitely and soundly.
 #
-#   * reset available (rst_ni free)      -> always_recoverable HOLDS (definite-TRUE):
-#       asserting reset returns the FSM to MainSmIdle from any state.
-#   * reset held inactive (rst_ni tied)  -> always_recoverable VIOLATED (definite-FALSE):
-#       the MainSmError state and the unreachable sparse encodings become
-#       permanent traps once reset is taken away.
+# The sound result — recovery depends on reset, exactly as the SEC_CM
+# sparse-FSM-plus-alert design intends:
+#   * Normal operation (init = MainSmIdle): AG EF idle HOLDS — verified out of
+#     reset, the running FSM always returns to idle; it never wedges.
+#   * Fault premise (FSM forced into MainSmError, reset withheld): AG EF idle
+#     VIOLATED — from the hardened error state, idle is UNREACHABLE without reset;
+#     the error state is a permanent trap. Recovery is possible only through
+#     reset (the flop's `state_q_next = rst_ni ? state_d : MainSmIdle` mux).
 #
-# Both verdicts are definite (no KleeneBot) and sound for the model (Bruns-Godefroid
-# preservation over the audited Control::All / bare-modality / unbounded fragment).
+# Pedigree / claims integrity: csrng_main_sm.sv is real OpenTitan RTL (Apache-2.0)
+# vendored under ../m2_opentitan_csrng_main_sm/source/. The fault premise forces
+# the flop's reset value to MainSmError to MODEL a fault that has driven the FSM
+# into its error state; the FSM's error self-loop (the behaviour under test) is
+# unchanged, so the VIOLATED verdict reflects the real design's error-trap
+# behaviour. This is a demonstration of the recoverability property class on real
+# silicon, not a vulnerability finding.
 #
-# Pedigree: csrng_main_sm.sv is real OpenTitan RTL (Apache-2.0), vendored + pinned
-# under ../m2_opentitan_csrng_main_sm/source/ (M.2). This fixture reuses that
-# source rather than re-vendoring it. The recoverability property is a
-# design-pattern demonstration of the property class on real silicon, not a
-# vulnerability finding — the reset-dependence it surfaces is intended behaviour.
+# Requires the mununu-sva toolchain (slang + sv2v + yosys) — run in the
+# `mununu-sva` Docker image. The standard prim_assert macros come from the M.0
+# prim_arbiter fixture (the csrng dir's own prim_assert.sv is the dummy variant).
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
-SRC="examples/verify/m2_opentitan_csrng_main_sm/source"
+CS="examples/verify/m2_opentitan_csrng_main_sm/source"
+PR="examples/verify/m0_opentitan_prim_arbiter/source"
 MUNUNU="${MUNUNU:-./target/debug/mununu}"
-export LIBRARY_PATH="${LIBRARY_PATH:-/usr/local/opt/z3/lib}"
 
 if [[ ! -x "${MUNUNU}" ]]; then
-  echo "validate.sh: mununu not found at ${MUNUNU} — build with: LIBRARY_PATH=/usr/local/opt/z3/lib cargo build -p mununu-cli" >&2
+  echo "validate.sh: mununu not found at ${MUNUNU} — build with: cargo build -p mununu-cli" >&2
   exit 2
 fi
-for tool in sv2v yosys; do
-  command -v "${tool}" >/dev/null 2>&1 || { echo "validate.sh: required tool '${tool}' not on PATH" >&2; exit 2; }
+for tool in slang sv2v yosys; do
+  command -v "${tool}" >/dev/null 2>&1 || { echo "validate.sh: required tool '${tool}' not on PATH (run in the mununu-sva image)" >&2; exit 2; }
 done
 
 OUT="$(mktemp -d -t mununu-v7c-XXXXXX)"
-FORMULA='nu Y. ((mu X. (idle || <> X)) && [] Y)'
-PREDS=(--predicate idle:state_q=55 --predicate err:state_q=41 --must-edge-inference smt-hyper-must)
+trap 'rm -rf "${OUT}"' EXIT
+AGEF='// @mununu_guarantee nu Y. ((mu X. ((state_q == 55) or <> X)) and [] Y)'
 
-# MainSmIdle = 6'b110111 = 55 ; MainSmError = 6'b101001 = 41 (csrng_pkg.sv).
-sv2v -I"${SRC}" "${SRC}/csrng_pkg.sv" "${SRC}/csrng_main_sm.sv" > "${OUT}/csrng.v" 2>"${OUT}/sv2v.err"
+cp "${CS}/csrng_pkg.sv" "${PR}/prim_assert.sv" "${PR}/prim_assert_standard_macros.svh" \
+   "${PR}/prim_assert_sec_cm.svh" "${PR}/prim_flop_macros.sv" "${OUT}/"
+SRCS=(--source "${OUT}/csrng_pkg.sv" --source "${OUT}/prim_assert.sv"
+      --source "${OUT}/prim_assert_standard_macros.svh" --source "${OUT}/prim_assert_sec_cm.svh"
+      --source "${OUT}/prim_flop_macros.sv")
 
-# Lift one variant to BTOR2 (reset free, or reset tied inactive) and run CEGAR.
-run_variant() {
-  local variant="$1" tie=""
-  [[ "${variant}" == "held" ]] && tie="connect -set rst_ni 1'b1;"
-  yosys -q -p "read_verilog -sv ${OUT}/csrng.v; hierarchy -check -top csrng_main_sm; proc; \
-               flatten; ${tie} async2sync; dffunmap; setundef -anyconst; write_btor ${OUT}/${variant}.btor2" \
-    2>"${OUT}/${variant}.yosys.err"
-  "${MUNUNU}" btor2 cegar "${OUT}/${variant}.btor2" --formula "${FORMULA}" "${PREDS[@]}" \
-    > "${OUT}/${variant}.out" 2>&1 || true
-  grep -iE "verdict cells|outcome" "${OUT}/${variant}.out" || true
-}
+# Normal: FSM reset value is MainSmIdle (unchanged).
+{ echo "${AGEF}"; cat "${CS}/csrng_main_sm.sv"; } > "${OUT}/normal.sv"
+# Fault premise: force the FSM reset value to MainSmError (models a fault-injected
+# error state); the error self-loop logic is untouched.
+{ echo "${AGEF}"; sed 's/main_sm_state_e, MainSmIdle)/main_sm_state_e, MainSmError)/' "${CS}/csrng_main_sm.sv"; } > "${OUT}/fault.sv"
 
-cell() { grep "verdict cells" "${OUT}/$1.out" | sed -E "s/.*$2=([0-9]+).*/\1/"; }
+run() { "${MUNUNU}" sv verify-auto "$1" "${SRCS[@]}" --top csrng_main_sm --preprocess-sv2v \
+          --engine exact-symbolic 2>&1 | grep -E "ann_guarantee" | head -1; }
 
-echo "=== V.7-c — recoverability of OpenTitan csrng_main_sm (AG EF MainSmIdle) ==="
+echo "=== V.7-c — recoverability of OpenTitan csrng_main_sm (AG EF MainSmIdle), exact-symbolic ==="
 echo
-echo "--- reset available (rst_ni free) — expect HOLDS ---"
-run_variant free
+echo "--- normal operation (init = MainSmIdle) — expect HOLDS ---"
+NORMAL="$(run "${OUT}/normal.sv")"; echo "  ${NORMAL}"
 echo
-echo "--- reset held inactive (rst_ni tied 1'b1) — expect VIOLATED ---"
-run_variant held
+echo "--- fault premise (FSM in MainSmError, reset withheld) — expect VIOLATED ---"
+FAULT="$(run "${OUT}/fault.sv")"; echo "  ${FAULT}"
 echo
-
-FREE_T="$(cell free T)"; FREE_F="$(cell free F)"
-HELD_T="$(cell held T)"; HELD_F="$(cell held F)"
 
 ok=1
-if [[ "${FREE_F}" != "0" || "${FREE_T:-0}" -lt 1 ]]; then
-  echo "FAIL: reset-available expected HOLDS (T>=1, F=0), got T=${FREE_T} F=${FREE_F}" >&2; ok=0
-fi
-if [[ "${HELD_T}" != "0" || "${HELD_F:-0}" -lt 1 ]]; then
-  echo "FAIL: reset-held expected VIOLATED (T=0, F>=1), got T=${HELD_T} F=${HELD_F}" >&2; ok=0
-fi
-[[ "${ok}" == "1" ]] || { rm -rf "${OUT}"; exit 1; }
+grep -qi "HOLDS" <<<"${NORMAL}" || { echo "FAIL: normal operation expected HOLDS, got: ${NORMAL}" >&2; ok=0; }
+grep -qi "VIOLATED" <<<"${FAULT}" || { echo "FAIL: fault premise expected VIOLATED, got: ${FAULT}" >&2; ok=0; }
+[[ "${ok}" == "1" ]] || exit 1
 
-rm -rf "${OUT}"
 echo "=== V.7-c VALIDATION PASSED ==="
-echo "Recovery to MainSmIdle holds while reset is available and fails once reset is"
-echo "withheld — mununu states and soundly decides this branching (AG EF) property"
-echo "on real OpenTitan RTL, with definite verdicts both ways."
+echo "The running FSM always recovers to idle (HOLDS); a fault-induced error state"
+echo "cannot reach idle without reset (VIOLATED) — a branching-time (AG EF)"
+echo "recoverability property decided soundly and exactly on real OpenTitan RTL."
