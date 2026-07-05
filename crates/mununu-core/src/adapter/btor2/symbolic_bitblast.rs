@@ -253,13 +253,26 @@ impl BddBitBlaster {
             WalkError::Backend(msg) => msg,
         })?;
 
-        // Pass 3 — collect the per-register next-state functions. A state's
-        // symbol is looked up from its declaration.
+        // Pass 3 — collect the per-register next-state functions, keyed by the
+        // state's symbol. This MUST use the SAME `collect_symbols` alias
+        // resolution `build()` used to name the leaf cells (line ~176): on
+        // flattened yosys output the `state` line loses its symbol and the
+        // user-visible name (`bit_cnt_q`) survives only on a `uext _ NID 0 NAME`
+        // alias, so `build()` names the cell `bit_cnt_q` via `collect_symbols`.
+        // Keying `next_funcs` off the RAW state symbol instead yields `state_<nid>`,
+        // which then MISSES the `next_funcs.get(&cell.symbol)` lookup in
+        // `exact_model()` — leaving the register with no next-state function, i.e.
+        // silently FROZEN at its init value. That is unsound: liveness/reachability
+        // over that register is decided against a model where it never transitions
+        // (a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Resolve identically here.
+        let symbols = crate::adapter::btor2::parser::collect_symbols(file);
         let mut nid_symbol: HashMap<Nid, String> = HashMap::new();
         for line in &file.lines {
             if let Node::State { symbol, .. } = &line.node {
-                let sym = symbol
-                    .clone()
+                let sym = symbols
+                    .get(&line.nid)
+                    .cloned()
+                    .or_else(|| symbol.clone())
                     .unwrap_or_else(|| format!("state_{}", line.nid));
                 nid_symbol.insert(line.nid, sym);
             }
@@ -3094,6 +3107,73 @@ mod tests {
         );
     }
 
+    // Frozen-register regression (2026-07-05) — a register that LOADS a nonzero
+    // value from a free input `ld` (`reg_next = ld ? 10 : reg`). Two shapes that
+    // MUST decide identically:
+    //   (A) the state line carries the symbol directly (`state 2 bit_cnt_q`);
+    //   (B) the state line is UNNAMED and the user-visible name survives only on a
+    //       `uext _ NID 0 NAME` alias (`state 2` + `uext 2 4 0 bit_cnt_q`) — the
+    //       exact shape yosys emits after flatten + async2sync + dffunmap.
+    // The bit-blaster names its cells via `collect_symbols` (alias-aware), so both
+    // cells are named `bit_cnt_q`. The bug: `next_funcs` was keyed off the RAW
+    // state symbol (`state_<nid>` for (B)), so `next_funcs.get(&cell.symbol)` missed
+    // and (B)'s register was left with NO next-state function — silently FROZEN at
+    // its init value. `EF(bit_cnt_q != 0)` then read `Violated` (a reachable state
+    // reported unreachable) for (B) while (A) correctly read `Holds`. From any
+    // state, asserting `ld` reaches `bit_cnt_q = 10`, so the sound verdict is
+    // `Holds` for BOTH.
+    const FROZEN_REG_ATOM_ON_STATE: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 input 1 ld
+4 state 2 bit_cnt_q
+5 const 2 0000
+6 const 2 1010
+7 ite 2 3 6 4
+8 next 2 4 7
+"#;
+    const FROZEN_REG_ATOM_ON_UEXT_ALIAS: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 input 1 ld
+4 state 2
+5 const 2 0000
+6 const 2 1010
+7 ite 2 3 6 4
+8 next 2 4 7
+9 uext 2 4 0 bit_cnt_q
+"#;
+
+    #[test]
+    fn exact_next_func_binds_to_uext_aliased_register_not_frozen() {
+        // The regression: named-state and uext-aliased-state must decide the SAME.
+        let ef = crate::mu_calculus::parser::parse("mu Y. ((not (bit_cnt_q == 0)) or <> Y)")
+            .expect("EF formula");
+        let named = exact_symbolic_verdict(FROZEN_REG_ATOM_ON_STATE, &ef).expect("verdict");
+        let aliased = exact_symbolic_verdict(FROZEN_REG_ATOM_ON_UEXT_ALIAS, &ef).expect("verdict");
+        assert_eq!(
+            named,
+            ExactVerdict::Holds,
+            "EF(bit_cnt_q != 0) is reachable (assert `ld`), so a named state decides Holds"
+        );
+        assert_eq!(
+            aliased, named,
+            "a uext-ALIASED state must decide identically to a named one — not a frozen \
+             register (Violated) from a `next_funcs` key that missed the alias resolution"
+        );
+        // The AF-liveness companion also agrees: with `ld` free, `ld=0` forever holds
+        // the loaded value, so `AG AF(bit_cnt_q == 0)` is a real Violated on BOTH.
+        let agaf = crate::mu_calculus::parser::parse(
+            "nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)",
+        )
+        .expect("AGAF formula");
+        assert_eq!(
+            exact_symbolic_verdict(FROZEN_REG_ATOM_ON_UEXT_ALIAS, &agaf).expect("verdict"),
+            exact_symbolic_verdict(FROZEN_REG_ATOM_ON_STATE, &agaf).expect("verdict"),
+            "AG AF must also decide identically for named vs uext-aliased state"
+        );
+    }
+
     /// D1.7 — the exact engine DEGRADES GRACEFULLY on a design too large to
     /// bit-blast. `BddBitBlaster::build` rejects a design whose register+input
     /// bit count exceeds `MAX_BITBLAST_BITS` (40) with a clean `Err` — and does so
@@ -3404,16 +3484,27 @@ mod tests {
         }
     }
 
-    /// D1 HEADLINE (docker-gated) — exact ROBDD μ-calculus MC decides on real
-    /// OpenTitan `uart_tx` the `AF`-liveness that predicate abstraction returns ⊥
-    /// for: `AG AF (bit_cnt_q == 0)` — the transmit bit counter always eventually
-    /// returns to idle — is **Holds** (definite), from the correct 0-reset init.
-    /// The `bit_cnt_q` atom binds via `collect_symbols` (cell naming) +
-    /// `resolve_register` (atom rewrite: `bit_cnt_q → bit_cnt_d`); the init pins
-    /// every register to its reset value (0 default), so the verdict is checked
-    /// from the actual reset state, not an over-broad free-init set. Companion
-    /// verdicts confirm soundness on the design: `AG EF` (recoverability) + `EF` +
-    /// `AG (bit_cnt < 12)` (a real bounded-counter safety invariant) all Holds.
+    /// D1 HEADLINE (docker-gated) — exact ROBDD μ-calculus MC *decides* on real
+    /// OpenTitan `uart_tx` an `AF`-liveness that predicate abstraction returns ⊥
+    /// for: `AG AF (bit_cnt_q == 0)` — "a transmission in progress always completes"
+    /// — is **Violated** (definite), and the engine returns a concrete stall lasso.
+    /// The counter does NOT always drain: `bit_cnt_q` loads on a write, and a
+    /// persistently-asserted `wr` (or a stalled `tick_baud_x16`) holds it non-zero
+    /// forever — a real liveness failure. The value of the exact engine is that it
+    /// decides this **definitely with a counterexample** where the predicate-cube
+    /// path answers ⊥ (an `AF` needs a ranking predicate abstraction cannot
+    /// synthesize).
+    ///
+    /// REGRESSION for the frozen-register fix (2026-07-05): this asserted `Holds`
+    /// until the `next_funcs` keying bug was fixed. `bit_cnt_q`'s name survives only
+    /// on a `uext` alias of an unnamed state (post flatten/async2sync/dffunmap); the
+    /// bug keyed `next_funcs` off the raw state symbol, so the lookup missed and the
+    /// register was silently FROZEN at its 0 init — making `AG AF` a *vacuous*
+    /// `Holds`. With the register actually transitioning, the true verdict is
+    /// `Violated`. Companion verdicts remain definite + sound: `AG EF`
+    /// (recoverability — idle always reachable, since reset drains the counter) and
+    /// `EF (bit_cnt==0)` are `Holds`; `AG (bit_cnt < 12)` (a real bounded-counter
+    /// safety invariant) is `Holds`.
     /// `#[ignore]`; the SV is read at run time so `make ci` only compiles it.
     #[test]
     #[ignore = "needs sv2v + yosys — run in the mununu-sva docker image"]
@@ -3436,18 +3527,22 @@ mod tests {
             exact_symbolic_verdict(&btor2, &ff).expect("definite verdict, binds")
         };
 
-        // THE HEADLINE: `AG AF (bit_cnt_q == 0)` — the transmit counter always
-        // eventually returns to idle — is decided **Holds** (definite liveness) on
-        // real OpenTitan RTL. The predicate-abstraction path answers this ⊥ (no
-        // ranking); exact ROBDD MC decides it, from the correct 0-reset init.
+        // THE HEADLINE: `AG AF (bit_cnt_q == 0)` — "a transmission always completes"
+        // — is decided **Violated** (definite liveness failure) on real OpenTitan
+        // RTL: a persistently-asserted `wr` (or a stalled tick) holds the counter
+        // non-zero forever. The predicate-abstraction path answers this ⊥ (no
+        // ranking); exact ROBDD MC decides it definitely, with a stall lasso. This
+        // is the frozen-register-fix regression: a false `Holds` here means the
+        // `next_funcs` alias-keying bug regressed and `bit_cnt_q` is frozen again.
         assert_eq!(
             verdict("nu X. ((mu Y. ((bit_cnt_q == 0) or [] Y)) and [] X)"),
-            ExactVerdict::Holds,
-            "AG AF (bit_cnt_q==0) holds on uart_tx"
+            ExactVerdict::Violated,
+            "AG AF (bit_cnt_q==0) is Violated on uart_tx (a stalled/persistently-written \
+             counter never drains) — NOT the vacuous Holds of a frozen register"
         );
-        // Companion sanity: `AG EF` (recoverability) holds; `EF (bit_cnt==0)` holds
-        // trivially (0 at reset); `AG (bit_cnt < 12)` is a real bounded-counter
-        // safety invariant — the exact engine proves it definitely.
+        // Companion sanity (all definite + sound): `AG EF` (recoverability — idle is
+        // always reachable because reset drains the counter) and `EF (bit_cnt==0)`
+        // hold; `AG (bit_cnt < 12)` is a real bounded-counter safety invariant.
         assert_eq!(
             verdict("nu Y. ((mu X. ((bit_cnt_q == 0) or <> X)) and [] Y)"),
             ExactVerdict::Holds,
