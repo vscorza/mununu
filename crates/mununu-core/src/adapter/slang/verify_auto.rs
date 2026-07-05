@@ -4903,16 +4903,17 @@ endmodule
     /// the headline `AG AF (bit_cnt_q == 0)` liveness property; `verify_auto` with
     /// `exact_symbolic: true` must route it through the exact full-state ROBDD MC
     /// (`exact_symbolic_verdict`) — the same engine `e2e_d1_uart_tx_exact_liveness_verdict`
-    /// exercises directly — and return a **definite Holds**, where the predicate-cube
-    /// path answers this ⊥ (no ranking for `AF`).
+    /// exercises directly — and return a **definite Violated** (with a stall lasso),
+    /// where the predicate-cube path answers this ⊥ (no ranking for `AF`).
     ///
     /// This validates the CLI/API `--engine exact-symbolic` wiring, not the D1 thesis
     /// itself (that is the direct test's job): the annotation guarantee flows through
     /// scan → merge → the hoisted exact branch (which runs BEFORE cube seeding, so it
-    /// is never gated behind a seeding skip). The btor2 here is reset-gated +
-    /// `$past`-shadow-augmented (unlike the direct test's raw btor2); reset-gating
-    /// pins the reset input inactive, so a genuinely-holding liveness property stays
-    /// Holds.
+    /// is never gated behind a seeding skip). Regression for the frozen-register fix
+    /// (2026-07-05): this asserted `Holds` while `bit_cnt_q` (a `uext`-aliased register)
+    /// was silently frozen by the `next_funcs` keying bug; the true verdict is
+    /// `Violated` (the counter can be held non-zero forever by a persistent write or a
+    /// stalled tick).
     #[test]
     #[ignore = "requires slang + sv2v + Yosys (use the mununu-sva docker image); run with --ignored"]
     fn e2e_d1_6_verify_auto_exact_symbolic_route_uart_tx() {
@@ -4963,9 +4964,11 @@ endmodule
             guarantee.name, guarantee.formula, guarantee.outcome
         );
         assert!(
-            matches!(guarantee.outcome, VerifyOutcome::Holds),
-            "AG AF (bit_cnt_q==0) must be decided Holds by the exact-symbolic route \
-             through verify_auto; got {:?}",
+            matches!(guarantee.outcome, VerifyOutcome::Violated { .. }),
+            "AG AF (bit_cnt_q==0) must be decided Violated by the exact-symbolic route \
+             through verify_auto (the counter can be held non-zero forever) — a false \
+             Holds means the frozen-register `next_funcs` alias-keying bug regressed; \
+             got {:?}",
             guarantee.outcome
         );
     }
