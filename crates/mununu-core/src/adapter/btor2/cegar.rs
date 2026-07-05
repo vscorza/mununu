@@ -764,6 +764,34 @@ pub fn cegar_refine_loop(
             location: None,
         });
     }
+    // A.4 (soundness-ledger, 2026-07-05) — sampling may-relation is an
+    // UNDER-approximation. `MayEdgeInference::Off` samples one canonical
+    // representative per source cube over a capped input enumeration, so it can
+    // MISS a real may-successor. A `Box` ([]) modality quantifies universally
+    // over may-successors, so a missing successor makes `[]φ` vacuously easier
+    // to satisfy — a definite HOLDS (`KleeneT`) on a box property is then NOT
+    // guaranteed sound (a missed successor can hide a violation). Surface this
+    // on the `btor2 cegar` / `sv cegar` / `/cegar` surface as a WARNING (not a
+    // reject: sampling is fast and exact when the input space is small enough to
+    // be exhaustively enumerated). `effective_may` already accounts for the
+    // compound/derived force to SmtAllPairs above, so this fires only when the
+    // run genuinely uses the sampling path.
+    let box_count = formula.box_modality_count();
+    if effective_may == crate::adapter::btor2::kmts_lift::MayEdgeInference::Off && box_count > 0 {
+        warnings.push(crate::adapter::AdapterWarning {
+            kind: crate::adapter::WarningKind::ApproximateTranslation,
+            location: None,
+            message: format!(
+                "adapter/btor2/cegar (A.4): may_edge_inference = Off (sampling) with {box_count} \
+                 box ([]) modality/-ies. The sampling may-relation is an UNDER-approximation \
+                 (one canonical representative per cube + a capped input enumeration) that can \
+                 MISS a real may-successor, so a definite HOLDS on a box property is NOT \
+                 guaranteed sound — a missed successor can hide a violation. Re-run with \
+                 `--may-edge-inference smt-all-pairs` for a sound over-approximating may-relation, \
+                 or use the exact-symbolic engine for an abstraction-free verdict.",
+            ),
+        });
+    }
     // R-Y5 (2026-06-08) — register names load-bearing for
     // `KleeneBot` verdicts across iterations. Populated at the
     // failure-subgame consumption point; surfaced in the final
@@ -2020,6 +2048,141 @@ mod tests {
 8 next 1 3 4
 ";
 
+    // A.5 (2026-07-05) — trap-FSM fixtures for the recoverability soundness
+    // reproduction. State `s` (2 bits): idle = 1, error = 2. The FSM's next-state
+    // is `fsm_next = (s == error) ? error : idle` — error is a permanent trap
+    // (self-loop), every other state moves to idle. No `init` line ⇒ `s` is havoc
+    // (the cube path enumerates all 4 predicate cubes, including the error cube).
+    // Predicates: idle = (s == 1), err = (s == 2).
+    //
+    // `TRAP_FSM_RESET_PINNED` is the "reset held" model: `next(s) = fsm_next` (no
+    // reset mux). From the error cube idle is UNREACHABLE, so `AG EF idle` is
+    // definite-FALSE at the error cube — the sound trap verdict.
+    const TRAP_FSM_RESET_PINNED: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 s
+4 constd 2 1
+5 constd 2 2
+6 eq 1 3 5
+7 ite 2 6 5 4
+8 next 2 3 7
+";
+
+    // `TRAP_FSM_RESET_FREE` is the SAME FSM with an async active-low reset mux left
+    // as a LIVE input: `next(s) = rst_ni ? fsm_next : idle`. rst_ni is a free
+    // primary input (not constant-folded). From the error cube the ∀∃ must-edge
+    // inference can pick rst_ni = 0 (asserted) ⇒ next = idle, so a must-edge
+    // error → idle is REAL and `AG EF idle` is definite-TRUE at the error cube.
+    // This is the un-pinned-reset artifact behind the recoverability "may=all-pairs
+    // spurious HOLDS": the must inference is correct; the reset was simply not tied.
+    const TRAP_FSM_RESET_FREE: &str = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 s
+4 constd 2 1
+5 constd 2 2
+6 eq 1 3 5
+7 ite 2 6 5 4
+8 input 1 rst_ni
+9 ite 2 8 7 4
+10 next 2 3 9
+";
+
+    // A.5 helper — run `AG EF idle` over a trap-FSM fixture with the canonical
+    // ∀∃ must-edge inference (`SmtPerTargetStandard`) + the sound over-approximating
+    // may-relation (`SmtAllPairs`), and return the definite verdict at the error
+    // cube (idle = false, err = true). `None` ⇒ the error cube was ⊥.
+    fn a5_err_cube_verdict(btor2: &str) -> Option<crate::mu_calculus::trit::Trit> {
+        use crate::mu_calculus::trit::Trit;
+        let formula = parser::parse("nu X. ((mu Y. (idle || <> Y)) && [] X)")
+            .expect("AG EF idle formula parses");
+        let predicates = vec![
+            PredicateSpec {
+                name: "idle".into(),
+                register: "s".into(),
+                value: 1,
+            },
+            PredicateSpec {
+                name: "err".into(),
+                register: "s".into(),
+                value: 2,
+            },
+        ];
+        let env = Environment::new(4);
+        let cegar_opts = CegarOptions {
+            max_iterations: 1,
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs,
+            must_edge_inference:
+                crate::adapter::btor2::kmts_lift::MustEdgeInference::SmtPerTargetStandard,
+            lift_strategy: LiftStrategy::Eager,
+            ..CegarOptions::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            btor2,
+            predicates,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds on the trap FSM");
+        // Cube index encodes predicate truth bit-per-predicate in `final_predicates`
+        // order. Find the index with idle=false, err=true.
+        let idle_bit = trace
+            .final_predicates
+            .iter()
+            .position(|p| p.name == "idle")
+            .expect("idle predicate present");
+        let err_bit = trace
+            .final_predicates
+            .iter()
+            .position(|p| p.name == "err")
+            .expect("err predicate present");
+        let err_cube = 1usize << err_bit; // err=1, idle=0
+        assert_eq!(err_cube & (1 << idle_bit), 0, "err cube must have idle=0");
+        for i in 0..trace.final_verdict.len() {
+            eprintln!("cube {i}: {:?}", trace.final_verdict.verdict_at(i));
+        }
+        eprintln!(
+            "final_predicates: {:?}",
+            trace
+                .final_predicates
+                .iter()
+                .map(|p| &p.name)
+                .collect::<Vec<_>>()
+        );
+        match trace.final_verdict.verdict_at(err_cube) {
+            Trit::Unknown => None,
+            v => Some(v),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Z3 (SMT must/may edges); run in the mununu-sva/dev image with --ignored"]
+    fn a5_trap_fsm_pinned_reset_error_is_false_free_reset_is_true() {
+        use crate::mu_calculus::trit::Trit;
+        // Reset PINNED (held): error is a permanent trap ⇒ AG EF idle is definite
+        // FALSE at the error cube. The sound recoverability verdict.
+        let pinned = a5_err_cube_verdict(TRAP_FSM_RESET_PINNED);
+        assert_eq!(
+            pinned,
+            Some(Trit::False),
+            "with the reset pinned, the error cube must be definite-FALSE (idle unreachable from a trap)"
+        );
+        // Reset FREE (un-pinned): the ∀∃ must-edge inference legitimately finds
+        // rst_ni=0 ⇒ next=idle, so AG EF idle is definite-TRUE at the error cube.
+        // This is the "may=all-pairs spurious HOLDS" — sound for a FREE reset,
+        // unsound only if the reset was meant to be tied. Root cause: the reset was
+        // not constant-folded out of the BTOR2 before the may/must SMT seam.
+        let free = a5_err_cube_verdict(TRAP_FSM_RESET_FREE);
+        assert_eq!(
+            free,
+            Some(Trit::True),
+            "with the reset free, the error cube flips to definite-TRUE via the real reset-recovery path"
+        );
+    }
+
     #[test]
     fn cegar_converges_immediately_when_initial_verdict_is_definite() {
         // `true` formula evaluates to KleeneT at every state; no
@@ -3275,6 +3438,111 @@ mod tests {
         assert!(
             trace.warnings.is_empty(),
             "default `true` formula MUST produce no warnings; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn a4_sampling_may_warning_fires_on_box_formula_with_may_off() {
+        // A.4 (2026-07-05) — a box ([]) formula run with the sampling
+        // may-relation (`MayEdgeInference::Off`) MUST emit the A.4 soundness
+        // warning: sampling under-approximates the may-relation, so a definite
+        // HOLDS on the box property is not guaranteed sound.
+        let formula = parser::parse("nu X. (true && [] X)").expect("formula parses");
+        assert_eq!(formula.box_modality_count(), 1);
+
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            ..CegarOptions::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        assert!(
+            trace.warnings.iter().any(|w| {
+                w.message.contains("(A.4)") && w.message.contains("may_edge_inference = Off")
+            }),
+            "expected an A.4 sampling-may warning on a box formula with may=off; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn a4_sampling_may_warning_absent_with_smt_all_pairs() {
+        // A.4 (2026-07-05) — the SAME box formula run with the sound
+        // `SmtAllPairs` over-approximating may-relation MUST NOT emit the A.4
+        // warning: the may-relation is then sound for the box.
+        let formula = parser::parse("nu X. (true && [] X)").expect("formula parses");
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs,
+            ..CegarOptions::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        assert!(
+            !trace.warnings.iter().any(|w| w.message.contains("(A.4)")),
+            "A.4 warning MUST NOT fire when may=SmtAllPairs; got: {:?}",
+            trace.warnings
+        );
+    }
+
+    #[test]
+    fn a4_sampling_may_warning_absent_on_diamond_only_formula() {
+        // A.4 (2026-07-05) — a formula with NO box (diamond-only) MUST NOT emit
+        // the A.4 warning even under may=off: the under-approximation soundness
+        // gap is specific to the universal (box) modality.
+        let formula = parser::parse("mu X. (true || <> X)").expect("formula parses");
+        assert_eq!(formula.box_modality_count(), 0);
+        let initial = vec![PredicateSpec {
+            name: "p".into(),
+            register: "reg_a".into(),
+            value: 0,
+        }];
+        let env = Environment::new(2);
+        let cegar_opts = CegarOptions {
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            ..CegarOptions::default()
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            SMALL_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+
+        assert!(
+            !trace.warnings.iter().any(|w| w.message.contains("(A.4)")),
+            "A.4 warning MUST NOT fire on a diamond-only formula; got: {:?}",
             trace.warnings
         );
     }
