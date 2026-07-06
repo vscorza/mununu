@@ -305,11 +305,10 @@ enum NotePosture {
     /// Exact-symbolic engine: the full bit-blasted state, no abstraction — a
     /// definite HOLDS/VIOLATED is sound and there is no `⊥`.
     Exact,
-    /// Predicate-cube path. `sampling_may_props` names the properties decided with
-    /// the sampling may-edges (`may=off`), which UNDER-approximate the may-relation
-    /// (unsound for the `AG` box / branching shapes); empty ⇒ every property used
-    /// the sound `SmtAllPairs` may-relation.
-    Cube { sampling_may_props: Vec<String> },
+    /// Predicate-cube path. The cube lift always uses the sound `SmtAllPairs`
+    /// may-relation (AR-S2 retired the sampling-may fallback + its A.4 ⊥-guard),
+    /// so a definite HOLDS on a safety property is sound by over-approximation.
+    Cube,
 }
 
 fn build_notes(
@@ -406,7 +405,7 @@ fn build_notes(
                 .into(),
             items: Vec::new(),
         }),
-        NotePosture::Cube { sampling_may_props } if sampling_may_props.is_empty() => {
+        NotePosture::Cube => {
             notes.push(VerificationNote {
                 kind: "abstraction-posture".into(),
                 level: NoteLevel::Info,
@@ -422,25 +421,6 @@ fn build_notes(
                 items: Vec::new(),
             });
         }
-        NotePosture::Cube { sampling_may_props } => notes.push(VerificationNote {
-            kind: "abstraction-posture".into(),
-            level: NoteLevel::SoundnessCaveat,
-            summary: format!(
-                "{} propert(y/ies) used sampling may-edges (may=off), which under-approximate the \
-                 may-relation — a definite HOLDS among them is NOT guaranteed sound.",
-                sampling_may_props.len()
-            ),
-            detail: format!(
-                "Sampling may-edges (one representative per cube + a capped input set) can miss \
-                 concrete transitions, violating the KMTS `concrete ⊆ may` precondition; for a \
-                 branching/box shape (AG, AG EF) a definite HOLDS decided this way is candidate, not \
-                 proven. Re-run the listed properties with `--may-edge-inference smt-all-pairs`, or \
-                 `--engine exact-symbolic`. Every other property used the sound SMT all-pairs \
-                 may-relation. Must-edge inference: {}.",
-                must_edge_inference_label(must_edge_inference),
-            ),
-            items: sampling_may_props.clone(),
-        }),
     }
 
     // Reset gating (Info).
@@ -1648,9 +1628,7 @@ pub fn verify_auto(
         let posture = if opts.exact_symbolic {
             NotePosture::Exact
         } else {
-            NotePosture::Cube {
-                sampling_may_props: Vec::new(),
-            }
+            NotePosture::Cube
         };
         report.notes = build_notes(&report, opts.must_edge_inference, &[], &[], &posture);
         if let Some(n) = annotation_note(&ann_scan) {
@@ -1822,29 +1800,10 @@ pub fn verify_auto(
         .collect();
     let is_input = |name: &str| -> bool { input_symbols.contains(name) };
 
-    // A.4 honest-⊥ signal (2026-07-06) — the sampling may-relation (`MayEdgeInference::Off`,
-    // the pure-state default) enumerates at most `SAMPLED_INPUT_CAP` boolean inputs per source
-    // cube. A design with MORE free boolean inputs is sampled INCOMPLETELY, so the may-relation
-    // UNDER-approximates the real one (`real ⊄ may`) and a cube DEFINITE on a modal property is
-    // NOT sound — a missed input can hide a real successor (`[]φ`=True) or a real path
-    // (`<>`/`EF`=False). This is exactly the ibex_controller failure: sampling missed the edge
-    // back to DECODE → a spurious `AG EF DECODE` = VIOLATED contradicting the sound exact engine.
-    // When this holds, a definite cube verdict on such a property is downgraded to ⊥ below. Small
-    // designs (≤ cap → exhaustive enumeration → sound) and input/compound/derived/combinational
-    // props (routed to the sound SmtAllPairs may) are unaffected.
-    const SAMPLED_INPUT_CAP: usize = 8; // == kmts_lift / cegar `max_input_bits`
-    let n_bool_inputs = file
-        .lines
-        .iter()
-        .filter_map(|l| match &l.node {
-            crate::adapter::btor2::ast::Node::Input { sort, .. } => {
-                crate::adapter::btor2::parser::bv_width(&file, *sort)
-            }
-            _ => None,
-        })
-        .filter(|w| *w == 1)
-        .count();
-    let sampling_may_incomplete = n_bool_inputs > SAMPLED_INPUT_CAP;
+    // AR-S2 (2026-07-06) — the cube lift now always uses the SOUND `SmtAllPairs`
+    // may-relation (retiring the pure-state sampling-may fallback + the A.4 ⊥-guard
+    // that papered over its input-sampling incompleteness). A definite cube verdict
+    // is therefore sound by over-approximation with no honest-⊥ downgrade needed.
 
     // H.E (combinational outputs) — named combinational nodes: an `Op` carrying
     // its OWN symbol that is neither a state cell (incl. value-alias, via
@@ -1920,13 +1879,6 @@ pub fn verify_auto(
     // note (sorted, deduped across properties).
     let mut counter_bound_items: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
-    // A.3 — names of properties decided with the sampling `may=off` may-relation
-    // (an under-approximation, unsound for the `AG` box); drives the
-    // abstraction-posture note. Empty ⇒ every property used the sound SmtAllPairs may.
-    let mut sampling_may_props: Vec<String> = Vec::new();
-    // A.4 honest-⊥ — properties whose cube DEFINITE was downgraded to ⊥ because the sampling
-    // may-relation was incomplete (see `sampling_may_incomplete`); surfaced in a soundness note.
-    let mut sampling_downgraded_props: Vec<String> = Vec::new();
 
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
@@ -2055,37 +2007,10 @@ pub fn verify_auto(
         seeded_names.extend(seeded.derived.iter().map(|d| d.name.clone()));
         seeded_names.extend(seeded.derived_relational.iter().map(|(n, _)| n.clone()));
 
-        // Compounds OR free inputs ⇒ force the SmtAllPairs eager lift.
-        // Compounds: the only compound-aware may path. Free inputs (H.B): the
-        // sampling may path is state-oriented (it builds a canonical
-        // representative over state registers and ignores `view.inputs`), so it
-        // cannot realise the source-pin / target-free input shape — only the
-        // SmtAllPairs seam (over `build_register_nid_map_with_inputs`) can.
-        // `cegar_refine_loop` re-checks the compound gate.
-        let has_compounds = !seeded.compounds.is_empty();
-        let has_inputs = !seeded.input_registers.is_empty();
-        // H.E / H.F — derived predicates (simple combinational-of-input atoms +
-        // relational ones) are labeled per cube by the SMT `combinational_labels`
-        // pass, which requires the SmtAllPairs eager lift.
-        let has_derived = !seeded.derived.is_empty() || !seeded.derived_relational.is_empty();
-        // H.U.2 — a combinational-of-state spec (register present in
-        // `combinational_nid`, not a state cell) is a cube dimension over a
-        // *determined function of state*. The sampling may-path is state-register
-        // oriented (its canonical representative cannot realise a combinational
-        // node's value), so it MUST use the SmtAllPairs seam — exactly like
-        // compounds and free inputs.
-        let has_combinational = seeded
-            .specs
-            .iter()
-            .any(|s| combinational_nid.contains_key(&s.register));
-        // A.3 — the sound may-relation (SmtAllPairs) is used when the property
-        // references inputs / compounds / derived / combinational atoms; a
-        // pure-state property falls back to the sampling may (may=off), recorded
-        // for the abstraction-posture note.
-        let sound_may = has_compounds || has_inputs || has_derived || has_combinational;
-        if !sound_may {
-            sampling_may_props.push(t.name.clone());
-        }
+        // AR-S2 — the cube lift always uses the SmtAllPairs eager seam now, so the
+        // old per-property may-policy branch (compounds / inputs / derived /
+        // combinational forcing SmtAllPairs, else sampling) is gone: every property
+        // gets the sound may. `cegar_refine_loop` still re-checks the compound gate.
         let cegar_opts = CegarOptions {
             max_iterations: opts.max_iterations,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -2105,11 +2030,9 @@ pub fn verify_auto(
             // implication is `⊥`, never a spurious `False`). With the root fix the
             // must relation is sound for these properties too.
             must_edge_inference: opts.must_edge_inference,
-            may_edge_inference: if sound_may {
-                MayEdgeInference::SmtAllPairs
-            } else {
-                MayEdgeInference::Off
-            },
+            // AR-S2 — always the sound all-pairs SMT may-relation (the pure-state
+            // sampling-may fallback + its A.4 ⊥-guard are retired).
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
             emit_ctxdsl: false,
         };
         // Every register the predicates reference — pin each to its init value
@@ -2272,24 +2195,10 @@ pub fn verify_auto(
             },
         };
 
-        // A.4 honest-⊥ downgrade — a cube DEFINITE from the sampling may-relation is unsound
-        // when the input enumeration was incomplete (`sampling_may_incomplete`) and the property
-        // is (a) a pure-state property routed to the sampling may (`!sound_may`) and (b) modal
-        // (its verdict depends on may-completeness). Emit ⊥ rather than a possibly-wrong definite;
-        // the exact engine (or `--may-edge-inference smt-all-pairs`) decides it soundly. Without
-        // this guard the cube engine returns e.g. a spurious `AG EF DECODE` = VIOLATED on
-        // ibex_controller, contradicting the sound exact verdict.
-        let outcome = if !sound_may
-            && sampling_may_incomplete
-            && formula.has_modality()
-            && outcome_definite(&outcome).is_some()
-        {
-            sampling_downgraded_props.push(t.name.clone());
-            VerifyOutcome::Unknown { unknown_cells: 0 }
-        } else {
-            outcome
-        };
-
+        // AR-S2 — the cube lift uses the sound `SmtAllPairs` may-relation, so a
+        // definite cube verdict is sound by over-approximation; the A.4 honest-⊥
+        // downgrade (a stopgap for the retired sampling-may under-approximation)
+        // is no longer needed.
         report.properties.push(PropertyVerdict {
             name: t.name.clone(),
             kind: t.kind,
@@ -2310,7 +2219,7 @@ pub fn verify_auto(
     let posture = if opts.exact_symbolic {
         NotePosture::Exact
     } else {
-        NotePosture::Cube { sampling_may_props }
+        NotePosture::Cube
     };
     report.notes = build_notes(
         &report,
@@ -2321,36 +2230,6 @@ pub fn verify_auto(
     );
     if let Some(n) = annotation_note(&ann_scan) {
         report.notes.push(n);
-    }
-    // A.4 honest-⊥ — surface any cube definite that was downgraded to ⊥ because the sampling
-    // may-relation under-approximated (design has > SAMPLED_INPUT_CAP boolean inputs, so the
-    // input enumeration was incomplete). A soundness caveat, not an error: the verdict is
-    // honestly ⊥ rather than a possibly-wrong definite. Use the exact engine or
-    // `--may-edge-inference smt-all-pairs` for a definite verdict on these.
-    if !sampling_downgraded_props.is_empty() {
-        report.notes.push(VerificationNote {
-            kind: "sampling-may-downgrade".to_string(),
-            level: NoteLevel::SoundnessCaveat,
-            summary: format!(
-                "{} modal propert{} downgraded to ⊥: the sampling may-relation under-approximated \
-                 (design has {n_bool_inputs} boolean inputs > the {SAMPLED_INPUT_CAP}-input \
-                 sampling cap)",
-                sampling_downgraded_props.len(),
-                if sampling_downgraded_props.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                }
-            ),
-            detail: "A cube DEFINITE on a modal property is unsound when the may-relation is an \
-                     under-approximation: sampling a subset of the design's inputs can miss a real \
-                     may-successor, hiding a real path (a spurious VIOLATED) or a real violation (a \
-                     spurious HOLDS). These properties were returned as ⊥ rather than a \
-                     possibly-wrong definite. Re-run with `--may-edge-inference smt-all-pairs` for \
-                     a sound over-approximating may-relation, or use the exact-symbolic engine."
-                .to_string(),
-            items: sampling_downgraded_props.clone(),
-        });
     }
     Ok(report)
 }
@@ -2976,9 +2855,7 @@ module uart_tx(); endmodule"#;
             MustEdgeInference::SmtHyperMust,
             &[("cfg_detect_timer_i".into(), 7)],
             &["cnt_q <= 7 (config-inferred)".to_string()],
-            &NotePosture::Cube {
-                sampling_may_props: Vec::new(),
-            },
+            &NotePosture::Cube,
         );
         let kinds: Vec<&str> = notes.iter().map(|n| n.kind.as_str()).collect();
         for expected in [
@@ -3033,9 +2910,7 @@ module uart_tx(); endmodule"#;
             MustEdgeInference::Off,
             &[],
             &[],
-            &NotePosture::Cube {
-                sampling_may_props: Vec::new(),
-            },
+            &NotePosture::Cube,
         );
         assert!(
             !notes_no_pins
@@ -3072,18 +2947,10 @@ module uart_tx(); endmodule"#;
                 .find(|n| n.kind == "abstraction-posture")
                 .unwrap()
         };
-        // Sampling may=off on a (branching) property → SoundnessCaveat naming it,
-        // NOT the hardcoded "HOLDS is sound".
-        let caveat = ap(&NotePosture::Cube {
-            sampling_may_props: vec!["recover".into()],
-        });
-        assert_eq!(caveat.level, NoteLevel::SoundnessCaveat);
-        assert!(caveat.items.contains(&"recover".to_string()));
-        assert!(caveat.summary.contains("may=off"), "{}", caveat.summary);
-        // All-SmtAllPairs cube → the sound over-approximation Info.
-        let sound = ap(&NotePosture::Cube {
-            sampling_may_props: Vec::new(),
-        });
+        // AR-S2 — the cube path always uses the sound `SmtAllPairs` may-relation,
+        // so the cube posture note is the sound over-approximation Info (the
+        // sampling-may SoundnessCaveat + its A.4 ⊥-guard were retired).
+        let sound = ap(&NotePosture::Cube);
         assert_eq!(sound.level, NoteLevel::Info);
         assert!(sound.summary.contains("may-over-approximation"));
         // Exact engine → Info, and it does not claim a may-over-approximation.
@@ -5005,11 +4872,8 @@ endmodule
             |_| Vec::new(),
         );
 
-        // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs
-        // iff a compound / input / derived predicate is present).
-        let has_smt_seam = !seeded.compounds.is_empty()
-            || !seeded.input_registers.is_empty()
-            || !seeded.derived.is_empty();
+        // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs —
+        // AR-S2 retired the sampling-may fallback).
         let cegar_opts = CegarOptions {
             max_iterations: 16,
             predicate_source: PredicateSource::WeakestPrecondition,
@@ -5019,11 +4883,7 @@ endmodule
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: MustEdgeInference::Off,
-            may_edge_inference: if has_smt_seam {
-                MayEdgeInference::SmtAllPairs
-            } else {
-                MayEdgeInference::Off
-            },
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
             emit_ctxdsl: false,
         };
 

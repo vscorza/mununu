@@ -742,8 +742,9 @@ mod tests {
 
     #[test]
     fn has_modality_detects_box_and_diamond_but_not_propositional() {
-        // A.4 honest-⊥ (2026-07-06) — any `[]` OR `<>` makes a formula modal (its cube definite
-        // depends on may-completeness); a purely propositional formula is not.
+        // `has_modality` — any `[]` OR `<>` makes a formula modal (its verdict depends on the
+        // transition relation); a purely propositional formula is not. (Originally the A.4
+        // ⊥-guard's modal gate, retired in AR-S2; kept as a general Formula utility.)
         assert!(!parser::parse("p").unwrap().has_modality());
         assert!(!parser::parse("(p || q) && !r").unwrap().has_modality());
         assert!(parser::parse("mu X. (p || <> X)").unwrap().has_modality()); // EF (diamond)

@@ -158,17 +158,17 @@ enum PredicateSourceArg {
 /// [`mununu_core::adapter::btor2::kmts_lift::MayEdgeInference`].
 #[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
 enum MayEdgeInferenceArg {
-    /// Sampling-based may-edges (default). Fast, but an
-    /// under-approximation of the may relation — sampling can MISS a
-    /// real may-edge, which is unsound for safety. Preserves the
-    /// pre-DR1 CEGAR behaviour.
-    #[default]
+    /// Sampling-based may-edges. Fast, but an under-approximation of the
+    /// may relation — sampling can MISS a real may-edge, which is unsound
+    /// for safety. Preserves the pre-DR1 CEGAR behaviour; opt in when the
+    /// input space is small enough to enumerate exhaustively.
     Off,
-    /// Sound all-pairs SMT may-edges: for every (src, tgt) cube pair Z3
-    /// decides whether a concrete witness exists; an edge is excluded
-    /// only when proven impossible (a sound over-approximation). O(cubes²)
-    /// SMT calls — tractable at small cube counts. Combining with a
-    /// non-`off` `--must-edge-inference` is not yet wired.
+    /// Sound all-pairs SMT may-edges (default, AR-S2): for every (src, tgt)
+    /// cube pair Z3 decides whether a concrete witness exists; an edge is
+    /// excluded only when proven impossible (a sound over-approximation).
+    /// O(cubes²) SMT calls — tractable at small cube counts. Combining with
+    /// a non-`off` `--must-edge-inference` is not yet wired.
+    #[default]
     SmtAllPairs,
 }
 
@@ -293,7 +293,7 @@ struct Btor2CegarArgs {
     /// may relation, unsound for safety). Set to `smt-all-pairs` for the
     /// sound all-pairs SMT may relation (an edge is excluded only when
     /// Z3 proves it impossible).
-    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::Off)]
+    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::SmtAllPairs)]
     may_edge_inference: MayEdgeInferenceArg,
     /// R-S8 session 2 (2026-06-08) — under-constrained constant's
     /// admissible value set. Format: `REGISTER=v1,v2,v3`. May be
@@ -1164,7 +1164,7 @@ struct SvCegarArgs {
     #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
     must_edge_inference: MustEdgeInferenceArg,
     /// May-edge inference policy.
-    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::Off)]
+    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::SmtAllPairs)]
     may_edge_inference: MayEdgeInferenceArg,
     /// R-S8 symbolic-init config-values, repeatable. Format
     /// `REG=v1,v2,...` — the register's admissible power-up set.

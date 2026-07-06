@@ -744,10 +744,12 @@ const CORPUS: &[CorpusDesign] = &[
     // the core always return to executing instructions? (`ctrl_fsm_cs == 5` = DECODE).
     //
     // The EXACT engine decides HOLDS (True) — the core always returns to DECODE. The cube engines
-    // return ⊥: ibex has > 8 boolean inputs, so the sampling may-relation is INCOMPLETE
-    // (under-approximate) and the A.4 honest-⊥ guard downgrades their would-be definite (a
-    // spurious VIOLATED from a missed edge back to DECODE) to ⊥. So exact=True, cube=⊥ — no
-    // cross-engine contradiction (the parity gate's oracle-violation is resolved by the fix).
+    // return an HONEST ⊥: with the sound `SmtAllPairs` may-relation (AR-S2 retired the sampling-may
+    // default + its A.4 ⊥-guard), the 1-predicate cube abstraction genuinely evaluates the νμ
+    // recoverability to KleeneBot — too coarse to decide, but never a spurious definite. So
+    // exact=True, cube=⊥, no cross-engine contradiction (soundness-flips=0). Before AR-S2 the cube
+    // would have produced a spurious VIOLATED that the A.4 stopgap downgraded to ⊥; the sound may
+    // makes that stopgap unnecessary.
     CorpusDesign {
         name: "ibex_controller",
         dir: "dc_lowrisc_ibex_controller",
@@ -761,7 +763,7 @@ const CORPUS: &[CorpusDesign] = &[
         annotations: &["nu Y. ((mu X. ((ctrl_fsm_cs == 5) or <> X)) and [] Y)"], // DECODE = 5
         config: &[("rst_ni", 1)],
         // HOLDS (exact engine) — the core always returns to executing. Non-spurious (reset gated,
-        // DECODE=5 is the real execution state). The cube engines honestly ⊥ (A.4 downgrade).
+        // DECODE=5 is the real execution state). The cube engines honestly ⊥ (sound-may KleeneBot).
         ledger: &[("(ctrl_fsm_cs == 5)", LedgerVerdict::True)],
     },
     // keymgr_ctrl — OpenTitan key-manager control FSM (sparse `state_e`, 10-bit: StCtrlReset =

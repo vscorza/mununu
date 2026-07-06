@@ -322,7 +322,11 @@ impl Default for CegarOptions {
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
-            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            // AR-S2 — the sound all-pairs SMT may-relation is the default (retiring
+            // the sampling-may default). Callers can still opt into the faster
+            // sampling path with `MayEdgeInference::Off` when the input space is
+            // small enough to enumerate exhaustively.
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs,
             emit_ctxdsl: false,
         }
     }
