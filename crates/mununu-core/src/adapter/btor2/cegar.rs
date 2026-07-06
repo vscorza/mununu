@@ -224,14 +224,12 @@ pub struct CegarOptions {
     /// Defaults to [`crate::adapter::btor2::kmts_lift::MustEdgeInference::Off`]
     /// (pre-R.2.5b behaviour, MayOnly only).
     ///
-    /// Set to `MustEdgeInference::SamplingConfluence` to opt the
-    /// CEGAR loop into sampling-derived must / hyper-must edges.
-    /// SOUNDNESS: the inferred must-edges are sampling-derived
-    /// (canonical-representative assumption). R.5 CEGAR verdicts
-    /// that depend on them carry the lifter's
-    /// `[R.2.5b-sampling-must]` `AdapterWarning` per iteration.
-    /// R.2.5b session 2 (SMT-backed must-edge query via Z3 array
-    /// theory) replaces the sampling pass with a sound proof.
+    /// Set to an SMT mode (`MustEdgeInference::SmtPerTargetStandard`
+    /// for the canonical ∀∃ KMTS must, or `SmtHyperMust` for the sound
+    /// νμ hyper-must) to opt the CEGAR loop into SMT-proved must /
+    /// hyper-must edges. SOUNDNESS: the inferred must-edges are
+    /// SMT-proved (UNSAT of the negated obligation), so R.5 CEGAR
+    /// verdicts that depend on them are sound (no sampling assumption).
     pub must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference,
     /// DR1 (IR-unification track, 2026-06-19) — may-edge inference
     /// policy forwarded to each iteration's `predicate_cube_lift`.
@@ -324,7 +322,11 @@ impl Default for CegarOptions {
             smart_uf_cap: true,
             lift_strategy: LiftStrategy::Eager,
             must_edge_inference: crate::adapter::btor2::kmts_lift::MustEdgeInference::Off,
-            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::Off,
+            // AR-S2 — the sound all-pairs SMT may-relation is the default (retiring
+            // the sampling-may default). Callers can still opt into the faster
+            // sampling path with `MayEdgeInference::Off` when the input space is
+            // small enough to enumerate exhaustively.
+            may_edge_inference: crate::adapter::btor2::kmts_lift::MayEdgeInference::SmtAllPairs,
             emit_ctxdsl: false,
         }
     }
@@ -864,9 +866,9 @@ pub fn cegar_refine_loop(
         max_input_bits: 8,
         // R.2.5b session-1 follow-up (2026-06-06): forward the
         // CEGAR-level must-edge inference policy to the lifter. When
-        // the user has opted into `SamplingConfluence`, each
-        // iteration's lift emits sampling-derived Sharp / MustHyperOnly
-        // edges + a [R.2.5b-sampling-must] AdapterWarning that
+        // the user has opted into an SMT must mode, each
+        // iteration's lift emits SMT-proved Sharp / MustHyperOnly
+        // edges + an [R.2.5b-smt-must*] AdapterWarning that
         // propagates through the CegarTrace to the verdict surface.
         must_edge_inference: cegar_opts.must_edge_inference,
         // MIG-3.2 (2026-06-13) — may-edge policy. DR1 (2026-06-19)

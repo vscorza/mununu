@@ -766,7 +766,6 @@ pub async fn sv_verify_auto_handler(
         ..Default::default()
     };
     let must_edge_inference = match request.must_edge_inference.as_deref() {
-        Some("sampling-confluence") => MustEdgeInference::SamplingConfluence,
         Some("smt-per-target") => MustEdgeInference::SmtPerTarget,
         Some("smt-per-target-standard") => MustEdgeInference::SmtPerTargetStandard,
         Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,
@@ -1075,7 +1074,6 @@ fn run_cegar_build_response(params: CegarRunParams<'_>) -> Result<Btor2CegarResp
         _ => PredicateSource::WeakestPrecondition,
     };
     let must_edge_inference = match params.must_edge_inference {
-        Some("sampling-confluence") => MustEdgeInference::SamplingConfluence,
         Some("smt-per-target") => MustEdgeInference::SmtPerTarget,
         Some("smt-per-target-standard") => MustEdgeInference::SmtPerTargetStandard,
         Some("smt-hyper-must") => MustEdgeInference::SmtHyperMust,

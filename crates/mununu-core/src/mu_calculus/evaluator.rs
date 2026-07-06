@@ -70,8 +70,8 @@ impl TransitionModalityFilter {
 /// the witness is "∃ t ∈ hyper_targets: t ∈ targets" (any-coverage).
 ///
 /// Cardinality-1 hyper-must reduces to the singleton case. The R.6.4
-/// fix matters only when a post-pass (e.g. R.2.5b session-1
-/// SamplingConfluence) emits a hyper-must with > 1 target.
+/// fix matters only when a post-pass (e.g. the R.2.5b `SmtHyperMust`
+/// must-edge pass) emits a hyper-must with > 1 target.
 #[inline]
 fn transition_target_in_set_diamond<S: IdStorage, L: IdStorage>(
     transition: &Transition<S, L>,

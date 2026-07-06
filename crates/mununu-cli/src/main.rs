@@ -158,17 +158,17 @@ enum PredicateSourceArg {
 /// [`mununu_core::adapter::btor2::kmts_lift::MayEdgeInference`].
 #[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
 enum MayEdgeInferenceArg {
-    /// Sampling-based may-edges (default). Fast, but an
-    /// under-approximation of the may relation — sampling can MISS a
-    /// real may-edge, which is unsound for safety. Preserves the
-    /// pre-DR1 CEGAR behaviour.
-    #[default]
+    /// Sampling-based may-edges. Fast, but an under-approximation of the
+    /// may relation — sampling can MISS a real may-edge, which is unsound
+    /// for safety. Preserves the pre-DR1 CEGAR behaviour; opt in when the
+    /// input space is small enough to enumerate exhaustively.
     Off,
-    /// Sound all-pairs SMT may-edges: for every (src, tgt) cube pair Z3
-    /// decides whether a concrete witness exists; an edge is excluded
-    /// only when proven impossible (a sound over-approximation). O(cubes²)
-    /// SMT calls — tractable at small cube counts. Combining with a
-    /// non-`off` `--must-edge-inference` is not yet wired.
+    /// Sound all-pairs SMT may-edges (default, AR-S2): for every (src, tgt)
+    /// cube pair Z3 decides whether a concrete witness exists; an edge is
+    /// excluded only when proven impossible (a sound over-approximation).
+    /// O(cubes²) SMT calls — tractable at small cube counts. Combining with
+    /// a non-`off` `--must-edge-inference` is not yet wired.
+    #[default]
     SmtAllPairs,
 }
 
@@ -227,14 +227,6 @@ enum MustEdgeInferenceArg {
     /// no must / hyper-must inference.
     #[default]
     Off,
-    /// Sampling-derived must-edge inference. The lifter's post-pass
-    /// promotes MayOnly → Sharp when all sampled paths agree on
-    /// a single target cube, and emits MustHyperOnly with the
-    /// target set when paths diverge. SOUNDNESS: sampling-based;
-    /// SMT-backed proof is queued for R.2.5b session 2. Verdicts
-    /// depending on the inferred must-edges carry an
-    /// `[R.2.5b-sampling-must]` AdapterWarning.
-    SamplingConfluence,
     /// R.2.5b session 2 (2026-06-08). SMT-backed must-edge inference
     /// via Z3 BV theory using the **stronger ∀∀ form** (`∀ state.
     /// ∀ input. transition ⟹ next ⊨ tgt` — deterministic into tgt
@@ -301,7 +293,7 @@ struct Btor2CegarArgs {
     /// may relation, unsound for safety). Set to `smt-all-pairs` for the
     /// sound all-pairs SMT may relation (an edge is excluded only when
     /// Z3 proves it impossible).
-    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::Off)]
+    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::SmtAllPairs)]
     may_edge_inference: MayEdgeInferenceArg,
     /// R-S8 session 2 (2026-06-08) — under-constrained constant's
     /// admissible value set. Format: `REGISTER=v1,v2,v3`. May be
@@ -1172,7 +1164,7 @@ struct SvCegarArgs {
     #[arg(long, value_enum, default_value_t = MustEdgeInferenceArg::Off)]
     must_edge_inference: MustEdgeInferenceArg,
     /// May-edge inference policy.
-    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::Off)]
+    #[arg(long, value_enum, default_value_t = MayEdgeInferenceArg::SmtAllPairs)]
     may_edge_inference: MayEdgeInferenceArg,
     /// R-S8 symbolic-init config-values, repeatable. Format
     /// `REG=v1,v2,...` — the register's admissible power-up set.
@@ -2286,7 +2278,6 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
     };
     let must_edge_inference = match args.must_edge_inference {
         MustEdgeInferenceArg::Off => MustEdgeInference::Off,
-        MustEdgeInferenceArg::SamplingConfluence => MustEdgeInference::SamplingConfluence,
         MustEdgeInferenceArg::SmtPerTarget => MustEdgeInference::SmtPerTarget,
         MustEdgeInferenceArg::SmtPerTargetStandard => MustEdgeInference::SmtPerTargetStandard,
         MustEdgeInferenceArg::SmtHyperMust => MustEdgeInference::SmtHyperMust,
@@ -2792,9 +2783,6 @@ fn run_cegar_cli(
     // the core MustEdgeInference enum.
     let must_edge_inference = match params.must_edge_inference {
         MustEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
-        MustEdgeInferenceArg::SamplingConfluence => {
-            mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SamplingConfluence
-        }
         MustEdgeInferenceArg::SmtPerTarget => {
             mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SmtPerTarget
         }
