@@ -38,10 +38,10 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 | 12 | otbn_start_stop_control | AG EF Halt(1) | **False** *(COI)* | terminal Locked trap (lc_ctrl/otp closure pruned) |
 | 13 | prim_arbiter_ppc | AG EF (mask==0) | ⊥ | atom does not bind — `mask` is not a post-synthesis register name |
 | 14 | prim_arbiter_tree | AG EF (prio_mask_q==0) | ⊥ | atom does not bind — `prio_mask_q` not a post-synthesis register name |
-| 15 | prim_packer_fifo | AG EF (depth_o==0) | ⊥ | drainability cone hits an unsupported `Mul` op |
-| 16 | prim_fifo_sync | AG EF (depth_o==0) | ⊥ | drainability cone hits an unsupported `Mul` op |
+| 15 | prim_packer_fifo | AG EF (depth_o==0) | **True** *(Mul/shift)* | always drainable — decided once the bit-blaster gained Mul + shifts |
+| 16 | prim_fifo_sync | AG EF (depth_o==0) | ⊥ | `depth_o` is combinational here (not a registered output) — atom binds to no state register |
 
-**Tally: True = 5, False = 7, ⊥ = 4.**
+**Tally: True = 6, False = 7, ⊥ = 3.**
 
 ## Are the False verdicts findings? No — expected violations (claims-integrity)
 
@@ -93,16 +93,23 @@ improvement (no locked verdict flipped — the soundness guardrail held). A herm
 (`rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath`) locks the mechanism: a 47-bit design whose
 property cone is 2 bits now decides.
 
-The **4 remaining ⊥ have nothing to do with the bit cap** — two distinct, actionable causes:
+A follow-up added the missing bit-blaster ops the FIFO cones needed — **`Mul` (shift-and-add),
+the variable shifts `Sll`/`Srl`/`Sra` (barrel shifter), and the signed comparisons
+`Slt`/`Sgt`/`Sgte`/`Slte`** — each with a hermetic correctness test. prim_packer_fifo then decided
+(**True**, always drainable). So there are now **no op-support ⊥ left**.
 
-- **Atom does not bind (arbiter_ppc, arbiter_tree).** `mask` / `prio_mask_q` are not the
-  post-flatten register names (the round-robin priority state is optimized/renamed by yosys).
-  Path forward: inspect the synthesized netlist and re-point the atom (a corpus-refinement TODO;
-  even bound, the arbiters' N-wide `req_i` keeps the cone wide — the next COI limit is BDD
-  variable ordering).
-- **Unsupported operator (packer_fifo, fifo_sync).** The drainability cone reaches a `Mul` the
-  R-F5.3a BDD bit-blaster does not implement → clean `Skipped`. Path forward: add `Mul` (and the
-  shift ops) to the bit-blaster's `eval_op`.
+The **3 remaining ⊥ are all ATOM-BINDING issues** (the property references a signal that is not a
+post-synthesis *state register*), not the engine:
+
+- **arbiter_ppc / arbiter_tree** — `mask` / `prio_mask_q` are not the post-flatten register names
+  (the round-robin priority state is optimized/renamed by yosys).
+- **fifo_sync** — `depth_o` is *combinational* here (computed from the wptr/rptr), not a
+  registered output like prim_packer_fifo's; the atom binds to no state register.
+
+Path forward (a corpus-refinement TODO, not an engine gap): inspect each synthesized netlist and
+re-point the atom to the real register (a pointer/fullness register for the FIFO, the priority
+register for the arbiters). Even bound, the arbiters' N-wide `req_i` keeps the cone wide — the
+next COI limit there is BDD **variable ordering**.
 
 ## Spurious-results audit
 

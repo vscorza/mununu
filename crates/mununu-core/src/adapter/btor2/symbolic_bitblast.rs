@@ -427,6 +427,61 @@ impl BddBitBlaster {
         (sum, carry)
     }
 
+    /// Barrel shifter: shift `a` by the VARIABLE amount `s` (a `width`-bit BitVec).
+    /// `left` ⇒ shift left (fill 0); else shift right, filling with 0 (logical) or the sign bit
+    /// `a[width-1]` (`arith`). log-depth: stage `k` conditionally shifts by `2^k` on `s[k]`.
+    /// A shift ≥ width falls out to the fill (the `sh < w`/`j+sh` bounds handle it).
+    fn barrel_shift(
+        &self,
+        a: &[BDDFunction],
+        s: &[BDDFunction],
+        width: u32,
+        left: bool,
+        arith: bool,
+    ) -> BitVec {
+        let w = width as usize;
+        let sign = if arith {
+            a.get(w.wrapping_sub(1))
+                .cloned()
+                .unwrap_or_else(|| self.ff.clone())
+        } else {
+            self.ff.clone()
+        };
+        let mut cur: BitVec = (0..w)
+            .map(|i| a.get(i).cloned().unwrap_or_else(|| self.ff.clone()))
+            .collect();
+        for (k, sk) in s.iter().enumerate() {
+            let sh = 1usize.checked_shl(k as u32).unwrap_or(usize::MAX); // 2^k, saturating
+            let nsk = sk.not().unwrap();
+            cur = (0..w)
+                .map(|j| {
+                    // The bit selected when s[k] is set (shift by 2^k this stage).
+                    let shifted = if left {
+                        // left: result[j] = (j ≥ 2^k) ? cur[j − 2^k] : 0
+                        if sh <= j {
+                            cur[j - sh].clone()
+                        } else {
+                            self.ff.clone()
+                        }
+                    } else {
+                        // right: result[j] = (j + 2^k < w) ? cur[j + 2^k] : fill
+                        if sh < w && j + sh < w {
+                            cur[j + sh].clone()
+                        } else {
+                            sign.clone()
+                        }
+                    };
+                    // result[j] = s[k] ? shifted : cur[j]
+                    sk.and(&shifted)
+                        .unwrap()
+                        .or(&nsk.and(&cur[j]).unwrap())
+                        .unwrap()
+                })
+                .collect();
+        }
+        cur
+    }
+
     /// OR-reduce a bit-vector to a single BDD (`|x`).
     fn or_reduce(&self, bits: &[BDDFunction]) -> BDDFunction {
         let mut acc = self.ff.clone();
@@ -480,6 +535,23 @@ impl BddBitBlaster {
             .collect();
         let (_, cout) = self.add_bits(a, &not_b, self.tt.clone(), width);
         cout
+    }
+
+    /// Signed (two's-complement) `a < b`: if the signs differ, the negative operand (MSB set)
+    /// is the smaller; if the signs match, unsigned `<` decides. `slt = (a_msb ⊕ b_msb) ? a_msb
+    /// : (a <u b)`, with `a <u b = ¬(a ≥u b)`.
+    fn slt(&self, a: &[BDDFunction], b: &[BDDFunction], width: u32) -> BDDFunction {
+        let w = width as usize;
+        let amsb = a.get(w - 1).cloned().unwrap_or_else(|| self.ff.clone());
+        let bmsb = b.get(w - 1).cloned().unwrap_or_else(|| self.ff.clone());
+        let signs_differ = self.xor(&amsb, &bmsb);
+        let ult = self.uge(a, b, width).not().unwrap(); // a <u b
+        // signs_differ ? amsb : ult
+        signs_differ
+            .and(&amsb)
+            .unwrap()
+            .or(&signs_differ.not().unwrap().and(&ult).unwrap())
+            .unwrap()
     }
 
     // ---- R-F5.3b: predicate BDDs over the register-bit variables ----
@@ -1267,6 +1339,47 @@ impl BvTermBackend for BddBitBlaster {
                 let not_a: BitVec = (0..width as usize).map(|i| a[i].not().unwrap()).collect();
                 self.add_bits(&not_a, &[], self.tt.clone(), width).0
             }
+            Op::Mul => {
+                // Schoolbook shift-and-add: Σ_i (b[i] ? (a << i) : 0), truncated to `width`.
+                // O(width²) BDD adds — fine at the ≤ MAX_BITBLAST_BITS cone widths. Both
+                // operands + the result are `width` bits; the product wraps mod 2^width.
+                let (a, b) = (read(0)?, read(1)?);
+                let w = width as usize;
+                let mut acc: BitVec = vec![self.ff.clone(); w];
+                for i in 0..w {
+                    let bi = b.get(i).cloned().unwrap_or_else(|| self.ff.clone());
+                    // Partial product: (a << i) masked by b[i]. Bit j = (j ≥ i) ? a[j−i] ∧ b[i] : 0.
+                    let partial: BitVec = (0..w)
+                        .map(|j| {
+                            if j >= i {
+                                a.get(j - i)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.ff.clone())
+                                    .and(&bi)
+                                    .unwrap()
+                            } else {
+                                self.ff.clone()
+                            }
+                        })
+                        .collect();
+                    acc = self.add_bits(&acc, &partial, self.ff.clone(), width).0;
+                }
+                acc
+            }
+
+            // ---- Variable shifts (barrel shifter, result + operands all `width` bits) ----
+            Op::Sll => {
+                let (a, s) = (read(0)?, read(1)?);
+                self.barrel_shift(&a, &s, width, true, false)
+            }
+            Op::Srl => {
+                let (a, s) = (read(0)?, read(1)?);
+                self.barrel_shift(&a, &s, width, false, false)
+            }
+            Op::Sra => {
+                let (a, s) = (read(0)?, read(1)?);
+                self.barrel_shift(&a, &s, width, false, true)
+            }
 
             // ---- Equality / implication (1-bit result) ----
             Op::Eq | Op::Iff => {
@@ -1307,6 +1420,31 @@ impl BvTermBackend for BddBitBlaster {
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
                 vec![self.uge(&b, &a, w)]
+            }
+
+            // ---- Signed comparisons (two's-complement, 1-bit result) ----
+            Op::Slt => {
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&a, &b, w)]
+            }
+            Op::Sgt => {
+                // a > b ⟺ b < a
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&b, &a, w)]
+            }
+            Op::Sgte => {
+                // a ≥ b ⟺ ¬(a < b)
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&a, &b, w).not().unwrap()]
+            }
+            Op::Slte => {
+                // a ≤ b ⟺ ¬(b < a)
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&b, &a, w).not().unwrap()]
             }
 
             // ---- Reductions (1-bit result) ----
@@ -3328,6 +3466,89 @@ mod tests {
             verdict,
             ExactVerdict::Holds,
             "fsm cycles to 0 ⇒ EF(fsm==0) holds; the 45-bit out-of-cone `wide` is pinned",
+        );
+    }
+
+    /// The bit-blasted `Mul` (shift-and-add) over a SYMBOLIC operand (not a constant fold):
+    /// `p' = x * 3` on a 4-bit input `x`. `EF (p == 6)` holds (x=2 ⇒ 6 mod 16), so the
+    /// multiplier is exercised end-to-end. Locks the `Op::Mul` arm that unblocks the
+    /// prim_packer_fifo / prim_fifo_sync drainability properties in the corpus.
+    #[test]
+    fn mul_bit_blaster_shift_and_add() {
+        const MUL_BTOR2: &str = r#"
+1 sort bitvec 4
+2 input 1 x
+3 const 1 0011
+4 mul 1 2 3
+5 state 1 p
+6 next 1 5 4
+7 const 1 0000
+8 init 1 5 7
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 6) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(MUL_BTOR2, &formula).expect("mul decides"),
+            ExactVerdict::Holds,
+            "p' = x*3; x=2 ⇒ p==6 reachable ⇒ EF(p==6) holds",
+        );
+    }
+
+    /// The bit-blasted variable `Srl` barrel shifter: `p' = 12 >> s` over a 4-bit shift input
+    /// `s`. `12 >> s ∈ {12,6,3,1,0}`, so `EF(p==3)` holds (s=2) but `EF(p==5)` is VIOLATED (5 is
+    /// never reachable) — a precise check of the shift amount/direction/fill. Unblocks the
+    /// prim_packer_fifo / prim_fifo_sync drainability cones (which use `Srl`).
+    #[test]
+    fn srl_bit_blaster_barrel_shift() {
+        const SRL_BTOR2: &str = r#"
+1 sort bitvec 4
+2 const 1 1100
+3 input 1 s
+4 srl 1 2 3
+5 state 1 p
+6 next 1 5 4
+7 const 1 0000
+8 init 1 5 7
+"#;
+        let reachable =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 3) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SRL_BTOR2, &reachable).expect("srl decides"),
+            ExactVerdict::Holds,
+            "12 >> 2 == 3 ⇒ EF(p==3) holds",
+        );
+        let unreachable =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 5) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SRL_BTOR2, &unreachable).expect("srl decides"),
+            ExactVerdict::Violated,
+            "12 >> s is never 5 ⇒ EF(p==5) is violated (validates exact shift semantics)",
+        );
+    }
+
+    /// The bit-blasted signed `Slt`: `p' = (x <s 0)` over a 4-bit input `x`. `EF(p==1)` holds
+    /// because x ∈ {8..15} are NEGATIVE two's-complement (−8..−1) — a verdict an UNSIGNED
+    /// comparison would get wrong (x <u 0 is never true ⇒ it would report Violated). Unblocks
+    /// prim_fifo_sync (its drainability cone uses `Slt`).
+    #[test]
+    fn slt_bit_blaster_signed_less_than() {
+        const SLT_BTOR2: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 input 2 x
+4 const 2 0000
+5 slt 1 3 4
+6 state 1 p
+7 next 1 6 5
+8 const 1 0
+9 init 1 6 8
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 1) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SLT_BTOR2, &formula).expect("slt decides"),
+            ExactVerdict::Holds,
+            "x in 8..15 are signed-negative so x <s 0 and EF(p==1) holds (unsigned would fail)",
         );
     }
 

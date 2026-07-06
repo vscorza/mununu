@@ -443,6 +443,8 @@ const CORPUS: &[CorpusDesign] = &[
         ledger: &[("(prio_mask_q == 0)", LedgerVerdict::Indefinite)],
     },
     // prim_packer_fifo — AG EF (depth_o==0): the packer FIFO is always drainable to empty.
+    // HOLDS once the bit-blaster supports Mul + shifts (the pointer datapath); depth_o is a
+    // registered output here (unlike prim_fifo_sync, where it is combinational).
     CorpusDesign {
         name: "prim_packer_fifo",
         dir: "dc_opentitan_prim_packer_fifo",
@@ -450,7 +452,7 @@ const CORPUS: &[CorpusDesign] = &[
         top: "prim_packer_fifo",
         annotations: &["nu Y. ((mu X. ((depth_o == 0) or <> X)) and [] Y)"],
         config: &[("rst_ni", 1)],
-        ledger: &[("(depth_o == 0)", LedgerVerdict::Indefinite)],
+        ledger: &[("(depth_o == 0)", LedgerVerdict::True)], // HOLDS (always drainable) via Mul/shift support
     },
     // prim_esc_sender — 5-state escalation-sender FSM (Idle=0). AG EF Idle recoverability.
     CorpusDesign {
@@ -537,9 +539,10 @@ const CORPUS: &[CorpusDesign] = &[
         config: &[("rst_ni", 1)],
         ledger: &[("(state_q == 55)", LedgerVerdict::False)], // VIOLATED (MainSmError trap, inputs free)
     },
-    // prim_fifo_sync — synchronous FIFO; AG EF (depth_o==0) drainability. Data storage +
-    // pointers — ⊥ because the drainability cone hits an unsupported Mul op (not bit-cap).
-    // prim_fifo_assert.svh is a `include`d
+    // prim_fifo_sync — synchronous FIFO; AG EF (depth_o==0) drainability. ⊥ because `depth_o`
+    // is COMBINATIONAL here (computed from the wptr/rptr, not a registered output like
+    // prim_packer_fifo's) → the atom binds to no state register. A corpus-atom TODO: re-point to
+    // a pointer/fullness register. prim_fifo_assert.svh is a `include`d
     // header (staged so the include resolves, never compiled as a top-level source).
     CorpusDesign {
         name: "prim_fifo_sync",
