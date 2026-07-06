@@ -14,7 +14,9 @@
 //!
 //! Docker-gated (`mununu-sva`): needs btormc. Run with `--ignored`.
 
-use mununu_core::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+use mununu_core::adapter::btor2::symbolic_bitblast::{
+    ExactVerdict, exact_bad_reachable, exact_symbolic_verdict,
+};
 use mununu_core::adapter::btormc::{DEFAULT_KMAX, McVerdict, locate_btormc, run_btormc};
 use mununu_core::adapter::slang::verify_auto::{
     PortfolioMode, VerifyAutoOptions, VerifyOutcome, verify_auto,
@@ -95,6 +97,113 @@ fn diff_reachability_exact_vs_btormc_agree_on_uext_aliased_register() {
          independent btormc oracle (the #242 frozen-register signature).",
         diff.exact_reachable,
         diff.btormc_reachable,
+    );
+}
+
+// ============================================================================
+// HWMCC-style portfolio COVERAGE STUDY — how much of a real BTOR2 safety-benchmark
+// suite the exact engine decides, and that every verdict it DOES emit agrees with
+// btormc (the independent oracle). Not a pass/fail coverage gate (most real
+// benchmarks are over the 40-bit bit-blast cap — an honest, documented limit); it
+// IS a hard SOUNDNESS gate (an exact↔btormc disagreement on a definite verdict is a
+// bug). Benchmarks are vendored byte-exact from btor2tools (MIT) — see
+// examples/btor2/btor2tools_suite/PROVENANCE.md.
+// ============================================================================
+
+/// The vendored btor2tools suite, with the ground-truth verdict where the upstream
+/// `-sat` / `-unsat` filename convention records it (`sat` = `bad` reachable).
+const BTOR2TOOLS_SUITE: &[(&str, Option<bool>)] = &[
+    ("count2.btor2", None),
+    ("count4.btor2", None),
+    ("recount4.btor2", None),
+    ("twocount2.btor2", None),
+    ("factorial4even.btor2", None),
+    ("twocount32.btor2", None),
+    ("noninitstate.btor2", None), // has a `constraint` — the exact engine refuses (soundness)
+    ("twocount2c.btor2", None),   // has a `constraint`
+    ("ponylink-slaveTXlen-sat.btor2", Some(true)), // 228-bit / 320-state — over the cap
+];
+
+#[test]
+#[ignore = "requires btormc (mununu-sva image); run with --ignored"]
+fn hwmcc_style_coverage_study() {
+    let bin = locate_btormc().expect("btormc present (mununu-sva)");
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/btor2/btor2tools_suite");
+
+    let (mut decided, mut skipped, mut agree, mut total) = (0u32, 0u32, 0u32, 0u32);
+    let mut disagreements: Vec<String> = Vec::new();
+    let mut oracle_label_mismatch: Vec<String> = Vec::new();
+
+    eprintln!(
+        "\n===== HWMCC-style coverage study: exact engine ↔ btormc (real btor2tools suite) ====="
+    );
+    for (fname, known) in BTOR2TOOLS_SUITE {
+        total += 1;
+        let content = std::fs::read_to_string(root.join(fname))
+            .unwrap_or_else(|e| panic!("read {fname}: {e}"));
+        // Our exact engine's bad-reachability, and btormc's (the independent oracle).
+        let ours = exact_bad_reachable(&content);
+        let mc = run_btormc(&bin, &content, DEFAULT_KMAX).expect("btormc runs");
+        let mc_reach = match mc {
+            McVerdict::Violated => Some(true), // bad reachable
+            McVerdict::Safe => Some(false),    // proved unreachable
+            McVerdict::Unknown => None,        // bounded-inconclusive
+        };
+        // Sanity on the oracle: btormc must match the benchmark's own -sat/-unsat label.
+        if let (Some(lbl), Some(mcr)) = (known, mc_reach)
+            && *lbl != mcr
+        {
+            oracle_label_mismatch.push(format!("{fname}: name={lbl} btormc={mcr}"));
+        }
+
+        match ours {
+            Ok(r) => {
+                decided += 1;
+                match mc_reach {
+                    Some(mcr) if mcr == r => agree += 1,
+                    // Opposite definite verdicts ⇒ one engine is unsound. The prize.
+                    Some(mcr) => {
+                        disagreements.push(format!("{fname}: exact={r} but btormc reachable={mcr}"))
+                    }
+                    // btormc bounded-inconclusive; our definite verdict cannot be contradicted.
+                    None => {}
+                }
+                eprintln!(
+                    "  {fname:34} exact={:11}  btormc={mc:?}",
+                    if r { "REACHABLE" } else { "unreachable" }
+                );
+            }
+            Err(e) => {
+                skipped += 1;
+                eprintln!(
+                    "  {fname:34} exact=SKIPPED      btormc={mc:?}   [{}]",
+                    e.lines().next().unwrap_or("")
+                );
+            }
+        }
+    }
+    eprintln!(
+        "-----------------------------------------------------------------------------------"
+    );
+    eprintln!(
+        "  coverage: exact decided {decided}/{total} (skipped/refused {skipped});  agreement with btormc {agree}/{decided};  disagreements {}",
+        disagreements.len()
+    );
+    eprintln!(
+        "===================================================================================\n"
+    );
+
+    // Hard soundness gate: a definite exact↔btormc contradiction is a genuine engine bug.
+    assert!(
+        disagreements.is_empty(),
+        "EXACT↔BTORMC SOUNDNESS DISAGREEMENT: {disagreements:?} — the exact engine's \
+         bad-reachability contradicts the independent btormc oracle."
+    );
+    // Sanity: btormc must agree with the vendored benchmarks' own ground-truth labels.
+    assert!(
+        oracle_label_mismatch.is_empty(),
+        "btormc disagrees with a benchmark's -sat/-unsat label: {oracle_label_mismatch:?}"
     );
 }
 

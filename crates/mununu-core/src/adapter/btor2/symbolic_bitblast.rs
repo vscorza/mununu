@@ -1948,6 +1948,74 @@ pub(crate) fn collect_predicate_registers(
     }
 }
 
+/// Directly decide whether ANY `bad` property of a BTOR2 design is REACHABLE from the reset
+/// state — the native HWMCC safety question (a reachable `bad` = the safety property is VIOLATED,
+/// "SAT" in competition terms; unreachable = "UNSAT" / safe). This bridges an ARBITRARY `bad`
+/// circuit (not just a register-value predicate, which [`exact_symbolic_verdict`] requires) to the
+/// exact engine: it ORs the `bad` nodes' 1-bit BDDs and evaluates `EF(bad) = μY. (bad ∨ ◇Y)` over
+/// the full bit-blasted transition relation, then tests whether the modelled reset state lies in
+/// it. The exact analogue of btormc's bad-reachability — the oracle the reachability differential
+/// + the portfolio coverage study compare against.
+///
+/// Returns `Ok(true)` (reachable / SAT / unsafe), `Ok(false)` (unreachable / UNSAT / safe), or an
+/// `Err` (undecided) when the design is over the bit cap, carries an unsupported op, or has
+/// `constraint`/`fair` lines. **The constraint guard is a soundness requirement:** this engine
+/// does not restrict reachability to constraint-satisfying runs, so on a constrained design it
+/// would OVER-approximate (report a spuriously-reachable `bad` that btormc, honouring the
+/// constraint, calls safe). Refusing to decide there keeps every verdict it DOES emit sound.
+pub fn exact_bad_reachable(btor2_content: &str) -> Result<bool, String> {
+    use crate::mu_calculus::parser as mu_parser;
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("exact bad-reachability: parse: {}", e.message))?;
+
+    // Soundness guard: we do not model `constraint` (assume) / `fair` — a design carrying them
+    // could have a `bad` reachable in OUR unconstrained relation but unreachable under btormc's
+    // constrained one. Refuse to decide rather than emit an over-approximate verdict.
+    if file
+        .lines
+        .iter()
+        .any(|l| matches!(l.node, Node::Constraint { .. } | Node::Fair { .. }))
+    {
+        return Err(
+            "exact bad-reachability: design has `constraint`/`fair` lines (not modelled) — \
+             undecided rather than over-approximate"
+                .into(),
+        );
+    }
+
+    let bad_ops: Vec<Operand> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            Node::Bad { signal } => Some(*signal),
+            _ => None,
+        })
+        .collect();
+    if bad_ops.is_empty() {
+        return Err("exact bad-reachability: the design has no `bad` property".into());
+    }
+
+    let bb = BddBitBlaster::build(&file)?; // cap-guarded: a wide design ⇒ Err ⇒ undecided
+    // OR the `bad` nodes' 1-bit BDDs into a single "some bad holds" state set.
+    let mut bad = bb.ff.clone();
+    for op in &bad_ops {
+        let bits = bb.resolve(*op)?;
+        let b = bits
+            .into_iter()
+            .next()
+            .ok_or_else(|| "exact bad-reachability: a `bad` signal has zero width".to_string())?;
+        bad = bad.or(&b).unwrap();
+    }
+
+    let model = bb.exact_model();
+    let formula = mu_parser::parse("mu Y. (BAD or <> Y)").expect("EF(bad) formula parses");
+    let mut atoms: HashMap<&str, BDDFunction> = HashMap::new();
+    atoms.insert("BAD", bad);
+    let reach = model.evaluate(&formula, &atoms)?;
+    let init = bb.initial_state_bdd(&file);
+    Ok(init.and(&reach).unwrap() != bb.ff)
+}
+
 /// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
 /// BTOR2, bit-blast it, evaluate `formula` over the exact model (2-valued, no
 /// abstraction), and return the initial-state verdict. Atoms in `formula` are
@@ -3642,6 +3710,74 @@ mod tests {
             exact_symbolic_verdict(FROZEN_REG_ATOM_ON_UEXT_ALIAS, &agaf).expect("verdict"),
             exact_symbolic_verdict(FROZEN_REG_ATOM_ON_STATE, &agaf).expect("verdict"),
             "AG AF must also decide identically for named vs uext-aliased state"
+        );
+    }
+
+    /// `exact_bad_reachable` — a reachable `bad` (a 3-bit counter reaches `0b111`) is SAT.
+    /// The btor2tools `count2` shape: init 0, `next = s + 1`, `bad = (s == 7)`.
+    #[test]
+    fn exact_bad_reachable_true_on_reaching_counter() {
+        const COUNT2: &str = r#"
+1 sort bitvec 3
+2 zero 1
+3 state 1
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 ones 1
+9 sort bitvec 1
+10 eq 9 3 8
+11 bad 10
+"#;
+        assert_eq!(
+            exact_bad_reachable(COUNT2),
+            Ok(true),
+            "a 3-bit counter from 0 reaches 0b111 ⇒ bad is reachable (SAT)"
+        );
+    }
+
+    /// `exact_bad_reachable` — an unreachable `bad` is UNSAT: a register held at 0 can never
+    /// equal 1, so `bad = (s == 1)` is unreachable from the reset state.
+    #[test]
+    fn exact_bad_reachable_false_on_stuck_register() {
+        const STUCK: &str = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 s
+4 init 1 3 2
+5 next 1 3 3
+6 one 1
+7 eq 1 3 6
+8 bad 7
+"#;
+        assert_eq!(
+            exact_bad_reachable(STUCK),
+            Ok(false),
+            "s is held at 0 ⇒ (s == 1) is never reachable (UNSAT / safe)"
+        );
+    }
+
+    /// `exact_bad_reachable` — the soundness guard: a design with a `constraint` line is
+    /// UNDECIDED (Err), never an over-approximate verdict (this engine does not restrict
+    /// reachability to constraint-satisfying runs).
+    #[test]
+    fn exact_bad_reachable_refuses_constrained_design() {
+        const CONSTRAINED: &str = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 s
+4 init 1 3 2
+5 next 1 3 3
+6 one 1
+7 eq 1 3 6
+8 bad 7
+9 input 1 c
+10 constraint 9
+"#;
+        assert!(
+            exact_bad_reachable(CONSTRAINED).is_err(),
+            "a constrained design must be undecided, not over-approximated"
         );
     }
 

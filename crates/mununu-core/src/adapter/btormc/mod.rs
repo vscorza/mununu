@@ -37,6 +37,14 @@
 //! `unsat`. So `unsat` ⇒ a genuine unbounded safety proof, and a too-shallow
 //! `-kmax` degrades to [`McVerdict::Unknown`], never to a wrong [`McVerdict::Safe`].
 //!
+//! **Multi-property caveat (2026-07-06).** On a design with MORE THAN ONE `bad`,
+//! `--kind` reports PER PROPERTY and may print `unsat bN` (property N safe) and STOP
+//! while a DIFFERENT property is reachable — so a lone `unsat` line is only a PARTIAL
+//! proof, not a whole-design safety proof. [`run_btormc`] therefore downgrades a
+//! `Safe` parse to [`McVerdict::Unknown`] when [`count_bad_properties`] > 1 (a `sat`
+//! — any property reachable — stays a sound [`McVerdict::Violated`]). Found by the
+//! HWMCC coverage study on `factorial4even` (`unsat b1` while `b0 = i==15` reachable).
+//!
 //! # `btormc` is optional at runtime
 //!
 //! Like the CVC5 wrapper ([`crate::adapter::cvc5`]) — discovery returns a
@@ -139,6 +147,20 @@ pub fn parse_btormc_output(stdout: &str) -> McVerdict {
     McVerdict::Unknown
 }
 
+/// Count the `bad` property lines in a BTOR2 text — a `<nid> bad <operand>` line
+/// (the second whitespace token is `bad`, the first a numeric node id). Comment
+/// (`;`) and other lines are ignored. Used to detect multi-property designs, where
+/// a `btormc --kind` `Safe` parse is only a partial proof (see [`run_btormc`]).
+pub fn count_bad_properties(btor2: &str) -> usize {
+    btor2
+        .lines()
+        .filter(|line| {
+            let mut toks = line.split_whitespace();
+            toks.next().is_some_and(|t| t.parse::<u64>().is_ok()) && toks.next() == Some("bad")
+        })
+        .count()
+}
+
 /// H.O.1a — run `btormc --kind -kmax <kmax>` on a BTOR2 description (piped via
 /// stdin) and parse the verdict.
 ///
@@ -196,7 +218,18 @@ pub fn run_btormc(bin: &BtormcBin, btor2: &str, kmax: u32) -> Result<McVerdict, 
     })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let verdict = parse_btormc_output(&stdout);
+    // MULTI-PROPERTY SOUNDNESS FIX — `--kind` reports per property and may STOP after
+    // proving ONE property of a multi-`bad` design safe (printing `unsat bN`) while a
+    // DIFFERENT property is reachable. `parse_btormc_output` returns on the first
+    // `sat`/`unsat` line, so a partial `unsat bN` would wrongly conclude the whole
+    // design SAFE. On a design with >1 `bad`, downgrade a `Safe` parse to `Unknown` —
+    // a partial proof cannot establish every property safe. A `sat` (some property IS
+    // reachable) stays a sound `Violated`. Single-`bad` designs are unaffected.
+    let bad_count = count_bad_properties(btor2);
+    let verdict = match parse_btormc_output(&stdout) {
+        McVerdict::Safe if bad_count > 1 => McVerdict::Unknown,
+        v => v,
+    };
 
     // A clean Unknown (exit 0, empty stdout) is valid. But if btormc reported a
     // hard error (non-zero exit, e.g. a BTOR2 parse error) AND produced no
@@ -248,6 +281,21 @@ mod tests {
         // Defensive: a stray later token never overrides the first real verdict.
         assert_eq!(parse_btormc_output("sat\nunsat\n"), McVerdict::Violated);
         assert_eq!(parse_btormc_output("unsat\nsat\n"), McVerdict::Safe);
+    }
+
+    #[test]
+    fn count_bad_properties_counts_bad_lines_only() {
+        // `<nid> bad <op>` lines count; comments, other ops, and blanks do not.
+        let single = "1 sort bitvec 1\n2 state 1\n3 bad 2\n";
+        assert_eq!(count_bad_properties(single), 1);
+        let multi =
+            "; comment\n1 sort bitvec 4\n2 state 1 f\n14 bad 13\n15 slice 12 3 0 0\n19 bad 18\n";
+        assert_eq!(
+            count_bad_properties(multi),
+            2,
+            "factorial4even-shape: two `bad`s"
+        );
+        assert_eq!(count_bad_properties("1 sort bitvec 1\n2 constraint 1\n"), 0);
     }
 
     #[test]
