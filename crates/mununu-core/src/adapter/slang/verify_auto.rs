@@ -108,6 +108,9 @@ pub struct ExactCounterexample {
     pub prefix: Vec<Vec<(String, u64)>>,
     /// The repeating stall cycle; the last state steps back to `cycle[0]`.
     pub cycle: Vec<Vec<(String, u64)>>,
+    /// P3 — the INPUT assignment driving each transition of `prefix ++ cycle` (`inputs[i]` is
+    /// the input at path-state `i`), for RTL replay. Empty when the engine did not record inputs.
+    pub inputs: Vec<Vec<(String, u64)>>,
 }
 
 /// Convert an engine [`StallLasso`](crate::adapter::btor2::symbolic_bitblast::StallLasso)
@@ -126,6 +129,7 @@ fn exact_counterexample_from_lasso(
     ExactCounterexample {
         prefix: conv(lasso.prefix),
         cycle: conv(lasso.cycle),
+        inputs: conv(lasso.inputs),
     }
 }
 

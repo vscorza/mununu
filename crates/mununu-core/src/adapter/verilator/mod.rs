@@ -632,6 +632,93 @@ pub fn build_reset_simulation_tb_cpp(config: &ResetSimConfig) -> Result<String, 
     Ok(s)
 }
 
+/// P3 — configuration for a COUNTEREXAMPLE-REPLAY simulation: reset, then drive a per-cycle
+/// input trace (the exact engine's witness), sampling the observed register(s) each cycle so a
+/// caller can confirm the design reaches (and stays in) the predicted trap state at RTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceReplayConfig {
+    /// Top module name (drives the `V<top>` C++ class).
+    pub top: String,
+    /// Clock signal (toggled `0 → 1 → 0` once per cycle).
+    pub clock_signal: String,
+    /// Reset signal, held at `reset_asserted` for `hold_cycles`, then released.
+    pub reset_signal: String,
+    /// Logical reset-active value (`1` active-high, `0` active-low).
+    pub reset_asserted: u8,
+    /// Cycles to hold reset active before the drive phase.
+    pub hold_cycles: u32,
+    /// Inputs HELD at a fixed value across the whole run — the non-cone / idle-safe ports the
+    /// witness does not constrain (driven once, before the trace).
+    pub held_inputs: Vec<(String, u64)>,
+    /// The per-cycle input assignments to drive (the counterexample's `inputs` sequence). Ports
+    /// absent from a cycle keep their previous value.
+    pub trace: Vec<Vec<(String, u64)>>,
+    /// Register(s) sampled + printed AFTER each drive cycle, as `<name>=0x<hex>` (parsed by
+    /// [`parse_reset_simulation_dump`]). The last cycle's sample is the trap check.
+    pub observe_registers: Vec<String>,
+}
+
+/// P3 — render an input-driven counterexample-replay testbench: reset, drive [`TraceReplayConfig::trace`]
+/// one input-set per cycle, and dump the observed registers after every cycle (so both the entry
+/// into and the persistence in the trap state are visible). Pure — no I/O; feed the output to
+/// [`compile_verilator`] and parse each cycle's dump with [`parse_reset_simulation_dump`].
+pub fn build_trace_replay_tb_cpp(config: &TraceReplayConfig) -> Result<String, AdapterError> {
+    if config.top.trim().is_empty() {
+        return Err(adapter_error("TraceReplayConfig.top must be non-empty"));
+    }
+    if config.observe_registers.is_empty() {
+        return Err(adapter_error(
+            "TraceReplayConfig.observe_registers must name at least one register",
+        ));
+    }
+    let top = &config.top;
+    let clk = &config.clock_signal;
+    let rst = &config.reset_signal;
+    let asserted = config.reset_asserted;
+    let deasserted: u8 = 1 - asserted;
+    let hold = config.hold_cycles;
+
+    let mut s = String::new();
+    s.push_str("// P3 — auto-generated counterexample-replay testbench.\n");
+    s.push_str("// DO NOT EDIT — regenerate via build_trace_replay_tb_cpp.\n");
+    s.push_str("#include \"verilated.h\"\n");
+    s.push_str(&format!("#include \"V{top}.h\"\n"));
+    s.push_str("#include <cstdio>\n#include <cstdint>\n\n");
+    s.push_str("static V");
+    s.push_str(top);
+    s.push_str("* dut;\n");
+    s.push_str(&format!(
+        "static void tick() {{ dut->{clk} = 0; dut->eval(); dut->{clk} = 1; dut->eval(); }}\n\n"
+    ));
+    s.push_str("int main(int argc, char** argv) {\n");
+    s.push_str("    Verilated::commandArgs(argc, argv);\n");
+    s.push_str(&format!("    dut = new V{top}();\n"));
+    // Held (non-cone) inputs — driven once.
+    for (name, val) in &config.held_inputs {
+        s.push_str(&format!("    dut->{name} = {val}ull;\n"));
+    }
+    // Reset phase.
+    s.push_str(&format!("    dut->{rst} = {asserted};\n"));
+    s.push_str(&format!(
+        "    for (uint32_t i = 0; i < {hold}; ++i) tick();\n"
+    ));
+    s.push_str(&format!("    dut->{rst} = {deasserted};\n"));
+    // Drive phase — one input-set per cycle, dump the observed registers after each.
+    for (cyc, step) in config.trace.iter().enumerate() {
+        for (name, val) in step {
+            s.push_str(&format!("    dut->{name} = {val}ull;\n"));
+        }
+        s.push_str("    tick();\n");
+        for reg in &config.observe_registers {
+            s.push_str(&format!(
+                "    printf(\"cyc{cyc}:{reg}=0x%016llx\\n\", (unsigned long long)dut->{reg});\n"
+            ));
+        }
+    }
+    s.push_str("    delete dut;\n    return 0;\n}\n");
+    Ok(s)
+}
+
 /// R-S2b.3a (2026-06-11) — pure parser for the testbench dump
 /// format produced by [`build_reset_simulation_tb_cpp`].
 ///
@@ -821,6 +908,53 @@ pub fn run_reset_simulation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P3 — the counterexample-replay testbench builder renders a reset phase, the held-input
+    /// setup, one input-drive-then-sample per trace cycle, and a per-cycle observed-register dump.
+    #[test]
+    fn build_trace_replay_tb_cpp_renders_reset_drive_and_sample() {
+        let cfg = TraceReplayConfig {
+            top: "fsm".to_string(),
+            clock_signal: "clk_i".to_string(),
+            reset_signal: "rst_ni".to_string(),
+            reset_asserted: 0, // active-low
+            hold_cycles: 3,
+            held_inputs: vec![("enable_i".to_string(), 1)],
+            trace: vec![
+                vec![("esc_i".to_string(), 1)],
+                vec![("esc_i".to_string(), 0)],
+            ],
+            observe_registers: vec!["state_q".to_string()],
+        };
+        let src = build_trace_replay_tb_cpp(&cfg).expect("render");
+        // Reset: active-low held then released.
+        assert!(src.contains("dut->rst_ni = 0;"), "asserts reset");
+        assert!(src.contains("dut->rst_ni = 1;"), "releases reset");
+        assert!(
+            src.contains("for (uint32_t i = 0; i < 3; ++i) tick();"),
+            "holds reset 3 cyc"
+        );
+        // Held input driven once.
+        assert!(
+            src.contains("dut->enable_i = 1ull;"),
+            "drives the held input"
+        );
+        // Both trace cycles' inputs.
+        assert!(
+            src.matches("dut->esc_i = 1ull;").count() == 1
+                && src.matches("dut->esc_i = 0ull;").count() == 1,
+            "drives esc_i per trace cycle",
+        );
+        // A per-cycle sample of the observed register.
+        assert!(
+            src.contains("cyc0:state_q=0x"),
+            "samples state_q on cycle 0"
+        );
+        assert!(
+            src.contains("cyc1:state_q=0x"),
+            "samples state_q on cycle 1"
+        );
+    }
 
     #[test]
     fn locate_verilator_returns_structured_error_when_binary_absent() {

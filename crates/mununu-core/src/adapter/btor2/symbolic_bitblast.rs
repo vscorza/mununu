@@ -2198,7 +2198,7 @@ pub fn gr1_response_formula(assume: &str, guarantee: &str) -> String {
 /// staying in `¬p` (the "stall"). The lasso is that path: a `prefix` from the
 /// initial state to the cycle entry, then the repeating `cycle`. Each state is a
 /// concrete valuation of the state registers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct StallLasso {
     /// States from the initial state up to (excluding) the cycle entry. Empty when
     /// the initial state is itself on the cycle.
@@ -2206,7 +2206,22 @@ pub struct StallLasso {
     /// The repeating `¬p` cycle; `cycle[0]` is the state the last one steps back to.
     /// Empty only in the (guarded) non-total-model deadlock case.
     pub cycle: Vec<BTreeMap<String, u128>>,
+    /// P3 — the INPUT assignment that drives each transition of the concatenated
+    /// `prefix ++ cycle` path (`inputs[i]` is the input at path-state `i`), for RTL replay.
+    /// Empty when a builder does not record inputs (e.g. hand-authored test lassos); the
+    /// [`StallLasso`] identity ignores it (see the manual `PartialEq`), so equality is over
+    /// the state path only.
+    pub inputs: Vec<BTreeMap<String, u128>>,
 }
+
+// StallLasso identity is the STATE path (prefix ++ cycle); `inputs` is replay metadata that
+// does not affect equality (a lasso witnessing the same path is the same witness).
+impl PartialEq for StallLasso {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix && self.cycle == other.cycle
+    }
+}
+impl Eq for StallLasso {}
 
 impl BddBitBlaster {
     /// D1.8 — extract a [`StallLasso`] witnessing that `AF p` is **Violated** from the
@@ -2237,7 +2252,7 @@ impl BddBitBlaster {
             return None;
         }
         let s = self.pick_state_assignment(&bad);
-        Some(self.walk_stall_cycle(&exact, &stall, s, Vec::new()))
+        Some(self.walk_stall_cycle(&exact, &stall, s, Vec::new(), Vec::new()))
     }
 
     /// D1.8b-2 — extract a [`StallLasso`] witnessing that `AG AF p` is **Violated**:
@@ -2283,6 +2298,7 @@ impl BddBitBlaster {
         // per step until inside the stall, recording the reset→stall prefix.
         let mut s = self.pick_state_assignment(&bad);
         let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        let mut inputs: Vec<BTreeMap<String, u128>> = Vec::new();
         for _ in 0..1_000_000 {
             if self.state_minterm(&s).and(&stall).unwrap() != self.ff {
                 break; // reached the stall
@@ -2300,16 +2316,18 @@ impl BddBitBlaster {
                 return Some(StallLasso {
                     prefix,
                     cycle: Vec::new(),
+                    inputs,
                 });
             }
             let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
             let mut ns = s.clone();
             for (reg, val) in self.eval_step(&full) {
                 ns.insert(reg, val);
             }
             s = ns;
         }
-        Some(self.walk_stall_cycle(&exact, &stall, s, prefix))
+        Some(self.walk_stall_cycle(&exact, &stall, s, prefix, inputs))
     }
 
     /// P3 — extract a concrete path witnessing that `AG EF p` is **Violated**: a state
@@ -2352,12 +2370,14 @@ impl BddBitBlaster {
         // Reach phase: descend one layer per step until inside the trap, recording the prefix.
         let mut s = self.pick_state_assignment(&bad);
         let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        let mut inputs: Vec<BTreeMap<String, u128>> = Vec::new();
         for _ in 0..1_000_000 {
             if self.state_minterm(&s).and(&trap).unwrap() != self.ff {
                 // Reached the trap: `s` witnesses `¬EF p`; it is absorbing (a 1-state cycle).
                 return Some(StallLasso {
                     prefix,
                     cycle: vec![s],
+                    inputs,
                 });
             }
             prefix.push(s.clone());
@@ -2372,9 +2392,11 @@ impl BddBitBlaster {
                 return Some(StallLasso {
                     prefix,
                     cycle: Vec::new(),
+                    inputs,
                 });
             }
             let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
             let mut ns = s.clone();
             for (reg, val) in self.eval_step(&full) {
                 ns.insert(reg, val);
@@ -2414,11 +2436,21 @@ impl BddBitBlaster {
         stall
     }
 
+    /// P3 — the INPUT part of a full (state+input) assignment: the values of the design's
+    /// input cells only. This is the input that drives the transition, recorded for RTL replay.
+    fn input_assignment(&self, full: &HashMap<String, u128>) -> BTreeMap<String, u128> {
+        self.cells
+            .iter()
+            .filter(|c| !c.is_state)
+            .filter_map(|c| full.get(&c.symbol).map(|v| (c.symbol.clone(), *v)))
+            .collect()
+    }
+
     /// Walk a concrete `¬p` path inside `stall` from `s` until a state repeats — the
     /// cycle. `prefix` (the already-walked reach path) is prepended to the result; any
-    /// pre-cycle stall states join it. Each step greedily picks a stall-preserving
-    /// input and advances via [`eval_step`]. Bounded by the stall's size; a deadlock
-    /// yields an open (cycle-less) lasso.
+    /// pre-cycle stall states join it. `inputs` accumulates the input driving each recorded
+    /// transition (for RTL replay). Each step greedily picks a stall-preserving input and
+    /// advances via [`eval_step`]. Bounded by the stall's size; a deadlock yields an open lasso.
     ///
     /// [`eval_step`]: BddBitBlaster::eval_step
     fn walk_stall_cycle(
@@ -2427,13 +2459,18 @@ impl BddBitBlaster {
         stall: &BDDFunction,
         mut s: BTreeMap<String, u128>,
         mut prefix: Vec<BTreeMap<String, u128>>,
+        mut inputs: Vec<BTreeMap<String, u128>>,
     ) -> StallLasso {
         let mut cyc: Vec<BTreeMap<String, u128>> = Vec::new();
         for _ in 0..1_000_000 {
             if let Some(j) = cyc.iter().position(|prev| *prev == s) {
                 let cycle = cyc.split_off(j);
                 prefix.extend(cyc); // pre-cycle stall states → prefix
-                return StallLasso { prefix, cycle };
+                return StallLasso {
+                    prefix,
+                    cycle,
+                    inputs,
+                };
             }
             cyc.push(s.clone());
             // The successors-in-stall set for state = s (inputs free) is
@@ -2445,11 +2482,13 @@ impl BddBitBlaster {
                 return StallLasso {
                     prefix,
                     cycle: Vec::new(),
+                    inputs,
                 };
             }
             // Pick a full (state = s, input) assignment, step concretely, and keep
             // held registers (no `Next` line) at their current value.
             let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
             let mut ns = s.clone();
             for (reg, val) in self.eval_step(&full) {
                 ns.insert(reg, val);
@@ -2460,6 +2499,7 @@ impl BddBitBlaster {
         StallLasso {
             prefix,
             cycle: Vec::new(),
+            inputs,
         }
     }
 
@@ -3829,6 +3869,33 @@ mod tests {
                 first.get("st").copied(),
                 Some(0),
                 "the witness prefix starts at the reset state st==0",
+            );
+        }
+        // SELF-VALIDATE the recorded inputs: replaying `inputs[i]` from `prefix[i]` via the
+        // concrete eval_step must land on the next path state — i.e. the witness's input
+        // sequence genuinely reproduces the reset→trap path (the basis for RTL replay).
+        assert_eq!(
+            w.inputs.len(),
+            w.prefix.len(),
+            "one recorded input per prefix transition",
+        );
+        let file = parser::parse(TRAP_FSM).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let path: Vec<_> = w.prefix.iter().chain(w.cycle.iter()).collect();
+        for (i, inp) in w.inputs.iter().enumerate() {
+            // full = state(path[i]) + input(inp)
+            let mut full: HashMap<String, u128> =
+                path[i].iter().map(|(k, v)| (k.clone(), *v)).collect();
+            for (k, v) in inp {
+                full.insert(k.clone(), *v);
+            }
+            let stepped = bb.eval_step(&full);
+            let next_st = stepped.get("st").copied().unwrap_or(path[i]["st"]);
+            assert_eq!(
+                Some(next_st),
+                path[i + 1].get("st").copied(),
+                "replaying input {i} from st={} must reach the next path state",
+                path[i]["st"],
             );
         }
     }
