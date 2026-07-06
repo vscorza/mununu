@@ -197,9 +197,38 @@ struct CorpusDesign {
 /// oracle read that both the strict ledger gate and the observation census share. Panics
 /// only on a SETUP failure (verify_auto errored, or a ledger property is absent from the
 /// report) — never on a verdict fact, so a definite/⊥ outcome is always returned, not raised.
+/// Which verification engine to route the corpus property through. All three share the same
+/// front-end (slang → sv2v → yosys → BTOR2 → reset-gated `$past`-shadow model) and the same
+/// per-property μ-calculus; they differ only in how the abstract transition relation is
+/// decided. Mirrors the CLI/API `--engine` selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    /// Default predicate-abstraction CEGAR (SMT all-pairs `cegar_refine_loop`): the current
+    /// production default (`symbolic_engine=false, exact_symbolic=false`).
+    Cegar,
+    /// Predicate-cube BDD CEGAR loop (`--engine symbolic`, `symbolic_engine=true`): the
+    /// default-flip *candidate*. Same cube space + init-cube read as `Cegar`; differs only in
+    /// the refinement loop (`symbolic_cegar_refine`).
+    SymbolicCube,
+    /// Exact full-state ROBDD MC (`--engine exact-symbolic`, `exact_symbolic=true`): 2-valued,
+    /// no ⊥, bounded to the bit cap (COI-pruned). The corpus ledger's oracle.
+    ExactSymbolic,
+}
+
+impl Engine {
+    /// The `(symbolic_engine, exact_symbolic)` flag pair for this engine.
+    fn flags(self) -> (bool, bool) {
+        match self {
+            Engine::Cegar => (false, false),
+            Engine::SymbolicCube => (true, false),
+            Engine::ExactSymbolic => (false, true),
+        }
+    }
+}
+
 fn run_corpus_verdicts(
     d: &CorpusDesign,
-    exact: bool,
+    engine: Engine,
 ) -> Vec<(&'static str, LedgerVerdict, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
     let read = |file: &str| {
@@ -228,14 +257,16 @@ fn run_corpus_verdicts(
         ..Default::default()
     };
     let config_values = d.config.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let (symbolic_engine, exact_symbolic) = engine.flags();
     let report = verify_auto(
         &sources,
         &yopts,
         &VerifyAutoOptions {
-            // exact-symbolic (ROBDD, 2-valued, ≤40 bits) vs the explicit predicate-cube
-            // CEGAR engine (abstraction-based, no hard bit cap) — the fallback the exact
-            // engine's own bit-cap Skip message recommends.
-            exact_symbolic: exact,
+            // exact-symbolic (ROBDD, 2-valued, ≤40 bits) vs the two cube engines
+            // (abstraction-based, no hard bit cap): the default predicate-abstraction
+            // CEGAR (`Cegar`) and the predicate-cube BDD CEGAR (`SymbolicCube`).
+            symbolic_engine,
+            exact_symbolic,
             config_values,
             ..Default::default()
         },
@@ -283,8 +314,9 @@ fn outcome_detail(o: &VerifyOutcome) -> String {
 /// Returns the list of ⊥→definite improvements (empty in steady state).
 fn check_corpus_design(d: &CorpusDesign) -> Vec<(String, LedgerVerdict)> {
     let mut improvements = Vec::new();
-    for ((needle, current, _), (_, recorded)) in
-        run_corpus_verdicts(d, true).into_iter().zip(d.ledger)
+    for ((needle, current, _), (_, recorded)) in run_corpus_verdicts(d, Engine::ExactSymbolic)
+        .into_iter()
+        .zip(d.ledger)
     {
         if let Some(up) = assert_monotone(d.name, needle, *recorded, current) {
             improvements.push((format!("{}.{needle}", d.name), up));
@@ -582,9 +614,9 @@ fn diff_corpus_monotone_verdict_ledger() {
 /// One catch_unwind wrapper around a corpus run under a given engine.
 fn observe_engine(
     d: &CorpusDesign,
-    exact: bool,
+    engine: Engine,
 ) -> Result<Vec<(&'static str, LedgerVerdict, String)>, String> {
-    std::panic::catch_unwind(|| run_corpus_verdicts(d, exact)).map_err(|e| {
+    std::panic::catch_unwind(|| run_corpus_verdicts(d, engine)).map_err(|e| {
         e.downcast_ref::<String>()
             .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
@@ -618,12 +650,12 @@ fn diff_corpus_verdict_census() {
         "\n================ corpus verdict census (exact engine; explicit fallback for ⊥) ================"
     );
     for d in CORPUS {
-        let exact = observe_engine(d, true);
+        let exact = observe_engine(d, Engine::ExactSymbolic);
         // Only pay for the explicit pass if opted in AND the exact pass left something ⊥.
         let needs_fallback = want_explicit
             && matches!(&exact, Ok(props) if props.iter().any(|(_, v, _)| *v == LedgerVerdict::Indefinite));
         let explicit = if needs_fallback {
-            Some(observe_engine(d, false))
+            Some(observe_engine(d, Engine::Cegar))
         } else {
             None
         };
@@ -679,6 +711,180 @@ fn diff_corpus_verdict_census() {
     );
     eprintln!(
         "=============================================================================================\n"
+    );
+}
+
+/// The DEFAULT-FLIP soundness + precision differential (roadmap §"Default-flip gate"). Runs
+/// every corpus property through BOTH cube engines — the current production default `Cegar`
+/// (predicate-abstraction SMT all-pairs) and the flip *candidate* `SymbolicCube` (predicate-cube
+/// BDD CEGAR) — and cross-checks each against the recorded EXACT ORACLE (`d.ledger`, the
+/// full-state ROBDD MC, all-definite on the corpus). Three anchors:
+///
+///   1. **cube-vs-exact-oracle (HARD GATE)** — any cube-engine DEFINITE verdict that disagrees
+///      with the exact oracle is a soundness bug: the cube abstractions must refine toward the
+///      full-state MC, never contradict it. The strongest anchor — catches a single wrong-definite
+///      that a cross-cube check would miss if BOTH cubes agreed on the wrong answer.
+///   2. **cross-cube flip (HARD GATE)** — the two cube engines returning OPPOSITE definites is a
+///      bug in one of them. Collected across all designs, asserted at the end (a setup error in
+///      one design can't mask a flip in another).
+///   3. **precision delta (REPORTED)** — def↔⊥ in either direction: `Cegar` definite / `Sym` ⊥ is
+///      a would-be regression; the reverse is a would-be gain.
+///
+/// **Empirical finding (2026-07-06, fast-FSM subset):** the two cube engines are COMPLEMENTARY,
+/// not dominated — `SymbolicCube` decides several liveness properties `Cegar` leaves ⊥ (uart_tx
+/// AG-AF / AG-EF, prim_count) while `Cegar` decides one `SymbolicCube` leaves ⊥ (aes_ctr_fsm).
+/// Both agree with the exact oracle wherever definite. So a blind default-SWAP is NOT justified
+/// (it trades regressions for gains); the sound production choice is a PORTFOLIO — take the
+/// definite verdict from whichever engine produces one (exact preferred; cube fallback), which
+/// this differential proves sound (no cross-engine contradiction, no oracle violation).
+///
+/// Each design runs under `catch_unwind`; a setup error is reported, not fatal. `MUNUNU_PARITY_ONLY`
+/// (comma-separated design names) restricts the run to a subset — the fast FSMs for a quick read;
+/// unset runs the whole corpus (slow: the big closures cost minutes per engine).
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn diff_corpus_cegar_vs_symbolic_engine_parity() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let only: Option<Vec<String>> = std::env::var("MUNUNU_PARITY_ONLY")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    let selected = |name: &str| {
+        only.as_ref()
+            .is_none_or(|list| list.iter().any(|n| n == name))
+    };
+
+    // Collected across all designs so no single design's setup error masks a violation elsewhere.
+    // A cross-cube flip (Cegar↔Sym opposite definite) OR a disagreement with the exact oracle
+    // (`d.ledger`, all-definite on the corpus) is a genuine soundness bug.
+    let mut soundness_flips: Vec<String> = Vec::new();
+    let mut oracle_violations: Vec<String> = Vec::new();
+    let (mut parity, mut regress, mut gain, mut both_bot, mut err) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    // Per-engine precision vs the exact oracle: how many corpus properties each cube engine
+    // decides DEFINITELY (and every such decision agrees with the oracle — asserted below).
+    let (mut cegar_definite, mut sym_definite, mut total_props) = (0u32, 0u32, 0u32);
+
+    eprintln!(
+        "\n===== cegar↔symbolic soundness + precision vs the exact oracle (default-flip evidence) ====="
+    );
+    for d in CORPUS.iter().filter(|d| selected(d.name)) {
+        let cegar = observe_engine(d, Engine::Cegar);
+        let symbolic = observe_engine(d, Engine::SymbolicCube);
+        match (&cegar, &symbolic) {
+            (Ok(cv), Ok(sv)) => {
+                // Zip the two cube reads with the recorded exact-oracle ledger (same order).
+                for (((needle, c, cdetail), (_, s, sdetail)), (_, oracle)) in
+                    cv.iter().zip(sv.iter()).zip(d.ledger.iter())
+                {
+                    use LedgerVerdict::{False, Indefinite, True};
+                    total_props += 1;
+                    if *c != Indefinite {
+                        cegar_definite += 1;
+                    }
+                    if *s != Indefinite {
+                        sym_definite += 1;
+                    }
+                    // Soundness anchor 1 — each cube-engine DEFINITE verdict must equal the exact
+                    // oracle's definite verdict (the oracle is 2-valued/all-definite on the corpus).
+                    for (eng, v) in [("Cegar", c), ("SymbolicCube", s)] {
+                        if *v != Indefinite && *v != *oracle {
+                            oracle_violations.push(format!(
+                                "{}.{needle}: {eng}={v:?} but exact oracle={oracle:?}",
+                                d.name
+                            ));
+                        }
+                    }
+                    // Soundness anchor 2 — the two cube engines must not give OPPOSITE definites.
+                    let tag = match (c, s) {
+                        (True, True) | (False, False) => {
+                            parity += 1;
+                            "parity ✓"
+                        }
+                        (True, False) | (False, True) => {
+                            soundness_flips.push(format!(
+                                "{}.{needle}: Cegar={c:?} SymbolicCube={s:?}",
+                                d.name
+                            ));
+                            "SOUNDNESS FLIP ✗"
+                        }
+                        (True | False, Indefinite) => {
+                            regress += 1;
+                            "regress (def→⊥)"
+                        }
+                        (Indefinite, True | False) => {
+                            gain += 1;
+                            "gain (⊥→def)"
+                        }
+                        (Indefinite, Indefinite) => {
+                            both_bot += 1;
+                            "both ⊥"
+                        }
+                    };
+                    let detail = if s == &Indefinite {
+                        format!("  [sym: {sdetail}]")
+                    } else if c == &Indefinite {
+                        format!("  [cegar: {cdetail}]")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "  {:28} {needle:32} Cegar={c:?} Sym={s:?} oracle={oracle:?}  {tag}{detail}",
+                        d.name
+                    );
+                }
+            }
+            (c, s) => {
+                err += 1;
+                let msg = c
+                    .as_ref()
+                    .err()
+                    .or(s.as_ref().err())
+                    .map(String::as_str)
+                    .unwrap_or("");
+                eprintln!(
+                    "  {:28} {:32} -> SETUP ERROR: {}",
+                    d.name,
+                    "",
+                    msg.lines().next().unwrap_or("")
+                );
+            }
+        }
+    }
+    std::panic::set_hook(prev);
+    eprintln!(
+        "-----------------------------------------------------------------------------------------------"
+    );
+    eprintln!(
+        "  cross-cube: parity={parity}  soundness-flips={}  regress(def→⊥)={regress}  gain(⊥→def)={gain}  both-⊥={both_bot}  setup-error={err}",
+        soundness_flips.len()
+    );
+    eprintln!(
+        "  precision vs exact oracle ({total_props} props):  Cegar decides {cegar_definite}  SymbolicCube decides {sym_definite}  (oracle-violations={})",
+        oracle_violations.len()
+    );
+    eprintln!(
+        "  FLIP READ: neither cube engine dominates — a def↔⊥ split in BOTH directions means the sound production choice is a PORTFOLIO (exact ⊕ cube), not a blind default-swap.",
+    );
+    eprintln!(
+        "===============================================================================================\n"
+    );
+
+    // Hard gate 1: a cross-cube True↔False disagreement is a genuine soundness bug in one of the
+    // two cube engines — never acceptable, regardless of the flip decision.
+    assert!(
+        soundness_flips.is_empty(),
+        "CEGAR↔SYMBOLIC SOUNDNESS FLIP(S): {soundness_flips:?} — the two cube engines returned \
+         OPPOSITE definite verdicts on the same property; one is unsound."
+    );
+    // Hard gate 2: any cube-engine DEFINITE verdict that disagrees with the exact oracle is a
+    // soundness bug — the exact full-state MC is the gold reference the cube abstractions must
+    // refine toward, never contradict. This is the strongest of the three anchors: it catches a
+    // single-engine wrong-definite that a cross-cube check would miss if BOTH cubes were wrong.
+    assert!(
+        oracle_violations.is_empty(),
+        "CUBE-vs-EXACT-ORACLE SOUNDNESS VIOLATION(S): {oracle_violations:?} — a cube engine \
+         returned a DEFINITE verdict contradicting the exact full-state model checker."
     );
 }
 
