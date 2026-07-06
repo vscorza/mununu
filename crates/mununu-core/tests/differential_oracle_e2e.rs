@@ -764,6 +764,39 @@ const CORPUS: &[CorpusDesign] = &[
         // DECODE=5 is the real execution state). The cube engines honestly ⊥ (A.4 downgrade).
         ledger: &[("(ctrl_fsm_cs == 5)", LedgerVerdict::True)],
     },
+    // keymgr_ctrl — OpenTitan key-manager control FSM (sparse `state_e`, 10-bit: StCtrlReset =
+    // 0b1101100001 = 865 … StCtrlDisabled/Invalid terminal traps). Byte-exact from OpenTitan
+    // 558921c; a 10-package closure (keymgr + otp_ctrl + lc_ctrl + prim mubi/secded/util) with
+    // the submodules (keymgr_op_state_ctrl / keymgr_err / prim_count / prim_mubi4_sender /
+    // prim_secded_inv_72_64_dec) blackboxed. AG EF StCtrlReset recoverability: can it always get
+    // back to reset? (`state_q == 865`). Ledger `Indefinite` = probe placeholder → lock in docker.
+    CorpusDesign {
+        name: "keymgr_ctrl",
+        dir: "dc_opentitan_keymgr_ctrl",
+        files: &[
+            "keymgr_ctrl.sv",
+            "prim_assert.sv",
+            "dv_fcov_macros.svh",
+            "prim_util_pkg.sv",
+            "prim_secded_pkg.sv",
+            "prim_mubi_pkg.sv",
+            "lc_ctrl_state_pkg.sv",
+            "lc_ctrl_reg_pkg.sv",
+            "lc_ctrl_pkg.sv",
+            "otp_ctrl_pkg.sv",
+            "keymgr_reg_pkg.sv",
+            "keymgr_pkg.sv",
+        ],
+        top: "keymgr_ctrl",
+        annotations: &["nu Y. ((mu X. ((state_q == 865) or <> X)) and [] Y)"], // StCtrlReset = 865
+        config: &[("rst_ni", 1)],
+        // VIOLATED (exact) — the key manager does NOT return to StCtrlReset: its terminal
+        // StCtrlDisabled / StCtrlInvalid hardening states only reset escapes (the same
+        // SEC_CM sparse-FSM pattern as csrng/edn — an EXPECTED violation, not a finding).
+        // Non-spurious: reset gated (rst_ni=1), StCtrlReset=865 is the real reset state.
+        // Decidable only after the > 128-bit binary-constant bit-blast fix (256-bit key-state).
+        ledger: &[("(state_q == 865)", LedgerVerdict::False)],
+    },
 ];
 
 #[test]

@@ -20,7 +20,7 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 
 ## Verdict census (exact-symbolic engine + R-F5.6 COI, reset-gated)
 
-17 distinct designs (16 OpenTitan + the lowRISC ibex core), 18 ledger properties.
+18 distinct designs (17 OpenTitan + the lowRISC ibex core), 19 ledger properties.
 
 | # | Module | Liveness property | Verdict | Notes |
 |---|---|---|---|---|
@@ -42,8 +42,9 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 | 16 | prim_fifo_sync | AG EF (depth_o==0) | **True** *(comb-atom)* | always drainable (`depth_o` is combinational → binds via named-signal support) |
 | 17 | prim_alert_sender | AG EF Idle(0) | **False** *(blackbox)* | alert-path sibling of esc_sender, but VIOLATED — the blackboxed diff_decode / sec_anchor / sigint environment can trap it out of Idle |
 | 18 | ibex_controller | AG EF DECODE(5) | **True** *(exact)* | the lowRISC ibex core's main FSM — always returns to executing (no permanent non-DECODE trap). First CPU-scale, non-prim design; exposed + fixed the A.4 sampling-may unsoundness (below) |
+| 19 | keymgr_ctrl | AG EF StCtrlReset(865) | **False** *(exact)* | OpenTitan key-manager sparse FSM — does NOT return to reset (terminal StCtrlDisabled/Invalid traps, the SEC_CM pattern). Deepest closure (10 packages); decidable only after the > 128-bit binary-constant bit-blast fix (256-bit key-state) |
 
-**Tally: True = 10, False = 8, ⊥ = 0. Every design decides.**
+**Tally: True = 10, False = 9, ⊥ = 0. Every design decides.**
 
 ## Are the False verdicts findings? No — expected violations (claims-integrity)
 
