@@ -16,7 +16,9 @@
 
 use mununu_core::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
 use mununu_core::adapter::btormc::{DEFAULT_KMAX, McVerdict, locate_btormc, run_btormc};
-use mununu_core::adapter::slang::verify_auto::{VerifyAutoOptions, VerifyOutcome, verify_auto};
+use mununu_core::adapter::slang::verify_auto::{
+    PortfolioMode, VerifyAutoOptions, VerifyOutcome, verify_auto,
+};
 use mununu_core::adapter::yosys::YosysOptions;
 use mununu_core::mu_calculus::parser;
 use std::path::PathBuf;
@@ -213,23 +215,35 @@ enum Engine {
     /// Exact full-state ROBDD MC (`--engine exact-symbolic`, `exact_symbolic=true`): 2-valued,
     /// no ⊥, bounded to the bit cap (COI-pruned). The corpus ledger's oracle.
     ExactSymbolic,
+    /// PORTFOLIO (sequential) — exact → symbolic → explicit, early-exit when all decided.
+    PortfolioSequential,
+    /// PORTFOLIO (parallel) — all three engines concurrently, merge, take any definite.
+    PortfolioParallel,
 }
 
 impl Engine {
-    /// The `(symbolic_engine, exact_symbolic)` flag pair for this engine.
-    fn flags(self) -> (bool, bool) {
-        match self {
-            Engine::Cegar => (false, false),
-            Engine::SymbolicCube => (true, false),
-            Engine::ExactSymbolic => (false, true),
-        }
+    /// Apply this engine's selection to a fresh option set.
+    fn apply(self, opts: &mut VerifyAutoOptions) {
+        let (sym, exact, portfolio) = match self {
+            Engine::Cegar => (false, false, None),
+            Engine::SymbolicCube => (true, false, None),
+            Engine::ExactSymbolic => (false, true, None),
+            Engine::PortfolioSequential => (false, false, Some(PortfolioMode::Sequential)),
+            Engine::PortfolioParallel => (false, false, Some(PortfolioMode::Parallel)),
+        };
+        opts.symbolic_engine = sym;
+        opts.exact_symbolic = exact;
+        opts.portfolio = portfolio;
     }
 }
 
-fn run_corpus_verdicts(
+/// Build the sources (untouched design + prepended `@mununu_guarantee` annotations) and run
+/// `verify_auto` under `engine`, returning the FULL report (so a caller can inspect notes /
+/// counterexamples, not just the ledger verdicts). Panics only on a SETUP failure.
+fn corpus_report(
     d: &CorpusDesign,
     engine: Engine,
-) -> Vec<(&'static str, LedgerVerdict, String)> {
+) -> mununu_core::adapter::slang::verify_auto::AutoVerifyReport {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
     let read = |file: &str| {
         let p = root.join(d.dir).join("source").join(file);
@@ -257,22 +271,22 @@ fn run_corpus_verdicts(
         ..Default::default()
     };
     let config_values = d.config.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    let (symbolic_engine, exact_symbolic) = engine.flags();
-    let report = verify_auto(
-        &sources,
-        &yopts,
-        &VerifyAutoOptions {
-            // exact-symbolic (ROBDD, 2-valued, ≤40 bits) vs the two cube engines
-            // (abstraction-based, no hard bit cap): the default predicate-abstraction
-            // CEGAR (`Cegar`) and the predicate-cube BDD CEGAR (`SymbolicCube`).
-            symbolic_engine,
-            exact_symbolic,
-            config_values,
-            ..Default::default()
-        },
-    )
-    .unwrap_or_else(|e| panic!("{}: verify_auto failed: {}", d.name, e.message));
+    // exact-symbolic (ROBDD, 2-valued, ≤40 bits) vs the two cube engines (abstraction-based,
+    // no hard bit cap) vs the multi-engine portfolio — selected by `engine.apply`.
+    let mut opts = VerifyAutoOptions {
+        config_values,
+        ..Default::default()
+    };
+    engine.apply(&mut opts);
+    verify_auto(&sources, &yopts, &opts)
+        .unwrap_or_else(|e| panic!("{}: verify_auto failed: {}", d.name, e.message))
+}
 
+fn run_corpus_verdicts(
+    d: &CorpusDesign,
+    engine: Engine,
+) -> Vec<(&'static str, LedgerVerdict, String)> {
+    let report = corpus_report(d, engine);
     d.ledger
         .iter()
         .map(|(needle, _)| {
@@ -885,6 +899,75 @@ fn diff_corpus_cegar_vs_symbolic_engine_parity() {
         oracle_violations.is_empty(),
         "CUBE-vs-EXACT-ORACLE SOUNDNESS VIOLATION(S): {oracle_violations:?} — a cube engine \
          returned a DEFINITE verdict contradicting the exact full-state model checker."
+    );
+}
+
+/// The PORTFOLIO end-to-end gate. Runs uart_tx (both liveness properties, definite under the
+/// exact engine but ⊥ under the default `Cegar`) through the real `verify_auto → portfolio →
+/// merge` chain — validating the full integration the hermetic combiner tests can't: the engine
+/// dispatch, the scoped-thread parallel orchestration, and the sequential early-exit, all
+/// against live slang/sv2v/yosys + the three real engines. Asserts:
+///   1. `Cegar` alone leaves BOTH properties ⊥ — the baseline the portfolio must beat.
+///   2. Both portfolio modes DECIDE both properties, matching the exact oracle (AG-AF=Violated,
+///      AG-EF=Holds) — the portfolio recovers what the default engine misses.
+///   3. Sequential and Parallel agree exactly (same engines, same merge).
+///   4. No `portfolio-soundness-alarm` note fired (the runtime guard stayed quiet) and a
+///      `portfolio` provenance note is present.
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn e2e_portfolio_decides_what_the_default_engine_misses() {
+    let uart = &CORPUS[0];
+    assert_eq!(
+        uart.name, "uart_tx",
+        "expected uart_tx as the first corpus design"
+    );
+
+    // 1. Baseline: the default Cegar engine leaves both uart_tx liveness props ⊥.
+    let cegar = run_corpus_verdicts(uart, Engine::Cegar);
+    assert!(
+        cegar
+            .iter()
+            .all(|(_, v, _)| *v == LedgerVerdict::Indefinite),
+        "precondition: Cegar leaves uart_tx ⊥⊥ (the gap the portfolio closes); got {cegar:?}"
+    );
+
+    // 2 + 3. Both portfolio modes decide both properties, and agree with each other.
+    let seq = run_corpus_verdicts(uart, Engine::PortfolioSequential);
+    let par = run_corpus_verdicts(uart, Engine::PortfolioParallel);
+    let seq_v: Vec<_> = seq.iter().map(|(n, v, _)| (*n, *v)).collect();
+    let par_v: Vec<_> = par.iter().map(|(n, v, _)| (*n, *v)).collect();
+    assert_eq!(
+        seq_v, par_v,
+        "portfolio-sequential and portfolio-parallel must return identical verdicts"
+    );
+    // The exact oracle: AG-AF (bit_cnt_q stalls) = Violated; AG-EF (recoverable) = Holds.
+    let expected = [
+        ("(mu Y. ((bit_cnt_q == 0) or [] Y))", LedgerVerdict::False),
+        ("(mu X. ((bit_cnt_q == 0) or <> X))", LedgerVerdict::True),
+    ];
+    for (needle, want) in expected {
+        let got = seq_v
+            .iter()
+            .find(|(n, _)| *n == needle)
+            .unwrap_or_else(|| panic!("portfolio result missing `{needle}`: {seq_v:?}"));
+        assert_eq!(
+            got.1, want,
+            "portfolio must decide `{needle}` as {want:?} (the exact-oracle verdict)"
+        );
+    }
+
+    // 4. The runtime soundness guard stayed quiet; the provenance note is present.
+    let report = corpus_report(uart, Engine::PortfolioParallel);
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|n| n.kind == "portfolio-soundness-alarm"),
+        "no engine may contradict another (the soundness-alarm note must be absent)"
+    );
+    assert!(
+        report.notes.iter().any(|n| n.kind == "portfolio"),
+        "the portfolio provenance note (engines ran + decided-by tally) must be present"
     );
 }
 
