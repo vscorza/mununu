@@ -1915,8 +1915,12 @@ fn resolve_predicate_expr_registers(
 
 /// R-F5.6 — collect every register name a [`PredicateExpr`] references (already resolved to
 /// canonical cell names). These are the seed atoms for the cone-of-influence keep-set that
-/// restricts the exact bit-blaster to the property's cone.
-fn collect_predicate_registers(expr: &PredicateExpr, out: &mut std::collections::HashSet<String>) {
+/// restricts the bit-blaster to the property's cone (used by both the exact engine and, via
+/// `symbolic_engine`, the symbolic cube-BDD engine).
+pub(crate) fn collect_predicate_registers(
+    expr: &PredicateExpr,
+    out: &mut std::collections::HashSet<String>,
+) {
     match expr {
         PredicateExpr::Cmp { register, .. } => {
             out.insert(register.clone());
