@@ -2025,9 +2025,17 @@ pub fn exact_symbolic_verdict_with_witness(
     // `exact_reachable_stall_lasso` finds a stall reachable from reset (subsuming the
     // stall-at-reset case), so it covers both shapes. Best-effort: `None` if the shape
     // isn't recognised or no stall is reachable.
+    // First the `AF`/`AG AF` stall lasso; failing that, the `AG EF p` recoverability trap path
+    // (a reachable state from which `p` is unreachable). Best-effort: `None` if neither shape
+    // matches or the witness region is unreachable.
     let witness = detect_af_target(formula)
         .and_then(|p_id| exact.eval_at(formula, p_id, &atoms).ok())
-        .and_then(|p_bdd| bb.exact_reachable_stall_lasso(&file, &p_bdd));
+        .and_then(|p_bdd| bb.exact_reachable_stall_lasso(&file, &p_bdd))
+        .or_else(|| {
+            detect_ag_ef_target(formula)
+                .and_then(|p_id| exact.eval_at(formula, p_id, &atoms).ok())
+                .and_then(|p_bdd| bb.exact_reachable_trap_path(&file, &p_bdd))
+        });
     Ok((ExactVerdict::Violated, witness))
 }
 
@@ -2092,6 +2100,62 @@ fn is_box_over_var(
             if *guard == Guard::default()
                 && matches!(formula.node(*target), MuNode::Variable(w) if w == v)
     )
+}
+
+/// Is `node` a bare `<> v` (unguarded diamond over the fixpoint variable `v`)?
+fn is_diamond_over_var(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+    v: &crate::mu_calculus::FormulaVarId,
+) -> bool {
+    matches!(
+        formula.node(node),
+        MuNode::Modal { kind: ModalKind::Diamond, guard, target }
+            if *guard == Guard::default()
+                && matches!(formula.node(*target), MuNode::Variable(w) if w == v)
+    )
+}
+
+/// P3 — detect `AG EF p = νY. ((μX. (p ∨ <> X)) ∧ [] Y)` (the recoverability shape) and return
+/// the node id of its target `p`. Mirrors [`detect_af_target`] but the inner μ uses a bare
+/// DIAMOND (`<> X` = `∃input`), not a box. `None` for any other shape.
+fn detect_ag_ef_target(formula: &Formula) -> Option<crate::mu_calculus::NodeId> {
+    let root = formula.root();
+    let MuNode::Nu { var, body } = formula.node(root) else {
+        return None;
+    };
+    let MuNode::And(a, b) = formula.node(*body) else {
+        return None;
+    };
+    let ef = if is_box_over_var(formula, *a, var) {
+        *b
+    } else if is_box_over_var(formula, *b, var) {
+        *a
+    } else {
+        return None;
+    };
+    ef_target_at(formula, ef)
+}
+
+/// Match `μX. (p ∨ <> X)` (= `EF p`) at `node` → the node id of `p` (the non-recursive
+/// disjunct). The diamond twin of [`af_target_at`].
+fn ef_target_at(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+) -> Option<crate::mu_calculus::NodeId> {
+    let MuNode::Mu { var, body } = formula.node(node) else {
+        return None;
+    };
+    let MuNode::Or(a, b) = formula.node(*body) else {
+        return None;
+    };
+    if is_diamond_over_var(formula, *a, var) {
+        Some(*b)
+    } else if is_diamond_over_var(formula, *b, var) {
+        Some(*a)
+    } else {
+        None
+    }
 }
 
 /// D1.8c — build the sound μ-calculus formula that verifies the GR(1) response
@@ -2246,6 +2310,93 @@ impl BddBitBlaster {
             s = ns;
         }
         Some(self.walk_stall_cycle(&exact, &stall, s, prefix))
+    }
+
+    /// P3 — extract a concrete path witnessing that `AG EF p` is **Violated**: a state
+    /// reachable from reset from which `p` is UNREACHABLE (the "trap" `¬EF p`), plus the
+    /// reset→trap prefix. `¬EF p` is absorbing (if you cannot reach `p`, no successor can
+    /// either), so the witness needs no cycle walk — the trap state is a single-state
+    /// absorbing `cycle`. `None` when the trap is unreachable (`AG EF p` holds).
+    ///
+    /// Reuses the layered reachability of [`exact_reachable_stall_lasso`] with `trap = ¬EF p`
+    /// in place of `stall = EG¬p`; the reach phase descends one layer per concrete
+    /// [`eval_step`] until inside the trap.
+    ///
+    /// [`exact_reachable_stall_lasso`]: BddBitBlaster::exact_reachable_stall_lasso
+    /// [`eval_step`]: BddBitBlaster::eval_step
+    pub fn exact_reachable_trap_path(
+        &self,
+        file: &Btor2File,
+        p: &BDDFunction,
+    ) -> Option<StallLasso> {
+        let exact = self.exact_model();
+        let trap = self.not_ef_p(&exact, p);
+        if trap == self.ff {
+            return None; // EF p holds everywhere ⇒ AG EF p holds
+        }
+        // Reach layers: L_0 = trap, L_k = L_{k-1} ∨ ◇L_{k-1}.
+        let mut layers = vec![trap.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.diamond_pre(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let init = self.initial_state_bdd(file);
+        let bad = init.and(layers.last().unwrap()).unwrap();
+        if bad == self.ff {
+            return None; // the trap is unreachable ⇒ AG EF p holds
+        }
+        // Reach phase: descend one layer per step until inside the trap, recording the prefix.
+        let mut s = self.pick_state_assignment(&bad);
+        let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if self.state_minterm(&s).and(&trap).unwrap() != self.ff {
+                // Reached the trap: `s` witnesses `¬EF p`; it is absorbing (a 1-state cycle).
+                return Some(StallLasso {
+                    prefix,
+                    cycle: vec![s],
+                });
+            }
+            prefix.push(s.clone());
+            let k = (1..layers.len())
+                .find(|&k| self.state_minterm(&s).and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(1);
+            let good = self
+                .state_minterm(&s)
+                .and(&exact.to_next(&layers[k - 1]))
+                .unwrap();
+            if good == self.ff {
+                return Some(StallLasso {
+                    prefix,
+                    cycle: Vec::new(),
+                });
+            }
+            let full = self.pick_full_assignment(&good);
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            s = ns;
+        }
+        None
+    }
+
+    /// `¬EF p = ¬(μX. (p ∨ ◇X))` over the exact model — the "trap" region: states from which
+    /// `p` is unreachable. `◇` is `∃input` (`diamond_pre`), so `EF p` is the states with SOME
+    /// path to `p`. Least fixpoint from ⊥.
+    fn not_ef_p(&self, exact: &ExactModel, p: &BDDFunction) -> BDDFunction {
+        let mut ef = self.ff.clone();
+        loop {
+            let next = p.or(&exact.diamond_pre(&ef)).unwrap();
+            if next == ef {
+                break;
+            }
+            ef = next;
+        }
+        ef.not().unwrap()
     }
 
     /// `stall = EG ¬p = νZ. (¬p ∧ ◇Z)` over the exact model — the states with an
@@ -3623,6 +3774,63 @@ mod tests {
             ExactVerdict::Holds,
             "o = p+1 is a combinational output; p reaches 2 ⇒ o==3 ⇒ EF(o==3) holds",
         );
+    }
+
+    /// P3 — the trap-path witness for a `Violated` `AG EF (st==0)` recoverability property.
+    /// `st` cycles 0→1→2→0, but `esc` drives it to the TERMINAL trap `st==3` (self-loop), from
+    /// which `st==0` is unreachable — so `AG EF (st==0)` is Violated, and the witness is a
+    /// concrete reset→trap path ending in the absorbing trap state. Self-validating: it replays
+    /// the prefix through `eval_step` and confirms the final state is the trap `st==3`.
+    #[test]
+    fn p3_ag_ef_trap_path_witness() {
+        const TRAP_FSM: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 esc
+4 state 2 st
+5 const 2 11
+6 const 2 00
+7 one 2
+8 add 2 4 7
+9 const 2 10
+10 eq 1 4 9
+11 ite 2 10 6 8
+12 eq 1 4 5
+13 ite 2 12 5 11
+14 ite 2 3 5 13
+15 next 2 4 14
+16 init 2 4 6
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("nu Y. ((mu X. ((st == 0) or <> X)) and [] Y)")
+                .expect("formula");
+        let (verdict, witness) =
+            exact_symbolic_verdict_with_witness(TRAP_FSM, &formula).expect("exact verdict");
+        assert_eq!(
+            verdict,
+            ExactVerdict::Violated,
+            "st==3 is a reachable terminal trap ⇒ AG EF (st==0) is Violated",
+        );
+        let w = witness.expect("a Violated AG EF must yield a reachable-trap-path witness");
+        // The witness ends in the absorbing trap `st==3` (its single-state cycle).
+        let trap_state = w
+            .cycle
+            .last()
+            .or_else(|| w.prefix.last())
+            .expect("non-empty witness");
+        assert_eq!(
+            trap_state.get("st").copied(),
+            Some(3),
+            "the witness ends in the terminal trap st==3; got {trap_state:?}",
+        );
+        // The prefix starts at the reset state (st==0) — a genuine reset→trap path.
+        if let Some(first) = w.prefix.first() {
+            assert_eq!(
+                first.get("st").copied(),
+                Some(0),
+                "the witness prefix starts at the reset state st==0",
+            );
+        }
     }
 
     /// D1.8 — the stall-lasso witness for a `Violated` `AF (cnt==3)` on the reset
