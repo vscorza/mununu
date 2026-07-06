@@ -119,6 +119,18 @@ use crate::mu_calculus::symbolic::TritBdd;
 use crate::mu_calculus::trit::Trit;
 use crate::mu_calculus::{Control, Formula, FormulaVarId, Guard, ModalKind, Node as MuNode};
 
+/// Bit-count cap for the shared [`BddBitBlaster`]: a design whose cone exceeds this many
+/// register+input bits is rejected before any BDD is built, so a caller (`sv verify-auto`)
+/// degrades to a `Skipped` property rather than OoM. **Calibrated empirically at 40** — a cone
+/// even a few bits wider can blow the BDD arena *during* `walk_design` and panic on a downstream
+/// `unwrap`. Measured 2026-07-06: raising it to 56 made `prim_esc_receiver` (47-b cone) OoM-panic
+/// mid-build instead of decide — its cone is NOT a compact FSM. Designs past the cap are covered by
+/// the portfolio's other engines (the exact engine's cone for the same atom is often narrower — it
+/// seeds only the formula atoms, not the wider auto-seeded cube-predicate set the symbolic engine
+/// needs — so it decides where the cube engine cannot). Do not raise this without a `walk_design`-
+/// internal node-budget guard: a post-walk node check cannot catch a mid-walk arena overflow.
+const MAX_BITBLAST_BITS: u32 = 40;
+
 /// A bit-vector of BDDs, LSB-first: index `b` is the BDD for bit `b`. Every
 /// node's value carries exactly `width` bits.
 type BitVec = Vec<BDDFunction>;
@@ -242,7 +254,6 @@ impl BddBitBlaster {
         // the whole design. On a real design whose CONE is still wide (hundreds of bits) the
         // BDD manager would OoM, so bail with a clean error above a conservative cap and let a
         // caller (`sv verify-auto`) degrade to a `Skipped` property rather than panic.
-        const MAX_BITBLAST_BITS: u32 = 40;
         if total_bits > MAX_BITBLAST_BITS {
             return Err(format!(
                 "symbolic bit-blaster: design has {total_bits} register+input bits \
