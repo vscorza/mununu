@@ -1,20 +1,32 @@
 //! Symbolic Transition System IR — the frontend-agnostic abstraction seam.
 //!
-//! > Status (as-built, 2026-07-05 AR audit): the canonical seam, **partially
-//! > adopted**. Design: `docs/design/sts-ir.md`. This module defines the *interface*
-//! > the abstraction engines need from a symbolic transition system, plus one
-//! > implementation ([`BtorSts`]) wrapping a parsed BTOR2 file. **Live call sites:**
-//! > the eager predicate-cube lift routes its opt-in `SmtAllPairs` may/must/hyper-must
-//! > edges + `combinational_labels` + register-name resolution through this seam
-//! > (`kmts_lift.rs`); the exact engine uses it for `resolve_register`. **Still
-//! > bypassing the seam** (the IR-unification P1 goal, un-finished — see
-//! > `measurements/AR-architecture-review.md`, the "full seam adoption" NO-GO-for-now
-//! > item): the *default* sampling cube path (`cube_sampling_edges` +
-//! > `smt_must_edge::*`), `bit_blast` (uses the shared step *primitive*, not the trait
-//! > type), and both BDD engines (`BddBitBlaster` reads `Btor2File` directly). So the
-//! > seam is canonical + faithful, but the "single de-duplicated predicate image" goal
-//! > is not yet met — three predicate-image implementations coexist (#242 was a
-//! > symptom of two symbol-resolution paths drifting).
+//! > Status (as-built; 2026-07-05 AR audit, updated 2026-07-06): the canonical
+//! > seam, **partially adopted**. Design: `docs/design/sts-ir.md`. This module defines
+//! > the *interface* the abstraction engines need from a symbolic transition system,
+//! > plus one implementation ([`BtorSts`]) wrapping a parsed BTOR2 file. **Live call
+//! > sites:** the eager predicate-cube lift routes its opt-in `SmtAllPairs`
+//! > may/must/hyper-must edges + `combinational_labels` + register-name resolution
+//! > through this seam (`kmts_lift.rs`); the exact engine uses it for
+//! > `resolve_register`. **Still bypassing the seam:** the *default* sampling cube
+//! > path (`cube_sampling_edges` + `smt_must_edge::*`), `bit_blast` (uses the shared
+//! > step *primitive*, not the trait type), and both BDD engines (`BddBitBlaster`
+//! > reads `Btor2File` directly). So the seam is canonical + faithful, but the
+//! > "single de-duplicated predicate image" goal is not yet met — three
+//! > predicate-image impls coexist (#242 was a symptom of two symbol-resolution
+//! > paths drifting).
+//! >
+//! > **Adoption is now scheduled, not blocked.** The per-impl differential harness the
+//! > AR review gated full seam adoption on has shipped
+//! > (`crates/mununu-core/tests/differential_oracle_e2e.rs` —
+//! > `diff_corpus_cegar_vs_symbolic_engine_parity` hard-gates every cube definite
+//! > against the exact oracle), so the roll-in is a graduated, differential-guarded
+//! > sequence (roadmap Track AR §AR-S): **S1** converge the BDD engines' infra (var
+//! > enumeration + cell naming) through [`SymbolicTransitionSystem`] — kills the #242
+//! > drift class; **S2** route the default sampling path through [`StepEval`] /
+//! > [`SmtEncode`]; **S3** (optional) the literal single image. Note the BDD engines'
+//! > `abstract_relation` is a *different* algorithm (symbolic BDD, not SMT
+//! > per-cube-pair), so only their infra converges — they never fold into
+//! > `may_edges`.
 //!
 //! The seam is two traits over a shared metadata trait:
 //!
