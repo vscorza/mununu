@@ -74,9 +74,13 @@ concrete RTL execution: Verilator (`hw-verif:latest`, native SV packages — no 
 byte-exact upstream `csrng_main_sm` shows the trap reached and held — reset→MainSmIdle(55),
 `local_escalate_i`→MainSmError(41) in one clock with `main_sm_err_o=1`, then 40 cycles never
 returning to Idle after deassert. So `AG EF MainSmIdle = VIOLATED` is not a model-only claim:
-`.claude/reviews/prospector/staging/RTL-003-csrng-main-sm/repro/sim-csrng.log`. (This is the P3
-seed — one design; extending it to every VIOLATED needs a witness/replay harness, since the exact
-engine does not yet emit a counterexample trace for the `AG EF` shape.)
+`.claude/reviews/prospector/staging/RTL-003-csrng-main-sm/repro/sim-csrng.log`. **The exact engine
+now emits a concrete counterexample for the `AG EF` recoverability shape too**
+(`exact_reachable_trap_path` — a reset→trap path where the trap is the absorbing `¬EF p` region),
+so all 7 `Violated` verdicts carry a replayable trace (the 6 `AG EF` traps + uart's `AG AF` stall
+lasso). RTL replay is directed per design (drive the trap-inducing input, confirm the trap is
+reached and held): csrng ✅ and edn are grounded; the remaining traps are the same mechanical
+pattern.
 
 **Category B — fairness-dependent must-liveness (1).** `uart_tx AG AF (bit_cnt==0)` is an `AF`
 (all-paths) property: with a free environment the baud tick can stall forever, holding a
