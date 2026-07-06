@@ -1823,6 +1823,30 @@ pub fn verify_auto(
         .collect();
     let is_input = |name: &str| -> bool { input_symbols.contains(name) };
 
+    // A.4 honest-⊥ signal (2026-07-06) — the sampling may-relation (`MayEdgeInference::Off`,
+    // the pure-state default) enumerates at most `SAMPLED_INPUT_CAP` boolean inputs per source
+    // cube. A design with MORE free boolean inputs is sampled INCOMPLETELY, so the may-relation
+    // UNDER-approximates the real one (`real ⊄ may`) and a cube DEFINITE on a modal property is
+    // NOT sound — a missed input can hide a real successor (`[]φ`=True) or a real path
+    // (`<>`/`EF`=False). This is exactly the ibex_controller failure: sampling missed the edge
+    // back to DECODE → a spurious `AG EF DECODE` = VIOLATED contradicting the sound exact engine.
+    // When this holds, a definite cube verdict on such a property is downgraded to ⊥ below. Small
+    // designs (≤ cap → exhaustive enumeration → sound) and input/compound/derived/combinational
+    // props (routed to the sound SmtAllPairs may) are unaffected.
+    const SAMPLED_INPUT_CAP: usize = 8; // == kmts_lift / cegar `max_input_bits`
+    let n_bool_inputs = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            crate::adapter::btor2::ast::Node::Input { sort, .. } => {
+                crate::adapter::btor2::parser::bv_width(&file, *sort)
+            }
+            _ => None,
+        })
+        .filter(|w| *w == 1)
+        .count();
+    let sampling_may_incomplete = n_bool_inputs > SAMPLED_INPUT_CAP;
+
     // H.E (combinational outputs) — named combinational nodes: an `Op` carrying
     // its OWN symbol that is neither a state cell (incl. value-alias, via
     // `resolves_to_state` precedence in the seeder) nor an input. Each is
@@ -1901,6 +1925,9 @@ pub fn verify_auto(
     // (an under-approximation, unsound for the `AG` box); drives the
     // abstraction-posture note. Empty ⇒ every property used the sound SmtAllPairs may.
     let mut sampling_may_props: Vec<String> = Vec::new();
+    // A.4 honest-⊥ — properties whose cube DEFINITE was downgraded to ⊥ because the sampling
+    // may-relation was incomplete (see `sampling_may_incomplete`); surfaced in a soundness note.
+    let mut sampling_downgraded_props: Vec<String> = Vec::new();
 
     // 4. Per property: seed → CEGAR → verdict.
     for t in &extraction.translated {
@@ -2246,6 +2273,24 @@ pub fn verify_auto(
             },
         };
 
+        // A.4 honest-⊥ downgrade — a cube DEFINITE from the sampling may-relation is unsound
+        // when the input enumeration was incomplete (`sampling_may_incomplete`) and the property
+        // is (a) a pure-state property routed to the sampling may (`!sound_may`) and (b) modal
+        // (its verdict depends on may-completeness). Emit ⊥ rather than a possibly-wrong definite;
+        // the exact engine (or `--may-edge-inference smt-all-pairs`) decides it soundly. Without
+        // this guard the cube engine returns e.g. a spurious `AG EF DECODE` = VIOLATED on
+        // ibex_controller, contradicting the sound exact verdict.
+        let outcome = if !sound_may
+            && sampling_may_incomplete
+            && formula.has_modality()
+            && outcome_definite(&outcome).is_some()
+        {
+            sampling_downgraded_props.push(t.name.clone());
+            VerifyOutcome::Unknown { unknown_cells: 0 }
+        } else {
+            outcome
+        };
+
         report.properties.push(PropertyVerdict {
             name: t.name.clone(),
             kind: t.kind,
@@ -2277,6 +2322,36 @@ pub fn verify_auto(
     );
     if let Some(n) = annotation_note(&ann_scan) {
         report.notes.push(n);
+    }
+    // A.4 honest-⊥ — surface any cube definite that was downgraded to ⊥ because the sampling
+    // may-relation under-approximated (design has > SAMPLED_INPUT_CAP boolean inputs, so the
+    // input enumeration was incomplete). A soundness caveat, not an error: the verdict is
+    // honestly ⊥ rather than a possibly-wrong definite. Use the exact engine or
+    // `--may-edge-inference smt-all-pairs` for a definite verdict on these.
+    if !sampling_downgraded_props.is_empty() {
+        report.notes.push(VerificationNote {
+            kind: "sampling-may-downgrade".to_string(),
+            level: NoteLevel::SoundnessCaveat,
+            summary: format!(
+                "{} modal propert{} downgraded to ⊥: the sampling may-relation under-approximated \
+                 (design has {n_bool_inputs} boolean inputs > the {SAMPLED_INPUT_CAP}-input \
+                 sampling cap)",
+                sampling_downgraded_props.len(),
+                if sampling_downgraded_props.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ),
+            detail: "A cube DEFINITE on a modal property is unsound when the may-relation is an \
+                     under-approximation: sampling a subset of the design's inputs can miss a real \
+                     may-successor, hiding a real path (a spurious VIOLATED) or a real violation (a \
+                     spurious HOLDS). These properties were returned as ⊥ rather than a \
+                     possibly-wrong definite. Re-run with `--may-edge-inference smt-all-pairs` for \
+                     a sound over-approximating may-relation, or use the exact-symbolic engine."
+                .to_string(),
+            items: sampling_downgraded_props.clone(),
+        });
     }
     Ok(report)
 }

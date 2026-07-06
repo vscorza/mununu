@@ -20,7 +20,7 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 
 ## Verdict census (exact-symbolic engine + R-F5.6 COI, reset-gated)
 
-16 distinct OpenTitan modules, 17 ledger properties.
+18 distinct designs (17 OpenTitan + the lowRISC ibex core), 19 ledger properties.
 
 | # | Module | Liveness property | Verdict | Notes |
 |---|---|---|---|---|
@@ -41,8 +41,10 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 | 15 | prim_packer_fifo | AG EF (depth_o==0) | **True** *(Mul/shift)* | always drainable — decided once the bit-blaster gained Mul + shifts |
 | 16 | prim_fifo_sync | AG EF (depth_o==0) | **True** *(comb-atom)* | always drainable (`depth_o` is combinational → binds via named-signal support) |
 | 17 | prim_alert_sender | AG EF Idle(0) | **False** *(blackbox)* | alert-path sibling of esc_sender, but VIOLATED — the blackboxed diff_decode / sec_anchor / sigint environment can trap it out of Idle |
+| 18 | ibex_controller | AG EF DECODE(5) | **True** *(exact)* | the lowRISC ibex core's main FSM — always returns to executing (no permanent non-DECODE trap). First CPU-scale, non-prim design; exposed + fixed the A.4 sampling-may unsoundness (below) |
+| 19 | keymgr_ctrl | AG EF StCtrlReset(865) | **False** *(exact)* | OpenTitan key-manager sparse FSM — does NOT return to reset (terminal StCtrlDisabled/Invalid traps, the SEC_CM pattern). Deepest closure (10 packages); decidable only after the > 128-bit binary-constant bit-blast fix (256-bit key-state) |
 
-**Tally: True = 9, False = 8, ⊥ = 0. Every design decides.**
+**Tally: True = 10, False = 9, ⊥ = 0. Every design decides.**
 
 ## Are the False verdicts findings? No — expected violations (claims-integrity)
 
@@ -188,6 +190,28 @@ because no two engines ever contradict. Wiring the portfolio as the `verify-auto
 follow-up; the closeout precisions (BDD variable ordering; COI on the cube engine, which would lift
 the 2 `Skipped`) raise each engine's individual hit-rate but are no longer *gates* — the portfolio
 is sound today.
+
+## A.4 honest-⊥ — the sampling-may unsoundness ibex_controller exposed (2026-07-06)
+
+Adding the first CPU-scale design (`ibex_controller`) made the parity gate flag a real
+**cross-engine soundness disagreement**: the exact engine said `AG EF DECODE` = **HOLDS** while the
+default cube engine (`Cegar`) said **VIOLATED** — a definite contradiction. Root cause (confirmed
+in code): the default may-relation is `MayEdgeInference::Off`, a **sampling** inference that
+enumerates at most 8 boolean inputs per source cube. ibex has **more than 8** boolean inputs, so the
+sampling was **incomplete** — it MISSED the real edge back to DECODE (`real ⊄ may`), so the cube
+engine concluded "DECODE unreachable" → a **spurious VIOLATED**. The exact engine (full bit-blast,
+no sampling) has the real edge → the sound HOLDS. This is a general hazard: an under-approximate may
+makes a definite `KleeneT` on `[]φ` and a definite `KleeneF` on `<>`/`EF` both unsound.
+
+**Fix — the A.4 honest-⊥ guard** ([`verify_auto`](../crates/mununu-core/src/adapter/slang/verify_auto.rs), `Formula::has_modality`): a
+cube DEFINITE on a modal, pure-state (sampling-may) property is **downgraded to ⊥** when the design
+has more boolean inputs than the sampling cap (incomplete enumeration). The engine now honestly
+returns ⊥ instead of a possibly-wrong definite; the exact engine (or `--may-edge-inference
+smt-all-pairs`) decides it soundly. Effect on the corpus: `ibex_controller` cube → ⊥ (exact True),
+and exactly one prior design's under-sampled Cegar definite → ⊥ (honest; the exact oracle still
+decides it). **Parity gate: 0 oracle-violations, 0 soundness-flips** — the disagreement is resolved
+soundly, not papered over. This is the differential discipline finding + fixing a real soundness
+bug on the first CPU-scale design.
 
 ## Automated, CI-ready e2e
 

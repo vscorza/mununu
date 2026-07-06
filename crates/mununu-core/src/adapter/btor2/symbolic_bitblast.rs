@@ -1298,10 +1298,27 @@ impl BvTermBackend for BddBitBlaster {
     type Error = String;
 
     fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<Self::Value, Self::Error> {
-        // Reuse the concrete constant semantics, then splat to per-bit BDDs. `bv.bits` is a
-        // `u128`, so bit `b ≥ 128` is 0 (and `>> b` would PANIC): guard it. A const wider than
-        // 128 bits only occurs OUT of the property cone (cone widths are ≤ the bit cap), where
-        // the truncated value is verdict-irrelevant; a cone const is ≤ cap bits < 128.
+        // Wide binary literals (> 128 bits) are built DIRECTLY from the bit string, bypassing the
+        // u128 `eval_const_value` (which ERRORS on a > 128-bit `Bin` — u128 overflow). Such consts
+        // occur out of the property cone (verdict-irrelevant, cone widths ≤ the bit cap), but a
+        // hard error would fail the whole exact MC; representing them per-bit keeps the build
+        // going. `s` is the btor2 MSB-first bit string; bit `b` (LSB-first) is `s[len-1-b]`,
+        // zero-extended past the string. Found: keymgr_ctrl's 256-bit key-state constants.
+        if let ConstValue::Bin(s) = value {
+            let bytes = s.as_bytes();
+            let n = bytes.len();
+            return Ok((0..width as usize)
+                .map(|b| {
+                    if b < n && bytes[n - 1 - b] == b'1' {
+                        self.tt.clone()
+                    } else {
+                        self.ff.clone()
+                    }
+                })
+                .collect());
+        }
+        // Non-`Bin` constants (Zero/One/Ones/Dec) fit the concrete u128 semantics. `bv.bits` is a
+        // `u128`, so bit `b ≥ 128` is 0 (and `>> b` would PANIC): guard it.
         let bv = eval_const_value(value, width)?;
         Ok((0..width as usize)
             .map(|b| {
@@ -3710,6 +3727,28 @@ mod tests {
             exact_symbolic_verdict(FROZEN_REG_ATOM_ON_UEXT_ALIAS, &agaf).expect("verdict"),
             exact_symbolic_verdict(FROZEN_REG_ATOM_ON_STATE, &agaf).expect("verdict"),
             "AG AF must also decide identically for named vs uext-aliased state"
+        );
+    }
+
+    /// A binary constant WIDER than 128 bits (out of the property cone) must not fail the exact
+    /// MC — it is built per-bit from the string, not parsed to u128. `wide` is a 130-bit const
+    /// register the FSM never reads; the property is over the 1-bit `fsm`. Regression for the
+    /// keymgr_ctrl "bad binary literal" Skip (256-bit key-state constants).
+    #[test]
+    fn exact_verdict_tolerates_over_128_bit_binary_constant() {
+        // 130-bit `wide` const held in a register out of the `fsm` cone; `fsm` toggles 0↔1.
+        let bits130 = "1".to_string() + &"0".repeat(129); // 130-char MSB-first binary literal
+        let btor2 = format!(
+            "1 sort bitvec 1\n2 sort bitvec 130\n3 const 2 {bits130}\n4 state 1 fsm\n5 state 2 wide\n\
+             6 not 1 4\n7 next 1 4 6\n8 next 2 5 3\n9 zero 1\n10 init 1 4 9\n11 init 2 5 3\n"
+        );
+        let formula = crate::mu_calculus::parser::parse("mu Y. ((fsm == 1) or <> Y)")
+            .expect("EF formula parses");
+        // Must DECIDE (not error on the 130-bit const): fsm reaches 1 ⇒ EF(fsm==1) holds.
+        assert_eq!(
+            exact_symbolic_verdict(&btor2, &formula),
+            Ok(ExactVerdict::Holds),
+            "a > 128-bit out-of-cone binary constant must not fail the exact MC"
         );
     }
 
