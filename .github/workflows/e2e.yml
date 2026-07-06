@@ -1,0 +1,60 @@
+name: E2E (SVA verification)
+
+# The `#[ignore]`d end-to-end suite (`make e2e`) shells out to the external
+# SystemVerilog toolchain — slang + sv2v + yosys, plus btormc for the
+# reachability differential and Verilator for the counterexample-replay gate.
+# Those tools are contributor-installed, not bundled, so `make ci` (in ci.yml)
+# skips these tests. This workflow runs them in the `mununu-sva` image, which
+# pins the whole chain, so the corpus monotone-verdict ledger, the
+# cegar↔symbolic↔exact parity gate, the portfolio e2e, and the RTL-replay gate
+# run automatically instead of only on a manual local docker invocation.
+#
+# Nightly (schedule) + on-demand (workflow_dispatch); not per-PR — building the
+# sva image + running the full corpus under real slang/yosys/Verilator costs
+# minutes, disproportionate for every push. A red run here is a soundness/
+# precision regression the fast PR gate cannot see.
+
+on:
+  schedule:
+    # 04:00 UTC nightly (after typical merge activity settles).
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  sva-e2e:
+    runs-on: ubuntu-latest
+    # slang ships prebuilts for linux-x86_64 (this runner) + macos-arm64 only;
+    # ubuntu-latest is linux-x86_64, so the toolchain resolves natively.
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The sva image extends `mununu-dev` (FROM mununu-dev), so build dev first
+      # and tag it locally for the sva build to pick up.
+      - name: Build mununu-dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.dev
+          load: true
+          tags: mununu-dev:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Plain `docker build` (not build-push-action) so the `FROM mununu-dev:latest`
+      # base resolves against the image the previous step loaded into the daemon —
+      # a buildx `docker-container` builder cannot see locally-loaded images.
+      - name: Build mununu-sva image
+        run: docker build -f docker/Dockerfile.sva -t mununu-sva:latest .
+
+      # Same `make e2e` line a contributor runs locally (the hw-verif principle:
+      # the docker invocation must work identically in CI and on a laptop).
+      - name: Run the SVA e2e suite in the sva image
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/work mununu-sva:latest \
+            make e2e
