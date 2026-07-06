@@ -20,7 +20,7 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 
 ## Verdict census (exact-symbolic engine + R-F5.6 COI, reset-gated)
 
-15 distinct OpenTitan modules, 16 ledger properties.
+16 distinct OpenTitan modules, 17 ledger properties.
 
 | # | Module | Liveness property | Verdict | Notes |
 |---|---|---|---|---|
@@ -40,12 +40,13 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 | 14 | prim_arbiter_tree | AG EF (gnt_o==0) | **True** *(comb-atom)* | always returns to no-grant (combinational output) |
 | 15 | prim_packer_fifo | AG EF (depth_o==0) | **True** *(Mul/shift)* | always drainable — decided once the bit-blaster gained Mul + shifts |
 | 16 | prim_fifo_sync | AG EF (depth_o==0) | **True** *(comb-atom)* | always drainable (`depth_o` is combinational → binds via named-signal support) |
+| 17 | prim_alert_sender | AG EF Idle(0) | **False** *(blackbox)* | alert-path sibling of esc_sender, but VIOLATED — the blackboxed diff_decode / sec_anchor / sigint environment can trap it out of Idle |
 
-**Tally: True = 9, False = 7, ⊥ = 0. Every design decides.**
+**Tally: True = 9, False = 8, ⊥ = 0. Every design decides.**
 
 ## Are the False verdicts findings? No — expected violations (claims-integrity)
 
-**None of the 7 `False` verdicts is a bug finding.** Each was checked against the design's own
+**None of the 8 `False` verdicts is a bug finding.** Each was checked against the design's own
 source; every one is an *expected* violation, and for most the design's *own* SVA asserts the
 behaviour mununu reports. This corpus is a **calibration + methodology testbed, not a findings
 list**, and must be read as such.
@@ -68,6 +69,16 @@ The key reframing: **a `HOLDS` here would be the red flag, not the `VIOLATED`.**
 the error state is escapable WITHOUT reset — a hardening bug contradicting the module's own
 `$stable` FPV assertion. So these VIOLATED verdicts **cross-confirm the design intent** via a
 completely independent (branching-time model-checking) route.
+
+**Category B — blackbox-environment trap (prim_alert_sender).** Unlike Category A's intentional
+terminal states, prim_alert_sender's `AG EF Idle` is VIOLATED as an artifact of the **abstraction
+posture**: its `prim_diff_decode` / `prim_sec_anchor_*` submodules are blackboxed (chaotic-stub),
+so the ack / ping / sigint signals they drive become a FREE adversarial environment that can hold
+the sender out of Idle forever (a never-acking or perpetually-signalling environment). This is the
+honest, sound reading of the *abstracted* model — an in-model expected violation, not a concrete-RTL
+finding (the real submodules constrain that environment). It contrasts with its sibling
+prim_esc_sender, whose `AG EF Idle` HOLDS: a useful calibration data point on how the blackbox
+posture (not the FSM itself) shifts a recoverability verdict.
 
 **RTL grounding (P3, claims-integrity Rule 9).** csrng's VIOLATED verdict is anchored to a
 concrete RTL execution: Verilator (`hw-verif:latest`, native SV packages — no sv2v/yosys) on the

@@ -621,6 +621,28 @@ const CORPUS: &[CorpusDesign] = &[
         config: &[("rst_ni", 1)],
         ledger: &[("(state_q == 0)", LedgerVerdict::True)], // HOLDS (esc_sender recovers to Idle)
     },
+    // prim_alert_sender — 7-state alert-sender FSM (Idle=0), the alert-path sibling of
+    // prim_esc_sender. Instantiated prim_diff_decode / prim_sec_anchor_* submodules are
+    // blackboxed (chaotic-stub), so the closure is DUT + pkg + the prim_assert shim.
+    // AG EF Idle recoverability is VIOLATED (unlike esc_sender, which HOLDS): with the
+    // blackboxed submodules a free alert/ping/sigint environment can drive the FSM into a
+    // reachable state with no path back to Idle — an in-model expected violation (an
+    // adversarial never-acking environment traps it out of Idle), analogous to the other
+    // corpus Violated designs. Non-spurious: reset is gated (rst_ni=1) and Idle=0 is the
+    // real idle state, not a vacuous atom.
+    CorpusDesign {
+        name: "prim_alert_sender",
+        dir: "dc_opentitan_prim_alert_sender",
+        files: &[
+            "prim_alert_sender.sv",
+            "prim_assert.sv",
+            "prim_alert_pkg.sv",
+        ],
+        top: "prim_alert_sender",
+        annotations: &["nu Y. ((mu X. ((state_q == 0) or <> X)) and [] Y)"], // Idle = 0
+        config: &[("rst_ni", 1)],
+        ledger: &[("(state_q == 0)", LedgerVerdict::False)], // VIOLATED (confirmed in docker)
+    },
     // usbdev_linkstate — 6-state USB link FSM (LinkDisconnected=0). AG EF LinkDisconnected —
     // HOLDS via COI (the link is always disconnectable; the 12-bit timers are pruned).
     CorpusDesign {
