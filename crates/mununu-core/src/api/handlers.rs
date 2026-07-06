@@ -811,6 +811,17 @@ pub async fn sv_verify_auto_handler(
             .engine
             .as_deref()
             .is_some_and(|e| e.eq_ignore_ascii_case("exact-symbolic")),
+        // PORTFOLIO — `engine: "portfolio-sequential" | "portfolio-parallel"` runs
+        // several engines and merges (ignores the two single-engine flags above).
+        portfolio: match request.engine.as_deref() {
+            Some(e) if e.eq_ignore_ascii_case("portfolio-sequential") => {
+                Some(crate::adapter::slang::verify_auto::PortfolioMode::Sequential)
+            }
+            Some(e) if e.eq_ignore_ascii_case("portfolio-parallel") => {
+                Some(crate::adapter::slang::verify_auto::PortfolioMode::Parallel)
+            }
+            _ => None,
+        },
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
