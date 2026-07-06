@@ -249,7 +249,6 @@ fn unseedable_skip_reason(unseedable: &[String], diag: &ModelDiagnostics) -> Str
 fn must_edge_inference_label(mode: MustEdgeInference) -> &'static str {
     match mode {
         MustEdgeInference::Off => "off (may-only over-approximation)",
-        MustEdgeInference::SamplingConfluence => "sampling-confluence",
         MustEdgeInference::SmtPerTarget => "SMT ∀∀ per-target",
         MustEdgeInference::SmtPerTargetStandard => "SMT ∀∃ per-target (canonical KMTS)",
         MustEdgeInference::SmtHyperMust => "SMT ∀∃ hyper-must (GKMTS, sound νμ)",

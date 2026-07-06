@@ -1,7 +1,8 @@
 //! R.2.5b session 2 (2026-06-08) — SMT-backed must-edge query.
 //!
-//! Replaces session 1's [`MustEdgeInference::SamplingConfluence`]
-//! sampling-based promotion with a Z3 BV theory check. Given a source
+//! The SMT-proved must-edge relation (replacing the removed session-1
+//! sampling-based `SamplingConfluence` promotion) via a Z3 BV theory
+//! check. Given a source
 //! cube + a target cube + the BTOR2 transition relation, the query
 //! asks:
 //!

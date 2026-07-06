@@ -227,14 +227,6 @@ enum MustEdgeInferenceArg {
     /// no must / hyper-must inference.
     #[default]
     Off,
-    /// Sampling-derived must-edge inference. The lifter's post-pass
-    /// promotes MayOnly → Sharp when all sampled paths agree on
-    /// a single target cube, and emits MustHyperOnly with the
-    /// target set when paths diverge. SOUNDNESS: sampling-based;
-    /// SMT-backed proof is queued for R.2.5b session 2. Verdicts
-    /// depending on the inferred must-edges carry an
-    /// `[R.2.5b-sampling-must]` AdapterWarning.
-    SamplingConfluence,
     /// R.2.5b session 2 (2026-06-08). SMT-backed must-edge inference
     /// via Z3 BV theory using the **stronger ∀∀ form** (`∀ state.
     /// ∀ input. transition ⟹ next ⊨ tgt` — deterministic into tgt
@@ -2286,7 +2278,6 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
     };
     let must_edge_inference = match args.must_edge_inference {
         MustEdgeInferenceArg::Off => MustEdgeInference::Off,
-        MustEdgeInferenceArg::SamplingConfluence => MustEdgeInference::SamplingConfluence,
         MustEdgeInferenceArg::SmtPerTarget => MustEdgeInference::SmtPerTarget,
         MustEdgeInferenceArg::SmtPerTargetStandard => MustEdgeInference::SmtPerTargetStandard,
         MustEdgeInferenceArg::SmtHyperMust => MustEdgeInference::SmtHyperMust,
@@ -2792,9 +2783,6 @@ fn run_cegar_cli(
     // the core MustEdgeInference enum.
     let must_edge_inference = match params.must_edge_inference {
         MustEdgeInferenceArg::Off => mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::Off,
-        MustEdgeInferenceArg::SamplingConfluence => {
-            mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SamplingConfluence
-        }
         MustEdgeInferenceArg::SmtPerTarget => {
             mununu_core::adapter::btor2::kmts_lift::MustEdgeInference::SmtPerTarget
         }
