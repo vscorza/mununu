@@ -726,3 +726,129 @@ fn dump_state_registers_atom_binding_todo() {
         }
     }
 }
+
+// ============================================================================
+// P3 — counterexample ↔ Verilator replay (claims-integrity Rule 9).
+//
+// The exact engine's `AG EF` recoverability counterexample (a reset→trap input
+// sequence) is REPLAYED at RTL under Verilator: the design, driven by the
+// witness's inputs, must actually reach and hold the trap state. A non-reproducing
+// trace is a failure. This closes the loop — the model-level `Violated` verdict is
+// backed by a concrete RTL execution, in the codebase (not a per-design agent run).
+// ============================================================================
+
+/// A self-contained SV FSM with a TERMINAL trap: `st` cycles 0→1→2→0, but `esc_i`
+/// drives it to `st==3` which self-loops (terminal). `AG EF (st==0)` is Violated.
+const TRAP_FSM_SV: &str = r#"module trapfsm (
+  input  logic       clk_i,
+  input  logic       rst_ni,
+  input  logic       esc_i,
+  output logic [1:0] st_o
+);
+  logic [1:0] st;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)         st <= 2'd0;
+    else if (esc_i)      st <= 2'd3;
+    else if (st == 2'd3) st <= 2'd3;
+    else if (st == 2'd2) st <= 2'd0;
+    else                 st <= st + 2'd1;
+  end
+  assign st_o = st;
+endmodule
+"#;
+
+#[test]
+#[ignore = "requires slang + sv2v + yosys + verilator (mununu-sva image); run with --ignored"]
+fn p3_verilator_replays_ag_ef_trap_counterexample() {
+    use mununu_core::adapter::verilator::{
+        TraceReplayConfig, VerilatorOptions, VerilatorTempDir, build_trace_replay_tb_cpp,
+        compile_verilator, locate_verilator, parse_reset_simulation_dump,
+    };
+
+    // 1. verify_auto (exact-symbolic, reset-gated) on the trap FSM → Violated + a
+    //    counterexample carrying the reset→trap INPUT sequence.
+    let src =
+        format!("// @mununu_guarantee nu Y. ((mu X. ((st == 0) or <> X)) and [] Y)\n{TRAP_FSM_SV}");
+    let report = verify_auto(
+        &[("trapfsm.sv".to_string(), src)],
+        &YosysOptions {
+            top: Some("trapfsm".to_string()),
+            use_sv2v: true,
+            ..Default::default()
+        },
+        &VerifyAutoOptions {
+            exact_symbolic: true,
+            config_values: [("rst_ni".to_string(), 1u64)].into_iter().collect(),
+            ..Default::default()
+        },
+    )
+    .expect("verify_auto");
+    let prop = report.properties.first().expect("one property");
+    assert!(
+        matches!(prop.outcome, VerifyOutcome::Violated { .. }),
+        "AG EF (st==0) must be Violated (esc→st==3 terminal trap); got {:?}",
+        prop.outcome
+    );
+    let cx = prop
+        .counterexample
+        .as_ref()
+        .expect("a Violated AG EF must carry a counterexample");
+    assert!(
+        !cx.inputs.is_empty(),
+        "the counterexample must carry the replayable input sequence"
+    );
+
+    // 2. Build the replay trace: the witness inputs (drive esc_i to reach the trap), then a few
+    //    esc_i=0 cycles to confirm the trap PERSISTS (terminal) at RTL.
+    let mut trace: Vec<Vec<(String, u64)>> = cx.inputs.clone();
+    for _ in 0..5 {
+        trace.push(vec![("esc_i".to_string(), 0)]);
+    }
+    let cfg = TraceReplayConfig {
+        top: "trapfsm".to_string(),
+        clock_signal: "clk_i".to_string(),
+        reset_signal: "rst_ni".to_string(),
+        reset_asserted: 0, // active-low rst_ni
+        hold_cycles: 2,
+        held_inputs: vec![],
+        trace,
+        observe_registers: vec!["st_o".to_string()],
+    };
+    let tb = build_trace_replay_tb_cpp(&cfg).expect("render replay testbench");
+
+    // 3. Compile the design + testbench under Verilator and run.
+    let ver = locate_verilator().expect("verilator present (mununu-sva)");
+    let tmp = VerilatorTempDir::new().expect("tempdir");
+    let sv_path = tmp.path().join("trapfsm.sv");
+    std::fs::write(&sv_path, TRAP_FSM_SV).expect("write sv");
+    let opts = VerilatorOptions {
+        top: Some("trapfsm".to_string()),
+        ..Default::default()
+    };
+    let bin = compile_verilator(&ver.path, &opts, &sv_path, &tb, tmp.path())
+        .expect("verilator compile+build");
+    let out = std::process::Command::new(&bin).output().expect("run sim");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // 4. The final observed cycle must be the trap `st_o == 3` — the RTL reached AND held it.
+    //    `parse_reset_simulation_dump` keeps the `cyc<N>:` prefix on each register name, so match
+    //    on the suffix and value rather than the exact string.
+    let dumps = parse_reset_simulation_dump(&stdout);
+    let st_dumps: Vec<_> = dumps.iter().filter(|d| d.name.ends_with("st_o")).collect();
+    assert!(
+        !st_dumps.is_empty(),
+        "expected at least one sampled st_o cycle; full dump: {stdout}"
+    );
+    let last = st_dumps.last().expect("at least one st_o sample");
+    assert_eq!(
+        last.value, 3,
+        "RTL replay of the counterexample must end in the trap st_o==3; full dump: {stdout}"
+    );
+    // The trap is terminal: once entered it must PERSIST for every remaining esc_i=0 cycle. The
+    // last 5 sampled cycles are the persistence tail appended in step 2 — all must read st_o==3.
+    let tail = &st_dumps[st_dumps.len().saturating_sub(5)..];
+    assert!(
+        tail.iter().all(|d| d.value == 3),
+        "trap st_o==3 must be absorbing across the persistence tail; full dump: {stdout}"
+    );
+}
