@@ -5499,7 +5499,8 @@ fn eval_op(
             let b = read(1)?;
             let shift = (b.bits as u32) & (a.width.saturating_sub(1).max(1));
             let signed = sign_extend(a.bits, a.width);
-            let shifted = signed >> shift;
+            // `i128 >> shift` panics for shift ≥ 128; clamp to 127 (a full sign-fill).
+            let shifted = signed >> shift.min(127);
             Ok(BvValue::new(shifted as u128, width))
         }
         Op::Rol => {
@@ -5511,7 +5512,7 @@ fn eval_op(
             } else {
                 (1u128 << a.width) - 1
             };
-            let bits = ((a.bits << shift) | (a.bits >> (a.width - shift))) & mask;
+            let bits = (shl_sat128(a.bits, shift) | shr_sat128(a.bits, a.width - shift)) & mask;
             Ok(BvValue::new(bits, width))
         }
         Op::Ror => {
@@ -5523,13 +5524,13 @@ fn eval_op(
             } else {
                 (1u128 << a.width) - 1
             };
-            let bits = ((a.bits >> shift) | (a.bits << (a.width - shift))) & mask;
+            let bits = (shr_sat128(a.bits, shift) | shl_sat128(a.bits, a.width - shift)) & mask;
             Ok(BvValue::new(bits, width))
         }
         Op::Concat => {
             let a = read(0)?;
             let b = read(1)?;
-            Ok(BvValue::new((a.bits << b.width) | b.bits, width))
+            Ok(BvValue::new(shl_sat128(a.bits, b.width) | b.bits, width))
         }
         Op::Slice => {
             let a = read(0)?;
@@ -5541,7 +5542,9 @@ fn eval_op(
                 .get(1)
                 .copied()
                 .ok_or_else(|| "slice missing lower".to_string())?;
-            let shifted = a.bits >> lower;
+            // A slice lower bound ≥ 128 (slicing a high bit of a > 128-bit value) would overflow
+            // the u128 shift; saturate to 0 (the sliced-out high bits are outside the window).
+            let shifted = shr_sat128(a.bits, lower);
             let mask = if width >= 128 {
                 u128::MAX
             } else {
@@ -5569,6 +5572,20 @@ fn eval_op(
             "operator {op:?} unsupported in Phase 1 bit-blaster"
         )),
     }
+}
+
+// The concrete backend represents values in a `u128`, so a value wider than 128 bits is already
+// truncated to its low 128 bits. A shift by ≥ 128 would then overflow-panic in debug (the shifted
+// data lies outside the 128-bit window anyway), so these saturate to 0 — a wide design (e.g.
+// keymgr_ctrl's 256-bit key-state concats) degrades gracefully instead of panicking. Sampling
+// enumeration over such abstracted-away wide datapaths does not need exact > 128-bit values.
+#[inline]
+fn shl_sat128(x: u128, n: u32) -> u128 {
+    if n >= 128 { 0 } else { x << n }
+}
+#[inline]
+fn shr_sat128(x: u128, n: u32) -> u128 {
+    if n >= 128 { 0 } else { x >> n }
 }
 
 fn sign_extend(bits: u128, width: u32) -> i128 {
@@ -5768,6 +5785,19 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
 mod tests {
     use super::*;
     use crate::adapter::AdapterOptions;
+
+    #[test]
+    fn saturating_shifts_do_not_overflow_at_or_above_128() {
+        // The concrete-backend shift guards: a shift ≥ 128 saturates to 0 (no debug panic).
+        // Regression for the keymgr_ctrl cube-lift "shift left with overflow" (256-bit key concat).
+        assert_eq!(shl_sat128(0xFF, 128), 0);
+        assert_eq!(shl_sat128(0xFF, 200), 0);
+        assert_eq!(shr_sat128(u128::MAX, 128), 0);
+        assert_eq!(shr_sat128(u128::MAX, 255), 0);
+        // Below 128 behaves as a normal shift.
+        assert_eq!(shl_sat128(1, 127), 1u128 << 127);
+        assert_eq!(shr_sat128(1u128 << 127, 127), 1);
+    }
 
     // ─────────────────────────────────────────────────────────────
     // §Phase 10 Option-4 step 1a — BvTermBackend equivalence.
