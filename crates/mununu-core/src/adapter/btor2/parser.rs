@@ -430,6 +430,33 @@ pub fn collect_symbols(file: &Btor2File) -> HashMap<Nid, String> {
     out
 }
 
+/// Resolve a BTOR2 leaf cell (state/input) NID to its canonical user-visible
+/// symbol via [`collect_symbols`] alias resolution — a `uext _ NID 0 NAME`
+/// alias name wins over a missing `state`-line symbol (the flattened-yosys
+/// shape), falling back to `{tag}_{nid}` for a truly anonymous cell.
+///
+/// **AR-S1 / AR-GO-1 / #242 drift guard.** This is the ONE cell-naming
+/// function. Every site that names a state/input cell — the exact
+/// bit-blaster's leaf enumeration ([`crate::adapter::sts_ir::BtorSts::leaf_cells`]),
+/// its `next_funcs` keying, its init-constraint keying — MUST resolve through
+/// here, else two sites drift and `next_funcs.get(&cell.symbol)` misses,
+/// silently freezing a register at its init value (the #242 soundness bug: a
+/// false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Routing every site through
+/// one function makes that drift impossible by construction rather than by
+/// matching comments.
+pub(crate) fn resolve_leaf_symbol(
+    symbols: &HashMap<Nid, String>,
+    nid: Nid,
+    raw_symbol: &Option<String>,
+    tag: &str,
+) -> String {
+    symbols
+        .get(&nid)
+        .cloned()
+        .or_else(|| raw_symbol.clone())
+        .unwrap_or_else(|| format!("{tag}_{nid}"))
+}
+
 /// Resolve an Operand's bit-vector width by looking up its defining
 /// line and reading the sort. Returns `None` for unresolvable operands
 /// (off-graph references, array sorts).

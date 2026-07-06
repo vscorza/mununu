@@ -109,7 +109,6 @@ use oxidd::{BooleanFunction, FunctionSubst, Manager, ManagerRef, Subst, VarNo};
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
 use crate::adapter::btor2::bit_blast::eval_const_value;
-use crate::adapter::btor2::parser::bv_width;
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
 use crate::adapter::btor2::term_backend::{BvTermBackend, WalkError, walk_design};
 // R-F5.4.1 — the symbolic mu-calculus evaluator reuses the (must, may) `TritBdd`
@@ -145,29 +144,6 @@ struct Cell {
     is_state: bool,
     vars: BitVec,
     varnos: Vec<VarNo>,
-}
-
-/// Resolve a BTOR2 leaf cell (state/input) NID to its canonical user-visible symbol
-/// via `collect_symbols` alias resolution — a `uext _ NID 0 NAME` alias name wins over
-/// a missing `state`-line symbol (the flattened-yosys shape), falling back to
-/// `{tag}_{nid}` for a truly anonymous cell.
-///
-/// **AR-GO-1 / #242 drift guard.** Cell naming in [`BddBitBlaster::build`] and the
-/// `next_funcs` keying MUST resolve identically, else `next_funcs.get(&cell.symbol)`
-/// misses and the register is silently frozen at its init value (the #242 soundness
-/// bug). Routing both through this one function makes that drift impossible by
-/// construction rather than by two matching comments.
-fn resolve_cell_symbol(
-    symbols: &HashMap<Nid, String>,
-    nid: Nid,
-    raw_symbol: &Option<String>,
-    tag: &str,
-) -> String {
-    symbols
-        .get(&nid)
-        .cloned()
-        .or_else(|| raw_symbol.clone())
-        .unwrap_or_else(|| format!("{tag}_{nid}"))
 }
 
 /// A BDD bit-blaster over one BTOR2 file. Owns one OxiDD manager; every node's
@@ -214,29 +190,23 @@ impl BddBitBlaster {
         file: &Btor2File,
         keep: Option<&std::collections::HashSet<Nid>>,
     ) -> Result<Self, String> {
-        // D1.4 — resolve each state/input to its user-visible name via
-        // `collect_symbols`, which walks Yosys's `uext _ NID 0 NAME` alias ops
-        // back to the underlying (often unnamed) state cell. Without this, the
-        // flattened yosys BTOR2 leaves registers unnamed (`state_<nid>`), so a
-        // predicate over a real register name (`bit_cnt_q`) never binds. For a
-        // directly-named state/input the resolved name equals the raw symbol, so
-        // this is a no-op there; the alias resolution matches what the cube path's
-        // external `resolve_predicate_registers` already relies on.
-        let symbols = crate::adapter::btor2::parser::collect_symbols(file);
-        // Pass 1 — collect register + input cells with their widths.
-        let mut leaf_specs: Vec<(Nid, String, bool, u32)> = Vec::new();
-        for line in &file.lines {
-            let (sort, symbol, is_state, tag) = match &line.node {
-                Node::State { sort, symbol } => (*sort, symbol.clone(), true, "state"),
-                Node::Input { sort, symbol } => (*sort, symbol.clone(), false, "input"),
-                _ => continue,
-            };
-            let width = bv_width(file, sort)
-                .ok_or_else(|| format!("NID {}: {tag} has non-bitvec sort", line.nid))?;
-            // AR-GO-1 / #242 drift guard — same resolver as the `next_funcs` keying below.
-            let symbol = resolve_cell_symbol(&symbols, line.nid, &symbol, tag);
-            leaf_specs.push((line.nid, symbol, is_state, width));
-        }
+        // AR-S1 / D1.4 — the ONE canonical leaf enumeration + naming lives on the
+        // STS-IR seam (`BtorSts::leaf_cells`). It resolves each state/input to its
+        // user-visible name via `collect_symbols` (walking Yosys's `uext _ NID 0 NAME`
+        // alias ops back to the underlying, often unnamed, state cell) through the
+        // single `parser::resolve_leaf_symbol`. Without this the flattened yosys BTOR2
+        // leaves registers unnamed (`state_<nid>`), so a predicate over a real register
+        // name (`bit_cnt_q`) never binds; for a directly-named cell the resolved name
+        // equals the raw symbol, so it is a no-op there. The bit-blaster no longer
+        // re-walks `file.lines` or re-implements naming — its enumeration and the
+        // seam's cannot drift (the #242 class), and Pass 3's `next_funcs` keying below
+        // reuses these same names.
+        let leaf_cells = crate::adapter::sts_ir::BtorSts::new(file).leaf_cells()?;
+        // Pass 1 — register + input cells with their widths, in file order.
+        let leaf_specs: Vec<(Nid, String, bool, u32)> = leaf_cells
+            .iter()
+            .map(|c| (c.nid, c.name.clone(), c.is_state, c.width))
+            .collect();
 
         // R-F5.6 — a leaf is KEPT (a BDD variable) iff no keep-set is given, or its NID is in
         // the property cone. Out-of-cone leaves are pinned to constant 0 (zero variables).
@@ -324,18 +294,16 @@ impl BddBitBlaster {
         })?;
 
         // Pass 3 — collect the per-register next-state functions, keyed by the state's
-        // symbol. AR-GO-1 / #242 drift guard: this MUST resolve identically to the cell
-        // naming in Pass 1 (both via `resolve_cell_symbol`) — else `next_funcs.get(&cell.symbol)`
-        // in `exact_model()` misses and the register is silently frozen at its init value
-        // (the #242 soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Pinned
+        // symbol. AR-S1 / #242 drift guard: these names come from the SAME `leaf_cells`
+        // enumeration as Pass 1, so `next_funcs.get(&cell.symbol)` in `exact_model()`
+        // cannot miss and silently freeze a register at its init value (the #242
+        // soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Pinned
         // (out-of-cone) registers are SKIPPED — they are constants and must not transition.
-        let mut nid_symbol: HashMap<Nid, String> = HashMap::new();
-        for line in &file.lines {
-            if let Node::State { symbol, .. } = &line.node {
-                let sym = resolve_cell_symbol(&symbols, line.nid, symbol, "state");
-                nid_symbol.insert(line.nid, sym);
-            }
-        }
+        let nid_symbol: HashMap<Nid, String> = leaf_cells
+            .iter()
+            .filter(|c| c.is_state)
+            .map(|c| (c.nid, c.name.clone()))
+            .collect();
         for line in &file.lines {
             if let Node::Next { state, value, .. } = &line.node {
                 if !is_kept(*state) {
@@ -1680,20 +1648,19 @@ impl BddBitBlaster {
                 init_value_nid.insert(*state, value.nid());
             }
         }
-        // State-line nid → the symbol `build()` assigned it. MUST use the SAME
-        // `collect_symbols` alias resolution `build()` uses (D1.4), else the cell
-        // lookup below misses on flattened yosys output (cell = `bit_cnt_d`, raw
-        // State symbol = none → `state_<nid>`) and the register is left
-        // unconstrained — a silently over-broad init.
+        // State-line nid → the symbol `build()` assigned it. AR-S1 / #242 drift
+        // guard: names go through the SAME `parser::resolve_leaf_symbol` the seam's
+        // `leaf_cells` enumeration (and hence `build()`) uses, else the cell lookup
+        // below misses on flattened yosys output (cell = `bit_cnt_d`, raw State
+        // symbol = none → `state_<nid>`) and the register is left unconstrained — a
+        // silently over-broad init.
         let symbols = crate::adapter::btor2::parser::collect_symbols(file);
         let mut sym_of_nid: HashMap<Nid, String> = HashMap::new();
         for line in &file.lines {
             if let Node::State { symbol, .. } = &line.node {
-                let sym = symbols
-                    .get(&line.nid)
-                    .cloned()
-                    .or_else(|| symbol.clone())
-                    .unwrap_or_else(|| format!("state_{}", line.nid));
+                let sym = crate::adapter::btor2::parser::resolve_leaf_symbol(
+                    &symbols, line.nid, symbol, "state",
+                );
                 sym_of_nid.insert(line.nid, sym);
             }
         }

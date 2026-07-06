@@ -7,23 +7,27 @@
 //! > sites:** the eager predicate-cube lift routes its opt-in `SmtAllPairs`
 //! > may/must/hyper-must edges + `combinational_labels` + register-name resolution
 //! > through this seam (`kmts_lift.rs`); the exact engine uses it for
-//! > `resolve_register`. **Still bypassing the seam:** the *default* sampling cube
-//! > path (`cube_sampling_edges` + `smt_must_edge::*`), `bit_blast` (uses the shared
-//! > step *primitive*, not the trait type), and both BDD engines (`BddBitBlaster`
+//! > `resolve_register` **and (AR-S1) for its leaf-cell enumeration + naming** —
+//! > `BddBitBlaster::build_with_keep` reads [`BtorSts::leaf_cells`], and all three of
+//! > its cell-naming sites now share the one [`parser::resolve_leaf_symbol`]. **Still
+//! > bypassing the seam:** the *default* sampling cube path (`cube_sampling_edges` +
+//! > `smt_must_edge::*`), `bit_blast` (uses the shared step *primitive*, not the trait
+//! > type), and the symbolic BDD engine's `abstract_relation` (a different algorithm —
 //! > reads `Btor2File` directly). So the seam is canonical + faithful, but the
 //! > "single de-duplicated predicate image" goal is not yet met — three
 //! > predicate-image impls coexist (#242 was a symptom of two symbol-resolution
-//! > paths drifting).
+//! > paths drifting; **AR-S1 collapsed the exact engine's copy of that drift class**).
 //! >
 //! > **Adoption is now scheduled, not blocked.** The per-impl differential harness the
 //! > AR review gated full seam adoption on has shipped
 //! > (`crates/mununu-core/tests/differential_oracle_e2e.rs` —
 //! > `diff_corpus_cegar_vs_symbolic_engine_parity` hard-gates every cube definite
 //! > against the exact oracle), so the roll-in is a graduated, differential-guarded
-//! > sequence (roadmap Track AR §AR-S): **S1** converge the BDD engines' infra (var
-//! > enumeration + cell naming) through [`SymbolicTransitionSystem`] — kills the #242
-//! > drift class; **S2** route the default sampling path through [`StepEval`] /
-//! > [`SmtEncode`]; **S3** (optional) the literal single image. Note the BDD engines'
+//! > sequence (roadmap Track AR §AR-S): **S1 ✅ (2026-07-06)** converged the exact
+//! > engine's infra (leaf var-enumeration + cell naming) through [`BtorSts::leaf_cells`]
+//! > + [`parser::resolve_leaf_symbol`] — the #242 drift class is dead by construction;
+//! > **S2** route the default sampling path through [`StepEval`] / [`SmtEncode`];
+//! > **S3** (optional) the literal single image. Note the BDD engines'
 //! > `abstract_relation` is a *different* algorithm (symbolic BDD, not SMT
 //! > per-cube-pair), so only their infra converges — they never fold into
 //! > `may_edges`.
@@ -47,7 +51,7 @@
 use std::collections::HashMap;
 
 use crate::adapter::AdapterError;
-use crate::adapter::btor2::ast::{Btor2File, Node};
+use crate::adapter::btor2::ast::{Btor2File, Nid, Node};
 use crate::adapter::btor2::smt_must_edge::PredicateLike;
 use crate::adapter::btor2::{bit_blast, parser};
 
@@ -57,6 +61,38 @@ use crate::adapter::btor2::{bit_blast, parser};
 pub struct StsVar {
     /// The variable's symbol (e.g. a register name `u_chan0.prediv_q`).
     pub name: String,
+    /// Bit width.
+    pub width: u32,
+}
+
+/// A single BTOR2 leaf cell (state register or free input) with its
+/// NID-level identity — the *concrete*, frontend-specific enumeration the
+/// bit-blaster needs, one level below the agnostic [`StsVar`] view.
+///
+/// AR-S1: this is the **single** BTOR2 leaf enumeration + naming. [`StsVar`]
+/// ([`SymbolicTransitionSystem::state_vars`] / [`input_vars`]) is the
+/// name-and-width-only agnostic projection of it; the exact bit-blaster
+/// ([`BddBitBlaster::build_with_keep`]) consumes the full cell (NID + width +
+/// `is_state`) directly. Both share the one naming function
+/// ([`parser::resolve_leaf_symbol`]), so the #242 drift class cannot recur.
+///
+/// [`input_vars`]: SymbolicTransitionSystem::input_vars
+/// [`BddBitBlaster::build_with_keep`]: crate::adapter::btor2::symbolic_bitblast::BddBitBlaster::build_with_keep
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafCell {
+    /// The defining line's NID (identity for `env` binding, keep-set
+    /// membership, the flat BDD-variable slice, and `next`/`init` keying).
+    pub nid: Nid,
+    /// Canonical user-visible symbol, resolved once via
+    /// [`parser::resolve_leaf_symbol`] (alias-aware, `{tag}_{nid}` for a truly
+    /// anonymous cell).
+    pub name: String,
+    /// Whether the cell carried a real resolved symbol (`true`) or fell back
+    /// to the synthetic `{tag}_{nid}` name (`false`). The agnostic
+    /// [`StsVar`] projection surfaces only `named` cells.
+    pub named: bool,
+    /// `true` for a `state` register, `false` for a free `input`.
+    pub is_state: bool,
     /// Bit width.
     pub width: u32,
 }
@@ -279,6 +315,45 @@ impl<'a> BtorSts<'a> {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out.dedup();
         out
+    }
+
+    /// AR-S1 — the ONE canonical BTOR2 leaf enumeration, in file order. Every
+    /// `state`/`input` cell (including anonymous ones, named `{tag}_{nid}`),
+    /// each carrying its NID, resolved symbol, `named` flag, and width. The
+    /// exact bit-blaster ([`BddBitBlaster::build_with_keep`]) consumes this
+    /// directly — it no longer re-walks `file.lines` or re-implements cell
+    /// naming, so its enumeration and the seam's cannot drift.
+    ///
+    /// Naming goes through the single [`parser::resolve_leaf_symbol`]; width
+    /// through [`parser::bv_width`]. Errors (matching the bit-blaster's
+    /// existing contract) when a `state`/`input` cell has a non-bit-vector
+    /// (e.g. array/memory) sort — the caller degrades that design to
+    /// `Skipped` rather than bit-blasting it. This is deliberately stricter
+    /// than the agnostic [`Self::vars_of`] projection, which tolerates a
+    /// non-bitvec cell by dropping just that cell (the cube path can still
+    /// reason over the scalar registers of a design with memory arrays).
+    ///
+    /// [`BddBitBlaster::build_with_keep`]: crate::adapter::btor2::symbolic_bitblast::BddBitBlaster::build_with_keep
+    pub fn leaf_cells(&self) -> Result<Vec<LeafCell>, String> {
+        let symbols = parser::collect_symbols(self.file);
+        let mut out = Vec::new();
+        for line in &self.file.lines {
+            let (sort, raw, is_state, tag) = match &line.node {
+                Node::State { sort, symbol } => (*sort, symbol, true, "state"),
+                Node::Input { sort, symbol } => (*sort, symbol, false, "input"),
+                _ => continue,
+            };
+            let width = parser::bv_width(self.file, sort)
+                .ok_or_else(|| format!("NID {}: {tag} has non-bitvec sort", line.nid))?;
+            out.push(LeafCell {
+                nid: line.nid,
+                named: symbols.contains_key(&line.nid),
+                name: parser::resolve_leaf_symbol(&symbols, line.nid, raw, tag),
+                is_state,
+                width,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -649,6 +724,90 @@ mod tests {
                 width: 1
             }]
         );
+    }
+
+    // An anonymous 1-bit state cell (no symbol on the state line, no alias) —
+    // the truly-unnamed case that must fall back to `state_<nid>` / `named=false`.
+    const ANON_STATE_BTOR2: &str =
+        "1 sort bitvec 1\n2 zero 1\n3 state 1\n4 init 1 3 2\n5 next 1 3 2\n";
+
+    #[test]
+    fn btor_sts_leaf_cells_is_the_canonical_enumeration() {
+        // AR-S1 — `leaf_cells` is the ONE enumeration the exact bit-blaster reads.
+        // It carries every state/input in file order with its NID + resolved name.
+        let file = parser::parse(STEP_BTOR2).expect("parse");
+        let cells = BtorSts::new(&file).leaf_cells().expect("leaf_cells");
+        assert_eq!(
+            cells,
+            vec![
+                LeafCell {
+                    nid: 3,
+                    name: "q".into(),
+                    named: true,
+                    is_state: true,
+                    width: 1,
+                },
+                LeafCell {
+                    nid: 5,
+                    name: "en".into(),
+                    named: true,
+                    is_state: false,
+                    width: 1,
+                },
+            ],
+            "state cell (nid 3) precedes the input (nid 5) in file order"
+        );
+
+        // The agnostic `state_vars`/`input_vars` projection must agree cell-for-cell
+        // with the named leaf cells — the two views cannot drift (the #242 class).
+        let sts = BtorSts::new(&file);
+        let named_states: Vec<StsVar> = cells
+            .iter()
+            .filter(|c| c.is_state && c.named)
+            .map(|c| StsVar {
+                name: c.name.clone(),
+                width: c.width,
+            })
+            .collect();
+        assert_eq!(sts.state_vars(), named_states);
+    }
+
+    // The real flattened-yosys shape: a 4-bit state cell with NO symbol on the
+    // state line, its user-visible name (`cnt_q`) surviving only on a
+    // width-matched `uext` alias. `collect_symbols` walks the alias back to the
+    // state cell; `leaf_cells` must surface that resolved name — the exact name
+    // the bit-blaster's `next_funcs`/`init` key against (the DR1 #1 / #242 path).
+    const ALIASED_ANON_BTOR2: &str =
+        "1 sort bitvec 4\n2 zero 1\n3 state 1\n4 init 1 3 2\n5 uext 1 3 0 cnt_q\n6 next 1 3 2\n";
+
+    #[test]
+    fn btor_sts_leaf_cells_resolves_uext_alias_name() {
+        let file = parser::parse(ALIASED_ANON_BTOR2).expect("parse");
+        let cells = BtorSts::new(&file).leaf_cells().expect("leaf_cells");
+        let state: Vec<_> = cells.iter().filter(|c| c.is_state).collect();
+        assert_eq!(state.len(), 1);
+        assert_eq!(
+            state[0].name, "cnt_q",
+            "the state cell is named by its width-matched uext alias, not `state_3`"
+        );
+        assert!(state[0].named);
+        assert_eq!(state[0].width, 4);
+    }
+
+    #[test]
+    fn btor_sts_leaf_cells_names_anonymous_cell_by_nid() {
+        // A cell with no symbol and no alias falls back to `state_<nid>` and is
+        // flagged `named = false` — so the agnostic `state_vars` view (named-only)
+        // omits it, while the bit-blaster still allocates a frame slot for it.
+        let file = parser::parse(ANON_STATE_BTOR2).expect("parse");
+        let sts = BtorSts::new(&file);
+        let cells = sts.leaf_cells().expect("leaf_cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].name, "state_3");
+        assert!(!cells[0].named);
+        assert!(cells[0].is_state);
+        // The agnostic projection drops the anonymous cell.
+        assert!(sts.state_vars().is_empty());
     }
 
     #[test]
