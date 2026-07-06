@@ -17,7 +17,7 @@ BASELINE   ?= main
 PROPTEST_CASES ?= 64
 
 .PHONY: build test lint verify ci clean help \
-        test-fast test-properties stress fuzz proptest-deep \
+        test-fast e2e test-properties stress fuzz proptest-deep \
         coverage mem-profile sweep \
         bench-baseline bench-compare bench-record \
         experiment replay publish-prep
@@ -27,6 +27,7 @@ help:
 	@echo "  build          - cargo build --release for mununu-cli and mununu-extract"
 	@echo "  test           - cargo test --workspace"
 	@echo "  test-fast      - cargo test --lib + integration tests, sub-minute (pre-commit gate)"
+	@echo "  e2e            - SVA-verification e2e suite (#[ignore]d; run inside the mununu-sva image)"
 	@echo "  lint           - cargo fmt --check && cargo clippy -D warnings"
 	@echo "  verify         - cargo run mununu against $(VERIFY_FILE)"
 	@echo "  ci             - lint + test (the gate)"
@@ -95,6 +96,28 @@ test:
 # alias to `test` until tier-3 stress tests are split out.
 test-fast:
 	$(CARGO) test --workspace --lib --bins --tests --examples
+
+# End-to-end SVA-verification suite — the `#[ignore]`d tests that shell out to
+# the external SystemVerilog toolchain (slang + sv2v + yosys, plus btormc for
+# the reachability differential and Verilator for the counterexample-replay
+# gate). They are `#[ignore]`d in `make ci` because the tools are contributor-
+# installed, not bundled (subprocess-tools-are-not-bundled policy), so this
+# target runs ONLY inside the `mununu-sva` image, which pins the whole chain.
+# See CLAUDE.md §"SVA-verification e2e validation (slang)".
+#
+#   docker build -f docker/Dockerfile.dev -t mununu-dev .   # once
+#   docker build -f docker/Dockerfile.sva -t mununu-sva .   # once
+#   docker volume create mununu-target                      # warm cargo cache
+#   docker run --rm -v "$(pwd)":/work -v mununu-target:/cargo-target \
+#     mununu-sva make e2e
+#
+# Covers the differential-oracle suite (P1 exact↔btormc reachability, the
+# corpus monotone-verdict ledger + census, the cegar↔symbolic↔exact parity
+# gate, the portfolio e2e, the Verilator counterexample-replay gate) plus the
+# adapter's `e2e_`-prefixed lib tests (verify-auto / extract-sva on real RTL).
+e2e:
+	$(CARGO) test -p mununu-core --lib --all-features e2e_ -- --ignored --nocapture
+	$(CARGO) test -p mununu-core --test differential_oracle_e2e --all-features -- --ignored --nocapture
 
 test-properties:
 	PROPTEST_CASES=$(PROPTEST_CASES) $(CARGO) test --workspace --test 'properties*' -- --nocapture

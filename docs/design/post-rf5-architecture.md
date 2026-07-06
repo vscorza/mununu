@@ -4,12 +4,15 @@
 > `Source of truth:` anchor rule per CLAUDE.md §Documentation Traceability. Every
 > named symbol below is a real, greppable artifact.
 >
-> Status (as-built): the R-F5 symbolic track has **shipped** — R-F5.0 (the OxiDD
-> spike, `mu_calculus/symbolic.rs`) through R-F5.5 (symbolic CEGAR loop, `--engine
-> symbolic` on `sv verify-auto`, and state-predicate-guarded modalities in the cube
-> evaluator). The remaining item is **R-F5.6** — a cone-of-influence restriction for
-> large designs; the symbolic engine is bit-count-capped until then. The few sections
-> still tagged **(planned)** below name that residual gap, not the whole track.
+> Status (as-built, 2026-07-05): the R-F5 symbolic track has **shipped** — R-F5.0 (the
+> OxiDD spike, `mu_calculus/symbolic.rs`) through R-F5.5 (symbolic CEGAR loop, `--engine
+> symbolic`, guarded modalities), and **R-F5.6 cone-of-influence is now shipped on BOTH the
+> exact and the symbolic bit-blaster** (`build_with_keep` + `dep_graph::cone_leaf_nids`), along
+> with bit-blaster op completeness (Mul / barrel shifts / signed compares) and
+> combinational-atom binding. On the 15-module OpenTitan differential-oracle corpus this took
+> bit-cap-⊥ from 9 to 0 (`measurements/differential-corpus-census.md`). The **remaining**
+> R-F5 close-out is BDD variable ordering + cegar-vs-symbolic verdict parity for the
+> default-flip (making `symbolic` the default) — see §7.
 
 ## 0. TL;DR
 
@@ -72,8 +75,9 @@ flowchart TD
 
   STS -->|"StepEval::step (via bit_blast primitive)"| ENUM["Explicit-Enumerate strategy<br/>(bit_blast) — Sharp CLTS"]
   STS -->|"SmtEncode::may_edges + must (opt-in SmtAllPairs);<br/>sampling default reaches Btor2File directly<br/>(--engine explicit, default)"| CUBE["Explicit predicate-cube lift<br/>(kmts_lift::predicate_cube_lift)"]
-  B2 -->|"BDD relation build (--engine symbolic; reads Btor2File)"| SYM["Symbolic predicate-cube (BDD)<br/>(symbolic_bitblast::BddBitBlaster<br/>→ AbstractRelation)"]
-  B2 -->|"full-state bit-blast (--engine exact-symbolic; reads Btor2File)"| EXACT["Exact-symbolic MC<br/>(symbolic_bitblast::exact_symbolic_verdict<br/>→ ExactModel, 2-valued definite)"]
+  B2 -->|"cone-of-influence keep-set (R-F5.6;<br/>dep_graph::cone_leaf_nids)"| COI["BddBitBlaster::build_with_keep<br/>(bit-blast the property cone;<br/>pin out-of-cone leaves to const 0)"]
+  COI -->|"BDD relation build (--engine symbolic)"| SYM["Symbolic predicate-cube (BDD)<br/>(symbolic_cube_verdicts<br/>→ AbstractRelation)"]
+  COI -->|"full-state bit-blast (--engine exact-symbolic)"| EXACT["Exact-symbolic MC<br/>(exact_symbolic_verdict<br/>→ ExactModel, 2-valued definite)"]
 
   ENUM --> CLTS["Clts (K)MTS<br/>states + may/must transitions + 3-valued labels"]
   CUBE --> CLTS
@@ -111,6 +115,99 @@ flowchart TD
   against `evaluate_tri` but not on a production caller.
 - All paths converge on the same verdict vocabulary (2-valued for exact/Sharp;
   3-valued Kleene for the abstraction paths).
+
+---
+
+## 2b. Operation modes — the path per `--engine`
+
+`sv verify-auto` exposes three engines via `--engine {explicit | symbolic | exact-symbolic}`
+(default `explicit`), plus the general `context eval` KMTS path for non-verify-auto adapters.
+Each is a different route from the same BTOR2 model to a verdict; this section draws the parts
+each one exercises. **Two dimensions distinguish them:** the *abstraction* (full concrete state
+vs a predicate cube) and the *engine representation* (explicit vs BDD).
+
+| CLI | Abstraction | Representation | Domain | Cone-of-influence | Refines? | Entry point |
+|---|---|---|---|---|---|---|
+| `--engine exact-symbolic` | **full concrete state** (bit-blast) | BDD (ROBDD) | 2-valued (definite) | ✅ R-F5.6 | no (exact) | `exact_symbolic_verdict` |
+| `--engine symbolic` | **predicate cube** | BDD relation | 3-valued (Kleene) | ✅ R-F5.6 | yes (symbolic CEGAR) | `symbolic_cube_verdicts` |
+| `--engine explicit` *(default)* | **predicate cube** | explicit KMTS (2^\|P\| states) | 3-valued (Kleene) | via cluster COI | yes (WP/interpolant CEGAR) | `cegar_refine_loop` |
+| `context eval` | adapter-chosen (enum / KMTS lift) | explicit `Clts` | 2- or 3-valued | — | no | `evaluate` / `evaluate_tri` |
+
+### Mode A — `--engine exact-symbolic` (full-state bit-blast, "bitblast")
+
+No predicate abstraction: the engine bit-blasts the whole (cone-restricted) state and decides
+the μ-calculus **exactly** over a ROBDD of the concrete state. 2-valued — it never returns `⊥`.
+
+```mermaid
+flowchart TD
+  X0["sv verify-auto --engine exact-symbolic"] --> X1["formula atoms → PredicateExpr<br/>(parse_predicate_expr + resolve_predicate_expr_registers)"]
+  X1 --> X2["cone-of-influence keep-set<br/>dep_graph::cone_leaf_nids (state+input cone) — R-F5.6"]
+  X2 --> X3["BddBitBlaster::build_with_keep(keep)<br/>out-of-cone leaves pinned to const 0"]
+  X3 --> X4["walk_design: per-nid BDD BitVec<br/>+ next_funcs (state) + named_signals (comb. outputs)"]
+  X4 --> X5["predicate_bdd → signal_bits<br/>(register OR combinational output, e.g. gnt_o / depth_o)"]
+  X5 --> X6["ExactModel: to_next · diamond_pre · box_pre"]
+  X6 --> X7["evaluate: νμ fixpoint over the full-state BDD"]
+  X7 --> X8["ExactVerdict: Holds / Violated (definite, never ⊥)"]
+```
+
+- **Cone-of-influence (R-F5.6)** is what makes this tractable on real designs: the 40-bit blast
+  cap counts only the *property cone's* register+input bits. On the differential-oracle corpus
+  this took bit-cap-⊥ from 9 designs to 0.
+- **Combinational-atom binding** (`named_signals` / `signal_bits`) lets a property target a
+  combinational output (`gnt_o`, `depth_o`) whose backing register was optimized away by yosys.
+
+### Mode B — `--engine symbolic` (predicate-cube, BDD relation)
+
+Predicate abstraction, but the abstract relation is a **BDD** (`R_may`/`R_must`), built once —
+avoiding the `O(2^{2|P|})` per-cube-pair SMT. 3-valued; a `⊥` cube drives symbolic CEGAR.
+
+```mermaid
+flowchart TD
+  S0["--engine symbolic"] --> S1["predicates: PredicateSpec (canonicalized)<br/>+ compound PredicateExpr"]
+  S1 --> S2["cone-of-influence keep-set (R-F5.6, same primitive as exact)"]
+  S2 --> S3["BddBitBlaster::build_with_keep"]
+  S3 --> S4["abstract_relation(predicates) → R_may / R_must BDDs<br/>(substitute + apply_exists per predicate — built ONCE)"]
+  S4 --> S5["AbstractRelation::evaluate<br/>BDD image/preimage νμ fixpoint (box_pre / diamond_pre)"]
+  S5 --> S6["TritBdd (must,may) → Trit per cube: True / False / ⊥"]
+  S6 -->|"⊥ cube"| S7["symbolic_cegar_refine:<br/>add predicate, rebuild relation, re-evaluate"]
+  S7 --> S4
+```
+
+### Mode C — `--engine explicit` (default; predicate-cube, explicit KMTS)
+
+Predicate abstraction with the **explicit** KMTS: materialise `2^|P|` cube states + may/must
+adjacency, evaluate with `evaluate_tri`. The workhorse default; CEGAR splits cubes on `⊥`.
+
+```mermaid
+flowchart TD
+  E0["--engine explicit (default)"] --> E1["predicate_cube_lift (kmts_lift)"]
+  E1 --> E2["may_edges (sampling default, or opt-in SmtAllPairs)<br/>+ must_edges (∀∃)"]
+  E2 --> E3["Clts KMTS: 2^|P| cube states<br/>Sharp / MayOnly / MustHyperOnly edges + Tristate labels"]
+  E3 --> E4["evaluate_tri: KleeneDom fixpoint over TritSet"]
+  E4 --> E5["Trit per cube: True / False / ⊥"]
+  E5 -->|"⊥"| E6["cegar_refine_loop:<br/>WeakestPrecondition / CraigInterpolation predicate, re-lift"]
+  E6 --> E1
+```
+
+### Mode D — `context eval` (KMTS lifter → KleeneDomain; general adapters)
+
+The non-verify-auto path: any adapter builds a `Clts` (directly, or the SV KMTS lifter turns
+BTOR2 into a KMTS with `state_3valued_predicates`), then the evaluator decides. This is the
+`context eval --adapter … --formula …` surface — 2-valued for a Sharp CLTS, 3-valued Kleene
+when the model carries a may/must split.
+
+```mermaid
+flowchart TD
+  C0["context eval --adapter sv-yosys --preprocessor sv2v --formula …"] --> C1["sv2v + yosys → BTOR2"]
+  C1 --> C2["KMTS lifter (R.2): BTOR2 → Clts KMTS<br/>state_3valued_predicates (Tristate)"]
+  C2 --> C3["evaluate_tri (R.3, KleeneDom) — or evaluate (BoolDom) for a Sharp CLTS"]
+  C3 --> C4["per-state verdict: True / False / (⊥)"]
+```
+
+**Choosing a mode.** Exact-symbolic is the sharpest (definite verdicts, no `⊥`) but bounded by
+the cone's bit-width; the two predicate-cube engines trade exactness for scale (a `⊥` when the
+predicates are too coarse, refined by CEGAR). Symbolic vs explicit is a representation choice at
+the same abstraction — pick symbolic when `2^|P|` cube enumeration is the bottleneck (§5).
 
 ---
 
@@ -303,11 +400,12 @@ flowchart TB
     ex1 --> ex2 --> ex3 --> ex4
   end
   subgraph SY["Symbolic engine (R-F5, shipped)"]
+    sy0["Cone-of-influence restriction (R-F5.6)<br/>build_with_keep — bit-blast only the property cone"]
     sy1["No cube enumeration — vars = predicate bits"]
     sy2["Build R_may / R_must as BDDs<br/>(BddBitBlaster, from BTOR2, once — not per pair)"]
     sy3["Fixpoint: BDD image/preimage<br/>∃x'. R(x,x') ∧ φ(x')  via apply_exists(And,…)"]
     sy4["Verdict: TritBdd (must/may BDD)"]
-    sy1 --> sy2 --> sy3 --> sy4
+    sy0 --> sy1 --> sy2 --> sy3 --> sy4
   end
 ```
 
@@ -440,10 +538,13 @@ flowchart LR
     d8["R-F5.3 symbolic R_may/R_must from BTOR2<br/>(BddBitBlaster → AbstractRelation, built once — not per pair)"]
     d9["R-F5.4 --engine symbolic on btor2/sv cegar (CLI + API)"]
     d10["R-F5.5 symbolic CEGAR loop + verify-auto wiring +<br/>compound-predicate cube dims"]
+    d11["R-F5.6 cone-of-influence on BOTH bit-blasters<br/>(build_with_keep + cone_leaf_nids)"]
+    d12["Bit-blaster op completeness (Mul / shifts / signed) +<br/>combinational-atom binding (named_signals)"]
   end
-  subgraph PLAN["Remaining"]
-    p1["R-F5.6 cone-of-influence restriction<br/>(symbolic engine is bit-count-capped today)"]
-    p2["Out-of-fragment over cubes (honest errors, not planned):<br/>controllability (ctrl) + step-bounded (steps) modalities;<br/>MustHyperOnly edges on the symbolic path"]
+  subgraph PLAN["Remaining (R-F5 close-out → default-flip)"]
+    p1["BDD variable ordering (push the cone cap higher generally)"]
+    p2["cegar-vs-symbolic verdict parity → make --engine symbolic the default"]
+    p3["Out-of-fragment over cubes (honest errors, not planned):<br/>controllability (ctrl) + step-bounded (steps) modalities;<br/>MustHyperOnly edges on the symbolic path"]
   end
   SHIP --> PLAN
 ```
@@ -459,13 +560,21 @@ modalities. This resolved the R-F5.0 spike's open question — the spike validat
 *evaluation* side (given a symbolic relation) and R-F5.3 delivered the *construction*
 side via BDD bit-blasting.
 
-**The remaining item is R-F5.6 (cone-of-influence).** `BddBitBlaster` currently
-bit-blasts the whole design, so the symbolic engine is gated by a bit-count cap
-(`MAX_SYMBOLIC_CUBE_BITS`) and skips designs above it (real sysrst RTL hits the cap).
-Restricting the bit-blast to the predicate cone-of-influence is the scaling work that
-lifts the cap. Independently, controllability (`ctrl`) and step-bounded (`steps`)
-modalities, and `MustHyperOnly` edges on the symbolic path, are **honest errors** (out of
-the predicate-cube fragment) rather than planned features — see `mu_calculus/symbolic.rs`.
+**R-F5.6 cone-of-influence has shipped (2026-07-05).** `BddBitBlaster::build_with_keep` pins
+out-of-cone leaves to constants so each engine bit-blasts only the property's cone
+(`dep_graph::cone_leaf_nids`), lifting the 40-bit cap on real designs — both the exact and the
+symbolic engines wire it (`exact_symbolic_verdict`, `symbolic_cube_verdicts`). Bit-blaster op
+completeness (`Mul` shift-and-add, `Sll`/`Srl`/`Sra` barrel shifter, signed `Slt`/`Sgt`/…) and
+combinational-atom binding (`named_signals` — bind a predicate to a combinational output whose
+register yosys optimized away) landed alongside. On the 15-module OpenTitan corpus the census
+went from True=3/False=4/⊥=9 to True=9/False=7/⊥=0.
+
+**Remaining (the R-F5 close-out → default-flip).** BDD **variable ordering** (push the cone cap
+higher for still-wide cones generally) and **cegar-vs-symbolic verdict parity** across the full
+suite, which together gate making `--engine symbolic` the default. Independently, controllability
+(`ctrl`) and step-bounded (`steps`) modalities, and `MustHyperOnly` edges on the symbolic path,
+are **honest errors** (out of the predicate-cube fragment) rather than planned features — see
+`mu_calculus/symbolic.rs`.
 
 ---
 

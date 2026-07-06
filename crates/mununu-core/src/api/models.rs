@@ -1050,9 +1050,12 @@ pub struct SvVerifyAutoRequest {
     /// note. Default empty.
     #[serde(default)]
     pub counter_bounds: Vec<String>,
-    /// R-F5.5d (2026-07-03) — predicate-cube engine: `"explicit"` (default) or
-    /// `"symbolic"` (R-F5 BDD relation + CEGAR loop, no per-cube-pair SMT).
-    /// Mirrors the CLI `--engine`.
+    /// Engine selector, mirroring the CLI `--engine`: `"explicit"`, `"symbolic"`,
+    /// `"exact-symbolic"`, `"portfolio-sequential"`, `"portfolio-parallel"`.
+    /// **Unspecified ⇒ the default `"portfolio-sequential"`** (2026-07-06): run
+    /// exact → symbolic → explicit, stopping when every property is decided — the
+    /// most precise sound choice, no slower than the former `explicit` default on
+    /// designs `explicit` already decided. Resolved by `verify_auto::engine_selection`.
     #[serde(default)]
     pub engine: Option<String>,
 }

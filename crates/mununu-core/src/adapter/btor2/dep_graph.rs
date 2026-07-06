@@ -211,6 +211,48 @@ pub fn resolve_atom_to_terminals(file: &Btor2File, atom: &str) -> Option<HashSet
 /// the reduction into an unsound over-approximation. This mirrors the
 /// closure in [`super::bit_blast`]'s `cone_slice`.
 pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
+    let (cone, symbols) = cone_symbols(file, atoms);
+    // Map cone state symbols back to their state-line NIDs.
+    file.states()
+        .filter(|l| {
+            symbols
+                .get(&l.nid)
+                .map(|sym| cone.contains(sym))
+                .unwrap_or(false)
+        })
+        .map(|l| l.nid)
+        .collect()
+}
+
+/// R-F5.6 — the cone's **state + input** NIDs (the exact-symbolic bit-blaster's keep-set).
+///
+/// Unlike the per-cluster path ([`state_cone_nids`]), the exact bit-blaster's bit cap counts
+/// INPUT bits as well as register bits (both become BDD variables), so cutting the design to
+/// the property cone must also pin out-of-cone INPUTS. An input in the cone feeds a cone
+/// register's `next` (or an atom directly) and stays free; an input outside the cone cannot
+/// influence any atom, so pinning it to a constant is sound (same COI argument as
+/// [`state_cone_nids`], extended to the input frame).
+pub fn cone_leaf_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
+    let (cone, symbols) = cone_symbols(file, atoms);
+    file.lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::State { .. } | Node::Input { .. }))
+        .filter(|l| {
+            symbols
+                .get(&l.nid)
+                .map(|sym| cone.contains(sym))
+                .unwrap_or(false)
+        })
+        .map(|l| l.nid)
+        .collect()
+}
+
+/// Shared core of [`state_cone_nids`] / [`cone_leaf_nids`]: the full cone-of-influence SYMBOL
+/// set (state + input) of `atoms`, closed under the data-flow dependency relation AND
+/// `constraint` / `fair` / `justice` co-occurrence. Returns the cone plus the `collect_symbols`
+/// map (reused by the callers to map symbols back to NIDs). See [`state_cone_nids`]'s SOUNDNESS
+/// note — with the constraint/fairness closure this is an EXACT reduction (not an approximation).
+fn cone_symbols(file: &Btor2File, atoms: &[String]) -> (HashSet<String>, HashMap<Nid, String>) {
     use crate::adapter::partition::coi::cone_of_influence;
 
     let symbols = parser::collect_symbols(file);
@@ -280,16 +322,7 @@ pub fn state_cone_nids(file: &Btor2File, atoms: &[String]) -> HashSet<Nid> {
         cone = cone_of_influence(&seeds, &deps);
     }
 
-    // Map cone state symbols back to their state-line NIDs.
-    file.states()
-        .filter(|l| {
-            symbols
-                .get(&l.nid)
-                .map(|sym| cone.contains(sym))
-                .unwrap_or(false)
-        })
-        .map(|l| l.nid)
-        .collect()
+    (cone, symbols)
 }
 
 /// Collect the COI seed set for a BTOR2 file from its intrinsic

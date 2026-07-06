@@ -108,6 +108,9 @@ pub struct ExactCounterexample {
     pub prefix: Vec<Vec<(String, u64)>>,
     /// The repeating stall cycle; the last state steps back to `cycle[0]`.
     pub cycle: Vec<Vec<(String, u64)>>,
+    /// P3 — the INPUT assignment driving each transition of `prefix ++ cycle` (`inputs[i]` is
+    /// the input at path-state `i`), for RTL replay. Empty when the engine did not record inputs.
+    pub inputs: Vec<Vec<(String, u64)>>,
 }
 
 /// Convert an engine [`StallLasso`](crate::adapter::btor2::symbolic_bitblast::StallLasso)
@@ -126,6 +129,7 @@ fn exact_counterexample_from_lasso(
     ExactCounterexample {
         prefix: conv(lasso.prefix),
         cycle: conv(lasso.cycle),
+        inputs: conv(lasso.inputs),
     }
 }
 
@@ -559,6 +563,55 @@ pub struct VerifyAutoOptions {
     /// Unknown; bounded by BDD size (a design over the bit cap ⇒ `Skipped`). Takes
     /// precedence over `symbolic_engine`. Mirrors the CLI/API `--engine`.
     pub exact_symbolic: bool,
+    /// PORTFOLIO (2026-07-06) — when set, IGNORE `symbolic_engine`/`exact_symbolic`
+    /// and instead run MULTIPLE engines (exact → symbolic-cube → explicit-CEGAR),
+    /// taking the definite verdict from whichever engine produces one. Proven sound
+    /// by `diff_corpus_cegar_vs_symbolic_engine_parity`: the three engines never
+    /// contradict on a definite verdict, and each cube definite matches the exact MC.
+    /// The mode is a BUDGET knob — [`PortfolioMode::Sequential`] early-exits (cheap),
+    /// [`PortfolioMode::Parallel`] runs all three concurrently (fast, 3× compute).
+    /// Default `None` ⇒ single-engine dispatch (unchanged). Mirrors the CLI/API
+    /// `--engine portfolio-sequential` / `portfolio-parallel`.
+    pub portfolio: Option<PortfolioMode>,
+}
+
+/// PORTFOLIO scheduling mode — the budget knob for the multi-engine default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortfolioMode {
+    /// Run the engines in PRECISION order (exact → symbolic-cube → explicit-CEGAR),
+    /// stopping the moment the report has no ⊥ property. Minimises compute — often
+    /// only the exact engine runs — at the cost of worst-case latency (the sum of
+    /// each engine tried until one decides). The budget-frugal choice.
+    Sequential,
+    /// Run ALL engines CONCURRENTLY (scoped threads) and merge; each property takes
+    /// the definite verdict from whichever engine produced one. Maximises compute
+    /// (every engine always runs) for minimum latency (the fastest engine to decide
+    /// each property). The budget-rich, low-latency choice.
+    Parallel,
+}
+
+/// Map an optional `--engine` / `"engine"` selector string to the
+/// `(symbolic_engine, exact_symbolic, portfolio)` option triple, applying the DEFAULT when the
+/// selector is unspecified. **The default (2026-07-06) is `portfolio-sequential`** — the
+/// exact-first, cube-fallback portfolio, the most precise sound choice and no slower than the
+/// former `explicit` default on designs `explicit` already decided (exact runs first). An
+/// explicit `"explicit"` selects the single predicate-abstraction CEGAR engine. The CLI reaches
+/// the same defaults through clap's `default_value_t = EngineArg::PortfolioSequential`; this
+/// helper is the API/string entry point (and the single place the default is defined for it).
+pub fn engine_selection(engine: Option<&str>) -> (bool, bool, Option<PortfolioMode>) {
+    match engine {
+        Some(e) if e.eq_ignore_ascii_case("symbolic") => (true, false, None),
+        Some(e) if e.eq_ignore_ascii_case("exact-symbolic") => (false, true, None),
+        Some(e) if e.eq_ignore_ascii_case("portfolio-parallel") => {
+            (false, false, Some(PortfolioMode::Parallel))
+        }
+        Some(e) if e.eq_ignore_ascii_case("portfolio-sequential") => {
+            (false, false, Some(PortfolioMode::Sequential))
+        }
+        Some(e) if e.eq_ignore_ascii_case("explicit") => (false, false, None),
+        // Unspecified (or unrecognised) → the default portfolio-sequential.
+        _ => (false, false, Some(PortfolioMode::Sequential)),
+    }
 }
 
 impl Default for VerifyAutoOptions {
@@ -572,6 +625,7 @@ impl Default for VerifyAutoOptions {
             counter_bounds: std::collections::HashMap::new(),
             symbolic_engine: false,
             exact_symbolic: false,
+            portfolio: None,
         }
     }
 }
@@ -1260,6 +1314,247 @@ fn symbolic_final_verdict(
 
 /// Verify every translated SVA property in `sources` against the model, with no
 /// sidecar. `sources` is `(file_name, content)`, the first being the primary.
+/// The portfolio's engines, in PRECISION order (`(label, symbolic_engine, exact_symbolic)`).
+/// Exact first — it is 2-valued/never-⊥ within its bit cap and carries the richest witness;
+/// the two cube engines follow as complementary fallbacks (proven by the parity differential to
+/// never contradict exact or each other). The `label` mirrors the CLI/API `--engine` value.
+const PORTFOLIO_ENGINES: [(&str, bool, bool); 3] = [
+    ("exact-symbolic", false, true),
+    ("symbolic", true, false),
+    ("explicit", false, false),
+];
+
+/// A property's definite verdict as a bool (`Some(true)` = Holds, `Some(false)` = Violated),
+/// or `None` for an undecided (⊥) outcome. The portfolio merges on this.
+fn outcome_definite(o: &VerifyOutcome) -> Option<bool> {
+    match o {
+        VerifyOutcome::Holds => Some(true),
+        VerifyOutcome::Violated { .. } => Some(false),
+        VerifyOutcome::Unknown { .. } | VerifyOutcome::Skipped { .. } => None,
+    }
+}
+
+/// PORTFOLIO orchestrator — run several single-engine [`verify_auto`] passes and merge them
+/// (see [`PortfolioMode`]). `Sequential` runs the engines in precision order, merging after each
+/// and stopping the moment every property is decided (early-exit — often just the exact engine).
+/// `Parallel` runs all three concurrently in scoped threads and merges once. Both call
+/// [`merge_portfolio_reports`], which enforces the runtime soundness guard.
+fn verify_auto_portfolio(
+    sources: &[(String, String)],
+    yosys_opts: &YosysOptions,
+    opts: &VerifyAutoOptions,
+    mode: PortfolioMode,
+) -> Result<AutoVerifyReport, AdapterError> {
+    // A single-engine option set derived from `opts` with the portfolio disabled and the two
+    // engine flags forced to this engine's pair.
+    let mk_opts = |symbolic_engine: bool, exact_symbolic: bool| {
+        let mut o = opts.clone();
+        o.portfolio = None;
+        o.symbolic_engine = symbolic_engine;
+        o.exact_symbolic = exact_symbolic;
+        o
+    };
+
+    match mode {
+        PortfolioMode::Sequential => {
+            let mut runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> = Vec::new();
+            for (label, sym, exact) in PORTFOLIO_ENGINES {
+                runs.push((
+                    label,
+                    verify_auto(sources, yosys_opts, &mk_opts(sym, exact)),
+                ));
+                // Early-exit as soon as the MERGE so far leaves no ⊥ property (the budget win).
+                let merged = merge_portfolio_reports(&runs, mode);
+                if let Ok(rep) = &merged
+                    && rep
+                        .properties
+                        .iter()
+                        .all(|p| outcome_definite(&p.outcome).is_some())
+                {
+                    return merged;
+                }
+            }
+            merge_portfolio_reports(&runs, mode)
+        }
+        PortfolioMode::Parallel => {
+            // Scoped threads borrow `sources` / `yosys_opts`; each owns its option clone.
+            let runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<(&str, _)> = PORTFOLIO_ENGINES
+                        .iter()
+                        .map(|&(label, sym, exact)| {
+                            let o = mk_opts(sym, exact);
+                            (
+                                label,
+                                scope.spawn(move || verify_auto(sources, yosys_opts, &o)),
+                            )
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(label, h)| {
+                            let r = h.join().unwrap_or_else(|_| {
+                                Err(AdapterError {
+                                    kind: AdapterErrorKind::IrConsistencyError,
+                                    message: format!("portfolio: engine `{label}` panicked"),
+                                    location: None,
+                                })
+                            });
+                            (label, r)
+                        })
+                        .collect()
+                });
+            merge_portfolio_reports(&runs, mode)
+        }
+    }
+}
+
+/// Merge the per-engine single-engine reports into one portfolio report. For each property
+/// (matched by name), the merged outcome is the definite verdict from the FIRST engine (in
+/// precision order) that produced one — carrying that engine's counterexample witness; a ⊥
+/// survives only if EVERY engine left it undecided. **Runtime soundness guard:** if two engines
+/// return OPPOSITE definite verdicts (Holds vs Violated) the property is forced to ⊥ with a
+/// `portfolio-soundness-alarm` note — never a silent pick (the runtime form of the parity gate;
+/// the differential proved this never fires on the corpus). Pure over the input reports, so it is
+/// unit-testable without the toolchain.
+fn merge_portfolio_reports(
+    runs: &[(&str, Result<AutoVerifyReport, AdapterError>)],
+    mode: PortfolioMode,
+) -> Result<AutoVerifyReport, AdapterError> {
+    // Successful reports, in precision order (exact first). Errors contribute nothing.
+    let oks: Vec<(&str, &AutoVerifyReport)> = runs
+        .iter()
+        .filter_map(|(l, r)| r.as_ref().ok().map(|rep| (*l, rep)))
+        .collect();
+    let Some(&(_, base)) = oks.first() else {
+        // Every engine errored — surface the first (highest-precision) error.
+        return Err(runs
+            .iter()
+            .find_map(|(_, r)| r.as_ref().err().cloned())
+            .unwrap_or_else(|| AdapterError {
+                kind: AdapterErrorKind::IrConsistencyError,
+                message: "portfolio: no engine produced a report".to_string(),
+                location: None,
+            }));
+    };
+
+    // The base (exact if available) supplies the property list, diagnostics, and notes.
+    let mut merged = base.clone();
+    let mut decided_by: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    let mut contradictions: Vec<String> = Vec::new();
+
+    for prop in merged.properties.iter_mut() {
+        let candidates: Vec<(&str, &PropertyVerdict)> = oks
+            .iter()
+            .filter_map(|(l, rep)| {
+                rep.properties
+                    .iter()
+                    .find(|p| p.name == prop.name)
+                    .map(|p| (*l, p))
+            })
+            .collect();
+        let has_true = candidates
+            .iter()
+            .any(|(_, p)| outcome_definite(&p.outcome) == Some(true));
+        let has_false = candidates
+            .iter()
+            .any(|(_, p)| outcome_definite(&p.outcome) == Some(false));
+
+        if has_true && has_false {
+            // CONTRADICTION — one engine is unsound on this design. Degrade to ⊥, loudly.
+            let trues: Vec<&str> = candidates
+                .iter()
+                .filter(|(_, p)| outcome_definite(&p.outcome) == Some(true))
+                .map(|(l, _)| *l)
+                .collect();
+            let falses: Vec<&str> = candidates
+                .iter()
+                .filter(|(_, p)| outcome_definite(&p.outcome) == Some(false))
+                .map(|(l, _)| *l)
+                .collect();
+            contradictions.push(format!(
+                "{}: Holds@[{}] vs Violated@[{}]",
+                prop.name,
+                trues.join(","),
+                falses.join(",")
+            ));
+            prop.outcome = VerifyOutcome::Unknown { unknown_cells: 0 };
+            prop.counterexample = None;
+            continue;
+        }
+
+        if let Some((label, pv)) = candidates
+            .iter()
+            .find(|(_, p)| outcome_definite(&p.outcome).is_some())
+        {
+            prop.outcome = pv.outcome.clone();
+            prop.counterexample = pv.counterexample.clone();
+            *decided_by.entry(*label).or_default() += 1;
+        } else {
+            // All ⊥ — prefer an Unknown (abstraction attempted, undecided) over a Skipped
+            // (atom not cube-bindable) so the merged ⊥ carries the most informative cause.
+            if let Some((_, pv)) = candidates
+                .iter()
+                .find(|(_, p)| matches!(p.outcome, VerifyOutcome::Unknown { .. }))
+            {
+                prop.outcome = pv.outcome.clone();
+            } else if let Some((_, pv)) = candidates
+                .iter()
+                .find(|(_, p)| matches!(p.outcome, VerifyOutcome::Skipped { .. }))
+            {
+                prop.outcome = pv.outcome.clone();
+            }
+            prop.counterexample = None;
+        }
+    }
+
+    let mode_str = match mode {
+        PortfolioMode::Sequential => "sequential",
+        PortfolioMode::Parallel => "parallel",
+    };
+    let n_props = merged.properties.len();
+    let n_decided = merged
+        .properties
+        .iter()
+        .filter(|p| outcome_definite(&p.outcome).is_some())
+        .count();
+    let engines_ran: Vec<String> = oks.iter().map(|(l, _)| (*l).to_string()).collect();
+    let mut items: Vec<String> = engines_ran.iter().map(|l| format!("ran:{l}")).collect();
+    items.extend(
+        decided_by
+            .iter()
+            .map(|(l, n)| format!("decided-by:{l}={n}")),
+    );
+    merged.notes.push(VerificationNote {
+        kind: "portfolio".to_string(),
+        level: NoteLevel::Info,
+        summary: format!("portfolio-{mode_str}: {n_decided}/{n_props} properties decided"),
+        detail: format!(
+            "portfolio-{mode_str}: {} engine(s) ran ({}); {n_decided}/{n_props} properties decided. \
+             Each property took the definite verdict from the first engine (exact → symbolic → \
+             explicit) to decide it; a ⊥ means every engine left it undecided.",
+            engines_ran.len(),
+            engines_ran.join(", ")
+        ),
+        items,
+    });
+    if !contradictions.is_empty() {
+        merged.notes.push(VerificationNote {
+            kind: "portfolio-soundness-alarm".to_string(),
+            level: NoteLevel::SoundnessCaveat,
+            summary: "engines returned CONTRADICTING definite verdicts (forced to ⊥)".to_string(),
+            detail: format!(
+                "two portfolio engines returned OPPOSITE definite verdicts on the same property; \
+                 the merged outcome is ⊥ (not silently picked) — one engine is unsound on this \
+                 design and must be investigated: {}",
+                contradictions.join("; ")
+            ),
+            items: contradictions,
+        });
+    }
+    Ok(merged)
+}
+
 pub fn verify_auto(
     sources: &[(String, String)],
     yosys_opts: &YosysOptions,
@@ -1274,6 +1569,13 @@ pub fn verify_auto(
     use crate::mu_calculus::Environment;
     use crate::mu_calculus::parser as mu_parser;
     use crate::mu_calculus::trit::Trit;
+
+    // PORTFOLIO dispatch — when a portfolio mode is set, run several single-engine
+    // passes and merge (each inner call has `portfolio: None`, so no recursion). The
+    // single-engine flags are ignored in this mode.
+    if let Some(mode) = opts.portfolio {
+        return verify_auto_portfolio(sources, yosys_opts, opts, mode);
+    }
 
     let (primary_name, primary_content) = sources.first().ok_or_else(|| AdapterError {
         kind: AdapterErrorKind::ParseError,
@@ -1990,6 +2292,252 @@ mod tests {
 
     fn src(content: &str) -> Vec<(String, String)> {
         vec![("design.sv".to_string(), content.to_string())]
+    }
+
+    // ---- PORTFOLIO combiner (hermetic: no toolchain, pure over reports) --------------------
+
+    /// A single-property report with the given name + outcome (+ optional counterexample).
+    fn mk_report(props: &[(&str, VerifyOutcome, Option<ExactCounterexample>)]) -> AutoVerifyReport {
+        AutoVerifyReport {
+            properties: props
+                .iter()
+                .map(|(name, outcome, cx)| PropertyVerdict {
+                    name: name.to_string(),
+                    kind: crate::adapter::slang::translate::SvaKind::Assert,
+                    formula: format!("formula::{name}"),
+                    outcome: outcome.clone(),
+                    seeded_predicates: Vec::new(),
+                    counterexample: cx.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn cx_stub() -> ExactCounterexample {
+        ExactCounterexample {
+            prefix: vec![vec![("st".to_string(), 0)]],
+            cycle: vec![vec![("st".to_string(), 3)]],
+            inputs: vec![vec![("esc".to_string(), 1)]],
+        }
+    }
+
+    /// A cube engine's ⊥ (Unknown) is filled by a later engine's definite verdict, and the
+    /// portfolio note records which engine decided it.
+    #[test]
+    fn portfolio_merge_fills_bottom_with_a_definite() {
+        let exact = (
+            "exact-symbolic",
+            Ok(mk_report(&[(
+                "p",
+                VerifyOutcome::Unknown { unknown_cells: 4 },
+                None,
+            )])),
+        );
+        let symbolic = (
+            "symbolic",
+            Ok(mk_report(&[("p", VerifyOutcome::Holds, None)])),
+        );
+        let runs = vec![exact, symbolic];
+        let merged = merge_portfolio_reports(&runs, PortfolioMode::Parallel).expect("merge ok");
+        assert_eq!(merged.properties[0].outcome, VerifyOutcome::Holds);
+        assert!(
+            merged
+                .notes
+                .iter()
+                .any(|n| n.kind == "portfolio"
+                    && n.items.iter().any(|i| i == "decided-by:symbolic=1")),
+            "the note must attribute the verdict to the symbolic engine"
+        );
+    }
+
+    /// When several engines agree on a definite, the FIRST (exact, highest-precision) engine's
+    /// verdict AND its counterexample witness are retained.
+    #[test]
+    fn portfolio_merge_prefers_exact_witness_on_agreement() {
+        let exact = (
+            "exact-symbolic",
+            Ok(mk_report(&[(
+                "p",
+                VerifyOutcome::Violated { false_cells: 1 },
+                Some(cx_stub()),
+            )])),
+        );
+        let symbolic = (
+            "symbolic",
+            Ok(mk_report(&[(
+                "p",
+                VerifyOutcome::Violated { false_cells: 9 },
+                None,
+            )])),
+        );
+        let runs = vec![exact, symbolic];
+        let merged = merge_portfolio_reports(&runs, PortfolioMode::Sequential).expect("merge ok");
+        // Exact's outcome (false_cells: 1) and its counterexample win.
+        assert_eq!(
+            merged.properties[0].outcome,
+            VerifyOutcome::Violated { false_cells: 1 }
+        );
+        assert!(
+            merged.properties[0].counterexample.is_some(),
+            "exact's counterexample witness must be retained"
+        );
+    }
+
+    /// The runtime soundness guard: OPPOSITE definite verdicts force ⊥ + a soundness-alarm note,
+    /// never a silent pick. (The parity differential proves this never fires on the corpus.)
+    #[test]
+    fn portfolio_merge_contradiction_forces_bottom_and_alarms() {
+        let exact = (
+            "exact-symbolic",
+            Ok(mk_report(&[("p", VerifyOutcome::Holds, None)])),
+        );
+        let symbolic = (
+            "symbolic",
+            Ok(mk_report(&[(
+                "p",
+                VerifyOutcome::Violated { false_cells: 1 },
+                None,
+            )])),
+        );
+        let runs = vec![exact, symbolic];
+        let merged = merge_portfolio_reports(&runs, PortfolioMode::Parallel).expect("merge ok");
+        assert!(
+            matches!(merged.properties[0].outcome, VerifyOutcome::Unknown { .. }),
+            "a contradiction must degrade to ⊥, not silently pick a verdict"
+        );
+        assert!(
+            merged.properties[0].counterexample.is_none(),
+            "a contradicted property carries no witness"
+        );
+        assert!(
+            merged
+                .notes
+                .iter()
+                .any(|n| n.kind == "portfolio-soundness-alarm"),
+            "the contradiction must raise a soundness-alarm note"
+        );
+    }
+
+    /// All engines ⊥: the merged ⊥ prefers an Unknown (abstraction attempted) over a Skipped
+    /// (atom not cube-bindable) — the more informative cause.
+    #[test]
+    fn portfolio_merge_all_bottom_prefers_unknown_over_skipped() {
+        let exact = (
+            "exact-symbolic",
+            Ok(mk_report(&[(
+                "p",
+                VerifyOutcome::Skipped {
+                    reason: "bit cap".to_string(),
+                },
+                None,
+            )])),
+        );
+        let symbolic = (
+            "symbolic",
+            Ok(mk_report(&[(
+                "p",
+                VerifyOutcome::Unknown { unknown_cells: 8 },
+                None,
+            )])),
+        );
+        let runs = vec![exact, symbolic];
+        let merged = merge_portfolio_reports(&runs, PortfolioMode::Parallel).expect("merge ok");
+        assert_eq!(
+            merged.properties[0].outcome,
+            VerifyOutcome::Unknown { unknown_cells: 8 }
+        );
+    }
+
+    /// Every engine errored → the merge surfaces the first (highest-precision) error, not a panic.
+    #[test]
+    fn portfolio_merge_all_errors_returns_first_error() {
+        let err = |m: &str| {
+            Err(AdapterError {
+                kind: AdapterErrorKind::StateSpaceOverflow,
+                message: m.to_string(),
+                location: None,
+            })
+        };
+        let runs: Vec<(&str, Result<AutoVerifyReport, AdapterError>)> = vec![
+            ("exact-symbolic", err("exact boom")),
+            ("symbolic", err("sym boom")),
+        ];
+        let merged = merge_portfolio_reports(&runs, PortfolioMode::Sequential);
+        assert!(merged.is_err());
+        assert_eq!(merged.unwrap_err().message, "exact boom");
+    }
+
+    /// An errored engine contributes nothing; a surviving engine's definite still lands.
+    #[test]
+    fn portfolio_merge_tolerates_one_engine_error() {
+        let exact = (
+            "exact-symbolic",
+            Err(AdapterError {
+                kind: AdapterErrorKind::UnsupportedConstruct,
+                message: "exact rejects free reset".to_string(),
+                location: None,
+            }),
+        );
+        let symbolic = (
+            "symbolic",
+            Ok(mk_report(&[("p", VerifyOutcome::Holds, None)])),
+        );
+        let runs = vec![exact, symbolic];
+        let merged = merge_portfolio_reports(&runs, PortfolioMode::Parallel).expect("merge ok");
+        assert_eq!(merged.properties[0].outcome, VerifyOutcome::Holds);
+    }
+
+    #[test]
+    fn engine_selection_defaults_to_portfolio_sequential() {
+        // THE DEFAULT (2026-07-06): an unspecified engine ⇒ portfolio-sequential.
+        assert_eq!(
+            engine_selection(None),
+            (false, false, Some(PortfolioMode::Sequential))
+        );
+        // An unrecognised string also falls to the default (rather than silently explicit).
+        assert_eq!(
+            engine_selection(Some("nonsense")),
+            (false, false, Some(PortfolioMode::Sequential))
+        );
+        // Each explicit selector maps to exactly its engine (case-insensitive).
+        assert_eq!(engine_selection(Some("explicit")), (false, false, None));
+        assert_eq!(engine_selection(Some("symbolic")), (true, false, None));
+        assert_eq!(
+            engine_selection(Some("exact-symbolic")),
+            (false, true, None)
+        );
+        assert_eq!(
+            engine_selection(Some("EXACT-SYMBOLIC")),
+            (false, true, None)
+        );
+        assert_eq!(
+            engine_selection(Some("portfolio-parallel")),
+            (false, false, Some(PortfolioMode::Parallel))
+        );
+        assert_eq!(
+            engine_selection(Some("portfolio-sequential")),
+            (false, false, Some(PortfolioMode::Sequential))
+        );
+    }
+
+    #[test]
+    fn outcome_definite_maps_holds_violated_only() {
+        assert_eq!(outcome_definite(&VerifyOutcome::Holds), Some(true));
+        assert_eq!(
+            outcome_definite(&VerifyOutcome::Violated { false_cells: 2 }),
+            Some(false)
+        );
+        assert_eq!(
+            outcome_definite(&VerifyOutcome::Unknown { unknown_cells: 1 }),
+            None
+        );
+        assert_eq!(
+            outcome_definite(&VerifyOutcome::Skipped {
+                reason: "x".to_string()
+            }),
+            None
+        );
     }
 
     /// H.5-GR1 — a `@mununu_guarantee` with a valid mu-calculus body is merged as

@@ -205,6 +205,17 @@ enum EngineArg {
     /// design too large to bit-blast ⇒ the property is `Skipped`). Verify-auto only
     /// (the surface that supplies a reset-gated model).
     ExactSymbolic,
+    /// PORTFOLIO (SEQUENTIAL) — run the engines in precision order (exact → symbolic
+    /// → explicit), stopping as soon as every property is decided. Takes the definite
+    /// verdict from whichever engine produces one; a ⊥ means all engines left it
+    /// undecided. Proven sound (the engines never contradict). The budget-FRUGAL
+    /// choice: often only the exact engine runs. Verify-auto only.
+    PortfolioSequential,
+    /// PORTFOLIO (PARALLEL) — run ALL engines concurrently and merge; each property
+    /// takes the definite verdict from whichever engine decided it. Same verdicts as
+    /// `portfolio-sequential` but minimum latency at 3× compute — the budget-RICH,
+    /// low-latency choice. Verify-auto only.
+    PortfolioParallel,
 }
 
 /// R.2.5b session-1 follow-up (2026-06-06) — must-edge inference
@@ -311,11 +322,13 @@ struct Btor2CegarArgs {
     /// human-readable format.
     #[arg(long)]
     json: bool,
-    /// R-F5.4.2b (2026-07-03) — predicate-cube engine: `explicit` (default,
-    /// SMT edges + CEGAR refinement) or `symbolic` (R-F5 BDD relation, no
-    /// per-cube-pair SMT; single-shot at the given predicate set). `symbolic`
-    /// is orders of magnitude faster at large `|P|`.
-    #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
+    /// Engine selector. **Default `portfolio-sequential`** (2026-07-06): run exact →
+    /// symbolic → explicit, stopping when every property is decided — the most
+    /// precise sound choice, no slower than `explicit` on designs `explicit` already
+    /// decides (exact runs first and usually decides FSMs outright). Single-engine
+    /// values (`explicit`, `symbolic`, `exact-symbolic`) and `portfolio-parallel`
+    /// remain available.
+    #[arg(long, value_enum, default_value_t = EngineArg::PortfolioSequential)]
     engine: EngineArg,
     /// R.6.6 / V.6 (2026-06-09) — name of a BTOR2 input symbol the
     /// controller drives. Repeated to declare multiple controllable
@@ -2242,7 +2255,7 @@ fn render_extract_sva_json(report: &mununu_core::adapter::slang::translate::Tran
 /// against the model with no sidecar.
 fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
     use mununu_core::adapter::btor2::kmts_lift::MustEdgeInference;
-    use mununu_core::adapter::slang::verify_auto::{VerifyAutoOptions, verify_auto};
+    use mununu_core::adapter::slang::verify_auto::{PortfolioMode, VerifyAutoOptions, verify_auto};
 
     let primary_name = args
         .file
@@ -2311,6 +2324,13 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         // D1.6 — `--engine exact-symbolic` decides each property exactly over the
         // full bit-blasted state (definite verdict, never ⊥).
         exact_symbolic: args.engine == EngineArg::ExactSymbolic,
+        // PORTFOLIO — `--engine portfolio-sequential|-parallel` runs several engines
+        // and merges (ignores the two single-engine flags above).
+        portfolio: match args.engine {
+            EngineArg::PortfolioSequential => Some(PortfolioMode::Sequential),
+            EngineArg::PortfolioParallel => Some(PortfolioMode::Parallel),
+            _ => None,
+        },
     };
 
     let report = verify_auto(&sources, &yopts, &opts)
@@ -2721,6 +2741,20 @@ fn run_cegar_cli(
             "--engine exact-symbolic is available on `sv verify-auto` only (it decides the \
              property exactly over the reset-gated model verify-auto builds). Use `--engine \
              explicit` or `symbolic` here."
+                .to_string(),
+        );
+    }
+
+    // PORTFOLIO is likewise verify-auto-only: it schedules the exact + cube engines over the
+    // reset-gated model verify-auto builds. Reject it on the raw cube-CEGAR surfaces.
+    if matches!(
+        params.engine,
+        EngineArg::PortfolioSequential | EngineArg::PortfolioParallel
+    ) {
+        return Err(
+            "--engine portfolio-sequential / portfolio-parallel is available on `sv verify-auto` \
+             only (it runs several engines over the reset-gated model verify-auto builds). Use \
+             `--engine explicit` or `symbolic` here."
                 .to_string(),
         );
     }

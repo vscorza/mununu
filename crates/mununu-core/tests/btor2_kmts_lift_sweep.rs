@@ -52,6 +52,14 @@ fn collect_btor2_fixtures() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // Skip the btor2tools HWMCC-style suite: those benchmarks are vendored to
+                // exercise the EXACT engine's bad-reachability + btormc (the
+                // `hwmcc_style_coverage_study`), deliberately spanning far past the R.2 KMTS
+                // lifter's 2^20-state cap (ponylink = 2868 state bits). They are not KMTS-lift
+                // fixtures; lifting them would (correctly) hit the explicit-state cap.
+                if path.file_name().and_then(|n| n.to_str()) == Some("btor2tools_suite") {
+                    continue;
+                }
                 stack.push(path);
             } else if path
                 .extension()

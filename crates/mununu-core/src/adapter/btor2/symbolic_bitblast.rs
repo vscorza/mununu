@@ -119,6 +119,18 @@ use crate::mu_calculus::symbolic::TritBdd;
 use crate::mu_calculus::trit::Trit;
 use crate::mu_calculus::{Control, Formula, FormulaVarId, Guard, ModalKind, Node as MuNode};
 
+/// Bit-count cap for the shared [`BddBitBlaster`]: a design whose cone exceeds this many
+/// register+input bits is rejected before any BDD is built, so a caller (`sv verify-auto`)
+/// degrades to a `Skipped` property rather than OoM. **Calibrated empirically at 40** — a cone
+/// even a few bits wider can blow the BDD arena *during* `walk_design` and panic on a downstream
+/// `unwrap`. Measured 2026-07-06: raising it to 56 made `prim_esc_receiver` (47-b cone) OoM-panic
+/// mid-build instead of decide — its cone is NOT a compact FSM. Designs past the cap are covered by
+/// the portfolio's other engines (the exact engine's cone for the same atom is often narrower — it
+/// seeds only the formula atoms, not the wider auto-seeded cube-predicate set the symbolic engine
+/// needs — so it decides where the cube engine cannot). Do not raise this without a `walk_design`-
+/// internal node-budget guard: a post-walk node check cannot catch a mid-walk arena overflow.
+const MAX_BITBLAST_BITS: u32 = 40;
+
 /// A bit-vector of BDDs, LSB-first: index `b` is the BDD for bit `b`. Every
 /// node's value carries exactly `width` bits.
 type BitVec = Vec<BDDFunction>;
@@ -170,6 +182,11 @@ pub struct BddBitBlaster {
     cells: Vec<Cell>,
     /// State symbol → its next-state BDD vector, from the `Node::Next` lines.
     next_funcs: HashMap<String, BitVec>,
+    /// Named COMBINATIONAL signal (module output / named wire) → its BDD vector over the
+    /// leaf vars, from `walk_design`. Lets a predicate bind to a combinational output
+    /// (`depth_o`, `gnt_o`, …) that is not a state register — the atom's cone still seeds
+    /// correctly (`resolve_atom_to_terminals` walks the output to its state/input terminals).
+    named_signals: HashMap<String, BitVec>,
 }
 
 impl BddBitBlaster {
@@ -177,6 +194,26 @@ impl BddBitBlaster {
     /// bind the leaves, walk every `Const`/`Op` node into a BDD vector, and
     /// collect the per-register next-state functions.
     pub fn build(file: &Btor2File) -> Result<Self, String> {
+        Self::build_with_keep(file, None)
+    }
+
+    /// R-F5.6 — build the exact bit-blaster, optionally restricted to a cone-of-influence
+    /// KEEP-SET of leaf NIDs. A leaf (register/input) whose NID is NOT in `keep` is PINNED to
+    /// a constant 0: it uses ZERO BDD variables, never appears in the state/input frame, and
+    /// (for a register) never transitions — so `total_bits` (the bit cap) counts only the
+    /// property's cone. `keep = None` bit-blasts the full design (the pre-R-F5.6 behaviour).
+    ///
+    /// SOUNDNESS: an out-of-cone leaf cannot influence any atom (the cone is closed under the
+    /// data-flow dependency relation AND `constraint`/`fair`/`justice` coupling — see
+    /// [`crate::adapter::btor2::dep_graph::cone_leaf_nids`]), so pinning it to any fixed value
+    /// is verdict-preserving for the FULL mu-calculus over the atoms — an EXACT reduction, not
+    /// an over/under-approximation. The dep graph over-approximates influence (spurious edges
+    /// keep MORE), so the cone is a superset of the true cone: it can never drop a relevant
+    /// leaf. `keep = None` is unchanged from before.
+    pub fn build_with_keep(
+        file: &Btor2File,
+        keep: Option<&std::collections::HashSet<Nid>>,
+    ) -> Result<Self, String> {
         // D1.4 — resolve each state/input to its user-visible name via
         // `collect_symbols`, which walks Yosys's `uext _ NID 0 NAME` alias ops
         // back to the underlying (often unnamed) state cell. Without this, the
@@ -201,32 +238,35 @@ impl BddBitBlaster {
             leaf_specs.push((line.nid, symbol, is_state, width));
         }
 
-        let total_bits: u32 = leaf_specs.iter().map(|(_, _, _, w)| *w).sum();
+        // R-F5.6 — a leaf is KEPT (a BDD variable) iff no keep-set is given, or its NID is in
+        // the property cone. Out-of-cone leaves are pinned to constant 0 (zero variables).
+        let is_kept = |nid: Nid| keep.is_none_or(|k| k.contains(&nid));
 
-        // R-F5.5d guard — the bit-blaster has no cone-of-influence restriction
-        // yet: it builds BDDs over EVERY register+input bit of the design. On a
-        // real design (the full sysrst_ctrl_detect, ~hundreds of bits: wide
-        // config timers × 5 detectors) that OoMs the BDD manager. Bail with a
-        // clean error above a conservative bit cap so a caller (e.g.
-        // `sv verify-auto --engine symbolic`) degrades to a `Skipped` property
-        // rather than a mid-construction OoM panic. The R-F5.6 scaling follow-up
-        // (COI restriction — only bit-blast the predicate cone — + variable
-        // ordering) lifts this to real designs.
-        const MAX_BITBLAST_BITS: u32 = 40;
+        // The bit cap now counts only the KEPT (cone) bits.
+        let total_bits: u32 = leaf_specs
+            .iter()
+            .filter(|(nid, _, _, _)| is_kept(*nid))
+            .map(|(_, _, _, w)| *w)
+            .sum();
+
+        // R-F5.6 guard — the bit-blaster builds BDDs over every KEPT register+input bit. With
+        // the cone-of-influence keep-set the frame is the property's cone; without one it is
+        // the whole design. On a real design whose CONE is still wide (hundreds of bits) the
+        // BDD manager would OoM, so bail with a clean error above a conservative cap and let a
+        // caller (`sv verify-auto`) degrade to a `Skipped` property rather than panic.
         if total_bits > MAX_BITBLAST_BITS {
             return Err(format!(
                 "symbolic bit-blaster: design has {total_bits} register+input bits \
-                 (> {MAX_BITBLAST_BITS}) — no cone-of-influence restriction yet (R-F5.6), \
-                 so bit-blasting the full design would exhaust BDD memory; use `--engine explicit`"
+                 (> {MAX_BITBLAST_BITS}) after cone-of-influence restriction (R-F5.6) — the \
+                 property's cone is too wide to bit-blast; use `--engine explicit`"
             ));
         }
 
-        // Allocate the manager + one BDD variable per leaf bit. 2M inner nodes
+        // Allocate the manager + one BDD variable per KEPT leaf bit. 2M inner nodes
         // (~32 MB arena, index manager) + a 512K apply cache — comfortably above
         // the toy fixtures' need and sized for a moderate (≤ `MAX_BITBLAST_BITS`)
-        // design; the manager is dropped per `BddBitBlaster`, so at most one
-        // arena is live at a time. Larger designs are rejected by the bit cap
-        // above (they need the R-F5.6 COI restriction, not just more nodes).
+        // cone; the manager is dropped per `BddBitBlaster`, so at most one
+        // arena is live at a time.
         let manager = bdd::new_manager(1 << 21, 1 << 19, 1);
         let (all_vars, var_base, tt, ff) = manager.with_manager_exclusive(|m| {
             let range = m.add_vars(total_bits as VarNo);
@@ -236,23 +276,32 @@ impl BddBitBlaster {
             (vars, range.start, BDDFunction::t(m), BDDFunction::f(m))
         });
 
-        // Slice the flat variable pool out per cell, LSB-first.
+        // Slice the flat variable pool out per KEPT cell (LSB-first); PIN each out-of-cone
+        // leaf to a constant-0 BitVec (env only — never a `Cell`, so it is invisible to the
+        // init BDD, the input cube, and the next-state substitution).
         let mut env: HashMap<Nid, BitVec> = HashMap::new();
         let mut cells: Vec<Cell> = Vec::new();
         let mut cursor = 0usize;
         for (nid, symbol, is_state, width) in leaf_specs {
-            let vars: BitVec = all_vars[cursor..cursor + width as usize].to_vec();
-            let varnos: Vec<VarNo> = (0..width as usize)
-                .map(|b| var_base + (cursor + b) as VarNo)
-                .collect();
-            cursor += width as usize;
-            env.insert(nid, vars.clone());
-            cells.push(Cell {
-                symbol,
-                is_state,
-                vars,
-                varnos,
-            });
+            if is_kept(nid) {
+                let vars: BitVec = all_vars[cursor..cursor + width as usize].to_vec();
+                let varnos: Vec<VarNo> = (0..width as usize)
+                    .map(|b| var_base + (cursor + b) as VarNo)
+                    .collect();
+                cursor += width as usize;
+                env.insert(nid, vars.clone());
+                cells.push(Cell {
+                    symbol,
+                    is_state,
+                    vars,
+                    varnos,
+                });
+            } else {
+                // Pinned: constant 0, zero BDD variables. `walk_design` resolves the leaf to
+                // this constant; downstream ops over it fold to constants (kept BDDs stay in
+                // the cone frame). Not pushed to `cells`.
+                env.insert(nid, vec![ff.clone(); width as usize]);
+            }
         }
 
         let mut blaster = BddBitBlaster {
@@ -262,6 +311,7 @@ impl BddBitBlaster {
             env,
             cells,
             next_funcs: HashMap::new(),
+            named_signals: HashMap::new(),
         };
 
         // Pass 2 — walk the node DAG, evaluating every Const/Op into a BitVec.
@@ -277,7 +327,8 @@ impl BddBitBlaster {
         // symbol. AR-GO-1 / #242 drift guard: this MUST resolve identically to the cell
         // naming in Pass 1 (both via `resolve_cell_symbol`) — else `next_funcs.get(&cell.symbol)`
         // in `exact_model()` misses and the register is silently frozen at its init value
-        // (the #242 soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS).
+        // (the #242 soundness bug: a false `EF`-VIOLATED / vacuous `AG AF`-HOLDS). Pinned
+        // (out-of-cone) registers are SKIPPED — they are constants and must not transition.
         let mut nid_symbol: HashMap<Nid, String> = HashMap::new();
         for line in &file.lines {
             if let Node::State { symbol, .. } = &line.node {
@@ -287,6 +338,9 @@ impl BddBitBlaster {
         }
         for line in &file.lines {
             if let Node::Next { state, value, .. } = &line.node {
+                if !is_kept(*state) {
+                    continue; // pinned register — stays constant, no next-state function
+                }
                 let Some(sym) = nid_symbol.get(state) else {
                     continue;
                 };
@@ -295,7 +349,45 @@ impl BddBitBlaster {
             }
         }
 
+        // Pass 4 — named combinational signals (module outputs / named wires), so a predicate
+        // can bind to a non-register signal (`depth_o`, `gnt_o`). Its BDD is already in `env`
+        // (walk_design); the atom's cone still seeds via the output's terminal fan-in.
+        for line in &file.lines {
+            match &line.node {
+                Node::Output {
+                    symbol: Some(s),
+                    signal,
+                } => {
+                    if let Some(bits) = blaster.env.get(&signal.nid()) {
+                        blaster
+                            .named_signals
+                            .entry(s.clone())
+                            .or_insert_with(|| bits.clone());
+                    }
+                }
+                Node::Op {
+                    symbol: Some(s), ..
+                } => {
+                    if let Some(bits) = blaster.env.get(&line.nid) {
+                        blaster
+                            .named_signals
+                            .entry(s.clone())
+                            .or_insert_with(|| bits.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Ok(blaster)
+    }
+
+    /// The BDD bit-vector for a predicate operand: a state/input register ([`register_bits`])
+    /// or, failing that, a named combinational signal (module output / wire). `None` if neither
+    /// names it.
+    fn signal_bits(&self, name: &str) -> Option<&BitVec> {
+        self.register_bits(name)
+            .or_else(|| self.named_signals.get(name))
     }
 
     /// Symbolically compute one clock step and restrict it to a concrete
@@ -390,6 +482,61 @@ impl BddBitBlaster {
         (sum, carry)
     }
 
+    /// Barrel shifter: shift `a` by the VARIABLE amount `s` (a `width`-bit BitVec).
+    /// `left` ⇒ shift left (fill 0); else shift right, filling with 0 (logical) or the sign bit
+    /// `a[width-1]` (`arith`). log-depth: stage `k` conditionally shifts by `2^k` on `s[k]`.
+    /// A shift ≥ width falls out to the fill (the `sh < w`/`j+sh` bounds handle it).
+    fn barrel_shift(
+        &self,
+        a: &[BDDFunction],
+        s: &[BDDFunction],
+        width: u32,
+        left: bool,
+        arith: bool,
+    ) -> BitVec {
+        let w = width as usize;
+        let sign = if arith {
+            a.get(w.wrapping_sub(1))
+                .cloned()
+                .unwrap_or_else(|| self.ff.clone())
+        } else {
+            self.ff.clone()
+        };
+        let mut cur: BitVec = (0..w)
+            .map(|i| a.get(i).cloned().unwrap_or_else(|| self.ff.clone()))
+            .collect();
+        for (k, sk) in s.iter().enumerate() {
+            let sh = 1usize.checked_shl(k as u32).unwrap_or(usize::MAX); // 2^k, saturating
+            let nsk = sk.not().unwrap();
+            cur = (0..w)
+                .map(|j| {
+                    // The bit selected when s[k] is set (shift by 2^k this stage).
+                    let shifted = if left {
+                        // left: result[j] = (j ≥ 2^k) ? cur[j − 2^k] : 0
+                        if sh <= j {
+                            cur[j - sh].clone()
+                        } else {
+                            self.ff.clone()
+                        }
+                    } else {
+                        // right: result[j] = (j + 2^k < w) ? cur[j + 2^k] : fill
+                        if sh < w && j + sh < w {
+                            cur[j + sh].clone()
+                        } else {
+                            sign.clone()
+                        }
+                    };
+                    // result[j] = s[k] ? shifted : cur[j]
+                    sk.and(&shifted)
+                        .unwrap()
+                        .or(&nsk.and(&cur[j]).unwrap())
+                        .unwrap()
+                })
+                .collect();
+        }
+        cur
+    }
+
     /// OR-reduce a bit-vector to a single BDD (`|x`).
     fn or_reduce(&self, bits: &[BDDFunction]) -> BDDFunction {
         let mut acc = self.ff.clone();
@@ -443,6 +590,23 @@ impl BddBitBlaster {
             .collect();
         let (_, cout) = self.add_bits(a, &not_b, self.tt.clone(), width);
         cout
+    }
+
+    /// Signed (two's-complement) `a < b`: if the signs differ, the negative operand (MSB set)
+    /// is the smaller; if the signs match, unsigned `<` decides. `slt = (a_msb ⊕ b_msb) ? a_msb
+    /// : (a <u b)`, with `a <u b = ¬(a ≥u b)`.
+    fn slt(&self, a: &[BDDFunction], b: &[BDDFunction], width: u32) -> BDDFunction {
+        let w = width as usize;
+        let amsb = a.get(w - 1).cloned().unwrap_or_else(|| self.ff.clone());
+        let bmsb = b.get(w - 1).cloned().unwrap_or_else(|| self.ff.clone());
+        let signs_differ = self.xor(&amsb, &bmsb);
+        let ult = self.uge(a, b, width).not().unwrap(); // a <u b
+        // signs_differ ? amsb : ult
+        signs_differ
+            .and(&amsb)
+            .unwrap()
+            .or(&signs_differ.not().unwrap().and(&ult).unwrap())
+            .unwrap()
     }
 
     // ---- R-F5.3b: predicate BDDs over the register-bit variables ----
@@ -504,7 +668,7 @@ impl BddBitBlaster {
     /// semantics bit-for-bit — including when a literal exceeds the register
     /// width. `And`/`Or`/`Not` map to the BDD boolean ops.
     pub fn predicate_bdd(&self, expr: &PredicateExpr) -> Result<BDDFunction, String> {
-        let unknown = |r: &str| format!("predicate references unknown register `{r}`");
+        let unknown = |r: &str| format!("predicate references unknown register/signal `{r}`");
         match expr {
             PredicateExpr::Cmp {
                 register,
@@ -512,7 +676,7 @@ impl BddBitBlaster {
                 value,
             } => {
                 let reg = self
-                    .register_bits(register)
+                    .signal_bits(register)
                     .ok_or_else(|| unknown(register))?;
                 // Compare at max(reg width, 64) so a u64 literal wider than the
                 // register keeps its high bits (reg's zero-extend to those bits
@@ -523,8 +687,8 @@ impl BddBitBlaster {
                 Ok(self.cmp_bits(&a, *op, &b, w as u32))
             }
             PredicateExpr::CmpReg { lhs, op, rhs } => {
-                let l = self.register_bits(lhs).ok_or_else(|| unknown(lhs))?;
-                let r = self.register_bits(rhs).ok_or_else(|| unknown(rhs))?;
+                let l = self.signal_bits(lhs).ok_or_else(|| unknown(lhs))?;
+                let r = self.signal_bits(rhs).ok_or_else(|| unknown(rhs))?;
                 let w = l.len().max(r.len());
                 let a = self.zero_extend(l, w);
                 let b = self.zero_extend(r, w);
@@ -537,8 +701,8 @@ impl BddBitBlaster {
                 addend,
                 width: _,
             } => {
-                let l = self.register_bits(lhs).ok_or_else(|| unknown(lhs))?;
-                let r = self.register_bits(rhs).ok_or_else(|| unknown(rhs))?;
+                let l = self.signal_bits(lhs).ok_or_else(|| unknown(lhs))?;
+                let r = self.signal_bits(rhs).ok_or_else(|| unknown(rhs))?;
                 // sum = (rhs + addend) mod 2^(rhs width) — wraps exactly as the
                 // RTL `+` (the `bvadd` in `build_constraint`; the `width` field
                 // is `eval`'s modulus and equals the rhs register width here).
@@ -1134,11 +1298,14 @@ impl BvTermBackend for BddBitBlaster {
     type Error = String;
 
     fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<Self::Value, Self::Error> {
-        // Reuse the concrete constant semantics, then splat to per-bit BDDs.
+        // Reuse the concrete constant semantics, then splat to per-bit BDDs. `bv.bits` is a
+        // `u128`, so bit `b ≥ 128` is 0 (and `>> b` would PANIC): guard it. A const wider than
+        // 128 bits only occurs OUT of the property cone (cone widths are ≤ the bit cap), where
+        // the truncated value is verdict-irrelevant; a cone const is ≤ cap bits < 128.
         let bv = eval_const_value(value, width)?;
         Ok((0..width as usize)
             .map(|b| {
-                if (bv.bits >> b) & 1 == 1 {
+                if b < 128 && (bv.bits >> b) & 1 == 1 {
                     self.tt.clone()
                 } else {
                     self.ff.clone()
@@ -1227,6 +1394,47 @@ impl BvTermBackend for BddBitBlaster {
                 let not_a: BitVec = (0..width as usize).map(|i| a[i].not().unwrap()).collect();
                 self.add_bits(&not_a, &[], self.tt.clone(), width).0
             }
+            Op::Mul => {
+                // Schoolbook shift-and-add: Σ_i (b[i] ? (a << i) : 0), truncated to `width`.
+                // O(width²) BDD adds — fine at the ≤ MAX_BITBLAST_BITS cone widths. Both
+                // operands + the result are `width` bits; the product wraps mod 2^width.
+                let (a, b) = (read(0)?, read(1)?);
+                let w = width as usize;
+                let mut acc: BitVec = vec![self.ff.clone(); w];
+                for i in 0..w {
+                    let bi = b.get(i).cloned().unwrap_or_else(|| self.ff.clone());
+                    // Partial product: (a << i) masked by b[i]. Bit j = (j ≥ i) ? a[j−i] ∧ b[i] : 0.
+                    let partial: BitVec = (0..w)
+                        .map(|j| {
+                            if j >= i {
+                                a.get(j - i)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.ff.clone())
+                                    .and(&bi)
+                                    .unwrap()
+                            } else {
+                                self.ff.clone()
+                            }
+                        })
+                        .collect();
+                    acc = self.add_bits(&acc, &partial, self.ff.clone(), width).0;
+                }
+                acc
+            }
+
+            // ---- Variable shifts (barrel shifter, result + operands all `width` bits) ----
+            Op::Sll => {
+                let (a, s) = (read(0)?, read(1)?);
+                self.barrel_shift(&a, &s, width, true, false)
+            }
+            Op::Srl => {
+                let (a, s) = (read(0)?, read(1)?);
+                self.barrel_shift(&a, &s, width, false, false)
+            }
+            Op::Sra => {
+                let (a, s) = (read(0)?, read(1)?);
+                self.barrel_shift(&a, &s, width, false, true)
+            }
 
             // ---- Equality / implication (1-bit result) ----
             Op::Eq | Op::Iff => {
@@ -1267,6 +1475,31 @@ impl BvTermBackend for BddBitBlaster {
                 let (a, b) = (read(0)?, read(1)?);
                 let w = a.len().max(b.len()) as u32;
                 vec![self.uge(&b, &a, w)]
+            }
+
+            // ---- Signed comparisons (two's-complement, 1-bit result) ----
+            Op::Slt => {
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&a, &b, w)]
+            }
+            Op::Sgt => {
+                // a > b ⟺ b < a
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&b, &a, w)]
+            }
+            Op::Sgte => {
+                // a ≥ b ⟺ ¬(a < b)
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&a, &b, w).not().unwrap()]
+            }
+            Op::Slte => {
+                // a ≤ b ⟺ ¬(b < a)
+                let (a, b) = (read(0)?, read(1)?);
+                let w = a.len().max(b.len()) as u32;
+                vec![self.slt(&b, &a, w).not().unwrap()]
             }
 
             // ---- Reductions (1-bit result) ----
@@ -1691,6 +1924,98 @@ fn resolve_predicate_expr_registers(
     }
 }
 
+/// R-F5.6 — collect every register name a [`PredicateExpr`] references (already resolved to
+/// canonical cell names). These are the seed atoms for the cone-of-influence keep-set that
+/// restricts the bit-blaster to the property's cone (used by both the exact engine and, via
+/// `symbolic_engine`, the symbolic cube-BDD engine).
+pub(crate) fn collect_predicate_registers(
+    expr: &PredicateExpr,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        PredicateExpr::Cmp { register, .. } => {
+            out.insert(register.clone());
+        }
+        PredicateExpr::CmpReg { lhs, rhs, .. } | PredicateExpr::CmpRegAddend { lhs, rhs, .. } => {
+            out.insert(lhs.clone());
+            out.insert(rhs.clone());
+        }
+        PredicateExpr::And(a, b) | PredicateExpr::Or(a, b) => {
+            collect_predicate_registers(a, out);
+            collect_predicate_registers(b, out);
+        }
+        PredicateExpr::Not(a) => collect_predicate_registers(a, out),
+    }
+}
+
+/// Directly decide whether ANY `bad` property of a BTOR2 design is REACHABLE from the reset
+/// state — the native HWMCC safety question (a reachable `bad` = the safety property is VIOLATED,
+/// "SAT" in competition terms; unreachable = "UNSAT" / safe). This bridges an ARBITRARY `bad`
+/// circuit (not just a register-value predicate, which [`exact_symbolic_verdict`] requires) to the
+/// exact engine: it ORs the `bad` nodes' 1-bit BDDs and evaluates `EF(bad) = μY. (bad ∨ ◇Y)` over
+/// the full bit-blasted transition relation, then tests whether the modelled reset state lies in
+/// it. The exact analogue of btormc's bad-reachability — the oracle the reachability differential
+/// + the portfolio coverage study compare against.
+///
+/// Returns `Ok(true)` (reachable / SAT / unsafe), `Ok(false)` (unreachable / UNSAT / safe), or an
+/// `Err` (undecided) when the design is over the bit cap, carries an unsupported op, or has
+/// `constraint`/`fair` lines. **The constraint guard is a soundness requirement:** this engine
+/// does not restrict reachability to constraint-satisfying runs, so on a constrained design it
+/// would OVER-approximate (report a spuriously-reachable `bad` that btormc, honouring the
+/// constraint, calls safe). Refusing to decide there keeps every verdict it DOES emit sound.
+pub fn exact_bad_reachable(btor2_content: &str) -> Result<bool, String> {
+    use crate::mu_calculus::parser as mu_parser;
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("exact bad-reachability: parse: {}", e.message))?;
+
+    // Soundness guard: we do not model `constraint` (assume) / `fair` — a design carrying them
+    // could have a `bad` reachable in OUR unconstrained relation but unreachable under btormc's
+    // constrained one. Refuse to decide rather than emit an over-approximate verdict.
+    if file
+        .lines
+        .iter()
+        .any(|l| matches!(l.node, Node::Constraint { .. } | Node::Fair { .. }))
+    {
+        return Err(
+            "exact bad-reachability: design has `constraint`/`fair` lines (not modelled) — \
+             undecided rather than over-approximate"
+                .into(),
+        );
+    }
+
+    let bad_ops: Vec<Operand> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            Node::Bad { signal } => Some(*signal),
+            _ => None,
+        })
+        .collect();
+    if bad_ops.is_empty() {
+        return Err("exact bad-reachability: the design has no `bad` property".into());
+    }
+
+    let bb = BddBitBlaster::build(&file)?; // cap-guarded: a wide design ⇒ Err ⇒ undecided
+    // OR the `bad` nodes' 1-bit BDDs into a single "some bad holds" state set.
+    let mut bad = bb.ff.clone();
+    for op in &bad_ops {
+        let bits = bb.resolve(*op)?;
+        let b = bits
+            .into_iter()
+            .next()
+            .ok_or_else(|| "exact bad-reachability: a `bad` signal has zero width".to_string())?;
+        bad = bad.or(&b).unwrap();
+    }
+
+    let model = bb.exact_model();
+    let formula = mu_parser::parse("mu Y. (BAD or <> Y)").expect("EF(bad) formula parses");
+    let mut atoms: HashMap<&str, BDDFunction> = HashMap::new();
+    atoms.insert("BAD", bad);
+    let reach = model.evaluate(&formula, &atoms)?;
+    let init = bb.initial_state_bdd(&file);
+    Ok(init.and(&reach).unwrap() != bb.ff)
+}
+
 /// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
 /// BTOR2, bit-blast it, evaluate `formula` over the exact model (2-valued, no
 /// abstraction), and return the initial-state verdict. Atoms in `formula` are
@@ -1720,8 +2045,6 @@ pub fn exact_symbolic_verdict_with_witness(
     use crate::adapter::sts_ir::SymbolicTransitionSystem;
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
-    let bb = BddBitBlaster::build(&file)?;
-    let exact = bb.exact_model();
 
     // Register-name resolution: a user-visible name (`bit_cnt_q`) maps to the
     // canonical state-cell name the bit-blast binds against (`bit_cnt_d` after
@@ -1733,19 +2056,36 @@ pub fn exact_symbolic_verdict_with_witness(
             .unwrap_or_else(|| name.to_string())
     };
 
-    // Resolve each distinct formula atom to its full-state BDD.
-    let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
+    // R-F5.6 — resolve each distinct formula atom to a canonical [`PredicateExpr`] BEFORE
+    // building the bit-blaster, and collect the register names they reference. Those seed the
+    // cone-of-influence keep-set so the bit-blaster bit-blasts only the property's cone
+    // (out-of-cone registers/inputs pinned to constants) instead of the whole design — the
+    // R-F5.6 scaling fix. An atom-free formula (no seeds) keeps the full-design behaviour.
+    let mut exprs: Vec<(String, PredicateExpr)> = Vec::new();
+    let mut seed_regs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node in formula.nodes() {
         if let MuNode::Predicate(name) = node {
-            if resolved.iter().any(|(n, _)| n == name) {
+            if exprs.iter().any(|(n, _)| n == name) {
                 continue;
             }
             let expr = parse_predicate_expr(name)
                 .map_err(|e| format!("exact MC: atom `{name}` is not a predicate: {e}"))?;
             let expr = resolve_predicate_expr_registers(&expr, &resolve);
-            let bdd = bb.predicate_bdd(&expr)?;
-            resolved.push((name.clone(), bdd));
+            collect_predicate_registers(&expr, &mut seed_regs);
+            exprs.push((name.clone(), expr));
         }
+    }
+    let seed_atoms: Vec<String> = seed_regs.into_iter().collect();
+    let keep_set = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let bb = BddBitBlaster::build_with_keep(&file, keep_set.as_ref())?;
+    let exact = bb.exact_model();
+
+    // Resolve each atom's full-state BDD against the (cone-restricted) bit-blaster.
+    let mut resolved: Vec<(String, BDDFunction)> = Vec::new();
+    for (name, expr) in &exprs {
+        let bdd = bb.predicate_bdd(expr)?;
+        resolved.push((name.clone(), bdd));
     }
     let atoms: HashMap<&str, BDDFunction> = resolved
         .iter()
@@ -1764,9 +2104,17 @@ pub fn exact_symbolic_verdict_with_witness(
     // `exact_reachable_stall_lasso` finds a stall reachable from reset (subsuming the
     // stall-at-reset case), so it covers both shapes. Best-effort: `None` if the shape
     // isn't recognised or no stall is reachable.
+    // First the `AF`/`AG AF` stall lasso; failing that, the `AG EF p` recoverability trap path
+    // (a reachable state from which `p` is unreachable). Best-effort: `None` if neither shape
+    // matches or the witness region is unreachable.
     let witness = detect_af_target(formula)
         .and_then(|p_id| exact.eval_at(formula, p_id, &atoms).ok())
-        .and_then(|p_bdd| bb.exact_reachable_stall_lasso(&file, &p_bdd));
+        .and_then(|p_bdd| bb.exact_reachable_stall_lasso(&file, &p_bdd))
+        .or_else(|| {
+            detect_ag_ef_target(formula)
+                .and_then(|p_id| exact.eval_at(formula, p_id, &atoms).ok())
+                .and_then(|p_bdd| bb.exact_reachable_trap_path(&file, &p_bdd))
+        });
     Ok((ExactVerdict::Violated, witness))
 }
 
@@ -1833,6 +2181,62 @@ fn is_box_over_var(
     )
 }
 
+/// Is `node` a bare `<> v` (unguarded diamond over the fixpoint variable `v`)?
+fn is_diamond_over_var(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+    v: &crate::mu_calculus::FormulaVarId,
+) -> bool {
+    matches!(
+        formula.node(node),
+        MuNode::Modal { kind: ModalKind::Diamond, guard, target }
+            if *guard == Guard::default()
+                && matches!(formula.node(*target), MuNode::Variable(w) if w == v)
+    )
+}
+
+/// P3 — detect `AG EF p = νY. ((μX. (p ∨ <> X)) ∧ [] Y)` (the recoverability shape) and return
+/// the node id of its target `p`. Mirrors [`detect_af_target`] but the inner μ uses a bare
+/// DIAMOND (`<> X` = `∃input`), not a box. `None` for any other shape.
+fn detect_ag_ef_target(formula: &Formula) -> Option<crate::mu_calculus::NodeId> {
+    let root = formula.root();
+    let MuNode::Nu { var, body } = formula.node(root) else {
+        return None;
+    };
+    let MuNode::And(a, b) = formula.node(*body) else {
+        return None;
+    };
+    let ef = if is_box_over_var(formula, *a, var) {
+        *b
+    } else if is_box_over_var(formula, *b, var) {
+        *a
+    } else {
+        return None;
+    };
+    ef_target_at(formula, ef)
+}
+
+/// Match `μX. (p ∨ <> X)` (= `EF p`) at `node` → the node id of `p` (the non-recursive
+/// disjunct). The diamond twin of [`af_target_at`].
+fn ef_target_at(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+) -> Option<crate::mu_calculus::NodeId> {
+    let MuNode::Mu { var, body } = formula.node(node) else {
+        return None;
+    };
+    let MuNode::Or(a, b) = formula.node(*body) else {
+        return None;
+    };
+    if is_diamond_over_var(formula, *a, var) {
+        Some(*b)
+    } else if is_diamond_over_var(formula, *b, var) {
+        Some(*a)
+    } else {
+        None
+    }
+}
+
 /// D1.8c — build the sound μ-calculus formula that verifies the GR(1) response
 /// property `GF assume → GF guarantee` over the **exact** engine. `assume` and
 /// `guarantee` are predicate expressions (e.g. `"req == 1"`).
@@ -1873,7 +2277,7 @@ pub fn gr1_response_formula(assume: &str, guarantee: &str) -> String {
 /// staying in `¬p` (the "stall"). The lasso is that path: a `prefix` from the
 /// initial state to the cycle entry, then the repeating `cycle`. Each state is a
 /// concrete valuation of the state registers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct StallLasso {
     /// States from the initial state up to (excluding) the cycle entry. Empty when
     /// the initial state is itself on the cycle.
@@ -1881,7 +2285,22 @@ pub struct StallLasso {
     /// The repeating `¬p` cycle; `cycle[0]` is the state the last one steps back to.
     /// Empty only in the (guarded) non-total-model deadlock case.
     pub cycle: Vec<BTreeMap<String, u128>>,
+    /// P3 — the INPUT assignment that drives each transition of the concatenated
+    /// `prefix ++ cycle` path (`inputs[i]` is the input at path-state `i`), for RTL replay.
+    /// Empty when a builder does not record inputs (e.g. hand-authored test lassos); the
+    /// [`StallLasso`] identity ignores it (see the manual `PartialEq`), so equality is over
+    /// the state path only.
+    pub inputs: Vec<BTreeMap<String, u128>>,
 }
+
+// StallLasso identity is the STATE path (prefix ++ cycle); `inputs` is replay metadata that
+// does not affect equality (a lasso witnessing the same path is the same witness).
+impl PartialEq for StallLasso {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix && self.cycle == other.cycle
+    }
+}
+impl Eq for StallLasso {}
 
 impl BddBitBlaster {
     /// D1.8 — extract a [`StallLasso`] witnessing that `AF p` is **Violated** from the
@@ -1912,7 +2331,7 @@ impl BddBitBlaster {
             return None;
         }
         let s = self.pick_state_assignment(&bad);
-        Some(self.walk_stall_cycle(&exact, &stall, s, Vec::new()))
+        Some(self.walk_stall_cycle(&exact, &stall, s, Vec::new(), Vec::new()))
     }
 
     /// D1.8b-2 — extract a [`StallLasso`] witnessing that `AG AF p` is **Violated**:
@@ -1958,6 +2377,7 @@ impl BddBitBlaster {
         // per step until inside the stall, recording the reset→stall prefix.
         let mut s = self.pick_state_assignment(&bad);
         let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        let mut inputs: Vec<BTreeMap<String, u128>> = Vec::new();
         for _ in 0..1_000_000 {
             if self.state_minterm(&s).and(&stall).unwrap() != self.ff {
                 break; // reached the stall
@@ -1975,16 +2395,109 @@ impl BddBitBlaster {
                 return Some(StallLasso {
                     prefix,
                     cycle: Vec::new(),
+                    inputs,
                 });
             }
             let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
             let mut ns = s.clone();
             for (reg, val) in self.eval_step(&full) {
                 ns.insert(reg, val);
             }
             s = ns;
         }
-        Some(self.walk_stall_cycle(&exact, &stall, s, prefix))
+        Some(self.walk_stall_cycle(&exact, &stall, s, prefix, inputs))
+    }
+
+    /// P3 — extract a concrete path witnessing that `AG EF p` is **Violated**: a state
+    /// reachable from reset from which `p` is UNREACHABLE (the "trap" `¬EF p`), plus the
+    /// reset→trap prefix. `¬EF p` is absorbing (if you cannot reach `p`, no successor can
+    /// either), so the witness needs no cycle walk — the trap state is a single-state
+    /// absorbing `cycle`. `None` when the trap is unreachable (`AG EF p` holds).
+    ///
+    /// Reuses the layered reachability of [`exact_reachable_stall_lasso`] with `trap = ¬EF p`
+    /// in place of `stall = EG¬p`; the reach phase descends one layer per concrete
+    /// [`eval_step`] until inside the trap.
+    ///
+    /// [`exact_reachable_stall_lasso`]: BddBitBlaster::exact_reachable_stall_lasso
+    /// [`eval_step`]: BddBitBlaster::eval_step
+    pub fn exact_reachable_trap_path(
+        &self,
+        file: &Btor2File,
+        p: &BDDFunction,
+    ) -> Option<StallLasso> {
+        let exact = self.exact_model();
+        let trap = self.not_ef_p(&exact, p);
+        if trap == self.ff {
+            return None; // EF p holds everywhere ⇒ AG EF p holds
+        }
+        // Reach layers: L_0 = trap, L_k = L_{k-1} ∨ ◇L_{k-1}.
+        let mut layers = vec![trap.clone()];
+        loop {
+            let prev = layers.last().unwrap();
+            let next = prev.or(&exact.diamond_pre(prev)).unwrap();
+            if &next == prev {
+                break;
+            }
+            layers.push(next);
+        }
+        let init = self.initial_state_bdd(file);
+        let bad = init.and(layers.last().unwrap()).unwrap();
+        if bad == self.ff {
+            return None; // the trap is unreachable ⇒ AG EF p holds
+        }
+        // Reach phase: descend one layer per step until inside the trap, recording the prefix.
+        let mut s = self.pick_state_assignment(&bad);
+        let mut prefix: Vec<BTreeMap<String, u128>> = Vec::new();
+        let mut inputs: Vec<BTreeMap<String, u128>> = Vec::new();
+        for _ in 0..1_000_000 {
+            if self.state_minterm(&s).and(&trap).unwrap() != self.ff {
+                // Reached the trap: `s` witnesses `¬EF p`; it is absorbing (a 1-state cycle).
+                return Some(StallLasso {
+                    prefix,
+                    cycle: vec![s],
+                    inputs,
+                });
+            }
+            prefix.push(s.clone());
+            let k = (1..layers.len())
+                .find(|&k| self.state_minterm(&s).and(&layers[k]).unwrap() != self.ff)
+                .unwrap_or(1);
+            let good = self
+                .state_minterm(&s)
+                .and(&exact.to_next(&layers[k - 1]))
+                .unwrap();
+            if good == self.ff {
+                return Some(StallLasso {
+                    prefix,
+                    cycle: Vec::new(),
+                    inputs,
+                });
+            }
+            let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
+            let mut ns = s.clone();
+            for (reg, val) in self.eval_step(&full) {
+                ns.insert(reg, val);
+            }
+            s = ns;
+        }
+        None
+    }
+
+    /// `¬EF p = ¬(μX. (p ∨ ◇X))` over the exact model — the "trap" region: states from which
+    /// `p` is unreachable. `◇` is `∃input` (`diamond_pre`), so `EF p` is the states with SOME
+    /// path to `p`. Least fixpoint from ⊥.
+    fn not_ef_p(&self, exact: &ExactModel, p: &BDDFunction) -> BDDFunction {
+        let mut ef = self.ff.clone();
+        loop {
+            let next = p.or(&exact.diamond_pre(&ef)).unwrap();
+            if next == ef {
+                break;
+            }
+            ef = next;
+        }
+        ef.not().unwrap()
     }
 
     /// `stall = EG ¬p = νZ. (¬p ∧ ◇Z)` over the exact model — the states with an
@@ -2002,11 +2515,21 @@ impl BddBitBlaster {
         stall
     }
 
+    /// P3 — the INPUT part of a full (state+input) assignment: the values of the design's
+    /// input cells only. This is the input that drives the transition, recorded for RTL replay.
+    fn input_assignment(&self, full: &HashMap<String, u128>) -> BTreeMap<String, u128> {
+        self.cells
+            .iter()
+            .filter(|c| !c.is_state)
+            .filter_map(|c| full.get(&c.symbol).map(|v| (c.symbol.clone(), *v)))
+            .collect()
+    }
+
     /// Walk a concrete `¬p` path inside `stall` from `s` until a state repeats — the
     /// cycle. `prefix` (the already-walked reach path) is prepended to the result; any
-    /// pre-cycle stall states join it. Each step greedily picks a stall-preserving
-    /// input and advances via [`eval_step`]. Bounded by the stall's size; a deadlock
-    /// yields an open (cycle-less) lasso.
+    /// pre-cycle stall states join it. `inputs` accumulates the input driving each recorded
+    /// transition (for RTL replay). Each step greedily picks a stall-preserving input and
+    /// advances via [`eval_step`]. Bounded by the stall's size; a deadlock yields an open lasso.
     ///
     /// [`eval_step`]: BddBitBlaster::eval_step
     fn walk_stall_cycle(
@@ -2015,13 +2538,18 @@ impl BddBitBlaster {
         stall: &BDDFunction,
         mut s: BTreeMap<String, u128>,
         mut prefix: Vec<BTreeMap<String, u128>>,
+        mut inputs: Vec<BTreeMap<String, u128>>,
     ) -> StallLasso {
         let mut cyc: Vec<BTreeMap<String, u128>> = Vec::new();
         for _ in 0..1_000_000 {
             if let Some(j) = cyc.iter().position(|prev| *prev == s) {
                 let cycle = cyc.split_off(j);
                 prefix.extend(cyc); // pre-cycle stall states → prefix
-                return StallLasso { prefix, cycle };
+                return StallLasso {
+                    prefix,
+                    cycle,
+                    inputs,
+                };
             }
             cyc.push(s.clone());
             // The successors-in-stall set for state = s (inputs free) is
@@ -2033,11 +2561,13 @@ impl BddBitBlaster {
                 return StallLasso {
                     prefix,
                     cycle: Vec::new(),
+                    inputs,
                 };
             }
             // Pick a full (state = s, input) assignment, step concretely, and keep
             // held registers (no `Next` line) at their current value.
             let full = self.pick_full_assignment(&good);
+            inputs.push(self.input_assignment(&full));
             let mut ns = s.clone();
             for (reg, val) in self.eval_step(&full) {
                 ns.insert(reg, val);
@@ -2048,6 +2578,7 @@ impl BddBitBlaster {
         StallLasso {
             prefix,
             cycle: Vec::new(),
+            inputs,
         }
     }
 
@@ -3182,6 +3713,74 @@ mod tests {
         );
     }
 
+    /// `exact_bad_reachable` — a reachable `bad` (a 3-bit counter reaches `0b111`) is SAT.
+    /// The btor2tools `count2` shape: init 0, `next = s + 1`, `bad = (s == 7)`.
+    #[test]
+    fn exact_bad_reachable_true_on_reaching_counter() {
+        const COUNT2: &str = r#"
+1 sort bitvec 3
+2 zero 1
+3 state 1
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 ones 1
+9 sort bitvec 1
+10 eq 9 3 8
+11 bad 10
+"#;
+        assert_eq!(
+            exact_bad_reachable(COUNT2),
+            Ok(true),
+            "a 3-bit counter from 0 reaches 0b111 ⇒ bad is reachable (SAT)"
+        );
+    }
+
+    /// `exact_bad_reachable` — an unreachable `bad` is UNSAT: a register held at 0 can never
+    /// equal 1, so `bad = (s == 1)` is unreachable from the reset state.
+    #[test]
+    fn exact_bad_reachable_false_on_stuck_register() {
+        const STUCK: &str = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 s
+4 init 1 3 2
+5 next 1 3 3
+6 one 1
+7 eq 1 3 6
+8 bad 7
+"#;
+        assert_eq!(
+            exact_bad_reachable(STUCK),
+            Ok(false),
+            "s is held at 0 ⇒ (s == 1) is never reachable (UNSAT / safe)"
+        );
+    }
+
+    /// `exact_bad_reachable` — the soundness guard: a design with a `constraint` line is
+    /// UNDECIDED (Err), never an over-approximate verdict (this engine does not restrict
+    /// reachability to constraint-satisfying runs).
+    #[test]
+    fn exact_bad_reachable_refuses_constrained_design() {
+        const CONSTRAINED: &str = r#"
+1 sort bitvec 1
+2 zero 1
+3 state 1 s
+4 init 1 3 2
+5 next 1 3 3
+6 one 1
+7 eq 1 3 6
+8 bad 7
+9 input 1 c
+10 constraint 9
+"#;
+        assert!(
+            exact_bad_reachable(CONSTRAINED).is_err(),
+            "a constrained design must be undecided, not over-approximated"
+        );
+    }
+
     /// D1.7 — the exact engine DEGRADES GRACEFULLY on a design too large to
     /// bit-blast. `BddBitBlaster::build` rejects a design whose register+input
     /// bit count exceeds `MAX_BITBLAST_BITS` (40) with a clean `Err` — and does so
@@ -3211,6 +3810,241 @@ mod tests {
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
         );
+    }
+
+    /// R-F5.6 — cone-of-influence restriction lifts the bit cap when the property's cone is
+    /// small even though the FULL design is over 40 bits. `fsm` (2-bit) cycles 1→2→3→0→…; `wide`
+    /// (45-bit) is an out-of-cone counter `fsm` never reads. The full build hits the cap (47 >
+    /// 40), but `exact_symbolic_verdict` restricts to the cone of `fsm == 0` = {fsm} (pinning
+    /// `wide` to a constant) and DECIDES `EF (fsm == 0)` = Holds. Locks that (a) COI is wired
+    /// into the exact path, and (b) pinning the out-of-cone datapath is verdict-preserving —
+    /// the whole point of R-F5.6, as a fast non-docker regression.
+    #[test]
+    fn rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath() {
+        const FSM_PLUS_WIDE_CTR: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 45
+3 state 1 fsm
+4 one 1
+5 add 1 3 4
+6 next 1 3 5
+7 zero 1
+8 init 1 3 4
+9 state 2 wide
+10 one 2
+11 add 2 9 10
+12 next 2 9 11
+"#;
+        // The full design is 2 + 45 = 47 bits — over the cap.
+        let file = parser::parse(FSM_PLUS_WIDE_CTR).expect("parse");
+        let full_err = BddBitBlaster::build(&file).err();
+        assert!(
+            full_err.as_ref().is_some_and(|e| e.contains("47")),
+            "full 47-bit build must still hit the cap; got {full_err:?}",
+        );
+        // The exact verdict restricts to the {fsm} cone (2 bits), pinning `wide` → decidable.
+        // `fsm` inits to 1 and cycles to 0, so `EF (fsm == 0)` holds from the initial state.
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((fsm == 0) or <> Y)").expect("formula");
+        let verdict = exact_symbolic_verdict(FSM_PLUS_WIDE_CTR, &formula)
+            .expect("COI restricts to the 2-bit fsm cone ⇒ decidable, not capped");
+        assert_eq!(
+            verdict,
+            ExactVerdict::Holds,
+            "fsm cycles to 0 ⇒ EF(fsm==0) holds; the 45-bit out-of-cone `wide` is pinned",
+        );
+    }
+
+    /// The bit-blasted `Mul` (shift-and-add) over a SYMBOLIC operand (not a constant fold):
+    /// `p' = x * 3` on a 4-bit input `x`. `EF (p == 6)` holds (x=2 ⇒ 6 mod 16), so the
+    /// multiplier is exercised end-to-end. Locks the `Op::Mul` arm that unblocks the
+    /// prim_packer_fifo / prim_fifo_sync drainability properties in the corpus.
+    #[test]
+    fn mul_bit_blaster_shift_and_add() {
+        const MUL_BTOR2: &str = r#"
+1 sort bitvec 4
+2 input 1 x
+3 const 1 0011
+4 mul 1 2 3
+5 state 1 p
+6 next 1 5 4
+7 const 1 0000
+8 init 1 5 7
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 6) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(MUL_BTOR2, &formula).expect("mul decides"),
+            ExactVerdict::Holds,
+            "p' = x*3; x=2 ⇒ p==6 reachable ⇒ EF(p==6) holds",
+        );
+    }
+
+    /// The bit-blasted variable `Srl` barrel shifter: `p' = 12 >> s` over a 4-bit shift input
+    /// `s`. `12 >> s ∈ {12,6,3,1,0}`, so `EF(p==3)` holds (s=2) but `EF(p==5)` is VIOLATED (5 is
+    /// never reachable) — a precise check of the shift amount/direction/fill. Unblocks the
+    /// prim_packer_fifo / prim_fifo_sync drainability cones (which use `Srl`).
+    #[test]
+    fn srl_bit_blaster_barrel_shift() {
+        const SRL_BTOR2: &str = r#"
+1 sort bitvec 4
+2 const 1 1100
+3 input 1 s
+4 srl 1 2 3
+5 state 1 p
+6 next 1 5 4
+7 const 1 0000
+8 init 1 5 7
+"#;
+        let reachable =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 3) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SRL_BTOR2, &reachable).expect("srl decides"),
+            ExactVerdict::Holds,
+            "12 >> 2 == 3 ⇒ EF(p==3) holds",
+        );
+        let unreachable =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 5) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SRL_BTOR2, &unreachable).expect("srl decides"),
+            ExactVerdict::Violated,
+            "12 >> s is never 5 ⇒ EF(p==5) is violated (validates exact shift semantics)",
+        );
+    }
+
+    /// The bit-blasted signed `Slt`: `p' = (x <s 0)` over a 4-bit input `x`. `EF(p==1)` holds
+    /// because x ∈ {8..15} are NEGATIVE two's-complement (−8..−1) — a verdict an UNSIGNED
+    /// comparison would get wrong (x <u 0 is never true ⇒ it would report Violated). Unblocks
+    /// prim_fifo_sync (its drainability cone uses `Slt`).
+    #[test]
+    fn slt_bit_blaster_signed_less_than() {
+        const SLT_BTOR2: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 input 2 x
+4 const 2 0000
+5 slt 1 3 4
+6 state 1 p
+7 next 1 6 5
+8 const 1 0
+9 init 1 6 8
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((p == 1) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(SLT_BTOR2, &formula).expect("slt decides"),
+            ExactVerdict::Holds,
+            "x in 8..15 are signed-negative so x <s 0 and EF(p==1) holds (unsigned would fail)",
+        );
+    }
+
+    /// A predicate binds to a named COMBINATIONAL signal, not just a state register: `o = p + 1`
+    /// is a module OUTPUT (no `next` line), and `EF(o == 3)` holds (p reaches 2 ⇒ o = 3). Locks
+    /// the `named_signals` binding that unblocks corpus atoms over combinational outputs
+    /// (`depth_o`, `gnt_o`) which are not post-synthesis registers.
+    #[test]
+    fn predicate_binds_combinational_output() {
+        const COMB_BTOR2: &str = r#"
+1 sort bitvec 4
+2 state 1 p
+3 one 1
+4 add 1 2 3
+5 output 4 o
+6 next 1 2 4
+7 const 1 0000
+8 init 1 2 7
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((o == 3) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(COMB_BTOR2, &formula).expect("combinational atom binds"),
+            ExactVerdict::Holds,
+            "o = p+1 is a combinational output; p reaches 2 ⇒ o==3 ⇒ EF(o==3) holds",
+        );
+    }
+
+    /// P3 — the trap-path witness for a `Violated` `AG EF (st==0)` recoverability property.
+    /// `st` cycles 0→1→2→0, but `esc` drives it to the TERMINAL trap `st==3` (self-loop), from
+    /// which `st==0` is unreachable — so `AG EF (st==0)` is Violated, and the witness is a
+    /// concrete reset→trap path ending in the absorbing trap state. Self-validating: it replays
+    /// the prefix through `eval_step` and confirms the final state is the trap `st==3`.
+    #[test]
+    fn p3_ag_ef_trap_path_witness() {
+        const TRAP_FSM: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 input 1 esc
+4 state 2 st
+5 const 2 11
+6 const 2 00
+7 one 2
+8 add 2 4 7
+9 const 2 10
+10 eq 1 4 9
+11 ite 2 10 6 8
+12 eq 1 4 5
+13 ite 2 12 5 11
+14 ite 2 3 5 13
+15 next 2 4 14
+16 init 2 4 6
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("nu Y. ((mu X. ((st == 0) or <> X)) and [] Y)")
+                .expect("formula");
+        let (verdict, witness) =
+            exact_symbolic_verdict_with_witness(TRAP_FSM, &formula).expect("exact verdict");
+        assert_eq!(
+            verdict,
+            ExactVerdict::Violated,
+            "st==3 is a reachable terminal trap ⇒ AG EF (st==0) is Violated",
+        );
+        let w = witness.expect("a Violated AG EF must yield a reachable-trap-path witness");
+        // The witness ends in the absorbing trap `st==3` (its single-state cycle).
+        let trap_state = w
+            .cycle
+            .last()
+            .or_else(|| w.prefix.last())
+            .expect("non-empty witness");
+        assert_eq!(
+            trap_state.get("st").copied(),
+            Some(3),
+            "the witness ends in the terminal trap st==3; got {trap_state:?}",
+        );
+        // The prefix starts at the reset state (st==0) — a genuine reset→trap path.
+        if let Some(first) = w.prefix.first() {
+            assert_eq!(
+                first.get("st").copied(),
+                Some(0),
+                "the witness prefix starts at the reset state st==0",
+            );
+        }
+        // SELF-VALIDATE the recorded inputs: replaying `inputs[i]` from `prefix[i]` via the
+        // concrete eval_step must land on the next path state — i.e. the witness's input
+        // sequence genuinely reproduces the reset→trap path (the basis for RTL replay).
+        assert_eq!(
+            w.inputs.len(),
+            w.prefix.len(),
+            "one recorded input per prefix transition",
+        );
+        let file = parser::parse(TRAP_FSM).expect("parse");
+        let bb = BddBitBlaster::build(&file).expect("build");
+        let path: Vec<_> = w.prefix.iter().chain(w.cycle.iter()).collect();
+        for (i, inp) in w.inputs.iter().enumerate() {
+            // full = state(path[i]) + input(inp)
+            let mut full: HashMap<String, u128> =
+                path[i].iter().map(|(k, v)| (k.clone(), *v)).collect();
+            for (k, v) in inp {
+                full.insert(k.clone(), *v);
+            }
+            let stepped = bb.eval_step(&full);
+            let next_st = stepped.get("st").copied().unwrap_or(path[i]["st"]);
+            assert_eq!(
+                Some(next_st),
+                path[i + 1].get("st").copied(),
+                "replaying input {i} from st={} must reach the next path state",
+                path[i]["st"],
+            );
+        }
     }
 
     /// D1.8 — the stall-lasso witness for a `Violated` `AF (cnt==3)` on the reset

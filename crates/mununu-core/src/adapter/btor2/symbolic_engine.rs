@@ -91,13 +91,24 @@ pub fn symbolic_cube_verdicts(
         e
     })?;
 
-    let bb = BddBitBlaster::build(&file).map_err(ir_err)?;
-
     let exprs: Vec<PredicateExpr> = predicates
         .iter()
         .map(|spec| spec_to_expr(spec, compound_exprs))
         .collect();
     let names: Vec<String> = predicates.iter().map(|s| s.name.clone()).collect();
+
+    // R-F5.6 — restrict the bit-blast to the predicates' cone of influence (out-of-cone leaves
+    // pinned to constants), mirroring the exact engine. The predicates are already canonicalized
+    // (`resolve_predicate_registers`), so the cone seeds match the bit-blaster's cell symbols; an
+    // empty predicate set keeps the full-design behaviour.
+    let mut seed_regs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &exprs {
+        crate::adapter::btor2::symbolic_bitblast::collect_predicate_registers(e, &mut seed_regs);
+    }
+    let seed_atoms: Vec<String> = seed_regs.into_iter().collect();
+    let keep = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let bb = BddBitBlaster::build_with_keep(&file, keep.as_ref()).map_err(ir_err)?;
 
     let rel = bb
         .abstract_relation(&exprs, Some(must_semantics))
@@ -530,6 +541,49 @@ mod tests {
                 "tally consistent for `{formula_str}`"
             );
         }
+    }
+
+    /// R-F5.6 on the SYMBOLIC engine: a 47-bit design (2-bit `fsm` + 45-bit out-of-cone `wide`)
+    /// exceeds the bit cap, but the predicate `p = (fsm==0)` has a 2-bit cone, so cone-of-
+    /// influence lets `symbolic_cube_verdicts` DECIDE instead of erroring on the cap. Mirrors the
+    /// exact engine's `rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath`.
+    #[test]
+    fn rf5_6_symbolic_coi_lifts_bit_cap() {
+        const FSM_PLUS_WIDE: &str = r#"
+1 sort bitvec 2
+2 sort bitvec 45
+3 state 1 fsm
+4 one 1
+5 add 1 3 4
+6 next 1 3 5
+7 zero 1
+8 init 1 3 7
+9 state 2 wide
+10 one 2
+11 add 2 9 10
+12 next 2 9 11
+"#;
+        let specs = vec![PredicateSpec {
+            name: "p".to_string(),
+            register: "fsm".to_string(),
+            value: 0,
+        }];
+        let compound: HashMap<String, PredicateExpr> = HashMap::new();
+        let formula = crate::mu_calculus::parser::parse("mu X. p or <> X").expect("formula");
+        // Full design is 2 + 45 = 47 bits (> the 40-bit cap); the cone of `fsm==0` is 2 bits, so
+        // COI restricts the bit-blast and the call decides instead of returning a cap error.
+        let got = symbolic_cube_verdicts(
+            FSM_PLUS_WIDE,
+            &specs,
+            &compound,
+            &formula,
+            MustSemantics::ForallExists,
+        )
+        .expect("symbolic COI restricts to the 2-bit fsm cone => decides, not capped");
+        assert!(
+            got.definite_true + got.definite_false + got.bottom > 0,
+            "COI-restricted symbolic engine produced cube verdicts",
+        );
     }
 
     /// A `w`-bit saturating-free counter `r` with an enable: `r' = en ? r+1 : r`,
