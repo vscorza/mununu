@@ -792,6 +792,8 @@ pub async fn sv_verify_auto_handler(
             Some((name.trim().to_string(), val.trim().parse::<u64>().ok()?))
         })
         .collect();
+    let (engine_symbolic, engine_exact, engine_portfolio) =
+        crate::adapter::slang::verify_auto::engine_selection(request.engine.as_deref());
     let opts = VerifyAutoOptions {
         max_iterations: request.max_iterations.unwrap_or(16),
         must_edge_inference,
@@ -799,29 +801,13 @@ pub async fn sv_verify_auto_handler(
         auto_stub_flops: request.auto_stub_flops.unwrap_or(true),
         config_values,
         counter_bounds,
-        // R-F5.5d — `engine: "symbolic"` routes properties through the R-F5 BDD
-        // CEGAR loop (no per-cube-pair SMT).
-        symbolic_engine: request
-            .engine
-            .as_deref()
-            .is_some_and(|e| e.eq_ignore_ascii_case("symbolic")),
-        // D1.6 — `engine: "exact-symbolic"` decides each property exactly over the
-        // full bit-blasted state (definite verdict, never ⊥).
-        exact_symbolic: request
-            .engine
-            .as_deref()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exact-symbolic")),
-        // PORTFOLIO — `engine: "portfolio-sequential" | "portfolio-parallel"` runs
-        // several engines and merges (ignores the two single-engine flags above).
-        portfolio: match request.engine.as_deref() {
-            Some(e) if e.eq_ignore_ascii_case("portfolio-sequential") => {
-                Some(crate::adapter::slang::verify_auto::PortfolioMode::Sequential)
-            }
-            Some(e) if e.eq_ignore_ascii_case("portfolio-parallel") => {
-                Some(crate::adapter::slang::verify_auto::PortfolioMode::Parallel)
-            }
-            _ => None,
-        },
+        // Engine selection (`"explicit"` | `"symbolic"` | `"exact-symbolic"` |
+        // `"portfolio-sequential"` | `"portfolio-parallel"`). Unspecified ⇒ the
+        // default `portfolio-sequential`. `engine_selection` is the single place the
+        // string→options mapping + default live (mirrors the CLI value-enum default).
+        symbolic_engine: engine_symbolic,
+        exact_symbolic: engine_exact,
+        portfolio: engine_portfolio,
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {

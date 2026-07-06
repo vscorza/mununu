@@ -590,6 +590,30 @@ pub enum PortfolioMode {
     Parallel,
 }
 
+/// Map an optional `--engine` / `"engine"` selector string to the
+/// `(symbolic_engine, exact_symbolic, portfolio)` option triple, applying the DEFAULT when the
+/// selector is unspecified. **The default (2026-07-06) is `portfolio-sequential`** — the
+/// exact-first, cube-fallback portfolio, the most precise sound choice and no slower than the
+/// former `explicit` default on designs `explicit` already decided (exact runs first). An
+/// explicit `"explicit"` selects the single predicate-abstraction CEGAR engine. The CLI reaches
+/// the same defaults through clap's `default_value_t = EngineArg::PortfolioSequential`; this
+/// helper is the API/string entry point (and the single place the default is defined for it).
+pub fn engine_selection(engine: Option<&str>) -> (bool, bool, Option<PortfolioMode>) {
+    match engine {
+        Some(e) if e.eq_ignore_ascii_case("symbolic") => (true, false, None),
+        Some(e) if e.eq_ignore_ascii_case("exact-symbolic") => (false, true, None),
+        Some(e) if e.eq_ignore_ascii_case("portfolio-parallel") => {
+            (false, false, Some(PortfolioMode::Parallel))
+        }
+        Some(e) if e.eq_ignore_ascii_case("portfolio-sequential") => {
+            (false, false, Some(PortfolioMode::Sequential))
+        }
+        Some(e) if e.eq_ignore_ascii_case("explicit") => (false, false, None),
+        // Unspecified (or unrecognised) → the default portfolio-sequential.
+        _ => (false, false, Some(PortfolioMode::Sequential)),
+    }
+}
+
 impl Default for VerifyAutoOptions {
     fn default() -> Self {
         Self {
@@ -2462,6 +2486,39 @@ mod tests {
         let runs = vec![exact, symbolic];
         let merged = merge_portfolio_reports(&runs, PortfolioMode::Parallel).expect("merge ok");
         assert_eq!(merged.properties[0].outcome, VerifyOutcome::Holds);
+    }
+
+    #[test]
+    fn engine_selection_defaults_to_portfolio_sequential() {
+        // THE DEFAULT (2026-07-06): an unspecified engine ⇒ portfolio-sequential.
+        assert_eq!(
+            engine_selection(None),
+            (false, false, Some(PortfolioMode::Sequential))
+        );
+        // An unrecognised string also falls to the default (rather than silently explicit).
+        assert_eq!(
+            engine_selection(Some("nonsense")),
+            (false, false, Some(PortfolioMode::Sequential))
+        );
+        // Each explicit selector maps to exactly its engine (case-insensitive).
+        assert_eq!(engine_selection(Some("explicit")), (false, false, None));
+        assert_eq!(engine_selection(Some("symbolic")), (true, false, None));
+        assert_eq!(
+            engine_selection(Some("exact-symbolic")),
+            (false, true, None)
+        );
+        assert_eq!(
+            engine_selection(Some("EXACT-SYMBOLIC")),
+            (false, true, None)
+        );
+        assert_eq!(
+            engine_selection(Some("portfolio-parallel")),
+            (false, false, Some(PortfolioMode::Parallel))
+        );
+        assert_eq!(
+            engine_selection(Some("portfolio-sequential")),
+            (false, false, Some(PortfolioMode::Sequential))
+        );
     }
 
     #[test]

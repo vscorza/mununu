@@ -52,6 +52,11 @@ refinement mode.
 
 > **Source of truth:** [`verify_auto_portfolio`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/slang/verify_auto.rs#L1318), [`EngineArg::PortfolioSequential`](https://github.com/vscorza/mununu/blob/main/crates/mununu-cli/src/main.rs#L213), [`engine: "portfolio-*"`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs#L814), [`verifyAuto engine`](https://github.com/vscorza/mununu-ui/blob/main/src/components/extraction/SvVerifyAutoRunner.tsx#L221) — surface: CLI+API+UI (`mununu sv verify-auto --engine portfolio-sequential`, `POST /api/v1/sv/verify-auto` with `"engine": "portfolio-parallel"`, the verify-auto UI engine selector).
 
+**`portfolio-sequential` is the `sv verify-auto` default** (2026-07-06): the exact-first,
+cube-fallback schedule is the most precise sound choice and no slower than the former `explicit`
+default on designs `explicit` already decided (the exact engine runs first and usually decides an
+FSM outright). Pass `--engine explicit` to force the single predicate-abstraction CEGAR engine.
+
 The three engines are **complementary, not dominated**: the exact engine decides everything
 within its bit cap, and where even cone-of-influence leaves the cone too wide, the two cube
 engines each decide properties the other leaves `⊥`. A cross-engine differential
