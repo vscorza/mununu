@@ -48,6 +48,34 @@ Selecting `--engine exact-symbolic` on `btor2 cegar` / `sv cegar` is rejected wi
 message pointing at `sv verify-auto` — the exact engine is not a predicate-cube
 refinement mode.
 
+## Engine portfolio (`--engine portfolio-sequential` / `portfolio-parallel`)
+
+> **Source of truth:** [`verify_auto_portfolio`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/slang/verify_auto.rs#L1318), [`EngineArg::PortfolioSequential`](https://github.com/vscorza/mununu/blob/main/crates/mununu-cli/src/main.rs#L213), [`engine: "portfolio-*"`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/api/handlers.rs#L814), [`verifyAuto engine`](https://github.com/vscorza/mununu-ui/blob/main/src/components/extraction/SvVerifyAutoRunner.tsx#L221) — surface: CLI+API+UI (`mununu sv verify-auto --engine portfolio-sequential`, `POST /api/v1/sv/verify-auto` with `"engine": "portfolio-parallel"`, the verify-auto UI engine selector).
+
+The three engines are **complementary, not dominated**: the exact engine decides everything
+within its bit cap, and where even cone-of-influence leaves the cone too wide, the two cube
+engines each decide properties the other leaves `⊥`. A cross-engine differential
+([`diff_corpus_cegar_vs_symbolic_engine_parity`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/tests/differential_oracle_e2e.rs)) proves they **never contradict**
+on a definite verdict. The portfolio exploits that: run several engines, take the definite
+verdict from whichever produces one. It is a **budget knob**:
+
+| Mode | Scheduling | Cost | Latency |
+|---|---|---|---|
+| `portfolio-sequential` | exact → symbolic → explicit, stop when every property is decided | frugal — often only the exact engine runs | worst-case = sum of engines tried |
+| `portfolio-parallel` | all three at once (scoped threads), merge | 3× compute (every engine always runs) | fastest engine to decide each property |
+
+Both modes return **identical verdicts**. A property is `⊥` only if every engine left it `⊥`.
+If two engines ever returned **opposite** definite verdicts, the merged outcome is forced to
+`⊥` with a `portfolio-soundness-alarm` note — never a silent pick (the differential proves this
+never fires on the corpus). The exact engine's counterexample witness is retained when it decides.
+
+```bash
+mununu sv verify-auto design.sv --top my_fsm --engine portfolio-sequential
+```
+
+Like `exact-symbolic`, the portfolio is **`sv verify-auto` only**; selecting it on
+`btor2 cegar` / `sv cegar` is rejected.
+
 ## Pipeline
 
 ```
