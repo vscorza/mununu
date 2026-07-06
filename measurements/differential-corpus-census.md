@@ -43,6 +43,45 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 
 **Tally: True = 5, False = 7, ⊥ = 4.**
 
+## Are the False verdicts findings? No — expected violations (claims-integrity)
+
+**None of the 7 `False` verdicts is a bug finding.** Each was checked against the design's own
+source; every one is an *expected* violation, and for most the design's *own* SVA asserts the
+behaviour mununu reports. This corpus is a **calibration + methodology testbed, not a findings
+list**, and must be read as such.
+
+**Category A — intentional terminal error/lock states (6).** `AG EF idle` is VIOLATED because the
+FSM has a DELIBERATELY terminal error/escalate/lockdown state that only reset escapes — correct
+SEC_CM sparse-FSM hardening, only reachable via a *fault* (escalation, glitch, unsupported
+command). The modules assert this themselves:
+
+| Design | Trap | Design's own evidence it is terminal |
+|---|---|---|
+| csrng_main_sm | MainSmError | `CsrngMainErrorStStable_A: state_q == MainSmError \|=> $stable(state_q)` |
+| edn_main_sm | Error | comment "don't move out of Error as it's terminal" + `ErrorStStable_A: … \|=> $stable` |
+| rom_ctrl_fsm | Invalid | comment "Invalid: Terminal and invalid state (only reachable by a glitch)" |
+| aes_ctr_fsm | CTR_ERROR | `aes_ctr_ns = CTR_ERROR` self-loop + `alert_o=1`; gated behind `alert_o` by `AesCtrStateValid` |
+| aes_cipher_control_fsm | alert/error state | cipher-core alert trap (same class) |
+| otbn_start_stop_control | Locked | `OtbnStartStopStateLocked` self-loop — secure lockdown on fault/RMA |
+
+The key reframing: **a `HOLDS` here would be the red flag, not the `VIOLATED`.** `HOLDS` would mean
+the error state is escapable WITHOUT reset — a hardening bug contradicting the module's own
+`$stable` FPV assertion. So these VIOLATED verdicts **cross-confirm the design intent** via a
+completely independent (branching-time model-checking) route.
+
+**Category B — fairness-dependent must-liveness (1).** `uart_tx AG AF (bit_cnt==0)` is an `AF`
+(all-paths) property: with a free environment the baud tick can stall forever, holding a
+transmission incomplete on some path — the classic *liveness-needs-a-fairness-assumption* case,
+expected under an adversarial environment. Its sibling `AG EF` (*can* complete) correctly HOLDS.
+
+**What would a real finding look like?** One of these coming back `HOLDS` unexpectedly (error state
+not terminal), or a NON-security FSM (uart, prim_count) failing recoverability with no error trap.
+Neither happened. The value of the corpus is (a) mununu decides a branching-time recoverability
+property the design's SVA cannot express (SVA asserts `$stable` *locally*; it cannot state "from
+EVERY reachable state, idle is reachable"); (b) each verdict independently confirms the hardening;
+(c) the definite verdicts are soundness tripwires — a future engine change that flipped one to
+`HOLDS` would fire the monotone gate immediately.
+
 ## R-F5.6 cone-of-influence — the ⊥ story, before and after
 
 Pre-COI the exact engine bit-blasted EVERY register+input bit and hit its 40-bit cap on **9**
