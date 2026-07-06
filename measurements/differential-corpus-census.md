@@ -141,11 +141,52 @@ True=9/False=7/⊥=0, with the monotone gate green at every step (no locked verd
   exact engine's reachability facts are self-consistent (verified on edn via EF-Error/EF(AG-Error)
   probes), and P1 cross-checks exact `EF` against btormc.
 
+## Cross-engine soundness + the default-engine decision (2026-07-06)
+
+The corpus verdicts above are the **exact** engine's (`--engine exact-symbolic`). The remaining
+question for the roadmap was whether to make one of the two *cube* engines the `verify-auto`
+default: `Cegar` (predicate-abstraction SMT all-pairs, today's default) or `SymbolicCube`
+(predicate-cube BDD CEGAR, `--engine symbolic`). `diff_corpus_cegar_vs_symbolic_engine_parity`
+answers it by running all 16 corpus properties through BOTH cube engines and cross-checking each
+against the exact oracle (the `d.ledger`, all-definite). Full-corpus result:
+
+| Anchor | Result |
+|---|---|
+| **Cube definite contradicts the exact oracle** | **0 / 16** — every cube definite matches exact |
+| **Cegar vs SymbolicCube opposite definites** | **0** — the two cube engines never contradict |
+| Properties decided (of 16): **exact** | **16** (the oracle) |
+| … **SymbolicCube** | **5** — uart_tx AG-AF/AG-EF, prim_count, usbdev_linkstate, otbn_start_stop |
+| … **Cegar** | **2** — aes_ctr_fsm, aes_cipher_control_fsm |
+| Both cube engines ⊥ (exact still decides) | 9 |
+
+**Soundness: proven on the corpus.** Zero oracle contradictions and zero cross-cube flips across
+16 properties × 2 cube engines — every definite a cube engine emits is correct, and the cubes
+never disagree with each other.
+
+**The two cube engines are COMPLEMENTARY, not dominated.** SymbolicCube decides 5 (all liveness
+that Cegar leaves ⊥); Cegar decides 2 (that SymbolicCube leaves ⊥ — its predicate-cube WP loop
+saturates first). The two winner-sets are **disjoint**. So a blind default-SWAP to `symbolic`
+would trade 2 regressions for 5 gains — that is *not* "verdict parity," which the gate required.
+
+**Decision: exact-first PORTFOLIO, not a swap.** The exact engine (COI-pruned) decides all 16;
+where even COI leaves the cone over the 40-bit cap (prim_esc_receiver 47 b, prim_fifo_sync 95 b —
+SymbolicCube `Skipped` on both), the exact engine still decides them here, and the two cube engines
+are a sound complementary fallback for designs beyond the exact cap. The differential proves the
+portfolio safe: pick the definite verdict from whichever engine produces one (exact preferred),
+because no two engines ever contradict. Wiring the portfolio as the `verify-auto` default is the
+follow-up; the closeout precisions (BDD variable ordering; COI on the cube engine, which would lift
+the 2 `Skipped`) raise each engine's individual hit-rate but are no longer *gates* — the portfolio
+is sound today.
+
 ## Automated, CI-ready e2e
 
 - `diff_corpus_monotone_verdict_ledger` — the **gate**: reruns every design, panics on any
   definite-verdict flip/regress. Add a design = one `CorpusDesign` literal (untouched source
   paths + a ledger). Docker-gated (`mununu-sva`; `#[ignore]`), fast (exact-only, ~4s).
+- `diff_corpus_cegar_vs_symbolic_engine_parity` — the **cross-engine soundness gate**: hard-fails
+  on any cube definite that contradicts the exact oracle, or any Cegar↔SymbolicCube opposite
+  definite; reports the per-engine precision (5 vs 2 above). `MUNUNU_PARITY_ONLY=<names>` subsets
+  it. Docker-gated (`mununu-sva`; `#[ignore]`), full corpus ~42s.
 - `diff_corpus_verdict_census` — the **diagnostic**: prints the T/F/⊥ table + per-⊥ cause;
   optional `MUNUNU_CENSUS_EXPLICIT=1` adds the explicit-engine fallback column.
 - Not prone to hallucination: the oracle is the engine + an independent cross-check (explicit
