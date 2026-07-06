@@ -7,16 +7,21 @@
 //! > sites:** the eager predicate-cube lift routes its opt-in `SmtAllPairs`
 //! > may/must/hyper-must edges + `combinational_labels` + register-name resolution
 //! > through this seam (`kmts_lift.rs`); the exact engine uses it for
-//! > `resolve_register` **and (AR-S1) for its leaf-cell enumeration + naming** —
-//! > `BddBitBlaster::build_with_keep` reads [`BtorSts::leaf_cells`], and all three of
-//! > its cell-naming sites now share the one [`parser::resolve_leaf_symbol`]. **Still
-//! > bypassing the seam:** the *default* sampling cube path (`cube_sampling_edges` +
-//! > `smt_must_edge::*`), `bit_blast` (uses the shared step *primitive*, not the trait
-//! > type), and the symbolic BDD engine's `abstract_relation` (a different algorithm —
-//! > reads `Btor2File` directly). So the seam is canonical + faithful, but the
-//! > "single de-duplicated predicate image" goal is not yet met — three
-//! > predicate-image impls coexist (#242 was a symptom of two symbol-resolution
-//! > paths drifting; **AR-S1 collapsed the exact engine's copy of that drift class**).
+//! > `resolve_register` **and (AR-S1) for its leaf-cell enumeration + naming**
+//! > (`BddBitBlaster::build_with_keep` reads [`BtorSts::leaf_cells`], all three
+//! > cell-naming sites share the one [`parser::resolve_leaf_symbol`]); **and (AR-S2)
+//! > the default cube path's no-UF concrete step ([`StepEval::step`]) + its canonical
+//! > ∀∃ KMTS must post-pass ([`SmtEncode::must_edges_over`]).** **Still bypassing the
+//! > seam:** the default cube path's *UF-representative* step
+//! > (`simulate_one_step_with_uf_rep`) and its ∀∀ / hyper-set must-checks
+//! > (`smt_must_edge::*`, the `SmtPerTarget` / `SmtHyperMust` post-passes), and the
+//! > symbolic BDD engine's `abstract_relation` (a different algorithm — reads
+//! > `Btor2File` directly). So the seam is canonical + faithful; the "single
+//! > de-duplicated predicate image" goal is closer — the ∀∃ must-image is now single
+//! > ([`SmtEncode::must_edges_over`], shared by the eager all-pairs and the lazy
+//! > sampling-candidate consumers); the ∀∀ / hyper-must / sampling-may images remain
+//! > (#242 was a symptom of two symbol-resolution paths drifting; **AR-S1 collapsed
+//! > the exact engine's copy of that class, AR-S2 the ∀∃ must copy**).
 //! >
 //! > **Adoption is now scheduled, not blocked.** The per-impl differential harness the
 //! > AR review gated full seam adoption on has shipped
@@ -26,7 +31,9 @@
 //! > sequence (roadmap Track AR §AR-S): **S1 ✅ (2026-07-06)** converged the exact
 //! > engine's infra (leaf var-enumeration + cell naming) through [`BtorSts::leaf_cells`]
 //! > + [`parser::resolve_leaf_symbol`] — the #242 drift class is dead by construction;
-//! > **S2** route the default sampling path through [`StepEval`] / [`SmtEncode`];
+//! > **S2 ◑ (2026-07-06)** routed the default cube path's no-UF step through
+//! > [`StepEval`] and its canonical ∀∃ must through [`SmtEncode::must_edges_over`]
+//! > (the ∀∀ / hyper-set must-checks + the UF-representative step remain — follow-up);
 //! > **S3** (optional) the literal single image. Note the BDD engines'
 //! > `abstract_relation` is a *different* algorithm (symbolic BDD, not SMT
 //! > per-cube-pair), so only their infra converges — they never fold into
@@ -229,6 +236,28 @@ pub trait SmtEncode: SymbolicTransitionSystem {
     fn must_edges<P: PredicateLike + Sync>(
         &self,
         predicates: &[P],
+        timeout_ms: u32,
+    ) -> Vec<(usize, usize)>;
+
+    /// AR-S2 — the ∀∃ must-relation restricted to an explicit `candidates`
+    /// list of `(src, tgt)` cube-index pairs, sharing ONE build (`view` +
+    /// primed node cache + nid-map) across all candidates. Same soundness as
+    /// [`must_edges`](SmtEncode::must_edges) — a pair is returned only on a
+    /// proved ∀∃ obligation (UNSAT of its negation); timeouts / encoder
+    /// failure drop it.
+    ///
+    /// This is the single predicate-image both the eager all-pairs consumer
+    /// and the *lazy* sampling-candidate consumer share:
+    /// [`must_edges`](SmtEncode::must_edges) is exactly `must_edges_over`
+    /// applied to the full `0..2^p × 0..2^p` grid, while the default cube
+    /// path's `SmtPerTargetStandard` post-pass applies it to only the
+    /// **sampled** candidate targets — so laziness is preserved without a
+    /// second must-image implementation. Returned pairs are a subset of
+    /// `candidates`, in `candidates` order.
+    fn must_edges_over<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        candidates: &[(usize, usize)],
         timeout_ms: u32,
     ) -> Vec<(usize, usize)>;
 
@@ -458,24 +487,41 @@ impl SmtEncode for BtorSts<'_> {
         predicates: &[P],
         timeout_ms: u32,
     ) -> Vec<(usize, usize)> {
+        if predicates.is_empty() {
+            return Vec::new();
+        }
+        // The all-pairs ∀∃ must is exactly `must_edges_over` applied to the
+        // full `0..2^p × 0..2^p` grid — one image, two candidate shapes.
+        let n_cubes = 1usize << predicates.len();
+        let all_pairs: Vec<(usize, usize)> = (0..n_cubes)
+            .flat_map(|i| (0..n_cubes).map(move |j| (i, j)))
+            .collect();
+        self.must_edges_over(predicates, &all_pairs, timeout_ms)
+    }
+
+    fn must_edges_over<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        candidates: &[(usize, usize)],
+        timeout_ms: u32,
+    ) -> Vec<(usize, usize)> {
         use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMustVerdict, build_register_nid_map_with_inputs, smt_per_target_must_check_uniform,
         };
         use crate::adapter::sidecar::predicate_image::btor2_encode::encode_primed;
 
-        if predicates.is_empty() {
+        if predicates.is_empty() || candidates.is_empty() {
             return Vec::new();
         }
-        // H.U.1c — mirrors `may_edges`: same encode + the next-cycle node cache
-        // (`encode_primed`) built ONCE, then the uniform ∀∃ must-check per pair
+        // H.U.1c — same encode + the next-cycle node cache (`encode_primed`)
+        // built ONCE, then the uniform ∀∃ must-check per candidate pair
         // (`smt_per_target_must_check_uniform`). BEHAVIOUR-IDENTICAL to the
         // per-kind `smt_per_target_must_check_standard` on every existing cube
         // dimension (state target = `state_next`; free-input target = free; state
         // compound leaves = `state_next`) — the uniform builder produces the same
         // Z3 terms. Keeps a pair only on a definite `Must` (UNSAT); NotMust /
         // Unknown / encoder failure drop it (sound under-approximation).
-        let n_cubes = 1usize << predicates.len();
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
             let view = match encode_design_for_lift(self.file) {
@@ -488,16 +534,14 @@ impl SmtEncode for BtorSts<'_> {
             };
             let nid_map = build_register_nid_map_with_inputs(&view);
             let mut edges = Vec::new();
-            for i in 0..n_cubes {
-                for j in 0..n_cubes {
-                    if matches!(
-                        smt_per_target_must_check_uniform(
-                            &view, &primed, i as u64, j as u64, predicates, &nid_map, timeout_ms,
-                        ),
-                        SmtMustVerdict::Must
-                    ) {
-                        edges.push((i, j));
-                    }
+            for &(i, j) in candidates {
+                if matches!(
+                    smt_per_target_must_check_uniform(
+                        &view, &primed, i as u64, j as u64, predicates, &nid_map, timeout_ms,
+                    ),
+                    SmtMustVerdict::Must
+                ) {
+                    edges.push((i, j));
                 }
             }
             edges

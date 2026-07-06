@@ -1183,43 +1183,31 @@ fn apply_sampled_must_inference(
             }
         }
         // SmtPerTargetStandard — ∀∃ form (canonical KMTS must, Bruns–Godefroid).
+        // AR-S2 — routed through the STS-IR seam's single ∀∃ predicate-image
+        // (`SmtEncode::must_edges_over`), applied to exactly the sampled
+        // candidate pairs (so laziness is preserved). The seam builds the
+        // encode + primed cache once and runs the uniform must-check —
+        // behaviour-identical to the per-kind `smt_per_target_must_check_standard`
+        // on state cube dimensions — collapsing the default path's ∀∃ must-image
+        // into the seam's. Differential-guarded: `diff_corpus_cegar_vs_symbolic_
+        // engine_parity` cross-checks every cube definite against the exact oracle.
         MustEdgeInference::SmtPerTargetStandard => {
-            let cfg = z3::Config::new();
-            let sharp = z3::with_z3_config(&cfg, || -> usize {
-                let Ok(view) = encode_design_for_lift(file) else {
-                    return 0;
-                };
-                let nid_map = build_register_nid_map(&view);
-                let mut promoted = 0usize;
-                for (src_idx, targets) in sampled_targets_per_source.iter().enumerate() {
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let src_id = state_ids[src_idx];
-                    for &tgt_idx in targets {
-                        if matches!(
-                            smt_per_target_must_check_standard(
-                                &view,
-                                src_idx as u64,
-                                tgt_idx as u64,
-                                predicates,
-                                &nid_map,
-                                5_000,
-                            ),
-                            SmtMustVerdict::Must
-                        ) {
-                            builder.transition_ids_with_modality(
-                                src_id,
-                                &[label_id],
-                                state_ids[tgt_idx],
-                                crate::clts::TransitionModality::Sharp,
-                            );
-                            promoted += 1;
-                        }
-                    }
-                }
-                promoted
-            });
+            use crate::adapter::sts_ir::{BtorSts, SmtEncode};
+            let candidates: Vec<(usize, usize)> = sampled_targets_per_source
+                .iter()
+                .enumerate()
+                .flat_map(|(src, targets)| targets.iter().map(move |&t| (src, t)))
+                .collect();
+            let must = BtorSts::new(file).must_edges_over(predicates, &candidates, 5_000);
+            let sharp = must.len();
+            for &(src_idx, tgt_idx) in &must {
+                builder.transition_ids_with_modality(
+                    state_ids[src_idx],
+                    &[label_id],
+                    state_ids[tgt_idx],
+                    crate::clts::TransitionModality::Sharp,
+                );
+            }
             if sharp > 0 {
                 warnings.push(crate::adapter::AdapterWarning {
                     kind: approx,
@@ -1580,15 +1568,19 @@ fn cube_sampling_edges(cube_index: usize, ctx: &CubeSamplingCtx) -> Vec<(usize, 
 
         // R.5b multi-value UF enumeration — when at least one Op is
         // UF-wrapped, enumerate `UfRepresentative::{Zero, Ones}`; else
-        // use plain `simulate_one_step` to keep the no-UF path on its
+        // take the plain single step to keep the no-UF path on its
         // existing performance profile.
+        //
+        // AR-S2 — the no-UF concrete step routes through the STS-IR seam
+        // (`StepEval::step` on `BtorSts`, which delegates to the shared
+        // `simulate_one_step_observe` primitive; its `next_state` is
+        // documented behaviour-identical to `simulate_one_step`). The seam
+        // does not yet model the UF-representative step, so the UF branch
+        // stays on `simulate_one_step_with_uf_rep` (a follow-up sub-item).
         let next_register_snapshots: Vec<std::collections::HashMap<String, u128>> =
             if ctx.uf_wrapped_nids.is_empty() {
-                match crate::adapter::btor2::bit_blast::simulate_one_step(
-                    ctx.file,
-                    &registers,
-                    &input_values,
-                ) {
+                use crate::adapter::sts_ir::{BtorSts, StepEval};
+                match BtorSts::new(ctx.file).step(&registers, &input_values) {
                     Ok(v) => vec![v],
                     Err(_) => continue,
                 }
