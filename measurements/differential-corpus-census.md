@@ -36,12 +36,12 @@ independent engine (the explicit predicate-cube CEGAR) and, for reachability ato
 | 10 | usbdev_linkstate | AG EF LinkDisconnected(0) | **True** *(COI)* | link always disconnectable (timers pruned) |
 | 11 | aes_cipher_control_fsm | AG EF CIPHER_CTRL_IDLE(9) | **False** *(COI)* | cipher error trap (aes_reg_pkg datapath pruned) |
 | 12 | otbn_start_stop_control | AG EF Halt(1) | **False** *(COI)* | terminal Locked trap (lc_ctrl/otp closure pruned) |
-| 13 | prim_arbiter_ppc | AG EF (mask==0) | ⊥ | atom does not bind — `mask` is not a post-synthesis register name |
-| 14 | prim_arbiter_tree | AG EF (prio_mask_q==0) | ⊥ | atom does not bind — `prio_mask_q` not a post-synthesis register name |
+| 13 | prim_arbiter_ppc | AG EF (gnt_o==0) | **True** *(comb-atom)* | always returns to no-grant (`mask` register optimized away → binds the combinational `gnt_o`) |
+| 14 | prim_arbiter_tree | AG EF (gnt_o==0) | **True** *(comb-atom)* | always returns to no-grant (combinational output) |
 | 15 | prim_packer_fifo | AG EF (depth_o==0) | **True** *(Mul/shift)* | always drainable — decided once the bit-blaster gained Mul + shifts |
-| 16 | prim_fifo_sync | AG EF (depth_o==0) | ⊥ | `depth_o` is combinational here (not a registered output) — atom binds to no state register |
+| 16 | prim_fifo_sync | AG EF (depth_o==0) | **True** *(comb-atom)* | always drainable (`depth_o` is combinational → binds via named-signal support) |
 
-**Tally: True = 6, False = 7, ⊥ = 3.**
+**Tally: True = 9, False = 7, ⊥ = 0. Every design decides.**
 
 ## Are the False verdicts findings? No — expected violations (claims-integrity)
 
@@ -93,23 +93,21 @@ improvement (no locked verdict flipped — the soundness guardrail held). A herm
 (`rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath`) locks the mechanism: a 47-bit design whose
 property cone is 2 bits now decides.
 
-A follow-up added the missing bit-blaster ops the FIFO cones needed — **`Mul` (shift-and-add),
-the variable shifts `Sll`/`Srl`/`Sra` (barrel shifter), and the signed comparisons
-`Slt`/`Sgt`/`Sgte`/`Slte`** — each with a hermetic correctness test. prim_packer_fifo then decided
-(**True**, always drainable). So there are now **no op-support ⊥ left**.
+Two follow-ups closed the remaining ⊥:
 
-The **3 remaining ⊥ are all ATOM-BINDING issues** (the property references a signal that is not a
-post-synthesis *state register*), not the engine:
+1. **Bit-blaster op completeness** — `Mul` (shift-and-add), variable shifts `Sll`/`Srl`/`Sra`
+   (barrel shifter), signed comparisons `Slt`/`Sgt`/`Sgte`/`Slte`, each with a hermetic test. This
+   decided prim_packer_fifo (**True**, always drainable).
+2. **Named-combinational-signal binding** — a predicate may now bind to a combinational module
+   output / wire (`depth_o`, `gnt_o`), not only a state register, using the BDD `walk_design`
+   already computes; the atom's cone still seeds via the output's terminal fan-in. This decided
+   the last three: the arbiters (`mask` is optimized away by yosys, but the combinational `gnt_o`
+   binds — the arbiter always returns to no-grant, and gnt_o's cone is small) and fifo_sync
+   (`depth_o` is combinational; its cone is just the pointers, so the wide data storage is pruned).
 
-- **arbiter_ppc / arbiter_tree** — `mask` / `prio_mask_q` are not the post-flatten register names
-  (the round-robin priority state is optimized/renamed by yosys).
-- **fifo_sync** — `depth_o` is *combinational* here (computed from the wptr/rptr), not a
-  registered output like prim_packer_fifo's; the atom binds to no state register.
-
-Path forward (a corpus-refinement TODO, not an engine gap): inspect each synthesized netlist and
-re-point the atom to the real register (a pointer/fullness register for the FIFO, the priority
-register for the arbiters). Even bound, the arbiters' N-wide `req_i` keeps the cone wide — the
-next COI limit there is BDD **variable ordering**.
+**Result: every design in the corpus now decides — ⊥ = 0.** The cone-of-influence restriction plus
+op-completeness plus combinational-atom binding took the corpus from True=3/False=4/⊥=9 to
+True=9/False=7/⊥=0, with the monotone gate green at every step (no locked verdict ever flipped).
 
 ## Spurious-results audit
 

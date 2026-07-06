@@ -170,6 +170,11 @@ pub struct BddBitBlaster {
     cells: Vec<Cell>,
     /// State symbol → its next-state BDD vector, from the `Node::Next` lines.
     next_funcs: HashMap<String, BitVec>,
+    /// Named COMBINATIONAL signal (module output / named wire) → its BDD vector over the
+    /// leaf vars, from `walk_design`. Lets a predicate bind to a combinational output
+    /// (`depth_o`, `gnt_o`, …) that is not a state register — the atom's cone still seeds
+    /// correctly (`resolve_atom_to_terminals` walks the output to its state/input terminals).
+    named_signals: HashMap<String, BitVec>,
 }
 
 impl BddBitBlaster {
@@ -295,6 +300,7 @@ impl BddBitBlaster {
             env,
             cells,
             next_funcs: HashMap::new(),
+            named_signals: HashMap::new(),
         };
 
         // Pass 2 — walk the node DAG, evaluating every Const/Op into a BitVec.
@@ -332,7 +338,45 @@ impl BddBitBlaster {
             }
         }
 
+        // Pass 4 — named combinational signals (module outputs / named wires), so a predicate
+        // can bind to a non-register signal (`depth_o`, `gnt_o`). Its BDD is already in `env`
+        // (walk_design); the atom's cone still seeds via the output's terminal fan-in.
+        for line in &file.lines {
+            match &line.node {
+                Node::Output {
+                    symbol: Some(s),
+                    signal,
+                } => {
+                    if let Some(bits) = blaster.env.get(&signal.nid()) {
+                        blaster
+                            .named_signals
+                            .entry(s.clone())
+                            .or_insert_with(|| bits.clone());
+                    }
+                }
+                Node::Op {
+                    symbol: Some(s), ..
+                } => {
+                    if let Some(bits) = blaster.env.get(&line.nid) {
+                        blaster
+                            .named_signals
+                            .entry(s.clone())
+                            .or_insert_with(|| bits.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Ok(blaster)
+    }
+
+    /// The BDD bit-vector for a predicate operand: a state/input register ([`register_bits`])
+    /// or, failing that, a named combinational signal (module output / wire). `None` if neither
+    /// names it.
+    fn signal_bits(&self, name: &str) -> Option<&BitVec> {
+        self.register_bits(name)
+            .or_else(|| self.named_signals.get(name))
     }
 
     /// Symbolically compute one clock step and restrict it to a concrete
@@ -613,7 +657,7 @@ impl BddBitBlaster {
     /// semantics bit-for-bit — including when a literal exceeds the register
     /// width. `And`/`Or`/`Not` map to the BDD boolean ops.
     pub fn predicate_bdd(&self, expr: &PredicateExpr) -> Result<BDDFunction, String> {
-        let unknown = |r: &str| format!("predicate references unknown register `{r}`");
+        let unknown = |r: &str| format!("predicate references unknown register/signal `{r}`");
         match expr {
             PredicateExpr::Cmp {
                 register,
@@ -621,7 +665,7 @@ impl BddBitBlaster {
                 value,
             } => {
                 let reg = self
-                    .register_bits(register)
+                    .signal_bits(register)
                     .ok_or_else(|| unknown(register))?;
                 // Compare at max(reg width, 64) so a u64 literal wider than the
                 // register keeps its high bits (reg's zero-extend to those bits
@@ -632,8 +676,8 @@ impl BddBitBlaster {
                 Ok(self.cmp_bits(&a, *op, &b, w as u32))
             }
             PredicateExpr::CmpReg { lhs, op, rhs } => {
-                let l = self.register_bits(lhs).ok_or_else(|| unknown(lhs))?;
-                let r = self.register_bits(rhs).ok_or_else(|| unknown(rhs))?;
+                let l = self.signal_bits(lhs).ok_or_else(|| unknown(lhs))?;
+                let r = self.signal_bits(rhs).ok_or_else(|| unknown(rhs))?;
                 let w = l.len().max(r.len());
                 let a = self.zero_extend(l, w);
                 let b = self.zero_extend(r, w);
@@ -646,8 +690,8 @@ impl BddBitBlaster {
                 addend,
                 width: _,
             } => {
-                let l = self.register_bits(lhs).ok_or_else(|| unknown(lhs))?;
-                let r = self.register_bits(rhs).ok_or_else(|| unknown(rhs))?;
+                let l = self.signal_bits(lhs).ok_or_else(|| unknown(lhs))?;
+                let r = self.signal_bits(rhs).ok_or_else(|| unknown(rhs))?;
                 // sum = (rhs + addend) mod 2^(rhs width) — wraps exactly as the
                 // RTL `+` (the `bvadd` in `build_constraint`; the `width` field
                 // is `eval`'s modulus and equals the rhs register width here).
@@ -3549,6 +3593,31 @@ mod tests {
             exact_symbolic_verdict(SLT_BTOR2, &formula).expect("slt decides"),
             ExactVerdict::Holds,
             "x in 8..15 are signed-negative so x <s 0 and EF(p==1) holds (unsigned would fail)",
+        );
+    }
+
+    /// A predicate binds to a named COMBINATIONAL signal, not just a state register: `o = p + 1`
+    /// is a module OUTPUT (no `next` line), and `EF(o == 3)` holds (p reaches 2 ⇒ o = 3). Locks
+    /// the `named_signals` binding that unblocks corpus atoms over combinational outputs
+    /// (`depth_o`, `gnt_o`) which are not post-synthesis registers.
+    #[test]
+    fn predicate_binds_combinational_output() {
+        const COMB_BTOR2: &str = r#"
+1 sort bitvec 4
+2 state 1 p
+3 one 1
+4 add 1 2 3
+5 output 4 o
+6 next 1 2 4
+7 const 1 0000
+8 init 1 2 7
+"#;
+        let formula =
+            crate::mu_calculus::parser::parse("mu Y. ((o == 3) or <> Y)").expect("formula");
+        assert_eq!(
+            exact_symbolic_verdict(COMB_BTOR2, &formula).expect("combinational atom binds"),
+            ExactVerdict::Holds,
+            "o = p+1 is a combinational output; p reaches 2 ⇒ o==3 ⇒ EF(o==3) holds",
         );
     }
 

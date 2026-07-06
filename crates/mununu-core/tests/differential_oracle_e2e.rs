@@ -422,25 +422,27 @@ const CORPUS: &[CorpusDesign] = &[
     // (rst_ni=1). R-F5.6 cone-of-influence restricts the exact engine to each property's cone,
     // so the large control FSMs (usbdev/aes_cipher/otbn) DECIDE (they were bit-cap ⊥ pre-COI). ----
     // prim_arbiter_ppc — round-robin arbiter; the `mask` register is its only state (resets 0).
-    // AG EF (mask==0): the priority mask is always returnable to the reset round-robin phase.
+    // AG EF (gnt_o==0): the arbiter can always return to no-grant (the priority `mask` register
+    // is optimized away by yosys, so the atom binds to the combinational output `gnt_o`).
     CorpusDesign {
         name: "prim_arbiter_ppc",
         dir: "dc_opentitan_prim_arbiter_ppc",
         files: &["prim_arbiter_ppc.sv", "prim_assert.sv", "prim_util_pkg.sv"],
         top: "prim_arbiter_ppc",
-        annotations: &["nu Y. ((mu X. ((mask == 0) or <> X)) and [] Y)"],
+        annotations: &["nu Y. ((mu X. ((gnt_o == 0) or <> X)) and [] Y)"],
         config: &[("rst_ni", 1)],
-        ledger: &[("(mask == 0)", LedgerVerdict::Indefinite)],
+        ledger: &[("(gnt_o == 0)", LedgerVerdict::True)],
     },
-    // prim_arbiter_tree — round-robin arbiter; `prio_mask_q` state (resets 0). AG EF prio_mask==0.
+    // prim_arbiter_tree — round-robin arbiter. AG EF (gnt_o==0) no-grant recoverability
+    // (combinational output; the priority register does not survive synthesis by that name).
     CorpusDesign {
         name: "prim_arbiter_tree",
         dir: "dc_opentitan_prim_arbiter_tree",
         files: &["prim_arbiter_tree.sv", "prim_assert.sv"],
         top: "prim_arbiter_tree",
-        annotations: &["nu Y. ((mu X. ((prio_mask_q == 0) or <> X)) and [] Y)"],
+        annotations: &["nu Y. ((mu X. ((gnt_o == 0) or <> X)) and [] Y)"],
         config: &[("rst_ni", 1)],
-        ledger: &[("(prio_mask_q == 0)", LedgerVerdict::Indefinite)],
+        ledger: &[("(gnt_o == 0)", LedgerVerdict::True)],
     },
     // prim_packer_fifo — AG EF (depth_o==0): the packer FIFO is always drainable to empty.
     // HOLDS once the bit-blaster supports Mul + shifts (the pointer datapath); depth_o is a
@@ -539,10 +541,10 @@ const CORPUS: &[CorpusDesign] = &[
         config: &[("rst_ni", 1)],
         ledger: &[("(state_q == 55)", LedgerVerdict::False)], // VIOLATED (MainSmError trap, inputs free)
     },
-    // prim_fifo_sync — synchronous FIFO; AG EF (depth_o==0) drainability. ⊥ because `depth_o`
-    // is COMBINATIONAL here (computed from the wptr/rptr, not a registered output like
-    // prim_packer_fifo's) → the atom binds to no state register. A corpus-atom TODO: re-point to
-    // a pointer/fullness register. prim_fifo_assert.svh is a `include`d
+    // prim_fifo_sync — synchronous FIFO; AG EF (depth_o==0) drainability = HOLDS. `depth_o` is
+    // COMBINATIONAL here (from the wptr/rptr, not a registered output like prim_packer_fifo's),
+    // so it binds via the exact engine's named-combinational-signal support; its cone is just the
+    // pointers (the data storage is out of it). prim_fifo_assert.svh is a `include`d
     // header (staged so the include resolves, never compiled as a top-level source).
     CorpusDesign {
         name: "prim_fifo_sync",
@@ -556,7 +558,7 @@ const CORPUS: &[CorpusDesign] = &[
         top: "prim_fifo_sync",
         annotations: &["nu Y. ((mu X. ((depth_o == 0) or <> X)) and [] Y)"],
         config: &[("rst_ni", 1)],
-        ledger: &[("(depth_o == 0)", LedgerVerdict::Indefinite)],
+        ledger: &[("(depth_o == 0)", LedgerVerdict::True)],
     },
 ];
 
@@ -678,4 +680,49 @@ fn diff_corpus_verdict_census() {
     eprintln!(
         "=============================================================================================\n"
     );
+}
+
+/// Diagnostic — dump the post-synthesis STATE-register + INPUT names of the atom-binding-⊥
+/// designs (arbiter_ppc/tree, fifo_sync). Their corpus atoms (`mask`, `prio_mask_q`, `depth_o`)
+/// bind to no state register; this prints the names yosys actually emits so the atoms can be
+/// re-pointed. Non-failing; run when refining those atoms.
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn dump_state_registers_atom_binding_todo() {
+    use mununu_core::adapter::btor2::parser::{collect_symbols, parse as parse_btor2};
+    use mununu_core::adapter::yosys::sv_to_btor2;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+    for name in ["prim_arbiter_ppc", "prim_arbiter_tree", "prim_fifo_sync"] {
+        let d = CORPUS
+            .iter()
+            .find(|d| d.name == name)
+            .expect("design in corpus");
+        let read = |f: &str| {
+            std::fs::read_to_string(root.join(d.dir).join("source").join(f))
+                .unwrap_or_else(|e| panic!("read {f}: {e}"))
+        };
+        let primary = read(d.files[0]);
+        let additional: Vec<(String, String)> = d.files[1..]
+            .iter()
+            .map(|f| (f.to_string(), read(f)))
+            .collect();
+        let yopts = YosysOptions {
+            top: Some(d.top.to_string()),
+            use_sv2v: true,
+            additional_sources: additional,
+            ..Default::default()
+        };
+        eprintln!("\n=== {name} — post-synthesis state/input symbols ===");
+        match sv_to_btor2(&primary, &yopts).and_then(|b| parse_btor2(&b)) {
+            Ok(file) => {
+                let mut names: Vec<String> = collect_symbols(&file).into_values().collect();
+                names.sort();
+                names.dedup();
+                for n in names {
+                    eprintln!("  {n}");
+                }
+            }
+            Err(e) => eprintln!("  ERROR: {}", e.message),
+        }
+    }
 }
