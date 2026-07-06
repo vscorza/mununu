@@ -229,6 +229,17 @@ impl Formula {
             .count()
     }
 
+    /// Whether the formula contains ANY modality (`[]` or `<>`). A modal formula's
+    /// definite verdict depends on the may relation's completeness in BOTH directions —
+    /// a definite `KleeneT` on `[]φ` (all may-successors) and a definite `KleeneF` on
+    /// `<>φ` / `EF` reachability (no may-path) both become unsound if the may relation is
+    /// an UNDER-approximation (the sampling `MayEdgeInference::Off` path with a capped
+    /// input enumeration). A purely propositional formula is unaffected. Callers use this
+    /// to decide whether a cube definite must be downgraded to `⊥` under sampling-may.
+    pub fn has_modality(&self) -> bool {
+        self.nodes.iter().any(|n| matches!(n, Node::Modal { .. }))
+    }
+
     /// Returns true if the subtree rooted at `id` contains a fixpoint of the
     /// opposite kind. `looking_for_nu = true` means we're inside a mu and
     /// looking for a nu (and vice versa).
@@ -726,6 +737,22 @@ mod tests {
                 .unwrap()
                 .box_modality_count(),
             2
+        );
+    }
+
+    #[test]
+    fn has_modality_detects_box_and_diamond_but_not_propositional() {
+        // A.4 honest-⊥ (2026-07-06) — any `[]` OR `<>` makes a formula modal (its cube definite
+        // depends on may-completeness); a purely propositional formula is not.
+        assert!(!parser::parse("p").unwrap().has_modality());
+        assert!(!parser::parse("(p || q) && !r").unwrap().has_modality());
+        assert!(parser::parse("mu X. (p || <> X)").unwrap().has_modality()); // EF (diamond)
+        assert!(parser::parse("nu X. (p && [] X)").unwrap().has_modality()); // AG (box)
+        // AG EF — the ibex_controller shape: both box and diamond.
+        assert!(
+            parser::parse("nu Y. ((mu X. (p or <> X)) and [] Y)")
+                .unwrap()
+                .has_modality()
         );
     }
 }

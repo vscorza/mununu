@@ -737,6 +737,33 @@ const CORPUS: &[CorpusDesign] = &[
         config: &[("rst_ni", 1)],
         ledger: &[("(depth_o == 0)", LedgerVerdict::True)],
     },
+    // ibex_controller — the lowRISC ibex RISC-V core's main control FSM (ctrl_fsm_e, 4-bit:
+    // RESET=0 … DECODE=5 … DBG_TAKEN_ID=9). Byte-exact from lowRISC/ibex c6edaa40; pure control
+    // logic (no submodules), self-contained ibex_pkg (791 lines) + prim_assert + a dv_fcov synth
+    // stub. The first NON-prim, CPU-scale design in the corpus. AG EF DECODE recoverability: does
+    // the core always return to executing instructions? (`ctrl_fsm_cs == 5` = DECODE).
+    //
+    // The EXACT engine decides HOLDS (True) — the core always returns to DECODE. The cube engines
+    // return ⊥: ibex has > 8 boolean inputs, so the sampling may-relation is INCOMPLETE
+    // (under-approximate) and the A.4 honest-⊥ guard downgrades their would-be definite (a
+    // spurious VIOLATED from a missed edge back to DECODE) to ⊥. So exact=True, cube=⊥ — no
+    // cross-engine contradiction (the parity gate's oracle-violation is resolved by the fix).
+    CorpusDesign {
+        name: "ibex_controller",
+        dir: "dc_lowrisc_ibex_controller",
+        files: &[
+            "ibex_controller.sv",
+            "prim_assert.sv",
+            "dv_fcov_macros.svh", // coverage-macro synth stub (ibex_controller includes it)
+            "ibex_pkg.sv",
+        ],
+        top: "ibex_controller",
+        annotations: &["nu Y. ((mu X. ((ctrl_fsm_cs == 5) or <> X)) and [] Y)"], // DECODE = 5
+        config: &[("rst_ni", 1)],
+        // HOLDS (exact engine) — the core always returns to executing. Non-spurious (reset gated,
+        // DECODE=5 is the real execution state). The cube engines honestly ⊥ (A.4 downgrade).
+        ledger: &[("(ctrl_fsm_cs == 5)", LedgerVerdict::True)],
+    },
 ];
 
 #[test]
