@@ -163,6 +163,12 @@ pub struct BddBitBlaster {
     /// (`depth_o`, `gnt_o`, …) that is not a state register — the atom's cone still seeds
     /// correctly (`resolve_atom_to_terminals` walks the output to its state/input terminals).
     named_signals: HashMap<String, BitVec>,
+    /// The conjunction of every `constraint` line's 1-bit signal (a BDD over the
+    /// state + input vars); `tt` when the design has no `constraint`. The exact
+    /// model injects it into the modal pre-image so `◇`/`□` range only over
+    /// constraint-respecting transitions — modelling BTOR2 `constraint` (assume)
+    /// soundly instead of over-approximating.
+    constraint_bdd: BDDFunction,
 }
 
 impl BddBitBlaster {
@@ -276,6 +282,7 @@ impl BddBitBlaster {
 
         let mut blaster = BddBitBlaster {
             _manager: manager,
+            constraint_bdd: tt.clone(), // real value computed after walk_design (Pass 5)
             tt,
             ff,
             env,
@@ -344,6 +351,22 @@ impl BddBitBlaster {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Pass 5 — the `constraint` (assume) conjunction: AND every `constraint`
+        // line's 1-bit signal into `constraint_bdd` (a function of the state +
+        // input vars). The exact model injects it into the modal pre-image so a
+        // `constraint` design is checked over constraint-respecting runs, not
+        // over-approximated. An out-of-cone (pinned) constraint signal folds to a
+        // constant, which is correct (the cone keeps every constraint-coupled leaf).
+        for line in &file.lines {
+            if let Node::Constraint { signal } = &line.node {
+                let bits = blaster.resolve(*signal)?;
+                let c = bits.into_iter().next().ok_or_else(|| {
+                    "exact bit-blaster: a `constraint` signal has zero width".to_string()
+                })?;
+                blaster.constraint_bdd = blaster.constraint_bdd.and(&c).unwrap();
             }
         }
 
@@ -1591,6 +1614,10 @@ pub struct ExactModel {
     sub_repl: Vec<BDDFunction>,
     /// The cube of input-bit vars, quantified in the modal pre-image.
     input_cube: BDDFunction,
+    /// BTOR2 `constraint` (assume) conjunction over the state + input vars — `tt`
+    /// when the design is unconstrained. Injected into `diamond_pre` / `box_pre`
+    /// so the modal quantifier ranges only over constraint-respecting transitions.
+    constraint: BDDFunction,
     tt: BDDFunction,
     ff: BDDFunction,
 }
@@ -1628,6 +1655,7 @@ impl BddBitBlaster {
             sub_vars,
             sub_repl,
             input_cube,
+            constraint: self.constraint_bdd.clone(),
             tt: self.tt.clone(),
             ff: self.ff.clone(),
         }
@@ -1722,16 +1750,41 @@ impl ExactModel {
         }
     }
 
-    /// `⟨⟩φ` — some successor (over some input) satisfies `φ`: `∃i. to_next(φ)`.
-    pub fn diamond_pre(&self, phi: &BDDFunction) -> BDDFunction {
+    /// The states where the `constraint` is satisfiable by *some* input:
+    /// `∃i. constraint(s,i)`. A valid constraint-respecting run only ever visits
+    /// such states (a state with no admissible input is a dead end), so callers
+    /// conjoin this into a *target* set (e.g. `bad`) to require the target itself
+    /// be constraint-consistent. `tt` when unconstrained.
+    pub fn constraint_satisfiable(&self) -> BDDFunction {
         use oxidd::BooleanFunctionQuant;
-        self.to_next(phi).exists(&self.input_cube).unwrap()
+        self.constraint.exists(&self.input_cube).unwrap()
     }
 
-    /// `[]φ` — all successors (over every input) satisfy `φ`: `∀i. to_next(φ)`.
+    /// `⟨⟩φ` — some **constraint-respecting** successor satisfies `φ`:
+    /// `∃i. constraint(s,i) ∧ to_next(φ)`. `constraint = tt` (unconstrained) makes
+    /// this the plain `∃i. to_next(φ)`, so an unconstrained design is unchanged.
+    pub fn diamond_pre(&self, phi: &BDDFunction) -> BDDFunction {
+        use oxidd::BooleanFunctionQuant;
+        self.to_next(phi)
+            .and(&self.constraint)
+            .unwrap()
+            .exists(&self.input_cube)
+            .unwrap()
+    }
+
+    /// `[]φ` — **every constraint-respecting** successor satisfies `φ`:
+    /// `∀i. constraint(s,i) ⟹ to_next(φ)` = `∀i. ¬constraint(s,i) ∨ to_next(φ)`.
+    /// The dual of the constrained diamond; `constraint = tt` gives the plain
+    /// `∀i. to_next(φ)`.
     pub fn box_pre(&self, phi: &BDDFunction) -> BDDFunction {
         use oxidd::BooleanFunctionQuant;
-        self.to_next(phi).forall(&self.input_cube).unwrap()
+        self.constraint
+            .not()
+            .unwrap()
+            .or(&self.to_next(phi))
+            .unwrap()
+            .forall(&self.input_cube)
+            .unwrap()
     }
 
     /// D1.2 — evaluate a **2-valued** μ-calculus `formula` over the exact model,
@@ -1953,21 +2006,11 @@ pub fn exact_bad_reachable(btor2_content: &str) -> Result<bool, String> {
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("exact bad-reachability: parse: {}", e.message))?;
 
-    // Soundness guard: we do not model `constraint` (assume) / `fair` — a design carrying them
-    // could have a `bad` reachable in OUR unconstrained relation but unreachable under btormc's
-    // constrained one. Refuse to decide rather than emit an over-approximate verdict.
-    if file
-        .lines
-        .iter()
-        .any(|l| matches!(l.node, Node::Constraint { .. } | Node::Fair { .. }))
-    {
-        return Err(
-            "exact bad-reachability: design has `constraint`/`fair` lines (not modelled) — \
-             undecided rather than over-approximate"
-                .into(),
-        );
-    }
-
+    // `constraint` (assume) is now modelled soundly: the bit-blaster folds every
+    // constraint into `ExactModel`'s pre-image (`diamond_pre` / `box_pre`), so the
+    // `EF(bad)` fixpoint below ranges only over constraint-respecting runs — no
+    // over-approximation, no refusal. `fair` is irrelevant to a finite safety
+    // reachability query (it constrains infinite justice runs) and is ignored.
     let bad_ops: Vec<Operand> = file
         .lines
         .iter()
@@ -1993,12 +2036,52 @@ pub fn exact_bad_reachable(btor2_content: &str) -> Result<bool, String> {
     }
 
     let model = bb.exact_model();
+    // The `bad` target must itself be constraint-consistent: btormc checks the
+    // constraint at the step where `bad` holds too, so reaching a state that
+    // violates every constraint is not a valid counterexample. Conjoining the
+    // constraint-satisfiable states leaves an unconstrained design unchanged
+    // (`constraint_satisfiable() = tt`). The constrained `◇` (`diamond_pre`)
+    // already restricts every intermediate step.
+    let bad = bad.and(&model.constraint_satisfiable()).unwrap();
     let formula = mu_parser::parse("mu Y. (BAD or <> Y)").expect("EF(bad) formula parses");
     let mut atoms: HashMap<&str, BDDFunction> = HashMap::new();
     atoms.insert("BAD", bad);
     let reach = model.evaluate(&formula, &atoms)?;
     let init = bb.initial_state_bdd(&file);
-    Ok(init.and(&reach).unwrap() != bb.ff)
+    let reachable = init.and(&reach).unwrap() != bb.ff;
+
+    // A REACHABLE verdict is always sound: the modelled reset (uninitialised
+    // registers pinned to 0) is ONE of the initial states btormc explores, so a
+    // path found from it is a real path. An UNREACHABLE verdict, however, is sound
+    // only when every state cell is initialised — an uninitialised (free-init)
+    // register could reach `bad` from a non-reset value that btormc considers but
+    // the pin-to-reset model does not (the `noninitstate` differential case). So we
+    // decide REACHABLE freely, and refuse an UNREACHABLE verdict on a design with
+    // free-init state rather than emit a possibly-unsound "safe".
+    if reachable {
+        return Ok(true);
+    }
+    let init_states: std::collections::HashSet<Nid> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            Node::Init { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    let has_free_init_state = file
+        .lines
+        .iter()
+        .any(|l| matches!(l.node, Node::State { .. }) && !init_states.contains(&l.nid));
+    if has_free_init_state {
+        return Err(
+            "exact bad-reachability: unreachable from the pinned reset, but the design has \
+                    uninitialised (free-init) state — btormc explores non-reset initial values the \
+                    pin-to-reset model does not; undecided rather than unsound"
+                .into(),
+        );
+    }
+    Ok(false)
 }
 
 /// D1.3 — exact full-state symbolic μ-calculus model checking end-to-end: parse the
@@ -3768,8 +3851,11 @@ mod tests {
     /// `exact_bad_reachable` — the soundness guard: a design with a `constraint` line is
     /// UNDECIDED (Err), never an over-approximate verdict (this engine does not restrict
     /// reachability to constraint-satisfying runs).
+    /// `exact_bad_reachable` — a `constraint` over a free input does not block an
+    /// already-unreachable `bad`: `s` held at 0, `bad = (s == 1)` is unreachable
+    /// regardless, so the modelled-constraint verdict is UNSAT (safe), not a refusal.
     #[test]
-    fn exact_bad_reachable_refuses_constrained_design() {
+    fn exact_bad_reachable_models_constraint_unreachable() {
         const CONSTRAINED: &str = r#"
 1 sort bitvec 1
 2 zero 1
@@ -3782,9 +3868,87 @@ mod tests {
 9 input 1 c
 10 constraint 9
 "#;
+        assert_eq!(
+            exact_bad_reachable(CONSTRAINED),
+            Ok(false),
+            "constraint over a free input; bad=(s==1) is unreachable ⇒ safe (decided, not refused)"
+        );
+    }
+
+    /// `exact_bad_reachable` — a `constraint` that FORBIDS the bad state blocks it:
+    /// a 3-bit counter reaches `0b111`, but `constraint (s != 7)` makes every
+    /// constraint-respecting run avoid `s == 7`, so `bad = (s == 7)` is unreachable
+    /// under the assumption (UNSAT). Without constraint modelling this would be SAT.
+    #[test]
+    fn exact_bad_reachable_constraint_blocks_bad() {
+        const BLOCKED: &str = r#"
+1 sort bitvec 3
+2 zero 1
+3 state 1
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 ones 1
+9 sort bitvec 1
+10 eq 9 3 8
+11 bad 10
+12 neq 9 3 8
+13 constraint 12
+"#;
+        assert_eq!(
+            exact_bad_reachable(BLOCKED),
+            Ok(false),
+            "constraint (s != 7) forbids the bad state ⇒ bad unreachable under the assumption"
+        );
+    }
+
+    /// `exact_bad_reachable` — a satisfiable `constraint` over a free input does NOT
+    /// block a reachable `bad`: the input can be chosen to satisfy the constraint at
+    /// every step, so the 3-bit counter still reaches `0b111` (SAT).
+    #[test]
+    fn exact_bad_reachable_constraint_satisfiable_still_reachable() {
+        const SAT: &str = r#"
+1 sort bitvec 3
+2 zero 1
+3 state 1
+4 init 1 3 2
+5 one 1
+6 add 1 3 5
+7 next 1 3 6
+8 ones 1
+9 sort bitvec 1
+10 eq 9 3 8
+11 bad 10
+12 input 9 c
+13 constraint 12
+"#;
+        assert_eq!(
+            exact_bad_reachable(SAT),
+            Ok(true),
+            "constraint (free input c) is satisfiable with c=1 every step ⇒ bad still reachable"
+        );
+    }
+
+    /// `exact_bad_reachable` — an UNREACHABLE-from-reset verdict on a design with
+    /// UNINITIALISED (free-init) state is refused, not returned as `false`: the
+    /// register is held (`next = s`) with no `init` line, so from the pin-to-0 reset
+    /// `bad = (s == 1)` is unreachable, but btormc explores `s = 1` at cycle 0
+    /// (reachable). Returning `false` there would be unsound, so the engine is
+    /// undecided.
+    #[test]
+    fn exact_bad_reachable_refuses_unreachable_on_free_init_state() {
+        const FREE_INIT: &str = r#"
+1 sort bitvec 1
+2 state 1 s
+3 next 1 2 2
+4 one 1
+5 eq 1 2 4
+6 bad 5
+"#;
         assert!(
-            exact_bad_reachable(CONSTRAINED).is_err(),
-            "a constrained design must be undecided, not over-approximated"
+            exact_bad_reachable(FREE_INIT).is_err(),
+            "unreachable-from-reset + free-init state ⇒ undecided (btormc may reach from a non-0 init)"
         );
     }
 
