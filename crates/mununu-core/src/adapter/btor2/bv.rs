@@ -566,9 +566,9 @@ mod tests {
                 &((BigUint::from(a) * BigUint::from(b)) & biguint_mask(w.min(128))),
             );
             assert_eq!(av.mul(&bv).to_u128(), Some(mref(mul_ref, w)), "mul w={w}");
-            if b != 0 {
-                assert_eq!(av.udiv(&bv).to_u128(), Some(mref(a / b, w)), "udiv w={w}");
-                assert_eq!(av.urem(&bv).to_u128(), Some(mref(a % b, w)), "urem w={w}");
+            if let (Some(q), Some(r)) = (a.checked_div(b), a.checked_rem(b)) {
+                assert_eq!(av.udiv(&bv).to_u128(), Some(mref(q, w)), "udiv w={w}");
+                assert_eq!(av.urem(&bv).to_u128(), Some(mref(r, w)), "urem w={w}");
             }
             // Shifts by a random amount in 0..=w+2 (covers the ≥ w saturation).
             let n = (rng.next() % (w as u128 + 3)) as u32;
