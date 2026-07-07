@@ -26,6 +26,7 @@ pub mod bv;
 pub mod cegar;
 pub mod concrete_oracle;
 pub mod dep_graph;
+pub mod emit;
 pub mod kmts_lift;
 pub mod parser;
 pub mod pin;
