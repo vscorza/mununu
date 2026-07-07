@@ -304,6 +304,145 @@ fn native_engine_adjudication_over_btor2tools_suite() {
     );
 }
 
+/// LOCAL-ONLY HWMCC adjudication harness — run the FULL reachability portfolio
+/// (exact ⊕ native ⊕ btormc ⊕ Pono) over a directory of BTOR2 benchmarks the USER
+/// provides, and gate on soundness + the benchmarks' own `-sat`/`-unsat` labels.
+///
+/// # Why a harness, not vendored benchmarks
+///
+/// The official HWMCC benchmark set (`hwmcc20benchmarks.tar.xz`) ships with **no
+/// license** — redistributing it is a copyright risk, so mununu does NOT vendor it.
+/// This ships the ADJUDICATOR; you provide the benchmarks — exactly like the
+/// subprocess-tools-not-bundled policy ships the code, not the tools.
+///
+/// # How to run
+///
+/// ```sh
+/// curl -LO https://hwmcc.github.io/2020/hwmcc20benchmarks.tar.xz
+/// mkdir -p /tmp/hwmcc20 && tar xf hwmcc20benchmarks.tar.xz -C /tmp/hwmcc20
+/// # in the mununu-sva image (btormc + pono on PATH), point at a leaf dir of .btor2:
+/// MUNUNU_HWMCC_DIR=/tmp/hwmcc20/<btor-subdir> \
+///   cargo test -p mununu-core --test differential_oracle_e2e \
+///   hwmcc_adjudication_over_user_dir -- --ignored --nocapture
+/// ```
+///
+/// Two HARD gates: (1) a [`ReachVerdict::Contradiction`] — two sound engines
+/// disagreeing — is a soundness alarm; (2) a definite portfolio verdict that
+/// contradicts the benchmark's `-sat`/`-unsat` filename label is a bug. It also
+/// reports coverage (decided / abstained) and which engine carried each verdict.
+/// Unset `MUNUNU_HWMCC_DIR` ⇒ the test no-ops (nothing to adjudicate).
+#[test]
+#[ignore = "provide MUNUNU_HWMCC_DIR (user-downloaded HWMCC benchmarks); run in mununu-sva"]
+fn hwmcc_adjudication_over_user_dir() {
+    use mununu_core::adapter::btor2::parser::parse as parse_btor2;
+    use mununu_core::adapter::reach_portfolio::{ReachVerdict, decide_reach_portfolio};
+
+    let Some(dir) = std::env::var_os("MUNUNU_HWMCC_DIR") else {
+        eprintln!("MUNUNU_HWMCC_DIR unset — nothing to adjudicate (see the doc comment).");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read dir {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|s| s.to_str()),
+                Some("btor2") | Some("btor")
+            )
+        })
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no .btor2/.btor files in {}",
+        dir.display()
+    );
+
+    let (mut total, mut decided, mut reach, mut unreach) = (0u32, 0u32, 0u32, 0u32);
+    let mut contradictions: Vec<String> = Vec::new();
+    let mut label_mismatch: Vec<String> = Vec::new();
+    let mut by_engine: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    eprintln!(
+        "\n===== HWMCC adjudication: full portfolio over {} =====",
+        dir.display()
+    );
+    for path in &files {
+        total += 1;
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let file = match parse_btor2(&content) {
+            Ok(f) => f,
+            Err(_) => {
+                eprintln!("  {fname:44} PARSE-ERROR");
+                continue;
+            }
+        };
+        let out = decide_reach_portfolio(&file);
+        // Ground truth from the -sat/-unsat filename convention.
+        let label = if fname.contains("-sat") {
+            Some(true)
+        } else if fname.contains("-unsat") {
+            Some(false)
+        } else {
+            None
+        };
+        let verdict_bool = match out.verdict {
+            ReachVerdict::Reachable => {
+                decided += 1;
+                reach += 1;
+                Some(true)
+            }
+            ReachVerdict::Unreachable => {
+                decided += 1;
+                unreach += 1;
+                Some(false)
+            }
+            ReachVerdict::Unknown => None,
+            ReachVerdict::Contradiction => {
+                contradictions.push(format!("{fname}: {out:?}"));
+                None
+            }
+        };
+        if let (Some(lbl), Some(v)) = (label, verdict_bool)
+            && lbl != v
+        {
+            label_mismatch.push(format!("{fname}: portfolio={v} vs label={lbl}"));
+        }
+        for e in out.reachable_by.iter().chain(out.unreachable_by.iter()) {
+            *by_engine.entry((*e).to_string()).or_default() += 1;
+        }
+        eprintln!(
+            "  {fname:44} {:?}   reach_by={:?} unreach_by={:?}",
+            out.verdict, out.reachable_by, out.unreachable_by
+        );
+    }
+    eprintln!(
+        "-----------------------------------------------------------------------------------"
+    );
+    eprintln!(
+        "  benchmarks {total};  decided {decided} (reachable {reach}, unreachable {unreach});  abstained {}",
+        total - decided
+    );
+    eprintln!("  per-engine contributions: {by_engine:?}");
+    eprintln!(
+        "===================================================================================\n"
+    );
+
+    // Hard SOUNDNESS gate — a portfolio contradiction is two sound engines disagreeing.
+    assert!(
+        contradictions.is_empty(),
+        "SOUNDNESS ALARM — portfolio contradiction: {contradictions:?}"
+    );
+    // Hard LABEL gate — a definite verdict must match the benchmark's ground truth.
+    assert!(
+        label_mismatch.is_empty(),
+        "a definite portfolio verdict contradicts the -sat/-unsat label: {label_mismatch:?}"
+    );
+}
+
 // ============================================================================
 // P2 — corpus differential over real open designs, with the MONOTONE VERDICT
 // LEDGER invariant.
