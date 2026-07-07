@@ -1,18 +1,24 @@
 //! Reachability portfolio — decide BTOR2 `bad`-reachability with every available
 //! engine and merge under the **differential-oracle discipline**.
 //!
-//! The P1 payoff made usable: the exact BDD engine
-//! ([`exact_bad_reachable`](crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable)),
-//! btormc (BMC + k-induction), and Pono (IC3/PDR) each decide a *different*
-//! slice of designs — the exact engine within its 40-bit cone cap, btormc on
-//! deep counterexamples, Pono on IC3-provable/violated instances. Running them
-//! together (the emit seam feeds the two subprocess members) decides strictly
-//! more than any one, and — crucially — every engine's verdict is **sound**, so:
+//! The P1 payoff made usable — four sound engines, each deciding a *different*
+//! slice of designs:
+//! - the **exact** BDD engine
+//!   ([`exact_bad_reachable`](crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable))
+//!   within its 40-bit cone cap;
+//! - the in-house **native** engine (BMC + k-induction on the Z3 seam,
+//!   [`native_bmc`](crate::adapter::btor2::native_bmc)) — no bit cap, no
+//!   subprocess: mununu's own scalable safety member;
+//! - **btormc** (BMC + k-induction) on deep counterexamples;
+//! - **Pono** (IC3/PDR) on IC3-provable / violated instances.
+//!
+//! Running them together decides strictly more than any one, and — crucially —
+//! every engine's verdict is **sound**, so:
 //!
 //! - **first definite wins** — any engine's `Reachable` / `Unreachable` decides it;
 //! - **two DEFINITE verdicts that DISAGREE raise a soundness alarm** ([`ReachVerdict::Contradiction`])
-//!   rather than a guess. Since all three engines are sound, a disagreement can
-//!   only mean a real bug — exactly what the differential oracle exists to catch.
+//!   rather than a guess. Since all engines are sound, a disagreement can only mean
+//!   a real bug — exactly what the differential oracle exists to catch.
 //!
 //! Both a **sequential** ([`decide_reach_portfolio`]) and a **parallel**
 //! ([`decide_reach_portfolio_parallel`]) driver are provided. They merge
@@ -26,6 +32,7 @@
 
 use crate::adapter::btor2::ast::Btor2File;
 use crate::adapter::btor2::emit::emit_btor2;
+use crate::adapter::btor2::native_bmc::{self, SafetyVerdict};
 use crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable;
 use crate::adapter::btormc::{self, McVerdict};
 use crate::adapter::pono;
@@ -79,21 +86,43 @@ fn run_exact(content: &str) -> Option<bool> {
     exact_bad_reachable(content).ok()
 }
 
-/// Merge the three members' verdicts into a [`ReachOutcome`], in the fixed
-/// engine order (`exact`, `btormc`, `pono`) so the outcome is deterministic
+/// The in-house **native engine** (BMC + k-induction on the Z3 seam) verdict:
+/// `Some(true)` reachable (a counterexample), `Some(false)` unreachable (a
+/// k-inductive safety proof), `None` abstained (Unknown / timeout / encode error).
+/// Unlike the exact BDD engine it has no 40-bit cone cap, and unlike btormc/Pono
+/// it needs no subprocess — mununu's own scalable safety member.
+fn run_native(file: &Btor2File) -> Option<bool> {
+    match native_bmc::decide_bad_safety(
+        file,
+        native_bmc::DEFAULT_MAX_K,
+        Some(native_bmc::DEFAULT_TIMEOUT_MS),
+    ) {
+        Ok(SafetyVerdict::Violated { .. }) => Some(true),
+        Ok(SafetyVerdict::Safe { .. }) => Some(false),
+        Ok(SafetyVerdict::Unknown { .. }) | Err(_) => None,
+    }
+}
+
+/// Merge the members' verdicts into a [`ReachOutcome`], in the fixed engine order
+/// (`exact`, `native`, `btormc`, `pono`) so the outcome is deterministic
 /// regardless of which driver (sequential / parallel) produced them.
 fn collect(
     exact: Option<bool>,
+    native: Option<bool>,
     btormc_v: Option<McVerdict>,
     pono_v: Option<McVerdict>,
 ) -> ReachOutcome {
     let mut reachable_by: Vec<&'static str> = Vec::new();
     let mut unreachable_by: Vec<&'static str> = Vec::new();
-    match exact {
-        Some(true) => reachable_by.push("exact"),
-        Some(false) => unreachable_by.push("exact"),
-        None => {}
+    // In-house engines report reachability as a bool (`Some(true)` = reachable).
+    for (name, v) in [("exact", exact), ("native", native)] {
+        match v {
+            Some(true) => reachable_by.push(name),
+            Some(false) => unreachable_by.push(name),
+            None => {}
+        }
     }
+    // Subprocess members report an `McVerdict`.
     for (name, v) in [("btormc", btormc_v), ("pono", pono_v)] {
         match v {
             Some(McVerdict::Violated) => reachable_by.push(name),
@@ -120,12 +149,14 @@ pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
     // Exact BDD engine — sound both ways (REACHABLE is always sound; an
     // UNREACHABLE verdict is refused on free-init state), within the bit cap.
     let exact = run_exact(&content);
+    // Native engine — in-house BMC + k-induction on the Z3 seam, no bit cap.
+    let native = run_native(file);
     // btormc — BMC (CEX) + k-induction (proof).
     let btormc_v =
         btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
     // Pono — IC3/PDR (proof + shallow CEX).
     let pono_v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
-    collect(exact, btormc_v, pono_v)
+    collect(exact, native, btormc_v, pono_v)
 }
 
 /// The **parallel** driver: run the exact engine (in-process) and the two
@@ -146,13 +177,17 @@ pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
         let pono_h = scope.spawn(|| {
             pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok()
         });
+        // The native engine is in-process Z3 work — its own thread so it overlaps
+        // the exact engine + the subprocess members rather than serialising.
+        let native_h = scope.spawn(|| run_native(file));
         // The exact engine is in-process BDD work — run it on this thread while the
-        // two subprocess members run on theirs.
+        // other members run on theirs.
         let exact = run_exact(&content);
         // A panicked member thread abstains (None) rather than poisoning the merge.
+        let native = native_h.join().unwrap_or(None);
         let btormc_v = btormc_h.join().unwrap_or(None);
         let pono_v = pono_h.join().unwrap_or(None);
-        collect(exact, btormc_v, pono_v)
+        collect(exact, native, btormc_v, pono_v)
     })
 }
 
@@ -200,6 +235,28 @@ mod tests {
         assert!(
             out.unreachable_by.is_empty(),
             "no engine should call the reachable counter unreachable"
+        );
+    }
+
+    #[test]
+    fn native_engine_decides_beyond_the_exact_cap_in_portfolio() {
+        // A 64-bit register that stays 0, `bad = (big != 0)`: SAFE, but the 64-bit
+        // cone is over the exact engine's 40-bit cap. With no btormc/pono on PATH
+        // and the exact engine abstaining, the portfolio would previously be
+        // Unknown; the in-house native engine (k-induction) now proves it
+        // Unreachable — the scale win, in-process, no subprocess.
+        const WIDE_SAFE: &str = "1 sort bitvec 64\n2 zero 1\n3 state 1 big\n4 init 1 3 2\n\
+                                 5 next 1 3 3\n6 sort bitvec 1\n7 neq 6 3 2\n8 bad 7\n";
+        let file = parser::parse(WIDE_SAFE).expect("parse");
+        let out = decide_reach_portfolio(&file);
+        assert_eq!(out.verdict, ReachVerdict::Unreachable, "outcome: {out:?}");
+        assert!(
+            out.unreachable_by.contains(&"native"),
+            "the native engine must carry the beyond-cap verdict: {out:?}"
+        );
+        assert!(
+            !out.unreachable_by.contains(&"exact"),
+            "the exact engine must abstain on the over-cap 64-bit design: {out:?}"
         );
     }
 
