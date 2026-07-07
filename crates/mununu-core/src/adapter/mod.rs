@@ -50,6 +50,7 @@ pub mod ir;
 pub mod langgraph;
 pub mod microcode;
 pub mod partition;
+pub mod pono;
 pub mod promela;
 pub mod sidecar;
 pub mod slang;
