@@ -82,6 +82,23 @@ impl Bv {
         }
     }
 
+    /// Build from a `u128` seed at any `width`: masks to `width` when
+    /// `width ≤ 128`, else zero-extends the `u128` into the wider field (the
+    /// seed value carries ≤ 128 bits of information). Used at the concrete
+    /// evaluator's `u128` seed boundary (register / input values) where a cell
+    /// may be wider than 128 bits.
+    pub fn from_u128_width(bits: u128, width: u32) -> Self {
+        if width <= 128 {
+            Bv::from_u128(bits, width)
+        } else {
+            // `bits < 2^128 ≤ 2^width`, so no masking is needed.
+            Bv::Wide {
+                mag: BigUint::from(bits),
+                width,
+            }
+        }
+    }
+
     pub fn zero(width: u32) -> Self {
         if width <= 128 {
             Bv::Small { bits: 0, width }
@@ -152,11 +169,33 @@ impl Bv {
         }
     }
 
+    /// The low 128 bits of the value (exact for `Small`, truncating for `Wide`).
+    /// Used to extract a shift amount or a narrow field from a possibly-wide value.
+    #[inline]
+    pub fn low128(&self) -> u128 {
+        match self {
+            Bv::Small { bits, .. } => *bits,
+            Bv::Wide { mag, .. } => biguint_to_u128_truncating(mag),
+        }
+    }
+
     /// The value as a `BigUint` magnitude (always exact).
     pub fn to_biguint(&self) -> BigUint {
         match self {
             Bv::Small { bits, .. } => BigUint::from(*bits),
             Bv::Wide { mag, .. } => mag.clone(),
+        }
+    }
+
+    /// `true` iff bit `i` is set (`i` may be ≥ 128; out-of-width bits are 0).
+    #[inline]
+    pub fn bit(&self, i: u64) -> bool {
+        if i as u32 >= self.width() {
+            return false;
+        }
+        match self {
+            Bv::Small { bits, .. } => (bits >> i) & 1 == 1,
+            Bv::Wide { mag, .. } => mag.bit(i),
         }
     }
 
@@ -325,6 +364,34 @@ impl Bv {
         // Fill the top `n` bits with ones: OR with (ones(w) << (w-n)).
         let fill = Bv::ones(w).shl(w - n);
         logical.or(&fill)
+    }
+
+    /// Rotate left by `n` bit positions (`n` taken modulo width by the caller).
+    pub fn rol(&self, n: u32) -> Bv {
+        let w = self.width();
+        let n = n % w.max(1);
+        if n == 0 {
+            return self.clone();
+        }
+        self.shl(n).or(&self.shr(w - n))
+    }
+
+    /// Rotate right by `n` bit positions (`n` taken modulo width by the caller).
+    pub fn ror(&self, n: u32) -> Bv {
+        let w = self.width();
+        let n = n % w.max(1);
+        if n == 0 {
+            return self.clone();
+        }
+        self.shr(n).or(&self.shl(w - n))
+    }
+
+    /// Population count (number of set bits within the width).
+    pub fn count_ones(&self) -> u64 {
+        match self {
+            Bv::Small { bits, .. } => bits.count_ones() as u64,
+            Bv::Wide { mag, .. } => mag.count_ones(),
+        }
     }
 
     // ---- structural ----
