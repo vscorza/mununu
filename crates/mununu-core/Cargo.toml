@@ -19,6 +19,10 @@ serde_json = "1.0"
 bitvec = "1.0"
 smallvec = "1.15"
 regex = "1.12"
+# Arbitrary-precision magnitudes for the concrete bit-vector evaluator's >128-bit
+# path (`adapter::btor2::bv::Bv::Wide`); the ≤128-bit path stays on native u128.
+num-bigint = "0.4"
+num-traits = "0.2"
 
 # OxiDD — pure-Rust decision-diagram framework (BDD). Backs the R-F5 symbolic
 # abstraction path: predicate-cube state sets + the may/must transition relation as
