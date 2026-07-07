@@ -53,6 +53,7 @@ pub mod partition;
 pub mod pono;
 pub mod promela;
 pub mod reach_portfolio;
+pub mod reach_rescue;
 pub mod sidecar;
 pub mod slang;
 pub mod state_enum;

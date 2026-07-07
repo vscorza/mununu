@@ -1336,3 +1336,69 @@ fn p3_verilator_replays_ag_ef_trap_counterexample() {
         "trap st_o==3 must be absorbing across the persistence tail; full dump: {stdout}"
     );
 }
+
+/// REACH-RESCUE reducibility census — measures the real-corpus payoff of the
+/// subprocess `reach_portfolio_rescue` BEFORE any surface wiring. For every corpus
+/// design it runs the full internal portfolio (`PortfolioSequential`), collects
+/// the properties it leaves ⊥, and reports how many of those are the reducible
+/// `AG(state ⋈ value)` shape [`reduce_ag_invariant`] recognises. Only reducible ⊥
+/// properties can be rescued by the subprocess portfolio, so this count is the
+/// upper bound on the feature's corpus payoff. Diagnostic (no assertion) — the
+/// `--nocapture` output is the deliverable. Needs only slang+sv2v+yosys (no
+/// btormc/pono): reducibility is a pure formula-shape question.
+#[test]
+#[ignore = "requires slang + sv2v + yosys (mununu-sva image); run with --ignored"]
+fn e2e_reach_rescue_reducibility_census() {
+    use mununu_core::adapter::reach_rescue::reduce_ag_invariant;
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (mut total, mut definite, mut bot, mut reducible) = (0u32, 0u32, 0u32, 0u32);
+    let mut designs_ran = 0u32;
+    eprintln!(
+        "\n============ reach-rescue reducibility census (portfolio-⊥ properties) ============"
+    );
+    for d in CORPUS {
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            corpus_report(d, Engine::PortfolioSequential)
+        }));
+        let report = match report {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("  {:28} SETUP-ERROR (skipped)", d.name);
+                continue;
+            }
+        };
+        designs_ran += 1;
+        eprintln!("  {:28} {} properties", d.name, report.properties.len());
+        for p in &report.properties {
+            total += 1;
+            if outcome_verdict(&p.outcome) != LedgerVerdict::Indefinite {
+                definite += 1;
+                continue;
+            }
+            bot += 1;
+            let red = mununu_core::mu_calculus::parser::parse(&p.formula)
+                .ok()
+                .and_then(|f| reduce_ag_invariant(&f));
+            let tag = match &red {
+                Some(inv) => {
+                    reducible += 1;
+                    format!("REDUCIBLE({} {:?} {})", inv.signal, inv.op, inv.value)
+                }
+                None => "not-reducible".to_string(),
+            };
+            eprintln!("  {:28} {:36} ⊥  [{tag}]", d.name, p.name);
+        }
+    }
+    std::panic::set_hook(prev);
+    eprintln!("----------------------------------------------------------------------------------");
+    eprintln!(
+        "  designs ran: {designs_ran}/{}   total properties: {total}   definite: {definite}",
+        CORPUS.len()
+    );
+    eprintln!("  portfolio-⊥ properties: {bot}   reducible to AG(state ⋈ value): {reducible}");
+    eprintln!(
+        "==================================================================================\n"
+    );
+}
