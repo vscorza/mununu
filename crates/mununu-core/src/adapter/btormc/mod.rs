@@ -63,9 +63,9 @@
 //! EMISSION (property → augmented BTOR2) is H.O.1b; the `McOracle` differential +
 //! real-RTL e2e is H.O.1c.
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::adapter::{AdapterError, AdapterErrorKind};
 
@@ -73,6 +73,11 @@ use crate::adapter::{AdapterError, AdapterErrorKind};
 /// reach a CEX or close k-induction on the small FSM fragments H.O targets, while
 /// bounding wall-clock on the e2e. Callers can override per-invocation.
 pub const DEFAULT_KMAX: u32 = 40;
+
+/// Default wall-clock timeout for a [`run_btormc`] invocation. `-kmax` bounds the
+/// unroll DEPTH, but each SAT check on a wide design can still be slow; this caps
+/// the total run so a portfolio member cannot hang the whole decision.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A discovered `btormc` binary + its parsed version (diagnostic only — mununu
 /// does not gate on a minimum version).
@@ -172,52 +177,28 @@ pub fn count_bad_properties(btor2: &str) -> usize {
 /// hard error (e.g. a malformed BTOR2 — a bug in the emission, not an
 /// inconclusive verdict) with no parseable verdict on stdout. A clean run with
 /// neither `sat` nor `unsat` is [`McVerdict::Unknown`], not an error.
-pub fn run_btormc(bin: &BtormcBin, btor2: &str, kmax: u32) -> Result<McVerdict, AdapterError> {
-    let mut child = Command::new(&bin.path)
-        .arg("--kind")
-        .arg("-kmax")
-        .arg(kmax.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+pub fn run_btormc(
+    bin: &BtormcBin,
+    btor2: &str,
+    kmax: u32,
+    timeout: Duration,
+) -> Result<McVerdict, AdapterError> {
+    let mut command = Command::new(&bin.path);
+    command.arg("--kind").arg("-kmax").arg(kmax.to_string());
+    let outcome = crate::adapter::run_with_timeout(&mut command, Some(btor2.as_bytes()), timeout)
         .map_err(|e| AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: format!(
-                "adapter/btormc: failed to spawn `{}`: {e}",
-                bin.path.display()
-            ),
-            location: None,
-        })?;
-
-    // Write the BTOR2 to stdin, then drop the handle to signal EOF (the fragment
-    // is small, so the pipe buffer never fills before `wait_with_output` drains
-    // stdout — no deadlock).
-    {
-        let mut stdin = child.stdin.take().ok_or_else(|| AdapterError {
-            kind: AdapterErrorKind::UnsupportedConstruct,
-            message: "adapter/btormc: child stdin unavailable".to_string(),
-            location: None,
-        })?;
-        stdin
-            .write_all(btor2.as_bytes())
-            .map_err(|e| AdapterError {
-                kind: AdapterErrorKind::UnsupportedConstruct,
-                message: format!("adapter/btormc: failed writing BTOR2 to stdin: {e}"),
-                location: None,
-            })?;
-    }
-
-    let output = child.wait_with_output().map_err(|e| AdapterError {
         kind: AdapterErrorKind::UnsupportedConstruct,
         message: format!(
-            "adapter/btormc: failed waiting for `{}`: {e}",
+            "adapter/btormc: failed to run `{}`: {e}",
             bin.path.display()
         ),
         location: None,
     })?;
+    // Timed out ⇒ inconclusive (never a wrong verdict).
+    let Some((status, stdout, stderr)) = outcome else {
+        return Ok(McVerdict::Unknown);
+    };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     // MULTI-PROPERTY SOUNDNESS FIX — `--kind` reports per property and may STOP after
     // proving ONE property of a multi-`bad` design safe (printing `unsat bN`) while a
     // DIFFERENT property is reachable. `parse_btormc_output` returns on the first
@@ -234,14 +215,13 @@ pub fn run_btormc(bin: &BtormcBin, btor2: &str, kmax: u32) -> Result<McVerdict, 
     // A clean Unknown (exit 0, empty stdout) is valid. But if btormc reported a
     // hard error (non-zero exit, e.g. a BTOR2 parse error) AND produced no
     // verdict, surface it — that signals a malformed monitor, not inconclusiveness.
-    if verdict == McVerdict::Unknown && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if verdict == McVerdict::Unknown && !status.success() {
         return Err(AdapterError {
             kind: AdapterErrorKind::UnsupportedConstruct,
             message: format!(
                 "adapter/btormc: `{}` exited with status {} and no verdict; stderr: {}",
                 bin.path.display(),
-                output.status,
+                status,
                 stderr.trim()
             ),
             location: None,
@@ -267,10 +247,11 @@ pub fn run_btormc(bin: &BtormcBin, btor2: &str, kmax: u32) -> Result<McVerdict, 
 pub fn decide_via_btormc(
     file: &crate::adapter::btor2::ast::Btor2File,
     kmax: u32,
+    timeout: Duration,
 ) -> Result<McVerdict, AdapterError> {
     let btor2 = crate::adapter::btor2::emit::emit_btor2(file);
     let bin = locate_btormc()?;
-    run_btormc(&bin, &btor2, kmax)
+    run_btormc(&bin, &btor2, kmax, timeout)
 }
 
 #[cfg(test)]
@@ -372,7 +353,7 @@ mod tests {
     fn run_btormc_reach_is_violated() {
         let bin = locate_btormc().expect("btormc present");
         assert_eq!(
-            run_btormc(&bin, REACH_BTOR2, DEFAULT_KMAX).unwrap(),
+            run_btormc(&bin, REACH_BTOR2, DEFAULT_KMAX, DEFAULT_TIMEOUT).unwrap(),
             McVerdict::Violated
         );
     }
@@ -383,7 +364,7 @@ mod tests {
         let bin = locate_btormc().expect("btormc present");
         // `--kind` (set by run_btormc) is what lets this conclude Safe.
         assert_eq!(
-            run_btormc(&bin, SAFE_BTOR2, DEFAULT_KMAX).unwrap(),
+            run_btormc(&bin, SAFE_BTOR2, DEFAULT_KMAX, DEFAULT_TIMEOUT).unwrap(),
             McVerdict::Safe
         );
     }
@@ -396,13 +377,13 @@ mod tests {
         // the emit hand-off end-to-end (the emitted text is btormc's input).
         let reach = crate::adapter::btor2::parser::parse(REACH_BTOR2).expect("parse reach");
         assert_eq!(
-            decide_via_btormc(&reach, DEFAULT_KMAX).unwrap(),
+            decide_via_btormc(&reach, DEFAULT_KMAX, DEFAULT_TIMEOUT).unwrap(),
             McVerdict::Violated,
             "emit→btormc must decide the reachable-bad model as Violated"
         );
         let safe = crate::adapter::btor2::parser::parse(SAFE_BTOR2).expect("parse safe");
         assert_eq!(
-            decide_via_btormc(&safe, DEFAULT_KMAX).unwrap(),
+            decide_via_btormc(&safe, DEFAULT_KMAX, DEFAULT_TIMEOUT).unwrap(),
             McVerdict::Safe,
             "emit→btormc must decide the safe model as Safe"
         );

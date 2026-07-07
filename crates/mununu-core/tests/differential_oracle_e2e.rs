@@ -17,7 +17,9 @@
 use mununu_core::adapter::btor2::symbolic_bitblast::{
     ExactVerdict, exact_bad_reachable, exact_symbolic_verdict,
 };
-use mununu_core::adapter::btormc::{DEFAULT_KMAX, McVerdict, locate_btormc, run_btormc};
+use mununu_core::adapter::btormc::{
+    DEFAULT_KMAX, DEFAULT_TIMEOUT, McVerdict, locate_btormc, run_btormc,
+};
 use mununu_core::adapter::slang::verify_auto::{
     PortfolioMode, VerifyAutoOptions, VerifyOutcome, verify_auto,
 };
@@ -69,7 +71,7 @@ fn reachability_differential(btor2: &str, ef_formula: &str) -> ReachDifferential
     );
     let bin = locate_btormc().expect("btormc present (mununu-sva)");
     let btormc_reachable = matches!(
-        run_btormc(&bin, btor2, DEFAULT_KMAX).expect("btormc runs"),
+        run_btormc(&bin, btor2, DEFAULT_KMAX, DEFAULT_TIMEOUT).expect("btormc runs"),
         McVerdict::Violated, // a reachable `bad` ⇒ the atom is reachable
     );
     ReachDifferential {
@@ -144,7 +146,7 @@ fn hwmcc_style_coverage_study() {
             .unwrap_or_else(|e| panic!("read {fname}: {e}"));
         // Our exact engine's bad-reachability, and btormc's (the independent oracle).
         let ours = exact_bad_reachable(&content);
-        let mc = run_btormc(&bin, &content, DEFAULT_KMAX).expect("btormc runs");
+        let mc = run_btormc(&bin, &content, DEFAULT_KMAX, DEFAULT_TIMEOUT).expect("btormc runs");
         let mc_reach = match mc {
             McVerdict::Violated => Some(true), // bad reachable
             McVerdict::Safe => Some(false),    // proved unreachable

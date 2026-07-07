@@ -35,6 +35,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use crate::adapter::btormc::{McVerdict, count_bad_properties};
 use crate::adapter::{AdapterError, AdapterErrorKind};
@@ -44,6 +45,13 @@ use crate::adapter::{AdapterError, AdapterErrorKind};
 /// finds shallow counterexamples (`sat`); deep-CEX designs are btormc's strength
 /// in the portfolio.
 pub const DEFAULT_ENGINE: &str = "ic3bits";
+
+/// Default wall-clock budget for a single Pono run. Pono's IC3/PDR has **no
+/// native wall-clock bound** (only depth caps on the bounded engines), so a hard
+/// instance can run unbounded — the external kill in
+/// [`crate::adapter::run_with_timeout`] is the only backstop. A timeout is a sound
+/// abstention: it yields [`McVerdict::Unknown`], never a wrong verdict.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A discovered `pono` binary + its parsed version (diagnostic only).
 #[derive(Debug, Clone)]
@@ -97,7 +105,12 @@ pub fn parse_pono_output(stdout: &str) -> McVerdict {
 /// multi-property `Safe`-downgrade mirrors [`crate::adapter::btormc::run_btormc`].
 /// `Err` only when the subprocess could not run; a clean run with no `sat`/`unsat`
 /// is [`McVerdict::Unknown`], not an error.
-pub fn run_pono(bin: &PonoBin, btor2: &str, engine: &str) -> Result<McVerdict, AdapterError> {
+pub fn run_pono(
+    bin: &PonoBin,
+    btor2: &str,
+    engine: &str,
+    timeout: Duration,
+) -> Result<McVerdict, AdapterError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     // Pono reads a file (not stdin). Write to a uniquely-named temp file — the
     // codebase's `std::env::temp_dir` convention (as in the verilator wrapper),
@@ -116,16 +129,19 @@ pub fn run_pono(bin: &PonoBin, btor2: &str, engine: &str) -> Result<McVerdict, A
         ))
     })?;
 
-    let result = Command::new(&bin.path)
-        .arg("-e")
-        .arg(engine)
-        .arg(&tmp_path)
-        .output();
+    // Pono's IC3/PDR has no native wall-clock bound — enforce one externally so a
+    // hard instance abstains (Unknown) rather than hanging the portfolio.
+    let mut command = Command::new(&bin.path);
+    command.arg("-e").arg(engine).arg(&tmp_path);
+    let result = crate::adapter::run_with_timeout(&mut command, None, timeout);
     let _ = std::fs::remove_file(&tmp_path);
-    let output =
-        result.map_err(|e| err(format!("failed to spawn `{}`: {e}", bin.path.display())))?;
+    let outcome =
+        result.map_err(|e| err(format!("failed to run `{}`: {e}", bin.path.display())))?;
+    // Timed out ⇒ inconclusive (never a wrong verdict).
+    let Some((status, stdout, stderr)) = outcome else {
+        return Ok(McVerdict::Unknown);
+    };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     // MULTI-PROPERTY SOUNDNESS — Pono checks property index 0 by default, so an
     // `unsat` on a design with >1 `bad` proves only that one property safe. Downgrade
     // a `Safe` parse to `Unknown`; a `sat` (some property reachable) stays `Violated`.
@@ -137,12 +153,11 @@ pub fn run_pono(bin: &PonoBin, btor2: &str, engine: &str) -> Result<McVerdict, A
 
     // A clean Unknown is valid; a hard error (non-zero exit, no verdict) is not —
     // surface it as a malformed-input signal rather than inconclusiveness.
-    if verdict == McVerdict::Unknown && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if verdict == McVerdict::Unknown && !status.success() {
         return Err(err(format!(
             "`{}` exited with status {} and no verdict; stderr: {}",
             bin.path.display(),
-            output.status,
+            status,
             stderr.trim()
         )));
     }
@@ -155,10 +170,11 @@ pub fn run_pono(bin: &PonoBin, btor2: &str, engine: &str) -> Result<McVerdict, A
 pub fn decide_via_pono(
     file: &crate::adapter::btor2::ast::Btor2File,
     engine: &str,
+    timeout: Duration,
 ) -> Result<McVerdict, AdapterError> {
     let btor2 = crate::adapter::btor2::emit::emit_btor2(file);
     let bin = locate_pono()?;
-    run_pono(&bin, &btor2, engine)
+    run_pono(&bin, &btor2, engine, timeout)
 }
 
 fn err(message: String) -> AdapterError {
@@ -202,12 +218,12 @@ mod tests {
         // a reachable-bad model is Violated, a safe one is Safe.
         let reach = parser::parse(REACH).expect("parse reach");
         assert_eq!(
-            decide_via_pono(&reach, DEFAULT_ENGINE).unwrap(),
+            decide_via_pono(&reach, DEFAULT_ENGINE, DEFAULT_TIMEOUT).unwrap(),
             McVerdict::Violated
         );
         let safe = parser::parse(SAFE).expect("parse safe");
         assert_eq!(
-            decide_via_pono(&safe, DEFAULT_ENGINE).unwrap(),
+            decide_via_pono(&safe, DEFAULT_ENGINE, DEFAULT_TIMEOUT).unwrap(),
             McVerdict::Safe
         );
     }

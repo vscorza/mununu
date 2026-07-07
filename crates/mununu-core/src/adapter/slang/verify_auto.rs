@@ -5080,7 +5080,9 @@ endmodule
     use crate::adapter::btor2::bad_monitor::{
         emit_ag_implies_next_monitor, emit_ag_state_atom_monitor,
     };
-    use crate::adapter::btormc::{DEFAULT_KMAX, McVerdict, locate_btormc, run_btormc};
+    use crate::adapter::btormc::{
+        DEFAULT_KMAX, DEFAULT_TIMEOUT, McVerdict, locate_btormc, run_btormc,
+    };
 
     /// MC analog of [`spurious_verdict`]: `Some(reason)` iff a DEFINITE cube
     /// verdict and the external model checker *contradict*. `McVerdict::Unknown`
@@ -5154,7 +5156,7 @@ endmodule
         let bin = locate_btormc().expect("btormc present");
         let monitor =
             emit_ag_state_atom_monitor(WIDE_INPUT_FSM, "cnt", CmpOp::Ne, 3, false).unwrap();
-        let mc = run_btormc(&bin, &monitor, DEFAULT_KMAX).unwrap();
+        let mc = run_btormc(&bin, &monitor, DEFAULT_KMAX, DEFAULT_TIMEOUT).unwrap();
         assert_eq!(
             mc,
             McVerdict::Safe,
@@ -5256,7 +5258,8 @@ endmodule
             .expect("emit |=> monitor on real-RTL (binds state_q + cfg_enable_i)");
 
         let bin = locate_btormc().expect("btormc present");
-        let mc = run_btormc(&bin, &monitor, 60).expect("btormc runs on the sysrst monitor");
+        let mc = run_btormc(&bin, &monitor, 60, DEFAULT_TIMEOUT)
+            .expect("btormc runs on the sysrst monitor");
         eprintln!("\n=== H.O.1c sysrst sva_0 external-MC verdict: {mc:?} ===");
 
         // Soundness gate (always): verify_auto's HOLDS (Trit::True) must not be
