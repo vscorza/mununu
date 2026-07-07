@@ -45,6 +45,17 @@ use crate::adapter::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// Per-invocation wall-clock cap for the per-module BTOR2 emission path
+/// ([`translate_sv_per_module`]). That path runs one FULL yosys elaboration PER
+/// submodule (re-reading the whole source set each time) and is designed for the
+/// SMALL multi-module fixtures the M.0–M.4 milestones use, where each call is
+/// sub-second. On a large real design a single call can thrash for minutes (or
+/// exhaust memory); this bound turns that into a clean, explained failure instead
+/// of an indefinite hang. Generous (60×+ the expected per-call time) so it never
+/// trips on the fixtures the feature actually targets.
+const PER_MODULE_YOSYS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Yosys-specific options.
 #[derive(Debug, Clone, Default)]
@@ -573,11 +584,13 @@ pub struct PerModuleOutput {
 ///    single-BTOR2 path. Each per-module BTOR2 is fed through the
 ///    BTOR2 adapter to produce an `AdapterOutput`.
 ///
-/// The cost (~N Yosys invocations for an N-submodule design) is
-/// acceptable for the small multi-module fixtures the M.0–M.4
-/// validation milestones target. A single-invocation variant using
-/// Yosys `select` is feasible in principle but introduces select-scope
-/// subtleties that the two-pass shape avoids.
+/// The cost (~N Yosys invocations for an N-submodule design, each re-reading
+/// the whole source set) is acceptable for the small multi-module fixtures the
+/// M.0–M.4 validation milestones target, but blows up on a large real design —
+/// each Yosys call is therefore capped at [`PER_MODULE_YOSYS_TIMEOUT`] and fails
+/// with an actionable error rather than hanging indefinitely. A single-invocation
+/// variant using Yosys `select` is feasible in principle but introduces
+/// select-scope subtleties that the two-pass shape avoids.
 pub fn translate_sv_per_module(
     content: &str,
     options: &AdapterOptions,
@@ -704,7 +717,7 @@ fn translate_sv_per_module_impl(
     // not provide one (matches the legacy build_script).
     let hier_json_path = tmp.path().join("hier.json");
     let discovery_script = build_discovery_script(&sources, yopts.top.as_deref(), &hier_json_path);
-    run_yosys(&yosys, &discovery_script)?;
+    run_yosys(&yosys, &discovery_script, PER_MODULE_YOSYS_TIMEOUT)?;
 
     let hier_body = std::fs::read_to_string(&hier_json_path).map_err(|e| AdapterError {
         kind: AdapterErrorKind::ParseError,
@@ -763,7 +776,7 @@ fn translate_sv_per_module_impl(
             yopts.setundef_anyconst,
             &yopts.init_policy_overrides,
         );
-        run_yosys(&yosys, &script)?;
+        run_yosys(&yosys, &script, PER_MODULE_YOSYS_TIMEOUT)?;
 
         let btor = std::fs::read_to_string(&btor_path).map_err(|e| AdapterError {
             kind: AdapterErrorKind::ParseError,
@@ -892,25 +905,49 @@ fn select_setundef_pass(anyseq: bool, anyconst: bool) -> &'static str {
 
 /// Spawn Yosys with the given script. Captures stdout/stderr into the
 /// `AdapterError` message on failure.
-fn run_yosys(yosys: &Path, script: &str) -> Result<(), AdapterError> {
-    let output = Command::new(yosys)
-        .arg("-q")
-        .arg("-p")
-        .arg(script)
-        .output()
-        .map_err(|e| AdapterError {
+fn run_yosys(yosys: &Path, script: &str, timeout: Duration) -> Result<(), AdapterError> {
+    let mut command = Command::new(yosys);
+    command.arg("-q").arg("-p").arg(script);
+    let outcome = crate::adapter::run_with_timeout(&mut command, None, timeout).map_err(|e| {
+        AdapterError {
             kind: AdapterErrorKind::ParseError,
             message: format!("adapter/yosys: failed to spawn yosys: {e}"),
             location: None,
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        }
+    })?;
+    yosys_run_outcome_to_result(outcome, script, timeout)
+}
+
+/// Map a [`crate::adapter::run_with_timeout`] outcome to a result: `None`
+/// (timed out ⇒ killed) becomes an actionable scope error rather than a hang;
+/// a non-zero exit surfaces yosys's own stderr. Split out so the error paths are
+/// unit-testable without spawning a slow subprocess.
+fn yosys_run_outcome_to_result(
+    outcome: Option<(std::process::ExitStatus, String, String)>,
+    script: &str,
+    timeout: Duration,
+) -> Result<(), AdapterError> {
+    // Timed out — killed. Per-module emission targets small fixtures; a large
+    // design can thrash past the cap. Surface an actionable error, not a hang.
+    let Some((status, stdout, stderr)) = outcome else {
         return Err(AdapterError {
             kind: AdapterErrorKind::ParseError,
             message: format!(
-                "adapter/yosys: yosys exited with status {} (script: {script})\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                output.status
+                "adapter/yosys: a per-module yosys invocation exceeded {}s and was killed. \
+                 Per-module BTOR2 emission runs one full yosys elaboration PER submodule and is \
+                 built for SMALL multi-module fixtures; a large design can exhaust time or memory. \
+                 For a large design use the whole-design path (`mununu sv verify-auto`, or a single \
+                 `write_btor`) instead of `sv emit-btor2-per-module`.",
+                timeout.as_secs()
+            ),
+            location: None,
+        });
+    };
+    if !status.success() {
+        return Err(AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!(
+                "adapter/yosys: yosys exited with status {status} (script: {script})\nstdout:\n{stdout}\nstderr:\n{stderr}"
             ),
             location: None,
         });
@@ -1752,6 +1789,31 @@ impl Drop for TempDir {
 mod tests {
     use super::*;
     use crate::controllability::BoundaryDirection;
+
+    #[test]
+    fn per_module_yosys_timeout_is_an_actionable_error() {
+        // A timed-out (killed) per-module yosys call must surface an ACTIONABLE
+        // scope error — naming the cap, the small-fixture scope, and the
+        // whole-design alternative — not hang and not a bare "failure".
+        let err = yosys_run_outcome_to_result(None, "write_btor …", Duration::from_secs(60))
+            .expect_err("a timeout must be an error");
+        assert_eq!(err.kind, AdapterErrorKind::ParseError);
+        assert!(
+            err.message.contains("exceeded 60s"),
+            "names the cap: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("multi-module fixtures"),
+            "names the scope: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("verify-auto"),
+            "points at the whole-design path: {}",
+            err.message
+        );
+    }
 
     fn yosys_available() -> bool {
         Command::new("yosys")

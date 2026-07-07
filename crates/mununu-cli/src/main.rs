@@ -944,6 +944,13 @@ enum SvCommand {
     /// Defaults to writing into the same directory as the input file
     /// when --output-dir is omitted. Also prints the per-submodule
     /// state-count / property-count summary to stdout.
+    ///
+    /// SCOPE: this runs one full Yosys elaboration PER submodule (re-reading
+    /// the whole source set each time) and is built for SMALL multi-module
+    /// fixtures. A large real-RTL design can exhaust time or memory; each
+    /// per-module Yosys call is capped at 60s and fails with an actionable
+    /// error rather than hanging. For a large design, use the whole-design
+    /// path (`sv verify-auto`, or a single `write_btor`).
     EmitBtor2PerModule(SvEmitBtor2PerModuleArgs),
     /// Validate a `.mununu.json` sidecar (sidecar-audit C0.2).
     ///
