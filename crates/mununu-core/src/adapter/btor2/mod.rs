@@ -28,6 +28,7 @@ pub mod concrete_oracle;
 pub mod dep_graph;
 pub mod emit;
 pub mod kmts_lift;
+pub mod native_bmc;
 pub mod parser;
 pub mod pin;
 pub mod predicate_expr;
