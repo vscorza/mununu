@@ -251,6 +251,28 @@ pub fn run_btormc(bin: &BtormcBin, btor2: &str, kmax: u32) -> Result<McVerdict, 
     Ok(verdict)
 }
 
+/// The L2-seam → subprocess decide path: emit a (possibly reduced / transformed)
+/// [`Btor2File`](crate::adapter::btor2::ast::Btor2File) to BTOR2 text and hand it
+/// to `btormc --kind` for a scalable safety verdict.
+///
+/// This is what lets mununu decide a model beyond the exact BDD engine's 40-bit
+/// cone cap: reduce internally, [`emit`](crate::adapter::btor2::emit::emit_btor2)
+/// the reduced query, and let the external engine (which honours `constraint`,
+/// free-init state, and wide datapaths natively) decide it. For now the hand-off
+/// is RAW — the emitted model is the file as-is; cone-of-influence + reduction
+/// passes layer on top later.
+///
+/// `Err` when `btormc` is unavailable (locate failure) or the run fails; callers
+/// degrade to `Skipped` exactly as the direct [`run_btormc`] path does.
+pub fn decide_via_btormc(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    kmax: u32,
+) -> Result<McVerdict, AdapterError> {
+    let btor2 = crate::adapter::btor2::emit::emit_btor2(file);
+    let bin = locate_btormc()?;
+    run_btormc(&bin, &btor2, kmax)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +385,26 @@ mod tests {
         assert_eq!(
             run_btormc(&bin, SAFE_BTOR2, DEFAULT_KMAX).unwrap(),
             McVerdict::Safe
+        );
+    }
+
+    #[test]
+    #[ignore = "requires btormc (MUNUNU_BTORMC_PATH or $PATH); run with --ignored in mununu-sva"]
+    fn decide_via_btormc_emits_and_decides() {
+        // The full L2-seam → subprocess path: parse → emit_btor2 → btormc. A
+        // reachable-bad model must come back Violated; a safe one Safe. This is
+        // the emit hand-off end-to-end (the emitted text is btormc's input).
+        let reach = crate::adapter::btor2::parser::parse(REACH_BTOR2).expect("parse reach");
+        assert_eq!(
+            decide_via_btormc(&reach, DEFAULT_KMAX).unwrap(),
+            McVerdict::Violated,
+            "emit→btormc must decide the reachable-bad model as Violated"
+        );
+        let safe = crate::adapter::btor2::parser::parse(SAFE_BTOR2).expect("parse safe");
+        assert_eq!(
+            decide_via_btormc(&safe, DEFAULT_KMAX).unwrap(),
+            McVerdict::Safe,
+            "emit→btormc must decide the safe model as Safe"
         );
     }
 }
