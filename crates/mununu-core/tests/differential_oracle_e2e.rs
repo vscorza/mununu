@@ -209,6 +209,101 @@ fn hwmcc_style_coverage_study() {
     );
 }
 
+/// MAKE-CI adjudication of the IN-HOUSE engines over the vendored btor2tools suite
+/// — the exact BDD engine ⊕ the native BMC/k-induction engine, both **in-process**
+/// (Z3 / BDD, NO subprocess), so this runs in `make ci` (unlike the btormc study
+/// above). Two gates: (1) a hard SOUNDNESS gate — wherever both engines decide they
+/// must AGREE (a definite disagreement is an engine bug); (2) a LABEL gate — a
+/// definite verdict must match the benchmark's own `-sat`/`-unsat` ground truth.
+/// It also reports the native engine's CONTRIBUTION: benchmarks it decides where
+/// the exact engine abstains (over its 40-bit cap) — the in-house scale win on
+/// real-derived inputs.
+#[test]
+fn native_engine_adjudication_over_btor2tools_suite() {
+    use mununu_core::adapter::btor2::native_bmc::{SafetyVerdict, decide_bad_safety};
+    use mununu_core::adapter::btor2::parser::parse as parse_btor2;
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/btor2/btor2tools_suite");
+
+    let (mut both, mut agree, mut native_only, mut exact_only) = (0u32, 0u32, 0u32, 0u32);
+    let mut disagreements: Vec<String> = Vec::new();
+    let mut label_mismatch: Vec<String> = Vec::new();
+    eprintln!(
+        "\n===== in-house adjudication: exact ⊕ native over the btor2tools suite (make-ci) ====="
+    );
+    for (fname, known) in BTOR2TOOLS_SUITE {
+        let content = std::fs::read_to_string(root.join(fname))
+            .unwrap_or_else(|e| panic!("read {fname}: {e}"));
+        // Exact BDD engine: Some(bool) reachability, or None (over-cap / free-init refusal).
+        let exact = exact_bad_reachable(&content).ok();
+        // Native engine: in-house BMC + k-induction, bounded k=40 + a 2s per-check
+        // budget (the deciding benchmarks resolve in well under it; only the 228-bit
+        // ponylink burns the budget, and it abstains anyway).
+        let native = match parse_btor2(&content) {
+            Ok(file) => match decide_bad_safety(&file, 40, Some(2_000)) {
+                Ok(SafetyVerdict::Violated { .. }) => Some(true),
+                Ok(SafetyVerdict::Safe { .. }) => Some(false),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        // Soundness: where BOTH decide, they must agree.
+        match (exact, native) {
+            (Some(e), Some(n)) => {
+                both += 1;
+                if e == n {
+                    agree += 1;
+                } else {
+                    disagreements.push(format!("{fname}: exact={e} native={n}"));
+                }
+            }
+            (None, Some(_)) => native_only += 1,
+            (Some(_), None) => exact_only += 1,
+            (None, None) => {}
+        }
+        // Label gate: a definite verdict must match the benchmark's ground truth.
+        if let Some(lbl) = known {
+            for (eng, v) in [("exact", exact), ("native", native)] {
+                if let Some(vv) = v
+                    && *lbl != vv
+                {
+                    label_mismatch.push(format!("{fname}: {eng}={vv} vs label={lbl}"));
+                }
+            }
+        }
+        let show = |v: Option<bool>| match v {
+            Some(true) => "REACHABLE",
+            Some(false) => "unreachable",
+            None => "abstain",
+        };
+        eprintln!(
+            "  {fname:34} exact={:11}  native={}",
+            show(exact),
+            show(native)
+        );
+    }
+    eprintln!(
+        "-----------------------------------------------------------------------------------"
+    );
+    eprintln!(
+        "  both-decided {both} (agree {agree});  native-only {native_only} (past the exact cap);  exact-only {exact_only}"
+    );
+    eprintln!(
+        "===================================================================================\n"
+    );
+
+    // Hard SOUNDNESS gate — an exact↔native definite disagreement is a genuine bug.
+    assert!(
+        disagreements.is_empty(),
+        "EXACT↔NATIVE SOUNDNESS DISAGREEMENT: {disagreements:?}"
+    );
+    // Label gate — a definite verdict must match the benchmark's -sat/-unsat label.
+    assert!(
+        label_mismatch.is_empty(),
+        "a definite in-house verdict contradicts the benchmark label: {label_mismatch:?}"
+    );
+}
+
 // ============================================================================
 // P2 — corpus differential over real open designs, with the MONOTONE VERDICT
 // LEDGER invariant.
