@@ -109,7 +109,7 @@ use oxidd::{BooleanFunction, FunctionSubst, Manager, ManagerRef, Subst, VarNo};
 
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node, Op, Operand};
 use crate::adapter::btor2::bit_blast::eval_const_value;
-use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_expr};
+use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr, parse_predicate_atom_bool};
 use crate::adapter::btor2::term_backend::{BvTermBackend, WalkError, walk_design};
 // R-F5.4.1 — the symbolic mu-calculus evaluator reuses the (must, may) `TritBdd`
 // pair + the crate `Trit` verdict; the mu-calculus `Node` is aliased to avoid a
@@ -2136,7 +2136,11 @@ pub fn exact_symbolic_verdict_with_witness(
             if exprs.iter().any(|(n, _)| n == name) {
                 continue;
             }
-            let expr = parse_predicate_expr(name)
+            // The exact engine reads mu-calculus atoms directly, so a bare-boolean
+            // atom (`sig`, no comparison) is admitted as `sig != 0` — the "signal is
+            // true" reading. (The seeder keeps the strict parser; see
+            // `parse_predicate_atom_bool`.)
+            let expr = parse_predicate_atom_bool(name)
                 .map_err(|e| format!("exact MC: atom `{name}` is not a predicate: {e}"))?;
             let expr = resolve_predicate_expr_registers(&expr, &resolve);
             collect_predicate_registers(&expr, &mut seed_regs);

@@ -659,6 +659,31 @@ pub fn parse_predicate_expr(s: &str) -> Result<PredicateExpr, PredicateExprParse
     Ok(expr)
 }
 
+/// Parse a predicate atom, tolerating a **bare boolean identifier** as `sig != 0`.
+///
+/// A single-identifier atom (`bnd_viol_o`, no comparison operator) is the
+/// mu-calculus "signal is true" reading; `!= 0` — not `== 1` — is the SOUND
+/// encoding (for a multi-bit signal `== 1` would spuriously exclude the truthy
+/// values 2, 3, …). Everything else delegates to the strict
+/// [`parse_predicate_expr`] grammar, so a malformed atom still errors.
+///
+/// This is a **caller-opt-in** relaxation. The verify_auto seeder deliberately
+/// keeps the strict parser (its own `Err`-path routes bare atoms into the
+/// combinational-input soundness machinery), so only callers that want the bare
+/// boolean read directly — the exact-symbolic engine parsing mu-calculus atoms —
+/// use this entry point.
+pub fn parse_predicate_atom_bool(s: &str) -> Result<PredicateExpr, PredicateExprParseError> {
+    let tokens = tokenize(s)?;
+    if let [Token::Ident(name)] = tokens.as_slice() {
+        return Ok(PredicateExpr::Cmp {
+            register: name.clone(),
+            op: CmpOp::Ne,
+            value: 0,
+        });
+    }
+    parse_predicate_expr(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +849,60 @@ mod tests {
             parse_predicate_expr("state_q == 5").unwrap(),
             PredicateExpr::eq("state_q", 5)
         );
+    }
+
+    #[test]
+    fn parse_predicate_atom_bool_bare_is_ne_zero() {
+        // A lone identifier atom (no comparison operator) is the mu-calculus
+        // "signal is true" reading, normalised to `register != 0` — matching the
+        // SVA translator's bool_expr. `!= 0` (not `== 1`) is the sound multi-bit form.
+        assert_eq!(
+            parse_predicate_atom_bool("bnd_viol_o").unwrap(),
+            PredicateExpr::Cmp {
+                register: "bnd_viol_o".into(),
+                op: CmpOp::Ne,
+                value: 0,
+            }
+        );
+        // Hierarchical BTOR2 symbol names (`$`/`.`) work as bare booleans too.
+        assert_eq!(
+            parse_predicate_atom_bool("top.err_o").unwrap(),
+            PredicateExpr::Cmp {
+                register: "top.err_o".into(),
+                op: CmpOp::Ne,
+                value: 0,
+            }
+        );
+        // The STRICT parser is unchanged — the seeder relies on a bare atom erroring
+        // so it can route it through its own combinational-input machinery.
+        assert!(parse_predicate_expr("bnd_viol_o").is_err());
+    }
+
+    #[test]
+    fn parse_predicate_atom_bool_delegates_for_non_bare() {
+        // A comparison atom delegates to the strict grammar (no change).
+        assert_eq!(
+            parse_predicate_atom_bool("cnt == 3").unwrap(),
+            PredicateExpr::eq("cnt", 3)
+        );
+        assert_eq!(
+            parse_predicate_atom_bool("state_q == state_q__past").unwrap(),
+            PredicateExpr::eq_reg("state_q", "state_q__past")
+        );
+        // Only a LONE identifier is rescued — a bare operand inside a compound is
+        // still an error (the exact engine receives pre-normalised compounds).
+        assert!(parse_predicate_atom_bool("en && cnt == 3").is_err());
+        // A malformed atom still errors.
+        assert!(parse_predicate_atom_bool("cnt ==").is_err());
+    }
+
+    #[test]
+    fn bare_boolean_atom_bool_evals_as_nonzero() {
+        // `flag` (≡ flag != 0) is true iff the register is nonzero.
+        let e = parse_predicate_atom_bool("flag").unwrap();
+        assert!(e.eval(&regs(&[("flag", 1)])));
+        assert!(e.eval(&regs(&[("flag", 7)])));
+        assert!(!e.eval(&regs(&[("flag", 0)])));
     }
 
     #[test]
