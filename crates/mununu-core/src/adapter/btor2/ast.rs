@@ -260,6 +260,65 @@ impl Op {
         })
     }
 
+    /// The BTOR2 keyword for this operator (inverse of [`Op::from_keyword`]).
+    /// Used by the BTOR2 emitter ([`super::emit`]).
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            Op::Not => "not",
+            Op::Inc => "inc",
+            Op::Dec => "dec",
+            Op::Neg => "neg",
+            Op::Redand => "redand",
+            Op::Redor => "redor",
+            Op::Redxor => "redxor",
+            Op::Iff => "iff",
+            Op::Implies => "implies",
+            Op::Eq => "eq",
+            Op::Neq => "neq",
+            Op::And => "and",
+            Op::Or => "or",
+            Op::Xor => "xor",
+            Op::Nand => "nand",
+            Op::Nor => "nor",
+            Op::Xnor => "xnor",
+            Op::Sgt => "sgt",
+            Op::Ugt => "ugt",
+            Op::Sgte => "sgte",
+            Op::Ugte => "ugte",
+            Op::Slt => "slt",
+            Op::Ult => "ult",
+            Op::Slte => "slte",
+            Op::Ulte => "ulte",
+            Op::Add => "add",
+            Op::Sub => "sub",
+            Op::Mul => "mul",
+            Op::Sll => "sll",
+            Op::Srl => "srl",
+            Op::Sra => "sra",
+            Op::Rol => "rol",
+            Op::Ror => "ror",
+            Op::Concat => "concat",
+            Op::Slice => "slice",
+            Op::Uext => "uext",
+            Op::Sext => "sext",
+            Op::Ite => "ite",
+            Op::Sdiv => "sdiv",
+            Op::Udiv => "udiv",
+            Op::Smod => "smod",
+            Op::Srem => "srem",
+            Op::Urem => "urem",
+            Op::Saddo => "saddo",
+            Op::Ssubo => "ssubo",
+            Op::Smulo => "smulo",
+            Op::Uaddo => "uaddo",
+            Op::Usubo => "usubo",
+            Op::Umulo => "umulo",
+            Op::Sdivo => "sdivo",
+            Op::Read => "read",
+            Op::Write => "write",
+        }
+    }
+
     /// Number of operands the operator expects.
     pub fn arity(&self) -> usize {
         match self {
