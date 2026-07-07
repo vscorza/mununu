@@ -45,6 +45,16 @@ use crate::adapter::sidecar::predicate_image::btor2_encode::{
 };
 use z3::ast::{Ast, BV, Bool};
 
+/// Default unrolling / induction depth bound for the portfolio-facing native
+/// engine — mirrors [`crate::adapter::btormc::DEFAULT_KMAX`].
+pub const DEFAULT_MAX_K: u32 = 40;
+
+/// Default per-check Z3 wall-clock budget (milliseconds) for the portfolio-facing
+/// native engine. A check that exceeds it returns `Unknown`, and the engine
+/// **abstains** (never a wrong verdict) — the in-process analogue of the
+/// subprocess members' kill-on-timeout.
+pub const DEFAULT_TIMEOUT_MS: u32 = 5_000;
+
 /// The outcome of a bounded model-checking run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BmcOutcome {
@@ -284,7 +294,22 @@ pub fn bmc_bad_reachable(file: &Btor2File, max_k: u32) -> Result<BmcOutcome, Bmc
 /// may return `Unknown`). The base and step run on independent solvers over the
 /// SAME frame variables (shared Z3 consts, separate assertion stacks), so the
 /// step's free initial state does not clash with the base's pinned init.
-pub fn decide_bad_safety(file: &Btor2File, max_k: u32) -> Result<SafetyVerdict, BmcError> {
+///
+/// `timeout_ms` sets a per-check Z3 wall-clock budget: a check that exceeds it
+/// returns `Unknown`, and the engine **abstains** ([`SafetyVerdict::Unknown`]) —
+/// never a wrong verdict. `None` = unbounded (QF_BV is decidable, so it still
+/// terminates). This is what lets the portfolio bound the in-process member the
+/// way it kills a timed-out subprocess.
+///
+/// **Soundness of the SAT/UNSAT/UNKNOWN handling.** `Violated` is returned ONLY on
+/// a definite base `Sat`; `Safe` ONLY on a definite step `Unsat`. Any `Unknown`
+/// (a timeout, or Z3 giving up) abstains — crucially, a step `Unknown` must NOT be
+/// read as "not satisfiable ⇒ inductive" (that would be a spurious `Safe`).
+pub fn decide_bad_safety(
+    file: &Btor2File,
+    max_k: u32,
+    timeout_ms: Option<u32>,
+) -> Result<SafetyVerdict, BmcError> {
     let (bad_ops, init_pairs, constraint_ops) = extract_props(file);
     if bad_ops.is_empty() {
         return Err(BmcError::NoBadProperty);
@@ -297,34 +322,43 @@ pub fn decide_bad_safety(file: &Btor2File, max_k: u32) -> Result<SafetyVerdict, 
 
         // Base: an init-constrained path (as in `bmc_bad_reachable`).
         let base = z3::Solver::new();
-        u.assert_init(&base, &init_pairs);
-        for c in u.constraints_at(0) {
-            base.assert(&c);
-        }
         // Step: a FREE path (no init) accumulating `¬bad ∧ transition` per frame;
         // if `bad` at the current frame is then unsatisfiable, the property is
         // k-inductive.
         let step = z3::Solver::new();
+        if let Some(ms) = timeout_ms {
+            let mut params = z3::Params::new();
+            params.set_u32("timeout", ms);
+            base.set_params(&params);
+            step.set_params(&params);
+        }
+        u.assert_init(&base, &init_pairs);
         for c in u.constraints_at(0) {
+            base.assert(&c);
             step.assert(&c);
         }
 
         for k in 0..=n {
-            // Base — reachable counterexample?
+            // Base — reachable counterexample? Violated ONLY on a definite Sat.
             base.push();
             base.assert(u.bad_at(k));
-            let base_sat = matches!(base.check(), z3::SatResult::Sat);
+            let base_res = base.check();
             base.pop(1);
-            if base_sat {
-                return Ok(SafetyVerdict::Violated { depth: k as u32 });
+            match base_res {
+                z3::SatResult::Sat => return Ok(SafetyVerdict::Violated { depth: k as u32 }),
+                z3::SatResult::Unknown => return Ok(SafetyVerdict::Unknown { k: k as u32 }),
+                z3::SatResult::Unsat => {}
             }
-            // Step — k-inductive? (base has held through depth k, checked above.)
+            // Step — k-inductive? Safe ONLY on a definite Unsat; an Unknown abstains
+            // (must NOT be read as "inductive"). Base has held through depth k above.
             step.push();
             step.assert(u.bad_at(k));
-            let step_sat = matches!(step.check(), z3::SatResult::Sat);
+            let step_res = step.check();
             step.pop(1);
-            if !step_sat {
-                return Ok(SafetyVerdict::Safe { k: k as u32 });
+            match step_res {
+                z3::SatResult::Unsat => return Ok(SafetyVerdict::Safe { k: k as u32 }),
+                z3::SatResult::Unknown => return Ok(SafetyVerdict::Unknown { k: k as u32 }),
+                z3::SatResult::Sat => {}
             }
             if k < n {
                 // Extend both paths to frame k+1.
@@ -452,7 +486,7 @@ mod tests {
 
     fn safety(content: &str, max_k: u32) -> SafetyVerdict {
         let file = parser::parse(content).expect("parse btor2");
-        decide_bad_safety(&file, max_k).expect("k-induction runs")
+        decide_bad_safety(&file, max_k, None).expect("k-induction runs")
     }
 
     #[test]
@@ -498,6 +532,39 @@ mod tests {
                     panic!("{name}: expected a definite k-induction verdict")
                 }
             }
+        }
+    }
+
+    #[test]
+    fn scale_curve_native_decides_past_the_exact_40_bit_cap() {
+        // The roadmap's `synth_pipeline(W)` signal, distilled to a scale CURVE: a
+        // W-bit register that stays 0 (`AG(big == 0)`, encoded `bad = big != 0`),
+        // swept over widths. The native k-induction engine proves it SAFE at EVERY
+        // width; the exact BDD engine ABSTAINS once the cone exceeds its 40-bit cap.
+        // That is the in-house scale win charted, not asserted by hand.
+        use crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable;
+        let wide_safe = |w: u32| -> String {
+            format!(
+                "1 sort bitvec {w}\n2 zero 1\n3 state 1 big\n4 init 1 3 2\n\
+                 5 next 1 3 3\n6 sort bitvec 1\n7 neq 6 3 2\n8 bad 7\n"
+            )
+        };
+        // Native proves SAFE at every width — including far past the BDD cap.
+        for w in [8u32, 20, 40, 64, 128, 256, 512] {
+            let file = parser::parse(&wide_safe(w)).expect("parse");
+            assert_eq!(
+                decide_bad_safety(&file, 5, None).expect("native runs"),
+                SafetyVerdict::Safe { k: 1 },
+                "native must prove W={w} SAFE"
+            );
+        }
+        // The exact engine abstains once the cone is over-cap (≥64 bits here),
+        // where the native engine still decides — the scale delta.
+        for w in [64u32, 128, 256, 512] {
+            assert!(
+                exact_bad_reachable(&wide_safe(w)).is_err(),
+                "the exact engine must abstain (over-cap) at W={w}"
+            );
         }
     }
 }
