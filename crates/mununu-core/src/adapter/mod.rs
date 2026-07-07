@@ -486,6 +486,73 @@ pub(crate) fn locate_tool(
     Ok((path, version))
 }
 
+/// Run a subprocess with a **wall-clock timeout**, draining stdout/stderr on
+/// separate threads (so a large witness trace can't deadlock the pipe) and
+/// killing the child if it exceeds `timeout`.
+///
+/// Returns `Ok(None)` on timeout — the caller treats a timed-out model checker as
+/// *inconclusive* (`Unknown`), never as a wrong verdict. `Ok(Some((status, stdout,
+/// stderr)))` when the child completes on its own. `stdin_data`, when present, is
+/// written to the child's stdin (then EOF); pass `None` for a file-arg tool.
+///
+/// std-only (no `wait-timeout` crate, no coreutils `timeout`) so it is portable
+/// and adds no dependency: model checkers like Pono's IC3 can run unbounded, and
+/// this is the portfolio's guard against a single member hanging the whole run.
+pub(crate) fn run_with_timeout(
+    command: &mut std::process::Command,
+    stdin_data: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String, String)>> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Feed stdin on its own thread (owned copy) so a large input can't deadlock
+    // against a tool that interleaves reading stdin with writing stdout — the
+    // writer, stdout-reader, and stderr-reader all run concurrently.
+    if let Some(mut si) = child.stdin.take() {
+        let data = stdin_data.unwrap_or_default().to_vec();
+        std::thread::spawn(move || {
+            let _ = si.write_all(&data); // drop `si` ⇒ EOF to the child
+        });
+    }
+    // Drain both pipes concurrently so the child never blocks on a full buffer.
+    let mut so = child.stdout.take().expect("piped stdout");
+    let mut se = child.stderr.take().expect("piped stderr");
+    let so_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = so.read_to_string(&mut s);
+        s
+    });
+    let se_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = se.read_to_string(&mut s);
+        s
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break Some(st);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait(); // reap; closing the pipes unblocks the readers
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = so_h.join().unwrap_or_default();
+    let stderr = se_h.join().unwrap_or_default();
+    Ok(status.map(|st| (st, stdout, stderr)))
+}
+
 /// Detect the source format from a file extension.
 pub fn detect_format_by_extension(path: &std::path::Path) -> Option<&'static str> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");

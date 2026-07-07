@@ -14,9 +14,15 @@
 //!   rather than a guess. Since all three engines are sound, a disagreement can
 //!   only mean a real bug — exactly what the differential oracle exists to catch.
 //!
-//! This is the *sequential* portfolio. A parallel variant + per-engine timeouts
-//! (Pono's IC3 can run unbounded on a hard instance) are follow-ups; today the
-//! members run in order and an engine that errors / times out simply abstains.
+//! Both a **sequential** ([`decide_reach_portfolio`]) and a **parallel**
+//! ([`decide_reach_portfolio_parallel`]) driver are provided. They merge
+//! identically — the parallel variant only overlaps the two subprocess members
+//! (and the in-process exact engine) in wall-clock, which matters once a
+//! per-engine timeout is in play: a slow member no longer serialises in front of
+//! a fast one. Every member carries a **wall-clock timeout** (Pono's IC3 has no
+//! native bound and can run unbounded on a hard instance); a member that errors,
+//! times out, or is undecided simply abstains — a timeout is a sound
+//! [`ReachVerdict::Unknown`], never a wrong verdict.
 
 use crate::adapter::btor2::ast::Btor2File;
 use crate::adapter::btor2::emit::emit_btor2;
@@ -67,45 +73,87 @@ impl ReachOutcome {
     }
 }
 
+/// The exact engine's optional verdict: `Some(true)` reachable, `Some(false)`
+/// unreachable, `None` abstained (over-cap / free-init / error).
+fn run_exact(content: &str) -> Option<bool> {
+    exact_bad_reachable(content).ok()
+}
+
+/// Merge the three members' verdicts into a [`ReachOutcome`], in the fixed
+/// engine order (`exact`, `btormc`, `pono`) so the outcome is deterministic
+/// regardless of which driver (sequential / parallel) produced them.
+fn collect(
+    exact: Option<bool>,
+    btormc_v: Option<McVerdict>,
+    pono_v: Option<McVerdict>,
+) -> ReachOutcome {
+    let mut reachable_by: Vec<&'static str> = Vec::new();
+    let mut unreachable_by: Vec<&'static str> = Vec::new();
+    match exact {
+        Some(true) => reachable_by.push("exact"),
+        Some(false) => unreachable_by.push("exact"),
+        None => {}
+    }
+    for (name, v) in [("btormc", btormc_v), ("pono", pono_v)] {
+        match v {
+            Some(McVerdict::Violated) => reachable_by.push(name),
+            Some(McVerdict::Safe) => unreachable_by.push(name),
+            Some(McVerdict::Unknown) | None => {}
+        }
+    }
+    ReachOutcome::from_sets(reachable_by, unreachable_by)
+}
+
 /// Decide `bad`-reachability of `file` across the exact BDD engine + the btormc
 /// and Pono subprocess members, merged under the differential-oracle discipline.
 ///
 /// Each member abstains gracefully: the exact engine on an over-cap / free-init
-/// design (`Err`), a subprocess member when its binary is absent (`Err`) or it is
-/// inconclusive (`Unknown`). The emitted BTOR2 (from [`emit_btor2`]) is the shared
-/// input, so a *reduced / transformed* model is decided consistently by all three.
+/// design (`Err`), a subprocess member when its binary is absent (`Err`), it is
+/// inconclusive (`Unknown`), or it hits its wall-clock timeout. The emitted BTOR2
+/// (from [`emit_btor2`]) is the shared input, so a *reduced / transformed* model
+/// is decided consistently by all three.
+///
+/// This is the **sequential** driver — members run one after another. Use
+/// [`decide_reach_portfolio_parallel`] to overlap them in wall-clock.
 pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
-    let mut reachable_by: Vec<&'static str> = Vec::new();
-    let mut unreachable_by: Vec<&'static str> = Vec::new();
-
+    let content = emit_btor2(file);
     // Exact BDD engine — sound both ways (REACHABLE is always sound; an
     // UNREACHABLE verdict is refused on free-init state), within the bit cap.
-    let content = emit_btor2(file);
-    match exact_bad_reachable(&content) {
-        Ok(true) => reachable_by.push("exact"),
-        Ok(false) => unreachable_by.push("exact"),
-        Err(_) => {}
-    }
-
+    let exact = run_exact(&content);
     // btormc — BMC (CEX) + k-induction (proof).
-    if let Ok(v) = btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX) {
-        match v {
-            McVerdict::Violated => reachable_by.push("btormc"),
-            McVerdict::Safe => unreachable_by.push("btormc"),
-            McVerdict::Unknown => {}
-        }
-    }
-
+    let btormc_v =
+        btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
     // Pono — IC3/PDR (proof + shallow CEX).
-    if let Ok(v) = pono::decide_via_pono(file, pono::DEFAULT_ENGINE) {
-        match v {
-            McVerdict::Violated => reachable_by.push("pono"),
-            McVerdict::Safe => unreachable_by.push("pono"),
-            McVerdict::Unknown => {}
-        }
-    }
+    let pono_v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
+    collect(exact, btormc_v, pono_v)
+}
 
-    ReachOutcome::from_sets(reachable_by, unreachable_by)
+/// The **parallel** driver: run the exact engine (in-process) and the two
+/// subprocess members concurrently, then merge identically to
+/// [`decide_reach_portfolio`]. Scoped threads borrow `file` directly — the scope
+/// guarantees the borrows end before this returns, so no clone / `Arc` is needed.
+///
+/// The merge is unchanged, so the verdict is identical to the sequential driver;
+/// only the wall-clock differs (≈ the slowest single member instead of the sum).
+/// This matters once per-engine timeouts are in play — a member that burns its
+/// full budget no longer serialises in front of a fast one.
+pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
+    let content = emit_btor2(file);
+    std::thread::scope(|scope| {
+        let btormc_h = scope.spawn(|| {
+            btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok()
+        });
+        let pono_h = scope.spawn(|| {
+            pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok()
+        });
+        // The exact engine is in-process BDD work — run it on this thread while the
+        // two subprocess members run on theirs.
+        let exact = run_exact(&content);
+        // A panicked member thread abstains (None) rather than poisoning the merge.
+        let btormc_v = btormc_h.join().unwrap_or(None);
+        let pono_v = pono_h.join().unwrap_or(None);
+        collect(exact, btormc_v, pono_v)
+    })
 }
 
 #[cfg(test)]
@@ -153,6 +201,22 @@ mod tests {
             out.unreachable_by.is_empty(),
             "no engine should call the reachable counter unreachable"
         );
+    }
+
+    #[test]
+    fn parallel_driver_agrees_with_sequential() {
+        // The parallel driver must return the *identical* outcome to the
+        // sequential one — it only overlaps members in wall-clock, never changes
+        // the merge. With no subprocess members on PATH both reduce to the
+        // exact-only verdict; the point is they agree byte-for-byte.
+        const COUNTER: &str = "1 sort bitvec 3\n2 zero 1\n3 state 1\n4 init 1 3 2\n5 one 1\n\
+                               6 add 1 3 5\n7 next 1 3 6\n8 ones 1\n9 sort bitvec 1\n\
+                               10 eq 9 3 8\n11 bad 10\n";
+        let file = parser::parse(COUNTER).expect("parse");
+        let seq = decide_reach_portfolio(&file);
+        let par = decide_reach_portfolio_parallel(&file);
+        assert_eq!(seq, par, "parallel and sequential drivers must agree");
+        assert_eq!(par.verdict, ReachVerdict::Reachable);
     }
 
     #[test]
