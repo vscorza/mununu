@@ -8,9 +8,9 @@
 //!
 //! - **Bit-blasting is exact** for the operators marked `is_blastable()` in
 //!   [`super::ast::Op`]. No approximation is introduced for those.
-//! - **Width truncation:** any bit-vector wider than [`BvValue::MAX_WIDTH`]
-//!   would silently lose information; the bit-blaster errors with
-//!   [`AdapterErrorKind::StateSpaceOverflow`] before this can happen.
+//! - **Arbitrary width:** concrete values use [`super::bv::Bv`] (native `u128`
+//!   for width ≤ 128, `BigUint` above), so intermediate and wide-datapath
+//!   values are exact — no `u128` truncation.
 //! - **State-space bound:** total reachable states are capped at
 //!   [`MAX_STATE_BITS`]; the bit-blaster errors before enumeration if the
 //!   bound is exceeded. This is an *under*-approximation in scope (the
@@ -21,6 +21,7 @@
 //!   (Phase 3 hand-off) is the documented escape hatch.
 
 use super::ast::*;
+use super::bv::Bv;
 use super::parser;
 use crate::adapter::ir::*;
 use crate::adapter::{
@@ -63,64 +64,9 @@ const OOB_SINK_KEY: &str = "__mununu_oob__";
 /// `Symbols` abstractions per input.
 pub const MAX_INPUT_BITS: u32 = 10;
 
-/// Bit-vector value. Backed by `u128` — sufficient for any width ≤ 128
-/// (we never enumerate beyond MAX_STATE_BITS + MAX_INPUT_BITS, but
-/// intermediate computations can reach wider widths).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BvValue {
-    /// Lower 128 bits of the value (mask to `width` for canonical form).
-    pub bits: u128,
-    pub width: u32,
-}
-
-impl BvValue {
-    pub const MAX_WIDTH: u32 = 128;
-
-    pub fn new(bits: u128, width: u32) -> Self {
-        let masked = if width >= 128 {
-            bits
-        } else {
-            bits & ((1u128 << width) - 1)
-        };
-        BvValue {
-            bits: masked,
-            width,
-        }
-    }
-
-    pub fn zero(width: u32) -> Self {
-        BvValue::new(0, width)
-    }
-
-    pub fn one(width: u32) -> Self {
-        BvValue::new(1, width)
-    }
-
-    pub fn ones(width: u32) -> Self {
-        let bits = if width >= 128 {
-            u128::MAX
-        } else {
-            (1u128 << width) - 1
-        };
-        BvValue { bits, width }
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.bits == 0
-    }
-
-    pub fn is_nonzero(&self) -> bool {
-        self.bits != 0
-    }
-
-    pub fn to_bool(&self) -> bool {
-        self.is_nonzero()
-    }
-
-    pub fn from_bool(b: bool) -> Self {
-        BvValue::new(if b { 1 } else { 0 }, 1)
-    }
-}
+// The concrete bit-vector value type is now [`crate::adapter::btor2::bv::Bv`]
+// (arbitrary width via a Small(u128)/Wide(BigUint) split); the previous
+// `u128`-ceiling `Bv` was retired in AR-S2.
 
 /// Bit-blaster output structure for a single BTOR2 file.
 struct BlastOutput {
@@ -206,11 +152,12 @@ pub fn simulate_one_step(
     let mut env = Env::default();
     for sm in &state_meta {
         let bits = register_values.get(&sm.symbol).copied().unwrap_or(0);
-        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
+        env.values
+            .insert(sm.nid, Bv::from_u128_width(bits, sm.width));
     }
     for (symbol, &(nid, width)) in &symbol_to_input_nid {
         let bits = input_values.get(symbol).copied().unwrap_or(0);
-        env.values.insert(nid, BvValue::new(bits, width));
+        env.values.insert(nid, Bv::from_u128_width(bits, width));
     }
 
     // Step the design: evaluate all derived NIDs, then commit
@@ -221,7 +168,7 @@ pub fn simulate_one_step(
     // Extract post-step state values keyed by symbol.
     let mut out: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
     for sm in &state_meta {
-        let bits = env.values.get(&sm.nid).map(|v| v.bits).unwrap_or(0);
+        let bits = env.values.get(&sm.nid).map(|v| v.low128()).unwrap_or(0);
         out.insert(sm.symbol.clone(), bits);
     }
     Ok(out)
@@ -385,11 +332,13 @@ impl<'a> PreparedStep<'a> {
         let mut env = Env::default();
         for sv in &self.states {
             let bits = register_values.get(&sv.symbol).copied().unwrap_or(0);
-            env.values.insert(sv.nid, BvValue::new(bits, sv.width));
+            env.values
+                .insert(sv.nid, Bv::from_u128_width(bits, sv.width));
         }
         for sv in &self.inputs {
             let bits = input_values.get(&sv.symbol).copied().unwrap_or(0);
-            env.values.insert(sv.nid, BvValue::new(bits, sv.width));
+            env.values
+                .insert(sv.nid, Bv::from_u128_width(bits, sv.width));
         }
 
         // Evaluate the combinational cone; observability + admissibility
@@ -407,7 +356,7 @@ impl<'a> PreparedStep<'a> {
                 .or_else(|| self.out_sig_nid.get(name.as_str()))
                 .or_else(|| self.si_nid.get(name.as_str()))
                 .and_then(|nid| env.values.get(nid))
-                .map(|bv| bv.bits);
+                .map(|bv| bv.low128());
             if let Some(v) = v {
                 observed.insert(name.clone(), v);
             }
@@ -419,7 +368,7 @@ impl<'a> PreparedStep<'a> {
         let mut next_state: std::collections::HashMap<String, u128> =
             std::collections::HashMap::new();
         for sv in &self.states {
-            let bits = env.values.get(&sv.nid).map(|v| v.bits).unwrap_or(0);
+            let bits = env.values.get(&sv.nid).map(|v| v.low128()).unwrap_or(0);
             next_state.insert(sv.symbol.clone(), bits);
         }
 
@@ -510,11 +459,12 @@ pub fn simulate_one_step_with_uf_rep(
     let mut env = Env::default();
     for sm in &state_meta {
         let bits = register_values.get(&sm.symbol).copied().unwrap_or(0);
-        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
+        env.values
+            .insert(sm.nid, Bv::from_u128_width(bits, sm.width));
     }
     for (symbol, &(nid, width)) in &symbol_to_input_nid {
         let bits = input_values.get(symbol).copied().unwrap_or(0);
-        env.values.insert(nid, BvValue::new(bits, width));
+        env.values.insert(nid, Bv::from_u128_width(bits, width));
     }
 
     evaluate_pure_with_uf_rep(file, &mut env, false, Some(uf_wrapped_nids), rep)?;
@@ -522,7 +472,7 @@ pub fn simulate_one_step_with_uf_rep(
 
     let mut out: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
     for sm in &state_meta {
-        let bits = env.values.get(&sm.nid).map(|v| v.bits).unwrap_or(0);
+        let bits = env.values.get(&sm.nid).map(|v| v.low128()).unwrap_or(0);
         out.insert(sm.symbol.clone(), bits);
     }
     Ok(out)
@@ -3098,7 +3048,7 @@ fn apply_next(
     state_meta: &[StateMeta],
 ) -> Result<(), AdapterError> {
     // First gather (state_nid, next-value) pairs to avoid mutating env mid-iteration.
-    let mut updates: Vec<(Nid, BvValue)> = Vec::new();
+    let mut updates: Vec<(Nid, Bv)> = Vec::new();
     for line in &file.lines {
         if let Node::Next { state, value, .. } = &line.node {
             let v = read_operand(env, *value).ok_or_else(|| AdapterError {
@@ -3126,7 +3076,7 @@ fn apply_next(
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Env {
-    values: std::collections::HashMap<Nid, BvValue>,
+    values: std::collections::HashMap<Nid, Bv>,
 }
 
 #[derive(Debug, Clone)]
@@ -3981,11 +3931,13 @@ fn make_step_env(
     let mut env = Env::default();
     for (i, sm) in state_meta.iter().enumerate() {
         let bits = cells.value_at(state_idx, i);
-        env.values.insert(sm.nid, BvValue::new(bits, sm.width));
+        env.values
+            .insert(sm.nid, Bv::from_u128_width(bits, sm.width));
     }
     for (i, im) in input_meta.iter().enumerate() {
         let bits = input_cells.value_at(input_idx, i);
-        env.values.insert(im.nid, BvValue::new(bits, im.width));
+        env.values
+            .insert(im.nid, Bv::from_u128_width(bits, im.width));
     }
     env
 }
@@ -4901,9 +4853,8 @@ fn enumerate_initial_combos(
                 let bits = init_env
                     .values
                     .get(&sm.nid)
-                    .copied()
-                    .unwrap_or(BvValue::zero(sm.width))
-                    .bits;
+                    .map(|v| v.low128())
+                    .unwrap_or(0);
                 vec![bits]
             }
         })
@@ -4982,7 +4933,7 @@ fn apply_reset_sequence(
     } else {
         (1u128 << width) - 1
     };
-    let asserted_bv = BvValue::new(seq.asserted_value as u128 & mask, width);
+    let asserted_bv = Bv::from_u128_width(seq.asserted_value as u128 & mask, width);
     apply_reset_hold(
         file,
         init_env,
@@ -5004,11 +4955,11 @@ fn apply_reset_hold(
     init_env: &mut Env,
     state_meta: &[StateMeta],
     reset_nid: Nid,
-    asserted_bv: BvValue,
+    asserted_bv: Bv,
     hold_cycles: u32,
 ) -> Result<(), AdapterError> {
     for _ in 0..hold_cycles {
-        init_env.values.insert(reset_nid, asserted_bv);
+        init_env.values.insert(reset_nid, asserted_bv.clone());
         evaluate_pure(file, init_env, /*honor_init=*/ false)?;
         apply_next(file, init_env, state_meta)?;
     }
@@ -5069,7 +5020,7 @@ fn apply_auto_reset(
         (1u128 << reset_im.width) - 1
     };
     let asserted = if active_high { 1u128 & mask } else { 0u128 };
-    let asserted_bv = BvValue::new(asserted, reset_im.width);
+    let asserted_bv = Bv::from_u128_width(asserted, reset_im.width);
     apply_reset_hold(file, init_env, state_meta, reset_im.nid, asserted_bv, 1)
 }
 
@@ -5168,11 +5119,11 @@ fn make_initial_env(
     // For init evaluation, states default to zero unless an init line is processed
     // (handled by `evaluate_pure` → `Init` propagating the init value).
     for sm in state_meta {
-        env.values.insert(sm.nid, BvValue::zero(sm.width));
+        env.values.insert(sm.nid, Bv::zero(sm.width));
     }
     if with_inputs_zero {
         for im in input_meta {
-            env.values.insert(im.nid, BvValue::zero(im.width));
+            env.values.insert(im.nid, Bv::zero(im.width));
         }
     }
     let _ = file;
@@ -5188,24 +5139,18 @@ fn make_initial_env(
 fn encode_state(env: &Env, state_meta: &[StateMeta], cells: &CellEnumeration) -> Option<usize> {
     let values: Vec<u128> = state_meta
         .iter()
-        .map(|sm| {
-            env.values
-                .get(&sm.nid)
-                .copied()
-                .unwrap_or(BvValue::zero(sm.width))
-                .bits
-        })
+        .map(|sm| env.values.get(&sm.nid).map(|v| v.low128()).unwrap_or(0))
         .collect();
     cells.encode(&values)
 }
 
-fn read_operand(env: &Env, op: Operand) -> Option<BvValue> {
-    let v = env.values.get(&op.nid()).copied()?;
+fn read_operand(env: &Env, op: Operand) -> Option<Bv> {
+    let v = env.values.get(&op.nid())?;
     if op.is_negated() {
         // BTOR2 negative-NID shorthand = bitwise NOT.
-        Some(BvValue::new(!v.bits, v.width))
+        Some(v.not())
     } else {
-        Some(v)
+        Some(v.clone())
     }
 }
 
@@ -5233,9 +5178,9 @@ fn evaluate_pure(file: &Btor2File, env: &mut Env, honor_init: bool) -> Result<()
 /// duplication per cube/input combo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UfRepresentative {
-    /// Substitute `BvValue::zero(width)`. The R.5b lifter MVP default.
+    /// Substitute `Bv::zero(width)`. The R.5b lifter MVP default.
     Zero,
-    /// Substitute `BvValue::ones(width)` (all bits set). Combined
+    /// Substitute `Bv::ones(width)` (all bits set). Combined
     /// with `Zero` covers the boundary values of the wrapped Op's
     /// result space; together they detect Boolean-controlled
     /// downstream paths that diverge on extremes.
@@ -5244,16 +5189,16 @@ pub enum UfRepresentative {
 
 impl UfRepresentative {
     /// Materialise the substituted value at the given Op width.
-    fn to_value(self, width: u32) -> BvValue {
+    fn to_value(self, width: u32) -> Bv {
         match self {
-            UfRepresentative::Zero => BvValue::zero(width),
-            UfRepresentative::Ones => BvValue::ones(width),
+            UfRepresentative::Zero => Bv::zero(width),
+            UfRepresentative::Ones => Bv::ones(width),
         }
     }
 }
 
 /// R.5b lifter integration MVP — variant of [`evaluate_pure`] that
-/// substitutes `BvValue::zero(width)` for every Op NID in
+/// substitutes `Bv::zero(width)` for every Op NID in
 /// `uf_wrapped_nids`, skipping the actual arithmetic evaluation. The
 /// substituted value propagates through downstream Op evaluations
 /// (since they read the env), so any computation that transitively
@@ -5349,189 +5294,91 @@ fn eval_op(
     args: &[Operand],
     width: u32,
     env: &Env,
-) -> Result<BvValue, String> {
-    let read = |i: usize| -> Result<BvValue, String> {
+) -> Result<Bv, String> {
+    let read = |i: usize| -> Result<Bv, String> {
         read_operand(env, args[i]).ok_or_else(|| format!("operand {} unevaluated", args[i].nid()))
     };
+    // Shift amount, matching the pre-Bv semantics exactly: Sll/Srl/Sra mask the
+    // amount to `& (width-1).max(1)`; Rol/Ror take it `% width`. `a` supplies
+    // the width, `b` the raw amount (low bits).
+    let shl_amount = |a: &Bv, b: &Bv| (b.low128() as u32) & (a.width().saturating_sub(1).max(1));
+    let rot_amount = |a: &Bv, b: &Bv| (b.low128() as u32) % a.width().max(1);
 
     match op {
-        Op::Not => {
-            let v = read(0)?;
-            Ok(BvValue::new(!v.bits, v.width))
-        }
+        Op::Not => Ok(read(0)?.not()),
         Op::Inc => {
             let v = read(0)?;
-            Ok(BvValue::new(v.bits.wrapping_add(1), v.width))
+            let w = v.width();
+            Ok(v.add(&Bv::one(w)))
         }
         Op::Dec => {
             let v = read(0)?;
-            Ok(BvValue::new(v.bits.wrapping_sub(1), v.width))
+            let w = v.width();
+            Ok(v.sub(&Bv::one(w)))
         }
-        Op::Neg => {
-            let v = read(0)?;
-            Ok(BvValue::new(0u128.wrapping_sub(v.bits), v.width))
-        }
+        Op::Neg => Ok(read(0)?.neg()),
         Op::Redand => {
             let v = read(0)?;
-            let all_ones = if v.width >= 128 {
-                v.bits == u128::MAX
-            } else {
-                v.bits == (1u128 << v.width) - 1
-            };
-            Ok(BvValue::from_bool(all_ones))
+            let w = v.width();
+            Ok(Bv::from_bool(v == Bv::ones(w)))
         }
-        Op::Redor => {
-            let v = read(0)?;
-            Ok(BvValue::from_bool(v.bits != 0))
-        }
-        Op::Redxor => {
-            let v = read(0)?;
-            Ok(BvValue::from_bool(v.bits.count_ones() & 1 == 1))
-        }
-        Op::Iff | Op::Eq => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::from_bool(a.bits == b.bits))
-        }
+        Op::Redor => Ok(Bv::from_bool(read(0)?.is_nonzero())),
+        Op::Redxor => Ok(Bv::from_bool(read(0)?.count_ones() & 1 == 1)),
+        Op::Iff | Op::Eq => Ok(read(0)?.eq_bv(&read(1)?)),
         Op::Implies => {
             let a = read(0)?;
             let b = read(1)?;
-            Ok(BvValue::from_bool(!a.to_bool() || b.to_bool()))
+            Ok(Bv::from_bool(!a.to_bool() || b.to_bool()))
         }
-        Op::Neq => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::from_bool(a.bits != b.bits))
-        }
-        Op::And => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(a.bits & b.bits, width))
-        }
-        Op::Or => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(a.bits | b.bits, width))
-        }
-        Op::Xor => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(a.bits ^ b.bits, width))
-        }
-        Op::Nand => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(!(a.bits & b.bits), width))
-        }
-        Op::Nor => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(!(a.bits | b.bits), width))
-        }
-        Op::Xnor => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(!(a.bits ^ b.bits), width))
-        }
-        Op::Add => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(a.bits.wrapping_add(b.bits), width))
-        }
-        Op::Sub => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(a.bits.wrapping_sub(b.bits), width))
-        }
-        Op::Mul => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(a.bits.wrapping_mul(b.bits), width))
-        }
-        Op::Ult => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::from_bool(a.bits < b.bits))
-        }
-        Op::Ulte => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::from_bool(a.bits <= b.bits))
-        }
-        Op::Ugt => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::from_bool(a.bits > b.bits))
-        }
-        Op::Ugte => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::from_bool(a.bits >= b.bits))
-        }
-        Op::Slt | Op::Slte | Op::Sgt | Op::Sgte => {
-            let a = read(0)?;
-            let b = read(1)?;
-            let sa = sign_extend(a.bits, a.width);
-            let sb = sign_extend(b.bits, b.width);
-            let r = match op {
-                Op::Slt => sa < sb,
-                Op::Slte => sa <= sb,
-                Op::Sgt => sa > sb,
-                Op::Sgte => sa >= sb,
-                _ => unreachable!(),
-            };
-            Ok(BvValue::from_bool(r))
-        }
+        Op::Neq => Ok(read(0)?.ne_bv(&read(1)?)),
+        Op::And => Ok(read(0)?.and(&read(1)?)),
+        Op::Or => Ok(read(0)?.or(&read(1)?)),
+        Op::Xor => Ok(read(0)?.xor(&read(1)?)),
+        Op::Nand => Ok(read(0)?.and(&read(1)?).not()),
+        Op::Nor => Ok(read(0)?.or(&read(1)?).not()),
+        Op::Xnor => Ok(read(0)?.xor(&read(1)?).not()),
+        Op::Add => Ok(read(0)?.add(&read(1)?)),
+        Op::Sub => Ok(read(0)?.sub(&read(1)?)),
+        Op::Mul => Ok(read(0)?.mul(&read(1)?)),
+        Op::Ult => Ok(read(0)?.ult(&read(1)?)),
+        Op::Ulte => Ok(read(0)?.ulte(&read(1)?)),
+        Op::Ugt => Ok(read(0)?.ugt(&read(1)?)),
+        Op::Ugte => Ok(read(0)?.ugte(&read(1)?)),
+        Op::Slt => Ok(read(0)?.slt(&read(1)?)),
+        Op::Slte => Ok(read(0)?.slte(&read(1)?)),
+        Op::Sgt => Ok(read(0)?.sgt(&read(1)?)),
+        Op::Sgte => Ok(read(0)?.sgte(&read(1)?)),
         Op::Sll => {
             let a = read(0)?;
             let b = read(1)?;
-            let shift = (b.bits as u32) & (a.width.saturating_sub(1).max(1));
-            Ok(BvValue::new(a.bits.wrapping_shl(shift), width))
+            let s = shl_amount(&a, &b);
+            Ok(a.shl(s))
         }
         Op::Srl => {
             let a = read(0)?;
             let b = read(1)?;
-            let shift = (b.bits as u32) & (a.width.saturating_sub(1).max(1));
-            Ok(BvValue::new(a.bits.wrapping_shr(shift), width))
+            let s = shl_amount(&a, &b);
+            Ok(a.shr(s))
         }
         Op::Sra => {
             let a = read(0)?;
             let b = read(1)?;
-            let shift = (b.bits as u32) & (a.width.saturating_sub(1).max(1));
-            let signed = sign_extend(a.bits, a.width);
-            // `i128 >> shift` panics for shift ≥ 128; clamp to 127 (a full sign-fill).
-            let shifted = signed >> shift.min(127);
-            Ok(BvValue::new(shifted as u128, width))
+            let s = shl_amount(&a, &b);
+            Ok(a.sra(s))
         }
         Op::Rol => {
             let a = read(0)?;
             let b = read(1)?;
-            let shift = (b.bits as u32) % a.width.max(1);
-            let mask = if a.width >= 128 {
-                u128::MAX
-            } else {
-                (1u128 << a.width) - 1
-            };
-            let bits = (shl_sat128(a.bits, shift) | shr_sat128(a.bits, a.width - shift)) & mask;
-            Ok(BvValue::new(bits, width))
+            let s = rot_amount(&a, &b);
+            Ok(a.rol(s))
         }
         Op::Ror => {
             let a = read(0)?;
             let b = read(1)?;
-            let shift = (b.bits as u32) % a.width.max(1);
-            let mask = if a.width >= 128 {
-                u128::MAX
-            } else {
-                (1u128 << a.width) - 1
-            };
-            let bits = (shr_sat128(a.bits, shift) | shl_sat128(a.bits, a.width - shift)) & mask;
-            Ok(BvValue::new(bits, width))
+            let s = rot_amount(&a, &b);
+            Ok(a.ror(s))
         }
-        Op::Concat => {
-            let a = read(0)?;
-            let b = read(1)?;
-            Ok(BvValue::new(shl_sat128(a.bits, b.width) | b.bits, width))
-        }
+        Op::Concat => Ok(read(0)?.concat(&read(1)?)),
         Op::Slice => {
             let a = read(0)?;
             let upper = immediates
@@ -5542,25 +5389,17 @@ fn eval_op(
                 .get(1)
                 .copied()
                 .ok_or_else(|| "slice missing lower".to_string())?;
-            // A slice lower bound ≥ 128 (slicing a high bit of a > 128-bit value) would overflow
-            // the u128 shift; saturate to 0 (the sliced-out high bits are outside the window).
-            let shifted = shr_sat128(a.bits, lower);
-            let mask = if width >= 128 {
-                u128::MAX
-            } else {
-                (1u128 << width) - 1
-            };
-            let _ = upper;
-            Ok(BvValue::new(shifted & mask, width))
+            Ok(a.slice(upper, lower))
         }
         Op::Uext => {
             let a = read(0)?;
-            Ok(BvValue::new(a.bits, width))
+            let by = width - a.width();
+            Ok(a.uext(by))
         }
         Op::Sext => {
             let a = read(0)?;
-            let signed = sign_extend(a.bits, a.width);
-            Ok(BvValue::new(signed as u128, width))
+            let by = width - a.width();
+            Ok(a.sext(by))
         }
         Op::Ite => {
             let c = read(0)?;
@@ -5574,66 +5413,39 @@ fn eval_op(
     }
 }
 
-// The concrete backend represents values in a `u128`, so a value wider than 128 bits is already
-// truncated to its low 128 bits. A shift by ≥ 128 would then overflow-panic in debug (the shifted
-// data lies outside the 128-bit window anyway), so these saturate to 0 — a wide design (e.g.
-// keymgr_ctrl's 256-bit key-state concats) degrades gracefully instead of panicking. Sampling
-// enumeration over such abstracted-away wide datapaths does not need exact > 128-bit values.
-#[inline]
-fn shl_sat128(x: u128, n: u32) -> u128 {
-    if n >= 128 { 0 } else { x << n }
-}
-#[inline]
-fn shr_sat128(x: u128, n: u32) -> u128 {
-    if n >= 128 { 0 } else { x >> n }
-}
-
-fn sign_extend(bits: u128, width: u32) -> i128 {
-    if width == 0 || width >= 128 {
-        return bits as i128;
-    }
-    let sign_bit = 1u128 << (width - 1);
-    if bits & sign_bit != 0 {
-        let mask = !((1u128 << width) - 1);
-        (bits | mask) as i128
-    } else {
-        bits as i128
-    }
-}
-
 /// §Phase 10 Option-4 step 1a (2026-06-12) — shared constant-node
 /// evaluation. Extracted from `evaluate_pure_with_uf_rep`'s inline
 /// `Node::Const` match so the bespoke loop AND the new
 /// `ConcreteBackend` (the [`crate::adapter::btor2::term_backend::BvTermBackend`]
 /// impl) compute constants from ONE source — no duplication, no
 /// drift. Returns `Err(message)` on a malformed literal.
-pub(crate) fn eval_const_value(value: &ConstValue, width: u32) -> Result<BvValue, String> {
+pub(crate) fn eval_const_value(value: &ConstValue, width: u32) -> Result<Bv, String> {
+    use num_bigint::BigUint;
     let bv = match value {
-        ConstValue::Zero => BvValue::zero(width),
-        ConstValue::One => BvValue::one(width),
-        ConstValue::Ones => BvValue::ones(width),
+        ConstValue::Zero => Bv::zero(width),
+        ConstValue::One => Bv::one(width),
+        ConstValue::Ones => Bv::ones(width),
+        // AR-S2 — arbitrary-width literals: parse the full magnitude (no u128
+        // ceiling) and let `Bv::from_biguint` mask + pick the Small/Wide storage.
         ConstValue::Bin(s) => {
-            let bits = u128::from_str_radix(s, 2).map_err(|_| "bad binary literal".to_string())?;
-            BvValue::new(bits, width)
+            let mag = BigUint::parse_bytes(s.as_bytes(), 2)
+                .ok_or_else(|| "bad binary literal".to_string())?;
+            Bv::from_biguint(mag, width)
         }
         ConstValue::Dec(d) => {
-            let bits = if *d >= 0 {
-                *d as u128
+            if *d >= 0 {
+                Bv::from_biguint(BigUint::from(*d as u128), width)
             } else {
-                // Two's complement of a negative literal.
-                let abs = (-d) as u128;
-                let mask = if width >= 128 {
-                    u128::MAX
-                } else {
-                    (1u128 << width) - 1
-                };
-                (mask.wrapping_sub(abs).wrapping_add(1)) & mask
-            };
-            BvValue::new(bits, width)
+                // Two's complement of a negative literal: (2^width - |d|) mod 2^width.
+                let modulus = BigUint::from(1u8) << width;
+                let abs = BigUint::from((-d) as u128) % &modulus;
+                Bv::from_biguint((&modulus - abs) % &modulus, width)
+            }
         }
         ConstValue::Hex(s) => {
-            let bits = u128::from_str_radix(s, 16).map_err(|_| "bad hex literal".to_string())?;
-            BvValue::new(bits, width)
+            let mag = BigUint::parse_bytes(s.as_bytes(), 16)
+                .ok_or_else(|| "bad hex literal".to_string())?;
+            Bv::from_biguint(mag, width)
         }
     };
     Ok(bv)
@@ -5642,7 +5454,7 @@ pub(crate) fn eval_const_value(value: &ConstValue, width: u32) -> Result<BvValue
 /// §Phase 10 Option-4 step 1a (2026-06-12) — the concrete
 /// instantiation of [`crate::adapter::btor2::term_backend::BvTermBackend`].
 ///
-/// `Value = BvValue`. Delegates operator evaluation to the existing
+/// `Value = Bv`. Delegates operator evaluation to the existing
 /// [`eval_op`] free function so the arithmetic is bit-identical to
 /// the production `evaluate_pure` path — this backend is a faithful
 /// re-expression of the concrete evaluator behind the unified seam,
@@ -5650,7 +5462,7 @@ pub(crate) fn eval_const_value(value: &ConstValue, width: u32) -> Result<BvValue
 /// [`eval_const_value`]; the UF substitution mirrors
 /// `evaluate_pure_with_uf_rep`'s representative logic.
 ///
-/// Holds its own [`Env`] (the `Nid → BvValue` store), seeded by the
+/// Holds its own [`Env`] (the `Nid → Bv` store), seeded by the
 /// caller with the input + state bindings (the same env
 /// `make_*_env` builds). As of step 1b this IS the production
 /// concrete evaluator: `evaluate_pure_with_uf_rep` drives
@@ -5688,10 +5500,10 @@ impl<'a> ConcreteBackend<'a> {
 }
 
 impl crate::adapter::btor2::term_backend::BvTermBackend for ConcreteBackend<'_> {
-    type Value = BvValue;
+    type Value = Bv;
     type Error = String;
 
-    fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<BvValue, String> {
+    fn eval_const(&mut self, value: &ConstValue, width: u32) -> Result<Bv, String> {
         eval_const_value(value, width)
     }
 
@@ -5702,13 +5514,13 @@ impl crate::adapter::btor2::term_backend::BvTermBackend for ConcreteBackend<'_> 
         immediates: &[u32],
         args: &[Operand],
         width: u32,
-    ) -> Result<BvValue, String> {
+    ) -> Result<Bv, String> {
         // The concrete free-fn `eval_op` derives its own error
         // context from the operand NIDs; the node nid is unused here.
         eval_op(op, immediates, args, width, &self.env)
     }
 
-    fn bind(&mut self, nid: Nid, value: BvValue) {
+    fn bind(&mut self, nid: Nid, value: Bv) {
         self.env.values.insert(nid, value);
     }
 
@@ -5716,11 +5528,11 @@ impl crate::adapter::btor2::term_backend::BvTermBackend for ConcreteBackend<'_> 
         self.honor_init
     }
 
-    fn read_operand(&self, op: Operand) -> Option<BvValue> {
+    fn read_operand(&self, op: Operand) -> Option<Bv> {
         read_operand(&self.env, op)
     }
 
-    fn uf_substitute(&mut self, nid: Nid, width: u32) -> Option<BvValue> {
+    fn uf_substitute(&mut self, nid: Nid, width: u32) -> Option<Bv> {
         if self.uf_wrapped_nids.is_some_and(|s| s.contains(&nid)) {
             Some(self.rep.to_value(width))
         } else {
@@ -5786,18 +5598,11 @@ mod tests {
     use super::*;
     use crate::adapter::AdapterOptions;
 
-    #[test]
-    fn saturating_shifts_do_not_overflow_at_or_above_128() {
-        // The concrete-backend shift guards: a shift ≥ 128 saturates to 0 (no debug panic).
-        // Regression for the keymgr_ctrl cube-lift "shift left with overflow" (256-bit key concat).
-        assert_eq!(shl_sat128(0xFF, 128), 0);
-        assert_eq!(shl_sat128(0xFF, 200), 0);
-        assert_eq!(shr_sat128(u128::MAX, 128), 0);
-        assert_eq!(shr_sat128(u128::MAX, 255), 0);
-        // Below 128 behaves as a normal shift.
-        assert_eq!(shl_sat128(1, 127), 1u128 << 127);
-        assert_eq!(shr_sat128(1u128 << 127, 127), 1);
-    }
+    // AR-S2 — the `shl_sat128`/`shr_sat128` saturating point-patches (and their
+    // regression test) are retired: `Bv` shifts are exact at any width, so a
+    // wide concat/shift (e.g. keymgr_ctrl's 256-bit key state) no longer
+    // truncates. Shift correctness is covered by the `bv` module's differential
+    // tests (20k iterations/op vs u128) + the wide-roundtrip test.
 
     // ─────────────────────────────────────────────────────────────
     // §Phase 10 Option-4 step 1a — BvTermBackend equivalence.
@@ -5825,13 +5630,13 @@ mod tests {
             // A deterministic non-trivial value per NID: low bits of
             // the NID, masked to width.
             let raw = (line.nid as u128).wrapping_mul(0x9E37) ^ 0x5A5A;
-            env.values.insert(nid, BvValue::new(raw, width));
+            env.values.insert(nid, Bv::from_u128_width(raw, width));
         }
         env
     }
 
     /// Run BOTH evaluators on the same seeded env + assert the
-    /// resulting `Nid → BvValue` maps are identical.
+    /// resulting `Nid → Bv` maps are identical.
     fn assert_backend_matches_bespoke(src: &str, honor_init: bool) {
         use crate::adapter::btor2::term_backend::walk_design;
         let file = super::parser::parse(src).expect("parse fixture");

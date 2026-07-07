@@ -22,6 +22,7 @@
 pub mod ast;
 pub mod bad_monitor;
 pub mod bit_blast;
+pub mod bv;
 pub mod cegar;
 pub mod concrete_oracle;
 pub mod dep_graph;

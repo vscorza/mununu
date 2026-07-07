@@ -1285,12 +1285,13 @@ impl BvTermBackend for BddBitBlaster {
                 })
                 .collect());
         }
-        // Non-`Bin` constants (Zero/One/Ones/Dec) fit the concrete u128 semantics. `bv.bits` is a
-        // `u128`, so bit `b ≥ 128` is 0 (and `>> b` would PANIC): guard it.
+        // AR-S2 — `eval_const_value` now returns an arbitrary-width `Bv`, so
+        // `bv.bit(b)` is exact for every bit (wide `Ones` / `Dec` constants
+        // included), not truncated at 128.
         let bv = eval_const_value(value, width)?;
         Ok((0..width as usize)
             .map(|b| {
-                if b < 128 && (bv.bits >> b) & 1 == 1 {
+                if bv.bit(b as u64) {
                     self.tt.clone()
                 } else {
                     self.ff.clone()
