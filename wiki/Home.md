@@ -33,6 +33,7 @@ Whether you are designing a handshake protocol, an arbiter, a multi-clock-domain
 | [Agentic Orchestration](Agentic-Orchestration) | Verify multi-agent workflows, MCP tool authorization, and handoff protocols |
 | [Agentic Adapters](Agentic-Adapters) | Native CrewAI + LangGraph JSON parsers — drop a `.crewai.json` / `.langgraph.json` directly into CLI / API / UI |
 | [Verify Project Flow](Verify-Project-Flow) | General N-source verification driven by `verify.toml` (CLI / API / UI wizard) |
+| [CI and Agent Integration](CI-and-Agent-Integration) | Drive mununu from GitHub Actions (verify verbs as exit-code gates) and from an RTL-writing agent over HTTP |
 | [Property Templates](Property-Templates) | Parameterized property patterns (no_deadlock, reachable, bounded, etc.) |
 | [CLI Reference](CLI-Reference) | Full command reference with adapter import/export examples |
 | [API Reference](API-Reference) | REST API documentation including the import endpoint |

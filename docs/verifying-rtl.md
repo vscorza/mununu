@@ -213,12 +213,21 @@ jobs:
 
 For a whole module's assertions in one gate, `mununu --quiet sv verify-auto rtl/mod.sv
 --preprocess-sv2v --json` exits non-zero iff any property is violated; the JSON on
-stdout carries the per-property detail for a summary step.
+stdout carries the per-property detail for a summary step. `verify-auto` also
+**auto-escalates** a *safety* property the cube abstraction leaves `⊥` to the
+multi-engine reachability portfolio (`--no-rescue` opts out), recording a
+`portfolio-rescue` note if the portfolio decides it.
+
+The full CI recipe (a complete GitHub Actions workflow) and the agent-over-HTTP
+recipe live in
+[`wiki/CI-and-Agent-Integration.md`](../wiki/CI-and-Agent-Integration.md).
 
 ---
 
 ## See also
 
+- [`../wiki/CI-and-Agent-Integration.md`](../wiki/CI-and-Agent-Integration.md) — the
+  full CI (GitHub Actions) + agent-over-HTTP integration guide.
 - [`design/recoverability-vs-sva.md`](design/recoverability-vs-sva.md) — why `AG EF`
   recoverability is outside SVA, with the OpenTitan `csrng` worked example.
 - [`cli-cookbook.md`](cli-cookbook.md) — common `mununu` CLI invocations.
