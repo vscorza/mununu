@@ -32,6 +32,13 @@ use crate::adapter::sidecar::predicate_image::btor2_encode::{EncodeError, encode
 use z3::ast::{Ast, BV, Bool};
 use z3::{FuncDecl, Sort};
 
+/// Default wall-clock budget for a portfolio SPACER solve. Invariant discovery can
+/// run longer than bounded BMC, so this is more generous than
+/// [`native_bmc::DEFAULT_TIMEOUT_MS`](crate::adapter::btor2::native_bmc::DEFAULT_TIMEOUT_MS),
+/// but still bounded — a timeout abstains ([`SafetyVerdict::Unknown`]), never a wrong
+/// verdict.
+pub const DEFAULT_TIMEOUT_MS: u32 = 10_000;
+
 /// `a ⟹ b`. Must be a real `(=> a b)` (not the `¬a ∨ b` rewrite): SPACER inspects
 /// the *syntactic* head of each rule and rejects an `(or …)` head as "not an
 /// uninterpreted predicate", so the implication node is load-bearing.
