@@ -1,7 +1,7 @@
 //! Reachability portfolio — decide BTOR2 `bad`-reachability with every available
 //! engine and merge under the **differential-oracle discipline**.
 //!
-//! The P1 payoff made usable — four sound engines, each deciding a *different*
+//! The P1 payoff made usable — five sound engines, each deciding a *different*
 //! slice of designs:
 //! - the **exact** BDD engine
 //!   ([`exact_bad_reachable`](crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable))
@@ -9,6 +9,10 @@
 //! - the in-house **native** engine (BMC + k-induction on the Z3 seam,
 //!   [`native_bmc`](crate::adapter::btor2::native_bmc)) — no bit cap, no
 //!   subprocess: mununu's own scalable safety member;
+//! - the in-house **SPACER** engine (IC3/PDR + interpolation via Z3's Fixedpoint,
+//!   [`native_spacer`](crate::adapter::btor2::native_spacer)) — decides safe
+//!   properties whose inductive invariant native k-induction cannot reach by simple
+//!   induction, also in-process;
 //! - **btormc** (BMC + k-induction) on deep counterexamples;
 //! - **Pono** (IC3/PDR) on IC3-provable / violated instances.
 //!
@@ -33,6 +37,7 @@
 use crate::adapter::btor2::ast::Btor2File;
 use crate::adapter::btor2::emit::emit_btor2;
 use crate::adapter::btor2::native_bmc::{self, SafetyVerdict};
+use crate::adapter::btor2::native_spacer;
 use crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable;
 use crate::adapter::btormc::{self, McVerdict};
 use crate::adapter::pono;
@@ -103,19 +108,34 @@ fn run_native(file: &Btor2File) -> Option<bool> {
     }
 }
 
+/// The in-house **SPACER engine** (IC3/PDR + interpolation via Z3's Fixedpoint)
+/// verdict: `Some(true)` reachable, `Some(false)` unreachable (an inductive-invariant
+/// safety proof), `None` abstained (Unknown / timeout / encode error). SPACER's
+/// invariant discovery decides *safe* designs whose invariant native k-induction
+/// cannot reach by simple induction below a large depth — also in-process, no
+/// subprocess.
+fn run_spacer(file: &Btor2File) -> Option<bool> {
+    match native_spacer::decide_bad_safety_spacer(file, Some(native_spacer::DEFAULT_TIMEOUT_MS)) {
+        Ok(SafetyVerdict::Violated { .. }) => Some(true),
+        Ok(SafetyVerdict::Safe { .. }) => Some(false),
+        Ok(SafetyVerdict::Unknown { .. }) | Err(_) => None,
+    }
+}
+
 /// Merge the members' verdicts into a [`ReachOutcome`], in the fixed engine order
-/// (`exact`, `native`, `btormc`, `pono`) so the outcome is deterministic
+/// (`exact`, `native`, `spacer`, `btormc`, `pono`) so the outcome is deterministic
 /// regardless of which driver (sequential / parallel) produced them.
 fn collect(
     exact: Option<bool>,
     native: Option<bool>,
+    spacer: Option<bool>,
     btormc_v: Option<McVerdict>,
     pono_v: Option<McVerdict>,
 ) -> ReachOutcome {
     let mut reachable_by: Vec<&'static str> = Vec::new();
     let mut unreachable_by: Vec<&'static str> = Vec::new();
     // In-house engines report reachability as a bool (`Some(true)` = reachable).
-    for (name, v) in [("exact", exact), ("native", native)] {
+    for (name, v) in [("exact", exact), ("native", native), ("spacer", spacer)] {
         match v {
             Some(true) => reachable_by.push(name),
             Some(false) => unreachable_by.push(name),
@@ -133,14 +153,17 @@ fn collect(
     ReachOutcome::from_sets(reachable_by, unreachable_by)
 }
 
-/// Decide `bad`-reachability of `file` across the exact BDD engine + the btormc
-/// and Pono subprocess members, merged under the differential-oracle discipline.
+/// Decide `bad`-reachability of `file` across all five engines — the exact BDD
+/// engine, the in-house native (BMC + k-induction) and SPACER engines, and the
+/// btormc and Pono subprocess members — merged under the differential-oracle
+/// discipline.
 ///
 /// Each member abstains gracefully: the exact engine on an over-cap / free-init
-/// design (`Err`), a subprocess member when its binary is absent (`Err`), it is
-/// inconclusive (`Unknown`), or it hits its wall-clock timeout. The emitted BTOR2
-/// (from [`emit_btor2`]) is the shared input, so a *reduced / transformed* model
-/// is decided consistently by all three.
+/// design (`Err`), the in-house engines on `Unknown` / timeout / encode error, a
+/// subprocess member when its binary is absent (`Err`), it is inconclusive
+/// (`Unknown`), or it hits its wall-clock timeout. The emitted BTOR2 (from
+/// [`emit_btor2`]) is the shared input, so a *reduced / transformed* model is decided
+/// consistently across all members.
 ///
 /// This is the **sequential** driver — members run one after another. Use
 /// [`decide_reach_portfolio_parallel`] to overlap them in wall-clock.
@@ -151,12 +174,14 @@ pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
     let exact = run_exact(&content);
     // Native engine — in-house BMC + k-induction on the Z3 seam, no bit cap.
     let native = run_native(file);
+    // SPACER engine — in-house IC3/PDR + interpolation (invariant discovery).
+    let spacer = run_spacer(file);
     // btormc — BMC (CEX) + k-induction (proof).
     let btormc_v =
         btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
     // Pono — IC3/PDR (proof + shallow CEX).
     let pono_v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
-    collect(exact, native, btormc_v, pono_v)
+    collect(exact, native, spacer, btormc_v, pono_v)
 }
 
 /// The **parallel** driver: run the exact engine (in-process) and the two
@@ -177,17 +202,20 @@ pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
         let pono_h = scope.spawn(|| {
             pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok()
         });
-        // The native engine is in-process Z3 work — its own thread so it overlaps
-        // the exact engine + the subprocess members rather than serialising.
+        // The native and SPACER engines are in-process Z3 work — each on its own
+        // thread so it overlaps the exact engine + the subprocess members rather than
+        // serialising.
         let native_h = scope.spawn(|| run_native(file));
+        let spacer_h = scope.spawn(|| run_spacer(file));
         // The exact engine is in-process BDD work — run it on this thread while the
         // other members run on theirs.
         let exact = run_exact(&content);
         // A panicked member thread abstains (None) rather than poisoning the merge.
         let native = native_h.join().unwrap_or(None);
+        let spacer = spacer_h.join().unwrap_or(None);
         let btormc_v = btormc_h.join().unwrap_or(None);
         let pono_v = pono_h.join().unwrap_or(None);
-        collect(exact, native, btormc_v, pono_v)
+        collect(exact, native, spacer, btormc_v, pono_v)
     })
 }
 
@@ -253,6 +281,36 @@ mod tests {
         assert!(
             out.unreachable_by.contains(&"native"),
             "the native engine must carry the beyond-cap verdict: {out:?}"
+        );
+        assert!(
+            !out.unreachable_by.contains(&"exact"),
+            "the exact engine must abstain on the over-cap 64-bit design: {out:?}"
+        );
+    }
+
+    #[test]
+    fn spacer_decides_beyond_native_k_induction_in_portfolio() {
+        // A 64-bit counter that STALLS at 0 (init 0, next = (c==0)?0:c+1), bad = (c==MAX).
+        // Reachable set is {0} ⇒ SAFE, but:
+        //   - the exact BDD engine abstains (64-bit > its 40-bit cone cap);
+        //   - native k-induction abstains — the property is not provable by *simple*
+        //     k-induction: an unreachable free path MAX-k → … → MAX stays ¬bad until
+        //     the last step at every depth, so it never closes below depth 2^64-1.
+        // Only SPACER's invariant discovery (`c == 0`) decides it, so the portfolio
+        // verdict is carried uniquely by "spacer". (btormc/pono absent in make-ci.)
+        const WIDE_STALL: &str = "1 sort bitvec 64\n2 zero 1\n3 one 1\n4 state 1 c\n5 init 1 4 2\n\
+             6 sort bitvec 1\n7 eq 6 4 2\n8 add 1 4 3\n9 ite 1 7 2 8\n\
+             10 next 1 4 9\n11 ones 1\n12 eq 6 4 11\n13 bad 12\n";
+        let file = parser::parse(WIDE_STALL).expect("parse");
+        let out = decide_reach_portfolio(&file);
+        assert_eq!(out.verdict, ReachVerdict::Unreachable, "outcome: {out:?}");
+        assert!(
+            out.unreachable_by.contains(&"spacer"),
+            "SPACER must carry the beyond-k-induction verdict: {out:?}"
+        );
+        assert!(
+            !out.unreachable_by.contains(&"native"),
+            "native k-induction must abstain on the non-simple-inductive design: {out:?}"
         );
         assert!(
             !out.unreachable_by.contains(&"exact"),
