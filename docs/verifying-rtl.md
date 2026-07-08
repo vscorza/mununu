@@ -176,6 +176,47 @@ portfolio engines) — an agent can trust a definite verdict and treat `unknown`
 
 ---
 
+## Using mununu in CI (GitHub Actions and friends)
+
+> Source of truth: [`FailOn` / `ci_exit_code`](../crates/mununu-cli/src/main.rs) — surface: CLI
+
+Every verify verb (and `sv verify-auto`) is a **CI gate**: it maps the verdict to a
+process **exit code** so a workflow step fails on a real violation without parsing
+JSON.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | property holds (or all properties hold) — the step passes |
+| `2` | a property is **violated** — the step fails |
+| `3` | a property is **unknown** *and* `--fail-on unknown` was set |
+| `1` | tool / usage error (bad file, unparseable atom, missing toolchain) |
+
+- `--fail-on <violated\|unknown\|none>` picks the gate policy. Default `violated`:
+  an undecided `unknown` does **not** fail the build (it is "not decided," not
+  "broken"). Use `--fail-on unknown` for a strict gate, or `--fail-on none` to
+  report-only (always exit `0`).
+- `--quiet` (global) suppresses the `logs/mununu.log` workspace file and the startup
+  banner — errors only to stderr, so the workspace stays clean and stdout is the JSON.
+
+```yaml
+# .github/workflows/verify.yml — fail the build if the FSM can't recover to idle
+jobs:
+  recoverability:
+    runs-on: ubuntu-latest
+    container: ghcr.io/vscorza/mununu-sva:latest   # bundles slang + sv2v + yosys
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mununu --quiet sv verify-recoverability rtl/fsm.sv \
+            --preprocess-sv2v --target "state_q == 0"   # exit 2 ⇒ step fails
+```
+
+For a whole module's assertions in one gate, `mununu --quiet sv verify-auto rtl/mod.sv
+--preprocess-sv2v --json` exits non-zero iff any property is violated; the JSON on
+stdout carries the per-property detail for a summary step.
+
+---
+
 ## See also
 
 - [`design/recoverability-vs-sva.md`](design/recoverability-vs-sva.md) — why `AG EF`

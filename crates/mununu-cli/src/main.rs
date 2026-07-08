@@ -34,8 +34,105 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
     disable_help_subcommand = true
 )]
 struct Cli {
+    /// Suppress the `logs/mununu.log` workspace file and the startup log banner —
+    /// errors only to stderr (`RUST_LOG` still wins). Use in CI to keep the workspace
+    /// clean and the output machine-readable.
+    #[arg(long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Which verdicts make a verify command exit non-zero — the CI-gate policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FailOn {
+    /// Exit non-zero only when a property is `violated` (default).
+    Violated,
+    /// Exit non-zero when a property is `violated` OR `unknown` (strict — treat an
+    /// undecided verdict as a failure).
+    Unknown,
+    /// Never exit non-zero on the verdict — always `0` (report-only).
+    None,
+}
+
+/// CI-gate flags flattened into every verify verb (`--fail-on`).
+#[derive(Args, Debug)]
+struct CiArgs {
+    /// Which verdicts fail the command (non-zero exit) for a CI gate:
+    /// `violated` (default) | `unknown` (also fail on undecided) | `none`.
+    #[arg(long, value_enum, default_value_t = FailOn::Violated)]
+    fail_on: FailOn,
+}
+
+/// Map a single property verdict + the `--fail-on` policy to a process exit code.
+/// `0` = pass, `2` = violated, `3` = unknown. (`1` is reserved for tool/usage errors
+/// via `main`.) `holds` / `skipped` / any definite-good verdict is always `0`.
+fn ci_exit_code(verdict: &str, fail_on: FailOn) -> i32 {
+    match verdict {
+        "violated" if matches!(fail_on, FailOn::Violated | FailOn::Unknown) => 2,
+        "unknown" if matches!(fail_on, FailOn::Unknown) => 3,
+        _ => 0,
+    }
+}
+
+/// The most severe verdict across many properties (for `verify-auto`):
+/// `violated` > `unknown` > everything else. `skipped` counts as pass (a property
+/// that was not evaluated is not a failure).
+fn worst_verdict<'a>(verdicts: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let mut worst = "holds";
+    for v in verdicts {
+        match v {
+            "violated" => return "violated",
+            "unknown" => worst = "unknown",
+            _ => {}
+        }
+    }
+    worst
+}
+
+/// Exit the process with the CI-gate code for `verdict` under `fail_on` (no-op
+/// return when the code is `0`, so the caller falls through to `Ok`).
+fn ci_gate_exit(verdict: &str, fail_on: FailOn) {
+    let code = ci_exit_code(verdict, fail_on);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+#[cfg(test)]
+mod ci_gate_tests {
+    use super::*;
+
+    #[test]
+    fn default_fails_on_violated_only() {
+        assert_eq!(ci_exit_code("holds", FailOn::Violated), 0);
+        assert_eq!(ci_exit_code("violated", FailOn::Violated), 2);
+        assert_eq!(ci_exit_code("unknown", FailOn::Violated), 0);
+        assert_eq!(ci_exit_code("skipped", FailOn::Violated), 0);
+    }
+
+    #[test]
+    fn strict_also_fails_on_unknown() {
+        assert_eq!(ci_exit_code("violated", FailOn::Unknown), 2);
+        assert_eq!(ci_exit_code("unknown", FailOn::Unknown), 3);
+        assert_eq!(ci_exit_code("holds", FailOn::Unknown), 0);
+    }
+
+    #[test]
+    fn none_never_fails_on_the_verdict() {
+        assert_eq!(ci_exit_code("violated", FailOn::None), 0);
+        assert_eq!(ci_exit_code("unknown", FailOn::None), 0);
+    }
+
+    #[test]
+    fn worst_ranks_violated_over_unknown_over_holds() {
+        assert_eq!(worst_verdict(["holds", "holds"]), "holds");
+        assert_eq!(worst_verdict(["holds", "unknown", "holds"]), "unknown");
+        assert_eq!(worst_verdict(["unknown", "violated", "holds"]), "violated");
+        // `skipped` (not evaluated) is not a failure.
+        assert_eq!(worst_verdict(["skipped", "holds"]), "holds");
+        assert_eq!(worst_verdict([] as [&str; 0]), "holds");
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -445,6 +542,8 @@ struct Btor2VerifyArgs {
     /// Path to the BTOR2 input file.
     #[arg(value_name = "BTOR2_FILE")]
     file: PathBuf,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 /// Arguments for `mununu btor2 verify-liveness` — the response-liveness reduction.
@@ -459,6 +558,8 @@ struct Btor2VerifyLivenessArgs {
     /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
     #[arg(long, value_name = "ATOM")]
     grant: String,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 /// Arguments for `mununu btor2 verify-recoverability` — `AG EF good`.
@@ -470,6 +571,8 @@ struct Btor2VerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1355,6 +1458,8 @@ struct SvVerifyAutoArgs {
     /// BDD size (a design too large to bit-blast ⇒ the property is `Skipped`).
     #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
     engine: EngineArg,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 /// Shared SV → BTOR2 lift inputs for the SV-direct verbs (`sv verify` /
@@ -1382,6 +1487,8 @@ struct SvLiftArgs {
 struct SvVerifyArgs {
     #[command(flatten)]
     lift: SvLiftArgs,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 /// Arguments for `mununu sv verify-liveness` — SV-direct response liveness.
@@ -1395,6 +1502,8 @@ struct SvVerifyLivenessArgs {
     /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
     #[arg(long, value_name = "ATOM")]
     grant: String,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 /// Arguments for `mununu sv verify-recoverability` — SV-direct `AG EF good`.
@@ -1405,6 +1514,8 @@ struct SvVerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    #[command(flatten)]
+    ci: CiArgs,
 }
 
 #[derive(Args, Debug)]
@@ -1679,8 +1790,8 @@ enum GraphOutputType {
 }
 
 fn main() {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(cli.quiet);
     if let Err(err) = dispatch(cli.command) {
         eprintln!("{err}");
         std::process::exit(1);
@@ -1771,7 +1882,20 @@ mod cli_controller_mode_tests {
     }
 }
 
-fn init_tracing() {
+fn init_tracing(quiet: bool) {
+    // CI mode (`--quiet`): no `logs/` file in the workspace, no init banner, errors
+    // only to stderr. `RUST_LOG` still wins if the user sets it explicitly.
+    if quiet {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .compact()
+            .try_init();
+        return;
+    }
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Create logs directory if it doesn't exist
@@ -2170,6 +2294,7 @@ fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<()
         "{}",
         serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
     );
+    ci_gate_exit(verdict.as_str(), args.ci.fail_on);
     Ok(())
 }
 
@@ -2208,6 +2333,7 @@ fn btor2_verify_liveness(args: Btor2VerifyLivenessArgs) -> Result<(), String> {
         "{}",
         serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
     );
+    ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
     Ok(())
 }
 
@@ -2240,6 +2366,10 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    ci_gate_exit(
+        PropertyVerdict::from(outcome.verdict).as_str(),
+        args.ci.fail_on,
     );
     Ok(())
 }
@@ -2563,7 +2693,28 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
     } else {
         render_verify_auto_text(&report);
     }
+    // CI gate: the most severe property verdict drives the exit code.
+    let worst = worst_verdict(
+        report
+            .properties
+            .iter()
+            .map(|p| verify_outcome_canonical(&p.outcome)),
+    );
+    ci_gate_exit(worst, args.ci.fail_on);
     Ok(())
+}
+
+/// The canonical `PropertyVerdict` label for a `verify-auto` outcome.
+fn verify_outcome_canonical(
+    outcome: &mununu_core::adapter::slang::verify_auto::VerifyOutcome,
+) -> &'static str {
+    use mununu_core::adapter::slang::verify_auto::VerifyOutcome;
+    match outcome {
+        VerifyOutcome::Holds => "holds",
+        VerifyOutcome::Violated { .. } => "violated",
+        VerifyOutcome::Unknown { .. } => "unknown",
+        VerifyOutcome::Skipped { .. } => "skipped",
+    }
 }
 
 fn verify_outcome_str(outcome: &mununu_core::adapter::slang::verify_auto::VerifyOutcome) -> String {
@@ -4405,7 +4556,12 @@ fn sv_verify(args: SvVerifyArgs) -> Result<(), String> {
         "contradiction": outcome.verdict
             == mununu_core::adapter::reach_portfolio::ReachVerdict::Contradiction,
     });
-    print_json_summary(&summary)
+    print_json_summary(&summary)?;
+    ci_gate_exit(
+        PropertyVerdict::from(outcome.verdict).as_str(),
+        args.ci.fail_on,
+    );
+    Ok(())
 }
 
 /// `mununu sv verify-liveness` — lift SV and decide `AG(request → AF grant)`.
@@ -4423,7 +4579,9 @@ fn sv_verify_liveness(args: SvVerifyLivenessArgs) -> Result<(), String> {
         "decided_by": outcome.reachable_by.iter().chain(outcome.unreachable_by.iter())
             .collect::<Vec<_>>(),
     });
-    print_json_summary(&summary)
+    print_json_summary(&summary)?;
+    ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
+    Ok(())
 }
 
 /// `mununu sv verify-recoverability` — lift SV and decide `AG EF good`.
@@ -4438,7 +4596,9 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
         "property": recoverability_property_str(&args.target),
         "verdict": verdict.as_str(),
     });
-    print_json_summary(&summary)
+    print_json_summary(&summary)?;
+    ci_gate_exit(verdict.as_str(), args.ci.fail_on);
+    Ok(())
 }
 
 /// Pretty-print a JSON summary to stdout.
