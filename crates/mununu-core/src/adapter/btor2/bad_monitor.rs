@@ -195,6 +195,29 @@ pub fn emit_ag_state_in_set_monitor(
     legal: &[u64],
     reset_pinned: bool,
 ) -> Result<String, AdapterError> {
+    let file = parser::parse(content).map_err(|mut e| {
+        e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
+        e
+    })?;
+    let (sig_nid, sig_sort) = state_nid_and_sort(&file, signal, reset_pinned).ok_or_else(|| {
+        err(format!(
+            "adapter/btor2/bad_monitor: `{signal}` does not resolve to a state cell \
+             (the AG(state ∈ set) monitor requires a state register or a value-alias of one)"
+        ))
+    })?;
+    emit_ag_state_in_set_monitor_by_nid(content, sig_nid, sig_sort, legal)
+}
+
+/// As [`emit_ag_state_in_set_monitor`], but with the state cell already resolved to its
+/// `(value_nid, sort_nid)` — for callers (the FSM-encoding scan) that discover the cell
+/// directly and would otherwise have to round-trip through a name that a combinational
+/// alias may shadow.
+pub fn emit_ag_state_in_set_monitor_by_nid(
+    content: &str,
+    sig_nid: Nid,
+    sig_sort: Nid,
+    legal: &[u64],
+) -> Result<String, AdapterError> {
     if legal.is_empty() {
         return Err(err(
             "adapter/btor2/bad_monitor: the state-in-set monitor needs a non-empty legal set"
@@ -204,13 +227,6 @@ pub fn emit_ag_state_in_set_monitor(
     let file = parser::parse(content).map_err(|mut e| {
         e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
         e
-    })?;
-
-    let (sig_nid, sig_sort) = state_nid_and_sort(&file, signal, reset_pinned).ok_or_else(|| {
-        err(format!(
-            "adapter/btor2/bad_monitor: `{signal}` does not resolve to a state cell \
-             (the AG(state ∈ set) monitor requires a state register or a value-alias of one)"
-        ))
     })?;
 
     let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;

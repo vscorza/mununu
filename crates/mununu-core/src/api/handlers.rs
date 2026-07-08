@@ -867,6 +867,48 @@ pub async fn sv_verify_recoverability_handler(
     }))
 }
 
+/// `POST /api/v1/sv/check-fsm` — lift SV and auto-scan every FSM register for a
+/// reachable illegal encoding. Surface peer of the CLI `sv check-fsm`; returns the same
+/// [`Btor2CheckFsmResponse`] as the BTOR2-direct verb.
+pub async fn sv_check_fsm_handler(
+    Json(request): Json<SvCheckFsmRequest>,
+) -> ApiResult<Json<Btor2CheckFsmResponse>> {
+    use crate::adapter::sv_verify::{SvLift, sv_check_fsm};
+
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+    };
+    let findings =
+        sv_check_fsm(&lift, request.max_width).map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
+        })?;
+
+    let illegal_encodings_found = findings.iter().filter(|f| f.is_finding()).count();
+    let registers = findings
+        .iter()
+        .map(|f| FsmRegisterFinding {
+            register: f.register.clone(),
+            legal_encodings: f.legal_encodings.clone(),
+            verdict: f.verdict.as_str().to_string(),
+            illegal_encoding_reachable: f.is_finding(),
+        })
+        .collect();
+
+    Ok(Json(Btor2CheckFsmResponse {
+        fsm_registers_checked: findings.len(),
+        illegal_encodings_found,
+        registers,
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
@@ -4153,28 +4195,30 @@ members = ["x"]
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 
-    // A 2-bit FSM (values 0..3) whose case logic recognizes 0/1/2 but a bug drives it
-    // to the illegal encoding 3. The auto-scan discovers `st`, derives legal {0,1,2},
-    // and reports the reachable illegal encoding — no user input.
+    // A 3-bit sparse FSM (enum Idle=1, Busy=2, Done=4) with a COMPUTED illegal-encoding
+    // bug: from Busy, `go` assigns `st + 3` (= 5 = 3'b101), outside the enum. The
+    // auto-scan discovers `st`, derives legal {1,2,4}, and reports the reachable illegal
+    // encoding 5 — no user input.
     const ILLEGAL_ENCODING_FSM: &str = "\
-1 sort bitvec 2
+1 sort bitvec 3
 2 sort bitvec 1
 3 state 1 st
-4 zero 1
+4 constd 1 1
 5 init 1 3 4
 6 input 2 go
-7 one 1
-8 constd 1 2
+7 constd 1 2
+8 constd 1 4
 9 constd 1 3
 10 eq 2 3 4
 11 eq 2 3 7
 12 eq 2 3 8
-13 ite 1 6 9 8
-14 ite 1 6 7 4
-15 ite 1 12 4 4
-16 ite 1 11 13 15
-17 ite 1 10 14 16
-18 next 1 3 17
+13 add 1 3 9
+14 ite 1 6 13 8
+15 ite 1 6 7 4
+16 ite 1 12 4 4
+17 ite 1 11 14 16
+18 ite 1 10 15 17
+19 next 1 3 18
 ";
 
     #[tokio::test]
@@ -4190,7 +4234,7 @@ members = ["x"]
         assert_eq!(out.illegal_encodings_found, 1);
         let st = &out.registers[0];
         assert_eq!(st.register, "st");
-        assert_eq!(st.legal_encodings, vec![0, 1, 2]);
+        assert_eq!(st.legal_encodings, vec![1, 2, 4]);
         assert_eq!(st.verdict, "violated");
         assert!(st.illegal_encoding_reachable);
     }

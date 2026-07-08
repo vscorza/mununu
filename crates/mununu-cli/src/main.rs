@@ -1223,6 +1223,12 @@ enum SvCommand {
     /// single register-comparison atom. Surface peer of
     /// `POST /api/v1/sv/verify-recoverability`.
     VerifyRecoverability(SvVerifyRecoverabilityArgs),
+    /// Lift SV and auto-scan every FSM-like state register for a reachable illegal
+    /// encoding — no input. The SV-direct one-call peer of `btor2 check-fsm`: derives
+    /// each register's legal encodings from the design and reports any register that can
+    /// reach a value outside its enum (an unambiguous bug). Surface peer of
+    /// `POST /api/v1/sv/check-fsm`.
+    CheckFsm(SvCheckFsmArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1542,6 +1548,18 @@ struct SvVerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu sv check-fsm` — SV-direct auto illegal-encoding scan.
+#[derive(Args, Debug)]
+struct SvCheckFsmArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+    /// Max state-register width to treat as an FSM (wider = datapath/counter, skipped).
+    #[arg(long, value_name = "BITS", default_value_t = mununu_core::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH)]
+    max_width: u32,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -4581,6 +4599,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Verify(args) => sv_verify(args),
         SvCommand::VerifyLiveness(args) => sv_verify_liveness(args),
         SvCommand::VerifyRecoverability(args) => sv_verify_recoverability(args),
+        SvCommand::CheckFsm(args) => sv_check_fsm(args),
     }
 }
 
@@ -4664,6 +4683,39 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
     });
     print_json_summary(&summary)?;
     ci_gate_exit(verdict.as_str(), args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu sv check-fsm` — lift SV then auto-scan every FSM register for a reachable
+/// illegal encoding. SV-direct peer of `btor2 check-fsm`; same JSON + CI exit.
+fn sv_check_fsm(args: SvCheckFsmArgs) -> Result<(), String> {
+    use mununu_core::adapter::sv_verify::sv_check_fsm as core_sv_check_fsm;
+    use mununu_core::verdict::PropertyVerdict;
+
+    let file = args.lift.file.display().to_string();
+    let findings = core_sv_check_fsm(&read_sv_lift(&args.lift)?, args.max_width)?;
+
+    let registers: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "register": f.register,
+                "legal_encodings": f.legal_encodings,
+                "verdict": f.verdict.as_str(),
+                "illegal_encoding_reachable": f.is_finding(),
+            })
+        })
+        .collect();
+    let summary = serde_json::json!({
+        "file": file,
+        "fsm_registers_checked": findings.len(),
+        "illegal_encodings_found": findings.iter().filter(|f| f.is_finding()).count(),
+        "registers": registers,
+    });
+    print_json_summary(&summary)?;
+
+    let worst = worst_verdict(findings.iter().map(|f| PropertyVerdict::as_str(f.verdict)));
+    ci_gate_exit(worst, args.ci.fail_on);
     Ok(())
 }
 

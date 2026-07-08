@@ -59,9 +59,11 @@ jobs:
 Every verb above needs a property or a target atom. **`btor2 check-fsm` needs neither.** It discovers every FSM-like state register, derives each one's set of **legal encodings** from the design itself (the constants its own logic compares it against, plus its reset value), and checks — starting from the real reset state — whether any **illegal encoding** (a value outside that set) is reachable. A reachable illegal encoding (`verdict: violated`) is an unambiguous bug: some input drives the FSM past its enum (an incomplete `case`, a missing `default`, a decoder that emits an out-of-range code).
 
 ```bash
-# Lift the module once, then auto-scan its FSMs. Exit 2 on any reachable illegal encoding.
-mununu --quiet sv emit-btor2 rtl/fsm.sv --preprocess-sv2v -o fsm.btor2
-mununu --quiet btor2 check-fsm fsm.btor2         # --fail-on / --quiet / exit codes as above
+# SV-direct: lift + auto-scan in one call. Exit 2 on any reachable illegal encoding.
+mununu --quiet sv check-fsm rtl/fsm.sv --preprocess-sv2v   # --fail-on / --quiet / exit codes as above
+
+# Or on a BTOR2 you already have (or lifted with `sv emit-btor2-per-module`):
+mununu --quiet btor2 check-fsm fsm.btor2
 ```
 
 Why this and not recoverability? Because reset makes recoverability tautological — with reset free the environment can always assert it to get back to idle, so an FSM trap is invisible; with reset held, every intended reset-recoverable error looks like a trap. Illegal-encoding reachability asks a question reset cannot paper over and design intent cannot excuse: *can the next-state logic, for some input, corrupt the register past its enum?* It is a **safety** property, decided by the word-level reachability portfolio (no bit cap), so it scales past the exact engine. Output is JSON:
@@ -109,7 +111,7 @@ POST /api/v1/sv/verify-recoverability
 
 `POST /api/v1/sv/verify` (safety of the module's assertions) and `/api/v1/sv/verify-liveness` (`{request, grant}`) round out the trio. All return the canonical `verdict`, so the agent gates on `verdict === "violated"`.
 
-**No property to name?** `POST /api/v1/btor2/check-fsm { "content": "<btor2>", "max_width": 8 }` auto-scans every FSM register for a reachable illegal encoding and returns `{ fsm_registers_checked, illegal_encodings_found, registers: [{ register, legal_encodings, verdict, illegal_encoding_reachable }] }` — the agent gates on `illegal_encodings_found > 0`. Lift the module with `sv emit-btor2` first (or post pre-lifted BTOR2).
+**No property to name?** `POST /api/v1/sv/check-fsm { "source": "<sv>", "use_sv2v": true }` lifts the module and auto-scans every FSM register for a reachable illegal encoding, returning `{ fsm_registers_checked, illegal_encodings_found, registers: [{ register, legal_encodings, verdict, illegal_encoding_reachable }] }` — the agent gates on `illegal_encodings_found > 0`. The BTOR2-direct peer is `POST /api/v1/btor2/check-fsm { "content": "<btor2>" }`.
 
 The agent can skip the SV lift entirely and post pre-lifted BTOR2 to `/api/v1/btor2/verify{,-liveness,-recoverability}` — same responses.
 

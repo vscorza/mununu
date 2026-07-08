@@ -42,7 +42,7 @@
 //!   engine's ceiling); a definite `Holds` / `Violated` is sound.
 
 use crate::adapter::btor2::ast::{Btor2File, Nid, Node, Op};
-use crate::adapter::btor2::bad_monitor::emit_ag_state_in_set_monitor;
+use crate::adapter::btor2::bad_monitor::emit_ag_state_in_set_monitor_by_nid;
 use crate::adapter::btor2::bit_blast::resolve_btor2_constant;
 use crate::adapter::btor2::parser;
 use crate::adapter::btor2::pin::pin_inputs_to_constants;
@@ -91,34 +91,33 @@ pub fn fsm_encoding_scan(btor2: &str, max_width: u32) -> Result<Vec<FsmFinding>,
     let (pinned, _) = pin_inputs_to_constants(&seeded, &resets);
     seeded = pinned;
 
-    // Enumerate NAMED signals and resolve each to its underlying state cell (directly
-    // or via a `uext`/reset-mux alias). Dedup by the resolved cell. Deterministic order.
-    let mut named: Vec<(&Nid, &String)> = symbols.iter().collect();
-    named.sort_by_key(|(nid, _)| **nid);
+    // The FSM-like state registers: `collect_symbols` already traces each user name
+    // (incl. Yosys `uext _ _ 0 NAME` aliases) back to its state cell, so an entry whose
+    // nid IS a state cell names that register — no re-resolution (a combinational alias
+    // like `state_d` can shadow the register's name and would fail to re-resolve).
+    // Deterministic order by cell nid.
+    let mut registers: Vec<(Nid, Nid, &String)> = symbols
+        .iter()
+        .filter_map(|(&nid, name)| match file.lookup(nid).map(|l| &l.node) {
+            Some(Node::State { sort, .. }) => Some((nid, *sort, name)),
+            _ => None,
+        })
+        .collect();
+    registers.sort_by_key(|(nid, _, _)| *nid);
 
-    let mut seen_cells: HashSet<Nid> = HashSet::new();
     let mut out = Vec::new();
-    for (_, sym) in named {
-        let Some(state_nid) = parser::resolve_state_alias(&file, sym, true) else {
-            continue;
-        };
-        if !seen_cells.insert(state_nid) {
-            continue;
-        }
-        let Some(Node::State { sort, .. }) = file.lookup(state_nid).map(|l| &l.node) else {
-            continue;
-        };
-        let Some(width) = parser::bv_width(&file, *sort) else {
+    for (cell_nid, sort, name) in registers {
+        let Some(width) = parser::bv_width(&file, sort) else {
             continue;
         };
         if width == 0 || width > max_width {
             continue;
         }
 
-        // Legal encodings = the constants the register's logic compares it against, plus
-        // its reset/init value. Skip a register with no non-trivial enum: fewer than two
+        // Legal encodings = the constants the register is assigned / compared against +
+        // its reset value. Skip a register with no non-trivial enum: fewer than two
         // legal values, or a legal set already covering every value of its width.
-        let legal = legal_encodings(&file, state_nid, &symbols);
+        let legal = legal_encodings(&file, cell_nid, &symbols);
         if legal.len() < 2 {
             continue;
         }
@@ -130,19 +129,19 @@ pub fn fsm_encoding_scan(btor2: &str, max_width: u32) -> Result<Vec<FsmFinding>,
 
         // bad = (reg ∉ legal); reachable from the (reset) start ⇒ an illegal encoding
         // is reachable (a bug). Decided by the word-level safety portfolio.
-        let monitored =
-            emit_ag_state_in_set_monitor(&seeded, sym, &legal_vec, true).map_err(|e| {
+        let monitored = emit_ag_state_in_set_monitor_by_nid(&seeded, cell_nid, sort, &legal_vec)
+            .map_err(|e| {
                 format!(
-                    "building the illegal-encoding monitor for `{sym}`: {}",
+                    "building the illegal-encoding monitor for `{name}`: {}",
                     e.message
                 )
             })?;
         let mfile = parser::parse(&monitored)
-            .map_err(|e| format!("parsing the monitored BTOR2 for `{sym}`: {}", e.message))?;
+            .map_err(|e| format!("parsing the monitored BTOR2 for `{name}`: {}", e.message))?;
         let outcome = decide_reach_portfolio(&mfile);
 
         out.push(FsmFinding {
-            register: sym.clone(),
+            register: name.clone(),
             legal_encodings: legal_vec,
             verdict: PropertyVerdict::from(outcome.verdict),
         });
@@ -150,19 +149,32 @@ pub fn fsm_encoding_scan(btor2: &str, max_width: u32) -> Result<Vec<FsmFinding>,
     Ok(out)
 }
 
-/// The legal encodings of a state register: every constant its own logic compares it
-/// against (via `eq` over a value-alias of the cell), plus its reset/init value.
+/// The legal encodings of a state register — an over-approximation, so that only a
+/// genuinely *computed* out-of-enum value (arithmetic / concat / decode) is ever
+/// flagged illegal (biasing to zero false positives). It is the union of:
+///
+/// - the register's reset/init value;
+/// - constants it is **compared** against (`eq` over a value-alias of the cell) — the
+///   enum values the case/if logic recognizes;
+/// - constants it is **assigned** (constant `ite`-branch leaves in its next-state cone)
+///   — the enum values transitions write, including states a `case` folds into
+///   `default` and so never compares against.
 fn legal_encodings(
     file: &Btor2File,
     state_nid: Nid,
     symbols: &HashMap<Nid, String>,
 ) -> BTreeSet<u64> {
     let aliases = value_alias_nids(file, state_nid);
+    let cell_sort = match file.lookup(state_nid).map(|l| &l.node) {
+        Some(Node::State { sort, .. }) => *sort,
+        _ => return BTreeSet::new(),
+    };
     let mut legal = BTreeSet::new();
 
     if let Some(v) = derive_idle(file, state_nid, symbols) {
         legal.insert(v);
     }
+    // Compared constants (eq over a value-alias of the cell).
     for line in &file.lines {
         let Node::Op {
             op: Op::Eq, args, ..
@@ -173,7 +185,6 @@ fn legal_encodings(
         if args.len() != 2 {
             continue;
         }
-        // The constant operand, when the other operand is a value-alias of the register.
         let (a, b) = (args[0].nid(), args[1].nid());
         let konst = if aliases.contains(&a) {
             resolve_btor2_constant(file, b)
@@ -186,7 +197,69 @@ fn legal_encodings(
             legal.insert(c);
         }
     }
+    // Assigned constants (constant `ite`-branch leaves in the next-state cone).
+    if let Some(next_val) = file.lines.iter().find_map(|l| match &l.node {
+        Node::Next { state, value, .. } if *state == state_nid => Some(*value),
+        _ => None,
+    }) {
+        collect_assigned_consts(
+            file,
+            next_val.nid(),
+            cell_sort,
+            &mut legal,
+            &mut HashSet::new(),
+        );
+    }
     legal
+}
+
+/// From a **value position** in the register's next-state expression, insert into
+/// `legal` every constant of `cell_sort` assigned to the register. Recurses only
+/// through value-carrying structure — `ite` branches (not the boolean condition) and
+/// `uext`/`sext` renames — and treats any *computed* op (arithmetic, concat, decode) as
+/// opaque: its result is the potential illegal value, and its operands are inputs, not
+/// assigned enum constants. This keeps a stray addend/comparison constant out of the
+/// legal set.
+fn collect_assigned_consts(
+    file: &Btor2File,
+    nid: Nid,
+    cell_sort: Nid,
+    legal: &mut BTreeSet<u64>,
+    visited: &mut HashSet<Nid>,
+) {
+    if !visited.insert(nid) {
+        return;
+    }
+    let Some(line) = file.lookup(nid) else {
+        return;
+    };
+    match &line.node {
+        // A constant of the register's sort reached as a value is a legal encoding.
+        Node::Const { sort, .. } if *sort == cell_sort => {
+            if let Some(v) = resolve_btor2_constant(file, nid) {
+                legal.insert(v);
+            }
+        }
+        // `ite(cond, then, else)`: the branches are assigned values; the condition is a
+        // boolean, not a value — skip it.
+        Node::Op {
+            op: Op::Ite, args, ..
+        } if args.len() == 3 => {
+            collect_assigned_consts(file, args[1].nid(), cell_sort, legal, visited);
+            collect_assigned_consts(file, args[2].nid(), cell_sort, legal, visited);
+        }
+        // `uext`/`sext`: a pure width-adjust rename — the value passes through.
+        Node::Op {
+            op: Op::Uext | Op::Sext,
+            args,
+            ..
+        } if !args.is_empty() => {
+            collect_assigned_consts(file, args[0].nid(), cell_sort, legal, visited);
+        }
+        // The register itself, or a computed op: opaque (its result is not a fresh enum
+        // constant, and may be the illegal value we are hunting).
+        _ => {}
+    }
 }
 
 /// The set of NIDs value-identical to `state_nid` — the cell itself plus every
@@ -350,28 +423,31 @@ mod tests {
 18 next 1 3 17
 ";
 
-    // The same FSM with a bug: from `req` (st==1), input `go` drives st to 3 — a value
-    // the case logic never compares against (an illegal encoding, an out-of-enum
-    // transition). 3 is reachable 0 →go 1 →go 3 ⇒ AG (st ∈ {0,1,2}) VIOLATED.
+    // A 3-bit sparse FSM (enum Idle=1, Busy=2, Done=4) with a COMPUTED illegal-encoding
+    // bug: from Busy, `go` assigns `st + 3` (= 2 + 3 = 5 = 3'b101), a value outside the
+    // enum. 5 is reachable Idle →go Busy →go 5 ⇒ AG (st ∈ {1,2,4}) VIOLATED. (A *computed*
+    // out-of-enum value is what the scan detects; a constant-assigned wrong value is
+    // indistinguishable from a legal encoding at the BTOR2 level — see legal_encodings.)
     const ILLEGAL_FSM: &str = "\
-1 sort bitvec 2
+1 sort bitvec 3
 2 sort bitvec 1
 3 state 1 st
-4 zero 1
+4 constd 1 1
 5 init 1 3 4
 6 input 2 go
-7 one 1
-8 constd 1 2
+7 constd 1 2
+8 constd 1 4
 9 constd 1 3
 10 eq 2 3 4
 11 eq 2 3 7
 12 eq 2 3 8
-13 ite 1 6 9 8
-14 ite 1 6 7 4
-15 ite 1 12 4 4
-16 ite 1 11 13 15
-17 ite 1 10 14 16
-18 next 1 3 17
+13 add 1 3 9
+14 ite 1 6 13 8
+15 ite 1 6 7 4
+16 ite 1 12 4 4
+17 ite 1 11 14 16
+18 ite 1 10 15 17
+19 next 1 3 18
 ";
 
     #[test]
@@ -381,7 +457,7 @@ mod tests {
             .iter()
             .find(|f| f.register == "st")
             .expect("st scanned");
-        // Legal set = {0,1,2} (compared against + init 0); 3 is illegal but unreachable.
+        // Legal set = {0,1,2} (compared + assigned + init 0); 3 is illegal but unreachable.
         assert_eq!(st.legal_encodings, vec![0, 1, 2]);
         assert_eq!(
             st.verdict,
@@ -398,15 +474,12 @@ mod tests {
             .iter()
             .find(|f| f.register == "st")
             .expect("st scanned");
-        assert!(
-            !st.legal_encodings.contains(&3),
-            "3 is not a legal encoding: {:?}",
-            st.legal_encodings
-        );
+        // Legal = {1,2,4}: Idle/Busy/Done. The computed `st + 3` (= 5) is not among them.
+        assert_eq!(st.legal_encodings, vec![1, 2, 4]);
         assert_eq!(
             st.verdict,
             PropertyVerdict::Violated,
-            "the bug drives st to the illegal value 3"
+            "the bug computes st + 3 = 5, an illegal encoding"
         );
         assert!(st.is_finding(), "a reachable illegal encoding is a finding");
     }

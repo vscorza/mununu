@@ -1065,6 +1065,27 @@ pub struct SvVerifyRecoverabilityRequest {
     pub target: String,
 }
 
+/// Request for `POST /api/v1/sv/check-fsm` — the SV lift fields plus the FSM width
+/// bound. Lifts the module and auto-scans every FSM register for a reachable illegal
+/// encoding (no property to name). Returns a [`Btor2CheckFsmResponse`].
+#[derive(Debug, Deserialize)]
+pub struct SvCheckFsmRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys. Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// Max state-register width treated as an FSM (wider = datapath/counter, skipped).
+    #[serde(default = "default_fsm_max_width")]
+    pub max_width: u32,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2
