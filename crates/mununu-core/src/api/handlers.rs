@@ -698,6 +698,30 @@ pub async fn btor2_verify_liveness_handler(
     }))
 }
 
+/// Decide recoverability `AG EF target` (`POST /api/v1/btor2/verify-recoverability`)
+/// — "from every reachable state, can the design get back to `target`?", the
+/// branching property SVA cannot state. Surface peer of the CLI
+/// `mununu btor2 verify-recoverability`: decides it with the exact 3-valued engine
+/// (sound at every alternation depth; `"unknown"` over the engine's cap). A malformed
+/// target atom is a `BadRequest`.
+pub async fn btor2_verify_recoverability_handler(
+    Json(request): Json<Btor2VerifyRecoverabilityRequest>,
+) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
+    use crate::adapter::recoverability::{recoverability_property_str, verify_recoverability};
+
+    let verdict = verify_recoverability(&request.content, &request.target).map_err(|message| {
+        ApiError::BadRequest {
+            message,
+            details: None,
+        }
+    })?;
+
+    Ok(Json(Btor2VerifyRecoverabilityResponse {
+        verdict: verdict.as_str().to_string(),
+        property: recoverability_property_str(&request.target),
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
@@ -3953,6 +3977,33 @@ members = ["x"]
         let err = btor2_verify_liveness_handler(Json(request))
             .await
             .expect_err("relational atom must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    // The staller's `stuck` state is an absorbing trap ⇒ AG EF (st==0) is VIOLATED
+    // (from stuck you can never get back to idle).
+    #[tokio::test]
+    async fn btor2_verify_recoverability_handler_detects_absorbing_trap() {
+        let request = Btor2VerifyRecoverabilityRequest {
+            content: LIVENESS_STALLER.to_string(),
+            target: "st == 0".to_string(),
+        };
+        let Json(out) = btor2_verify_recoverability_handler(Json(request))
+            .await
+            .expect("verify-recoverability runs");
+        assert_eq!(out.verdict, "violated", "response: {out:?}");
+        assert_eq!(out.property, "AG EF (st == 0)");
+    }
+
+    #[tokio::test]
+    async fn btor2_verify_recoverability_handler_rejects_malformed_target() {
+        let request = Btor2VerifyRecoverabilityRequest {
+            content: LIVENESS_STALLER.to_string(),
+            target: "definitely not an atom".to_string(),
+        };
+        let err = btor2_verify_recoverability_handler(Json(request))
+            .await
+            .expect_err("malformed target must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 }
