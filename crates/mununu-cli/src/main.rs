@@ -136,6 +136,18 @@ enum Btor2Command {
     /// warning + falls back to the `wp` heuristic automatically.
     /// See `docs/external-tools.md` for CVC5 install instructions.
     Cegar(Btor2CegarArgs),
+    /// Decide `bad`-reachability with the multi-engine safety portfolio.
+    ///
+    /// Runs every available sound engine over the BTOR2 design and merges
+    /// them under the differential-oracle discipline: the exact BDD engine,
+    /// the in-house native (BMC + k-induction) and SPACER (IC3/PDR +
+    /// interpolation) engines — all in-process — plus the `btormc` and
+    /// `Pono` subprocess members when their binaries are on PATH. Prints the
+    /// merged verdict (`reachable` / `unreachable` / `unknown` /
+    /// `contradiction`) and which engines reached each conclusion. A
+    /// `contradiction` means two sound engines disagree — a soundness alarm,
+    /// never a silent guess. Engines whose binary is absent simply abstain.
+    Verify(Btor2VerifyArgs),
 }
 
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — predicate-source
@@ -407,6 +419,14 @@ struct Btor2LiftKmtsArgs {
     /// means no cap.
     #[arg(long, value_name = "N")]
     max_predicates: Option<usize>,
+}
+
+/// Arguments for `mununu btor2 verify` — the multi-engine safety portfolio.
+#[derive(Args, Debug)]
+struct Btor2VerifyArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2017,7 +2037,39 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::Discover(args) => btor2_discover(args),
         Btor2Command::LiftKmts(args) => btor2_lift_kmts(args),
         Btor2Command::Cegar(args) => btor2_cegar(args),
+        Btor2Command::Verify(args) => btor2_verify(args),
     }
+}
+
+/// `mununu btor2 verify` — decide `bad`-reachability with the multi-engine safety
+/// portfolio and print the merged verdict + per-engine breakdown as JSON. Surface
+/// peer of the API `POST /api/v1/btor2/verify`; both share the verdict labels via
+/// [`mununu_core::adapter::reach_portfolio::ReachVerdict::as_str`].
+fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
+    use mununu_core::adapter::reach_portfolio::decide_reach_portfolio_parallel;
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let file = mununu_core::adapter::btor2::parser::parse(&content)
+        .map_err(|e| format!("BTOR2 parse error in '{}': {e}", args.file.display()))?;
+
+    // Parallel driver: identical merge to the sequential one, but wall-clock is
+    // bounded by the slowest single engine rather than their sum.
+    let outcome = decide_reach_portfolio_parallel(&file);
+
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "verdict": outcome.verdict.as_str(),
+        "reachable_by": outcome.reachable_by,
+        "unreachable_by": outcome.unreachable_by,
+        "contradiction": outcome.verdict
+            == mununu_core::adapter::reach_portfolio::ReachVerdict::Contradiction,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    Ok(())
 }
 
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — CEGAR refinement

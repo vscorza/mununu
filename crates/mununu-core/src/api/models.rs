@@ -882,6 +882,31 @@ pub struct Btor2CegarRequest {
     pub engine: Option<String>,
 }
 
+/// Request for the multi-engine safety portfolio endpoint
+/// (`POST /api/v1/btor2/verify`). Mirrors the CLI `mununu btor2 verify`: decides
+/// `bad`-reachability of a BTOR2 design across every available sound engine.
+#[derive(Debug, Deserialize)]
+pub struct Btor2VerifyRequest {
+    /// BTOR2 source content.
+    pub content: String,
+}
+
+/// Response for `POST /api/v1/btor2/verify` — the merged portfolio verdict plus
+/// which engines reached each definite conclusion. Mirrors
+/// [`crate::adapter::reach_portfolio::ReachOutcome`].
+#[derive(Debug, Serialize)]
+pub struct Btor2VerifyResponse {
+    /// Merged verdict: `"reachable"` | `"unreachable"` | `"unknown"` |
+    /// `"contradiction"` (via [`crate::adapter::reach_portfolio::ReachVerdict::as_str`]).
+    pub verdict: String,
+    /// Engines that found `bad` reachable (a real counterexample).
+    pub reachable_by: Vec<String>,
+    /// Engines that proved `bad` unreachable (a real safety proof).
+    pub unreachable_by: Vec<String>,
+    /// `true` when two sound engines disagree — a soundness alarm, not a guess.
+    pub contradiction: bool,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2

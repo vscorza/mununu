@@ -623,6 +623,39 @@ pub async fn btor2_cegar_handler(
     Ok(Json(run_cegar_build_response(params)?))
 }
 
+/// Decide `bad`-reachability of a BTOR2 design with the multi-engine safety
+/// portfolio (`POST /api/v1/btor2/verify`). Surface peer of the CLI
+/// `mununu btor2 verify`: runs every available sound engine (exact ⊕ native ⊕
+/// spacer ⊕ btormc ⊕ Pono) via the **parallel** driver — its wall-clock is bounded
+/// by the slowest single engine, keeping the request within the extended client's
+/// budget even when the subprocess members are present — and returns the merged
+/// verdict + per-engine breakdown. A `"contradiction"` verdict means two sound
+/// engines disagree (a soundness alarm), never a silent guess.
+pub async fn btor2_verify_handler(
+    Json(request): Json<Btor2VerifyRequest>,
+) -> ApiResult<Json<Btor2VerifyResponse>> {
+    use crate::adapter::reach_portfolio::{ReachVerdict, decide_reach_portfolio_parallel};
+
+    let file = crate::adapter::btor2::parser::parse(&request.content).map_err(|e| {
+        ApiError::BadRequest {
+            message: format!("BTOR2 parse error: {e}"),
+            details: None,
+        }
+    })?;
+
+    let outcome = decide_reach_portfolio_parallel(&file);
+    Ok(Json(Btor2VerifyResponse {
+        verdict: outcome.verdict.as_str().to_string(),
+        reachable_by: outcome.reachable_by.iter().map(|s| s.to_string()).collect(),
+        unreachable_by: outcome
+            .unreachable_by
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        contradiction: outcome.verdict == ReachVerdict::Contradiction,
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
@@ -3792,5 +3825,43 @@ members = ["x"]
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    /// The safety-portfolio endpoint decides a small reachable counter (the exact
+    /// engine is enough — btormc/Pono may be absent) and reports the deciding engine.
+    #[tokio::test]
+    async fn btor2_verify_handler_decides_reachable_counter() {
+        // 3-bit counter incrementing to `ones`; `bad = (c == 7)` is reachable.
+        let btor2 = "1 sort bitvec 3\n2 zero 1\n3 state 1\n4 init 1 3 2\n5 one 1\n\
+                     6 add 1 3 5\n7 next 1 3 6\n8 ones 1\n9 sort bitvec 1\n\
+                     10 eq 9 3 8\n11 bad 10\n";
+        let request = Btor2VerifyRequest {
+            content: btor2.to_string(),
+        };
+        let Json(out) = btor2_verify_handler(Json(request))
+            .await
+            .expect("verify runs");
+        assert_eq!(out.verdict, "reachable", "outcome: {out:?}");
+        assert!(
+            out.reachable_by.contains(&"exact".to_string()),
+            "the exact engine should decide the small reachable counter: {out:?}"
+        );
+        assert!(
+            !out.contradiction,
+            "no sound engine should disagree: {out:?}"
+        );
+    }
+
+    /// Malformed BTOR2 is a `BadRequest`, not a 500 — the parse guard runs before
+    /// any engine work.
+    #[tokio::test]
+    async fn btor2_verify_handler_rejects_malformed_btor2() {
+        let request = Btor2VerifyRequest {
+            content: "this is not btor2".to_string(),
+        };
+        let err = btor2_verify_handler(Json(request))
+            .await
+            .expect_err("malformed BTOR2 must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 }
