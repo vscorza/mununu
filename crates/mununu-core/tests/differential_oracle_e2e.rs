@@ -443,6 +443,79 @@ fn hwmcc_adjudication_over_user_dir() {
     );
 }
 
+/// IN-HOUSE timing runner for the full-bv-track study — times the exact BDD engine
+/// and the native BMC/k-induction engine over every `.btor2` in `MUNUNU_HWMCC_DIR`,
+/// emitting a `INHOUSE\t<file>\t<native_verdict>\t<native_ms>\t<exact_verdict>\t<exact_ms>`
+/// line per benchmark for the orchestration script to merge with the btormc/Pono
+/// timings. Both are in-process (Z3 / BDD), so this pass is fast; the subprocess
+/// members are timed separately (their CLIs). `MUNUNU_NATIVE_MAXK` /
+/// `MUNUNU_NATIVE_MS` override the native depth / per-check budget (default 100 /
+/// 30000 ms). Verdicts: `sat` (reachable) / `unsat` (unreachable / safe) / `?`.
+#[test]
+#[ignore = "study runner: provide MUNUNU_HWMCC_DIR; driven by scripts/hwmcc_bv_study.sh"]
+fn hwmcc_inhouse_timing() {
+    use mununu_core::adapter::btor2::native_bmc::{SafetyVerdict, decide_bad_safety};
+    use mununu_core::adapter::btor2::parser::parse as parse_btor2;
+    use std::time::Instant;
+
+    let Some(dir) = std::env::var_os("MUNUNU_HWMCC_DIR") else {
+        eprintln!("MUNUNU_HWMCC_DIR unset — nothing to time.");
+        return;
+    };
+    let max_k: u32 = std::env::var("MUNUNU_NATIVE_MAXK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let per_check_ms: u32 = std::env::var("MUNUNU_NATIVE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(PathBuf::from(&dir))
+        .unwrap_or_else(|e| panic!("read dir: {e}"))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|s| s.to_str()),
+                Some("btor2") | Some("btor")
+            )
+        })
+        .collect();
+    files.sort();
+
+    for path in &files {
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Exact (in-process BDD): Some(bool) reachability, or abstain.
+        let t = Instant::now();
+        let exact = exact_bad_reachable(&content).ok();
+        let exact_ms = t.elapsed().as_millis();
+        let exact_v = match exact {
+            Some(true) => "sat",
+            Some(false) => "unsat",
+            None => "?",
+        };
+        // Native (in-process BMC + k-induction).
+        let (native_v, native_ms) = match parse_btor2(&content) {
+            Ok(file) => {
+                let t = Instant::now();
+                let v = decide_bad_safety(&file, max_k, Some(per_check_ms));
+                let ms = t.elapsed().as_millis();
+                let s = match v {
+                    Ok(SafetyVerdict::Violated { .. }) => "sat",
+                    Ok(SafetyVerdict::Safe { .. }) => "unsat",
+                    _ => "?",
+                };
+                (s, ms)
+            }
+            Err(_) => ("?", 0),
+        };
+        println!("INHOUSE\t{fname}\t{native_v}\t{native_ms}\t{exact_v}\t{exact_ms}");
+    }
+}
+
 // ============================================================================
 // P2 — corpus differential over real open designs, with the MONOTONE VERDICT
 // LEDGER invariant.
