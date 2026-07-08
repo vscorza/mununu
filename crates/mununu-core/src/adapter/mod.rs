@@ -48,6 +48,7 @@ pub mod emit;
 pub mod extraction;
 pub mod ir;
 pub mod langgraph;
+pub mod liveness_rescue;
 pub mod microcode;
 pub mod partition;
 pub mod pono;

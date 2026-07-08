@@ -67,7 +67,7 @@ fn err(message: String) -> AdapterError {
 
 /// BTOR2 keyword for an *unsigned* comparison (the internal oracle compares
 /// `u128`, so unsigned is the matching semantics).
-fn btor2_cmp_keyword(op: CmpOp) -> &'static str {
+pub(crate) fn btor2_cmp_keyword(op: CmpOp) -> &'static str {
     match op {
         CmpOp::Eq => "eq",
         CmpOp::Ne => "neq",
@@ -91,7 +91,7 @@ fn negate_cmp(op: CmpOp) -> CmpOp {
 }
 
 /// Find an existing `sort bitvec 1` line, or append one. Returns its NID.
-fn find_or_make_bool_sort(
+pub(crate) fn find_or_make_bool_sort(
     file: &crate::adapter::btor2::ast::Btor2File,
     next_nid: &mut Nid,
     appended: &mut Vec<String>,
@@ -112,7 +112,7 @@ fn find_or_make_bool_sort(
 
 /// Resolve a STATE signal (value-alias / reset-mux aware) to `(value_nid,
 /// sort_nid)`. `None` when it is not a state cell.
-fn state_nid_and_sort(
+pub(crate) fn state_nid_and_sort(
     file: &crate::adapter::btor2::ast::Btor2File,
     signal: &str,
     reset_pinned: bool,
@@ -125,7 +125,7 @@ fn state_nid_and_sort(
 }
 
 /// Resolve a 1-bit (or any) primary-input signal to `(nid, sort_nid)`.
-fn input_nid_and_sort(
+pub(crate) fn input_nid_and_sort(
     file: &crate::adapter::btor2::ast::Btor2File,
     signal: &str,
 ) -> Option<(Nid, Nid)> {
