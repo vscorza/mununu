@@ -552,6 +552,13 @@ pub struct VerifyAutoOptions {
     /// Default `None` ⇒ single-engine dispatch (unchanged). Mirrors the CLI/API
     /// `--engine portfolio-sequential` / `portfolio-parallel`.
     pub portfolio: Option<PortfolioMode>,
+    /// On a *safety* property the cube portfolio leaves `⊥`, escalate to the
+    /// multi-engine reachability portfolio (reduce the AG-invariant to a `bad`-monitor
+    /// and decide it symbolically — exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). Only
+    /// fires on `⊥` reducible AG-invariants, so there is no common-path cost and
+    /// liveness / recoverability are untouched. Default `true`; the CLI `--no-rescue`
+    /// / API `rescue_bottom_safety: false` opts out.
+    pub rescue_bottom_safety: bool,
 }
 
 /// PORTFOLIO scheduling mode — the budget knob for the multi-engine default.
@@ -605,6 +612,7 @@ impl Default for VerifyAutoOptions {
             symbolic_engine: false,
             exact_symbolic: false,
             portfolio: None,
+            rescue_bottom_safety: true,
         }
     }
 }
@@ -2209,6 +2217,16 @@ pub fn verify_auto(
         });
     }
 
+    // Safety-⊥ escalation (before the notes/coverage build, so the counts reflect any
+    // rescue): reduce a reducible AG-invariant the cube left ⊥ to a `bad`-monitor and
+    // decide it with the multi-engine reachability portfolio. Only fires on ⊥
+    // reducible AG-invariants — no common-path cost.
+    let rescue_notes = if opts.rescue_bottom_safety {
+        escalate_bottom_safety(&mut report, &btor2, reset_pinned)
+    } else {
+        Vec::new()
+    };
+
     // H.J — provenance notes: surface every abstraction/scoping decision this run
     // made (config concretizations, posture, reset-gating, flop stubs, cut
     // modules, coverage).
@@ -2231,7 +2249,81 @@ pub fn verify_auto(
     if let Some(n) = annotation_note(&ann_scan) {
         report.notes.push(n);
     }
+    report.notes.extend(rescue_notes);
     Ok(report)
+}
+
+/// On each *safety* property the cube portfolio left `⊥`, try the multi-engine
+/// reachability portfolio: [`reach_portfolio_rescue`](crate::adapter::reach_rescue::reach_portfolio_rescue)
+/// reduces a reducible AG-invariant to a `bad`-monitor over `design_btor2` and decides
+/// it symbolically (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). Upgrades the property's
+/// outcome in place and returns a provenance note per rescue. `reach_portfolio_rescue`
+/// returns `None` for every shape other than the single-atom AG-invariant, so liveness
+/// / recoverability `⊥` and implication-bodied safety are left untouched — no
+/// common-path cost. Pure over `(report, design_btor2)`, so it is unit-testable on a
+/// BTOR2 fixture without the SV toolchain.
+fn escalate_bottom_safety(
+    report: &mut AutoVerifyReport,
+    design_btor2: &str,
+    reset_pinned: bool,
+) -> Vec<VerificationNote> {
+    use crate::adapter::reach_rescue::{RescueVerdict, reach_portfolio_rescue};
+    use crate::mu_calculus::parser as mu_parser;
+
+    let mut notes = Vec::new();
+    for prop in report.properties.iter_mut() {
+        if !matches!(prop.outcome, VerifyOutcome::Unknown { .. }) {
+            continue;
+        }
+        let Ok(formula) = mu_parser::parse(&prop.formula) else {
+            continue;
+        };
+        let Some((verdict, reach)) = reach_portfolio_rescue(design_btor2, &formula, reset_pinned)
+        else {
+            continue;
+        };
+        let engines: Vec<&str> = reach
+            .reachable_by
+            .iter()
+            .chain(reach.unreachable_by.iter())
+            .copied()
+            .collect();
+        match verdict {
+            RescueVerdict::Holds => {
+                prop.outcome = VerifyOutcome::Holds;
+                notes.push(rescue_note(&prop.name, "HOLDS", &engines));
+            }
+            RescueVerdict::Violated => {
+                prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                notes.push(rescue_note(&prop.name, "VIOLATED", &engines));
+            }
+            RescueVerdict::Inconclusive => {}
+        }
+    }
+    notes
+}
+
+/// A provenance note for a property the reachability portfolio rescued from `⊥`.
+fn rescue_note(name: &str, verdict: &str, engines: &[&str]) -> VerificationNote {
+    VerificationNote {
+        kind: "portfolio-rescue".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "`{name}`: the cube abstraction left ⊥; the reachability portfolio decided it \
+             {verdict} (engine(s): {})",
+            if engines.is_empty() {
+                "—".to_string()
+            } else {
+                engines.join(", ")
+            }
+        ),
+        detail: "The safety ⊥ was reduced to a `bad`-monitor and decided symbolically by the \
+                 multi-engine reachability portfolio (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). \
+                 Sound: every portfolio member is sound, and a disagreement would surface a \
+                 contradiction alarm rather than a verdict."
+            .into(),
+        items: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -2273,6 +2365,68 @@ mod tests {
             cycle: vec![vec![("st".to_string(), 3)]],
             inputs: vec![vec![("esc".to_string(), 1)]],
         }
+    }
+
+    // The safety-⊥ escalation reduces a reducible AG-invariant the cube left ⊥ to a
+    // `bad`-monitor and decides it with the reachability portfolio — testable on a
+    // BTOR2 fixture without the SV toolchain (exact/native/spacer run in-process).
+    #[test]
+    fn escalate_bottom_safety_rescues_a_reducible_invariant() {
+        // `big` (4-bit) is init 0 and holds its value ⇒ AG(big == 0) HOLDS; the cube
+        // is pretended to have left it ⊥.
+        const DESIGN: &str =
+            "1 sort bitvec 4\n2 state 1 big\n3 zero 1\n4 init 1 2 3\n5 next 1 2 2\n";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "big_zero".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu X. ((big == 0) && [] X)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+
+        let notes = escalate_bottom_safety(&mut report, DESIGN, false);
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "the ⊥ safety property should be rescued to HOLDS, got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "portfolio-rescue"),
+            "a portfolio-rescue provenance note should be recorded"
+        );
+    }
+
+    // A liveness / recoverability ⊥ (diamond-bodied μ) is NOT a reducible AG-invariant,
+    // so the escalation leaves it untouched (no unsound reachability reduction of νμ).
+    #[test]
+    fn escalate_bottom_safety_ignores_non_safety_bottom() {
+        const DESIGN: &str =
+            "1 sort bitvec 4\n2 state 1 big\n3 zero 1\n4 init 1 2 3\n5 next 1 2 2\n";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "recover".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                // AG EF (recoverability) — diamond inner, not an AG-invariant.
+                formula: "nu Y. ((mu X. ((big == 0) || <> X)) && [] Y)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom_safety(&mut report, DESIGN, false);
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
+            "a νμ ⊥ must be left untouched (2-valued reachability can't soundly decide it)"
+        );
+        assert!(
+            notes.is_empty(),
+            "no rescue note for an un-reducible property"
+        );
     }
 
     /// A cube engine's ⊥ (Unknown) is filled by a later engine's definite verdict, and the

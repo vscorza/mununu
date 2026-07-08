@@ -1198,6 +1198,12 @@ pub struct SvVerifyAutoRequest {
     /// designs `explicit` already decided. Resolved by `verify_auto::engine_selection`.
     #[serde(default)]
     pub engine: Option<String>,
+    /// Safety-⊥ escalation (default `true`): a *safety* property the cube leaves ⊥
+    /// (a reducible AG-invariant) is retried with the multi-engine reachability
+    /// portfolio (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). Set `false` to report the
+    /// cube's ⊥ unchanged. Only fires on ⊥ reducible AG-invariants.
+    #[serde(default)]
+    pub rescue_bottom_safety: Option<bool>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.

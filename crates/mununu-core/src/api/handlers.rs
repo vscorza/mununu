@@ -1015,6 +1015,7 @@ pub async fn sv_verify_auto_handler(
         symbolic_engine: engine_symbolic,
         exact_symbolic: engine_exact,
         portfolio: engine_portfolio,
+        rescue_bottom_safety: request.rescue_bottom_safety.unwrap_or(true),
     };
 
     let report = verify_auto(&sources, &yopts, &opts).map_err(|e| ApiError::BadRequest {
