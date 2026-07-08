@@ -938,6 +938,31 @@ pub struct Btor2VerifyLivenessResponse {
     pub decided_by: Vec<String>,
 }
 
+/// Request for the recoverability endpoint
+/// (`POST /api/v1/btor2/verify-recoverability`). Mirrors the CLI
+/// `mununu btor2 verify-recoverability`: decides `AG EF target` — "from every
+/// reachable state, can the design get back to `target`?". `target` is a single
+/// register-comparison atom string (`"state_q == 3"`).
+#[derive(Debug, Deserialize)]
+pub struct Btor2VerifyRecoverabilityRequest {
+    /// BTOR2 source content.
+    pub content: String,
+    /// The `good` atom to recover to (`"REG op VALUE"`).
+    pub target: String,
+}
+
+/// Response for `POST /api/v1/btor2/verify-recoverability`.
+#[derive(Debug, Serialize)]
+pub struct Btor2VerifyRecoverabilityResponse {
+    /// Canonical property verdict — `"holds"` (every reachable state can reach
+    /// `target`) | `"violated"` (a reachable trap cannot) | `"unknown"` (over the
+    /// exact engine's cap; try the cube + `smt-hyper-must` path), via
+    /// [`crate::verdict::PropertyVerdict`].
+    pub verdict: String,
+    /// The decided property, echoed for provenance: `AG EF (<target>)`.
+    pub property: String,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2

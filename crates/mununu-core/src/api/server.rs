@@ -119,6 +119,12 @@ fn create_router() -> Router {
             "/api/v1/btor2/verify-liveness",
             post(handlers::btor2_verify_liveness_handler),
         )
+        // P2 recoverability — AG EF good ("can it always get back?"), the branching
+        // property SVA cannot state. Surface peer of `mununu btor2 verify-recoverability`.
+        .route(
+            "/api/v1/btor2/verify-recoverability",
+            post(handlers::btor2_verify_recoverability_handler),
+        )
         // cegar-extraction Stage 2 — SV-direct CEGAR one-call (sv2v +
         // Yosys → flattened BTOR2 → cegar_refine_loop). Surface peer of
         // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow

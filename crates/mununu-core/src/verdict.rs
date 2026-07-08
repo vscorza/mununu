@@ -13,6 +13,7 @@
 //! soundness-contradiction alarm, cube-cell counts) stays in the surface's own
 //! response fields alongside this canonical verdict.
 
+use crate::adapter::btor2::symbolic_bitblast::ExactVerdict;
 use crate::adapter::liveness_rescue::LivenessVerdict;
 use crate::adapter::reach_portfolio::ReachVerdict;
 
@@ -63,6 +64,17 @@ impl From<LivenessVerdict> for PropertyVerdict {
             LivenessVerdict::Holds => PropertyVerdict::Holds,
             LivenessVerdict::Violated => PropertyVerdict::Violated,
             LivenessVerdict::Inconclusive => PropertyVerdict::Unknown,
+        }
+    }
+}
+
+impl From<ExactVerdict> for PropertyVerdict {
+    /// The exact 3-valued engine gives a *definite* verdict within its cap (the
+    /// over-cap / unsupported case is an `Err` the caller maps to `Unknown`).
+    fn from(v: ExactVerdict) -> Self {
+        match v {
+            ExactVerdict::Holds => PropertyVerdict::Holds,
+            ExactVerdict::Violated => PropertyVerdict::Violated,
         }
     }
 }

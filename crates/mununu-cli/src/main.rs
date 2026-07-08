@@ -154,9 +154,18 @@ enum Btor2Command {
     /// — the canonical request/grant liveness property. Reduces it to a single
     /// `bad`-reachability query (Biere–Artho–Schuppan liveness-to-safety) that
     /// the multi-engine portfolio decides symbolically on wide designs, then
-    /// prints the verdict (`holds` / `violated` / `inconclusive`). `--request`
+    /// prints the verdict (`holds` / `violated` / `unknown`). `--request`
     /// and `--grant` are single register-comparison atoms (`"st == 1"`).
     VerifyLiveness(Btor2VerifyLivenessArgs),
+    /// Decide recoverability `AG EF good` — the branching property SVA cannot state.
+    ///
+    /// "From every reachable state, can the design still get back to a `good`
+    /// state?" A `violated` verdict means a reachable state is a trap from which
+    /// `good` is unreachable. Decided by the exact 3-valued engine (sound at every
+    /// alternation depth, definite within its 40-bit cap; `unknown` over the cap —
+    /// use `btor2 cegar … --must-edge-inference smt-hyper-must` for wider designs).
+    /// `--target` is a single register-comparison atom (`"state_q == 3"`).
+    VerifyRecoverability(Btor2VerifyRecoverabilityArgs),
 }
 
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — predicate-source
@@ -450,6 +459,17 @@ struct Btor2VerifyLivenessArgs {
     /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
     #[arg(long, value_name = "ATOM")]
     grant: String,
+}
+
+/// Arguments for `mununu btor2 verify-recoverability` — `AG EF good`.
+#[derive(Args, Debug)]
+struct Btor2VerifyRecoverabilityArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
+    #[arg(long, value_name = "ATOM")]
+    target: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2062,7 +2082,32 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::Cegar(args) => btor2_cegar(args),
         Btor2Command::Verify(args) => btor2_verify(args),
         Btor2Command::VerifyLiveness(args) => btor2_verify_liveness(args),
+        Btor2Command::VerifyRecoverability(args) => btor2_verify_recoverability(args),
     }
+}
+
+/// `mununu btor2 verify-recoverability` — decide `AG EF target` via the exact
+/// 3-valued engine and print the canonical verdict as JSON. Surface peer of the API
+/// `POST /api/v1/btor2/verify-recoverability`.
+fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<(), String> {
+    use mununu_core::adapter::recoverability::{
+        recoverability_property_str, verify_recoverability,
+    };
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let verdict = verify_recoverability(&content, &args.target)?;
+
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "property": recoverability_property_str(&args.target),
+        "verdict": verdict.as_str(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    Ok(())
 }
 
 /// `mununu btor2 verify-liveness` — decide the response-liveness property
