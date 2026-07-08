@@ -52,6 +52,28 @@ jobs:
 
 `sv verify-auto` gates on the **worst** property verdict (`violated` > `unknown` > `holds`; a `skipped` property counts as pass). The `--json` stream carries the per-property detail for a summary or `jq` step.
 
+### The zero-input FSM auto-scan (`check-fsm`)
+
+> **Source of truth:** [`fsm_recoverability_scan`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/fsm_scan.rs) + `btor2 check-fsm` / `POST /api/v1/btor2/check-fsm` — surface: CLI+API+UI.
+
+Every verb above needs a property or a target atom. **`btor2 check-fsm` needs neither.** It discovers every FSM-like state register, derives each one's idle/reset value from the design itself (the register's `init` value, or the reset-mux constant of an init-less yosys lift), and decides recoverability `AG EF (reg == idle)` with reset **free** — reporting any **unrecoverable trap** (`verdict: violated`) as a finding. A trap is a reachable state the FSM can never get back to idle from *even with reset available* — the branching bug SVA cannot state, found with zero input.
+
+```bash
+# Lift the module once, then auto-scan its FSMs. Exit 2 on any unrecoverable trap.
+mununu --quiet sv emit-btor2 rtl/fsm.sv --preprocess-sv2v -o fsm.btor2
+mununu --quiet btor2 check-fsm fsm.btor2         # --fail-on / --quiet / exit codes as above
+```
+
+The reset-free framing is the intended-vs-unintended-trap filter: a design's *intended* reset-dependence (recovers only when reset is asserted) still `holds`; only a genuine unrecoverable trap — a gated/ineffective reset, a wrong idle encoding, or an upstream trap — comes back `violated`. Output is JSON:
+
+```jsonc
+{ "file": "fsm.btor2", "fsm_registers_checked": 1, "traps_found": 0,
+  "registers": [ { "register": "state_q", "idle_value": 55,
+                   "verdict": "holds", "unrecoverable_trap": false } ] }
+```
+
+`--max-width <bits>` (default `8`) bounds which registers count as "FSM-like" — a wider register is a datapath / counter and is skipped. Each register runs the exact 3-valued engine; a register whose cone exceeds the cap comes back `unknown` (skipped), never wrong.
+
 ---
 
 ## 2. From an agent that writes RTL: the HTTP API
@@ -86,6 +108,8 @@ POST /api/v1/sv/verify-recoverability
 ```
 
 `POST /api/v1/sv/verify` (safety of the module's assertions) and `/api/v1/sv/verify-liveness` (`{request, grant}`) round out the trio. All return the canonical `verdict`, so the agent gates on `verdict === "violated"`.
+
+**No property to name?** `POST /api/v1/btor2/check-fsm { "content": "<btor2>", "max_width": 8 }` auto-scans every FSM register for an unrecoverable trap and returns `{ fsm_registers_checked, traps_found, registers: [{ register, idle_value, verdict, unrecoverable_trap }] }` — the agent gates on `traps_found > 0`. Lift the module with `sv emit-btor2` first (or post pre-lifted BTOR2).
 
 The agent can skip the SV lift entirely and post pre-lifted BTOR2 to `/api/v1/btor2/verify{,-liveness,-recoverability}` — same responses.
 
