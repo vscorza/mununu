@@ -89,6 +89,16 @@ pub fn sv_verify_recoverability(lift: &SvLift, target: &str) -> Result<PropertyV
     verify_recoverability(&btor2, target)
 }
 
+/// `sv check-fsm` — lift SV and auto-scan every FSM-like state register for a reachable
+/// illegal encoding (no user input). The SV-direct peer of `btor2 check-fsm`.
+pub fn sv_check_fsm(
+    lift: &SvLift,
+    max_width: u32,
+) -> Result<Vec<crate::adapter::fsm_scan::FsmFinding>, String> {
+    let btor2 = lift.lift()?;
+    crate::adapter::fsm_scan::fsm_encoding_scan(&btor2, max_width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,7 +25,7 @@ branching (νμ) properties can only go through the 3-valued engines.
 | `btor2/sv verify` (safety) | `decide_reach_portfolio` → **reach portfolio** | none |
 | `btor2/sv verify-liveness` (`AG(a→AF b)`) | Biere l2s → `bad`-monitor → **reach portfolio** | none |
 | `btor2/sv verify-recoverability` (`AG EF good`) | `exact_symbolic_verdict` → **exact-symbolic** | **none** |
-| `btor2 check-fsm` (auto `AG EF (reg==idle)` per FSM reg) | `fsm_recoverability_scan` → **exact-symbolic** per register | **none** (idle auto-derived from init / reset-mux) |
+| `btor2 check-fsm` (auto illegal-encoding per FSM reg) | `fsm_encoding_scan` → **reach portfolio** per register | **none** (legal set auto-derived from the design) |
 | `sv verify-auto` (default `portfolio-sequential`) | **exact-symbolic → symbolic → explicit**, early-exit | exact leg none; cube legs **auto-seeded** |
 | `sv verify-auto` safety ⊥ | escalate → reduce → **reach portfolio** | none |
 | `btor2 cegar` (explicit) | `cegar_refine_loop` → **cube** | hand-`--predicate` unless auto-seeded upstream |
@@ -42,7 +42,8 @@ So: **hand-written predicates are already the exception, not the rule** — the 
 
 ## Defensibility (which paths to lead with)
 
-- **`AG EF` recoverability via exact-symbolic / cube+hyper-must — DEFENSIBLE.** A branching νμ property SVA/LTL cannot express, decided soundly, on real RTL, with no predicates at FSM scale. No mainstream tool offers it. **This is the wedge — invest here (P1).** The first P1 slice ships `btor2 check-fsm` — the zero-input auto-scan that discovers FSM registers, derives idle from init / reset-mux, and reports unrecoverable traps (validated end-to-end on the real csrng `state_q`, idle=55 auto-derived).
+- **`AG EF` recoverability via exact-symbolic / cube+hyper-must — DEFENSIBLE as a *named* property.** A branching νμ property SVA/LTL cannot express, decided soundly, on real RTL, with no predicates at FSM scale. No mainstream tool offers it. Keep the `verify-recoverability` verb (the user names a meaningful target). **Do not auto-scan it**: reset-free recoverability-to-the-reset-value is *tautological* on a reset-carrying design (reset always provides an escape → `holds` everywhere), and reset-held flags every intended reset-recoverable error — neither is a zero-touch bug signal (soundness finding, 2026-07-08).
+- **Illegal-encoding reachability via the reach portfolio — the zero-touch auto bug-finder (P1).** The first P1 slice ships `btor2 check-fsm` (`fsm_encoding_scan`): discover FSM registers, derive each one's legal encoding set from the design (compared constants + reset value), and check from the reset state whether any illegal encoding is reachable. Reset cannot paper it over and design intent cannot excuse it — a reachable out-of-enum value is an unambiguous bug. A *safety* property, so it rides the word-level portfolio (no bit cap). Validated on the real csrng `state_q` (8 legal sparse encodings auto-derived, `holds`).
 - **Response-liveness via l2s — partly defensible.** Sound concrete reduction, but liveness-to-safety is known art; keep, don't lead.
 - **Safety via the reach portfolio — TABLE-STAKES.** SymbiYosys/commercial do BMC/PDR safety at scale, often better. Keep for completeness + the ⊥ escalation; don't position as the differentiator.
 

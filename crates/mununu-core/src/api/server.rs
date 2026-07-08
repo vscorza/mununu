@@ -162,6 +162,9 @@ fn create_router() -> Router {
             "/api/v1/sv/verify-recoverability",
             post(handlers::sv_verify_recoverability_handler),
         )
+        // SV-direct auto FSM illegal-encoding scan (lift + scan, one call). Surface peer
+        // of the CLI `sv check-fsm` and the BTOR2-direct `/api/v1/btor2/check-fsm`.
+        .route("/api/v1/sv/check-fsm", post(handlers::sv_check_fsm_handler))
         .route(
             "/api/v1/verify/memory-check",
             post(handlers::memory_check_handler),

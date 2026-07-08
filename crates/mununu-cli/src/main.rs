@@ -263,14 +263,16 @@ enum Btor2Command {
     /// use `btor2 cegar … --must-edge-inference smt-hyper-must` for wider designs).
     /// `--target` is a single register-comparison atom (`"state_q == 3"`).
     VerifyRecoverability(Btor2VerifyRecoverabilityArgs),
-    /// Auto-scan every FSM-like state register for an unrecoverable trap — no input.
+    /// Auto-scan every FSM-like state register for a reachable illegal encoding — no input.
     ///
-    /// For each narrow (≤ `--max-width` bit) state register, derive its idle/reset
-    /// state as the register's init value and check recoverability `AG EF (reg ==
-    /// idle)` with reset left free. A `violated` register is an **unrecoverable trap**
-    /// — a reachable state the FSM can never get back to idle from, even with reset (a
-    /// bug SVA can't state and can't detect). Intended reset-dependence still `holds`
-    /// (reset is free). Prints one line per register; exits non-zero on any trap.
+    /// For each narrow (≤ `--max-width` bit) state register, derive its legal encodings
+    /// from the design (the constants its own logic compares it against, plus its reset
+    /// value) and check — from the real reset state — whether any value **outside** that
+    /// set is reachable. A `violated` register has a reachable **illegal encoding**: some
+    /// input drives the FSM past its enum (an incomplete `case`, a missing `default`), an
+    /// unambiguous bug. A `holds` register provably stays within its encoding. Decided by
+    /// the word-level reachability portfolio (scales past the exact engine). Prints one
+    /// line per register; exits non-zero on any reachable illegal encoding.
     CheckFsm(Btor2CheckFsmArgs),
 }
 
@@ -1221,6 +1223,12 @@ enum SvCommand {
     /// single register-comparison atom. Surface peer of
     /// `POST /api/v1/sv/verify-recoverability`.
     VerifyRecoverability(SvVerifyRecoverabilityArgs),
+    /// Lift SV and auto-scan every FSM-like state register for a reachable illegal
+    /// encoding — no input. The SV-direct one-call peer of `btor2 check-fsm`: derives
+    /// each register's legal encodings from the design and reports any register that can
+    /// reach a value outside its enum (an unambiguous bug). Surface peer of
+    /// `POST /api/v1/sv/check-fsm`.
+    CheckFsm(SvCheckFsmArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1540,6 +1548,18 @@ struct SvVerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu sv check-fsm` — SV-direct auto illegal-encoding scan.
+#[derive(Args, Debug)]
+struct SvCheckFsmArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+    /// Max state-register width to treat as an FSM (wider = datapath/counter, skipped).
+    #[arg(long, value_name = "BITS", default_value_t = mununu_core::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH)]
+    max_width: u32,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2304,28 +2324,28 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
 /// traps (no user input) and print the per-register recoverability result as JSON.
 /// Exits non-zero on any trap (via `--fail-on`).
 fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
-    use mununu_core::adapter::fsm_scan::fsm_recoverability_scan;
+    use mununu_core::adapter::fsm_scan::fsm_encoding_scan;
     use mununu_core::verdict::PropertyVerdict;
 
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
-    let findings = fsm_recoverability_scan(&content, args.max_width)?;
+    let findings = fsm_encoding_scan(&content, args.max_width)?;
 
     let registers: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
             serde_json::json!({
                 "register": f.register,
-                "idle_value": f.idle_value,
+                "legal_encodings": f.legal_encodings,
                 "verdict": f.verdict.as_str(),
-                "unrecoverable_trap": f.is_finding(),
+                "illegal_encoding_reachable": f.is_finding(),
             })
         })
         .collect();
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "fsm_registers_checked": findings.len(),
-        "traps_found": findings.iter().filter(|f| f.is_finding()).count(),
+        "illegal_encodings_found": findings.iter().filter(|f| f.is_finding()).count(),
         "registers": registers,
     });
     print_json_summary(&summary)?;
@@ -4579,6 +4599,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Verify(args) => sv_verify(args),
         SvCommand::VerifyLiveness(args) => sv_verify_liveness(args),
         SvCommand::VerifyRecoverability(args) => sv_verify_recoverability(args),
+        SvCommand::CheckFsm(args) => sv_check_fsm(args),
     }
 }
 
@@ -4662,6 +4683,39 @@ fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), Stri
     });
     print_json_summary(&summary)?;
     ci_gate_exit(verdict.as_str(), args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu sv check-fsm` — lift SV then auto-scan every FSM register for a reachable
+/// illegal encoding. SV-direct peer of `btor2 check-fsm`; same JSON + CI exit.
+fn sv_check_fsm(args: SvCheckFsmArgs) -> Result<(), String> {
+    use mununu_core::adapter::sv_verify::sv_check_fsm as core_sv_check_fsm;
+    use mununu_core::verdict::PropertyVerdict;
+
+    let file = args.lift.file.display().to_string();
+    let findings = core_sv_check_fsm(&read_sv_lift(&args.lift)?, args.max_width)?;
+
+    let registers: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "register": f.register,
+                "legal_encodings": f.legal_encodings,
+                "verdict": f.verdict.as_str(),
+                "illegal_encoding_reachable": f.is_finding(),
+            })
+        })
+        .collect();
+    let summary = serde_json::json!({
+        "file": file,
+        "fsm_registers_checked": findings.len(),
+        "illegal_encodings_found": findings.iter().filter(|f| f.is_finding()).count(),
+        "registers": registers,
+    });
+    print_json_summary(&summary)?;
+
+    let worst = worst_verdict(findings.iter().map(|f| PropertyVerdict::as_str(f.verdict)));
+    ci_gate_exit(worst, args.ci.fail_on);
     Ok(())
 }
 

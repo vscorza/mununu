@@ -722,39 +722,38 @@ pub async fn btor2_verify_recoverability_handler(
     }))
 }
 
-/// Auto-scan every FSM-like state register for an unrecoverable trap
+/// Auto-scan every FSM-like state register for a reachable illegal encoding
 /// (`POST /api/v1/btor2/check-fsm`) — no user input. Surface peer of the CLI
-/// `mununu btor2 check-fsm`: derives each narrow state register's idle/reset value
-/// (init or reset-mux constant) and decides recoverability `AG EF (reg == idle)` with
-/// reset free; a `"violated"` register is an unrecoverable trap. A malformed BTOR2
-/// source is a `BadRequest`.
+/// `mununu btor2 check-fsm`: derives each narrow state register's legal encoding set
+/// from the design and checks, from the reset state, whether any illegal encoding is
+/// reachable via the word-level portfolio; a `"violated"` register has a reachable
+/// illegal encoding (a bug). A malformed BTOR2 source is a `BadRequest`.
 pub async fn btor2_check_fsm_handler(
     Json(request): Json<Btor2CheckFsmRequest>,
 ) -> ApiResult<Json<Btor2CheckFsmResponse>> {
-    use crate::adapter::fsm_scan::fsm_recoverability_scan;
+    use crate::adapter::fsm_scan::fsm_encoding_scan;
 
-    let findings =
-        fsm_recoverability_scan(&request.content, request.max_width).map_err(|message| {
-            ApiError::BadRequest {
-                message,
-                details: None,
-            }
-        })?;
+    let findings = fsm_encoding_scan(&request.content, request.max_width).map_err(|message| {
+        ApiError::BadRequest {
+            message,
+            details: None,
+        }
+    })?;
 
-    let traps_found = findings.iter().filter(|f| f.is_finding()).count();
+    let illegal_encodings_found = findings.iter().filter(|f| f.is_finding()).count();
     let registers = findings
         .iter()
         .map(|f| FsmRegisterFinding {
             register: f.register.clone(),
-            idle_value: f.idle_value,
+            legal_encodings: f.legal_encodings.clone(),
             verdict: f.verdict.as_str().to_string(),
-            unrecoverable_trap: f.is_finding(),
+            illegal_encoding_reachable: f.is_finding(),
         })
         .collect();
 
     Ok(Json(Btor2CheckFsmResponse {
         fsm_registers_checked: findings.len(),
-        traps_found,
+        illegal_encodings_found,
         registers,
     }))
 }
@@ -865,6 +864,48 @@ pub async fn sv_verify_recoverability_handler(
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
         property,
+    }))
+}
+
+/// `POST /api/v1/sv/check-fsm` — lift SV and auto-scan every FSM register for a
+/// reachable illegal encoding. Surface peer of the CLI `sv check-fsm`; returns the same
+/// [`Btor2CheckFsmResponse`] as the BTOR2-direct verb.
+pub async fn sv_check_fsm_handler(
+    Json(request): Json<SvCheckFsmRequest>,
+) -> ApiResult<Json<Btor2CheckFsmResponse>> {
+    use crate::adapter::sv_verify::{SvLift, sv_check_fsm};
+
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+    };
+    let findings =
+        sv_check_fsm(&lift, request.max_width).map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
+        })?;
+
+    let illegal_encodings_found = findings.iter().filter(|f| f.is_finding()).count();
+    let registers = findings
+        .iter()
+        .map(|f| FsmRegisterFinding {
+            register: f.register.clone(),
+            legal_encodings: f.legal_encodings.clone(),
+            verdict: f.verdict.as_str().to_string(),
+            illegal_encoding_reachable: f.is_finding(),
+        })
+        .collect();
+
+    Ok(Json(Btor2CheckFsmResponse {
+        fsm_registers_checked: findings.len(),
+        illegal_encodings_found,
+        registers,
     }))
 }
 
@@ -4154,24 +4195,48 @@ members = ["x"]
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 
-    // The auto-scan discovers `st` (init 0), derives idle=0, and reports the absorbing
-    // trap as an unrecoverable finding — no user input.
+    // A 3-bit sparse FSM (enum Idle=1, Busy=2, Done=4) with a COMPUTED illegal-encoding
+    // bug: from Busy, `go` assigns `st + 3` (= 5 = 3'b101), outside the enum. The
+    // auto-scan discovers `st`, derives legal {1,2,4}, and reports the reachable illegal
+    // encoding 5 — no user input.
+    const ILLEGAL_ENCODING_FSM: &str = "\
+1 sort bitvec 3
+2 sort bitvec 1
+3 state 1 st
+4 constd 1 1
+5 init 1 3 4
+6 input 2 go
+7 constd 1 2
+8 constd 1 4
+9 constd 1 3
+10 eq 2 3 4
+11 eq 2 3 7
+12 eq 2 3 8
+13 add 1 3 9
+14 ite 1 6 13 8
+15 ite 1 6 7 4
+16 ite 1 12 4 4
+17 ite 1 11 14 16
+18 ite 1 10 15 17
+19 next 1 3 18
+";
+
     #[tokio::test]
-    async fn btor2_check_fsm_handler_reports_the_trap() {
+    async fn btor2_check_fsm_handler_reports_the_illegal_encoding() {
         let request = Btor2CheckFsmRequest {
-            content: LIVENESS_STALLER.to_string(),
+            content: ILLEGAL_ENCODING_FSM.to_string(),
             max_width: crate::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH,
         };
         let Json(out) = btor2_check_fsm_handler(Json(request))
             .await
             .expect("check-fsm runs");
         assert_eq!(out.fsm_registers_checked, 1, "response: {out:?}");
-        assert_eq!(out.traps_found, 1);
+        assert_eq!(out.illegal_encodings_found, 1);
         let st = &out.registers[0];
         assert_eq!(st.register, "st");
-        assert_eq!(st.idle_value, 0);
+        assert_eq!(st.legal_encodings, vec![1, 2, 4]);
         assert_eq!(st.verdict, "violated");
-        assert!(st.unrecoverable_trap);
+        assert!(st.illegal_encoding_reachable);
     }
 
     #[tokio::test]
