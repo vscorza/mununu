@@ -148,6 +148,15 @@ enum Btor2Command {
     /// `contradiction` means two sound engines disagree — a soundness alarm,
     /// never a silent guess. Engines whose binary is absent simply abstain.
     Verify(Btor2VerifyArgs),
+    /// Decide a response-liveness property `AG(request → AF grant)` at scale.
+    ///
+    /// "Whenever `request` holds, `grant` is eventually reached on every path"
+    /// — the canonical request/grant liveness property. Reduces it to a single
+    /// `bad`-reachability query (Biere–Artho–Schuppan liveness-to-safety) that
+    /// the multi-engine portfolio decides symbolically on wide designs, then
+    /// prints the verdict (`holds` / `violated` / `inconclusive`). `--request`
+    /// and `--grant` are single register-comparison atoms (`"st == 1"`).
+    VerifyLiveness(Btor2VerifyLivenessArgs),
 }
 
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — predicate-source
@@ -427,6 +436,20 @@ struct Btor2VerifyArgs {
     /// Path to the BTOR2 input file.
     #[arg(value_name = "BTOR2_FILE")]
     file: PathBuf,
+}
+
+/// Arguments for `mununu btor2 verify-liveness` — the response-liveness reduction.
+#[derive(Args, Debug)]
+struct Btor2VerifyLivenessArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// The request atom — a register comparison, e.g. `"st == 1"`.
+    #[arg(long, value_name = "ATOM")]
+    request: String,
+    /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
+    #[arg(long, value_name = "ATOM")]
+    grant: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2038,7 +2061,45 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::LiftKmts(args) => btor2_lift_kmts(args),
         Btor2Command::Cegar(args) => btor2_cegar(args),
         Btor2Command::Verify(args) => btor2_verify(args),
+        Btor2Command::VerifyLiveness(args) => btor2_verify_liveness(args),
     }
+}
+
+/// `mununu btor2 verify-liveness` — decide the response-liveness property
+/// `AG(request → AF grant)` via the l2s reduction + the portfolio, printing the
+/// verdict as JSON. Surface peer of the API `POST /api/v1/btor2/verify-liveness`;
+/// both share the verdict labels via
+/// [`mununu_core::adapter::liveness_rescue::liveness_verdict_str`].
+fn btor2_verify_liveness(args: Btor2VerifyLivenessArgs) -> Result<(), String> {
+    use mununu_core::adapter::liveness_rescue::{
+        liveness_verdict_str, parse_response_atom, response_liveness_rescue_atoms,
+    };
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let request = parse_response_atom(&args.request)?;
+    let grant = parse_response_atom(&args.grant)?;
+
+    let (verdict, outcome) = response_liveness_rescue_atoms(&content, &request, &grant, false)
+        .ok_or_else(|| {
+            format!(
+                "could not build the liveness monitor for '{}' — an atom likely binds no signal",
+                args.file.display()
+            )
+        })?;
+
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "property": format!("AG(({}) -> AF ({}))", args.request, args.grant),
+        "verdict": liveness_verdict_str(verdict),
+        "decided_by": outcome.reachable_by.iter().chain(outcome.unreachable_by.iter())
+            .collect::<Vec<_>>(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    Ok(())
 }
 
 /// `mununu btor2 verify` — decide `bad`-reachability with the multi-engine safety

@@ -656,6 +656,46 @@ pub async fn btor2_verify_handler(
     }))
 }
 
+/// Decide the response-liveness property `AG(request → AF grant)` at scale
+/// (`POST /api/v1/btor2/verify-liveness`). Surface peer of the CLI
+/// `mununu btor2 verify-liveness`: reduces the property to a single
+/// `bad`-reachability query (Biere–Artho–Schuppan liveness-to-safety) the portfolio
+/// decides, returning `"holds"` / `"violated"` / `"inconclusive"`. A malformed atom
+/// or unparseable BTOR2 is a `BadRequest`.
+pub async fn btor2_verify_liveness_handler(
+    Json(request): Json<Btor2VerifyLivenessRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    use crate::adapter::liveness_rescue::{
+        liveness_verdict_str, parse_response_atom, response_liveness_rescue_atoms,
+    };
+
+    let bad_req = |message: String| ApiError::BadRequest {
+        message,
+        details: None,
+    };
+    let ante = parse_response_atom(&request.request).map_err(bad_req)?;
+    let cons = parse_response_atom(&request.grant).map_err(bad_req)?;
+
+    let (verdict, outcome) = response_liveness_rescue_atoms(&request.content, &ante, &cons, false)
+        .ok_or_else(|| {
+            bad_req(
+            "could not build the liveness monitor — an atom likely binds no signal in the design"
+                .to_string(),
+        )
+        })?;
+
+    Ok(Json(Btor2VerifyLivenessResponse {
+        verdict: liveness_verdict_str(verdict).to_string(),
+        property: format!("AG(({}) -> AF ({}))", request.request, request.grant),
+        decided_by: outcome
+            .reachable_by
+            .iter()
+            .chain(outcome.unreachable_by.iter())
+            .map(|s| s.to_string())
+            .collect(),
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
@@ -3862,6 +3902,53 @@ members = ["x"]
         let err = btor2_verify_handler(Json(request))
             .await
             .expect_err("malformed BTOR2 must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    // A 4-state staller: st 0=idle,1=req,3=stuck; 2=grant unreachable. req -> stuck ->
+    // stuck forever ⇒ AG((st==1) → AF (st==2)) is VIOLATED.
+    const LIVENESS_STALLER: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 st
+4 zero 1
+5 init 1 3 4
+6 input 2 go
+7 one 1
+8 constd 1 2
+9 constd 1 3
+10 eq 2 3 4
+11 eq 2 3 7
+12 ite 1 6 7 4
+13 ite 1 11 9 3
+14 ite 1 10 12 13
+15 next 1 3 14
+";
+
+    #[tokio::test]
+    async fn btor2_verify_liveness_handler_decides_violated_staller() {
+        let request = Btor2VerifyLivenessRequest {
+            content: LIVENESS_STALLER.to_string(),
+            request: "st == 1".to_string(),
+            grant: "st == 2".to_string(),
+        };
+        let Json(out) = btor2_verify_liveness_handler(Json(request))
+            .await
+            .expect("verify-liveness runs");
+        assert_eq!(out.verdict, "violated", "response: {out:?}");
+        assert!(out.property.contains("AF"), "property echoed: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn btor2_verify_liveness_handler_rejects_relational_atom() {
+        let request = Btor2VerifyLivenessRequest {
+            content: LIVENESS_STALLER.to_string(),
+            request: "st == 1".to_string(),
+            grant: "x == y".to_string(), // relational — out of the response fragment
+        };
+        let err = btor2_verify_liveness_handler(Json(request))
+            .await
+            .expect_err("relational atom must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 }

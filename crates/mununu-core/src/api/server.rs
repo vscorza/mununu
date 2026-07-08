@@ -113,6 +113,12 @@ fn create_router() -> Router {
         // sound engine (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono), merged under the
         // differential-oracle discipline. Surface peer of the CLI `mununu btor2 verify`.
         .route("/api/v1/btor2/verify", post(handlers::btor2_verify_handler))
+        // P2 response-liveness at scale — AG(request → AF grant) via liveness-to-
+        // safety + the portfolio. Surface peer of the CLI `mununu btor2 verify-liveness`.
+        .route(
+            "/api/v1/btor2/verify-liveness",
+            post(handlers::btor2_verify_liveness_handler),
+        )
         // cegar-extraction Stage 2 — SV-direct CEGAR one-call (sv2v +
         // Yosys → flattened BTOR2 → cegar_refine_loop). Surface peer of
         // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow
