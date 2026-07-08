@@ -80,13 +80,7 @@ pub fn decide_bad_safety_spacer(
         return Ok(SafetyVerdict::Safe { k: 0 });
     }
 
-    // Select SPACER — Z3's IC3/PDR + interpolation CHC engine — explicitly, rather
-    // than relying on the Fixedpoint auto-config to route these bit-vector Horn rules
-    // there. `fp.engine` is a module parameter, so it is pinned on the `Config` that
-    // builds the context; context-scoped, it does not perturb the `Solver`-based
-    // native BMC / k-induction engines.
-    let mut cfg = z3::Config::new();
-    cfg.set_param_value("fp.engine", "spacer");
+    let cfg = z3::Config::new();
     z3::with_z3_config(&cfg, || {
         let view = encode_design(file)?;
 
@@ -110,11 +104,19 @@ pub fn decide_bad_safety_spacer(
         let err = FuncDecl::new("Err", &[], &bool_sort);
 
         let fp = z3::Fixedpoint::new();
+        // Select SPACER — Z3's IC3/PDR + interpolation CHC engine — explicitly. The
+        // Fixedpoint default is `auto-config`, which routes *these* bit-vector Horn
+        // rules to SPACER anyway, but pinning it keeps the choice robust against
+        // auto-config heuristics. NB: `engine` is a *Fixedpoint-object* parameter set
+        // via `set_params`, NOT a Config/global one (setting `fp.engine` on the Config
+        // is rejected by Z3 with a warning). Context-scoped — it does not perturb the
+        // `Solver`-based native BMC / k-induction engines.
+        let mut params = z3::Params::new();
+        params.set_symbol("engine", "spacer");
         if let Some(ms) = timeout_ms {
-            let mut params = z3::Params::new();
             params.set_u32("timeout", ms);
-            fp.set_params(&params);
         }
+        fp.set_params(&params);
         fp.register_relation(&inv);
         fp.register_relation(&err);
 

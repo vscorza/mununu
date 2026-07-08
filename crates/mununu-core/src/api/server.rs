@@ -109,6 +109,10 @@ fn create_router() -> Router {
         )
         .route("/api/v1/verify", post(handlers::verify_project_handler))
         .route("/api/v1/btor2/cegar", post(handlers::btor2_cegar_handler))
+        // Multi-engine safety portfolio — decide `bad`-reachability across every
+        // sound engine (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono), merged under the
+        // differential-oracle discipline. Surface peer of the CLI `mununu btor2 verify`.
+        .route("/api/v1/btor2/verify", post(handlers::btor2_verify_handler))
         // cegar-extraction Stage 2 — SV-direct CEGAR one-call (sv2v +
         // Yosys → flattened BTOR2 → cegar_refine_loop). Surface peer of
         // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow
