@@ -1085,6 +1085,19 @@ enum SvCommand {
     /// can't bind them) — never given a misleading verdict. Surface peer of
     /// `POST /api/v1/sv/verify-auto` + the extraction-tab verify-auto panel.
     VerifyAuto(SvVerifyAutoArgs),
+    /// Lift SV (sv2v + Yosys) and decide `bad`-reachability of its assertions with
+    /// the multi-engine safety portfolio — one call, no `emit-btor2` step. Surface
+    /// peer of `POST /api/v1/sv/verify`.
+    Verify(SvVerifyArgs),
+    /// Lift SV and decide a response-liveness property `AG(request → AF grant)` — the
+    /// SV-direct peer of `btor2 verify-liveness`. `--request` / `--grant` are single
+    /// register-comparison atoms. Surface peer of `POST /api/v1/sv/verify-liveness`.
+    VerifyLiveness(SvVerifyLivenessArgs),
+    /// Lift SV and decide recoverability `AG EF good` — the branching property SVA
+    /// cannot state, checked directly against raw SV in one call. `--target` is a
+    /// single register-comparison atom. Surface peer of
+    /// `POST /api/v1/sv/verify-recoverability`.
+    VerifyRecoverability(SvVerifyRecoverabilityArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1342,6 +1355,56 @@ struct SvVerifyAutoArgs {
     /// BDD size (a design too large to bit-blast ⇒ the property is `Skipped`).
     #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
     engine: EngineArg,
+}
+
+/// Shared SV → BTOR2 lift inputs for the SV-direct verbs (`sv verify` /
+/// `verify-liveness` / `verify-recoverability`).
+#[derive(Args, Debug)]
+struct SvLiftArgs {
+    /// Primary SystemVerilog source file (.sv / .v).
+    #[arg(value_name = "SV_FILE")]
+    file: PathBuf,
+    /// Additional SV sources (packages, `include` targets), staged alongside the
+    /// primary input. Repeatable.
+    #[arg(long = "source", value_name = "FILE")]
+    sources: Vec<PathBuf>,
+    /// Top module for the SV → BTOR2 Yosys lift (auto-detect when omitted).
+    #[arg(long = "top", value_name = "NAME")]
+    top: Option<String>,
+    /// Run sv2v before Yosys. Required for modern SV (`import pkg::*;`, structs,
+    /// interfaces) — essentially all real OpenTitan / Caliptra / ibex RTL.
+    #[arg(long = "preprocess-sv2v")]
+    preprocess_sv2v: bool,
+}
+
+/// Arguments for `mununu sv verify` — SV-direct safety portfolio.
+#[derive(Args, Debug)]
+struct SvVerifyArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+}
+
+/// Arguments for `mununu sv verify-liveness` — SV-direct response liveness.
+#[derive(Args, Debug)]
+struct SvVerifyLivenessArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+    /// The request atom — a register comparison, e.g. `"st == 1"`.
+    #[arg(long, value_name = "ATOM")]
+    request: String,
+    /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
+    #[arg(long, value_name = "ATOM")]
+    grant: String,
+}
+
+/// Arguments for `mununu sv verify-recoverability` — SV-direct `AG EF good`.
+#[derive(Args, Debug)]
+struct SvVerifyRecoverabilityArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+    /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
+    #[arg(long, value_name = "ATOM")]
+    target: String,
 }
 
 #[derive(Args, Debug)]
@@ -4298,7 +4361,93 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::Cegar(args) => sv_cegar(args),
         SvCommand::ExtractSva(args) => sv_extract_sva(args),
         SvCommand::VerifyAuto(args) => sv_verify_auto(args),
+        SvCommand::Verify(args) => sv_verify(args),
+        SvCommand::VerifyLiveness(args) => sv_verify_liveness(args),
+        SvCommand::VerifyRecoverability(args) => sv_verify_recoverability(args),
     }
+}
+
+/// Read the primary + additional SV sources named by `args` into a core `SvLift`.
+fn read_sv_lift(args: &SvLiftArgs) -> Result<mununu_core::adapter::sv_verify::SvLift, String> {
+    let source = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read SV '{}': {e}", args.file.display()))?;
+    let mut additional_sources = Vec::new();
+    for p in &args.sources {
+        let content = std::fs::read_to_string(p)
+            .map_err(|e| format!("Failed to read '{}': {e}", p.display()))?;
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("source.sv")
+            .to_string();
+        additional_sources.push((name, content));
+    }
+    Ok(mununu_core::adapter::sv_verify::SvLift {
+        source,
+        additional_sources,
+        top: args.top.clone(),
+        use_sv2v: args.preprocess_sv2v,
+    })
+}
+
+/// `mununu sv verify` — lift SV and decide `bad`-reachability with the portfolio.
+fn sv_verify(args: SvVerifyArgs) -> Result<(), String> {
+    use mununu_core::adapter::sv_verify::sv_verify_safety;
+    use mununu_core::verdict::PropertyVerdict;
+
+    let file = args.lift.file.display().to_string();
+    let outcome = sv_verify_safety(&read_sv_lift(&args.lift)?)?;
+    let summary = serde_json::json!({
+        "file": file,
+        "verdict": PropertyVerdict::from(outcome.verdict).as_str(),
+        "reachable_by": outcome.reachable_by,
+        "unreachable_by": outcome.unreachable_by,
+        "contradiction": outcome.verdict
+            == mununu_core::adapter::reach_portfolio::ReachVerdict::Contradiction,
+    });
+    print_json_summary(&summary)
+}
+
+/// `mununu sv verify-liveness` — lift SV and decide `AG(request → AF grant)`.
+fn sv_verify_liveness(args: SvVerifyLivenessArgs) -> Result<(), String> {
+    use mununu_core::adapter::sv_verify::sv_verify_liveness as core_sv_verify_liveness;
+    use mununu_core::verdict::PropertyVerdict;
+
+    let file = args.lift.file.display().to_string();
+    let (verdict, outcome) =
+        core_sv_verify_liveness(&read_sv_lift(&args.lift)?, &args.request, &args.grant)?;
+    let summary = serde_json::json!({
+        "file": file,
+        "property": format!("AG(({}) -> AF ({}))", args.request, args.grant),
+        "verdict": PropertyVerdict::from(verdict).as_str(),
+        "decided_by": outcome.reachable_by.iter().chain(outcome.unreachable_by.iter())
+            .collect::<Vec<_>>(),
+    });
+    print_json_summary(&summary)
+}
+
+/// `mununu sv verify-recoverability` — lift SV and decide `AG EF good`.
+fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), String> {
+    use mununu_core::adapter::recoverability::recoverability_property_str;
+    use mununu_core::adapter::sv_verify::sv_verify_recoverability as core_sv_verify_recoverability;
+
+    let file = args.lift.file.display().to_string();
+    let verdict = core_sv_verify_recoverability(&read_sv_lift(&args.lift)?, &args.target)?;
+    let summary = serde_json::json!({
+        "file": file,
+        "property": recoverability_property_str(&args.target),
+        "verdict": verdict.as_str(),
+    });
+    print_json_summary(&summary)
+}
+
+/// Pretty-print a JSON summary to stdout.
+fn print_json_summary(summary: &serde_json::Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    Ok(())
 }
 
 /// Build the skeleton `SvAnnotation` from discovered state cells (the pure,
