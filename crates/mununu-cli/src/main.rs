@@ -263,6 +263,15 @@ enum Btor2Command {
     /// use `btor2 cegar … --must-edge-inference smt-hyper-must` for wider designs).
     /// `--target` is a single register-comparison atom (`"state_q == 3"`).
     VerifyRecoverability(Btor2VerifyRecoverabilityArgs),
+    /// Auto-scan every FSM-like state register for an unrecoverable trap — no input.
+    ///
+    /// For each narrow (≤ `--max-width` bit) state register, derive its idle/reset
+    /// state as the register's init value and check recoverability `AG EF (reg ==
+    /// idle)` with reset left free. A `violated` register is an **unrecoverable trap**
+    /// — a reachable state the FSM can never get back to idle from, even with reset (a
+    /// bug SVA can't state and can't detect). Intended reset-dependence still `holds`
+    /// (reset is free). Prints one line per register; exits non-zero on any trap.
+    CheckFsm(Btor2CheckFsmArgs),
 }
 
 /// R.5 Item 3 sub-item 3.5 (2026-06-04) — predicate-source
@@ -569,6 +578,19 @@ struct Btor2VerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu btor2 check-fsm` — the auto FSM-recoverability scan.
+#[derive(Args, Debug)]
+struct Btor2CheckFsmArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// Max state-register width to treat as an FSM (wider = datapath/counter, skipped).
+    #[arg(long, value_name = "BITS", default_value_t = mununu_core::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH)]
+    max_width: u32,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2274,7 +2296,44 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::Verify(args) => btor2_verify(args),
         Btor2Command::VerifyLiveness(args) => btor2_verify_liveness(args),
         Btor2Command::VerifyRecoverability(args) => btor2_verify_recoverability(args),
+        Btor2Command::CheckFsm(args) => btor2_check_fsm(args),
     }
+}
+
+/// `mununu btor2 check-fsm` — auto-scan FSM-like state registers for unrecoverable
+/// traps (no user input) and print the per-register recoverability result as JSON.
+/// Exits non-zero on any trap (via `--fail-on`).
+fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
+    use mununu_core::adapter::fsm_scan::fsm_recoverability_scan;
+    use mununu_core::verdict::PropertyVerdict;
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let findings = fsm_recoverability_scan(&content, args.max_width)?;
+
+    let registers: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "register": f.register,
+                "idle_value": f.idle_value,
+                "verdict": f.verdict.as_str(),
+                "unrecoverable_trap": f.is_finding(),
+            })
+        })
+        .collect();
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "fsm_registers_checked": findings.len(),
+        "traps_found": findings.iter().filter(|f| f.is_finding()).count(),
+        "registers": registers,
+    });
+    print_json_summary(&summary)?;
+
+    // Exit code: the worst verdict across the checked registers.
+    let worst = worst_verdict(findings.iter().map(|f| PropertyVerdict::as_str(f.verdict)));
+    ci_gate_exit(worst, args.ci.fail_on);
+    Ok(())
 }
 
 /// `mununu btor2 verify-recoverability` — decide `AG EF target` via the exact

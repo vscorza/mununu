@@ -125,6 +125,13 @@ fn create_router() -> Router {
             "/api/v1/btor2/verify-recoverability",
             post(handlers::btor2_verify_recoverability_handler),
         )
+        // P1 auto FSM-recoverability scan — discover FSM-like state registers and
+        // decide recoverability of each to its idle/reset value with no user input.
+        // Surface peer of the CLI `mununu btor2 check-fsm`.
+        .route(
+            "/api/v1/btor2/check-fsm",
+            post(handlers::btor2_check_fsm_handler),
+        )
         // cegar-extraction Stage 2 — SV-direct CEGAR one-call (sv2v +
         // Yosys → flattened BTOR2 → cegar_refine_loop). Surface peer of
         // the CLI `mununu sv cegar`; lets the extraction-tab SV workflow
