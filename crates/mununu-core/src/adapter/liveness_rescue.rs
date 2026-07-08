@@ -48,17 +48,22 @@
 //! Every other shape returns `None` — a sound abstention (the caller leaves the
 //! property to the exact engine), never a mis-reduction.
 //!
-//! # Status — validated reduction, wiring is the next slice (2026-07-08)
+//! # Status — validated + user-surfaced (2026-07-08)
 //!
 //! [`response_liveness_rescue`] is proven correct end-to-end by the differential
 //! tests below: on both a responder (HOLDS) and a staller (VIOLATED) the
 //! l2s → portfolio verdict **matches** the exact 3-valued engine
 //! ([`crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict`]) — the
-//! roadmap's "every reduced verdict is cross-checked by the exact engine". Routing
-//! `verify_auto` to try this reduction when a liveness property escapes the exact
-//! engine's enumeration cap (and the CLI/API/UI surface for it) is the next P2 slice,
-//! mirroring how [`crate::adapter::reach_rescue`]'s reduction primitive landed and was
-//! validated before any surface wiring.
+//! roadmap's "every reduced verdict is cross-checked by the exact engine".
+//!
+//! The reduction is user-invocable via [`response_liveness_rescue_atoms`] +
+//! [`parse_response_atom`] across all three surfaces: CLI `mununu btor2
+//! verify-liveness --request … --grant …`, API `POST /api/v1/btor2/verify-liveness`,
+//! and the UI `runBtor2VerifyLiveness` client. Auto-routing `verify_auto` to *try*
+//! this reduction when a translated SVA liveness property escapes the exact engine's
+//! cap is a further follow-up (it needs a real SVA liveness target to validate under
+//! the mununu-sva toolchain, per the [`crate::adapter::reach_rescue`] no-target
+//! lesson).
 
 use crate::adapter::btor2::l2s_monitor::emit_response_l2s_monitor;
 use crate::adapter::btor2::parser;
@@ -220,10 +225,27 @@ pub fn response_liveness_rescue(
     reset_pinned: bool,
 ) -> Option<(LivenessVerdict, ReachOutcome)> {
     let r = reduce_response_af(formula)?;
+    response_liveness_rescue_atoms(design_btor2, &r.ante, &r.cons, reset_pinned)
+}
+
+/// Like [`response_liveness_rescue`] but with the request / grant atoms given
+/// directly (the caller asserts the `AG(ante → AF cons)` shape) — the entry point
+/// for the `verify-liveness` surface, where the user names the two atoms rather than
+/// authoring the full μ-calculus formula.
+///
+/// Returns `None` only when the l2s monitor cannot be built (an atom binds no
+/// signal). See [`response_liveness_rescue`] for the `design_btor2` / `reset_pinned`
+/// contract and the returned [`ReachOutcome`].
+pub fn response_liveness_rescue_atoms(
+    design_btor2: &str,
+    ante: &Atom,
+    cons: &Atom,
+    reset_pinned: bool,
+) -> Option<(LivenessVerdict, ReachOutcome)> {
     let monitored = emit_response_l2s_monitor(
         design_btor2,
-        (&r.ante.signal, r.ante.op, r.ante.value),
-        (&r.cons.signal, r.cons.op, r.cons.value),
+        (&ante.signal, ante.op, ante.value),
+        (&cons.signal, cons.op, cons.value),
         reset_pinned,
     )
     .ok()?;
@@ -235,6 +257,40 @@ pub fn response_liveness_rescue(
         ReachVerdict::Unknown | ReachVerdict::Contradiction => LivenessVerdict::Inconclusive,
     };
     Some((verdict, outcome))
+}
+
+/// Parse a request/grant atom string (`"REG op VALUE"`, e.g. `"st == 2"`) into an
+/// [`Atom`], for the CLI / API `verify-liveness` surface. Reuses the same predicate
+/// grammar as the classifier, so a relational (`reg ⋈ reg`) or malformed atom is
+/// rejected identically.
+pub fn parse_response_atom(s: &str) -> Result<Atom, String> {
+    match parse_predicate_expr(s) {
+        Ok(PredicateExpr::Cmp {
+            register,
+            op,
+            value,
+        }) => Ok(Atom {
+            signal: register,
+            op,
+            value: value as u128,
+        }),
+        Ok(_) => Err(format!(
+            "`{s}` is not a single register-comparison atom (`REG op VALUE`); relational or \
+             compound atoms are out of the response fragment"
+        )),
+        Err(e) => Err(format!("cannot parse response atom `{s}`: {e:?}")),
+    }
+}
+
+/// Stable lowercase label for a [`LivenessVerdict`] — the single source of truth
+/// shared by the CLI (`mununu btor2 verify-liveness`) and the API
+/// (`POST /api/v1/btor2/verify-liveness`) so the two surfaces never drift.
+pub fn liveness_verdict_str(v: LivenessVerdict) -> &'static str {
+    match v {
+        LivenessVerdict::Holds => "holds",
+        LivenessVerdict::Violated => "violated",
+        LivenessVerdict::Inconclusive => "inconclusive",
+    }
 }
 
 #[cfg(test)]
@@ -379,5 +435,36 @@ mod tests {
         );
         let (v, out) = response_liveness_rescue(STALLER, &f, false).expect("reducible");
         assert_eq!(v, LivenessVerdict::Violated, "l2s outcome: {out:?}");
+    }
+
+    // The atoms-based surface entry (the CLI / API path) agrees with the formula path.
+    #[test]
+    fn atoms_entry_matches_formula_entry() {
+        let ante = parse_response_atom("st == 1").expect("atom parses");
+        let cons = parse_response_atom("st == 2").expect("atom parses");
+        assert_eq!(ante.op, CmpOp::Eq);
+        assert_eq!(cons.value, 2);
+        let (v_r, _) = response_liveness_rescue_atoms(RESPONDER, &ante, &cons, false).expect("ok");
+        assert_eq!(v_r, LivenessVerdict::Holds);
+        let (v_s, _) = response_liveness_rescue_atoms(STALLER, &ante, &cons, false).expect("ok");
+        assert_eq!(v_s, LivenessVerdict::Violated);
+    }
+
+    #[test]
+    fn parse_response_atom_rejects_relational_and_reports_labels() {
+        assert!(
+            parse_response_atom("x == y").is_err(),
+            "relational atom rejected"
+        );
+        assert!(
+            parse_response_atom("not an atom !!").is_err(),
+            "garbage rejected"
+        );
+        assert_eq!(liveness_verdict_str(LivenessVerdict::Holds), "holds");
+        assert_eq!(liveness_verdict_str(LivenessVerdict::Violated), "violated");
+        assert_eq!(
+            liveness_verdict_str(LivenessVerdict::Inconclusive),
+            "inconclusive"
+        );
     }
 }

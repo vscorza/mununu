@@ -907,6 +907,35 @@ pub struct Btor2VerifyResponse {
     pub contradiction: bool,
 }
 
+/// Request for the response-liveness endpoint
+/// (`POST /api/v1/btor2/verify-liveness`). Mirrors the CLI
+/// `mununu btor2 verify-liveness`: decides `AG(request → AF grant)` via the l2s
+/// reduction + the portfolio. `request` / `grant` are register-comparison atom
+/// strings (`"st == 1"`).
+#[derive(Debug, Deserialize)]
+pub struct Btor2VerifyLivenessRequest {
+    /// BTOR2 source content.
+    pub content: String,
+    /// The request atom (`"REG op VALUE"`).
+    pub request: String,
+    /// The grant atom that must eventually follow on every path.
+    pub grant: String,
+}
+
+/// Response for `POST /api/v1/btor2/verify-liveness`. Mirrors
+/// [`crate::adapter::liveness_rescue::LivenessVerdict`].
+#[derive(Debug, Serialize)]
+pub struct Btor2VerifyLivenessResponse {
+    /// The verdict: `"holds"` | `"violated"` | `"inconclusive"` (via
+    /// [`crate::adapter::liveness_rescue::liveness_verdict_str`]).
+    pub verdict: String,
+    /// The reduced property, echoed for provenance:
+    /// `AG((<request>) -> AF (<grant>))`.
+    pub property: String,
+    /// Portfolio engines that decided the reduced `bad`-reachability query.
+    pub decided_by: Vec<String>,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2
