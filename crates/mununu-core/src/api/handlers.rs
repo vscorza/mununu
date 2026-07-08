@@ -722,6 +722,115 @@ pub async fn btor2_verify_recoverability_handler(
     }))
 }
 
+// --- SV-direct verbs: lift SV (sv2v + Yosys) then decide, in one call. Surface peers
+// of the CLI `sv verify` / `verify-liveness` / `verify-recoverability`; they return
+// the same `Btor2Verify*Response` shapes as the BTOR2-direct verbs. The lift needs
+// sv2v + Yosys on the host (a missing tool → BadRequest). ---
+
+/// `POST /api/v1/sv/verify` — lift SV and decide `bad`-reachability of its assertions
+/// with the multi-engine safety portfolio.
+pub async fn sv_verify_handler(
+    Json(request): Json<SvVerifyRequest>,
+) -> ApiResult<Json<Btor2VerifyResponse>> {
+    use crate::adapter::reach_portfolio::ReachVerdict;
+    use crate::adapter::sv_verify::{SvLift, sv_verify_safety};
+
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+    };
+    let outcome = sv_verify_safety(&lift).map_err(|message| ApiError::BadRequest {
+        message,
+        details: None,
+    })?;
+    Ok(Json(Btor2VerifyResponse {
+        verdict: crate::verdict::PropertyVerdict::from(outcome.verdict)
+            .as_str()
+            .to_string(),
+        reachable_by: outcome.reachable_by.iter().map(|s| s.to_string()).collect(),
+        unreachable_by: outcome
+            .unreachable_by
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        contradiction: outcome.verdict == ReachVerdict::Contradiction,
+    }))
+}
+
+/// `POST /api/v1/sv/verify-liveness` — lift SV and decide `AG(request → AF grant)`.
+pub async fn sv_verify_liveness_handler(
+    Json(request): Json<SvVerifyLivenessRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    use crate::adapter::sv_verify::{SvLift, sv_verify_liveness};
+
+    let property = format!("AG(({}) -> AF ({}))", request.request, request.grant);
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+    };
+    let (verdict, outcome) =
+        sv_verify_liveness(&lift, &request.request, &request.grant).map_err(|message| {
+            ApiError::BadRequest {
+                message,
+                details: None,
+            }
+        })?;
+    Ok(Json(Btor2VerifyLivenessResponse {
+        verdict: crate::verdict::PropertyVerdict::from(verdict)
+            .as_str()
+            .to_string(),
+        property,
+        decided_by: outcome
+            .reachable_by
+            .iter()
+            .chain(outcome.unreachable_by.iter())
+            .map(|s| s.to_string())
+            .collect(),
+    }))
+}
+
+/// `POST /api/v1/sv/verify-recoverability` — lift SV and decide `AG EF target`.
+pub async fn sv_verify_recoverability_handler(
+    Json(request): Json<SvVerifyRecoverabilityRequest>,
+) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
+    use crate::adapter::recoverability::recoverability_property_str;
+    use crate::adapter::sv_verify::{SvLift, sv_verify_recoverability};
+
+    let property = recoverability_property_str(&request.target);
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+    };
+    let verdict = sv_verify_recoverability(&lift, &request.target).map_err(|message| {
+        ApiError::BadRequest {
+            message,
+            details: None,
+        }
+    })?;
+    Ok(Json(Btor2VerifyRecoverabilityResponse {
+        verdict: verdict.as_str().to_string(),
+        property,
+    }))
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — SV-direct CEGAR in one call.
 ///
 /// Lifts SystemVerilog to a single flattened BTOR2 (sv2v + Yosys, the
@@ -4004,6 +4113,40 @@ members = ["x"]
         let err = btor2_verify_recoverability_handler(Json(request))
             .await
             .expect_err("malformed target must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    // SV-direct verbs validate the atoms BEFORE the (toolchain-gated) SV→BTOR2 lift,
+    // so the guard is a BadRequest reachable in make-ci without sv2v / Yosys. The full
+    // lift → verdict path is covered by the mununu-sva e2e suite.
+    #[tokio::test]
+    async fn sv_verify_liveness_handler_rejects_malformed_atom_before_lift() {
+        let request = SvVerifyLivenessRequest {
+            source: "module m; endmodule".to_string(),
+            additional_sources: vec![],
+            top: None,
+            use_sv2v: false,
+            request: "x == y".to_string(), // relational — rejected before the lift
+            grant: "st == 1".to_string(),
+        };
+        let err = sv_verify_liveness_handler(Json(request))
+            .await
+            .expect_err("relational request atom must be rejected pre-lift");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn sv_verify_recoverability_handler_rejects_malformed_target_before_lift() {
+        let request = SvVerifyRecoverabilityRequest {
+            source: "module m; endmodule".to_string(),
+            additional_sources: vec![],
+            top: None,
+            use_sv2v: false,
+            target: "not an atom !!".to_string(),
+        };
+        let err = sv_verify_recoverability_handler(Json(request))
+            .await
+            .expect_err("malformed target must be rejected pre-lift");
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 }

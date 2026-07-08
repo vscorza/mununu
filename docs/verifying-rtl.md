@@ -146,16 +146,23 @@ supported environment). See [`external-tools.md`](external-tools.md).
 
 `sv verify-auto` checks the SVA the design *carries*; it takes no formula. An agent
 that emits RTL **with** `assert property` statements gets those checked automatically.
-An agent that emits assertion-free RTL gets zero properties back — it must either
-embed SVA, or use the **explicit-property path**:
+An agent that emits assertion-free RTL gets zero properties back — it names the
+property it cares about with an **SV-direct verb**, which lifts the module *and*
+decides the property in one call:
+
+> Source of truth: [`sv_verify::sv_verify_recoverability`](../crates/mununu-core/src/adapter/sv_verify.rs#L84) — surface: (CLI+API+UI)
 
 ```bash
-mununu sv emit-btor2-per-module my_module.sv   # SV → BTOR2 (one file per module)
-mununu btor2 verify-recoverability my_module.btor2 --target "state_q == 3"
+mununu sv verify-recoverability my_module.sv --target "state_q == 3"
+mununu sv verify-liveness      my_module.sv --request "req == 1" --grant "grant == 1"
+mununu sv verify               my_module.sv                       # safety of its assertions
 ```
 
-The BTOR2-direct verbs above let the agent name *any* property — including the
-branching ones (recoverability) that SVA cannot state at all — against its design.
+Same over HTTP: `POST /api/v1/sv/verify` · `/sv/verify-liveness` ·
+`/sv/verify-recoverability`. These let the agent name *any* property — including the
+branching ones (recoverability) SVA cannot state at all — against raw SV, no BTOR2
+round-trip. (The two-step `sv emit-btor2-per-module` → `btor2 verify-*` path still
+works when you want the intermediate BTOR2.)
 
 ### 3. Coverage is a fragment, and verdicts are honest
 

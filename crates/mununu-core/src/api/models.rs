@@ -963,6 +963,65 @@ pub struct Btor2VerifyRecoverabilityResponse {
     pub property: String,
 }
 
+/// The SV → BTOR2 lift inputs shared by the SV-direct verb endpoints
+/// (`/api/v1/sv/verify`, `/sv/verify-liveness`, `/sv/verify-recoverability`). These
+/// lift the module (sv2v + Yosys) and then decide the corresponding BTOR2 property,
+/// returning the same `Btor2Verify*Response` shapes — one call, no `emit-btor2` step.
+#[derive(Debug, Deserialize)]
+pub struct SvVerifyRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys (modern SV). Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+}
+
+/// Request for `POST /api/v1/sv/verify-liveness` — the SV lift fields plus the
+/// response-liveness atoms.
+#[derive(Debug, Deserialize)]
+pub struct SvVerifyLivenessRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys. Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// The request atom (`"REG op VALUE"`).
+    pub request: String,
+    /// The grant atom that must eventually follow on every path.
+    pub grant: String,
+}
+
+/// Request for `POST /api/v1/sv/verify-recoverability` — the SV lift fields plus the
+/// recoverability target atom.
+#[derive(Debug, Deserialize)]
+pub struct SvVerifyRecoverabilityRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys. Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// The `good` atom to recover to (`"REG op VALUE"`).
+    pub target: String,
+}
+
 /// cegar-extraction Stage 2 (2026-06-22) — request for the SV-direct
 /// CEGAR endpoint (`POST /api/v1/sv/cegar`). Mirrors the CLI
 /// `mununu sv cegar`: lifts SystemVerilog to a single flattened BTOR2

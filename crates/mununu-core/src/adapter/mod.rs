@@ -60,6 +60,7 @@ pub mod sidecar;
 pub mod slang;
 pub mod state_enum;
 pub mod sts_ir;
+pub mod sv_verify;
 pub mod systemverilog;
 pub mod templates;
 pub mod tlsf;
