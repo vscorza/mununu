@@ -441,13 +441,11 @@ struct Btor2CegarArgs {
     /// human-readable format.
     #[arg(long)]
     json: bool,
-    /// Engine selector. **Default `portfolio-sequential`** (2026-07-06): run exact →
-    /// symbolic → explicit, stopping when every property is decided — the most
-    /// precise sound choice, no slower than `explicit` on designs `explicit` already
-    /// decides (exact runs first and usually decides FSMs outright). Single-engine
-    /// values (`explicit`, `symbolic`, `exact-symbolic`) and `portfolio-parallel`
-    /// remain available.
-    #[arg(long, value_enum, default_value_t = EngineArg::PortfolioSequential)]
+    /// Cube-CEGAR engine. **Default `explicit`** (SMT edges + refinement loop);
+    /// `symbolic` uses the R-F5 BDD relation (no per-cube-pair SMT). The
+    /// `exact-symbolic` and `portfolio-*` engines are `sv verify-auto`-only (they need
+    /// the reset-gated model verify-auto builds), so `btor2 cegar` rejects them.
+    #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
     engine: EngineArg,
     /// R.6.6 / V.6 (2026-06-09) — name of a BTOR2 input symbol the
     /// controller drives. Repeated to declare multiple controllable
