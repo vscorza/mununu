@@ -46,6 +46,7 @@ pub mod cvc5;
 pub mod domain;
 pub mod emit;
 pub mod extraction;
+pub mod fsm_scan;
 pub mod ir;
 pub mod langgraph;
 pub mod liveness_rescue;

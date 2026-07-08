@@ -722,6 +722,43 @@ pub async fn btor2_verify_recoverability_handler(
     }))
 }
 
+/// Auto-scan every FSM-like state register for an unrecoverable trap
+/// (`POST /api/v1/btor2/check-fsm`) — no user input. Surface peer of the CLI
+/// `mununu btor2 check-fsm`: derives each narrow state register's idle/reset value
+/// (init or reset-mux constant) and decides recoverability `AG EF (reg == idle)` with
+/// reset free; a `"violated"` register is an unrecoverable trap. A malformed BTOR2
+/// source is a `BadRequest`.
+pub async fn btor2_check_fsm_handler(
+    Json(request): Json<Btor2CheckFsmRequest>,
+) -> ApiResult<Json<Btor2CheckFsmResponse>> {
+    use crate::adapter::fsm_scan::fsm_recoverability_scan;
+
+    let findings =
+        fsm_recoverability_scan(&request.content, request.max_width).map_err(|message| {
+            ApiError::BadRequest {
+                message,
+                details: None,
+            }
+        })?;
+
+    let traps_found = findings.iter().filter(|f| f.is_finding()).count();
+    let registers = findings
+        .iter()
+        .map(|f| FsmRegisterFinding {
+            register: f.register.clone(),
+            idle_value: f.idle_value,
+            verdict: f.verdict.as_str().to_string(),
+            unrecoverable_trap: f.is_finding(),
+        })
+        .collect();
+
+    Ok(Json(Btor2CheckFsmResponse {
+        fsm_registers_checked: findings.len(),
+        traps_found,
+        registers,
+    }))
+}
+
 // --- SV-direct verbs: lift SV (sv2v + Yosys) then decide, in one call. Surface peers
 // of the CLI `sv verify` / `verify-liveness` / `verify-recoverability`; they return
 // the same `Btor2Verify*Response` shapes as the BTOR2-direct verbs. The lift needs
@@ -4114,6 +4151,38 @@ members = ["x"]
         let err = btor2_verify_recoverability_handler(Json(request))
             .await
             .expect_err("malformed target must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    // The auto-scan discovers `st` (init 0), derives idle=0, and reports the absorbing
+    // trap as an unrecoverable finding — no user input.
+    #[tokio::test]
+    async fn btor2_check_fsm_handler_reports_the_trap() {
+        let request = Btor2CheckFsmRequest {
+            content: LIVENESS_STALLER.to_string(),
+            max_width: crate::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH,
+        };
+        let Json(out) = btor2_check_fsm_handler(Json(request))
+            .await
+            .expect("check-fsm runs");
+        assert_eq!(out.fsm_registers_checked, 1, "response: {out:?}");
+        assert_eq!(out.traps_found, 1);
+        let st = &out.registers[0];
+        assert_eq!(st.register, "st");
+        assert_eq!(st.idle_value, 0);
+        assert_eq!(st.verdict, "violated");
+        assert!(st.unrecoverable_trap);
+    }
+
+    #[tokio::test]
+    async fn btor2_check_fsm_handler_rejects_malformed_btor2() {
+        let request = Btor2CheckFsmRequest {
+            content: "this is not btor2".to_string(),
+            max_width: crate::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH,
+        };
+        let err = btor2_check_fsm_handler(Json(request))
+            .await
+            .expect_err("malformed BTOR2 must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 

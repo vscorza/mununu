@@ -4650,7 +4650,7 @@ pub(crate) fn apply_vcd_trace_seeding(
 ///
 /// Returns `None` for any non-constant NID (operations on other
 /// signals, references to inputs, etc.).
-fn resolve_btor2_constant(file: &Btor2File, nid: Nid) -> Option<u64> {
+pub(crate) fn resolve_btor2_constant(file: &Btor2File, nid: Nid) -> Option<u64> {
     for line in &file.lines {
         if line.nid != nid {
             continue;
