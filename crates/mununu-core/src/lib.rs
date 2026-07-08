@@ -22,6 +22,7 @@ pub mod ltl;
 pub mod mu_calculus;
 pub mod mununu_annotations;
 pub mod persistence;
+pub mod verdict;
 pub mod verify;
 
 #[cfg(any(test, feature = "test_support"))]

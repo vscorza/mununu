@@ -56,19 +56,11 @@ pub enum ReachVerdict {
     Contradiction,
 }
 
-impl ReachVerdict {
-    /// Stable lowercase string form — the single source of truth for the verdict
-    /// label across the CLI (`mununu btor2 verify`) and the API
-    /// (`POST /api/v1/btor2/verify`), so the two surfaces never drift.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ReachVerdict::Reachable => "reachable",
-            ReachVerdict::Unreachable => "unreachable",
-            ReachVerdict::Unknown => "unknown",
-            ReachVerdict::Contradiction => "contradiction",
-        }
-    }
-}
+// The surface verdict label comes from the canonical
+// [`crate::verdict::PropertyVerdict`] (`From<ReachVerdict>`), not a per-enum string,
+// so `btor2 verify` reports the same `holds`/`violated`/`unknown` vocabulary as every
+// other verify surface. The reachability *detail* stays in `reachable_by` /
+// `unreachable_by` + the `Contradiction` alarm.
 
 /// The portfolio outcome: the merged verdict plus which engines reached each
 /// definite conclusion (empty lists ⇒ that side was undecided by all).

@@ -2068,12 +2068,13 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
 /// `mununu btor2 verify-liveness` — decide the response-liveness property
 /// `AG(request → AF grant)` via the l2s reduction + the portfolio, printing the
 /// verdict as JSON. Surface peer of the API `POST /api/v1/btor2/verify-liveness`;
-/// both share the verdict labels via
-/// [`mununu_core::adapter::liveness_rescue::liveness_verdict_str`].
+/// both share the canonical verdict label via
+/// [`mununu_core::verdict::PropertyVerdict`].
 fn btor2_verify_liveness(args: Btor2VerifyLivenessArgs) -> Result<(), String> {
     use mununu_core::adapter::liveness_rescue::{
-        liveness_verdict_str, parse_response_atom, response_liveness_rescue_atoms,
+        parse_response_atom, response_liveness_rescue_atoms,
     };
+    use mununu_core::verdict::PropertyVerdict;
 
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
@@ -2091,7 +2092,7 @@ fn btor2_verify_liveness(args: Btor2VerifyLivenessArgs) -> Result<(), String> {
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "property": format!("AG(({}) -> AF ({}))", args.request, args.grant),
-        "verdict": liveness_verdict_str(verdict),
+        "verdict": PropertyVerdict::from(verdict).as_str(),
         "decided_by": outcome.reachable_by.iter().chain(outcome.unreachable_by.iter())
             .collect::<Vec<_>>(),
     });
@@ -2103,11 +2104,13 @@ fn btor2_verify_liveness(args: Btor2VerifyLivenessArgs) -> Result<(), String> {
 }
 
 /// `mununu btor2 verify` — decide `bad`-reachability with the multi-engine safety
-/// portfolio and print the merged verdict + per-engine breakdown as JSON. Surface
-/// peer of the API `POST /api/v1/btor2/verify`; both share the verdict labels via
-/// [`mununu_core::adapter::reach_portfolio::ReachVerdict::as_str`].
+/// portfolio and print the canonical property verdict (`holds` = `bad` unreachable,
+/// `violated` = reachable, `unknown` = undecided) + the per-engine reachability
+/// breakdown as JSON. Surface peer of the API `POST /api/v1/btor2/verify`; both share
+/// the verdict label via [`mununu_core::verdict::PropertyVerdict`].
 fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
     use mununu_core::adapter::reach_portfolio::decide_reach_portfolio_parallel;
+    use mununu_core::verdict::PropertyVerdict;
 
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
@@ -2120,7 +2123,7 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
 
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
-        "verdict": outcome.verdict.as_str(),
+        "verdict": PropertyVerdict::from(outcome.verdict).as_str(),
         "reachable_by": outcome.reachable_by,
         "unreachable_by": outcome.unreachable_by,
         "contradiction": outcome.verdict
