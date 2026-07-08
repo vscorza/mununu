@@ -263,14 +263,16 @@ enum Btor2Command {
     /// use `btor2 cegar … --must-edge-inference smt-hyper-must` for wider designs).
     /// `--target` is a single register-comparison atom (`"state_q == 3"`).
     VerifyRecoverability(Btor2VerifyRecoverabilityArgs),
-    /// Auto-scan every FSM-like state register for an unrecoverable trap — no input.
+    /// Auto-scan every FSM-like state register for a reachable illegal encoding — no input.
     ///
-    /// For each narrow (≤ `--max-width` bit) state register, derive its idle/reset
-    /// state as the register's init value and check recoverability `AG EF (reg ==
-    /// idle)` with reset left free. A `violated` register is an **unrecoverable trap**
-    /// — a reachable state the FSM can never get back to idle from, even with reset (a
-    /// bug SVA can't state and can't detect). Intended reset-dependence still `holds`
-    /// (reset is free). Prints one line per register; exits non-zero on any trap.
+    /// For each narrow (≤ `--max-width` bit) state register, derive its legal encodings
+    /// from the design (the constants its own logic compares it against, plus its reset
+    /// value) and check — from the real reset state — whether any value **outside** that
+    /// set is reachable. A `violated` register has a reachable **illegal encoding**: some
+    /// input drives the FSM past its enum (an incomplete `case`, a missing `default`), an
+    /// unambiguous bug. A `holds` register provably stays within its encoding. Decided by
+    /// the word-level reachability portfolio (scales past the exact engine). Prints one
+    /// line per register; exits non-zero on any reachable illegal encoding.
     CheckFsm(Btor2CheckFsmArgs),
 }
 
@@ -2304,28 +2306,28 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
 /// traps (no user input) and print the per-register recoverability result as JSON.
 /// Exits non-zero on any trap (via `--fail-on`).
 fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
-    use mununu_core::adapter::fsm_scan::fsm_recoverability_scan;
+    use mununu_core::adapter::fsm_scan::fsm_encoding_scan;
     use mununu_core::verdict::PropertyVerdict;
 
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
-    let findings = fsm_recoverability_scan(&content, args.max_width)?;
+    let findings = fsm_encoding_scan(&content, args.max_width)?;
 
     let registers: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
             serde_json::json!({
                 "register": f.register,
-                "idle_value": f.idle_value,
+                "legal_encodings": f.legal_encodings,
                 "verdict": f.verdict.as_str(),
-                "unrecoverable_trap": f.is_finding(),
+                "illegal_encoding_reachable": f.is_finding(),
             })
         })
         .collect();
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "fsm_registers_checked": findings.len(),
-        "traps_found": findings.iter().filter(|f| f.is_finding()).count(),
+        "illegal_encodings_found": findings.iter().filter(|f| f.is_finding()).count(),
         "registers": registers,
     });
     print_json_summary(&summary)?;

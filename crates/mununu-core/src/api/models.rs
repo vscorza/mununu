@@ -963,11 +963,11 @@ pub struct Btor2VerifyRecoverabilityResponse {
     pub property: String,
 }
 
-/// Request for the auto FSM-recoverability scan
+/// Request for the auto FSM illegal-encoding scan
 /// (`POST /api/v1/btor2/check-fsm`). Mirrors the CLI `mununu btor2 check-fsm`:
-/// auto-discovers the FSM-like state registers and decides recoverability of each to
-/// its idle/reset value with **no user input** (idle derived from the register's init
-/// or reset-mux constant).
+/// auto-discovers the FSM-like state registers and checks, from the reset state,
+/// whether any illegal encoding (a value outside the register's legal set) is
+/// reachable — with **no user input** (the legal set is derived from the design).
 #[derive(Debug, Deserialize)]
 pub struct Btor2CheckFsmRequest {
     /// BTOR2 source content.
@@ -981,18 +981,18 @@ fn default_fsm_max_width() -> u32 {
     crate::adapter::fsm_scan::DEFAULT_FSM_MAX_WIDTH
 }
 
-/// One state register's recoverability result in a [`Btor2CheckFsmResponse`].
+/// One state register's illegal-encoding result in a [`Btor2CheckFsmResponse`].
 #[derive(Debug, Serialize)]
 pub struct FsmRegisterFinding {
     /// The state register's symbol.
     pub register: String,
-    /// The idle/reset value recoverability targets.
-    pub idle_value: u64,
-    /// Canonical verdict — `"holds"` | `"violated"` (an unrecoverable trap) |
-    /// `"unknown"` (over the exact engine's cap).
+    /// The legal encodings the register's own logic recognizes (sorted).
+    pub legal_encodings: Vec<u64>,
+    /// Canonical verdict — `"holds"` (stays within its encoding) | `"violated"` (an
+    /// illegal encoding is reachable) | `"unknown"` (the portfolio could not decide).
     pub verdict: String,
-    /// `true` when the register is an unrecoverable trap (a finding).
-    pub unrecoverable_trap: bool,
+    /// `true` when an illegal encoding is reachable (a finding).
+    pub illegal_encoding_reachable: bool,
 }
 
 /// Response for `POST /api/v1/btor2/check-fsm`.
@@ -1000,8 +1000,8 @@ pub struct FsmRegisterFinding {
 pub struct Btor2CheckFsmResponse {
     /// Number of FSM-like state registers scanned.
     pub fsm_registers_checked: usize,
-    /// Number of unrecoverable traps found (`verdict == "violated"`).
-    pub traps_found: usize,
+    /// Number of registers with a reachable illegal encoding (`verdict == "violated"`).
+    pub illegal_encodings_found: usize,
     /// Per-register results.
     pub registers: Vec<FsmRegisterFinding>,
 }

@@ -184,6 +184,71 @@ pub fn emit_ag_state_atom_monitor(
     Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
 }
 
+/// P1 — append a `bad` monitor for `AG (signal ∈ legal)`, the FSM-encoding-legality
+/// invariant. `signal` must resolve to a state register (value-alias / reset-mux
+/// aware). The emitted `bad` fires when `signal` holds a value **outside** `legal` (an
+/// illegal encoding): `bad = ⋀_{c ∈ legal} (signal != c)`. `legal` must be non-empty
+/// and is deduplicated by the caller; the final `and` node carries [`BAD_COND_SYMBOL`].
+pub fn emit_ag_state_in_set_monitor(
+    content: &str,
+    signal: &str,
+    legal: &[u64],
+    reset_pinned: bool,
+) -> Result<String, AdapterError> {
+    if legal.is_empty() {
+        return Err(err(
+            "adapter/btor2/bad_monitor: the state-in-set monitor needs a non-empty legal set"
+                .to_string(),
+        ));
+    }
+    let file = parser::parse(content).map_err(|mut e| {
+        e.message = format!("adapter/btor2/bad_monitor: {}", e.message);
+        e
+    })?;
+
+    let (sig_nid, sig_sort) = state_nid_and_sort(&file, signal, reset_pinned).ok_or_else(|| {
+        err(format!(
+            "adapter/btor2/bad_monitor: `{signal}` does not resolve to a state cell \
+             (the AG(state ∈ set) monitor requires a state register or a value-alias of one)"
+        ))
+    })?;
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut appended: Vec<String> = Vec::new();
+    let bool_sort = find_or_make_bool_sort(&file, &mut next_nid, &mut appended);
+
+    // neq_c = (signal != c) for each legal encoding c.
+    let mut terms: Vec<Nid> = Vec::with_capacity(legal.len());
+    for &c in legal {
+        let const_nid = next_nid;
+        next_nid += 1;
+        appended.push(format!("{const_nid} constd {sig_sort} {c}"));
+        let neq_nid = next_nid;
+        next_nid += 1;
+        appended.push(format!("{neq_nid} neq {bool_sort} {sig_nid} {const_nid}"));
+        terms.push(neq_nid);
+    }
+
+    // illegal = ⋀ terms; fold with `and`, naming the final node so it can be observed.
+    let mut acc = terms[0];
+    let last = terms.len() - 1;
+    for (i, &t) in terms.iter().enumerate().skip(1) {
+        let and_nid = next_nid;
+        next_nid += 1;
+        let sym = if i == last {
+            format!(" {BAD_COND_SYMBOL}")
+        } else {
+            String::new()
+        };
+        appended.push(format!("{and_nid} and {bool_sort} {acc} {t}{sym}"));
+        acc = and_nid;
+    }
+
+    let bad_line = next_nid;
+    appended.push(format!("{bad_line} bad {acc}"));
+    Ok(format!("{}\n{}\n", content.trim_end(), appended.join("\n")))
+}
+
 /// H.O.1b — append a `bad` monitor for `ante |=> cons` (= `AG (ante → AX cons)`).
 ///
 /// `cons` must resolve to a state register; `ante` may be a state register OR a
