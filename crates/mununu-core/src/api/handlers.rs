@@ -645,7 +645,9 @@ pub async fn btor2_verify_handler(
 
     let outcome = decide_reach_portfolio_parallel(&file);
     Ok(Json(Btor2VerifyResponse {
-        verdict: outcome.verdict.as_str().to_string(),
+        verdict: crate::verdict::PropertyVerdict::from(outcome.verdict)
+            .as_str()
+            .to_string(),
         reachable_by: outcome.reachable_by.iter().map(|s| s.to_string()).collect(),
         unreachable_by: outcome
             .unreachable_by
@@ -660,14 +662,12 @@ pub async fn btor2_verify_handler(
 /// (`POST /api/v1/btor2/verify-liveness`). Surface peer of the CLI
 /// `mununu btor2 verify-liveness`: reduces the property to a single
 /// `bad`-reachability query (Biere–Artho–Schuppan liveness-to-safety) the portfolio
-/// decides, returning `"holds"` / `"violated"` / `"inconclusive"`. A malformed atom
-/// or unparseable BTOR2 is a `BadRequest`.
+/// decides, returning the canonical `"holds"` / `"violated"` / `"unknown"` verdict.
+/// A malformed atom or unparseable BTOR2 is a `BadRequest`.
 pub async fn btor2_verify_liveness_handler(
     Json(request): Json<Btor2VerifyLivenessRequest>,
 ) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
-    use crate::adapter::liveness_rescue::{
-        liveness_verdict_str, parse_response_atom, response_liveness_rescue_atoms,
-    };
+    use crate::adapter::liveness_rescue::{parse_response_atom, response_liveness_rescue_atoms};
 
     let bad_req = |message: String| ApiError::BadRequest {
         message,
@@ -685,7 +685,9 @@ pub async fn btor2_verify_liveness_handler(
         })?;
 
     Ok(Json(Btor2VerifyLivenessResponse {
-        verdict: liveness_verdict_str(verdict).to_string(),
+        verdict: crate::verdict::PropertyVerdict::from(verdict)
+            .as_str()
+            .to_string(),
         property: format!("AG(({}) -> AF ({}))", request.request, request.grant),
         decided_by: outcome
             .reachable_by
@@ -3881,7 +3883,9 @@ members = ["x"]
         let Json(out) = btor2_verify_handler(Json(request))
             .await
             .expect("verify runs");
-        assert_eq!(out.verdict, "reachable", "outcome: {out:?}");
+        // Canonical verdict: `bad` reachable ⇒ the safety property is VIOLATED. The
+        // reachability detail (which engine found it) stays in `reachable_by`.
+        assert_eq!(out.verdict, "violated", "outcome: {out:?}");
         assert!(
             out.reachable_by.contains(&"exact".to_string()),
             "the exact engine should decide the small reachable counter: {out:?}"

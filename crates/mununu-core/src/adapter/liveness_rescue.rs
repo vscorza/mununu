@@ -282,16 +282,10 @@ pub fn parse_response_atom(s: &str) -> Result<Atom, String> {
     }
 }
 
-/// Stable lowercase label for a [`LivenessVerdict`] — the single source of truth
-/// shared by the CLI (`mununu btor2 verify-liveness`) and the API
-/// (`POST /api/v1/btor2/verify-liveness`) so the two surfaces never drift.
-pub fn liveness_verdict_str(v: LivenessVerdict) -> &'static str {
-    match v {
-        LivenessVerdict::Holds => "holds",
-        LivenessVerdict::Violated => "violated",
-        LivenessVerdict::Inconclusive => "inconclusive",
-    }
-}
+// The surface verdict label comes from the canonical
+// [`crate::verdict::PropertyVerdict`] (`From<LivenessVerdict>`), so
+// `btor2 verify-liveness` reports the same `holds`/`violated`/`unknown` vocabulary as
+// every other verify surface (`Inconclusive` folds to `unknown`).
 
 #[cfg(test)]
 mod tests {
@@ -451,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_atom_rejects_relational_and_reports_labels() {
+    fn parse_response_atom_rejects_relational() {
         assert!(
             parse_response_atom("x == y").is_err(),
             "relational atom rejected"
@@ -460,11 +454,24 @@ mod tests {
             parse_response_atom("not an atom !!").is_err(),
             "garbage rejected"
         );
-        assert_eq!(liveness_verdict_str(LivenessVerdict::Holds), "holds");
-        assert_eq!(liveness_verdict_str(LivenessVerdict::Violated), "violated");
+    }
+
+    // The surface label comes from the canonical PropertyVerdict — Inconclusive folds
+    // to the shared `unknown`, not a bespoke `inconclusive`.
+    #[test]
+    fn liveness_verdict_maps_to_canonical_vocabulary() {
+        use crate::verdict::PropertyVerdict;
         assert_eq!(
-            liveness_verdict_str(LivenessVerdict::Inconclusive),
-            "inconclusive"
+            PropertyVerdict::from(LivenessVerdict::Holds).as_str(),
+            "holds"
+        );
+        assert_eq!(
+            PropertyVerdict::from(LivenessVerdict::Violated).as_str(),
+            "violated"
+        );
+        assert_eq!(
+            PropertyVerdict::from(LivenessVerdict::Inconclusive).as_str(),
+            "unknown"
         );
     }
 }

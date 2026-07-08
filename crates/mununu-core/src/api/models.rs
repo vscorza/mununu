@@ -896,8 +896,10 @@ pub struct Btor2VerifyRequest {
 /// [`crate::adapter::reach_portfolio::ReachOutcome`].
 #[derive(Debug, Serialize)]
 pub struct Btor2VerifyResponse {
-    /// Merged verdict: `"reachable"` | `"unreachable"` | `"unknown"` |
-    /// `"contradiction"` (via [`crate::adapter::reach_portfolio::ReachVerdict::as_str`]).
+    /// Canonical property verdict — `"holds"` (`bad` unreachable) | `"violated"`
+    /// (reachable) | `"unknown"` (undecided / contradiction), via
+    /// [`crate::verdict::PropertyVerdict`]. The reachability *detail* is in the
+    /// `reachable_by` / `unreachable_by` lists + the `contradiction` alarm.
     pub verdict: String,
     /// Engines that found `bad` reachable (a real counterexample).
     pub reachable_by: Vec<String>,
@@ -926,8 +928,8 @@ pub struct Btor2VerifyLivenessRequest {
 /// [`crate::adapter::liveness_rescue::LivenessVerdict`].
 #[derive(Debug, Serialize)]
 pub struct Btor2VerifyLivenessResponse {
-    /// The verdict: `"holds"` | `"violated"` | `"inconclusive"` (via
-    /// [`crate::adapter::liveness_rescue::liveness_verdict_str`]).
+    /// Canonical property verdict — `"holds"` | `"violated"` | `"unknown"`, via
+    /// [`crate::verdict::PropertyVerdict`].
     pub verdict: String,
     /// The reduced property, echoed for provenance:
     /// `AG((<request>) -> AF (<grant>))`.
