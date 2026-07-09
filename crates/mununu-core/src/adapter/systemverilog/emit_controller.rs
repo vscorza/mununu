@@ -15,6 +15,33 @@ pub struct SvPort {
     pub width: usize,            // 1 = single bit
 }
 
+/// Sanitize a controller state name into a legal SystemVerilog identifier. Composite
+/// product-state names (e.g. `Free|Idle|Idle`) carry `|` and other non-identifier
+/// characters that are illegal as `enum` literals — the emitted module would not
+/// compile. Map every non-`[A-Za-z0-9_]` character to `_`, prefix a leading digit, and
+/// never emit the empty string. (Two distinct states that differ only in punctuation
+/// could collide; product-state names use consistent separators, so this is safe in
+/// practice — a future revision can index-suffix on collision.)
+fn sv_ident(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        return "s_empty".to_string();
+    }
+    if s.starts_with(|c: char| c.is_ascii_digit()) {
+        s = format!("s_{s}");
+    }
+    s
+}
+
 /// Convert a synthesized controller CLTS to a SystemVerilog module string.
 ///
 /// If `ports` is provided, the module declaration preserves the original
@@ -69,10 +96,7 @@ pub fn controller_to_systemverilog_with_ports(
     let initials = controller.initial_states();
 
     for state_id in controller.states() {
-        let name = controller
-            .state_name(state_id)
-            .unwrap_or("unknown")
-            .to_string();
+        let name = sv_ident(controller.state_name(state_id).unwrap_or("unknown"));
         if initials.contains(&state_id) && initial_name.is_empty() {
             initial_name = name.clone();
         }
@@ -131,19 +155,13 @@ pub fn controller_to_systemverilog_with_ports(
 
     // Case branches from transitions
     for state_id in controller.states() {
-        let source_name = controller
-            .state_name(state_id)
-            .unwrap_or("unknown")
-            .to_string();
+        let source_name = sv_ident(controller.state_name(state_id).unwrap_or("unknown"));
 
         let outgoing: Vec<(String, String)> = controller
             .outgoing(state_id)
             .iter()
             .map(|t| {
-                let target = controller
-                    .state_name(t.target())
-                    .unwrap_or("unknown")
-                    .to_string();
+                let target = sv_ident(controller.state_name(t.target()).unwrap_or("unknown"));
                 // Collect transition label for comment
                 let label = t
                     .labels()
@@ -308,5 +326,25 @@ mod tests {
         assert!(sv.contains("input  logic [7:0] data"));
         assert!(sv.contains("output  logic ack"));
         assert!(sv.contains("endmodule"));
+    }
+
+    #[test]
+    fn sv_ident_sanitizes_composite_and_illegal_names() {
+        // Composite product-state names carry `|`, illegal as SV enum literals.
+        assert_eq!(
+            sv_ident("Free|Idle|Idle|Idle|Idle"),
+            "Free_Idle_Idle_Idle_Idle"
+        );
+        assert_eq!(sv_ident("Grant0|Holding"), "Grant0_Holding");
+        // Leading digit gets a prefix; empty → placeholder; already-legal is unchanged.
+        assert_eq!(sv_ident("3state"), "s_3state");
+        assert_eq!(sv_ident(""), "s_empty");
+        assert_eq!(sv_ident("valid_name_1"), "valid_name_1");
+        // Every character of a sanitized name is a legal identifier character.
+        assert!(
+            sv_ident("a|b.c-d")
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        );
     }
 }
