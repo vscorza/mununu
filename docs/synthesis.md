@@ -4,11 +4,14 @@
 
 ## ControllerMode
 
-Three modes control how synthesis extracts a strategy from the winning region:
+Several modes control how synthesis extracts a strategy from the winning region:
 
 - **Projection** (default). Keeps **all** transitions between winning states. Not a strategy — just the winning region as a sub-CLTS.
-- **Functional** (`--extract-strategy`). Picks **one** controllable transition per state — the one whose target has the lexicographically smallest signature (best mu-progress). Deterministic, correct for all formulas.
+- **Functional** (`--extract-strategy`). Picks **one** controllable transition per state — the one whose target has the lexicographically smallest signature (best mu-progress). Deterministic. **Sound for a single objective, but UNSOUND for conjunctive safety+liveness (GR(1)) objectives**: it can pick different controllable moves for different obligations at the same plant state, and the underlying model-checking evaluation over-approximates the winning region (conjuncts are intersected pointwise — "can force each" ≠ "can force both"). For reactive assume/guarantee specs, use **Gr1**. (Oracle-confirmed on `examples/tlsf/request_grant.tlsf`: the Functional/ProductGame controller violates `G(grant → X !grant)`.)
 - **Permissive**. Keeps **all** controllable transitions whose target signature is ≤ the source's. Maximally permissive supervisor (Ramadge-Wonham canonical). Nondeterministic, composable with other supervisors.
+- **Gr1** (`--controller-mode gr1`). **Sound** reactive controller synthesis from an LTL assume/guarantee spec, via the direct GR(1) fixpoint (Piterman–Pnueli–Sá'ar) over a monitor-augmented game where the safety guarantees **constrain the game arena** rather than being intersected as denotational conjuncts. So both the realizability verdict and the extracted strategy are sound for conjunctive safety+liveness. Needs the **structured** LTL spec (assumptions + guarantees + input/output signals), so it is driven from the adapter IR rather than the combined μ-calculus formula: CLI `context synth --controller-mode gr1 [--emit-sv FILE]`, API `POST /api/v1/synth/gr1`, UI `synthesizeGr1`. Currently supports TLSF sources and the fragment {invariant safety, transition safety `G(pre → X post)`, input fairness `GF p`, response `G(trig → F resp)`}; ≥2 system guarantees give a sound verdict but no emitted controller yet (multi-guarantee strategy memory is future work).
+
+> Source of truth: [`ControllerMode`](../crates/mununu-core/src/context/mod.rs) · GR(1): [`synthesise_gr1`](../crates/mununu-core/src/mu_calculus/gr1_build.rs), [`gr1_win`](../crates/mununu-core/src/mu_calculus/gr1.rs), [`synthesise_gr1_from_ir`](../crates/mununu-core/src/adapter/gr1_synth.rs), [`gr1_synthesize_handler`](../crates/mununu-core/src/api/handlers.rs) — surface: CLI+API+UI
 
 ## Signatures
 
