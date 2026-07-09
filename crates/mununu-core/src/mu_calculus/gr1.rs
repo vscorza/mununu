@@ -339,6 +339,123 @@ pub fn gr1_strategy_single(
     strat
 }
 
+/// Per-state rank of the `μY` fixpoint for one guarantee `g_j` (the same fixpoint
+/// `gr1_win` iterates), given the outer winning region `z`. `rank[s] = Some(k)`
+/// means `s` entered `Y_j` at iteration `k` — descending it makes progress toward
+/// reaching `g_j` **or** toward an environment-unfairness region (the `νX` wait).
+/// Unlike [`gr1_reach_ranks`], this leverages the assumptions, so states from
+/// which Eve can only win *because the environment must eventually cooperate* get
+/// a finite rank.
+pub fn gr1_mu_y_ranks(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    safe: &StateSet,
+    g_j: &StateSet,
+    z: &StateSet,
+    env_fair: &[StateSet],
+) -> Vec<Option<usize>> {
+    let n = clts.state_count();
+    let cpre_z = cpre(clts, safe, z);
+    let mut g_and_cprez = g_j.clone();
+    g_and_cprez &= &cpre_z;
+    let mut rank = vec![None; n];
+    let mut y = empty(n);
+    let mut k = 0usize;
+    loop {
+        let cpre_y = cpre(clts, safe, &y);
+        let mut base = g_and_cprez.clone();
+        base |= &cpre_y;
+        let disj = if env_fair.is_empty() {
+            base.clone()
+        } else {
+            let mut d = empty(n);
+            for a_i in env_fair {
+                d |= &gr1_nu_x(clts, safe, &base, a_i);
+            }
+            d
+        };
+        let mut y_next = y.clone();
+        y_next |= &disj;
+        let mut added = false;
+        for i in 0..n {
+            if y_next[i] && !y[i] {
+                rank[i] = Some(k);
+                added = true;
+            }
+        }
+        if !added {
+            return rank;
+        }
+        y = y_next;
+        k += 1;
+    }
+}
+
+/// A memoryful GR(1) controller strategy for **multiple** system guarantees
+/// (generalized Büchi). Memory is the guarantee index (mode) `j ∈ 0..m`: the
+/// controller pursues `g_j`, and advances to `(j+1) mod m` once `g_j` is reached
+/// — round-robin, so every guarantee is served infinitely often.
+#[derive(Debug)]
+pub struct Gr1MultiStrategy {
+    /// `(game_state, mode) → (chosen controllable target, next mode)` for Eve
+    /// (controllable) states in the winning region.
+    pub moves: std::collections::HashMap<(usize, usize), (usize, usize)>,
+    /// Number of modes (= number of guarantees, ≥ 1).
+    pub n_modes: usize,
+}
+
+/// Extract the memoryful strategy. In mode `j` at state `s`: the mode advances to
+/// `(j+1) mod m` iff `s ∈ g_j` (guarantee `j` reached); the controllable move then
+/// descends the μY-rank of the (possibly advanced) mode, staying in `z`.
+pub fn gr1_strategy_multi(
+    clts: &Clts<DefaultStateIdx, DefaultLabelIdx>,
+    safe: &StateSet,
+    z: &StateSet,
+    sys_fair: &[StateSet],
+    env_fair: &[StateSet],
+) -> Gr1MultiStrategy {
+    let m = sys_fair.len().max(1);
+    let ranks: Vec<Vec<Option<usize>>> = sys_fair
+        .iter()
+        .map(|g| gr1_mu_y_ranks(clts, safe, g, z, env_fair))
+        .collect();
+    let big = usize::MAX;
+    let mut moves = std::collections::HashMap::new();
+    for s in clts.states() {
+        let si = s.index();
+        if !z[si] {
+            continue;
+        }
+        let outs = clts.outgoing(s);
+        if !outs.iter().any(|t| t.is_controllable(clts)) {
+            continue; // Adam state — env chooses; memory advance handled at emit
+        }
+        for mode in 0..m {
+            // Pursue g_{mode}: pick the controllable move descending mode's μY-rank.
+            let mut best: Option<(usize, usize)> = None;
+            for t in outs.iter().filter(|t| t.is_controllable(clts)) {
+                let ti = t.target().index();
+                if !z[ti] {
+                    continue;
+                }
+                let tr = ranks[mode][ti].unwrap_or(big);
+                if best.is_none_or(|(br, _)| tr < br) {
+                    best = Some((tr, ti));
+                }
+            }
+            if let Some((_, ti)) = best {
+                // Advance the mode iff the chosen target reaches guarantee `mode`.
+                let next_mode = if sys_fair[mode][ti] {
+                    (mode + 1) % m
+                } else {
+                    mode
+                };
+                moves.insert((si, mode), (ti, next_mode));
+            }
+        }
+    }
+    Gr1MultiStrategy { moves, n_modes: m }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +602,58 @@ mod tests {
         assert!(
             w[0] && w[1] && w[2] && w[3],
             "GF grant ∧ GF env realizable, got {w:?}"
+        );
+    }
+
+    #[test]
+    fn multi_guarantee_strategy_reaches_both_guarantees() {
+        // GF grant ∧ GF env — the memoryful strategy must round-robin so its
+        // (state, mode) product reaches BOTH guarantee sets from init.
+        let a = arena();
+        let n = a.state_count();
+        let all = full(n);
+        let g = set_of(n, &[3]); // grant
+        let e = set_of(n, &[0]); // env
+        let sys_fair = vec![g, e];
+        let z = gr1_win(&a, &all, &sys_fair, &[]);
+        assert!(z[0], "realizable");
+        let strat = gr1_strategy_multi(&a, &all, &z, &sys_fair, &[]);
+        // Simulate the (state, mode) product from (env=0, mode=0): Eve follows
+        // the strategy, Adam explores all successors; the mode advances on g_mode.
+        let m = strat.n_modes;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(0usize, 0usize)];
+        let (mut hit_grant, mut hit_env) = (false, false);
+        while let Some((s, mode)) = stack.pop() {
+            if !seen.insert((s, mode)) {
+                continue;
+            }
+            if s == 3 {
+                hit_grant = true;
+            }
+            if s == 0 {
+                hit_env = true;
+            }
+            let next_mode = if sys_fair[mode][s] {
+                (mode + 1) % m
+            } else {
+                mode
+            };
+            let sid = crate::clts::StateId::<DefaultStateIdx>::from_index(s).unwrap();
+            let outs = a.outgoing(sid);
+            if outs.iter().any(|t| t.is_controllable(&a)) {
+                if let Some(&(t, nm)) = strat.moves.get(&(s, mode)) {
+                    stack.push((t, nm));
+                }
+            } else {
+                for t in outs {
+                    stack.push((t.target().index(), next_mode));
+                }
+            }
+        }
+        assert!(
+            hit_grant && hit_env,
+            "multi-guarantee strategy product must reach both grant and env"
         );
     }
 
