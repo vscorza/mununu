@@ -762,6 +762,13 @@ impl Context {
             let vars = clts.state_variables(state);
             builder.with_variables_for_state(new_state, vars.iter().map(|s| s.as_str()));
 
+            // Preserve structured signal valuations (e.g. `grant0 = 1`) onto the
+            // controller state — the RTL emitter derives Moore outputs from them, and
+            // counterexample/counterstrategy traces read them.
+            if let Some(valuation) = clts.state_valuation(state) {
+                builder.with_valuation_for_state(new_state, valuation.clone());
+            }
+
             mapping.insert(state, new_state);
         }
 

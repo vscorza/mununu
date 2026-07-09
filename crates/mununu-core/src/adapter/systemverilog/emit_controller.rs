@@ -347,4 +347,50 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_')
         );
     }
+
+    #[test]
+    fn synthesis_preserves_state_valuations_for_moore_outputs() {
+        // The RTL emitter derives Moore outputs from state valuations, so synthesis must
+        // carry them onto the controller state (context::mod copies `state_valuation`
+        // alongside `state_variables`). Without that copy the controller would have no
+        // valuations and the emitter could not tell which output is high in which state.
+        let ctxdsl = r#"
+        context t {
+            alphabet { label go; }
+            automata {
+                automaton M {
+                    controllable { label go; }
+                    states {
+                        state A initial { valuations { phase = 1; } };
+                        state B { valuations { phase = 2; } };
+                    }
+                    transitions {
+                        transition A -> B on label go;
+                        transition B -> A on label go;
+                    }
+                }
+            }
+            mu_formulas { formula safe { over M; body = nu X. ([] X); } }
+            controllers { controller c { source M; satisfying safe; } }
+        }
+        "#;
+        let doc = crate::context_dsl::parse(ctxdsl).unwrap();
+        let realized = crate::context_dsl::realize_context(&doc, &[]).unwrap();
+        let formula = realized.formulas.get("safe").unwrap();
+        let env = realized.environment_for("M");
+        let synth = realized
+            .context
+            .synthesise_controller("M", &formula.formula, &env, None)
+            .unwrap();
+        assert!(synth.realizable);
+        let ctrl = &synth.controller;
+        let a = ctrl
+            .states()
+            .find(|&s| ctrl.state_name(s) == Some("A"))
+            .expect("controller has state A");
+        let val = ctrl
+            .state_valuation(a)
+            .expect("state A's valuation was preserved onto the controller");
+        assert_eq!(val.get("phase"), Some(&"1".to_string()));
+    }
 }
