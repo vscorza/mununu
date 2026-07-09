@@ -346,6 +346,44 @@ pub async fn context_synthesize_handler(
     }))
 }
 
+/// Sound GR(1) controller synthesis (`POST /api/v1/synth/gr1`). Translates the
+/// source to the adapter IR, runs the sound GR(1) synthesizer on the structured
+/// LTL spec, and returns the realizability verdict plus (when realizable) the
+/// controller SystemVerilog. See `crate::mu_calculus::gr1_build`.
+pub async fn gr1_synthesize_handler(
+    Json(request): Json<Gr1SynthesizeRequest>,
+) -> ApiResult<Json<Gr1SynthesizeResponse>> {
+    let adapter = request.adapter.as_deref().unwrap_or("tlsf");
+    if adapter != "tlsf" {
+        return Err(ApiError::BadRequest {
+            message: format!("GR(1) synthesis currently supports adapter 'tlsf', got '{adapter}'"),
+            details: None,
+        });
+    }
+    let ir = crate::adapter::tlsf::translate_to_ir(
+        &request.context.content,
+        &crate::adapter::AdapterOptions::default(),
+    )
+    .map_err(|e| ApiError::BadRequest {
+        message: format!("TLSF translation failed: {e}"),
+        details: None,
+    })?;
+    let module = request.module.as_deref().unwrap_or("gr1_controller");
+    let synth = crate::adapter::gr1_synth::synthesise_gr1_from_ir(&ir, module).map_err(|e| {
+        ApiError::BadRequest {
+            message: e,
+            details: None,
+        }
+    })?;
+    Ok(Json(Gr1SynthesizeResponse {
+        realizable: synth.realizable,
+        controller_sv: synth.controller_sv,
+        game_states: synth.n_game_states,
+        monitor_bits: synth.n_monitor_bits,
+        notes: synth.notes,
+    }))
+}
+
 /// Import an external format (XState, SystemVerilog, TLSF, AIGER, Promela) into CTXDSL.
 pub async fn context_import_handler(
     Json(request): Json<ContextImportRequest>,
@@ -3198,6 +3236,27 @@ mod contract_handler_tests {
         };
         let Json(verdict) = contract_validate_handler(Json(set)).await.unwrap();
         assert!(matches!(verdict, DischargeVerdict::Circular { .. }));
+    }
+
+    #[tokio::test]
+    async fn gr1_synthesize_handler_request_grant_realizable() {
+        let req = Gr1SynthesizeRequest {
+            context: FileContent {
+                name: "rg.tlsf".to_string(),
+                content: "INFO { TITLE: \"rg\"; DESCRIPTION: \"rg\"; SEMANTICS: Mealy; \
+                          TARGET: Mealy; }\nMAIN { INPUTS { req; } OUTPUTS { grant; } \
+                          ASSUMPTIONS { G F req; } GUARANTEES { G (req -> F grant); \
+                          G (grant -> X !grant); } }"
+                    .to_string(),
+            },
+            adapter: None,
+            module: None,
+        };
+        let Json(resp) = gr1_synthesize_handler(Json(req)).await.unwrap();
+        assert!(resp.realizable, "request_grant realizable via the API");
+        assert_eq!(resp.monitor_bits, 2);
+        let sv = resp.controller_sv.expect("controller SV emitted");
+        assert!(sv.contains("module gr1_controller"));
     }
 }
 

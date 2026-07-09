@@ -64,6 +64,16 @@ impl FormatAdapter for TlsfAdapter {
     }
 }
 
+/// Translate a TLSF source directly to the [`AdapterIR`] — the structured spec
+/// (signals with `Input`/`Output` kinds + properties carrying LTL formulas and
+/// assume/guarantee roles). Unlike [`TlsfAdapter::translate`], which returns
+/// emitted CTXDSL, this exposes the IR for the GR(1) synthesis path, which needs
+/// the structured LTL assumptions/guarantees rather than the combined formula.
+pub fn translate_to_ir(content: &str, options: &AdapterOptions) -> Result<AdapterIR, AdapterError> {
+    let spec = parser::parse(content)?;
+    to_ir(&spec, options)
+}
+
 /// Convert a parsed TLSF spec to AdapterIR.
 fn to_ir(spec: &parser::TlsfSpec, options: &AdapterOptions) -> Result<AdapterIR, AdapterError> {
     let context_name = options

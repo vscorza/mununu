@@ -1742,7 +1742,9 @@ struct ContextSynthesizeArgs {
     /// Template argument bindings (KEY=VALUE). Repeatable.
     #[arg(long = "template-arg", value_name = "KEY=VALUE", requires = "template")]
     template_args: Vec<String>,
-    /// Automaton over which the controller should be synthesised.
+    /// Automaton over which the controller should be synthesised. (Ignored by
+    /// `--controller-mode gr1`, which synthesises directly from the LTL spec —
+    /// pass any placeholder there.)
     #[arg(long = "automaton", value_name = "NAME")]
     automaton: String,
     /// Disable guard partitions during evaluation.
@@ -1780,6 +1782,10 @@ struct ContextSynthesizeArgs {
     /// Path where a controller-only DSL snapshot should be written.
     #[arg(long = "emit-dsl", value_name = "FILE")]
     emit_dsl: Option<PathBuf>,
+    /// Path where the synthesized GR(1) controller SystemVerilog should be
+    /// written (only meaningful with `--controller-mode gr1`).
+    #[arg(long = "emit-sv", value_name = "FILE")]
+    emit_sv: Option<PathBuf>,
     /// Path where diagnostics should be exported as a DSL sidecar.
     #[arg(long = "dump-diagnostics", value_name = "FILE")]
     dump_diagnostics: Option<PathBuf>,
@@ -5747,7 +5753,65 @@ fn context_eval(args: ContextEvalArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// GR(1) controller synthesis path (`--controller-mode gr1`): read the source,
+/// translate it to the adapter IR, run the sound GR(1) synthesizer, print the
+/// verdict, and optionally write the controller SystemVerilog (`--emit-sv`).
+/// Currently supports TLSF sources (LTL assume/guarantee specs).
+fn context_synthesize_gr1(args: &ContextSynthesizeArgs) -> Result<(), String> {
+    let source = std::fs::read_to_string(&args.context)
+        .map_err(|e| format!("failed to read '{}': {e}", args.context.display()))?;
+    if let Some(a) = args.adapter.as_deref()
+        && a != "tlsf"
+    {
+        return Err(format!(
+            "--controller-mode gr1 currently supports --adapter tlsf, got '{a}'"
+        ));
+    }
+    let ir = mununu_core::adapter::tlsf::translate_to_ir(
+        &source,
+        &mununu_core::adapter::AdapterOptions::default(),
+    )
+    .map_err(|e| format!("TLSF translation failed: {e}"))?;
+
+    let synth = mununu_core::adapter::gr1_synth::synthesise_gr1_from_ir(&ir, "gr1_controller")?;
+
+    println!("GR(1) controller synthesis ({}):", args.context.display());
+    println!(
+        "  Realizable: {}",
+        if synth.realizable { "yes" } else { "no" }
+    );
+    println!(
+        "  Game: {} states, {} monitor bit(s)",
+        synth.n_game_states, synth.n_monitor_bits
+    );
+    for note in &synth.notes {
+        println!("  note: {note}");
+    }
+    if let Some(sv) = &synth.controller_sv {
+        if let Some(path) = &args.emit_sv {
+            std::fs::write(path, sv)
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+            println!("  Controller SystemVerilog written to {}", path.display());
+        } else {
+            println!(
+                "  Controller synthesized ({} lines of SV); pass --emit-sv <FILE> to write it",
+                sv.lines().count()
+            );
+        }
+    } else if synth.realizable {
+        println!("  (no controller emitted — see notes)");
+    }
+    Ok(())
+}
+
 fn context_synthesize(args: ContextSynthesizeArgs) -> Result<(), String> {
+    // GR(1) synthesis takes a different path: it needs the STRUCTURED LTL spec
+    // (assumptions + guarantees + signal directions) from the adapter IR, not
+    // the combined μ-calculus formula the standard path realizes.
+    let cli_mode = parse_cli_controller_mode(&args.controller_mode, args.extract_strategy)?;
+    if cli_mode == mununu_core::context::ControllerMode::Gr1 {
+        return context_synthesize_gr1(&args);
+    }
     let preprocessor = validate_preprocessor(args.preprocessor.as_deref())?;
     let PreparedEvalContext {
         realized,
