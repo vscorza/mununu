@@ -48,6 +48,8 @@ pub enum ContextError {
     },
     #[error("μ-calculus evaluation failed: {0}")]
     MuEvaluation(#[from] EvaluationError),
+    #[error("unsupported synthesis request: {0}")]
+    Unsupported(String),
 }
 
 /// Cache for incremental DSL loads.
@@ -572,6 +574,18 @@ impl Context {
                 options.mode
             };
 
+        // GR(1) synthesis needs the STRUCTURED LTL spec (assumptions + guarantees
+        // + signal directions), not the combined μ-calculus formula this path
+        // receives. Callers must route to the dedicated GR(1) entry point
+        // (`crate::mu_calculus::gr1_build::synthesise_gr1`), which the CLI/API do.
+        if effective_mode == ControllerMode::Gr1 {
+            return Err(ContextError::Unsupported(
+                "ControllerMode::Gr1 requires the structured LTL spec; use the GR(1) \
+                 synthesis path (synthesise_gr1), not synthesise_controller"
+                    .to_string(),
+            ));
+        }
+
         // When strategy extraction is requested, use witness-guided evaluation
         let (keep_bits, witness_map) = if effective_mode != ControllerMode::Projection {
             let (bits, wm) =
@@ -851,6 +865,10 @@ impl Context {
                 ControllerMode::ProductGame | ControllerMode::ParityGame => {
                     // Both modes are handled by their early-return branches above.
                     unreachable!("ProductGame/ParityGame return before reaching this loop");
+                }
+                ControllerMode::Gr1 => {
+                    // Rejected at function entry (needs the structured LTL spec).
+                    unreachable!("Gr1 returns an error before reaching this loop");
                 }
             }
         }
@@ -1354,6 +1372,16 @@ pub enum ControllerMode {
     /// Emerson-Jutla. See `crate::mu_calculus::parity_game` for the
     /// underlying construction and solver.
     ParityGame,
+    /// GR(1): sound reactive controller synthesis from an LTL assume/guarantee
+    /// spec via the direct Piterman-Pnueli-Sá'ar fixpoint over a
+    /// monitor-augmented game (`crate::mu_calculus::gr1` /
+    /// `crate::mu_calculus::gr1_build`). Unlike the signature-based modes this is
+    /// **sound for conjunctive safety+liveness (GR(1)) objectives** — the safety
+    /// guarantees constrain the game arena rather than being intersected as
+    /// denotational conjuncts. Requires the STRUCTURED LTL spec (assumptions +
+    /// guarantees + input/output signals), so it is driven from the adapter IR
+    /// rather than the combined μ-calculus formula; see the CLI/API GR(1) path.
+    Gr1,
 }
 
 impl ControllerMode {
@@ -1373,6 +1401,7 @@ impl ControllerMode {
             "signaturememory" => Ok(Self::SignatureMemory),
             "productgame" => Ok(Self::ProductGame),
             "paritygame" => Ok(Self::ParityGame),
+            "gr1" | "gr1game" => Ok(Self::Gr1),
             _ => Err(normalized),
         }
     }

@@ -50,6 +50,7 @@ fn create_router() -> Router {
             "/api/v1/context/synthesize",
             post(handlers::context_synthesize_handler),
         )
+        .route("/api/v1/synth/gr1", post(handlers::gr1_synthesize_handler))
         .route(
             "/api/v1/context/graphs",
             post(handlers::context_graphs_handler),

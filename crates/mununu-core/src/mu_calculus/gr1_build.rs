@@ -542,6 +542,85 @@ impl Gr1Game {
     }
 }
 
+/// Result of GR(1) controller synthesis from an LTL spec.
+pub struct Gr1Synthesis {
+    /// Whether the spec is realizable (init in the GR(1) winning region).
+    pub realizable: bool,
+    /// The synthesized controller as a SystemVerilog Mealy module — present iff
+    /// realizable and a strategy could be extracted.
+    pub controller_sv: Option<String>,
+    /// Number of monitor bits in the game state.
+    pub n_monitor_bits: usize,
+    /// Number of game states (env + ctrl + BAD).
+    pub n_game_states: usize,
+    /// Human-readable notes (e.g. unsupported multi-guarantee memory).
+    pub notes: Vec<String>,
+}
+
+/// Synthesize a sound GR(1) controller from an LTL spec: classify → build the
+/// monitor-augmented game → solve the Piterman fixpoint → extract a rank-descent
+/// strategy → emit SystemVerilog. Returns the realizability verdict and (when
+/// realizable) the controller RTL.
+///
+/// Strategy extraction currently covers **0 or 1** system guarantees (the common
+/// reactive-control shape). With ≥2 guarantees the realizability verdict is still
+/// sound (`gr1_win` handles generalized Büchi), but strategy emission is deferred
+/// to multi-guarantee memory — reported in `notes`.
+pub fn synthesise_gr1(
+    assumptions: &[LtlFormula],
+    guarantees: &[LtlFormula],
+    inputs: &[String],
+    outputs: &[String],
+    module: &str,
+) -> Result<Gr1Synthesis, String> {
+    use super::gr1::{StateSet, gr1_strategy_single, gr1_win};
+
+    let spec = Gr1Spec::classify(assumptions, guarantees, inputs, outputs)?;
+    let game = Gr1Game::build(&spec);
+    let z = gr1_win(&game.clts, &game.safe, &game.sys_fair, &game.env_fair);
+    let n_game_states = game.clts.state_count();
+    let n_monitor_bits = game.n_monitors;
+    let mut notes = Vec::new();
+
+    if !z[game.init] {
+        return Ok(Gr1Synthesis {
+            realizable: false,
+            controller_sv: None,
+            n_monitor_bits,
+            n_game_states,
+            notes,
+        });
+    }
+
+    let controller_sv = match game.sys_fair.len() {
+        0 => {
+            // Safety-only: every winning state is a goal — any safe move works.
+            let goal: StateSet = z.clone();
+            let strat = gr1_strategy_single(&game.clts, &z, &goal);
+            Some(game.emit_mealy_sv(module, &z, &strat))
+        }
+        1 => {
+            let strat = gr1_strategy_single(&game.clts, &z, &game.sys_fair[0]);
+            Some(game.emit_mealy_sv(module, &z, &strat))
+        }
+        k => {
+            notes.push(format!(
+                "{k} system guarantees: realizability is sound, but multi-guarantee \
+                 strategy memory is not yet implemented — no controller emitted"
+            ));
+            None
+        }
+    };
+
+    Ok(Gr1Synthesis {
+        realizable: true,
+        controller_sv,
+        n_monitor_bits,
+        n_game_states,
+        notes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +741,62 @@ mod tests {
             std::fs::write(&p, sv).unwrap();
             eprintln!("wrote emitted GR(1) controller to {p}");
         }
+    }
+
+    #[test]
+    fn synthesise_gr1_request_grant_realizable_with_controller() {
+        let assumptions = vec![LtlFormula::Recurrence(Box::new(pred("req")))];
+        let guarantees = vec![
+            LtlFormula::Response {
+                trigger: Box::new(pred("req")),
+                response: Box::new(pred("grant")),
+            },
+            LtlFormula::Always(Box::new(LtlFormula::Implies(
+                Box::new(pred("grant")),
+                Box::new(LtlFormula::Next(Box::new(LtlFormula::Not(Box::new(pred(
+                    "grant",
+                )))))),
+            ))),
+        ];
+        let r = synthesise_gr1(
+            &assumptions,
+            &guarantees,
+            &["req".into()],
+            &["grant".into()],
+            "gr1_ctrl",
+        )
+        .expect("request_grant classifies");
+        assert!(r.realizable, "request_grant is realizable");
+        let sv = r.controller_sv.expect("a controller was emitted");
+        assert!(sv.contains("module gr1_ctrl"));
+        assert!(sv.contains("grant_c = 1'b1"), "grants somewhere");
+        assert_eq!(r.n_monitor_bits, 2, "was_grant + pending");
+    }
+
+    #[test]
+    fn synthesise_gr1_unrealizable_reports_no_controller() {
+        // grant -> X !grant AND grant -> X grant is contradictory when req forces grant.
+        let assumptions = vec![LtlFormula::Recurrence(Box::new(pred("req")))];
+        let guarantees = vec![
+            LtlFormula::Response {
+                trigger: Box::new(pred("req")),
+                response: Box::new(pred("grant")),
+            },
+            LtlFormula::Always(Box::new(LtlFormula::Not(Box::new(pred("grant"))))), // G !grant
+        ];
+        let r = synthesise_gr1(
+            &assumptions,
+            &guarantees,
+            &["req".into()],
+            &["grant".into()],
+            "c",
+        )
+        .expect("classifies");
+        assert!(
+            !r.realizable,
+            "serve-every-request while never-grant is UNrealizable"
+        );
+        assert!(r.controller_sv.is_none());
     }
 
     #[test]

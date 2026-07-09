@@ -151,6 +151,38 @@ pub struct ContextSynthesizeResponse {
     pub counterstrategy: Option<CounterstrategyResult>,
 }
 
+/// Request for sound GR(1) controller synthesis from an LTL assume/guarantee
+/// spec (TLSF today). Unlike `/context/synthesize`, this runs the sound GR(1)
+/// pipeline (`ControllerMode::Gr1`) directly on the structured LTL spec.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Gr1SynthesizeRequest {
+    /// The source spec.
+    pub context: FileContent,
+    /// Adapter to interpret the source (defaults to `tlsf`).
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// Module name for the emitted controller (defaults to `gr1_controller`).
+    #[serde(default)]
+    pub module: Option<String>,
+}
+
+/// Response from GR(1) controller synthesis.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Gr1SynthesizeResponse {
+    /// Whether the spec is realizable (sound GR(1) verdict).
+    pub realizable: bool,
+    /// The synthesized controller as SystemVerilog, if realizable and a strategy
+    /// was extracted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_sv: Option<String>,
+    /// Number of game states (env + ctrl + BAD).
+    pub game_states: usize,
+    /// Number of monitor bits in the game state.
+    pub monitor_bits: usize,
+    /// Human-readable notes (e.g. unsupported multi-guarantee memory).
+    pub notes: Vec<String>,
+}
+
 /// Synthesis diagnostics (matches ControllerDiagnostics structure)
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct SynthesisDiagnostics {
