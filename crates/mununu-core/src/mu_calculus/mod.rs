@@ -7,6 +7,7 @@
 use crate::clts::{Clts, IdStorage, StateId, Transition};
 
 pub mod evaluator;
+pub mod gr1;
 pub mod invert;
 mod memo;
 pub mod nnf;

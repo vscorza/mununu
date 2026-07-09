@@ -334,27 +334,106 @@ fn expand_position(
             guard,
             target,
         } => {
-            let owner = modal_owner(*kind);
-            game.owners[pos_idx] = owner;
             let state_id = StateId::<DefaultStateIdx>::from_index(pos.state)
                 .expect("position state index fits storage");
-            for transition in clts.outgoing(state_id) {
-                if !transition_matches_guard(transition, guard, clts, state_id) {
-                    continue;
+            match guard.control {
+                Control::Controllable => {
+                    // Synthesis (Skolem) semantics — de Alfaro–Godefroid–Jagadeesan
+                    // LICS 2004, matching `evaluator::modal_trit_core`'s
+                    // `Control::Controllable` arm: `[ctrl=Controllable] φ` means
+                    //   (∀ uncontrollable/env move → φ) ∧ (∃ controllable move → φ).
+                    // The guard's `control` field selects the *operator*, not an
+                    // edge filter, so we range over BOTH controllabilities (only
+                    // the label / current-/next-state filters apply here) and
+                    // assign game ownership by the transition group: environment
+                    // moves are Adam's (∀), controllable moves are Eve's (∃).
+                    // `kind` (Box/Diamond) is subsumed by the controllability
+                    // structure, exactly as in the evaluator.
+                    //
+                    // In the turn-based plant each state is pure (all-env or
+                    // all-ctrl), so exactly one group is non-empty and the owner
+                    // is unambiguous.
+                    let mut env_targets: Vec<Position> = Vec::new();
+                    let mut ctrl_targets: Vec<Position> = Vec::new();
+                    for transition in clts.outgoing(state_id) {
+                        if !guard_matches_labels_and_vars(state_id, transition, guard, clts) {
+                            continue;
+                        }
+                        let next = Position {
+                            state: transition.target().index(),
+                            node: *target,
+                        };
+                        if transition.is_controllable(clts) {
+                            ctrl_targets.push(next);
+                        } else {
+                            env_targets.push(next);
+                        }
+                    }
+                    match (env_targets.is_empty(), ctrl_targets.is_empty()) {
+                        (true, true) => {
+                            // No matched moves: ∀env and ∃ctrl both vacuous → φ
+                            // holds here (Eve wins), matching the evaluator's
+                            // `if ctrl_seen { .. } else { true }` and the empty-Box
+                            // convention.
+                            set_terminal(game, pos_idx, true);
+                        }
+                        (false, true) => {
+                            // env-turn: ∀ environment move → Adam owns; the ∃ctrl
+                            // conjunct is vacuously true (no controllable move).
+                            game.owners[pos_idx] = Player::Adam;
+                            for next in env_targets {
+                                add_edge(game, formula, var_priority, pos_idx, next, queue);
+                            }
+                        }
+                        (true, false) => {
+                            // ctrl-turn: ∃ controllable move → Eve owns; the ∀env
+                            // conjunct is vacuously true (no environment move).
+                            game.owners[pos_idx] = Player::Eve;
+                            for next in ctrl_targets {
+                                add_edge(game, formula, var_priority, pos_idx, next, queue);
+                            }
+                        }
+                        (false, false) => {
+                            // Mixed-controllability state — not produced by the
+                            // turn-based plant. Sound fallback: treat every move
+                            // adversarially (Adam owns all), which UNDER-approximates
+                            // Eve's winning region (never claims a controller that
+                            // does not exist) at the cost of completeness. A precise
+                            // And-split (Adam chooses the ∀env vs ∃ctrl conjunct via
+                            // intermediate positions) is future work.
+                            game.owners[pos_idx] = Player::Adam;
+                            for next in env_targets.into_iter().chain(ctrl_targets) {
+                                add_edge(game, formula, var_priority, pos_idx, next, queue);
+                            }
+                        }
+                    }
                 }
-                let next = Position {
-                    state: transition.target().index(),
-                    node: *target,
-                };
-                add_edge(game, formula, var_priority, pos_idx, next, queue);
-            }
-            // If no outgoing transitions matched, the position has no
-            // successors. Box with no successors is vacuously
-            // satisfied (Eve wins); Diamond with no successors is
-            // unsatisfiable (Adam wins).
-            if game.edges[pos_idx].is_empty() {
-                let eve_wins = matches!(kind, ModalKind::Box);
-                set_terminal(game, pos_idx, eve_wins);
+                Control::All | Control::Environment => {
+                    // Model-checking modality (verifier/refuter by modal kind).
+                    // Unchanged: `Control::All` is the single-agent Kleene modal;
+                    // `Control::Environment` (rare; from inverted formulas) keeps
+                    // the existing behavior pending a dual synthesis treatment.
+                    let owner = modal_owner(*kind);
+                    game.owners[pos_idx] = owner;
+                    for transition in clts.outgoing(state_id) {
+                        if !transition_matches_guard(transition, guard, clts, state_id) {
+                            continue;
+                        }
+                        let next = Position {
+                            state: transition.target().index(),
+                            node: *target,
+                        };
+                        add_edge(game, formula, var_priority, pos_idx, next, queue);
+                    }
+                    // If no outgoing transitions matched, the position has no
+                    // successors. Box with no successors is vacuously
+                    // satisfied (Eve wins); Diamond with no successors is
+                    // unsatisfiable (Adam wins).
+                    if game.edges[pos_idx].is_empty() {
+                        let eve_wins = matches!(kind, ModalKind::Box);
+                        set_terminal(game, pos_idx, eve_wins);
+                    }
+                }
             }
         }
         Node::Mu { body, .. } | Node::Nu { body, .. } => {
