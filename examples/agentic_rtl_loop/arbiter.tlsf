@@ -1,0 +1,11 @@
+INFO { TITLE: "arbiter2"; DESCRIPTION: "2-client bus arbiter: mutual exclusion + no-starvation"; SEMANTICS: Mealy; TARGET: Mealy; }
+MAIN {
+  INPUTS { req_0; req_1; }
+  OUTPUTS { grant_0; grant_1; }
+  ASSUMPTIONS { G F req_0; G F req_1; }
+  GUARANTEES {
+    G (!(grant_0 && grant_1));   // mutual exclusion (safety)
+    G (req_0 -> F grant_0);      // no starvation, client 0 (liveness)
+    G (req_1 -> F grant_1);      // no starvation, client 1 (liveness)
+  }
+}
