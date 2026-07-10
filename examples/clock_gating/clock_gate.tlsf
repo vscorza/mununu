@@ -1,0 +1,12 @@
+INFO { TITLE: "clock_gate"; DESCRIPTION: "clock-gating interlock: never gate while active, honor sleep requests when idle"; SEMANTICS: Mealy; TARGET: Mealy; }
+MAIN {
+  INPUTS  { activity; sleep_req; }
+  OUTPUTS { gate; }
+  ASSUMPTIONS {
+    G F !activity;                        // the domain eventually goes idle
+  }
+  GUARANTEES {
+    G (!(gate && activity));              // INTERLOCK: never gate while the domain is active
+    G ((sleep_req && !activity) -> F gate); // honor a sleep request once the domain is idle
+  }
+}
