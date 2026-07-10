@@ -163,6 +163,45 @@ mod tests {
         assert!(e.is_err(), "a malformed target must be rejected pre-lift");
     }
 
+    // P2 industrial anchor — recoverability on REAL OpenTitan RTL. From every reachable
+    // state the AES cipher-control FSM can return to CIPHER_CTRL_IDLE (= 6'b001001 = 9):
+    // `AG EF (aes_cipher_ctrl_cs == 9)`, the branching νμ property SVA cannot express,
+    // decides HOLDS end-to-end through the SV lift + the recoverability verb. NOTE: the
+    // vendored design is the EXTRACTED control FSM (18 state bits — within the exact
+    // engine's ~40-bit cap, so the exact engine decides it); the OVER-CAP cube +
+    // smt-hyper-must scale path is proven separately by the wide-fixture differential
+    // tests in `crate::adapter::recoverability` (a 48-bit design where the exact engine
+    // abstains and the cube path decides both polarities).
+    #[test]
+    #[ignore = "requires sv2v + Yosys + z3 (mununu-sva docker image); run with --ignored"]
+    fn e2e_opentitan_aes_cipher_ctrl_recoverability_holds() {
+        use std::path::PathBuf;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/verify/dc_opentitan_aes_cipher_control_fsm/source");
+        let read = |n: &str| {
+            std::fs::read_to_string(dir.join(n)).unwrap_or_else(|e| panic!("read {n}: {e}"))
+        };
+        let lift = SvLift {
+            source: read("aes_cipher_control_fsm.sv"),
+            additional_sources: vec![
+                ("aes_pkg.sv".into(), read("aes_pkg.sv")),
+                ("aes_reg_pkg.sv".into(), read("aes_reg_pkg.sv")),
+                ("prim_util_pkg.sv".into(), read("prim_util_pkg.sv")),
+                ("prim_assert.sv".into(), read("prim_assert.sv")),
+            ],
+            top: Some("aes_cipher_control_fsm".into()),
+            use_sv2v: true,
+        };
+        let verdict = sv_verify_recoverability(&lift, "aes_cipher_ctrl_cs == 9")
+            .expect("recoverability decides on the AES cipher-control FSM");
+        assert_eq!(
+            verdict,
+            PropertyVerdict::Holds,
+            "AG EF idle must HOLD on the AES cipher-control FSM (every reachable state can \
+             return to CIPHER_CTRL_IDLE); got {verdict:?}"
+        );
+    }
+
     // The full lift → verdict path needs sv2v + Yosys; covered by the e2e suite in
     // the mununu-sva image, not make-ci.
 }
