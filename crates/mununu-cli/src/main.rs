@@ -2893,6 +2893,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         },
         rescue_bottom_safety: !args.no_rescue,
         rescue_bottom_liveness: !args.no_rescue,
+        rescue_bottom_recoverability: !args.no_rescue,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)

@@ -1348,6 +1348,12 @@ pub struct SvVerifyAutoRequest {
     /// on the l2s-able box-AF shape (diamond-EF recoverability stays on the νμ path).
     #[serde(default)]
     pub rescue_bottom_liveness: Option<bool>,
+    /// Recoverability-⊥ escalation (default `true`): a νμ recoverability property `AG EF
+    /// good` the cube leaves ⊥ is retried via the cube + `smt-hyper-must` νμ path. Set
+    /// `false` to report the cube's ⊥ unchanged. Only fires on the `AG EF (REG == VALUE)`
+    /// shape.
+    #[serde(default)]
+    pub rescue_bottom_recoverability: Option<bool>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.
