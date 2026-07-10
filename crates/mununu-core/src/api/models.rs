@@ -981,6 +981,11 @@ pub struct Btor2VerifyRecoverabilityRequest {
     pub content: String,
     /// The `good` atom to recover to (`"REG op VALUE"`).
     pub target: String,
+    /// Extra abstraction predicate(s) for the cube-path escalation, each
+    /// `"NAME:REGISTER=VALUE"` (P2 Slice 1). Used only when the exact engine abstains
+    /// (over the ~40-bit cone cap); the escalation is automatic even with none.
+    #[serde(default)]
+    pub predicates: Vec<String>,
 }
 
 /// Response for `POST /api/v1/btor2/verify-recoverability`.
@@ -1095,6 +1100,10 @@ pub struct SvVerifyRecoverabilityRequest {
     pub use_sv2v: bool,
     /// The `good` atom to recover to (`"REG op VALUE"`).
     pub target: String,
+    /// Extra abstraction predicate(s) for the cube-path escalation, each
+    /// `"NAME:REGISTER=VALUE"` (P2 Slice 1). Used only when the exact engine abstains.
+    #[serde(default)]
+    pub predicates: Vec<String>,
 }
 
 /// Request for `POST /api/v1/sv/check-fsm` — the SV lift fields plus the FSM width

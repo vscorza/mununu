@@ -17,13 +17,14 @@
 //! reset-dependent (see `docs/design/recoverability-vs-sva.md` §3.2). Reset-gating
 //! (as `sv verify-auto` offers) is a future option.
 
+use crate::adapter::btor2::kmts_lift::PredicateSpec;
 use crate::adapter::btor2::parser;
 use crate::adapter::btor2::predicate_expr::parse_predicate_expr;
 use crate::adapter::liveness_rescue::{
     Atom, LivenessVerdict, parse_response_atom, response_liveness_rescue_atoms,
 };
 use crate::adapter::reach_portfolio::{ReachOutcome, decide_reach_portfolio_parallel};
-use crate::adapter::recoverability::verify_recoverability;
+use crate::adapter::recoverability::verify_recoverability_with_predicates;
 use crate::adapter::yosys::{YosysOptions, sv_to_btor2};
 use crate::verdict::PropertyVerdict;
 
@@ -82,11 +83,22 @@ pub fn sv_verify_liveness(
 /// `sv verify-recoverability` — lift SV and decide `AG EF target`. The target atom is
 /// validated before the lift.
 pub fn sv_verify_recoverability(lift: &SvLift, target: &str) -> Result<PropertyVerdict, String> {
+    sv_verify_recoverability_with_predicates(lift, target, &[])
+}
+
+/// [`sv_verify_recoverability`] with optional extra abstraction predicates for the
+/// cube-path escalation (P2 Slice 1). The target atom is validated before the
+/// (toolchain-gated) lift; the extras only refine the cube if the exact engine abstains.
+pub fn sv_verify_recoverability_with_predicates(
+    lift: &SvLift,
+    target: &str,
+    extra_predicates: &[PredicateSpec],
+) -> Result<PropertyVerdict, String> {
     parse_predicate_expr(target).map_err(|e| {
         format!("recoverability target `{target}` is not a register-comparison atom: {e:?}")
     })?;
     let btor2 = lift.lift()?;
-    verify_recoverability(&btor2, target)
+    verify_recoverability_with_predicates(&btor2, target, extra_predicates)
 }
 
 /// `sv check-fsm` — lift SV and auto-scan every FSM-like state register for a reachable

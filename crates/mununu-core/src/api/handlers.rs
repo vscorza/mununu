@@ -745,14 +745,24 @@ pub async fn btor2_verify_liveness_handler(
 pub async fn btor2_verify_recoverability_handler(
     Json(request): Json<Btor2VerifyRecoverabilityRequest>,
 ) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
-    use crate::adapter::recoverability::{recoverability_property_str, verify_recoverability};
+    use crate::adapter::recoverability::{
+        parse_extra_predicate, recoverability_property_str, verify_recoverability_with_predicates,
+    };
 
-    let verdict = verify_recoverability(&request.content, &request.target).map_err(|message| {
-        ApiError::BadRequest {
+    let extra = request
+        .predicates
+        .iter()
+        .map(|s| parse_extra_predicate(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| ApiError::BadRequest {
             message,
             details: None,
-        }
-    })?;
+        })?;
+    let verdict = verify_recoverability_with_predicates(&request.content, &request.target, &extra)
+        .map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
+        })?;
 
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
@@ -879,10 +889,19 @@ pub async fn sv_verify_liveness_handler(
 pub async fn sv_verify_recoverability_handler(
     Json(request): Json<SvVerifyRecoverabilityRequest>,
 ) -> ApiResult<Json<Btor2VerifyRecoverabilityResponse>> {
-    use crate::adapter::recoverability::recoverability_property_str;
-    use crate::adapter::sv_verify::{SvLift, sv_verify_recoverability};
+    use crate::adapter::recoverability::{parse_extra_predicate, recoverability_property_str};
+    use crate::adapter::sv_verify::{SvLift, sv_verify_recoverability_with_predicates};
 
     let property = recoverability_property_str(&request.target);
+    let extra = request
+        .predicates
+        .iter()
+        .map(|s| parse_extra_predicate(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| ApiError::BadRequest {
+            message,
+            details: None,
+        })?;
     let lift = SvLift {
         source: request.source,
         additional_sources: request
@@ -893,12 +912,11 @@ pub async fn sv_verify_recoverability_handler(
         top: request.top,
         use_sv2v: request.use_sv2v,
     };
-    let verdict = sv_verify_recoverability(&lift, &request.target).map_err(|message| {
-        ApiError::BadRequest {
+    let verdict = sv_verify_recoverability_with_predicates(&lift, &request.target, &extra)
+        .map_err(|message| ApiError::BadRequest {
             message,
             details: None,
-        }
-    })?;
+        })?;
     Ok(Json(Btor2VerifyRecoverabilityResponse {
         verdict: verdict.as_str().to_string(),
         property,
@@ -4234,6 +4252,7 @@ members = ["x"]
         let request = Btor2VerifyRecoverabilityRequest {
             content: LIVENESS_STALLER.to_string(),
             target: "st == 0".to_string(),
+            predicates: Vec::new(),
         };
         let Json(out) = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4247,6 +4266,7 @@ members = ["x"]
         let request = Btor2VerifyRecoverabilityRequest {
             content: LIVENESS_STALLER.to_string(),
             target: "definitely not an atom".to_string(),
+            predicates: Vec::new(),
         };
         let err = btor2_verify_recoverability_handler(Json(request))
             .await
@@ -4337,6 +4357,7 @@ members = ["x"]
             top: None,
             use_sv2v: false,
             target: "not an atom !!".to_string(),
+            predicates: Vec::new(),
         };
         let err = sv_verify_recoverability_handler(Json(request))
             .await
