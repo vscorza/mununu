@@ -66,6 +66,19 @@ pub enum BmcOutcome {
     NoCexWithin { k: u32 },
 }
 
+/// A concrete `Init → bad` execution witness extracted from the BMC model
+/// ([`bmc_bad_reachable_witness`]). Each frame lists only the NAMED state cells /
+/// inputs (a BTOR2 line with a `symbol`), so it maps back onto the original
+/// design's registers without projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BmcTrace {
+    /// State-register valuations, frame 0 (reset) .. frame k (the bad state), each a
+    /// sorted `(symbol, value)` list (only named state cells).
+    pub states: Vec<Vec<(String, u64)>>,
+    /// Input valuations driving each transition, frame 0 .. frame k-1.
+    pub inputs: Vec<Vec<(String, u64)>>,
+}
+
 /// A complete safety verdict from the k-induction driver
 /// ([`decide_bad_safety`]) — BMC's bounded outcome plus a genuine SAFE proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +130,30 @@ fn extract_props(file: &Btor2File) -> Props {
         }
     }
     (bad_ops, init_pairs, constraint_ops)
+}
+
+/// Build `Nid → symbol` maps for the NAMED state cells and inputs — the cells the
+/// witness trace ([`BmcTrace`]) reports. An anonymous state/input (no `symbol`) is
+/// not surfaced in the trace.
+fn symbol_maps(file: &Btor2File) -> (HashMap<Nid, String>, HashMap<Nid, String>) {
+    let mut state_syms = HashMap::new();
+    let mut input_syms = HashMap::new();
+    for l in &file.lines {
+        match &l.node {
+            Node::State {
+                symbol: Some(s), ..
+            } => {
+                state_syms.insert(l.nid, s.clone());
+            }
+            Node::Input {
+                symbol: Some(s), ..
+            } => {
+                input_syms.insert(l.nid, s.clone());
+            }
+            _ => {}
+        }
+    }
+    (state_syms, input_syms)
 }
 
 /// The shared unrolling machinery: fresh per-frame state/input Z3 variables and
@@ -233,6 +270,40 @@ impl<'a> Unroller<'a> {
             }
         }
     }
+
+    /// Extract the concrete `Init → bad` witness from a SAT `model` whose `bad`
+    /// fired at frame `k`: per-frame state (frames `0..=k`) and input (frames
+    /// `0..k`) valuations for the NAMED cells, each a sorted `(symbol, value)` list.
+    /// `model_completion` is on, so a free (init-less / unconstrained-input) cell
+    /// gets a concrete value — the trace is a full assignment of a real model run.
+    fn extract_trace(
+        &self,
+        model: &z3::Model,
+        k: usize,
+        state_syms: &HashMap<Nid, String>,
+        input_syms: &HashMap<Nid, String>,
+    ) -> BmcTrace {
+        let eval_frame =
+            |frame: &HashMap<Nid, BV>, syms: &HashMap<Nid, String>| -> Vec<(String, u64)> {
+                let mut out: Vec<(String, u64)> = frame
+                    .iter()
+                    .filter_map(|(nid, bv)| {
+                        let sym = syms.get(nid)?;
+                        let val = model.eval(bv, true)?.as_u64()?;
+                        Some((sym.clone(), val))
+                    })
+                    .collect();
+                out.sort();
+                out
+            };
+        let states = (0..=k)
+            .map(|j| eval_frame(&self.frame_state[j], state_syms))
+            .collect();
+        let inputs = (0..k)
+            .map(|j| eval_frame(&self.frame_input[j], input_syms))
+            .collect();
+        BmcTrace { states, inputs }
+    }
 }
 
 /// Bounded model check: is a `bad` reachable within `max_k` steps of the BTOR2
@@ -242,10 +313,27 @@ impl<'a> Unroller<'a> {
 /// depth; the returned `Violated { depth }` is the SHALLOWEST counterexample
 /// (frames are checked in increasing order), which is the most useful witness.
 pub fn bmc_bad_reachable(file: &Btor2File, max_k: u32) -> Result<BmcOutcome, BmcError> {
+    bmc_bad_reachable_witness(file, max_k).map(|(outcome, _trace)| outcome)
+}
+
+/// As [`bmc_bad_reachable`], but on a `Violated` verdict also extracts the concrete
+/// `Init → bad` execution witness ([`BmcTrace`]) from the Z3 model.
+///
+/// The search loop is identical to [`bmc_bad_reachable`]'s; the only difference is
+/// that on SAT at frame `k` — before the `pop` that discards the model — the model
+/// is queried for every named per-frame state/input variable, giving the concrete
+/// counting/driving path that reaches `bad`. `NoCexWithin` carries no trace
+/// (`None`); a `Violated` carries `Some(trace)` unless the solver returned no model
+/// (also `None`, defensively — a SAT check always has a model here).
+pub fn bmc_bad_reachable_witness(
+    file: &Btor2File,
+    max_k: u32,
+) -> Result<(BmcOutcome, Option<BmcTrace>), BmcError> {
     let (bad_ops, init_pairs, constraint_ops) = extract_props(file);
     if bad_ops.is_empty() {
         return Err(BmcError::NoBadProperty);
     }
+    let (state_syms, input_syms) = symbol_maps(file);
     let n = max_k as usize;
     let cfg = z3::Config::new();
     z3::with_z3_config(&cfg, || {
@@ -262,10 +350,15 @@ pub fn bmc_bad_reachable(file: &Btor2File, max_k: u32) -> Result<BmcOutcome, Bmc
             solver.push();
             solver.assert(u.bad_at(k));
             let sat = matches!(solver.check(), z3::SatResult::Sat);
-            solver.pop(1);
             if sat {
-                return Ok(BmcOutcome::Violated { depth: k as u32 });
+                // Extract the concrete witness from the model BEFORE popping it.
+                let trace = solver
+                    .get_model()
+                    .map(|m| u.extract_trace(&m, k, &state_syms, &input_syms));
+                solver.pop(1);
+                return Ok((BmcOutcome::Violated { depth: k as u32 }, trace));
             }
+            solver.pop(1);
             if k < n {
                 solver.assert(u.transition_at(k));
                 for c in u.constraints_at(k + 1) {
@@ -273,7 +366,7 @@ pub fn bmc_bad_reachable(file: &Btor2File, max_k: u32) -> Result<BmcOutcome, Bmc
                 }
             }
         }
-        Ok(BmcOutcome::NoCexWithin { k: max_k })
+        Ok((BmcOutcome::NoCexWithin { k: max_k }, None))
     })
 }
 
@@ -402,6 +495,50 @@ mod tests {
     #[test]
     fn finds_shallowest_cex() {
         assert_eq!(bmc(REACH, 5), BmcOutcome::Violated { depth: 1 });
+    }
+
+    #[test]
+    fn witness_is_the_concrete_counting_path() {
+        // 2-bit up-counter: `cnt` init 0, `next = cnt + 1`, `bad = (cnt == 3)`.
+        // `bad` is reachable at depth 3 and `cnt` is fully determined by init +
+        // transition (no free input drives it), so the ONLY model run is the
+        // concrete 0→1→2→3 count — the extracted witness must be exactly that path,
+        // proving the trace is the real execution and not a fabricated one.
+        const COUNTER: &str = "1 sort bitvec 2\n2 zero 1\n3 one 1\n4 state 1 cnt\n5 init 1 4 2\n\
+                               6 add 1 4 3\n7 next 1 4 6\n8 constd 1 3\n9 sort bitvec 1\n\
+                               10 eq 9 4 8\n11 bad 10\n";
+        let file = parser::parse(COUNTER).expect("parse btor2");
+        let (outcome, trace) = bmc_bad_reachable_witness(&file, 5).expect("bmc runs");
+        assert_eq!(outcome, BmcOutcome::Violated { depth: 3 });
+        let trace = trace.expect("a Violated verdict carries the witness trace");
+        assert_eq!(
+            trace.states,
+            vec![
+                vec![("cnt".to_string(), 0)],
+                vec![("cnt".to_string(), 1)],
+                vec![("cnt".to_string(), 2)],
+                vec![("cnt".to_string(), 3)],
+            ],
+            "the extracted trace must be the concrete 0→3 counting path"
+        );
+        // The last state satisfies the `bad` condition (cnt == 3) — the trace really
+        // ends in a violating state.
+        assert_eq!(trace.states.last().unwrap(), &vec![("cnt".to_string(), 3)]);
+        // 3 transitions ⇒ 3 input frames; this design has no named inputs ⇒ empty.
+        assert_eq!(trace.inputs.len(), 3);
+        assert!(trace.inputs.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn no_witness_when_bounded_safe() {
+        // A bounded-safe design produces `NoCexWithin` and therefore no trace.
+        let file = parser::parse(SAFE).expect("parse btor2");
+        let (outcome, trace) = bmc_bad_reachable_witness(&file, 10).expect("bmc runs");
+        assert_eq!(outcome, BmcOutcome::NoCexWithin { k: 10 });
+        assert!(
+            trace.is_none(),
+            "a bounded-safe run carries no counterexample"
+        );
     }
 
     #[test]

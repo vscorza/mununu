@@ -2318,6 +2318,22 @@ fn escalate_bottom(
                         }
                         RescueVerdict::Violated => {
                             prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                            // P3 Update 2 — attach the concrete safety counterexample: native
+                            // BMC extracts the `Init → ¬invariant` path from the same bad-monitor.
+                            // A safety CEX is a finite path (empty `cycle`); the monitor adds no
+                            // state, so the trace is over the original design registers.
+                            if let Some(trace) = crate::adapter::reach_rescue::ag_invariant_witness(
+                                design_btor2,
+                                &formula,
+                                reset_pinned,
+                                60,
+                            ) {
+                                prop.counterexample = Some(ExactCounterexample {
+                                    prefix: trace.states,
+                                    cycle: Vec::new(),
+                                    inputs: trace.inputs,
+                                });
+                            }
                             notes.push(rescue_note(&prop.name, "VIOLATED", &engines));
                         }
                         RescueVerdict::Inconclusive => {}
@@ -2516,6 +2532,60 @@ mod tests {
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
             "the ⊥ safety property should be rescued to HOLDS, got {:?}",
             report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "portfolio-rescue"),
+            "a portfolio-rescue provenance note should be recorded"
+        );
+    }
+
+    // P3 Update 2 — a safety AG-invariant the cube left ⊥ that is actually VIOLATED is
+    // rescued to Violated AND carries the concrete native-BMC counterexample: a wrapping
+    // 2-bit counter `cnt` (0→1→2→3→0) violates `AG(cnt != 3)` at depth 3. The attached
+    // witness is a finite path (empty cycle) over the ORIGINAL design register `cnt`,
+    // ending in the violating state (cnt == 3).
+    #[test]
+    fn escalate_bottom_safety_attaches_violation_witness() {
+        const COUNTER: &str = "1 sort bitvec 2\n2 sort bitvec 1\n3 zero 1\n4 one 1\n\
+                               5 state 1 cnt\n6 init 1 5 3\n7 add 1 5 4\n8 next 1 5 7\n";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "cnt_ne_3".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu X. ((cnt != 3) && [] X)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom(&mut report, COUNTER, false, &VerifyAutoOptions::default());
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Violated { .. }),
+            "the ⊥ safety property should be rescued to VIOLATED, got {:?}",
+            report.properties[0].outcome
+        );
+        let cx = report.properties[0]
+            .counterexample
+            .as_ref()
+            .expect("a VIOLATED safety rescue must attach the native-BMC counterexample");
+        assert!(
+            !cx.prefix.is_empty(),
+            "the safety CEX prefix (the finite Init→bad path) must be non-empty"
+        );
+        assert!(
+            cx.cycle.is_empty(),
+            "a safety counterexample is a finite path — no repeating cycle"
+        );
+        // The final state of the finite path satisfies the violation (cnt == 3).
+        assert!(
+            cx.prefix
+                .last()
+                .unwrap()
+                .iter()
+                .any(|(sig, v)| sig == "cnt" && *v == 3),
+            "the witness's final state must satisfy the violated bad condition (cnt == 3); got {:?}",
+            cx.prefix.last().unwrap()
         );
         assert!(
             notes.iter().any(|n| n.kind == "portfolio-rescue"),
