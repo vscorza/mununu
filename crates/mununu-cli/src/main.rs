@@ -1491,10 +1491,11 @@ struct SvVerifyAutoArgs {
     /// stubbed so its register survives the lift; pass this to leave it cut.
     #[arg(long = "no-auto-stub-flops")]
     no_auto_stub_flops: bool,
-    /// Disable the safety-⊥ escalation. By default, a *safety* property the cube
-    /// abstraction leaves ⊥ (and that is a reducible AG-invariant) is retried with the
-    /// multi-engine reachability portfolio (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono);
-    /// pass this to report the cube's ⊥ verdict unchanged.
+    /// Disable the ⊥ escalations. By default, a *safety* property the cube abstraction
+    /// leaves ⊥ (and that is a reducible AG-invariant) is retried with the multi-engine
+    /// reachability portfolio (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono), and a *box-AF
+    /// liveness* property left ⊥ is retried via the liveness-to-safety reduction; pass
+    /// this to report the cube's ⊥ verdict unchanged for both.
     #[arg(long = "no-rescue")]
     no_rescue: bool,
     /// H.J.b — config concretization: pin a wide config input to a constant so
@@ -2891,6 +2892,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
             _ => None,
         },
         rescue_bottom_safety: !args.no_rescue,
+        rescue_bottom_liveness: !args.no_rescue,
     };
 
     let report = verify_auto(&sources, &yopts, &opts)

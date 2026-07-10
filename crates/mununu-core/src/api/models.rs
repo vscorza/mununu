@@ -1342,6 +1342,12 @@ pub struct SvVerifyAutoRequest {
     /// cube's ⊥ unchanged. Only fires on ⊥ reducible AG-invariants.
     #[serde(default)]
     pub rescue_bottom_safety: Option<bool>,
+    /// Liveness-⊥ escalation (default `true`): a *box-AF* liveness property `AG(a → AF
+    /// b)` the cube leaves ⊥ is retried via the liveness-to-safety reduction + the
+    /// reachability portfolio. Set `false` to report the cube's ⊥ unchanged. Only fires
+    /// on the l2s-able box-AF shape (diamond-EF recoverability stays on the νμ path).
+    #[serde(default)]
+    pub rescue_bottom_liveness: Option<bool>,
 }
 
 /// Response for `/api/v1/sv/verify-auto`.

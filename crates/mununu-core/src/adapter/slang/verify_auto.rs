@@ -559,6 +559,14 @@ pub struct VerifyAutoOptions {
     /// liveness / recoverability are untouched. Default `true`; the CLI `--no-rescue`
     /// / API `rescue_bottom_safety: false` opts out.
     pub rescue_bottom_safety: bool,
+    /// On a *box-response liveness* property `AG(a → AF b)` the cube portfolio leaves
+    /// `⊥`, escalate to the liveness-to-safety reduction + reachability portfolio
+    /// (reduce to a `bad`-monitor lasso and decide it symbolically). Only fires on `⊥`
+    /// reducible box-AF responses — the diamond-EF recoverability liveness (`AG(a → EF
+    /// b)`, νμ) is NOT l2s-able and stays on the exact / cube νμ path, so there is no
+    /// common-path cost and no mis-route. Default `true`; opts out with the same
+    /// `--no-rescue` / API `rescue_bottom_liveness: false`.
+    pub rescue_bottom_liveness: bool,
 }
 
 /// PORTFOLIO scheduling mode — the budget knob for the multi-engine default.
@@ -613,6 +621,7 @@ impl Default for VerifyAutoOptions {
             exact_symbolic: false,
             portfolio: None,
             rescue_bottom_safety: true,
+            rescue_bottom_liveness: true,
         }
     }
 }
@@ -2221,11 +2230,19 @@ pub fn verify_auto(
     // rescue): reduce a reducible AG-invariant the cube left ⊥ to a `bad`-monitor and
     // decide it with the multi-engine reachability portfolio. Only fires on ⊥
     // reducible AG-invariants — no common-path cost.
-    let rescue_notes = if opts.rescue_bottom_safety {
+    let mut rescue_notes = if opts.rescue_bottom_safety {
         escalate_bottom_safety(&mut report, &btor2, reset_pinned)
     } else {
         Vec::new()
     };
+
+    // Liveness-⊥ escalation (P2): a box-response `AG(a → AF b)` the cube left ⊥ is
+    // reduced to a `bad`-monitor lasso (Biere–Artho–Schuppan l2s) and decided by the
+    // reachability portfolio. Only fires on ⊥ reducible box-AF responses — the
+    // diamond-EF recoverability liveness stays on the νμ path — no common-path cost.
+    if opts.rescue_bottom_liveness {
+        rescue_notes.extend(escalate_bottom_liveness(&mut report, &btor2, reset_pinned));
+    }
 
     // H.J — provenance notes: surface every abstraction/scoping decision this run
     // made (config concretizations, posture, reset-gating, flop stubs, cut
@@ -2321,6 +2338,86 @@ fn rescue_note(name: &str, verdict: &str, engines: &[&str]) -> VerificationNote 
                  multi-engine reachability portfolio (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). \
                  Sound: every portfolio member is sound, and a disagreement would surface a \
                  contradiction alarm rather than a verdict."
+            .into(),
+        items: Vec::new(),
+    }
+}
+
+/// On each *box-response liveness* property `AG(a → AF b)` the cube portfolio left `⊥`,
+/// try the liveness-to-safety reduction
+/// ([`response_liveness_rescue`](crate::adapter::liveness_rescue::response_liveness_rescue)):
+/// reduce the property to a reachable-`b`-free-lasso `bad`-monitor over `design_btor2`
+/// and decide it with the reachability portfolio. Upgrades the property's outcome in
+/// place and returns a provenance note per rescue.
+///
+/// SOUNDNESS: `response_liveness_rescue` (via `reduce_response_af`) returns `None` for
+/// every shape other than the exact single-atom **box-AF** response with unconstrained
+/// boxes — so the **diamond-EF** recoverability liveness (`AG(a → EF b)`, a νμ property
+/// l2s does NOT decide) and every safety shape are left untouched (no mis-route, no
+/// common-path cost). The l2s reduction it does apply is sound + complete for the box-AF
+/// shape, cross-checked against the exact engine in the `liveness_rescue` module tests.
+/// Pure over `(report, design_btor2)`, so it is unit-testable on a BTOR2 fixture without
+/// the SV toolchain.
+fn escalate_bottom_liveness(
+    report: &mut AutoVerifyReport,
+    design_btor2: &str,
+    reset_pinned: bool,
+) -> Vec<VerificationNote> {
+    use crate::adapter::liveness_rescue::{LivenessVerdict, response_liveness_rescue};
+    use crate::mu_calculus::parser as mu_parser;
+
+    let mut notes = Vec::new();
+    for prop in report.properties.iter_mut() {
+        if !matches!(prop.outcome, VerifyOutcome::Unknown { .. }) {
+            continue;
+        }
+        let Ok(formula) = mu_parser::parse(&prop.formula) else {
+            continue;
+        };
+        let Some((verdict, reach)) = response_liveness_rescue(design_btor2, &formula, reset_pinned)
+        else {
+            continue;
+        };
+        let engines: Vec<&str> = reach
+            .reachable_by
+            .iter()
+            .chain(reach.unreachable_by.iter())
+            .copied()
+            .collect();
+        match verdict {
+            LivenessVerdict::Holds => {
+                prop.outcome = VerifyOutcome::Holds;
+                notes.push(liveness_rescue_note(&prop.name, "HOLDS", &engines));
+            }
+            LivenessVerdict::Violated => {
+                prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                notes.push(liveness_rescue_note(&prop.name, "VIOLATED", &engines));
+            }
+            LivenessVerdict::Inconclusive => {}
+        }
+    }
+    notes
+}
+
+/// A provenance note for a box-AF liveness property the l2s reduction + reachability
+/// portfolio rescued from `⊥`.
+fn liveness_rescue_note(name: &str, verdict: &str, engines: &[&str]) -> VerificationNote {
+    VerificationNote {
+        kind: "liveness-rescue".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "`{name}`: the cube abstraction left ⊥; the liveness-to-safety reduction + \
+             reachability portfolio decided it {verdict} (engine(s): {})",
+            if engines.is_empty() {
+                "—".to_string()
+            } else {
+                engines.join(", ")
+            }
+        ),
+        detail: "The box-response liveness ⊥ (`AG(a → AF b)`) was reduced to a reachable \
+                 `b`-free-lasso `bad`-monitor (Biere–Artho–Schuppan liveness-to-safety) and \
+                 decided symbolically by the reachability portfolio. Sound + complete for the \
+                 box-AF shape; the diamond-EF recoverability response is not reduced here."
             .into(),
         items: Vec::new(),
     }
@@ -2427,6 +2524,76 @@ mod tests {
             notes.is_empty(),
             "no rescue note for an un-reducible property"
         );
+    }
+
+    // 3-state responder: st 0=idle,1=req,2=grant; idle -go-> req; req -> grant; grant ->
+    // idle. AG((st==1) → AF (st==2)) HOLDS — the l2s reduction + portfolio decides it.
+    const RESPONDER_LIVE: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 st
+4 zero 1
+5 init 1 3 4
+6 input 2 go
+7 one 1
+8 constd 1 2
+9 eq 2 3 4
+10 eq 2 3 7
+11 ite 1 6 7 4
+12 ite 1 10 8 4
+13 ite 1 9 11 12
+14 next 1 3 13
+";
+
+    // A box-response `AG(a → AF b)` the cube left ⊥ is rescued to a definite verdict by
+    // the liveness-to-safety reduction + reachability portfolio.
+    #[test]
+    fn escalate_bottom_liveness_rescues_a_box_response() {
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "req_grant".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu Z. ((!(st == 1) || mu Y. ((st == 2) || [] Y)) && [] Z)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom_liveness(&mut report, RESPONDER_LIVE, false);
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "the ⊥ box-AF liveness property should be rescued to HOLDS, got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "liveness-rescue"),
+            "a liveness-rescue provenance note should be recorded"
+        );
+    }
+
+    // SOUNDNESS: a diamond-EF recoverability liveness (`AG(a → EF b)`, νμ) is NOT the
+    // l2s-able box-AF shape, so the liveness escalation must leave it untouched — never
+    // route a νμ property through the 2-valued l2s.
+    #[test]
+    fn escalate_bottom_liveness_ignores_diamond_ef() {
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "recover".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu Z. ((!(st == 1) || mu Y. ((st == 2) || <> Y)) && [] Z)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom_liveness(&mut report, RESPONDER_LIVE, false);
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
+            "a diamond-EF νμ ⊥ must be left untouched (l2s does not decide it)"
+        );
+        assert!(notes.is_empty(), "no rescue note for a non-box-AF property");
     }
 
     /// A cube engine's ⊥ (Unknown) is filled by a later engine's definite verdict, and the
