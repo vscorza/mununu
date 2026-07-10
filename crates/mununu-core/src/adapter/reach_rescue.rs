@@ -203,6 +203,29 @@ pub fn reach_portfolio_rescue(
     Some((verdict, outcome))
 }
 
+/// The concrete counterexample trace for an AG-invariant the reachability portfolio
+/// found VIOLATED: rebuild the same `bad`-monitor [`reach_portfolio_rescue`] uses and
+/// run native BMC to extract the `Init → ¬invariant` path. The bad-monitor adds no
+/// state, so the trace is over the ORIGINAL design's registers (no projection).
+/// Returns `None` if the formula is not a reducible AG-invariant or no bounded
+/// counterexample is found within `max_k`.
+pub fn ag_invariant_witness(
+    design_btor2: &str,
+    formula: &Formula,
+    reset_pinned: bool,
+    max_k: u32,
+) -> Option<crate::adapter::btor2::native_bmc::BmcTrace> {
+    let inv = reduce_ag_invariant(formula)?;
+    let monitored =
+        emit_ag_state_atom_monitor(design_btor2, &inv.signal, inv.op, inv.value, reset_pinned)
+            .ok()?;
+    let file = parser::parse(&monitored).ok()?;
+    match crate::adapter::btor2::native_bmc::bmc_bad_reachable_witness(&file, max_k).ok()? {
+        (crate::adapter::btor2::native_bmc::BmcOutcome::Violated { .. }, trace) => trace,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
