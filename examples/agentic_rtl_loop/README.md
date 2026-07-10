@@ -94,6 +94,25 @@ no-starvation guarantees). `mununu … --controller-mode gr1` synthesizes it (a
 3-way mutual exclusion** (k-induction) with no starvation counterexample for any
 client. Nothing about the pipeline is specific to two clients.
 
+## The productized verb
+
+`run.sh` uses `btormc` directly (a mununu engine) so it can check *every* property
+— including the combinational grants and the liveness monitors — in one place.
+The headline no-sidecar verb, `mununu sv verify-auto`, is also wired:
+
+```bash
+./verify_auto.sh
+#   verify-auto: 1 property verified, 0 unsupported assertion(s)
+#     model: 6 state register(s)
+#     [assert] system_checked_sva_0: HOLDS
+```
+
+`system_checked.sv` writes the arbiter's mutual-exclusion guarantee as an SVA over
+*registered* grants, so verify-auto's predicate-abstraction path binds it and
+proves it **HOLDS** (a definite, sound verdict) on the assembled design. (verify-auto's
+cube path only binds *state* atoms, which is why the full-coverage `run.sh` uses
+explicit state monitors for the combinational/liveness properties.)
+
 ## Honest scope
 
 - This is a **constructed demo system**, not a finding about a real chip.
