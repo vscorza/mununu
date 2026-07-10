@@ -970,6 +970,19 @@ pub struct Btor2VerifyLivenessResponse {
     pub decided_by: Vec<String>,
 }
 
+/// Request for the conjunctive response-liveness endpoint
+/// (`POST /api/v1/btor2/verify-liveness-all`). Mirrors the CLI
+/// `mununu btor2 verify-liveness-all`: decides `⋀ᵢ AG(aᵢ → AF bᵢ)`. Each `responses`
+/// entry is a `"ANTE => CONS"` pair of register-comparison atoms. At least one
+/// required. Reuses [`Btor2VerifyLivenessResponse`] for the reply.
+#[derive(Debug, Deserialize)]
+pub struct Btor2VerifyLivenessAllRequest {
+    /// BTOR2 source content.
+    pub content: String,
+    /// The response pairs, each `"ANTE => CONS"`.
+    pub responses: Vec<String>,
+}
+
 /// Request for the recoverability endpoint
 /// (`POST /api/v1/btor2/verify-recoverability`). Mirrors the CLI
 /// `mununu btor2 verify-recoverability`: decides `AG EF target` — "from every
@@ -1081,6 +1094,26 @@ pub struct SvVerifyLivenessRequest {
     pub request: String,
     /// The grant atom that must eventually follow on every path.
     pub grant: String,
+}
+
+/// Request for `POST /api/v1/sv/verify-liveness-all` — the SV lift fields plus the
+/// conjunction's `"ANTE => CONS"` response pairs. Mirrors the CLI
+/// `mununu sv verify-liveness-all`; reuses [`Btor2VerifyLivenessResponse`].
+#[derive(Debug, Deserialize)]
+pub struct SvVerifyLivenessAllRequest {
+    /// SystemVerilog primary source content.
+    pub source: String,
+    /// Additional SV sources (packages / includes).
+    #[serde(default)]
+    pub additional_sources: Vec<FileContent>,
+    /// Top module for the lift (auto-detect when omitted).
+    #[serde(default)]
+    pub top: Option<String>,
+    /// Run sv2v before Yosys. Default `false`.
+    #[serde(default)]
+    pub use_sv2v: bool,
+    /// The response pairs, each `"ANTE => CONS"`. At least one required.
+    pub responses: Vec<String>,
 }
 
 /// Request for `POST /api/v1/sv/verify-recoverability` — the SV lift fields plus the

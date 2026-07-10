@@ -736,6 +736,48 @@ pub async fn btor2_verify_liveness_handler(
     }))
 }
 
+/// Decide the conjunction of response-liveness properties `⋀ᵢ AG(aᵢ → AF bᵢ)`
+/// (`POST /api/v1/btor2/verify-liveness-all`). Surface peer of the CLI
+/// `mununu btor2 verify-liveness-all`: reduces each `"ANTE => CONS"` conjunct to its
+/// own `bad`-reachability query, returning the combined `"holds"` / `"violated"` /
+/// `"unknown"` verdict. A malformed response (missing `=>` or a non-atom side) or
+/// unparseable BTOR2 is a `BadRequest`.
+pub async fn btor2_verify_liveness_all_handler(
+    Json(request): Json<Btor2VerifyLivenessAllRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    use crate::adapter::liveness_rescue::{
+        parse_response_pairs, response_conjunction_property, response_liveness_rescue_conjunction,
+    };
+
+    let bad_req = |message: String| ApiError::BadRequest {
+        message,
+        details: None,
+    };
+    let pairs = parse_response_pairs(&request.responses).map_err(bad_req)?;
+    let property = response_conjunction_property(&request.responses);
+
+    let (verdict, outcomes) = response_liveness_rescue_conjunction(&request.content, &pairs, false)
+        .ok_or_else(|| {
+            bad_req(
+                "could not build a liveness monitor — an atom likely binds no signal, or no \
+                 responses were given"
+                    .to_string(),
+            )
+        })?;
+
+    Ok(Json(Btor2VerifyLivenessResponse {
+        verdict: crate::verdict::PropertyVerdict::from(verdict)
+            .as_str()
+            .to_string(),
+        property,
+        decided_by: outcomes
+            .iter()
+            .flat_map(|o| o.reachable_by.iter().chain(o.unreachable_by.iter()))
+            .map(|s| s.to_string())
+            .collect(),
+    }))
+}
+
 /// Decide recoverability `AG EF target` (`POST /api/v1/btor2/verify-recoverability`)
 /// — "from every reachable state, can the design get back to `target`?", the
 /// branching property SVA cannot state. Surface peer of the CLI
@@ -880,6 +922,46 @@ pub async fn sv_verify_liveness_handler(
             .reachable_by
             .iter()
             .chain(outcome.unreachable_by.iter())
+            .map(|s| s.to_string())
+            .collect(),
+    }))
+}
+
+/// `POST /api/v1/sv/verify-liveness-all` — lift SV and decide the conjunction
+/// `⋀ᵢ AG(aᵢ → AF bᵢ)` from `"ANTE => CONS"` response pairs. SV-direct peer of the
+/// CLI `sv verify-liveness-all`; reuses the [`Btor2VerifyLivenessResponse`] shape.
+pub async fn sv_verify_liveness_all_handler(
+    Json(request): Json<SvVerifyLivenessAllRequest>,
+) -> ApiResult<Json<Btor2VerifyLivenessResponse>> {
+    use crate::adapter::liveness_rescue::response_conjunction_property;
+    use crate::adapter::sv_verify::{SvLift, sv_verify_liveness_all};
+
+    let property = response_conjunction_property(&request.responses);
+    let lift = SvLift {
+        source: request.source,
+        additional_sources: request
+            .additional_sources
+            .into_iter()
+            .map(|f| (f.name, f.content))
+            .collect(),
+        top: request.top,
+        use_sv2v: request.use_sv2v,
+    };
+    let (verdict, outcomes) =
+        sv_verify_liveness_all(&lift, &request.responses).map_err(|message| {
+            ApiError::BadRequest {
+                message,
+                details: None,
+            }
+        })?;
+    Ok(Json(Btor2VerifyLivenessResponse {
+        verdict: crate::verdict::PropertyVerdict::from(verdict)
+            .as_str()
+            .to_string(),
+        property,
+        decided_by: outcomes
+            .iter()
+            .flat_map(|o| o.reachable_by.iter().chain(o.unreachable_by.iter()))
             .map(|s| s.to_string())
             .collect(),
     }))
@@ -4242,6 +4324,36 @@ members = ["x"]
         let err = btor2_verify_liveness_handler(Json(request))
             .await
             .expect_err("relational atom must be rejected");
+        assert!(matches!(err, ApiError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn btor2_verify_liveness_all_handler_decides_violated_conjunction() {
+        // The staller violates `st == 1 => st == 2`; a conjunction containing it is
+        // violated regardless of the second (trivially-holding) conjunct.
+        let request = Btor2VerifyLivenessAllRequest {
+            content: LIVENESS_STALLER.to_string(),
+            responses: vec![
+                "st == 1 => st == 2".to_string(),
+                "st == 0 => st == 0".to_string(),
+            ],
+        };
+        let Json(out) = btor2_verify_liveness_all_handler(Json(request))
+            .await
+            .expect("verify-liveness-all runs");
+        assert_eq!(out.verdict, "violated", "response: {out:?}");
+        assert!(out.property.contains("&&"), "conjunction echoed: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn btor2_verify_liveness_all_handler_rejects_missing_arrow() {
+        let request = Btor2VerifyLivenessAllRequest {
+            content: LIVENESS_STALLER.to_string(),
+            responses: vec!["st == 1 st == 2".to_string()], // no `=>`
+        };
+        let err = btor2_verify_liveness_all_handler(Json(request))
+            .await
+            .expect_err("a response without `=>` must be rejected");
         assert!(matches!(err, ApiError::BadRequest { .. }));
     }
 

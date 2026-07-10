@@ -254,6 +254,15 @@ enum Btor2Command {
     /// prints the verdict (`holds` / `violated` / `unknown`). `--request`
     /// and `--grant` are single register-comparison atoms (`"st == 1"`).
     VerifyLiveness(Btor2VerifyLivenessArgs),
+    /// Decide a conjunction of response-liveness properties `⋀ᵢ AG(aᵢ → AF bᵢ)`.
+    ///
+    /// The multi-guarantee peer of `verify-liveness`: pass a repeatable
+    /// `--response "ANTE => CONS"` (each a request/grant pair of register-comparison
+    /// atoms). Every conjunct is reduced to its own `bad`-reachability query; the
+    /// combined verdict is `violated` if any conjunct is (a real ungranted-request
+    /// lasso), else `unknown` if any is, else `holds`. Surface peer of
+    /// `POST /api/v1/btor2/verify-liveness-all`.
+    VerifyLivenessAll(Btor2VerifyLivenessAllArgs),
     /// Decide recoverability `AG EF good` — the branching property SVA cannot state.
     ///
     /// "From every reachable state, can the design still get back to a `good`
@@ -567,6 +576,22 @@ struct Btor2VerifyLivenessArgs {
     /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
     #[arg(long, value_name = "ATOM")]
     grant: String,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu btor2 verify-liveness-all` — a conjunction of
+/// response-liveness properties, each a repeatable `--response "ANTE => CONS"`.
+#[derive(Args, Debug)]
+struct Btor2VerifyLivenessAllArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
+    /// A response pair `"ANTE => CONS"` — both sides register-comparison atoms
+    /// (`"req == 1 => grant == 1"`). Repeatable; the verdict is the conjunction
+    /// `⋀ AG(ANTE → AF CONS)`. At least one required.
+    #[arg(long = "response", value_name = "ANTE => CONS", required = true)]
+    responses: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -1224,6 +1249,11 @@ enum SvCommand {
     /// SV-direct peer of `btor2 verify-liveness`. `--request` / `--grant` are single
     /// register-comparison atoms. Surface peer of `POST /api/v1/sv/verify-liveness`.
     VerifyLiveness(SvVerifyLivenessArgs),
+    /// Lift SV and decide a conjunction of response-liveness properties
+    /// `⋀ᵢ AG(aᵢ → AF bᵢ)` from repeatable `--response "ANTE => CONS"` pairs — the
+    /// SV-direct peer of `btor2 verify-liveness-all`. Surface peer of
+    /// `POST /api/v1/sv/verify-liveness-all`.
+    VerifyLivenessAll(SvVerifyLivenessAllArgs),
     /// Lift SV and decide recoverability `AG EF good` — the branching property SVA
     /// cannot state, checked directly against raw SV in one call. `--target` is a
     /// single register-comparison atom. Surface peer of
@@ -1542,6 +1572,21 @@ struct SvVerifyLivenessArgs {
     /// The grant atom that must eventually follow on every path, e.g. `"st == 2"`.
     #[arg(long, value_name = "ATOM")]
     grant: String,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu sv verify-liveness-all` — SV-direct conjunction of
+/// response-liveness properties.
+#[derive(Args, Debug)]
+struct SvVerifyLivenessAllArgs {
+    #[command(flatten)]
+    lift: SvLiftArgs,
+    /// A response pair `"ANTE => CONS"` — both sides register-comparison atoms
+    /// (`"req == 1 => grant == 1"`). Repeatable; the verdict is the conjunction
+    /// `⋀ AG(ANTE → AF CONS)`. At least one required.
+    #[arg(long = "response", value_name = "ANTE => CONS", required = true)]
+    responses: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2332,6 +2377,7 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::Cegar(args) => btor2_cegar(args),
         Btor2Command::Verify(args) => btor2_verify(args),
         Btor2Command::VerifyLiveness(args) => btor2_verify_liveness(args),
+        Btor2Command::VerifyLivenessAll(args) => btor2_verify_liveness_all(args),
         Btor2Command::VerifyRecoverability(args) => btor2_verify_recoverability(args),
         Btor2Command::CheckFsm(args) => btor2_check_fsm(args),
     }
@@ -2440,6 +2486,62 @@ fn btor2_verify_liveness(args: Btor2VerifyLivenessArgs) -> Result<(), String> {
     );
     ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
     Ok(())
+}
+
+/// `mununu btor2 verify-liveness-all` — decide the conjunction of response-liveness
+/// properties `⋀ᵢ AG(aᵢ → AF bᵢ)` from repeatable `--response "ANTE => CONS"` pairs,
+/// via the l2s reduction + the portfolio, printing the combined verdict + per-response
+/// `decided_by` as JSON. Surface peer of `POST /api/v1/btor2/verify-liveness-all`.
+fn btor2_verify_liveness_all(args: Btor2VerifyLivenessAllArgs) -> Result<(), String> {
+    use mununu_core::adapter::liveness_rescue::{
+        parse_response_pairs, response_conjunction_property, response_liveness_rescue_conjunction,
+    };
+    use mununu_core::verdict::PropertyVerdict;
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let pairs = parse_response_pairs(&args.responses)?;
+
+    let (verdict, outcomes) = response_liveness_rescue_conjunction(&content, &pairs, false)
+        .ok_or_else(|| {
+            format!(
+                "could not build the liveness monitor for '{}' — an atom likely binds no signal",
+                args.file.display()
+            )
+        })?;
+
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "property": response_conjunction_property(&args.responses),
+        "verdict": PropertyVerdict::from(verdict).as_str(),
+        "responses": per_response_decided_by(&args.responses, &outcomes),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
+    Ok(())
+}
+
+/// Build the per-response `[{ response, decided_by }]` JSON for the
+/// `verify-liveness-all` summaries (BTOR2- and SV-direct), pairing each `"ANTE => CONS"`
+/// input with the engines that decided its `bad`-reachability query.
+fn per_response_decided_by(
+    responses: &[String],
+    outcomes: &[mununu_core::adapter::reach_portfolio::ReachOutcome],
+) -> Vec<serde_json::Value> {
+    responses
+        .iter()
+        .zip(outcomes.iter())
+        .map(|(r, o)| {
+            serde_json::json!({
+                "response": r.trim(),
+                "decided_by": o.reachable_by.iter().chain(o.unreachable_by.iter())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 /// `mununu btor2 verify` — decide `bad`-reachability with the multi-engine safety
@@ -4620,6 +4722,7 @@ fn handle_sv(command: SvCommand) -> Result<(), String> {
         SvCommand::VerifyAuto(args) => sv_verify_auto(args),
         SvCommand::Verify(args) => sv_verify(args),
         SvCommand::VerifyLiveness(args) => sv_verify_liveness(args),
+        SvCommand::VerifyLivenessAll(args) => sv_verify_liveness_all(args),
         SvCommand::VerifyRecoverability(args) => sv_verify_recoverability(args),
         SvCommand::CheckFsm(args) => sv_check_fsm(args),
     }
@@ -4685,6 +4788,28 @@ fn sv_verify_liveness(args: SvVerifyLivenessArgs) -> Result<(), String> {
         "verdict": PropertyVerdict::from(verdict).as_str(),
         "decided_by": outcome.reachable_by.iter().chain(outcome.unreachable_by.iter())
             .collect::<Vec<_>>(),
+    });
+    print_json_summary(&summary)?;
+    ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu sv verify-liveness-all` — lift SV and decide the conjunction
+/// `⋀ᵢ AG(aᵢ → AF bᵢ)` from repeatable `--response "ANTE => CONS"` pairs. SV-direct
+/// peer of `btor2 verify-liveness-all`; same JSON summary + CI exit.
+fn sv_verify_liveness_all(args: SvVerifyLivenessAllArgs) -> Result<(), String> {
+    use mununu_core::adapter::liveness_rescue::response_conjunction_property;
+    use mununu_core::adapter::sv_verify::sv_verify_liveness_all as core_sv_verify_liveness_all;
+    use mununu_core::verdict::PropertyVerdict;
+
+    let file = args.lift.file.display().to_string();
+    let (verdict, outcomes) =
+        core_sv_verify_liveness_all(&read_sv_lift(&args.lift)?, &args.responses)?;
+    let summary = serde_json::json!({
+        "file": file,
+        "property": response_conjunction_property(&args.responses),
+        "verdict": PropertyVerdict::from(verdict).as_str(),
+        "responses": per_response_decided_by(&args.responses, &outcomes),
     });
     print_json_summary(&summary)?;
     ci_gate_exit(PropertyVerdict::from(verdict).as_str(), args.ci.fail_on);
