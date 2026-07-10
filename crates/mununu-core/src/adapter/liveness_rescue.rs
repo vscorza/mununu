@@ -259,6 +259,62 @@ pub fn response_liveness_rescue_atoms(
     Some((verdict, outcome))
 }
 
+/// Decide a **conjunction** of response-liveness properties `⋀_i AG(a_i → AF b_i)`
+/// over one `design_btor2`, by deciding each response independently via
+/// [`response_liveness_rescue_atoms`] and combining the verdicts:
+///
+/// - **any `Violated` ⇒ `Violated`** — a real `b_i`-free lasso through a pending `a_i`
+///   is a genuine path violating the conjunction (the counterexample to conjunct `i`
+///   is a counterexample to `⋀`), so `Violated` dominates.
+/// - else **any `Inconclusive` ⇒ `Inconclusive`** — that conjunct might yet be
+///   violated, so the conjunction cannot be declared to hold.
+/// - else **all `Holds` ⇒ `Holds`**.
+///
+/// This is **correct by composition**: each single-response query is a sound + complete
+/// l2s reduction (see [`response_liveness_rescue`]), a conjunction violation is exactly
+/// *some* conjunct's violation (which its query finds), and each query still scales via
+/// the reachability portfolio. It is the closed-system shape — verifying a
+/// multi-guarantee controller (e.g. an arbiter's per-client no-starvation) in place,
+/// where the environment is concrete and any GR(1) assumptions are already discharged.
+/// The open-system Streett shape `(⋀ GF a_i) → (⋀ GF b_j)` — where live assumptions
+/// couple the guarantees, so this N-query decomposition does NOT hold — is a separate
+/// follow-up (the Emerson–Lei fair-cycle l2s).
+///
+/// Returns `None` (matching [`response_liveness_rescue_atoms`]) if `pairs` is empty or
+/// any monitor cannot be built (an atom binds no signal). On `Some`, the second
+/// component is the per-response [`ReachOutcome`] (same order as `pairs`) for diagnostics.
+pub fn response_liveness_rescue_conjunction(
+    design_btor2: &str,
+    pairs: &[(Atom, Atom)],
+    reset_pinned: bool,
+) -> Option<(LivenessVerdict, Vec<ReachOutcome>)> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut outcomes = Vec::with_capacity(pairs.len());
+    let mut any_violated = false;
+    let mut any_inconclusive = false;
+    for (ante, cons) in pairs {
+        let (verdict, outcome) =
+            response_liveness_rescue_atoms(design_btor2, ante, cons, reset_pinned)?;
+        match verdict {
+            LivenessVerdict::Violated => any_violated = true,
+            LivenessVerdict::Inconclusive => any_inconclusive = true,
+            LivenessVerdict::Holds => {}
+        }
+        outcomes.push(outcome);
+    }
+    // Violated dominates Inconclusive dominates Holds (conjunction semantics).
+    let verdict = if any_violated {
+        LivenessVerdict::Violated
+    } else if any_inconclusive {
+        LivenessVerdict::Inconclusive
+    } else {
+        LivenessVerdict::Holds
+    };
+    Some((verdict, outcomes))
+}
+
 /// Parse a request/grant atom string (`"REG op VALUE"`, e.g. `"st == 2"`) into an
 /// [`Atom`], for the CLI / API `verify-liveness` surface. Reuses the same predicate
 /// grammar as the classifier, so a relational (`reg ⋈ reg`) or malformed atom is
@@ -280,6 +336,48 @@ pub fn parse_response_atom(s: &str) -> Result<Atom, String> {
         )),
         Err(e) => Err(format!("cannot parse response atom `{s}`: {e:?}")),
     }
+}
+
+/// Parse repeatable `"ANTE => CONS"` response strings (the `verify-liveness-all`
+/// surface) into `(ante, cons)` [`Atom`] pairs for
+/// [`response_liveness_rescue_conjunction`]. Each string is split on the first literal
+/// `=>`; both sides are trimmed and parsed with [`parse_response_atom`]. Errors if a
+/// string lacks `=>`, or either side is not a single register-comparison atom.
+///
+/// Reused by the CLI, HTTP API, and SV-direct surfaces so the `--response` grammar is
+/// identical everywhere.
+pub fn parse_response_pairs(responses: &[String]) -> Result<Vec<(Atom, Atom)>, String> {
+    responses
+        .iter()
+        .map(|r| {
+            let (ante, cons) = r.split_once("=>").ok_or_else(|| {
+                format!(
+                    "response `{r}` must contain `=>` separating the antecedent and consequent \
+                     (e.g. `\"req == 1 => grant == 1\"`)"
+                )
+            })?;
+            Ok((
+                parse_response_atom(ante.trim())?,
+                parse_response_atom(cons.trim())?,
+            ))
+        })
+        .collect()
+}
+
+/// Render a list of `"ANTE => CONS"` response strings as the display property
+/// `AG((a) -> AF (b)) && AG((c) -> AF (d))`, echoed for provenance across the
+/// `verify-liveness-all` surfaces. Splits each string on the first `=>` (falling back
+/// to the raw trimmed text when absent — a malformed entry is caught by
+/// [`parse_response_pairs`], so this is display-only).
+pub fn response_conjunction_property(responses: &[String]) -> String {
+    responses
+        .iter()
+        .map(|r| match r.split_once("=>") {
+            Some((ante, cons)) => format!("AG(({}) -> AF ({}))", ante.trim(), cons.trim()),
+            None => r.trim().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 // The surface verdict label comes from the canonical
@@ -442,6 +540,63 @@ mod tests {
         assert_eq!(v_r, LivenessVerdict::Holds);
         let (v_s, _) = response_liveness_rescue_atoms(STALLER, &ante, &cons, false).expect("ok");
         assert_eq!(v_s, LivenessVerdict::Violated);
+    }
+
+    // --- Multi-response conjunction (correct by composition) ---
+
+    // Two responses on RESPONDER, each individually Holds — req→grant and grant→idle —
+    // so the conjunction Holds, and the conjunction verdict matches the composition of
+    // the individual single-response verdicts.
+    #[test]
+    fn conjunction_all_hold_is_holds() {
+        let p1 = (
+            parse_response_atom("st == 1").unwrap(),
+            parse_response_atom("st == 2").unwrap(),
+        );
+        let p2 = (
+            parse_response_atom("st == 2").unwrap(),
+            parse_response_atom("st == 0").unwrap(),
+        );
+        let (v1, _) = response_liveness_rescue_atoms(RESPONDER, &p1.0, &p1.1, false).unwrap();
+        let (v2, _) = response_liveness_rescue_atoms(RESPONDER, &p2.0, &p2.1, false).unwrap();
+        assert_eq!(v1, LivenessVerdict::Holds, "req→grant holds");
+        assert_eq!(v2, LivenessVerdict::Holds, "grant→idle holds");
+        let (v, outs) =
+            response_liveness_rescue_conjunction(RESPONDER, &[p1, p2], false).expect("decides");
+        assert_eq!(v, LivenessVerdict::Holds, "both hold ⇒ conjunction holds");
+        assert_eq!(outs.len(), 2, "one outcome per response");
+    }
+
+    // On STALLER the req→grant response is Violated; conjoined with a trivially-holding
+    // response, the conjunction is Violated (Violated dominates).
+    #[test]
+    fn conjunction_one_violated_is_violated() {
+        let p_bad = (
+            parse_response_atom("st == 1").unwrap(),
+            parse_response_atom("st == 2").unwrap(),
+        );
+        let p_ok = (
+            parse_response_atom("st == 0").unwrap(),
+            parse_response_atom("st == 0").unwrap(),
+        );
+        let (vb, _) = response_liveness_rescue_atoms(STALLER, &p_bad.0, &p_bad.1, false).unwrap();
+        assert_eq!(
+            vb,
+            LivenessVerdict::Violated,
+            "req→grant violated on staller"
+        );
+        let (v, _) =
+            response_liveness_rescue_conjunction(STALLER, &[p_ok, p_bad], false).expect("decides");
+        assert_eq!(
+            v,
+            LivenessVerdict::Violated,
+            "one violated conjunct ⇒ conjunction violated"
+        );
+    }
+
+    #[test]
+    fn conjunction_empty_is_none() {
+        assert!(response_liveness_rescue_conjunction(RESPONDER, &[], false).is_none());
     }
 
     #[test]

@@ -21,7 +21,8 @@ use crate::adapter::btor2::kmts_lift::PredicateSpec;
 use crate::adapter::btor2::parser;
 use crate::adapter::btor2::predicate_expr::parse_predicate_expr;
 use crate::adapter::liveness_rescue::{
-    Atom, LivenessVerdict, parse_response_atom, response_liveness_rescue_atoms,
+    Atom, LivenessVerdict, parse_response_atom, parse_response_pairs,
+    response_liveness_rescue_atoms, response_liveness_rescue_conjunction,
 };
 use crate::adapter::reach_portfolio::{ReachOutcome, decide_reach_portfolio_parallel};
 use crate::adapter::recoverability::verify_recoverability_with_predicates;
@@ -76,6 +77,27 @@ pub fn sv_verify_liveness(
     let btor2 = lift.lift()?;
     response_liveness_rescue_atoms(&btor2, &ante, &cons, false).ok_or_else(|| {
         "could not build the liveness monitor — an atom likely binds no signal in the design"
+            .to_string()
+    })
+}
+
+/// `sv verify-liveness-all` — lift SV and decide the **conjunction** of
+/// response-liveness properties `⋀ᵢ AG(aᵢ → AF bᵢ)` via the l2s reduction + the
+/// portfolio (one lift, one `bad`-reachability query per response). Each `responses`
+/// entry is a `"ANTE => CONS"` pair; every pair is parsed first, so a malformed
+/// response errors before the (toolchain-gated) lift — matching [`sv_verify_liveness`].
+///
+/// Returns the combined verdict + the per-response [`ReachOutcome`] (same order as
+/// `responses`), via [`response_liveness_rescue_conjunction`].
+pub fn sv_verify_liveness_all(
+    lift: &SvLift,
+    responses: &[String],
+) -> Result<(LivenessVerdict, Vec<ReachOutcome>), String> {
+    let pairs = parse_response_pairs(responses)?;
+    let btor2 = lift.lift()?;
+    response_liveness_rescue_conjunction(&btor2, &pairs, false).ok_or_else(|| {
+        "could not build a liveness monitor — an atom likely binds no signal in the design, \
+         or no responses were given"
             .to_string()
     })
 }

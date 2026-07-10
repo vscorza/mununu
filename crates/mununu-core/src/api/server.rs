@@ -120,6 +120,12 @@ fn create_router() -> Router {
             "/api/v1/btor2/verify-liveness",
             post(handlers::btor2_verify_liveness_handler),
         )
+        // Conjunctive response-liveness — ⋀ᵢ AG(aᵢ → AF bᵢ) via N liveness-to-safety
+        // queries + the portfolio. Surface peer of `mununu btor2 verify-liveness-all`.
+        .route(
+            "/api/v1/btor2/verify-liveness-all",
+            post(handlers::btor2_verify_liveness_all_handler),
+        )
         // P2 recoverability — AG EF good ("can it always get back?"), the branching
         // property SVA cannot state. Surface peer of `mununu btor2 verify-recoverability`.
         .route(
@@ -158,6 +164,10 @@ fn create_router() -> Router {
         .route(
             "/api/v1/sv/verify-liveness",
             post(handlers::sv_verify_liveness_handler),
+        )
+        .route(
+            "/api/v1/sv/verify-liveness-all",
+            post(handlers::sv_verify_liveness_all_handler),
         )
         .route(
             "/api/v1/sv/verify-recoverability",
