@@ -60,7 +60,10 @@ pub enum AgOracle {
 
 /// Init value of each state cell (from BTOR2 `init` lines, default 0 — the
 /// `setundef -zero` power-up).
-fn init_valuation(file: &Btor2File) -> BTreeMap<String, u128> {
+///
+/// `pub(crate)` (P2 Slice 1): the recoverability cube path reuses it to build the
+/// initial-cube pin (`config_values`) so the lift's initial cube is the reset state.
+pub(crate) fn init_valuation(file: &Btor2File) -> BTreeMap<String, u128> {
     let symbols = parser::collect_symbols(file);
     let mut init_of: HashMap<crate::adapter::btor2::ast::Nid, u128> = HashMap::new();
     for line in &file.lines {

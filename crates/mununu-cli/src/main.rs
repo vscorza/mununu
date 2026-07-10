@@ -580,6 +580,12 @@ struct Btor2VerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    /// Extra abstraction predicate(s) for the cube-path escalation,
+    /// `NAME:REGISTER=VALUE` (repeatable, like `btor2 cegar`). Used only when the exact
+    /// engine abstains (over the ~40-bit cone cap); the escalation is automatic even
+    /// with none.
+    #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
+    predicate: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -1548,6 +1554,11 @@ struct SvVerifyRecoverabilityArgs {
     /// The `good` atom to recover to — a register comparison, e.g. `"state_q == 3"`.
     #[arg(long, value_name = "ATOM")]
     target: String,
+    /// Extra abstraction predicate(s) for the cube-path escalation,
+    /// `NAME:REGISTER=VALUE` (repeatable). Used only when the exact engine abstains; the
+    /// escalation is automatic even with none.
+    #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
+    predicate: Vec<String>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2367,12 +2378,17 @@ fn btor2_check_fsm(args: Btor2CheckFsmArgs) -> Result<(), String> {
 /// `POST /api/v1/btor2/verify-recoverability`.
 fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<(), String> {
     use mununu_core::adapter::recoverability::{
-        recoverability_property_str, verify_recoverability,
+        parse_extra_predicate, recoverability_property_str, verify_recoverability_with_predicates,
     };
 
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
-    let verdict = verify_recoverability(&content, &args.target)?;
+    let extra = args
+        .predicate
+        .iter()
+        .map(|s| parse_extra_predicate(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let verdict = verify_recoverability_with_predicates(&content, &args.target, &extra)?;
 
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
@@ -4677,11 +4693,19 @@ fn sv_verify_liveness(args: SvVerifyLivenessArgs) -> Result<(), String> {
 
 /// `mununu sv verify-recoverability` — lift SV and decide `AG EF good`.
 fn sv_verify_recoverability(args: SvVerifyRecoverabilityArgs) -> Result<(), String> {
-    use mununu_core::adapter::recoverability::recoverability_property_str;
-    use mununu_core::adapter::sv_verify::sv_verify_recoverability as core_sv_verify_recoverability;
+    use mununu_core::adapter::recoverability::{
+        parse_extra_predicate, recoverability_property_str,
+    };
+    use mununu_core::adapter::sv_verify::sv_verify_recoverability_with_predicates;
 
     let file = args.lift.file.display().to_string();
-    let verdict = core_sv_verify_recoverability(&read_sv_lift(&args.lift)?, &args.target)?;
+    let extra = args
+        .predicate
+        .iter()
+        .map(|s| parse_extra_predicate(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let verdict =
+        sv_verify_recoverability_with_predicates(&read_sv_lift(&args.lift)?, &args.target, &extra)?;
     let summary = serde_json::json!({
         "file": file,
         "property": recoverability_property_str(&args.target),
