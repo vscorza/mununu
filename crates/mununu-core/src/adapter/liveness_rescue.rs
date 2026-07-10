@@ -174,6 +174,57 @@ fn is_unconstrained_box_to_var(formula: &Formula, id: NodeId, var: FormulaVarId)
     )
 }
 
+/// A `<> var` diamond whose target is exactly `var` and whose guard is unconstrained —
+/// the inner recursion of the `EF` in `AG EF good`, the branching content that
+/// distinguishes νμ recoverability from the box-AF response.
+fn is_unconstrained_diamond_to_var(formula: &Formula, id: NodeId, var: FormulaVarId) -> bool {
+    matches!(
+        formula.node(id),
+        Node::Modal { kind: ModalKind::Diamond, guard, target }
+            if *guard == Guard::default()
+                && matches!(formula.node(*target), Node::Variable(v) if *v == var)
+    )
+}
+
+/// Conservatively recognize the recoverability shape `AG EF good` =
+/// `ν Y. ((μ X. (good ∨ <> X)) ∧ [] Y)` with a single-atom `good`, returning that atom.
+/// Returns `None` for every other shape — in particular the box-AF response (whose
+/// inner recursion is `[] Y`, not `<> X`) — so a caller can route a νμ recoverability ⊥
+/// to the cube + `smt-hyper-must` path while leaving box-AF to l2s. The mirror of
+/// [`reduce_response_af`] for the diamond (`EF`) inner fixpoint.
+pub fn reduce_ag_ef_target(formula: &Formula) -> Option<Atom> {
+    // ν Y. BODY
+    let Node::Nu { var: y, body } = formula.node(formula.root()) else {
+        return None;
+    };
+    // BODY = core ∧ [] Y
+    let Node::And(l, r) = formula.node(*body) else {
+        return None;
+    };
+    let (core_id, _box_y) = split_and_box_to_var(formula, *l, *r, *y)?;
+    // core = μ X. (good ∨ <> X)
+    let Node::Mu {
+        var: x,
+        body: mbody,
+    } = formula.node(core_id)
+    else {
+        return None;
+    };
+    let Node::Or(ml, mr) = formula.node(*mbody) else {
+        return None;
+    };
+    // Exactly one side is `<> X`; the other is the `good` predicate.
+    let good_id = match (
+        is_unconstrained_diamond_to_var(formula, *ml, *x),
+        is_unconstrained_diamond_to_var(formula, *mr, *x),
+    ) {
+        (true, false) => *mr,
+        (false, true) => *ml,
+        _ => return None,
+    };
+    predicate_atom(formula, good_id)
+}
+
 /// Parse a `Predicate` node as a single register-comparison atom. `None` for a
 /// relational (`reg ⋈ reg`), compound, or unparseable atom.
 fn predicate_atom(formula: &Formula, id: NodeId) -> Option<Atom> {

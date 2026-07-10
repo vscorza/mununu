@@ -567,6 +567,11 @@ pub struct VerifyAutoOptions {
     /// common-path cost and no mis-route. Default `true`; opts out with the same
     /// `--no-rescue` / API `rescue_bottom_liveness: false`.
     pub rescue_bottom_liveness: bool,
+    /// On a νμ **recoverability** property `AG EF good` the cube portfolio leaves `⊥`,
+    /// escalate to the cube + `smt-hyper-must` path (definite νμ verdicts transfer).
+    /// Only fires on the `AG EF (REG == VALUE)` shape. Default `true`; `--no-rescue` /
+    /// API `rescue_bottom_recoverability: false` opts out.
+    pub rescue_bottom_recoverability: bool,
 }
 
 /// PORTFOLIO scheduling mode — the budget knob for the multi-engine default.
@@ -622,6 +627,7 @@ impl Default for VerifyAutoOptions {
             portfolio: None,
             rescue_bottom_safety: true,
             rescue_bottom_liveness: true,
+            rescue_bottom_recoverability: true,
         }
     }
 }
@@ -2226,23 +2232,11 @@ pub fn verify_auto(
         });
     }
 
-    // Safety-⊥ escalation (before the notes/coverage build, so the counts reflect any
-    // rescue): reduce a reducible AG-invariant the cube left ⊥ to a `bad`-monitor and
-    // decide it with the multi-engine reachability portfolio. Only fires on ⊥
-    // reducible AG-invariants — no common-path cost.
-    let mut rescue_notes = if opts.rescue_bottom_safety {
-        escalate_bottom_safety(&mut report, &btor2, reset_pinned)
-    } else {
-        Vec::new()
-    };
-
-    // Liveness-⊥ escalation (P2): a box-response `AG(a → AF b)` the cube left ⊥ is
-    // reduced to a `bad`-monitor lasso (Biere–Artho–Schuppan l2s) and decided by the
-    // reachability portfolio. Only fires on ⊥ reducible box-AF responses — the
-    // diamond-EF recoverability liveness stays on the νμ path — no common-path cost.
-    if opts.rescue_bottom_liveness {
-        rescue_notes.extend(escalate_bottom_liveness(&mut report, &btor2, reset_pinned));
-    }
+    // ⊥ escalation (P3 router): dispatch each ⊥ property by property_class to its sound
+    // reduction — safety→reach_rescue, box-AF→l2s, νμ recoverability→cube+hyper-must.
+    // Runs before the notes/coverage build so the counts reflect any rescue; each arm is
+    // gated by its own `rescue_bottom_*` opt and only fires on its recognized shape.
+    let rescue_notes = escalate_bottom(&mut report, &btor2, reset_pinned, opts);
 
     // H.J — provenance notes: surface every abstraction/scoping decision this run
     // made (config concretizations, posture, reset-gating, flop stubs, cut
@@ -2270,22 +2264,38 @@ pub fn verify_auto(
     Ok(report)
 }
 
-/// On each *safety* property the cube portfolio left `⊥`, try the multi-engine
-/// reachability portfolio: [`reach_portfolio_rescue`](crate::adapter::reach_rescue::reach_portfolio_rescue)
-/// reduces a reducible AG-invariant to a `bad`-monitor over `design_btor2` and decides
-/// it symbolically (exact ⊕ native ⊕ spacer ⊕ btormc ⊕ Pono). Upgrades the property's
-/// outcome in place and returns a provenance note per rescue. `reach_portfolio_rescue`
-/// returns `None` for every shape other than the single-atom AG-invariant, so liveness
-/// / recoverability `⊥` and implication-bodied safety are left untouched — no
-/// common-path cost. Pure over `(report, design_btor2)`, so it is unit-testable on a
-/// BTOR2 fixture without the SV toolchain.
-fn escalate_bottom_safety(
+/// Unified ⊥-escalation router (P3): for each property the cube portfolio left `⊥`,
+/// dispatch by [`property_class`](crate::mu_calculus::Formula::property_class) to the
+/// sound reduction matching its shape and upgrade the verdict in place —
+///   - **Safety** (an AG-invariant) → the multi-engine reachability portfolio
+///     ([`reach_portfolio_rescue`](crate::adapter::reach_rescue::reach_portfolio_rescue));
+///   - **Liveness / box-AF response** `AG(a → AF b)` → liveness-to-safety
+///     ([`response_liveness_rescue`](crate::adapter::liveness_rescue::response_liveness_rescue));
+///   - **Liveness / νμ recoverability** `AG EF good` → the cube + `smt-hyper-must` path
+///     ([`verify_recoverability_scalable`](crate::adapter::recoverability::verify_recoverability_scalable)).
+///
+/// Each reducer recognizes ONLY its own shape (returns `None`/abstains otherwise), so a
+/// property is routed to at most one reduction and an un-reducible ⊥ is left untouched —
+/// the roadmap's L3 `property_class()` promoted from a diagnostic label to the actual
+/// escalation dispatch. The νμ recoverability arm closes the gap where a diamond-EF ⊥
+/// was previously left undecided in verify_auto even though the cube + smt-hyper-must
+/// path could decide it. Pure over `(report, design_btor2)`, so it is unit-testable on a
+/// BTOR2 fixture without the SV toolchain. Per-arm rescues are gated by
+/// `rescue_bottom_{safety,liveness,recoverability}`.
+fn escalate_bottom(
     report: &mut AutoVerifyReport,
     design_btor2: &str,
     reset_pinned: bool,
+    opts: &VerifyAutoOptions,
 ) -> Vec<VerificationNote> {
+    use crate::adapter::btor2::predicate_expr::CmpOp;
+    use crate::adapter::liveness_rescue::{
+        LivenessVerdict, reduce_ag_ef_target, response_liveness_rescue,
+    };
     use crate::adapter::reach_rescue::{RescueVerdict, reach_portfolio_rescue};
-    use crate::mu_calculus::parser as mu_parser;
+    use crate::adapter::recoverability::verify_recoverability_scalable;
+    use crate::mu_calculus::{PropertyClass, parser as mu_parser};
+    use crate::verdict::PropertyVerdict;
 
     let mut notes = Vec::new();
     for prop in report.properties.iter_mut() {
@@ -2295,29 +2305,83 @@ fn escalate_bottom_safety(
         let Ok(formula) = mu_parser::parse(&prop.formula) else {
             continue;
         };
-        let Some((verdict, reach)) = reach_portfolio_rescue(design_btor2, &formula, reset_pinned)
-        else {
-            continue;
-        };
-        let engines: Vec<&str> = reach
-            .reachable_by
-            .iter()
-            .chain(reach.unreachable_by.iter())
-            .copied()
-            .collect();
-        match verdict {
-            RescueVerdict::Holds => {
-                prop.outcome = VerifyOutcome::Holds;
-                notes.push(rescue_note(&prop.name, "HOLDS", &engines));
+        match formula.property_class() {
+            PropertyClass::Safety if opts.rescue_bottom_safety => {
+                if let Some((verdict, reach)) =
+                    reach_portfolio_rescue(design_btor2, &formula, reset_pinned)
+                {
+                    let engines = engines_of(&reach);
+                    match verdict {
+                        RescueVerdict::Holds => {
+                            prop.outcome = VerifyOutcome::Holds;
+                            notes.push(rescue_note(&prop.name, "HOLDS", &engines));
+                        }
+                        RescueVerdict::Violated => {
+                            prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                            notes.push(rescue_note(&prop.name, "VIOLATED", &engines));
+                        }
+                        RescueVerdict::Inconclusive => {}
+                    }
+                }
             }
-            RescueVerdict::Violated => {
-                prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
-                notes.push(rescue_note(&prop.name, "VIOLATED", &engines));
+            PropertyClass::Liveness => {
+                let mut handled = false;
+                if opts.rescue_bottom_liveness
+                    && let Some((verdict, reach)) =
+                        response_liveness_rescue(design_btor2, &formula, reset_pinned)
+                {
+                    handled = true;
+                    let engines = engines_of(&reach);
+                    match verdict {
+                        LivenessVerdict::Holds => {
+                            prop.outcome = VerifyOutcome::Holds;
+                            notes.push(liveness_rescue_note(&prop.name, "HOLDS", &engines));
+                        }
+                        LivenessVerdict::Violated => {
+                            prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                            notes.push(liveness_rescue_note(&prop.name, "VIOLATED", &engines));
+                        }
+                        LivenessVerdict::Inconclusive => {}
+                    }
+                }
+                if !handled
+                    && opts.rescue_bottom_recoverability
+                    && let Some(good) = reduce_ag_ef_target(&formula)
+                    && good.op == CmpOp::Eq
+                {
+                    // SOUNDNESS: verify_recoverability_scalable runs the sound cube +
+                    // smt-hyper-must νμ path and abstains (Unknown) if it cannot decide,
+                    // so a ⊥ is only ever upgraded to a DEFINITE verdict.
+                    let good_str = format!("{} == {}", good.signal, good.value);
+                    if let Ok(v) = verify_recoverability_scalable(design_btor2, &good_str, &[]) {
+                        match v {
+                            PropertyVerdict::Holds => {
+                                prop.outcome = VerifyOutcome::Holds;
+                                notes.push(recoverability_rescue_note(&prop.name, "HOLDS"));
+                            }
+                            PropertyVerdict::Violated => {
+                                prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
+                                notes.push(recoverability_rescue_note(&prop.name, "VIOLATED"));
+                            }
+                            PropertyVerdict::Unknown | PropertyVerdict::Skipped => {}
+                        }
+                    }
+                }
             }
-            RescueVerdict::Inconclusive => {}
+            _ => {}
         }
     }
     notes
+}
+
+/// The engines that participated in a reachability-portfolio rescue (for a note).
+fn engines_of(reach: &crate::adapter::reach_portfolio::ReachOutcome) -> Vec<&'static str> {
+    reach
+        .reachable_by
+        .iter()
+        .chain(reach.unreachable_by.iter())
+        .copied()
+        .collect()
 }
 
 /// A provenance note for a property the reachability portfolio rescued from `⊥`.
@@ -2343,60 +2407,22 @@ fn rescue_note(name: &str, verdict: &str, engines: &[&str]) -> VerificationNote 
     }
 }
 
-/// On each *box-response liveness* property `AG(a → AF b)` the cube portfolio left `⊥`,
-/// try the liveness-to-safety reduction
-/// ([`response_liveness_rescue`](crate::adapter::liveness_rescue::response_liveness_rescue)):
-/// reduce the property to a reachable-`b`-free-lasso `bad`-monitor over `design_btor2`
-/// and decide it with the reachability portfolio. Upgrades the property's outcome in
-/// place and returns a provenance note per rescue.
-///
-/// SOUNDNESS: `response_liveness_rescue` (via `reduce_response_af`) returns `None` for
-/// every shape other than the exact single-atom **box-AF** response with unconstrained
-/// boxes — so the **diamond-EF** recoverability liveness (`AG(a → EF b)`, a νμ property
-/// l2s does NOT decide) and every safety shape are left untouched (no mis-route, no
-/// common-path cost). The l2s reduction it does apply is sound + complete for the box-AF
-/// shape, cross-checked against the exact engine in the `liveness_rescue` module tests.
-/// Pure over `(report, design_btor2)`, so it is unit-testable on a BTOR2 fixture without
-/// the SV toolchain.
-fn escalate_bottom_liveness(
-    report: &mut AutoVerifyReport,
-    design_btor2: &str,
-    reset_pinned: bool,
-) -> Vec<VerificationNote> {
-    use crate::adapter::liveness_rescue::{LivenessVerdict, response_liveness_rescue};
-    use crate::mu_calculus::parser as mu_parser;
-
-    let mut notes = Vec::new();
-    for prop in report.properties.iter_mut() {
-        if !matches!(prop.outcome, VerifyOutcome::Unknown { .. }) {
-            continue;
-        }
-        let Ok(formula) = mu_parser::parse(&prop.formula) else {
-            continue;
-        };
-        let Some((verdict, reach)) = response_liveness_rescue(design_btor2, &formula, reset_pinned)
-        else {
-            continue;
-        };
-        let engines: Vec<&str> = reach
-            .reachable_by
-            .iter()
-            .chain(reach.unreachable_by.iter())
-            .copied()
-            .collect();
-        match verdict {
-            LivenessVerdict::Holds => {
-                prop.outcome = VerifyOutcome::Holds;
-                notes.push(liveness_rescue_note(&prop.name, "HOLDS", &engines));
-            }
-            LivenessVerdict::Violated => {
-                prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
-                notes.push(liveness_rescue_note(&prop.name, "VIOLATED", &engines));
-            }
-            LivenessVerdict::Inconclusive => {}
-        }
+/// A provenance note for a νμ recoverability property the cube + smt-hyper-must path
+/// rescued from `⊥`.
+fn recoverability_rescue_note(name: &str, verdict: &str) -> VerificationNote {
+    VerificationNote {
+        kind: "recoverability-rescue".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "`{name}`: the cube abstraction left ⊥; the cube + smt-hyper-must νμ path decided \
+             the recoverability property {verdict}"
+        ),
+        detail: "The AG EF (recoverability) ⊥ was escalated to the sound predicate-cube + \
+                 smt-hyper-must path (definite νμ verdicts transfer per Bruns–Godefroid / \
+                 Shoham–Grumberg); box-AF liveness and safety take their own reductions."
+            .into(),
+        items: Vec::new(),
     }
-    notes
 }
 
 /// A provenance note for a box-AF liveness property the l2s reduction + reachability
@@ -2485,7 +2511,7 @@ mod tests {
             ..Default::default()
         };
 
-        let notes = escalate_bottom_safety(&mut report, DESIGN, false);
+        let notes = escalate_bottom(&mut report, DESIGN, false, &VerifyAutoOptions::default());
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
             "the ⊥ safety property should be rescued to HOLDS, got {:?}",
@@ -2497,8 +2523,11 @@ mod tests {
         );
     }
 
-    // A liveness / recoverability ⊥ (diamond-bodied μ) is NOT a reducible AG-invariant,
-    // so the escalation leaves it untouched (no unsound reachability reduction of νμ).
+    // A liveness / recoverability ⊥ (diamond-bodied μ) is NOT a reducible AG-invariant, so
+    // the SAFETY (reachability-portfolio) arm never touches it — property_class classifies
+    // it Liveness, not Safety. With only the safety arm enabled (the recoverability arm that
+    // WOULD legitimately decide this νμ is gated off), the router leaves it untouched: no
+    // 2-valued reachability reduction is ever applied to a νμ.
     #[test]
     fn escalate_bottom_safety_ignores_non_safety_bottom() {
         const DESIGN: &str =
@@ -2515,10 +2544,18 @@ mod tests {
             }],
             ..Default::default()
         };
-        let notes = escalate_bottom_safety(&mut report, DESIGN, false);
+        // Only the safety arm on — the νμ recoverability arm (which would decide this) is
+        // gated off, isolating the property under test: the safety arm ignores a νμ ⊥.
+        let opts = VerifyAutoOptions {
+            rescue_bottom_liveness: false,
+            rescue_bottom_recoverability: false,
+            ..VerifyAutoOptions::default()
+        };
+        let notes = escalate_bottom(&mut report, DESIGN, false, &opts);
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
-            "a νμ ⊥ must be left untouched (2-valued reachability can't soundly decide it)"
+            "a νμ ⊥ must be left untouched by the safety arm (2-valued reachability can't \
+             soundly decide it)"
         );
         assert!(
             notes.is_empty(),
@@ -2560,7 +2597,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let notes = escalate_bottom_liveness(&mut report, RESPONDER_LIVE, false);
+        let notes = escalate_bottom(
+            &mut report,
+            RESPONDER_LIVE,
+            false,
+            &VerifyAutoOptions::default(),
+        );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
             "the ⊥ box-AF liveness property should be rescued to HOLDS, got {:?}",
@@ -2588,12 +2630,52 @@ mod tests {
             }],
             ..Default::default()
         };
-        let notes = escalate_bottom_liveness(&mut report, RESPONDER_LIVE, false);
+        let notes = escalate_bottom(
+            &mut report,
+            RESPONDER_LIVE,
+            false,
+            &VerifyAutoOptions::default(),
+        );
         assert!(
             matches!(report.properties[0].outcome, VerifyOutcome::Unknown { .. }),
             "a diamond-EF νμ ⊥ must be left untouched (l2s does not decide it)"
         );
         assert!(notes.is_empty(), "no rescue note for a non-box-AF property");
+    }
+
+    // A νμ recoverability property `AG EF (st == 0)` the cube left ⊥ is routed by
+    // property_class → the Liveness arm → (l2s abstains) → the cube + smt-hyper-must νμ
+    // path, which decides it on RESPONDER_LIVE (st==0 is reachable from every reachable
+    // state: idle stays/returns, req→grant→idle, grant→idle).
+    #[test]
+    fn escalate_bottom_routes_recoverability_to_cube() {
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "recover_idle".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu Y. ((mu X. ((st == 0) || <> X)) && [] Y)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let notes = escalate_bottom(
+            &mut report,
+            RESPONDER_LIVE,
+            false,
+            &VerifyAutoOptions::default(),
+        );
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "the ⊥ νμ recoverability property should be rescued to HOLDS by the cube + \
+             smt-hyper-must path, got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "recoverability-rescue"),
+            "a recoverability-rescue provenance note should be recorded"
+        );
     }
 
     /// A cube engine's ⊥ (Unknown) is filled by a later engine's definite verdict, and the
