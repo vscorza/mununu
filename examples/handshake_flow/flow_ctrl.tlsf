@@ -1,0 +1,18 @@
+INFO { TITLE: "flow_ctrl"; DESCRIPTION: "producer/FIFO/consumer flow control: no overflow/underflow, no drop, eager transfer"; SEMANTICS: Mealy; TARGET: Mealy; }
+MAIN {
+  INPUTS  { p_valid; c_ready; full; empty; }
+  OUTPUTS { enq; deq; }
+  ASSUMPTIONS {
+    G F c_ready;                               // consumer eventually accepts
+    G F !full;                                 // FIFO eventually has room
+    G F p_valid;                               // producer eventually offers
+  }
+  GUARANTEES {
+    G (!(enq && full));                        // no overflow
+    G (!(deq && empty));                       // no underflow
+    G (!(enq && !p_valid));                    // only accept real producer data
+    G (!(deq && !c_ready));                    // only deliver when the consumer takes it (no drop)
+    G ((p_valid && !full) -> F enq);           // eager accept: offered data with room is taken
+    G ((!empty && c_ready) -> F deq);          // eager deliver: buffered data with a ready consumer is delivered
+  }
+}
