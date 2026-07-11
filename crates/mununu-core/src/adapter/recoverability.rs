@@ -188,17 +188,19 @@ pub fn verify_recoverability_scalable(
         ..Default::default()
     };
 
-    // SOUNDNESS (2026-07-11): abstain when the cube lift would UF-wrap any op. `smart_uf_cap`
-    // substitutes a wide op (Mul, or Add/Sub wider than `UF_WIDE_ADD_SUB_THRESHOLD`) to the
-    // multi-value havoc set {0, ones}. That is a MAY-side over-approximation (documented sound for
-    // safety), but recoverability is νμ: its definite `Holds` rests on the MUST relation, and the
-    // may-havoc inflates the may-successor set from which the `SmtHyperMust` target set is drawn —
-    // manufacturing a spurious must-path out of a genuine trap. (Repro: a wide `data' = data + 2`
-    // odd counter whose `data==0` escape is concretely unreachable is reported `Holds` at width
-    // > 32, while the exact engine correctly says `Violated` under the cap.) The exact engine has no
-    // such leak (it abstains over-cap instead). Rather than emit an unsound definite verdict we
-    // ABSTAIN. Recovering the cases where every wrapped op is IRRELEVANT to the property (outside
-    // every final predicate's cone) is a completeness follow-up — abstaining is always sound.
+    // Abstain (`Unknown`) when the cube lift would UF-wrap any wide op (Mul, or wide Add/Sub).
+    //
+    // NOTE (2026-07-11): this is now a PRECISION/PERFORMANCE guard, no longer a soundness band-aid.
+    // The original #301 abstain was needed because the multi-target hyper-must ◇ was *existential*
+    // (any-of-set), which the may-havoc could exploit to fabricate a spurious `Holds` on a trap.
+    // PR #302 made ◇ *universal* (a definite `◇φ` needs EVERY hyper-target to reach φ), so an
+    // inflated (havoc'd) target set now only pushes toward `⊥` — the wrapped case is SOUND without
+    // the guard. But it is not USEFUL: empirically the wrapped cube either abstains anyway (a coarse
+    // control-only abstraction cannot prove wide-datapath recoverability — it lands on `Unknown`) or
+    // times out (adding datapath predicates hits the `2^|P|` all-pairs-SMT blow-up). So running it
+    // buys no new verdict and risks a hang; abstaining fast is strictly better here. Deciding these
+    // designs needs lazy, property-directed predicate discovery WITHOUT the cube blow-up — the N1
+    // incremental engine, not this explicit cube. (Gate-1 + PR #302 fallout + this all point there.)
     if !crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, &adapter_options)
         .is_empty()
     {
@@ -436,16 +438,15 @@ mod tests {
     #[test]
     fn scalable_matches_exact_holds_polarity() {
         // Differential SOUNDNESS gate: the cube path must never CONTRADICT the exact engine — it
-        // either agrees or soundly abstains (`Unknown`). It must never emit the OPPOSITE definite
-        // verdict. (Soundness ≠ completeness: requiring an exact match would demand the cube be as
-        // *precise* as exact, which is not a soundness property.)
+        // either agrees or soundly abstains (`Unknown`), never the opposite definite verdict.
+        // (Soundness ≠ completeness.)
         //
-        // RESPONDER: exact decides Holds. Post the universal-hyper-must-◇ fix (2026-07-11) the cube
-        // ABSTAINS here: the coarse hyper-must target set (the full may-successor set — a documented
-        // imprecision, `SmtEncode::hyper_must_edges`) combined with the now-SOUND universal ◇
-        // over-abstains where the old (unsound) existential ◇ decided. Sound — the auto verb returns
-        // exact's Holds for small designs regardless; recovering cube-alone precision needs
-        // tightening the hyper-must target set (follow-up).
+        // RESPONDER: exact = Holds; the cube ABSTAINS. Post the universal-hyper-must-◇ fix the coarse
+        // 2-cube abstraction is too coarse to PROVE recoverability soundly — cube 1's only must-edge
+        // is a self-loop with no must-progress toward idle (an irreducible multi-target hyper-must),
+        // so `EF idle` is `⊥`. This is abstraction coarseness, not target-set coarseness (target-set
+        // tightening does not recover it); the sound recovery needs finer predicate discovery (N1).
+        // The auto verb returns exact's Holds for small designs regardless.
         let exact = exact_verdict(RESPONDER, "st == 0");
         let scalable = verify_recoverability_scalable(RESPONDER, "st == 0", &[]).expect("decides");
         assert_eq!(
