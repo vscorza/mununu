@@ -188,6 +188,23 @@ pub fn verify_recoverability_scalable(
         ..Default::default()
     };
 
+    // SOUNDNESS (2026-07-11): abstain when the cube lift would UF-wrap any op. `smart_uf_cap`
+    // substitutes a wide op (Mul, or Add/Sub wider than `UF_WIDE_ADD_SUB_THRESHOLD`) to the
+    // multi-value havoc set {0, ones}. That is a MAY-side over-approximation (documented sound for
+    // safety), but recoverability is νμ: its definite `Holds` rests on the MUST relation, and the
+    // may-havoc inflates the may-successor set from which the `SmtHyperMust` target set is drawn —
+    // manufacturing a spurious must-path out of a genuine trap. (Repro: a wide `data' = data + 2`
+    // odd counter whose `data==0` escape is concretely unreachable is reported `Holds` at width
+    // > 32, while the exact engine correctly says `Violated` under the cap.) The exact engine has no
+    // such leak (it abstains over-cap instead). Rather than emit an unsound definite verdict we
+    // ABSTAIN. Recovering the cases where every wrapped op is IRRELEVANT to the property (outside
+    // every final predicate's cone) is a completeness follow-up — abstaining is always sound.
+    if !crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, &adapter_options)
+        .is_empty()
+    {
+        return Ok(PropertyVerdict::Unknown);
+    }
+
     // Cube + smt-hyper-must, matching the verify_auto CegarOptions shape.
     let cegar_opts = CegarOptions {
         max_iterations: RECOVERABILITY_MAX_ITERATIONS,
@@ -480,6 +497,90 @@ mod tests {
             verify_recoverability_scalable(WIDE_TRAP, "st == 0", &[]).expect("decides"),
             PropertyVerdict::Violated,
             "the cube path must DECIDE Violated where the exact engine abstains"
+        );
+    }
+
+    // === SOUNDNESS regression (2026-07-11): UF-wrap must NOT manufacture a spurious `Holds` =====
+    // `data' = data + 2`, `data` init 1 ⇒ `data` stays ODD ⇒ `data==0` is unreachable ⇒ the
+    // `busy --(data==0)--> done` escape never fires ⇒ `busy` is an absorbing trap ⇒ `AG EF idle`
+    // is VIOLATED. At width 8 (cone under the exact cap) the exact engine proves it. At width 48
+    // the wide `add` (> UF_WIDE_ADD_SUB_THRESHOLD = 32) is UF-wrapped; the pre-fix cube path
+    // reported an unsound `Holds` (may-havoc manufactured the `data==0` escape). The fix ABSTAINS.
+    const TRAP_UF_W8: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 sort bitvec 8
+4 state 1 ctrl
+5 zero 1
+6 init 1 4 5
+7 state 3 data
+8 zero 3
+13 one 3
+30 constd 3 2
+9 init 3 7 13
+10 input 2 start
+11 one 1
+12 constd 1 2
+14 eq 2 4 5
+15 eq 2 4 11
+23 eq 2 7 8
+17 ite 1 10 11 5
+25 ite 1 23 12 11
+18 ite 1 15 25 5
+19 ite 1 14 17 18
+20 next 1 4 19
+31 add 3 7 30
+22 next 3 7 31
+";
+    const TRAP_UF_W48: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 sort bitvec 48
+4 state 1 ctrl
+5 zero 1
+6 init 1 4 5
+7 state 3 data
+8 zero 3
+13 one 3
+30 constd 3 2
+9 init 3 7 13
+10 input 2 start
+11 one 1
+12 constd 1 2
+14 eq 2 4 5
+15 eq 2 4 11
+23 eq 2 7 8
+17 ite 1 10 11 5
+25 ite 1 23 12 11
+18 ite 1 15 25 5
+19 ite 1 14 17 18
+20 next 1 4 19
+31 add 3 7 30
+22 next 3 7 31
+";
+
+    #[test]
+    fn uf_wrap_recoverability_abstains_not_unsound_holds() {
+        // Ground truth (exact, width-8 cone under the cap): the odd-counter trap is VIOLATED.
+        assert_eq!(
+            exact_verdict(TRAP_UF_W8, "ctrl == 0"),
+            PropertyVerdict::Violated,
+            "exact engine (under cap) must prove the odd-counter trap VIOLATED"
+        );
+        // At width 48 the wide `add` UF-wraps ⇒ the cube path must ABSTAIN (Unknown), NEVER the
+        // pre-fix unsound `Holds`.
+        assert_eq!(
+            verify_recoverability_scalable(TRAP_UF_W48, "ctrl == 0", &[])
+                .expect("abstains soundly"),
+            PropertyVerdict::Unknown,
+            "UF-wrap must force a sound abstain, not an unsound Holds"
+        );
+        // The public auto-escalating verb inherits the sound abstain (exact over-caps, cube
+        // abstains on UF-wrap) — it must not fabricate a definite verdict either.
+        assert_eq!(
+            verify_recoverability(TRAP_UF_W48, "ctrl == 0").expect("abstains soundly"),
+            PropertyVerdict::Unknown,
+            "auto-escalation must inherit the sound abstain"
         );
     }
 
