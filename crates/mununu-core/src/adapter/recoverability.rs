@@ -150,6 +150,92 @@ fn eq_reg_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(Stri
     out
 }
 
+/// N1 frontier (a) — the good register's cone-of-influence: the state registers whose values determine
+/// when `good` is (re)reached — those reachable backward from the good register's next-state function,
+/// plus the register itself. A guard atom over a register OUTSIDE this cone (a decoy comparison on an
+/// unrelated register) cannot change the recoverability verdict, yet seeding it still doubles the cube
+/// (`2^{|P|}`) — the un-directed eager extraction's scaling wall (a design with many unrelated guards
+/// blows up). Restricting the guard-atom seeds to this cone is the property-directed discovery of
+/// frontier (a): only the guards the return path actually branches on are seeded, at cone-of-influence
+/// granularity (a sound over-approximation of the strictly per-⊥-classifying-transition guard set).
+/// Returns the register NAMES in the cone; an EMPTY set (good register absent, or no restriction found)
+/// means "do not restrict" so the caller keeps its prior, unfiltered behaviour.
+fn good_register_coi(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    good_register: &str,
+) -> std::collections::HashSet<String> {
+    use crate::adapter::btor2::parser::{
+        collect_reachable_states_from, collect_symbols, find_next_value_operand,
+    };
+    let symbols = collect_symbols(file);
+    let Some(seed_nid) = symbols
+        .iter()
+        .find_map(|(nid, name)| (name == good_register).then_some(*nid))
+    else {
+        return std::collections::HashSet::new(); // good register absent → no restriction
+    };
+    let mut reachable: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    reachable.insert(seed_nid);
+    if let Some(next_value) = find_next_value_operand(file, seed_nid) {
+        reachable.extend(collect_reachable_states_from(
+            file,
+            std::slice::from_ref(&next_value),
+        ));
+    }
+    reachable
+        .iter()
+        .filter_map(|nid| symbols.get(nid).cloned())
+        .collect()
+}
+
+/// N1 frontier (a) — the constant literals appearing in the good register's next-state cone (the values
+/// its control logic assigns or branches on). Directs the control-state candidate pool: enumerating
+/// `good == v` for EVERY global constant (the prior behaviour) seeds control predicates the good
+/// register can never take — decoy constants that belong to unrelated registers — and each is a cube
+/// dimension, so a design with many unrelated constants blows up the `2^{|P|}` all-pairs SMT even though
+/// none of those predicates can change the verdict. Restricting to the good register's own cone keeps
+/// the control-state seeding property-directed. An EMPTY result (good register absent / no `next`) means
+/// "no cone info" so the caller falls back to `{0,1} ∪ global constants`.
+fn good_next_cone_constants(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    good_register: &str,
+) -> Vec<u64> {
+    use crate::adapter::btor2::ast::Node;
+    use crate::adapter::btor2::parser::{collect_symbols, find_next_value_operand};
+    let symbols = collect_symbols(file);
+    let Some(seed_nid) = symbols
+        .iter()
+        .find_map(|(nid, name)| (name == good_register).then_some(*nid))
+    else {
+        return Vec::new();
+    };
+    let Some(next_value) = find_next_value_operand(file, seed_nid) else {
+        return Vec::new();
+    };
+    let mut queue: std::collections::VecDeque<i64> =
+        std::collections::VecDeque::from([next_value.0.abs()]);
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut consts: Vec<u64> = Vec::new();
+    while let Some(nid) = queue.pop_front() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        if let Some(v) = crate::adapter::btor2::bit_blast::resolve_btor2_constant(file, nid)
+            && !consts.contains(&v)
+        {
+            consts.push(v);
+        }
+        if let Some(line) = file.lookup(nid)
+            && let Node::Op { args, .. } = &line.node
+        {
+            for o in args {
+                queue.push_back(o.0.abs());
+            }
+        }
+    }
+    consts
+}
+
 /// Decide recoverability `AG EF (good)` of `btor2_content`, where `good` is a single
 /// register-comparison atom string (`"state_q == 3"`).
 ///
@@ -266,9 +352,19 @@ pub fn verify_recoverability_scalable(
     // safety. Directed by the `good` atom (the property), it recovers the control-return
     // recoverability class the coarse abstraction abstained on. Sound: adding predicates only
     // sharpens `⊥` toward a definite verdict (monotone refinement), never flips one.
+    // Frontier (a): the constant pool is the good register's OWN cone constants (property-directed),
+    // not every global constant — a design with many unrelated constants would otherwise seed
+    // `good == decoy` predicates the good register can never take, inflating the cube. Fall back to the
+    // global pool only when the cone is empty (good register absent / no `next`).
     const MAX_AUTO_SEED: usize = 8;
     let mut candidate_values: Vec<u64> = vec![0, 1];
-    for v in crate::adapter::btor2::bit_blast::collect_btor2_constants(&file) {
+    let cone_constants = good_next_cone_constants(&file, &good_register);
+    let const_pool = if cone_constants.is_empty() {
+        crate::adapter::btor2::bit_blast::collect_btor2_constants(&file)
+    } else {
+        cone_constants
+    };
+    for v in const_pool {
         if !candidate_values.contains(&v) {
             candidate_values.push(v);
         }
@@ -299,11 +395,19 @@ pub fn verify_recoverability_scalable(
     // discovery of the datapath predicate from the design's own guards (the shipped, eager form of the
     // lazy "discover from the ⊥ obligation" idea). Bounded by the number of comparison nodes; deduped
     // against what is already seeded; capped with the control seeding at MAX_AUTO_SEED.
+    // N1 frontier (a) — property-directed guard discovery: restrict the guard-atom seeds to the good
+    // register's cone-of-influence. A guard over a register the return path does not depend on (a decoy
+    // comparison on an unrelated register) cannot change the verdict but still doubles the cube; without
+    // this filter a design with many unrelated guards blows up the `2^{|P|}` all-pairs SMT. An empty
+    // cone (good register absent / no `next`) means "no restriction" — prior behaviour preserved.
+    let good_coi = good_register_coi(&file, &good_register);
+    let in_coi = |reg: &str| good_coi.is_empty() || good_coi.contains(reg);
+
     for (reg, k) in eq_guard_atoms(&file) {
         if specs.len() > MAX_AUTO_SEED {
             break;
         }
-        if !specs.iter().any(|s| s.register == reg && s.value == k) {
+        if in_coi(&reg) && !specs.iter().any(|s| s.register == reg && s.value == k) {
             specs.push(PredicateSpec {
                 name: format!("guard_{reg}_eq_{k}"),
                 register: reg,
@@ -328,6 +432,11 @@ pub fn verify_recoverability_scalable(
     for (lhs, rhs) in eq_reg_guard_atoms(&file) {
         if specs.len() + compound_seeds.len() > MAX_AUTO_SEED {
             break;
+        }
+        // Frontier (a): both operands must be in the good register's cone (a relational guard over
+        // unrelated registers cannot change the verdict).
+        if !(in_coi(&lhs) && in_coi(&rhs)) {
+            continue;
         }
         let expr_str = format!("{lhs} == {rhs}");
         let Ok(expr) = parse_predicate_expr(&expr_str) else {
@@ -982,6 +1091,98 @@ mod tests {
         );
         assert_eq!(
             verify_recoverability(&relational_w(8, "7"), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Violated,
+            "8-bit exact oracle must agree with the 48-bit cube Violated"
+        );
+    }
+
+    // Frontier (a) — COI-directed seeding. A 2-state ctrl FSM whose return is gated on `data == 42`
+    // (data'=data → invariant when `data` inits 42), PLUS a decoy register `mode` compared against
+    // constants 2..9 in dead logic (`mode` is NOT in ctrl's cone-of-influence). The UN-directed eager
+    // extraction seeds `good == v` for every global constant (2..9, 42) and every `eq` atom
+    // (`mode==2..9`), inflating the cube to a >30s all-pairs-SMT hang. COI-directed seeding restricts
+    // both the control-state constant pool and the guard atoms to ctrl's cone → seeds only `data == 42`
+    // (+ good, + ctrl==1) → decides fast. `AG EF (ctrl==0)` HOLDS.
+    fn manyguard_btor2(width: u32, data_init: u64) -> String {
+        let mut l: Vec<String> = vec![
+            "1 sort bitvec 4".into(),
+            "2 sort bitvec 1".into(),
+            format!("3 sort bitvec {width}"),
+            "4 state 1 ctrl".into(),
+            "5 state 3 data".into(),
+            "6 state 1 mode".into(),
+            "10 zero 1".into(),
+            "11 one 1".into(),
+            "12 constd 3 42".into(),            // K
+            format!("13 constd 3 {data_init}"), // data reset value
+        ];
+        let mut dc: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut nid = 20i64;
+        for k in 2..10 {
+            l.push(format!("{nid} constd 1 {k}"));
+            dc.insert(k, nid);
+            nid += 1;
+        }
+        l.push("14 init 1 4 11".into()); // ctrl = busy(1)
+        l.push("15 init 3 5 13".into()); // data = data_init
+        l.push(format!("16 init 1 6 {}", dc[&2])); // mode = 2
+        // return: busy && data==42
+        l.push(format!("{nid} eq 2 4 11"));
+        let busy = nid;
+        nid += 1;
+        l.push(format!("{nid} eq 2 5 12"));
+        let dk = nid;
+        nid += 1;
+        l.push(format!("{nid} and 2 {busy} {dk}"));
+        let ret = nid;
+        nid += 1;
+        l.push(format!("{nid} ite 1 {ret} 10 4")); // busy&&data==42 -> idle(0) else stay
+        let cn = nid;
+        nid += 1;
+        l.push(format!("{nid} next 1 4 {cn}"));
+        nid += 1;
+        l.push(format!("{nid} next 3 5 5")); // data' = data
+        nid += 1;
+        // decoy `mode` ring over eq(mode, 2..9) — dead logic, not in ctrl's cone
+        let mut chain = 6i64;
+        for k in 2..10 {
+            let nxt = *dc.get(&(k + 1)).unwrap_or(&dc[&2]);
+            l.push(format!("{nid} eq 2 6 {}", dc[&k]));
+            let eqk = nid;
+            nid += 1;
+            l.push(format!("{nid} ite 1 {eqk} {nxt} {chain}"));
+            chain = nid;
+            nid += 1;
+        }
+        l.push(format!("{nid} next 1 6 {chain}"));
+        l.join("\n")
+    }
+
+    #[test]
+    fn class2_frontier_a_coi_directed_seeding_scales_past_decoy_guards() {
+        // POSITIVE (data init 42): decides Holds fast — COI-direction drops the decoy `mode` guards and
+        // the decoy control constants, so |P| stays small where the un-directed path blows up (>30s).
+        assert_eq!(
+            verify_recoverability_scalable(&manyguard_btor2(48, 42), "ctrl == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Holds,
+            "COI-directed seeding decides the many-decoy-guard design (un-directed blows up)"
+        );
+        // NEGATIVE (data init 7 != 42): `data == 42` never holds → busy is a trap → not recoverable.
+        assert_eq!(
+            verify_recoverability_scalable(&manyguard_btor2(48, 7), "ctrl == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Violated,
+            "the never-return many-guard variant decides Violated"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD) — must agree with the wide cube verdicts.
+        assert_eq!(
+            verify_recoverability(&manyguard_btor2(8, 42), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle must agree with the 48-bit cube Holds"
+        );
+        assert_eq!(
+            verify_recoverability(&manyguard_btor2(8, 7), "ctrl == 0").expect("exact decides"),
             PropertyVerdict::Violated,
             "8-bit exact oracle must agree with the 48-bit cube Violated"
         );
