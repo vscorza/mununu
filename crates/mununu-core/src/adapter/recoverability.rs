@@ -99,6 +99,57 @@ fn eq_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(String, 
     out
 }
 
+/// N1 Class-2 RELATIONAL discovery — the datapath-dependent return whose guard compares two STATE
+/// registers (`busy → done` gated on `data == target`), not a register to a constant. Extracts the
+/// `(lhs, rhs)` register pairs from the design's `Eq` comparison nodes where BOTH operands are state
+/// registers — the relational decision conditions the control logic branches on. The seeded relational
+/// predicate lets the recoverability return decide at SCALE: the exact hyper-must edge preserves the
+/// invariant (`data == target ⟹ data' == target'`) across the wide datapath WITHOUT concretising the
+/// register values (which are not enumerable over `2^W`); the may side may UF-wrap the increments, but
+/// that only pushes toward `⊥` (sound, per PR #302's universal ◇). Pairs are ordered (`lhs <= rhs`) for
+/// deterministic dedup (`data == target` and `target == data` are the same predicate); reflexive
+/// `r == r` is dropped (no information). Deduped.
+fn eq_reg_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(String, String)> {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let state_nids: std::collections::HashSet<i64> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::State { .. }))
+        .map(|l| l.nid)
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in &file.lines {
+        let Node::Op {
+            op: Op::Eq, args, ..
+        } = &line.node
+        else {
+            continue;
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        let (a, b) = (args[0].0.abs(), args[1].0.abs());
+        if a == b {
+            continue; // reflexive `r == r` carries no information
+        }
+        if state_nids.contains(&a)
+            && state_nids.contains(&b)
+            && let (Some(sa), Some(sb)) = (symbols.get(&a), symbols.get(&b))
+        {
+            let (lhs, rhs) = if sa <= sb {
+                (sa.clone(), sb.clone())
+            } else {
+                (sb.clone(), sa.clone())
+            };
+            if !out.iter().any(|(l, r)| l == &lhs && r == &rhs) {
+                out.push((lhs, rhs));
+            }
+        }
+    }
+    out
+}
+
 /// Decide recoverability `AG EF (good)` of `btor2_content`, where `good` is a single
 /// register-comparison atom string (`"state_q == 3"`).
 ///
@@ -263,6 +314,33 @@ pub fn verify_recoverability_scalable(
 
     specs.extend(extra_predicates.iter().cloned());
 
+    // Class-2 RELATIONAL return: seed the design's `register == register` guard atoms — the relational
+    // decision conditions the control branches on (`busy → done` gated on `data == target`). These are
+    // COMPOUND predicates (two registers, no literal), so they flow through the sidecar's
+    // `compound_predicates`: the SMT hyper-must seam decides each cube's truth via the EXACT transition
+    // (preserving the relational invariant across the wide datapath without concretising it), and the
+    // reset cube below evaluates the relational expr rather than `register == value`. Bounded by the
+    // number of comparison nodes; deduped implicitly (a `data == target` seed re-derives to the same
+    // expr); capped WITH the other auto-seeds so the cube dimension count stays `≤ MAX_AUTO_SEED + 1`.
+    // Built via `parse_predicate_expr` on the same string the sidecar carries, so the local expr used
+    // for the reset-cube eval is byte-identical to the one the CEGAR lift parses.
+    let mut compound_seeds: Vec<(String, String, PredicateExpr)> = Vec::new();
+    for (lhs, rhs) in eq_reg_guard_atoms(&file) {
+        if specs.len() + compound_seeds.len() > MAX_AUTO_SEED {
+            break;
+        }
+        let expr_str = format!("{lhs} == {rhs}");
+        let Ok(expr) = parse_predicate_expr(&expr_str) else {
+            continue;
+        };
+        compound_seeds.push((format!("rel_{lhs}_eq_{rhs}"), expr_str, expr));
+    }
+    // name → expr, for the reset-cube evaluation + free-input guard of the compound predicates.
+    let compound_map: std::collections::HashMap<String, PredicateExpr> = compound_seeds
+        .iter()
+        .map(|(name, _, expr)| (name.clone(), expr.clone()))
+        .collect();
+
     // AG EF good, over the PREDICATE-NAME atom (the cube path resolves `good` to the
     // `good` predicate's 3-valued label, not a raw register comparison).
     let formula = mu_parser::parse("nu Y. ((mu X. (good || <> X)) && [] Y)")
@@ -274,7 +352,7 @@ pub fn verify_recoverability_scalable(
     // the reset state and can falsely report VIOLATED — the pin is mandatory. A
     // predicate whose register has no `init_values` entry (e.g. a free input) is
     // silently skipped, which is correct (a free input has no reset value to pin).
-    let config_entries: Vec<String> = specs
+    let mut config_entries: Vec<String> = specs
         .iter()
         .filter_map(|s| {
             init_values
@@ -282,8 +360,41 @@ pub fn verify_recoverability_scalable(
                 .map(|v| format!("{}={}", s.register, v))
         })
         .collect();
-    let sidecar_json = config_values_to_sidecar_json(&config_entries)
+    // Pin the relational predicates' registers to their reset values too (both operands are states),
+    // so the lift's initial cube is the design's reset state for the compound bits as well.
+    for (_, _, expr) in &compound_seeds {
+        for reg in expr.registers() {
+            if let Some(v) = init_values.get(&reg) {
+                let entry = format!("{reg}={v}");
+                if !config_entries.contains(&entry) {
+                    config_entries.push(entry);
+                }
+            }
+        }
+    }
+    let base_sidecar_json = config_values_to_sidecar_json(&config_entries)
         .map_err(|e| format!("recoverability cube path: building the config-values pin: {e}"))?;
+    // Inject the relational atoms as sidecar `compound_predicates` (the CEGAR loop reads them via
+    // `sidecar_compound_predicates`, adds each as a cube dimension, and forces the compound-aware
+    // SmtAllPairs+Eager lift). A `None` base (no config entries) still needs the compound array.
+    let sidecar_json = if compound_seeds.is_empty() {
+        base_sidecar_json
+    } else {
+        let mut val: serde_json::Value = match &base_sidecar_json {
+            Some(s) => serde_json::from_str(s).map_err(|e| {
+                format!("recoverability cube path: re-parsing the config-values sidecar: {e}")
+            })?,
+            None => serde_json::json!({ "module": "cegar", "source": "cegar.btor2" }),
+        };
+        let decls: Vec<serde_json::Value> = compound_seeds
+            .iter()
+            .map(|(name, expr, _)| {
+                serde_json::json!({ "name": name, "expr": expr, "derived": false })
+            })
+            .collect();
+        val["compound_predicates"] = serde_json::Value::Array(decls);
+        Some(val.to_string())
+    };
     let adapter_options = AdapterOptions {
         sidecar_json,
         ..Default::default()
@@ -330,7 +441,8 @@ pub fn verify_recoverability_scalable(
         may_edge_inference: MayEdgeInference::SmtAllPairs,
         emit_ctxdsl: false,
     };
-    let env = Environment::new(1usize << specs.len());
+    // The cube space includes the compound (relational) predicates the CEGAR loop adds as dimensions.
+    let env = Environment::new(1usize << (specs.len() + compound_seeds.len()));
 
     let trace = match cegar_refine_loop(
         &formula,
@@ -356,11 +468,14 @@ pub fn verify_recoverability_scalable(
     // there is no cross-check to catch it. Rather than under-read (unsound) we ABSTAIN
     // (sound). Fully enumerating free-input initial flavours conjunctively (à la
     // verify_auto's `free_input_init_cubes`) is a completeness follow-up.
-    if !trace
-        .final_predicates
-        .iter()
-        .all(|spec| init_values.contains_key(&spec.register))
-    {
+    if !trace.final_predicates.iter().all(|spec| {
+        // A relational (compound) predicate is well-defined at reset iff EVERY register it references
+        // has a reset value; a simple atom needs only its one register pinned.
+        match compound_map.get(&spec.name) {
+            Some(expr) => expr.registers().iter().all(|r| init_values.contains_key(r)),
+            None => init_values.contains_key(&spec.register),
+        }
+    }) {
         return Ok(PropertyVerdict::Unknown);
     }
 
@@ -368,9 +483,18 @@ pub fn verify_recoverability_scalable(
     // in the lift's cube-bit order (`final_predicates[i]` ↔ bit `i`). Every final predicate
     // is now a pinned `register == value` state atom (guarded above), so its reset truth is
     // `init_values[register] == value` and the reset cube is input-independent.
+    // A relational (compound) predicate's reset truth is the EXPR evaluated at the reset valuation
+    // (e.g. `data == target`), NOT `register == value` — its `spec.register`/`spec.value` are only
+    // placeholders. `eval` wants a `HashMap`, so build one view of the reset valuation.
+    let init_map: std::collections::HashMap<String, u128> =
+        init_values.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut init_cube = 0usize;
     for (i, spec) in trace.final_predicates.iter().enumerate() {
-        if init_values.get(&spec.register).copied() == Some(spec.value as u128) {
+        let holds = match compound_map.get(&spec.name) {
+            Some(expr) => expr.eval(&init_map),
+            None => init_values.get(&spec.register).copied() == Some(spec.value as u128),
+        };
+        if holds {
             init_cube |= 1 << i;
         }
     }
@@ -811,6 +935,55 @@ mod tests {
             verify_recoverability_scalable(CLASS2_DATADEP, "ctrl == 0", &[]).expect("decides"),
             PropertyVerdict::Holds,
             "datapath-dependent-return recoverability decides Holds via guard-atom discovery"
+        );
+    }
+
+    // Class-2 RELATIONAL return. `busy → idle` (`ctrl' = ctrl & !(data==target)`) fires iff the two
+    // 48-bit registers are equal; both init 0 and increment by 1, so `data == target` is INVARIANT →
+    // `AG EF (ctrl==0)` HOLDS. But no `register == constant` predicate captures it: the guard compares
+    // two STATE registers, and the constant K is not enumerable. `eq_reg_guard_atoms` reads the
+    // relational atom `data == target` off the design's `eq` node; the exact hyper-must edge preserves
+    // the invariant across the wide (UF-wrapped-on-the-may-side) `+1` increments WITHOUT concretising
+    // the values, so the return decides at scale where the exact BDD walls.
+    fn relational_w(width: u32, target_init_nid: &str) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 1 ctrl\n4 state 2 data\n\
+             5 state 2 target\n6 zero 2\n7 one 2\n9 one 1\n10 init 1 3 9\n11 init 2 4 6\n\
+             12 init 2 5 {target_init_nid}\n13 add 2 4 7\n14 add 2 5 7\n15 eq 1 4 5\n16 not 1 15\n\
+             17 and 1 3 16\n18 next 1 3 17\n19 next 2 4 13\n20 next 2 5 14\n"
+        )
+    }
+
+    #[test]
+    fn class2_relational_return_decides_via_reg_eq_reg_atoms() {
+        // POSITIVE (target init 0 == data init 0): `data == target` invariant → recoverable.
+        let pos = relational_w(48, "6"); // nid 6 = zero
+        assert_eq!(
+            verify_recoverability_scalable(&pos, "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit RELATIONAL-return recoverability decides Holds via reg==reg atom discovery"
+        );
+        // NEGATIVE (target init 1 != data init 0): `data == target` NEVER holds → `busy` is a trap →
+        // NOT recoverable. The relational predicate soundly reports Violated (not a spurious Holds).
+        let neg = relational_w(48, "7"); // nid 7 = one
+        assert_eq!(
+            verify_recoverability_scalable(&neg, "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Violated,
+            "the never-equal relational trap decides Violated"
+        );
+
+        // DIFFERENTIAL ORACLE: the same designs at 8-bit route through the EXACT BDD engine (below the
+        // 40-bit cap) via the public verb. The narrow exact verdict must equal the wide cube verdict —
+        // zero mismatches is the soundness gate for the relational seeding.
+        assert_eq!(
+            verify_recoverability(&relational_w(8, "6"), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle must agree with the 48-bit cube Holds"
+        );
+        assert_eq!(
+            verify_recoverability(&relational_w(8, "7"), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Violated,
+            "8-bit exact oracle must agree with the 48-bit cube Violated"
         );
     }
 
