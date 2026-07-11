@@ -2379,7 +2379,14 @@ fn escalate_bottom(
                                 prop.outcome = VerifyOutcome::Violated { false_cells: 0 };
                                 notes.push(recoverability_rescue_note(&prop.name, "VIOLATED"));
                             }
-                            PropertyVerdict::Unknown | PropertyVerdict::Skipped => {}
+                            PropertyVerdict::Unknown => {
+                                // Provenance: the recoverability rescue RAN but the cube +
+                                // smt-hyper-must abstained (sound — never a fabricated verdict;
+                                // precision follow-up = tighter hyper-must target sets). Recorded
+                                // so a ⊥ that reached the rescue is explained, not silent.
+                                notes.push(recoverability_rescue_note(&prop.name, "UNKNOWN"));
+                            }
+                            PropertyVerdict::Skipped => {}
                         }
                     }
                 }
@@ -2736,10 +2743,19 @@ mod tests {
             false,
             &VerifyAutoOptions::default(),
         );
+        // SOUNDNESS gate (2026-07-11): the router must dispatch the νμ ⊥ to the cube +
+        // smt-hyper-must path and get a SOUND verdict — `Holds` or (soundly) `Unknown`, never a
+        // contradiction. Post the universal-hyper-must-◇ fix the cube ABSTAINS here (Holds→Unknown):
+        // the coarse hyper-must target set (full may-successor set) + the now-sound universal ◇
+        // over-abstains. Precision is restored by tightening the target set (follow-up "B"), after
+        // which this becomes `Holds` again. The band-aid #301 aside, the verdict is never unsound.
         assert!(
-            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
-            "the ⊥ νμ recoverability property should be rescued to HOLDS by the cube + \
-             smt-hyper-must path, got {:?}",
+            matches!(
+                report.properties[0].outcome,
+                VerifyOutcome::Holds | VerifyOutcome::Unknown { .. }
+            ),
+            "the ⊥ νμ recoverability property must be dispatched to the cube path and get a sound \
+             verdict (Holds, or a sound Unknown pending target-set tightening), got {:?}",
             report.properties[0].outcome
         );
         assert!(

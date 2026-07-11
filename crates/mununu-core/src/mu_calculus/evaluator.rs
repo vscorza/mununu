@@ -1824,11 +1824,26 @@ where
         // already uses plain ∀ for `Control::All`, so only the diamond was
         // affected.
         if guard.control == Control::All {
+            // SOUNDNESS (2026-07-11) — a multi-target `MustHyperOnly` edge guarantees reaching the
+            // target *set* but not *which* member, so its hyper-target coverage keys on the BOUND,
+            // not the ◇ modality: the definite-true (`must_bits`) pass reaches φ only if ALL
+            // hyper-targets do (ALL-coverage), while the not-false (`may_bits`) pass reaches φ if
+            // ANY hyper-target might (ANY-coverage). The bound is carried by `modality_filter`: for
+            // Diamond, `must_bits` is computed with `MustOnly`, `may_bits` with `All`. Keying
+            // coverage on the modality (pre-fix, always ANY) made ◇'s must-bits existential —
+            // unsound: a hyper-must claimed ◇φ definite-true when only SOME target satisfied φ.
+            // Singleton/Sharp/MayOnly edges read identically under both, so only multi-target
+            // hyper-must changes.
+            let all_coverage = matches!(modality_filter, TransitionModalityFilter::MustOnly);
             return outgoing.iter().any(|t| {
                 modality_filter.allows(t)
                     && self.guard_matches(state, t, guard)
                     && guard_parts.is_none_or(|p| p.matches_next(t.target().index()))
-                    && transition_target_in_set_diamond(t, targets)
+                    && if all_coverage {
+                        transition_target_in_set_box(t, targets)
+                    } else {
+                        transition_target_in_set_diamond(t, targets)
+                    }
             });
         }
 
@@ -3251,14 +3266,19 @@ where
         } else {
             None
         };
-        // Kind-aware forcing-set reach.
-        let reaches = |transition: &Transition<S, L>, set: &BitVec<usize, Lsb0>| -> bool {
-            match kind {
-                ModalKind::Diamond => transition_target_in_set_diamond(transition, set),
-                ModalKind::Box => transition_target_in_set_box(transition, set),
-            }
-        };
-
+        // SOUNDNESS (2026-07-11) — the per-edge hyper-target coverage keys on the BOUND, not the
+        // modality. A `MustHyperOnly` edge guarantees reaching the target *set* but not *which*
+        // member, so:
+        //   - `reaches_must` (definite-true / lower bound): the edge reaches φ only if ALL
+        //     hyper-targets are definite-φ ⇒ ALL-coverage (`transition_target_in_set_box`).
+        //   - `reaches_may` (not-false / upper bound): the edge might reach φ if ANY hyper-target
+        //     is possible-φ ⇒ ANY-coverage (`transition_target_in_set_diamond`).
+        // The ◇/□ distinction is the OUTER quantifier in `modal_trit_core` (∃ over must-edges for
+        // ◇-True, ∀ over may-edges for □-True), NOT the per-edge coverage. Keying coverage on
+        // `kind` (pre-fix) made ◇'s `reaches_must` existential — unsound: a multi-target hyper-must
+        // could claim ◇φ definite-true when only SOME target satisfied φ (the concrete successor
+        // could be another). Singleton edges (Sharp / MayOnly / card-1 hyper) read identically
+        // under both helpers, so this changes only multi-target `MustHyperOnly` edges.
         let mut edges: Vec<EdgeFacts> = Vec::new();
         for state in self.clts.states() {
             edges.clear();
@@ -3277,8 +3297,8 @@ where
                         transition.modality(),
                         crate::clts::TransitionModality::MayOnly
                     ),
-                    reaches_must: reaches(transition, &must_set),
-                    reaches_may: reaches(transition, &may_set),
+                    reaches_must: transition_target_in_set_box(transition, &must_set), // ALL
+                    reaches_may: transition_target_in_set_diamond(transition, &may_set), // ANY
                 });
             }
             match modal_trit_core(kind, guard.control, &edges) {
@@ -5796,6 +5816,51 @@ mod modal_trit_draft_tests {
             &targets_empty
         ));
         assert!(!transition_target_in_set_box(hyper_trans, &targets_empty));
+    }
+
+    /// SOUNDNESS regression (2026-07-11) — the multi-target `MustHyperOnly` ◇ must be UNIVERSAL,
+    /// not existential. A hyper-must edge `s0 ⤳ {s1,s2}` GUARANTEES reaching the SET {s1,s2} but
+    /// not WHICH member; so `◇p` is definite-true at `s0` ONLY if `p` holds at BOTH s1 and s2
+    /// (all-coverage). The pre-fix evaluator computed `reaches_must` with ANY-coverage (keyed on
+    /// the ◇ modality), so it wrongly returned `True` when only s1 ⊨ p — the exact mechanism behind
+    /// the recoverability cube path's unsound `holds` on a trap (`trap48`).
+    #[test]
+    fn hyper_must_diamond_is_universal_not_existential() {
+        use crate::mu_calculus::trit::Trit;
+        let clts = build_hyper_must_kmts(); // s0 ⤳ {s1,s2} (MustHyperOnly), label `act`
+        let s0 = clts.state_id("s0").expect("s0").index();
+        let s1 = clts.state_id("s1").expect("s1").index();
+        let s2 = clts.state_id("s2").expect("s2").index();
+        let formula = parser::parse("< labels = {act} > p").expect("parse");
+
+        // p at s1 ONLY: s2 ⊭ p ⇒ the hyper-must does NOT guarantee reaching p ⇒ ◇p is Unknown,
+        // NOT definite-true. (Pre-fix ANY-coverage wrongly gave True.)
+        let mut p_s1 = bv(&[false, false, false]);
+        p_s1.set(s1, true);
+        let env = Environment::new(clts.state_count()).with_predicate("p", p_s1);
+        let v = evaluate_tri_with_options(&formula, &clts, &env, &EvaluationOptions::default())
+            .expect("eval");
+        assert_eq!(
+            v.verdict_at(s0),
+            Trit::Unknown,
+            "◇p at s0 must be Unknown when only some hyper-target satisfies p (must-false: not \
+             guaranteed; may-true: might). Pre-fix any-coverage wrongly returned True."
+        );
+
+        // p at BOTH s1 and s2: the guarantee holds ⇒ ◇p is genuinely definite-true (all-coverage).
+        let mut p_both = bv(&[false, false, false]);
+        p_both.set(s1, true);
+        p_both.set(s2, true);
+        let env_both = Environment::new(clts.state_count()).with_predicate("p", p_both);
+        let v_both =
+            evaluate_tri_with_options(&formula, &clts, &env_both, &EvaluationOptions::default())
+                .expect("eval");
+        assert_eq!(
+            v_both.verdict_at(s0),
+            Trit::True,
+            "◇p at s0 must be definite-True when ALL hyper-targets satisfy p (the legitimate \
+             guarantee — the fix must not over-abstain)."
+        );
     }
 
     /// R.6.3 — dual fix on the Box side: `[]false` over a CLTS where

@@ -435,7 +435,17 @@ mod tests {
 
     #[test]
     fn scalable_matches_exact_holds_polarity() {
-        // RESPONDER: every reachable state can reach idle ⇒ Holds, both engines.
+        // Differential SOUNDNESS gate: the cube path must never CONTRADICT the exact engine — it
+        // either agrees or soundly abstains (`Unknown`). It must never emit the OPPOSITE definite
+        // verdict. (Soundness ≠ completeness: requiring an exact match would demand the cube be as
+        // *precise* as exact, which is not a soundness property.)
+        //
+        // RESPONDER: exact decides Holds. Post the universal-hyper-must-◇ fix (2026-07-11) the cube
+        // ABSTAINS here: the coarse hyper-must target set (the full may-successor set — a documented
+        // imprecision, `SmtEncode::hyper_must_edges`) combined with the now-SOUND universal ◇
+        // over-abstains where the old (unsound) existential ◇ decided. Sound — the auto verb returns
+        // exact's Holds for small designs regardless; recovering cube-alone precision needs
+        // tightening the hyper-must target set (follow-up).
         let exact = exact_verdict(RESPONDER, "st == 0");
         let scalable = verify_recoverability_scalable(RESPONDER, "st == 0", &[]).expect("decides");
         assert_eq!(
@@ -443,9 +453,9 @@ mod tests {
             PropertyVerdict::Holds,
             "exact decides RESPONDER Holds"
         );
-        assert_eq!(
-            scalable, exact,
-            "cube path must AGREE with the exact engine on RESPONDER (Holds)"
+        assert!(
+            scalable == exact || scalable == PropertyVerdict::Unknown,
+            "cube must agree with exact or soundly abstain — never contradict (got {scalable:?}, exact {exact:?})"
         );
     }
 
