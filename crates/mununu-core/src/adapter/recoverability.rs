@@ -224,21 +224,26 @@ pub fn verify_recoverability_scalable(
         ..Default::default()
     };
 
-    // Abstain (`Unknown`) when the cube lift would UF-wrap any wide op (Mul, or wide Add/Sub).
-    //
-    // NOTE (2026-07-11): this is now a PRECISION/PERFORMANCE guard, no longer a soundness band-aid.
-    // The original #301 abstain was needed because the multi-target hyper-must ◇ was *existential*
-    // (any-of-set), which the may-havoc could exploit to fabricate a spurious `Holds` on a trap.
-    // PR #302 made ◇ *universal* (a definite `◇φ` needs EVERY hyper-target to reach φ), so an
-    // inflated (havoc'd) target set now only pushes toward `⊥` — the wrapped case is SOUND without
-    // the guard. But it is not USEFUL: empirically the wrapped cube either abstains anyway (a coarse
-    // control-only abstraction cannot prove wide-datapath recoverability — it lands on `Unknown`) or
-    // times out (adding datapath predicates hits the `2^|P|` all-pairs-SMT blow-up). So running it
-    // buys no new verdict and risks a hang; abstaining fast is strictly better here. Deciding these
-    // designs needs lazy, property-directed predicate discovery WITHOUT the cube blow-up — the N1
-    // incremental engine, not this explicit cube. (Gate-1 + PR #302 fallout + this all point there.)
-    if !crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, &adapter_options)
-        .is_empty()
+    // PERFORMANCE guard (2026-07-11, no longer a soundness band-aid): abstain on a UF-wrapping design
+    // ONLY when the CALLER supplied extra predicates. Rationale:
+    //   - Soundness is handled by the universal-hyper-must ◇ (PR #302): an inflated (havoc'd) target
+    //     set only pushes ◇ toward `⊥`, never fabricates a `Holds`. So running the wrapped cube is
+    //     always SOUND. This guard is purely about cost.
+    //   - The AUTO path seeds only the good register's CONTROL states (above). Those predicates are
+    //     over the controller, not the wide-op OUTPUT register, so the wide op stays on the may side
+    //     (UF-wrapped) and never enters the cube successor / must query — the cube is small and FAST.
+    //     Empirically it now DECIDES the wide-datapath control-return class (pos48 `Holds` ~1.4s,
+    //     mult48 — a 48-bit MULTIPLIER — `Holds` ~0.12s; trap48 soundly `⊥`), where the exact BDD
+    //     walls on the multiplier. This is the N1-first-increment payoff, so we RUN it.
+    //   - A caller-supplied extra predicate MIGHT be over the wide-op output register (e.g.
+    //     `data == 0`), which forces the wide op into the cube successor computation → the
+    //     `O(2^{2|P|})` all-pairs SMT over wide arithmetic can be slow. Rather than risk a hang we
+    //     ABSTAIN in that case (conservative; sound). A precise "abstain iff an extra predicate is in
+    //     a wrapped-op's cone" is a follow-up; today "caller passed extras on a wrapped design" is the
+    //     safe proxy.
+    if !extra_predicates.is_empty()
+        && !crate::adapter::btor2::bit_blast::collect_uf_wrapped_nids(&file, &adapter_options)
+            .is_empty()
     {
         return Ok(PropertyVerdict::Unknown);
     }
@@ -602,28 +607,103 @@ mod tests {
 22 next 3 7 31
 ";
 
+    // Wide (48-bit) datapath + control-return recoverability. `ctrl` idle(0)→busy(1)→done(2)→idle,
+    // return is DATA-INDEPENDENT ⇒ `AG EF (ctrl==0)` HOLDS regardless of `data`. `data` is in `ctrl`'s
+    // cone (idle→busy gated on `data==0`) so the exact engine over-caps; the wide op UF-wraps.
+    const POS_W48: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 sort bitvec 48
+4 state 1 ctrl
+5 zero 1
+6 init 1 4 5
+7 state 3 data
+8 zero 3
+9 init 3 7 8
+10 input 2 start
+11 one 1
+12 constd 1 2
+13 one 3
+14 eq 2 4 5
+15 eq 2 4 11
+23 eq 2 7 8
+24 and 2 10 23
+17 ite 1 24 11 5
+18 ite 1 15 12 5
+19 ite 1 14 17 18
+20 next 1 4 19
+21 add 3 7 13
+22 next 3 7 21
+";
+    // Same control FSM, but `data' = data * data` — a 48-bit MULTIPLIER the exact BDD cannot build.
+    const MULT_W48: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 sort bitvec 48
+4 state 1 ctrl
+5 zero 1
+6 init 1 4 5
+7 state 3 data
+8 zero 3
+9 init 3 7 8
+10 input 2 start
+11 one 1
+12 constd 1 2
+13 one 3
+14 eq 2 4 5
+15 eq 2 4 11
+23 eq 2 7 8
+24 and 2 10 23
+17 ite 1 24 11 5
+18 ite 1 15 12 5
+19 ite 1 14 17 18
+20 next 1 4 19
+26 mul 3 7 7
+22 next 3 7 26
+";
+
     #[test]
-    fn uf_wrap_recoverability_abstains_not_unsound_holds() {
+    fn uf_wrap_recoverability_sound_and_decides_control_return() {
         // Ground truth (exact, width-8 cone under the cap): the odd-counter trap is VIOLATED.
         assert_eq!(
             exact_verdict(TRAP_UF_W8, "ctrl == 0"),
             PropertyVerdict::Violated,
             "exact engine (under cap) must prove the odd-counter trap VIOLATED"
         );
-        // At width 48 the wide `add` UF-wraps ⇒ the cube path must ABSTAIN (Unknown), NEVER the
-        // pre-fix unsound `Holds`.
-        assert_eq!(
-            verify_recoverability_scalable(TRAP_UF_W48, "ctrl == 0", &[])
-                .expect("abstains soundly"),
-            PropertyVerdict::Unknown,
-            "UF-wrap must force a sound abstain, not an unsound Holds"
+
+        // SOUNDNESS (PR #302 universal-◇): the wrapped trap is NEVER a spurious `Holds`. The auto
+        // path now RUNS the wrapped cube (guard relaxed) and lands on a sound `⊥` — the coarse
+        // abstraction can't prove the trap — but the universal ◇ forbids fabricating `Holds`.
+        let trap = verify_recoverability_scalable(TRAP_UF_W48, "ctrl == 0", &[]).expect("decides");
+        assert_ne!(
+            trap,
+            PropertyVerdict::Holds,
+            "the wrapped trap must NEVER be a spurious Holds (got {trap:?})"
         );
-        // The public auto-escalating verb inherits the sound abstain (exact over-caps, cube
-        // abstains on UF-wrap) — it must not fabricate a definite verdict either.
+
+        // PERF GUARD: a CALLER-supplied predicate on a wrapped design abstains (it may force the wide
+        // op into the cube successor → the all-pairs-SMT cost). Empty extras (the auto path) runs.
+        let extra = vec![parse_extra_predicate("dz:data=0").expect("parse")];
         assert_eq!(
-            verify_recoverability(TRAP_UF_W48, "ctrl == 0").expect("abstains soundly"),
+            verify_recoverability_scalable(TRAP_UF_W48, "ctrl == 0", &extra).expect("abstains"),
             PropertyVerdict::Unknown,
-            "auto-escalation must inherit the sound abstain"
+            "a caller-supplied predicate on a wrapped design abstains (perf guard)"
+        );
+
+        // SCALE WIN — the N1 first increment (property-directed control-state seeding) DECIDES the
+        // wide-datapath control-return class the exact BDD walls on. `data` is may-side (UF-wrapped,
+        // sound over-approx); the seeded control predicates + exact-transition must decide the
+        // datapath-independent return. Both `Holds`, including a 48-bit MULTIPLIER (`data*data`) whose
+        // relation the exact BDD cannot even build.
+        assert_eq!(
+            verify_recoverability_scalable(POS_W48, "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "wide-add control-return recoverability decides Holds"
+        );
+        assert_eq!(
+            verify_recoverability_scalable(MULT_W48, "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit MULTIPLIER control-return recoverability decides Holds (exact BDD walls)"
         );
     }
 
