@@ -2743,19 +2743,15 @@ mod tests {
             false,
             &VerifyAutoOptions::default(),
         );
-        // SOUNDNESS gate (2026-07-11): the router must dispatch the νμ ⊥ to the cube +
-        // smt-hyper-must path and get a SOUND verdict — `Holds` or (soundly) `Unknown`, never a
-        // contradiction. Post the universal-hyper-must-◇ fix the cube ABSTAINS here (Holds→Unknown):
-        // the coarse hyper-must target set (full may-successor set) + the now-sound universal ◇
-        // over-abstains. Precision is restored by tightening the target set (follow-up "B"), after
-        // which this becomes `Holds` again. The band-aid #301 aside, the verdict is never unsound.
+        // The router dispatches the νμ ⊥ to the cube + smt-hyper-must path, which now DECIDES it
+        // `Holds`: the N1-first-increment property-directed seeding (good register's other control
+        // states) splits the coarse abstraction so the recoverability is provable. (Between the
+        // universal-◇ soundness fix and the seeding this abstained to a sound `Unknown`.) Soundness
+        // invariant preserved throughout: agree with exact or abstain, never contradict.
         assert!(
-            matches!(
-                report.properties[0].outcome,
-                VerifyOutcome::Holds | VerifyOutcome::Unknown { .. }
-            ),
-            "the ⊥ νμ recoverability property must be dispatched to the cube path and get a sound \
-             verdict (Holds, or a sound Unknown pending target-set tightening), got {:?}",
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "the ⊥ νμ recoverability property must be rescued to Holds by the cube + smt-hyper-must \
+             path (property-directed seeding), got {:?}",
             report.properties[0].outcome
         );
         assert!(
