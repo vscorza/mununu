@@ -150,6 +150,90 @@ fn eq_reg_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(Stri
     out
 }
 
+/// N1 frontier (b′) — arithmetic-relational discovery: the datapath-dependent return whose guard is
+/// `data == target + K` (a register compared to ANOTHER register plus a constant addend), not a bare
+/// `register == register`. The value that unblocks the return (`target + K`) is neither a design literal
+/// nor a syntactic single-register comparison, so the literal- and relational-guard extractions both
+/// miss it — but the design DOES contain it as `eq(reg, add(reg, const))`. Extracting that pattern yields
+/// the `PredicateExpr::CmpRegAddend` the return needs; like the relational case, the exact hyper-must
+/// edge preserves the invariant (`data == target + K ⟹ data' == target' + K`, in mod-2^width BV) across
+/// the wide increments without concretising the registers. Returns `(lhs_reg, rhs_reg, addend, width)`;
+/// `width` is the register width (for the mod-2^width arithmetic the reset-cube eval needs). Skips the
+/// degenerate `reg == reg + K` (same register). Deduped.
+fn eq_reg_addend_guard_atoms(
+    file: &crate::adapter::btor2::ast::Btor2File,
+) -> Vec<(String, String, u64, u32)> {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let state_nids: std::collections::HashSet<i64> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::State { .. }))
+        .map(|l| l.nid)
+        .collect();
+    let state_width = |nid: i64| -> Option<u32> {
+        match file.lookup(nid).map(|l| &l.node) {
+            Some(Node::State { sort, .. }) => crate::adapter::btor2::parser::bv_width(file, *sort),
+            _ => None,
+        }
+    };
+    let mut out: Vec<(String, String, u64, u32)> = Vec::new();
+    for line in &file.lines {
+        let Node::Op {
+            op: Op::Eq, args, ..
+        } = &line.node
+        else {
+            continue;
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        // One operand is a state register `lhs`; the other is an `add(state, const)` node.
+        for (reg_nid, other_nid) in [
+            (args[0].0.abs(), args[1].0.abs()),
+            (args[1].0.abs(), args[0].0.abs()),
+        ] {
+            if !state_nids.contains(&reg_nid) {
+                continue;
+            }
+            let Some(lhs_sym) = symbols.get(&reg_nid) else {
+                continue;
+            };
+            let Some(Node::Op {
+                op: Op::Add,
+                args: aa,
+                ..
+            }) = file.lookup(other_nid).map(|l| &l.node)
+            else {
+                continue;
+            };
+            if aa.len() != 2 {
+                continue;
+            }
+            // The add is `rhs_state + const` (either operand order).
+            for (rs_nid, ac_nid) in [
+                (aa[0].0.abs(), aa[1].0.abs()),
+                (aa[1].0.abs(), aa[0].0.abs()),
+            ] {
+                if state_nids.contains(&rs_nid)
+                    && let Some(rhs_sym) = symbols.get(&rs_nid)
+                    && rhs_sym != lhs_sym
+                    && let Some(addend) =
+                        crate::adapter::btor2::bit_blast::resolve_btor2_constant(file, ac_nid)
+                    && let Some(width) = state_width(reg_nid)
+                    && width > 0
+                    && !out
+                        .iter()
+                        .any(|(l, r, a, _)| l == lhs_sym && r == rhs_sym && *a == addend)
+                {
+                    out.push((lhs_sym.clone(), rhs_sym.clone(), addend, width));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// N1 frontier (a) — the good register's cone-of-influence: the state registers whose values determine
 /// when `good` is (re)reached — those reachable backward from the good register's next-state function,
 /// plus the register itself. A guard atom over a register OUTSIDE this cone (a decoy comparison on an
@@ -443,6 +527,32 @@ pub fn verify_recoverability_scalable(
             continue;
         };
         compound_seeds.push((format!("rel_{lhs}_eq_{rhs}"), expr_str, expr));
+    }
+
+    // Frontier (b′) — arithmetic-relational returns `data == target + K` (the addend form the bare
+    // relational extraction misses). Same compound-predicate path; the LOCAL expr carries the register
+    // width so the reset-cube eval does the mod-2^width arithmetic the design's `+` wraps by (the sidecar
+    // string parses to a width-agnostic BV form for the SMT seam, which is width-implicit).
+    for (lhs, rhs, addend, width) in eq_reg_addend_guard_atoms(&file) {
+        if specs.len() + compound_seeds.len() > MAX_AUTO_SEED {
+            break;
+        }
+        if !(in_coi(&lhs) && in_coi(&rhs)) {
+            continue;
+        }
+        let name = format!("rel_{lhs}_eq_{rhs}_plus_{addend}");
+        if compound_seeds.iter().any(|(n, _, _)| n == &name) {
+            continue;
+        }
+        let expr_str = format!("{lhs} == {rhs} + {addend}");
+        let expr = PredicateExpr::CmpRegAddend {
+            lhs: lhs.clone(),
+            op: CmpOp::Eq,
+            rhs: rhs.clone(),
+            addend,
+            width,
+        };
+        compound_seeds.push((name, expr_str, expr));
     }
     // name → expr, for the reset-cube evaluation + free-input guard of the compound predicates.
     let compound_map: std::collections::HashMap<String, PredicateExpr> = compound_seeds
@@ -1091,6 +1201,49 @@ mod tests {
         );
         assert_eq!(
             verify_recoverability(&relational_w(8, "7"), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Violated,
+            "8-bit exact oracle must agree with the 48-bit cube Violated"
+        );
+    }
+
+    // Frontier (b′) — arithmetic-relational return `data == target + 2` (`ctrl' = ctrl & !(data==target+2)`).
+    // Both registers increment, so `data == target + 2` is INVARIANT when `data` inits `target + 2`. The
+    // addend form is neither a literal K nor a bare `reg == reg` guard, so the earlier extractions miss
+    // it; `eq_reg_addend_guard_atoms` reads it off `eq(data, add(target, 2))` and seeds the
+    // `CmpRegAddend`, decided at scale by the exact must edge preserving the invariant across the wide
+    // increments (mod-2^width).
+    fn arith_rel_w(width: u32, data_init: u64) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 1 ctrl\n4 state 2 data\n\
+             5 state 2 target\n6 zero 1\n7 one 1\n8 one 2\n9 constd 2 2\n10 constd 2 {data_init}\n\
+             11 constd 2 3\n12 init 1 3 7\n13 init 2 4 10\n14 init 2 5 11\n15 add 2 4 8\n\
+             16 add 2 5 8\n17 add 2 5 9\n18 eq 1 4 17\n19 not 1 18\n20 and 1 3 19\n21 next 1 3 20\n\
+             22 next 2 4 15\n23 next 2 5 16\n"
+        )
+    }
+
+    #[test]
+    fn class2_frontier_bprime_arith_relational_return_decides_via_addend_atoms() {
+        // POSITIVE (data init 5 == target(3)+2): `data == target + 2` invariant → recoverable.
+        assert_eq!(
+            verify_recoverability_scalable(&arith_rel_w(48, 5), "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit arithmetic-relational return decides Holds via addend-atom discovery"
+        );
+        // NEGATIVE (data init 2 != target(3)+2): the relation never holds → busy is a trap → Violated.
+        assert_eq!(
+            verify_recoverability_scalable(&arith_rel_w(48, 2), "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Violated,
+            "the never-equal arithmetic-relational trap decides Violated"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD) — must agree with the wide cube verdicts.
+        assert_eq!(
+            verify_recoverability(&arith_rel_w(8, 5), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle must agree with the 48-bit cube Holds"
+        );
+        assert_eq!(
+            verify_recoverability(&arith_rel_w(8, 2), "ctrl == 0").expect("exact decides"),
             PropertyVerdict::Violated,
             "8-bit exact oracle must agree with the 48-bit cube Violated"
         );
