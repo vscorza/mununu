@@ -56,6 +56,49 @@ use crate::verdict::PropertyVerdict;
 /// after a few weakest-precondition splits.
 const RECOVERABILITY_MAX_ITERATIONS: usize = 8;
 
+/// Extract `state_register == constant` guard atoms from the design's `Eq` comparison nodes — the
+/// decision conditions the control logic branches on. Seeds the datapath predicates a
+/// datapath-DEPENDENT recoverability return needs (Class 2): `busy → done` gated on `data == K`
+/// yields the atom `(data, K)`, where K is a design literal (not enumerable over `2^W`). Returns only
+/// comparisons of a STATE register to a resolvable CONSTANT; deduped.
+fn eq_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(String, u64)> {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let state_nids: std::collections::HashSet<i64> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::State { .. }))
+        .map(|l| l.nid)
+        .collect();
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for line in &file.lines {
+        let Node::Op {
+            op: Op::Eq, args, ..
+        } = &line.node
+        else {
+            continue;
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        // Either operand may be the register vs the constant.
+        for (reg_nid, const_nid) in [
+            (args[0].0.abs(), args[1].0.abs()),
+            (args[1].0.abs(), args[0].0.abs()),
+        ] {
+            if state_nids.contains(&reg_nid)
+                && let Some(sym) = symbols.get(&reg_nid)
+                && let Some(k) =
+                    crate::adapter::btor2::bit_blast::resolve_btor2_constant(file, const_nid)
+                && !out.iter().any(|(s, v)| s == sym && *v == k)
+            {
+                out.push((sym.clone(), k));
+            }
+        }
+    }
+    out
+}
+
 /// Decide recoverability `AG EF (good)` of `btor2_content`, where `good` is a single
 /// register-comparison atom string (`"state_q == 3"`).
 ///
@@ -196,6 +239,28 @@ pub fn verify_recoverability_scalable(
             });
         }
     }
+
+    // Class-2 (datapath-DEPENDENT return): seed the design's `register == constant` GUARD atoms — the
+    // decision conditions the control branches on (e.g. `busy → done` only when `data == K`). When
+    // the must-return reads a datapath predicate, control-state seeding alone leaves `EF good` at `⊥`;
+    // the needed predicate is `data == K`, whose value K CANNOT be enumerated (`2^W`), but IS a design
+    // literal read by a comparison node. Extracting those comparison atoms is the property-directed
+    // discovery of the datapath predicate from the design's own guards (the shipped, eager form of the
+    // lazy "discover from the ⊥ obligation" idea). Bounded by the number of comparison nodes; deduped
+    // against what is already seeded; capped with the control seeding at MAX_AUTO_SEED.
+    for (reg, k) in eq_guard_atoms(&file) {
+        if specs.len() > MAX_AUTO_SEED {
+            break;
+        }
+        if !specs.iter().any(|s| s.register == reg && s.value == k) {
+            specs.push(PredicateSpec {
+                name: format!("guard_{reg}_eq_{k}"),
+                register: reg,
+                value: k,
+            });
+        }
+    }
+
     specs.extend(extra_predicates.iter().cloned());
 
     // AG EF good, over the PREDICATE-NAME atom (the cube path resolves `good` to the
@@ -704,6 +769,48 @@ mod tests {
             verify_recoverability_scalable(MULT_W48, "ctrl == 0", &[]).expect("decides"),
             PropertyVerdict::Holds,
             "48-bit MULTIPLIER control-return recoverability decides Holds (exact BDD walls)"
+        );
+    }
+
+    // Class-2: datapath-DEPENDENT return. `busy → idle` only when `data == 7` (K=7, a 48-bit design
+    // literal); `data == 7` is invariant (data' = data, init 7). `AG EF (ctrl==0)` HOLDS but needs the
+    // `data == 7` predicate: control-state seeding alone (good register only) leaves it `⊥`, and K=7
+    // cannot be enumerated (2^48 values). The guard-atom extraction reads `data == 7` off the design's
+    // own comparison node and decides it.
+    const CLASS2_DATADEP: &str = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 sort bitvec 48
+4 state 1 ctrl
+5 zero 1
+6 init 1 4 5
+7 state 3 data
+30 constd 3 7
+9 init 3 7 30
+10 input 2 start
+11 one 1
+14 eq 2 4 5
+15 eq 2 4 11
+23 eq 2 7 30
+17 ite 1 10 11 5
+25 ite 1 23 5 11
+18 ite 1 15 25 5
+19 ite 1 14 17 18
+20 next 1 4 19
+22 next 3 7 7
+";
+
+    #[test]
+    fn class2_datapath_dependent_return_decides_via_guard_atoms() {
+        // Class-2 discovery: the return reads a datapath predicate (`data == 7`) that control-state
+        // seeding does not cover. The guard-atom extraction discovers it from the design's `eq`
+        // comparison node (K=7, a 48-bit literal, unenumerable over `2^W`), and the datapath-dependent
+        // recoverability decides `Holds`. (Diagnostic: `data==0`/`data==1` — what value-enumeration
+        // would propose — leave it `⊥`; only `data==7`, the guard atom, decides.)
+        assert_eq!(
+            verify_recoverability_scalable(CLASS2_DATADEP, "ctrl == 0", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "datapath-dependent-return recoverability decides Holds via guard-atom discovery"
         );
     }
 
