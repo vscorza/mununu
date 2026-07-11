@@ -144,28 +144,64 @@ pub fn verify_recoverability_scalable(
         _ => return Ok(PropertyVerdict::Unknown),
     };
 
-    // Seed predicates = [good] ++ extra. The `good` predicate is named `good` so the
-    // formula atom resolves to it via the cube labelling; the extras carry their own
-    // names and only refine the abstraction (they are not referenced by the formula).
+    // Parse the design early — needed both for the reset valuation and for the auto-seed candidate
+    // values below.
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("recoverability cube path: parsing BTOR2: {}", e.message))?;
+    let init_values: BTreeMap<String, u128> =
+        crate::adapter::btor2::concrete_oracle::init_valuation(&file);
+
+    // Seed predicates = [good] ++ [good register's OTHER control states] ++ extra. The `good`
+    // predicate is named `good` so the formula atom resolves to it via the cube labelling; the
+    // rest only refine the abstraction (they are not referenced by the formula).
     let good_spec = PredicateSpec {
         name: "good".to_string(),
-        register: good_register,
+        register: good_register.clone(),
         value: good_value,
     };
     let mut specs: Vec<PredicateSpec> = Vec::with_capacity(1 + extra_predicates.len());
     specs.push(good_spec);
+
+    // N1 first increment — property-directed discovery (2026-07-11). Recoverability `EF good` must
+    // DISTINGUISH the control states on the return path, not just `good` vs `!good`: a `good`-only
+    // abstraction lumps every non-good control state into one cube whose must-successor self-loops,
+    // so `EF good` is `⊥` (e.g. RESPONDER's `{st!=0}` lumps `req`/`grant` — it needs `st==1` and
+    // `st==2`). Auto-seed `good_register == v` for each candidate value `v != good_value`, where the
+    // candidate pool is `{0,1} ∪ the design's constant literals` (the FSM state encodings). This is
+    // BOUNDED — `O(#constants)`, NOT `2^W` — so a wide `good` register does not blow up; capped for
+    // safety. Directed by the `good` atom (the property), it recovers the control-return
+    // recoverability class the coarse abstraction abstained on. Sound: adding predicates only
+    // sharpens `⊥` toward a definite verdict (monotone refinement), never flips one.
+    const MAX_AUTO_SEED: usize = 8;
+    let mut candidate_values: Vec<u64> = vec![0, 1];
+    for v in crate::adapter::btor2::bit_blast::collect_btor2_constants(&file) {
+        if !candidate_values.contains(&v) {
+            candidate_values.push(v);
+        }
+    }
+    for v in candidate_values {
+        // Cap the total predicate count at good (1) + MAX_AUTO_SEED to bound the cube space.
+        if specs.len() > MAX_AUTO_SEED {
+            break;
+        }
+        if v != good_value
+            && !specs
+                .iter()
+                .any(|s| s.register == good_register && s.value == v)
+        {
+            specs.push(PredicateSpec {
+                name: format!("state_{good_register}_eq_{v}"),
+                register: good_register.clone(),
+                value: v,
+            });
+        }
+    }
     specs.extend(extra_predicates.iter().cloned());
 
     // AG EF good, over the PREDICATE-NAME atom (the cube path resolves `good` to the
     // `good` predicate's 3-valued label, not a raw register comparison).
     let formula = mu_parser::parse("nu Y. ((mu X. (good || <> X)) && [] Y)")
         .map_err(|e| format!("building the AG EF cube formula: {e:?}"))?;
-
-    // Reset valuation of the BTOR2 (init lines, default 0).
-    let file = crate::adapter::btor2::parser::parse(btor2_content)
-        .map_err(|e| format!("recoverability cube path: parsing BTOR2: {}", e.message))?;
-    let init_values: BTreeMap<String, u128> =
-        crate::adapter::btor2::concrete_oracle::init_valuation(&file);
 
     // SOUNDNESS: pin each predicate's register to its BTOR2 reset value via
     // `config_values`, so the cube lift's initial cube is the design's reset state.
@@ -437,16 +473,12 @@ mod tests {
 
     #[test]
     fn scalable_matches_exact_holds_polarity() {
-        // Differential SOUNDNESS gate: the cube path must never CONTRADICT the exact engine — it
-        // either agrees or soundly abstains (`Unknown`), never the opposite definite verdict.
-        // (Soundness ≠ completeness.)
-        //
-        // RESPONDER: exact = Holds; the cube ABSTAINS. Post the universal-hyper-must-◇ fix the coarse
-        // 2-cube abstraction is too coarse to PROVE recoverability soundly — cube 1's only must-edge
-        // is a self-loop with no must-progress toward idle (an irreducible multi-target hyper-must),
-        // so `EF idle` is `⊥`. This is abstraction coarseness, not target-set coarseness (target-set
-        // tightening does not recover it); the sound recovery needs finer predicate discovery (N1).
-        // The auto verb returns exact's Holds for small designs regardless.
+        // Differential SOUNDNESS gate: the cube path agrees with the exact engine on RESPONDER
+        // (both `Holds`). The N1-first-increment property-directed seeding (auto-seeding the good
+        // register's other control states — `st==1`, `st==2`) splits the coarse `good`-vs-`!good`
+        // abstraction so cube 1's must-self-loop resolves and `EF idle` is provably `Holds`. Before
+        // the increment this abstained to `Unknown` (sound but imprecise). The gate stays soundness
+        // (`agree or abstain, never contradict`) but is now met by AGREEMENT.
         let exact = exact_verdict(RESPONDER, "st == 0");
         let scalable = verify_recoverability_scalable(RESPONDER, "st == 0", &[]).expect("decides");
         assert_eq!(
@@ -454,9 +486,9 @@ mod tests {
             PropertyVerdict::Holds,
             "exact decides RESPONDER Holds"
         );
-        assert!(
-            scalable == exact || scalable == PropertyVerdict::Unknown,
-            "cube must agree with exact or soundly abstain — never contradict (got {scalable:?}, exact {exact:?})"
+        assert_eq!(
+            scalable, exact,
+            "cube path (with property-directed seeding) must DECIDE RESPONDER Holds, agreeing with exact"
         );
     }
 
