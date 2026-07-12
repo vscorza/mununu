@@ -562,6 +562,7 @@ fn run_controllability_aware_lift(
         config_values: std::collections::HashMap::new(),
         compound_exprs: std::collections::HashMap::new(),
         derived_predicates: Vec::new(),
+        may_postimage: false,
     };
 
     let lift_result =
