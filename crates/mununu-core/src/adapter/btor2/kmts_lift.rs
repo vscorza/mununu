@@ -2632,9 +2632,171 @@ fn compute_all_may_edges_smt_postimage(
     })
 }
 
+/// P1 (scalable-KMTS) increment 2 — the compound-aware MUST-edge pass for the post-image lazy path.
+/// For each post-image may-edge `src → tgt`, run the per-target ∀∃ must check
+/// ([`crate::adapter::btor2::smt_must_edge::smt_per_target_must_check`]) over the compound-aware
+/// [`CubePredicate`]s (spec + `compound_exprs`) — the same machinery the eager path uses, so the
+/// resulting `Sharp` (must) / `MayOnly` modalities match. Returns `cube → sorted Sharp target cubes`.
+///
+/// Together with [`compute_all_may_edges_smt_postimage`] this reproduces the eager
+/// `SmtAllPairs` + `SmtPerTargetStandard` KMTS (may + per-target must) — validated verdict-for-verdict
+/// by `p1_postimage_may_and_must_match_eager_lift` below — but via reachability-friendly post-image
+/// (`O(2^|P| · #succ)`) rather than all-pairs (`O(2^{2|P|})`), and soundly for compound predicates.
+#[allow(dead_code)]
+fn postimage_sharp_edges(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    predicates: &[PredicateSpec],
+    compound_exprs: &std::collections::HashMap<
+        String,
+        crate::adapter::btor2::predicate_expr::PredicateExpr,
+    >,
+    may_edges: &std::collections::HashMap<usize, Vec<usize>>,
+) -> Option<std::collections::HashMap<usize, Vec<usize>>> {
+    use crate::adapter::btor2::smt_must_edge::{SmtMustVerdict, smt_per_target_must_check};
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let view = encode_design_for_lift(file).ok()?;
+        let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
+        let cube_preds = cube_predicates(predicates, compound_exprs);
+        let mut sharp: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (&src, tgts) in may_edges {
+            let mut sharp_tgts: Vec<usize> = Vec::new();
+            for &tgt in tgts {
+                let verdict = smt_per_target_must_check(
+                    &view,
+                    src as u64,
+                    tgt as u64,
+                    &cube_preds,
+                    &nid_map,
+                    5000,
+                );
+                if matches!(verdict, SmtMustVerdict::Must) {
+                    sharp_tgts.push(tgt);
+                }
+            }
+            sharp_tgts.sort_unstable();
+            sharp.insert(src, sharp_tgts);
+        }
+        Some(sharp)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Shared 2-bit relational design for the P1 post-image tests: x'=x+1, y'=y+1 (x==y preserved),
+    // predicates P0=(x==0) and the RELATIONAL P1=(x==y).
+    fn p1_rel_design() -> (
+        &'static str,
+        Vec<PredicateSpec>,
+        std::collections::HashMap<String, crate::adapter::btor2::predicate_expr::PredicateExpr>,
+    ) {
+        let btor2 = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 x
+4 state 2 y
+5 zero 2
+6 one 2
+7 init 2 3 5
+8 init 2 4 5
+9 add 2 3 6
+10 next 2 3 9
+11 add 2 4 6
+12 next 2 4 11
+";
+        let preds = vec![
+            PredicateSpec {
+                name: "p0".into(),
+                register: "x".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "rel".into(),
+                register: "x".into(),
+                value: 0,
+            },
+        ];
+        let mut compound = std::collections::HashMap::new();
+        compound.insert(
+            "rel".to_string(),
+            crate::adapter::btor2::predicate_expr::PredicateExpr::CmpReg {
+                lhs: "x".into(),
+                op: crate::adapter::btor2::predicate_expr::CmpOp::Eq,
+                rhs: "y".into(),
+            },
+        );
+        (btor2, preds, compound)
+    }
+
+    #[test]
+    fn p1_postimage_may_and_must_match_eager_lift() {
+        // P1 increment 2 — the post-image path (may via `compute_all_may_edges_smt_postimage`, Sharp
+        // must via `postimage_sharp_edges`) must reproduce the EAGER `SmtAllPairs` +
+        // `SmtPerTargetStandard` compound lift's (may-edges, Sharp must-edges), VERDICT-FOR-VERDICT —
+        // the P1 soundness gate. A discriminating mix: some cubes have split successors (no Sharp),
+        // others a single-successor Sharp.
+        use crate::clts::{StateId, TransitionModality};
+        let (btor2, preds, compound) = p1_rel_design();
+        let file = crate::adapter::btor2::parser::parse(btor2).expect("parse");
+
+        // Eager reference.
+        let lift_opts = PredicateCubeLiftOptions {
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            must_edge_inference: MustEdgeInference::SmtPerTargetStandard,
+            compound_exprs: compound.clone(),
+            ..Default::default()
+        };
+        let eager =
+            predicate_cube_lift(preds.clone(), btor2, &AdapterOptions::default(), &lift_opts)
+                .expect("eager lift");
+        assert_eq!(eager.cube_count, 4);
+        let mut e_may: std::collections::HashMap<usize, std::collections::BTreeSet<usize>> =
+            std::collections::HashMap::new();
+        let mut e_sharp: std::collections::HashMap<usize, std::collections::BTreeSet<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..4usize {
+            let sid = StateId::<DefaultStateIdx>::from_index(i).expect("state id");
+            for t in eager.clts.outgoing(sid) {
+                let tgt = t.target().index();
+                e_may.entry(i).or_default().insert(tgt);
+                if matches!(t.modality(), TransitionModality::Sharp) {
+                    e_sharp.entry(i).or_default().insert(tgt);
+                }
+            }
+        }
+
+        // Post-image path.
+        let may = compute_all_may_edges_smt_postimage(&file, &preds, &compound).expect("may");
+        let sharp = postimage_sharp_edges(&file, &preds, &compound, &may).expect("sharp");
+
+        for i in 0..4usize {
+            let my_may: std::collections::BTreeSet<usize> = may
+                .get(&i)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let my_sharp: std::collections::BTreeSet<usize> = sharp
+                .get(&i)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                my_may,
+                e_may.get(&i).cloned().unwrap_or_default(),
+                "post-image MAY-edges of cube {i} differ from the eager lift"
+            );
+            assert_eq!(
+                my_sharp,
+                e_sharp.get(&i).cloned().unwrap_or_default(),
+                "post-image SHARP must-edges of cube {i} differ from the eager lift"
+            );
+        }
+    }
 
     #[test]
     fn p1_smt_postimage_may_edges_match_concrete_oracle() {
