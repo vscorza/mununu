@@ -449,6 +449,13 @@ pub struct PredicateCubeLiftOptions {
     /// (`2^|predicates|` is unchanged). Default empty preserves pre-H.E
     /// behaviour.
     pub derived_predicates: Vec<PredicateSpec>,
+    /// scalable-KMTS P1.4 (2026-07-12) — compute the `SmtAllPairs` may-edges via the compound-sound SMT
+    /// **post-image** ([`compute_all_may_edges_smt_postimage`]) instead of the `O(2^{2|P|})` all-pairs
+    /// loop (`BtorSts::may_edges`). Both encode the transition via `encode_design_for_lift` (identical,
+    /// exact), so the may-relation — and thus the KMTS and every verdict — is IDENTICAL; only the cost
+    /// differs (`O(2^|P| · #succ)` post-image vs `O(2^{2|P|})` all-pairs). Sound for compounds. Only
+    /// consulted on the `SmtAllPairs` may path; `false` preserves the all-pairs behaviour exactly.
+    pub may_postimage: bool,
 }
 
 impl Default for PredicateCubeLiftOptions {
@@ -461,6 +468,7 @@ impl Default for PredicateCubeLiftOptions {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         }
     }
 }
@@ -2123,7 +2131,20 @@ pub fn predicate_cube_lift(
         // compounds every expr is None → identical to passing `&predicates`
         // (behaviour-preserving for the simple SmtAllPairs path).
         let cube_preds = cube_predicates(&predicates, &lift_opts.compound_exprs);
-        let may_edges: Vec<(usize, usize)> = {
+        // scalable-KMTS P1.4 — the may-relation via post-image (O(2^|P|·#succ)) instead of all-pairs
+        // (O(2^{2|P|})). Both use `encode_design_for_lift`, so the edge set is IDENTICAL; a `None` (an
+        // unresolvable register / cube-space over the bound) falls back to the all-pairs seam.
+        let may_edges: Vec<(usize, usize)> = if lift_opts.may_postimage
+            && let Some(map) =
+                compute_all_may_edges_smt_postimage(&file, &predicates, &lift_opts.compound_exprs)
+        {
+            let mut pairs: Vec<(usize, usize)> = map
+                .into_iter()
+                .flat_map(|(src, tgts)| tgts.into_iter().map(move |t| (src, t)))
+                .collect();
+            pairs.sort_unstable();
+            pairs
+        } else {
             use crate::adapter::sts_ir::{BtorSts, SmtEncode};
             BtorSts::new(&file).may_edges(&cube_preds, 5_000)
         };
@@ -2524,9 +2545,8 @@ fn collect_boolean_input_symbols(
 /// Returns `cube_index → sorted distinct may-successor cube indices`, or `None` if a predicate register
 /// does not resolve to a state cell / the cube space exceeds the bound (the caller falls back to eager).
 ///
-/// P1 increment 1: validated by `p1_smt_postimage_may_edges_match_concrete_oracle` (below); wired into
-/// the lazy lift + must-edge path in the next increment.
-#[allow(dead_code)]
+/// P1 increment 1: validated by `p1_smt_postimage_may_edges_match_concrete_oracle`. P1.4: wired into
+/// `predicate_cube_lift` behind `PredicateCubeLiftOptions::may_postimage`.
 fn compute_all_may_edges_smt_postimage(
     file: &crate::adapter::btor2::ast::Btor2File,
     predicates: &[PredicateSpec],
@@ -2729,6 +2749,52 @@ mod tests {
             },
         );
         (btor2, preds, compound)
+    }
+
+    #[test]
+    fn p1_postimage_lift_matches_all_pairs_lift() {
+        // P1.4 — lifting with `may_postimage = true` produces the IDENTICAL KMTS (may-edges + must
+        // modalities, incl. SmtHyperMust) as the all-pairs path, because both compute the may-relation
+        // via `encode_design_for_lift`. The production swap is verdict-equivalent, just cheaper.
+        use crate::clts::{StateId, TransitionModality};
+        let (btor2, preds, compound) = p1_rel_design();
+        let base = PredicateCubeLiftOptions {
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            must_edge_inference: MustEdgeInference::SmtHyperMust,
+            compound_exprs: compound.clone(),
+            ..Default::default()
+        };
+        let all_pairs =
+            predicate_cube_lift(preds.clone(), btor2, &AdapterOptions::default(), &base)
+                .expect("all-pairs lift");
+        let mut pi_opts = base.clone();
+        pi_opts.may_postimage = true;
+        let post_image =
+            predicate_cube_lift(preds.clone(), btor2, &AdapterOptions::default(), &pi_opts)
+                .expect("post-image lift");
+
+        let edges =
+            |r: &PredicateCubeLiftResult| -> std::collections::BTreeSet<(usize, usize, u8)> {
+                let mut s = std::collections::BTreeSet::new();
+                for i in 0..r.cube_count {
+                    let sid = StateId::<DefaultStateIdx>::from_index(i).expect("state id");
+                    for t in r.clts.outgoing(sid) {
+                        let tag = match t.modality() {
+                            TransitionModality::MayOnly => 0u8,
+                            TransitionModality::Sharp => 1,
+                            TransitionModality::MustHyperOnly(_) => 2,
+                        };
+                        s.insert((i, t.target().index(), tag));
+                    }
+                }
+                s
+            };
+        assert_eq!(all_pairs.cube_count, post_image.cube_count);
+        assert_eq!(
+            edges(&all_pairs),
+            edges(&post_image),
+            "post-image lift KMTS (may + must modalities) differs from the all-pairs lift"
+        );
     }
 
     #[test]
@@ -3111,6 +3177,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, SMALL_BTOR2, &AdapterOptions::default(), &opts);
         assert!(result.is_err());
@@ -3679,6 +3746,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
 
         // Baseline: SmtAllPairs may, no must → MayOnly only, zero promotions.
@@ -3743,6 +3811,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let lifted = predicate_cube_lift(preds, toggle, &AdapterOptions::default(), &opts)
             .expect("SmtAllPairs + SmtHyperMust lift");
@@ -3802,6 +3871,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs,
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let preds = vec![PredicateSpec {
             name: "idle".into(),
@@ -3841,6 +3911,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::Off,
             compound_exprs,
             derived_predicates: Vec::new(),
+            may_postimage: false,
             ..Default::default()
         };
         let preds = vec![PredicateSpec {
@@ -3880,6 +3951,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs,
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let preds = vec![PredicateSpec {
             name: "stable".into(),
@@ -4028,6 +4100,7 @@ mod tests {
                     config_values: std::collections::HashMap::new(),
                     compound_exprs: std::collections::HashMap::new(),
                     derived_predicates: Vec::new(),
+                    may_postimage: false,
                 };
                 let eager = predicate_cube_lift(
                     preds.clone(),
@@ -4086,6 +4159,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let eager = lift_predicate_cube(
             preds.clone(),
@@ -4127,6 +4201,7 @@ mod tests {
             may_edge_inference: MayEdgeInference::SmtAllPairs,
             compound_exprs,
             derived_predicates: Vec::new(),
+            may_postimage: false,
             ..Default::default()
         };
         let preds = vec![PredicateSpec {
@@ -4169,6 +4244,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("ok");
@@ -4240,6 +4316,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4299,6 +4376,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4331,6 +4409,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -4391,6 +4470,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(
             preds.clone(),
@@ -4428,6 +4508,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let mvp_result =
             predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &mvp_opts)
@@ -4469,6 +4550,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("lift succeeds");
@@ -4508,6 +4590,7 @@ mod tests {
                 config_values: std::collections::HashMap::new(),
                 compound_exprs: std::collections::HashMap::new(),
                 derived_predicates: Vec::new(),
+                may_postimage: false,
             };
             let result = predicate_cube_lift(
                 preds.clone(),
@@ -4549,6 +4632,7 @@ mod tests {
                 config_values: std::collections::HashMap::new(),
                 compound_exprs: std::collections::HashMap::new(),
                 derived_predicates: Vec::new(),
+                may_postimage: false,
             };
             let mut lazy = LazyLift::from_btor2(
                 preds.clone(),
@@ -4704,6 +4788,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &adapter_opts, &lift_opts)
             .expect("lift succeeds");
@@ -4796,6 +4881,7 @@ mod tests {
             config_values: std::collections::HashMap::new(),
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let mut lazy =
             LazyLift::from_btor2(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
@@ -4884,6 +4970,7 @@ mod tests {
             config_values,
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");
@@ -4920,6 +5007,7 @@ mod tests {
             config_values,
             compound_exprs: std::collections::HashMap::new(),
             derived_predicates: Vec::new(),
+            may_postimage: false,
         };
         let result = predicate_cube_lift(preds, COUNTER_BTOR2, &AdapterOptions::default(), &opts)
             .expect("predicate_cube_lift succeeds");

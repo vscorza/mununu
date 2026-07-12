@@ -898,6 +898,12 @@ pub fn cegar_refine_loop(
         // SmtEncode seam's `combinational_labels` pass and writes the label into
         // `state_3valued_predicates` (NOT a cube dimension).
         derived_predicates: derived_predicates.clone(),
+        // scalable-KMTS P1.4 — compute the SmtAllPairs may-relation via the compound-sound SMT
+        // post-image (O(2^|P|·#succ)) instead of the all-pairs O(2^{2|P|}) loop. Both encode via
+        // `encode_design_for_lift`, so the KMTS and every verdict are IDENTICAL (proven by
+        // `p1_postimage_lift_matches_all_pairs_lift`); only the cost differs. This is the P0-wall fix
+        // for every cube verification (recoverability, safety). Consulted only on the SmtAllPairs path.
+        may_postimage: true,
     };
 
     for iteration in 0..=cegar_opts.max_iterations {
