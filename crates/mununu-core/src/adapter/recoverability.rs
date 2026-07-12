@@ -333,11 +333,12 @@ fn good_next_cone_constants(
 ///   **(A) all-path** — `transition ∧ ¬good ∧ (δ_next ≥ δ_curr)` UNSAT: EVERY input choice out of a
 ///   non-good state strictly decreases δ. No quantifier (inputs free), fast; proves the stronger
 ///   `AG AF good` ⊆ `AG EF good`. Decides deterministic descents (down-counters, timers).
-///   **(B) some-path** — `¬good ∧ ∀(inputs, state_next). (transition → δ_next ≥ δ_curr)` UNSAT: every
-///   non-good state has at least ONE input whose successor strictly decreases δ. Quantified (slower),
-///   the fallback; proves `AG EF good` directly (a strictly-descending path reaches good). Decides a
-///   relation drained by only SOME input — a FIFO's read-gated `wptr == rptr` (`AG EF` but not `AG AF`,
-///   since the environment may write forever) — which (A) cannot.
+///   **(B) some-path** — decides a relation drained by only SOME input (a FIFO's read-gated
+///   `wptr == rptr`, `AG EF` but not `AG AF`, since the environment may write forever) which (A) cannot.
+///   Rather than a flaky quantified-BV query, it ENUMERATES constant input valuations: if some fixed
+///   input `v` makes `transition ∧ ¬good ∧ (inputs == v) ∧ (δ_next ≥ δ_curr)` UNSAT, the constant-`v`
+///   path strictly descends δ from every non-good state, so it reaches good ⇒ `AG EF good`. Capped at a
+///   few input bits (a drain is gated on narrow control inputs), a non-quantified fast path.
 /// With δ ≥ 0 (trivial for an unsigned BV) either certificate ⇒ `EF good` from every state ⇒ `AG EF good`,
 /// so returning `Holds` is SOUND. Both correctly FAIL on wrap/overshoot (`cnt - 2` from an odd start
 /// never hits 0 → the difference jumps up → SAT) and on non-monotone designs (a sound fall-through to the
@@ -408,32 +409,45 @@ fn ranking_certificate_holds(
             }
         }
 
-        // Attempt 2 — SOME-PATH descent (`AG EF good`, the recoverability property): `¬good ∧
-        // ∀(inputs, state_next). (transition → δ_next ≥ δ_curr)` UNSAT, i.e. every non-good state has at
-        // least ONE input whose successor strictly decreases δ. This decides a relation drained by only
-        // some input — a FIFO's read-gated `wptr == rptr` (`AG EF` but not `AG AF`) — where attempt 1
-        // fails (writing keeps δ non-decreasing). Quantified (∀ over the next-cycle vars), so it is the
-        // slower fallback. SOUND: (δ bounded below) + (∃ decreasing successor at every non-good state) ⇒
-        // a strictly-descending path reaches good ⇒ `EF good` from every state ⇒ `AG EF good`.
-        let mut bound: Vec<z3::ast::BV> = Vec::new();
-        for bv in view.inputs.values() {
-            bound.push(bv.clone());
+        // Attempt 2 — SOME-PATH descent (`AG EF good`, the recoverability property): a relation drained
+        // by only SOME input — a FIFO's read-gated `wptr == rptr` (`AG EF` but not `AG AF`, since the
+        // environment may write forever) — where attempt 1 fails (writing keeps δ non-decreasing). The
+        // natural encoding quantifies over the next-cycle vars (`∀(inputs, state_next). …`), but z3's
+        // quantified-BV engine returns `Unknown` on the wide `state_next` inconsistently across versions
+        // (a robustness hazard). Instead ENUMERATE candidate CONSTANT input valuations, each a fast
+        // NON-quantified check: if some fixed input `v` makes `transition ∧ ¬good ∧ (inputs == v) ∧
+        // (δ_next ≥ δ_curr)` UNSAT, then under `v` EVERY non-good state strictly decreases δ, so the
+        // constant-`v` path (bounded below) descends to good ⇒ `AG EF good`. SOUND (that path is a real
+        // witness). Capped at a few input bits — a drain is gated on narrow control inputs; a wider input
+        // space skips (falls through to the cube, a sound abstain).
+        let input_bvs: Vec<z3::ast::BV> = view.inputs.values().cloned().collect();
+        let total_input_bits: u32 = input_bvs.iter().map(|bv| bv.get_size()).sum();
+        if total_input_bits == 0 || total_input_bits > 10 {
+            return false;
         }
-        for bv in view.state_next.values() {
-            bound.push(bv.clone());
+        for v in 0u64..(1u64 << total_input_bits) {
+            let solver = z3::Solver::new();
+            let mut params = z3::Params::new();
+            params.set_u32("timeout", 5_000);
+            solver.set_params(&params);
+            solver.assert(&view.transition);
+            solver.assert(&not_good);
+            // Pin every input to its slice of `v` (a specific constant valuation).
+            let mut bit = 0u32;
+            for bv in &input_bvs {
+                let w = bv.get_size();
+                let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let vbv = z3::ast::BV::from_u64((v >> bit) & m, w);
+                let pin = bv.eq(&vbv);
+                solver.assert(&pin);
+                bit += w;
+            }
+            solver.assert(&non_decreasing);
+            if matches!(solver.check(), z3::SatResult::Unsat) {
+                return true;
+            }
         }
-        let bound_refs: Vec<&dyn z3::ast::Ast> =
-            bound.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
-        // `transition → δ_next ≥ δ_curr` as `¬transition ∨ (δ_next ≥ δ_curr)`.
-        let body = z3::ast::Bool::or(&[&view.transition.not(), &non_decreasing]);
-        let universal = z3::ast::forall_const(&bound_refs, &[], &body);
-        let solver = z3::Solver::new();
-        let mut params = z3::Params::new();
-        params.set_u32("timeout", 8_000);
-        solver.set_params(&params);
-        solver.assert(&not_good);
-        solver.assert(&universal);
-        matches!(solver.check(), z3::SatResult::Unsat)
+        false
     })
 }
 

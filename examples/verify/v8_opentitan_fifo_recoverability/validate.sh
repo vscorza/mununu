@@ -57,8 +57,10 @@ sv2v -I"${SRC}" "${SRC}/prim_count_pkg.sv" "${SRC}/prim_util_pkg.sv" \
 # the write pointer), not a reset escape — the honest, harder question.
 lift() {
   local depth="$1" out="$2"
+  # `flatten; opt -full` inlines sv2v's identity-cast helper functions (`sv2v_cast_*`); without it yosys
+  # leaves them as spurious wide free inputs that swamp the ranking certificate's input enumeration.
   yosys -q -p "read_verilog -sv ${OUT}/cnt.v; hierarchy -check -top prim_fifo_sync_cnt -chparam Depth ${depth}; \
-               proc; async2sync; dffunmap; connect -set rst_ni 1'b1; clean; write_btor ${out}" 2>"${OUT}/yosys.err"
+               proc; flatten; opt -full; async2sync; dffunmap; connect -set rst_ni 1'b1; opt_clean -purge; write_btor ${out}" 2>"${OUT}/yosys.err"
   python3 - "$out" <<'PY'
 import sys
 p=sys.argv[1]; L=open(p).read().splitlines(); out=[]; n=[]
