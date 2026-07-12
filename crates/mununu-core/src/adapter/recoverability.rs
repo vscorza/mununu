@@ -320,6 +320,44 @@ fn good_next_cone_constants(
     consts
 }
 
+/// N1 ranking helper — the INPUT nids in the next-state cone of the given (good) registers: the inputs
+/// that can affect the RANKING's evolution. The ∃-input enumeration pins only these; a real design
+/// often carries wide inputs outside this cone (an FPV backdoor, a hardened counter's SECONDARY-register
+/// or dead-output logic — e.g. OpenTitan `prim_count`) that would otherwise swamp the enumeration's bit
+/// cap. Leaving an out-of-cone input FREE rather than pinning it is SOUND — pinning fewer inputs makes
+/// the UNSAT check STRONGER (∀ over the free ones), so a certified verdict stays a real witness.
+fn inputs_in_next_cone(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    seed_state_nids: &[i64],
+) -> std::collections::HashSet<i64> {
+    use crate::adapter::btor2::ast::Node;
+    let mut queue: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
+    for &s in seed_state_nids {
+        if let Some(nv) = crate::adapter::btor2::parser::find_next_value_operand(file, s) {
+            queue.push_back(nv.0.abs());
+        }
+    }
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut inputs: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    while let Some(nid) = queue.pop_front() {
+        if !seen.insert(nid) {
+            continue;
+        }
+        match file.lookup(nid).map(|l| &l.node) {
+            Some(Node::Input { .. }) => {
+                inputs.insert(nid);
+            }
+            Some(Node::Op { args, .. }) => {
+                for o in args {
+                    queue.push_back(o.0.abs());
+                }
+            }
+            _ => {}
+        }
+    }
+    inputs
+}
+
 /// N1 ranking certificate for `AG EF good` — the well-founded-descent / RANKING class the predicate
 /// cube cannot capture. When `good` is reached by a monotone datapath descent (a down-counter to 0, a
 /// timer, a drain), no bounded predicate set represents the descent, so the cube abstains (`Unknown`) —
@@ -423,8 +461,17 @@ fn ranking_certificate_holds(
             })
             .collect();
 
-        // Input-valuation enumeration setup (shared across measures).
-        let input_bvs: Vec<z3::ast::BV> = view.inputs.values().cloned().collect();
+        // Input-valuation enumeration setup (shared across measures). Only inputs in the state
+        // registers' next-state cone are enumerated — out-of-cone inputs (an FPV backdoor, a dead
+        // output's wide operand) are left FREE (sound: they cannot affect any δ_next) so they do not
+        // swamp the enumeration's bit cap.
+        let cone_inputs = inputs_in_next_cone(file, &good_nids);
+        let input_bvs: Vec<z3::ast::BV> = view
+            .inputs
+            .iter()
+            .filter(|(nid, _)| cone_inputs.contains(nid))
+            .map(|(_, bv)| bv.clone())
+            .collect();
         let total_input_bits: u32 = input_bvs.iter().map(|bv| bv.get_size()).sum();
         let can_enum = total_input_bits > 0 && total_input_bits <= 10;
 
@@ -1761,6 +1808,41 @@ mod tests {
             verify_recoverability(&nested3_w(8, 3, 2, 100), "hi == 0").expect("exact decides"),
             PropertyVerdict::Holds,
             "8-bit exact oracle agrees with the 48-bit full-tuple ranking Holds"
+        );
+    }
+
+    // COI-filtered ∃-input enumeration — a drain gated on `dec` PLUS a DEAD wide input `junk` (declared,
+    // never used). The enumeration pins only inputs in the good register's next-cone (`dec`); the dead
+    // 48-bit input is left free (sound), so it does not swamp the enumeration's bit cap. This is the
+    // shape a real hardened primitive (OpenTitan `prim_count`, with its secondary counter + FPV backdoor)
+    // presents — inputs that do not touch the ranking register but would otherwise block the enumeration.
+    fn dead_input_drain_w(width: u32, init: u128) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 2 cnt\n4 zero 2\n5 one 2\n\
+             6 constd 2 {init}\n7 init 2 3 6\n8 input 1 dec\n9 input 2 junk\n10 eq 1 3 4\n\
+             11 sub 2 3 5\n12 ite 2 8 11 3\n13 ite 2 10 4 12\n14 next 2 3 13\n"
+        )
+    }
+
+    #[test]
+    fn ranking_certificate_ignores_dead_wide_input() {
+        // The dead 48-bit input would push the total enumerated input bits over the cap; the good-cone
+        // filter excludes it, so the ∃-input drain (`dec`) still decides Holds.
+        assert_eq!(
+            verify_recoverability_scalable(
+                &dead_input_drain_w(48, 140_737_488_355_328),
+                "cnt == 0",
+                &[]
+            )
+            .expect("decides"),
+            PropertyVerdict::Holds,
+            "the dead wide input is excluded from the ∃-input enumeration → decides Holds"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD).
+        assert_eq!(
+            verify_recoverability(&dead_input_drain_w(8, 200), "cnt == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees"
         );
     }
 
