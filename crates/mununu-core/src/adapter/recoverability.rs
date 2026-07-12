@@ -339,6 +339,11 @@ fn good_next_cone_constants(
 ///   input `v` makes `transition ∧ ¬good ∧ (inputs == v) ∧ (δ_next ≥ δ_curr)` UNSAT, the constant-`v`
 ///   path strictly descends δ from every non-good state, so it reaches good ⇒ `AG EF good`. Capped at a
 ///   few input bits (a drain is gated on narrow control inputs), a non-quantified fast path.
+/// Each attempt runs first with the single-register measure δ1, then with LEXICOGRAPHIC measures
+/// `(δ1, s)` — δ1 paired with each other register `s` as a tiebreaker — so a NESTED descent decides:
+/// when δ1 alone does not strictly decrease every step (it holds while an inner counter runs down), the
+/// tuple `(δ1, s)` does, and lex order on the tuple is well-founded (`non_dec` becomes
+/// `¬[(δ1' < δ1) ∨ (δ1' == δ1 ∧ s' < s)]`).
 /// With δ ≥ 0 (trivial for an unsigned BV) either certificate ⇒ `EF good` from every state ⇒ `AG EF good`,
 /// so returning `Holds` is SOUND. Both correctly FAIL on wrap/overshoot (`cnt - 2` from an odd start
 /// never hits 0 → the difference jumps up → SAT) and on non-monotone designs (a sound fall-through to the
@@ -355,9 +360,15 @@ fn ranking_certificate_holds(
         };
         let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
         let mask = |w: u32| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-        // Build δ_curr, δ_next, and the ¬good constraint for the candidate ranking.
-        let parts = match good_value {
-            // Simple good `r == V`: δ = r - V.
+        // PRIMARY ranking component δ1 + the ¬good constraint, plus the good register NIDs (excluded from
+        // the lexicographic secondaries below).
+        let (d1_curr, d1_next, not_good, good_nids): (
+            z3::ast::BV,
+            z3::ast::BV,
+            z3::ast::Bool,
+            Vec<i64>,
+        ) = match good_value {
+            // Simple good `r == V`: δ1 = r - V.
             Some(v) => {
                 let [r] = good_registers else { return false };
                 let Some(&nid) = nid_map.get(r) else {
@@ -368,9 +379,9 @@ fn ranking_certificate_holds(
                 };
                 let w = rc.get_size();
                 let vbv = z3::ast::BV::from_u64(v & mask(w), w);
-                (rc.bvsub(&vbv), rn.bvsub(&vbv), rc.eq(&vbv).not())
+                (rc.bvsub(&vbv), rn.bvsub(&vbv), rc.eq(&vbv).not(), vec![nid])
             }
-            // Relational good `a == b`: δ = a - b (same-width registers only).
+            // Relational good `a == b`: δ1 = a - b (same-width registers only).
             None => {
                 let [a, b] = good_registers else { return false };
                 let (Some(&na), Some(&nb)) = (nid_map.get(a), nid_map.get(b)) else {
@@ -387,63 +398,99 @@ fn ranking_certificate_holds(
                 if ac.get_size() != bc.get_size() {
                     return false;
                 }
-                (ac.bvsub(bc), an.bvsub(bn), ac.eq(bc).not())
+                (ac.bvsub(bc), an.bvsub(bn), ac.eq(bc).not(), vec![na, nb])
             }
         };
-        let (delta_curr, delta_next, not_good) = parts;
-        let non_decreasing = delta_next.bvuge(&delta_curr);
 
-        // Attempt 1 — ALL-PATH descent (`AG AF good`): `transition ∧ ¬good ∧ (δ_next ≥ δ_curr)` UNSAT,
-        // i.e. EVERY input choice out of a non-good state strictly decreases δ. No quantifier (inputs are
-        // free), so this is the fast path; it decides deterministic descents (down-counters, timers).
-        {
-            let solver = z3::Solver::new();
-            let mut params = z3::Params::new();
-            params.set_u32("timeout", 5_000);
-            solver.set_params(&params);
-            solver.assert(&view.transition);
-            solver.assert(&not_good);
-            solver.assert(&non_decreasing);
-            if matches!(solver.check(), z3::SatResult::Unsat) {
-                return true;
-            }
-        }
+        // Lexicographic SECONDARY candidates: each OTHER state register's (curr, next) value — any BV is
+        // a well-founded tiebreaker. Bounded + sorted-by-nid for a stable search order.
+        const MAX_SECONDARIES: usize = 6;
+        let mut sec_nids: Vec<i64> = view
+            .state_curr
+            .keys()
+            .copied()
+            .filter(|n| !good_nids.contains(n))
+            .collect();
+        sec_nids.sort_unstable();
+        let secondaries: Vec<(z3::ast::BV, z3::ast::BV)> = sec_nids
+            .iter()
+            .take(MAX_SECONDARIES)
+            .filter_map(|n| {
+                Some((
+                    view.state_curr.get(n)?.clone(),
+                    view.state_next.get(n)?.clone(),
+                ))
+            })
+            .collect();
 
-        // Attempt 2 — SOME-PATH descent (`AG EF good`, the recoverability property): a relation drained
-        // by only SOME input — a FIFO's read-gated `wptr == rptr` (`AG EF` but not `AG AF`, since the
-        // environment may write forever) — where attempt 1 fails (writing keeps δ non-decreasing). The
-        // natural encoding quantifies over the next-cycle vars (`∀(inputs, state_next). …`), but z3's
-        // quantified-BV engine returns `Unknown` on the wide `state_next` inconsistently across versions
-        // (a robustness hazard). Instead ENUMERATE candidate CONSTANT input valuations, each a fast
-        // NON-quantified check: if some fixed input `v` makes `transition ∧ ¬good ∧ (inputs == v) ∧
-        // (δ_next ≥ δ_curr)` UNSAT, then under `v` EVERY non-good state strictly decreases δ, so the
-        // constant-`v` path (bounded below) descends to good ⇒ `AG EF good`. SOUND (that path is a real
-        // witness). Capped at a few input bits — a drain is gated on narrow control inputs; a wider input
-        // space skips (falls through to the cube, a sound abstain).
+        // Input-valuation enumeration setup (shared across measures).
         let input_bvs: Vec<z3::ast::BV> = view.inputs.values().cloned().collect();
         let total_input_bits: u32 = input_bvs.iter().map(|bv| bv.get_size()).sum();
-        if total_input_bits == 0 || total_input_bits > 10 {
-            return false;
-        }
-        for v in 0u64..(1u64 << total_input_bits) {
-            let solver = z3::Solver::new();
-            let mut params = z3::Params::new();
-            params.set_u32("timeout", 5_000);
-            solver.set_params(&params);
-            solver.assert(&view.transition);
-            solver.assert(&not_good);
-            // Pin every input to its slice of `v` (a specific constant valuation).
-            let mut bit = 0u32;
-            for bv in &input_bvs {
-                let w = bv.get_size();
-                let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                let vbv = z3::ast::BV::from_u64((v >> bit) & m, w);
-                let pin = bv.eq(&vbv);
-                solver.assert(&pin);
-                bit += w;
+        let can_enum = total_input_bits > 0 && total_input_bits <= 10;
+
+        // For a candidate ranking measure, `non_dec` is "the measure did NOT strictly (lex-)decrease".
+        //   - ALL-PATH (`AG AF good`): `transition ∧ ¬good ∧ non_dec` UNSAT ⇒ every input choice descends
+        //     (down-counters, timers, deterministic nested loops). No quantifier.
+        //   - SOME-PATH (`AG EF good`): ENUMERATE constant input valuations — if some fixed `v` makes
+        //     `transition ∧ ¬good ∧ (inputs == v) ∧ non_dec` UNSAT, the constant-`v` path descends (a
+        //     FIFO's read-gated drain). Non-quantified (z3's quantified-BV engine is version-flaky);
+        //     capped at a few input bits (a drain is gated on narrow control inputs).
+        // Either UNSAT ⇒ a strictly-descending, well-founded path reaches good ⇒ `AG EF good` (SOUND).
+        let certifies = |non_dec: &z3::ast::Bool| -> bool {
+            let mk_solver = || {
+                let solver = z3::Solver::new();
+                let mut params = z3::Params::new();
+                params.set_u32("timeout", 5_000);
+                solver.set_params(&params);
+                solver
+            };
+            {
+                let solver = mk_solver();
+                solver.assert(&view.transition);
+                solver.assert(&not_good);
+                solver.assert(non_dec);
+                if matches!(solver.check(), z3::SatResult::Unsat) {
+                    return true;
+                }
             }
-            solver.assert(&non_decreasing);
-            if matches!(solver.check(), z3::SatResult::Unsat) {
+            if can_enum {
+                for v in 0u64..(1u64 << total_input_bits) {
+                    let solver = mk_solver();
+                    solver.assert(&view.transition);
+                    solver.assert(&not_good);
+                    let mut bit = 0u32;
+                    for bv in &input_bvs {
+                        let w = bv.get_size();
+                        let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        let vbv = z3::ast::BV::from_u64((v >> bit) & m, w);
+                        let pin = bv.eq(&vbv);
+                        solver.assert(&pin);
+                        bit += w;
+                    }
+                    solver.assert(non_dec);
+                    if matches!(solver.check(), z3::SatResult::Unsat) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
+        // MEASURE 1 — single-register δ1: `non_dec` = `δ1_next ≥ δ1_curr`.
+        if certifies(&d1_next.bvuge(&d1_curr)) {
+            return true;
+        }
+        // MEASURES 2.. — lexicographic (δ1, secondary). Decides nested / multi-phase descents where δ1
+        // alone does not strictly decrease every step (it holds while a secondary counts down); the
+        // secondary breaks the tie, and lex order on the tuple is well-founded, so the descent still
+        // reaches good. `non_dec` = `¬[(δ1' < δ1) ∨ (δ1' == δ1 ∧ sec' < sec)]`.
+        for (sc, sn) in &secondaries {
+            let d1_lt = d1_next.bvult(&d1_curr);
+            let d1_eq = d1_next.eq(&d1_curr);
+            let sec_lt = sn.bvult(sc);
+            let tie = z3::ast::Bool::and(&[&d1_eq, &sec_lt]);
+            let lex_dec = z3::ast::Bool::or(&[&d1_lt, &tie]);
+            if certifies(&lex_dec.not()) {
                 return true;
             }
         }
@@ -1627,6 +1674,37 @@ mod tests {
             verify_recoverability(&nondet_drain_w(8, 200), "cnt == 0").expect("exact decides"),
             PropertyVerdict::Holds,
             "8-bit exact oracle agrees with the 48-bit ∃-input ranking Holds"
+        );
+    }
+
+    // Lexicographic ranking — a NESTED counter. `lo` cycles `lo_max → 0`; `hi` decrements ONLY when
+    // `lo == 0`. `AG EF (hi == 0)` HOLDS, but δ = `hi` is NOT a valid ranking (hi holds while lo > 0, so
+    // it does not strictly decrease every step). The lexicographic measure `(hi, lo)` decreases every
+    // step (either `lo` down with `hi` fixed, or `hi` down when `lo` wraps) and is well-founded → decides.
+    fn nested_w(width: u32, lo_max: u128, hi_init: u128) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 2 hi\n4 state 2 lo\n5 zero 2\n6 one 2\n\
+             7 constd 2 {lo_max}\n8 constd 2 {hi_init}\n9 init 2 3 8\n10 init 2 4 7\n11 eq 1 4 5\n\
+             12 sub 2 4 6\n13 ite 2 11 7 12\n14 next 2 4 13\n15 eq 1 3 5\n16 sub 2 3 6\n\
+             17 ite 2 15 5 16\n18 ite 2 11 17 3\n19 next 2 3 18\n"
+        )
+    }
+
+    #[test]
+    fn ranking_certificate_decides_nested_counter_via_lexicographic() {
+        // 48-bit nested counter: `hi` alone is not a ranking; the lexicographic `(hi, lo)` decides Holds
+        // where the single-register certificate fails, the cube abstains, and exact BDD walls.
+        assert_eq!(
+            verify_recoverability_scalable(&nested_w(48, 100, 140_737_488_355_328), "hi == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit nested counter decides Holds via the lexicographic ranking certificate"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD).
+        assert_eq!(
+            verify_recoverability(&nested_w(8, 5, 200), "hi == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees with the 48-bit lexicographic ranking Holds"
         );
     }
 
