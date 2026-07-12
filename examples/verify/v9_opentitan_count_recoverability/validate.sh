@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # validate.sh — V.9 recoverability showcase on OpenTitan prim_count (a hardened counter).
 #
-# Asks a branching-time question SVA cannot state: "from any count value, can the counter
-# always get back to zero?" — recoverability over a datapath descent:
-#     always_recoverable = nu Y. ((mu X. (cnt==0 || <> X)) && [] Y)   (AG EF cnt==0)
-# The counter is a real OpenTitan `prim_count` wired as a down-counter (step=1, no clear/set,
-# see count_top.sv), so reaching zero is a well-founded DESCENT — the RANKING class, which no
-# bounded predicate set captures. mununu's RANKING CERTIFICATE decides it over the exact
-# transition: from every non-zero state SOME input (decrement + commit) strictly decreases the
-# count, which — bounded below by 0 — forces a descent to zero (∃-input variant, one relation).
+# Asks a branching-time question SVA cannot state, in BOTH directions on the SAME real primitive:
+#   (1) DESCENT  — "from any count, can the counter always get back to zero?"    (AG EF cnt==0)
+#   (2) ASCENT   — "from any count, can the counter always fill to max credit?"  (AG EF cnt==MAX)
+#     always_recoverable = nu Y. ((mu X. (cnt==GOAL || <> X)) && [] Y)
+# The counter is a real OpenTitan `prim_count` (step=1, no clear/set, see count_top.sv). Reaching
+# zero is a well-founded DESCENT; reaching MAX = 2^Width-1 is a well-founded ASCENT — both the
+# RANKING class, which no bounded predicate set captures. mununu's RANKING CERTIFICATE decides
+# each over the exact transition: from every off-goal state SOME input strictly moves a
+# well-founded measure toward the goal — δ = cnt for the descent (bounded below by 0), δ = MAX−cnt
+# for the ascent (bounded below by 0). The certificate tries BOTH measure directions, so one
+# extraction decides both properties (∃-input variant, one relation each).
 #
-# RESULT: `AG EF (cnt == 0)` decides HOLDS on a 48-bit prim_count in ~1.4 s, where the exact BDD
-# engine walls and the predicate cube abstains. This is a SINGLE-REGISTER ranking on a real
-# hardened primitive — a different shape from v8's relational FIFO drain.
+# RESULT: both `AG EF (cnt == 0)` and `AG EF (cnt == MAX)` decide HOLDS on a 48-bit prim_count,
+# where the exact BDD engine walls and the predicate cube abstains. A SINGLE-REGISTER ranking in
+# TWO directions on a real hardened primitive — a different shape from v8's relational FIFO drain.
 #
 # Note on the extraction: prim_count is HARDENED — it carries a redundant SECONDARY counter (for
 # fault detection) and an FPV backdoor. Those leave wide signals in the lifted BTOR2 that do not
@@ -79,24 +82,37 @@ open(p,"w").write("\n".join(out)+"\n")
 PY
 }
 
-echo "=== V.9 — recoverability of OpenTitan prim_count (AG EF cnt==0, a down-counter descent) ==="
+echo "=== V.9 — recoverability of OpenTitan prim_count, BOTH directions on one real primitive ==="
+echo "===        (1) AG EF cnt==0  descent      (2) AG EF cnt==MAX  ascent                    ==="
 echo
-echo "--- small counter (Width=8, exact engine) — expect HOLDS ---"
+
+# MAX credit for the ascent = 2^Width - 1.
+MAX8=255
+MAX48=281474976710655
+
+echo "--- small counter (Width=8, exact engine) — expect HOLDS both directions ---"
 lift 8 "${OUT}/w8.btor2"
-"${MUNUNU}" btor2 verify-recoverability "${OUT}/w8.btor2" --target 'cnt == 0' 2>/dev/null | grep -iE '"verdict"'
-SMALL="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/w8.btor2" --target 'cnt == 0' 2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
+echo -n "  descent AG EF (cnt == 0):     "; "${MUNUNU}" btor2 verify-recoverability "${OUT}/w8.btor2" --target 'cnt == 0'        2>/dev/null | grep -oiE '"verdict": "[a-z]+"'
+echo -n "  ascent  AG EF (cnt == ${MAX8}):   "; "${MUNUNU}" btor2 verify-recoverability "${OUT}/w8.btor2" --target "cnt == ${MAX8}"  2>/dev/null | grep -oiE '"verdict": "[a-z]+"'
+S_DN="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/w8.btor2" --target 'cnt == 0'       2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
+S_UP="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/w8.btor2" --target "cnt == ${MAX8}" 2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
 echo
-echo "--- wide counter (Width=48, > exact cap) — expect HOLDS via the ranking certificate ---"
+echo "--- wide counter (Width=48, > exact cap) — expect HOLDS both directions via the ranking certificate ---"
 lift 48 "${OUT}/w48.btor2"
-"${MUNUNU}" btor2 verify-recoverability "${OUT}/w48.btor2" --target 'cnt == 0' 2>/dev/null | grep -iE '"verdict"'
-WIDE="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/w48.btor2" --target 'cnt == 0' 2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
+echo -n "  descent AG EF (cnt == 0):                  "; "${MUNUNU}" btor2 verify-recoverability "${OUT}/w48.btor2" --target 'cnt == 0'         2>/dev/null | grep -oiE '"verdict": "[a-z]+"'
+echo -n "  ascent  AG EF (cnt == ${MAX48}):   "; "${MUNUNU}" btor2 verify-recoverability "${OUT}/w48.btor2" --target "cnt == ${MAX48}" 2>/dev/null | grep -oiE '"verdict": "[a-z]+"'
+W_DN="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/w48.btor2" --target 'cnt == 0'          2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
+W_UP="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/w48.btor2" --target "cnt == ${MAX48}" 2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
 echo
 
 ok=1
-[[ "${SMALL}" != "holds" ]] && { echo "FAIL: small counter expected holds, got ${SMALL}" >&2; ok=0; }
-[[ "${WIDE}"  != "holds" ]] && { echo "FAIL: wide counter expected holds (ranking certificate), got ${WIDE}" >&2; ok=0; }
+[[ "${S_DN}" != "holds" ]] && { echo "FAIL: small descent expected holds, got ${S_DN}" >&2; ok=0; }
+[[ "${S_UP}" != "holds" ]] && { echo "FAIL: small ascent expected holds, got ${S_UP}" >&2; ok=0; }
+[[ "${W_DN}" != "holds" ]] && { echo "FAIL: wide descent expected holds (ranking certificate), got ${W_DN}" >&2; ok=0; }
+[[ "${W_UP}" != "holds" ]] && { echo "FAIL: wide ascent expected holds (ranking certificate), got ${W_UP}" >&2; ok=0; }
 if [[ "${ok}" == "1" ]]; then
-  echo "PASS — down-counter recoverability DECIDES HOLDS on real prim_count at Width=48 (ranking certificate), where exact BDD walls and the predicate cube abstains."
+  echo "PASS — prim_count recoverability DECIDES HOLDS in BOTH directions at Width=48 (ranking certificate,"
+  echo "       δ=cnt for the descent, δ=MAX−cnt for the ascent), where exact BDD walls and the cube abstains."
 else
   echo "FAILED"; exit 1
 fi
