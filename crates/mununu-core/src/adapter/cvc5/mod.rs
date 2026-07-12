@@ -35,6 +35,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::adapter::btor2::PredicateSpec;
+use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
 use crate::adapter::{AdapterError, AdapterErrorKind};
 
 /// R.5 Item 3 sub-item 3.2 (2026-06-03) — default bit-width
@@ -410,15 +411,304 @@ pub fn invoke_cvc5_for_interpolant(
 /// - The `(error "...")` reply CVC5 emits when no interpolant
 ///   exists.
 pub fn parse_cvc5_interpolant_response(stdout: &str) -> Option<PredicateSpec> {
-    // Locate the `(define-fun I () Bool <expr>)` line. CVC5 may
-    // emit prelude lines (status / set-info echoes); scan for
-    // the marker.
+    // Back-compat shim: the PredicateSpec-typed Craig flow only carries
+    // `register == value` atoms. Parse the full interpolant, then downcast a
+    // simple `Cmp { .., Eq, .. }` to a PredicateSpec; anything relational or
+    // compound returns None here (the richer path is
+    // [`parse_interpolant_to_predicate_expr`]). This also fixes the cvc5 1.3.4
+    // `(and <atom> true)` wrapping that the old bare-`(= ..)` parser rejected.
+    match parse_interpolant_to_predicate_expr(stdout)? {
+        PredicateExpr::Cmp {
+            register,
+            op: CmpOp::Eq,
+            value,
+        } => Some(PredicateSpec {
+            name: "craig_interp".to_string(),
+            register,
+            value,
+        }),
+        _ => None,
+    }
+}
+
+/// sub-item 3.4 (2026-07-12) — parse CVC5's interpolant response into the richer
+/// [`PredicateExpr`] (relational + compound), the representation the cube path
+/// uses for emergent-K discovery.
+///
+/// CVC5 1.3.4's `(get-interpolant I <B>)` emits `(define-fun I () Bool <expr>)`
+/// where `<expr>` is a SyGuS-grammar term. Real shapes observed on 1.3.4:
+/// - `(and (= a #b00000101) true)` — a REG==VALUE atom wrapped in `(and .. true)`;
+/// - `(and (= a b) true)` — a REG==REG relation (→ [`PredicateExpr::CmpReg`]);
+/// - `(not (bvult b a))` — a negated inequality;
+/// - `(and (= x (bvadd y #b01)) ..)` — an arithmetic-addend relation
+///   (→ [`PredicateExpr::CmpRegAddend`]).
+///
+/// Returns `None` for trivial (`true`/`false`) interpolants, the `(error ..)`
+/// no-interpolant reply, and any term outside the mapped grammar (bitwise ops,
+/// multiplication, `ite`, …) — the caller then falls back to WP.
+///
+/// **Soundness.** The returned predicate is only a *candidate cube dimension*.
+/// Adding any well-formed predicate refines the abstraction monotonically
+/// (Shoham–Grumberg) and can never flip a definite verdict — so a mis-parse
+/// costs *refinement power*, never soundness.
+pub fn parse_interpolant_to_predicate_expr(stdout: &str) -> Option<PredicateExpr> {
     let define_marker = "(define-fun I () Bool ";
     let start = stdout.find(define_marker)?;
     let after = &stdout[start + define_marker.len()..];
-    // Extract the expression up to the matching closing paren.
     let expr = extract_balanced_expr(after)?;
-    parse_equality_expression(expr.trim())
+    let toks = tokenize_sexpr(expr.trim());
+    let mut pos = 0usize;
+    let sexpr = parse_sexpr(&toks, &mut pos)?;
+    sexpr_to_predicate_expr(&sexpr)
+}
+
+/// A minimal S-expression tree for the CVC5 interpolant grammar.
+enum SExpr {
+    Atom(String),
+    List(Vec<SExpr>),
+}
+
+/// Tokenize an SMT-LIB term into parens + atoms. Whitespace separates atoms;
+/// `#b…` / `#x…` literals and identifiers stay whole.
+fn tokenize_sexpr(s: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '(' | ')' => {
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+                toks.push(ch.to_string());
+            }
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    toks
+}
+
+/// Recursive-descent parse of a token stream into an [`SExpr`]. Advances `pos`.
+fn parse_sexpr(toks: &[String], pos: &mut usize) -> Option<SExpr> {
+    let t = toks.get(*pos)?;
+    if t == "(" {
+        *pos += 1;
+        let mut items = Vec::new();
+        while toks.get(*pos).is_some_and(|x| x != ")") {
+            items.push(parse_sexpr(toks, pos)?);
+        }
+        toks.get(*pos)?; // must be the closing ")" (else unbalanced → None)
+        *pos += 1;
+        Some(SExpr::List(items))
+    } else if t == ")" {
+        None
+    } else {
+        *pos += 1;
+        Some(SExpr::Atom(t.clone()))
+    }
+}
+
+/// Map a parsed interpolant [`SExpr`] to a [`PredicateExpr`]. `None` for trivial
+/// or out-of-grammar terms.
+fn sexpr_to_predicate_expr(e: &SExpr) -> Option<PredicateExpr> {
+    match e {
+        // A bare atom (`true` / `false` / a lone register) is not a usable
+        // boolean predicate.
+        SExpr::Atom(_) => None,
+        SExpr::List(items) => {
+            let SExpr::Atom(op) = items.first()? else {
+                return None;
+            };
+            match op.as_str() {
+                // n-ary `and` — drop trivial `true` conjuncts (the cvc5
+                // `(and X true)` idiom); fold the rest into a right-nested And.
+                "and" => fold_bool_children(&items[1..], /* is_and */ true),
+                "or" => fold_bool_children(&items[1..], /* is_and */ false),
+                "not" => Some(PredicateExpr::Not(Box::new(sexpr_to_predicate_expr(
+                    items.get(1)?,
+                )?))),
+                "=" => cmp_from_operands(items.get(1)?, items.get(2)?, CmpOp::Eq),
+                "distinct" => cmp_from_operands(items.get(1)?, items.get(2)?, CmpOp::Ne),
+                "bvult" => cmp_from_operands(items.get(1)?, items.get(2)?, CmpOp::Lt),
+                "bvule" => cmp_from_operands(items.get(1)?, items.get(2)?, CmpOp::Le),
+                "bvugt" => cmp_from_operands(items.get(1)?, items.get(2)?, CmpOp::Gt),
+                "bvuge" => cmp_from_operands(items.get(1)?, items.get(2)?, CmpOp::Ge),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Fold the children of an `and`/`or` node. Trivial identity children (`true`
+/// for `and`, `false` for `or`) are dropped; every remaining child must parse
+/// (an unparseable conjunct/disjunct ⇒ `None`, so we never fabricate a partial
+/// predicate). One survivor collapses to itself; ≥2 fold right-nested.
+fn fold_bool_children(children: &[SExpr], is_and: bool) -> Option<PredicateExpr> {
+    let identity = if is_and { "true" } else { "false" };
+    let mut parsed: Vec<PredicateExpr> = Vec::new();
+    for c in children {
+        if let SExpr::Atom(a) = c
+            && a == identity
+        {
+            continue; // drop the identity element
+        }
+        parsed.push(sexpr_to_predicate_expr(c)?);
+    }
+    let mut iter = parsed.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, next| {
+        if is_and {
+            PredicateExpr::And(Box::new(acc), Box::new(next))
+        } else {
+            PredicateExpr::Or(Box::new(acc), Box::new(next))
+        }
+    }))
+}
+
+/// Build a comparison [`PredicateExpr`] from two operand s-expressions and an
+/// operator. Handles register/literal/`(bvadd reg lit)` operands in either
+/// order (swapping the operator when the register is on the right).
+fn cmp_from_operands(lhs: &SExpr, rhs: &SExpr, op: CmpOp) -> Option<PredicateExpr> {
+    let l = classify_operand(lhs);
+    let r = classify_operand(rhs);
+    match (l, r) {
+        // reg <op> literal
+        (Operand::Register(reg), Operand::Literal(value, _)) => Some(PredicateExpr::Cmp {
+            register: reg,
+            op,
+            value,
+        }),
+        // literal <op> reg  ⇒  reg <swap(op)> literal
+        (Operand::Literal(value, _), Operand::Register(reg)) => Some(PredicateExpr::Cmp {
+            register: reg,
+            op: swap_cmp_op(op),
+            value,
+        }),
+        // reg <op> reg
+        (Operand::Register(lhs), Operand::Register(rhs)) => {
+            Some(PredicateExpr::CmpReg { lhs, op, rhs })
+        }
+        // reg <op> (bvadd reg lit)
+        (Operand::Register(lhs), Operand::RegAddend(rhs, addend, width)) => {
+            Some(PredicateExpr::CmpRegAddend {
+                lhs,
+                op,
+                rhs,
+                addend,
+                width,
+            })
+        }
+        // (bvadd reg lit) <op> reg  ⇒  reg <swap(op)> (bvadd reg lit)
+        (Operand::RegAddend(rhs, addend, width), Operand::Register(lhs)) => {
+            Some(PredicateExpr::CmpRegAddend {
+                lhs,
+                op: swap_cmp_op(op),
+                rhs,
+                addend,
+                width,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A classified interpolant operand.
+enum Operand {
+    Register(String),
+    Literal(u64, u32),
+    /// `(bvadd reg lit)` — register `.0` plus constant `.1` at width `.2`.
+    RegAddend(String, u64, u32),
+    Other,
+}
+
+fn classify_operand(e: &SExpr) -> Operand {
+    match e {
+        SExpr::Atom(a) => {
+            if let Some((v, w)) = parse_bv_literal_sexpr(a) {
+                Operand::Literal(v, w)
+            } else if is_register_ident(a) {
+                Operand::Register(a.clone())
+            } else {
+                Operand::Other
+            }
+        }
+        SExpr::List(items) => {
+            // `(_ bv<n> <w>)` literal.
+            if let Some((v, w)) = parse_underscore_literal(items) {
+                return Operand::Literal(v, w);
+            }
+            // `(bvadd A B)` with one register + one literal.
+            if let Some(SExpr::Atom(head)) = items.first()
+                && head == "bvadd"
+                && items.len() == 3
+            {
+                let a = classify_operand(&items[1]);
+                let b = classify_operand(&items[2]);
+                return match (a, b) {
+                    (Operand::Register(reg), Operand::Literal(k, w))
+                    | (Operand::Literal(k, w), Operand::Register(reg)) => {
+                        Operand::RegAddend(reg, k, w)
+                    }
+                    _ => Operand::Other,
+                };
+            }
+            Operand::Other
+        }
+    }
+}
+
+/// Is `a` a plausible register identifier (not a literal, not a keyword)?
+fn is_register_ident(a: &str) -> bool {
+    !a.is_empty()
+        && !a.starts_with('#')
+        && a != "true"
+        && a != "false"
+        && a != "_"
+        && parse_bv_literal_sexpr(a).is_none()
+}
+
+/// Parse a `#b…` / `#x…` bitvector literal, returning `(value, width_bits)`.
+fn parse_bv_literal_sexpr(s: &str) -> Option<(u64, u32)> {
+    if let Some(bits) = s.strip_prefix("#b") {
+        return Some((u64::from_str_radix(bits, 2).ok()?, bits.len() as u32));
+    }
+    if let Some(hex) = s.strip_prefix("#x") {
+        return Some((u64::from_str_radix(hex, 16).ok()?, (hex.len() as u32) * 4));
+    }
+    None
+}
+
+/// Parse a `(_ bv<n> <w>)` literal list into `(value, width)`.
+fn parse_underscore_literal(items: &[SExpr]) -> Option<(u64, u32)> {
+    if items.len() == 3
+        && let (SExpr::Atom(us), SExpr::Atom(bv), SExpr::Atom(w)) =
+            (&items[0], &items[1], &items[2])
+        && us == "_"
+    {
+        let value = bv.strip_prefix("bv")?.parse::<u64>().ok()?;
+        let width = w.parse::<u32>().ok()?;
+        return Some((value, width));
+    }
+    None
+}
+
+/// Swap a comparison operator for operand reordering (`k < r` ⇒ `r > k`).
+fn swap_cmp_op(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+    }
 }
 
 /// R.5 Item 3 sub-item 3.3 (2026-06-03) — extract a balanced
@@ -454,66 +744,10 @@ fn extract_balanced_expr(input: &str) -> Option<&str> {
     end.map(|e| &input[..e])
 }
 
-/// R.5 Item 3 sub-item 3.3 (2026-06-03) — parse an equality
-/// expression of shape `(= <register> <bv-literal>)` into a
-/// [`PredicateSpec`]. Returns `None` for any other shape.
-///
-/// Accepted bv-literal forms:
-/// - `#b<binary-digits>` (e.g. `#b00000000`)
-/// - `#x<hex-digits>` (e.g. `#x00`)
-/// - `(_ bv<decimal> <width>)` (e.g. `(_ bv0 8)`)
-fn parse_equality_expression(expr: &str) -> Option<PredicateSpec> {
-    let trimmed = expr.trim();
-    // Must be (= <ident> <bv-literal>).
-    let inner = trimmed.strip_prefix("(=")?.strip_suffix(')')?.trim();
-    // Split on whitespace; the bv-literal may itself be a
-    // parenthesised `(_ bv<n> <w>)` form, so we need to handle
-    // both whitespace-separated identifiers and paren groups.
-    let (register, rest) = split_first_token(inner)?;
-    let bv_value = parse_bv_literal(rest.trim())?;
-    Some(PredicateSpec {
-        name: "craig_interp".to_string(),
-        register: register.to_string(),
-        value: bv_value,
-    })
-}
-
-/// Split off the first whitespace-delimited token, returning
-/// `(token, remainder)`. Used to extract the register name
-/// from the `(= <register> <value>)` form.
-fn split_first_token(input: &str) -> Option<(&str, &str)> {
-    let s = input.trim_start();
-    let end = s.find(char::is_whitespace).unwrap_or(s.len());
-    if end == 0 {
-        return None;
-    }
-    Some((&s[..end], &s[end..]))
-}
-
-/// Parse an SMT-LIB bitvector literal into its numeric value
-/// as `u64`. Handles `#b...`, `#x...`, and `(_ bv<n> <w>)`
-/// forms. Returns `None` for unrecognised shapes or values
-/// exceeding `u64`.
-fn parse_bv_literal(s: &str) -> Option<u64> {
-    let trimmed = s.trim();
-    // Binary form: #b0101...
-    if let Some(bits) = trimmed.strip_prefix("#b") {
-        return u64::from_str_radix(bits, 2).ok();
-    }
-    // Hex form: #x0a...
-    if let Some(hex) = trimmed.strip_prefix("#x") {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    // Underscored decimal form: (_ bv0 8) — extract the
-    // numeric token after "bv".
-    if let Some(rest) = trimmed.strip_prefix("(_") {
-        let inner = rest.trim().strip_suffix(')')?.trim();
-        let bv_token = inner.split_whitespace().next()?;
-        let value_str = bv_token.strip_prefix("bv")?;
-        return value_str.parse::<u64>().ok();
-    }
-    None
-}
+// (2026-07-12) The bare-`(= reg lit)` string parser + its `split_first_token` /
+// `parse_bv_literal` helpers were superseded by the recursive
+// [`parse_interpolant_to_predicate_expr`] s-expression parser above (which also
+// unwraps the cvc5 1.3.4 `(and X true)` idiom and handles relational forms).
 
 #[cfg(test)]
 mod tests {
@@ -831,8 +1065,9 @@ mod tests {
 
     #[test]
     fn r5_subitem_33_parse_interpolant_returns_none_on_compound_and() {
-        // Compound `(and ...)` interpolants are NOT decoded by
-        // the MVP parser. CEGAR falls back to WP.
+        // A compound `(and A B)` decodes to PredicateExpr::And (see
+        // `parse_interpolant_to_predicate_expr`), but the PredicateSpec shim
+        // only carries a single REG==VALUE atom, so it declines the compound.
         let stdout = "(define-fun I () Bool (and (= reg_a #b0) (= reg_b #b1)))\n";
         let got = parse_cvc5_interpolant_response(stdout);
         assert_eq!(got, None);
@@ -840,9 +1075,8 @@ mod tests {
 
     #[test]
     fn r5_subitem_33_parse_interpolant_returns_none_on_negation() {
-        // Negation in the interpolant — MVP parser doesn't
-        // emit an "inequality" PredicateSpec (the type only
-        // supports equality). CEGAR falls back to WP.
+        // A negation decodes to PredicateExpr::Not, but the PredicateSpec shim
+        // only carries a positive REG==VALUE atom, so it declines it here.
         let stdout = "(define-fun I () Bool (not (= reg_a #b00)))\n";
         let got = parse_cvc5_interpolant_response(stdout);
         assert_eq!(got, None);
@@ -906,30 +1140,138 @@ mod tests {
         assert_eq!(got, Some("true"));
     }
 
+    // === sub-item 3.4 (2026-07-12): relational + compound interpolant parser ===
+    // Every input below is REAL cvc5 1.3.4 `get-interpolant` output (captured
+    // from live queries), the shapes the PredicateSpec-only parser could not
+    // decode — including the `(and X true)` wrapping cvc5 1.3.4 puts even a
+    // plain REG==VALUE interpolant in.
+
     #[test]
-    fn r5_subitem_33_parse_bv_literal_binary() {
-        assert_eq!(parse_bv_literal("#b1010"), Some(10));
-        assert_eq!(parse_bv_literal("#b00000000"), Some(0));
-        assert_eq!(parse_bv_literal("#b1"), Some(1));
+    fn interp_expr_unwraps_and_true_reg_value() {
+        // cvc5 1.3.4 wraps a REG==VALUE interpolant as `(and (= a #b..) true)`.
+        let stdout = "(define-fun I () Bool (and (= a #b00000101) true))\n";
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(stdout),
+            Some(PredicateExpr::Cmp {
+                register: "a".to_string(),
+                op: CmpOp::Eq,
+                value: 5,
+            })
+        );
+        // …and the PredicateSpec shim now decodes it too (the 1.3.4 fix).
+        let spec = parse_cvc5_interpolant_response(stdout).expect("REG==VALUE decodes");
+        assert_eq!(spec.register, "a");
+        assert_eq!(spec.value, 5);
     }
 
     #[test]
-    fn r5_subitem_33_parse_bv_literal_hex() {
-        assert_eq!(parse_bv_literal("#xff"), Some(255));
-        assert_eq!(parse_bv_literal("#x0"), Some(0));
+    fn interp_expr_reg_eq_reg_relation() {
+        // `(and (= a b) true)` — a REG==REG relation (emergent relational K).
+        let stdout = "(define-fun I () Bool (and (= a b) true))\n";
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(stdout),
+            Some(PredicateExpr::CmpReg {
+                lhs: "a".to_string(),
+                op: CmpOp::Eq,
+                rhs: "b".to_string(),
+            })
+        );
+        // A REG==REG relation is not a PredicateSpec — the shim declines it.
+        assert_eq!(parse_cvc5_interpolant_response(stdout), None);
     }
 
     #[test]
-    fn r5_subitem_33_parse_bv_literal_underscored() {
-        assert_eq!(parse_bv_literal("(_ bv5 8)"), Some(5));
-        assert_eq!(parse_bv_literal("(_ bv0 32)"), Some(0));
+    fn interp_expr_negated_inequality() {
+        // `(not (bvult b a))` = ¬(b < a) — a negated relational comparison.
+        let stdout = "(define-fun I () Bool (not (bvult b a)))\n";
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(stdout),
+            Some(PredicateExpr::Not(Box::new(PredicateExpr::CmpReg {
+                lhs: "b".to_string(),
+                op: CmpOp::Lt,
+                rhs: "a".to_string(),
+            })))
+        );
     }
 
     #[test]
-    fn r5_subitem_33_parse_bv_literal_returns_none_on_invalid() {
-        assert_eq!(parse_bv_literal("not a literal"), None);
-        assert_eq!(parse_bv_literal("#znot-binary"), None);
-        assert_eq!(parse_bv_literal(""), None);
+    fn interp_expr_addend_relation_and_conjunction() {
+        // Real cvc5 output for A=(x==y+1 & y<200) ⟹ B=(x>y):
+        //   (and (= x (bvadd y #b00000001)) (bvult y (bvadd #b00000001 y)))
+        // → And( x == y+1 , y < y+1 ) — both addend relations.
+        let stdout = "(define-fun I () Bool (and (= x (bvadd y #b00000001)) \
+                      (bvult y (bvadd #b00000001 y))))\n";
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(stdout),
+            Some(PredicateExpr::And(
+                Box::new(PredicateExpr::CmpRegAddend {
+                    lhs: "x".to_string(),
+                    op: CmpOp::Eq,
+                    rhs: "y".to_string(),
+                    addend: 1,
+                    width: 8,
+                }),
+                Box::new(PredicateExpr::CmpRegAddend {
+                    lhs: "y".to_string(),
+                    op: CmpOp::Lt,
+                    rhs: "y".to_string(),
+                    addend: 1,
+                    width: 8,
+                }),
+            ))
+        );
+    }
+
+    #[test]
+    fn interp_expr_literal_on_left_swaps_operator() {
+        // `(bvult #b00000101 a)` = 5 < a  ⟹  a > 5 (operator swapped).
+        let stdout = "(define-fun I () Bool (bvult #b00000101 a))\n";
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(stdout),
+            Some(PredicateExpr::Cmp {
+                register: "a".to_string(),
+                op: CmpOp::Gt,
+                value: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn interp_expr_underscore_literal_form() {
+        // `(= r (_ bv42 32))` — the underscored decimal literal form.
+        let stdout = "(define-fun I () Bool (= r (_ bv42 32)))\n";
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(stdout),
+            Some(PredicateExpr::Cmp {
+                register: "r".to_string(),
+                op: CmpOp::Eq,
+                value: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn interp_expr_trivial_and_out_of_grammar_return_none() {
+        assert_eq!(
+            parse_interpolant_to_predicate_expr("(define-fun I () Bool true)\n"),
+            None
+        );
+        assert_eq!(
+            parse_interpolant_to_predicate_expr("(define-fun I () Bool false)\n"),
+            None
+        );
+        // A bitwise op is outside the mapped grammar.
+        assert_eq!(
+            parse_interpolant_to_predicate_expr(
+                "(define-fun I () Bool (= a (bvand b #b00001111)))\n"
+            ),
+            None
+        );
+        // No define-fun marker (the `(error ..)` no-interpolant reply).
+        assert_eq!(
+            parse_interpolant_to_predicate_expr("(error \"no interpolant\")\n"),
+            None
+        );
     }
 
     #[test]
