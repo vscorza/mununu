@@ -2,9 +2,11 @@
 
 > **Status: PASS.** Asks whether OpenTitan's `prim_fifo_sync_cnt` can always drain
 > back to **empty** — a recoverability (`AG EF`) question — but over a datapath
-> **relation** (`wptr == rptr`), not a control-FSM state. The small FIFO gets a
-> definite `Holds`; the wide FIFO lands on the honest ranking boundary. §Phase 8
-> V-track recoverability showcase (the relational-target companion to
+> **relation** (`wptr == rptr`), not a control-FSM state. It decides a definite
+> `Holds` on both the small FIFO (exact) **and** a 2²¹-deep FIFO (via the ranking
+> certificate), where exact BDD walls and the predicate cube abstains — a real
+> OpenTitan datapath-branching property decided at scale. §Phase 8 V-track
+> recoverability showcase (the relational-target companion to
 > [`../v7_csrng_recoverability`](../v7_csrng_recoverability), which targets a
 > control state).
 
@@ -40,24 +42,34 @@ always_recoverable = nu Y. (recoverable && [] Y)      # AG EF empty
 The `<>` (some-successor) inside the `[]` (all-successors) is the branching content a
 linear formalism (LTL / SVA) cannot state.
 
-## What the verdict depends on — the honest ranking boundary
+## What decides it — the ranking certificate
 
-| Setup | `always_recoverable` | Reading |
+Reset is tied **inactive** in both runs, so recoverability rests on the *datapath* drain
+(reads catching the write pointer), not a reset escape.
+
+| Setup | `always_recoverable` | How |
 |---|---|---|
-| **Small FIFO** (`Depth=16`, ≤ ~40 bits of pointer state) | **`Holds`** (exact engine) | from any fill level, empty is reachable (drain, or assert reset) |
-| **Wide FIFO** (`Depth=2^21`, beyond the exact cap) | **`Unknown`** (cube path — a *sound* abstain) | draining needs the read pointer to progress up to the write pointer — a **ranking** the cube cannot capture with a bounded predicate set |
+| **Small FIFO** (`Depth=16`, ≤ ~40 bits of pointer state) | **`Holds`** | exact 3-valued engine (enumerates the pointer state) |
+| **Wide FIFO** (`Depth=2^21`, 22-bit pointers, beyond the exact cap) | **`Holds`** | the **ranking certificate** over the exact transition — exact walls, the predicate cube abstains |
 
-The contrast that makes this precise: an **invariant** relation (two registers kept
-equal — `data == target`, both incrementing together) decides `Holds` at *any* width,
-because the relation holds throughout (the must-edge is one exact step). The FIFO's
-`empty` is **not** invariant — the two wrap counters advance **independently** (writes
-vs. reads), so `wptr == rptr` is *achieved* by draining, a well-founded descent. That
-descent is the **ranking class**, mununu's honest ⊥ boundary — `Unknown` is sound
-(never a false `Holds` or `Violated`).
+`empty` (`wptr == rptr`) is **not invariant** — the two wrap counters advance
+**independently** (writes vs. reads), so `wptr == rptr` is *achieved* by draining, a
+well-founded descent. No bounded predicate set captures a 2²¹-step descent, so the
+predicate cube alone abstains. mununu's **ranking certificate** decides it directly over
+the exact transition (Podelski–Rybalchenko): for the ranking δ = `wptr − rptr`, a single
+SMT query proves that from every non-empty state *some* input (a read) strictly decreases
+δ; with δ bounded below, that forces a descent to empty — so `AG EF empty` **Holds**, in
+~0.1 s at 2²¹ depth.
+
+The `∃`-input form is what fits a FIFO: only *some* input drains it, so `AG EF empty`
+holds but `AG AF empty` does **not** (the environment may write forever). The all-path
+variant of the certificate correctly *fails* here and is reserved for deterministic
+descents (down-counters, timers).
 
 This is the value: mununu can *state and soundly decide* a relational branching-time
-property on real RTL where it can, and *soundly abstain* where the property needs a
-ranking argument — rather than silently over-claiming.
+property — one SVA cannot express — on real RTL **at a scale where bit-level engines and
+predicate abstraction both give out**, without over-claiming (it still soundly abstains
+where the property genuinely needs a ranking argument no certificate finds).
 
 ## Run it
 

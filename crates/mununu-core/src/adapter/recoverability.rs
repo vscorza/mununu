@@ -329,11 +329,19 @@ fn good_next_cone_constants(
 ///   (2) **`transition ∧ ¬good ∧ δ_next ≥ δ_curr` is UNSAT** — i.e. EVERY transition out of a non-good
 ///       state STRICTLY decreases δ; combined with (1) δ ≥ 0 (trivial for an unsigned BV), δ cannot
 ///       decrease forever, so every path reaches good.
-/// That proves the STRONGER `AG AF good` (all paths reach good), which implies the target `AG EF good` —
-/// so returning `Holds` is SOUND. It correctly FAILS on wrap/overshoot (`cnt - 2` from an odd start
-/// never hits 0 → the difference jumps up → SAT) and on non-monotone designs. It uses the transition's
-/// implicit ∀-inputs (every input choice must descend); a relation drained by only SOME input (a FIFO's
-/// read-gated `wptr==rptr`, which is `AG EF` but not `AG AF`) needs the ∃-input variant — a follow-up.
+/// Two attempts, in order of cost:
+///   **(A) all-path** — `transition ∧ ¬good ∧ (δ_next ≥ δ_curr)` UNSAT: EVERY input choice out of a
+///   non-good state strictly decreases δ. No quantifier (inputs free), fast; proves the stronger
+///   `AG AF good` ⊆ `AG EF good`. Decides deterministic descents (down-counters, timers).
+///   **(B) some-path** — `¬good ∧ ∀(inputs, state_next). (transition → δ_next ≥ δ_curr)` UNSAT: every
+///   non-good state has at least ONE input whose successor strictly decreases δ. Quantified (slower),
+///   the fallback; proves `AG EF good` directly (a strictly-descending path reaches good). Decides a
+///   relation drained by only SOME input — a FIFO's read-gated `wptr == rptr` (`AG EF` but not `AG AF`,
+///   since the environment may write forever) — which (A) cannot.
+/// With δ ≥ 0 (trivial for an unsigned BV) either certificate ⇒ `EF good` from every state ⇒ `AG EF good`,
+/// so returning `Holds` is SOUND. Both correctly FAIL on wrap/overshoot (`cnt - 2` from an odd start
+/// never hits 0 → the difference jumps up → SAT) and on non-monotone designs (a sound fall-through to the
+/// cube — the certificate is sufficient, not necessary).
 fn ranking_certificate_holds(
     file: &crate::adapter::btor2::ast::Btor2File,
     good_registers: &[String],
@@ -382,15 +390,49 @@ fn ranking_certificate_holds(
             }
         };
         let (delta_curr, delta_next, not_good) = parts;
+        let non_decreasing = delta_next.bvuge(&delta_curr);
+
+        // Attempt 1 — ALL-PATH descent (`AG AF good`): `transition ∧ ¬good ∧ (δ_next ≥ δ_curr)` UNSAT,
+        // i.e. EVERY input choice out of a non-good state strictly decreases δ. No quantifier (inputs are
+        // free), so this is the fast path; it decides deterministic descents (down-counters, timers).
+        {
+            let solver = z3::Solver::new();
+            let mut params = z3::Params::new();
+            params.set_u32("timeout", 5_000);
+            solver.set_params(&params);
+            solver.assert(&view.transition);
+            solver.assert(&not_good);
+            solver.assert(&non_decreasing);
+            if matches!(solver.check(), z3::SatResult::Unsat) {
+                return true;
+            }
+        }
+
+        // Attempt 2 — SOME-PATH descent (`AG EF good`, the recoverability property): `¬good ∧
+        // ∀(inputs, state_next). (transition → δ_next ≥ δ_curr)` UNSAT, i.e. every non-good state has at
+        // least ONE input whose successor strictly decreases δ. This decides a relation drained by only
+        // some input — a FIFO's read-gated `wptr == rptr` (`AG EF` but not `AG AF`) — where attempt 1
+        // fails (writing keeps δ non-decreasing). Quantified (∀ over the next-cycle vars), so it is the
+        // slower fallback. SOUND: (δ bounded below) + (∃ decreasing successor at every non-good state) ⇒
+        // a strictly-descending path reaches good ⇒ `EF good` from every state ⇒ `AG EF good`.
+        let mut bound: Vec<z3::ast::BV> = Vec::new();
+        for bv in view.inputs.values() {
+            bound.push(bv.clone());
+        }
+        for bv in view.state_next.values() {
+            bound.push(bv.clone());
+        }
+        let bound_refs: Vec<&dyn z3::ast::Ast> =
+            bound.iter().map(|bv| bv as &dyn z3::ast::Ast).collect();
+        // `transition → δ_next ≥ δ_curr` as `¬transition ∨ (δ_next ≥ δ_curr)`.
+        let body = z3::ast::Bool::or(&[&view.transition.not(), &non_decreasing]);
+        let universal = z3::ast::forall_const(&bound_refs, &[], &body);
         let solver = z3::Solver::new();
         let mut params = z3::Params::new();
-        params.set_u32("timeout", 5_000);
+        params.set_u32("timeout", 8_000);
         solver.set_params(&params);
-        solver.assert(&view.transition);
         solver.assert(&not_good);
-        // δ_next ≥ δ_curr — UNSAT ⇒ every non-good transition strictly decreases δ (bounded below by 0).
-        let non_decreasing = delta_next.bvuge(&delta_curr);
-        solver.assert(&non_decreasing);
+        solver.assert(&universal);
         matches!(solver.check(), z3::SatResult::Unsat)
     })
 }
@@ -1537,6 +1579,40 @@ mod tests {
             verify_recoverability(&downcnt_w(8, 200, 1), "cnt == 0").expect("exact decides"),
             PropertyVerdict::Holds,
             "8-bit exact oracle agrees with the 48-bit ranking Holds"
+        );
+    }
+
+    // ∃-input ranking — a SOME-path descent. `cnt` decrements only when a free input `dec` is 1
+    // (`cnt' = ite(cnt==0, 0, ite(dec, cnt-1, cnt))`), so `AG EF (cnt == 0)` HOLDS (the `dec=1` path
+    // drains) but NOT `AG AF` (`dec=0` forever holds). The all-path certificate (A) fails; the ∃-input
+    // certificate (B) decides it — the shape of a FIFO drained by only some input (read, not write).
+    fn nondet_drain_w(width: u32, init: u128) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 2 cnt\n4 zero 2\n5 one 2\n\
+             6 constd 2 {init}\n7 init 2 3 6\n8 input 1 dec\n9 eq 1 3 4\n10 sub 2 3 5\n11 ite 2 8 10 3\n\
+             12 ite 2 9 4 11\n13 next 2 3 12\n"
+        )
+    }
+
+    #[test]
+    fn ranking_certificate_exists_input_decides_nondeterministic_drain() {
+        // 48-bit nondeterministic drain: AG EF (cnt==0) decides Holds via the ∃-input certificate (some
+        // input path drains) where the all-path certificate fails (dec=0 holds cnt) and the cube abstains.
+        assert_eq!(
+            verify_recoverability_scalable(
+                &nondet_drain_w(48, 140_737_488_355_328),
+                "cnt == 0",
+                &[]
+            )
+            .expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit nondeterministic drain decides Holds via the ∃-input ranking certificate"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD).
+        assert_eq!(
+            verify_recoverability(&nondet_drain_w(8, 200), "cnt == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees with the 48-bit ∃-input ranking Holds"
         );
     }
 

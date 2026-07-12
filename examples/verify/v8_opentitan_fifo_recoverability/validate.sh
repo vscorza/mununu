@@ -12,14 +12,17 @@
 #
 # HONEST RESULT (this is the interesting part, not a bug):
 #   * Small FIFO (exact engine, <= ~40 bits of pointer state): AG EF empty HOLDS —
-#     from any fill level empty is reachable (drain, or assert reset). Definite-TRUE.
-#   * Wide FIFO (beyond the exact cap, cube path): the drain to empty needs the read
-#     pointer to PROGRESS up to the write pointer — a well-founded descent over two
-#     INDEPENDENT counters. That is the RANKING class, which no bounded predicate set
-#     captures, so the cube soundly ABSTAINS (Unknown, never a false verdict). This is
-#     the paper's honest bottom/ranking boundary, confirmed on real silicon: unlike an
-#     INVARIANT relation (`data == target` kept equal, which decides at any width), a
-#     relation ACHIEVED by unbounded progress does not.
+#     from any fill level empty is reachable (drain). Definite-TRUE.
+#   * Wide FIFO (beyond the exact cap, 2^21 entries = 22-bit wrap pointers): the drain to
+#     empty needs the read pointer to PROGRESS up to the write pointer — a well-founded
+#     descent over two INDEPENDENT counters (the RANKING class), which no bounded predicate
+#     set captures, so the predicate cube alone ABSTAINS. mununu's RANKING CERTIFICATE
+#     decides it anyway: over the EXACT transition it proves that from every non-empty state
+#     SOME input (a read) strictly decreases the ranking δ = wptr - rptr, which — δ bounded
+#     below — forces a descent to empty (Podelski-Rybalchenko, ∃-input variant, one relation,
+#     no 2^|P|). So AG EF empty decides HOLDS at 2^21 depth in ~0.1s where exact BDD walls.
+#     Contrast: the ALL-PATH variant fails here (writing keeps δ non-decreasing), which is
+#     correct — the FIFO is AG EF empty but NOT AG AF empty (the env may write forever).
 #
 # Pedigree: prim_fifo_sync_cnt.sv + prim_count_pkg.sv are real OpenTitan RTL
 # (Apache-2.0), vendored + pinned under source/ at the commit in UPSTREAM_COMMIT.txt.
@@ -50,10 +53,12 @@ sv2v -I"${SRC}" "${SRC}/prim_count_pkg.sv" "${SRC}/prim_util_pkg.sv" \
 # Lift prim_fifo_sync_cnt at a chosen Depth to BTOR2. The two wrap-pointer counters are the
 # only state; yosys does not surface their generate-scoped names, so we name the two state
 # lines deterministically (cnta / cntb) — the `empty` relation `cnta == cntb` is symmetric.
+# Reset is tied INACTIVE (rst_ni = 1) so recoverability rests on the DATAPATH drain (reads catching
+# the write pointer), not a reset escape — the honest, harder question.
 lift() {
   local depth="$1" out="$2"
   yosys -q -p "read_verilog -sv ${OUT}/cnt.v; hierarchy -check -top prim_fifo_sync_cnt -chparam Depth ${depth}; \
-               proc; async2sync; dffunmap; write_btor ${out}" 2>"${OUT}/yosys.err"
+               proc; async2sync; dffunmap; connect -set rst_ni 1'b1; clean; write_btor ${out}" 2>"${OUT}/yosys.err"
   python3 - "$out" <<'PY'
 import sys
 p=sys.argv[1]; L=open(p).read().splitlines(); out=[]; n=[]
@@ -75,7 +80,7 @@ lift 16 "${OUT}/d16.btor2"
 SMALL="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/d16.btor2" --target 'cnta == cntb' 2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
 echo
 
-echo "--- wide FIFO (Depth=2^21, > exact cap, cube path) — expect UNKNOWN (ranking boundary, sound) ---"
+echo "--- wide FIFO (Depth=2^21 = 22-bit pointers, > exact cap) — expect HOLDS via the ∃-input ranking certificate ---"
 lift 2097152 "${OUT}/wide.btor2"
 "${MUNUNU}" btor2 verify-recoverability "${OUT}/wide.btor2" --target 'cnta == cntb' 2>/dev/null | grep -iE '"verdict"'
 WIDE="$("${MUNUNU}" btor2 verify-recoverability "${OUT}/wide.btor2" --target 'cnta == cntb' 2>/dev/null | grep -oiE 'holds|violated|unknown' | head -1)"
@@ -83,12 +88,13 @@ echo
 
 ok=1
 if [[ "${SMALL}" != "holds" ]]; then echo "FAIL: small FIFO expected holds, got ${SMALL}" >&2; ok=0; fi
-# Wide is the honest ranking boundary: a sound abstain (unknown). A definite 'violated' would be
-# unsound (the property is TRUE); 'holds' would mean the cube captured the drain ranking (it cannot).
-if [[ "${WIDE}" != "unknown" ]]; then echo "NOTE: wide FIFO verdict is '${WIDE}' (expected unknown = ranking boundary)"; fi
+# Wide MUST decide HOLDS via the ranking certificate (the datapath drain is a well-founded ∃-input
+# descent). 'unknown' would mean the certificate did not fire; 'violated' would be unsound (the
+# property is TRUE — a read-only path always drains to empty).
+if [[ "${WIDE}" != "holds" ]]; then echo "FAIL: wide FIFO expected holds (ranking certificate), got ${WIDE}" >&2; ok=0; fi
 
 if [[ "${ok}" == "1" ]]; then
-  echo "PASS — relational recoverability target decides HOLDS on real RTL (small); wide is the sound ranking boundary."
+  echo "PASS — relational recoverability DECIDES HOLDS on real RTL at 2^21 depth (∃-input ranking certificate), where exact BDD walls and the predicate cube abstains."
 else
   echo "FAILED"; exit 1
 fi
