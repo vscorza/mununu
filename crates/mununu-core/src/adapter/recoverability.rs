@@ -320,6 +320,81 @@ fn good_next_cone_constants(
     consts
 }
 
+/// N1 ranking certificate for `AG EF good` — the well-founded-descent / RANKING class the predicate
+/// cube cannot capture. When `good` is reached by a monotone datapath descent (a down-counter to 0, a
+/// timer, a drain), no bounded predicate set represents the descent, so the cube abstains (`Unknown`) —
+/// yet the property HOLDS. This proves it directly over the EXACT transition (Podelski–Rybalchenko),
+/// sidestepping the cube. For a candidate ranking δ — `good = (r == V)` → δ = `r - V`; `good = (a == b)`
+/// → δ = `a - b` (unsigned BV difference) — it checks:
+///   (2) **`transition ∧ ¬good ∧ δ_next ≥ δ_curr` is UNSAT** — i.e. EVERY transition out of a non-good
+///       state STRICTLY decreases δ; combined with (1) δ ≥ 0 (trivial for an unsigned BV), δ cannot
+///       decrease forever, so every path reaches good.
+/// That proves the STRONGER `AG AF good` (all paths reach good), which implies the target `AG EF good` —
+/// so returning `Holds` is SOUND. It correctly FAILS on wrap/overshoot (`cnt - 2` from an odd start
+/// never hits 0 → the difference jumps up → SAT) and on non-monotone designs. It uses the transition's
+/// implicit ∀-inputs (every input choice must descend); a relation drained by only SOME input (a FIFO's
+/// read-gated `wptr==rptr`, which is `AG EF` but not `AG AF`) needs the ∃-input variant — a follow-up.
+fn ranking_certificate_holds(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    good_registers: &[String],
+    good_value: Option<u64>,
+) -> bool {
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let Ok(view) = crate::adapter::btor2::kmts_lift::encode_design_for_lift(file) else {
+            return false;
+        };
+        let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
+        let mask = |w: u32| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        // Build δ_curr, δ_next, and the ¬good constraint for the candidate ranking.
+        let parts = match good_value {
+            // Simple good `r == V`: δ = r - V.
+            Some(v) => {
+                let [r] = good_registers else { return false };
+                let Some(&nid) = nid_map.get(r) else {
+                    return false;
+                };
+                let (Some(rc), Some(rn)) = (view.curr_state(nid), view.next_state(nid)) else {
+                    return false;
+                };
+                let w = rc.get_size();
+                let vbv = z3::ast::BV::from_u64(v & mask(w), w);
+                (rc.bvsub(&vbv), rn.bvsub(&vbv), rc.eq(&vbv).not())
+            }
+            // Relational good `a == b`: δ = a - b (same-width registers only).
+            None => {
+                let [a, b] = good_registers else { return false };
+                let (Some(&na), Some(&nb)) = (nid_map.get(a), nid_map.get(b)) else {
+                    return false;
+                };
+                let (Some(ac), Some(an), Some(bc), Some(bn)) = (
+                    view.curr_state(na),
+                    view.next_state(na),
+                    view.curr_state(nb),
+                    view.next_state(nb),
+                ) else {
+                    return false;
+                };
+                if ac.get_size() != bc.get_size() {
+                    return false;
+                }
+                (ac.bvsub(bc), an.bvsub(bn), ac.eq(bc).not())
+            }
+        };
+        let (delta_curr, delta_next, not_good) = parts;
+        let solver = z3::Solver::new();
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", 5_000);
+        solver.set_params(&params);
+        solver.assert(&view.transition);
+        solver.assert(&not_good);
+        // δ_next ≥ δ_curr — UNSAT ⇒ every non-good transition strictly decreases δ (bounded below by 0).
+        let non_decreasing = delta_next.bvuge(&delta_curr);
+        solver.assert(&non_decreasing);
+        matches!(solver.check(), z3::SatResult::Unsat)
+    })
+}
+
 /// Decide recoverability `AG EF (good)` of `btor2_content`, where `good` is a single
 /// register-comparison atom string (`"state_q == 3"`).
 ///
@@ -423,6 +498,19 @@ pub fn verify_recoverability_scalable(
         .map_err(|e| format!("recoverability cube path: parsing BTOR2: {}", e.message))?;
     let init_values: BTreeMap<String, u128> =
         crate::adapter::btor2::concrete_oracle::init_valuation(&file);
+
+    // N1 RANKING RESCUE: `AG EF good` may HOLD by a well-founded datapath descent (a down-counter to 0,
+    // a timer, a deterministic drain) that the predicate cube cannot capture — the RANKING class. Prove
+    // it directly over the exact transition BEFORE the cube; a sound sufficient condition (it establishes
+    // the stronger `AG AF good`). If it fails, fall through to the cube (the certificate is sufficient,
+    // not necessary).
+    if ranking_certificate_holds(
+        &file,
+        &good_registers,
+        good_simple.as_ref().map(|(_, v)| *v),
+    ) {
+        return Ok(PropertyVerdict::Holds);
+    }
 
     // Seed predicates = [good] ++ [good register's OTHER control states] ++ extra. The `good`
     // predicate is named `good` so the formula atom resolves to it via the cube labelling; the
@@ -1412,6 +1500,43 @@ mod tests {
         assert_eq!(
             verify_recoverability(&inv_rel_w(8, "7"), "data == target").expect("small decides"),
             PropertyVerdict::Violated
+        );
+    }
+
+    // Ranking certificate — the well-founded-descent / RANKING class. A down-counter to 0: `cnt`
+    // decrements (`cnt' = ite(cnt==0, 0, cnt - step)`), so `AG EF (cnt == 0)` HOLDS by a well-founded
+    // descent, but no bounded predicate set captures the 2^W-step descent → the cube abstains. The
+    // ranking certificate proves it over the exact transition (δ = cnt strictly decreases, bounded below).
+    fn downcnt_w(width: u32, init: u128, step: u64) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 2 cnt\n4 zero 2\n5 constd 2 {step}\n\
+             6 constd 2 {init}\n7 init 2 3 6\n8 eq 1 3 4\n9 sub 2 3 5\n10 ite 2 8 4 9\n11 next 2 3 10\n"
+        )
+    }
+
+    #[test]
+    fn ranking_certificate_decides_downcounter_at_scale() {
+        // 48-bit down-counter to 0 (step 1): the cube abstains (ranking), the certificate decides Holds.
+        assert_eq!(
+            verify_recoverability_scalable(&downcnt_w(48, 140_737_488_355_328, 1), "cnt == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit down-counter recoverability decides Holds via the ranking certificate"
+        );
+        // OVERSHOOT (step 2 from an ODD start): cnt stays odd, wraps past 0, never == 0 → the property
+        // does NOT hold. The certificate correctly FAILS (the BV difference jumps up at the wrap), so it
+        // soundly abstains rather than fabricate Holds.
+        assert_ne!(
+            verify_recoverability_scalable(&downcnt_w(48, 140_737_488_355_327, 2), "cnt == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Holds,
+            "the overshoot counter must NOT be a spurious Holds"
+        );
+        // DIFFERENTIAL ORACLE: the 8-bit down-counter routes through the exact BDD engine and agrees.
+        assert_eq!(
+            verify_recoverability(&downcnt_w(8, 200, 1), "cnt == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees with the 48-bit ranking Holds"
         );
     }
 
