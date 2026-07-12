@@ -476,21 +476,40 @@ fn ranking_certificate_holds(
             false
         };
 
-        // MEASURE 1 — single-register δ1: `non_dec` = `δ1_next ≥ δ1_curr`.
-        if certifies(&d1_next.bvuge(&d1_curr)) {
+        // A ranking MEASURE is a list of components (curr, next), most-significant first. `non_decrease`
+        // builds "the tuple did NOT strictly lex-decrease": fold least-significant up,
+        //   acc_i = (next_i < curr_i) ∨ (next_i == curr_i ∧ acc_below),  base = false; then negate.
+        let non_decrease = |measure: &[(&z3::ast::BV, &z3::ast::BV)]| -> z3::ast::Bool {
+            let mut acc = z3::ast::Bool::from_bool(false);
+            for &(curr, next) in measure.iter().rev() {
+                let lt = next.bvult(curr);
+                let eq = next.eq(curr);
+                let tie = z3::ast::Bool::and(&[&eq, &acc]);
+                acc = z3::ast::Bool::or(&[&lt, &tie]);
+            }
+            acc.not()
+        };
+
+        // Candidate measures, increasing complexity. MEASURE 1: single δ1. MEASURES 2..: each 2-tuple
+        // `(δ1, s)` — decides a 2-level nested descent (δ1 holds while s counts down). FINAL: the FULL
+        // tuple `(δ1, s1, …, sk)` over all secondaries in nid order — decides a k-LEVEL nested descent
+        // (a 3-deep counter needs the 3-tuple; a 2-tuple over any single secondary fails). Lex order on
+        // the tuple is well-founded, so the descent still reaches good (SOUND).
+        let d1 = (&d1_curr, &d1_next);
+        if certifies(&non_decrease(&[d1])) {
             return true;
         }
-        // MEASURES 2.. — lexicographic (δ1, secondary). Decides nested / multi-phase descents where δ1
-        // alone does not strictly decrease every step (it holds while a secondary counts down); the
-        // secondary breaks the tie, and lex order on the tuple is well-founded, so the descent still
-        // reaches good. `non_dec` = `¬[(δ1' < δ1) ∨ (δ1' == δ1 ∧ sec' < sec)]`.
         for (sc, sn) in &secondaries {
-            let d1_lt = d1_next.bvult(&d1_curr);
-            let d1_eq = d1_next.eq(&d1_curr);
-            let sec_lt = sn.bvult(sc);
-            let tie = z3::ast::Bool::and(&[&d1_eq, &sec_lt]);
-            let lex_dec = z3::ast::Bool::or(&[&d1_lt, &tie]);
-            if certifies(&lex_dec.not()) {
+            if certifies(&non_decrease(&[d1, (sc, sn)])) {
+                return true;
+            }
+        }
+        if secondaries.len() >= 2 {
+            let mut full: Vec<(&z3::ast::BV, &z3::ast::BV)> = vec![d1];
+            for (sc, sn) in &secondaries {
+                full.push((sc, sn));
+            }
+            if certifies(&non_decrease(&full)) {
                 return true;
             }
         }
@@ -1705,6 +1724,43 @@ mod tests {
             verify_recoverability(&nested_w(8, 5, 200), "hi == 0").expect("exact decides"),
             PropertyVerdict::Holds,
             "8-bit exact oracle agrees with the 48-bit lexicographic ranking Holds"
+        );
+    }
+
+    // Multi-component (k-tuple) lexicographic — a 3-LEVEL nested counter. `lo` cycles; `mid` decrements
+    // iff `lo==0`; `hi` decrements iff `lo==0 && mid==0`. `AG EF (hi==0)` HOLDS, but NO single register
+    // and NO 2-tuple `(hi, s)` is a ranking (when lo counts down, `(hi, mid)` holds; at the mid step
+    // `(hi, lo)` sees lo wrap up). Only the FULL 3-tuple `(hi, mid, lo)` decreases every step.
+    fn nested3_w(width: u32, lo_max: u128, mid_max: u128, hi_init: u128) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 2 hi\n4 state 2 mid\n5 state 2 lo\n\
+             6 zero 2\n7 one 2\n8 constd 2 {lo_max}\n9 constd 2 {mid_max}\n10 constd 2 {hi_init}\n\
+             11 init 2 3 10\n12 init 2 4 9\n13 init 2 5 8\n14 eq 1 5 6\n15 sub 2 5 7\n16 ite 2 14 8 15\n\
+             17 next 2 5 16\n18 eq 1 4 6\n19 sub 2 4 7\n20 ite 2 18 9 19\n21 ite 2 14 20 4\n\
+             22 next 2 4 21\n23 and 1 14 18\n24 eq 1 3 6\n25 sub 2 3 7\n26 ite 2 24 6 25\n\
+             27 ite 2 23 26 3\n28 next 2 3 27\n"
+        )
+    }
+
+    #[test]
+    fn ranking_certificate_decides_three_level_nested_via_full_tuple() {
+        // 48-bit 3-level nested: only the full (hi, mid, lo) tuple decides — the single-register and
+        // 2-tuple measures fail, the cube abstains, exact BDD walls.
+        assert_eq!(
+            verify_recoverability_scalable(
+                &nested3_w(48, 50, 30, 140_737_488_355_328),
+                "hi == 0",
+                &[]
+            )
+            .expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit 3-level nested counter decides Holds via the full-tuple lexicographic ranking"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD).
+        assert_eq!(
+            verify_recoverability(&nested3_w(8, 3, 2, 100), "hi == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees with the 48-bit full-tuple ranking Holds"
         );
     }
 
