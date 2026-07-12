@@ -2134,7 +2134,11 @@ pub fn predicate_cube_lift(
         // scalable-KMTS P1.4 — the may-relation via post-image (O(2^|P|·#succ)) instead of all-pairs
         // (O(2^{2|P|})). Both use `encode_design_for_lift`, so the edge set is IDENTICAL; a `None` (an
         // unresolvable register / cube-space over the bound) falls back to the all-pairs seam.
+        // GATE (follow-up A): only for |P| >= 2. At |P| == 1 all-pairs is 2 cubes / ~4 checks (trivial),
+        // and the post-image's fixed all-SAT overhead loses (measured 1.6s vs 0.13s); from |P| == 2 the
+        // post-image wins (and grows to 33-256x by |P| = 3-7).
         let may_edges: Vec<(usize, usize)> = if lift_opts.may_postimage
+            && predicates.len() >= 2
             && let Some(map) =
                 compute_all_may_edges_smt_postimage(&file, &predicates, &lift_opts.compound_exprs)
         {
