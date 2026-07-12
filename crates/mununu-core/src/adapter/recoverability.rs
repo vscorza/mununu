@@ -424,13 +424,24 @@ fn houdini_inductive_conjunction(
         }
 
         let mut params = z3::Params::new();
-        params.set_u32("timeout", 5000);
+        params.set_u32("timeout", 3000);
+        // Bound the total SMT budget: a wide `bvmul` in the exact transition makes each query expensive,
+        // and the fixpoint is `O(candidates²)`. Cutting off early is SOUND — the survivors are only cube
+        // DIMENSIONS (evaluated exactly per-cube), never asserted as invariants, so a not-fully-filtered
+        // set costs refinement power, never soundness. A per-query timeout also drops a candidate (treated
+        // as not-inductive), which is likewise sound.
+        const MAX_HOUDINI_QUERIES: usize = 48;
+        let mut queries = 0usize;
         // Houdini fixpoint: drop any P not inductive relative to the (shrinking) conjunction.
-        loop {
+        'fixpoint: loop {
             let conj: Vec<&z3::ast::Bool> = set.iter().map(|(_, cc, _)| cc).collect();
             let mut keep = vec![true; set.len()];
             let mut removed = false;
             for (i, (_, _, cn)) in set.iter().enumerate() {
+                if queries >= MAX_HOUDINI_QUERIES {
+                    break 'fixpoint;
+                }
+                queries += 1;
                 let solver = z3::Solver::new();
                 solver.set_params(&params);
                 for &c in &conj {
@@ -1107,7 +1118,13 @@ pub fn verify_recoverability_scalable(
     // because `y>=1`, and vice-versa). Enumerate simple bound candidates (`r >= 1` per good-cone state
     // register) and keep the largest relatively-inductive sub-conjunction; seed each survivor as a
     // compound predicate. SOUND: an inductive conjunction over-approximates the reachable set.
-    if specs.len() + compound_seeds.len() < MAX_AUTO_SEED {
+    //
+    // GATE (cost): only run this (the O(candidates²)-SMT fallback) when the CHEAP relational discovery
+    // found NOTHING — if a difference/addend relation was already lifted, it is almost always what the
+    // cube needs, and Houdini's conjunctive search would just add SMT cost. The ranking certificate has
+    // already returned for the ranking class, so this fires only on cube-path designs with no cheap
+    // relational seed (exactly the swap/coupling fallback the diagnosis identified).
+    if compound_seeds.is_empty() && specs.len() < MAX_AUTO_SEED {
         let candidates: Vec<PredicateExpr> = init_values
             .keys()
             .filter(|r| in_coi(r))
