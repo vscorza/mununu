@@ -380,12 +380,15 @@ pub fn verify_recoverability_with_predicates(
 /// `smt-hyper-must`** path, so the νμ property decides beyond the exact engine's
 /// ~40-bit cone cap.
 ///
-/// `good` must be a `REG == VALUE` equality atom; any other comparison (`<`, `>=`, …)
-/// returns `Ok(Unknown)` (an honest abstain — the auto-seed pins/enumerates only `==`
-/// targets). `extra_predicates` are additional abstraction predicates that refine the
-/// cube (they do not enter the formula). Returns the canonical verdict at the design's
-/// reset cube, or `Ok(Unknown)` when the abstraction cannot decide or the CEGAR loop
-/// errors (a sound abstain — never a fabricated definite verdict).
+/// `good` is either a simple `REG == VALUE` equality atom OR a relational `REG == REG` atom (a
+/// relational recoverability target — e.g. a FIFO's `AG EF (wptr == rptr)`, decided by the compound-good
+/// machinery); any other comparison (`<`, `>=`, an addend form, …) returns `Ok(Unknown)` (an honest
+/// abstain — the reset-cube construction is well-defined only for `==`). `extra_predicates` are
+/// additional abstraction predicates that refine the cube (they do not enter the formula). Returns the
+/// canonical verdict at the design's reset cube, or `Ok(Unknown)` when the abstraction cannot decide or
+/// the CEGAR loop errors (a sound abstain — never a fabricated definite verdict). NOTE: a relation
+/// reached by unbounded progress (a FIFO draining `wptr` up to `rptr` — independent counters) is the
+/// ranking class and soundly abstains at scale; only invariant / bounded-must relations decide.
 pub fn verify_recoverability_scalable(
     btor2_content: &str,
     good: &str,
@@ -395,16 +398,22 @@ pub fn verify_recoverability_scalable(
     let good_expr = parse_predicate_expr(good).map_err(|e| {
         format!("recoverability target `{good}` is not a register-comparison atom (`REG op VALUE`): {e:?}")
     })?;
-    let (good_register, good_value) = match good_expr {
+    // The good atom may be a simple `REG == VALUE` OR a relational `REG == REG`. The latter enables
+    // relational recoverability targets — e.g. a FIFO's `AG EF (wptr == rptr)` ("always able to drain to
+    // empty") — decided by the same relational compound-predicate machinery as frontier (b). Any other
+    // comparison (`<`, `>=`, an addend form, …) is an honest abstain: the reset-cube construction below
+    // is only well-defined for `==`.
+    let (good_registers, good_simple): (Vec<String>, Option<(String, u64)>) = match good_expr {
         PredicateExpr::Cmp {
             register,
             op: CmpOp::Eq,
             value,
-        } => (register, value),
-        // SOUNDNESS: the cube auto-seed pins each predicate register to its reset value
-        // and reads the reset cube; that construction is only well-defined for an
-        // equality (`==`) target. A non-equality `good` (e.g. `st < 3`) is an honest
-        // abstain (Unknown), never a fabricated definite verdict.
+        } => (vec![register.clone()], Some((register, value))),
+        PredicateExpr::CmpReg {
+            ref lhs,
+            op: CmpOp::Eq,
+            ref rhs,
+        } => (vec![lhs.clone(), rhs.clone()], None),
         _ => return Ok(PropertyVerdict::Unknown),
     };
 
@@ -418,13 +427,27 @@ pub fn verify_recoverability_scalable(
     // Seed predicates = [good] ++ [good register's OTHER control states] ++ extra. The `good`
     // predicate is named `good` so the formula atom resolves to it via the cube labelling; the
     // rest only refine the abstraction (they are not referenced by the formula).
-    let good_spec = PredicateSpec {
-        name: "good".to_string(),
-        register: good_register.clone(),
-        value: good_value,
-    };
     let mut specs: Vec<PredicateSpec> = Vec::with_capacity(1 + extra_predicates.len());
-    specs.push(good_spec);
+    // The `good` predicate (named `good` so the formula atom resolves to it). A SIMPLE target is a cube
+    // dimension `register == value`; a RELATIONAL target is a COMPOUND predicate carried in
+    // `good_compound` and added to `compound_seeds` below, so the reset cube evaluates the relation
+    // (`lhs == rhs`) rather than a `register == value` atom.
+    let good_compound: Option<(String, String, PredicateExpr)> = match &good_simple {
+        Some((register, value)) => {
+            specs.push(PredicateSpec {
+                name: "good".to_string(),
+                register: register.clone(),
+                value: *value,
+            });
+            None
+        }
+        None => {
+            let expr_str = format!("{} == {}", good_registers[0], good_registers[1]);
+            let expr = parse_predicate_expr(&expr_str)
+                .map_err(|e| format!("relational recoverability good `{expr_str}`: {e:?}"))?;
+            Some(("good".to_string(), expr_str, expr))
+        }
+    };
 
     // N1 first increment — property-directed discovery (2026-07-11). Recoverability `EF good` must
     // DISTINGUISH the control states on the return path, not just `good` vs `!good`: a `good`-only
@@ -441,33 +464,36 @@ pub fn verify_recoverability_scalable(
     // `good == decoy` predicates the good register can never take, inflating the cube. Fall back to the
     // global pool only when the cone is empty (good register absent / no `next`).
     const MAX_AUTO_SEED: usize = 8;
-    let mut candidate_values: Vec<u64> = vec![0, 1];
-    let cone_constants = good_next_cone_constants(&file, &good_register);
-    let const_pool = if cone_constants.is_empty() {
-        crate::adapter::btor2::bit_blast::collect_btor2_constants(&file)
-    } else {
-        cone_constants
-    };
-    for v in const_pool {
-        if !candidate_values.contains(&v) {
-            candidate_values.push(v);
+    for gr in &good_registers {
+        let cone_constants = good_next_cone_constants(&file, gr);
+        let const_pool = if cone_constants.is_empty() {
+            crate::adapter::btor2::bit_blast::collect_btor2_constants(&file)
+        } else {
+            cone_constants
+        };
+        let mut candidate_values: Vec<u64> = vec![0, 1];
+        for v in const_pool {
+            if !candidate_values.contains(&v) {
+                candidate_values.push(v);
+            }
         }
-    }
-    for v in candidate_values {
-        // Cap the total predicate count at good (1) + MAX_AUTO_SEED to bound the cube space.
-        if specs.len() > MAX_AUTO_SEED {
-            break;
-        }
-        if v != good_value
-            && !specs
-                .iter()
-                .any(|s| s.register == good_register && s.value == v)
-        {
-            specs.push(PredicateSpec {
-                name: format!("state_{good_register}_eq_{v}"),
-                register: good_register.clone(),
-                value: v,
-            });
+        for v in candidate_values {
+            // Cap the total dimension count at good + MAX_AUTO_SEED to bound the cube space.
+            if specs.len() > MAX_AUTO_SEED {
+                break;
+            }
+            // Skip the good value only for the SIMPLE good's OWN register (that value IS the good atom;
+            // for a relational good every value is a legitimate discriminator).
+            let is_good_val = good_simple
+                .as_ref()
+                .is_some_and(|(r, val)| r == gr && *val == v);
+            if !is_good_val && !specs.iter().any(|s| s.register == *gr && s.value == v) {
+                specs.push(PredicateSpec {
+                    name: format!("state_{gr}_eq_{v}"),
+                    register: gr.clone(),
+                    value: v,
+                });
+            }
         }
     }
 
@@ -484,7 +510,10 @@ pub fn verify_recoverability_scalable(
     // comparison on an unrelated register) cannot change the verdict but still doubles the cube; without
     // this filter a design with many unrelated guards blows up the `2^{|P|}` all-pairs SMT. An empty
     // cone (good register absent / no `next`) means "no restriction" — prior behaviour preserved.
-    let good_coi = good_register_coi(&file, &good_register);
+    let good_coi: std::collections::HashSet<String> = good_registers
+        .iter()
+        .flat_map(|gr| good_register_coi(&file, gr))
+        .collect();
     let in_coi = |reg: &str| good_coi.is_empty() || good_coi.contains(reg);
 
     for (reg, k) in eq_guard_atoms(&file) {
@@ -513,6 +542,10 @@ pub fn verify_recoverability_scalable(
     // Built via `parse_predicate_expr` on the same string the sidecar carries, so the local expr used
     // for the reset-cube eval is byte-identical to the one the CEGAR lift parses.
     let mut compound_seeds: Vec<(String, String, PredicateExpr)> = Vec::new();
+    // A RELATIONAL good target is the first compound predicate (named `good`; the formula references it).
+    if let Some(gc) = good_compound {
+        compound_seeds.push(gc);
+    }
     for (lhs, rhs) in eq_reg_guard_atoms(&file) {
         if specs.len() + compound_seeds.len() > MAX_AUTO_SEED {
             break;
@@ -1338,6 +1371,47 @@ mod tests {
             verify_recoverability(&manyguard_btor2(8, 7), "ctrl == 0").expect("exact decides"),
             PropertyVerdict::Violated,
             "8-bit exact oracle must agree with the 48-bit cube Violated"
+        );
+    }
+
+    // Relational recoverability TARGET — `AG EF (data == target)` where the good atom itself is a
+    // register-vs-register relation, not `REG == VALUE`. data,target both init 0 and increment, so the
+    // relation is INVARIANT and the property Holds; the target flows through the compound-good machinery
+    // (the reset cube evaluates the relation). Decides at 48-bit where the exact engine walls. (Contrast:
+    // a FIFO's `AG EF (wptr == rptr)` reaches the relation by DRAINING — independent counters — which is
+    // the ranking class and correctly abstains at scale; this test covers the invariant case the cube
+    // decides.)
+    fn inv_rel_w(width: u32, target_init_nid: &str) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n4 state 2 data\n5 state 2 target\n6 zero 2\n\
+             7 one 2\n13 init 2 4 6\n14 init 2 5 {target_init_nid}\n15 add 2 4 7\n16 add 2 5 7\n\
+             22 next 2 4 15\n23 next 2 5 16\n"
+        )
+    }
+
+    #[test]
+    fn relational_recoverability_target_decides_at_scale() {
+        // POSITIVE (target inits 0 == data): `data == target` invariant → Holds at 48-bit via the
+        // relational target, where exact walls.
+        assert_eq!(
+            verify_recoverability(&inv_rel_w(48, "6"), "data == target").expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit invariant-relational recoverability target decides Holds"
+        );
+        // NEGATIVE (target inits 1 != data): never equal → Violated.
+        assert_eq!(
+            verify_recoverability(&inv_rel_w(48, "7"), "data == target").expect("decides"),
+            PropertyVerdict::Violated,
+            "the never-equal relational target decides Violated"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit — must agree with the 48-bit verdicts.
+        assert_eq!(
+            verify_recoverability(&inv_rel_w(8, "6"), "data == target").expect("small decides"),
+            PropertyVerdict::Holds
+        );
+        assert_eq!(
+            verify_recoverability(&inv_rel_w(8, "7"), "data == target").expect("small decides"),
+            PropertyVerdict::Violated
         );
     }
 
