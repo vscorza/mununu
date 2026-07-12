@@ -234,6 +234,150 @@ fn eq_reg_addend_guard_atoms(
     out
 }
 
+/// N1 EMERGENT-K — discover inductive RELATIONAL invariants (`a == b`, `a == b + k`) that hold on every
+/// reachable state but have NO syntactic comparison node in the design, so the guard-atom extractors
+/// ([`eq_reg_guard_atoms`] / [`eq_reg_addend_guard_atoms`], which read `eq`/`add` nodes) miss them
+/// entirely. This is the emergent case: a design that decides its control return through *inequalities*
+/// (`a >= b && b >= a`) or arithmetic carries the relation `a == b` only *semantically*, never as a form
+/// the syntactic seeders can lift.
+///
+/// **Mechanism (sound inductive-invariant discovery).** For each same-width pair of state registers, one
+/// SMT query over the EXACT transition asks whether the difference `a - b` is preserved by *every*
+/// transition — `T ∧ (a' - b' != a - b)` UNSAT. If so, the reachable states all satisfy
+/// `a - b == (a_init - b_init)` (base: the initial state fixes the difference; step: every transition
+/// preserves it), a 1-inductive relational invariant. It is seeded as a compound predicate (`a == b` when
+/// the reset difference is 0, else `a == b + k`), so the cube can refute the *spurious* havoc-equal (or
+/// havoc-unequal) states the wide-datapath UF-wrap admits — exactly the states that leave the cube at ⊥.
+///
+/// **SOUNDNESS.** An inductive invariant over-approximates the reachable set, so adding it as a cube
+/// dimension only refines the abstraction monotonically (Shoham–Grumberg) — it can never flip a definite
+/// verdict, and the discovery need not be complete. The preservation check quantifies over ALL inputs
+/// (the transition relation carries the free inputs), so a relation some input could break is simply not
+/// discovered: fewer seeds, never a wrong one. The direction with the smaller addend is chosen for a
+/// tidy `a == b + k`; either direction denotes the same relation.
+///
+/// Returns `(name, expr_str, expr)` tuples ready to append to `compound_seeds`, deduplicated by the
+/// unordered register pair, COI-filtered to the good register's cone, and capped by `budget`.
+fn discover_inductive_relational_invariants(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    init_values: &std::collections::BTreeMap<String, u128>,
+    good_coi: &std::collections::HashSet<String>,
+    budget: usize,
+) -> Vec<(String, String, PredicateExpr)> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    // Bound the O(n^2) pair search: real designs have few state registers in a good register's cone, and
+    // each pair costs one SMT solve. A hard cap keeps a pathological register count from stalling.
+    const MAX_DISCOVERY_QUERIES: usize = 128;
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let Ok(view) = crate::adapter::btor2::kmts_lift::encode_design_for_lift(file) else {
+            return Vec::new();
+        };
+        let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
+        let in_coi = |r: &str| good_coi.is_empty() || good_coi.contains(r);
+        // Candidate registers: state cells that carry a reset value and lie in the good cone. Sorted by
+        // name for a deterministic search order (and so the smaller-addend tie-break is stable).
+        let mut regs: Vec<(String, i64, u32)> = nid_map
+            .iter()
+            .filter_map(|(name, &nid)| {
+                if !in_coi(name) || !init_values.contains_key(name) {
+                    return None;
+                }
+                let w = view.curr_state(nid)?.get_size();
+                Some((name.clone(), nid, w))
+            })
+            .collect();
+        regs.sort_unstable();
+
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", 5000);
+        let mut out: Vec<(String, String, PredicateExpr)> = Vec::new();
+        let mut seen_pairs: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut queries = 0usize;
+        'outer: for i in 0..regs.len() {
+            for j in (i + 1)..regs.len() {
+                if out.len() >= budget || queries >= MAX_DISCOVERY_QUERIES {
+                    break 'outer;
+                }
+                let (a_name, a_nid, aw) = &regs[i];
+                let (b_name, b_nid, bw) = &regs[j];
+                if aw != bw {
+                    continue;
+                }
+                let (Some(&a_init), Some(&b_init)) =
+                    (init_values.get(a_name), init_values.get(b_name))
+                else {
+                    continue;
+                };
+                let (Some(ac), Some(an), Some(bc), Some(bn)) = (
+                    view.curr_state(*a_nid),
+                    view.next_state(*a_nid),
+                    view.curr_state(*b_nid),
+                    view.next_state(*b_nid),
+                ) else {
+                    continue;
+                };
+                // Difference-preservation: is `a - b` constant across every transition?
+                queries += 1;
+                let solver = z3::Solver::new();
+                solver.set_params(&params);
+                solver.assert(&view.transition);
+                let diff_curr = ac.bvsub(bc);
+                let changed = an.bvsub(bn).eq(&diff_curr).not();
+                solver.assert(&changed);
+                if !matches!(solver.check(), z3::SatResult::Unsat) {
+                    continue; // difference not invariant (some transition changes it) — do not seed
+                }
+                if !seen_pairs.insert((a_name.clone(), b_name.clone())) {
+                    continue;
+                }
+                // The difference is the constant `a_init - b_init`. Seed the relation.
+                if a_init == b_init {
+                    let expr_str = format!("{a_name} == {b_name}");
+                    let Ok(expr) = parse_predicate_expr(&expr_str) else {
+                        continue;
+                    };
+                    out.push((format!("ind_{a_name}_eq_{b_name}"), expr_str, expr));
+                    continue;
+                }
+                let w = *aw;
+                if w > 64 {
+                    continue; // an addend wider than u64 — a == b (above) still covers the equal case
+                }
+                let modulus_m1: u128 = if w >= 64 {
+                    u64::MAX as u128
+                } else {
+                    (1u128 << w) - 1
+                };
+                let modulus: u128 = modulus_m1 + 1;
+                let diff = a_init.wrapping_sub(b_init) & modulus_m1; // (a_init - b_init) mod 2^w, in [1, 2^w-1]
+                // Choose the direction with the smaller addend: `a == b + diff` vs `b == a + (2^w-diff)`.
+                let (lhs, rhs, addend) = if diff <= modulus / 2 {
+                    (a_name.clone(), b_name.clone(), diff as u64)
+                } else {
+                    (b_name.clone(), a_name.clone(), (modulus - diff) as u64)
+                };
+                let expr_str = format!("{lhs} == {rhs} + {addend}");
+                out.push((
+                    format!("ind_{lhs}_eq_{rhs}_plus_{addend}"),
+                    expr_str,
+                    PredicateExpr::CmpRegAddend {
+                        lhs,
+                        op: CmpOp::Eq,
+                        rhs,
+                        addend,
+                        width: w,
+                    },
+                ));
+            }
+        }
+        out
+    })
+}
+
 /// N1 frontier (a) — the good register's cone-of-influence: the state registers whose values determine
 /// when `good` is (re)reached — those reachable backward from the good register's next-state function,
 /// plus the register itself. A guard atom over a register OUTSIDE this cone (a decoy comparison on an
@@ -857,6 +1001,25 @@ pub fn verify_recoverability_scalable(
         };
         compound_seeds.push((name, expr_str, expr));
     }
+
+    // N1 EMERGENT-K — inductive relational-invariant discovery. The frontiers above lift relations from
+    // syntactic `eq`/`add` nodes; a design that decides its control return through inequalities or
+    // arithmetic carries the deciding relation (`data == target`, `target == data + 1`) only semantically,
+    // with NO node to lift — the cube then abstains at ⊥ on the wide datapath (the UF-wrap havoc admits
+    // spurious states the missing relation would refute). `discover_inductive_relational_invariants` finds
+    // those relations by checking, over the EXACT transition, which register-pair differences are
+    // invariant, and seeds them the same compound-predicate way. Deduped against the syntactic seeds by
+    // expr string (a relation both a node and the difference-check yield is seeded once).
+    let discovery_budget = (MAX_AUTO_SEED + 1).saturating_sub(specs.len() + compound_seeds.len());
+    for (name, expr_str, expr) in
+        discover_inductive_relational_invariants(&file, &init_values, &good_coi, discovery_budget)
+    {
+        if compound_seeds.iter().any(|(_, e, _)| e == &expr_str) {
+            continue; // a syntactic frontier already seeded this exact relation
+        }
+        compound_seeds.push((name, expr_str, expr));
+    }
+
     // name → expr, for the reset-cube evaluation + free-input guard of the compound predicates.
     let compound_map: std::collections::HashMap<String, PredicateExpr> = compound_seeds
         .iter()
@@ -1641,6 +1804,54 @@ mod tests {
             verify_recoverability(&manyguard_btor2(8, 7), "ctrl == 0").expect("exact decides"),
             PropertyVerdict::Violated,
             "8-bit exact oracle must agree with the 48-bit cube Violated"
+        );
+    }
+
+    // N1 EMERGENT-K — a control return decided by INEQUALITIES (`data >= target && target >= data`),
+    // so the design carries the deciding relation `data == target` with NO `eq`/`add` node for the
+    // syntactic frontiers (b)/(b′) to lift. The relation is therefore EMERGENT: only
+    // `discover_inductive_relational_invariants` recovers it, by checking over the EXACT transition that
+    // the register-pair difference is invariant, and seeding it — so the wide cube decides where it
+    // otherwise abstains at ⊥. (Node 6 = zero, node 7 = one, used as the two `target` reset values.)
+    fn emergent_ineq_w(width: u32, target_init_nid: &str) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 1 ctrl\n4 state 2 data\n5 state 2 target\n\
+             6 zero 2\n7 one 2\n9 one 1\n10 init 1 3 9\n11 init 2 4 6\n12 init 2 5 {target_init_nid}\n\
+             13 add 2 4 7\n14 add 2 5 7\n15 ugte 1 4 5\n16 ugte 1 5 4\n17 and 1 15 16\n18 not 1 17\n\
+             19 and 1 3 18\n20 next 1 3 19\n21 next 2 4 13\n22 next 2 5 14\n"
+        )
+    }
+
+    #[test]
+    fn emergent_k_discovers_inductive_relation_where_no_node_exists() {
+        // NEGATIVE (target init 1 = node 7; data init 0): `target == data + 1` is INVARIANT, so
+        // `data == target` (idle) is NEVER reached → busy is a trap → `AG EF (ctrl==0)` VIOLATED. Idle is
+        // decided by two `ugte`s (no `eq` node), so the syntactic seeders find nothing and the wide cube
+        // abstains at ⊥; the difference-invariant discovery recovers `target == data + 1` and refutes the
+        // spurious havoc-equal states.
+        assert_eq!(
+            verify_recoverability_scalable(&emergent_ineq_w(48, "7"), "ctrl == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Violated,
+            "48-bit emergent (no-eq-node) trap decides Violated via inductive relational-invariant discovery"
+        );
+        // POSITIVE (target init 0 = node 6 == data): `data == target` invariant → recoverable → Holds.
+        assert_eq!(
+            verify_recoverability_scalable(&emergent_ineq_w(48, "6"), "ctrl == 0", &[])
+                .expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit emergent positive decides Holds (discovery does not regress the recoverable case)"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD) — must agree with the wide cube verdicts.
+        assert_eq!(
+            verify_recoverability(&emergent_ineq_w(8, "7"), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Violated,
+            "8-bit exact oracle agrees with the 48-bit emergent Violated"
+        );
+        assert_eq!(
+            verify_recoverability(&emergent_ineq_w(8, "6"), "ctrl == 0").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees with the 48-bit emergent Holds"
         );
     }
 
