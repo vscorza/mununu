@@ -329,7 +329,34 @@ fn discover_inductive_relational_invariants(
                 let changed = an.bvsub(bn).eq(&diff_curr).not();
                 solver.assert(&changed);
                 if !matches!(solver.check(), z3::SatResult::Unsat) {
-                    continue; // difference not invariant (some transition changes it) — do not seed
+                    // Difference varies — try an ORDERING inequality (`a <= b`) that a varying gap may
+                    // still preserve (FIFO pointers, a catch-up counter), in the direction the reset gap
+                    // fixes: `a_init <= b_init` ⇒ candidate `a <= b`. One more SMT query per pair. SOUND:
+                    // init establishes `lo_init <= hi_init`; `T ∧ (lo<=hi) ∧ (lo'>hi')` UNSAT is the
+                    // inductive step, so `lo <= hi` holds on every reachable state.
+                    if out.len() < budget && queries < MAX_DISCOVERY_QUERIES {
+                        queries += 1;
+                        let (lo_c, lo_n, hi_c, hi_n, lname, hname) = if a_init <= b_init {
+                            (ac, an, bc, bn, a_name, b_name)
+                        } else {
+                            (bc, bn, ac, an, b_name, a_name)
+                        };
+                        let s2 = z3::Solver::new();
+                        s2.set_params(&params);
+                        s2.assert(&view.transition);
+                        let ord = lo_c.bvule(hi_c);
+                        let broken = lo_n.bvugt(hi_n);
+                        s2.assert(&ord);
+                        s2.assert(&broken);
+                        if matches!(s2.check(), z3::SatResult::Unsat) {
+                            seen_pairs.insert((a_name.clone(), b_name.clone()));
+                            let expr_str = format!("{lname} <= {hname}");
+                            if let Ok(expr) = parse_predicate_expr(&expr_str) {
+                                out.push((format!("ind_{lname}_le_{hname}"), expr_str, expr));
+                            }
+                        }
+                    }
+                    continue; // difference not invariant; inequality (if any) already seeded above
                 }
                 if !seen_pairs.insert((a_name.clone(), b_name.clone())) {
                     continue;
@@ -1354,6 +1381,259 @@ pub fn recoverability_property_str(good: &str) -> String {
     format!("AG EF ({good})")
 }
 
+/// Append a fresh 1-bit combinational node that is the disjunction of every `bad` condition, carrying a
+/// stable symbol so the predicate-cube can reference `bad` as a DERIVED (combinational) predicate.
+/// Returns `(rewritten_btor2, bad_symbol, has_constraints)`. `None` when the design has no `bad` line.
+///
+/// The disjunction is the safety obligation (ANY `bad` reachable ⇒ unsafe). `has_constraints` flags
+/// whether the design carries `constraint` (environment-assumption) lines: the cube encoding ignores
+/// them (it over-approximates by dropping the assumption), which keeps a `Holds` verdict SOUND (safe
+/// under more behaviours ⇒ safe under the assumed subset) but makes a `Violated` verdict suspect (the
+/// counterexample may violate an assumption) — the caller downgrades `Violated` to `Unknown` then.
+fn inject_bad_symbol(btor2: &str, file: &crate::adapter::btor2::ast::Btor2File) -> Option<String> {
+    use crate::adapter::btor2::ast::{Node, Sort};
+    let bad_conds: Vec<i64> = file
+        .lines
+        .iter()
+        .filter_map(|l| match &l.node {
+            Node::Bad { signal } => Some(signal.0.abs()),
+            _ => None,
+        })
+        .collect();
+    if bad_conds.is_empty() {
+        return None;
+    }
+    // A 1-bit sort node (every `bad` is 1-bit, so one exists).
+    let sort1 = file.lines.iter().find_map(|l| match &l.node {
+        Node::Sort {
+            sort: Sort::BitVec { width: 1 },
+        } => Some(l.nid),
+        _ => None,
+    })?;
+    let mut nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut out = String::from(btor2);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    // Fold the bad conditions into a single OR chain; the final node gets the `__mununu_bad` symbol.
+    let mut acc = bad_conds[0];
+    if bad_conds.len() == 1 {
+        // `or C C` == C — a uniform way to give the single condition a named node.
+        out.push_str(&format!("{nid} or {sort1} {acc} {acc} __mununu_bad\n"));
+    } else {
+        for (i, c) in bad_conds[1..].iter().enumerate() {
+            let last = i == bad_conds.len() - 2;
+            if last {
+                out.push_str(&format!("{nid} or {sort1} {acc} {c} __mununu_bad\n"));
+            } else {
+                out.push_str(&format!("{nid} or {sort1} {acc} {c}\n"));
+                acc = nid;
+                nid += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Decide a BTOR2 **safety** obligation (`bad` unreachable) with the KMTS 3-valued predicate cube —
+/// the translation that lets the branching-cube engine (and its inductive relational-invariant
+/// discovery) attack a `bad`-state property. `bad` is translated to the modal-μ safety formula
+/// `AG ¬bad = nu X. ((not bad) and [] X)`, with `bad` carried as a DERIVED combinational predicate and
+/// the abstraction seeded from the design's guard atoms PLUS
+/// [`discover_inductive_relational_invariants`] (the emergent-K invariant discovery).
+///
+/// Verdict mapping (over the reset cube, Bruns–Godefroid definite-verdict transfer):
+/// - `Holds` ⇒ **safe** (`bad` unreachable) — sound even ignoring `constraint` lines (over-approx);
+/// - `Violated` ⇒ **`bad` reachable** via a must-path — downgraded to `Unknown` when the design has
+///   `constraint` lines (the must-path may violate an assumption; conservative, sound);
+/// - `Unknown` ⇒ the bounded predicate cube abstains (the honest boundary).
+///
+/// This is the evaluation surface for "how far does the 3-valued cube + invariant discovery reach on
+/// real safety benchmarks (HWMCC)". It is deliberately a thin translation over the audited cube path.
+pub fn verify_safety_scalable(btor2_content: &str) -> Result<PropertyVerdict, String> {
+    let file = crate::adapter::btor2::parser::parse(btor2_content)
+        .map_err(|e| format!("safety cube path: parsing BTOR2: {}", e.message))?;
+    let has_constraints = file
+        .lines
+        .iter()
+        .any(|l| matches!(l.node, crate::adapter::btor2::ast::Node::Constraint { .. }));
+    let Some(rewritten) = inject_bad_symbol(btor2_content, &file) else {
+        return Err("safety cube path: BTOR2 has no `bad` property".to_string());
+    };
+    let file = crate::adapter::btor2::parser::parse(&rewritten).map_err(|e| {
+        format!(
+            "safety cube path: re-parsing translated BTOR2: {}",
+            e.message
+        )
+    })?;
+    let init_values: BTreeMap<String, u128> =
+        crate::adapter::btor2::concrete_oracle::init_valuation(&file);
+
+    const MAX_AUTO_SEED: usize = 8;
+    // Cube dimensions: the design's `register == constant` guard atoms (the values the control logic
+    // compares against), capped. If none, bootstrap with a few state registers pinned at their reset
+    // value so the cube has ≥1 dimension for the CEGAR loop to refine from.
+    let mut specs: Vec<PredicateSpec> = Vec::new();
+    for (reg, k) in eq_guard_atoms(&file) {
+        if specs.len() >= MAX_AUTO_SEED {
+            break;
+        }
+        if !specs.iter().any(|s| s.register == reg && s.value == k) {
+            specs.push(PredicateSpec {
+                name: format!("guard_{reg}_eq_{k}"),
+                register: reg,
+                value: k,
+            });
+        }
+    }
+    if specs.is_empty() {
+        for (reg, v) in init_values.iter().take(MAX_AUTO_SEED) {
+            if let Ok(value) = u64::try_from(*v) {
+                specs.push(PredicateSpec {
+                    name: format!("reset_{reg}"),
+                    register: reg.clone(),
+                    value,
+                });
+            }
+        }
+    }
+
+    // Relational / inductive compound predicates: the syntactic relational guard atoms PLUS the
+    // emergent-K inductive difference-invariant discovery (unrestricted cone for safety).
+    let empty_cone: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut compound_seeds: Vec<(String, String, PredicateExpr)> = Vec::new();
+    for (lhs, rhs) in eq_reg_guard_atoms(&file) {
+        if specs.len() + compound_seeds.len() >= MAX_AUTO_SEED {
+            break;
+        }
+        let expr_str = format!("{lhs} == {rhs}");
+        if let Ok(expr) = parse_predicate_expr(&expr_str)
+            && !compound_seeds.iter().any(|(_, e, _)| e == &expr_str)
+        {
+            compound_seeds.push((format!("rel_{lhs}_eq_{rhs}"), expr_str, expr));
+        }
+    }
+    let discovery_budget = (MAX_AUTO_SEED + 1).saturating_sub(specs.len() + compound_seeds.len());
+    for (name, expr_str, expr) in
+        discover_inductive_relational_invariants(&file, &init_values, &empty_cone, discovery_budget)
+    {
+        if !compound_seeds.iter().any(|(_, e, _)| e == &expr_str) {
+            compound_seeds.push((name, expr_str, expr));
+        }
+    }
+    let compound_map: std::collections::HashMap<String, PredicateExpr> = compound_seeds
+        .iter()
+        .map(|(name, _, expr)| (name.clone(), expr.clone()))
+        .collect();
+
+    // AG ¬bad, over the `bad` derived-predicate atom.
+    let formula = mu_parser::parse("nu X. ((not bad) and [] X)")
+        .map_err(|e| format!("safety cube path: building the AG ¬bad formula: {e:?}"))?;
+
+    // Pin each seed predicate's register to its reset value (mandatory — an unpinned initial cube
+    // defaults to all-false, not the reset state, and can falsely report Violated).
+    let mut config_entries: Vec<String> = specs
+        .iter()
+        .filter_map(|s| {
+            init_values
+                .get(&s.register)
+                .map(|v| format!("{}={}", s.register, v))
+        })
+        .collect();
+    for (_, _, expr) in &compound_seeds {
+        for reg in expr.registers() {
+            if let Some(v) = init_values.get(&reg) {
+                let entry = format!("{reg}={v}");
+                if !config_entries.contains(&entry) {
+                    config_entries.push(entry);
+                }
+            }
+        }
+    }
+    let base_sidecar_json = config_values_to_sidecar_json(&config_entries)
+        .map_err(|e| format!("safety cube path: building the config-values pin: {e}"))?;
+    // Sidecar: the `bad` derived predicate + the relational compound predicates.
+    let mut val: serde_json::Value = match &base_sidecar_json {
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| format!("safety cube path: re-parsing the config-values sidecar: {e}"))?,
+        None => serde_json::json!({ "module": "safety", "source": "safety.btor2" }),
+    };
+    val["combinational_predicates"] = serde_json::json!([
+        { "name": "bad", "signal": "__mununu_bad", "value": 1 }
+    ]);
+    if !compound_seeds.is_empty() {
+        let decls: Vec<serde_json::Value> = compound_seeds
+            .iter()
+            .map(|(name, expr, _)| serde_json::json!({ "name": name, "expr": expr, "derived": false }))
+            .collect();
+        val["compound_predicates"] = serde_json::Value::Array(decls);
+    }
+    let adapter_options = AdapterOptions {
+        sidecar_json: Some(val.to_string()),
+        ..Default::default()
+    };
+
+    let cegar_opts = CegarOptions {
+        max_iterations: RECOVERABILITY_MAX_ITERATIONS,
+        predicate_source: PredicateSource::WeakestPrecondition,
+        max_cube_count: 1024,
+        capture_approximants: false,
+        enable_approximant_reuse: false,
+        smart_uf_cap: true,
+        lift_strategy: LiftStrategy::Eager,
+        must_edge_inference: MustEdgeInference::SmtHyperMust,
+        may_edge_inference: MayEdgeInference::SmtAllPairs,
+        emit_ctxdsl: false,
+    };
+    let env = Environment::new(1usize << (specs.len() + compound_seeds.len()));
+    let trace = match cegar_refine_loop(
+        &formula,
+        &rewritten,
+        specs.clone(),
+        &env,
+        &adapter_options,
+        &cegar_opts,
+    ) {
+        Ok(t) => t,
+        Err(_) => return Ok(PropertyVerdict::Unknown),
+    };
+
+    // Reset-cube verdict — abstain if any final predicate's register lacks a pinned reset value.
+    if !trace
+        .final_predicates
+        .iter()
+        .all(|spec| match compound_map.get(&spec.name) {
+            Some(expr) => expr.registers().iter().all(|r| init_values.contains_key(r)),
+            None => init_values.contains_key(&spec.register),
+        })
+    {
+        return Ok(PropertyVerdict::Unknown);
+    }
+    let init_map: std::collections::HashMap<String, u128> =
+        init_values.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut init_cube = 0usize;
+    for (i, spec) in trace.final_predicates.iter().enumerate() {
+        let holds = match compound_map.get(&spec.name) {
+            Some(expr) => expr.eval(&init_map),
+            None => init_values.get(&spec.register).copied() == Some(spec.value as u128),
+        };
+        if holds {
+            init_cube |= 1 << i;
+        }
+    }
+    let verdict = match trace.final_verdict.verdict_at(init_cube) {
+        Trit::False => PropertyVerdict::Violated,
+        Trit::Unknown => PropertyVerdict::Unknown,
+        Trit::True => PropertyVerdict::Holds,
+    };
+    // SOUNDNESS: with `constraint` lines the cube's must-path may violate an assumption, so a
+    // `Violated` is not trustworthy — downgrade to `Unknown`. `Holds` stays (over-approx is sound).
+    if has_constraints && verdict == PropertyVerdict::Violated {
+        return Ok(PropertyVerdict::Unknown);
+    }
+    Ok(verdict)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1439,6 +1719,95 @@ mod tests {
             verify_recoverability(&osc(8), "x == 0").expect("exact decides"),
             PropertyVerdict::Violated,
             "8-bit exact oracle agrees with the Houdini-seeded 48-bit Violated"
+        );
+    }
+
+    // === verify_safety_scalable — the bad → AG ¬bad cube translation ===
+
+    #[test]
+    fn safety_cube_decides_tiny_safe_and_unsafe() {
+        // SAFE: `a` counts up but CAPS at 4 (a==4 ⇒ a'=a), so `bad = (a==5)` is unreachable. The cube
+        // seeds the guard atoms {a==4, a==5} and proves AG ¬(a==5) ⇒ Holds (= safe).
+        let safe = "\
+1 sort bitvec 1
+2 sort bitvec 8
+3 state 2 a
+4 zero 2
+5 init 2 3 4
+6 one 2
+7 constd 2 4
+8 eq 1 3 7
+9 add 2 3 6
+10 ite 2 8 3 9
+11 next 2 3 10
+12 constd 2 5
+13 eq 1 3 12
+14 bad 13
+";
+        assert_eq!(
+            verify_safety_scalable(safe).expect("decides"),
+            PropertyVerdict::Holds,
+            "capped counter: bad (a==5) unreachable ⇒ safe (Holds)"
+        );
+        // UNSAFE: `a` counts up freely (0,1,2,3,4,5,…) so `bad = (a==5)` IS reached ⇒ Violated.
+        let unsafe_design = "\
+1 sort bitvec 1
+2 sort bitvec 8
+3 state 2 a
+4 zero 2
+5 init 2 3 4
+6 one 2
+9 add 2 3 6
+11 next 2 3 9
+12 constd 2 5
+13 eq 1 3 12
+14 bad 13
+";
+        assert_eq!(
+            verify_safety_scalable(unsafe_design).expect("decides"),
+            PropertyVerdict::Violated,
+            "free counter: bad (a==5) reachable ⇒ unsafe (Violated)"
+        );
+    }
+
+    #[test]
+    fn safety_cube_decides_ordering_invariant_via_inequality() {
+        // Catch-up counter: `b` SATURATES at MAX (no wrap); `a = ite(a<b, a+1, a)` catches up but never
+        // passes `b`. So `a <= b` is a genuine 1-INDUCTIVE invariant, but the difference `a - b` VARIES
+        // (0 then −1…) — the difference-invariant discovery misses it. Only the ORDERING inequality
+        // `a <= b` proves `bad = (a > b)` unreachable. Decides Holds (= safe) at 48-bit where exact walls.
+        let sat = |w: u32| -> String {
+            format!(
+                "1 sort bitvec 1\n2 sort bitvec {w}\n3 state 2 a\n4 state 2 b\n5 zero 2\n6 one 2\n\
+                 7 ones 2\n8 init 2 3 5\n9 init 2 4 5\n10 ult 1 3 4\n11 add 2 3 6\n12 ite 2 10 11 3\n\
+                 13 next 2 3 12\n14 eq 1 4 7\n15 add 2 4 6\n16 ite 2 14 4 15\n17 next 2 4 16\n\
+                 18 ugt 1 3 4\n19 bad 18\n"
+            )
+        };
+        assert_eq!(
+            verify_safety_scalable(&sat(48)).expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit ordering-invariant safety decides Holds via the inductive inequality a<=b"
+        );
+        assert_eq!(
+            verify_safety_scalable(&sat(8)).expect("decides"),
+            PropertyVerdict::Holds,
+            "8-bit ordering-invariant safety also Holds"
+        );
+        // WRAP variant (soundness guard): `b` WRAPS instead of saturating, so at b==MAX→0 with a high,
+        // `a > b` IS reached ⇒ `a <= b` is NOT invariant (the inequality check correctly declines to seed
+        // it) and the design is genuinely unsafe ⇒ Violated. (Portfolio ground truth: reachable.)
+        let wrap = |w: u32| -> String {
+            format!(
+                "1 sort bitvec 1\n2 sort bitvec {w}\n3 state 2 a\n4 state 2 b\n5 zero 2\n6 one 2\n\
+                 7 init 2 3 5\n8 init 2 4 5\n9 ult 1 3 4\n10 add 2 3 6\n11 ite 2 9 10 3\n12 next 2 3 11\n\
+                 13 add 2 4 6\n14 next 2 4 13\n15 ugt 1 3 4\n16 bad 15\n"
+            )
+        };
+        assert_eq!(
+            verify_safety_scalable(&wrap(8)).expect("decides"),
+            PropertyVerdict::Violated,
+            "the wrapping variant is genuinely unsafe (b wraps below a) ⇒ Violated"
         );
     }
 

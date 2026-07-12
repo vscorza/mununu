@@ -2509,9 +2509,213 @@ fn collect_boolean_input_symbols(
     out
 }
 
+/// P1 (scalable-KMTS, 2026-07-12) — compound-sound SMT POST-IMAGE of the predicate cube's may-edges.
+/// The eager `SmtAllPairs` may-relation checks all `O(cubes²)` (source, target) pairs; this instead
+/// computes, for each source cube, its may-successors by projecting `cube_curr ∧ T` onto the next-state
+/// predicate valuations (all-SAT enumeration). A reachability-guided BFS over these edges pays only
+/// `O(reachable × #successors)` — the P1 scalability lever the P0 measurement identified.
+///
+/// **Sound for compound/relational predicates** (unlike the sampling `LazyLift`): each predicate's
+/// constraint is built via [`PredicateExpr::build_constraint`] straight into the SMT — over
+/// `state_curr` for the source cube, `state_next` for the projection — so a relation like `a == b` is
+/// honoured with no sampling representative. The transition is the EXACT `view.transition`
+/// (`bvadd`/`bvmul`), matching the eager `SmtAllPairs` on designs the cube does not UF-wrap.
+///
+/// Returns `cube_index → sorted distinct may-successor cube indices`, or `None` if a predicate register
+/// does not resolve to a state cell / the cube space exceeds the bound (the caller falls back to eager).
+///
+/// P1 increment 1: validated by `p1_smt_postimage_may_edges_match_concrete_oracle` (below); wired into
+/// the lazy lift + must-edge path in the next increment.
+#[allow(dead_code)]
+fn compute_all_may_edges_smt_postimage(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    predicates: &[PredicateSpec],
+    compound_exprs: &std::collections::HashMap<
+        String,
+        crate::adapter::btor2::predicate_expr::PredicateExpr,
+    >,
+) -> Option<std::collections::HashMap<usize, Vec<usize>>> {
+    use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+    let n = predicates.len();
+    if n == 0 || n > 20 {
+        return None; // outside the cube-space bound; caller uses the eager path
+    }
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let view = encode_design_for_lift(file).ok()?;
+        let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
+        // Effective constraint per predicate: a compound (by name) or the simple `reg == value`.
+        let exprs: Vec<PredicateExpr> = predicates
+            .iter()
+            .map(|s| {
+                compound_exprs
+                    .get(&s.name)
+                    .cloned()
+                    .unwrap_or(PredicateExpr::Cmp {
+                        register: s.register.clone(),
+                        op: CmpOp::Eq,
+                        value: s.value,
+                    })
+            })
+            .collect();
+        let curr = |name: &str| {
+            nid_map
+                .get(name)
+                .and_then(|nid| view.curr_state(*nid))
+                .cloned()
+        };
+        let next = |name: &str| {
+            nid_map
+                .get(name)
+                .and_then(|nid| view.next_state(*nid))
+                .cloned()
+        };
+        let curr_c: Vec<z3::ast::Bool> = exprs
+            .iter()
+            .map(|e| e.build_constraint(&curr))
+            .collect::<Option<Vec<_>>>()?;
+        let next_c: Vec<z3::ast::Bool> = exprs
+            .iter()
+            .map(|e| e.build_constraint(&next))
+            .collect::<Option<Vec<_>>>()?;
+
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", 5000);
+        let mut out: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for cube in 0..(1usize << n) {
+            let solver = z3::Solver::new();
+            solver.set_params(&params);
+            solver.assert(&view.transition);
+            for (i, cc) in curr_c.iter().enumerate() {
+                if (cube >> i) & 1 == 1 {
+                    solver.assert(cc);
+                } else {
+                    let neg = cc.not();
+                    solver.assert(&neg);
+                }
+            }
+            // All-SAT: project `cube_curr ∧ T` onto the next-state predicate valuation.
+            let mut targets: Vec<usize> = Vec::new();
+            while matches!(solver.check(), z3::SatResult::Sat) {
+                let Some(model) = solver.get_model() else {
+                    break;
+                };
+                let mut tgt = 0usize;
+                let mut block: Vec<z3::ast::Bool> = Vec::with_capacity(n);
+                for (i, nc) in next_c.iter().enumerate() {
+                    let holds = model
+                        .eval(nc, true)
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false);
+                    if holds {
+                        tgt |= 1 << i;
+                        block.push(nc.clone());
+                    } else {
+                        block.push(nc.not());
+                    }
+                }
+                targets.push(tgt);
+                // Block this exact next valuation: ¬(⋀ block).
+                let refs: Vec<&z3::ast::Bool> = block.iter().collect();
+                let bar = z3::ast::Bool::and(&refs).not();
+                solver.assert(&bar);
+                if targets.len() > (1usize << n) {
+                    break; // safety: at most 2^n distinct next cubes
+                }
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            out.insert(cube, targets);
+        }
+        Some(out)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p1_smt_postimage_may_edges_match_concrete_oracle() {
+        // P1 increment 1 — no-input 2-bit design: x'=x+1, y'=y+1 (so `x==y` is PRESERVED). Predicates
+        // P0=(x==0) and P1=(x==y); P1 is a RELATIONAL compound the sampling lazy lift cannot realise.
+        // The SMT post-image must reproduce the exact may-edge relation an independent concrete-
+        // simulation oracle induces (the P1 soundness gate, at a width small enough that no UF-wrap
+        // diverges the transition abstraction).
+        let btor2 = "\
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 x
+4 state 2 y
+5 zero 2
+6 one 2
+7 init 2 3 5
+8 init 2 4 5
+9 add 2 3 6
+10 next 2 3 9
+11 add 2 4 6
+12 next 2 4 11
+";
+        let file = crate::adapter::btor2::parser::parse(btor2).expect("parse");
+        let preds = vec![
+            PredicateSpec {
+                name: "p0".into(),
+                register: "x".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "rel".into(),
+                register: "x".into(),
+                value: 0,
+            },
+        ];
+        let mut compound = std::collections::HashMap::new();
+        compound.insert(
+            "rel".to_string(),
+            crate::adapter::btor2::predicate_expr::PredicateExpr::CmpReg {
+                lhs: "x".into(),
+                op: crate::adapter::btor2::predicate_expr::CmpOp::Eq,
+                rhs: "y".into(),
+            },
+        );
+        // Bit 0 = P0 (x==0); bit 1 = P1 (x==y).
+        let cube_of = |x: u128, y: u128| -> usize {
+            (if x == 0 { 1usize } else { 0 }) | (if x == y { 2usize } else { 0 })
+        };
+        // Independent concrete oracle over all 2-bit (x,y).
+        let mut oracle: std::collections::HashMap<usize, std::collections::BTreeSet<usize>> =
+            std::collections::HashMap::new();
+        let no_inputs = std::collections::HashMap::<String, u128>::new();
+        for x in 0u128..4 {
+            for y in 0u128..4 {
+                let regs =
+                    std::collections::HashMap::from([("x".to_string(), x), ("y".to_string(), y)]);
+                let nxt =
+                    crate::adapter::btor2::bit_blast::simulate_one_step(&file, &regs, &no_inputs)
+                        .expect("simulate");
+                oracle
+                    .entry(cube_of(x, y))
+                    .or_default()
+                    .insert(cube_of(nxt["x"], nxt["y"]));
+            }
+        }
+        let got =
+            compute_all_may_edges_smt_postimage(&file, &preds, &compound).expect("post-image");
+        for cube in 0..4usize {
+            let mine: std::collections::BTreeSet<usize> = got
+                .get(&cube)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let want = oracle.get(&cube).cloned().unwrap_or_default();
+            assert_eq!(
+                mine, want,
+                "may-successors of cube {cube} disagree with the concrete oracle"
+            );
+        }
+    }
 
     // Test fixture: (automaton, [(state, [(var, value)])]).
     type StateVarPair<'a> = (&'a str, &'a str);

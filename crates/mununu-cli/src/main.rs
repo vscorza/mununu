@@ -272,6 +272,15 @@ enum Btor2Command {
     /// use `btor2 cegar … --must-edge-inference smt-hyper-must` for wider designs).
     /// `--target` is a single register-comparison atom (`"state_q == 3"`).
     VerifyRecoverability(Btor2VerifyRecoverabilityArgs),
+    /// Decide a `bad`-state safety property with the KMTS 3-valued predicate cube.
+    ///
+    /// Translates the design's `bad` obligation to `AG ¬bad = nu X. ((not bad) and [] X)`, carries
+    /// `bad` as a derived combinational predicate, and seeds the abstraction from the guard atoms plus
+    /// inductive relational-invariant discovery (the emergent-K path). `holds` = safe (`bad`
+    /// unreachable); `violated` = `bad` reachable (downgraded to `unknown` when the design has
+    /// `constraint` lines); `unknown` = the bounded cube abstains. Complements `btor2 verify` (the
+    /// bit-level portfolio); this is the branching-cube route on safety.
+    VerifySafety(Btor2VerifySafetyArgs),
     /// Auto-scan every FSM-like state register for a reachable illegal encoding — no input.
     ///
     /// For each narrow (≤ `--max-width` bit) state register, derive its legal encodings
@@ -611,6 +620,16 @@ struct Btor2VerifyRecoverabilityArgs {
     /// with none.
     #[arg(long = "predicate", value_name = "NAME:REG=VALUE")]
     predicate: Vec<String>,
+    #[command(flatten)]
+    ci: CiArgs,
+}
+
+/// Arguments for `mununu btor2 verify-safety` — the `bad` → `AG ¬bad` cube translation.
+#[derive(Args, Debug)]
+struct Btor2VerifySafetyArgs {
+    /// Path to the BTOR2 input file.
+    #[arg(value_name = "BTOR2_FILE")]
+    file: PathBuf,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2380,6 +2399,7 @@ fn handle_btor2(command: Btor2Command) -> Result<(), String> {
         Btor2Command::VerifyLiveness(args) => btor2_verify_liveness(args),
         Btor2Command::VerifyLivenessAll(args) => btor2_verify_liveness_all(args),
         Btor2Command::VerifyRecoverability(args) => btor2_verify_recoverability(args),
+        Btor2Command::VerifySafety(args) => btor2_verify_safety(args),
         Btor2Command::CheckFsm(args) => btor2_check_fsm(args),
     }
 }
@@ -2440,6 +2460,29 @@ fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<()
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "property": recoverability_property_str(&args.target),
+        "verdict": verdict.as_str(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialize summary: {e}"))?
+    );
+    ci_gate_exit(verdict.as_str(), args.ci.fail_on);
+    Ok(())
+}
+
+/// `mununu btor2 verify-safety` — decide `bad`-unreachability via the KMTS 3-valued cube
+/// (`AG ¬bad`), printing the canonical verdict as JSON. The branching-cube route on a safety
+/// obligation, complementing the bit-level `btor2 verify` portfolio.
+fn btor2_verify_safety(args: Btor2VerifySafetyArgs) -> Result<(), String> {
+    use mununu_core::adapter::recoverability::verify_safety_scalable;
+
+    let content = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
+    let verdict = verify_safety_scalable(&content)?;
+
+    let summary = serde_json::json!({
+        "file": args.file.display().to_string(),
+        "property": "AG !bad",
         "verdict": verdict.as_str(),
     });
     println!(
