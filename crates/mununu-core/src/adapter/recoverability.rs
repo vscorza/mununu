@@ -362,8 +362,9 @@ fn inputs_in_next_cone(
 /// cube cannot capture. When `good` is reached by a monotone datapath descent (a down-counter to 0, a
 /// timer, a drain), no bounded predicate set represents the descent, so the cube abstains (`Unknown`) —
 /// yet the property HOLDS. This proves it directly over the EXACT transition (Podelski–Rybalchenko),
-/// sidestepping the cube. For a candidate ranking δ — `good = (r == V)` → δ = `r - V`; `good = (a == b)`
-/// → δ = `a - b` (unsigned BV difference) — it checks:
+/// sidestepping the cube. For a candidate ranking δ — `good = (r == V)` → δ = `r - V` (a DESCENT of r to
+/// V) or δ = `V - r` (an ASCENT of r to V); `good = (a == b)` → δ = `a - b` or `b - a` (unsigned BV
+/// difference; both directions are tried) — it checks:
 ///   (2) **`transition ∧ ¬good ∧ δ_next ≥ δ_curr` is UNSAT** — i.e. EVERY transition out of a non-good
 ///       state STRICTLY decreases δ; combined with (1) δ ≥ 0 (trivial for an unsigned BV), δ cannot
 ///       decrease forever, so every path reaches good.
@@ -398,15 +399,15 @@ fn ranking_certificate_holds(
         };
         let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
         let mask = |w: u32| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-        // PRIMARY ranking component δ1 + the ¬good constraint, plus the good register NIDs (excluded from
-        // the lexicographic secondaries below).
-        let (d1_curr, d1_next, not_good, good_nids): (
-            z3::ast::BV,
-            z3::ast::BV,
+        // PRIMARY ranking components + the ¬good constraint + the good register NIDs. BOTH directions are
+        // tried: a DESCENT `δ = r - V` (r counts DOWN to V) and an ASCENT `δ = V - r` (r counts UP to V).
+        // Exactly one direction is a well-founded measure for a monotone move toward `good`; the other
+        // wraps and fails harmlessly. For a relational good `a == b`, the two are `a - b` and `b - a`.
+        let (primaries, not_good, good_nids): (
+            Vec<(z3::ast::BV, z3::ast::BV)>,
             z3::ast::Bool,
             Vec<i64>,
         ) = match good_value {
-            // Simple good `r == V`: δ1 = r - V.
             Some(v) => {
                 let [r] = good_registers else { return false };
                 let Some(&nid) = nid_map.get(r) else {
@@ -417,9 +418,15 @@ fn ranking_certificate_holds(
                 };
                 let w = rc.get_size();
                 let vbv = z3::ast::BV::from_u64(v & mask(w), w);
-                (rc.bvsub(&vbv), rn.bvsub(&vbv), rc.eq(&vbv).not(), vec![nid])
+                (
+                    vec![
+                        (rc.bvsub(&vbv), rn.bvsub(&vbv)), // descent δ = r - V
+                        (vbv.bvsub(rc), vbv.bvsub(rn)),   // ascent  δ = V - r
+                    ],
+                    rc.eq(&vbv).not(),
+                    vec![nid],
+                )
             }
-            // Relational good `a == b`: δ1 = a - b (same-width registers only).
             None => {
                 let [a, b] = good_registers else { return false };
                 let (Some(&na), Some(&nb)) = (nid_map.get(a), nid_map.get(b)) else {
@@ -436,7 +443,11 @@ fn ranking_certificate_holds(
                 if ac.get_size() != bc.get_size() {
                     return false;
                 }
-                (ac.bvsub(bc), an.bvsub(bn), ac.eq(bc).not(), vec![na, nb])
+                (
+                    vec![(ac.bvsub(bc), an.bvsub(bn)), (bc.bvsub(ac), bn.bvsub(an))],
+                    ac.eq(bc).not(),
+                    vec![na, nb],
+                )
             }
         };
 
@@ -542,22 +553,24 @@ fn ranking_certificate_holds(
         // tuple `(δ1, s1, …, sk)` over all secondaries in nid order — decides a k-LEVEL nested descent
         // (a 3-deep counter needs the 3-tuple; a 2-tuple over any single secondary fails). Lex order on
         // the tuple is well-founded, so the descent still reaches good (SOUND).
-        let d1 = (&d1_curr, &d1_next);
-        if certifies(&non_decrease(&[d1])) {
-            return true;
-        }
-        for (sc, sn) in &secondaries {
-            if certifies(&non_decrease(&[d1, (sc, sn)])) {
+        for (d1_curr, d1_next) in &primaries {
+            let d1 = (d1_curr, d1_next);
+            if certifies(&non_decrease(&[d1])) {
                 return true;
             }
-        }
-        if secondaries.len() >= 2 {
-            let mut full: Vec<(&z3::ast::BV, &z3::ast::BV)> = vec![d1];
             for (sc, sn) in &secondaries {
-                full.push((sc, sn));
+                if certifies(&non_decrease(&[d1, (sc, sn)])) {
+                    return true;
+                }
             }
-            if certifies(&non_decrease(&full)) {
-                return true;
+            if secondaries.len() >= 2 {
+                let mut full: Vec<(&z3::ast::BV, &z3::ast::BV)> = vec![d1];
+                for (sc, sn) in &secondaries {
+                    full.push((sc, sn));
+                }
+                if certifies(&non_decrease(&full)) {
+                    return true;
+                }
             }
         }
         false
@@ -1843,6 +1856,35 @@ mod tests {
             verify_recoverability(&dead_input_drain_w(8, 200), "cnt == 0").expect("exact decides"),
             PropertyVerdict::Holds,
             "8-bit exact oracle agrees"
+        );
+    }
+
+    // Ascent ranking — a saturating UP-counter to MAX = 2^W-1. `AG EF (cnt == MAX)` ("always able to fill
+    // up") HOLDS by an ASCENT, but the descent measure δ = cnt - MAX wraps; the ASCENT measure δ = MAX -
+    // cnt strictly decreases every step. The certificate tries both directions.
+    fn upcnt_w(width: u32) -> String {
+        format!(
+            "1 sort bitvec 1\n2 sort bitvec {width}\n3 state 2 cnt\n4 ones 2\n5 one 2\n6 zero 2\n\
+             7 init 2 3 6\n8 eq 1 3 4\n9 add 2 3 5\n10 ite 2 8 4 9\n11 next 2 3 10\n"
+        )
+    }
+
+    #[test]
+    fn ranking_certificate_decides_ascent_to_max() {
+        // 48-bit up-counter to MAX: decides Holds via the ascent (δ = V - r) direction, where the descent
+        // direction wraps, the cube abstains, and exact BDD walls.
+        let max48: u128 = (1u128 << 48) - 1;
+        assert_eq!(
+            verify_recoverability_scalable(&upcnt_w(48), &format!("cnt == {max48}"), &[])
+                .expect("decides"),
+            PropertyVerdict::Holds,
+            "48-bit up-counter to MAX decides Holds via the ascent ranking"
+        );
+        // DIFFERENTIAL ORACLE at 8-bit (exact BDD).
+        assert_eq!(
+            verify_recoverability(&upcnt_w(8), "cnt == 255").expect("exact decides"),
+            PropertyVerdict::Holds,
+            "8-bit exact oracle agrees with the 48-bit ascent ranking Holds"
         );
     }
 
