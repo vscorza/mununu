@@ -378,6 +378,87 @@ fn discover_inductive_relational_invariants(
     })
 }
 
+/// IC3ia I1 (2026-07-12) — HOUDINI relative-inductive filter. Given candidate predicates, return the
+/// largest subset whose CONJUNCTION is an inductive invariant of the design, over the EXACT transition:
+/// every survivor holds at the initial state AND is preserved *assuming the whole surviving conjunction*
+/// (not individually). This is the step the one-shot discovery ([`discover_inductive_relational_invariants`],
+/// which only keeps *individually* 1-inductive relations) structurally cannot take: it finds conjunctive
+/// invariants `P1 ∧ P2` where **neither `Pi` is inductive alone** but the pair is — the relative induction
+/// the diagnosis identified as the real gap. The de-risk (I1) of the IC3ia-on-the-cube direction.
+///
+/// **Algorithm (Houdini greatest-fixpoint).** Start with every candidate that holds at init; repeatedly
+/// drop any `P` for which `(⋀ set) ∧ T ∧ ¬P'` is SAT (i.e. `P` is not implied one step from the current
+/// conjunction), until no candidate is dropped. The surviving conjunction is inductive.
+///
+/// **SOUNDNESS.** The result holds at init and is closed under `T` (over the exact transition), so it
+/// over-approximates the reachable set — seeding it (each survivor a cube dimension) only refines the
+/// abstraction monotonically (Shoham–Grumberg), never flipping a definite verdict.
+fn houdini_inductive_conjunction(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    init_values: &std::collections::BTreeMap<String, u128>,
+    candidates: Vec<PredicateExpr>,
+) -> Vec<PredicateExpr> {
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let Ok(view) = crate::adapter::btor2::kmts_lift::encode_design_for_lift(file) else {
+            return Vec::new();
+        };
+        let nid_map = crate::adapter::btor2::smt_must_edge::build_register_nid_map(&view);
+        let curr = |name: &str| nid_map.get(name).and_then(|n| view.curr_state(*n)).cloned();
+        let next = |name: &str| nid_map.get(name).and_then(|n| view.next_state(*n)).cloned();
+        let init_map: std::collections::HashMap<String, u128> =
+            init_values.iter().map(|(k, v)| (k.clone(), *v)).collect();
+
+        // Keep candidates that hold at INIT and whose every register resolves to a state cell (so both
+        // current and next constraints build). `(expr, curr_bool, next_bool)`.
+        let mut set: Vec<(PredicateExpr, z3::ast::Bool, z3::ast::Bool)> = Vec::new();
+        for c in candidates {
+            if !c.eval(&init_map) {
+                continue;
+            }
+            let (Some(cc), Some(cn)) = (c.build_constraint(&curr), c.build_constraint(&next))
+            else {
+                continue;
+            };
+            set.push((c, cc, cn));
+        }
+
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", 5000);
+        // Houdini fixpoint: drop any P not inductive relative to the (shrinking) conjunction.
+        loop {
+            let conj: Vec<&z3::ast::Bool> = set.iter().map(|(_, cc, _)| cc).collect();
+            let mut keep = vec![true; set.len()];
+            let mut removed = false;
+            for (i, (_, _, cn)) in set.iter().enumerate() {
+                let solver = z3::Solver::new();
+                solver.set_params(&params);
+                for &c in &conj {
+                    solver.assert(c);
+                }
+                solver.assert(&view.transition);
+                let neg = cn.not();
+                solver.assert(&neg);
+                // SAT ⇒ a transition from the conjunction reaches ¬P' ⇒ P not relatively inductive.
+                if !matches!(solver.check(), z3::SatResult::Unsat) {
+                    keep[i] = false;
+                    removed = true;
+                }
+            }
+            if !removed {
+                break;
+            }
+            let mut idx = 0usize;
+            set.retain(|_| {
+                let k = keep[idx];
+                idx += 1;
+                k
+            });
+        }
+        set.into_iter().map(|(e, _, _)| e).collect()
+    })
+}
+
 /// N1 frontier (a) — the good register's cone-of-influence: the state registers whose values determine
 /// when `good` is (re)reached — those reachable backward from the good register's next-state function,
 /// plus the register itself. A guard atom over a register OUTSIDE this cone (a decoy comparison on an
@@ -1020,6 +1101,45 @@ pub fn verify_recoverability_scalable(
         compound_seeds.push((name, expr_str, expr));
     }
 
+    // IC3ia I1 — HOUDINI relative-inductive conjunction. The difference-discovery above keeps only
+    // INDIVIDUALLY 1-inductive relations; some designs need a CONJUNCTIVE invariant `P1 ∧ P2` whose
+    // conjuncts are inductive only *relative to each other* (a swap/coupling where `x>=1` holds only
+    // because `y>=1`, and vice-versa). Enumerate simple bound candidates (`r >= 1` per good-cone state
+    // register) and keep the largest relatively-inductive sub-conjunction; seed each survivor as a
+    // compound predicate. SOUND: an inductive conjunction over-approximates the reachable set.
+    if specs.len() + compound_seeds.len() < MAX_AUTO_SEED {
+        let candidates: Vec<PredicateExpr> = init_values
+            .keys()
+            .filter(|r| in_coi(r))
+            .take(MAX_AUTO_SEED)
+            .map(|r| PredicateExpr::Cmp {
+                register: r.clone(),
+                op: CmpOp::Ge,
+                value: 1,
+            })
+            .collect();
+        if candidates.len() >= 2 {
+            for expr in houdini_inductive_conjunction(&file, &init_values, candidates) {
+                if specs.len() + compound_seeds.len() > MAX_AUTO_SEED {
+                    break;
+                }
+                let PredicateExpr::Cmp {
+                    register,
+                    op: CmpOp::Ge,
+                    value,
+                } = &expr
+                else {
+                    continue;
+                };
+                let expr_str = format!("{register} >= {value}");
+                if compound_seeds.iter().any(|(_, e, _)| e == &expr_str) {
+                    continue;
+                }
+                compound_seeds.push((format!("houdini_{register}_ge_{value}"), expr_str, expr));
+            }
+        }
+    }
+
     // name → expr, for the reset-cube evaluation + free-input guard of the compound predicates.
     let compound_map: std::collections::HashMap<String, PredicateExpr> = compound_seeds
         .iter()
@@ -1220,6 +1340,90 @@ pub fn recoverability_property_str(good: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // IC3ia I1 DE-RISK — relative-inductive (Houdini) conjunction discovery. The load-bearing question:
+    // can we discover a CONJUNCTIVE invariant `P1 ∧ P2` where NEITHER `Pi` is inductive alone (so the
+    // one-shot per-predicate discovery cannot), over mununu's exact transition? A 48-bit SWAP design
+    // (`x' = y`, `y' = x`, both init 1) has the invariant `x>=1 ∧ y>=1`: neither conjunct is 1-inductive
+    // (proving `x'=y >= 1` needs `y>=1`, and vice-versa), but the pair is. No arithmetic ⇒ no BV-wrap
+    // confound; the coupling is purely relational.
+    #[test]
+    fn ic3ia_i1_houdini_finds_conjunction_neither_conjunct_alone() {
+        let swap = "\
+1 sort bitvec 48
+2 state 1 x
+3 state 1 y
+4 constd 1 1
+5 init 1 2 4
+6 init 1 3 4
+7 next 1 2 3
+8 next 1 3 2
+";
+        let file = crate::adapter::btor2::parser::parse(swap).expect("parse");
+        let init = crate::adapter::btor2::concrete_oracle::init_valuation(&file);
+        let x_ge1 = PredicateExpr::Cmp {
+            register: "x".into(),
+            op: CmpOp::Ge,
+            value: 1,
+        };
+        let y_ge1 = PredicateExpr::Cmp {
+            register: "y".into(),
+            op: CmpOp::Ge,
+            value: 1,
+        };
+        let x_le1 = PredicateExpr::Cmp {
+            register: "x".into(),
+            op: CmpOp::Le,
+            value: 1,
+        };
+
+        // NEITHER conjunct is individually 1-inductive: Houdini over a singleton drops it.
+        assert!(
+            houdini_inductive_conjunction(&file, &init, vec![x_ge1.clone()]).is_empty(),
+            "x>=1 is NOT inductive alone (x'=y with y unconstrained can be 0)"
+        );
+        assert!(
+            houdini_inductive_conjunction(&file, &init, vec![y_ge1.clone()]).is_empty(),
+            "y>=1 is NOT inductive alone"
+        );
+
+        // The CONJUNCTION is inductive: Houdini keeps BOTH — the relative-induction the one-shot can't do.
+        let both = houdini_inductive_conjunction(&file, &init, vec![x_ge1.clone(), y_ge1.clone()]);
+        assert_eq!(both.len(), 2, "the pair x>=1 ∧ y>=1 IS inductive together");
+        assert!(both.contains(&x_ge1) && both.contains(&y_ge1));
+
+        // A relatively-NON-inductive decoy that HOLDS at init (`x<=1`) is dropped by the fixpoint (not the
+        // init filter) — exercising the Houdini removal loop, not just the init prefilter.
+        let filtered =
+            houdini_inductive_conjunction(&file, &init, vec![x_ge1.clone(), y_ge1.clone(), x_le1]);
+        assert_eq!(filtered.len(), 2, "x<=1 is dropped by relative-induction");
+        assert!(filtered.contains(&x_ge1) && filtered.contains(&y_ge1));
+    }
+
+    #[test]
+    fn ic3ia_i1_houdini_seeding_decides_where_one_shot_abstains() {
+        // END-TO-END de-risk: an OSCILLATING swap (`x'=y`, `y'=x`, init x=1,y=2) — `x-y` alternates
+        // (−1,+1) so the difference-invariant discovery finds nothing, and `x` oscillates in {1,2}, never
+        // 0, so `AG EF (x==0)` is VIOLATED. Proving the trap needs `x>=1 ∧ y>=1` — a conjunction NEITHER
+        // conjunct of which is 1-inductive. The baseline cube ABSTAINS (Unknown) at 48-bit; the Houdini
+        // relative-inductive seeding recovers the conjunction and DECIDES Violated. 8-bit exact oracle agrees.
+        let osc = |w: u32| -> String {
+            format!(
+                "1 sort bitvec {w}\n2 state 1 x\n3 state 1 y\n4 constd 1 1\n5 constd 1 2\n\
+                 6 init 1 2 4\n7 init 1 3 5\n8 next 1 2 3\n9 next 1 3 2\n"
+            )
+        };
+        assert_eq!(
+            verify_recoverability_scalable(&osc(48), "x == 0", &[]).expect("decides"),
+            PropertyVerdict::Violated,
+            "48-bit conjunctive-invariant trap decides Violated via Houdini relative-inductive seeding"
+        );
+        assert_eq!(
+            verify_recoverability(&osc(8), "x == 0").expect("exact decides"),
+            PropertyVerdict::Violated,
+            "8-bit exact oracle agrees with the Houdini-seeded 48-bit Violated"
+        );
+    }
 
     // 3-state responder: st 0=idle, 1=req, 2=grant; idle -go-> req; req -> grant;
     // grant -> idle. Every reachable state can reach idle ⇒ AG EF (st==0) HOLDS.
