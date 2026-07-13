@@ -19,6 +19,7 @@
 //! - Overflow detectors (`saddo`, `uaddo`, `smulo`, ...).
 //! - Multi-clock designs.
 
+pub mod abs_safety;
 pub mod ast;
 pub mod bad_monitor;
 pub mod bit_blast;
@@ -36,6 +37,7 @@ pub mod parser;
 pub mod pin;
 pub mod predicate_expr;
 pub mod r_s8_encoder;
+pub mod refine;
 pub mod reset_init;
 pub mod shadow;
 pub mod smt_must_edge;
