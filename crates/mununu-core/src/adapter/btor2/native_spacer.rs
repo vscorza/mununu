@@ -1,12 +1,17 @@
-//! Native SPACER — in-house IC3/PDR + interpolation via Z3's **Fixedpoint (CHC)**
-//! engine.
+//! SPACER frontend — a btor2→CHC encoding decided by **Z3's SPACER**
+//! (Fixedpoint/IC3-PDR) engine.
 //!
-//! Slice 3 of P1's in-house scalable-safety back-end. It decides SAFE properties
-//! native k-induction ([`crate::adapter::btor2::native_bmc::decide_bad_safety`])
-//! leaves `Unknown` — the *non-k-inductive* ones that need an inductive-invariant
-//! search. Z3's **SPACER** does interpolation-based IC3 INTERNALLY, so this stays
-//! in-process: no cvc5 cross-solver bridge, no subprocess, commercially clean like
-//! the rest of the native engine.
+//! **Ownership note (do not overclaim):** the model-checking *algorithm* here is
+//! **Z3's**, not mununu's. Unlike native BMC / k-induction / McMillan interpolation —
+//! where mununu drives the search loop and calls z3/cvc5 only as per-query oracles —
+//! this module builds the Horn encoding and hands the *entire* IC3/PDR + interpolation
+//! search to `z3::Fixedpoint::query` (SPACER runs the frames, generalization, and proof
+//! obligations internally). So mununu owns the **encoding**, Z3 owns the **deciding**;
+//! for engine-provenance accounting this is an *external algorithm* run in-process (the
+//! same algorithm-ownership class as btormc/Pono, differing only in that Z3 is linked
+//! rather than forked as a subprocess). It decides SAFE properties native k-induction
+//! ([`crate::adapter::btor2::native_bmc::decide_bad_safety`]) leaves `Unknown` — the
+//! *non-k-inductive* ones needing an inductive-invariant search — with no subprocess.
 //!
 //! # The Horn encoding
 //!
@@ -56,10 +61,11 @@ fn and_all(cs: &[Bool]) -> Bool {
     }
 }
 
-/// Decide `bad`-reachability of `file` with Z3's SPACER (Fixedpoint/CHC) engine —
-/// an in-house IC3/PDR + interpolation model checker. See the module docs for the
-/// Horn encoding and verdict semantics. `timeout_ms` bounds the SPACER solve (a
-/// timeout returns [`SafetyVerdict::Unknown`] — never a wrong verdict).
+/// Decide `bad`-reachability of `file` with **Z3's SPACER** (Fixedpoint/CHC) engine.
+/// mununu owns the btor2→CHC encoding; the IC3/PDR + interpolation model checking is
+/// Z3's (see the module docs — this is an external algorithm run in-process, not an
+/// in-house model checker). `timeout_ms` bounds the SPACER solve (a timeout returns
+/// [`SafetyVerdict::Unknown`] — never a wrong verdict).
 pub fn decide_bad_safety_spacer(
     file: &Btor2File,
     timeout_ms: Option<u32>,
