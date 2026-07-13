@@ -32,7 +32,7 @@ use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node};
 use crate::adapter::btor2::native_bmc::{BmcOutcome, bmc_bad_reachable};
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
 use crate::adapter::btor2::refine::{
-    RefineOutcome, synthesize_reachability_predicate, synthesize_refinement_predicate,
+    RefineOutcome, sequence_interpolant_predicates, synthesize_refinement_predicate,
 };
 use crate::adapter::sidecar::predicate_image::btor2_encode::{SignalKind, encode_design};
 
@@ -505,9 +505,20 @@ fn extract_cube(model: &z3::Model, pred_cur: &[Bool]) -> IcCube {
         .collect()
 }
 
-/// P2.2b — decide `AG ¬bad` by the IC3 frame ladder over the predicate abstraction,
-/// with P2.1 refinement. Sound by independent verdict verification (see the module
-/// banner). `max_frames` bounds the ladder depth; `max_refine` the refinement loop.
+/// P2.2b/P2.3b — decide `AG ¬bad` by the IC3 frame ladder over the predicate
+/// abstraction, with sequence-interpolation refinement (P2.3b). Sound by independent
+/// verdict verification (see the module banner); guarded so it always terminates
+/// (abstains on non-convergence). `max_frames` bounds the ladder depth; `max_refine`
+/// the refinement loop.
+///
+/// **Honest status (the make-or-break result, 2026-07-13):** decides small designs
+/// but does NOT converge on real ones (even 644-byte `paper_v3`) — the CTI blocking
+/// hits its iteration guard and abstains. z3-SPACER decides these instantly. A
+/// competitive owned IC3/PDR is a large specialised engine; this is a research
+/// FOUNDATION whose *reusable* value is the refinement primitives in
+/// [`super::refine`] (P2.1/P2.3, reused by the branching driver P2.4), not a
+/// production safety engine — safety-at-scale is covered by
+/// [`super::native_interp`] + z3-SPACER. Not wired into any surface.
 pub fn verify_safety_ic3(
     file: &Btor2File,
     max_frames: usize,
@@ -523,13 +534,19 @@ pub fn verify_safety_ic3(
                 };
             }
             Ic3Pass::Unsafe { depth } => return AbsVerdict::Unsafe { depth },
-            Ic3Pass::Refine(p) => {
-                if preds.contains(&p) {
+            Ic3Pass::Refine(ps) => {
+                let before = preds.len();
+                for p in ps {
+                    if !preds.contains(&p) {
+                        preds.push(p);
+                    }
+                }
+                if preds.len() == before {
                     return AbsVerdict::Unknown {
-                        reason: "IC3 refinement stalled (predicate already present)".into(),
+                        reason: "IC3 refinement stalled (no new predicate — grammar ceiling)"
+                            .into(),
                     };
                 }
-                preds.push(p);
             }
             Ic3Pass::Unknown(reason) => return AbsVerdict::Unknown { reason },
         }
@@ -542,7 +559,7 @@ pub fn verify_safety_ic3(
 enum Ic3Pass {
     Safe,
     Unsafe { depth: u32 },
-    Refine(PredicateExpr),
+    Refine(Vec<PredicateExpr>),
     Unknown(String),
 }
 
@@ -586,8 +603,16 @@ fn ic3_pass(
                 return Ic3Pass::Unknown(format!("IC3 exceeded {max_frames} frames"));
             }
 
-            // Block every bad-predecessor in F(k).
+            // Block every bad-predecessor in F(k). Bounded so a blocking that fails to
+            // converge (an implementation-completeness gap) ABSTAINS rather than hangs.
+            let mut block_iters = 0u32;
             loop {
+                block_iters += 1;
+                if block_iters > 400 {
+                    return Ic3Pass::Unknown(
+                        "IC3 blocking-iteration limit (no convergence)".into(),
+                    );
+                }
                 let query = Bool::and(&[
                     &frame_formula(&scope, &frames, k),
                     &scope.transition,
@@ -653,7 +678,7 @@ fn ic3_pass(
 enum BlockResult {
     Blocked,
     Unsafe { depth: u32 },
-    Refine(PredicateExpr),
+    Refine(Vec<PredicateExpr>),
     Unknown(String),
 }
 
@@ -671,14 +696,20 @@ fn rec_block(
     mk: &dyn Fn() -> z3::Solver,
     timeout_ms: u32,
 ) -> BlockResult {
-    // Obligations processed lowest-level-first.
+    // Obligations processed lowest-level-first. Bounded so a runaway obligation
+    // chain abstains rather than hangs.
     let mut obligations: Vec<(usize, IcCube)> = vec![(lvl, s0)];
+    let mut steps = 0u32;
     while let Some(idx) = obligations
         .iter()
         .enumerate()
         .min_by_key(|(_, (l, _))| *l)
         .map(|(i, _)| i)
     {
+        steps += 1;
+        if steps > 2000 {
+            return BlockResult::Unknown("IC3 obligation limit (no convergence)".into());
+        }
         let (j, c) = obligations.remove(idx);
         if j == 0 {
             // Abstract CEX reaches Init. Concrete check bounds by the ladder depth.
@@ -691,21 +722,20 @@ fn rec_block(
                     if let RefineOutcome::Predicate(p) =
                         synthesize_refinement_predicate(file, &source, &bad_atoms, timeout_ms)
                     {
-                        return BlockResult::Refine(p);
+                        return BlockResult::Refine(vec![p]);
                     }
-                    // P2.3 — reachability spuriousness: single-step can't add a
-                    // reachability-constraining predicate; PATH-interpolate over the
-                    // suffix bounded by the ladder depth.
-                    match synthesize_reachability_predicate(file, frames.len(), timeout_ms) {
-                        RefineOutcome::Predicate(p) => return BlockResult::Refine(p),
-                        _ => {
-                            return BlockResult::Unknown(
-                                "IC3 spurious CEX; neither single-step nor path interpolation \
-                                 yielded a parseable predicate (grammar ceiling — emergent-K)"
-                                    .into(),
-                            );
-                        }
+                    // P2.3b — targeted per-trace refinement: SEQUENCE-interpolate the
+                    // depth-n BMC unrolling of this spurious counterexample → a SET of
+                    // reachability predicates that collectively rule the trace out.
+                    let ps = sequence_interpolant_predicates(file, frames.len(), timeout_ms);
+                    if !ps.is_empty() {
+                        return BlockResult::Refine(ps);
                     }
+                    return BlockResult::Unknown(
+                        "IC3 spurious CEX; sequence interpolation yielded no parseable \
+                         predicate (grammar ceiling — emergent-K)"
+                            .into(),
+                    );
                 }
             }
         }
@@ -1151,8 +1181,19 @@ mod tests {
             .expect("set MUNUNU_INTERP_PROBE=/path/to/design.btor2");
         let content = std::fs::read_to_string(&path).expect("read design");
         let file = parser::parse(&content).expect("parse btor2");
+        let eu = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
         let t0 = std::time::Instant::now();
-        let v = verify_safety_ic3(&file, 40, 24, 8_000);
+        let v = verify_safety_ic3(
+            &file,
+            eu("MUNUNU_IC3_FRAMES", 40) as usize,
+            eu("MUNUNU_IC3_REFINE", 24),
+            eu("MUNUNU_IC3_QTO", 8_000),
+        );
         eprintln!(
             "IC3 verdict on {path} [{}ms]: {v:?}",
             t0.elapsed().as_millis()

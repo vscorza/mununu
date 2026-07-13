@@ -215,28 +215,23 @@ pub fn synthesize_refinement_predicate(
     })
 }
 
-/// P2.3 — synthesise a **reachability-constraining** predicate via PATH
-/// interpolation: the Craig interpolant of `A = Init(s0) ∧ T(s0,s1)` against
-/// `B = ¬(bad reachable within `suffix_depth` steps from s1)`, over the exact
-/// transition, parsed to a [`PredicateExpr`].
-///
-/// This closes the gap the single-step [`synthesize_refinement_predicate`] cannot:
-/// a cube that is *abstractly* reachable but *concretely* unreachable (every single
-/// step realizable, the composed path not) needs a predicate that constrains
-/// **reachability**, which only a multi-step suffix interpolant supplies. `I(s1)`
-/// over-approximates the one-step image of `Init` while excluding states that reach
-/// `bad` within `suffix_depth` — exactly such a predicate.
-///
-/// Returns `Realizable` when `bad` IS reachable within the suffix from `Init`'s
-/// image (no interpolant — the caller confirms a real CEX elsewhere), and
-/// `Unavailable` when cvc5 is absent / the interpolant is outside the `#318`
-/// grammar (the grammar ceiling — the emergent-K parser-extension frontier).
-pub fn synthesize_reachability_predicate(
+/// P2.3b — the Craig interpolant AT CUT `cut` of the depth-`depth` BMC unrolling
+/// `Init(s0) ∧ T(s0,s1) ∧ … ∧ T(s_{depth-1}, s_depth)` with `bad` at any step
+/// `≥ cut`: `A = Init ∧ (prefix to s_cut)` vs `B = ¬(bad reachable from s_cut
+/// within the suffix)`. `I(s_cut)` — over-approximates the states reachable in
+/// `cut` steps AND excludes states that reach `bad` in the remaining suffix — is a
+/// **reachability-constraining** predicate. Sweeping `cut` (see
+/// [`sequence_interpolant_predicates`]) is the targeted per-trace refinement IC3ia
+/// needs; a single cut is what [`synthesize_reachability_predicate`] uses.
+#[allow(clippy::needless_range_loop)] // `m` indexes both `state(m)` and `inp[m]`
+fn interpolant_at_cut(
     file: &Btor2File,
-    suffix_depth: usize,
+    cut: usize,
+    depth: usize,
     timeout_ms: u32,
 ) -> RefineOutcome {
-    let k = suffix_depth.max(1);
+    let depth = depth.max(1);
+    let cut = cut.clamp(1, depth);
     let cfg = z3::Config::new();
     z3::with_z3_config(&cfg, || {
         let view = match encode_design(file) {
@@ -250,8 +245,8 @@ pub fn synthesize_reachability_predicate(
             .filter_map(|s| s.symbol.clone().map(|sym| (s.nid, sym)))
             .collect();
 
-        // Frame state maps: `s0` (`<reg>__cur`), `s1` (`<reg>` — the interpolation
-        // vocabulary, so `I` parses to a predicate), `s2..sk` (`<reg>__f<j>`).
+        // s0 = `<reg>__cur`; the cut state s_cut = `<reg>` (interpolation vocabulary,
+        // so `I` parses to a predicate); every other step = `<reg>__f<j>`.
         let mk_state = |tag: &dyn Fn(&str) -> String| -> HashMap<Nid, BV> {
             view.state_curr
                 .iter()
@@ -263,13 +258,15 @@ pub fn synthesize_reachability_predicate(
                 .collect()
         };
         let s0 = mk_state(&|sym| format!("{sym}__cur"));
-        let mut frames: Vec<HashMap<Nid, BV>> = Vec::new(); // frames[j] = state at step j+1
-        frames.push(mk_state(&|sym| sym.to_string())); // s1 = register name
-        for j in 2..=k {
-            frames.push(mk_state(&|sym| format!("{sym}__f{j}")));
+        let mut frames: Vec<HashMap<Nid, BV>> = Vec::new(); // frames[m-1] = state at step m (1..=depth)
+        for m in 1..=depth {
+            if m == cut {
+                frames.push(mk_state(&|sym| sym.to_string()));
+            } else {
+                frames.push(mk_state(&|sym| format!("{sym}__f{m}")));
+            }
         }
-        // Fresh inputs per step (0..k): step `t` uses `inp[t]`.
-        let inp: Vec<HashMap<Nid, BV>> = (0..=k)
+        let inp: Vec<HashMap<Nid, BV>> = (0..=depth)
             .map(|t| {
                 view.inputs
                     .iter()
@@ -277,8 +274,9 @@ pub fn synthesize_reachability_predicate(
                     .collect()
             })
             .collect();
+        // State at step m: s0 for m == 0, else frames[m-1].
+        let state = |m: usize| -> &HashMap<Nid, BV> { if m == 0 { &s0 } else { &frames[m - 1] } };
 
-        // The transition from state map `src` to `dst` using inputs `iv`.
         let trans =
             |src: &HashMap<Nid, BV>, dst: &HashMap<Nid, BV>, iv: &HashMap<Nid, BV>| -> Bool {
                 let mut subs: Vec<(&BV, &BV)> = Vec::new();
@@ -299,7 +297,6 @@ pub fn synthesize_reachability_predicate(
                 }
                 view.transition.substitute(&subs)
             };
-        // `bad` over a state map + its inputs.
         let one1 = BV::from_u64(1, 1);
         let bad_ops: Vec<Nid> = file
             .lines
@@ -340,7 +337,6 @@ pub fn synthesize_reachability_predicate(
             }
         };
 
-        // Init(s0).
         let init = {
             let subs: Vec<(&BV, &BV)> = view
                 .state_curr
@@ -370,22 +366,28 @@ pub fn synthesize_reachability_predicate(
             }
         };
 
-        // A = Init(s0) ∧ T(s0→s1).
-        let a = Bool::and(&[&init, &trans(&s0, &frames[0], &inp[0])]);
-        // reach = ⋁_{j=1}^{k} [ (⋀_{i=1}^{j-1} T(s_i→s_{i+1})) ∧ bad(s_j) ].
+        // A = Init(s0) ∧ prefix to s_cut  (steps 0→1 … (cut-1)→cut).
+        let mut a_terms = vec![init];
+        for m in 0..cut {
+            a_terms.push(trans(state(m), state(m + 1), &inp[m]));
+        }
+        let a = Bool::and(&a_terms.iter().collect::<Vec<_>>());
+
+        // reach = bad reachable from s_cut within the suffix:
+        //   ⋁_{j=cut}^{depth} [ (⋀_{m=cut}^{j-1} T(s_m→s_{m+1})) ∧ bad(s_j) ].
         let mut reach_disj: Vec<Bool> = Vec::new();
-        for j in 1..=k {
+        for j in cut..=depth {
             let mut path: Vec<Bool> = Vec::new();
-            for i in 1..j {
-                path.push(trans(&frames[i - 1], &frames[i], &inp[i]));
+            for m in cut..j {
+                path.push(trans(state(m), state(m + 1), &inp[m]));
             }
-            path.push(bad_over(&frames[j - 1], &inp[j - 1]));
+            path.push(bad_over(state(j), &inp[j]));
             reach_disj.push(Bool::and(&path.iter().collect::<Vec<_>>()));
         }
         let reach = Bool::or(&reach_disj.iter().collect::<Vec<_>>());
         let b = reach.not();
 
-        // Realizable (bad reachable within k from Init) ⇒ no interpolant.
+        // Realizable (bad reachable from Init's prefix through the suffix) ⇒ no interpolant.
         {
             let solver = z3::Solver::new();
             let mut params = z3::Params::new();
@@ -402,7 +404,6 @@ pub fn synthesize_reachability_predicate(
             }
         }
 
-        // Interpolate A vs B; I over `s1` (register names) → PredicateExpr.
         let (a_decls, a_body) = match serialize_term(&a) {
             Some(x) => x,
             None => return RefineOutcome::Unavailable("serialize A".into()),
@@ -443,6 +444,40 @@ pub fn synthesize_reachability_predicate(
             )),
         }
     })
+}
+
+/// P2.3 — a single reachability predicate: the interpolant at cut 1 of a
+/// depth-`suffix_depth` unrolling. See [`interpolant_at_cut`].
+pub fn synthesize_reachability_predicate(
+    file: &Btor2File,
+    suffix_depth: usize,
+    timeout_ms: u32,
+) -> RefineOutcome {
+    interpolant_at_cut(file, 1, suffix_depth, timeout_ms)
+}
+
+/// P2.3b — the SEQUENCE of predicates from interpolating the depth-`depth` BMC
+/// unrolling at every cut `1..=depth` (the targeted per-trace refinement IC3ia
+/// needs). Returns the parseable, deduplicated interpolant predicates — a SET that
+/// collectively rules out the spurious depth-`depth` counterexample, rather than
+/// the single (often redundant) predicate a one-cut interpolation gives. Empty when
+/// `bad` is reachable within `depth` (a real CEX — the caller confirms elsewhere) or
+/// every interpolant is outside the `#318` grammar.
+pub fn sequence_interpolant_predicates(
+    file: &Btor2File,
+    depth: usize,
+    timeout_ms: u32,
+) -> Vec<PredicateExpr> {
+    let depth = depth.clamp(1, 24);
+    let mut out: Vec<PredicateExpr> = Vec::new();
+    for cut in 1..=depth {
+        if let RefineOutcome::Predicate(p) = interpolant_at_cut(file, cut, depth, timeout_ms)
+            && !out.contains(&p)
+        {
+            out.push(p);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
