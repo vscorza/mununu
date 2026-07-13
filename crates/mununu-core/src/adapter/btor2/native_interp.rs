@@ -205,7 +205,7 @@ fn init_bool(view: &Btor2SmtView, props: &Props, iface: &Interface) -> Bool {
 /// via [`z3::Solver::to_smt2`]. Because the interface vars were built with
 /// [`BV::new_const`], the rendered names are the controlled `mc_*` names — stable
 /// across `A` and `B`, so their shared vocabulary lines up in the cvc5 query.
-fn serialize_term(b: &Bool) -> Option<(Vec<String>, String)> {
+pub(crate) fn serialize_term(b: &Bool) -> Option<(Vec<String>, String)> {
     let solver = z3::Solver::new();
     solver.assert(b);
     let smt2 = solver.to_smt2();
@@ -709,7 +709,7 @@ fn interpolate_bool(a: &Bool, b: &Bool, shared: &BTreeMap<Nid, BV>, timeout_ms: 
 }
 
 /// Run cvc5 on an interpolation query, returning raw stdout.
-fn run_cvc5_raw(query: &str, timeout_ms: u32) -> Result<String, String> {
+pub(crate) fn run_cvc5_raw(query: &str, timeout_ms: u32) -> Result<String, String> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -765,7 +765,7 @@ fn run_cvc5_raw(query: &str, timeout_ms: u32) -> Result<String, String> {
 /// Extract the interpolant term from cvc5's `(define-fun I () Bool <body>)` reply
 /// (cvc5 ≥ 1.x). Falls back to a bare top-level s-expression if `define-fun` is
 /// absent.
-fn extract_interpolant_body(stdout: &str) -> Option<String> {
+pub(crate) fn extract_interpolant_body(stdout: &str) -> Option<String> {
     if let Some(p) = stdout.find("(define-fun I () Bool") {
         let after = &stdout[p + "(define-fun I () Bool".len()..];
         return balanced_prefix(after.trim_start()).map(|s| s.to_string());
