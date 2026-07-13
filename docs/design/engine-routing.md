@@ -14,9 +14,9 @@ branching (νμ) properties can only go through the 3-valued engines.
 |---|---|---|---|
 | **exact-symbolic** (BDD bit-blast) | full modal-μ incl. νμ, at the *initial state* | definite (exact, no abstraction) | ~40-bit cone (enumeration) |
 | **cube CEGAR** (+ `smt-hyper-must`) | full modal-μ incl. νμ, over a **predicate abstraction** | Bruns–Godefroid 3-valued (definite verdicts transfer; ⊥ ⇒ refine) | predicate-count bound; needs the right predicates |
-| **reach portfolio** (exact ⊕ native BMC/k-induction ⊕ SPACER ⊕ btormc ⊕ Pono) | **`bad`-reachability only** (safety) | each member sound; first-definite wins; disagreement ⇒ contradiction alarm | word-level, **no bit cap** (native/SPACER/btormc/Pono) |
+| **reach portfolio** (exact ⊕ native BMC/k-induction ⊕ SPACER ⊕ btormc ⊕ Pono ⊕ *last-resort* interpolation) | **`bad`-reachability only** (safety) | each member sound; first-definite wins; disagreement ⇒ contradiction alarm | word-level, **no bit cap** (native/SPACER/btormc/Pono/interp) |
 
-> Source of truth: [`exact_symbolic_verdict`](../../crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs#L2095) · [`cegar_refine_loop`](../../crates/mununu-core/src/adapter/btor2/cegar.rs) · [`decide_reach_portfolio_parallel`](../../crates/mununu-core/src/adapter/reach_portfolio.rs#L202) — surface: (CLI+API+UI)
+> Source of truth: [`exact_symbolic_verdict`](../../crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs#L2095) · [`cegar_refine_loop`](../../crates/mununu-core/src/adapter/btor2/cegar.rs) · [`decide_reach_portfolio_parallel`](../../crates/mununu-core/src/adapter/reach_portfolio.rs#L260) — surface: (CLI+API+UI)
 
 ## Per-surface routing
 

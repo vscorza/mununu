@@ -16,6 +16,14 @@
 //! - **btormc** (BMC + k-induction) on deep counterexamples;
 //! - **Pono** (IC3/PDR) on IC3-provable / violated instances.
 //!
+//! Plus a **last-resort** sixth member — the in-house **interpolation** engine
+//! ([`native_interp`], owned McMillan-style forward reachability with an
+//! interpolation k-schedule) — invoked ONLY when all five above abstain. It
+//! synthesises inductive invariants that neither k-induction nor even z3-SPACER
+//! reach at their budgets (measured *unique* HWMCC coverage), while costing
+//! nothing on the common path where a faster engine already decides. It needs cvc5
+//! (a subprocess) and abstains when absent.
+//!
 //! Running them together decides strictly more than any one, and — crucially —
 //! every engine's verdict is **sound**, so:
 //!
@@ -37,6 +45,7 @@
 use crate::adapter::btor2::ast::Btor2File;
 use crate::adapter::btor2::emit::emit_btor2;
 use crate::adapter::btor2::native_bmc::{self, SafetyVerdict};
+use crate::adapter::btor2::native_interp::{self, InterpSafetyVerdict};
 use crate::adapter::btor2::native_spacer;
 use crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable;
 use crate::adapter::btormc::{self, McVerdict};
@@ -128,6 +137,54 @@ fn run_spacer(file: &Btor2File) -> Option<bool> {
     }
 }
 
+/// Budget for the last-resort interpolation member. It runs ONLY when every other
+/// engine abstained, so on the common (fast-decided) design it costs nothing; when
+/// it does run, these caps bound the cvc5 interpolation work. Tuned so the measured
+/// unique HWMCC decides (`gen12`/`gen14`/`gen39`) land while the minutes-long
+/// interpolation queries (`gen43`-class) abstain at the deadline.
+const INTERP_MAX_SUFFIX: u32 = 16;
+const INTERP_MAX_ITERS: u32 = 24;
+const INTERP_QUERY_TIMEOUT_MS: u32 = 5_000;
+const INTERP_OVERALL_TIMEOUT_MS: u64 = 25_000;
+
+/// The in-house **interpolation engine** ([`native_interp`], owned McMillan-style
+/// forward reachability with an interpolation k-schedule) verdict: `Some(true)`
+/// reachable, `Some(false)` unreachable (an interpolation-synthesised inductive
+/// invariant), `None` abstained. It decides a slice of safe designs whose invariant
+/// needs *synthesised* predicates that neither k-induction nor even z3-SPACER's PDR
+/// reach at their budgets — measured *unique* HWMCC coverage (`gen12`/`gen14`/`gen39`,
+/// which the whole rest of the portfolio leaves `Unknown`). cvc5 (a subprocess) is
+/// required; when it is absent the engine abstains.
+fn run_interp(file: &Btor2File) -> Option<bool> {
+    match native_interp::verify_safety_interp(
+        file,
+        INTERP_MAX_SUFFIX,
+        INTERP_MAX_ITERS,
+        INTERP_QUERY_TIMEOUT_MS,
+        INTERP_OVERALL_TIMEOUT_MS,
+    ) {
+        InterpSafetyVerdict::Unsafe { .. } => Some(true),
+        InterpSafetyVerdict::Safe { .. } => Some(false),
+        InterpSafetyVerdict::Undecided { .. } => None,
+    }
+}
+
+/// Escalate to the interpolation member ONLY when the base outcome is `Unknown`
+/// (every faster engine abstained). This keeps the interpolation cost off the
+/// common path while still adding its unique decides. Because it runs only when
+/// no definite verdict exists, it can never raise a [`ReachVerdict::Contradiction`]
+/// — it is purely additive (and sound, per [`native_interp::verify_safety_interp`]).
+fn escalate_to_interp(file: &Btor2File, base: ReachOutcome) -> ReachOutcome {
+    if base.verdict != ReachVerdict::Unknown {
+        return base;
+    }
+    match run_interp(file) {
+        Some(true) => ReachOutcome::from_sets(vec!["interp"], vec![]),
+        Some(false) => ReachOutcome::from_sets(vec![], vec!["interp"]),
+        None => base,
+    }
+}
+
 /// Merge the members' verdicts into a [`ReachOutcome`], in the fixed engine order
 /// (`exact`, `native`, `spacer`, `btormc`, `pono`) so the outcome is deterministic
 /// regardless of which driver (sequential / parallel) produced them.
@@ -187,7 +244,8 @@ pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
         btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
     // Pono — IC3/PDR (proof + shallow CEX).
     let pono_v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
-    collect(exact, native, spacer, btormc_v, pono_v)
+    // Last-resort owned interpolation member — only if the five above all abstained.
+    escalate_to_interp(file, collect(exact, native, spacer, btormc_v, pono_v))
 }
 
 /// The **parallel** driver: run the exact engine (in-process) and the two
@@ -221,7 +279,8 @@ pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
         let spacer = spacer_h.join().unwrap_or(None);
         let btormc_v = btormc_h.join().unwrap_or(None);
         let pono_v = pono_h.join().unwrap_or(None);
-        collect(exact, native, spacer, btormc_v, pono_v)
+        // Last-resort owned interpolation member — only if the five above all abstained.
+        escalate_to_interp(file, collect(exact, native, spacer, btormc_v, pono_v))
     })
 }
 
@@ -251,6 +310,24 @@ mod tests {
         assert_eq!(c.verdict, ReachVerdict::Contradiction);
         assert_eq!(c.reachable_by, vec!["btormc"]);
         assert_eq!(c.unreachable_by, vec!["exact"]);
+    }
+
+    #[test]
+    fn interp_escalation_only_fires_on_unknown() {
+        // A definite base outcome must pass through untouched — the interpolation
+        // member never runs (so no cvc5 dependency and no latency on the common
+        // path, and it can never override a definite verdict).
+        const SAFE_1IND: &str = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n\
+                                 5 next 1 3 2\n6 bad 3\n";
+        let file = parser::parse(SAFE_1IND).expect("parse");
+        // Native k-induction alone proves this safe, so the base is Unreachable and
+        // escalate_to_interp is a no-op regardless of cvc5's presence.
+        let base = ReachOutcome::from_sets(vec![], vec!["native"]);
+        let out = escalate_to_interp(&file, base.clone());
+        assert_eq!(out, base, "definite base must pass through unchanged");
+        // A definite Reachable base likewise passes through.
+        let r = ReachOutcome::from_sets(vec!["exact"], vec![]);
+        assert_eq!(escalate_to_interp(&file, r.clone()), r);
     }
 
     #[test]

@@ -29,11 +29,14 @@ signal/value of interest (`"state_q == 3"`).
 
 ### `btor2 verify` — safety / reachability
 
-> Source of truth: [`decide_reach_portfolio_parallel`](../crates/mununu-core/src/adapter/reach_portfolio.rs#L202) — surface: (CLI+API+UI)
+> Source of truth: [`decide_reach_portfolio_parallel`](../crates/mununu-core/src/adapter/reach_portfolio.rs#L260) — surface: (CLI+API+UI)
 
 Decides `bad`-reachability with the multi-engine safety portfolio — the exact BDD
 engine, the in-house native BMC + k-induction and SPACER (IC3/PDR) engines (all
-in-process), plus the `btormc` and `Pono` subprocess members when present — merged
+in-process), plus the `btormc` and `Pono` subprocess members when present, and a
+**last-resort** in-house interpolation engine (owned McMillan forward reachability;
+[`native_interp`](../crates/mununu-core/src/adapter/btor2/native_interp.rs)) invoked
+only when every other member abstains — merged
 under a **differential-oracle** discipline: the first definite verdict wins, and two
 sound engines disagreeing raises a `contradiction` soundness alarm rather than a
 guess. `verdict` is the property reading (`bad` unreachable = `holds`, reachable =
