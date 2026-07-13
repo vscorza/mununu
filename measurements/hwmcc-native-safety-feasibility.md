@@ -265,25 +265,30 @@ alternating fixpoints (`AG EF good` recoverability, νμ) over an **abstracted**
 where the may/must distinction is load-bearing. On plain `AG ¬bad` bit-level safety it
 has three problems, each real:
 
-1. **It abstracts what the benchmark says not to.** HWMCC safety is bit-precise; the
-   cube's value is *dropping* datapath precision to decide a branching property. On a
-   bit-level obligation that abstraction can only lose the precision the property needs
-   — you are back to needing predicates that exactly separate `bad`, i.e. an exact
-   analysis, i.e. §1. *(These are representational arguments: the cube's predicate
-   vocabulary is `register==const` / register-relational cubes; the claim is that no such
-   finite cube separates the bad region.)*
+1. **Predicate abstraction here *inherits* §1/§5 — it does not escape them.** A predicate
+   abstraction is **not** limited to `register==const` cubes: you *can* carry an arbitrary
+   datapath predicate (e.g. `a*b == K`) and let interpolation-based CEGAR refine it — which
+   is exactly what mununu's emergent-K loop (`discover_relational_predicates`) is meant to
+   do. The problem on a bit-precise datapath obligation is not that a separating predicate
+   *cannot exist*; it is that finding and using it **relocates the hard part** into the
+   predicate's discovery and the abstraction's edge queries, landing back on §1 (scale) or
+   §5 (nonlinear SMT):
    - **`mul9`** — `bad` is a condition on the exact 64-bit product `a*b` (2 multiplier
-     nodes). Multiplication is not a finite union of register-equality cubes, so a
-     predicate abstraction over `register==const` literals cannot separate the bad set
-     without one cube per operand pair (i.e. no abstraction at all). Dropping the product
-     bits is exactly discarding what `bad` reads.
-   - **`gen43`** — `bad` rides a `bvurem` (modular) relation over a **256-bit** datapath.
-     Expressing "the reachable set excludes the modular-bad states" needs the exact
-     256-bit residue; a finite register-equality cube cannot represent a modular class,
-     so the abstraction is either unsound or collapses to the concrete state.
-   - **`arbitrated_top_*`** — the property distinguishes per-channel arbitration counts
-     across a 313–8378-bit state; a coarse predicate cube merges the counter states the
-     safety obligation counts on, and a fine enough cube is §1's exact analysis again.
+     nodes). A predicate over the product *could* separate `bad` in principle, but (i)
+     mununu's predicate grammar (`PredicateExpr`: register vs const / register /
+     register+const comparisons + boolean combinations — verified: **no multiplication
+     atom**) cannot state it, so the emergent-K interpolant→predicate parser returns `None`
+     on a `bvmul` interpolant and falls back; and (ii) even with the atom, *discovering* it
+     is interpolation over `bvmul` — the §5 SyGuS explosion (a measured 105 s for the
+     simpler `bvurem`) — and *using* it makes every may/must abstract edge a multiplier-SAT
+     query. The cube inherits §5's nonlinear wall rather than abstracting past it. (The
+     grammar gap is fixable; the interpolation/edge-SMT hardness is §5 and is not.)
+   - **`gen43`** — the same shape with a `bvurem` (modular) relation over a **256-bit**
+     datapath: the separating predicate is a modular-arithmetic fact the grammar cannot
+     state and cvc5 cannot interpolate within budget. Inherits §5.
+   - **`arbitrated_top_*`** — no nonlinearity, but a safety proof over a 313–8378-bit
+     arbitration state needs *many* predicates to separate `bad`; the predicate count that
+     actually decides it is §1's exact-analysis blow-up under another name. Inherits §1.
 
 2. **Emergent-K discovers the wrong kind of fact for these designs (measured).** The
    emergent-K interpolation loop (`discover_relational_predicates`) *does* find genuinely
