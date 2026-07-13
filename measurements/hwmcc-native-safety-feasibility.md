@@ -265,42 +265,57 @@ alternating fixpoints (`AG EF good` recoverability, νμ) over an **abstracted**
 where the may/must distinction is load-bearing. On plain `AG ¬bad` bit-level safety it
 has three problems, each real:
 
-1. **It abstracts what the benchmark says not to.** HWMCC safety is bit-precise; the
-   cube's value is *dropping* datapath precision to decide a branching property. On a
-   bit-level obligation that abstraction can only lose the precision the property needs
-   — you are back to needing predicates that exactly separate `bad`, i.e. an exact
-   analysis, i.e. §1. *(These are representational arguments: the cube's predicate
-   vocabulary is `register==const` / register-relational cubes; the claim is that no such
-   finite cube separates the bad region.)*
+1. **Predicate abstraction here *inherits* §1/§5 — it does not escape them.** A predicate
+   abstraction is **not** limited to `register==const` cubes: you *can* carry an arbitrary
+   datapath predicate (e.g. `a*b == K`) and let interpolation-based CEGAR refine it — which
+   is exactly what mununu's emergent-K loop (`discover_relational_predicates`) is meant to
+   do. The problem on a bit-precise datapath obligation is not that a separating predicate
+   *cannot exist*; it is that finding and using it **relocates the hard part** into the
+   predicate's discovery and the abstraction's edge queries, landing back on §1 (scale) or
+   §5 (nonlinear SMT):
    - **`mul9`** — `bad` is a condition on the exact 64-bit product `a*b` (2 multiplier
-     nodes). Multiplication is not a finite union of register-equality cubes, so a
-     predicate abstraction over `register==const` literals cannot separate the bad set
-     without one cube per operand pair (i.e. no abstraction at all). Dropping the product
-     bits is exactly discarding what `bad` reads.
-   - **`gen43`** — `bad` rides a `bvurem` (modular) relation over a **256-bit** datapath.
-     Expressing "the reachable set excludes the modular-bad states" needs the exact
-     256-bit residue; a finite register-equality cube cannot represent a modular class,
-     so the abstraction is either unsound or collapses to the concrete state.
-   - **`arbitrated_top_*`** — the property distinguishes per-channel arbitration counts
-     across a 313–8378-bit state; a coarse predicate cube merges the counter states the
-     safety obligation counts on, and a fine enough cube is §1's exact analysis again.
+     nodes). A predicate over the product *could* separate `bad` in principle, but (i)
+     mununu's predicate grammar (`PredicateExpr`: register vs const / register /
+     register+const comparisons + boolean combinations — verified: **no multiplication
+     atom**) cannot state it, so the emergent-K interpolant→predicate parser returns `None`
+     on a `bvmul` interpolant and falls back; and (ii) even with the atom, *discovering* it
+     is interpolation over `bvmul` — the §5 SyGuS explosion (a measured 105 s for the
+     simpler `bvurem`) — and *using* it makes every may/must abstract edge a multiplier-SAT
+     query. The cube inherits §5's nonlinear wall rather than abstracting past it. (The
+     grammar gap is fixable; the interpolation/edge-SMT hardness is §5 and is not.)
+   - **`gen43`** — the same shape with a `bvurem` (modular) relation over a **256-bit**
+     datapath: the separating predicate is a modular-arithmetic fact the grammar cannot
+     state and cvc5 cannot interpolate within budget. Inherits §5.
+   - **`arbitrated_top_*`** — no nonlinearity, but a safety proof over a 313–8378-bit
+     arbitration state needs *many* predicates to separate `bad`; the predicate count that
+     actually decides it is §1's exact-analysis blow-up under another name. Inherits §1.
 
-2. **Emergent-K discovers the wrong kind of fact for these designs (measured).** The
-   emergent-K interpolation loop (`discover_relational_predicates`) *does* find genuinely
-   unique invariant forms — register-to-constant bounds and orderings the mature
-   pair-difference / eq-atom machinery structurally cannot express. **But on the real
-   HWMCC corpus, every design where those forms appeared is `SAT`/UNSAFE at depth**, so
-   the discovered "bound" is a *spurious shallow-forward over-approximation* of a property
-   that is actually violated deeper:
+2. **Emergent-K finds a *relevant* predicate that is not an *invariant* here — the design
+   is unsafe (measured).** The emergent-K interpolation loop
+   (`discover_relational_predicates`) *does* find genuinely unique, *relevant* forms —
+   register-to-constant bounds and orderings the mature pair-difference / eq-atom machinery
+   structurally cannot express. These are **good** predicates (`count < 16` is *exactly*
+   `¬bad` for a "buffer overflows at 16" design). **But on the real HWMCC corpus, every
+   design where those forms appeared is `SAT`/UNSAFE at depth**, so the predicate is not an
+   *invariant* — the design genuinely violates it:
    - **`vis_arrays_buf_bug`** — discovered `count < 16`, but the design has a concrete
-     counterexample at **depth 18–28**; `count` genuinely exceeds 16 on the real trace.
+     counterexample at **depth 18–28**; `count` genuinely reaches 16 on the real trace.
    - **`krebs.3`** — discovered `v_energy < 8`, but the counterexample is at **depth 75**.
    - **`brp2.2`** — discovered the ordering `dve_invalid ≥ a_done`, but the counterexample
      is at **depth 119**.
 
-   In each, seeding the false bound cannot add a sound `safe` decide; the verdict-verified
-   driver correctly *rejects* the non-inductive seed (sound abstain), so no harm — but no
-   lift either. The correct lever for all three is **deeper BMC** (§2), not a predicate.
+   So seeding the predicate as `safe` is wrong, and the verdict-verified driver correctly
+   *rejects* the non-inductive seed (sound abstain) — no false `safe`. **This is not a
+   theoretical dead end, and not a bad-predicate problem — it is an implementation gap.**
+   The failed inductiveness check (`p ∧ T ⊭ p'`) is itself the signal that `bad` is
+   reachable, and the predicate says *where* (`count → 16`). So the discovered fact could
+   **direct a counterexample search** — a targeted deeper BMC toward the escaping region,
+   or an IC3-style backward obligation chain — and turn the abstain into a definite
+   `violated` with a trace. Today the loop only tries the predicate as a *safe* seed; the
+   CEX-direction wiring is a concrete task (§8.1, T3). The simplest lever remains **deeper
+   BMC** (§2) — for these moderate depths (18–119) it finds the counterexample with or
+   without the hint; the predicate's unique value is on *very* deep counterexamples, where
+   it enables acceleration rather than blind unrolling.
 
 3. **The residual is BMC-depth, not missing-invariant.** The portfolio's remaining HWMCC
    abstentions are dominated by deep-CEX-unsafe cases and the §1/§3/§5 walls — where the
@@ -316,6 +331,51 @@ has three problems, each real:
 
    So predicate discovery is a sound, tested **hint generator** for the paper's emergent-K
    direction, not a bit-level-safety decider.
+
+### 6.1 Does adding predicate-generation capability make these feasible?
+
+The natural follow-up: if the *only* stated obstacle for `mul9` is a missing grammar
+atom, does *adding* multiplication / modular predicate generation make it — and the other
+cases — decidable? **No, not in general.** Adding a predicate atom expands what invariants
+are *representable*; it does not reduce the *complexity* of finding or checking one. The
+complexity relocates, it does not vanish. Everything in this suite is *decidable* (finite
+state); the walls are complexity, and predicate abstraction wins **exactly when a compact,
+discoverable inductive certificate exists in the chosen vocabulary.** Whether adding
+capability helps therefore depends on *why* the case is hard:
+
+- **Violated cases (§2, e.g. `circular_pointer_d128`) — predicates are irrelevant.** There
+  is no inductive invariant to find; the task is to exhibit a counterexample. No
+  predicate-generation helps at all; the only lever is deeper/faster BMC (§2's
+  incremental-BMC increment). This is the majority of the hard residual, and it is the
+  clearest "adding predicates does nothing" case.
+
+- **Nonlinear-safe cases (§5, `mul9`/`gen43`) — representable, still §5-hard.** Adding a
+  `bvmul`/`bvurem` atom lets the cube *state* a datapath predicate, and **if** the design
+  has a *coarse* safety proof (one not needing the exact product — a range, sign, or
+  parity fact) it becomes feasible. That coarse-proof class is exactly predicate
+  abstraction's real edge and the emergent-K "unique form" wins. **But if the proof
+  genuinely needs the exact multiplier**, both *discovering* the predicate (interpolation
+  over `bvmul`) and *validating* the abstraction (per-edge multiplier-SAT) inherit §5's
+  hardness — the same wall that leaves `mul9` `unknown` for btormc/Pono/SPACER too (§7). So
+  it is feasible **iff a coarse discoverable proof exists**, not by grammar alone; the
+  grammar atom is the cheap, fixable half.
+
+- **Wide-scale cases (§1/§3, `arbitrated_top`) — representation is already fine.**
+  Register-comparison predicates *can* express arbitration / counter invariants; the wall
+  is *discovering* a compact inductive certificate at scale, which is the §3 SPACER-class
+  problem — and even external Pono/SPACER do not crack the *deep* instances at budget (§7).
+  Adding predicate generation here is not a grammar fix; it is building the IC3/PDR that
+  mununu already links in-process.
+
+**The unifying principle.** Predicate abstraction *discretizes* the state space by
+predicate valuations and decides a design precisely when a *compact, discoverable*
+inductive certificate lives in its vocabulary. Expanding the vocabulary helps only that
+class. It does nothing for violated designs (no certificate to represent), and it does not
+lower the complexity of *finding* or *checking* a certificate when the property genuinely
+depends on the exact datapath — there it merely lets the cube fail the same way the
+external engines already do. So "add predicate generation and discretize" makes more cases
+*expressible*; it makes feasible only the ones with a compact certificate a bounded search
+can reach — which is the §3 class in-process SPACER already serves.
 
 **Feasibility verdict for KMTS-on-HWMCC-safety: not the right tool — and that is fine.**
 The cube's real, defensible domain is **branching-time recoverability on abstracted
@@ -414,6 +474,41 @@ nonlinear-safe frontier — provably or empirically open for native and external
 6. **Keep the KMTS cube pointed at its real target.** Its differentiation is
    branching-time recoverability external bv tools cannot state — not bit-level HWMCC
    safety. Measuring or marketing it on HWMCC safety is the wrong axis.
+
+### 8.1 Concrete engineering tasks
+
+Two classes of increment fall out of §6. The first expands *representability* (helps the
+coarse-invariant class only, §6.1); the second turns *abstentions into definite verdicts*
+on the unsafe-at-depth class (§6.2). Each is scoped, and each carries an honest caveat.
+
+**Grammar / discovery — missing predicate atoms** *(helps §5 coarse-invariant proofs;
+measured caveat: does **not** lift the exact-datapath cases — the interpolation/edge-SMT
+hardness is §5 and is unchanged, so gate behind a flag and measure, do not assume a lift):*
+
+- **T1 — multiplication predicate atom.** Extend `PredicateExpr` (today: `Cmp` / `CmpReg`
+  / `CmpRegAddend` + boolean — no product) with a `bvmul`-based comparison atom, and teach
+  the interpolant→predicate parser to accept a `bvmul`-shaped interpolant (today it returns
+  `None` → falls back). Unlocks the cube for `mul9`-class designs **iff** they have a coarse
+  product-predicate proof.
+- **T2 — modular / remainder predicate atom.** The same for `bvurem` / `bvudiv`
+  (`gen43`-class 256-bit modular relations).
+- **T1/T2 acceptance test.** A design with a *known* coarse product/modular invariant
+  decides `holds` with the atom on and `unknown` with it off (the isolation pattern the
+  existing `safety_cube_decides_constant_bound_via_interpolation_discovery` test uses), and
+  a free/unsafe counterpart never decides a false `safe` (soundness half).
+
+**Predicate-directed counterexample search — turn §6.2 abstentions into `violated`:**
+
+- **T3 — non-inductive discovery ⇒ CEX direction.** When a discovered candidate invariant
+  fails its inductiveness check (`p ∧ T ⊭ p'`), treat the failure as a reachability signal
+  rather than only a rejected safe-seed: run a *targeted* deeper BMC toward the escaping
+  region (`p → ¬p`), or chain the counterexample-to-induction backward (IC3-style), and on
+  success return `violated` with the trace instead of abstaining. Validates on
+  `vis_arrays_buf_bug` (@18–28), `krebs.3` (@75), `brp2.2` (@119). This is the natural
+  companion to the incremental-BMC increment (item 2): the predicate supplies the
+  *direction*, incremental BMC supplies the *reach*; the predicate's unique value is on
+  *very* deep counterexamples where blind unrolling can't get there but the escaping
+  transition can be accelerated.
 
 **Bottom line — the native/external division of labor.** The measured picture (§7) is
 sharper than "external engines cover mununu's gaps." External wins **one category
