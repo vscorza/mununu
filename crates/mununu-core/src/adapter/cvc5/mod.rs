@@ -245,16 +245,19 @@ fn render_cube_conjunction(predicates: &[PredicateSpec], cube: usize) -> Option<
 /// matching the breakdown doc's sub-item 3.3 spec.
 #[derive(Debug, Clone)]
 pub struct InterpolantQueryOptions {
-    /// Wall-clock timeout for the CVC5 subprocess. Exceeding this
-    /// kills the child and returns
-    /// `Err(AdapterError { kind: UnsupportedConstruct, ... })`.
+    /// Wall-clock (and, via `--tlimit`, cvc5-internal) budget for one interpolant
+    /// query. cvc5 abandons the SyGuS search gracefully at this budget; the hard
+    /// wall-kill is a backstop. Default **10 s** — most decidable interpolants return
+    /// in well under a second, and a genuinely hard one (deep-grammar `bvurem`, ~100 s)
+    /// is out of reach at any practical budget, so a tight bound fails those *fast*
+    /// (abstain in seconds) rather than pinning a multi-query discovery loop.
     pub timeout: Duration,
 }
 
 impl Default for InterpolantQueryOptions {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(10),
         }
     }
 }
@@ -285,9 +288,20 @@ pub fn invoke_cvc5_for_interpolant(
     query: &str,
     opts: &InterpolantQueryOptions,
 ) -> Result<Option<PredicateSpec>, AdapterError> {
-    // Spawn CVC5 with the SMT-LIB query piped to stdin.
+    // Spawn CVC5 with the SMT-LIB query piped to stdin. `--tlimit` is cvc5's OWN
+    // budget (ms): without it, cvc5's SyGuS interpolant search runs unbounded and is
+    // only stopped by the hard wall-kill below — burning the full budget on a
+    // pathological deep-grammar interpolant (the `gen43`-class `bvurem` query took 105 s
+    // when unbounded). With `--tlimit` cvc5 abandons the search *gracefully* within the
+    // budget (a clean "no interpolant", not a mid-search kill), so a hard query fails
+    // fast instead of pinning the discovery loop. Matched to the wall budget.
+    let tlimit_ms = opts.timeout.as_millis().min(u128::from(u32::MAX)) as u32;
     let mut child = Command::new(&bin.path)
-        .args(["--lang=smt2", "--produce-interpolants"])
+        .args([
+            "--lang=smt2",
+            "--produce-interpolants",
+            &format!("--tlimit={tlimit_ms}"),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1275,10 +1289,11 @@ mod tests {
     }
 
     #[test]
-    fn r5_subitem_33_default_timeout_is_30_seconds() {
-        // Documented contract.
+    fn default_interpolant_timeout_is_ten_seconds() {
+        // Fail-fast budget: cvc5 `--tlimit` + wall backstop at 10 s so a pathological
+        // deep-grammar interpolant abstains in seconds rather than pinning the loop.
         let opts = InterpolantQueryOptions::default();
-        assert_eq!(opts.timeout, Duration::from_secs(30));
+        assert_eq!(opts.timeout, Duration::from_secs(10));
     }
 
     #[test]
