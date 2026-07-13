@@ -1,0 +1,323 @@
+# Can mununu's native engines decide HWMCC safety? — real cases, feasibility proofs, and a path
+
+> Companion to [`hwmcc-owned-engine-gaps.md`](hwmcc-owned-engine-gaps.md). That doc
+> *categorizes* where the owned engines fail on the HWMCC'20 bv suite. This one
+> *instantiates* each category with a real design, asks whether a mununu-**native**
+> approach is feasible at all, and where it is not, says so plainly; where it is, it
+> proposes the concrete path. Grounded in the `--owned-only` measurement (2026-07-13,
+> commit `84185f1`) and the shipped engine behaviors.
+
+> Method: "native" = mununu owns the search loop — the exact 3-valued BDD engine
+> (`symbolic_bitblast::exact_bad_reachable`), native BMC + k-induction
+> (`native_bmc::decide_bad_safety`), the deep counterexample search
+> (`native_bmc::bmc_cex_until`), and native McMillan interpolation
+> (`native_interp::verify_safety_interp`). "External" = the search runs in someone
+> else's engine — Z3 SPACER (`native_spacer`, in-process), btormc, Pono. Every verdict
+> below is either **measured** with `mununu btor2 verify --owned-only` on the named
+> real design, or a **theorem** about the representation, or an **argument** — each is
+> labeled.
+
+---
+
+## 0. The one property class, and the one honest question
+
+Every HWMCC'20 bv obligation is **bit-level safety**: `AG ¬bad` — is a `bad` node
+reachable over the concrete (bit-precise) transition relation? There is no liveness,
+no branching, no abstraction in the benchmark itself. So the question "can a native
+engine decide it" is **not** about property class; it is about whether a native engine
+can, on the *concrete bit-level model*, either (a) find a counterexample or (b) prove
+an inductive safety invariant, within a budget.
+
+The honest answer, established below: **for two categories it is provably infeasible
+for a native engine to stay exact; for one it is feasible and now shipped; for two it
+is feasible only by building (or reusing) a SPACER-class engine — which mununu already
+links in-process.** The KMTS 3-valued cube — mununu's headline native technique — is
+**not** a bit-level-safety engine at all (§5), and understanding why is the key to not
+chasing the wrong lever.
+
+---
+
+## 1. The exact 3-valued engine: infeasible above ~40 bits (theorem)
+
+**Real case — `arbitrated_top_n2_w8_d16_e0`:** 45 state cells, datapath widths up to
+16 bits; the *narrowest* arbiter instance is already **313 total state bits**, and the
+family runs to **8,378** (`arbitrated_top_n2_w128_d32_e0`). The exact engine's cap is
+40 register+input bits (`MAX_BITBLAST_BITS`); it `Skip`s and abstains.
+
+**Measured:** `--owned-only` reports `unknown` with the exact engine contributing
+nothing — it never enters the merge on any arbiter.
+
+**Why this is a theorem, not a tuning knob.** BDD image computation is worst-case
+exponential in the number of BDD variables; on a few-hundred-to-few-thousand-bit
+sequential circuit the ROBDD for the reachable-state set blows up before a fixpoint.
+The 40-bit cap is a *deliberate sound abstain*, not an OOM crash. There is **no native
+fix that preserves exactness** — raising the cap trades a sound abstain for an OOM.
+The only escape is to stop being exact (abstract the datapath — which is the KMTS
+cube's job, §5, and changes the property you are deciding).
+
+**Feasibility verdict: INFEASIBLE for a native *exact* engine.** Correct dispositions:
+route wide designs to a bit-level SAT/BMC engine (native BMC for CEX, external IC3 for
+proofs), or abstract (KMTS) when the property is branching.
+
+---
+
+## 2. Deep / slow counterexamples: feasible, and shipped (measured)
+
+**Real cases — `circular_pointer_top_*`, `shift_register_top_*`:** violated designs
+with 64-/32-bit datapaths (17 and 14 state cells) whose counterexample the *default*
+portfolio missed. In `hwmcc-owned-engine-gaps.md` these are Category C — "deep
+counterexamples btormc finds, owned engines miss" — because native BMC in the full
+portfolio runs `decide_bad_safety(max_k=40, timeout=5s)`, and one unrolling step of a
+wide design does not fit in the 5-second per-query budget.
+
+**Why native CEX-finding is feasible where native proof is not.** Finding a
+counterexample is a *satisfiability* question over a bounded unrolling — no inductive
+invariant to synthesize. It scales with SAT/SMT throughput and unrolling depth, both of
+which are engineering, not representation, limits.
+
+**Shipped fix — `native_bmc::bmc_cex_until` + `decide_reach_owned_only`.** A dedicated
+wall-bounded, cancellable, **CEX-only** unrolling (no k-induction step queries to slow
+or abort it) to depth 128, run as a separate "counterstrategy" thread alongside the
+safety-proof engines (first-definite wins). Given a fair budget it decides the Category-C
+designs:
+
+| Design | verdict | decider | time (@240s owned-only) |
+|---|---|---|---|
+| `circular_pointer_top_w64_d8_e0` | violated | native + cex | 10 s |
+| `circular_pointer_top_w128_d8_e0` | violated | native + cex | 13 s |
+| `shift_register_top_w16/w32/w64_d8_e0` | violated | native + cex | 17–23 s |
+
+**Precision — depth vs throughput (measured, §2.1).** These `d8` designs have a
+*shallow* counterexample; the win came from the *fair time budget* (native BMC also
+decides them once its per-query budget is 240 s instead of 5 s), with `bmc_cex_until`
+corroborating. The CEX search's distinct value — reaching a counterexample at depth
+41–128 that `max_k=40` cannot — is a separate, sound guarantee. Its **boundary** is
+established empirically next.
+
+### 2.1 The deep-CEX boundary (measured on the `d8 / d128` depth ladder)
+
+The `circular_pointer_top_w*_d*` family is parameterized by datapath width `w` and a
+counterexample-depth knob `d`. Running `--owned-only` across the ladder isolates
+*throughput* from *depth*:
+
+| Design | states × width | verdict @ budget | decided by |
+|---|---|---|---|
+| `circular_pointer_top_w64_d8_e0` | 17 × 64 b | **violated in 10 s** | native + cex |
+| `circular_pointer_top_w16_d128_e0` | 137 × 16 b | **abstain (not decided in ~60–75 s)** | — |
+| `circular_pointer_top_w64_d128_e0` | 137 × 64 b | **abstain (not decided in ~60–75 s)** | — |
+
+**Reading:** the *shallow* case (`d8`) decides fast — a **throughput** win (native BMC
+alone decides it once its per-query budget is 240 s not 5 s; `cex` corroborates). The
+*deep* cases (`d128`, 137 state cells) do **not** decide, narrow or wide. The binding
+constraint is **not** the overall budget but the CEX search's **per-query timeout**
+(`OWNED_CEX_QUERY_MS = 15 s`): a single monolithic z3 query over ~128 unrolled frames of
+a 137-cell design exceeds 15 s before the depth-128 `bad` frame is reached, so
+`bmc_cex_until` abstains — and enlarging the *overall* budget cannot lift a *per-query*
+wall. Reaching a genuinely deep counterexample on a state-heavy design is exactly what
+**incremental SAT** (btormc/Boolector — assert one frame at a time, keep the learned
+clauses) is built for, and what a from-scratch monolithic-unroll native BMC is not.
+
+**Feasibility verdict: FEASIBLE and SHIPPED for the CEX direction up to the width×depth
+product that fits one per-query SMT solve; beyond that (deep CEX on a state-heavy
+design) even the owned CEX search soundly abstains.** Closing that last gap natively
+would mean an **incremental** native BMC (persistent solver, frame-at-a-time assertion,
+clause reuse) — a feasible, well-scoped engineering increment (§8) that would extend
+the owned CEX reach toward btormc's, without any external tool.
+
+---
+
+## 3. Auxiliary-invariant safety proofs: feasible only as a SPACER-class engine
+
+**Real cases — the `cal*` family (`cal159`, `cal161`, `cal162`, `cal21`, `cal35`, …,
+200+ instances):** *safe* designs whose property is **not k-inductive for small k** —
+they need an auxiliary strengthening invariant. Pono proves them; in the full portfolio
+they show `unreach=[pono]`, and at the 60 s per-engine budget even Pono times out on the
+harder ones.
+
+**What each native engine can do here:**
+
+- **native k-induction** (`decide_bad_safety` step queries): decides only when the
+  property is genuinely k-inductive at a reachable `k`. It does **not** synthesize the
+  missing invariant. On the `cal*` family it abstains — correctly, soundly, uselessly.
+- **native McMillan interpolation** (`native_interp`): *does* synthesize an inductive
+  invariant, from Craig interpolants. **Measured win — `vis_arrays_am2910_p2`
+  → safe via interpolation in 94 s** (`--owned-only @240s`), a design the exact engine
+  can't touch (over cap) and k-induction can't prove. This is the one native engine
+  that *closes* invariant-needing safe proofs. But its ceiling is **cvc5's interpolant
+  search speed**: on `gen43` (a 256-bit design) the required interpolant
+  `(or (= s32 s17) (= s19 (bvurem s19 s26)))` took cvc5's SyGuS enumeration **105 s** to
+  reach — past any per-query budget — so `gen43` abstains not because no invariant
+  exists but because *finding* it is too slow.
+
+**Why "feasible" here means "SPACER".** Matching Pono/SPACER on the `cal*` class means
+strong inductive-invariant synthesis over bit-level transition systems — i.e.
+re-implementing IC3/PDR or a fast interpolating model checker. mununu's own IC3ia
+foundation (`abs_safety::verify_safety_ic3`, frames + MIC + refinement) exists but,
+**measured, abstains on real designs** — e.g. `paper_v3 → unknown` with `detail =
+"IC3 refinement stalled (grammar ceiling)"` — because the completeness lever it needs
+(targeted per-trace sequence interpolation) is the same interpolant-search problem, at
+the same cvc5 ceiling. And z3-SPACER — a mature IC3/PDR — is **already linked
+in-process** (`native_spacer`), so the "native" version competes with something mununu
+already ships.
+
+**Feasibility verdict: FEASIBLE but the feasible thing is a SPACER-class engine.** Two
+honest sub-paths: (i) *lean on in-process z3-SPACER* for the proof direction on
+HWMCC — it is already there, in-process, no subprocess; (ii) *raise native
+interpolation's ceiling* by replacing cvc5's SyGuS search with a faster
+(word-level, IC3ia-integrated) interpolant procedure — a real research lever (this is
+the paper track), not a quick win, and it only helps the interpolation-tractable subset.
+Building a from-scratch native IC3/PDR to beat Pono on `cal*` is **not** recommended:
+large, uncertain, and duplicative of the in-process SPACER.
+
+---
+
+## 4. Arrays / memories: feasible with array-aware work (not yet built)
+
+**Real case — `vcegar_arrays_itc99_b12_p2`:** pure bit-vector after flattening (0 array
+ops survive), but memory-backed designs in the class (`vis_arrays_*`) put each memory
+word in the state → wide (Category 1) *and* array-semantic. This is also where the one
+**soundness-bug candidate** lives: native SPACER's btor2→CHC encoding returned a
+spurious `violated` where ground truth is safe. That symptom is now **guarded**
+(a sole-decider SPACER `reachable` is dropped to `unknown`, `reach_portfolio::collect`),
+but the root-cause encoding is unfixed.
+
+**Feasibility verdict: FEASIBLE with array abstraction / an array-aware native BMC.**
+External tools carry mature array theory; mununu's native array handling is the weakest
+link. A scoped native increment (array-aware unrolling, or a sound array→UF abstraction
+with CEGAR) is feasible but unbuilt. Priority is low unless an array-heavy corpus
+matters — the guard already prevents the unsound outcome.
+
+---
+
+## 5. Nonlinear datapath arithmetic: infeasible for native (theorem + measured)
+
+**Real case — `mul9`:** 29 state cells, 64-bit datapath, **2 multiplier nodes**;
+`--owned-only @240s → unknown`. Also `mul7` (`unknown` in 0 s — instant abstain).
+
+**Why this is the hardest wall, on *both* native proof routes:**
+
+- **Exact BDD:** BDDs for integer multiplication are provably exponential in the operand
+  width (Bryant, 1991) — the exact engine cannot even *build* the multiplier relation,
+  independent of the 40-bit cap.
+- **McMillan interpolation:** an interpolant separating the reachable set from `bad` on a
+  multiplier/modulo design must speak `bvmul`/`bvurem`; cvc5's interpolant search
+  explodes in grammar depth on nonlinear operators — **measured 105 s** for the
+  `bvurem`-shaped `gen43` interpolant, and worse for genuine multipliers.
+- **native BMC (CEX):** for a *violated* nonlinear design the deep CEX search can still
+  find a witness (SAT over a bounded unrolling with a concrete multiplier is decidable);
+  but for a *safe* nonlinear design there is no CEX, and both proof routes above wall.
+
+**Feasibility verdict: INFEASIBLE for a native engine on the *proof* side.** BDD is a
+theorem; interpolation is measured-hard. The correct disposition is (a) native BMC for
+the violated cases, (b) accept `unknown` (or route to a bit-level SAT prover) for the
+safe nonlinear cases. A multiplier-aware native technique (e.g. algebraic /
+Gröbner-basis reasoning as in modern arithmetic verifiers) is a different tool than
+anything in mununu today and out of scope for the safety portfolio.
+
+---
+
+## 6. Why the KMTS 3-valued refinement does **not** rescue HWMCC safety
+
+This is the crux the question asks about, and the answer is specific and measured.
+
+The KMTS 3-valued predicate cube (`recoverability::verify_safety_scalable` + emergent-K
+discovery) is built for a **different property class**: branching-time properties with
+alternating fixpoints (`AG EF good` recoverability, νμ) over an **abstracted** datapath,
+where the may/must distinction is load-bearing. On plain `AG ¬bad` bit-level safety it
+has three problems, each real:
+
+1. **It abstracts what the benchmark says not to.** HWMCC safety is bit-precise; the
+   cube's value is *dropping* datapath precision to decide a branching property. On a
+   bit-level obligation that abstraction can only lose the precision the property needs
+   — you are back to needing predicates that exactly separate `bad`, i.e. an exact
+   analysis, i.e. §1.
+
+2. **Emergent-K discovers the wrong kind of fact for these designs (measured).** The
+   emergent-K interpolation loop (`discover_relational_predicates`) *does* find genuinely
+   unique invariant forms — register-to-constant bounds and orderings the mature
+   pair-difference / eq-atom machinery structurally cannot express (`vis_arrays_buf_bug:
+   count<16`, `krebs.3: v_energy<8`, `brp2.2: dve_invalid≥a_done`). **But on the real
+   HWMCC corpus, the designs where those forms appear are `SAT`/UNSAFE at depth**
+   (`vis_arrays_buf_bug` CEX@18–28, `krebs.3` CEX@75, `brp2.2` CEX@119). The discovered
+   "bound" is a *spurious shallow-forward over-approximation* of a property that is
+   actually violated deeper. Seeding a false `count<16` cannot add a sound `safe` decide;
+   the correct lever for those designs is **deeper BMC** (a throughput gap, §2), not a
+   missing predicate. The verdict-verified driver correctly *rejects* the spurious seed
+   (sound abstain), so no harm — but no lift either.
+
+3. **The residual is BMC-depth, not missing-invariant.** Session-wide finding: the
+   portfolio's remaining HWMCC abstentions are dominated by deep-CEX-unsafe cases and by
+   the §1/§3/§5 walls — categories the *cube's* refinement (predicate discovery) is the
+   wrong instrument for. It is a sound, tested **hint generator** for the paper's
+   emergent-K direction, not a bit-level-safety decider.
+
+**Feasibility verdict for KMTS-on-HWMCC-safety: not the right tool — and that is fine.**
+The cube's real, defensible domain is **branching-time recoverability on abstracted
+datapaths** (`AG EF good`), which *no external bv tool can even state*, decided at
+scale via the ranking certificate and property-directed seeding. That is orthogonal to
+the HWMCC bit-level-safety question, and it is where the native differentiation actually
+lives.
+
+---
+
+## 7. The feasibility matrix
+
+| Category | Real case | Native proof feasible? | Native CEX feasible? | Basis |
+|---|---|---|---|---|
+| 1. State ≫ 40 bits | `arbitrated_top_*` (313–8378 b) | **No** (exact) | via native BMC | theorem (BDD blowup) |
+| 2. Deep/slow CEX | `circular_pointer_top_*` | n/a (violated) | **Yes — shipped** | measured |
+| 3. Aux-invariant safe | `cal*`, `gen43` | **Only as SPACER-class** | n/a (safe) | measured + argument |
+| 4. Arrays | `vcegar_arrays_*` | feasible, unbuilt | feasible, unbuilt | argument |
+| 5. Nonlinear | `mul9`, `mul7` | **No** | via native BMC (if violated) | theorem + measured |
+
+Two rows are hard **No** on the native proof side (1 exact-cap, 5 nonlinear — both
+theorems). One is a clean **Yes, shipped** (2, the deep CEX search). One is
+"feasible = re-use in-process SPACER" (3). One is feasible-but-unbuilt (4).
+
+---
+
+## 8. The proposed path for native safety — prioritized and honest
+
+1. **DONE — own the counterexample direction (Category 2, throughput half).**
+   `bmc_cex_until` + `--owned-only` ship a sound, wall-bounded deep CEX search that
+   decides the *shallow* Category-2 designs owned-standalone (`circular_pointer_d8` in
+   10 s). This is the one place a *native* engine cleanly beats the portfolio's default
+   budget, no external tool.
+
+2. **NEXT feasible native increment — incremental BMC (Category 2, deep half).** The
+   §2.1 boundary shows the monolithic-unroll CEX search abstains on deep (`d128`)
+   counterexamples because one 128-frame query exceeds the per-query budget. Replacing
+   the rebuild-per-depth unrolling with a **persistent solver that asserts one frame at a
+   time and reuses learned clauses** (incremental SAT/SMT, the technique btormc uses)
+   is a well-scoped, feasible engineering increment that would push the owned CEX reach
+   toward btormc's — entirely within the native BMC engine, no external dependency. This
+   is the highest-ROI native safety work remaining.
+
+3. **Lean on in-process z3-SPACER for the proof direction (Category 3) — do not
+   re-implement it.** SPACER is already linked in-process (`native_spacer`); for HWMCC
+   safe-invariant proofs it is the pragmatic answer, no subprocess. Building a
+   from-scratch native IC3/PDR to beat Pono here is large, uncertain, and duplicative.
+
+4. **Raise native interpolation's ceiling as the *research* lever (Category 3, subset).**
+   `native_interp` is the only owned engine that closes invariant-needing proofs
+   (`vis_arrays` @94 s); its wall is cvc5's SyGuS interpolant search time. A faster,
+   word-level, IC3ia-integrated interpolant procedure is the paper track
+   (`cube-ic3ia-invariant-discovery.md`) — real, but slow, and only helps the
+   interpolation-tractable subset. Not a HWMCC-numbers play.
+
+5. **Accept `unknown` (or route external) for Categories 1 and 5.** Wide-exact and
+   nonlinear-safe are theorems against native exactness; the sound move is a graceful
+   abstain plus native BMC on the violated instances. Do not spend engineering trying to
+   make the exact engine or interpolation cross a proven barrier.
+
+6. **Keep the KMTS cube pointed at its real target.** Its differentiation is
+   branching-time recoverability external bv tools cannot state — not bit-level HWMCC
+   safety. Measuring or marketing it on HWMCC safety is the wrong axis.
+
+**Bottom line.** On HWMCC bit-level safety, a *native* mununu engine can own the
+counterexample direction (shipped) and close the interpolation-tractable safe proofs;
+it **cannot**, by theorem, stay exact above ~40 bits or on nonlinear datapaths, and it
+**should not** re-build the IC3/PDR it already links in-process. The native
+differentiation that is real — owned deep-CEX search, the exact/soundness cross-check,
+and branching-time properties no external tool can state — is orthogonal to "beat
+btormc/Pono on the bv suite," which for two of five categories is provably out of reach.
