@@ -111,6 +111,15 @@ vs-ground-truth mismatch in the whole run (1/32 checked) is here. Notably, the i
 contradiction check **missed** it (only SPACER decided the instance), so this category is
 also where mununu's soundness *net* is thinnest.
 
+> **Mitigation shipped (`reach_portfolio::collect`, 2026-07-13):** the portfolio now
+> refuses a *sole-decider* SPACER `reachable`. SPACER decides from a Horn derivation over
+> the (buggy) CHC encoding, whereas every other member exhibits a concrete witness; so an
+> uncorroborated spacer-reachable is dropped to a sound `Unknown` instead of a spurious
+> `Reachable`. On `vcegar_arrays_itc99_b12_p2` the portfolio therefore now *abstains*
+> rather than emitting the wrong verdict. This is a **defensive** guard, not the root-cause
+> fix: the btor2→CHC array/BV encoding bug itself is still open, and until it is fixed
+> SPACER cannot contribute a `reachable` verdict on its own.
+
 ### E. Nonlinear datapath arithmetic (multipliers, `bvurem`/`bvmul`) → BDD + interpolation both choke
 
 - **Example (btormc+Pono find the CEX, owned miss):** `mul7`.
@@ -128,12 +137,19 @@ but wall on multiplier/modulo relations.
 
 In a *separate* single-engine eval, mununu's owned **McMillan `native_interp`** uniquely
 decides `gen12/14/39` — cases the whole rest of the portfolio (incl. in-process SPACER,
-btormc, Pono) left `unknown`. In *this* shared-budget portfolio run they show as
-`unreach=[pono]`, because `native_interp` is a **last-resort** member (it fires only when
-the other engines abstain) and here Pono decided them first inside the shared 120 s. So they
-are **not** a clean owned-engine failure — mununu *can* decide them; the budget order just
-let the external tool win. This is the one place the owned interpolation engine has a genuine
-*unique* edge on this suite.
+btormc, Pono) left `unknown`. In the *original* FINAL.md portfolio run they showed as
+`unreach=[pono]`, because `native_interp` was then a **last-resort** member (it fired only
+when the other engines abstained) and Pono decided them first inside the shared 120 s.
+
+> **Change shipped (`reach_portfolio::decide_reach_portfolio_parallel`, 2026-07-13):**
+> `native_interp` is now a **first-class parallel member** with an early-cancellation flag,
+> so in the default `btor2 verify` path it runs *concurrently* and gets `interp` credit on
+> any design it decides — while still bailing the instant a faster engine decides, so it
+> costs ~nothing on the common path. Whether that converts any HWMCC instance into an
+> *owned-unique* decide (vs. a co-decide with Pono) is what the full-suite re-measurement
+> settles; on `gen12/14/39` specifically Pono also decides them, so they are co-decides, not
+> owned-unique. This is the one place the owned interpolation engine has a genuine edge on
+> this suite.
 
 ## The other axis: property class (not exercised by bv-track)
 

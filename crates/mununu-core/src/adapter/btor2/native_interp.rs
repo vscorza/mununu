@@ -475,6 +475,31 @@ pub fn verify_safety_interp(
     timeout_ms: u32,
     overall_timeout_ms: u64,
 ) -> InterpSafetyVerdict {
+    verify_safety_interp_cancellable(
+        file,
+        max_suffix,
+        max_iters,
+        timeout_ms,
+        overall_timeout_ms,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// Like [`verify_safety_interp`] but abandons the search early — returning
+/// `Undecided` — once `cancel` is set. The portfolio sets it when a *faster* member
+/// produces a definite verdict, so this engine can run **concurrently** (not only as a
+/// last resort) without its pathological interpolation query (cvc5 SyGuS can take tens
+/// of seconds on a deep-grammar interpolant) dominating the wall-clock after another
+/// engine has already decided. On the cases where this engine is the *unique* decider
+/// (nothing else fires), `cancel` stays clear and the full budget is used.
+pub(crate) fn verify_safety_interp_cancellable(
+    file: &Btor2File,
+    max_suffix: u32,
+    max_iters: u32,
+    timeout_ms: u32,
+    overall_timeout_ms: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> InterpSafetyVerdict {
     let props = extract_props(file);
     if props.bad.is_empty() {
         return InterpSafetyVerdict::Undecided {
@@ -526,6 +551,11 @@ pub fn verify_safety_interp(
 
         // Outer k-schedule: deepen the suffix until a fixpoint or a real CEX.
         for ksfx in 1..=max_suffix as usize {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return InterpSafetyVerdict::Undecided {
+                    reason: "cancelled — another portfolio member decided first".into(),
+                };
+            }
             if std::time::Instant::now() >= deadline {
                 return InterpSafetyVerdict::Undecided {
                     reason: format!(
@@ -573,6 +603,11 @@ pub fn verify_safety_interp(
             let mut r = init0.clone();
             let mut grown = false;
             for iter in 0..max_iters {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return InterpSafetyVerdict::Undecided {
+                        reason: "cancelled — another portfolio member decided first".into(),
+                    };
+                }
                 if std::time::Instant::now() >= deadline {
                     return InterpSafetyVerdict::Undecided {
                         reason: format!("overall timeout ({overall_timeout_ms}ms)"),

@@ -16,13 +16,17 @@
 //! - **btormc** (BMC + k-induction) on deep counterexamples;
 //! - **Pono** (IC3/PDR) on IC3-provable / violated instances.
 //!
-//! Plus a **last-resort** sixth member — the in-house **interpolation** engine
+//! Plus a sixth member — the in-house **interpolation** engine
 //! ([`native_interp`], owned McMillan-style forward reachability with an
-//! interpolation k-schedule) — invoked ONLY when all five above abstain. It
-//! synthesises inductive invariants that neither k-induction nor even z3-SPACER
-//! reach at their budgets (measured *unique* HWMCC coverage), while costing
-//! nothing on the common path where a faster engine already decides. It needs cvc5
-//! (a subprocess) and abstains when absent.
+//! interpolation k-schedule). It synthesises inductive invariants that neither
+//! k-induction nor even z3-SPACER reach at their budgets (measured *unique* HWMCC
+//! decides `gen12`/`gen14`/`gen39`). In the **parallel** driver it runs
+//! *concurrently* with the other five but polls a shared cancellation flag and
+//! bails the instant any faster engine reaches a definite verdict — so it costs
+//! ~nothing on the common (fast-decided) path yet still spends its full budget on
+//! the designs where it is the unique decider. In the **sequential** driver it is
+//! gated as a last resort, computed only once the other five have abstained. It
+//! needs cvc5 (a subprocess) and abstains when absent.
 //!
 //! Running them together decides strictly more than any one, and — crucially —
 //! every engine's verdict is **sound**, so:
@@ -30,17 +34,23 @@
 //! - **first definite wins** — any engine's `Reachable` / `Unreachable` decides it;
 //! - **two DEFINITE verdicts that DISAGREE raise a soundness alarm** ([`ReachVerdict::Contradiction`])
 //!   rather than a guess. Since all engines are sound, a disagreement can only mean
-//!   a real bug — exactly what the differential oracle exists to catch.
+//!   a real bug — exactly what the differential oracle exists to catch;
+//! - **a SPACER-only `Reachable` is not trusted without corroboration** — SPACER
+//!   decides from a Horn *derivation* over mununu's btor2→CHC encoding (which has a
+//!   demonstrated spurious-counterexample bug on a pure-BV design), whereas every
+//!   other member exhibits a concrete witness. A sole-decider spacer-reachable is
+//!   therefore dropped to a sound `Unknown` rather than emitted (see [`collect`]).
 //!
 //! Both a **sequential** ([`decide_reach_portfolio`]) and a **parallel**
 //! ([`decide_reach_portfolio_parallel`]) driver are provided. They merge
-//! identically — the parallel variant only overlaps the two subprocess members
-//! (and the in-process exact engine) in wall-clock, which matters once a
-//! per-engine timeout is in play: a slow member no longer serialises in front of
-//! a fast one. Every member carries a **wall-clock timeout** (Pono's IC3 has no
-//! native bound and can run unbounded on a hard instance); a member that errors,
-//! times out, or is undecided simply abstains — a timeout is a sound
-//! [`ReachVerdict::Unknown`], never a wrong verdict.
+//! identically — the parallel variant overlaps every member (the two subprocess
+//! engines, the in-process exact/native/spacer engines, and the cancellable
+//! interpolation member) in wall-clock, which matters once a per-engine timeout is
+//! in play: a slow member no longer serialises in front of a fast one. Every
+//! member carries a **wall-clock timeout** (Pono's IC3 has no native bound and can
+//! run unbounded on a hard instance); a member that errors, times out, or is
+//! undecided simply abstains — a timeout is a sound [`ReachVerdict::Unknown`],
+//! never a wrong verdict.
 
 use crate::adapter::btor2::ast::Btor2File;
 use crate::adapter::btor2::emit::emit_btor2;
@@ -137,11 +147,14 @@ fn run_spacer(file: &Btor2File) -> Option<bool> {
     }
 }
 
-/// Budget for the last-resort interpolation member. It runs ONLY when every other
-/// engine abstained, so on the common (fast-decided) design it costs nothing; when
-/// it does run, these caps bound the cvc5 interpolation work. Tuned so the measured
-/// unique HWMCC decides (`gen12`/`gen14`/`gen39`) land while the minutes-long
-/// interpolation queries (`gen43`-class) abstain at the deadline.
+/// Budget for the interpolation member. In the parallel driver it runs concurrently
+/// but cancels the moment another engine decides (so the common fast-decided design
+/// pays almost nothing); in the sequential driver it runs only after the other five
+/// abstain. These caps bound the cvc5 interpolation work when it does run — tuned so
+/// the measured unique HWMCC decides (`gen12`/`gen14`/`gen39`) land while the
+/// minutes-long interpolation queries (`gen43`-class) abstain at the deadline. The
+/// 25 s overall cap sits under the 60 s btormc/Pono member timeouts, so as a parallel
+/// member it never extends the portfolio's wall-clock past its existing slowest.
 const INTERP_MAX_SUFFIX: u32 = 16;
 const INTERP_MAX_ITERS: u32 = 24;
 const INTERP_QUERY_TIMEOUT_MS: u32 = 5_000;
@@ -155,13 +168,14 @@ const INTERP_OVERALL_TIMEOUT_MS: u64 = 25_000;
 /// reach at their budgets — measured *unique* HWMCC coverage (`gen12`/`gen14`/`gen39`,
 /// which the whole rest of the portfolio leaves `Unknown`). cvc5 (a subprocess) is
 /// required; when it is absent the engine abstains.
-fn run_interp(file: &Btor2File) -> Option<bool> {
-    match native_interp::verify_safety_interp(
+fn run_interp(file: &Btor2File, cancel: &std::sync::atomic::AtomicBool) -> Option<bool> {
+    match native_interp::verify_safety_interp_cancellable(
         file,
         INTERP_MAX_SUFFIX,
         INTERP_MAX_ITERS,
         INTERP_QUERY_TIMEOUT_MS,
         INTERP_OVERALL_TIMEOUT_MS,
+        cancel,
     ) {
         InterpSafetyVerdict::Unsafe { .. } => Some(true),
         InterpSafetyVerdict::Safe { .. } => Some(false),
@@ -169,36 +183,26 @@ fn run_interp(file: &Btor2File) -> Option<bool> {
     }
 }
 
-/// Escalate to the interpolation member ONLY when the base outcome is `Unknown`
-/// (every faster engine abstained). This keeps the interpolation cost off the
-/// common path while still adding its unique decides. Because it runs only when
-/// no definite verdict exists, it can never raise a [`ReachVerdict::Contradiction`]
-/// — it is purely additive (and sound, per [`native_interp::verify_safety_interp`]).
-fn escalate_to_interp(file: &Btor2File, base: ReachOutcome) -> ReachOutcome {
-    if base.verdict != ReachVerdict::Unknown {
-        return base;
-    }
-    match run_interp(file) {
-        Some(true) => ReachOutcome::from_sets(vec!["interp"], vec![]),
-        Some(false) => ReachOutcome::from_sets(vec![], vec!["interp"]),
-        None => base,
-    }
-}
-
 /// Merge the members' verdicts into a [`ReachOutcome`], in the fixed engine order
-/// (`exact`, `native`, `spacer`, `btormc`, `pono`) so the outcome is deterministic
-/// regardless of which driver (sequential / parallel) produced them.
+/// (`exact`, `native`, `spacer`, `interp`, `btormc`, `pono`) so the outcome is
+/// deterministic regardless of which driver (sequential / parallel) produced them.
 fn collect(
     exact: Option<bool>,
     native: Option<bool>,
     spacer: Option<bool>,
+    interp: Option<bool>,
     btormc_v: Option<McVerdict>,
     pono_v: Option<McVerdict>,
 ) -> ReachOutcome {
     let mut reachable_by: Vec<&'static str> = Vec::new();
     let mut unreachable_by: Vec<&'static str> = Vec::new();
     // In-house engines report reachability as a bool (`Some(true)` = reachable).
-    for (name, v) in [("exact", exact), ("native", native), ("spacer", spacer)] {
+    for (name, v) in [
+        ("exact", exact),
+        ("native", native),
+        ("spacer", spacer),
+        ("interp", interp),
+    ] {
         match v {
             Some(true) => reachable_by.push(name),
             Some(false) => unreachable_by.push(name),
@@ -212,6 +216,28 @@ fn collect(
             Some(McVerdict::Safe) => unreachable_by.push(name),
             Some(McVerdict::Unknown) | None => {}
         }
+    }
+    // SOUNDNESS GUARD — uncorroborated SPACER counterexample.
+    //
+    // Every other member proves *reachable* with a concrete witness: exact-BDD is
+    // exact, native BMC / btormc / Pono return a bounded trace, and native interp
+    // (McMillan) escalates through BMC. SPACER alone reports `reachable` from a Horn
+    // *derivation* over mununu's btor2→CHC rule encoding, and that encoding has at
+    // least one demonstrated spurious-CEX bug on a pure-BV design
+    // (`vcegar_arrays_itc99_b12_p2`: SPACER says reachable, ground truth is safe, and
+    // no BMC engine can corroborate the trace). The inter-engine `Contradiction`
+    // alarm did not catch it because SPACER was the *sole* decider — nothing else
+    // ran to disagree.
+    //
+    // So: when SPACER is the only engine claiming reachable AND nothing contradicts
+    // it, we cannot trust the derivation — drop the claim and abstain (`Unknown`)
+    // rather than emit a spurious `Reachable`. A spacer-reachable that any
+    // concrete-witness engine corroborates, or a spacer-vs-safe disagreement (which
+    // stays a `Contradiction` alarm), is left untouched. See
+    // `measurements/hwmcc-owned-engine-gaps.md` (Category D) for the root-cause
+    // encoding fix that would let SPACER emit `Reachable` on its own again.
+    if reachable_by == ["spacer"] && unreachable_by.is_empty() {
+        reachable_by.clear();
     }
     ReachOutcome::from_sets(reachable_by, unreachable_by)
 }
@@ -237,15 +263,24 @@ pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
     let exact = run_exact(&content);
     // Native engine — in-house BMC + k-induction on the Z3 seam, no bit cap.
     let native = run_native(file);
-    // SPACER engine — in-house IC3/PDR + interpolation (invariant discovery).
+    // SPACER (via Z3's Fixedpoint) — external algorithm, in-process invariant discovery.
     let spacer = run_spacer(file);
     // btormc — BMC (CEX) + k-induction (proof).
     let btormc_v =
         btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
     // Pono — IC3/PDR (proof + shallow CEX).
     let pono_v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
-    // Last-resort owned interpolation member — only if the five above all abstained.
-    escalate_to_interp(file, collect(exact, native, spacer, btormc_v, pono_v))
+    // Owned interpolation member: in the SEQUENTIAL driver it runs after the others, so
+    // keep it last-resort (only when nothing else decided) to keep its cost off the
+    // common path — the flag is set iff a definite verdict already exists.
+    let interp = if collect(exact, native, spacer, None, btormc_v, pono_v).verdict
+        == ReachVerdict::Unknown
+    {
+        run_interp(file, &std::sync::atomic::AtomicBool::new(false))
+    } else {
+        None
+    };
+    collect(exact, native, spacer, interp, btormc_v, pono_v)
 }
 
 /// The **parallel** driver: run the exact engine (in-process) and the two
@@ -253,34 +288,73 @@ pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
 /// [`decide_reach_portfolio`]. Scoped threads borrow `file` directly — the scope
 /// guarantees the borrows end before this returns, so no clone / `Arc` is needed.
 ///
-/// The merge is unchanged, so the verdict is identical to the sequential driver;
+/// The merge is unchanged, so the merged *verdict* is identical to the sequential
+/// driver (all members are sound, so they cannot disagree on a definite answer);
 /// only the wall-clock differs (≈ the slowest single member instead of the sum).
-/// This matters once per-engine timeouts are in play — a member that burns its
-/// full budget no longer serialises in front of a fast one.
+/// This matters once per-engine timeouts are in play — a member that burns its full
+/// budget no longer serialises in front of a fast one. One benign detail difference:
+/// because the interpolation member runs concurrently here (rather than only as a
+/// sequential last resort), a design it decides in time will additionally list
+/// `interp` in `reachable_by` / `unreachable_by`, giving the owned engine its credit.
 pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let content = emit_btor2(file);
+    // A definite verdict from ANY faster member sets this; the owned interpolation
+    // member polls it and abandons its (possibly slow) cvc5 interpolation search early
+    // (#1 — run interpolation as a concurrent member, not last-resort, so its unique
+    // decides get owned credit, without its pathological query dominating wall-clock on
+    // instances another engine already decided).
+    let decided = AtomicBool::new(false);
+    let decided = &decided;
     std::thread::scope(|scope| {
         let btormc_h = scope.spawn(|| {
-            btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok()
+            let v =
+                btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
+            if matches!(v, Some(McVerdict::Violated) | Some(McVerdict::Safe)) {
+                decided.store(true, Relaxed);
+            }
+            v
         });
         let pono_h = scope.spawn(|| {
-            pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok()
+            let v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
+            if matches!(v, Some(McVerdict::Violated) | Some(McVerdict::Safe)) {
+                decided.store(true, Relaxed);
+            }
+            v
         });
         // The native and SPACER engines are in-process Z3 work — each on its own
         // thread so it overlaps the exact engine + the subprocess members rather than
         // serialising.
-        let native_h = scope.spawn(|| run_native(file));
-        let spacer_h = scope.spawn(|| run_spacer(file));
+        let native_h = scope.spawn(|| {
+            let v = run_native(file);
+            if v.is_some() {
+                decided.store(true, Relaxed);
+            }
+            v
+        });
+        let spacer_h = scope.spawn(|| {
+            let v = run_spacer(file);
+            if v.is_some() {
+                decided.store(true, Relaxed);
+            }
+            v
+        });
+        // Owned McMillan interpolation — now a FIRST-CLASS concurrent member (was
+        // last-resort). Polls `decided` and bails out early once a faster member decides.
+        let interp_h = scope.spawn(|| run_interp(file, decided));
         // The exact engine is in-process BDD work — run it on this thread while the
         // other members run on theirs.
         let exact = run_exact(&content);
+        if exact.is_some() {
+            decided.store(true, Relaxed);
+        }
         // A panicked member thread abstains (None) rather than poisoning the merge.
         let native = native_h.join().unwrap_or(None);
         let spacer = spacer_h.join().unwrap_or(None);
         let btormc_v = btormc_h.join().unwrap_or(None);
         let pono_v = pono_h.join().unwrap_or(None);
-        // Last-resort owned interpolation member — only if the five above all abstained.
-        escalate_to_interp(file, collect(exact, native, spacer, btormc_v, pono_v))
+        let interp = interp_h.join().unwrap_or(None);
+        collect(exact, native, spacer, interp, btormc_v, pono_v)
     })
 }
 
@@ -313,21 +387,57 @@ mod tests {
     }
 
     #[test]
-    fn interp_escalation_only_fires_on_unknown() {
-        // A definite base outcome must pass through untouched — the interpolation
-        // member never runs (so no cvc5 dependency and no latency on the common
-        // path, and it can never override a definite verdict).
+    fn interp_member_never_overrides_a_definite_verdict() {
+        // The interpolation member is gated: the sequential driver only computes it
+        // when the base portfolio (exact / native / spacer / btormc / pono) is still
+        // Unknown, and the merge is first-definite-wins. A design that native
+        // k-induction already proves safe must come back Unreachable with the interp
+        // member never running or flipping it.
         const SAFE_1IND: &str = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n\
                                  5 next 1 3 2\n6 bad 3\n";
         let file = parser::parse(SAFE_1IND).expect("parse");
-        // Native k-induction alone proves this safe, so the base is Unreachable and
-        // escalate_to_interp is a no-op regardless of cvc5's presence.
-        let base = ReachOutcome::from_sets(vec![], vec!["native"]);
-        let out = escalate_to_interp(&file, base.clone());
-        assert_eq!(out, base, "definite base must pass through unchanged");
-        // A definite Reachable base likewise passes through.
-        let r = ReachOutcome::from_sets(vec!["exact"], vec![]);
-        assert_eq!(escalate_to_interp(&file, r.clone()), r);
+        let out = decide_reach_portfolio(&file);
+        assert_eq!(out.verdict, ReachVerdict::Unreachable, "outcome: {out:?}");
+        assert!(
+            out.unreachable_by.contains(&"native"),
+            "native k-induction proves the 1-inductive design safe: {out:?}"
+        );
+        // At the merge level a definite base is likewise untouched by an interp abstain.
+        assert_eq!(
+            collect(Some(true), None, None, None, None, None).verdict,
+            ReachVerdict::Reachable
+        );
+    }
+
+    #[test]
+    fn uncorroborated_spacer_counterexample_abstains() {
+        // SOUNDNESS GUARD (`vcegar_arrays_itc99_b12_p2`): a SPACER-only `reachable`
+        // with no concrete-witness corroboration is a suspect derivation over the
+        // btor2→CHC encoding, so the merge drops it and abstains rather than emit a
+        // spurious Reachable.
+        let out = collect(None, None, Some(true), None, None, None);
+        assert_eq!(
+            out.verdict,
+            ReachVerdict::Unknown,
+            "sole-decider spacer-reachable must abstain: {out:?}"
+        );
+        assert!(
+            out.reachable_by.is_empty(),
+            "the uncorroborated spacer claim is dropped: {out:?}"
+        );
+        // Corroborated by any concrete-witness engine ⇒ trusted (stays Reachable).
+        assert_eq!(
+            collect(None, Some(true), Some(true), None, None, None).verdict,
+            ReachVerdict::Reachable,
+            "native BMC corroborates spacer ⇒ trust the counterexample"
+        );
+        // A spacer-vs-safe disagreement is a real soundness alarm, NOT silently
+        // resolved — the guard only fires when spacer is the *sole* decider.
+        assert_eq!(
+            collect(Some(false), None, Some(true), None, None, None).verdict,
+            ReachVerdict::Contradiction,
+            "exact-safe vs spacer-reachable must still raise the alarm"
+        );
     }
 
     #[test]
