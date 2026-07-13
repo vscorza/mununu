@@ -72,6 +72,13 @@ docker run --rm -v "$(pwd)":/work -v mununu-target:/cargo-target \
 
 **Host caveat.** slang ships prebuilts only for `linux-x86_64` and `macos-arm64`. On an Intel (x86_64) macOS host there is no native slang binary, and the workspace's `z3-sys` link also differs from the dev image — so the Linux `mununu-sva` image (which runs natively on x86_64 hosts) is the supported way to run these tests there. The `e2e_csrng_real_sva_verdict_breakdown` test reads only vendored fixtures (`examples/verify/m2_opentitan_csrng_main_sm` + the standard prim_assert macros from `examples/verify/m0_opentitan_prim_arbiter`), so it is fully reproducible.
 
+**[RULE] Validate any slang / SVA-touching change in the `mununu-sva` image — never on the bare host (added 2026-07-13).** The dev host commonly has `sv2v` + `yosys` but **not** `slang`. That combination is a trap, not a convenience:
+
+- `mununu sv verify-auto` / `sv extract-sva` (and the correct SVA→cube path) locate slang via `locate_slang()`; with slang absent they cannot run, so a "green" host run has simply *skipped* the real path.
+- The **sv2v-only lift is worse than useless for SVA**: `sv2v` (0.0.13) silently **drops** `assert property (@…)` during conversion (both concurrent and immediate forms), so `sv_to_btor2` yields a BTOR2 with **0 `bad` nodes**. The plain `mununu sv verify` verb (sv2v+yosys, no slang) then reports a **VACUOUS `holds`** — the property was never checked. (2026-07-13 incident: an sv-yosys "safety-cube" wiring looked like it produced no result / a spurious `holds`; the whole chain was the sv2v drop, invisible without slang. Root-caused via `MUNUNU_KEEP_YOSYS_TMP=1` — `preprocessed.sv` had 0 asserts.)
+
+**How to comply.** Any change that exercises `adapter/slang/**`, `sv extract-sva`, `sv verify-auto`, or an SV→BTOR2 path that must preserve assertions is validated by running the relevant `#[ignore]`d `e2e_` tests **in the `mununu-sva` image** (command above), not by a host `cargo test`. Pure-Rust / `btor2` / non-slang paths may still be validated on the host. When a host run of an SV path returns `holds` with no counterexample, treat it as *unverified* until reproduced under `mununu-sva` — a bare-host `holds` on SVA is presumed vacuous. slang honours `MUNUNU_SLANG_PATH`; the image provides a pinned build.
+
 ### Pre-push workspace check (added 2026-06-08)
 
 **Rule.** Before `git push`, when a commit touches a field of a struct with multiple construction sites (`OriginalTransition`, `TransitionSpec`, `SignalAnnotation`, `CegarOptions`, `PredicateCubeLiftOptions`, `TransitionDecl`, etc.), run the CI-equivalent workspace check:

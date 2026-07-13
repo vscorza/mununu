@@ -151,7 +151,12 @@ over = "System"
 
 > **Source of truth:** [`verify::config::ProjectSection::safety_cube`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/config.rs), [`verify::orchestrator::run_safety_cube_pass`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/orchestrator.rs) — surface: CLI+API+UI.
 
-Set `[project] safety_cube = true` to additionally run the KMTS 3-valued safety cube (`AG ¬bad` — enumeration + the **emergent-K** interpolation discovery of constant-bound / register-ordering invariants) on every `btor2`-adapter source that carries a `bad` obligation. Those sources are **cube-only**: the orchestrator has no `btor2`→automaton dispatch, so they are excluded from composition + property evaluation, and only the cube verdict is reported (in `safety_cube_results`). A best-effort pass — a `btor2` source with no `bad` node is silently skipped. Reuses [`recoverability::verify_safety_scalable`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/recoverability.rs) (also the standalone `mununu btor2 verify-safety` verb).
+Set `[project] safety_cube = true` to additionally run the KMTS 3-valued safety cube (`AG ¬bad`) on the project's sources, reporting per-source/per-assertion verdicts in `safety_cube_results`:
+
+- **`btor2` sources** — run [`recoverability::verify_safety_scalable`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/recoverability.rs) (enumeration + the **emergent-K** interpolation discovery of constant-bound / register-ordering invariants) on the source's `bad` obligation. These are **cube-only** (the orchestrator has no `btor2`→automaton dispatch): excluded from composition, one result (`property = None`).
+- **`sv-yosys` sources** — route through [`slang::verify_auto`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/slang/verify_auto.rs), whose **slang** front-end parses each `assert property` into a cube obligation *independently of sv2v* (the sv2v flatten silently drops SVA). One result **per SVA assertion** (its name in `property`). These sources still compose normally — the cube is an additional per-assertion check. **Requires slang** (a subprocess tool not on bare hosts; validate under the `mununu-sva` image).
+
+A best-effort pass — an unreadable file, an absent toolchain, or a design with no obligation is silently skipped.
 
 ```toml
 [project]
@@ -183,9 +188,10 @@ pub struct VerifyReport {
 }
 
 pub struct SafetyCubeResult {
-    pub source_id: String,                     // the btor2 source the cube ran on
+    pub source_id: String,                     // the source the cube ran on
     pub file: String,
-    pub verdict: String,                       // "holds" | "violated" | "unknown"
+    pub property: Option<String>,              // SVA assertion name (sv-yosys); None for btor2
+    pub verdict: String,                       // "holds" | "violated" | "unknown" | "skipped"
 }
 
 pub struct PropertyVerdict {
