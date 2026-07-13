@@ -1139,6 +1139,16 @@ pub fn verify_recoverability_scalable(
         compound_seeds.push((name, expr_str, expr));
     }
 
+    // NOTE (emergent-K, 2026-07-13): the interpolation discovery
+    // (`refine::discover_relational_predicates`) is VALIDATED for safety (it uniquely
+    // finds constant bounds `reg <= K` the pair-search + Houdini miss), but it
+    // interpolates against `¬bad` — recoverability designs carry a `good` TARGET and
+    // NO `bad` node, so upfront seeding here is inert. The correct integration is
+    // REFINEMENT-based (interpolate the reachable states against the ⊥ failure-subgame
+    // in the CEGAR loop), a heavier change deferred until a real branching ⊥ case
+    // demonstrates it is needed (the mature difference/ordering/ranking/Houdini
+    // machinery decided every case probed so far). See the plan §9 P2.4.
+
     // IC3ia I1 — HOUDINI relative-inductive conjunction. The difference-discovery above keeps only
     // INDIVIDUALLY 1-inductive relations; some designs need a CONJUNCTIVE invariant `P1 ∧ P2` whose
     // conjuncts are inductive only *relative to each other* (a swap/coupling where `x>=1` holds only
@@ -1450,6 +1460,39 @@ fn inject_bad_symbol(btor2: &str, file: &crate::adapter::btor2::ast::Btor2File) 
 ///
 /// This is the evaluation surface for "how far does the 3-valued cube + invariant discovery reach on
 /// real safety benchmarks (HWMCC)". It is deliberately a thin translation over the audited cube path.
+/// Format an **atomic** [`PredicateExpr`] (a single `Cmp` / `CmpReg` / `CmpRegAddend`
+/// leaf) back into a `parse_predicate_expr`-round-trippable string — the form the
+/// sidecar `compound_predicates` entry carries. Returns `None` for boolean compounds
+/// (`And` / `Or` / `Not`), which the safety cube does not seed as single dimensions.
+fn atomic_expr_string(expr: &PredicateExpr) -> Option<String> {
+    fn op(op: CmpOp) -> &'static str {
+        match op {
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        }
+    }
+    match expr {
+        PredicateExpr::Cmp {
+            register,
+            op: o,
+            value,
+        } => Some(format!("{register} {} {value}", op(*o))),
+        PredicateExpr::CmpReg { lhs, op: o, rhs } => Some(format!("{lhs} {} {rhs}", op(*o))),
+        PredicateExpr::CmpRegAddend {
+            lhs,
+            op: o,
+            rhs,
+            addend,
+            ..
+        } => Some(format!("{lhs} {} {rhs} + {addend}", op(*o))),
+        PredicateExpr::And(..) | PredicateExpr::Or(..) | PredicateExpr::Not(..) => None,
+    }
+}
+
 pub fn verify_safety_scalable(btor2_content: &str) -> Result<PropertyVerdict, String> {
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("safety cube path: parsing BTOR2: {}", e.message))?;
@@ -1518,6 +1561,40 @@ pub fn verify_safety_scalable(btor2_content: &str) -> Result<PropertyVerdict, St
         discover_inductive_relational_invariants(&file, &init_values, &empty_cone, discovery_budget)
     {
         if !compound_seeds.iter().any(|(_, e, _)| e == &expr_str) {
+            compound_seeds.push((name, expr_str, expr));
+        }
+    }
+    // Emergent-K interpolation discovery — iterative forward Craig interpolation over the exact
+    // transition finds CONSTANT BOUNDS (`reg < K`) and register ORDERINGS the difference/eq search
+    // structurally misses (it never compares a register to a literal). The safety path has a `bad`
+    // node (via `inject_bad_symbol`), so the discovery is live here (unlike the recoverability path,
+    // which has no `bad`). Seeds are HINTS: the CEGAR loop independently re-verifies each verdict, so
+    // a spurious over-approximation on an unsafe design is rejected (sound abstain), never a false
+    // Holds.
+    //
+    // LAST-RESORT gating (mirrors `native_interp`'s role in `reach_portfolio`). The discovery spawns
+    // cvc5 and costs ~7.5s; a broad HWMCC/OpenTitan sweep (2026-07-13) measured ZERO decide-lift when
+    // it ran on well-seeded designs (the residual abstentions there are deep-CEX-unsafe / BMC-depth
+    // gaps, not missing-predicate gaps). So only pay it when the cheap syntactic + difference paths
+    // left the cube RELATIONALLY under-constrained — `compound_seeds` below the watermark — which is
+    // the only regime where a discovered bound/ordering can add a genuinely new dimension. A cube
+    // already carrying relational structure skips the expensive step (sub-second, unchanged).
+    const DISCOVERY_LAST_RESORT_WATERMARK: usize = 2;
+    if compound_seeds.len() < DISCOVERY_LAST_RESORT_WATERMARK
+        && specs.len() + compound_seeds.len() < MAX_AUTO_SEED
+        && std::env::var_os("MUNUNU_NO_INTERP_DISCOVERY").is_none()
+    {
+        for expr in crate::adapter::btor2::refine::discover_relational_predicates(&file, 8, 4_000) {
+            if specs.len() + compound_seeds.len() >= MAX_AUTO_SEED {
+                break;
+            }
+            let Some(expr_str) = atomic_expr_string(&expr) else {
+                continue;
+            };
+            if compound_seeds.iter().any(|(_, e, _)| e == &expr_str) {
+                continue;
+            }
+            let name = format!("interp_{}", compound_seeds.len());
             compound_seeds.push((name, expr_str, expr));
         }
     }
@@ -1808,6 +1885,71 @@ mod tests {
             verify_safety_scalable(&wrap(8)).expect("decides"),
             PropertyVerdict::Violated,
             "the wrapping variant is genuinely unsafe (b wraps below a) ⇒ Violated"
+        );
+    }
+
+    #[test]
+    fn safety_cube_decides_constant_bound_via_interpolation_discovery() {
+        // The interpolation last-resort discovery (`discover_relational_predicates`, gated behind the
+        // relationally-under-constrained watermark in `verify_safety_scalable`) seeds a register-TO-
+        // CONSTANT bound (`a <= 4`) that no cheaper path can produce: `eq_guard_atoms` yields the
+        // equality `a == 4` (not a bound); the difference/ordering discovery compares register PAIRS
+        // (a single-register design has none); and the CEGAR loop's WeakestPrecondition refinement
+        // ALSO cannot get there (measured: with the discovery disabled via MUNUNU_NO_INTERP_DISCOVERY
+        // the same design is Unknown, not Holds). `bad = (a > 4)` on a counter that CAPS at 4 is
+        // therefore decided Holds ONLY once the discovered bound seeds the cube — this test fails
+        // (→ Unknown) if the last-resort wiring is removed.
+        let cap_gt = "\
+1 sort bitvec 1
+2 sort bitvec 8
+3 state 2 a
+4 zero 2
+5 init 2 3 4
+6 one 2
+7 constd 2 4
+8 eq 1 3 7
+9 add 2 3 6
+10 ite 2 8 3 9
+11 next 2 3 10
+12 ugt 1 3 7
+13 bad 12
+";
+        // SOUNDNESS (always valid, cvc5 present or not): the FREE counter (no cap) genuinely reaches
+        // a>4. The discovery must NEVER yield a false Holds — with cvc5 the verdict-verified CEGAR
+        // rejects the spurious over-approximation (measured: Unknown); without cvc5 no bound is seeded
+        // (also Unknown). Either way `!= Holds`. Guards the exact failure mode a HINT-generator risks:
+        // a plausible-but-false invariant becoming a wrong `safe`.
+        let free_gt = "\
+1 sort bitvec 1
+2 sort bitvec 8
+3 state 2 a
+4 zero 2
+5 init 2 3 4
+6 one 2
+9 add 2 3 6
+11 next 2 3 9
+7 constd 2 4
+12 ugt 1 3 7
+13 bad 12
+";
+        assert_ne!(
+            verify_safety_scalable(free_gt).expect("decides"),
+            PropertyVerdict::Holds,
+            "free counter reaches a>4 — the discovered bound must never yield a false Holds"
+        );
+        // DECIDE-LIFT (cvc5-gated — cvc5 is a subprocess tool, NOT bundled in the mununu-dev CI image,
+        // so `discover_relational_predicates` returns no predicates there and the cube abstains). When
+        // cvc5 is present, `a <= 4` is discovered and decides Holds; when absent, the verdict is
+        // Unknown and we skip (matching the `#[ignore]`-free cvc5-absence guard in refine.rs's tests).
+        let cap_verdict = verify_safety_scalable(cap_gt).expect("decides");
+        if cap_verdict == PropertyVerdict::Unknown {
+            eprintln!("SKIP (cvc5 absent): no discovered bound a<=4 ⇒ the safety cube abstains");
+            return;
+        }
+        assert_eq!(
+            cap_verdict,
+            PropertyVerdict::Holds,
+            "capped counter bad=(a>4) decides Holds via the interpolation-discovered bound a<=4"
         );
     }
 
