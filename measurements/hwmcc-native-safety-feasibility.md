@@ -1,4 +1,4 @@
-# Can mununu's native engines decide HWMCC safety? — real cases, feasibility proofs, and a path
+# Can mununu's native engines decide HWMCC safety? — real cases, native vs external feasibility, and a path
 
 > Companion to [`hwmcc-owned-engine-gaps.md`](hwmcc-owned-engine-gaps.md). That doc
 > *categorizes* where the owned engines fail on the HWMCC'20 bv suite. This one
@@ -31,9 +31,13 @@ an inductive safety invariant, within a budget.
 The honest answer, established below: **for two categories it is provably infeasible
 for a native engine to stay exact; for one it is feasible and now shipped; for two it
 is feasible only by building (or reusing) a SPACER-class engine — which mununu already
-links in-process.** The KMTS 3-valued cube — mununu's headline native technique — is
-**not** a bit-level-safety engine at all (§5), and understanding why is the key to not
-chasing the wrong lever.
+links in-process.** And the natural follow-up — *do the **external** engines (btormc,
+Pono, SPACER) succeed where native can't?* — is measured in §7 with a load-bearing
+result: external wins one category cleanly and the *shallow* tier of the rest, but on
+the **hard instance of every category** btormc/Pono/SPACER abstain too — the frontier is
+undecided-by-everyone, not native-vs-external. The KMTS 3-valued cube — mununu's
+headline native technique — is **not** a bit-level-safety engine at all (§6), and
+understanding why is the key to not chasing the wrong lever.
 
 ---
 
@@ -53,10 +57,17 @@ sequential circuit the ROBDD for the reachable-state set blows up before a fixpo
 The 40-bit cap is a *deliberate sound abstain*, not an OOM crash. There is **no native
 fix that preserves exactness** — raising the cap trades a sound abstain for an OOM.
 The only escape is to stop being exact (abstract the datapath — which is the KMTS
-cube's job, §5, and changes the property you are deciding).
+cube's job, §6, and changes the property you are deciding).
 
-**Feasibility verdict: INFEASIBLE for a native *exact* engine.** Correct dispositions:
-route wide designs to a bit-level SAT/BMC engine (native BMC for CEX, external IC3 for
+**External:** btormc/Pono have no BDD cap and decide the *shallow* arbiter instances
+(e.g. `arbitrated_top_*_d16` via a btormc counterexample), but the **deep proof is open
+even for them** — measured, `arbitrated_top_n2_w128_d64_e0 → unknown` under the full
+portfolio (btormc + Pono + SPACER) at 60 s. So external rescues the shallow tier, not
+the deep-proof tier.
+
+**Feasibility verdict: INFEASIBLE for a native *exact* engine; external decides the
+shallow instances, the deep proofs are open for everyone.** Correct dispositions: route
+wide designs to a bit-level SAT/BMC engine (native BMC for CEX, external IC3 for
 proofs), or abstract (KMTS) when the property is branching.
 
 ---
@@ -115,13 +126,18 @@ a 137-cell design exceeds 15 s before the depth-128 `bad` frame is reached, so
 `bmc_cex_until` abstains — and enlarging the *overall* budget cannot lift a *per-query*
 wall. Reaching a genuinely deep counterexample on a state-heavy design is exactly what
 **incremental SAT** (btormc/Boolector — assert one frame at a time, keep the learned
-clauses) is built for, and what a from-scratch monolithic-unroll native BMC is not.
+clauses) is built for, and what a from-scratch monolithic-unroll native BMC is not —
+**though the gap is shared at the portfolio budget:** the full portfolio (btormc + Pono
++ SPACER) *also* returns `unknown` on both `w64_d128` and `w16_d128` at 60 s (§7), so
+even external incremental SAT needs more than 60 s here. This is a throughput/budget
+wall for everyone, not a native-only deficiency.
 
 **Feasibility verdict: FEASIBLE and SHIPPED for the CEX direction up to the width×depth
 product that fits one per-query SMT solve; beyond that (deep CEX on a state-heavy
-design) even the owned CEX search soundly abstains.** Closing that last gap natively
-would mean an **incremental** native BMC (persistent solver, frame-at-a-time assertion,
-clause reuse) — a feasible, well-scoped engineering increment (§8) that would extend
+design) even the owned CEX search — and even btormc at 60 s — soundly abstains.**
+Closing that last gap natively means an **incremental** native BMC (persistent solver,
+frame-at-a-time assertion, clause reuse) — a feasible, well-scoped engineering increment
+(§8) that would extend
 the owned CEX reach toward btormc's, without any external tool.
 
 ---
@@ -160,14 +176,22 @@ the same cvc5 ceiling. And z3-SPACER — a mature IC3/PDR — is **already linke
 in-process** (`native_spacer`), so the "native" version competes with something mununu
 already ships.
 
-**Feasibility verdict: FEASIBLE but the feasible thing is a SPACER-class engine.** Two
-honest sub-paths: (i) *lean on in-process z3-SPACER* for the proof direction on
-HWMCC — it is already there, in-process, no subprocess; (ii) *raise native
-interpolation's ceiling* by replacing cvc5's SyGuS search with a faster
-(word-level, IC3ia-integrated) interpolant procedure — a real research lever (this is
-the paper track), not a quick win, and it only helps the interpolation-tractable subset.
-Building a from-scratch native IC3/PDR to beat Pono on `cal*` is **not** recommended:
-large, uncertain, and duplicative of the in-process SPACER.
+**External:** this is external's *cleanest* win — measured, `cal159 → holds via pono`
+(60 s) under the full portfolio, where every native engine abstains. Pono's IC3/PDR (and
+in-process SPACER) synthesize exactly the strengthening invariant native k-induction
+cannot. (The interpolation-hard `gen43` is the exception even here: `unknown` for
+external too at the portfolio budget — its invariant *exists* but needs the 105 s
+`bvurem` interpolant no engine reaches in time.)
+
+**Feasibility verdict: FEASIBLE, and the feasible thing external already ships is a
+SPACER-class engine — which mununu links in-process.** Two honest sub-paths: (i) *lean
+on in-process z3-SPACER* for the proof direction on HWMCC — it is already there,
+in-process, no subprocess; (ii) *raise native interpolation's ceiling* by replacing
+cvc5's SyGuS search with a faster (word-level, IC3ia-integrated) interpolant procedure —
+a real research lever (this is the paper track), not a quick win, and it only helps the
+interpolation-tractable subset. Building a from-scratch native IC3/PDR to beat Pono on
+`cal*` is **not** recommended: large, uncertain, and duplicative of the in-process
+SPACER.
 
 ---
 
@@ -181,11 +205,18 @@ spurious `violated` where ground truth is safe. That symptom is now **guarded**
 (a sole-decider SPACER `reachable` is dropped to `unknown`, `reach_portfolio::collect`),
 but the root-cause encoding is unfixed.
 
-**Feasibility verdict: FEASIBLE with array abstraction / an array-aware native BMC.**
-External tools carry mature array theory; mununu's native array handling is the weakest
-link. A scoped native increment (array-aware unrolling, or a sound array→UF abstraction
-with CEGAR) is feasible but unbuilt. Priority is low unless an array-heavy corpus
-matters — the guard already prevents the unsound outcome.
+**External:** btormc/Pono carry mature BTOR2 array theory, but on this instance they
+*also* abstain at the portfolio budget — measured, `vcegar_arrays_itc99_b12_p2 →
+unknown` at 60 s (ground truth is safe; the design flattens to pure BV and needs more
+budget or a better proof). So external is the right tool class here but not a free
+decide at 60 s.
+
+**Feasibility verdict: FEASIBLE with array abstraction / an array-aware native BMC
+(unbuilt); external is the natural home but not free at the portfolio budget.** External
+tools carry mature array theory; mununu's native array handling is the weakest link. A
+scoped native increment (array-aware unrolling, or a sound array→UF abstraction with
+CEGAR) is feasible but unbuilt. Priority is low unless an array-heavy corpus matters —
+the guard already prevents the unsound outcome.
 
 ---
 
@@ -207,12 +238,20 @@ matters — the guard already prevents the unsound outcome.
   find a witness (SAT over a bounded unrolling with a concrete multiplier is decidable);
   but for a *safe* nonlinear design there is no CEX, and both proof routes above wall.
 
-**Feasibility verdict: INFEASIBLE for a native engine on the *proof* side.** BDD is a
-theorem; interpolation is measured-hard. The correct disposition is (a) native BMC for
-the violated cases, (b) accept `unknown` (or route to a bit-level SAT prover) for the
-safe nonlinear cases. A multiplier-aware native technique (e.g. algebraic /
-Gröbner-basis reasoning as in modern arithmetic verifiers) is a different tool than
-anything in mununu today and out of scope for the safety portfolio.
+**External:** the *violated* nonlinear case is external's to win — measured, `mul7 →
+violated via btormc+pono` (19 s), because a bounded unrolling with concrete multipliers
+bit-blasts to a SAT instance a mature engine cracks. But the *safe* nonlinear case is
+hard **even for external** — measured, `mul9 → unknown` at 60 s (btormc finds no CEX;
+proving a multiplier invariant is a known-hard problem for CDCL SAT). So external rescues
+nonlinear *violations*, not nonlinear *proofs*.
+
+**Feasibility verdict: INFEASIBLE for a native engine on the *proof* side; external
+decides nonlinear *violations* (btormc) but not nonlinear *proofs* either.** BDD is a
+theorem; interpolation is measured-hard; the safe-multiplier proof is hard for every
+engine here. The correct disposition is (a) native BMC (or btormc) for the violated
+cases, (b) accept `unknown` for the safe nonlinear cases. A multiplier-aware technique
+(e.g. algebraic / Gröbner-basis reasoning as in modern arithmetic verifiers) is a
+different tool than anything in mununu today and out of scope for the safety portfolio.
 
 ---
 
@@ -260,19 +299,54 @@ lives.
 
 ---
 
-## 7. The feasibility matrix
+## 7. Native vs external — the measured division of labor
 
-| Category | Real case | Native proof feasible? | Native CEX feasible? | Basis |
+The natural next question is: *where the native engines can't, do the external engines
+(btormc, Pono, in-process SPACER) succeed?* Measured — full portfolio (`mununu btor2
+verify`, exact + native + in-process SPACER + btormc + Pono, each at its ~60 s default
+budget; mununu-sva, 2026-07-13):
+
+| Design | Category | External verdict @~60 s | Owned-only @240 s |
+|---|---|---|---|
+| `circular_pointer_top_w64_d8_e0` | 2 shallow CEX | violated — **btormc** (60 s) | violated — native+cex (**10 s**) |
+| `circular_pointer_top_w64_d128_e0` | 2 deep CEX | **unknown** | unknown |
+| `circular_pointer_top_w16_d128_e0` | 2 deep CEX | **unknown** | unknown |
+| `mul7` | 5 nonlinear, violated | violated — **btormc+pono** (19 s) | — |
+| `mul9` | 5 nonlinear, safe | **unknown** | unknown |
+| `gen43` | 3/5 · 256-bit, `bvurem` | **unknown** | unknown |
+| `arbitrated_top_n2_w128_d64_e0` | 1 deep proof | **unknown** | unknown |
+| `cal159` | 3 aux-invariant safe | holds — **pono** (60 s) | — |
+| `vcegar_arrays_itc99_b12_p2` | 4 arrays | **unknown** (ground truth: safe) | unknown |
+
+**The load-bearing finding: on the *hard* instance of every category, the external
+engines abstain too.** At the portfolio budget, deep counterexamples (`d128`), the deep
+arbiter proof (`d64`), nonlinear-safe (`mul9`), the 256-bit `gen43`, and the array proof
+are undecided by btormc, Pono, *and* in-process SPACER — not just by the native engines.
+So these categories are **not** "mununu is missing what external has"; for the hard
+residual, **nobody decides them** at practical budgets. (Budget matters: FINAL.md at
+120 s decides 41/136 where this ran at 60 s — a longer budget lifts some *middle-tier*
+instances, but the deep/wide/nonlinear-safe frontier stays open regardless of *which*
+engine.) Note too that on `circular_pointer_w64_d8` the owned deep-CEX search decided in
+**10 s** vs btormc's 60 s — because the full portfolio runs native BMC at the 5 s default
+while `--owned-only` gives it a fair budget; the owned path is not merely a fallback, it
+is sometimes *faster* on the throughput cases.
+
+### The feasibility matrix (native | external)
+
+| Category | Native proof | Native CEX | External | Basis |
 |---|---|---|---|---|
-| 1. State ≫ 40 bits | `arbitrated_top_*` (313–8378 b) | **No** (exact) | via native BMC | theorem (BDD blowup) |
-| 2. Deep/slow CEX | `circular_pointer_top_*` | n/a (violated) | **Yes — shipped** | measured |
-| 3. Aux-invariant safe | `cal*`, `gen43` | **Only as SPACER-class** | n/a (safe) | measured + argument |
-| 4. Arrays | `vcegar_arrays_*` | feasible, unbuilt | feasible, unbuilt | argument |
-| 5. Nonlinear | `mul9`, `mul7` | **No** | via native BMC (if violated) | theorem + measured |
+| 1. State ≫ 40 b | **No** (exact) | via native BMC | shallow: **btormc/Pono**; deep proof (`d64`): **No** even external | theorem + measured |
+| 2. Deep/slow CEX | n/a (violated) | **Yes — shipped** (shallow) | shallow: **btormc**; deep (`d128`): **No** @60 s even external | measured |
+| 3. Aux-invariant safe | Only as SPACER-class | n/a (safe) | **Yes — Pono / SPACER** (`cal159` holds) | measured |
+| 4. Arrays | feasible, unbuilt | feasible, unbuilt | array theory — yes with budget (unknown @60 s) | argument + measured |
+| 5. Nonlinear | **No** | via native BMC (if violated) | violated: **btormc** (`mul7`); safe: **No** (`mul9`) | theorem + measured |
 
-Two rows are hard **No** on the native proof side (1 exact-cap, 5 nonlinear — both
-theorems). One is a clean **Yes, shipped** (2, the deep CEX search). One is
-"feasible = re-use in-process SPACER" (3). One is feasible-but-unbuilt (4).
+**Where external cleanly beats native:** Category 3 — Pono/SPACER synthesize the
+auxiliary strengthening invariant the native engines cannot — and the *middle tier* of
+1/2/5, where btormc's incremental SAT finds a shallow counterexample the portfolio's
+5 s native budget misses (though a fair native budget or the owned deep-CEX also
+decides those). **Where external does *not* rescue the problem:** the deep/wide/
+nonlinear-safe frontier — provably or empirically open for native and external alike.
 
 ---
 
@@ -314,10 +388,22 @@ theorems). One is a clean **Yes, shipped** (2, the deep CEX search). One is
    branching-time recoverability external bv tools cannot state — not bit-level HWMCC
    safety. Measuring or marketing it on HWMCC safety is the wrong axis.
 
-**Bottom line.** On HWMCC bit-level safety, a *native* mununu engine can own the
-counterexample direction (shipped) and close the interpolation-tractable safe proofs;
-it **cannot**, by theorem, stay exact above ~40 bits or on nonlinear datapaths, and it
-**should not** re-build the IC3/PDR it already links in-process. The native
-differentiation that is real — owned deep-CEX search, the exact/soundness cross-check,
-and branching-time properties no external tool can state — is orthogonal to "beat
-btormc/Pono on the bv suite," which for two of five categories is provably out of reach.
+**Bottom line — the native/external division of labor.** The measured picture (§7) is
+sharper than "external engines cover mununu's gaps." External wins **one category
+cleanly (3, auxiliary-invariant safe proofs — Pono/SPACER)** and the **shallow tier of
+1/2/5** (btormc's incremental SAT on shallow counterexamples the portfolio's 5 s native
+budget misses). But on the **hard instance of every category** — deep counterexamples
+(`d128`), the deep arbiter proof (`d64`), nonlinear-safe (`mul9`), the 256-bit `gen43`,
+the array proof — **btormc, Pono, and in-process SPACER abstain too.** For that frontier
+the choice is not native-vs-external; it is undecided-by-everyone at practical budgets.
+
+So a *native* mununu engine can own the counterexample direction (shipped; sometimes
+*faster* than btormc, §7) and close the interpolation-tractable safe proofs; it
+**cannot**, by theorem, stay exact above ~40 bits or on nonlinear datapaths; it
+**should not** re-build the IC3/PDR it already links in-process (that is external's clean
+win, and it is already available); and it **need not chase** the hard residual as if
+external had it — external does not. The native differentiation that is real — owned
+deep-CEX search (with an incremental-BMC path to extend it), the exact/soundness
+cross-check, and branching-time properties no external bv tool can even *state* — is
+orthogonal to "beat btormc/Pono on the bv suite," which for two of five categories is
+provably out of reach for everyone.
