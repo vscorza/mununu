@@ -21,6 +21,24 @@ pub struct VerifyReport {
     pub composition: CompositionInfo,
     /// One verdict per `[[properties]]` entry.
     pub property_verdicts: Vec<PropertyVerdict>,
+    /// Per-source KMTS safety-cube (`AG ¬bad`) verdicts — populated only when
+    /// `[project].safety_cube = true` (or the config field `safety_cube`). Empty
+    /// otherwise. See [`crate::verify::config::ProjectSection::safety_cube`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_cube_results: Vec<SafetyCubeResult>,
+}
+
+/// One `btor2`-source safety-cube result from the opt-in `safety_cube` pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyCubeResult {
+    /// `[[sources]].id` the cube ran on.
+    pub source_id: String,
+    /// The BTOR2 file (relative to the project base dir) the cube read.
+    pub file: String,
+    /// `AG ¬bad` verdict from `verify_safety_scalable` (cube + emergent-K discovery),
+    /// as the canonical [`crate::verdict::PropertyVerdict::as_str`] string —
+    /// `"holds"` | `"violated"` | `"unknown"`.
+    pub verdict: String,
 }
 
 /// Per-source diagnostic information.

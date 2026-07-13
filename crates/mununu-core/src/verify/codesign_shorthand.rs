@@ -70,6 +70,9 @@ pub fn codesign_to_verify(codesign: &CodesignProjectConfig) -> VerifyConfig {
     let project = ProjectSection {
         name: codesign.project.name.clone(),
         description: codesign.project.description.clone(),
+        // Codesign shorthand targets composed firmware+RTL properties, not raw btor2
+        // safety-cube passes; leave the opt-in cube off.
+        safety_cube: false,
     };
 
     // Sources: one for the firmware C, one for the RTL SV.
