@@ -355,42 +355,118 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     })
 }
 
-/// The opt-in `safety_cube` pass — run the KMTS 3-valued safety cube
-/// ([`crate::adapter::recoverability::verify_safety_scalable`]: `AG ¬bad`, enumeration +
-/// emergent-K interpolation discovery) on every `btor2`-adapter source that carries a
-/// `bad` obligation. Best-effort and side-channel to property evaluation: a source with
-/// no `bad` node (the cube returns `Err`), an unreadable file, or a parse failure is
-/// silently skipped, so the pass never aborts the run. Parameterised sources
-/// (`count >= 2`) are not expanded here — the cube reads each declared file directly.
+/// The opt-in `safety_cube` pass — run the KMTS 3-valued safety cube (`AG ¬bad`) on every
+/// source that carries a safety obligation:
 ///
-/// Scope: `btor2` sources only. `sv-yosys` sources are NOT lifted here — the cube needs a
-/// BTOR2 whose SVA `assert property` survives as a `bad` node, and the available `sv2v`
-/// (0.0.13) drops the concurrent-assertion form during the flatten lift (`sv_to_btor2`
-/// yields 0 `bad` nodes), so the cube would have nothing to check. Verify SV safety with
-/// the standalone `mununu sv verify` portfolio verb; wiring the cube onto a reliably
-/// SVA-preserving SV→BTOR2 lift is a follow-up.
+/// - **`btor2`** sources — the file already *is* the BTOR2 (cube-only; skipped in
+///   dispatch). Run [`crate::adapter::recoverability::verify_safety_scalable`]
+///   (enumeration plus the emergent-K interpolation discovery) directly; one result per
+///   source (`property = None`). A source with no `bad` node returns `Err` → skipped.
+/// - **`sv-yosys`** (/ `yosys`) sources — route through [`verify_auto`], whose **slang**
+///   front-end parses each `assert property` into a cube obligation *independently of
+///   sv2v* (the sv2v flatten silently drops SVA — see the CLAUDE.md `mununu-sva` rule).
+///   One result **per SVA assertion** (its slang name in `property`). These sources ALSO
+///   compose normally — the cube is an additional per-assertion safety check.
+///   **Requires slang** (a subprocess tool absent on bare hosts): when slang is missing
+///   `verify_auto` errors and the source is silently skipped, so this path is validated in
+///   the `mununu-sva` image, never on the host.
+///
+/// Best-effort and side-channel to property evaluation: an unreadable file, an absent
+/// tool, a lift failure, or a `bad`-less design is silently skipped, so the pass never
+/// aborts the run. Parameterised sources (`count >= 2`) are not expanded here.
 fn run_safety_cube_pass(config: &VerifyConfig, base_dir: &Path) -> Vec<SafetyCubeResult> {
     let mut out = Vec::new();
     for src in &config.sources {
-        if src.adapter != "btor2" {
-            continue;
-        }
-        for file in &src.files {
-            let path = base_dir.join(file);
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // `Err` = no `bad` node / parse error → skip (opt-in best-effort).
-            if let Ok(verdict) = crate::adapter::recoverability::verify_safety_scalable(&content) {
-                out.push(SafetyCubeResult {
-                    source_id: src.id.clone(),
-                    file: file.display().to_string(),
-                    verdict: verdict.as_str().to_string(),
-                });
+        match src.adapter.as_str() {
+            "btor2" => {
+                for file in &src.files {
+                    let Ok(content) = std::fs::read_to_string(base_dir.join(file)) else {
+                        continue;
+                    };
+                    // `Err` = no `bad` node / parse error → skip (opt-in best-effort).
+                    if let Ok(verdict) =
+                        crate::adapter::recoverability::verify_safety_scalable(&content)
+                    {
+                        out.push(SafetyCubeResult {
+                            source_id: src.id.clone(),
+                            file: file.display().to_string(),
+                            property: None,
+                            verdict: verdict.as_str().to_string(),
+                        });
+                    }
+                }
             }
+            "sv-yosys" | "yosys" => {
+                out.extend(sv_safety_cube_results(src, base_dir));
+            }
+            _ => continue,
         }
     }
     out
+}
+
+/// Run the slang SVA front-end + cube ([`verify_auto`]) on one `sv-yosys` source and map
+/// its per-assertion outcomes to [`SafetyCubeResult`]s. Best-effort: an unreadable file or
+/// an absent/failed toolchain (slang / sv2v / yosys) yields an empty vec.
+fn sv_safety_cube_results(
+    src: &crate::verify::config::SourceSection,
+    base_dir: &Path,
+) -> Vec<SafetyCubeResult> {
+    use crate::adapter::slang::verify_auto::{VerifyAutoOptions, VerifyOutcome, verify_auto};
+
+    let Some(primary) = src.files.first() else {
+        return Vec::new();
+    };
+    // Stage every declared file as an in-memory SV source (name, content).
+    let mut sources: Vec<(String, String)> = Vec::with_capacity(src.files.len());
+    for f in &src.files {
+        let Ok(body) = std::fs::read_to_string(base_dir.join(f)) else {
+            return Vec::new();
+        };
+        let name = f
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("source.sv")
+            .to_string();
+        sources.push((name, body));
+    }
+    let additional_sources: Vec<(String, String)> = sources.iter().skip(1).cloned().collect();
+    let top = src
+        .options
+        .get("top")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let use_sv2v = src
+        .options
+        .get("use_sv2v")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let yopts = crate::adapter::yosys::YosysOptions {
+        top,
+        additional_sources,
+        use_sv2v,
+        ..Default::default()
+    };
+    // slang absent / lift failure / no SVA → Err or empty → skip.
+    let Ok(report) = verify_auto(&sources, &yopts, &VerifyAutoOptions::default()) else {
+        return Vec::new();
+    };
+    report
+        .properties
+        .iter()
+        .map(|p| SafetyCubeResult {
+            source_id: src.id.clone(),
+            file: primary.display().to_string(),
+            property: Some(p.name.clone()),
+            verdict: match p.outcome {
+                VerifyOutcome::Holds => "holds",
+                VerifyOutcome::Violated { .. } => "violated",
+                VerifyOutcome::Unknown { .. } => "unknown",
+                VerifyOutcome::Skipped { .. } => "skipped",
+            }
+            .to_string(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1978,6 +2054,75 @@ name = "System"
         assert!(
             report.property_verdicts.is_empty(),
             "a cube-only project has no mu-calculus property verdicts"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_sv_safety_cube_reports_slang_sva_verdict() {
+        // `[project] safety_cube = true` routes an sv-yosys source through the slang SVA
+        // front-end (verify_auto), so each `assert property` becomes a cube obligation —
+        // independently of sv2v (which silently drops SVA). The one-hot state invariant
+        // `$onehot0(state_q)` HOLDS, and it is reported per-assertion in
+        // `safety_cube_results` (property = the slang assertion name).
+        const SV: &str = r#"module onehot_fsm (input logic clk, input logic rst_ni, input logic go_i);
+  localparam logic [2:0] S0 = 3'b001, S1 = 3'b010, S2 = 3'b100;
+  logic [2:0] state_q, state_d;
+  always_comb begin
+    state_d = state_q;
+    unique case (state_q)
+      S0: if (go_i) state_d = S1;
+      S1: state_d = S2;
+      S2: state_d = S0;
+      default: state_d = S0;
+    endcase
+  end
+  always_ff @(posedge clk or negedge rst_ni) begin
+    if (!rst_ni) state_q <= S0;
+    else         state_q <= state_d;
+  end
+  OneHotState_A: assert property (@(posedge clk) disable iff (!rst_ni) $onehot0(state_q));
+endmodule
+"#;
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("onehot_fsm.sv"), SV).unwrap();
+        let toml_src = r#"
+[project]
+name = "SvSafetyCube"
+safety_cube = true
+
+[[sources]]
+id = "fsm"
+adapter = "sv-yosys"
+files = ["onehot_fsm.sv"]
+options = { top = "onehot_fsm", use_sv2v = true }
+
+[composition]
+semantics = "asynchronous"
+members = ["fsm"]
+name = "System"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let report = verify_project(&config, temp.path()).expect("verify_project succeeds");
+        // The design's single SVA assertion is reported per-property (slang names it
+        // `<module>_sva_<index>`, e.g. `onehot_fsm_sva_0`) and the one-hot invariant HOLDS.
+        let r = report
+            .safety_cube_results
+            .iter()
+            .find(|r| r.source_id == "fsm")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the sv-yosys source's slang SVA assertion is reported; got {:?}",
+                    report.safety_cube_results
+                )
+            });
+        assert!(
+            r.property.is_some(),
+            "an sv-yosys safety-cube result carries the slang assertion name: {r:?}"
+        );
+        assert_eq!(
+            r.verdict, "holds",
+            "the one-hot state invariant HOLDS (slang SVA → cube): {r:?}"
         );
     }
 

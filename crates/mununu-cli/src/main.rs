@@ -2258,9 +2258,12 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
                 report.safety_cube_results.len()
             );
             for r in &report.safety_cube_results {
+                let label = match &r.property {
+                    Some(p) => format!("{}::{p}", r.source_id),
+                    None => r.source_id.clone(),
+                };
                 println!(
-                    "    {src}: {verdict} [{file}]",
-                    src = r.source_id,
+                    "    {label}: {verdict} [{file}]",
                     verdict = r.verdict,
                     file = r.file,
                 );
