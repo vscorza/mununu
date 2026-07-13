@@ -269,26 +269,53 @@ has three problems, each real:
    cube's value is *dropping* datapath precision to decide a branching property. On a
    bit-level obligation that abstraction can only lose the precision the property needs
    — you are back to needing predicates that exactly separate `bad`, i.e. an exact
-   analysis, i.e. §1.
+   analysis, i.e. §1. *(These are representational arguments: the cube's predicate
+   vocabulary is `register==const` / register-relational cubes; the claim is that no such
+   finite cube separates the bad region.)*
+   - **`mul9`** — `bad` is a condition on the exact 64-bit product `a*b` (2 multiplier
+     nodes). Multiplication is not a finite union of register-equality cubes, so a
+     predicate abstraction over `register==const` literals cannot separate the bad set
+     without one cube per operand pair (i.e. no abstraction at all). Dropping the product
+     bits is exactly discarding what `bad` reads.
+   - **`gen43`** — `bad` rides a `bvurem` (modular) relation over a **256-bit** datapath.
+     Expressing "the reachable set excludes the modular-bad states" needs the exact
+     256-bit residue; a finite register-equality cube cannot represent a modular class,
+     so the abstraction is either unsound or collapses to the concrete state.
+   - **`arbitrated_top_*`** — the property distinguishes per-channel arbitration counts
+     across a 313–8378-bit state; a coarse predicate cube merges the counter states the
+     safety obligation counts on, and a fine enough cube is §1's exact analysis again.
 
 2. **Emergent-K discovers the wrong kind of fact for these designs (measured).** The
    emergent-K interpolation loop (`discover_relational_predicates`) *does* find genuinely
    unique invariant forms — register-to-constant bounds and orderings the mature
-   pair-difference / eq-atom machinery structurally cannot express (`vis_arrays_buf_bug:
-   count<16`, `krebs.3: v_energy<8`, `brp2.2: dve_invalid≥a_done`). **But on the real
-   HWMCC corpus, the designs where those forms appear are `SAT`/UNSAFE at depth**
-   (`vis_arrays_buf_bug` CEX@18–28, `krebs.3` CEX@75, `brp2.2` CEX@119). The discovered
-   "bound" is a *spurious shallow-forward over-approximation* of a property that is
-   actually violated deeper. Seeding a false `count<16` cannot add a sound `safe` decide;
-   the correct lever for those designs is **deeper BMC** (a throughput gap, §2), not a
-   missing predicate. The verdict-verified driver correctly *rejects* the spurious seed
-   (sound abstain), so no harm — but no lift either.
+   pair-difference / eq-atom machinery structurally cannot express. **But on the real
+   HWMCC corpus, every design where those forms appeared is `SAT`/UNSAFE at depth**, so
+   the discovered "bound" is a *spurious shallow-forward over-approximation* of a property
+   that is actually violated deeper:
+   - **`vis_arrays_buf_bug`** — discovered `count < 16`, but the design has a concrete
+     counterexample at **depth 18–28**; `count` genuinely exceeds 16 on the real trace.
+   - **`krebs.3`** — discovered `v_energy < 8`, but the counterexample is at **depth 75**.
+   - **`brp2.2`** — discovered the ordering `dve_invalid ≥ a_done`, but the counterexample
+     is at **depth 119**.
 
-3. **The residual is BMC-depth, not missing-invariant.** Session-wide finding: the
-   portfolio's remaining HWMCC abstentions are dominated by deep-CEX-unsafe cases and by
-   the §1/§3/§5 walls — categories the *cube's* refinement (predicate discovery) is the
-   wrong instrument for. It is a sound, tested **hint generator** for the paper's
-   emergent-K direction, not a bit-level-safety decider.
+   In each, seeding the false bound cannot add a sound `safe` decide; the verdict-verified
+   driver correctly *rejects* the non-inductive seed (sound abstain), so no harm — but no
+   lift either. The correct lever for all three is **deeper BMC** (§2), not a predicate.
+
+3. **The residual is BMC-depth, not missing-invariant.** The portfolio's remaining HWMCC
+   abstentions are dominated by deep-CEX-unsafe cases and the §1/§3/§5 walls — where the
+   fix is a deeper/faster reachability query, not a new predicate:
+   - **`circular_pointer_top_w64_d128_e0`** — measured `unknown` for native *and* external
+     (btormc/Pono/SPACER) at 60 s (§7); it is *violated* at depth ≈128, so **no predicate
+     helps** — only deeper BMC finds the concrete trace.
+   - **`arbitrated_top_n2_w128_d64_e0`** — measured `unknown` for everyone; a deep safety
+     proof over an ~8 k-bit state, a scale/depth problem, not a missing cube.
+   - **the item-2 designs** (`vis_arrays_buf_bug` @18–28, `krebs.3` @75, `brp2.2` @119) —
+     the same story from the discovery side: `SAT` at depth, where a predicate is the
+     wrong instrument.
+
+   So predicate discovery is a sound, tested **hint generator** for the paper's emergent-K
+   direction, not a bit-level-safety decider.
 
 **Feasibility verdict for KMTS-on-HWMCC-safety: not the right tool — and that is fine.**
 The cube's real, defensible domain is **branching-time recoverability on abstracted
