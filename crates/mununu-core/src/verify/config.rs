@@ -105,6 +105,15 @@ pub struct ProjectSection {
     /// Optional human-readable description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Opt-in (`[project] safety_cube = true`): also run the KMTS 3-valued safety cube
+    /// (`AG ¬bad`, [`crate::adapter::recoverability::verify_safety_scalable`] —
+    /// enumeration + the emergent-K interpolation discovery) on every `btor2`-adapter
+    /// source that carries a `bad` obligation, reporting the per-source verdict in
+    /// [`crate::verify::report::VerifyReport::safety_cube_results`] alongside the
+    /// mu-calculus property verdicts. Default `false`. A best-effort pass: a source with
+    /// no `bad` node (or a parse error) is silently skipped.
+    #[serde(default)]
+    pub safety_cube: bool,
 }
 
 /// One entry in the `[[sources]]` array.

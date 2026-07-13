@@ -328,6 +328,28 @@ enum MayEdgeInferenceArg {
     SmtAllPairs,
 }
 
+/// Safety engine selector for `mununu btor2 verify-safety`.
+///
+/// surface: CLI-only — the `ic3` engine (IC3ia predicate abstraction,
+/// [`mununu_core::adapter::btor2::abs_safety::verify_safety_ic3`]) is an experimental,
+/// guarded foundation: on real designs its backward refinement stalls and it abstains
+/// (the P2.3b make-or-break finding). It is surfaced for evaluation, NOT production
+/// routing — the production safety path is `cube`. No API/UI surface until it decides
+/// real cases competitively with the cube + `native_interp`.
+#[derive(Clone, Debug, Copy, clap::ValueEnum, Default)]
+enum SafetyEngineArg {
+    /// The KMTS 3-valued cube (default) — [`verify_safety_scalable`]. Enumeration +
+    /// emergent-K interpolation discovery; the production safety path.
+    ///
+    /// [`verify_safety_scalable`]: mununu_core::adapter::recoverability::verify_safety_scalable
+    #[default]
+    Cube,
+    /// Experimental IC3ia predicate-abstraction frame ladder — `verify_safety_ic3`.
+    /// Guarded foundation; abstains where refinement stalls. Uses cvc5 for refinement
+    /// (abstains when cvc5 is absent).
+    Ic3,
+}
+
 /// R-F5.4.2b (2026-07-03) — which predicate-cube engine evaluates the
 /// property. Mirrors the two edge-construction strategies.
 #[derive(Clone, Debug, Copy, clap::ValueEnum, Default, PartialEq, Eq)]
@@ -630,6 +652,11 @@ struct Btor2VerifySafetyArgs {
     /// Path to the BTOR2 input file.
     #[arg(value_name = "BTOR2_FILE")]
     file: PathBuf,
+    /// Safety engine (default `cube`). `ic3` selects the experimental IC3ia
+    /// predicate-abstraction frame ladder — a guarded foundation for evaluation only;
+    /// it abstains where refinement stalls (see `SafetyEngineArg`).
+    #[arg(long, value_enum, default_value_t = SafetyEngineArg::Cube)]
+    engine: SafetyEngineArg,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2225,6 +2252,20 @@ fn handle_verify(args: VerifyArgs) -> Result<(), String> {
                 println!("        ({term})");
             }
         }
+        if !report.safety_cube_results.is_empty() {
+            println!(
+                "  safety-cube AG !bad ({}):",
+                report.safety_cube_results.len()
+            );
+            for r in &report.safety_cube_results {
+                println!(
+                    "    {src}: {verdict} [{file}]",
+                    src = r.source_id,
+                    verdict = r.verdict,
+                    file = r.file,
+                );
+            }
+        }
     }
 
     if args.strict && report.property_verdicts.iter().any(|v| !v.satisfied) {
@@ -2475,14 +2516,32 @@ fn btor2_verify_recoverability(args: Btor2VerifyRecoverabilityArgs) -> Result<()
 /// obligation, complementing the bit-level `btor2 verify` portfolio.
 fn btor2_verify_safety(args: Btor2VerifySafetyArgs) -> Result<(), String> {
     use mununu_core::adapter::recoverability::verify_safety_scalable;
+    use mununu_core::verdict::PropertyVerdict;
 
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
-    let verdict = verify_safety_scalable(&content)?;
+
+    let (verdict, engine) = match args.engine {
+        SafetyEngineArg::Cube => (verify_safety_scalable(&content)?, "cube"),
+        SafetyEngineArg::Ic3 => {
+            use mununu_core::adapter::btor2::abs_safety::{AbsVerdict, verify_safety_ic3};
+            let file = mununu_core::adapter::btor2::parser::parse(&content)
+                .map_err(|e| format!("verify-safety (ic3): parsing BTOR2: {}", e.message))?;
+            // Budgets mirror the abs_safety unit tests (32 frames, 8 refinements, 5 s/query),
+            // with a longer overall query timeout for the CLI's larger inputs.
+            let verdict = match verify_safety_ic3(&file, 32, 8, 10_000) {
+                AbsVerdict::Safe { .. } => PropertyVerdict::Holds,
+                AbsVerdict::Unsafe { .. } => PropertyVerdict::Violated,
+                AbsVerdict::Unknown { .. } => PropertyVerdict::Unknown,
+            };
+            (verdict, "ic3")
+        }
+    };
 
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "property": "AG !bad",
+        "engine": engine,
         "verdict": verdict.as_str(),
     });
     println!(

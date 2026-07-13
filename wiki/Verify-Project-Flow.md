@@ -147,6 +147,28 @@ formula = "mu X. (Init || <> X)"
 over = "System"
 ```
 
+### Safety-cube pass (`[project] safety_cube`)
+
+> **Source of truth:** [`verify::config::ProjectSection::safety_cube`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/config.rs), [`verify::orchestrator::run_safety_cube_pass`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/orchestrator.rs) — surface: CLI+API+UI.
+
+Set `[project] safety_cube = true` to additionally run the KMTS 3-valued safety cube (`AG ¬bad` — enumeration + the **emergent-K** interpolation discovery of constant-bound / register-ordering invariants) on every `btor2`-adapter source that carries a `bad` obligation. Those sources are **cube-only**: the orchestrator has no `btor2`→automaton dispatch, so they are excluded from composition + property evaluation, and only the cube verdict is reported (in `safety_cube_results`). A best-effort pass — a `btor2` source with no `bad` node is silently skipped. Reuses [`recoverability::verify_safety_scalable`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/adapter/recoverability.rs) (also the standalone `mununu btor2 verify-safety` verb).
+
+```toml
+[project]
+name = "csrng_safety"
+safety_cube = true
+
+[[sources]]
+id = "design"
+adapter = "btor2"          # cube-only: carries a `bad` property, not composed
+files = ["design.btor2"]
+
+[composition]
+semantics = "asynchronous"
+members = ["design"]       # resolves to [] in the report — btor2 sources don't compose
+name = "System"
+```
+
 ## Report shape
 
 > **Source of truth:** [`verify::report::VerifyReport`](https://github.com/vscorza/mununu/blob/main/crates/mununu-core/src/verify/report.rs) — surface: CLI+API+UI.
@@ -157,6 +179,13 @@ pub struct VerifyReport {
     pub sources: Vec<SourceSummary>,           // id, adapter, resolved automaton
     pub composition: CompositionInfo,          // semantics, name, resolved members
     pub property_verdicts: Vec<PropertyVerdict>,
+    pub safety_cube_results: Vec<SafetyCubeResult>, // opt-in `[project] safety_cube`; empty otherwise
+}
+
+pub struct SafetyCubeResult {
+    pub source_id: String,                     // the btor2 source the cube ran on
+    pub file: String,
+    pub verdict: String,                       // "holds" | "violated" | "unknown"
 }
 
 pub struct PropertyVerdict {

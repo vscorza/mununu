@@ -63,8 +63,8 @@ use crate::verify::binding::{AlphabetBinding, apply_renamings_to_ctxdsl};
 use crate::verify::config::{PropertySection, VerifyConfig};
 use crate::verify::register_map_rewriter::derive_sv_renamings_from_register_map;
 use crate::verify::report::{
-    CompositionInfo, PropertyFormulaSource, PropertyVerdict, SourceSummary, TraceStep,
-    TraceTermination, TraceWitness, VerifyError, VerifyReport,
+    CompositionInfo, PropertyFormulaSource, PropertyVerdict, SafetyCubeResult, SourceSummary,
+    TraceStep, TraceTermination, TraceWitness, VerifyError, VerifyReport,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +115,18 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
     let mut source_ctxdsls: Vec<SourceCtxdsl> = Vec::with_capacity(config.sources.len());
     let mut source_summaries: Vec<SourceSummary> = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
+        // btor2 sources are CUBE-ONLY when `safety_cube` is on: they carry a `bad`
+        // obligation for `run_safety_cube_pass` (step 9), not a composable automaton —
+        // the orchestrator has no btor2→automaton dispatch. Record a summary and skip.
+        if config.project.safety_cube && source.adapter == "btor2" {
+            source_summaries.push(SourceSummary {
+                id: source.id.clone(),
+                adapter: source.adapter.clone(),
+                automaton: None,
+                partition_summary: None,
+            });
+            continue;
+        }
         let primary_file = source
             .files
             .first()
@@ -179,6 +191,28 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
                 partition_summary,
             });
         }
+    }
+
+    // Cube-only project: every source was a btor2 safety-cube source (no composable
+    // automaton). Composition + property evaluation both require ≥1 automaton, so return
+    // the cube results directly instead of failing on an empty composition.
+    if source_ctxdsls.is_empty() {
+        let safety_cube_results = if config.project.safety_cube {
+            run_safety_cube_pass(config, base_dir)
+        } else {
+            Vec::new()
+        };
+        return Ok(VerifyReport {
+            project: config.project.name.clone(),
+            sources: source_summaries,
+            composition: CompositionInfo {
+                semantics: config.composition.semantics.clone(),
+                name: config.composition_name(),
+                members: Vec::new(),
+            },
+            property_verdicts: Vec::new(),
+            safety_cube_results,
+        });
     }
 
     // R46-3 (R.4.6 per-cluster verification) — collect the
@@ -304,12 +338,52 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
         property_verdicts.push(verdict);
     }
 
+    // 9. Opt-in KMTS safety-cube pass (`safety_cube = true`): run `AG ¬bad` (cube +
+    //    emergent-K discovery) on each `btor2` source carrying a `bad` obligation.
+    let safety_cube_results = if config.project.safety_cube {
+        run_safety_cube_pass(config, base_dir)
+    } else {
+        Vec::new()
+    };
+
     Ok(VerifyReport {
         project: config.project.name.clone(),
         sources: source_summaries,
         composition: composition_info,
         property_verdicts,
+        safety_cube_results,
     })
+}
+
+/// The opt-in `safety_cube` pass — run the KMTS 3-valued safety cube
+/// ([`crate::adapter::recoverability::verify_safety_scalable`]: `AG ¬bad`, enumeration +
+/// emergent-K interpolation discovery) on every `btor2`-adapter source that carries a
+/// `bad` obligation. Best-effort and side-channel to property evaluation: a source with
+/// no `bad` node (the cube returns `Err`), an unreadable file, or a parse failure is
+/// silently skipped, so the pass never aborts the run. Parameterised sources
+/// (`count >= 2`) are not expanded here — the cube reads each declared file directly.
+fn run_safety_cube_pass(config: &VerifyConfig, base_dir: &Path) -> Vec<SafetyCubeResult> {
+    let mut out = Vec::new();
+    for src in &config.sources {
+        if src.adapter != "btor2" {
+            continue;
+        }
+        for file in &src.files {
+            let path = base_dir.join(file);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // `Err` = no `bad` node / parse error → skip (opt-in best-effort).
+            if let Ok(verdict) = crate::adapter::recoverability::verify_safety_scalable(&content) {
+                out.push(SafetyCubeResult {
+                    source_id: src.id.clone(),
+                    file: file.display().to_string(),
+                    verdict: verdict.as_str().to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,6 +1909,99 @@ formula = "true"
 over = "System"
 "#;
         VerifyConfig::from_toml(toml_src).unwrap()
+    }
+
+    /// Safe capped counter — `a` caps at 4, so `bad = (a==5)` is unreachable. The safety
+    /// cube decides Holds via the `{a==4, a==5}` eq-atoms alone (no cvc5 needed → the
+    /// emergent-K discovery never fires → CI-safe without the subprocess tool).
+    const CAPPED_SAFE_BTOR2: &str = "\
+1 sort bitvec 1
+2 sort bitvec 8
+3 state 2 a
+4 zero 2
+5 init 2 3 4
+6 one 2
+7 constd 2 4
+8 eq 1 3 7
+9 add 2 3 6
+10 ite 2 8 3 9
+11 next 2 3 10
+12 constd 2 5
+13 eq 1 3 12
+14 bad 13
+";
+
+    #[test]
+    fn safety_cube_pass_decides_btor2_source_when_enabled() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("design.btor2"), CAPPED_SAFE_BTOR2).unwrap();
+        let toml_src = r#"
+[project]
+name = "CubeSmoke"
+safety_cube = true
+
+[[sources]]
+id = "design"
+adapter = "btor2"
+files = ["design.btor2"]
+
+[composition]
+semantics = "asynchronous"
+members = ["design"]
+name = "System"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        assert!(
+            config.project.safety_cube,
+            "`[project] safety_cube = true` parses"
+        );
+        // End-to-end: `verify_project` treats the btor2 source as cube-only (not
+        // composable → members = []), runs the cube on it, and reports the verdict.
+        let report = verify_project(&config, temp.path()).expect("verify_project succeeds");
+        assert_eq!(
+            report.safety_cube_results.len(),
+            1,
+            "one btor2 source with a `bad` node ⇒ one cube result"
+        );
+        assert_eq!(report.safety_cube_results[0].source_id, "design");
+        assert_eq!(
+            report.safety_cube_results[0].verdict, "holds",
+            "capped counter: bad (a==5) unreachable ⇒ safe"
+        );
+        assert!(
+            report.property_verdicts.is_empty(),
+            "a cube-only project has no mu-calculus property verdicts"
+        );
+    }
+
+    #[test]
+    fn safety_cube_pass_skips_non_btor2_and_bad_less_sources() {
+        let temp = tempdir().unwrap();
+        // A non-`btor2` adapter is skipped; a `btor2` source with NO `bad` node returns
+        // `Err` from the cube and is silently skipped ⇒ zero results either way.
+        let no_bad = "1 sort bitvec 8\n2 state 1 a\n3 zero 1\n4 init 1 2 3\n5 next 1 2 2\n";
+        std::fs::write(temp.path().join("nobad.btor2"), no_bad).unwrap();
+        let toml_src = r#"
+[project]
+name = "CubeSkip"
+safety_cube = true
+
+[[sources]]
+id = "nobad"
+adapter = "btor2"
+files = ["nobad.btor2"]
+
+[composition]
+semantics = "asynchronous"
+members = ["nobad"]
+name = "System"
+"#;
+        let config = VerifyConfig::from_toml(toml_src).unwrap();
+        let results = run_safety_cube_pass(&config, temp.path());
+        assert!(
+            results.is_empty(),
+            "a btor2 source with no `bad` obligation is skipped"
+        );
     }
 
     #[test]
