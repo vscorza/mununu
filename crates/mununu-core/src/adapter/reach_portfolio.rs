@@ -358,6 +358,110 @@ pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
     })
 }
 
+/// Depth cap for the owned-standalone deep counterexample search — well above
+/// [`native_bmc::DEFAULT_MAX_K`] so a *deep* violation is caught, while the wall
+/// deadline + per-query timeout keep the (eagerly-built) unrolling bounded.
+const OWNED_DEEP_CEX_MAX_K: u32 = 128;
+/// Per-z3-check timeout inside the owned deep CEX search.
+const OWNED_CEX_QUERY_MS: u32 = 15_000;
+
+/// The **owned-standalone** driver: decide `bad`-reachability with ONLY the
+/// mununu-owned engines, run concurrently under a shared `timeout_ms` wall budget,
+/// deliberately EXCLUDING the external algorithms (Z3 SPACER, btormc, Pono). It
+/// answers "what can mununu's *own* algorithms decide on their own budget?" — the
+/// ceiling that matters for a no-subprocess deployment and the soundness cross-check.
+///
+/// Two complementary directions run in parallel (first-definite wins; each sets a
+/// shared `decided` flag the others poll and bail on):
+/// - **safety proof (the formula):** the exact BDD engine (≤ 40 bits), native
+///   k-induction, and native McMillan interpolation;
+/// - **counterstrategy (the negation):** a dedicated deep, wall-bounded pure BMC
+///   counterexample search ([`native_bmc::bmc_cex_until`], depth ≤
+///   [`OWNED_DEEP_CEX_MAX_K`]). Finding a concrete counterexample is sound and usually
+///   far cheaper than an equivalent safety proof, so it flips many designs the
+///   proof side leaves `Unknown` straight to `Violated`. It is attributed to the
+///   `"cex"` engine so a native-safe vs cex-violated split still raises the
+///   [`ReachVerdict::Contradiction`] alarm rather than being silently merged.
+pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcome {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let content = emit_btor2(file);
+    let decided = AtomicBool::new(false);
+    let decided = &decided;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    std::thread::scope(|scope| {
+        // Safety proof — shallow native BMC + k-induction.
+        let native_h = scope.spawn(|| {
+            let v = match native_bmc::decide_bad_safety(
+                file,
+                native_bmc::DEFAULT_MAX_K,
+                Some(timeout_ms),
+            ) {
+                Ok(SafetyVerdict::Violated { .. }) => Some(true),
+                Ok(SafetyVerdict::Safe { .. }) => Some(false),
+                Ok(SafetyVerdict::Unknown { .. }) | Err(_) => None,
+            };
+            if v.is_some() {
+                decided.store(true, Relaxed);
+            }
+            v
+        });
+        // Counterstrategy — deep, wall-bounded pure counterexample search.
+        let cex_h = scope.spawn(|| {
+            let v = native_bmc::bmc_cex_until(
+                file,
+                OWNED_DEEP_CEX_MAX_K,
+                OWNED_CEX_QUERY_MS,
+                deadline,
+                decided,
+            )
+            .map(|_depth| ());
+            if v.is_some() {
+                decided.store(true, Relaxed);
+            }
+            v.is_some()
+        });
+        // Safety proof — McMillan interpolation.
+        let interp_h = scope.spawn(|| {
+            match native_interp::verify_safety_interp_cancellable(
+                file,
+                INTERP_MAX_SUFFIX,
+                64,
+                INTERP_QUERY_TIMEOUT_MS,
+                u64::from(timeout_ms),
+                decided,
+            ) {
+                InterpSafetyVerdict::Unsafe { .. } => Some(true),
+                InterpSafetyVerdict::Safe { .. } => Some(false),
+                InterpSafetyVerdict::Undecided { .. } => None,
+            }
+        });
+        let exact = run_exact(&content);
+        if exact.is_some() {
+            decided.store(true, Relaxed);
+        }
+        let native = native_h.join().unwrap_or(None);
+        let cex_hit = cex_h.join().unwrap_or(false);
+        let interp = interp_h.join().unwrap_or(None);
+        // Build the outcome directly so the deep CEX search keeps its own `"cex"`
+        // attribution (and any native-safe vs cex-violated disagreement stays a
+        // Contradiction alarm). No spacer / btormc / pono — owned engines only.
+        let mut reachable_by: Vec<&'static str> = Vec::new();
+        let mut unreachable_by: Vec<&'static str> = Vec::new();
+        for (name, v) in [("exact", exact), ("native", native), ("interp", interp)] {
+            match v {
+                Some(true) => reachable_by.push(name),
+                Some(false) => unreachable_by.push(name),
+                None => {}
+            }
+        }
+        if cex_hit {
+            reachable_by.push("cex");
+        }
+        ReachOutcome::from_sets(reachable_by, unreachable_by)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +647,118 @@ mod tests {
             out.reachable_by.len() >= 2,
             "at least the exact engine + one subprocess member should agree; got {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn owned_only_excludes_external_engines_on_small_counter() {
+        // The owned-standalone driver decides the small reachable counter via the
+        // exact engine and never lists an external member.
+        const COUNTER: &str = "1 sort bitvec 3\n2 zero 1\n3 state 1\n4 init 1 3 2\n5 one 1\n\
+                               6 add 1 3 5\n7 next 1 3 6\n8 ones 1\n9 sort bitvec 1\n\
+                               10 eq 9 3 8\n11 bad 10\n";
+        let file = parser::parse(COUNTER).expect("parse");
+        let out = decide_reach_owned_only(&file, 30_000);
+        assert_eq!(out.verdict, ReachVerdict::Reachable, "outcome: {out:?}");
+        assert!(out.reachable_by.contains(&"exact"), "{out:?}");
+        for ext in ["spacer", "btormc", "pono"] {
+            assert!(
+                !out.reachable_by.contains(&ext) && !out.unreachable_by.contains(&ext),
+                "owned-only must never list {ext}: {out:?}"
+            );
+        }
+    }
+
+    /// The **owned-standalone ceiling** sweep: for every `*.btor2` in
+    /// `MUNUNU_HWMCC_FLAT`, run [`decide_reach_owned_only`] with `MUNUNU_OWNED_TIMEOUT_MS`
+    /// (default 240 000) and report how many the owned engines decide *without any
+    /// external tool*. Cross-checks each definite verdict against an optional
+    /// `MUNUNU_HWMCC_GT` (`basename safe|unsafe` per line) and fails on any mismatch —
+    /// the soundness net. `#[ignore]`d (reads an external corpus, minutes-to-hours).
+    #[test]
+    #[ignore = "owned-only HWMCC ceiling sweep; set MUNUNU_HWMCC_FLAT (+ optional MUNUNU_HWMCC_GT), MUNUNU_OWNED_TIMEOUT_MS default 240000"]
+    fn owned_only_hwmcc_ceiling() {
+        let flat = std::env::var("MUNUNU_HWMCC_FLAT").expect("set MUNUNU_HWMCC_FLAT");
+        let to_ms: u32 = std::env::var("MUNUNU_OWNED_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(240_000);
+        let gt: std::collections::HashMap<String, String> = std::env::var("MUNUNU_HWMCC_GT")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| {
+                        let mut it = l.split_whitespace();
+                        Some((it.next()?.to_string(), it.next()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&flat)
+            .expect("read MUNUNU_HWMCC_FLAT dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "btor2"))
+            .map(|p| {
+                (
+                    std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX),
+                    p,
+                )
+            })
+            .collect();
+        // Small-file-first: the owned-decidable designs skew small, so the decide
+        // count stabilises early and the large-undecided tail just confirms itself.
+        files.sort();
+        let files: Vec<std::path::PathBuf> = files.into_iter().map(|(_, p)| p).collect();
+        let (mut decided, mut safe, mut unsafe_n) = (0u32, 0u32, 0u32);
+        let mut violations: Vec<String> = Vec::new();
+        for p in &files {
+            let name = p.file_stem().unwrap().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(p).unwrap();
+            let file = match crate::adapter::btor2::parser::parse(&content) {
+                Ok(f) => f,
+                Err(_) => {
+                    eprintln!("  ----  parse-error       {name}");
+                    continue;
+                }
+            };
+            let t0 = std::time::Instant::now();
+            let out = decide_reach_owned_only(&file, to_ms);
+            let secs = t0.elapsed().as_secs();
+            let (label, eng) = match out.verdict {
+                ReachVerdict::Reachable => ("unsafe", out.reachable_by.join("+")),
+                ReachVerdict::Unreachable => ("safe", out.unreachable_by.join("+")),
+                ReachVerdict::Unknown => ("unknown", String::new()),
+                ReachVerdict::Contradiction => ("CONTRADICTION", String::new()),
+            };
+            if label == "safe" || label == "unsafe" {
+                decided += 1;
+                if label == "safe" {
+                    safe += 1;
+                } else {
+                    unsafe_n += 1;
+                }
+                let gtv = gt.get(&name).map(String::as_str).unwrap_or("?");
+                let sound = gtv == "?" || gtv == label;
+                if !sound {
+                    violations.push(format!("{name}: gt={gtv} owned={label}"));
+                }
+                eprintln!(
+                    "{} {secs:>4}s  {label:<7} via {eng:<8} gt={gtv:<7} {name}",
+                    if sound { "✓" } else { "✗✗✗" }
+                );
+            } else {
+                eprintln!("  {secs:>4}s  {label:<7}          {name}");
+            }
+        }
+        eprintln!(
+            "\nOWNED-ONLY CEILING @ {to_ms}ms: {decided}/{} decided ({safe} safe, {unsafe_n} unsafe); soundness violations {}",
+            files.len(),
+            violations.len()
+        );
+        assert!(
+            violations.is_empty(),
+            "SOUNDNESS VIOLATIONS: {violations:?}"
         );
     }
 }
