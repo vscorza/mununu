@@ -468,6 +468,75 @@ pub fn decide_bad_safety(
     })
 }
 
+/// Time-boxed **pure counterexample search** — the "counterstrategy" half of the
+/// owned portfolio, run alongside (not inside) the safety proof.
+///
+/// Unrolls the transition relation depth-by-depth on a single init-constrained solver,
+/// looking ONLY for a reachable `bad` (no k-induction step queries to slow it down or
+/// abort it). Returns `Some(depth)` on a concrete, sound `Violated`; `None` if no
+/// counterexample is found within budget.
+///
+/// The point of splitting this out: finding a concrete counterexample is *sound* and
+/// is usually far cheaper than synthesising an equivalent safety invariant, so a deep,
+/// time-boxed CEX search flips many designs that the shallow ([`DEFAULT_MAX_K`]) or
+/// proof-oriented engines leave `Unknown` straight to a definite `Violated`. `max_k`
+/// may therefore be set well above [`DEFAULT_MAX_K`]. Bounded by the wall `deadline`
+/// and `cancel` (both checked before each depth) and by `per_query_ms` per z3 check.
+pub fn bmc_cex_until(
+    file: &Btor2File,
+    max_k: u32,
+    per_query_ms: u32,
+    deadline: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<u32> {
+    let (bad_ops, init_pairs, constraint_ops) = extract_props(file);
+    if bad_ops.is_empty() {
+        return None;
+    }
+    let n = max_k as usize;
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let view = encode_design(file).ok()?;
+        let u = Unroller::build(&view, &bad_ops, &constraint_ops, n);
+        let base = z3::Solver::new();
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", per_query_ms);
+        base.set_params(&params);
+        u.assert_init(&base, &init_pairs);
+        for c in u.constraints_at(0) {
+            base.assert(&c);
+        }
+        for k in 0..=n {
+            // Wall-clock / cancellation bound: abandon the search (return `None`, never
+            // a wrong verdict) when the deadline passes or a peer engine decides first.
+            if cancel.load(std::sync::atomic::Ordering::Relaxed)
+                || std::time::Instant::now() >= deadline
+            {
+                return None;
+            }
+            base.push();
+            base.assert(u.bad_at(k));
+            let res = base.check();
+            base.pop(1);
+            match res {
+                // A concrete init→bad path at depth `k` — sound `Violated`.
+                z3::SatResult::Sat => return Some(k as u32),
+                // This depth's query hit `per_query_ms`; deeper frames only get larger,
+                // so abstain rather than spin.
+                z3::SatResult::Unknown => return None,
+                z3::SatResult::Unsat => {}
+            }
+            if k < n {
+                base.assert(u.transition_at(k));
+                for c in u.constraints_at(k + 1) {
+                    base.assert(&c);
+                }
+            }
+        }
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +564,26 @@ mod tests {
     #[test]
     fn finds_shallowest_cex() {
         assert_eq!(bmc(REACH, 5), BmcOutcome::Violated { depth: 1 });
+    }
+
+    #[test]
+    fn bmc_cex_until_finds_cex_and_abstains_soundly() {
+        use std::sync::atomic::AtomicBool;
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let never = AtomicBool::new(false);
+        // Reaches bad at depth 1 / 5 — the deep CEX-only search returns the depth.
+        let reach = parser::parse(REACH).expect("parse");
+        assert_eq!(bmc_cex_until(&reach, 64, 5_000, far, &never), Some(1));
+        let wide = parser::parse(WIDE).expect("parse"); // depth 5, 64-bit (beyond exact cap)
+        assert_eq!(bmc_cex_until(&wide, 64, 5_000, far, &never), Some(5));
+        // Bounded-safe design → no CEX within the depth budget → None (never a wrong verdict).
+        let safe = parser::parse(SAFE).expect("parse");
+        assert_eq!(bmc_cex_until(&safe, 32, 5_000, far, &never), None);
+        // Cancellation / passed deadline are honored before any work.
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(bmc_cex_until(&reach, 64, 5_000, far, &cancelled), None);
+        let past = far - std::time::Duration::from_secs(120);
+        assert_eq!(bmc_cex_until(&reach, 64, 5_000, past, &never), None);
     }
 
     #[test]

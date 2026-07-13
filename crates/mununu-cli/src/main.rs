@@ -591,6 +591,21 @@ struct Btor2VerifyArgs {
     /// Path to the BTOR2 input file.
     #[arg(value_name = "BTOR2_FILE")]
     file: PathBuf,
+    /// Decide with ONLY the mununu-owned engines (exact BDD, native BMC /
+    /// k-induction, native McMillan interpolation, and the deep counterexample
+    /// search) — no external SPACER / btormc / Pono. Answers "what can mununu's own
+    /// algorithms decide on their own?", for no-subprocess deployments and the
+    /// soundness cross-check.
+    ///
+    /// surface: CLI-only — a soundness-audit / no-subprocess diagnostic, peer of the
+    /// CLI-only `verify-safety --engine ic3`; the default full portfolio remains the
+    /// CLI+API+UI path.
+    #[arg(long)]
+    owned_only: bool,
+    /// Per-engine wall budget (ms) for `--owned-only` (default 60000). Larger values
+    /// let native interpolation and the deep counterexample search reach more designs.
+    #[arg(long, value_name = "MS", default_value_t = 60_000)]
+    owned_timeout_ms: u32,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2524,20 +2539,31 @@ fn btor2_verify_safety(args: Btor2VerifySafetyArgs) -> Result<(), String> {
     let content = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
 
-    let (verdict, engine) = match args.engine {
-        SafetyEngineArg::Cube => (verify_safety_scalable(&content)?, "cube"),
+    let (verdict, engine, detail) = match args.engine {
+        SafetyEngineArg::Cube => (verify_safety_scalable(&content)?, "cube", None),
         SafetyEngineArg::Ic3 => {
             use mununu_core::adapter::btor2::abs_safety::{AbsVerdict, verify_safety_ic3};
             let file = mununu_core::adapter::btor2::parser::parse(&content)
                 .map_err(|e| format!("verify-safety (ic3): parsing BTOR2: {}", e.message))?;
             // Budgets mirror the abs_safety unit tests (32 frames, 8 refinements, 5 s/query),
             // with a longer overall query timeout for the CLI's larger inputs.
-            let verdict = match verify_safety_ic3(&file, 32, 8, 10_000) {
+            let av = verify_safety_ic3(&file, 32, 8, 10_000);
+            // Surface the engine's own diagnosis — the abstain *reason* (grammar ceiling,
+            // frame/blocking limit, refinement stall) or the invariant/CEX size — so the
+            // experimental IC3ia path is diagnosable from the CLI, not opaque.
+            let detail = Some(match &av {
+                AbsVerdict::Safe { predicates } => {
+                    format!("inductive invariant over {predicates} predicates")
+                }
+                AbsVerdict::Unsafe { depth } => format!("counterexample at depth {depth}"),
+                AbsVerdict::Unknown { reason } => reason.clone(),
+            });
+            let verdict = match av {
                 AbsVerdict::Safe { .. } => PropertyVerdict::Holds,
                 AbsVerdict::Unsafe { .. } => PropertyVerdict::Violated,
                 AbsVerdict::Unknown { .. } => PropertyVerdict::Unknown,
             };
-            (verdict, "ic3")
+            (verdict, "ic3", detail)
         }
     };
 
@@ -2546,6 +2572,7 @@ fn btor2_verify_safety(args: Btor2VerifySafetyArgs) -> Result<(), String> {
         "property": "AG !bad",
         "engine": engine,
         "verdict": verdict.as_str(),
+        "detail": detail,
     });
     println!(
         "{}",
@@ -2656,7 +2683,9 @@ fn per_response_decided_by(
 /// breakdown as JSON. Surface peer of the API `POST /api/v1/btor2/verify`; both share
 /// the verdict label via [`mununu_core::verdict::PropertyVerdict`].
 fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
-    use mununu_core::adapter::reach_portfolio::decide_reach_portfolio_parallel;
+    use mununu_core::adapter::reach_portfolio::{
+        decide_reach_owned_only, decide_reach_portfolio_parallel,
+    };
     use mununu_core::verdict::PropertyVerdict;
 
     let content = std::fs::read_to_string(&args.file)
@@ -2664,12 +2693,18 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
     let file = mununu_core::adapter::btor2::parser::parse(&content)
         .map_err(|e| format!("BTOR2 parse error in '{}': {e}", args.file.display()))?;
 
-    // Parallel driver: identical merge to the sequential one, but wall-clock is
-    // bounded by the slowest single engine rather than their sum.
-    let outcome = decide_reach_portfolio_parallel(&file);
+    // `--owned-only`: mununu-owned engines only (no external SPACER/btormc/Pono).
+    // Otherwise the full parallel portfolio — identical merge to the sequential
+    // driver, but wall-clock bounded by the slowest single engine.
+    let outcome = if args.owned_only {
+        decide_reach_owned_only(&file, args.owned_timeout_ms)
+    } else {
+        decide_reach_portfolio_parallel(&file)
+    };
 
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
+        "engines": if args.owned_only { "owned-only" } else { "full-portfolio" },
         "verdict": PropertyVerdict::from(outcome.verdict).as_str(),
         "reachable_by": outcome.reachable_by,
         "unreachable_by": outcome.unreachable_by,
