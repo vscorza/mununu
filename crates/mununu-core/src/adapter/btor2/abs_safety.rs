@@ -343,6 +343,481 @@ fn sat_of(mk: &dyn Fn() -> z3::Solver, terms: &[&Bool]) -> z3::SatResult {
     s.check()
 }
 
+// ============================================================================
+// P2.2b — the IC3 frame ladder (scalability half of §9's safety driver).
+//
+// Blocks counterexamples-to-induction (CTIs) *incrementally* over the predicate
+// abstraction — NO enumeration of the reachable cube set — so it decides designs
+// whose reachable abstract state space is large but whose inductive invariant is
+// compact (where the `verify_safety_abs` BFS hits `max_cubes`). Queries run over
+// the EXACT transition with the frames expressed as clauses over predicates
+// (Cimatti–Griggio IC3ia). Refinement of a spurious CTI reuses the shared P2.1
+// primitive; the deeper reachability-spurious refinement via path interpolation
+// is the remaining completeness half.
+//
+// SOUNDNESS is again structural: `Safe` is returned only after the converged
+// frame is *independently re-verified* as an inductive invariant; `Unsafe` only
+// via `bmc_bad_reachable`. A bug in the blocking/propagation can only cause an
+// abstain (or, bounded by `max_frames`, non-termination), never a wrong verdict.
+// ============================================================================
+
+/// A literal of the predicate abstraction: `(predicate index, polarity)`.
+type Lit = (usize, bool);
+/// A cube = a (possibly partial) conjunction of predicate literals.
+type IcCube = Vec<Lit>;
+
+/// The z3-scope-bound abstraction pieces (built once per solver scope). Holds
+/// owned z3 `Bool`s valid for the enclosing [`z3::with_z3_config`] closure.
+struct AbsScope {
+    pred_cur: Vec<Bool>,
+    pred_nx: Vec<Bool>,
+    transition: Bool,
+    init_cur: Bool,
+    bad_cur: Bool,
+    bad_nx: Bool,
+}
+
+/// Build the abstraction scope for `preds` over the exact transition — the shared
+/// cur/nx interface, the instantiated transition, and each predicate's z3 `Bool`
+/// over current- and next-state. Must be called inside a `with_z3_config` closure.
+fn build_abs_scope(
+    view: &crate::adapter::sidecar::predicate_image::btor2_encode::Btor2SmtView,
+    preds: &[PredicateExpr],
+    props: &Props,
+) -> Option<AbsScope> {
+    let name_to_nid: HashMap<String, Nid> = view
+        .signals
+        .iter()
+        .filter(|s| s.kind == SignalKind::State)
+        .filter_map(|s| s.symbol.clone().map(|sym| (sym, s.nid)))
+        .collect();
+    let nid_to_name: HashMap<Nid, String> =
+        name_to_nid.iter().map(|(n, &d)| (d, n.clone())).collect();
+    let named = |suffix: &str| -> HashMap<Nid, BV> {
+        view.state_curr
+            .iter()
+            .filter_map(|(nid, bv)| {
+                let sym = nid_to_name.get(nid)?;
+                Some((*nid, BV::new_const(format!("{sym}{suffix}"), bv.get_size())))
+            })
+            .collect()
+    };
+    let cur = named("__c");
+    let nx = named("__n");
+    let inp: HashMap<Nid, BV> = view
+        .inputs
+        .iter()
+        .map(|(nid, bv)| (*nid, BV::new_const(format!("i{nid}__x"), bv.get_size())))
+        .collect();
+    let mut subs: Vec<(&BV, &BV)> = Vec::new();
+    for (nid, bv) in &view.state_curr {
+        if let Some(c) = cur.get(nid) {
+            subs.push((bv, c));
+        }
+    }
+    for (nid, bv) in &view.state_next {
+        if let Some(n) = nx.get(nid) {
+            subs.push((bv, n));
+        }
+    }
+    for (nid, bv) in &view.inputs {
+        if let Some(i) = inp.get(nid) {
+            subs.push((bv, i));
+        }
+    }
+    let transition = view.transition.substitute(&subs);
+
+    let build_over = |frame: &HashMap<Nid, BV>, p: &PredicateExpr| -> Option<Bool> {
+        let lookup = |name: &str| {
+            name_to_nid
+                .get(name)
+                .and_then(|nid| frame.get(nid))
+                .cloned()
+        };
+        p.build_constraint(&lookup)
+    };
+    let mut pred_cur = Vec::new();
+    let mut pred_nx = Vec::new();
+    for p in preds {
+        pred_cur.push(build_over(&cur, p)?);
+        pred_nx.push(build_over(&nx, p)?);
+    }
+    Some(AbsScope {
+        pred_cur,
+        pred_nx,
+        transition,
+        init_cur: init_bool(view, props, &cur, &nid_to_name),
+        bad_cur: bad_bool(view, props, &cur),
+        bad_nx: bad_bool(view, props, &nx),
+    })
+}
+
+/// `⋀ literal` of a cube over the given predicate frame (`pred_cur` or `pred_nx`).
+fn cube_over(preds: &[Bool], c: &IcCube) -> Bool {
+    if c.is_empty() {
+        return Bool::from_bool(true);
+    }
+    let lits: Vec<Bool> = c
+        .iter()
+        .map(|&(i, pos)| {
+            if pos {
+                preds[i].clone()
+            } else {
+                preds[i].not()
+            }
+        })
+        .collect();
+    Bool::and(&lits.iter().collect::<Vec<_>>())
+}
+
+/// The frame formula `F(i)` over current-state: the property `¬bad` (implicitly in
+/// every IC3 frame), `Init` (only at `i == 0`), and `¬cube` for every cube blocked
+/// at level `≥ i` (delta encoding).
+fn frame_formula(scope: &AbsScope, frames: &[Vec<IcCube>], i: usize) -> Bool {
+    // `¬bad` is part of every frame — an IC3 frame over-approximates the states
+    // reachable in ≤ i steps AND is contained in the safe region.
+    let mut terms: Vec<Bool> = vec![scope.bad_cur.not()];
+    if i == 0 {
+        terms.push(scope.init_cur.clone());
+    }
+    for level in frames.iter().skip(i) {
+        for c in level {
+            terms.push(cube_over(&scope.pred_cur, c).not());
+        }
+    }
+    Bool::and(&terms.iter().collect::<Vec<_>>())
+}
+
+/// The full predicate valuation of a z3 model (over `pred_cur`) as a cube.
+fn extract_cube(model: &z3::Model, pred_cur: &[Bool]) -> IcCube {
+    pred_cur
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let v = model
+                .eval(p, true)
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            (i, v)
+        })
+        .collect()
+}
+
+/// P2.2b — decide `AG ¬bad` by the IC3 frame ladder over the predicate abstraction,
+/// with P2.1 refinement. Sound by independent verdict verification (see the module
+/// banner). `max_frames` bounds the ladder depth; `max_refine` the refinement loop.
+pub fn verify_safety_ic3(
+    file: &Btor2File,
+    max_frames: usize,
+    max_refine: u32,
+    timeout_ms: u32,
+) -> AbsVerdict {
+    let mut preds = seed_predicates(file);
+    for _ in 0..max_refine {
+        match ic3_pass(file, &preds, max_frames, timeout_ms) {
+            Ic3Pass::Safe => {
+                return AbsVerdict::Safe {
+                    predicates: preds.len(),
+                };
+            }
+            Ic3Pass::Unsafe { depth } => return AbsVerdict::Unsafe { depth },
+            Ic3Pass::Refine(p) => {
+                if preds.contains(&p) {
+                    return AbsVerdict::Unknown {
+                        reason: "IC3 refinement stalled (predicate already present)".into(),
+                    };
+                }
+                preds.push(p);
+            }
+            Ic3Pass::Unknown(reason) => return AbsVerdict::Unknown { reason },
+        }
+    }
+    AbsVerdict::Unknown {
+        reason: format!("IC3 no convergence within {max_refine} refinements"),
+    }
+}
+
+enum Ic3Pass {
+    Safe,
+    Unsafe { depth: u32 },
+    Refine(PredicateExpr),
+    Unknown(String),
+}
+
+fn ic3_pass(
+    file: &Btor2File,
+    preds: &[PredicateExpr],
+    max_frames: usize,
+    timeout_ms: u32,
+) -> Ic3Pass {
+    let props = extract_props(file);
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let view = match encode_design(file) {
+            Ok(v) => v,
+            Err(e) => return Ic3Pass::Unknown(format!("encode: {e:?}")),
+        };
+        let scope = match build_abs_scope(&view, preds, &props) {
+            Some(s) => s,
+            None => return Ic3Pass::Unknown("predicate references unknown register".into()),
+        };
+        let mk = || {
+            let s = z3::Solver::new();
+            let mut p = z3::Params::new();
+            p.set_u32("timeout", timeout_ms);
+            s.set_params(&p);
+            s
+        };
+
+        // Init ∧ bad? (exact formulas — a real bad init state.)
+        if sat_of(&mk, &[&scope.init_cur, &scope.bad_cur]) == z3::SatResult::Sat {
+            return Ic3Pass::Unsafe { depth: 0 };
+        }
+
+        // frames[0] = Init; frames[k≥1] start empty (F(k) = ⊤).
+        let mut frames: Vec<Vec<IcCube>> = vec![vec![]];
+        let mut k = 0usize;
+        loop {
+            k += 1;
+            frames.push(Vec::new());
+            if k > max_frames {
+                return Ic3Pass::Unknown(format!("IC3 exceeded {max_frames} frames"));
+            }
+
+            // Block every bad-predecessor in F(k).
+            loop {
+                let query = Bool::and(&[
+                    &frame_formula(&scope, &frames, k),
+                    &scope.transition,
+                    &scope.bad_nx,
+                ]);
+                let s = mk();
+                s.assert(&query);
+                match s.check() {
+                    z3::SatResult::Unsat => break, // no bad-predecessor in F(k)
+                    z3::SatResult::Unknown => {
+                        return Ic3Pass::Unknown("solver timeout (bad-predecessor)".into());
+                    }
+                    z3::SatResult::Sat => {
+                        let model = match s.get_model() {
+                            Some(m) => m,
+                            None => return Ic3Pass::Unknown("no model".into()),
+                        };
+                        let cti = extract_cube(&model, &scope.pred_cur);
+                        match rec_block(file, &scope, &mut frames, cti, k, &mk, timeout_ms) {
+                            BlockResult::Blocked => continue,
+                            BlockResult::Unsafe { depth } => {
+                                return Ic3Pass::Unsafe { depth };
+                            }
+                            BlockResult::Refine(p) => return Ic3Pass::Refine(p),
+                            BlockResult::Unknown(r) => return Ic3Pass::Unknown(r),
+                        }
+                    }
+                }
+            }
+
+            // Propagate ALL clauses forward first (push any clause still inductive at
+            // the next level), THEN test for a fixpoint.
+            for i in 1..k {
+                let movable: Vec<IcCube> = frames[i].clone();
+                let mut keep = Vec::new();
+                for g in movable {
+                    let q = Bool::and(&[
+                        &frame_formula(&scope, &frames, i),
+                        &scope.transition,
+                        &cube_over(&scope.pred_nx, &g),
+                    ]);
+                    if sat_of(&mk, &[&q]) == z3::SatResult::Unsat {
+                        frames[i + 1].push(g); // still inductive at i+1 → push
+                    } else {
+                        keep.push(g);
+                    }
+                }
+                frames[i] = keep;
+            }
+            // Fixpoint: some frame `i` with an empty delta AND whose `F(i+1)` is a
+            // genuine inductive invariant (independently re-verified — the soundness
+            // gate). A non-fixpoint empty frame (nothing yet blocked there) fails the
+            // check and the ladder simply deepens.
+            for i in 1..k {
+                if frames[i].is_empty() && verify_inductive(&scope, &frames, i + 1, &mk) {
+                    return Ic3Pass::Safe;
+                }
+            }
+        }
+    })
+}
+
+enum BlockResult {
+    Blocked,
+    Unsafe { depth: u32 },
+    Refine(PredicateExpr),
+    Unknown(String),
+}
+
+/// Block cube `s0` at level `lvl` (prove it unreachable in ≤ `lvl` steps) via an
+/// obligation queue over the exact transition. On reaching frame 0 (an abstract
+/// counterexample to `Init`), classify concretely: a real BMC counterexample ⇒
+/// `Unsafe`; otherwise refine (P2.1) or abstain.
+#[allow(clippy::too_many_arguments)]
+fn rec_block(
+    file: &Btor2File,
+    scope: &AbsScope,
+    frames: &mut [Vec<IcCube>],
+    s0: IcCube,
+    lvl: usize,
+    mk: &dyn Fn() -> z3::Solver,
+    timeout_ms: u32,
+) -> BlockResult {
+    // Obligations processed lowest-level-first.
+    let mut obligations: Vec<(usize, IcCube)> = vec![(lvl, s0)];
+    while let Some(idx) = obligations
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (l, _))| *l)
+        .map(|(i, _)| i)
+    {
+        let (j, c) = obligations.remove(idx);
+        if j == 0 {
+            // Abstract CEX reaches Init. Concrete check bounds by the ladder depth.
+            match bmc_bad_reachable(file, (frames.len() as u32 + 2).max(4)) {
+                Ok(BmcOutcome::Violated { depth }) => return BlockResult::Unsafe { depth },
+                _ => {
+                    // Spurious → try single-step refinement (source = c, target = bad).
+                    let source = cube_to_predicate_list(scope, &c);
+                    let bad_atoms = bad_target_atoms(file);
+                    if let RefineOutcome::Predicate(p) =
+                        synthesize_refinement_predicate(file, &source, &bad_atoms, timeout_ms)
+                    {
+                        return BlockResult::Refine(p);
+                    }
+                    return BlockResult::Unknown(
+                        "IC3 spurious CEX with no single-step refinement (path interpolation = \
+                         further increment)"
+                            .into(),
+                    );
+                }
+            }
+        }
+        // Predecessor of c in F(j-1)?  F(j-1) ∧ T ∧ c'
+        let q = Bool::and(&[
+            &frame_formula(scope, frames, j - 1),
+            &scope.transition,
+            &cube_over(&scope.pred_nx, &c),
+        ]);
+        let s = mk();
+        s.assert(&q);
+        match s.check() {
+            z3::SatResult::Unknown => return BlockResult::Unknown("solver timeout (block)".into()),
+            z3::SatResult::Sat => {
+                // Predecessor exists → block it first, then retry c.
+                let model = match s.get_model() {
+                    Some(m) => m,
+                    None => return BlockResult::Unknown("no model (block)".into()),
+                };
+                let d = extract_cube(&model, &scope.pred_cur);
+                obligations.push((j - 1, d));
+                obligations.push((j, c));
+            }
+            z3::SatResult::Unsat => {
+                // No predecessor in F(j-1). If c intersects Init we cannot block it as
+                // unreachable — defer to the frame-0 concrete check.
+                if sat_of(mk, &[&scope.init_cur, &cube_over(&scope.pred_cur, &c)])
+                    == z3::SatResult::Sat
+                {
+                    obligations.push((0, c));
+                    continue;
+                }
+                // Generalize (MIC) and add ¬g to F(1..=j).
+                let g = mic(scope, frames, &c, j, mk);
+                frames[j].push(g);
+            }
+        }
+    }
+    BlockResult::Blocked
+}
+
+/// Minimal inductive clause: greedily drop literals from `c` while the reduced cube
+/// still has no predecessor in `F(j-1)` and does not intersect `Init`.
+fn mic(
+    scope: &AbsScope,
+    frames: &[Vec<IcCube>],
+    c: &IcCube,
+    j: usize,
+    mk: &dyn Fn() -> z3::Solver,
+) -> IcCube {
+    let mut cur = c.clone();
+    let mut i = 0;
+    while i < cur.len() && cur.len() > 1 {
+        let mut trial = cur.clone();
+        trial.remove(i);
+        let no_pred = sat_of(
+            mk,
+            &[
+                &frame_formula(scope, frames, j - 1),
+                &scope.transition,
+                &cube_over(&scope.pred_nx, &trial),
+            ],
+        ) == z3::SatResult::Unsat;
+        let init_disjoint = sat_of(mk, &[&scope.init_cur, &cube_over(&scope.pred_cur, &trial)])
+            == z3::SatResult::Unsat;
+        if no_pred && init_disjoint {
+            cur = trial; // keep the drop
+        } else {
+            i += 1;
+        }
+    }
+    cur
+}
+
+/// The frame formula `F(i)` over **next**-state (`¬bad_nx ∧ ⋀ ¬cube_over(pred_nx)`),
+/// for the consecution check. Only called with `i ≥ 1` (no `Init` term).
+fn frame_formula_nx(scope: &AbsScope, frames: &[Vec<IcCube>], i: usize) -> Bool {
+    let mut terms: Vec<Bool> = vec![scope.bad_nx.not()];
+    for level in frames.iter().skip(i) {
+        for c in level {
+            terms.push(cube_over(&scope.pred_nx, c).not());
+        }
+    }
+    Bool::and(&terms.iter().collect::<Vec<_>>())
+}
+
+/// Independently verify `F(i)` is an inductive invariant: `Init ⟹ F(i)`,
+/// `F(i) ⟹ ¬bad` (structural — `¬bad` is in every frame), `F(i) ∧ T ⟹ F(i)'`.
+/// The soundness gate for `Safe`.
+fn verify_inductive(
+    scope: &AbsScope,
+    frames: &[Vec<IcCube>],
+    i: usize,
+    mk: &dyn Fn() -> z3::Solver,
+) -> bool {
+    let inv = frame_formula(scope, frames, i);
+    let inv_nx = frame_formula_nx(scope, frames, i);
+    // Init ⟹ inv
+    if sat_of(mk, &[&scope.init_cur, &inv.not()]) != z3::SatResult::Unsat {
+        return false;
+    }
+    // inv ∧ T ⟹ inv'  (inv ⟹ ¬bad is structural)
+    sat_of(mk, &[&inv, &scope.transition, &inv_nx.not()]) == z3::SatResult::Unsat
+}
+
+/// A cube's literals as a `PredicateExpr` list (positive literal → the predicate,
+/// negative → its negation), for handing a spurious CTI to the refinement primitive.
+fn cube_to_predicate_list(_scope: &AbsScope, _c: &IcCube) -> Vec<PredicateExpr> {
+    // The scope holds z3 Bools, not the source PredicateExprs; the caller passes the
+    // predicate list separately. This shim returns empty (source = ⊤) so the
+    // refinement asks "from anywhere, can we reach bad?" — a coarse but sound query.
+    Vec::new()
+}
+
+/// The `bad` cone's `eq(register, const)` atoms as a `PredicateExpr` target list.
+fn bad_target_atoms(file: &Btor2File) -> Vec<PredicateExpr> {
+    // Reuse the seed extraction, then keep only atoms that appear in the bad cone —
+    // approximated here as all seeded comparison atoms (sound: a superset target only
+    // makes the refinement query easier to satisfy, never unsound).
+    seed_predicates(file)
+}
+
 fn recover_path(target: &Cube, parent: &HashMap<Cube, Cube>) -> Vec<Cube> {
     let mut path = vec![target.clone()];
     let mut cur = target;
@@ -607,6 +1082,70 @@ mod tests {
                 eprintln!("SKIP: {reason}")
             }
             other => panic!("expected Unsafe depth 0, got {other:?}"),
+        }
+    }
+
+    // ---- P2.2b: the IC3 frame ladder (verify_safety_ic3) ----
+
+    #[test]
+    fn ic3_proves_constant_hold_safe() {
+        const HOLD: &str = "1 sort bitvec 2\n2 zero 1\n3 state 1 x\n4 init 1 3 2\n5 next 1 3 3\n\
+                            6 constd 1 3\n7 sort bitvec 1\n8 eq 7 3 6\n9 bad 8\n";
+        let file = parser::parse(HOLD).expect("parse");
+        match verify_safety_ic3(&file, 32, 8, 5_000) {
+            AbsVerdict::Safe { .. } => {}
+            AbsVerdict::Unknown { reason } if reason.contains("cvc5") => {
+                eprintln!("SKIP: {reason}")
+            }
+            other => panic!("expected Safe (IC3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ic3_refutes_reachable_bad() {
+        const REACH: &str = "1 sort bitvec 2\n2 zero 1\n3 state 1 x\n4 init 1 3 2\n5 one 1\n\
+                             6 add 1 3 5\n7 next 1 3 6\n8 constd 1 3\n9 sort bitvec 1\n\
+                             10 eq 9 3 8\n11 bad 10\n";
+        let file = parser::parse(REACH).expect("parse");
+        match verify_safety_ic3(&file, 32, 8, 5_000) {
+            AbsVerdict::Unsafe { .. } => {}
+            AbsVerdict::Unknown { reason } if reason.contains("cvc5") => {
+                eprintln!("SKIP: {reason}")
+            }
+            other => panic!("expected Unsafe (IC3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ic3_detects_initial_violation() {
+        const INIT_BAD: &str =
+            "1 sort bitvec 1\n2 one 1\n3 state 1 x\n4 init 1 3 2\n5 next 1 3 2\n6 bad 3\n";
+        let file = parser::parse(INIT_BAD).expect("parse");
+        match verify_safety_ic3(&file, 32, 8, 5_000) {
+            AbsVerdict::Unsafe { depth } => assert_eq!(depth, 0),
+            AbsVerdict::Unknown { reason } if reason.contains("cvc5") => {
+                eprintln!("SKIP: {reason}")
+            }
+            other => panic!("expected Unsafe depth 0 (IC3), got {other:?}"),
+        }
+    }
+
+    /// The IC3 frame ladder proves the non-1-inductive safe design via *incremental
+    /// blocking* (invariant re-verified before Safe) — no reachable-cube enumeration.
+    /// `a` holds at 0, `b = a + 1`, `bad = (b == 2)`.
+    #[test]
+    fn ic3_proves_non_inductive_safe() {
+        const D: &str = "1 sort bitvec 2\n2 zero 1\n3 state 1 a\n4 init 1 3 2\n5 next 1 3 3\n\
+                         6 state 1 b\n7 init 1 6 2\n8 one 1\n9 add 1 3 8\n10 next 1 6 9\n\
+                         11 constd 1 2\n12 sort bitvec 1\n13 eq 12 6 11\n14 bad 13\n";
+        let file = parser::parse(D).expect("parse");
+        match verify_safety_ic3(&file, 32, 8, 5_000) {
+            AbsVerdict::Safe { .. } => {}
+            AbsVerdict::Unknown { reason } if reason.contains("cvc5") => {
+                eprintln!("SKIP: {reason}")
+            }
+            // NEVER Unsafe (b never reaches 2) — the soundness gate guarantees it.
+            other => panic!("expected Safe via IC3 blocking, got {other:?}"),
         }
     }
 }
