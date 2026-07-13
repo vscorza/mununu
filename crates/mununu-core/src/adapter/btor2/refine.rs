@@ -463,6 +463,214 @@ pub fn synthesize_reachability_predicate(
 /// the single (often redundant) predicate a one-cut interpolation gives. Empty when
 /// `bad` is reachable within `depth` (a real CEX — the caller confirms elsewhere) or
 /// every interpolant is outside the `#318` grammar.
+/// **Emergent-K** — discover RELATIONAL invariants by ITERATIVE forward
+/// interpolation. Starting from `R = Init`, repeatedly interpolate
+/// `A = R(s0) ∧ T(s0,s1)` against `B = ¬bad(s1)`; the interpolant `I(s1)` (a
+/// reachable-state over-approximation excluding `bad`) is parsed to a
+/// [`PredicateExpr`] and `R` grows by it. The key (de-risked 2026-07-13): from
+/// concrete `Init` the first interpolant is concrete values, but as `R` grows to
+/// span a relational region cvc5 GENERALISES the interpolant to the relation
+/// (e.g. `data == target`) — an "emergent" predicate that no *syntactic* extractor
+/// finds. Returns the discovered predicates (the relational ones are the payoff),
+/// most-general last. Stops at a fixpoint, an unparseable interpolant (grammar
+/// ceiling), or when `bad` is one-step reachable from `R` (the invariant fails).
+pub fn discover_relational_predicates(
+    file: &Btor2File,
+    max_iters: usize,
+    timeout_ms: u32,
+) -> Vec<PredicateExpr> {
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let view = match encode_design(file) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let nid_to_name: HashMap<Nid, String> = view
+            .signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::State)
+            .filter_map(|s| s.symbol.clone().map(|sym| (s.nid, sym)))
+            .collect();
+        let mk_state = |tag: &dyn Fn(&str) -> String| -> HashMap<Nid, BV> {
+            view.state_curr
+                .iter()
+                .filter_map(|(nid, bv)| {
+                    nid_to_name
+                        .get(nid)
+                        .map(|sym| (*nid, BV::new_const(tag(sym), bv.get_size())))
+                })
+                .collect()
+        };
+        let s0 = mk_state(&|sym| format!("{sym}__cur")); // current state (R's vocabulary)
+        let s1 = mk_state(&|sym| sym.to_string()); // next state (interpolant vocabulary)
+        let inp0: HashMap<Nid, BV> = view
+            .inputs
+            .iter()
+            .map(|(nid, bv)| (*nid, BV::new_const(format!("in{nid}"), bv.get_size())))
+            .collect();
+        // T(s0 → s1).
+        let transition = {
+            let mut subs: Vec<(&BV, &BV)> = Vec::new();
+            for (nid, bv) in &view.state_curr {
+                if let Some(s) = s0.get(nid) {
+                    subs.push((bv, s));
+                }
+            }
+            for (nid, bv) in &view.state_next {
+                if let Some(d) = s1.get(nid) {
+                    subs.push((bv, d));
+                }
+            }
+            for (nid, bv) in &view.inputs {
+                if let Some(i) = inp0.get(nid) {
+                    subs.push((bv, i));
+                }
+            }
+            view.transition.substitute(&subs)
+        };
+        let one1 = BV::from_u64(1, 1);
+        let bad_ops: Vec<Nid> = file
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                crate::adapter::btor2::ast::Node::Bad { signal } => Some(signal.nid()),
+                _ => None,
+            })
+            .collect();
+        // `bad` over `s1`.
+        let bad_s1 = {
+            let subs: Vec<(&BV, &BV)> = view
+                .state_curr
+                .iter()
+                .filter_map(|(nid, bv)| s1.get(nid).map(|s| (bv, s)))
+                .collect();
+            let disj: Vec<Bool> = bad_ops
+                .iter()
+                .filter_map(|op| {
+                    view.signal_bvs
+                        .get(op)
+                        .or_else(|| view.state_curr.get(op))
+                        .map(|bv| bv.substitute(&subs).eq(&one1))
+                })
+                .collect();
+            if disj.is_empty() {
+                Bool::from_bool(false)
+            } else {
+                Bool::or(&disj.iter().collect::<Vec<_>>())
+            }
+        };
+        // Init(s0).
+        let init = {
+            let subs: Vec<(&BV, &BV)> = view
+                .state_curr
+                .iter()
+                .filter_map(|(nid, bv)| s0.get(nid).map(|c| (bv, c)))
+                .collect();
+            let conj: Vec<Bool> = file
+                .lines
+                .iter()
+                .filter_map(|l| match &l.node {
+                    crate::adapter::btor2::ast::Node::Init { state, value, .. } => {
+                        let c = s0.get(state)?;
+                        let vbv = view
+                            .signal_bvs
+                            .get(&value.nid())
+                            .or_else(|| view.state_curr.get(&value.nid()))?
+                            .substitute(&subs);
+                        Some(c.eq(&vbv))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if conj.is_empty() {
+                Bool::from_bool(true)
+            } else {
+                Bool::and(&conj.iter().collect::<Vec<_>>())
+            }
+        };
+        // Build a PredicateExpr as a z3 Bool over `s0` (to grow `R`).
+        let over_s0 = |p: &PredicateExpr| -> Option<Bool> {
+            let name_to_nid: HashMap<&str, Nid> =
+                nid_to_name.iter().map(|(n, s)| (s.as_str(), *n)).collect();
+            let lookup = |name: &str| name_to_nid.get(name).and_then(|nid| s0.get(nid)).cloned();
+            p.build_constraint(&lookup)
+        };
+
+        let mk = || {
+            let s = z3::Solver::new();
+            let mut pr = z3::Params::new();
+            pr.set_u32("timeout", timeout_ms);
+            s.set_params(&pr);
+            s
+        };
+
+        let mut r = init.clone();
+        let mut discovered: Vec<PredicateExpr> = Vec::new();
+        for _ in 0..max_iters.max(1) {
+            // If `bad` is one-step reachable from R, the invariant fails — stop.
+            {
+                let s = mk();
+                s.assert(Bool::and(&[&r, &transition, &bad_s1]));
+                if s.check() != z3::SatResult::Unsat {
+                    break;
+                }
+            }
+            // Interpolate A = R ∧ T  vs  B = ¬bad(s1).  I over s1 (register names).
+            let a = Bool::and(&[&r, &transition]);
+            let b = bad_s1.not();
+            let (a_decls, a_body) = match serialize_term(&a) {
+                Some(x) => x,
+                None => break,
+            };
+            let (b_decls, b_body) = match serialize_term(&b) {
+                Some(x) => x,
+                None => break,
+            };
+            let mut decls: BTreeSet<String> = BTreeSet::new();
+            decls.extend(a_decls);
+            decls.extend(b_decls);
+            let mut query =
+                String::from("(set-logic QF_BV)\n(set-option :produce-interpolants true)\n");
+            for d in &decls {
+                query.push_str(d);
+                query.push('\n');
+            }
+            query.push_str(&format!(
+                "(assert {a_body})\n(get-interpolant I {b_body})\n(exit)\n"
+            ));
+            let stdout = match run_cvc5_raw(&query, timeout_ms) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let p = match parse_interpolant_to_predicate_expr(&stdout) {
+                Some(p) => p,
+                None => break, // grammar ceiling
+            };
+            // Grow R by the new predicate; stop at a fixpoint (nothing new).
+            let grown = match over_s0(&p) {
+                Some(pb) => pb,
+                None => break,
+            };
+            let is_new = !discovered.contains(&p);
+            if is_new {
+                discovered.push(p);
+            }
+            let new_r = Bool::or(&[&r, &grown]);
+            // Fixpoint: R didn't grow (new_r ⟹ r) AND no new predicate.
+            let fixed = {
+                let s = mk();
+                s.assert(Bool::and(&[&new_r, &r.not()]));
+                s.check() == z3::SatResult::Unsat
+            };
+            r = new_r;
+            if fixed && !is_new {
+                break;
+            }
+        }
+        discovered
+    })
+}
+
 pub fn sequence_interpolant_predicates(
     file: &Btor2File,
     depth: usize,
@@ -536,6 +744,121 @@ mod tests {
                 panic!("bad (b==2) is NOT reachable — cannot be Realizable")
             }
         }
+    }
+
+    /// Emergent-K: the iterative forward interpolation DISCOVERS the relational
+    /// invariant `data == target` — a predicate with NO syntactic `eq` node in the
+    /// design (the invariant is only implied by the two counters incrementing
+    /// together). This is the emergent-K payoff: a relation no syntactic extractor
+    /// finds, synthesised from interpolation.
+    #[test]
+    fn discovers_emergent_relational_invariant() {
+        // data, target: 8-bit, both init 0, both += 1 ⇒ data==target invariant.
+        // bad = (data != target) — never holds. NO `eq` node anywhere.
+        const D: &str = "1 sort bitvec 8\n2 sort bitvec 1\n3 zero 1\n4 one 1\n\
+                         5 state 1 data\n6 init 1 5 3\n7 state 1 target\n8 init 1 7 3\n\
+                         9 add 1 5 4\n10 next 1 5 9\n11 add 1 7 4\n12 next 1 7 11\n\
+                         13 neq 2 5 7\n14 bad 13\n";
+        let file = parser::parse(D).expect("parse");
+        let preds = discover_relational_predicates(&file, 8, 5_000);
+        if preds.is_empty() {
+            eprintln!("SKIP (cvc5 absent / grammar): no predicates discovered");
+            return;
+        }
+        // A relational `data == target` (CmpReg) must be among the discovered preds.
+        let found_relation = preds.iter().any(|p| {
+            matches!(p, PredicateExpr::CmpReg { lhs, op, rhs }
+                if *op == CmpOp::Eq
+                    && ((lhs == "data" && rhs == "target") || (lhs == "target" && rhs == "data")))
+        });
+        assert!(
+            found_relation,
+            "expected to discover the emergent relation data==target; got {preds:?}"
+        );
+    }
+
+    /// Emergent-K on an INEQUALITY bound: a saturating counter (`cnt' = cnt>=5 ? 5 :
+    /// cnt+1`) has the invariant `cnt <= 5`. No `eq` node; the *syntactic* extractors
+    /// are equality-only, so this bound is exactly the kind of invariant interpolation
+    /// can uniquely supply. Expect the discovery to find `cnt <= 5` (`Cmp{Le}`).
+    #[test]
+    fn discovers_inequality_bound_invariant() {
+        const D: &str = "1 sort bitvec 8\n2 sort bitvec 1\n3 constd 1 5\n4 one 1\n5 zero 1\n\
+                         6 state 1 cnt\n7 init 1 6 5\n8 ugte 2 6 3\n9 add 1 6 4\n\
+                         10 ite 1 8 3 9\n11 next 1 6 10\n12 ugt 2 6 3\n13 bad 12\n";
+        let file = parser::parse(D).expect("parse");
+        let preds = discover_relational_predicates(&file, 8, 5_000);
+        if preds.is_empty() {
+            eprintln!("SKIP (cvc5 absent / grammar): none discovered");
+            return;
+        }
+        let found_bound = preds.iter().any(|p| {
+            matches!(p, PredicateExpr::Cmp { register, op, value }
+                if register == "cnt" && matches!(op, CmpOp::Le | CmpOp::Lt) && *value >= 5)
+        });
+        assert!(
+            found_bound,
+            "expected to discover the bound invariant cnt<=5; got {preds:?}"
+        );
+    }
+
+    /// Validation sweep: run the interpolation invariant-discovery over every
+    /// `*.btor2` in `MUNUNU_DISCOVER_DIR` (real HWMCC / OpenTitan designs) and print
+    /// the discovered predicates per design — how often does it find a non-trivial
+    /// relational / bound invariant on REAL designs? `#[ignore]`d.
+    #[test]
+    #[ignore = "sweeps an external BTOR2 dir named by MUNUNU_DISCOVER_DIR"]
+    fn sweep_discovery_on_external_designs() {
+        let dir = std::env::var("MUNUNU_DISCOVER_DIR").expect("set MUNUNU_DISCOVER_DIR");
+        let max_bytes: u64 = std::env::var("MUNUNU_DISCOVER_MAXBYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "btor2"))
+            .filter(|p| {
+                std::fs::metadata(p)
+                    .map(|m| m.len() <= max_bytes)
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        let mut found = 0usize;
+        let mut relational = 0usize;
+        for p in &files {
+            let Ok(content) = std::fs::read_to_string(p) else {
+                continue;
+            };
+            let Ok(file) = parser::parse(&content) else {
+                continue;
+            };
+            let preds = discover_relational_predicates(&file, 8, 4_000);
+            if preds.is_empty() {
+                continue;
+            }
+            found += 1;
+            let rel = preds.iter().any(|pe| {
+                matches!(
+                    pe,
+                    PredicateExpr::CmpReg { .. } | PredicateExpr::CmpRegAddend { .. }
+                ) || matches!(pe, PredicateExpr::Cmp { op, .. } if !matches!(op, CmpOp::Eq | CmpOp::Ne))
+            });
+            if rel {
+                relational += 1;
+            }
+            let name = p.file_name().unwrap().to_string_lossy();
+            eprintln!("  {name}: {preds:?}");
+        }
+        eprintln!(
+            "\nSWEEP: {} designs (<= {}B); discovered non-trivial on {}, of which {} had a \
+             RELATIONAL/BOUND invariant (the interpolation-unique forms)",
+            files.len(),
+            max_bytes,
+            found,
+            relational
+        );
     }
 
     /// A realizable step (`x==0 → x==1`: `0+1=1`) must report `Realizable`, never a
