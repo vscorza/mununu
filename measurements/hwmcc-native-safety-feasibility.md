@@ -322,6 +322,51 @@ has three problems, each real:
    So predicate discovery is a sound, tested **hint generator** for the paper's emergent-K
    direction, not a bit-level-safety decider.
 
+### 6.1 Does adding predicate-generation capability make these feasible?
+
+The natural follow-up: if the *only* stated obstacle for `mul9` is a missing grammar
+atom, does *adding* multiplication / modular predicate generation make it — and the other
+cases — decidable? **No, not in general.** Adding a predicate atom expands what invariants
+are *representable*; it does not reduce the *complexity* of finding or checking one. The
+complexity relocates, it does not vanish. Everything in this suite is *decidable* (finite
+state); the walls are complexity, and predicate abstraction wins **exactly when a compact,
+discoverable inductive certificate exists in the chosen vocabulary.** Whether adding
+capability helps therefore depends on *why* the case is hard:
+
+- **Violated cases (§2, e.g. `circular_pointer_d128`) — predicates are irrelevant.** There
+  is no inductive invariant to find; the task is to exhibit a counterexample. No
+  predicate-generation helps at all; the only lever is deeper/faster BMC (§2's
+  incremental-BMC increment). This is the majority of the hard residual, and it is the
+  clearest "adding predicates does nothing" case.
+
+- **Nonlinear-safe cases (§5, `mul9`/`gen43`) — representable, still §5-hard.** Adding a
+  `bvmul`/`bvurem` atom lets the cube *state* a datapath predicate, and **if** the design
+  has a *coarse* safety proof (one not needing the exact product — a range, sign, or
+  parity fact) it becomes feasible. That coarse-proof class is exactly predicate
+  abstraction's real edge and the emergent-K "unique form" wins. **But if the proof
+  genuinely needs the exact multiplier**, both *discovering* the predicate (interpolation
+  over `bvmul`) and *validating* the abstraction (per-edge multiplier-SAT) inherit §5's
+  hardness — the same wall that leaves `mul9` `unknown` for btormc/Pono/SPACER too (§7). So
+  it is feasible **iff a coarse discoverable proof exists**, not by grammar alone; the
+  grammar atom is the cheap, fixable half.
+
+- **Wide-scale cases (§1/§3, `arbitrated_top`) — representation is already fine.**
+  Register-comparison predicates *can* express arbitration / counter invariants; the wall
+  is *discovering* a compact inductive certificate at scale, which is the §3 SPACER-class
+  problem — and even external Pono/SPACER do not crack the *deep* instances at budget (§7).
+  Adding predicate generation here is not a grammar fix; it is building the IC3/PDR that
+  mununu already links in-process.
+
+**The unifying principle.** Predicate abstraction *discretizes* the state space by
+predicate valuations and decides a design precisely when a *compact, discoverable*
+inductive certificate lives in its vocabulary. Expanding the vocabulary helps only that
+class. It does nothing for violated designs (no certificate to represent), and it does not
+lower the complexity of *finding* or *checking* a certificate when the property genuinely
+depends on the exact datapath — there it merely lets the cube fail the same way the
+external engines already do. So "add predicate generation and discretize" makes more cases
+*expressible*; it makes feasible only the ones with a compact certificate a bounded search
+can reach — which is the §3 class in-process SPACER already serves.
+
 **Feasibility verdict for KMTS-on-HWMCC-safety: not the right tool — and that is fine.**
 The cube's real, defensible domain is **branching-time recoverability on abstracted
 datapaths** (`AG EF good`), which *no external bv tool can even state*, decided at
