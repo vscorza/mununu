@@ -362,6 +362,13 @@ pub fn verify_project(config: &VerifyConfig, base_dir: &Path) -> Result<VerifyRe
 /// no `bad` node (the cube returns `Err`), an unreadable file, or a parse failure is
 /// silently skipped, so the pass never aborts the run. Parameterised sources
 /// (`count >= 2`) are not expanded here — the cube reads each declared file directly.
+///
+/// Scope: `btor2` sources only. `sv-yosys` sources are NOT lifted here — the cube needs a
+/// BTOR2 whose SVA `assert property` survives as a `bad` node, and the available `sv2v`
+/// (0.0.13) drops the concurrent-assertion form during the flatten lift (`sv_to_btor2`
+/// yields 0 `bad` nodes), so the cube would have nothing to check. Verify SV safety with
+/// the standalone `mununu sv verify` portfolio verb; wiring the cube onto a reliably
+/// SVA-preserving SV→BTOR2 lift is a follow-up.
 fn run_safety_cube_pass(config: &VerifyConfig, base_dir: &Path) -> Vec<SafetyCubeResult> {
     let mut out = Vec::new();
     for src in &config.sources {
