@@ -290,22 +290,32 @@ has three problems, each real:
      arbitration state needs *many* predicates to separate `bad`; the predicate count that
      actually decides it is §1's exact-analysis blow-up under another name. Inherits §1.
 
-2. **Emergent-K discovers the wrong kind of fact for these designs (measured).** The
-   emergent-K interpolation loop (`discover_relational_predicates`) *does* find genuinely
-   unique invariant forms — register-to-constant bounds and orderings the mature
-   pair-difference / eq-atom machinery structurally cannot express. **But on the real
-   HWMCC corpus, every design where those forms appeared is `SAT`/UNSAFE at depth**, so
-   the discovered "bound" is a *spurious shallow-forward over-approximation* of a property
-   that is actually violated deeper:
+2. **Emergent-K finds a *relevant* predicate that is not an *invariant* here — the design
+   is unsafe (measured).** The emergent-K interpolation loop
+   (`discover_relational_predicates`) *does* find genuinely unique, *relevant* forms —
+   register-to-constant bounds and orderings the mature pair-difference / eq-atom machinery
+   structurally cannot express. These are **good** predicates (`count < 16` is *exactly*
+   `¬bad` for a "buffer overflows at 16" design). **But on the real HWMCC corpus, every
+   design where those forms appeared is `SAT`/UNSAFE at depth**, so the predicate is not an
+   *invariant* — the design genuinely violates it:
    - **`vis_arrays_buf_bug`** — discovered `count < 16`, but the design has a concrete
-     counterexample at **depth 18–28**; `count` genuinely exceeds 16 on the real trace.
+     counterexample at **depth 18–28**; `count` genuinely reaches 16 on the real trace.
    - **`krebs.3`** — discovered `v_energy < 8`, but the counterexample is at **depth 75**.
    - **`brp2.2`** — discovered the ordering `dve_invalid ≥ a_done`, but the counterexample
      is at **depth 119**.
 
-   In each, seeding the false bound cannot add a sound `safe` decide; the verdict-verified
-   driver correctly *rejects* the non-inductive seed (sound abstain), so no harm — but no
-   lift either. The correct lever for all three is **deeper BMC** (§2), not a predicate.
+   So seeding the predicate as `safe` is wrong, and the verdict-verified driver correctly
+   *rejects* the non-inductive seed (sound abstain) — no false `safe`. **This is not a
+   theoretical dead end, and not a bad-predicate problem — it is an implementation gap.**
+   The failed inductiveness check (`p ∧ T ⊭ p'`) is itself the signal that `bad` is
+   reachable, and the predicate says *where* (`count → 16`). So the discovered fact could
+   **direct a counterexample search** — a targeted deeper BMC toward the escaping region,
+   or an IC3-style backward obligation chain — and turn the abstain into a definite
+   `violated` with a trace. Today the loop only tries the predicate as a *safe* seed; the
+   CEX-direction wiring is a concrete task (§8.1, T3). The simplest lever remains **deeper
+   BMC** (§2) — for these moderate depths (18–119) it finds the counterexample with or
+   without the hint; the predicate's unique value is on *very* deep counterexamples, where
+   it enables acceleration rather than blind unrolling.
 
 3. **The residual is BMC-depth, not missing-invariant.** The portfolio's remaining HWMCC
    abstentions are dominated by deep-CEX-unsafe cases and the §1/§3/§5 walls — where the
@@ -464,6 +474,41 @@ nonlinear-safe frontier — provably or empirically open for native and external
 6. **Keep the KMTS cube pointed at its real target.** Its differentiation is
    branching-time recoverability external bv tools cannot state — not bit-level HWMCC
    safety. Measuring or marketing it on HWMCC safety is the wrong axis.
+
+### 8.1 Concrete engineering tasks
+
+Two classes of increment fall out of §6. The first expands *representability* (helps the
+coarse-invariant class only, §6.1); the second turns *abstentions into definite verdicts*
+on the unsafe-at-depth class (§6.2). Each is scoped, and each carries an honest caveat.
+
+**Grammar / discovery — missing predicate atoms** *(helps §5 coarse-invariant proofs;
+measured caveat: does **not** lift the exact-datapath cases — the interpolation/edge-SMT
+hardness is §5 and is unchanged, so gate behind a flag and measure, do not assume a lift):*
+
+- **T1 — multiplication predicate atom.** Extend `PredicateExpr` (today: `Cmp` / `CmpReg`
+  / `CmpRegAddend` + boolean — no product) with a `bvmul`-based comparison atom, and teach
+  the interpolant→predicate parser to accept a `bvmul`-shaped interpolant (today it returns
+  `None` → falls back). Unlocks the cube for `mul9`-class designs **iff** they have a coarse
+  product-predicate proof.
+- **T2 — modular / remainder predicate atom.** The same for `bvurem` / `bvudiv`
+  (`gen43`-class 256-bit modular relations).
+- **T1/T2 acceptance test.** A design with a *known* coarse product/modular invariant
+  decides `holds` with the atom on and `unknown` with it off (the isolation pattern the
+  existing `safety_cube_decides_constant_bound_via_interpolation_discovery` test uses), and
+  a free/unsafe counterpart never decides a false `safe` (soundness half).
+
+**Predicate-directed counterexample search — turn §6.2 abstentions into `violated`:**
+
+- **T3 — non-inductive discovery ⇒ CEX direction.** When a discovered candidate invariant
+  fails its inductiveness check (`p ∧ T ⊭ p'`), treat the failure as a reachability signal
+  rather than only a rejected safe-seed: run a *targeted* deeper BMC toward the escaping
+  region (`p → ¬p`), or chain the counterexample-to-induction backward (IC3-style), and on
+  success return `violated` with the trace instead of abstaining. Validates on
+  `vis_arrays_buf_bug` (@18–28), `krebs.3` (@75), `brp2.2` (@119). This is the natural
+  companion to the incremental-BMC increment (item 2): the predicate supplies the
+  *direction*, incremental BMC supplies the *reach*; the predicate's unique value is on
+  *very* deep counterexamples where blind unrolling can't get there but the escaping
+  transition can be accelerated.
 
 **Bottom line — the native/external division of labor.** The measured picture (§7) is
 sharper than "external engines cover mununu's gaps." External wins **one category
