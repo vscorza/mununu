@@ -31,7 +31,9 @@ use z3::ast::{Ast, BV, Bool};
 use crate::adapter::btor2::ast::{Btor2File, ConstValue, Nid, Node};
 use crate::adapter::btor2::native_bmc::{BmcOutcome, bmc_bad_reachable};
 use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
-use crate::adapter::btor2::refine::{RefineOutcome, synthesize_refinement_predicate};
+use crate::adapter::btor2::refine::{
+    RefineOutcome, synthesize_reachability_predicate, synthesize_refinement_predicate,
+};
 use crate::adapter::sidecar::predicate_image::btor2_encode::{SignalKind, encode_design};
 
 /// Verdict of the predicate-abstraction safety driver.
@@ -683,7 +685,7 @@ fn rec_block(
             match bmc_bad_reachable(file, (frames.len() as u32 + 2).max(4)) {
                 Ok(BmcOutcome::Violated { depth }) => return BlockResult::Unsafe { depth },
                 _ => {
-                    // Spurious → try single-step refinement (source = c, target = bad).
+                    // Spurious. First try the cheap single-step refinement.
                     let source = cube_to_predicate_list(scope, &c);
                     let bad_atoms = bad_target_atoms(file);
                     if let RefineOutcome::Predicate(p) =
@@ -691,11 +693,19 @@ fn rec_block(
                     {
                         return BlockResult::Refine(p);
                     }
-                    return BlockResult::Unknown(
-                        "IC3 spurious CEX with no single-step refinement (path interpolation = \
-                         further increment)"
-                            .into(),
-                    );
+                    // P2.3 — reachability spuriousness: single-step can't add a
+                    // reachability-constraining predicate; PATH-interpolate over the
+                    // suffix bounded by the ladder depth.
+                    match synthesize_reachability_predicate(file, frames.len(), timeout_ms) {
+                        RefineOutcome::Predicate(p) => return BlockResult::Refine(p),
+                        _ => {
+                            return BlockResult::Unknown(
+                                "IC3 spurious CEX; neither single-step nor path interpolation \
+                                 yielded a parseable predicate (grammar ceiling — emergent-K)"
+                                    .into(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1128,6 +1138,25 @@ mod tests {
             }
             other => panic!("expected Unsafe depth 0 (IC3), got {other:?}"),
         }
+    }
+
+    /// P2.3 make-or-break probe: run the IC3 frame ladder (with path-interpolation
+    /// refinement) on a real HWMCC design (`MUNUNU_INTERP_PROBE`), printing the
+    /// verdict + wall-clock — does IC3's cheap blocking + rare interpolation decide
+    /// it? Ignored by default (needs an external file + cvc5).
+    #[test]
+    #[ignore = "reads an external BTOR2 file named by MUNUNU_INTERP_PROBE"]
+    fn probe_ic3_on_external_design() {
+        let path = std::env::var("MUNUNU_INTERP_PROBE")
+            .expect("set MUNUNU_INTERP_PROBE=/path/to/design.btor2");
+        let content = std::fs::read_to_string(&path).expect("read design");
+        let file = parser::parse(&content).expect("parse btor2");
+        let t0 = std::time::Instant::now();
+        let v = verify_safety_ic3(&file, 40, 24, 8_000);
+        eprintln!(
+            "IC3 verdict on {path} [{}ms]: {v:?}",
+            t0.elapsed().as_millis()
+        );
     }
 
     /// The IC3 frame ladder proves the non-1-inductive safe design via *incremental
