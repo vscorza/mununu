@@ -183,6 +183,96 @@ The full design — predicate abstraction, explicit & symbolic model checking, t
 layering, and how over/under/⊥ approximation and may/must edges operate — is in
 [`docs/design/post-rf5-architecture.md`](docs/design/post-rf5-architecture.md).
 
+### Verification engines
+
+A property's fixpoint shape routes it to one of two families. The verdict vocabulary is
+always `True` / `False` / `⊥` — a definite verdict is sound; `⊥` means "the abstraction
+can't decide," never a false claim.
+
+```mermaid
+flowchart TD
+  P["Property (μ-calculus formula)"] --> C{"Fixpoint shape<br/>(property_class)"}
+  C -->|"ν-only → Safety<br/>(AG ¬bad, SVA assert)"| SAFE["Bit-level safety portfolio"]
+  C -->|"νμ box-AF → Response-liveness<br/>(AG(req → AF grant))"| L2S["Liveness-to-safety + portfolio"]
+  C -->|"νμ diamond → Recoverability<br/>(AG EF good) — SVA/LTL can't state"| CUBE["KMTS 3-valued branching cube"]
+
+  SAFE --> PORT["exact BDD · native BMC/k-induction ·<br/>native SPACER · native interp (cvc5) ·<br/>btormc* · Pono*  →  differential-oracle merge"]
+  CUBE --> BR["exact 3-valued BDD (≤40b) →<br/>predicate-cube + SMT hyper-must →<br/>Podelski–Rybalchenko ranking cert"]
+
+  PORT --> V["True / False / ⊥"]
+  L2S --> V
+  BR --> V
+
+  LTL["LTL assumptions/guarantees"] --> SYN["GR(1) fixpoints · parity game (Zielonka)"] --> CTRL["Synthesised controller (SV / CTXDSL / AIGER)"]
+```
+
+_* = external subprocess (btormc, Pono); every other engine is mununu-owned (z3/cvc5 are linked libraries or interpolation calls)._
+
+**Bit-level safety portfolio** — decides `AG ¬bad` (SVA `assert` / BTOR2 `bad`
+reachability). [`adapter/reach_portfolio.rs`](crates/mununu-core/src/adapter/reach_portfolio.rs)
+runs several sound members under a *differential-oracle* merge: the first definite verdict
+wins, and two disagreeing definite verdicts raise a `Contradiction` alarm rather than
+guessing. Any timeout / absent tool / inconclusive is a sound `⊥`.
+
+| Engine | Owner | Method |
+|---|---|---|
+| Exact BDD reachability | mununu (OxiDD, in-process) | ≤40-bit exact; refuses an unsound "safe" on free init |
+| Native BMC + k-induction | mununu (z3 library, in-process) | word-level counterexample + inductive proof |
+| Native SPACER (IC3/PDR) | mununu (z3 Fixedpoint/CHC, in-process) | Horn-clause inductive invariant |
+| Native interpolation (McMillan) | mununu (cvc5 for interpolants) | last-resort; uniquely decides HWMCC `gen12/14/39` |
+| btormc | **external** subprocess | BMC + k-induction |
+| Pono | **external** subprocess | IC3/PDR (`ic3bits`) |
+
+**KMTS 3-valued branching cube** — the differentiator: it decides *branching-time*
+μ-calculus that SVA and LTL **cannot state**, most notably recoverability `AG EF good`
+("from every reachable state, a good state is still reachable") and `AG AF`. Every engine
+here is mununu-owned. Definite verdicts are sound at *every* alternation depth
+(Bruns–Godefroid). An exact 3-valued BDD / enumeration path (≤40-bit) escalates, over wide
+datapaths, to a predicate-cube + SMT hyper-must abstraction and a Podelski–Rybalchenko
+**ranking certificate** (single-register, ∃-input, and lexicographic) that decides
+well-founded-descent cases no bounded cube captures.
+[`adapter/recoverability.rs`](crates/mununu-core/src/adapter/recoverability.rs),
+[`adapter/btor2/symbolic_bitblast.rs`](crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs).
+
+**Synthesis** — sound GR(1) via direct Piterman–Pnueli–Sá'ar symbolic μ-calculus
+fixpoints, plus a Zielonka parity-game solver for higher alternation. Rejected LTL clauses
+are reported, never silently dropped.
+[`mu_calculus/gr1.rs`](crates/mununu-core/src/mu_calculus/gr1.rs),
+[`mu_calculus/parity_game.rs`](crates/mununu-core/src/mu_calculus/parity_game.rs).
+
+**Honest boundaries.** The exact engines cap at 40 register+input bits and abstain above.
+The IC3ia predicate-abstraction ladder
+([`adapter/btor2/abs_safety.rs`](crates/mununu-core/src/adapter/btor2/abs_safety.rs)) is a
+guarded research foundation, **not** a production decider — it abstains on real designs.
+On the HWMCC bit-level suite the two external subprocess checkers (btormc, Pono) do most of
+the deciding; the mununu-owned engines contribute the unique and branching-time decides.
+The only external subprocess tools in the *verification* engines are `btormc`, `Pono`, and
+`cvc5` (interpolation); everything labelled z3/SPACER is the linked z3 **library**,
+in-process. `slang` / `sv2v` / `yosys` are SV *front-ends*, not solvers.
+
+### Surfaces — CLI · API · UI
+
+Every production capability ships on the **CLI** (a clap subcommand), the **HTTP API** (an
+axum handler under `/api/v1/…`), and the **Web UI** (a typed client in `mununu-ui`) — the
+surface-parity rule. The property verbs exist in both an SV-direct form (`sv …`, one call
+from raw SystemVerilog) and a BTOR2-direct form (`btor2 …`).
+
+| Capability | CLI | API | UI |
+|---|---|---|---|
+| SV / BTOR2 safety (`AG ¬bad`, portfolio) | `sv verify`, `btor2 verify` | `POST /sv/verify`, `/btor2/verify` | ✅ |
+| **No-sidecar auto SVA verify** | `sv verify-auto` | `POST /sv/verify-auto` | ✅ |
+| Response-liveness `AG(req → AF grant)` | `sv verify-liveness[-all]`, `btor2 …` | `POST /{sv,btor2}/verify-liveness[-all]` | ✅ |
+| **Recoverability `AG EF good`** (branching) | `sv verify-recoverability`, `btor2 …` | `POST /{sv,btor2}/verify-recoverability` | ✅ |
+| FSM illegal-encoding auto-scan | `sv check-fsm`, `btor2 check-fsm` | `POST /{sv,btor2}/check-fsm` | ✅ |
+| μ-calculus eval / CEGAR | `context eval`, `{sv,btor2} cegar` | `POST /context/verify`, `/{sv,btor2}/cegar` | ✅ |
+| Controller synthesis (GR(1) / parity) | `context synth` | `POST /context/synthesize`, `/synth/gr1` | ✅ |
+| N-source project verify (`verify.toml`) | `verify` | `POST /verify` | ✅ |
+| KMTS safety cube (`--engine cube\|ic3`) | `btor2 verify-safety` | — (CLI-only) | — |
+
+Full route list: [`api/server.rs`](crates/mununu-core/src/api/server.rs) ·
+[`api/handlers.rs`](crates/mununu-core/src/api/handlers.rs) ·
+[`mununu-ui/src/api/endpoints.ts`](https://github.com/vscorza/mununu-ui/blob/main/src/api/endpoints.ts).
+
 Source layout — a Cargo workspace (Edition 2024) of three crates:
 
 ```
@@ -233,6 +323,16 @@ STS-IR seam.
 | Web UI | Yes | No | No | No |
 | Implementation | Rust | C++ | Rust/C++ | C |
 | State abstraction | Yes | No | No | Partial |
+| **Branching-time μ-calc (`AG EF` recoverability)** | **Yes** | No | No | Partial |
+| **No-sidecar SV → verdict (one call)** | **Yes** | No | No | No |
+| **Synthesis _and_ verification, one tool** | **Yes** | Synth only | Synth only | Yes |
+| **HTTP API (request-based)** | **Yes** | No | No | No |
+
+The distinctive combination is the last block: mununu both **synthesizes** controllers and
+**verifies** RTL — including *branching-time* properties (`AG EF` recoverability) that
+assertion languages (SVA) and LTL bounded model checkers cannot express — behind a single
+request-based API. Synthesis is absent from every RTL verification tool; branching-time
+recoverability is absent from every LTL/SVA tool.
 
 ## Building from Source
 
