@@ -89,9 +89,18 @@ implementation; the two new ones are §5.
 | `brp2.2` | deep-CEX (@119) | **fast-SAT** | **Yes** — reaches depth 119 |
 | `circular_pointer_top_w64_d128` | deep-CEX (@~128), wide | **fast-SAT** | **Likely** — incremental SAT scales past z3's monolithic query |
 | `vis_arrays_buf_bug` | deep-CEX (@18–28), **arrays** | **fast-SAT + arrays** | **Yes** — a BV+array SMT backend handles the memory |
-| `mul9` | nonlinear **safe** (`a*b`) | **nonlinear** | **Partial** — oracle answers the *edge* queries; the *discovery* of the datapath predicate is the residual (§4.2) |
-| `gen43` | 256-bit `bvurem` **safe** | **nonlinear** | **Partial** — a modular oracle validates the invariant faster than cvc5 SyGuS; discovery still hard |
+| `mul9` | multipliers present, but **control** property (`bad = and(51,52)`, *not* `out == a·b`) | nonlinear (mismatched) + invariant synthesis | **Partial at best** — mixed logic+arithmetic proof; not a clean multiplier-correctness target the algebraic oracle cracks (§4.2) |
+| `gen43` | 256-bit **pure BV** (0 `mul`/`urem`/`add`) | fast-SAT (width) + **invariant synthesis** | **No by nonlinear oracle** — it has no arithmetic; needs §3 synthesis, not a datapath oracle |
 | `arbitrated_top_*_d64` | wide **proof** (no nonlinearity) | fast-SAT (queries) + **invariant synthesis** | **No by oracle alone** — the wall is §3 invariant *discovery*, not the query speed |
+
+> **Structure audit (2026-07-13).** A BTOR2-node inspection of the two "nonlinear" targets
+> changed this table: **`gen43` has zero arithmetic operators** (the `bvurem` was a cvc5
+> interpolant-search artifact, not a datapath op) — it is a wide pure-BV invariant-synthesis
+> case, not a nonlinear one; and **`mul9`'s property is a control condition** that reads the
+> product only indirectly, so it is a *mixed* proof, not the multiplier-correctness problem
+> the algebraic oracle targets. **Consequence: no current failing design cleanly motivates
+> the nonlinear oracle (§5.2/P2).** It remains a *potential* capability, but the concrete
+> corpus points at the fast-SAT oracle (P1) + §3 invariant synthesis, not P2.
 
 ### 4.1 Deep-CEX cases — the clean win (fast-SAT oracle)
 
@@ -105,18 +114,31 @@ the work; for a *branching* property over the same design the oracle answers the
 reach queries the Kleene evaluation needs. **This is the recommended first increment** —
 it fixes four of the seven cases and is license-clean (§5).
 
-### 4.2 Nonlinear-safe cases — query layer helped, discovery layer residual
+### 4.2 The nonlinear oracle in principle — and why the current corpus doesn't need it
 
-`mul9` is safe and its `bad` reads the exact 64-bit product. A datapath predicate
-(`a*b == K`, or a coarser range fact) + a nonlinear oracle that answers "does this product
-relation hold across the transition?" makes the **abstraction computable** over the
-multiplier. But the CEGAR loop must still **discover** the right datapath predicate — and
-that discovery is interpolation/synthesis over `bvmul`, the §5 wall. So the nonlinear
-oracle converts "cannot even try" into "tries, with each edge query now tractable" — a
-real improvement, but it only *decides* the design if a **bounded, discoverable** datapath
-invariant exists. `gen43` (`bvurem`) is the same shape; a modular-arithmetic oracle
-(reasoning mod 2^n) validates a candidate invariant far more reliably than cvc5's SyGuS
-search that §8.2 measured not converging at 300 s.
+*In principle*, on a **genuine multiplier design whose property is the arithmetic relation**
+(`out == a·b`), a datapath predicate + a nonlinear oracle answering "does this product
+relation hold across the transition?" makes the abstraction computable over the multiplier.
+Even then, the CEGAR loop must still **discover** the right datapath predicate — interpolation
+over `bvmul`, the §5 wall — so the oracle converts "cannot even try" into "tries, each edge
+query now tractable," but only *decides* if a **bounded, discoverable** datapath invariant
+exists. That is the honest ceiling of the mechanism.
+
+*In practice, the two designs that looked like the motivation are not that problem* (structure
+audit above):
+
+- **`mul9`** has multipliers but `bad = and(51, 52)` is a **control** condition reading the
+  product only indirectly. Proving it safe needs an invariant relating that control condition
+  *through* the multiplier — a **mixed logic+arithmetic** proof, the worst case for a pure
+  algebraic reasoner (which proves `out == a·b`, not "control condition C holds given the
+  product"). The nonlinear oracle would help the arithmetic *sub-queries*, but the proof
+  is not a clean multiplier-verification task.
+- **`gen43`** has **no arithmetic at all** (0 `mul`/`urem`/`add`) — it is 256-bit pure logic;
+  a nonlinear oracle has nothing to reason about. Its `unknown` is a §1 width + §3 synthesis
+  problem, served by the fast-SAT oracle for the width and invariant discovery for the proof.
+
+So the datapath oracle stays a *sound, principled* extension point, but **P2 is not motivated
+by any design currently failing** — the corpus points at P1 (fast-SAT) + §3 synthesis.
 
 ### 4.3 Wide-proof case — outside the oracle's reach
 
@@ -198,11 +220,12 @@ multipliers) mirroring the btormc pattern, not a linked dependency.
   `circular_pointer_top_w64_d128`, `vis_arrays_buf_bug` (arrays) flipping owned-standalone
   to a sound `violated`. Differential-check every verdict against z3 + the concrete trace
   (soundness net). **This is the high-value, license-clean increment.**
-- **P2 — nonlinear datapath oracle (subprocess, AMulet2-style).** Only if the multiplier
-  class is a target. A non-bundled subprocess oracle for `bvmul`/`bvurem` invariant
-  validation, wired like btormc. Pair with a datapath-predicate grammar atom (the T1/T2
-  work) *for the cube's discovery parser*, and accept the discovery-layer residual (§4.2).
-  Higher cost, narrower payoff, subprocess-only for license reasons.
+- **P2 — nonlinear datapath oracle (subprocess, AMulet2-style).** **Not motivated by any
+  currently-failing design** (the §4 structure audit: `gen43` is pure-BV, `mul9`'s property
+  is control) — so this is *parked* until a genuine multiplier-*correctness* branching
+  target appears. If one does: a non-bundled subprocess oracle for `bvmul` invariant
+  validation, wired like btormc (subprocess-only for license reasons — §5.2). Higher cost,
+  narrowest payoff; do the hour-0 property-fit check on the target first.
 
 ## 7. Honest limits
 

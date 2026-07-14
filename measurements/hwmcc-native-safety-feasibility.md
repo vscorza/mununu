@@ -179,9 +179,10 @@ already ships.
 **External:** this is external's *cleanest* win — measured, `cal159 → holds via pono`
 (60 s) under the full portfolio, where every native engine abstains. Pono's IC3/PDR (and
 in-process SPACER) synthesize exactly the strengthening invariant native k-induction
-cannot. (The interpolation-hard `gen43` is the exception even here: `unknown` for
-external too at the portfolio budget — its invariant *exists* but needs the 105 s
-`bvurem` interpolant no engine reaches in time.)
+cannot. (`gen43` is the exception even here: `unknown` for external too at the portfolio
+budget — a compact invariant over its 256-bit **pure-BV** state that no engine's synthesis
+reaches in the budget; cvc5's interpolant search only made it worse by wandering into a
+`bvurem`-shaped separator, per §5's correction.)
 
 **Feasibility verdict: FEASIBLE, and the feasible thing external already ships is a
 SPACER-class engine — which mununu links in-process.** Two honest sub-paths: (i) *lean
@@ -222,8 +223,29 @@ the guard already prevents the unsound outcome.
 
 ## 5. Nonlinear datapath arithmetic: infeasible for native (theorem + measured)
 
-**Real case — `mul9`:** 29 state cells, 64-bit datapath, **2 multiplier nodes**;
-`--owned-only @240s → unknown`. Also `mul7` (`unknown` in 0 s — instant abstain).
+> **Correction (2026-07-13, from a BTOR2-structure audit of the actual designs).** Two
+> earlier claims in this section were wrong and are fixed below:
+> - **`gen43` is NOT a nonlinear design.** Its BTOR2 has **zero** `mul`/`urem`/`udiv`/
+>   `add`/`sub` nodes — it is pure logic (`ite`/`or`/`eq`/`and`/`not`/`concat`/`uext`/
+>   `redor`), 256 bits wide, with `bad = and(47, 48)` (a control condition). The
+>   `bvurem`-shaped interpolant cvc5 emitted was an **artifact of cvc5's SyGuS interpolant
+>   *search*** (it wandered into `bvurem` grammar depth to express a separator), **not** a
+>   datapath operator in the design. So `gen43` belongs in §1 (width) / the invariant-
+>   synthesis rows, not here; a nonlinear/algebraic oracle would find nothing to reason
+>   about. It stays `unknown` because it needs a compact invariant over a wide pure-BV
+>   state, not because of nonlinear arithmetic.
+> - **`mul9`'s property is control, not multiplier-correctness.** It *does* have 2 `mul`
+>   nodes in the datapath, but `bad = and(51, 52)` is a boolean control condition — not
+>   "the product equals `a*b`." So the algebraic sweet spot (proving a multiplier *is* a
+>   multiplier) does not directly apply; a safe proof needs an invariant relating the
+>   control condition *through* the multiplier — a mixed logic+arithmetic problem, the
+>   worst case for a pure algebraic engine (see `docs/design/datapath-oracle-hybrid.md`
+>   §4.2). The nonlinear wall below is still real *for the proof*, but neither current
+>   failing design is a clean multiplier-verification target.
+
+**Real case — `mul9`:** 29 state cells, 64-bit datapath, **2 multiplier nodes** (but the
+property `bad = and(51, 52)` is control, per the correction above); `--owned-only @240s →
+unknown`. Also `mul7` (`unknown` in 0 s — instant abstain).
 
 **Why this is the hardest wall, on *both* native proof routes:**
 
@@ -231,9 +253,11 @@ the guard already prevents the unsound outcome.
   width (Bryant, 1991) — the exact engine cannot even *build* the multiplier relation,
   independent of the 40-bit cap.
 - **McMillan interpolation:** an interpolant separating the reachable set from `bad` on a
-  multiplier/modulo design must speak `bvmul`/`bvurem`; cvc5's interpolant search
-  explodes in grammar depth on nonlinear operators — **measured 105 s** for the
-  `bvurem`-shaped `gen43` interpolant, and worse for genuine multipliers.
+  genuine multiplier/modulo design must speak `bvmul`/`bvurem`, and cvc5's interpolant
+  search explodes in grammar depth on nonlinear operators. (The **105 s** figure is from
+  `gen43`, where cvc5's SyGuS search *wandered into* a `bvurem`-shaped separator even
+  though the design has no arithmetic — an illustration of how badly the search degrades
+  when the grammar allows nonlinear operators, not evidence that `gen43` needs one.)
 - **native BMC (CEX):** for a *violated* nonlinear design the deep CEX search can still
   find a witness (SAT over a bounded unrolling with a concrete multiplier is decidable);
   but for a *safe* nonlinear design there is no CEX, and both proof routes above wall.
@@ -283,10 +307,12 @@ has three problems, each real:
      simpler `bvurem`) — and *using* it makes every may/must abstract edge a multiplier-SAT
      query. The cube inherits §5's nonlinear wall rather than abstracting past it. (The
      grammar gap is fixable; the interpolation/edge-SMT hardness is §5 and is not.)
-   - **`gen43`** — the same shape with a `bvurem` (modular) relation over a **256-bit**
-     datapath: the separating predicate is a modular-arithmetic fact the grammar cannot
-     state and cvc5 cannot interpolate within budget. Inherits §5.
-   - **`arbitrated_top_*`** — no nonlinearity, but a safety proof over a 313–8378-bit
+   - **`gen43`** — *not* a nonlinear case (§5 correction): its 256-bit datapath is **pure
+     BV** (no `mul`/`urem`), so the obstacle is the *number* of predicates needed to
+     separate `bad` over a wide state, and the difficulty of *discovering* them — §1's
+     width blow-up + §3's synthesis, not a datapath relation. cvc5's `bvurem`-shaped
+     interpolant was a search artifact, not a needed fact. **Inherits §1/§3, not §5.**
+   - **`arbitrated_top_*`** — likewise no nonlinearity: a safety proof over a 313–8378-bit
      arbitration state needs *many* predicates to separate `bad`; the predicate count that
      actually decides it is §1's exact-analysis blow-up under another name. Inherits §1.
 
@@ -349,16 +375,19 @@ capability helps therefore depends on *why* the case is hard:
   incremental-BMC increment). This is the majority of the hard residual, and it is the
   clearest "adding predicates does nothing" case.
 
-- **Nonlinear-safe cases (§5, `mul9`/`gen43`) — representable, still §5-hard.** Adding a
-  `bvmul`/`bvurem` atom lets the cube *state* a datapath predicate, and **if** the design
-  has a *coarse* safety proof (one not needing the exact product — a range, sign, or
-  parity fact) it becomes feasible. That coarse-proof class is exactly predicate
-  abstraction's real edge and the emergent-K "unique form" wins. **But if the proof
-  genuinely needs the exact multiplier**, both *discovering* the predicate (interpolation
-  over `bvmul`) and *validating* the abstraction (per-edge multiplier-SAT) inherit §5's
-  hardness — the same wall that leaves `mul9` `unknown` for btormc/Pono/SPACER too (§7). So
-  it is feasible **iff a coarse discoverable proof exists**, not by grammar alone; the
-  grammar atom is the cheap, fixable half.
+- **Nonlinear-safe cases (§5, `mul9` only) — representable, still §5-hard.** (`gen43` was
+  *mis-filed* here; it is pure-BV — §1/§3, see the §5 correction — so it moves to the
+  wide-scale bullet below.) For a genuine multiplier design, adding a `bvmul` atom lets the
+  cube *state* a datapath predicate, and **if** the design has a *coarse* safety proof (one
+  not needing the exact product — a range, sign, or parity fact) it becomes feasible — that
+  coarse-proof class is predicate abstraction's real edge. **But if the proof genuinely
+  needs the exact multiplier**, both *discovering* the predicate (interpolation over
+  `bvmul`) and *validating* the abstraction (per-edge multiplier-SAT) inherit §5's hardness
+  — the wall that leaves `mul9` `unknown` for btormc/Pono/SPACER too (§7). And `mul9`'s
+  measured obstacle is compounded: its `bad` is a *control* condition reading the product
+  indirectly, so it is a *mixed* logic+arithmetic proof, not a clean multiplier-correctness
+  target a pure algebraic reasoner would crack. Feasible **iff a coarse discoverable proof
+  exists**, not by grammar alone.
 
 - **Wide-scale cases (§1/§3, `arbitrated_top`) — representation is already fine.**
   Register-comparison predicates *can* express arbitration / counter invariants; the wall
@@ -400,7 +429,7 @@ budget; mununu-sva, 2026-07-13):
 | `circular_pointer_top_w16_d128_e0` | 2 deep CEX | **unknown** | unknown |
 | `mul7` | 5 nonlinear, violated | violated — **btormc+pono** (19 s) | — |
 | `mul9` | 5 nonlinear, safe | **unknown** | unknown |
-| `gen43` | 3/5 · 256-bit, `bvurem` | **unknown** | unknown |
+| `gen43` | 1/3 · 256-bit pure-BV (no arithmetic) | **unknown** | unknown |
 | `arbitrated_top_n2_w128_d64_e0` | 1 deep proof | **unknown** | unknown |
 | `cal159` | 3 aux-invariant safe | holds — **pono** (60 s) | — |
 | `vcegar_arrays_itc99_b12_p2` | 4 arrays | **unknown** (ground truth: safe) | unknown |
@@ -524,8 +553,12 @@ empirical validation of §1–§6, not a fix:
   designs given budget. **Measured: `gen43` and `mul9` are both `unknown` at owned-only
   @300 s** (300 s > `gen43`'s 105 s single-interpolant time). One interpolant does not
   close the proof and the search does not converge, so an atom that merely lets the *cube*
-  hold the same interpolant cannot do better. §5's nonlinear-SMT wall stands; the grammar
-  build was not undertaken because the interp probe proves it futile on these designs.
+  hold the same interpolant cannot do better; the grammar build was not undertaken because
+  the interp probe proves it futile on these designs. **NB (structure audit):** the two
+  designs are unknown for *different* reasons — `gen43` is **pure BV** (no arithmetic; §1
+  width + §3 synthesis, per the §5 correction) and `mul9` is a genuine multiplier but with
+  a *control* property (not multiplier-correctness), so **neither is a clean nonlinear-
+  verification target** and the grammar atom would not have been the right lever regardless.
 - **T3 (predicate-directed CEX) — confirmed §2/§7.** The natural first lever — scaling the
   deep-CEX per-query budget with the wall budget — was implemented and measured.
   **`krebs.3` stayed `unknown` at owned-only @240 s**: the search never reached depth 75,
