@@ -606,6 +606,12 @@ struct Btor2VerifyArgs {
     /// let native interpolation and the deep counterexample search reach more designs.
     #[arg(long, value_name = "MS", default_value_t = 60_000)]
     owned_timeout_ms: u32,
+    /// Wall budget (ms) for the SUBPROCESS members (btormc / Pono) in the default full
+    /// portfolio (default 60000). A larger value lets the incremental-SAT model checkers
+    /// reach deeper counterexamples — e.g. `krebs.3`'s depth-75 CEX needs ~73000. Ignored
+    /// under `--owned-only` (which has its own `--owned-timeout-ms`).
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2685,6 +2691,7 @@ fn per_response_decided_by(
 fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
     use mununu_core::adapter::reach_portfolio::{
         decide_reach_owned_only, decide_reach_portfolio_parallel,
+        decide_reach_portfolio_parallel_with_timeout,
     };
     use mununu_core::verdict::PropertyVerdict;
 
@@ -2695,9 +2702,13 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
 
     // `--owned-only`: mununu-owned engines only (no external SPACER/btormc/Pono).
     // Otherwise the full parallel portfolio — identical merge to the sequential
-    // driver, but wall-clock bounded by the slowest single engine.
+    // driver, but wall-clock bounded by the slowest single engine. `--timeout-ms`
+    // raises the subprocess (btormc/Pono) budget so their incremental SAT reaches
+    // deeper counterexamples.
     let outcome = if args.owned_only {
         decide_reach_owned_only(&file, args.owned_timeout_ms)
+    } else if let Some(ms) = args.timeout_ms {
+        decide_reach_portfolio_parallel_with_timeout(&file, std::time::Duration::from_millis(ms))
     } else {
         decide_reach_portfolio_parallel(&file)
     };
