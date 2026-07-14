@@ -1,0 +1,221 @@
+# Datapath-oracle hybrid for the KMTS 3-valued engine — design note + plan
+
+> Status: planning
+
+Companion to [`../../measurements/hwmcc-native-safety-feasibility.md`](../../measurements/hwmcc-native-safety-feasibility.md).
+That doc measured the walls (§1–§5) and validated (§8.2) that grammar/budget tweaks
+*confirm* them. This note proposes the structural way to actually cross the two that
+matter — deep-CEX reach and datapath (nonlinear) reasoning — **without** discarding the
+3-valued KMTS engine, and audits which libraries can be used given mununu's license.
+
+---
+
+## 1. The idea — the KMTS engine is already layered; the walls are in the query layer
+
+The 3-valued KMTS engine separates cleanly into two layers:
+
+- **Abstraction layer** — predicates → cubes → a KMTS (may/must) structure → Kleene
+  3-valued modal-μ evaluation (`mu_calculus`). This is what buys branching-time +
+  alternation soundness (Bruns–Godefroid: definite `KleeneT`/`KleeneF` transfer at every
+  alternation depth).
+- **Decision-procedure (query) layer** — the may/must edges
+  (`kmts_lift` SMT post-image), the CEGAR refinement (`refine` / `native_interp`
+  interpolation), and the verdict verification (`native_bmc::bmc_bad_reachable`, the
+  inductive re-check in `abs_safety`) are **all SMT/SAT queries over the exact,
+  bit-precise, word-level transition.**
+
+Bruns–Godefroid depends only on **may edges over-approximating** and **must edges
+under-approximating** — *not* on how a query is answered. So **any sound decision
+procedure can be swapped into the query layer without touching the 3-valued soundness.**
+The two feasibility walls both live in that layer:
+
+- **Deep-CEX reach** (T3 / §2, §7): `bmc_bad_reachable` over z3 is too slow to reach
+  depth 75–128 on wide designs (the *cumulative* cost of the accumulated unrolling).
+- **Nonlinear datapath** (T1/T2 / §5): the may/must + refinement queries over `bvmul` /
+  `bvurem` explode (cvc5 SyGuS interpolation; z3 per-edge multiplier-SAT).
+
+Neither wall is in the abstraction layer. That is the whole compatibility argument.
+
+## 2. There is already a precedent in the tree
+
+mununu already ships one datapath-specialised oracle merged into the KMTS path: the
+**ranking certificate** (`recoverability::ranking_certificate_holds`). It answers a query
+the generic predicate cube cannot — "does every non-`good` transition strictly decrease a
+measure δ?" — with a single Podelski–Rybalchenko SMT query over the **exact** transition
+(including a 48-bit multiplier in the `data*data` recoverability example), and hands a
+sound verdict back to the KMTS structure. That is precisely "merge a datapath reasoning
+technique with the 3-valued engine," and it is sound-by-construction (it abstains, never a
+wrong verdict). The hybrid proposed here generalises that one-off into a **pluggable oracle
+interface**.
+
+## 3. The oracle abstraction
+
+A trait the query layer consults instead of calling z3 directly:
+
+```rust
+/// A sound decision procedure for the KMTS engine's concrete queries. Every method
+/// has a SOUNDNESS DIRECTION; an oracle that cannot answer returns the conservative
+/// value so 3-valued soundness is preserved.
+pub trait DatapathOracle {
+    /// EXACT reachability (concrete witness). `Violated{depth, trace}` is sound only
+    /// with a real model; `NoCexWithin{k}` is a bounded fact; `Unknown` abstains.
+    fn bad_reachable_within(&self, view: &Btor2SmtView, k: u32) -> Reach;
+
+    /// MAY edge — OVER-approx. `∃` a concrete transition `cube_i → cube_j`?
+    /// SOUND DIRECTION: a `false` must be a *proof* of no transition; on `Unknown`
+    /// the caller KEEPS the may edge (over-approx stays sound).
+    fn may_edge(&self, t: &Transition, ci: &Cube, cj: &Cube) -> Trit;
+
+    /// MUST edge — UNDER-approx. does EVERY concrete transition from `cube_i` land in
+    /// `cube_j`? SOUND DIRECTION: a `true` must be a *proof*; on `Unknown` the caller
+    /// DROPS the must edge (under-approx stays sound).
+    fn must_edge(&self, t: &Transition, ci: &Cube, cj: &Cube) -> Trit;
+
+    /// REFINEMENT — a separating predicate for a spurious abstract step, or `None`.
+    fn refine(&self, spurious: &AbstractStep) -> Option<PredicateExpr>;
+}
+```
+
+The contract is the load-bearing part: **`Unknown` maps to the conservative side per
+method** (keep may, drop must, abstain on reachability), so a fast-but-incomplete oracle
+can only *widen* the ⊥ region, never produce a wrong `KleeneT`/`KleeneF`. z3 is the default
+implementation; the two new ones are §5.
+
+## 4. Worked application to the failing HWMCC cases
+
+| Design | Class | Which oracle | Would it decide? |
+|---|---|---|---|
+| `krebs.3` | deep-CEX (@75), non-array | **fast-SAT** | **Yes** — incremental BV-SAT reaches depth 75 |
+| `brp2.2` | deep-CEX (@119) | **fast-SAT** | **Yes** — reaches depth 119 |
+| `circular_pointer_top_w64_d128` | deep-CEX (@~128), wide | **fast-SAT** | **Likely** — incremental SAT scales past z3's monolithic query |
+| `vis_arrays_buf_bug` | deep-CEX (@18–28), **arrays** | **fast-SAT + arrays** | **Yes** — a BV+array SMT backend handles the memory |
+| `mul9` | nonlinear **safe** (`a*b`) | **nonlinear** | **Partial** — oracle answers the *edge* queries; the *discovery* of the datapath predicate is the residual (§4.2) |
+| `gen43` | 256-bit `bvurem` **safe** | **nonlinear** | **Partial** — a modular oracle validates the invariant faster than cvc5 SyGuS; discovery still hard |
+| `arbitrated_top_*_d64` | wide **proof** (no nonlinearity) | fast-SAT (queries) + **invariant synthesis** | **No by oracle alone** — the wall is §3 invariant *discovery*, not the query speed |
+
+### 4.1 Deep-CEX cases — the clean win (fast-SAT oracle)
+
+`krebs.3` violated at depth 75; §8.2 measured owned z3-BMC never reaching it (cumulative
+query cost) *and* external btormc @60 s also abstaining. The fast-SAT oracle answers
+`bad_reachable_within` with an **incremental** bit-vector SAT engine (assert one frame,
+keep learned clauses, re-solve) instead of z3's grow-and-re-solve. This is exactly what
+btormc does internally; doing it in-process closes the reach. The abstraction is
+untouched — for a pure `AG ¬bad` the KMTS layer is a thin pass-through and the oracle does
+the work; for a *branching* property over the same design the oracle answers the may/must
+reach queries the Kleene evaluation needs. **This is the recommended first increment** —
+it fixes four of the seven cases and is license-clean (§5).
+
+### 4.2 Nonlinear-safe cases — query layer helped, discovery layer residual
+
+`mul9` is safe and its `bad` reads the exact 64-bit product. A datapath predicate
+(`a*b == K`, or a coarser range fact) + a nonlinear oracle that answers "does this product
+relation hold across the transition?" makes the **abstraction computable** over the
+multiplier. But the CEGAR loop must still **discover** the right datapath predicate — and
+that discovery is interpolation/synthesis over `bvmul`, the §5 wall. So the nonlinear
+oracle converts "cannot even try" into "tries, with each edge query now tractable" — a
+real improvement, but it only *decides* the design if a **bounded, discoverable** datapath
+invariant exists. `gen43` (`bvurem`) is the same shape; a modular-arithmetic oracle
+(reasoning mod 2^n) validates a candidate invariant far more reliably than cvc5's SyGuS
+search that §8.2 measured not converging at 300 s.
+
+### 4.3 Wide-proof case — outside the oracle's reach
+
+`arbitrated_top_*_d64` has no nonlinearity; §7 measured it `unknown` for everyone. The
+wall is synthesising a compact inductive invariant over an ~8 k-bit state — the §3
+SPACER-class problem. A faster query oracle speeds each IC3/interpolation query but does
+**not** synthesise the certificate; this case needs the invariant-discovery engine, not a
+datapath oracle. Listed to keep the scope honest: the hybrid is not a universal solvent.
+
+## 5. Library & license audit — the poisoning question
+
+**Mununu's constraint is unusually strict.** The workspace is under the **Mununu
+Non-Commercial License** (proprietary, source-available — *not* open-source), and
+`deny.toml` allows only genuinely-permissive licenses on **linked** crates (MIT, Apache-2.0,
+BSD-2/3, ISC, Zlib, MPL-2.0, …), enforced by `cargo deny check licenses` in CI. Two
+consequences:
+
+1. **Copyleft is hard poison for *linked* code.** GPL/LGPL/AGPL require the combined work
+   be (L)GPL — impossible for a non-commercial proprietary work, and blocked by `deny.toml`
+   anyway. So an in-process (statically-linked) solver **must** be permissive.
+2. **Subprocess, not-bundled = no poisoning.** mununu already shells to btormc / Pono /
+   cvc5 / yosys / sv2v / slang at arm's length (separate process, invoked if present, never
+   bundled). A separate process communicating over files/pipes is not a derivative work, so
+   a *GPL* tool used this way does not contaminate mununu — this is the existing escape
+   hatch and the only clean route for the copyleft-only algebraic tools.
+
+> Licenses below are stated to the best of current knowledge; **re-verify the exact SPDX at
+> integration time** (upstreams relicense). The rule to apply is mechanical: *linked ⇒ must
+> be in the `deny.toml` allow-list; copyleft ⇒ subprocess-only, never bundled.*
+
+### 5.1 Fast bit-vector SAT / SMT-BV (for §4.1 — the deep-CEX oracle)
+
+| Candidate | Kind | License | Verdict for mununu |
+|---|---|---|---|
+| **Bitwuzla** (`bitwuzla-sys`) | word-level BV+array SMT, incremental | **MIT** | ✅ **link** — SOTA on BV, has array theory (covers `vis_arrays`), MIT is allow-listed. Preferred. |
+| **CaDiCaL** (`cadical` crate) | CNF SAT, incremental (IPASIR) | **MIT** | ✅ **link** — pair with mununu's own bit-blaster (`symbolic_bitblast`); cleanest "fast SAT + own encoding" path |
+| **Kissat** | CNF SAT, one-shot | **MIT** | ⚠️ link-OK but **non-incremental** → poor fit for incremental BMC; prefer CaDiCaL |
+| **Varisat** | pure-Rust SAT, incremental | **MIT/Apache-2.0** | ✅ **link** — zero FFI/build risk, easiest integration; slower than CaDiCaL |
+| **splr** | pure-Rust SAT | **MPL-2.0** | ✅ link — MPL is allow-listed (file-level copyleft, non-viral) |
+| **CryptoMiniSat** | CNF SAT | **MIT** (relicensed) | ✅ link — heavier; verify the linked version is the MIT one |
+| **Boolector 3.x** | word-level BV SMT | MIT *(verify)* | ⚠️ prefer **Bitwuzla** (its actively-maintained MIT successor) |
+| **btormc / Boolector** *(as today)* | model checker | *(subprocess)* | ✅ already subprocess — no poisoning; but in-process is the point here |
+
+**Conclusion: the fast-SAT oracle is license-clean.** Bitwuzla (MIT, in-process,
+BV+arrays) is the strongest single choice; CaDiCaL+own-bitblaster or pure-Rust Varisat are
+clean fallbacks. No copyleft is required for this mechanism.
+
+### 5.2 Word-level / algebraic nonlinear reasoning (for §4.2 — the datapath oracle)
+
+| Candidate | Kind | License | Verdict for mununu |
+|---|---|---|---|
+| **Singular** | Gröbner bases (CAS) | **GPL** | ⛔ **no link** — subprocess-only if used at all |
+| **msolve** | polynomial system solving | **GPL** | ⛔ no link — subprocess-only |
+| **CoCoALib** | Gröbner bases | **GPL** | ⛔ no link |
+| **FLINT** | number theory / polynomials | **LGPL** | ⛔ no link (LGPL still incompatible with a proprietary non-commercial work); subprocess-only |
+| **AMulet2** | algebraic multiplier verification (mod 2ⁿ) | MIT *(verify)* | ⚠️ a *tool*, not a library → **subprocess** (AIG→certificate), like btormc; or port its algorithm |
+| **z3 nlsat** *(already linked)* | nonlinear real arith | MIT | ✅ linked, but NRA — it **bit-blasts** BV multiplication (the hard path); not an algebraic-BV oracle |
+| *native mod-2ⁿ polynomial reasoning* | roll-your-own | mununu's own | ✅ license-clean, but a real research/eng effort |
+
+**Conclusion: the nonlinear oracle is doubly hard — technically *and* by license.** The
+strong algebraic engines (Singular/msolve/CoCoA/FLINT) are **all copyleft**, so they are
+**subprocess-only** for mununu (fine, same pattern as btormc — invoke if present, never
+bundle). The only *linkable* clean routes are (a) AMulet2's algorithm reimplemented
+natively (polynomial reasoning mod 2ⁿ — clean but substantial), or (b) staying with
+z3/cvc5 and accepting the bit-blasting wall. So the honest recommendation is: if the
+nonlinear class is pursued, do it as a **non-bundled subprocess oracle** (AMulet2 for
+multipliers) mirroring the btormc pattern, not a linked dependency.
+
+## 6. Phased plan
+
+- **P0 — the oracle seam (no new dependency).** Extract the `DatapathOracle` trait and
+  route the existing z3-backed queries (`bad_reachable_within`, may/must edges, refine)
+  through it, with z3 as the sole implementation. Pure refactor; behaviour-identical;
+  gated by the existing differential tests. This is the enabling step and carries no
+  license risk.
+- **P1 — fast-SAT reachability oracle (Bitwuzla, MIT, in-process).** Implement
+  `bad_reachable_within` (and the may/must reach queries) on Bitwuzla's incremental API.
+  Validate on the §4.1 deep-CEX cases: target `krebs.3` (@75), `brp2.2` (@119),
+  `circular_pointer_top_w64_d128`, `vis_arrays_buf_bug` (arrays) flipping owned-standalone
+  to a sound `violated`. Differential-check every verdict against z3 + the concrete trace
+  (soundness net). **This is the high-value, license-clean increment.**
+- **P2 — nonlinear datapath oracle (subprocess, AMulet2-style).** Only if the multiplier
+  class is a target. A non-bundled subprocess oracle for `bvmul`/`bvurem` invariant
+  validation, wired like btormc. Pair with a datapath-predicate grammar atom (the T1/T2
+  work) *for the cube's discovery parser*, and accept the discovery-layer residual (§4.2).
+  Higher cost, narrower payoff, subprocess-only for license reasons.
+
+## 7. Honest limits
+
+- **Answering ≠ discovering.** The oracle makes each concrete query sound + faster; it does
+  not, by itself, discover *which* datapath predicates to add. Datapath-*dependent* safety
+  proofs (mul9-class) still need the interpolation/synthesis loop to converge — the §5
+  residual that §8.2 measured not converging at 300 s.
+- **The hybrid earns its keep on branching-time properties over nonlinear/wide datapaths**
+  (recoverability over a multiplier), where neither a pure bit-vector model checker (cannot
+  *state* `AG EF`) nor pure predicate abstraction (chokes on the datapath) works alone. For
+  plain bit-level `AG ¬bad`, the may/must machinery is overhead and a P1 fast-SAT engine is
+  simply the point — that is what btormc already is, now in-process and license-clean.
+- **P1 is the recommendation; P2 is optional and subprocess-only.** The deep-CEX reach is a
+  clean, permissive-library win that fixes four of the seven failing cases; the nonlinear
+  class is a copyleft-constrained, discovery-limited follow-up worth doing only if the
+  multiplier-datapath branching class becomes a concrete target.
