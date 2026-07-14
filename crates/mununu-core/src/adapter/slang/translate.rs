@@ -170,11 +170,20 @@ pub fn translate_ast_json_with_options(
     json: &str,
     opts: &TranslateOptions,
 ) -> Result<TranslationReport, AdapterError> {
-    let root: Value = serde_json::from_str(json).map_err(|e| AdapterError {
-        kind: AdapterErrorKind::ParseError,
-        message: format!("adapter/slang/translate: --ast-json is not valid JSON: {e}"),
-        location: None,
-    })?;
+    // slang emits deeply-nested ASTs on some designs (e.g. `wishbone_high_performance_z80`),
+    // and serde_json's default 128-level recursion limit rejects them. The AST is trusted
+    // (our own `slang --ast-json` invocation), so disable the limit — the actual nesting is
+    // bounded by the design's expression depth, well within the thread stack.
+    let root: Value = {
+        use serde::Deserialize as _;
+        let mut de = serde_json::Deserializer::from_str(json);
+        de.disable_recursion_limit();
+        Value::deserialize(&mut de).map_err(|e| AdapterError {
+            kind: AdapterErrorKind::ParseError,
+            message: format!("adapter/slang/translate: --ast-json is not valid JSON: {e}"),
+            location: None,
+        })?
+    };
 
     let mut found: Vec<(String, &Value)> = Vec::new();
     collect_assertions(&root, "design", &mut found);
