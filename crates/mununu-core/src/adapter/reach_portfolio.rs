@@ -465,6 +465,25 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
                 InterpSafetyVerdict::Undecided { .. } => None,
             }
         });
+        // Fast bit-vector counterexample search — in-process Boolector (owned, no
+        // subprocess). Decides deep BV unrollings the Z3 members leave `Unknown`:
+        // measured on HWMCC20, the Z3 owned path returns `unknown` on `krebs.3`
+        // (CEX at depth 75) and `vis_arrays_buf_bug` even at 180 s/engine, while
+        // Boolector cracks both. Only ever contributes a `Violated` (never a safety
+        // claim); feature-gated so the default build stays Boolector-free.
+        #[cfg(feature = "boolector")]
+        let boolector_h = scope.spawn(|| {
+            let v = crate::adapter::btor2::native_boolector::decide_reachable_boolector(
+                file,
+                OWNED_DEEP_CEX_MAX_K,
+                deadline,
+                decided,
+            );
+            if v == Some(true) {
+                decided.store(true, Relaxed);
+            }
+            v
+        });
         let exact = run_exact(&content);
         if exact.is_some() {
             decided.store(true, Relaxed);
@@ -472,12 +491,21 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
         let native = native_h.join().unwrap_or(None);
         let cex_hit = cex_h.join().unwrap_or(false);
         let interp = interp_h.join().unwrap_or(None);
+        #[cfg(feature = "boolector")]
+        let boolector = boolector_h.join().unwrap_or(None);
+        #[cfg(not(feature = "boolector"))]
+        let boolector: Option<bool> = None;
         // Build the outcome directly so the deep CEX search keeps its own `"cex"`
         // attribution (and any native-safe vs cex-violated disagreement stays a
         // Contradiction alarm). No spacer / btormc / pono — owned engines only.
         let mut reachable_by: Vec<&'static str> = Vec::new();
         let mut unreachable_by: Vec<&'static str> = Vec::new();
-        for (name, v) in [("exact", exact), ("native", native), ("interp", interp)] {
+        for (name, v) in [
+            ("exact", exact),
+            ("native", native),
+            ("interp", interp),
+            ("boolector", boolector),
+        ] {
             match v {
                 Some(true) => reachable_by.push(name),
                 Some(false) => unreachable_by.push(name),

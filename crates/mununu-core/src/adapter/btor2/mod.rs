@@ -31,6 +31,8 @@ pub mod emit;
 pub mod kmts_lift;
 pub mod l2s_monitor;
 pub mod native_bmc;
+#[cfg(feature = "boolector")]
+pub mod native_boolector;
 pub mod native_interp;
 pub mod native_spacer;
 pub mod parser;

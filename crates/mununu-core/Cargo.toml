@@ -93,6 +93,17 @@ rand = { version = "0.8", optional = true }
 rand_chacha = { version = "0.3", optional = true }
 dhat = { version = "0.3", optional = true }
 
+# In-process Boolector (bit-vector SAT model checker) — the owned-standalone
+# scalable-safety back-end's fast-BV member. Both the Rust wrapper crate and the
+# Boolector C library are MIT-licensed (no copyleft; clean under `cargo deny
+# check licenses`). `vendor-lgl` builds Boolector + Lingeling + btor2tools from
+# the crate's bundled/setup-script sources via cmake (no system Boolector
+# needed), so the feature is self-contained given a C toolchain + cmake (both in
+# `mununu-dev`). Feature-gated because it C-compiles Boolector; the default
+# `make ci` build stays Boolector-free. Built + tested in the `mununu-dev` image
+# with `--features boolector`.
+boolector = { version = "0.4", optional = true, features = ["vendor-lgl"] }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1.9"
@@ -111,6 +122,10 @@ syntcomp = []
 test_support = ["dep:rand", "dep:rand_chacha"]
 stress = ["test_support"]
 dhat = ["dep:dhat"]
+# In-process Boolector fast-BV reachability engine (owned-standalone portfolio
+# member). C-compiles Boolector, so it is opt-in — validated in Docker, not in
+# the default `make ci`.
+boolector = ["dep:boolector"]
 
 [[test]]
 name = "api_graph_valuations"
