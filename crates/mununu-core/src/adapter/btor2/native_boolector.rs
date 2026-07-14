@@ -48,8 +48,23 @@
 //! init-less cells left free — BTOR2's nondeterministic-init semantics); each later
 //! frame's state cell is *the expression* its `next` operand evaluated to in the
 //! previous frame (no per-transition equality assertion needed). `constraint`s are
-//! asserted permanently at every frame; `bad` is checked per frame as a one-shot
-//! **assumption** so the incremental solver context is reused across depths.
+//! asserted permanently at every frame.
+//!
+//! # Bound scheduling (the frame-simplification win)
+//!
+//! Instead of asking "is `bad` true at *exactly* depth k?" once per depth, the search
+//! maintains a running monitor `reached_k = bad_0 ∨ … ∨ bad_k` ("a `bad` is reachable
+//! *within* k steps") and checks it as a one-shot assumption. Crucially, one
+//! `reached_k` UNSAT proves the *whole* `0..k` range clean, so after a shallow
+//! threshold the search **strides** — a single deep solve covers `STRIDE` frames
+//! rather than one solve each. Measured on HWMCC `krebs.3` (CEX @ depth 75), the deep
+//! per-frame UNSAT proofs (frames 60–74) dominate the runtime, and this striding cuts
+//! the wall time to roughly a third by skipping the intermediate ones. On a SAT bound
+//! the *exact* CEX depth is read back as the shallowest frame whose `bad` holds in the
+//! model, so verdicts stay depth-exact. (Cone-of-influence pruning was measured to not
+//! help here — `bad`'s cone covers ~97 % of the logic; and disabling model generation
+//! during the search is a net loss — the witness re-solve of the deep deciding formula
+//! costs more than it saves.)
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -368,8 +383,14 @@ pub fn bmc_bad_reachable_boolector(
     cancel: &AtomicBool,
 ) -> Result<(BmcOutcome, Option<BmcTrace>), BoolectorError> {
     let maps = build_maps(file)?;
+    // `MUNUNU_BOOLECTOR_TRACE` — eprintln each `sat()`'s wall time (per-bound diagnostics).
+    let trace = std::env::var_os("MUNUNU_BOOLECTOR_TRACE").is_some();
     let btor = Rc::new(Btor::new());
     btor.set_opt(BtorOption::Incremental(true));
+    // Model generation stays ON: it costs nothing on the UNSAT bound checks (a model is
+    // only built on SAT), and it is needed to extract the exact CEX depth + witness from
+    // the deciding model. (Measured: turning it off during the search and re-solving for
+    // the witness is a *net loss* — the re-solve of the deep deciding formula dominates.)
     btor.set_opt(BtorOption::ModelGen(ModelGen::All));
 
     // Frame 0 — fresh states, then assert `init` and the frame-0 constraints.
@@ -388,8 +409,25 @@ pub fn bmc_bad_reachable_boolector(
     let mut frames: Vec<Env> = vec![env0];
     let mut named_states: Vec<Vec<(String, Bv)>> = vec![ns0];
     let mut named_inputs: Vec<Vec<(String, Bv)>> = vec![ni0];
+    // Per-frame `bad` signal (1-bit), kept so the exact CEX depth can be read back from
+    // a SAT model, and `reached_k = bad_0 ∨ … ∨ bad_k` (the running "a `bad` is reachable
+    // within k steps" monitor).
+    let mut bad_per_frame: Vec<Bv> = vec![bad_condition(&frames[0], &maps.bad_ops)?];
+    let mut reached: Bv = bad_per_frame[0].clone();
 
-    for k in 0..=max_k as usize {
+    // Bound-check schedule. Measured on HWMCC `krebs.3` (CEX @ depth 75): the deep
+    // per-frame UNSAT proofs (frames 60–74) cost ~180 s of the ~205 s total, and
+    // checking `bad` at *every* depth re-proves each. A single `reached_k` UNSAT proves
+    // the WHOLE 0..k range clean, so after a threshold we STRIDE — one deep solve covers
+    // `STRIDE` frames instead of one each. Shallow depths (≤ threshold) are still checked
+    // every frame (cheap, and keeps the reported CEX depth exact for shallow properties).
+    // `max_k` is always a check point so the last frame is never skipped.
+    const EXACT_THRESHOLD: usize = 32;
+    const STRIDE: usize = 8;
+
+    let n = max_k as usize;
+    let mut last_check: Option<usize> = None;
+    for k in 0..=n {
         if cancel.load(Relaxed) || Instant::now() >= deadline {
             // Budget / peer-decided: honest bounded outcome, no verdict claimed.
             return Ok((
@@ -399,7 +437,8 @@ pub fn bmc_bad_reachable_boolector(
                 None,
             ));
         }
-        // Lazily extend the unrolling to frame k, asserting its constraints.
+        // Lazily extend the unrolling to frame k, asserting its constraints and folding
+        // its `bad` into the running `reached` monitor.
         while frames.len() <= k {
             let j = frames.len() - 1;
             let (envk, nsk, nik) = build_frame(&btor, file, &maps, Some(&frames[j]))?;
@@ -408,23 +447,48 @@ pub fn bmc_bad_reachable_boolector(
                     cbv.assert();
                 }
             }
+            let bad_k = bad_condition(&envk, &maps.bad_ops)?;
+            reached = reached.or(&bad_k);
+            bad_per_frame.push(bad_k);
             frames.push(envk);
             named_states.push(nsk);
             named_inputs.push(nik);
         }
-        // `bad` at frame k as a one-shot assumption (cleared after this sat()).
-        bad_condition(&frames[k], &maps.bad_ops)?.assume();
-        match btor.sat() {
+        // Only *solve* at a scheduled bound — every frame up to the threshold, then every
+        // STRIDE frames, plus always the last frame. In between we just keep unrolling
+        // (cheap — node construction, no solve).
+        let is_check =
+            k <= EXACT_THRESHOLD || k == n || last_check.is_none_or(|lc| k - lc >= STRIDE);
+        if !is_check {
+            continue;
+        }
+        last_check = Some(k);
+        // `reached_k` as a one-shot assumption: is a `bad` reachable within k steps?
+        reached.assume();
+        let t0 = trace.then(Instant::now);
+        let res = btor.sat();
+        if let Some(t0) = t0 {
+            eprintln!("[boolector] reached≤{k}: {res:?} in {:.3?}", t0.elapsed());
+        }
+        match res {
             SolverResult::Sat => {
-                let states = (0..=k).map(|j| eval_named(&named_states[j])).collect();
-                let inputs = (0..k).map(|j| eval_named(&named_inputs[j])).collect();
+                // A `bad` is reachable within k steps. The exact depth is the SHALLOWEST
+                // frame whose `bad` holds in this model — sound (a real init→bad run) and,
+                // since every bound below the previous check was proven clean, correct.
+                let depth = (0..=k)
+                    .find(|&j| bad_per_frame[j].get_a_solution().as_bool() == Some(true))
+                    .unwrap_or(k);
+                let states = (0..=depth).map(|j| eval_named(&named_states[j])).collect();
+                let inputs = (0..depth).map(|j| eval_named(&named_inputs[j])).collect();
                 return Ok((
-                    BmcOutcome::Violated { depth: k as u32 },
+                    BmcOutcome::Violated {
+                        depth: depth as u32,
+                    },
                     Some(BmcTrace { states, inputs }),
                 ));
             }
             SolverResult::Unsat => {}
-            // Solver gave up on this depth (deeper frames only grow) — abstain.
+            // Solver gave up on this bound (deeper only grows) — abstain.
             SolverResult::Unknown => return Ok((BmcOutcome::NoCexWithin { k: k as u32 }, None)),
         }
     }
@@ -497,6 +561,27 @@ mod tests {
         assert_eq!(run(WIDE, 10).0, BmcOutcome::Violated { depth: 5 });
         // With too small a bound it is honestly bounded, never a wrong SAFE.
         assert_eq!(run(WIDE, 3).0, BmcOutcome::NoCexWithin { k: 3 });
+    }
+
+    #[test]
+    fn strided_search_recovers_exact_depth_past_threshold() {
+        // 8-bit counter, `bad = (cnt == 37)`. The CEX depth 37 is PAST the exact-check
+        // threshold (32), so it is found by a STRIDED `reached_k` check (whose bound
+        // overshoots to 40) — yet the reported depth must be the EXACT 37, read back
+        // from the model, not the check bound. This is the core correctness guard for
+        // the striding optimisation.
+        const C37: &str = "1 sort bitvec 8\n2 zero 1\n3 one 1\n4 state 1 cnt\n5 init 1 4 2\n\
+                           6 add 1 4 3\n7 next 1 4 6\n8 constd 1 37\n9 sort bitvec 1\n\
+                           10 eq 9 4 8\n11 bad 10\n";
+        let (outcome, trace) = run(C37, 60);
+        assert_eq!(
+            outcome,
+            BmcOutcome::Violated { depth: 37 },
+            "strided search must report the exact CEX depth (37), not the check bound (40)"
+        );
+        let trace = trace.expect("witness");
+        assert_eq!(trace.states.len(), 38, "frames 0..=37");
+        assert_eq!(trace.states.last().unwrap(), &vec![("cnt".to_string(), 37)]);
     }
 
     #[test]

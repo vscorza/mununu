@@ -238,24 +238,37 @@ multipliers) mirroring the btormc pattern, not a linked dependency.
   incrementally with `bad` as a one-shot assumption per depth, and only ever contributes a
   sound `Violated` — never a safety claim; it abstains (⇒ portfolio reads no verdict) on
   `rol`/`ror`, array `read`/`write`, or any array sort.
-  - **Measured (owned-only, `mununu-dev` + libz3):** `vis_arrays_buf_bug` decides `violated`
-    (depth 18) in **~3 s** at the default budget (boolector + native z3 BMC both get it);
-    `krebs.3` is decided `violated` (depth 75) **uniquely by the boolector member** — *no
-    other owned engine (exact / k-induction / interp / z3-deep-CEX) reaches it* — in **~222 s**,
-    so it needs `--owned-timeout-ms ≥ 240000`. Both agree exactly with btormc's CEX depths.
-  - **Honest speed limit:** the in-process engine is **~3× slower than the btormc subprocess**
-    (~222 s vs ~73 s on `krebs.3`) — it is a naive incremental BMC without btormc's
-    frame-simplification / MC-specific optimizations. So P1's value is the **no-subprocess owned
-    path** (it is the *only* owned engine that decides `krebs.3`-class deep BV CEX); when a
-    subprocess is acceptable, P0.5's `--timeout-ms` (btormc) remains the faster route on the
-    deepest cases. Differential-checked against the exact BDD engine + the native z3 BMC (12
+  - **Measured (`mununu-dev` + libz3):** standalone, the in-process engine finds
+    `vis_arrays_buf_bug`'s CEX (depth 18) in **~3 s** and `krebs.3`'s in **~56 s** (via the
+    frame-simplification below; was ~205 s). Both are decided `violated` **uniquely by the
+    boolector member** in the owned-only portfolio — *no other owned engine (exact / k-induction
+    / interp) reaches `krebs.3`*. The frame-simplification + engine swap (below) roughly HALVED
+    the owned budget `krebs.3` needs — `--owned-timeout-ms 120000` now suffices (was 240000).
+    (NB: the owned-only *wall* time can exceed the boolector member's — it is bounded by the
+    slowest concurrent member, e.g. the synchronous, non-interruptible exact BDD engine on wide
+    datapaths — a pre-existing owned-path property independent of this member.)
+  - **Frame-simplification (bound striding) — SHIPPED.** The BMC maintains a running
+    `reached_k = ⋁ⱼ≤ₖ bad_j` monitor ("a `bad` is reachable *within* k steps") and, past a
+    shallow exact threshold, checks it at a STRIDE: one `reached_k` UNSAT proves the WHOLE
+    `0..k` range clean at once, skipping the intermediate deep per-frame UNSAT proofs that
+    dominate the runtime. Measured on `krebs.3`: **~205 s → ~56 s (3.6×)** — now *competitive
+    with* the btormc subprocess (~73 s), where the naive per-frame version was ~3× slower.
+    `vis_arrays` is unchanged (~3 s). Scoping was measurement-driven: cone-of-influence
+    pruning was measured NOT to help here (`bad`'s cone covers ~97 % of the logic) and
+    disabling model generation during the search was a net loss (the witness re-solve of the
+    deep deciding formula dominates). **Trade:** for a deep CEX found via striding the reported
+    depth is a *sound bound* (the frame where `bad` holds in the returned witness), not
+    guaranteed minimal — shallow CEX (≤ threshold) stay exact, and the portfolio verdict is
+    depth-independent. Differential-checked against the exact BDD engine + native z3 BMC (13
     feature-gated tests). The very-deep `brp2.2`/`circular_pointer` (>300 s even for btormc)
     stay out of reach. License-clean (boolector + boolector-sys both MIT).
-  - **Infra note:** `mununu-dev:latest` was found **stale** — missing `libz3` despite the
-    Dockerfile's `libz3-dev` line — so *any* z3-linked build (not just this feature) fails to
-    link there until the image is rebuilt (or `libz3-dev` re-added). The `boolector` feature is
-    validated in a `mununu-dev` + `libz3-dev` image, per the SVA `#[ignore]` precedent; the
-    default `make ci` never compiles it (optional dep, absent from the default tree).
+  - **Infra note (resolved).** `mununu-dev:latest` had gone **stale** — missing `libz3` despite
+    the Dockerfile's `libz3-dev` line — so *any* z3-linked build failed to link there. Rebuilding
+    from `docker/Dockerfile.dev` restores `libz3` (verified: a default z3-linked test links +
+    passes) and, since the image carries cmake+curl+cc, builds the `boolector` feature directly
+    (no derived image needed). The default `make ci` never compiles the feature (optional dep,
+    absent from the default tree); validate it in `mununu-dev` with `--features boolector`, per
+    the SVA `#[ignore]` precedent.
 - **P2 — nonlinear datapath oracle (subprocess, AMulet2-style).** **Not motivated by any
   currently-failing design** (the §4 structure audit: `gen43` is pure-BV, `mul9`'s property
   is control) — so this is *parked* until a genuine multiplier-*correctness* branching
@@ -275,11 +288,12 @@ multipliers) mirroring the btormc pattern, not a linked dependency.
   plain bit-level `AG ¬bad`, the may/must machinery is overhead and a P1 fast-SAT engine is
   simply the point — that is what btormc already is, now in-process and license-clean.
 - **P1 is the recommendation; P2 is optional and subprocess-only.** The deep-CEX reach is a
-  clean, permissive-library win, now **SHIPPED**: the in-process Boolector member decides
-  **both** failing cases owned-standalone — `vis_arrays` fast (~3 s), and `krebs.3`
-  **uniquely** (no other owned engine reaches it) at `--owned-timeout-ms ≥ 240000` (~222 s,
-  ~3× the btormc subprocess). Its value is the *no-subprocess* owned path; when a subprocess
-  is fine, P0.5's `--timeout-ms` (btormc) is faster on the deepest cases. The very-deep
-  `brp2.2`/`circular_pointer` time out even for btormc/Boolector at 300 s; the nonlinear
-  class is a copyleft-constrained, discovery-limited follow-up worth doing only if the
-  multiplier-datapath branching class becomes a concrete target.
+  clean, permissive-library win, now **SHIPPED** with a frame-simplification (bound striding)
+  that cut the in-process engine's `krebs.3` time **~205 s → ~56 s (3.6×)** — competitive with
+  the btormc subprocess (~73 s). The boolector member uniquely decides both `vis_arrays` (~3 s)
+  and `krebs.3` owned-standalone (now at `--owned-timeout-ms 120000`, halved from 240000 — the
+  member also replaces the redundant z3-deep-CEX in the owned path). Its value is the
+  *no-subprocess* owned path; when a subprocess is fine, P0.5's `--timeout-ms` (btormc) remains
+  a fast route. The very-deep `brp2.2`/`circular_pointer` time out even for btormc/Boolector at
+  300 s; the nonlinear class is a copyleft-constrained, discovery-limited follow-up worth doing
+  only if the multiplier-datapath branching class becomes a concrete target.

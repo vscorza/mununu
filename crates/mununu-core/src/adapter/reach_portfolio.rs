@@ -435,7 +435,13 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
             }
             v
         });
-        // Counterstrategy — deep, wall-bounded pure counterexample search.
+        // Counterstrategy — deep, wall-bounded pure counterexample search on z3.
+        // When the `boolector` feature is on, the in-process Boolector BMC below fills
+        // this exact role (deep BV CEX search) and is faster on it (measured: ~56 s vs
+        // this member timing out on `krebs.3`), so running both would only contend for
+        // CPU and slow Boolector's deep solves. We therefore SWAP: z3-deep-CEX runs only
+        // when Boolector is absent.
+        #[cfg(not(feature = "boolector"))]
         let cex_h = scope.spawn(|| {
             let v = native_bmc::bmc_cex_until(
                 file,
@@ -466,11 +472,12 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
             }
         });
         // Fast bit-vector counterexample search — in-process Boolector (owned, no
-        // subprocess). Decides deep BV unrollings the Z3 members leave `Unknown`:
-        // measured on HWMCC20, the Z3 owned path returns `unknown` on `krebs.3`
-        // (CEX at depth 75) and `vis_arrays_buf_bug` even at 180 s/engine, while
-        // Boolector cracks both. Only ever contributes a `Violated` (never a safety
-        // claim); feature-gated so the default build stays Boolector-free.
+        // subprocess). REPLACES the z3-deep-CEX member above (same role, faster). Decides
+        // deep BV unrollings the Z3 members leave `Unknown`: measured on HWMCC20, the Z3
+        // owned path returns `unknown` on `krebs.3` (CEX at depth 75) and
+        // `vis_arrays_buf_bug` even at 180 s/engine, while Boolector cracks both (~56 s /
+        // ~3 s). Only ever contributes a `Violated` (never a safety claim); feature-gated
+        // so the default build stays Boolector-free.
         #[cfg(feature = "boolector")]
         let boolector_h = scope.spawn(|| {
             let v = crate::adapter::btor2::native_boolector::decide_reachable_boolector(
@@ -489,7 +496,11 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
             decided.store(true, Relaxed);
         }
         let native = native_h.join().unwrap_or(None);
+        // z3-deep-CEX runs only without the boolector feature (see the swap above).
+        #[cfg(not(feature = "boolector"))]
         let cex_hit = cex_h.join().unwrap_or(false);
+        #[cfg(feature = "boolector")]
+        let cex_hit = false;
         let interp = interp_h.join().unwrap_or(None);
         #[cfg(feature = "boolector")]
         let boolector = boolector_h.join().unwrap_or(None);
