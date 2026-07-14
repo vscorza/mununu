@@ -12,7 +12,10 @@
 //! - the in-house **SPACER** engine (IC3/PDR + interpolation via Z3's Fixedpoint,
 //!   [`native_spacer`](crate::adapter::btor2::native_spacer)) — decides safe
 //!   properties whose inductive invariant native k-induction cannot reach by simple
-//!   induction, also in-process;
+//!   induction. It is run in an ISOLATED child process (a self-exec of the hidden
+//!   `btor2 spacer-check` subcommand, gated on `MUNUNU_SELF_EXE`) because z3's
+//!   Fixedpoint can flaky-`SIGSEGV` on some CHC encodings; a crash in the child is
+//!   read as a sound `Unknown`, never a crash of the whole verify;
 //! - **btormc** (BMC + k-induction) on deep counterexamples;
 //! - **Pono** (IC3/PDR) on IC3-provable / violated instances.
 //!
@@ -140,11 +143,64 @@ fn run_native(file: &Btor2File) -> Option<bool> {
 /// cannot reach by simple induction below a large depth — also in-process, no
 /// subprocess.
 fn run_spacer(file: &Btor2File) -> Option<bool> {
-    match native_spacer::decide_bad_safety_spacer(file, Some(native_spacer::DEFAULT_TIMEOUT_MS)) {
+    // z3's Fixedpoint (SPACER) has a demonstrated FLAKY SIGSEGV on some CHC encodings
+    // (e.g. `vis_arrays_bufferAlloc`) — a z3-internal abort, uncatchable in-process and
+    // independent of concurrency (it segfaults even run alone). When the CLI / server
+    // exports `MUNUNU_SELF_EXE`, run SPACER in an ISOLATED child process (a self-exec of
+    // the hidden `btor2 spacer-check` subcommand) so a segfault becomes a non-success
+    // child exit we read as ABSTAIN rather than a crash of the whole verify. Without that
+    // env var (unit tests, or an embedding without the CLI binary) fall back to the
+    // in-process engine — those paths never exercise a crash-triggering design.
+    match std::env::var_os("MUNUNU_SELF_EXE") {
+        Some(exe) => run_spacer_isolated(
+            std::path::Path::new(&exe),
+            file,
+            native_spacer::DEFAULT_TIMEOUT_MS,
+        ),
+        None => run_spacer_in_process(file, native_spacer::DEFAULT_TIMEOUT_MS),
+    }
+}
+
+/// In-process SPACER — the direct engine call. Used as the fallback when no isolated
+/// self-exec target is available (tests / non-CLI embeddings).
+fn run_spacer_in_process(file: &Btor2File, timeout_ms: u32) -> Option<bool> {
+    match native_spacer::decide_bad_safety_spacer(file, Some(timeout_ms)) {
         Ok(SafetyVerdict::Violated { .. }) => Some(true),
         Ok(SafetyVerdict::Safe { .. }) => Some(false),
         Ok(SafetyVerdict::Unknown { .. }) | Err(_) => None,
     }
+}
+
+/// SPACER in an isolated child (`<exe> btor2 spacer-check --timeout-ms <t>`, BTOR2 on
+/// stdin, `safe`/`unsafe`/`unknown` on stdout). A z3-Fixedpoint SIGSEGV in the child is
+/// a non-success exit ⇒ `None` (abstain); a timeout ⇒ `None`; a clean verdict maps like
+/// the in-process engine. This contains the crash to a throwaway process — the verify
+/// itself never dies.
+fn run_spacer_isolated(exe: &std::path::Path, file: &Btor2File, timeout_ms: u32) -> Option<bool> {
+    let content = emit_btor2(file);
+    let mut cmd = std::process::Command::new(exe);
+    // `--quiet` keeps the child's tracing off stdout; we still scan for the verdict
+    // line defensively (the child may print a startup log line before it).
+    cmd.args(["--quiet", "btor2", "spacer-check", "--timeout-ms"])
+        .arg(timeout_ms.to_string());
+    // Wall headroom over the child's own z3 timeout so we read its verdict rather than
+    // killing it; a hung or segfaulting child is bounded either way.
+    let wall = std::time::Duration::from_millis(u64::from(timeout_ms) + 5_000);
+    let (status, stdout, _stderr) =
+        crate::adapter::run_with_timeout(&mut cmd, Some(content.as_bytes()), wall).ok()??;
+    if !status.success() {
+        return None; // SIGSEGV / error exit — the isolation payoff: abstain, don't crash.
+    }
+    // The verdict is the last `safe`/`unsafe`/`unknown` line the child printed.
+    for line in stdout.lines().rev() {
+        match line.trim() {
+            "safe" => return Some(false),
+            "unsafe" => return Some(true),
+            "unknown" => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Budget for the interpolation member. In the parallel driver it runs concurrently
