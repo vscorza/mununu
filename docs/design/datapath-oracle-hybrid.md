@@ -244,9 +244,18 @@ multipliers) mirroring the btormc pattern, not a linked dependency.
     boolector member** in the owned-only portfolio — *no other owned engine (exact / k-induction
     / interp) reaches `krebs.3`*. The frame-simplification + engine swap (below) roughly HALVED
     the owned budget `krebs.3` needs — `--owned-timeout-ms 120000` now suffices (was 240000).
-    (NB: the owned-only *wall* time can exceed the boolector member's — it is bounded by the
-    slowest concurrent member, e.g. the synchronous, non-interruptible exact BDD engine on wide
-    datapaths — a pre-existing owned-path property independent of this member.)
+  - **Owned-path early-return (resolved the wall-time caveat).** `decide_reach_owned_only`
+    previously ran the exact BDD engine synchronously and joined every member (`thread::scope`),
+    so the non-interruptible exact engine could block the whole owned verdict long past the
+    budget even after Boolector had decided. It now spawns every member (exact included) as a
+    detached thread and reads results off a channel, RETURNING on the first definite verdict (or
+    the deadline). Validated before/after (`--owned-only`, 90 s budget) on OpenTitan m0
+    `prim_arbiter` + a HWMCC subset: **no verdict flips**; `mul1` and `vis_arrays_buf_bug`, which
+    both *blocked past the budget* on the synchronous exact BDD, are now bounded — `vis_arrays`
+    returns `violated` in **~3 s** (was blocked >130 s) and `mul1` abstains at the deadline;
+    `paper_v3` still decides `holds` via exact when exact is fast. Trade: the inter-engine
+    contradiction alarm now covers only members that finish by return time (the full parallel
+    portfolio keeps the complete cross-check).
   - **Frame-simplification (bound striding) — SHIPPED.** The BMC maintains a running
     `reached_k = ⋁ⱼ≤ₖ bad_j` monitor ("a `bad` is reachable *within* k steps") and, past a
     shallow exact threshold, checks it at a STRIDE: one `reached_k` UNSAT proves the WHOLE

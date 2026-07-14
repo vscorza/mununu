@@ -413,16 +413,36 @@ const OWNED_CEX_QUERY_MS: u32 = 15_000;
 ///   [`ReachVerdict::Contradiction`] alarm rather than being silently merged.
 pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcome {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    let content = emit_btor2(file);
-    let decided = AtomicBool::new(false);
-    let decided = &decided;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
-    std::thread::scope(|scope| {
-        // Safety proof — shallow native BMC + k-induction.
-        let native_h = scope.spawn(|| {
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    // Detached threads + a result channel (NOT `thread::scope`) so the collector can
+    // RETURN the moment a definite verdict arrives, without joining the slow members.
+    // The exact BDD engine in particular is synchronous and NON-interruptible: on a wide
+    // in-cap datapath it can grind for minutes, and running it synchronously (as before)
+    // blocked the whole owned verdict long past the budget even when Boolector had already
+    // decided in seconds. Spawning it and reading results off a channel bounds the wall
+    // time by the FIRST decider (or the deadline), not the slowest member. Detached
+    // members keep running in the background; a CLI reaps them on process exit, and no
+    // caller is ever blocked on them.
+    //
+    // Trade vs the full parallel portfolio: early-return means a member still running when
+    // we return is not cross-checked, so the inter-engine `Contradiction` alarm here only
+    // covers members that finished by return time (the full `decide_reach_portfolio_parallel`
+    // keeps the complete cross-check). Every member is individually sound, so the first
+    // definite verdict is itself sound.
+    let file = Arc::new(file.clone());
+    let content = Arc::new(emit_btor2(&file));
+    let decided = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    let (tx, rx) = mpsc::channel::<(&'static str, Option<bool>)>();
+
+    // Safety proof — shallow native BMC + k-induction.
+    {
+        let (file, decided, tx) = (Arc::clone(&file), Arc::clone(&decided), tx.clone());
+        std::thread::spawn(move || {
             let v = match native_bmc::decide_bad_safety(
-                file,
+                &file,
                 native_bmc::DEFAULT_MAX_K,
                 Some(timeout_ms),
             ) {
@@ -433,101 +453,125 @@ pub fn decide_reach_owned_only(file: &Btor2File, timeout_ms: u32) -> ReachOutcom
             if v.is_some() {
                 decided.store(true, Relaxed);
             }
-            v
+            let _ = tx.send(("native", v));
         });
-        // Counterstrategy — deep, wall-bounded pure counterexample search on z3.
-        // When the `boolector` feature is on, the in-process Boolector BMC below fills
-        // this exact role (deep BV CEX search) and is faster on it (measured: ~56 s vs
-        // this member timing out on `krebs.3`), so running both would only contend for
-        // CPU and slow Boolector's deep solves. We therefore SWAP: z3-deep-CEX runs only
-        // when Boolector is absent.
-        #[cfg(not(feature = "boolector"))]
-        let cex_h = scope.spawn(|| {
-            let v = native_bmc::bmc_cex_until(
-                file,
-                OWNED_DEEP_CEX_MAX_K,
-                OWNED_CEX_QUERY_MS,
-                deadline,
-                decided,
-            )
-            .map(|_depth| ());
-            if v.is_some() {
-                decided.store(true, Relaxed);
-            }
-            v.is_some()
-        });
-        // Safety proof — McMillan interpolation.
-        let interp_h = scope.spawn(|| {
-            match native_interp::verify_safety_interp_cancellable(
-                file,
+    }
+    // Safety proof — McMillan interpolation.
+    {
+        let (file, decided, tx) = (Arc::clone(&file), Arc::clone(&decided), tx.clone());
+        std::thread::spawn(move || {
+            let v = match native_interp::verify_safety_interp_cancellable(
+                &file,
                 INTERP_MAX_SUFFIX,
                 64,
                 INTERP_QUERY_TIMEOUT_MS,
                 u64::from(timeout_ms),
-                decided,
+                &decided,
             ) {
                 InterpSafetyVerdict::Unsafe { .. } => Some(true),
                 InterpSafetyVerdict::Safe { .. } => Some(false),
                 InterpSafetyVerdict::Undecided { .. } => None,
+            };
+            if v.is_some() {
+                decided.store(true, Relaxed);
             }
+            let _ = tx.send(("interp", v));
         });
-        // Fast bit-vector counterexample search — in-process Boolector (owned, no
-        // subprocess). REPLACES the z3-deep-CEX member above (same role, faster). Decides
-        // deep BV unrollings the Z3 members leave `Unknown`: measured on HWMCC20, the Z3
-        // owned path returns `unknown` on `krebs.3` (CEX at depth 75) and
-        // `vis_arrays_buf_bug` even at 180 s/engine, while Boolector cracks both (~56 s /
-        // ~3 s). Only ever contributes a `Violated` (never a safety claim); feature-gated
-        // so the default build stays Boolector-free.
-        #[cfg(feature = "boolector")]
-        let boolector_h = scope.spawn(|| {
+    }
+    // Deep BV counterexample search. With the `boolector` feature the in-process Boolector
+    // BMC fills this role (faster — measured ~56 s vs the z3 search timing out on
+    // `krebs.3`); without it, the z3 deep-CEX search. Only ever contributes `Violated`.
+    #[cfg(feature = "boolector")]
+    {
+        let (file, decided, tx) = (Arc::clone(&file), Arc::clone(&decided), tx.clone());
+        std::thread::spawn(move || {
             let v = crate::adapter::btor2::native_boolector::decide_reachable_boolector(
-                file,
+                &file,
                 OWNED_DEEP_CEX_MAX_K,
                 deadline,
-                decided,
+                &decided,
             );
             if v == Some(true) {
                 decided.store(true, Relaxed);
             }
-            v
+            let _ = tx.send(("boolector", v));
         });
-        let exact = run_exact(&content);
-        if exact.is_some() {
-            decided.store(true, Relaxed);
+    }
+    #[cfg(not(feature = "boolector"))]
+    {
+        let (file, decided, tx) = (Arc::clone(&file), Arc::clone(&decided), tx.clone());
+        std::thread::spawn(move || {
+            let hit = native_bmc::bmc_cex_until(
+                &file,
+                OWNED_DEEP_CEX_MAX_K,
+                OWNED_CEX_QUERY_MS,
+                deadline,
+                &decided,
+            )
+            .is_some();
+            if hit {
+                decided.store(true, Relaxed);
+            }
+            let _ = tx.send(("cex", if hit { Some(true) } else { None }));
+        });
+    }
+    // Exact BDD — the non-interruptible member; spawned so it can never block the return.
+    {
+        let (content, decided, tx) = (Arc::clone(&content), Arc::clone(&decided), tx.clone());
+        std::thread::spawn(move || {
+            let v = run_exact(&content);
+            if v.is_some() {
+                decided.store(true, Relaxed);
+            }
+            let _ = tx.send(("exact", v));
+        });
+    }
+    drop(tx); // the collector's `rx` disconnects once every member thread has finished.
+
+    // Four members: native, interp, {boolector | z3-cex}, exact.
+    const N_MEMBERS: usize = 4;
+    let mut reachable_by: Vec<&'static str> = Vec::new();
+    let mut unreachable_by: Vec<&'static str> = Vec::new();
+    let mut reports = 0usize;
+    let mut definite = false;
+    // Wait for a definite verdict, or all members to abstain, or the deadline.
+    while reports < N_MEMBERS && !definite {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
         }
-        let native = native_h.join().unwrap_or(None);
-        // z3-deep-CEX runs only without the boolector feature (see the swap above).
-        #[cfg(not(feature = "boolector"))]
-        let cex_hit = cex_h.join().unwrap_or(false);
-        #[cfg(feature = "boolector")]
-        let cex_hit = false;
-        let interp = interp_h.join().unwrap_or(None);
-        #[cfg(feature = "boolector")]
-        let boolector = boolector_h.join().unwrap_or(None);
-        #[cfg(not(feature = "boolector"))]
-        let boolector: Option<bool> = None;
-        // Build the outcome directly so the deep CEX search keeps its own `"cex"`
-        // attribution (and any native-safe vs cex-violated disagreement stays a
-        // Contradiction alarm). No spacer / btormc / pono — owned engines only.
-        let mut reachable_by: Vec<&'static str> = Vec::new();
-        let mut unreachable_by: Vec<&'static str> = Vec::new();
-        for (name, v) in [
-            ("exact", exact),
-            ("native", native),
-            ("interp", interp),
-            ("boolector", boolector),
-        ] {
+        match rx.recv_timeout(deadline - now) {
+            Ok((name, v)) => {
+                reports += 1;
+                match v {
+                    Some(true) => {
+                        reachable_by.push(name);
+                        definite = true;
+                    }
+                    Some(false) => {
+                        unreachable_by.push(name);
+                        definite = true;
+                    }
+                    None => {}
+                }
+            }
+            // Timeout (deadline) or all members finished (disconnected) — stop waiting.
+            Err(_) => break,
+        }
+    }
+    // A definite verdict is in — grab any members that ALSO already finished (so a
+    // co-completed contradiction is still surfaced) but do NOT wait for slow stragglers
+    // (e.g. the non-interruptible exact BDD engine on a wide datapath).
+    if definite {
+        while let Ok((name, v)) = rx.try_recv() {
             match v {
                 Some(true) => reachable_by.push(name),
                 Some(false) => unreachable_by.push(name),
                 None => {}
             }
         }
-        if cex_hit {
-            reachable_by.push("cex");
-        }
-        ReachOutcome::from_sets(reachable_by, unreachable_by)
-    })
+    }
+    ReachOutcome::from_sets(reachable_by, unreachable_by)
 }
 
 #[cfg(test)]
@@ -749,7 +793,16 @@ mod tests {
         let file = parser::parse(COUNTER).expect("parse");
         let out = decide_reach_owned_only(&file, 30_000);
         assert_eq!(out.verdict, ReachVerdict::Reachable, "outcome: {out:?}");
-        assert!(out.reachable_by.contains(&"exact"), "{out:?}");
+        // An owned member decides it. Which one wins is timing-dependent under the
+        // early-return collector, so assert only that the decider(s) are owned engines —
+        // never an external member.
+        assert!(!out.reachable_by.is_empty(), "{out:?}");
+        for name in out.reachable_by.iter().chain(out.unreachable_by.iter()) {
+            assert!(
+                ["exact", "native", "interp", "boolector", "cex"].contains(name),
+                "owned-only listed a non-owned engine {name}: {out:?}"
+            );
+        }
         for ext in ["spacer", "btormc", "pono"] {
             assert!(
                 !out.reachable_by.contains(&ext) && !out.unreachable_by.contains(&ext),
