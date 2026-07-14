@@ -2147,6 +2147,35 @@ pub fn exact_symbolic_verdict_with_witness(
             exprs.push((name.clone(), expr));
         }
     }
+
+    // Input-atom soundness guard. This engine leaves primary inputs FREE (they are
+    // quantified out by the modalities — see the module header: "inputs stay free and
+    // are quantified out"). A formula atom that *pins* a primary input therefore cannot
+    // be evaluated as a state predicate: the input copy read by the atom is decoupled
+    // from the input copy driving the adjacent `[]`/`<>` transition. This is exactly the
+    // SVA `input |=> next-state` shape — the antecedent input and the transition input
+    // are the same physical signal in the same cycle, but the engine treats them as
+    // independent, yielding a spurious verdict. Refuse to decide rather than emit an
+    // unsound Holds/Violated. The default `explicit` cube engine handles input-antecedent
+    // properties correctly (it shadow-registers the antecedent). Proper fix in this
+    // engine = guarded modalities / an antecedent shadow register — deferred (deep).
+    let input_leaf_names: std::collections::HashSet<String> = sts
+        .leaf_cells()
+        .map_err(|e| format!("exact MC: {e}"))?
+        .into_iter()
+        .filter(|c| !c.is_state)
+        .map(|c| c.name)
+        .collect();
+    if let Some(bad) = seed_regs.iter().find(|r| input_leaf_names.contains(*r)) {
+        return Err(format!(
+            "exact MC: atom references primary input `{bad}`. The exact-symbolic engine \
+             leaves inputs free/quantified, so a temporal property that pins an input \
+             (e.g. an SVA `input |=> next-state` lift) decouples the antecedent from its \
+             consequent and would report an unsound verdict. Use the default `explicit` \
+             cube engine, or lift the antecedent through a shadow register."
+        ));
+    }
+
     let seed_atoms: Vec<String> = seed_regs.into_iter().collect();
     let keep_set = (!seed_atoms.is_empty())
         .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
@@ -4135,6 +4164,33 @@ mod tests {
             exact_symbolic_verdict(COMB_BTOR2, &formula).expect("combinational atom binds"),
             ExactVerdict::Holds,
             "o = p+1 is a combinational output; p reaches 2 ⇒ o==3 ⇒ EF(o==3) holds",
+        );
+    }
+
+    /// Soundness guard: an atom that PINS a primary input is REFUSED (`Err`), never
+    /// decided. The exact-symbolic engine leaves inputs free/quantified, so a temporal
+    /// property with an input in an atom (the SVA `input |=> next-state` shape) decouples
+    /// the antecedent input from the transition input and would report an unsound verdict.
+    /// Contrast `predicate_binds_combinational_output`: an atom over a combinational
+    /// OUTPUT (derived from state) is fine — only *primary inputs* are refused.
+    #[test]
+    fn exact_symbolic_refuses_primary_input_atom() {
+        // `q' = clr` (a 1-bit latch of the primary input `clr`); the formula's atom pins
+        // the input `clr` directly.
+        const INPUT_ATOM_BTOR2: &str = r#"
+1 sort bitvec 1
+2 input 1 clr
+3 state 1 q
+4 const 1 0
+5 init 1 3 4
+6 next 1 3 2
+"#;
+        let formula = crate::mu_calculus::parser::parse("mu Y. (clr or <> Y)").expect("formula");
+        let err = exact_symbolic_verdict(INPUT_ATOM_BTOR2, &formula)
+            .expect_err("an atom pinning a primary input must be refused, not decided");
+        assert!(
+            err.contains("primary input") && err.contains("clr"),
+            "diagnostic should name the offending input `clr`: {err}"
         );
     }
 

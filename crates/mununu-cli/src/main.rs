@@ -625,6 +625,20 @@ struct Btor2VerifyArgs {
     /// under `--owned-only` (which has its own `--owned-timeout-ms`).
     #[arg(long, value_name = "MS")]
     timeout_ms: Option<u64>,
+    /// On a `violated` verdict, also emit a concrete init→bad counterexample trace
+    /// (per-cycle state + input assignments) in the summary JSON. Re-derives the
+    /// SHALLOWEST witness via the native bit-precise BMC engine (bounded to
+    /// `--witness-max-k` cycles); omitted if that bound doesn't reach the `bad` node.
+    /// This is the actionable payload for an LLM RTL-refinement loop — verdict + the
+    /// exact stimulus that trips the assertion.
+    ///
+    /// surface: CLI-only — a diagnostic augmentation of the CLI-only `btor2 verify`;
+    /// the default portfolio verdict remains the CLI+API+UI path.
+    #[arg(long)]
+    witness: bool,
+    /// Cycle bound for `--witness` counterexample re-derivation (default 200).
+    #[arg(long, value_name = "K", default_value_t = 200)]
+    witness_max_k: u32,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2764,6 +2778,40 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
         decide_reach_portfolio_parallel(&file)
     };
 
+    // `--witness`: on a `violated` (Reachable) verdict, re-derive the shallowest
+    // concrete init→bad trace with the bit-precise native BMC engine. The portfolio
+    // itself only reports WHICH engines proved reachability; the actionable payload —
+    // the exact per-cycle stimulus that trips the assertion — is what an LLM
+    // refinement loop consumes. Bounded to `--witness-max-k`; if the bound doesn't
+    // reach the `bad` node (a very deep CEX another engine found), the witness is
+    // simply omitted (null) rather than fabricated.
+    let witness_json = if args.witness
+        && outcome.verdict == mununu_core::adapter::reach_portfolio::ReachVerdict::Reachable
+    {
+        use mununu_core::adapter::btor2::native_bmc::{BmcOutcome, bmc_bad_reachable_witness};
+        match bmc_bad_reachable_witness(&file, args.witness_max_k) {
+            Ok((BmcOutcome::Violated { depth }, Some(trace))) => {
+                let frame_obj = |f: &Vec<(String, u64)>| -> serde_json::Value {
+                    serde_json::Value::Object(
+                        f.iter()
+                            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                            .collect(),
+                    )
+                };
+                serde_json::json!({
+                    "depth": depth,
+                    "states": trace.states.iter().map(frame_obj).collect::<Vec<_>>(),
+                    "inputs": trace.inputs.iter().map(frame_obj).collect::<Vec<_>>(),
+                })
+            }
+            // Reachable per the portfolio but the bounded native re-derivation didn't
+            // reach it within `--witness-max-k` — report the bound honestly.
+            _ => serde_json::json!({ "unavailable_within_k": args.witness_max_k }),
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
     let summary = serde_json::json!({
         "file": args.file.display().to_string(),
         "engines": if args.owned_only { "owned-only" } else { "full-portfolio" },
@@ -2772,6 +2820,7 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
         "unreachable_by": outcome.unreachable_by,
         "contradiction": outcome.verdict
             == mununu_core::adapter::reach_portfolio::ReachVerdict::Contradiction,
+        "witness": witness_json,
     });
     println!(
         "{}",
