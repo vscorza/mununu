@@ -662,6 +662,69 @@ fn bool_expr(expr: &Value) -> Result<String, String> {
                 )),
             }
         }
+        // `x inside {v1, v2, [lo:hi], …}` — expand to the already-supported comparison
+        // fragment: a single value `v` → `(x == v)`, a simple `[lo:hi]` range →
+        // `((x >= lo) && (x <= hi))`, OR-ed across the set. Every atom produced (`==`,
+        // `>=`, `<=`, `||`) is in the Tier-1 fragment, so `inside` needs no new predicate
+        // machinery. Exact — the disjunction IS the definition of `inside`. Members /
+        // bounds must be signal-or-literal atoms (the ubiquitous value-set / range form
+        // in real + LLM-generated SVA); a member that is itself a complex expression, or
+        // a non-simple (`$`/dist) range, is rejected honestly rather than mis-translated.
+        "Inside" => {
+            let atom = |e: &Value| -> Option<String> {
+                cmp_signal_atom(e).or_else(|| sv_integer(e).map(|n| n.to_string()))
+            };
+            let lhs = atom(child(expr, "left")?)
+                .ok_or_else(|| "inside: left operand is not a signal/literal atom".to_string())?;
+            let members = child(expr, "rangeList")?
+                .as_array()
+                .ok_or_else(|| "inside: `rangeList` is not an array".to_string())?;
+            if members.is_empty() {
+                return Err("inside: empty set list".to_string());
+            }
+            // Cap the enumerated width (each value member is a cube dimension the
+            // abstraction tracks) — ranges are cheap (2 comparisons) so they don't count.
+            let value_members = members
+                .iter()
+                .filter(|m| m.get("kind").and_then(Value::as_str) != Some("ValueRange"))
+                .count();
+            if value_members > 64 {
+                return Err(format!(
+                    "inside: {value_members} value members — the enumerated set is too large \
+                     (>64) to expand into cube predicates"
+                ));
+            }
+            let mut terms: Vec<String> = Vec::with_capacity(members.len());
+            for m in members {
+                if m.get("kind").and_then(Value::as_str) == Some("ValueRange") {
+                    let rk = m
+                        .get("rangeKind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Simple");
+                    if rk != "Simple" {
+                        return Err(format!(
+                            "inside: only simple `[lo:hi]` ranges are supported (got `{rk}`)"
+                        ));
+                    }
+                    let lo = atom(child(m, "left")?).ok_or_else(|| {
+                        "inside: range low bound is not a signal/literal".to_string()
+                    })?;
+                    let hi = atom(child(m, "right")?).ok_or_else(|| {
+                        "inside: range high bound is not a signal/literal".to_string()
+                    })?;
+                    terms.push(format!("(({lhs} >= {lo}) && ({lhs} <= {hi}))"));
+                } else {
+                    let v = atom(m).ok_or_else(|| {
+                        format!(
+                            "inside: set member is not a signal/literal atom (kind={:?})",
+                            m.get("kind").and_then(Value::as_str)
+                        )
+                    })?;
+                    terms.push(format!("({lhs} == {v})"));
+                }
+            }
+            Ok(format!("({})", terms.join(" || ")))
+        }
         other => Err(format!("unsupported expression kind: {other}")),
     }
 }
@@ -1626,6 +1689,44 @@ mod tests {
         assert!(
             err.contains("$isunknown") || err.contains("not in the"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn inside_set_and_range_expand_to_supported_comparisons() {
+        // `x inside {2, 4, [1:3]}` → `((x==2) || (x==4) || ((x>=1) && (x<=3)))` — every
+        // atom is in the Tier-1 fragment. The slang AST wraps literals in `Conversion`
+        // (stripped by `unwrap`), modelled here with the real `4'bNNN` constant form.
+        let lit = |v: &str| {
+            serde_json::json!({
+                "kind": "Conversion",
+                "operand": {"kind": "IntegerLiteral", "type": "bit[3:0]", "constant": v}
+            })
+        };
+        let node = serde_json::json!({
+            "kind": "Inside",
+            "left": {"kind": "NamedValue", "type": "logic[3:0]", "symbol": "9 x"},
+            "rangeList": [
+                lit("4'b10"),   // 2
+                lit("4'b100"),  // 4
+                {"kind": "ValueRange", "rangeKind": "Simple",
+                 "left": lit("4'b1"), "right": lit("4'b11")}   // [1:3]
+            ]
+        });
+        let out = bool_expr(&node).expect("inside translates");
+        assert_eq!(
+            out, "((x == 2) || (x == 4) || ((x >= 1) && (x <= 3)))",
+            "got: {out}"
+        );
+        // A set member that is not a signal/literal atom is rejected honestly.
+        let bad = serde_json::json!({
+            "kind": "Inside",
+            "left": {"kind": "NamedValue", "type": "logic[3:0]", "symbol": "9 x"},
+            "rangeList": [{"kind": "BinaryOp", "op": "Add"}]
+        });
+        assert!(
+            bool_expr(&bad).is_err(),
+            "a non-atom `inside` member must be rejected, not silently dropped"
         );
     }
 
