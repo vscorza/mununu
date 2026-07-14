@@ -510,6 +510,39 @@ hardness is §5 and is unchanged, so gate behind a flag and measure, do not assu
   *very* deep counterexamples where blind unrolling can't get there but the escaping
   transition can be accelerated.
 
+### 8.2 Validation of §8.1 (attempted 2026-07-13) — the cheap levers confirm the walls
+
+The §8.1 tasks were probed against the exact examples before committing to the large
+builds. **On these designs all three confirm the limitations rather than lift them** — an
+empirical validation of §1–§6, not a fix:
+
+- **T1 (`bvmul`) / T2 (`bvurem`) — confirmed §5, grammar build short-circuited.** A key
+  fact makes the grammar atom moot for the *portfolio*: `native_interp` already
+  round-trips *arbitrary* cvc5 interpolant shapes through z3 (including `bvmul`/`bvurem`) —
+  the `PredicateExpr` atom is only needed by the *cube's* discovery parser, not the
+  interpolation engine. So the decisive test is whether owned interpolation decides the
+  designs given budget. **Measured: `gen43` and `mul9` are both `unknown` at owned-only
+  @300 s** (300 s > `gen43`'s 105 s single-interpolant time). One interpolant does not
+  close the proof and the search does not converge, so an atom that merely lets the *cube*
+  hold the same interpolant cannot do better. §5's nonlinear-SMT wall stands; the grammar
+  build was not undertaken because the interp probe proves it futile on these designs.
+- **T3 (predicate-directed CEX) — confirmed §2/§7.** The natural first lever — scaling the
+  deep-CEX per-query budget with the wall budget — was implemented and measured.
+  **`krebs.3` stayed `unknown` at owned-only @240 s**: the search never reached depth 75,
+  because the wall is the *cumulative* z3-BMC cost of ~75 deep queries, which a per-query
+  bump cannot fix. And it is **not** an owned-vs-external gap — **`krebs.3` and `brp2.2`
+  are `unknown` for the full external portfolio (btormc/Pono/SPACER) @60 s as well.** These
+  deep-CEX-unsafe designs are hard for *everyone* at practical budgets; a predicate
+  direction does not help when the bottleneck is BMC *reach*. The per-query change was
+  reverted (a tweak that does not fix the target is not worth shipping).
+
+**Net.** The §8.1 tasks are real *directions*, but on these specific examples the binding
+constraint is the underlying wall — nonlinear SMT for T1/T2, deep-CEX BMC reach for T3 —
+and the cheap levers do not cross it. The genuine levers remain the hard ones: a faster
+bit-vector SAT backend (btormc-class) or a much larger budget for deep CEX, and word-level
+nonlinear reasoning for multiplier proofs — none a quick owned change. This section is the
+measured confirmation that the §1–§6 walls are real, not artifacts of a missing feature.
+
 **Bottom line — the native/external division of labor.** The measured picture (§7) is
 sharper than "external engines cover mununu's gaps." External wins **one category
 cleanly (3, auxiliary-invariant safe proofs — Pono/SPACER)** and the **shallow tier of
