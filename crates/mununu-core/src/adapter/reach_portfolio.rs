@@ -297,8 +297,38 @@ pub fn decide_reach_portfolio(file: &Btor2File) -> ReachOutcome {
 /// sequential last resort), a design it decides in time will additionally list
 /// `interp` in `reachable_by` / `unreachable_by`, giving the owned engine its credit.
 pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
+    decide_reach_portfolio_parallel_with_timeout(file, btormc::DEFAULT_TIMEOUT)
+}
+
+/// btormc unrolling depth cap for the **raised-budget** path. The default portfolio caps
+/// btormc at [`btormc::DEFAULT_KMAX`] (40) to bound its cost, but a deep counterexample
+/// needs a deeper unrolling — `krebs.3`'s CEX is at depth 75 — so raising the *time* budget
+/// is useless while the *depth* stays 40 (measured: `--timeout-ms 120000` alone still
+/// returned `unknown` on `krebs.3`). When the caller raises the budget we therefore also
+/// raise the depth cap; btormc unrolls incrementally, so it still stops at the first CEX /
+/// proof / the wall timeout, never pre-paying for the higher cap.
+const DEEP_BUDGET_KMAX: u32 = 1000;
+
+/// [`decide_reach_portfolio_parallel`] with the **subprocess** members' (btormc / Pono)
+/// wall budget set to `subprocess_timeout` instead of the 60 s default. When the budget is
+/// raised above the default, btormc's depth cap is also lifted to [`DEEP_BUDGET_KMAX`] (a
+/// longer budget is pointless if the unrolling stays capped at 40 — see that constant).
+/// Measured: with both raised, `krebs.3`'s depth-75 CEX is found in ~73 s (`unknown` →
+/// `violated`); `vis_arrays_buf_bug`'s is found in ~1 s either way. The in-process members
+/// (exact / native / SPACER / interp) keep their own budgets. Surfaced via `btor2 verify
+/// --timeout-ms`.
+pub fn decide_reach_portfolio_parallel_with_timeout(
+    file: &Btor2File,
+    subprocess_timeout: std::time::Duration,
+) -> ReachOutcome {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let content = emit_btor2(file);
+    // Raising the wall budget signals "reach deeper" — so lift btormc's depth cap too.
+    let btormc_kmax = if subprocess_timeout > btormc::DEFAULT_TIMEOUT {
+        DEEP_BUDGET_KMAX
+    } else {
+        btormc::DEFAULT_KMAX
+    };
     // A definite verdict from ANY faster member sets this; the owned interpolation
     // member polls it and abandons its (possibly slow) cvc5 interpolation search early
     // (#1 — run interpolation as a concurrent member, not last-resort, so its unique
@@ -308,15 +338,14 @@ pub fn decide_reach_portfolio_parallel(file: &Btor2File) -> ReachOutcome {
     let decided = &decided;
     std::thread::scope(|scope| {
         let btormc_h = scope.spawn(|| {
-            let v =
-                btormc::decide_via_btormc(file, btormc::DEFAULT_KMAX, btormc::DEFAULT_TIMEOUT).ok();
+            let v = btormc::decide_via_btormc(file, btormc_kmax, subprocess_timeout).ok();
             if matches!(v, Some(McVerdict::Violated) | Some(McVerdict::Safe)) {
                 decided.store(true, Relaxed);
             }
             v
         });
         let pono_h = scope.spawn(|| {
-            let v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, pono::DEFAULT_TIMEOUT).ok();
+            let v = pono::decide_via_pono(file, pono::DEFAULT_ENGINE, subprocess_timeout).ok();
             if matches!(v, Some(McVerdict::Violated) | Some(McVerdict::Safe)) {
                 decided.store(true, Relaxed);
             }
@@ -629,6 +658,27 @@ mod tests {
         let par = decide_reach_portfolio_parallel(&file);
         assert_eq!(seq, par, "parallel and sequential drivers must agree");
         assert_eq!(par.verdict, ReachVerdict::Reachable);
+    }
+
+    #[test]
+    fn parallel_with_timeout_delegates_and_agrees() {
+        // The `--timeout-ms` variant only changes the subprocess budget; on a design
+        // the exact engine decides (no subprocess needed) it returns the identical
+        // outcome regardless of the budget passed.
+        const COUNTER: &str = "1 sort bitvec 3\n2 zero 1\n3 state 1\n4 init 1 3 2\n5 one 1\n\
+                               6 add 1 3 5\n7 next 1 3 6\n8 ones 1\n9 sort bitvec 1\n\
+                               10 eq 9 3 8\n11 bad 10\n";
+        let file = parser::parse(COUNTER).expect("parse");
+        let default = decide_reach_portfolio_parallel(&file);
+        let custom = decide_reach_portfolio_parallel_with_timeout(
+            &file,
+            std::time::Duration::from_secs(120),
+        );
+        assert_eq!(
+            default, custom,
+            "budget override must not change an exact-decided verdict"
+        );
+        assert_eq!(custom.verdict, ReachVerdict::Reachable);
     }
 
     #[test]

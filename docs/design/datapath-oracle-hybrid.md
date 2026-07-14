@@ -85,10 +85,10 @@ implementation; the two new ones are §5.
 
 | Design | Class | Which oracle | Would it decide? |
 |---|---|---|---|
-| `krebs.3` | deep-CEX (@75), non-array | **fast-SAT** | **Yes** — incremental BV-SAT reaches depth 75 |
-| `brp2.2` | deep-CEX (@119) | **fast-SAT** | **Yes** — reaches depth 119 |
-| `circular_pointer_top_w64_d128` | deep-CEX (@~128), wide | **fast-SAT** | **Likely** — incremental SAT scales past z3's monolithic query |
-| `vis_arrays_buf_bug` | deep-CEX (@18–28), **arrays** | **fast-SAT + arrays** | **Yes** — a BV+array SMT backend handles the memory |
+| `vis_arrays_buf_bug` | deep-CEX (@18–28), **arrays** | **fast-SAT + arrays** | **Yes (measured)** — btormc/Boolector: **1 s** (owned z3-BMC: timeout @120 s) |
+| `krebs.3` | deep-CEX (@75), non-array | **fast-SAT** | **Yes (measured)** — btormc/Boolector: **73 s** (owned z3-BMC: never reached it @240 s) |
+| `brp2.2` | deep-CEX (@119) | fast-SAT | **No (measured)** — btormc/Boolector **timed out @300 s**; too deep even for the best BV-SAT in budget |
+| `circular_pointer_top_w64_d128` | deep-CEX (@~128), wide | fast-SAT | **No (measured)** — btormc/Boolector **timed out @300 s** |
 | `mul9` | multipliers present, but **control** property (`bad = and(51,52)`, *not* `out == a·b`) | nonlinear (mismatched) + invariant synthesis | **Partial at best** — mixed logic+arithmetic proof; not a clean multiplier-correctness target the algebraic oracle cracks (§4.2) |
 | `gen43` | 256-bit **pure BV** (0 `mul`/`urem`/`add`) | fast-SAT (width) + **invariant synthesis** | **No by nonlinear oracle** — it has no arithmetic; needs §3 synthesis, not a datapath oracle |
 | `arbitrated_top_*_d64` | wide **proof** (no nonlinearity) | fast-SAT (queries) + **invariant synthesis** | **No by oracle alone** — the wall is §3 invariant *discovery*, not the query speed |
@@ -111,8 +111,12 @@ keep learned clauses, re-solve) instead of z3's grow-and-re-solve. This is exact
 btormc does internally; doing it in-process closes the reach. The abstraction is
 untouched — for a pure `AG ¬bad` the KMTS layer is a thin pass-through and the oracle does
 the work; for a *branching* property over the same design the oracle answers the may/must
-reach queries the Kleene evaluation needs. **This is the recommended first increment** —
-it fixes four of the seven cases and is license-clean (§5).
+reach queries the Kleene evaluation needs. **This is the recommended first increment** and
+is license-clean (§5). **Measured scope (2026-07-13):** it fixes **two** of the deep-CEX
+cases — `vis_arrays` (btormc 1 s) and `krebs.3` (btormc 73 s) — *not* four: `brp2.2` (@119)
+and `circular_pointer_d128` **time out even for btormc/Boolector at 300 s**, so no fast-SAT
+engine (in-process or external) closes them in budget. P1's win is real but bounded to the
+shallow/moderate deep-CEX class.
 
 ### 4.2 The nonlinear oracle in principle — and why the current corpus doesn't need it
 
@@ -214,12 +218,24 @@ multipliers) mirroring the btormc pattern, not a linked dependency.
   through it, with z3 as the sole implementation. Pure refactor; behaviour-identical;
   gated by the existing differential tests. This is the enabling step and carries no
   license risk.
-- **P1 — fast-SAT reachability oracle (Bitwuzla, MIT, in-process).** Implement
-  `bad_reachable_within` (and the may/must reach queries) on Bitwuzla's incremental API.
-  Validate on the §4.1 deep-CEX cases: target `krebs.3` (@75), `brp2.2` (@119),
-  `circular_pointer_top_w64_d128`, `vis_arrays_buf_bug` (arrays) flipping owned-standalone
-  to a sound `violated`. Differential-check every verdict against z3 + the concrete trace
-  (soundness net). **This is the high-value, license-clean increment.**
+- **P0.5 — cheap portfolio budget knob (no dependency) — SHIPPED.** A `--timeout-ms` flag
+  on `btor2 verify` overriding the subprocess-member (btormc/Pono) budget (default 60 s).
+  **Subtlety that a naive version misses (caught empirically):** raising the *time* is
+  useless while btormc's *depth* stays capped at `DEFAULT_KMAX = 40` — `krebs.3`'s CEX is at
+  depth 75 — so the raised-budget path also lifts btormc's `-kmax` (to 1000). Measured:
+  `krebs.3` goes `unknown` @default → `violated via btormc` @`--timeout-ms 120000`.
+  (`vis_arrays_buf_bug` is *already* decided by the default portfolio — its CEX @18–28 is
+  within kmax 40 and btormc finds it in ~1 s — so P0.5's net new decide is the deep-CEX
+  class beyond depth 40, e.g. `krebs.3`.) No new dependency, no build-time cost. It does
+  *not* give the no-subprocess path — that is P1's job.
+- **P1 — fast-SAT reachability oracle (Boolector/Bitwuzla, MIT, in-process — feature-gated).**
+  Implement `bad_reachable_within` on an in-process Boolector (safe crate `boolector` 0.4,
+  MIT — the exact engine btormc uses, validated to build alongside z3 0.20) behind a
+  `boolector` cargo feature so the default build/CI stays fast. **Measured target: flip
+  `vis_arrays` + `krebs.3` owned-standalone to a sound `violated`** (the two btormc actually
+  cracks in budget). Differential-check every verdict against z3 + the concrete trace
+  (soundness net). License-clean; bounded payoff (the very-deep `brp2.2`/`circular_pointer`
+  are out of reach even for Boolector, so P1 does not target them).
 - **P2 — nonlinear datapath oracle (subprocess, AMulet2-style).** **Not motivated by any
   currently-failing design** (the §4 structure audit: `gen43` is pure-BV, `mul9`'s property
   is control) — so this is *parked* until a genuine multiplier-*correctness* branching
@@ -239,6 +255,8 @@ multipliers) mirroring the btormc pattern, not a linked dependency.
   plain bit-level `AG ¬bad`, the may/must machinery is overhead and a P1 fast-SAT engine is
   simply the point — that is what btormc already is, now in-process and license-clean.
 - **P1 is the recommendation; P2 is optional and subprocess-only.** The deep-CEX reach is a
-  clean, permissive-library win that fixes four of the seven failing cases; the nonlinear
+  clean, permissive-library win that (measured) fixes **two** of the failing cases owned-
+  standalone (`vis_arrays`, `krebs.3`) — the very-deep `brp2.2`/`circular_pointer` time out
+  even for btormc/Boolector at 300 s; the nonlinear
   class is a copyleft-constrained, discovery-limited follow-up worth doing only if the
   multiplier-datapath branching class becomes a concrete target.
