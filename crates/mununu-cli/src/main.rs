@@ -639,6 +639,20 @@ struct Btor2VerifyArgs {
     /// Cycle bound for `--witness` counterexample re-derivation (default 200).
     #[arg(long, value_name = "K", default_value_t = 200)]
     witness_max_k: u32,
+    /// BMC-only bounded reachability: run ONLY the native bit-precise BMC to `--bmc-k`
+    /// steps and skip the full portfolio (no equivalence/safety PROOF). A `bad` reached
+    /// within the bound ⇒ `violated` (a sound, shallow counterexample); no `bad` within
+    /// the bound ⇒ `unknown` (BOUNDED — not a safety proof, a deeper CEX may exist). Turns
+    /// the wide-datapath equivalence-miter timeouts (where the proof is intractable but a
+    /// distinguishing input is shallow) into fast definite `violated` decisions.
+    ///
+    /// surface: CLI-only — a bounded-reachability diagnostic, peer of `--owned-only`; the
+    /// default full portfolio remains the CLI+API+UI verdict path.
+    #[arg(long)]
+    bmc_only: bool,
+    /// Step bound for `--bmc-only` (default 20).
+    #[arg(long, value_name = "K", default_value_t = 20)]
+    bmc_k: u32,
     #[command(flatten)]
     ci: CiArgs,
 }
@@ -2764,6 +2778,34 @@ fn btor2_verify(args: Btor2VerifyArgs) -> Result<(), String> {
         .map_err(|e| format!("Failed to read BTOR2 '{}': {e}", args.file.display()))?;
     let file = mununu_core::adapter::btor2::parser::parse(&content)
         .map_err(|e| format!("BTOR2 parse error in '{}': {e}", args.file.display()))?;
+
+    // `--bmc-only`: bounded reachability, no portfolio / no proof. A shallow `bad` ⇒ a sound
+    // `violated`; no `bad` within the bound ⇒ a BOUNDED `unknown` (not a safety proof). The
+    // bounded-miter path for wide-datapath equivalence checks whose full proof is intractable.
+    if args.bmc_only {
+        use mununu_core::adapter::btor2::native_bmc::{self, BmcOutcome};
+        let (verdict, depth) = match native_bmc::bmc_bad_reachable(&file, args.bmc_k) {
+            Ok(BmcOutcome::Violated { depth }) => ("violated", Some(depth)),
+            Ok(BmcOutcome::NoCexWithin { .. }) => ("unknown", None),
+            Err(e) => return Err(format!("bmc-only: {e:?}")),
+        };
+        let summary = serde_json::json!({
+            "file": args.file.display().to_string(),
+            "engines": format!("bmc-only(k={})", args.bmc_k),
+            "verdict": verdict,
+            "reachable_by": if verdict == "violated" { vec!["native-bmc"] } else { Vec::<&str>::new() },
+            "unreachable_by": Vec::<&str>::new(),
+            "contradiction": false,
+            "bmc_depth": depth,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .map_err(|e| format!("serialize summary: {e}"))?
+        );
+        ci_gate_exit(verdict, args.ci.fail_on);
+        return Ok(());
+    }
 
     // `--owned-only`: mununu-owned engines only (no external SPACER/btormc/Pono).
     // Otherwise the full parallel portfolio — identical merge to the sequential
