@@ -36,7 +36,7 @@
 use crate::adapter::btor2::ast::{Nid, Node};
 use crate::adapter::btor2::bad_monitor::{
     BAD_COND_SYMBOL, btor2_cmp_keyword, find_or_make_bool_sort, input_nid_and_sort,
-    state_nid_and_sort,
+    output_nid_and_sort, state_nid_and_sort,
 };
 use crate::adapter::btor2::parser;
 use crate::adapter::btor2::predicate_expr::CmpOp;
@@ -78,12 +78,17 @@ fn emit_atom(
     role: &str,
 ) -> Result<Nid, AdapterError> {
     let (signal, op, value) = atom;
+    // Resolve against a state cell, a primary input, or a named output port. The
+    // output case (registered grants like `level1` / `q`) is essential: the standard
+    // lift keeps port names but drops state-cell names, so a grant signal surfaces
+    // only as an `output` — comparing its driver net per-cycle is a sound observation.
     let (nid, sort) = state_nid_and_sort(file, signal, reset_pinned)
         .or_else(|| input_nid_and_sort(file, signal))
+        .or_else(|| output_nid_and_sort(file, signal))
         .ok_or_else(|| {
             err(format!(
-                "adapter/btor2/l2s_monitor: {role} `{signal}` is neither a state cell nor a \
-                 primary input, so the response monitor cannot bind it"
+                "adapter/btor2/l2s_monitor: {role} `{signal}` is not a state cell, a primary \
+                 input, or a named output, so the response monitor cannot bind it"
             ))
         })?;
     let cst = e.push(format!("constd {sort} {value}"));
@@ -241,5 +246,42 @@ mod tests {
             false,
         );
         assert!(e.is_err(), "an atom that binds no signal must error");
+    }
+
+    // The real-lift shape: `flatten; opt_clean; dffunmap` keeps port names but drops
+    // state-cell names, so a registered grant surfaces only as a named `output` over
+    // an *unnamed* state. Binding the grant atom must follow the output to its driver.
+    const REGISTERED_OUTPUT: &str = "\
+1 sort bitvec 1
+2 input 1 req
+3 state 1
+4 zero 1
+5 init 1 3 4
+6 next 1 3 2
+7 output 3 grant
+";
+
+    #[test]
+    fn binds_registered_output_grant() {
+        // `grant` is a named output over the unnamed state 3; `req` is a primary input.
+        let out = emit_response_l2s_monitor(
+            REGISTERED_OUTPUT,
+            ("req", CmpOp::Eq, 1),
+            ("grant", CmpOp::Eq, 1),
+            false,
+        )
+        .expect("a registered-output grant must bind via output_nid_and_sort");
+        let file = parser::parse(&out).expect("emitted BTOR2 re-parses");
+        assert!(
+            file.lines
+                .iter()
+                .any(|l| matches!(l.node, Node::Bad { .. })),
+            "the monitor emits a bad line"
+        );
+        // The grant comparison binds the output's driver (state 3), not the output line.
+        assert!(
+            out.contains("eq 1 3 "),
+            "grant compares against driver nid 3"
+        );
     }
 }
