@@ -138,6 +138,39 @@ pub(crate) fn input_nid_and_sort(
     })
 }
 
+/// Resolve an OUTPUT port symbol to `(driver_nid, sort_nid)` — the net driving the
+/// named output.
+///
+/// A *registered* output (e.g. a grant flop) surfaces here even when the underlying
+/// state cell is unnamed after the standard `flatten; opt_clean; dffunmap` lift drops
+/// state symbols but keeps port names. Comparing the driver's value is a **sound**
+/// per-cycle observation for the response monitor: it is exactly the signal's value
+/// each step, and the l2s `AF` semantics stay sound whether the driver is a pure
+/// function of state or of state+inputs (a `b`-free lasso is still a genuine
+/// never-granted path). A *negated* output operand is skipped — binding its
+/// un-negated net would flip the comparison sense — so it falls through to the
+/// caller's bind error rather than binding the wrong polarity.
+pub(crate) fn output_nid_and_sort(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    signal: &str,
+) -> Option<(Nid, Nid)> {
+    let drv = file.lines.iter().find_map(|l| match &l.node {
+        Node::Output {
+            signal: op,
+            symbol: Some(sym),
+        } if sym == signal && !op.is_negated() => Some(op.nid()),
+        _ => None,
+    })?;
+    let sort = match &file.lookup(drv)?.node {
+        Node::Input { sort, .. }
+        | Node::State { sort, .. }
+        | Node::Const { sort, .. }
+        | Node::Op { sort, .. } => *sort,
+        _ => return None,
+    };
+    Some((drv, sort))
+}
+
 /// H.O.1b — append a `bad` monitor for `AG (signal ⋈ value)`.
 ///
 /// `signal` must resolve to a state register (value-alias / reset-mux aware, like
