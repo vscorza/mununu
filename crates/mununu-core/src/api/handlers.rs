@@ -1188,6 +1188,7 @@ pub async fn sv_verify_auto_handler(
             .map(|f| (f.name.clone(), f.content.clone()))
             .collect(),
         use_sv2v: request.use_sv2v,
+        cutpoint_signals: request.cutpoint.clone(),
         ..Default::default()
     };
     let must_edge_inference = match request.must_edge_inference.as_deref() {

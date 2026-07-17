@@ -1337,6 +1337,16 @@ pub struct SvVerifyAutoRequest {
     /// note. Default empty.
     #[serde(default)]
     pub counter_bounds: Vec<String>,
+    /// Control-slice cut points, mirroring the CLI `--cutpoint`: net names to replace
+    /// with a free `$anyseq` input in the SV → BTOR2 lift (Yosys `cutpoint w:<net>`), so
+    /// the FSM's datapath guards drop out of the cone via cone-of-influence — the sound,
+    /// netlist-level way to fit `"exact-symbolic"` on a wide control FSM. Each entry is a
+    /// bare net name (e.g. `"must_refresh"`). OVER-APPROXIMATION: a definite HOLDS
+    /// transfers (safety + over-approx); a definite VIOLATED is sound only when
+    /// guard-independent (an orphaned FSM state). Surfaced as a `control-slice` note.
+    /// Default empty.
+    #[serde(default)]
+    pub cutpoint: Vec<String>,
     /// Engine selector, mirroring the CLI `--engine`: `"explicit"`, `"symbolic"`,
     /// `"exact-symbolic"`, `"portfolio-sequential"`, `"portfolio-parallel"`.
     /// **Unspecified ⇒ the default `"portfolio-sequential"`** (2026-07-06): run

@@ -316,6 +316,7 @@ fn build_notes(
     must_edge_inference: MustEdgeInference,
     applied_config_values: &[(String, u64)],
     counter_bounds: &[String],
+    cutpoint_signals: &[String],
     posture: &NotePosture,
 ) -> Vec<VerificationNote> {
     let d = &report.diagnostics;
@@ -364,6 +365,31 @@ fn build_notes(
                 .iter()
                 .map(|(sig, v)| format!("{sig}={v}"))
                 .collect(),
+        });
+    }
+
+    // Control-slice cut points (ScopeCaveat) — present only when the user cut nets
+    // to free `$anyseq` inputs in the lift. This is an OVER-APPROXIMATION: it adds
+    // transitions, so a definite HOLDS is sound but a definite VIOLATED may be
+    // spurious unless it is guard-independent (the orphaned-FSM-state case).
+    if !cutpoint_signals.is_empty() {
+        notes.push(VerificationNote {
+            kind: "control-slice".into(),
+            level: NoteLevel::ScopeCaveat,
+            summary: format!(
+                "{} net(s) cut to free inputs (control-slice) — an over-approximation of the design.",
+                cutpoint_signals.len()
+            ),
+            detail: "Each listed net was replaced by a free `$anyseq` input (Yosys `cutpoint`), so its \
+                     datapath fanin drops out of the cone (this is what lets `exact-symbolic` fit a wide \
+                     control FSM). Because freeing a net only ADDS transitions, a definite HOLDS transfers \
+                     to the concrete RTL (safety + over-approx = sound); a definite VIOLATED is sound only \
+                     when the counterexample is guard-independent — the canonical case being an ORPHANED \
+                     FSM state (in-degree 0), which no freed guard can make reachable, so `AG EF \
+                     <orphaned-state>` stays soundly VIOLATED. Treat any other VIOLATED under cut points \
+                     as possibly spurious and re-check without the cut."
+                .into(),
+            items: cutpoint_signals.to_vec(),
         });
     }
 
@@ -1653,7 +1679,14 @@ pub fn verify_auto(
         } else {
             NotePosture::Cube
         };
-        report.notes = build_notes(&report, opts.must_edge_inference, &[], &[], &posture);
+        report.notes = build_notes(
+            &report,
+            opts.must_edge_inference,
+            &[],
+            &[],
+            &yosys_opts.cutpoint_signals,
+            &posture,
+        );
         if let Some(n) = annotation_note(&ann_scan) {
             report.notes.push(n);
         }
@@ -2255,6 +2288,7 @@ pub fn verify_auto(
         opts.must_edge_inference,
         &applied_config_values,
         &counter_bound_items_vec,
+        &yosys_opts.cutpoint_signals,
         &posture,
     );
     if let Some(n) = annotation_note(&ann_scan) {
@@ -3340,6 +3374,7 @@ module uart_tx(); endmodule"#;
             MustEdgeInference::SmtHyperMust,
             &[("cfg_detect_timer_i".into(), 7)],
             &["cnt_q <= 7 (config-inferred)".to_string()],
+            &[],
             &NotePosture::Cube,
         );
         let kinds: Vec<&str> = notes.iter().map(|n| n.kind.as_str()).collect();
@@ -3395,13 +3430,66 @@ module uart_tx(); endmodule"#;
             MustEdgeInference::Off,
             &[],
             &[],
+            &[],
             &NotePosture::Cube,
         );
         assert!(
             !notes_no_pins
                 .iter()
-                .any(|n| n.kind == "config-concretization" || n.kind == "counter-bound")
+                .any(|n| n.kind == "config-concretization"
+                    || n.kind == "counter-bound"
+                    || n.kind == "control-slice")
         );
+    }
+
+    #[test]
+    fn control_slice_note_present_when_cutpoints_given() {
+        // The control-slice note is a ScopeCaveat present iff nets were cut, carrying
+        // the cut list and the over-approximation posture. It documents that a HOLDS
+        // is sound but a VIOLATED is sound only when guard-independent (orphan case).
+        let report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "p".into(),
+                kind: SvaKind::Assert,
+                formula: "nu X. (a && [] X)".into(),
+                outcome: VerifyOutcome::Holds,
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            unsupported: Vec::new(),
+            diagnostics: ModelDiagnostics {
+                state_register_count: 1,
+                blackboxed_modules: Vec::new(),
+                gated_resets: Vec::new(),
+                auto_provided_stubs: Vec::new(),
+            },
+            notes: Vec::new(),
+        };
+        let notes = build_notes(
+            &report,
+            MustEdgeInference::SmtHyperMust,
+            &[],
+            &[],
+            &["must_refresh".to_string(), "precharge_done".to_string()],
+            &NotePosture::Exact,
+        );
+        let cs = notes
+            .iter()
+            .find(|n| n.kind == "control-slice")
+            .expect("control-slice note present when cut points given");
+        assert_eq!(cs.level, NoteLevel::ScopeCaveat);
+        assert!(cs.items.contains(&"must_refresh".to_string()));
+        assert!(cs.summary.contains("over-approximation"), "{}", cs.summary);
+        // No cut points ⇒ no control-slice note.
+        let none = build_notes(
+            &report,
+            MustEdgeInference::Off,
+            &[],
+            &[],
+            &[],
+            &NotePosture::Exact,
+        );
+        assert!(!none.iter().any(|n| n.kind == "control-slice"));
     }
 
     #[test]
@@ -3427,10 +3515,17 @@ module uart_tx(); endmodule"#;
             notes: Vec::new(),
         };
         let ap = |posture: &NotePosture| {
-            build_notes(&report, MustEdgeInference::SmtHyperMust, &[], &[], posture)
-                .into_iter()
-                .find(|n| n.kind == "abstraction-posture")
-                .unwrap()
+            build_notes(
+                &report,
+                MustEdgeInference::SmtHyperMust,
+                &[],
+                &[],
+                &[],
+                posture,
+            )
+            .into_iter()
+            .find(|n| n.kind == "abstraction-posture")
+            .unwrap()
         };
         // AR-S2 — the cube path always uses the sound `SmtAllPairs` may-relation,
         // so the cube posture note is the sound over-approximation Info (the
@@ -4189,6 +4284,101 @@ module uart_tx(); endmodule"#;
                 .iter()
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_cutpoint_frees_wide_counter_guard_so_exact_symbolic_fits() {
+        // Control-slice cut points, end-to-end. A 3-state FSM whose INIT→RUN edge is
+        // gated by a wide (48-bit) counter-derived `tick`. That counter sits in the
+        // state's cone, so `AG EF (state==DONE)` under `exact-symbolic` is Skipped
+        // (cone-too-wide) — UNTIL `--cutpoint tick` frees the guard to a `$anyseq`
+        // input, dropping the 48-bit counter out of the cone (COI). The design then
+        // fits and the goal is decided HOLDS. The netlist-level, width-agnostic
+        // version of the `control_slice.py` source prototype; `cutpoint` needs no
+        // width resolution or source rewriting.
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        let src = r#"// @mununu_guarantee nu Y.((mu X.(state == 2 || <> X)) && [] Y)
+module wide_guard_fsm(input clk, input rst, output reg [1:0] state);
+  localparam INIT = 2'd0, RUN = 2'd1, DONE = 2'd2;
+  reg [47:0] cnt;
+  wire tick = (cnt == 48'd0);
+  always @(posedge clk) begin
+    if (rst) begin
+      state <= INIT;
+      cnt   <= 48'd100;
+    end else begin
+      cnt <= cnt - 48'd1;
+      case (state)
+        INIT:    if (tick) state <= RUN;
+        RUN:     state <= DONE;
+        DONE:    state <= INIT;
+        default: state <= INIT;
+      endcase
+    end
+  end
+endmodule
+"#;
+        let sources = vec![("wide_guard_fsm.v".to_string(), src.to_string())];
+        let base = YosysOptions {
+            top: Some("wide_guard_fsm".to_string()),
+            ..Default::default()
+        };
+        let vopts = || VerifyAutoOptions {
+            must_edge_inference: MustEdgeInference::SmtHyperMust,
+            exact_symbolic: true,
+            ..Default::default()
+        };
+
+        // (1) WITHOUT cut points: the 48-bit counter is in the state cone → Skipped.
+        let no_cut = verify_auto(&sources, &base, &vopts()).expect("verify_auto runs (no cut)");
+        let g0 = no_cut
+            .properties
+            .iter()
+            .find(|p| p.name.contains("guarantee"))
+            .expect("annotated guarantee present");
+        eprintln!("no-cut:   {} => {:?}", g0.name, g0.outcome);
+        assert!(
+            matches!(g0.outcome, VerifyOutcome::Skipped { .. }),
+            "without cut points the wide-counter cone should be Skipped, got {:?}",
+            g0.outcome
+        );
+
+        // (2) WITH `--cutpoint tick`: guard freed → counter drops out of the cone →
+        // exact-symbolic FITS and returns a DEFINITE verdict (Holds or Violated) where
+        // it previously refused (Skipped). Decidability — not a specific verdict — is
+        // the feature's claim; and per the over-approximation posture a Violated under
+        // cut points must not be over-trusted anyway (see the control-slice note). The
+        // control-slice note is present and names the cut net.
+        let cut = YosysOptions {
+            cutpoint_signals: vec!["tick".to_string()],
+            ..base.clone()
+        };
+        let with_cut = verify_auto(&sources, &cut, &vopts()).expect("verify_auto runs (cut)");
+        let g1 = with_cut
+            .properties
+            .iter()
+            .find(|p| p.name.contains("guarantee"))
+            .expect("annotated guarantee present");
+        eprintln!("with-cut: {} => {:?}", g1.name, g1.outcome);
+        assert!(
+            matches!(
+                g1.outcome,
+                VerifyOutcome::Holds | VerifyOutcome::Violated { .. }
+            ),
+            "cutting `tick` should let exact-symbolic reach a DEFINITE verdict (was Skipped), got {:?}",
+            g1.outcome
+        );
+        let cs = with_cut
+            .notes
+            .iter()
+            .find(|n| n.kind == "control-slice")
+            .expect("control-slice note present when cut points given");
+        assert!(
+            cs.items.contains(&"tick".to_string()),
+            "note items: {:?}",
+            cs.items
         );
     }
 

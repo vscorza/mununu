@@ -163,6 +163,29 @@ pub struct YosysOptions {
     /// carry the CLTS, sidecars, and partition summaries the BTOR2
     /// adapter produced.
     pub per_module_output_dir: Option<PathBuf>,
+    /// Control-slice cut points: net names to replace with a free
+    /// `$anyseq` input in the SV → BTOR2 lift (Yosys `cutpoint w:<net>`),
+    /// spliced after `proc`/`write_json` and before `flatten`. The net's
+    /// datapath fanin then drops out via cone-of-influence — the sound,
+    /// netlist-level way to shrink a wide FSM's cone so `--engine
+    /// exact-symbolic` fits (the `control_slice.py` prototype done in the
+    /// engine; here `cutpoint` handles reg/wire/width/multi-driver
+    /// uniformly, no source rewriting).
+    ///
+    /// **SOUNDNESS — this is an OVER-APPROXIMATION.** A freed net becomes
+    /// nondeterministic, which only *adds* transitions. A definite HOLDS
+    /// therefore transfers to the concrete RTL (safety + over-approx =
+    /// sound). A definite VIOLATED is sound only when the counterexample
+    /// is guard-independent — the canonical case being an *orphaned* FSM
+    /// state (in-degree 0), which no freed guard can make reachable, so
+    /// `AG EF <orphaned-state>` stays soundly VIOLATED. A general VIOLATED
+    /// under cut points may be spurious; verify-auto surfaces a
+    /// `control-slice` ScopeCaveat note when this vector is non-empty.
+    ///
+    /// Names are validated to a safe identifier charset before being
+    /// interpolated into the Yosys `-p` script (no injection). Default:
+    /// empty (no cut points).
+    pub cutpoint_signals: Vec<String>,
 }
 
 /// SV-via-Yosys adapter — wraps the BTOR2 path with a Yosys subprocess.
@@ -277,6 +300,7 @@ fn run_sv_flatten_btor2(
         yopts.setundef_anyseq,
         yopts.setundef_anyconst,
         &yopts.init_policy_overrides,
+        &yopts.cutpoint_signals,
     );
 
     let output = Command::new(&yosys)
@@ -1644,6 +1668,45 @@ fn emit_init_policy_setattrs(overrides: &InitPolicyOverrides) -> String {
     }
 }
 
+/// A Yosys net name is safe to interpolate into the `-p` script iff it is a
+/// plain identifier (optionally hierarchical `a.b.c` or bit-selected `sig[3:0]`).
+/// This is a security gate: the whole script is one `-p` argument, so a name
+/// containing `;`, whitespace, or quotes could inject an arbitrary Yosys pass
+/// (OWASP command-injection). Anything else is rejected.
+fn is_valid_net_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | '[' | ']' | ':'))
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+/// Emit the explicit control-slice cut-point pass: `cutpoint w:<sig> …; ` (empty
+/// when no valid signals). Placed after `proc`/`write_json` and before `flatten`
+/// so the named nets still exist unprefixed; `cutpoint` replaces each net's driver
+/// with a free `$anyseq`, and cone-of-influence then drops the (now-dead) datapath
+/// fanin. Invalid names ([`is_valid_net_name`]) are skipped — a skipped cut point
+/// only leaves the cone wider (the property may be `Skipped`), never a wrong verdict.
+fn emit_cutpoints(signals: &[String]) -> String {
+    let sel: Vec<String> = signals
+        .iter()
+        .filter(|s| is_valid_net_name(s))
+        .map(|s| format!("w:{s}"))
+        .collect();
+    if sel.is_empty() {
+        String::new()
+    } else {
+        format!("cutpoint {}; ", sel.join(" "))
+    }
+}
+
+// The lift-script builder threads each independent Yosys-pass knob (top, output
+// paths, the two setundef flags, per-signal init overrides, and now the cut points)
+// as its own argument; bundling them into a struct would not improve clarity here.
+#[allow(clippy::too_many_arguments)]
 fn build_script(
     sources: &[PathBuf],
     top: Option<&str>,
@@ -1652,6 +1715,7 @@ fn build_script(
     setundef_anyseq: bool,
     setundef_anyconst: bool,
     init_policy_overrides: &InitPolicyOverrides,
+    cutpoint_signals: &[String],
 ) -> String {
     let read_cmds: Vec<String> = sources
         .iter()
@@ -1706,10 +1770,18 @@ fn build_script(
     // is R-Y2 (§Phase 8 §8.1), shipping post-R-Y1.
     let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
     let per_signal = emit_init_policy_setattrs(init_policy_overrides);
+    // Explicit control-slice cut points, spliced after the discovery `write_json`
+    // snapshot (so state-cell discovery still sees the real signals) and before
+    // `flatten`/bit-blast: each named net is driven by a free `$anyseq`, and
+    // cone-of-influence drops its now-dead datapath fanin. Over-approximation —
+    // see `YosysOptions::cutpoint_signals`.
+    let cutpoints = emit_cutpoints(cutpoint_signals);
+    // `memory_collect` (see the single-module lift above): normalize memory ports
+    // for BTOR2 array emission, no opt_clean / map-to-flops. No-op when memory-free.
+    // The explicit control-slice cut points splice in just before `cutpoint -blackbox`
+    // (both after `write_json`, before `memory_collect`/`flatten`).
     format!(
-        // `memory_collect` (see the single-module lift above): normalize memory ports
-        // for BTOR2 array emission, no opt_clean / map-to-flops. No-op when memory-free.
-        "{}; {hier}; {per_signal}proc; write_json {}; cutpoint -blackbox; memory_collect; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        "{}; {hier}; {per_signal}proc; write_json {}; {cutpoints}cutpoint -blackbox; memory_collect; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         hier_json_out.display(),
         btor_out.display()
@@ -2214,6 +2286,102 @@ mod tests {
         assert!(
             hier_pos < setattr_pos && setattr_pos < proc_pos,
             "setattr must appear between hierarchy and proc; ordering = hier@{hier_pos} setattr@{setattr_pos} proc@{proc_pos}"
+        );
+    }
+
+    // ----- Control-slice cut-point tests (yosys-free) ----------------
+
+    #[test]
+    fn is_valid_net_name_accepts_identifiers_and_selects() {
+        assert!(is_valid_net_name("must_refresh"));
+        assert!(is_valid_net_name("_leading_underscore"));
+        assert!(is_valid_net_name("top.sub.sig"));
+        assert!(is_valid_net_name("cnt_q[3:0]"));
+        assert!(is_valid_net_name("gen$flop"));
+    }
+
+    #[test]
+    fn is_valid_net_name_rejects_injection_and_bad_starts() {
+        assert!(!is_valid_net_name("")); // empty
+        assert!(!is_valid_net_name("3state")); // leading digit
+        assert!(!is_valid_net_name("a; write_verilog /etc/passwd")); // pass injection via `;`
+        assert!(!is_valid_net_name("a b")); // whitespace
+        assert!(!is_valid_net_name("a\"b")); // quote
+        assert!(!is_valid_net_name("a-b")); // stray operator
+    }
+
+    #[test]
+    fn emit_cutpoints_empty_and_populated() {
+        assert_eq!(emit_cutpoints(&[]), "");
+        assert_eq!(
+            emit_cutpoints(&["must_refresh".to_string(), "precharge_done".to_string()]),
+            "cutpoint w:must_refresh w:precharge_done; "
+        );
+        // Invalid names are dropped; a lone invalid name yields the empty (no-op) pass.
+        assert_eq!(emit_cutpoints(&["bad;name".to_string()]), "");
+        assert_eq!(
+            emit_cutpoints(&["bad;name".to_string(), "ok_net".to_string()]),
+            "cutpoint w:ok_net; "
+        );
+    }
+
+    #[test]
+    fn build_script_injects_cutpoint_between_write_json_and_flatten() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/foo.sv")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let hier = PathBuf::from("/tmp/hier.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let cuts = vec!["must_refresh".to_string(), "precharge_done".to_string()];
+        let script = build_script(
+            &sources,
+            Some("top"),
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &cuts,
+        );
+        assert!(
+            script.contains("cutpoint w:must_refresh w:precharge_done"),
+            "explicit cut points missing from script: {script}"
+        );
+        // Ordering: the control-slice cut points come after the discovery `write_json`
+        // snapshot (so state discovery sees the real nets) and before `flatten`.
+        let wj = script.find("write_json").expect("write_json present");
+        let cut = script
+            .find("cutpoint w:must_refresh")
+            .expect("explicit cutpoint present");
+        let flat = script.find("flatten").expect("flatten present");
+        assert!(
+            wj < cut && cut < flat,
+            "cutpoint must sit between write_json and flatten; wj@{wj} cut@{cut} flatten@{flat}"
+        );
+    }
+
+    #[test]
+    fn build_script_without_cutpoints_has_no_explicit_cutpoint_pass() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/foo.sv")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let hier = PathBuf::from("/tmp/hier.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let script = build_script(
+            &sources,
+            Some("top"),
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+        );
+        // The blackbox cut is always present; there must be no explicit `cutpoint w:` pass.
+        assert!(script.contains("cutpoint -blackbox"));
+        assert!(
+            !script.contains("cutpoint w:"),
+            "no explicit cut points expected: {script}"
         );
     }
 
