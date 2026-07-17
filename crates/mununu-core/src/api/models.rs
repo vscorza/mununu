@@ -747,8 +747,17 @@ pub struct ProposeCompositionRequest {
 /// Phase B response: list of detected concurrency findings, in source
 /// order. An empty `findings` list is the common case (no concurrency
 /// patterns present); not an error.
+///
+/// The `findings` field is gated behind `ast-extract` because its element
+/// type lives behind that feature. Without `ast-extract` the struct is a
+/// well-formed empty response type: the `#[cfg(not(feature = "ast-extract"))]`
+/// stub of `extraction_propose_composition_handler` returns an error and never
+/// constructs it, so it is only ever serialized on the `ast-extract` path. This
+/// lets `cargo … --features api` (without `ast-extract`) compile — matching the
+/// handler stubs' intent that the API build standalone.
 #[derive(Debug, Serialize)]
 pub struct ProposeCompositionResponse {
+    #[cfg(feature = "ast-extract")]
     pub findings:
         Vec<crate::adapter::extraction::ast_extract::concurrency_detect::DetectedConcurrency>,
 }
