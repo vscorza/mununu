@@ -1622,6 +1622,16 @@ struct SvVerifyAutoArgs {
     /// the inferred one. Shown as a `counter-bound` note.
     #[arg(long = "counter-bound", value_name = "SIGNAL<=VALUE")]
     counter_bound: Vec<String>,
+    /// Control-slice cut point: replace a net with a free `$anyseq` input in the
+    /// SV → BTOR2 lift (Yosys `cutpoint w:<net>`), so its datapath fanin drops out
+    /// via cone-of-influence. The sound, netlist-level way to shrink a wide FSM's
+    /// cone so `--engine exact-symbolic` fits — cut the FSM's datapath *guards*
+    /// (e.g. `--cutpoint must_refresh --cutpoint precharge_done`). Repeatable.
+    /// OVER-APPROXIMATION: a definite HOLDS transfers (safety + over-approx); a
+    /// definite VIOLATED is sound only when guard-independent (an orphaned FSM
+    /// state). Surfaced as a `control-slice` scope-caveat note.
+    #[arg(long = "cutpoint", value_name = "SIGNAL")]
+    cutpoint: Vec<String>,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -3136,6 +3146,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         additional_sources: additional,
         primary_source_path: Some(args.file.display().to_string()),
         use_sv2v: args.preprocess_sv2v,
+        cutpoint_signals: args.cutpoint.clone(),
         ..Default::default()
     };
     let must_edge_inference = match args.must_edge_inference {
