@@ -1696,7 +1696,7 @@ pub fn verify_auto(
     // Reset inputs to pin inactive (reset-gating) — applied to the lifted BTOR2
     // below via `pin_inputs_to_constants`. Empty when gating is off or no
     // `disable iff` reset was recognized.
-    let reset_pins: Vec<(String, u64)> = if opts.gate_reset {
+    let mut reset_pins: Vec<(String, u64)> = if opts.gate_reset {
         extraction
             .reset_signals
             .iter()
@@ -1738,6 +1738,27 @@ pub fn verify_auto(
         }
     }
     report.diagnostics.blackboxed_modules = blackboxed_modules;
+
+    // Structural reset auto-pin. When reset-gating is on but no `disable iff (reset)`
+    // guard was recognized (`reset_pins` empty — the common case for a plain-RTL
+    // `@mununu_guarantee` design with no SVA), detect the async-reset input from the
+    // lifted BTOR2's reset-mux structure (`next(state) = ite(reset, RESET_CONST, normal)`
+    // / active-low branch-swap) and pin it inactive. Without this the reset input stays a
+    // free primary input, so the transition relation carries a reset-edge from every
+    // state to the reset state — and every `[]`/`AF`/box-universal property is then
+    // spuriously VIOLATED (it would have to hold at the reset state too). Diamond/`EF`/
+    // `AG EF` properties are immune (existential), which is why they verified correctly
+    // even without this. The detected reset flows through `inject_reset_init` and
+    // `pin_inputs_to_constants` exactly like a `disable iff`-recognized one, and is
+    // surfaced in `diagnostics.gated_resets`. The `disable iff` path always wins (guard
+    // on `reset_pins.is_empty()`), mirroring the fsm-encoding scan's reset handling.
+    if opts.gate_reset
+        && reset_pins.is_empty()
+        && let Ok(file) = crate::adapter::btor2::parser::parse(&btor2)
+    {
+        let symbols = crate::adapter::btor2::parser::collect_symbols(&file);
+        reset_pins.extend(crate::adapter::fsm_scan::detect_resets(&file, &symbols));
+    }
 
     // Inject `init` lines at the post-reset state so a reset-gated async-reset
     // FSM starts in its real reset state (e.g. an OpenTitan sparse-FSM's non-zero
@@ -4379,6 +4400,64 @@ endmodule
             cs.items.contains(&"tick".to_string()),
             "note items: {:?}",
             cs.items
+        );
+    }
+
+    #[test]
+    #[ignore = "requires slang + sv2v + Yosys + z3 (use the mununu-sva docker image); run with --ignored"]
+    fn e2e_structural_reset_autopin_makes_box_af_sound() {
+        // Structural async-reset auto-pin, end-to-end. A plain-RTL FSM with NO SVA
+        // `disable iff` — so the reset is recognized ONLY by the structural detector
+        // (from the lifted BTOR2 reset-mux `next(st) = ite(rst, 0, normal)`). Without the
+        // auto-pin the free `rst` input leaves a reset-edge from every state to the reset
+        // state, and `AF st==2` (`mu Y.(st==2 || [] Y)`) is spuriously VIOLATED; with it,
+        // `rst` is pinned inactive and AF decides correctly HOLDS. Also asserts the
+        // detected reset is surfaced in `gated_resets` (same path as a `disable iff` one).
+        use crate::adapter::btor2::kmts_lift::MustEdgeInference;
+        let src = r#"// @mununu_guarantee mu Y.(st == 2 || [] Y)
+module cyc(input clk, input rst, output reg [1:0] st);
+  always @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: st <= 2'd1;
+      2'd1: st <= 2'd2;
+      2'd2: st <= 2'd0;
+      default: st <= 2'd0;
+    endcase
+endmodule
+"#;
+        let sources = vec![("cyc.v".to_string(), src.to_string())];
+        let yopts = YosysOptions {
+            top: Some("cyc".to_string()),
+            ..Default::default()
+        };
+        let report = verify_auto(
+            &sources,
+            &yopts,
+            &VerifyAutoOptions {
+                must_edge_inference: MustEdgeInference::SmtHyperMust,
+                exact_symbolic: true,
+                ..Default::default()
+            },
+        )
+        .expect("verify_auto runs");
+        // The structural detector pinned the async reset even absent an SVA `disable iff`.
+        assert_eq!(
+            report.diagnostics.gated_resets,
+            vec!["rst=0".to_string()],
+            "structural reset auto-pin should pin rst inactive; got {:?}",
+            report.diagnostics.gated_resets
+        );
+        let g = report
+            .properties
+            .iter()
+            .find(|p| p.name.contains("guarantee"))
+            .expect("annotated guarantee present");
+        eprintln!("AF st==2 => {:?}", g.outcome);
+        assert!(
+            matches!(g.outcome, VerifyOutcome::Holds),
+            "AF st==2 must HOLD once the reset is auto-pinned (was spuriously VIOLATED); got {:?}",
+            g.outcome
         );
     }
 
