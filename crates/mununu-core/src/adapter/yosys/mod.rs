@@ -897,7 +897,14 @@ fn build_per_module_script(
     let setundef_pass = select_setundef_pass(setundef_anyseq, setundef_anyconst);
     let per_signal = emit_init_policy_setattrs(init_policy_overrides);
     format!(
-        "{}; hierarchy -check -top {module}; {per_signal}proc; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        // `memory_collect` normalizes memory read/write accesses into `$mem` cells
+        // (fixing an internal yosys assert on some fifo styles when a raw `$mem`
+        // reaches `write_btor`) while KEEPING the memory as a BTOR2 array — the
+        // bit-blaster resolves array sorts, so this stays scalable (no map-to-flops
+        // explosion). Unlike `memory`/`memory -nomap`, it runs NO internal `opt_clean`,
+        // so it does not drop dead registers (which would change memory-free lifts).
+        // No-op when the design has no memories.
+        "{}; hierarchy -check -top {module}; {per_signal}proc; memory_collect; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         btor_out.display()
     )
@@ -1769,8 +1776,12 @@ fn build_script(
     // cone-of-influence drops its now-dead datapath fanin. Over-approximation —
     // see `YosysOptions::cutpoint_signals`.
     let cutpoints = emit_cutpoints(cutpoint_signals);
+    // `memory_collect` (see the single-module lift above): normalize memory ports
+    // for BTOR2 array emission, no opt_clean / map-to-flops. No-op when memory-free.
+    // The explicit control-slice cut points splice in just before `cutpoint -blackbox`
+    // (both after `write_json`, before `memory_collect`/`flatten`).
     format!(
-        "{}; {hier}; {per_signal}proc; write_json {}; {cutpoints}cutpoint -blackbox; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
+        "{}; {hier}; {per_signal}proc; write_json {}; {cutpoints}cutpoint -blackbox; memory_collect; flatten; async2sync; chformal -lower; dffunmap; {setundef_pass}; write_btor {}",
         read_cmds.join("; "),
         hier_json_out.display(),
         btor_out.display()
