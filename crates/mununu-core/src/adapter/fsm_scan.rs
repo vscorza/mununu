@@ -310,7 +310,15 @@ fn value_alias_nids(file: &Btor2File, state_nid: Nid) -> HashSet<Nid> {
 
 /// Detect the design's reset inputs as `(name, inactive_value)` from each state cell's
 /// reset mux — the set [`inject_reset_init`] / [`pin_inputs_to_constants`] consume.
-fn detect_resets(file: &Btor2File, symbols: &HashMap<Nid, String>) -> Vec<(String, u64)> {
+///
+/// `pub(crate)` so `verify_auto` can reuse it to structurally auto-pin the reset on a
+/// plain-RTL `@mununu_guarantee` design that carries no SVA `disable iff` (otherwise the
+/// free reset input leaves a reset-edge from every state to the reset state, which
+/// soundly-but-spuriously VIOLATES box/`AF`/box-universal properties).
+pub(crate) fn detect_resets(
+    file: &Btor2File,
+    symbols: &HashMap<Nid, String>,
+) -> Vec<(String, u64)> {
     let mut resets: BTreeSet<(String, u64)> = BTreeSet::new();
     for line in &file.lines {
         if !matches!(&line.node, Node::State { .. }) {
@@ -493,5 +501,52 @@ mod tests {
             findings.iter().all(|f| f.register != "flag"),
             "a fully-covered 1-bit register has no illegal encoding to check"
         );
+    }
+
+    fn detect(src: &str) -> Vec<(String, u64)> {
+        let file = crate::adapter::btor2::parser::parse(src).expect("parse");
+        let syms = crate::adapter::btor2::parser::collect_symbols(&file);
+        detect_resets(&file, &syms)
+    }
+
+    #[test]
+    fn detect_resets_active_high_pins_to_zero() {
+        // next(st) = ite(rst, 0 /*reset*/, st+1 /*normal*/): const in THEN ⇒ active-high, inactive = 0.
+        const HI: &str = "\
+1 sort bitvec 1
+2 input 1 rst
+3 sort bitvec 2
+4 state 3 st
+5 zero 3
+6 one 3
+7 add 3 4 6
+8 ite 3 2 5 7
+9 next 3 4 8
+";
+        assert_eq!(detect(HI), vec![("rst".to_string(), 0)]);
+    }
+
+    #[test]
+    fn detect_resets_active_low_pins_to_one() {
+        // next(st) = ite(rst_n, st+1 /*normal*/, 0 /*reset*/): const in ELSE ⇒ active-low, inactive = 1.
+        const LO: &str = "\
+1 sort bitvec 1
+2 input 1 rst_n
+3 sort bitvec 2
+4 state 3 st
+5 zero 3
+6 one 3
+7 add 3 4 6
+8 ite 3 2 7 5
+9 next 3 4 8
+";
+        assert_eq!(detect(LO), vec![("rst_n".to_string(), 1)]);
+    }
+
+    #[test]
+    fn detect_resets_none_without_reset_mux() {
+        // A free-running counter (no reset mux) yields no reset to pin.
+        const NONE: &str = "1 sort bitvec 2\n2 state 1 st\n3 one 1\n4 add 1 2 3\n5 next 1 2 4\n";
+        assert!(detect(NONE).is_empty());
     }
 }
