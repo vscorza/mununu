@@ -1772,6 +1772,31 @@ pub fn verify_auto(
     // non-empty) and the design carries no authoritative `init` line.
     btor2 = crate::adapter::btor2::reset_init::inject_reset_init(&btor2, &reset_pins)?;
 
+    // Complete the init to the `setundef -zero` power-up for a RESET-LESS design:
+    // every init-less bitvec state cell gets an explicit `init … 0`. A design with
+    // no reset (`reset_pins` empty) has no reset mechanism to establish its start
+    // state — its init is fixed ONLY by `initial` values plus the FPGA/`setundef
+    // -zero` power-up (0) for the rest, which is exactly what the cube and exact
+    // engines already assume (`state_cell_init_values` / `initial_state_bdd`). The
+    // reachability portfolio (native BMC / spacer / Boolector) otherwise leaves an
+    // init-less cell FREE (BTOR2's nondeterministic-init semantics), so a
+    // reset-less design with a partial `initial` (a Xilinx wrapper: `initial state
+    // = IDLE` but an init-less status flop) hands the portfolio a spurious
+    // power-up counterexample the exact engine never sees — an engine verdict
+    // disagreement. Making the 0 power-up explicit puts every engine on the same
+    // start state.
+    //
+    // Scoped to reset-LESS designs on purpose: a RESET-based design establishes
+    // its operational init through the reset (`inject_reset_init`), and the
+    // portfolio's free-init for any cell the reset does not pin is the existing,
+    // real-RTL-validated behavior (`e2e_btormc_confirms_sysrst_real_rtl_verdict`
+    // et al.) — a free-init counterexample there is a genuine run of the model, so
+    // it must not be clamped. Raw `btor2 verify` (no reset-gating) also keeps
+    // BTOR2's free-init semantics.
+    if opts.gate_reset && reset_pins.is_empty() {
+        btor2 = crate::adapter::btor2::reset_init::inject_zero_init(&btor2)?;
+    }
+
     // Augment only the `__past` shadows whose base resolves to a BTOR2 state
     // cell. A base the lift renamed away (the SVA name not matching the lifted
     // register) would hard-error `augment_with_past_shadows`, aborting the whole
