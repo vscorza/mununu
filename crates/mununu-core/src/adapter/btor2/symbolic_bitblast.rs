@@ -2110,18 +2110,32 @@ pub fn exact_symbolic_verdict_with_witness(
     btor2_content: &str,
     formula: &Formula,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
-    use crate::adapter::sts_ir::SymbolicTransitionSystem;
     let file = crate::adapter::btor2::parser::parse(btor2_content)
         .map_err(|e| format!("adapter/btor2/exact MC: {}", e.message))?;
 
     // Register-name resolution: a user-visible name (`bit_cnt_q`) maps to the
     // canonical state-cell name the bit-blast binds against (`bit_cnt_d` after
-    // yosys async2sync/flatten aliasing) — the same `BtorSts::resolve_register`
-    // the cube path uses. Idempotent on names that are already canonical.
+    // yosys async2sync/flatten aliasing). Use the SOUND (Strict) alias resolution,
+    // NOT the Loose "nearest state in the cone" BFS: Strict follows only pure
+    // aliases (`Output` / `Uext`-`Sext`-by-0 / reset-mux `Ite`) to a state cell, so
+    // a register alias still resolves, but a combinational-FUNCTION output
+    // (`done = (state == 2)`, a 1-bit signal over the 2-bit `state`) hits the `==`
+    // Op and resolves to `None` — the atom then KEEPS its own name and binds to the
+    // 1-bit combinational signal (`named_signals`) via `signal_bits`, NOT the
+    // wrong-width driving register. The Loose BFS rewrote `done` → `state`, so
+    // `done == K` was evaluated as `state == K` (`EF (done == 2)` spuriously
+    // `Holds`) — a soundness bug on ANY combinational-function output atom. The
+    // exact engine is the differential oracle and must use the sound resolution.
     let sts = crate::adapter::sts_ir::BtorSts::new(&file);
     let resolve = |name: &str| -> String {
-        sts.resolve_register(name)
-            .unwrap_or_else(|| name.to_string())
+        crate::adapter::btor2::parser::resolve_to_canonical_name(
+            &file,
+            name,
+            crate::adapter::btor2::parser::ResolveStrictness::Strict {
+                allow_reset_mux: true,
+            },
+        )
+        .unwrap_or_else(|| name.to_string())
     };
 
     // R-F5.6 — resolve each distinct formula atom to a canonical [`PredicateExpr`] BEFORE
@@ -4164,6 +4178,64 @@ mod tests {
             exact_symbolic_verdict(COMB_BTOR2, &formula).expect("combinational atom binds"),
             ExactVerdict::Holds,
             "o = p+1 is a combinational output; p reaches 2 ⇒ o==3 ⇒ EF(o==3) holds",
+        );
+    }
+
+    /// Regression (2026-07-20): a 1-bit combinational-FUNCTION output atom must bind to the
+    /// 1-bit signal, NOT the wider driving register. `done = (st == 2)` over a 2-bit `st`
+    /// cycling 0→1→2→0 — `done` is a strict one-cycle pulse. The Loose "nearest state in the
+    /// cone" resolver rewrote `done` → `st`, so `done == K` was evaluated as `st == K` (2-bit):
+    /// `EF (done == 2)` spuriously `Holds` and `AG (done → AX (done == 0))` spuriously
+    /// `Violated`, with `done == 0` (`st == 0`) disagreeing with `!(done == 1)` (`st != 1`).
+    /// The Strict alias resolver returns `None` for the `==` combinational op, so the atom
+    /// binds to the 1-bit `done` (`named_signals`) — the sound verdict.
+    #[test]
+    fn combinational_output_atom_binds_at_its_own_width() {
+        const PULSE_FSM: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 2
+3 state 2 st
+4 const 2 10
+5 const 2 00
+6 one 2
+7 add 2 3 6
+8 eq 1 3 4
+9 ite 2 8 5 7
+10 next 2 3 9
+11 output 8 done
+12 init 2 3 5
+"#;
+        let parse = |s: &str| crate::mu_calculus::parser::parse(s).expect("formula");
+        // `done` is 1-bit: it is NEVER 2 (that value belongs to `st`, the driving register).
+        assert_eq!(
+            exact_symbolic_verdict(PULSE_FSM, &parse("mu Y. ((done == 2) or <> Y)")).unwrap(),
+            ExactVerdict::Violated,
+            "1-bit combinational `done`: EF(done==2) must be Violated (was Holds when `done` \
+             misresolved to the 2-bit `st`)",
+        );
+        // `done` ∈ {0,1}: never "neither 0 nor 1".
+        assert_eq!(
+            exact_symbolic_verdict(
+                PULSE_FSM,
+                &parse("mu Y. ((not (done == 0) and not (done == 1)) or <> Y)"),
+            )
+            .unwrap(),
+            ExactVerdict::Violated,
+            "a 1-bit `done` is always 0 or 1",
+        );
+        // `done` is a strict one-cycle pulse ⇒ AG(done → AX(done==0)) Holds; and now that
+        // `done` binds at 1 bit, the `done==0` and `!(done==1)` encodings agree.
+        let pulse_eq0 = "nu Y. ((not (done == 1) or [] (done == 0)) and [] Y)";
+        let pulse_ne1 = "nu Y. ((not (done == 1) or [] (not (done == 1))) and [] Y)";
+        assert_eq!(
+            exact_symbolic_verdict(PULSE_FSM, &parse(pulse_eq0)).unwrap(),
+            ExactVerdict::Holds,
+            "done pulses one cycle ⇒ AG(done→AX(done==0)) Holds (was spurious Violated)",
+        );
+        assert_eq!(
+            exact_symbolic_verdict(PULSE_FSM, &parse(pulse_ne1)).unwrap(),
+            exact_symbolic_verdict(PULSE_FSM, &parse(pulse_eq0)).unwrap(),
+            "`done==0` and `!(done==1)` must agree for a 1-bit combinational output",
         );
     }
 
