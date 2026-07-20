@@ -2352,6 +2352,44 @@ fn ef_target_at(
     }
 }
 
+/// A `Violated` bare `EF p = μX. (p ∨ ◇X)` (reachability) means exactly that the
+/// target `p` is **UNREACHABLE** from the reset state — there is no counterexample
+/// *trace* (no path reaches `p`), so the actionable witness is the *target itself*:
+/// "the design never reaches `p`". Under cut points the model is an over-approximation
+/// (freeing a net only ADDS transitions ⇒ MORE reachability), so a `p` that is
+/// unreachable even in the over-approximation is unreachable in the concrete RTL too —
+/// the unreachability transfers **soundly**.
+///
+/// If `formula` is that bare-`EF` shape, return the predicate-atom strings that make up
+/// its target `p` (naming the unreachable target for a repair witness); `None` for any
+/// other shape. Complements the `AF`/`AG AF` stall lasso and the `AG EF` trap path,
+/// which witness *liveness/recoverability* failures with a concrete path.
+pub(crate) fn ef_target_atoms(formula: &Formula) -> Option<Vec<String>> {
+    let p = ef_target_at(formula, formula.root())?;
+    let mut atoms = Vec::new();
+    collect_target_atoms(formula, p, &mut atoms);
+    (!atoms.is_empty()).then_some(atoms)
+}
+
+/// Collect the distinct predicate-atom strings under a formula sub-node (the `EF`
+/// target `p`), descending through boolean structure only. Modal/fixpoint nodes are
+/// not expected inside a reachability target and are ignored.
+fn collect_target_atoms(
+    formula: &Formula,
+    node: crate::mu_calculus::NodeId,
+    out: &mut Vec<String>,
+) {
+    match formula.node(node) {
+        MuNode::Predicate(name) if !out.contains(name) => out.push(name.clone()),
+        MuNode::And(a, b) | MuNode::Or(a, b) => {
+            collect_target_atoms(formula, *a, out);
+            collect_target_atoms(formula, *b, out);
+        }
+        MuNode::Not(a) => collect_target_atoms(formula, *a, out),
+        _ => {}
+    }
+}
+
 /// D1.8c — build the sound μ-calculus formula that verifies the GR(1) response
 /// property `GF assume → GF guarantee` over the **exact** engine. `assume` and
 /// `guarantee` are predicate expressions (e.g. `"req == 1"`).
@@ -2758,6 +2796,28 @@ mod tests {
     use super::*;
     use crate::adapter::btor2::bit_blast::simulate_one_step;
     use crate::adapter::btor2::parser;
+
+    /// A.4 — `ef_target_atoms` names the reachability target of a bare `EF p`
+    /// (`μX. (p ∨ ◇X)`), whose violation is the "target unreachable" repair witness,
+    /// and returns `None` for the liveness/recoverability shapes (which carry a concrete
+    /// path witness instead).
+    #[test]
+    fn ef_target_atoms_names_bare_ef_reachability_target() {
+        use crate::mu_calculus::parser as mu_parser;
+        // bare `EF p` = μX.(p ∨ ◇X): the reachability target is the single atom.
+        let ef = mu_parser::parse("mu X. ((round_counter == 31) or <> X)").expect("EF parses");
+        let atoms = ef_target_atoms(&ef).expect("bare EF yields a target");
+        assert_eq!(atoms.len(), 1);
+        assert!(atoms[0].contains("round_counter"));
+        // `AG EF p` (recoverability, νμ) is NOT a bare EF — its failure is a trap PATH,
+        // not an unreachable target, so no unreachable-target witness here.
+        let agef = mu_parser::parse("nu Y. ((mu X. ((busy == 0) or <> X)) and [] Y)")
+            .expect("AG EF parses");
+        assert_eq!(ef_target_atoms(&agef), None);
+        // `AF p` (box inner) is a liveness/stall shape, not reachability.
+        let af = mu_parser::parse("mu X. ((done == 1) or [] X)").expect("AF parses");
+        assert_eq!(ef_target_atoms(&af), None);
+    }
 
     /// Run the BDD bit-blaster against the concrete simulator over an
     /// exhaustive enumeration of the given (symbol, bit-width) leaves.

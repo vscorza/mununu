@@ -1284,6 +1284,7 @@ pub async fn sv_verify_auto_handler(
                 CounterexampleView {
                     prefix: states(&c.prefix),
                     cycle: states(&c.cycle),
+                    unreachable_target: c.unreachable_target.clone(),
                 }
             });
             PropertyVerdictView {
