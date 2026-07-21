@@ -3288,24 +3288,33 @@ fn render_verify_auto_text(report: &mununu_core::adapter::slang::verify_auto::Au
         if !p.seeded_predicates.is_empty() {
             println!("        predicates: {}", p.seeded_predicates.join(", "));
         }
-        // D1.8b — the exact engine's stall-lasso counterexample (reset → prefix →
-        // repeating ¬p cycle), present only for a Violated bare `AF p`.
+        // The exact engine's counterexample: either the A.4 unreachable-target witness
+        // for a bare `EF p` (reachability) — "the design never reaches <p>", the repair
+        // signal a safety check never produces — or the D1.8b stall-lasso / trap-path
+        // (reset → prefix → repeating ¬p cycle) for a `AF`/`AG AF`/`AG EF` failure.
         if let Some(cex) = &p.counterexample {
-            println!("        counterexample (stall lasso):");
-            let render_state = |st: &[(String, u64)]| {
-                st.iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            for st in &cex.prefix {
-                println!("          -> {}", render_state(st));
+            if !cex.unreachable_target.is_empty() {
+                println!(
+                    "        counterexample: target UNREACHABLE from reset - the design never reaches {}",
+                    cex.unreachable_target.join(" ∧ ")
+                );
+            } else {
+                println!("        counterexample (stall lasso):");
+                let render_state = |st: &[(String, u64)]| {
+                    st.iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                for st in &cex.prefix {
+                    println!("          -> {}", render_state(st));
+                }
+                for (i, st) in cex.cycle.iter().enumerate() {
+                    let marker = if i == 0 { "(*)" } else { "   " };
+                    println!("          {marker} {}", render_state(st));
+                }
+                println!("          (cycle repeats forever - the property is avoided)");
             }
-            for (i, st) in cex.cycle.iter().enumerate() {
-                let marker = if i == 0 { "(*)" } else { "   " };
-                println!("          {marker} {}", render_state(st));
-            }
-            println!("          (cycle repeats forever - the property is avoided)");
         }
     }
     for (name, reason) in &report.unsupported {

@@ -111,6 +111,12 @@ pub struct ExactCounterexample {
     /// P3 — the INPUT assignment driving each transition of `prefix ++ cycle` (`inputs[i]` is
     /// the input at path-state `i`), for RTL replay. Empty when the engine did not record inputs.
     pub inputs: Vec<Vec<(String, u64)>>,
+    /// A.4 — the UNREACHABLE-target witness for a `Violated` bare `EF p` (reachability):
+    /// there is no trace (`prefix`/`cycle` empty), because the target `p` is never reached
+    /// from reset. These are the predicate-atom strings comprising `p` — the actionable
+    /// repair signal "the design never reaches `<atoms>`". Empty for the stall-lasso /
+    /// trap-path (liveness/recoverability) counterexamples, which carry a concrete path.
+    pub unreachable_target: Vec<String>,
 }
 
 /// Convert an engine [`StallLasso`](crate::adapter::btor2::symbolic_bitblast::StallLasso)
@@ -130,7 +136,26 @@ fn exact_counterexample_from_lasso(
         prefix: conv(lasso.prefix),
         cycle: conv(lasso.cycle),
         inputs: conv(lasso.inputs),
+        unreachable_target: Vec::new(),
     }
+}
+
+/// A.4 — build the UNREACHABLE-target counterexample for a `Violated` bare `EF p`
+/// (`μX. (p ∨ ◇X)`): the violation *is* the proof that `p` is unreachable from reset,
+/// so no trace exists. Returns the target's predicate atoms as the witness (empty
+/// path). `None` when `formula` is not a bare `EF` shape (a liveness/recoverability
+/// failure keeps its concrete stall-lasso / trap-path witness instead).
+fn ef_unreachable_counterexample(
+    formula: &crate::mu_calculus::Formula,
+) -> Option<ExactCounterexample> {
+    crate::adapter::btor2::symbolic_bitblast::ef_target_atoms(formula).map(|atoms| {
+        ExactCounterexample {
+            prefix: Vec::new(),
+            cycle: Vec::new(),
+            inputs: Vec::new(),
+            unreachable_target: atoms,
+        }
+    })
 }
 
 /// Model-level diagnostics for an automated verification run — what the lift
@@ -2027,12 +2052,17 @@ pub fn verify_auto(
                 match exact_symbolic_verdict_with_witness(&btor2, &formula) {
                     Ok((ExactVerdict::Holds, _)) => (VerifyOutcome::Holds, None),
                     Ok((ExactVerdict::Violated, witness)) => {
-                        // A definite full-state counterexample (not a cube tally); for
-                        // a bare `AF p` the witness carries the concrete stall lasso
-                        // (D1.8b) — reset → prefix → ¬p cycle.
+                        // A definite full-state counterexample (not a cube tally). For a
+                        // liveness/recoverability failure (`AF p` / `AG AF p` / `AG EF p`)
+                        // the witness carries the concrete path (stall lasso / trap path).
+                        // Failing that, a bare `EF p` (reachability) violation carries the
+                        // A.4 unreachable-target witness — no trace, because the target is
+                        // simply never reached (sound under the over-approximating cut).
                         (
                             VerifyOutcome::Violated { false_cells: 1 },
-                            witness.map(exact_counterexample_from_lasso),
+                            witness
+                                .map(exact_counterexample_from_lasso)
+                                .or_else(|| ef_unreachable_counterexample(&formula)),
                         )
                     }
                     Err(e) => (
@@ -2412,6 +2442,7 @@ fn escalate_bottom(
                                     prefix: trace.states,
                                     cycle: Vec::new(),
                                     inputs: trace.inputs,
+                                    unreachable_target: Vec::new(),
                                 });
                             }
                             notes.push(rescue_note(&prop.name, "VIOLATED", &engines));
@@ -2554,6 +2585,23 @@ fn liveness_rescue_note(name: &str, verdict: &str, engines: &[&str]) -> Verifica
 
 #[cfg(test)]
 mod tests {
+    /// A.4 — a `Violated` bare `EF p` (reachability) yields the unreachable-target
+    /// witness: no path (`prefix`/`cycle` empty), the target atoms naming what the
+    /// design never reaches. A recoverability (`AG EF`) shape is not a bare `EF` and
+    /// keeps its concrete trap-path witness instead (no unreachable-target here).
+    #[test]
+    fn bare_ef_violation_yields_unreachable_target_witness() {
+        use crate::mu_calculus::parser as mu_parser;
+        let ef = mu_parser::parse("mu X. ((round_counter == 31) or <> X)").expect("EF parses");
+        let cx = super::ef_unreachable_counterexample(&ef).expect("bare EF → unreachable witness");
+        assert!(cx.prefix.is_empty() && cx.cycle.is_empty() && cx.inputs.is_empty());
+        assert_eq!(cx.unreachable_target.len(), 1);
+        assert!(cx.unreachable_target[0].contains("round_counter"));
+        let agef = mu_parser::parse("nu Y. ((mu X. ((busy == 0) or <> X)) and [] Y)")
+            .expect("AG EF parses");
+        assert!(super::ef_unreachable_counterexample(&agef).is_none());
+    }
+
     use super::*;
     use crate::mu_calculus::parser as mu_parser;
 
@@ -2590,6 +2638,7 @@ mod tests {
             prefix: vec![vec![("st".to_string(), 0)]],
             cycle: vec![vec![("st".to_string(), 3)]],
             inputs: vec![vec![("esc".to_string(), 1)]],
+            unreachable_target: Vec::new(),
         }
     }
 

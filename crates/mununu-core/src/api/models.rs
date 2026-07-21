@@ -1454,6 +1454,11 @@ pub struct CounterexampleView {
     pub prefix: Vec<Vec<CexCellView>>,
     /// The repeating stall cycle; the last state steps back to `cycle[0]`.
     pub cycle: Vec<Vec<CexCellView>>,
+    /// A.4 — for a `Violated` bare `EF p` (reachability): the target predicate atoms that
+    /// are UNREACHABLE from reset ("the design never reaches these"). Empty for the
+    /// stall-lasso / trap-path (liveness) counterexamples, which carry `prefix`/`cycle`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreachable_target: Vec<String>,
 }
 
 /// One register's concrete value in a counterexample state.
