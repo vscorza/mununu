@@ -626,21 +626,33 @@ impl<'a> Parser<'a> {
 
     fn parse_identifier(&mut self) -> Option<String> {
         self.skip_whitespace();
-        let mut chars = self.input[self.pos..].chars();
-        let first = chars.next()?;
+        let rest = &self.input[self.pos..];
+        let first = rest.chars().next()?;
         if !is_ident_start(first) {
             return None;
         }
         let mut len = first.len_utf8();
-        for ch in chars {
-            if !is_ident_continue(ch) {
+        // Absorb identifier chars, plus a hierarchical separator `.` (`a.b.c`,
+        // e.g. a flattened SV register `byte_controller.bit_controller.cnt`) —
+        // but ONLY when the `.` is followed by another identifier char. This keeps
+        // a fixpoint binder's `.` in `nu X.(…)` (a `.` before `(`/whitespace) for
+        // the binder parser, so hierarchical atom names do not swallow the binder
+        // separator. Bit-selects (`[N]`) are still not part of an identifier.
+        loop {
+            let tail = &rest[len..];
+            let mut it = tail.chars();
+            let Some(ch) = it.next() else { break };
+            // A `.` joins the identifier only when followed by another identifier
+            // char (`a.b.c`); a binder's `.` in `nu X.(…)` is left unconsumed.
+            if is_ident_continue(ch) || (ch == '.' && it.next().is_some_and(is_ident_continue)) {
+                len += ch.len_utf8();
+            } else {
                 break;
             }
-            len += ch.len_utf8();
         }
-        let ident = &self.input[self.pos..self.pos + len];
+        let ident = rest[..len].to_owned();
         self.pos += len;
-        Some(ident.to_owned())
+        Some(ident)
     }
 
     fn expect_char(&mut self, ch: char) -> Result<(), ParseError> {
@@ -935,6 +947,31 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn hierarchical_dotted_atom_names_parse() {
+        // A flattened SV register `a.b.c` is ONE atom (shadow-register grounding on
+        // an internal register), while the fixpoint binder's `.` in `nu X.(…)` is
+        // NOT absorbed into the variable.
+        let f = parse("mu Z. (byte_controller.bit_controller.cnt == 0 || <> Z)")
+            .expect("dotted atom parses");
+        assert!(
+            f.nodes().iter().any(|n| matches!(
+                n, Node::Predicate(p) if p == "byte_controller.bit_controller.cnt == 0"
+            )),
+            "hierarchical atom kept whole: {:?}",
+            f.nodes()
+        );
+        // `reg == reg` with dotted operands on BOTH sides (relational atom).
+        parse("nu Y. ((a.b == c.d) && [] Y)").expect("dotted reg==reg parses");
+        // The binder variable is X (bound), not swallowed into a dotted atom — the
+        // `.` before `(` stays the binder separator.
+        let b = parse("nu X.(<> true && [] X)").expect("binder still parses");
+        assert!(
+            b.nodes().iter().any(|n| matches!(n, Node::Variable(_))),
+            "X binds as a variable, the binder `.` is not absorbed"
+        );
     }
 
     fn predicate_name(formula: &Formula, id: NodeId) -> &str {
