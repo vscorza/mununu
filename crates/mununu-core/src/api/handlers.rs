@@ -1226,6 +1226,7 @@ pub async fn sv_verify_auto_handler(
         auto_stub_flops: request.auto_stub_flops.unwrap_or(true),
         config_values,
         counter_bounds,
+        predicate_hints: request.predicate.clone(),
         // Engine selection (`"explicit"` | `"symbolic"` | `"exact-symbolic"` |
         // `"portfolio-sequential"` | `"portfolio-parallel"`). Unspecified ⇒ the
         // default `portfolio-sequential`. `engine_selection` is the single place the

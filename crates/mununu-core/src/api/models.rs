@@ -1347,6 +1347,14 @@ pub struct SvVerifyAutoRequest {
     /// Default empty.
     #[serde(default)]
     pub cutpoint: Vec<String>,
+    /// Abstraction-predicate hints, mirroring the CLI `--predicate` and the in-source
+    /// `// @mununu_predicate <expr>` annotation (all three are merged). Each entry is a
+    /// predicate expression (`"reg == value"`, `"reg == reg"`, `"reg >= K"`) seeded as a
+    /// cube dimension for EVERY property, even when absent from the property formula.
+    /// Sound by monotonicity — a hint only refines the cube (a ⊥ can become definite; a
+    /// definite verdict never flips; an unclassifiable hint is dropped). Default empty.
+    #[serde(default)]
+    pub predicate: Vec<String>,
     /// Engine selector, mirroring the CLI `--engine`: `"explicit"`, `"symbolic"`,
     /// `"exact-symbolic"`, `"portfolio-sequential"`, `"portfolio-parallel"`.
     /// **Unspecified ⇒ the default `"portfolio-sequential"`** (2026-07-06): run

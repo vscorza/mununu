@@ -1632,6 +1632,15 @@ struct SvVerifyAutoArgs {
     /// state). Surfaced as a `control-slice` scope-caveat note.
     #[arg(long = "cutpoint", value_name = "SIGNAL")]
     cutpoint: Vec<String>,
+    /// Abstraction-predicate hint: a predicate expression (`reg == value`,
+    /// `reg == reg`, `reg >= K`) seeded as a cube dimension for EVERY property,
+    /// even when it does not appear in the property formula. The command-line peer
+    /// of the in-source `// @mununu_predicate <expr>` annotation (both are merged).
+    /// Sound by monotonicity of predicate abstraction — a hint only refines the
+    /// cube (a ⊥ can become definite; a definite verdict never flips). Repeatable
+    /// (e.g. `--predicate "c_state == 0" --predicate "wptr == rptr"`).
+    #[arg(long = "predicate", value_name = "EXPR")]
+    predicate: Vec<String>,
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
@@ -3182,6 +3191,7 @@ fn sv_verify_auto(args: SvVerifyAutoArgs) -> Result<(), String> {
         auto_stub_flops: !args.no_auto_stub_flops,
         config_values,
         counter_bounds,
+        predicate_hints: args.predicate.clone(),
         // R-F5.5d — `--engine symbolic` routes every property through the R-F5
         // BDD CEGAR loop (no per-cube-pair SMT).
         symbolic_engine: args.engine == EngineArg::Symbolic,

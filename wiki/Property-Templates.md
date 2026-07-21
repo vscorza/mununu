@@ -76,6 +76,37 @@ Example — an I²C master (protocol + shared-bus classes), `<error>` = `AL == 1
 > may return **⊥** in the cube — that is an honest "not decided", never a pass; see
 > [Hardware Verification Patterns](Hardware-Verification-Patterns.md) for the ranking/recoverability path.
 
+## Abstraction-predicate hints (`@mununu_predicate`)
+
+> Source of truth: [`MununuTag::Predicate`](../crates/mununu-core/src/mununu_annotations/mod.rs) / [`seed_from_formula`](../crates/mununu-core/src/adapter/slang/verify_auto.rs) — surface: (CLI+API+UI)
+
+When a cube ⊥ is caused by a *missing* abstraction predicate — the property's own atoms don't pin the
+inductive invariant that decides it — you can **seed extra cube dimensions** without changing the property.
+Three equivalent surfaces, all merged:
+
+- **In-source annotation:** `// @mununu_predicate <expr>` alongside the design (the property-writing agent's
+  in-file channel).
+- **CLI:** `mununu sv verify-auto … --predicate "<expr>"` (repeatable).
+- **API / UI:** the `predicate: string[]` field / the "Abstraction-predicate hints" box.
+
+`<expr>` is a predicate expression — a literal `reg == value`, a relational `reg == reg`, or a bound
+`reg >= K` — routed through the SAME classification as a formula atom (state → cube dimension, state-only
+combinational → dimension, input-dependent combinational → derived label, unresolvable → dropped).
+
+```systemverilog
+// @mununu_predicate byte_controller.c_state == 0   // the FSM's idle/completion invariant
+// @mununu_predicate wptr == rptr                    // a FIFO's "drained" relation
+// @mununu_guarantee nu Y.((mu X.(scl_padoen_o == 1 || <> X)) && [] Y)
+```
+
+**Soundness.** Predicate abstraction is *monotone*: a hint only refines the may/must partition, so a ⊥ can
+become definite but a definite `HOLDS`/`VIOLATED` can **never** flip, and a mis-bound hint is dropped — you
+can suggest freely. A hint is *not* an assumption (it never constrains the design). Its value is two-fold:
+turning a ⊥ into a decide when the deciding invariant is a statable *state* relation, and **removing a
+spurious `VIOLATED`** (a cutpoint over-approximation the extra dimension refutes). It does **not** decide a
+recoverability target that is itself a *combinational* output — that needs the target bound as a derived
+predicate, not a state hint.
+
 ## Using Templates
 
 ### CLI

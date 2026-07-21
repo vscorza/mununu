@@ -299,6 +299,9 @@ impl AnnotationSummary {
                 // codesign extractor's ISR detection, not by the
                 // contract pipeline. Ignore here.
                 MununuTag::Isr => {}
+                // `@mununu_predicate` is a cube-abstraction hint consumed by
+                // `sv verify-auto`'s seeder, not by the contract pipeline. Ignore.
+                MununuTag::Predicate => {}
             }
         }
         s
