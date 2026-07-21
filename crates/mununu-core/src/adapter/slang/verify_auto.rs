@@ -158,6 +158,35 @@ fn ef_unreachable_counterexample(
     })
 }
 
+/// RANKING RESCUE — route a recoverability `AG EF <good>` whose `good` is a single
+/// `reg == value` / `reg == reg` atom to the scalable recoverability engine
+/// ([`verify_recoverability_scalable`](crate::adapter::recoverability)), which proves
+/// `AG EF good` by a well-founded datapath **ranking** (a down-counter/drain to a
+/// value) BEFORE its cube. This decides the deep-counter recoverability class that the
+/// bit-blaster is over-cap for and the predicate cube leaves ⊥ — e.g. a timer/FIFO
+/// `AG EF (cnt == N)` at counter widths the exact engine can't fit. Used as a fallback
+/// (not a replacement) — `None` when the formula is not that shape, `good` is not a
+/// single register-comparison atom, or the engine abstains, so the caller keeps its
+/// Skipped/⊥ verdict. The ranking certificate is a **sound sufficient** condition (it
+/// establishes the stronger `AG AF good`), and the engine abstains rather than emit an
+/// unsound Holds on a UF-wrapping datapath (PR #301).
+fn try_ranking_recoverability(
+    btor2: &str,
+    formula: &crate::mu_calculus::Formula,
+) -> Option<VerifyOutcome> {
+    let atoms = crate::adapter::btor2::symbolic_bitblast::ag_ef_good_atoms(formula)?;
+    let [good] = atoms.as_slice() else {
+        return None; // only a single register-comparison good routes to the engine
+    };
+    match crate::adapter::recoverability::verify_recoverability_scalable(btor2, good, &[]) {
+        Ok(crate::verdict::PropertyVerdict::Holds) => Some(VerifyOutcome::Holds),
+        Ok(crate::verdict::PropertyVerdict::Violated) => {
+            Some(VerifyOutcome::Violated { false_cells: 1 })
+        }
+        _ => None, // Unknown / Skipped / Err → keep the caller's verdict
+    }
+}
+
 /// Model-level diagnostics for an automated verification run — what the lift
 /// produced, so a "couldn't verify" outcome is traceable to a root cause
 /// (rather than only a per-property symptom like "atom over non-state signal").
@@ -2065,12 +2094,21 @@ pub fn verify_auto(
                                 .or_else(|| ef_unreachable_counterexample(&formula)),
                         )
                     }
-                    Err(e) => (
-                        VerifyOutcome::Skipped {
-                            reason: format!("exact symbolic MC: {e}"),
-                        },
-                        None,
-                    ),
+                    Err(e) => {
+                        // RANKING RESCUE — the bit-blaster is over-cap (a wide counter);
+                        // a recoverability `AG EF <cnt == N>` may still HOLD by a
+                        // well-founded datapath descent the exact engine can't fit. Route
+                        // it to the scalable ranking/recoverability engine before abstaining.
+                        match try_ranking_recoverability(&btor2, &formula) {
+                            Some(outcome) => (outcome, None),
+                            None => (
+                                VerifyOutcome::Skipped {
+                                    reason: format!("exact symbolic MC: {e}"),
+                                },
+                                None,
+                            ),
+                        }
+                    }
                 };
             report.properties.push(PropertyVerdict {
                 name: t.name.clone(),
@@ -2600,6 +2638,39 @@ mod tests {
         let agef = mu_parser::parse("nu Y. ((mu X. ((busy == 0) or <> X)) and [] Y)")
             .expect("AG EF parses");
         assert!(super::ef_unreachable_counterexample(&agef).is_none());
+    }
+
+    /// Ranking-wiring — a recoverability `AG EF <good>` routes to the scalable
+    /// recoverability engine (ranking + cube), returning its definite verdict. `good`
+    /// = `data == target` over a design where both increment from 0 (invariant → the
+    /// relation always holds ⇒ recoverable ⇒ Holds); the never-equal variant ⇒ Violated.
+    /// A non-recoverability shape (bare `EF`) does NOT route (`None`).
+    #[test]
+    fn ranking_rescue_routes_ag_ef_recoverability_verdict() {
+        use crate::mu_calculus::parser as mu_parser;
+        // data,target both init 0 and +1 each cycle ⇒ data==target INVARIANT ⇒ AG EF holds.
+        let holds_btor2 = "1 sort bitvec 1\n2 sort bitvec 8\n4 state 2 data\n5 state 2 target\n\
+             6 zero 2\n7 one 2\n13 init 2 4 6\n14 init 2 5 6\n15 add 2 4 7\n16 add 2 5 7\n\
+             22 next 2 4 15\n23 next 2 5 16\n";
+        // target inits 1 ≠ data(0), both +1 ⇒ never equal ⇒ AG EF (data==target) VIOLATED.
+        let viol_btor2 = "1 sort bitvec 1\n2 sort bitvec 8\n4 state 2 data\n5 state 2 target\n\
+             6 zero 2\n7 one 2\n13 init 2 4 6\n14 init 2 5 7\n15 add 2 4 7\n16 add 2 5 7\n\
+             22 next 2 4 15\n23 next 2 5 16\n";
+        let agef = mu_parser::parse("nu Y. ((mu X. ((data == target) or <> X)) and [] Y)")
+            .expect("parses");
+        assert_eq!(
+            super::try_ranking_recoverability(holds_btor2, &agef),
+            Some(VerifyOutcome::Holds),
+            "invariant-relational recoverability routes to Holds via the recoverability engine",
+        );
+        assert_eq!(
+            super::try_ranking_recoverability(viol_btor2, &agef),
+            Some(VerifyOutcome::Violated { false_cells: 1 }),
+            "never-equal relational target routes to Violated",
+        );
+        // A bare `EF` (not the recoverability νμ shape) does not route.
+        let ef = mu_parser::parse("mu X. ((data == target) or <> X)").expect("EF parses");
+        assert_eq!(super::try_ranking_recoverability(holds_btor2, &ef), None);
     }
 
     use super::*;

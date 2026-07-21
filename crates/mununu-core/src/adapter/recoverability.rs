@@ -99,6 +99,69 @@ fn eq_guard_atoms(file: &crate::adapter::btor2::ast::Btor2File) -> Vec<(String, 
     out
 }
 
+/// N1 boolean-gated-event rewrite — given a `good` EVENT signal `sig` (a 1-bit output like a
+/// watchdog `timeout` or a `done` strobe) that is driven **EXACTLY** by a `counter == constant`
+/// comparison (`done <= (cnt == 0)`; registered OR combinational), return `(counter_register,
+/// threshold)`. The recoverability of the event — `AG EF (sig == 1)` — then reduces to the counter
+/// recoverability `AG EF (counter == threshold)`, which the RANKING certificate decides (a boolean
+/// `sig` carries no descending measure; its driving counter does). **SOUND only for a PURE `Eq`
+/// driver:** if `sig`'s next/definition is an `Ite`/`And`/anything other than a bare `Eq(state,
+/// const)` (i.e. it also depends on a reset gate, an enable, another condition), the equivalence
+/// `sig == 1 ⟺ counter == threshold` breaks (`sig` could be 0 while `counter == threshold`), so any
+/// non-`Eq` driver returns `None` (abstain — never a rewrite that could fabricate a Holds). The
+/// one-cycle register delay is absorbed by `EF` (reaching the counter value one step before `sig`).
+fn counter_gate_of(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    sig: &str,
+) -> Option<(String, u64)> {
+    use crate::adapter::btor2::ast::{Node, Op};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    let sig_nid = *symbols
+        .iter()
+        .find(|(_, s)| s.as_str() == sig)
+        .map(|(n, _)| n)?;
+    // The node that DEFINES `sig`: a state register's `next` value, or the op line itself
+    // (a combinational output carrying the symbol).
+    let driver_nid = match &file.lookup(sig_nid)?.node {
+        Node::State { .. } => {
+            crate::adapter::btor2::parser::find_next_value_operand(file, sig_nid)?
+                .0
+                .abs()
+        }
+        _ => sig_nid,
+    };
+    // The driver must be a BARE `Eq` — no surrounding mux/gate (soundness of the rewrite).
+    let Node::Op {
+        op: Op::Eq, args, ..
+    } = &file.lookup(driver_nid)?.node
+    else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let state_nids: std::collections::HashSet<i64> = file
+        .lines
+        .iter()
+        .filter(|l| matches!(l.node, Node::State { .. }))
+        .map(|l| l.nid)
+        .collect();
+    // One operand is the counter STATE register, the other a resolvable CONSTANT threshold.
+    for (reg_nid, const_nid) in [
+        (args[0].0.abs(), args[1].0.abs()),
+        (args[1].0.abs(), args[0].0.abs()),
+    ] {
+        if state_nids.contains(&reg_nid)
+            && let Some(counter) = symbols.get(&reg_nid)
+            && let Some(k) =
+                crate::adapter::btor2::bit_blast::resolve_btor2_constant(file, const_nid)
+        {
+            return Some((counter.clone(), k));
+        }
+    }
+    None
+}
+
 /// N1 Class-2 RELATIONAL discovery — the datapath-dependent return whose guard compares two STATE
 /// registers (`busy → done` gated on `data == target`), not a register to a constant. Extracts the
 /// `(lhs, rhs)` register pairs from the design's `Eq` comparison nodes where BOTH operands are state
@@ -954,6 +1017,20 @@ pub fn verify_recoverability_scalable(
         &good_registers,
         good_simple.as_ref().map(|(_, v)| *v),
     ) {
+        return Ok(PropertyVerdict::Holds);
+    }
+
+    // N1 BOOLEAN-GATED-EVENT RANKING RESCUE: a `good` EVENT like `timeout == 1` / `done == 1` carries
+    // no descending measure itself, but if it is driven EXACTLY by a `counter == threshold` gate, the
+    // event recoverability `AG EF (sig == 1)` reduces to the counter recoverability `AG EF (counter ==
+    // threshold)` — which the ranking DOES decide (the counter descends/ascends to the threshold).
+    // Sound: `counter_gate_of` only rewrites a PURE `Eq` driver (so `sig == 1 ⟺ counter == threshold`),
+    // and a ranking Holds on the counter transfers to the event (`EF` absorbs the one-cycle register
+    // delay). A reload/kick that stalls the descent leaves the ranking un-certified ⇒ fall to the cube.
+    if let Some((sig, 1)) = good_simple.as_ref().map(|(s, v)| (s.clone(), *v))
+        && let Some((counter, threshold)) = counter_gate_of(&file, &sig)
+        && ranking_certificate_holds(&file, &[counter], Some(threshold))
+    {
         return Ok(PropertyVerdict::Holds);
     }
 
@@ -2625,6 +2702,53 @@ mod tests {
         assert_eq!(
             verify_recoverability(&inv_rel_w(8, "7"), "data == target").expect("small decides"),
             PropertyVerdict::Violated
+        );
+    }
+
+    /// N1 boolean-gated-event rewrite — a `good` EVENT `done == 1` that is driven EXACTLY by a
+    /// `counter == threshold` gate (`done <= (cnt == 0)`) reduces to the counter recoverability
+    /// `AG EF (cnt == 0)`, decided by the ranking (the boolean `done` carries no measure; the cube
+    /// over `{done == 1}` alone cannot track `cnt`). A GATED driver (`done <= enable ? (cnt==0) : 0`)
+    /// is NOT a pure `Eq`, so the rewrite abstains (soundness: `done == 1` is not equivalent to
+    /// `cnt == 0`).
+    #[test]
+    fn boolean_gated_event_rewrite_decides_via_counter_ranking() {
+        // done <= (cnt == 0); cnt a down-counter to 0 (`cnt' = ite(cnt==0, 0, cnt-1)`). Pure Eq driver
+        // (node 8). Mirrors the passing `downcnt_w` fixture (decimal `constd`, `zero`/`one`).
+        let clean = "1 sort bitvec 1\n2 sort bitvec 8\n3 state 2 cnt\n4 zero 2\n5 one 2\n\
+             6 constd 2 5\n7 init 2 3 6\n8 eq 1 3 4\n9 sub 2 3 5\n10 ite 2 8 4 9\n11 next 2 3 10\n\
+             12 state 1 done\n13 zero 1\n14 init 1 12 13\n15 next 1 12 8\n";
+        let file = crate::adapter::btor2::parser::parse(clean).expect("parse clean");
+        assert_eq!(
+            counter_gate_of(&file, "done"),
+            Some(("cnt".to_string(), 0)),
+            "the pure `done <= (cnt == 0)` driver rewrites to the counter gate (cnt, 0)"
+        );
+        // DIAGNOSTIC: the counter recoverability itself + the ranking directly.
+        assert!(
+            ranking_certificate_holds(&file, &["cnt".to_string()], Some(0)),
+            "the ranking certifies the down-counter cnt descends to 0"
+        );
+        assert_eq!(
+            verify_recoverability_scalable(clean, "cnt == 0", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "the counter recoverability AG EF (cnt==0) decides Holds"
+        );
+        assert_eq!(
+            verify_recoverability_scalable(clean, "done == 1", &[]).expect("decides"),
+            PropertyVerdict::Holds,
+            "boolean-gated event AG EF (done==1) decides Holds via the counter-gate ranking rewrite"
+        );
+        // GATED: done <= enable ? (cnt==0) : 0 — an `Ite` driver (node 17), not a bare `Eq` ⇒ abstain.
+        let gated = "1 sort bitvec 1\n2 sort bitvec 8\n3 state 2 cnt\n4 zero 2\n5 one 2\n\
+             6 constd 2 5\n7 init 2 3 6\n8 eq 1 3 4\n9 sub 2 3 5\n10 ite 2 8 4 9\n11 next 2 3 10\n\
+             12 state 1 done\n13 zero 1\n14 init 1 12 13\n16 input 1 enable\n17 ite 1 16 8 13\n\
+             18 next 1 12 17\n";
+        let gfile = crate::adapter::btor2::parser::parse(gated).expect("parse gated");
+        assert_eq!(
+            counter_gate_of(&gfile, "done"),
+            None,
+            "a gated (non-pure-Eq) event driver is not rewritten (soundness)"
         );
     }
 

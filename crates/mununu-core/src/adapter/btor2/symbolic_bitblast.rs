@@ -2390,6 +2390,18 @@ fn collect_target_atoms(
     }
 }
 
+/// If `formula` is a recoverability `AG EF good` (`νY. ((μX. (good ∨ ◇X)) ∧ □Y)`),
+/// return the predicate atoms of its `good` target — so a caller can route the
+/// property to the scalable ranking/recoverability engine (which decides a
+/// well-founded datapath descent, e.g. a down-counter to a value, that the cube
+/// leaves ⊥). `None` for any other shape. Complements [`ef_target_atoms`] (bare `EF`).
+pub(crate) fn ag_ef_good_atoms(formula: &Formula) -> Option<Vec<String>> {
+    let p = detect_ag_ef_target(formula)?;
+    let mut atoms = Vec::new();
+    collect_target_atoms(formula, p, &mut atoms);
+    (!atoms.is_empty()).then_some(atoms)
+}
+
 /// D1.8c — build the sound μ-calculus formula that verifies the GR(1) response
 /// property `GF assume → GF guarantee` over the **exact** engine. `assume` and
 /// `guarantee` are predicate expressions (e.g. `"req == 1"`).
@@ -2817,6 +2829,30 @@ mod tests {
         // `AF p` (box inner) is a liveness/stall shape, not reachability.
         let af = mu_parser::parse("mu X. ((done == 1) or [] X)").expect("AF parses");
         assert_eq!(ef_target_atoms(&af), None);
+    }
+
+    /// Ranking-wiring — `ag_ef_good_atoms` names the `good` target of a recoverability
+    /// `AG EF good` (`νY. ((μX. (good ∨ ◇X)) ∧ □Y)`), so a caller can route it to the
+    /// scalable ranking/recoverability engine. `None` for a bare `EF` (that is the
+    /// unreachable-target case) or any non-recoverability shape.
+    #[test]
+    fn ag_ef_good_atoms_names_recoverability_target() {
+        use crate::mu_calculus::parser as mu_parser;
+        // `AG EF (cnt == 0)` — a down-counter/timer recoverability target.
+        let agef = mu_parser::parse("nu Y. ((mu X. ((cnt == 0) or <> X)) and [] Y)")
+            .expect("AG EF parses");
+        let atoms = ag_ef_good_atoms(&agef).expect("AG EF yields a good target");
+        assert_eq!(atoms, vec!["cnt == 0".to_string()]);
+        // relational good `AG EF (wptr == rptr)` (FIFO drain) — the register-vs-register atom.
+        let rel = mu_parser::parse("nu Y. ((mu X. ((wptr == rptr) or <> X)) and [] Y)")
+            .expect("relational AG EF parses");
+        assert_eq!(
+            ag_ef_good_atoms(&rel),
+            Some(vec!["wptr == rptr".to_string()])
+        );
+        // a bare `EF` is NOT the recoverability shape (it is the unreachable-target case).
+        let ef = mu_parser::parse("mu X. ((cnt == 0) or <> X)").expect("EF parses");
+        assert_eq!(ag_ef_good_atoms(&ef), None);
     }
 
     /// Run the BDD bit-blaster against the concrete simulator over an
