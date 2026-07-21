@@ -605,6 +605,15 @@ pub struct VerifyAutoOptions {
     /// appearing in a self-relational `$past` atom) are bounded; other registers
     /// are ignored.
     pub counter_bounds: std::collections::HashMap<String, u64>,
+    /// W1/W2 — user-supplied **predicate hints** (the CLI `--predicate` / API
+    /// `predicates` peer of the in-source `@mununu_predicate <expr>` annotation).
+    /// Each entry is a predicate expression (`reg == value`, `reg == reg`,
+    /// `reg >= K`) seeded into every property's cube via `seed_from_formula`'s
+    /// `extra_atoms`, MERGED with the scanned `@mununu_predicate` annotations.
+    /// Sound by monotonicity of predicate abstraction — a hint only refines the
+    /// cube (a ⊥ can become definite; a definite verdict never flips; a hint that
+    /// fails classification is dropped). Default empty ⇒ no behaviour change.
+    pub predicate_hints: Vec<String>,
     /// R-F5.5d (2026-07-03) — run each property through the R-F5 **symbolic**
     /// predicate-cube engine (BDD relation + WP CEGAR loop; no per-cube-pair
     /// SMT) instead of the explicit `cegar_refine_loop`. Default `false`
@@ -702,6 +711,7 @@ impl Default for VerifyAutoOptions {
             auto_stub_flops: true,
             config_values: std::collections::HashMap::new(),
             counter_bounds: std::collections::HashMap::new(),
+            predicate_hints: Vec::new(),
             symbolic_engine: false,
             exact_symbolic: false,
             portfolio: None,
@@ -787,6 +797,7 @@ fn seed_from_formula(
     is_input: impl Fn(&str) -> bool,
     combinational_kind: impl Fn(&str) -> Option<CombKind>,
     cone_inputs_of: impl Fn(&str) -> Vec<String>,
+    extra_atoms: &[String],
 ) -> Seeded {
     // Slice 3 (the unwrap lever) — cap how many raw cone inputs a single
     // combinational-of-input atom may add as free cube dimensions. Each added
@@ -886,11 +897,25 @@ fn seed_from_formula(
             }
         }
     };
-    for node in formula.nodes() {
-        let Node::Predicate(atom) = node else {
-            continue;
-        };
-        if !seen.insert(atom.as_str()) {
+    // Formula atoms first, then annotation `@mununu_predicate` atoms — both run the
+    // IDENTICAL provenance classification (state → cube dimension, state-only
+    // combinational → dimension, input-dependent combinational → derived label,
+    // unresolvable → skip). Annotation predicates seed the cube even when they do NOT
+    // appear in the property formula: they are auxiliary invariant HINTS. Soundness is
+    // unaffected — predicate abstraction is monotone, so an extra dimension only
+    // refines the may/must partition (a ⊥ can become definite; a definite verdict can
+    // never flip). A hint that fails classification lands in `unseedable` and is
+    // dropped, never a spurious verdict.
+    let atoms = formula
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            Node::Predicate(atom) => Some(atom.as_str()),
+            _ => None,
+        })
+        .chain(extra_atoms.iter().map(String::as_str));
+    for atom in atoms {
+        if !seen.insert(atom) {
             continue;
         }
         match parse_predicate_expr(atom) {
@@ -916,14 +941,14 @@ fn seed_from_formula(
                         // only, BV `bvadd` at the real register width). Sound — a
                         // pure per-cube observation, like any derived relational.
                         if resolvable {
-                            out.derived_relational.push((atom.clone(), expr));
+                            out.derived_relational.push((atom.to_string(), expr));
                         } else {
-                            out.unseedable.push(atom.clone());
+                            out.unseedable.push(atom.to_string());
                         }
                     } else if regs.iter().all(|r| is_state(r)) {
                         // All-state → a cube DIMENSION (B.1 compound). The SMT
                         // dimension path reads state BVs.
-                        out.compounds.push((atom.clone(), expr));
+                        out.compounds.push((atom.to_string(), expr));
                     } else if resolvable {
                         // H.F — a relational with an input / combinational operand
                         // (`cnt_q >= cfg_detect_timer_i`, `trigger_i !=
@@ -935,11 +960,11 @@ fn seed_from_formula(
                         // `trigger_i != ~trigger_i` ≡ true → HOLDS), KleeneBot where
                         // a free operand swings it. Sound (a pure observation; a
                         // KleeneBot atom is ⊥, never a spurious verdict).
-                        out.derived_relational.push((atom.clone(), expr));
+                        out.derived_relational.push((atom.to_string(), expr));
                     } else {
                         // An operand resolves to nothing in the lifted design —
                         // cannot label it. Honest SKIP.
-                        out.unseedable.push(atom.clone());
+                        out.unseedable.push(atom.to_string());
                     }
                 }
             },
@@ -1011,6 +1036,11 @@ struct AnnotationScan {
     /// `@mununu_guarantee` bodies that did NOT parse — surfaced, never silently
     /// dropped.
     skipped: Vec<String>,
+    /// `@mununu_predicate <expr>` auxiliary abstraction-predicate hints (verbatim
+    /// expr strings, validated as parseable). Seeded into every property's cube via
+    /// `seed_from_formula`'s `extra_atoms`. Sound by monotonicity — a hint only
+    /// refines the cube (a ⊥ can become definite; a definite verdict never flips).
+    predicates: Vec<String>,
 }
 
 /// H.5-GR1 — scan the SV source(s) for `@mununu_guarantee` / `@mununu_assume`
@@ -1053,6 +1083,21 @@ fn scan_annotation_properties(sources: &[(String, String)]) -> AnnotationScan {
                     }
                 }
                 MununuTag::Assume => scan.assumes.push(ann.value.trim().to_string()),
+                MununuTag::Predicate => {
+                    let body = ann.value.trim();
+                    // A bare identifier (`sig` ≡ `sig == 1`) is admitted like a bare
+                    // formula atom; anything else must parse as a predicate expr.
+                    let ok = !body.is_empty()
+                        && (!body.contains(['=', '<', '>', '!'])
+                            || parse_predicate_expr(body).is_ok());
+                    if ok {
+                        scan.predicates.push(body.to_string());
+                    } else {
+                        scan.skipped.push(format!(
+                            "@mununu_predicate `{body}` did not parse as a predicate expression"
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1714,6 +1759,15 @@ pub fn verify_auto(
     // Merged BEFORE the empty-check so a design with no SVA but annotation-only
     // properties still verifies.
     let ann_scan = scan_annotation_properties(sources);
+    // W1/W2 — the abstraction-predicate hints seeded into every property's cube:
+    // in-source `@mununu_predicate` annotations MERGED with CLI `--predicate` / API
+    // `predicate` hints. Sound by monotonicity (a hint only refines the cube).
+    let predicate_hints: Vec<String> = ann_scan
+        .predicates
+        .iter()
+        .chain(opts.predicate_hints.iter())
+        .cloned()
+        .collect();
     extraction
         .translated
         .extend(ann_scan.guarantees.iter().cloned());
@@ -2127,6 +2181,7 @@ pub fn verify_auto(
             is_input,
             combinational_kind,
             cone_inputs_of,
+            &predicate_hints,
         );
         // H.H — seed a bound compound `X <= K` for each counter register (a state
         // cell whose `$past` shadow is also present, i.e. a self-relational
@@ -3259,6 +3314,34 @@ module uart_tx(); endmodule"#;
         assert!(annotation_note(&plain).is_none());
     }
 
+    #[test]
+    fn scan_collects_predicate_hints_and_rejects_unparseable() {
+        // W1 — `@mununu_predicate <expr>` hints are collected (literal, relational,
+        // bound); a bare boolean signal is admitted; a malformed comparison is
+        // surfaced in `skipped`, never silently dropped.
+        let sv = "// @mununu_predicate c_state == 0\n\
+                  // @mununu_predicate wptr == rptr\n\
+                  // @mununu_predicate fill >= 30\n\
+                  // @mununu_predicate ready\n\
+                  // @mununu_predicate bogus ==\n\
+                  module m(); endmodule";
+        let scan = scan_annotation_properties(&src(sv));
+        assert_eq!(
+            scan.predicates,
+            vec![
+                "c_state == 0".to_string(),
+                "wptr == rptr".to_string(),
+                "fill >= 30".to_string(),
+                "ready".to_string(),
+            ]
+        );
+        assert!(
+            scan.skipped.iter().any(|s| s.contains("bogus ==")),
+            "malformed predicate surfaced in skipped: {:?}",
+            scan.skipped
+        );
+    }
+
     /// R-F5.5d projection SOUNDNESS fix — an infeasible cube (absent from the
     /// symbolic feasible-cube tally) must project to ⊥, NOT a spurious
     /// definite-False. Regression for the unsound VIOLATED verify-auto returned
@@ -3716,6 +3799,7 @@ module uart_tx(); endmodule"#;
             |_| false,
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert_eq!(s.specs.len(), 1, "one simple reg==val spec");
         assert_eq!(s.specs[0].name, "state == 5");
@@ -3723,6 +3807,80 @@ module uart_tx(); endmodule"#;
         assert_eq!(s.specs[0].value, 5);
         assert!(s.compounds.is_empty());
         assert!(s.unseedable.is_empty());
+    }
+
+    #[test]
+    fn extra_atoms_seed_the_cube_like_formula_atoms() {
+        // W1 (`@mununu_predicate`): an auxiliary predicate `aux == 3` that is NOT in
+        // the formula seeds a cube dimension exactly as a formula atom would — a
+        // simple state spec, plus a relational one as a compound. Dedups against the
+        // formula atom.
+        let f = mu_parser::parse("mu X. ((target == 1) || <> X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["target", "aux", "a", "b"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+            &[
+                "aux == 3".to_string(),
+                "a == b".to_string(),
+                "target == 1".to_string(), // duplicate of the formula atom → deduped
+            ],
+        );
+        assert!(
+            s.specs.iter().any(|p| p.name == "target == 1"),
+            "formula atom still seeded"
+        );
+        assert!(
+            s.specs.iter().any(|p| p.name == "aux == 3"),
+            "extra simple atom seeded as a spec"
+        );
+        assert!(
+            s.compounds.iter().any(|(n, _)| n == "a == b"),
+            "extra relational atom seeded as a compound"
+        );
+        assert_eq!(
+            s.specs.iter().filter(|p| p.name == "target == 1").count(),
+            1,
+            "duplicate extra atom is deduped against the formula atom"
+        );
+    }
+
+    #[test]
+    fn extra_atoms_bound_predicate_routes_to_compound() {
+        // W2 (relational/bound grammar rides the SAME annotation path): a bound
+        // `cnt >= 5` over a state cell seeds a compound dimension (not a literal spec).
+        let f = mu_parser::parse("mu X. ((done == 1) || <> X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["done", "cnt"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+            &["cnt >= 5".to_string()],
+        );
+        assert!(
+            s.compounds.iter().any(|(n, _)| n == "cnt >= 5"),
+            "bound hint seeded as a compound dimension"
+        );
+        assert!(s.unseedable.is_empty(), "a state bound is seedable");
+    }
+
+    #[test]
+    fn extra_atoms_empty_is_the_baseline() {
+        // No `@mununu_predicate` hints ⇒ identical to the pre-W1 behaviour.
+        let f = mu_parser::parse("nu X. ((state == 5) && [] X)").unwrap();
+        let s = seed_from_formula(
+            &f,
+            |n| cells(&["state"]).contains(n),
+            |_| false,
+            |_| None,
+            |_| Vec::new(),
+            &[],
+        );
+        assert_eq!(s.specs.len(), 1);
+        assert_eq!(s.specs[0].name, "state == 5");
     }
 
     #[test]
@@ -3735,6 +3893,7 @@ module uart_tx(); endmodule"#;
             |_| false,
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert!(s.specs.is_empty(), "relational atom is not a simple spec");
         assert_eq!(s.compounds.len(), 1, "one compound (relational) predicate");
@@ -3768,6 +3927,7 @@ module uart_tx(); endmodule"#;
             |_| false,
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert!(
             s.unseedable.contains(&"gnt_o != 0".to_string()),
@@ -3790,6 +3950,7 @@ module uart_tx(); endmodule"#;
             |_| false,
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "busy");
@@ -3810,6 +3971,7 @@ module uart_tx(); endmodule"#;
             |n| cells(&["cfg_enable_i"]).contains(n),
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert!(
             s.unseedable.is_empty(),
@@ -3837,6 +3999,7 @@ module uart_tx(); endmodule"#;
             |n| cells(&["trigger_i"]).contains(n),
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].name, "trigger_i");
@@ -3877,6 +4040,7 @@ module uart_tx(); endmodule"#;
             |n| cells(&["cfg_enable_i"]).contains(n),
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert!(s.specs.is_empty());
         assert!(
@@ -3914,6 +4078,7 @@ module uart_tx(); endmodule"#;
                     .then_some(CombKind::StateOnly)
             },
             |_| Vec::new(),
+            &[],
         );
         assert_eq!(
             s.specs.len(),
@@ -3939,6 +4104,7 @@ module uart_tx(); endmodule"#;
                     .then_some(CombKind::StateOnly)
             },
             |_| Vec::new(),
+            &[],
         );
         assert_eq!(s.specs.len(), 1);
         assert_eq!(s.specs[0].register, "err_code");
@@ -3957,6 +4123,7 @@ module uart_tx(); endmodule"#;
             |_| false,
             |n| cells(&["sig"]).contains(n).then_some(CombKind::StateOnly),
             |_| Vec::new(),
+            &[],
         );
         assert_eq!(s.specs.len(), 1, "a cube dimension");
     }
@@ -3979,6 +4146,7 @@ module uart_tx(); endmodule"#;
                     .then_some(CombKind::InputDependent)
             },
             |_| Vec::new(),
+            &[],
         );
         assert!(
             !s.input_registers.contains("trigger_active"),
@@ -4021,6 +4189,7 @@ module uart_tx(); endmodule"#;
                     Vec::new()
                 }
             },
+            &[],
         );
         assert!(
             s.derived.iter().any(|p| p.register == "trigger_active"),
@@ -4059,6 +4228,7 @@ module uart_tx(); endmodule"#;
                     Vec::new()
                 }
             },
+            &[],
         );
         assert!(
             s.derived.iter().any(|p| p.register == "wide"),
@@ -4090,6 +4260,7 @@ module uart_tx(); endmodule"#;
             |n| n == "cfg_detect_timer_i",
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert!(
             s.compounds.is_empty(),
@@ -4121,6 +4292,7 @@ module uart_tx(); endmodule"#;
             |_| false,
             |_| None,
             |_| Vec::new(),
+            &[],
         );
         assert!(
             s.derived_relational.is_empty(),
@@ -5769,6 +5941,7 @@ endmodule
             |_| false,
             |_| None,
             |_| Vec::new(),
+            &[],
         );
 
         // Mirror verify_auto's default cegar_opts (must Off; may = SmtAllPairs —

@@ -53,6 +53,12 @@ pub enum MununuTag {
     /// reactive-modules ISR + main-thread interleaving in Doc C
     /// §C.5. Annotation-only; no naming-convention defaults.
     Isr,
+    /// `@mununu_predicate <expr>` — an auxiliary abstraction-predicate HINT
+    /// for the predicate cube (SV verify-auto). The `<expr>` is a predicate
+    /// expression (`reg == value`, `reg == reg`, `reg >= K`) that seeds a cube
+    /// dimension even when it does not appear in any property formula. Sound by
+    /// monotonicity of predicate abstraction — a hint only refines the cube.
+    Predicate,
 }
 
 impl MununuTag {
@@ -68,6 +74,7 @@ impl MununuTag {
             "controllable" => Some(MununuTag::Controllable),
             "uncontrollable" => Some(MununuTag::Uncontrollable),
             "isr" => Some(MununuTag::Isr),
+            "predicate" => Some(MununuTag::Predicate),
             _ => None,
         }
     }
@@ -82,6 +89,7 @@ impl MununuTag {
             MununuTag::Controllable => "controllable",
             MununuTag::Uncontrollable => "uncontrollable",
             MununuTag::Isr => "isr",
+            MununuTag::Predicate => "predicate",
         }
     }
 }
