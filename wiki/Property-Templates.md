@@ -35,6 +35,47 @@ Templates resolve to standard `PropertyFormula::MuCalculus(String)` at instantia
 
 \* `$UNDERFLOW` is optional with default `false`.
 
+## Behavioral property patterns by design class
+
+> Source of truth: [`scan_annotation_properties`](../crates/mununu-core/src/adapter/slang/verify_auto.rs#L995) — surface: (CLI+API+UI)
+
+Beyond the atomic templates above, common **behavior classes** warrant recurring *branching-time* patterns —
+`AG EF` recoverability, `EF` reachability, error-recovery round-trips — that a plain safety invariant cannot
+state. Each pattern below is a parameterized mu-calculus formula you instantiate by substituting the design's
+observable signals into the `<slots>` (an atom: `<sig> == <val>`, `<sig> != <val>`, or a bare boolean output),
+then verify with `mununu sv verify-auto` via a `@mununu_guarantee` annotation (or `mununu context eval`).
+Shorthand → mu-calculus is the [Mu-Calculus Reference](Mu-Calculus-Reference.md):
+`EF p = mu X.(p || <> X)`, `AG p = nu S.(p && [] S)`, `AF p = mu Y.(p || [] Y)`,
+`AG EF p = nu Y.((mu X.(p || <> X)) && [] Y)`, `AG(a → EF b) = nu Z.((!(a) || mu Y.(b || <> Y)) && [] Z)`.
+
+**Soundness default — use `EF` (reachable), not `AF` (inevitable).** `AF`/box-`AF` is sound only where no free
+input (a kick, a clock-stretch, a competing request, a bus-cycle drop) can stall the antecedent path forever;
+`GF` fairness is not assumable. When unsure, `EF`.
+
+| class | trigger | patterns (shorthand, `<slots>` = observable signals) |
+|---|---|---|
+| **FIFO / buffer / queue** | full/empty/level, push/pop | `EF <full>`, `EF <empty>` (extremes reachable); `AG EF !<full>` (always drainable, never wedges); `AG(<full> → EF !<full>)` (stuck-at-full fails); `AG(<wr_full> → EF !<rd_empty>)` (CDC data-visibility); `AG !(<full> && <empty>)` (safety, if exclusive) |
+| **timer / watchdog / recurring pulse** | timeout, expire, tick, pps | `AG EF <ev>==1` (can **always fire again** — fire-once-then-wedge fails) + `EF <ev>==1`; `AG(<ev>==1 → EF <ev>==0)` (pulse doesn't stick); `AG EF <ev>==0` (kick always available); `AG(<armed> → AF <ev>==1)` **only** if no input can stall it |
+| **protocol w/ error-recovery** | error/AL/NACK/collision/abort | `EF <error>==1` (error reachable); `AG(<error>==1 → EF <idle>)` (**does NOT trap in error** — the sharpest); `AG(<error>==1 → EF <error>==0)` (flag clears) |
+| **CPU / sequencer core** | fetch/decode/execute, stall | `AG EF <fetch>` (no hang); `AG(<stall>==1 → EF <stall>==0)` (stall resolves); `AG(<exec>==1 → EF <fetch>)` (retire) |
+| **bridge / arbiter / shared resource** | two interfaces, req/grant | `AG(<req_in>==1 → EF <resp_out>==1)` (forward); `AG(<b_event>==1 → EF <a_out>==1)` (return); `AG !(<g_a>==1 && <g_b>==1)` (mutex); `AG(<req>==1 → AF <grant>==1)` (fair, AF only if no starver) |
+| **mode / phase machine** | modes, phases, speed settings | `EF <mode>==k` for **every** documented mode (a dead mode = dead feature); `AG(<mode>==A → EF <mode>==B)` (transition); `AG(<phase>==late → EF <phase>==early)` (restart) |
+| **resource release** | shared/open-drain bus, lock | `AG EF <released>` (never permanently locks the bus) + `EF <held>` |
+
+Example — an I²C master (protocol + shared-bus classes), `<error>` = `AL == 1`, `<idle>` = `BUSY == 0`,
+`<released>` = `scl_padoen_o == 1`:
+
+```
+// @mununu_guarantee nu Z.((!(AL == 1) || mu Y.(BUSY == 0 || <> Y)) && [] Z)   // does not trap in arbitration-loss
+// @mununu_guarantee nu Y.((mu X.(scl_padoen_o == 1 || <> X)) && [] Y)          // always releases the bus
+```
+
+> **Decidability note.** These patterns are *definite* on compact control FSMs (`--engine exact-symbolic`) and
+> decide via predicate abstraction (`--engine explicit --must-edge-inference smt-hyper-must`) when the event
+> grounds on a state/registered signal. An event gated by a **deep counter** (a timeout counting to a value)
+> may return **⊥** in the cube — that is an honest "not decided", never a pass; see
+> [Hardware Verification Patterns](Hardware-Verification-Patterns.md) for the ranking/recoverability path.
+
 ## Using Templates
 
 ### CLI
