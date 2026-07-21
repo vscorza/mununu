@@ -1526,11 +1526,11 @@ fn warn_unmatched_sidecar_signals(
 /// against the sidecar's `memories[]` declarations.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryCellMeta {
-    /// BTOR2 NID of the `state` line; reserved for the §Phase 10
-    /// §10.2 stage 3+ lifter to look up the cell during predicate-image
-    /// queries. Currently unused in stage 1 (schema/validate-only).
-    #[allow(dead_code)]
-    nid: Nid,
+    /// BTOR2 NID of the `state` line. Read by the exact-symbolic array/$mem
+    /// lift (`symbolic_bitblast::exact_symbolic_verdict_with_witness`) to test
+    /// each memory's cone membership before auto-havocing out-of-cone memories,
+    /// and by the §Phase 10 §10.2 sidecar lifter for predicate-image queries.
+    pub(crate) nid: Nid,
     name: String,
     address_width: u32,
     data_width: u32,
@@ -1786,7 +1786,7 @@ pub(crate) fn sidecar_uf_memory_nids(
 /// well-formed Yosys-emitted BTOR2 for stage 1b's target fixtures
 /// (register files, mailboxes); the error message asks the user to
 /// file a bug with the BTOR2 dump so we can extend the rewriter.
-fn havoc_rewrite_memories(
+pub(crate) fn havoc_rewrite_memories(
     file: &Btor2File,
     havoc_nids: &std::collections::HashSet<Nid>,
 ) -> Result<Btor2File, AdapterError> {

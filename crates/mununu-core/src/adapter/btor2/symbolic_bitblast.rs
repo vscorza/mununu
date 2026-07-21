@@ -2126,7 +2126,6 @@ pub fn exact_symbolic_verdict_with_witness(
     // `done == K` was evaluated as `state == K` (`EF (done == 2)` spuriously
     // `Holds`) — a soundness bug on ANY combinational-function output atom. The
     // exact engine is the differential oracle and must use the sound resolution.
-    let sts = crate::adapter::sts_ir::BtorSts::new(&file);
     let resolve = |name: &str| -> String {
         crate::adapter::btor2::parser::resolve_to_canonical_name(
             &file,
@@ -2162,6 +2161,39 @@ pub fn exact_symbolic_verdict_with_witness(
         }
     }
 
+    // R-F5.6 cone + array/$mem lift. Compute the property's cone-of-influence keep-set
+    // BEFORE enumerating leaf cells, then auto-havoc any memory whose reads are OUT of that
+    // cone so the exact bit-blaster (which cannot bit-blast an array sort) still decides an
+    // array-datapath design whose CONTROL cone is array-free — an S-box ROM, a register file
+    // the property never reads.
+    //
+    // SOUNDNESS: an out-of-cone memory does not feed the property, so replacing its reads with
+    // free inputs (pinned out-of-cone by the cone restriction) cannot change the verdict. We
+    // only havoc when EVERY detected memory is out of cone; an IN-cone memory is left in place
+    // (havoc over-approximates the read, which is unsound for liveness on the read contents),
+    // so `leaf_cells` errors on its array sort → honest Skip rather than an unsound verdict.
+    // `havoc_rewrite_memories` preserves every non-array NID (Reads become same-NID Inputs), so
+    // the keep-set computed on the original file stays valid against the rewritten file.
+    let seed_atoms: Vec<String> = seed_regs.iter().cloned().collect();
+    let keep_set = (!seed_atoms.is_empty())
+        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    let file = {
+        let memories = crate::adapter::btor2::bit_blast::detect_btor2_memories(&file);
+        let all_out_of_cone = !memories.is_empty()
+            && keep_set
+                .as_ref()
+                .is_some_and(|keep| memories.iter().all(|m| !keep.contains(&m.nid)));
+        if all_out_of_cone {
+            let havoc: std::collections::HashSet<Nid> = memories.iter().map(|m| m.nid).collect();
+            crate::adapter::btor2::bit_blast::havoc_rewrite_memories(&file, &havoc)
+                .map_err(|e| format!("exact MC: out-of-cone memory havoc: {e:?}"))?
+        } else {
+            file
+        }
+    };
+    // STS-IR seam on the (possibly havoc'd) file — the single canonical leaf enumeration.
+    let sts = crate::adapter::sts_ir::BtorSts::new(&file);
+
     // Input-atom soundness guard. This engine leaves primary inputs FREE (they are
     // quantified out by the modalities — see the module header: "inputs stay free and
     // are quantified out"). A formula atom that *pins* a primary input therefore cannot
@@ -2190,9 +2222,6 @@ pub fn exact_symbolic_verdict_with_witness(
         ));
     }
 
-    let seed_atoms: Vec<String> = seed_regs.into_iter().collect();
-    let keep_set = (!seed_atoms.is_empty())
-        .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
     let bb = BddBitBlaster::build_with_keep(&file, keep_set.as_ref())?;
     let exact = bb.exact_model();
 
@@ -3854,6 +3883,122 @@ mod tests {
         assert_eq!(
             exact_symbolic_verdict(SATURATING_COUNTER_BTOR2, &f).expect("verdict"),
             ExactVerdict::Violated,
+        );
+    }
+
+    // ---- Array/$mem lift: auto-havoc out-of-cone memories on the exact path ----
+
+    /// Oracle: a 1-bit `phase` toggle (init 0, `phase' = !phase`) with NO memory.
+    /// This is the ground-truth verdict source for the differential below.
+    const PHASE_TOGGLE_NO_MEM: &str = r#"
+1 sort bitvec 1
+2 state 1 phase
+3 zero 1
+4 init 1 2 3
+5 not 1 2
+6 next 1 2 5
+"#;
+
+    /// Same `phase` toggle PLUS an array `rf_reg` (32×8 register file) that the
+    /// property never reads — its `read` feeds only a dead `eq`. The memory is OUT
+    /// of `phase`'s cone, so the exact engine auto-havocs it and decides the phase
+    /// property. Before the lift, `leaf_cells` errored on the array sort (Skip).
+    const PHASE_TOGGLE_OUT_OF_CONE_MEM: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 8
+4 sort array 2 3
+5 state 4 rf_reg
+6 input 1 we
+7 input 2 addr
+8 input 3 wdata
+9 ite 4 6 5 5
+10 next 4 5 9
+11 read 3 5 7
+12 zero 3
+13 eq 1 11 12
+14 state 1 phase
+15 zero 1
+16 init 1 14 15
+17 not 1 14
+18 next 1 14 17
+"#;
+
+    /// A register `dout` LOADS from the memory read (`dout' = rf_reg[addr]`), so the
+    /// memory IS in `dout`'s cone. Havoc would over-approximate the read (unsound for
+    /// liveness on memory contents), so the engine must NOT havoc — it leaves the
+    /// array in place and `leaf_cells` errors → honest Skip (Err), not a verdict.
+    const DOUT_READS_IN_CONE_MEM: &str = r#"
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 8
+4 sort array 2 3
+5 state 4 rf_reg
+6 input 1 we
+7 input 2 addr
+8 input 3 wdata
+9 ite 4 6 5 5
+10 next 4 5 9
+11 read 3 5 7
+12 state 3 dout
+13 next 3 12 11
+"#;
+
+    #[test]
+    fn array_lift_out_of_cone_memory_decides_and_matches_oracle() {
+        // Every phase property must decide IDENTICALLY with and without the
+        // out-of-cone memory — the differential-oracle check that auto-havoc is
+        // verdict-preserving. (Without the lift, the `_MEM` column errored.)
+        let cases = [
+            ("(phase == 0)", ExactVerdict::Holds), // init is 0
+            ("mu X. ((phase == 1) or <> X)", ExactVerdict::Holds), // EF phase==1 (toggles)
+            ("[] (phase == 0)", ExactVerdict::Violated), // successor phase=1
+            (
+                "nu Y. ((mu X. ((phase == 0) or <> X)) and [] Y)", // AG EF phase==0 (toggles back)
+                ExactVerdict::Holds,
+            ),
+        ];
+        for (fs, expected) in cases {
+            let formula = crate::mu_calculus::parser::parse(fs).expect("formula parses");
+            let oracle = exact_symbolic_verdict(PHASE_TOGGLE_NO_MEM, &formula)
+                .expect("mem-free oracle verdict");
+            assert_eq!(oracle, expected, "oracle `{fs}`");
+            let lifted = exact_symbolic_verdict(PHASE_TOGGLE_OUT_OF_CONE_MEM, &formula)
+                .expect("out-of-cone memory should decide, not Skip");
+            assert_eq!(lifted, oracle, "array-lifted `{fs}` must match the oracle");
+        }
+    }
+
+    #[test]
+    fn array_lift_in_cone_memory_skips_rather_than_havoc() {
+        // `dout` reads the memory, so the memory is in the property's cone. The
+        // engine must NOT auto-havoc (unsound for liveness on read contents) — it
+        // returns an honest Skip (Err), never a verdict.
+        let formula =
+            crate::mu_calculus::parser::parse("mu X. ((dout == 0) or <> X)").expect("formula");
+        let r = exact_symbolic_verdict(DOUT_READS_IN_CONE_MEM, &formula);
+        assert!(
+            r.is_err(),
+            "in-cone memory must Skip (Err), got a verdict: {r:?}"
+        );
+    }
+
+    /// A real Yosys-emitted BTOR2 (lowRISC/ibex 32×32 register file). Every output
+    /// (`rdata_a_o`/`rdata_b_o`) reads the `mem` array, so any property atom over a
+    /// read output puts the memory IN the cone — the in-cone guard must decline to
+    /// havoc and Skip (Err), NOT emit an unsound verdict, on genuine yosys `write`/
+    /// `read`/`init` array emission (not just the hand-authored fixtures above).
+    const IBEX_REGFILE_YOSYS_BTOR2: &str =
+        include_str!("../../../tests/data/ibex_register_file_fpga_16x4.btor2");
+
+    #[test]
+    fn array_lift_real_yosys_regfile_read_output_skips() {
+        let formula =
+            crate::mu_calculus::parser::parse("mu X. ((rdata_a_o == 0) or <> X)").expect("formula");
+        let r = exact_symbolic_verdict(IBEX_REGFILE_YOSYS_BTOR2, &formula);
+        assert!(
+            r.is_err(),
+            "a property reading the register-file memory must Skip (Err), got: {r:?}"
         );
     }
 
