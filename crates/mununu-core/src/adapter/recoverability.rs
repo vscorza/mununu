@@ -959,6 +959,79 @@ pub fn verify_recoverability_with_predicates(
     }
 }
 
+/// b2 — decide `AG EF good` by COMPOSING a ranking certificate (every in-cone
+/// down-counter that gates progress always eventually expires) with b1's counter
+/// may-abstraction ([`counter_may_abstract`](crate::adapter::btor2::bit_blast::counter_may_abstract)),
+/// then the EXACT engine on the resulting SMALL model. This is the νμ lever for an
+/// FSM-gated-by-counter recoverability target (e.g. i2c's SCL recurrence) that the
+/// bare cube leaves `⊥` because the wide counter blows its state space and the
+/// may-abstracted decrement carries no must-progress.
+///
+/// **Soundness.** b1 replaces each certified counter with a 1-bit `cnt == T` register
+/// whose decrement is a free (may) input — its ONLY added behaviour.
+/// [`ranking_certificate_holds`] certifies each such counter descends to its threshold
+/// from every reachable state, so the abstract "counter expires" step is a genuine
+/// eventuality; and because the gated advance is conditioned on `cnt == T`, the FSM is
+/// held while `cnt ≠ T`, so the abstract single-step expiry and the concrete K-step
+/// descent reach the SAME control state. Hence every abstract `EF good` witness lifts to
+/// a concrete path, and the over-approximating outer `AG` only strengthens a `Holds`
+/// claim. We therefore trust ONLY a `Holds` verdict on the abstract model; a `Violated`
+/// there could be a spurious over-approximation and is mapped to abstain (`None`).
+/// `good_registers` are excluded from abstraction so the property atom never desyncs.
+///
+/// **Detection scope.** [`detect_down_counter`](crate::adapter::btor2::bit_blast::detect_down_counter)
+/// recognises a counter whose stride operates on the raw state nid (hand-authored BTOR2,
+/// clean adapters) and whose expiry gate is `eq/neq(cnt, T)` or `redor(cnt)`. Yosys often
+/// wire-indirects a synchronous counter through an async-reset mux — the decrement reads
+/// `sub(ite(reset, cnt, reset_const), 1)` rather than `sub(cnt, 1)` — so on such lifts the
+/// stride is not yet seen and this rescue abstains (falls through to the cube, never
+/// unsound). A bounded reset-mux "see-through" in the detector is the follow-on that would
+/// extend this to yosys-lifted RTL. Even then, a counter whose reload is gated by a
+/// demonic input (an `ena`/sync that an adversary can hold to stall the descent) has no
+/// ranking certificate — `AG EF good` there genuinely needs a fairness assumption mununu
+/// cannot make, and the abstain is the sound answer.
+fn verify_recoverability_counter_abstracted(
+    file: &crate::adapter::btor2::ast::Btor2File,
+    good: &str,
+    good_registers: &[String],
+) -> Option<PropertyVerdict> {
+    use crate::adapter::btor2::bit_blast::{counter_may_abstract, detect_down_counter};
+    let symbols = crate::adapter::btor2::parser::collect_symbols(file);
+    // Gating down-counters the good atom does NOT read, each with a ranking-certified
+    // descent to its threshold (so its abstract may-expiry is a real eventuality).
+    let counters: Vec<_> = detect_down_counter(file)
+        .into_iter()
+        .filter(|c| {
+            symbols
+                .get(&c.nid)
+                .is_none_or(|s| !good_registers.contains(s))
+        })
+        .filter(|c| {
+            symbols.get(&c.nid).is_some_and(|s| {
+                ranking_certificate_holds(file, std::slice::from_ref(s), Some(c.threshold))
+            })
+        })
+        .collect();
+    if counters.is_empty() {
+        return None;
+    }
+    // Apply b1 to every certified counter (disjoint registers, NIDs preserved).
+    let mut abstracted = file.clone();
+    for c in &counters {
+        abstracted = counter_may_abstract(&abstracted, c)?;
+    }
+    let abstract_src = crate::adapter::btor2::emit::emit_btor2(&abstracted);
+    let formula_str = format!("nu Y. ((mu X. (({good}) || <> X)) && [] Y)");
+    let formula = mu_parser::parse(&formula_str).ok()?;
+    match crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict(&abstract_src, &formula)
+    {
+        Ok(crate::adapter::btor2::symbolic_bitblast::ExactVerdict::Holds) => {
+            Some(PropertyVerdict::Holds)
+        }
+        _ => None,
+    }
+}
+
 /// P2 Slice 1 — decide recoverability `AG EF good` via the **predicate-cube +
 /// `smt-hyper-must`** path, so the νμ property decides beyond the exact engine's
 /// ~40-bit cone cap.
@@ -1032,6 +1105,17 @@ pub fn verify_recoverability_scalable(
         && ranking_certificate_holds(&file, &[counter], Some(threshold))
     {
         return Ok(PropertyVerdict::Holds);
+    }
+
+    // b2 COUNTER-ABSTRACTION RESCUE: when `good` is gated (through an FSM) by one or more
+    // in-cone DOWN-COUNTERS whose descent is ranking-certified, collapse each to its
+    // `{cnt==T}` bit (b1) and decide `AG EF good` with the EXACT engine on the resulting
+    // small model. Handles the FSM-gated-by-counter shape (i2c's SCL recurrence) that the
+    // direct counter-gate rescue above and the bare cube both miss. Sound: only a `Holds`
+    // is trusted (see `verify_recoverability_counter_abstracted`); a non-Holds falls through
+    // to the cube, so this is never less sound than the prior behaviour.
+    if let Some(v) = verify_recoverability_counter_abstracted(&file, good, &good_registers) {
+        return Ok(v);
     }
 
     // Seed predicates = [good] ++ [good register's OTHER control states] ++ extra. The `good`
@@ -3023,5 +3107,111 @@ mod tests {
         assert!(parse_extra_predicate("no_colon").is_err());
         assert!(parse_extra_predicate("n:reg").is_err());
         assert!(parse_extra_predicate("n:reg=notanumber").is_err());
+    }
+
+    // === b2: counter-abstraction recoverability =================================
+
+    /// A `w`-bit down-counter `cnt` (reload 4 at expiry, decrement otherwise) gating a
+    /// 3-state FSM `idle→A→{B|idle}→idle` that advances ONLY when `cnt==0`. When
+    /// `reaches_b` the FSM cycles through `B` (so `AG EF (fsm==2)` HOLDS); otherwise `B`
+    /// is unreachable (so it is VIOLATED). This is the FSM-gated-by-counter shape b2
+    /// targets — the counter gates progress but is not itself the recoverability target.
+    fn fsm_gated_counter(w: usize, reaches_b: bool) -> String {
+        let reload = format!("{:0width$b}", 4, width = w);
+        let dec = format!("{:0width$b}", 1, width = w);
+        let advance_from_a = if reaches_b { 16 } else { 14 }; // A → B, or A → idle
+        format!(
+            r#"
+1 sort bitvec {w}
+2 sort bitvec 2
+3 sort bitvec 1
+4 state 1 cnt
+5 state 2 fsm
+6 const 1 {reload}
+7 const 1 {dec}
+8 zero 1
+9 eq 3 4 8
+10 sub 1 4 7
+11 ite 1 9 6 10
+12 next 1 4 11
+13 init 1 4 6
+14 zero 2
+15 const 2 01
+16 const 2 10
+17 eq 3 5 14
+18 eq 3 5 15
+19 ite 2 18 {advance_from_a} 14
+20 ite 2 17 15 19
+21 ite 2 9 20 5
+22 next 2 5 21
+23 init 2 5 14
+"#
+        )
+    }
+
+    /// b2 SOUNDNESS — on the SMALL (exact-decidable) recoverable model the exact engine
+    /// is the ground-truth oracle (Holds), and b2 must AGREE. This is the differential
+    /// oracle for the counter-abstraction composition.
+    #[test]
+    fn b2_matches_exact_oracle_on_recoverable_fsm() {
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        let small = fsm_gated_counter(3, true);
+        let f = mu_parser::parse("nu Y. ((mu X. ((fsm == 2) || <> X)) && [] Y)").unwrap();
+        // ORACLE: the exact engine decides the small model directly.
+        assert_eq!(
+            exact_symbolic_verdict(&small, &f).expect("exact decides small"),
+            ExactVerdict::Holds,
+            "ground truth: the FSM cycles through B forever"
+        );
+        // b2 on the same model → the same definite verdict.
+        let file = crate::adapter::btor2::parser::parse(&small).unwrap();
+        assert_eq!(
+            verify_recoverability_counter_abstracted(&file, "fsm == 2", &["fsm".to_string()]),
+            Some(PropertyVerdict::Holds),
+            "b2 must agree with the exact oracle"
+        );
+    }
+
+    /// b2 SOUNDNESS — b2 must NEVER fabricate a `Holds`. On the unrecoverable model the
+    /// oracle says Violated; b2 must abstain (`None`), since only a `Holds` on the
+    /// over-approximating abstract model is sound.
+    #[test]
+    fn b2_abstains_on_unrecoverable_fsm_never_fabricates_holds() {
+        use crate::adapter::btor2::symbolic_bitblast::{ExactVerdict, exact_symbolic_verdict};
+        let trap = fsm_gated_counter(3, false);
+        let f = mu_parser::parse("nu Y. ((mu X. ((fsm == 2) || <> X)) && [] Y)").unwrap();
+        // ORACLE: B is unreachable ⇒ AG EF (fsm==2) is Violated.
+        assert_eq!(
+            exact_symbolic_verdict(&trap, &f).expect("exact decides trap"),
+            ExactVerdict::Violated,
+            "ground truth: B is unreachable"
+        );
+        // b2 must NOT return Holds — abstain (the cube then decides Violated).
+        let file = crate::adapter::btor2::parser::parse(&trap).unwrap();
+        assert_eq!(
+            verify_recoverability_counter_abstracted(&file, "fsm == 2", &["fsm".to_string()]),
+            None,
+            "b2 must abstain (never fabricate Holds) on a real Violated"
+        );
+    }
+
+    /// b2 SIZE LEVER — a 40-bit counter puts the exact cone over the bit-blast cap, so
+    /// the exact engine cannot decide it directly; the public escalating entry routes
+    /// through b2, which collapses the counter and decides Holds.
+    #[test]
+    fn b2_decides_wide_counter_gated_recoverability() {
+        use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
+        let wide = fsm_gated_counter(40, true);
+        let f = mu_parser::parse("nu Y. ((mu X. ((fsm == 2) || <> X)) && [] Y)").unwrap();
+        // Guard: the wide counter genuinely exceeds the exact cap (else the test is vacuous).
+        assert!(
+            exact_symbolic_verdict(&wide, &f).is_err(),
+            "the 40-bit counter must exceed the exact bit-cap"
+        );
+        // The escalating public entry (exact → scalable → b2) decides Holds.
+        assert_eq!(
+            verify_recoverability(&wide, "fsm == 2").expect("b2 decides the wide design"),
+            PropertyVerdict::Holds,
+        );
     }
 }

@@ -1909,6 +1909,408 @@ pub(crate) fn onehot_reencode(file: &Btor2File, meta: &OneHotStateMeta) -> Optio
     Some(Btor2File { lines: out, by_nid })
 }
 
+/// b1 — metadata for a counter register the cube path can collapse to a single
+/// `cnt == threshold` bit via a **may-abstraction** (over-approximating the count,
+/// SOUND for the outer ν / AG-safety; the inner-μ must-obligation is discharged
+/// separately by b2's ranking). Unlike [`OneHotStateMeta`] this abstraction is
+/// LOSSY — it must feed the 3-valued / cube engine, never the exact oracle.
+#[derive(Debug, Clone)]
+pub(crate) struct DownCounterMeta {
+    /// BTOR2 NID of the `state` line.
+    pub nid: Nid,
+    /// Bit-vector width of the counter (collapses to 1 bit).
+    pub width: u32,
+    /// The single constant the counter is compared against externally; the
+    /// abstraction predicate is `cnt == threshold` (usually 0 — expiry).
+    pub threshold: u64,
+}
+
+/// b1 detection — counter registers whose only EXTERNAL use is a comparison of `cnt`
+/// against a single threshold `T` (`eq/neq(cnt, T)`, or `redor(cnt)` = `~|cnt` for the
+/// `T = 0` expiry idiom), and whose `next` value path is built ONLY from arithmetic
+/// strides (`add`/`sub` of `cnt` and a constant), holds (`cnt`), reload constants,
+/// opaque reload values that do NOT reference `cnt` (a prescale input, `clk_cnt >> 2`),
+/// and `ite` muxes. SOUND syntactic sufficient condition:
+/// - a stride leaf (`cnt ± k`) or an opaque reload can produce ANY value ⇒ under the
+///   may-abstraction `cnt == T` becomes a free (nondeterministic) bit — a sound
+///   over-approximation;
+/// - requiring ≥1 stride distinguishes a genuine counter from a one-hot (F1) or a
+///   frozen register (a future fold);
+/// - requiring every external use to be a single-threshold comparison guarantees the
+///   1-bit `{cnt==T}` abstraction PRESERVES those uses (multi-threshold / arithmetic
+///   external uses ⇒ abstain, the value would be needed).
+///
+/// Guards/conditions are not walked (like F1). Read-only; `counter_may_abstract`
+/// consumes this.
+pub(crate) fn detect_down_counter(file: &Btor2File) -> Vec<DownCounterMeta> {
+    use crate::adapter::btor2::ast::Op;
+    let mut out = Vec::new();
+    'states: for line in &file.lines {
+        let Node::State { sort, .. } = &line.node else {
+            continue;
+        };
+        let Some(width) = parser::bv_width(file, *sort) else {
+            continue;
+        };
+        if width < 2 {
+            continue;
+        }
+        let cnt = line.nid;
+        let Some(next) = parser::find_next_value_operand(file, cnt) else {
+            continue;
+        };
+
+        // Walk the next-state VALUE path; classify every leaf. Collect the node
+        // set so external-use analysis can exclude the counter's own logic.
+        let mut value_path: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+        let mut has_stride = false;
+        let mut visited: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+        let mut stack = vec![next.nid()];
+        while let Some(nid) = stack.pop() {
+            if !visited.insert(nid) {
+                continue;
+            }
+            value_path.insert(nid);
+            let Some(n) = file.lookup(nid) else {
+                continue 'states;
+            };
+            match &n.node {
+                // Reload / floor constant.
+                Node::Const { .. } => {}
+                // Hold — the counter feeding its own next.
+                Node::State { .. } if nid == cnt => {}
+                // A mux — recurse into THEN/ELSE only (not the condition).
+                Node::Op {
+                    op, args, sort: s, ..
+                } if parser::bv_width(file, *s) == Some(width)
+                    && *op == Op::Ite
+                    && args.len() >= 3 =>
+                {
+                    stack.push(args[1].nid());
+                    stack.push(args[2].nid());
+                }
+                // A stride: `cnt ± k` (k a constant). Operands are NOT pushed — the
+                // count itself is abstracted away, so its value is irrelevant.
+                Node::Op {
+                    op, args, sort: s, ..
+                } if parser::bv_width(file, *s) == Some(width)
+                    && (*op == Op::Add || *op == Op::Sub)
+                    && args.len() == 2 =>
+                {
+                    let (a, b) = (args[0].nid(), args[1].nid());
+                    let one_is_cnt = a == cnt || b == cnt;
+                    let other = if a == cnt { b } else { a };
+                    if one_is_cnt && resolve_btor2_constant(file, other).is_some() {
+                        has_stride = true;
+                    } else {
+                        continue 'states; // stride over another register ⇒ not a simple counter
+                    }
+                }
+                // An OPAQUE reload value that does NOT reference the counter — a prescale
+                // input (`clk_cnt`), a derived reload (`clk_cnt >> 2`), a floor register.
+                // Accepted as a value-path leaf (NOT recursed) and abstracted to a free
+                // may-bit; sound because a free bit over-approximates any reload value.
+                // A node that DOES reference `cnt` but is not a recognised stride/hold ⇒
+                // abstain (it could hide a use we cannot cleanly collapse).
+                other if !node_refs_nid(other, cnt) => {}
+                _ => continue 'states,
+            }
+        }
+        if !has_stride {
+            continue;
+        }
+
+        // External uses — every node DIRECTLY referencing `cnt` that is not part of
+        // the counter's own logic (value path, its `next`/`init` lines, the state
+        // line) must be `eq/neq(cnt, T)` for a single constant `T`.
+        let mut threshold: Option<u64> = None;
+        for l in &file.lines {
+            if l.nid == cnt || value_path.contains(&l.nid) {
+                continue;
+            }
+            match &l.node {
+                Node::Next { state, .. } | Node::Init { state, .. } if *state == cnt => continue,
+                _ => {}
+            }
+            if !node_refs_nid(&l.node, cnt) {
+                continue;
+            }
+            // The external use must be a comparison of `cnt` against a single threshold:
+            // `eq/neq(cnt, T)`, or `redor(cnt)` (the `~|cnt` / `|cnt` idiom = `cnt != 0`,
+            // threshold 0 — the DOMINANT "counter expired" check in RTL).
+            let Node::Op { op, args, .. } = &l.node else {
+                continue 'states;
+            };
+            let t = match op {
+                Op::Redor if args.len() == 1 && args[0].nid() == cnt => 0u64,
+                Op::Eq | Op::Neq if args.len() == 2 => {
+                    let (a, b) = (args[0].nid(), args[1].nid());
+                    let other = if a == cnt {
+                        b
+                    } else if b == cnt {
+                        a
+                    } else {
+                        continue 'states;
+                    };
+                    let Some(t) = resolve_btor2_constant(file, other) else {
+                        continue 'states; // compared to a non-constant (another register) ⇒ abstain
+                    };
+                    t
+                }
+                _ => continue 'states,
+            };
+            match threshold {
+                None => threshold = Some(t),
+                Some(prev) if prev == t => {}
+                Some(_) => continue 'states, // ≥2 distinct thresholds ⇒ abstain
+            }
+        }
+        if let Some(threshold) = threshold {
+            out.push(DownCounterMeta {
+                nid: cnt,
+                width,
+                threshold,
+            });
+        }
+    }
+    out
+}
+
+/// b1 — the may-abstraction rewrite. Collapse the W-bit counter `meta.nid` to a
+/// 1-bit `cnt_z` (`⟺ cnt == threshold`), replacing each arithmetic-stride branch of
+/// its next-state with a FRESH INPUT (a nondeterministic bit ⇒ over-approximating
+/// the count). Holds map to `cnt_z`; reload constants `C` map to the bit `(C == T)`;
+/// external `eq/neq(cnt, T)` reads become `eq/neq(cnt_z, 1)`. Abstains (returns None)
+/// on any unhandled reference to `cnt` — never a partial rewrite.
+///
+/// LOSSY (over-approximation): the result must feed the 3-valued / cube engine, whose
+/// `smt_must_edge` construction reads the free-input stride as a **may-edge**. SOUND for
+/// the outer ν (AG-safety) — holds transfers, a would-be violation on the may-edge falls
+/// to ⊥. NEVER feed to the exact oracle (its 2-valued `Violated` would be unsound).
+pub(crate) fn counter_may_abstract(file: &Btor2File, meta: &DownCounterMeta) -> Option<Btor2File> {
+    use crate::adapter::btor2::ast::{ConstValue, Op, Sort};
+    let cnt = meta.nid;
+    let t = meta.threshold;
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut prelude: Vec<Line> = Vec::new();
+    // 1-bit sort (reuse or create).
+    let bit_sort = file
+        .lines
+        .iter()
+        .find_map(|l| match &l.node {
+            Node::Sort {
+                sort: Sort::BitVec { width },
+            } if *width == 1 => Some(l.nid),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            let n = next_nid;
+            next_nid += 1;
+            prelude.push(Line {
+                nid: n,
+                node: Node::Sort {
+                    sort: Sort::BitVec { width: 1 },
+                },
+                immediates: Vec::new(),
+                source_line: 0,
+            });
+            n
+        });
+    let mut mk_const = |v: i128| -> Nid {
+        let n = next_nid;
+        next_nid += 1;
+        prelude.push(Line {
+            nid: n,
+            node: Node::Const {
+                sort: bit_sort,
+                value: ConstValue::Dec(v),
+            },
+            immediates: Vec::new(),
+            source_line: 0,
+        });
+        n
+    };
+    let const_0 = mk_const(0);
+    let const_1 = mk_const(1);
+    let bit_for = |is_t: bool| Operand(if is_t { const_1 } else { const_0 });
+
+    // Classify the value-path nodes. `may_input` maps a value leaf whose exact value
+    // is abstracted away — a stride (`cnt ± k`) OR an opaque reload (a prescale input) —
+    // to a fresh 1-bit may-bit. `dropped` are the STRIDE nodes only: they reference
+    // `cnt` (soon 1-bit) so must be removed; opaque reloads may be shared and are kept.
+    let next_op = parser::find_next_value_operand(file, cnt)?;
+    let mut may_input: std::collections::HashMap<Nid, Nid> = std::collections::HashMap::new();
+    let mut dropped: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    let mut ite_nodes: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    let fresh_may = |next_nid: &mut Nid, prelude: &mut Vec<Line>| -> Nid {
+        let inp = *next_nid;
+        *next_nid += 1;
+        prelude.push(Line {
+            nid: inp,
+            node: Node::Input {
+                sort: bit_sort,
+                symbol: Some(format!("__cnt{cnt}_may{inp}")),
+            },
+            immediates: Vec::new(),
+            source_line: 0,
+        });
+        inp
+    };
+    {
+        let mut vis: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+        let mut st = vec![next_op.nid()];
+        while let Some(nid) = st.pop() {
+            if !vis.insert(nid) {
+                continue;
+            }
+            let n = file.lookup(nid)?;
+            match &n.node {
+                Node::Const { .. } => {}
+                Node::State { .. } if nid == cnt => {}
+                Node::Op { op, args, sort, .. }
+                    if parser::bv_width(file, *sort) == Some(meta.width)
+                        && *op == Op::Ite
+                        && args.len() >= 3 =>
+                {
+                    ite_nodes.insert(nid);
+                    st.push(args[1].nid());
+                    st.push(args[2].nid());
+                }
+                Node::Op { op, args, sort, .. }
+                    if parser::bv_width(file, *sort) == Some(meta.width)
+                        && (*op == Op::Add || *op == Op::Sub)
+                        && args.len() == 2 =>
+                {
+                    // A stride ⇒ a fresh may-bit; the node references cnt ⇒ drop it.
+                    let inp = fresh_may(&mut next_nid, &mut prelude);
+                    may_input.insert(nid, inp);
+                    dropped.insert(nid);
+                }
+                other if !node_refs_nid(other, cnt) => {
+                    // An opaque reload value (prescale input, floor register) ⇒ a fresh
+                    // may-bit. KEEP the node (it may be shared with other logic).
+                    let inp = fresh_may(&mut next_nid, &mut prelude);
+                    may_input.insert(nid, inp);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    // Map a value operand to its 1-bit abstraction.
+    let rewire_val = |o: &Operand| -> Option<Operand> {
+        let n = o.nid();
+        if n == cnt {
+            Some(Operand(cnt)) // hold
+        } else if let Some(&inp) = may_input.get(&n) {
+            Some(Operand(inp)) // stride / opaque reload → may-bit
+        } else if ite_nodes.contains(&n) {
+            Some(Operand(n)) // nested ite (rewritten in place)
+        } else {
+            // reload constant → (C == T); anything else is unhandled.
+            resolve_btor2_constant(file, n).map(|c| bit_for(c == t))
+        }
+    };
+
+    let mut out: Vec<Line> = Vec::with_capacity(file.lines.len() + prelude.len());
+    out.extend(prelude);
+    for line in &file.lines {
+        let nid = line.nid;
+        // Drop the stride nodes — replaced by fresh may-bits.
+        if dropped.contains(&nid) {
+            continue;
+        }
+        let node = match &line.node {
+            Node::State { symbol, .. } if nid == cnt => Node::State {
+                sort: bit_sort,
+                symbol: symbol.clone(),
+            },
+            Node::Init { state, value, .. } if *state == cnt => {
+                let c = resolve_btor2_constant(file, value.nid())?;
+                Node::Init {
+                    sort: bit_sort,
+                    state: cnt,
+                    value: bit_for(c == t),
+                }
+            }
+            Node::Next { state, value, .. } if *state == cnt => Node::Next {
+                sort: bit_sort,
+                state: cnt,
+                value: rewire_val(value)?,
+            },
+            // A value-path `ite`: sort → 1, operands remapped (condition unchanged).
+            Node::Op {
+                op: Op::Ite,
+                args,
+                symbol,
+                ..
+            } if ite_nodes.contains(&nid) => {
+                if args.len() < 3 {
+                    return None;
+                }
+                Node::Op {
+                    op: Op::Ite,
+                    sort: bit_sort,
+                    args: vec![args[0], rewire_val(&args[1])?, rewire_val(&args[2])?],
+                    symbol: symbol.clone(),
+                }
+            }
+            // External `redor(cnt)` (= `cnt != 0`, the `~|cnt` gate) → `not(cnt)` (= `!cnt_z`;
+            // valid because `redor` fixes the threshold at 0, so `cnt_z ⟺ cnt == 0`).
+            Node::Op {
+                op: Op::Redor,
+                args,
+                symbol,
+                sort,
+            } if args.len() == 1 && args[0].nid() == cnt => {
+                if t != 0 {
+                    return None;
+                }
+                Node::Op {
+                    op: Op::Not,
+                    sort: *sort,
+                    args: vec![Operand(cnt)],
+                    symbol: symbol.clone(),
+                }
+            }
+            // External `eq/neq(cnt, T)` → `eq/neq(cnt, 1)` (cnt is now the `==T` bit).
+            Node::Op {
+                op: op @ (Op::Eq | Op::Neq),
+                args,
+                symbol,
+                sort,
+            } if args.iter().any(|a| a.nid() == cnt) => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let new_args = if args[0].nid() == cnt {
+                    vec![Operand(cnt), Operand(const_1)]
+                } else {
+                    vec![Operand(const_1), Operand(cnt)]
+                };
+                Node::Op {
+                    op: *op,
+                    sort: *sort,
+                    args: new_args,
+                    symbol: symbol.clone(),
+                }
+            }
+            // Any OTHER reference to cnt ⇒ abstain.
+            other if node_refs_nid(other, cnt) => return None,
+            other => other.clone(),
+        };
+        out.push(Line {
+            nid,
+            node,
+            immediates: line.immediates.clone(),
+            source_line: line.source_line,
+        });
+    }
+    let by_nid = out.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
+    Some(Btor2File { lines: out, by_nid })
+}
+
 /// §Phase 10 §10.2 stage 1 — validate detected memory cells against
 /// the sidecar's `memories[]` declarations. Returns Ok when every
 /// detected memory has a matching sidecar entry with matching
@@ -6014,6 +6416,216 @@ mod tests {
                 vo, vr,
                 "re-encode changed the verdict for `{prop}`: {vo:?} vs {vr:?}"
             );
+        }
+    }
+
+    /// b1 — a 3-bit down-counter `cnt` (reload 4 at expiry, decrement otherwise)
+    /// gating a 1-bit `phase` toggle. Detection must find the COUNTER (a `sub`
+    /// stride on its value path + only `eq(cnt, 0)` external uses) and REJECT
+    /// `phase` (a `not` on its value path — not an arithmetic counter).
+    const GATED_PHASE_COUNTER: &str = r#"
+1 sort bitvec 3
+2 sort bitvec 1
+3 state 1 cnt
+4 state 2 phase
+5 const 1 100
+6 const 1 001
+7 zero 1
+8 zero 2
+9 eq 2 3 7
+10 sub 1 3 6
+11 ite 1 9 5 10
+12 next 1 3 11
+13 init 1 3 5
+14 not 2 4
+15 ite 2 9 14 4
+16 next 2 4 15
+17 init 2 4 8
+"#;
+
+    #[test]
+    fn detect_down_counter_finds_gated_counter_rejects_toggle() {
+        use crate::adapter::btor2::parser::parse;
+        let file = parse(GATED_PHASE_COUNTER).expect("parses");
+        let cs = detect_down_counter(&file);
+        assert_eq!(cs.len(), 1, "only cnt is a counter, not phase: {cs:?}");
+        assert_eq!(cs[0].nid, 3);
+        assert_eq!(cs[0].width, 3);
+        assert_eq!(cs[0].threshold, 0, "compared only against cnt == 0");
+    }
+
+    /// b1 SOUNDNESS DIFFERENTIAL — the may-abstraction must **simulate** the
+    /// concrete model (over-approximation): for every concrete step
+    /// `c → c'`, there is a choice of the fresh may-input under which the
+    /// abstract model steps `α(c) → α(c')`, where `α` maps `cnt ↦ (cnt == T)`
+    /// and leaves other registers untouched. Simulation ⇒ every universal
+    /// (ν / AG-safety) property that holds on the abstract model holds on the
+    /// concrete one — the direction b1 claims. A rewrite bug (wrong reload
+    /// constant, dropped edge, inverted threshold) breaks the simulation here.
+    #[test]
+    fn counter_may_abstract_simulates_concrete_sound_overapprox() {
+        use crate::adapter::btor2::parser::parse;
+        use std::collections::HashMap;
+        let concrete = parse(GATED_PHASE_COUNTER).expect("parses");
+        let meta = &detect_down_counter(&concrete)[0];
+        let abstract_file = counter_may_abstract(&concrete, meta).expect("abstractable");
+
+        // cnt collapsed 3 → 1 bit; phase unchanged.
+        let cnt_w = abstract_file.lines.iter().find_map(|l| match &l.node {
+            Node::State { sort, .. } if l.nid == 3 => parser::bv_width(&abstract_file, *sort),
+            _ => None,
+        });
+        assert_eq!(cnt_w, Some(1), "cnt re-encoded to the {{==0}} bit");
+
+        // Re-parse the serialized abstract model + collect the may-input symbol(s).
+        let abstract_src = crate::adapter::btor2::emit::emit_btor2(&abstract_file);
+        let abstract_re = parse(&abstract_src).expect("abstract re-parses");
+        let may_syms: Vec<String> = abstract_re
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::Input {
+                    symbol: Some(s), ..
+                } if s.starts_with("__cnt") => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!may_syms.is_empty(), "the stride became a may-input");
+
+        let alpha = |cnt: u128| -> u128 { if cnt == meta.threshold as u128 { 1 } else { 0 } };
+        // Exhaustive: every concrete (cnt, phase). The counter is autonomous
+        // (no primary inputs), so the abstract model's only inputs are may-inputs.
+        for cnt in 0..(1u128 << meta.width) {
+            for phase in 0..2u128 {
+                let cregs = HashMap::from([("cnt".to_string(), cnt), ("phase".to_string(), phase)]);
+                let cnext =
+                    simulate_one_step(&concrete, &cregs, &HashMap::new()).expect("concrete step");
+                let want_cnt = alpha(cnext["cnt"]);
+                let want_phase = cnext["phase"];
+
+                // ∃ may-input choice reproducing α(c') in the abstract model.
+                let mut matched = false;
+                for may in 0..(1u128 << may_syms.len()) {
+                    let aregs = HashMap::from([
+                        ("cnt".to_string(), alpha(cnt)),
+                        ("phase".to_string(), phase),
+                    ]);
+                    let ainps: HashMap<String, u128> = may_syms
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (s.clone(), (may >> i) & 1))
+                        .collect();
+                    let anext =
+                        simulate_one_step(&abstract_re, &aregs, &ainps).expect("abstract step");
+                    if anext["cnt"] == want_cnt && anext["phase"] == want_phase {
+                        matched = true;
+                        break;
+                    }
+                }
+                assert!(
+                    matched,
+                    "no abstract step simulates concrete cnt={cnt} phase={phase} \
+                     → (cnt'={}, phase'={want_phase}); abstraction is NOT a sound \
+                     over-approximation",
+                    cnext["cnt"]
+                );
+            }
+        }
+    }
+
+    /// b1 GENERALIZED — the DOMINANT real-RTL counter idiom: an INPUT reload value
+    /// (`rld`, a prescale register/input) and a `redor(cnt)` (`~|cnt`) expiry gate.
+    /// Detection must find it (the const-reload/`eq`-gate form is essentially
+    /// synthetic-only), and the may-abstraction must still SIMULATE the concrete model.
+    #[test]
+    fn counter_may_abstract_generalized_input_reload_redor_gate() {
+        use crate::adapter::btor2::parser::parse;
+        use std::collections::HashMap;
+        // cnt: `~|cnt ? reload(rld) : cnt-1` (redor gate + INPUT reload); phase toggles
+        // at expiry (cnt==0). rld is a 3-bit input; the redor node (9) gates both.
+        let src = r#"
+1 sort bitvec 3
+2 sort bitvec 1
+3 state 1 cnt
+4 state 2 phase
+5 input 1 rld
+6 const 1 001
+7 const 1 100
+8 zero 2
+9 redor 2 3
+10 sub 1 3 6
+11 ite 1 9 10 5
+12 next 1 3 11
+13 init 1 3 7
+14 not 2 9
+15 not 2 4
+16 ite 2 14 15 4
+17 next 2 4 16
+18 init 2 4 8
+"#;
+        let concrete = parse(src).expect("parses");
+        let cs = detect_down_counter(&concrete);
+        assert_eq!(
+            cs.len(),
+            1,
+            "input-reload + redor-gated counter must be detected: {cs:?}"
+        );
+        assert_eq!(cs[0].nid, 3);
+        assert_eq!(cs[0].threshold, 0, "redor(cnt) fixes the threshold at 0");
+        let ab = counter_may_abstract(&concrete, &cs[0]).expect("abstractable");
+        let cnt_w = ab.lines.iter().find_map(|l| match &l.node {
+            Node::State { sort, .. } if l.nid == 3 => parser::bv_width(&ab, *sort),
+            _ => None,
+        });
+        assert_eq!(cnt_w, Some(1));
+        let ab_src = crate::adapter::btor2::emit::emit_btor2(&ab);
+        let ab_re = parse(&ab_src).expect("abstract re-parses");
+        let may: Vec<String> = ab_re
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::Input {
+                    symbol: Some(s), ..
+                } if s.starts_with("__cnt") => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let alpha = |c: u128| if c == 0 { 1 } else { 0 };
+        // Exhaustive over concrete (cnt, phase, rld input); ∃ may-input reproduces α(c').
+        for cnt in 0..8u128 {
+            for phase in 0..2u128 {
+                for rld in 0..8u128 {
+                    let cregs =
+                        HashMap::from([("cnt".to_string(), cnt), ("phase".to_string(), phase)]);
+                    let cinps = HashMap::from([("rld".to_string(), rld)]);
+                    let cnext =
+                        simulate_one_step(&concrete, &cregs, &cinps).expect("concrete step");
+                    let (want_cnt, want_phase) = (alpha(cnext["cnt"]), cnext["phase"]);
+                    let mut matched = false;
+                    for m in 0..(1u128 << may.len()) {
+                        let aregs = HashMap::from([
+                            ("cnt".to_string(), alpha(cnt)),
+                            ("phase".to_string(), phase),
+                        ]);
+                        let mut ainps: HashMap<String, u128> = may
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| (s.clone(), (m >> i) & 1))
+                            .collect();
+                        ainps.insert("rld".to_string(), rld); // kept but dead in the abstract
+                        let anext =
+                            simulate_one_step(&ab_re, &aregs, &ainps).expect("abstract step");
+                        if anext["cnt"] == want_cnt && anext["phase"] == want_phase {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    assert!(
+                        matched,
+                        "no abstract step simulates cnt={cnt} phase={phase} rld={rld}"
+                    );
+                }
+            }
         }
     }
 
