@@ -1925,6 +1925,48 @@ pub(crate) struct DownCounterMeta {
     pub threshold: u64,
 }
 
+/// Every NID used as an operand anywhere (Op args, next/init state+value, bad/output/
+/// constraint/fair/justice signals). A NID absent from this set is DEAD — no node reads
+/// it and it drives no property — so it cannot affect any verdict (the cone-of-influence
+/// would drop it). Used to ignore yosys's named observable copies (`uext(cnt, 0)` named
+/// `…cnt`) that would otherwise trip the counter's external-use guard.
+fn collect_referenced(file: &Btor2File) -> std::collections::HashSet<Nid> {
+    let mut work = Vec::new();
+    for l in &file.lines {
+        push_operand_nids(&l.node, &mut work);
+    }
+    work.into_iter().collect()
+}
+
+/// The reset-mux aliases of a counter state `cnt`: `cnt` itself plus every wire
+/// `ite(cond, cnt, const)` / `ite(cond, const, cnt)`. Yosys lowers an async-reset
+/// register so its value reaches arithmetic / comparisons through a mux forcing the
+/// reset constant on one branch (`sub(ite(arst_n, cnt, 0), 1)`, `redor(ite(arst_n,
+/// cnt, 0))`). Such a wire behaves as `cnt` for the counter's stride and threshold
+/// comparisons, and — being a value-path `ite` — abstracts to `ite(cond, cnt_z,
+/// const==T)`, a faithful `(alias == T)` bit. One level of mux (the async-reset
+/// idiom); deeper nests fall back to the raw-nid pattern.
+fn reset_mux_aliases(file: &Btor2File, cnt: Nid) -> std::collections::HashSet<Nid> {
+    use crate::adapter::btor2::ast::Op;
+    let mut aliases = std::collections::HashSet::new();
+    aliases.insert(cnt);
+    for l in &file.lines {
+        if let Node::Op {
+            op: Op::Ite, args, ..
+        } = &l.node
+            && args.len() >= 3
+        {
+            let (then, els) = (args[1].nid(), args[2].nid());
+            let one_is_cnt = then == cnt || els == cnt;
+            let other = if then == cnt { els } else { then };
+            if one_is_cnt && resolve_btor2_constant(file, other).is_some() {
+                aliases.insert(l.nid);
+            }
+        }
+    }
+    aliases
+}
+
 /// b1 detection — counter registers whose only EXTERNAL use is a comparison of `cnt`
 /// against a single threshold `T` (`eq/neq(cnt, T)`, or `redor(cnt)` = `~|cnt` for the
 /// `T = 0` expiry idiom), and whose `next` value path is built ONLY from arithmetic
@@ -1944,6 +1986,7 @@ pub(crate) struct DownCounterMeta {
 /// consumes this.
 pub(crate) fn detect_down_counter(file: &Btor2File) -> Vec<DownCounterMeta> {
     use crate::adapter::btor2::ast::Op;
+    let referenced = collect_referenced(file);
     let mut out = Vec::new();
     'states: for line in &file.lines {
         let Node::State { sort, .. } = &line.node else {
@@ -1959,6 +2002,12 @@ pub(crate) fn detect_down_counter(file: &Btor2File) -> Vec<DownCounterMeta> {
         let Some(next) = parser::find_next_value_operand(file, cnt) else {
             continue;
         };
+        // Reset-mux aliases: `cnt` plus every wire `ite(cond, cnt, const)` — yosys's
+        // async-reset lowering, where the counter's value reaches its stride and expiry
+        // comparison through a mux that forces a constant (the reset value) on one
+        // branch. A stride / comparison on such an alias is a stride / comparison on cnt.
+        let aliases = reset_mux_aliases(file, cnt);
+        let is_alias = |o: Nid| aliases.contains(&o);
 
         // Walk the next-state VALUE path; classify every leaf. Collect the node
         // set so external-use analysis can exclude the counter's own logic.
@@ -1989,8 +2038,9 @@ pub(crate) fn detect_down_counter(file: &Btor2File) -> Vec<DownCounterMeta> {
                     stack.push(args[1].nid());
                     stack.push(args[2].nid());
                 }
-                // A stride: `cnt ± k` (k a constant). Operands are NOT pushed — the
-                // count itself is abstracted away, so its value is irrelevant.
+                // A stride: `alias ± k` (k a constant), where `alias` is `cnt` or a
+                // reset-mux wire of `cnt`. Operands are NOT pushed — the count itself is
+                // abstracted away, so its value is irrelevant.
                 Node::Op {
                     op, args, sort: s, ..
                 } if parser::bv_width(file, *s) == Some(width)
@@ -1998,8 +2048,8 @@ pub(crate) fn detect_down_counter(file: &Btor2File) -> Vec<DownCounterMeta> {
                     && args.len() == 2 =>
                 {
                     let (a, b) = (args[0].nid(), args[1].nid());
-                    let one_is_cnt = a == cnt || b == cnt;
-                    let other = if a == cnt { b } else { a };
+                    let one_is_cnt = is_alias(a) || is_alias(b);
+                    let other = if is_alias(a) { b } else { a };
                     if one_is_cnt && resolve_btor2_constant(file, other).is_some() {
                         has_stride = true;
                     } else {
@@ -2020,34 +2070,41 @@ pub(crate) fn detect_down_counter(file: &Btor2File) -> Vec<DownCounterMeta> {
             continue;
         }
 
-        // External uses — every node DIRECTLY referencing `cnt` that is not part of
-        // the counter's own logic (value path, its `next`/`init` lines, the state
-        // line) must be `eq/neq(cnt, T)` for a single constant `T`.
+        // External uses — every node referencing `cnt` OR a reset-mux alias that is not
+        // part of the counter's own logic (value path, its `next`/`init` lines, the
+        // state line, the alias reset-mux wires) must be a single-threshold comparison:
+        // `eq/neq(·, T)`, or `redor(·)` (the `~|cnt` / `|cnt` idiom = `· != 0`,
+        // threshold 0 — the DOMINANT "counter expired" check in RTL).
         let mut threshold: Option<u64> = None;
         for l in &file.lines {
-            if l.nid == cnt || value_path.contains(&l.nid) {
+            if is_alias(l.nid) || value_path.contains(&l.nid) {
+                continue;
+            }
+            // A DEAD value node (an `Op` nothing reads) cannot affect the verdict — skip
+            // it. Ignores yosys's named observable copies of the counter. Structural
+            // nodes (Next/Init/Bad/Output) are never operands but ARE load-bearing, so
+            // they are NOT skipped here — a Next feeding cnt's value into another register
+            // or a Bad reading it must still trip the abstain below.
+            if matches!(l.node, Node::Op { .. }) && !referenced.contains(&l.nid) {
                 continue;
             }
             match &l.node {
                 Node::Next { state, .. } | Node::Init { state, .. } if *state == cnt => continue,
                 _ => {}
             }
-            if !node_refs_nid(&l.node, cnt) {
+            if !aliases.iter().any(|&a| node_refs_nid(&l.node, a)) {
                 continue;
             }
-            // The external use must be a comparison of `cnt` against a single threshold:
-            // `eq/neq(cnt, T)`, or `redor(cnt)` (the `~|cnt` / `|cnt` idiom = `cnt != 0`,
-            // threshold 0 — the DOMINANT "counter expired" check in RTL).
             let Node::Op { op, args, .. } = &l.node else {
                 continue 'states;
             };
             let t = match op {
-                Op::Redor if args.len() == 1 && args[0].nid() == cnt => 0u64,
+                Op::Redor if args.len() == 1 && is_alias(args[0].nid()) => 0u64,
                 Op::Eq | Op::Neq if args.len() == 2 => {
                     let (a, b) = (args[0].nid(), args[1].nid());
-                    let other = if a == cnt {
+                    let other = if is_alias(a) {
                         b
-                    } else if b == cnt {
+                    } else if is_alias(b) {
                         a
                     } else {
                         continue 'states;
@@ -2091,6 +2148,12 @@ pub(crate) fn counter_may_abstract(file: &Btor2File, meta: &DownCounterMeta) -> 
     use crate::adapter::btor2::ast::{ConstValue, Op, Sort};
     let cnt = meta.nid;
     let t = meta.threshold;
+    // The reset-mux aliases (`cnt` + `ite(cond, cnt, const)` wires). Comparisons on an
+    // alias are rewritten like comparisons on `cnt`; the alias reset-mux ites are
+    // themselves value-path ites rewritten to `ite(cond, cnt_z, const==T)`.
+    let aliases = reset_mux_aliases(file, cnt);
+    let is_alias = |o: Nid| aliases.contains(&o);
+    let referenced = collect_referenced(file);
 
     let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
     let mut prelude: Vec<Line> = Vec::new();
@@ -2221,6 +2284,17 @@ pub(crate) fn counter_may_abstract(file: &Btor2File, meta: &DownCounterMeta) -> 
         if dropped.contains(&nid) {
             continue;
         }
+        // Drop a DEAD value node that reads cnt/an alias (a yosys observable copy like
+        // `uext(cnt, 0)` named `…cnt`): nothing reads it, so removing it is sound and
+        // avoids re-typing a now-1-bit operand it would otherwise carry at full width.
+        // Only `Op` value nodes qualify — Next/Init/Bad/Output are structural (never
+        // referenced as operands, but load-bearing) and must NOT be dropped.
+        if matches!(line.node, Node::Op { .. })
+            && !referenced.contains(&nid)
+            && aliases.iter().any(|&a| node_refs_nid(&line.node, a))
+        {
+            continue;
+        }
         let node = match &line.node {
             Node::State { symbol, .. } if nid == cnt => Node::State {
                 sort: bit_sort,
@@ -2239,13 +2313,16 @@ pub(crate) fn counter_may_abstract(file: &Btor2File, meta: &DownCounterMeta) -> 
                 state: cnt,
                 value: rewire_val(value)?,
             },
-            // A value-path `ite`: sort → 1, operands remapped (condition unchanged).
+            // A value-path `ite` OR a reset-mux alias wire `ite(cond, cnt, const)`: sort → 1,
+            // operands remapped (condition unchanged). Covering aliases here (even when not
+            // on the value path — e.g. used only by the expiry gate) keeps them well-typed
+            // and off the abstain guard.
             Node::Op {
                 op: Op::Ite,
                 args,
                 symbol,
                 ..
-            } if ite_nodes.contains(&nid) => {
+            } if ite_nodes.contains(&nid) || (is_alias(nid) && nid != cnt) => {
                 if args.len() < 3 {
                     return None;
                 }
@@ -2256,38 +2333,39 @@ pub(crate) fn counter_may_abstract(file: &Btor2File, meta: &DownCounterMeta) -> 
                     symbol: symbol.clone(),
                 }
             }
-            // External `redor(cnt)` (= `cnt != 0`, the `~|cnt` gate) → `not(cnt)` (= `!cnt_z`;
-            // valid because `redor` fixes the threshold at 0, so `cnt_z ⟺ cnt == 0`).
+            // External `redor(alias)` (= `alias != 0`, the `~|cnt` gate) → `not(alias)`
+            // (= `!(alias==T)`; valid because `redor` fixes the threshold at 0, and the
+            // alias node holds the `(alias == T)` bit after abstraction).
             Node::Op {
                 op: Op::Redor,
                 args,
                 symbol,
                 sort,
-            } if args.len() == 1 && args[0].nid() == cnt => {
+            } if args.len() == 1 && is_alias(args[0].nid()) => {
                 if t != 0 {
                     return None;
                 }
                 Node::Op {
                     op: Op::Not,
                     sort: *sort,
-                    args: vec![Operand(cnt)],
+                    args: vec![args[0]],
                     symbol: symbol.clone(),
                 }
             }
-            // External `eq/neq(cnt, T)` → `eq/neq(cnt, 1)` (cnt is now the `==T` bit).
+            // External `eq/neq(alias, T)` → `eq/neq(alias, 1)` (the alias is now the `==T` bit).
             Node::Op {
                 op: op @ (Op::Eq | Op::Neq),
                 args,
                 symbol,
                 sort,
-            } if args.iter().any(|a| a.nid() == cnt) => {
+            } if args.iter().any(|a| is_alias(a.nid())) => {
                 if args.len() != 2 {
                     return None;
                 }
-                let new_args = if args[0].nid() == cnt {
-                    vec![Operand(cnt), Operand(const_1)]
+                let new_args = if is_alias(args[0].nid()) {
+                    vec![args[0], Operand(const_1)]
                 } else {
-                    vec![Operand(const_1), Operand(cnt)]
+                    vec![Operand(const_1), args[1]]
                 };
                 Node::Op {
                     op: *op,
@@ -2296,8 +2374,8 @@ pub(crate) fn counter_may_abstract(file: &Btor2File, meta: &DownCounterMeta) -> 
                     symbol: symbol.clone(),
                 }
             }
-            // Any OTHER reference to cnt ⇒ abstain.
-            other if node_refs_nid(other, cnt) => return None,
+            // Any OTHER reference to cnt or an alias ⇒ abstain.
+            other if aliases.iter().any(|&a| node_refs_nid(other, a)) => return None,
             other => other.clone(),
         };
         out.push(Line {
@@ -6624,6 +6702,111 @@ mod tests {
                         matched,
                         "no abstract step simulates cnt={cnt} phase={phase} rld={rld}"
                     );
+                }
+            }
+        }
+    }
+
+    /// b1 RESET-MUX SEE-THROUGH — the yosys async-reset lowering, where the counter's
+    /// value reaches its stride AND its expiry gate through a mux `ite(arst, cnt, 0)`
+    /// (i2c's clock divider, nid 143: `sub(ite(arst,143,0),1)` + `redor(ite(arst,143,0))`).
+    /// Detection must see the counter through the alias, and the may-abstraction must
+    /// still SIMULATE the concrete model (α maps `cnt ↦ cnt==0`).
+    #[test]
+    fn counter_may_abstract_reset_mux_alias_detects_and_simulates() {
+        use crate::adapter::btor2::parser::parse;
+        use std::collections::HashMap;
+        // mux = arst ? cnt : 0 (the reset-mux alias, node 11); the decrement (14) and the
+        // expiry gate (12 = redor(mux)) both read the ALIAS, not raw cnt. next(cnt) =
+        // arst ? (expired ? rld : mux-1) : 0. phase toggles at expiry.
+        let src = r#"
+1 sort bitvec 3
+2 sort bitvec 1
+3 state 1 cnt
+4 state 2 phase
+5 input 2 arst
+6 input 1 rld
+7 const 1 001
+8 zero 1
+9 zero 2
+10 const 1 100
+11 ite 1 5 3 8
+12 redor 2 11
+13 not 2 12
+14 sub 1 11 7
+15 ite 1 13 6 14
+16 ite 1 5 15 8
+17 next 1 3 16
+18 init 1 3 10
+19 not 2 4
+20 ite 2 13 19 4
+21 next 2 4 20
+22 init 2 4 9
+"#;
+        let concrete = parse(src).expect("parses");
+        let cs = detect_down_counter(&concrete);
+        assert_eq!(
+            cs.len(),
+            1,
+            "the counter must be detected THROUGH the reset-mux alias: {cs:?}"
+        );
+        assert_eq!(cs[0].nid, 3);
+        assert_eq!(cs[0].threshold, 0, "redor(mux) fixes threshold 0");
+        let ab = counter_may_abstract(&concrete, &cs[0]).expect("abstractable");
+        let cnt_w = ab.lines.iter().find_map(|l| match &l.node {
+            Node::State { sort, .. } if l.nid == 3 => parser::bv_width(&ab, *sort),
+            _ => None,
+        });
+        assert_eq!(cnt_w, Some(1));
+        let ab_re = parse(&crate::adapter::btor2::emit::emit_btor2(&ab)).expect("re-parses");
+        let may: Vec<String> = ab_re
+            .lines
+            .iter()
+            .filter_map(|l| match &l.node {
+                Node::Input {
+                    symbol: Some(s), ..
+                } if s.starts_with("__cnt") => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let alpha = |c: u128| if c == 0 { 1 } else { 0 };
+        // Exhaustive over concrete (cnt, phase, arst, rld); ∃ may-input reproduces α(c').
+        for cnt in 0..8u128 {
+            for phase in 0..2u128 {
+                for arst in 0..2u128 {
+                    for rld in 0..8u128 {
+                        let cregs =
+                            HashMap::from([("cnt".to_string(), cnt), ("phase".to_string(), phase)]);
+                        let cinps =
+                            HashMap::from([("arst".to_string(), arst), ("rld".to_string(), rld)]);
+                        let cnext =
+                            simulate_one_step(&concrete, &cregs, &cinps).expect("concrete step");
+                        let (want_cnt, want_phase) = (alpha(cnext["cnt"]), cnext["phase"]);
+                        let mut matched = false;
+                        for m in 0..(1u128 << may.len()) {
+                            let aregs = HashMap::from([
+                                ("cnt".to_string(), alpha(cnt)),
+                                ("phase".to_string(), phase),
+                            ]);
+                            let mut ainps: HashMap<String, u128> = may
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| (s.clone(), (m >> i) & 1))
+                                .collect();
+                            ainps.insert("arst".to_string(), arst);
+                            ainps.insert("rld".to_string(), rld);
+                            let anext =
+                                simulate_one_step(&ab_re, &aregs, &ainps).expect("abstract step");
+                            if anext["cnt"] == want_cnt && anext["phase"] == want_phase {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        assert!(
+                            matched,
+                            "no abstract step simulates cnt={cnt} phase={phase} arst={arst} rld={rld}"
+                        );
+                    }
                 }
             }
         }
