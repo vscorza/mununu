@@ -1579,6 +1579,336 @@ pub(crate) fn detect_btor2_memories(file: &Btor2File) -> Vec<MemoryCellMeta> {
     out
 }
 
+/// F1 — metadata for a provably one-hot state register (a candidate for enum
+/// re-encoding: `W` bits → `⌈log₂K⌉` bits, a bijection on the reachable states ⇒
+/// verdict-preserving). Consumed by the (future) enum re-encode pass; the detection
+/// itself is read-only.
+#[derive(Debug, Clone)]
+pub(crate) struct OneHotStateMeta {
+    /// BTOR2 NID of the `state` line.
+    pub nid: Nid,
+    /// Bit-vector width of the register — the bits an enum re-encode compresses to
+    /// `⌈log₂ values.len()⌉`.
+    pub width: u32,
+    /// The distinct one-hot values the register can hold (its enum domain),
+    /// ascending; always includes the init value.
+    pub values: Vec<u64>,
+}
+
+/// The `init` value operand of a state cell (`None` if the state has no `init` line).
+fn init_value_of(file: &Btor2File, state_nid: Nid) -> Option<crate::adapter::btor2::ast::Operand> {
+    file.lines.iter().find_map(|l| match &l.node {
+        Node::Init { state, value, .. } if *state == state_nid => Some(*value),
+        _ => None,
+    })
+}
+
+/// F1 detection — state registers that are provably ONE-HOT: their `init` and every
+/// value their `next` logic can WRITE are one-hot constants (popcount ≤ 1). SOUND
+/// syntactic sufficient condition: walk only the next-state VALUE path (the `ite`
+/// then/else chain, NOT the conditions) — every value node must be a one-hot `Const`,
+/// the register itself (a hold), or another `ite`. Anything else on the value path
+/// (an `add`/`or`/`shift`, or a copy of a different register) could yield a non-one-hot
+/// value, so the register is conservatively EXCLUDED. Guards may freely reference other
+/// registers (they are not on the value path). Read-only; the re-encode consumes this.
+pub(crate) fn detect_onehot_states(file: &Btor2File) -> Vec<OneHotStateMeta> {
+    use crate::adapter::btor2::ast::Op;
+    let mut out = Vec::new();
+    for line in &file.lines {
+        let Node::State { sort, .. } = &line.node else {
+            continue;
+        };
+        // bitvec sort only, and wide enough that an enum re-encode saves bits.
+        let Some(width) = parser::bv_width(file, *sort) else {
+            continue;
+        };
+        if width < 3 {
+            continue;
+        }
+        let state_nid = line.nid;
+        // init must be a one-hot constant (an un-init / non-constant init could power
+        // up non-one-hot — conservatively skip).
+        let Some(init_v) =
+            init_value_of(file, state_nid).and_then(|op| resolve_btor2_constant(file, op.nid()))
+        else {
+            continue;
+        };
+        if init_v.count_ones() > 1 {
+            continue;
+        }
+        let Some(next) = parser::find_next_value_operand(file, state_nid) else {
+            continue;
+        };
+        let mut values: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        values.insert(init_v);
+        let mut ok = true;
+        let mut visited: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+        let mut stack = vec![next.nid()];
+        while let Some(nid) = stack.pop() {
+            if !visited.insert(nid) {
+                continue;
+            }
+            let Some(n) = file.lookup(nid) else {
+                ok = false;
+                break;
+            };
+            match &n.node {
+                // A one-hot constant leaf on the value path.
+                Node::Const { sort, .. } if parser::bv_width(file, *sort) == Some(width) => {
+                    let Some(v) = resolve_btor2_constant(file, nid) else {
+                        ok = false;
+                        break;
+                    };
+                    if v.count_ones() > 1 {
+                        ok = false;
+                        break;
+                    }
+                    values.insert(v);
+                }
+                // A hold (the register feeding its own next).
+                Node::State { .. } if nid == state_nid => {}
+                // A mux selecting among values — recurse into THEN/ELSE only (args[1],
+                // args[2]); the condition (args[0]) is guard logic, not a written value.
+                Node::Op { op, args, sort, .. }
+                    if parser::bv_width(file, *sort) == Some(width)
+                        && *op == Op::Ite
+                        && args.len() >= 3 =>
+                {
+                    stack.push(args[1].nid());
+                    stack.push(args[2].nid());
+                }
+                // Any other same-width value on the path ⇒ not provably one-hot.
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && values.len() >= 2 {
+            out.push(OneHotStateMeta {
+                nid: state_nid,
+                width,
+                values: values.into_iter().collect(),
+            });
+        }
+    }
+    out
+}
+
+/// Does `node` reference `target` as an operand?
+fn node_refs_nid(node: &Node, target: Nid) -> bool {
+    match node {
+        Node::Op { args, .. } => args.iter().any(|a| a.nid() == target),
+        Node::Init { state, value, .. } | Node::Next { state, value, .. } => {
+            *state == target || value.nid() == target
+        }
+        Node::Bad { signal }
+        | Node::Constraint { signal }
+        | Node::Fair { signal }
+        | Node::Output { signal, .. } => signal.nid() == target,
+        Node::Justice { signals } => signals.iter().any(|s| s.nid() == target),
+        _ => false,
+    }
+}
+
+/// F1 re-encode — replace a provably one-hot register `meta` (`W` bits) with an ENUM
+/// register (`E = ⌈log₂K⌉` bits). A BIJECTION on the reachable one-hot states ⇒
+/// VERDICT-PRESERVING. Rewrites: the state's sort; its init (one-hot → index); its
+/// next-state VALUE PATH (one-hot const leaves → index consts, `ite` sorts → `E`); and
+/// every READ — `eq/neq(S, onehot v)` → `eq/neq(S, index v)`, `redor(S)` →
+/// `neq(S, index 0)` (is-non-idle). ABSTAINS (`None`) on ANY other use of `S` (slice,
+/// arithmetic, output, a compare to a non-reachable value) so a re-encode is only ever
+/// applied when provably sound. The register keeps its NID; only new sort/const nodes
+/// are added (fresh NIDs), so the result composes with re-encoding other registers.
+pub(crate) fn onehot_reencode(file: &Btor2File, meta: &OneHotStateMeta) -> Option<Btor2File> {
+    use crate::adapter::btor2::ast::{ConstValue, Op, Sort};
+    let s = meta.nid;
+    let k = meta.values.len() as u32;
+    let e: u32 = (u32::BITS - (k - 1).leading_zeros()).max(1);
+    let index_of =
+        |v: u64| -> Option<u64> { meta.values.iter().position(|&x| x == v).map(|p| p as u64) };
+
+    let mut next_nid: Nid = file.lines.iter().map(|l| l.nid).max().unwrap_or(0) + 1;
+    let mut prelude: Vec<Line> = Vec::new();
+    // E-bit sort (reuse an existing bitvec-E sort, else create one).
+    let e_sort = file
+        .lines
+        .iter()
+        .find_map(|l| match &l.node {
+            Node::Sort {
+                sort: Sort::BitVec { width },
+            } if *width == e => Some(l.nid),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            let n = next_nid;
+            next_nid += 1;
+            prelude.push(Line {
+                nid: n,
+                node: Node::Sort {
+                    sort: Sort::BitVec { width: e },
+                },
+                immediates: Vec::new(),
+                source_line: 0,
+            });
+            n
+        });
+    // One index const per value (E-bit).
+    let mut idx_const: std::collections::HashMap<u64, Nid> = std::collections::HashMap::new();
+    for i in 0..meta.values.len() as u64 {
+        let n = next_nid;
+        next_nid += 1;
+        prelude.push(Line {
+            nid: n,
+            node: Node::Const {
+                sort: e_sort,
+                value: ConstValue::Dec(i as i128),
+            },
+            immediates: Vec::new(),
+            source_line: 0,
+        });
+        idx_const.insert(i, n);
+    }
+    let const_for = |v: u64| -> Option<Operand> {
+        index_of(v)
+            .and_then(|i| idx_const.get(&i))
+            .map(|n| Operand(*n))
+    };
+
+    // The value-path node set (the `ite`/const nodes feeding S's next).
+    let next_op = parser::find_next_value_operand(file, s)?;
+    let mut value_path: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+    {
+        let mut vis: std::collections::HashSet<Nid> = std::collections::HashSet::new();
+        let mut st = vec![next_op.nid()];
+        while let Some(nid) = st.pop() {
+            if !vis.insert(nid) {
+                continue;
+            }
+            let n = file.lookup(nid)?;
+            match &n.node {
+                Node::Const { sort, .. } if parser::bv_width(file, *sort) == Some(meta.width) => {
+                    value_path.insert(nid);
+                }
+                Node::State { .. } if nid == s => {}
+                Node::Op {
+                    op: Op::Ite,
+                    args,
+                    sort,
+                    ..
+                } if parser::bv_width(file, *sort) == Some(meta.width) => {
+                    value_path.insert(nid);
+                    if args.len() >= 3 {
+                        st.push(args[1].nid());
+                        st.push(args[2].nid());
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    // Rewrite pass.
+    let mut out: Vec<Line> = Vec::with_capacity(file.lines.len() + prelude.len());
+    out.extend(prelude);
+    for line in &file.lines {
+        let nid = line.nid;
+        let node = match &line.node {
+            Node::State { symbol, .. } if nid == s => Node::State {
+                sort: e_sort,
+                symbol: symbol.clone(),
+            },
+            Node::Init { state, value, .. } if *state == s => Node::Init {
+                sort: e_sort,
+                state: s,
+                value: const_for(resolve_btor2_constant(file, value.nid())?)?,
+            },
+            Node::Next { state, value, .. } if *state == s => Node::Next {
+                sort: e_sort,
+                state: s,
+                value: *value,
+            },
+            // A value-path `ite`: sort → E, const operands → index consts (a hold or a
+            // nested value-path ite keeps its NID — resolved to None by const-lookup).
+            Node::Op {
+                op: Op::Ite,
+                args,
+                symbol,
+                ..
+            } if value_path.contains(&nid) => {
+                if args.len() < 3 {
+                    return None;
+                }
+                let rewire = |o: &Operand| -> Option<Operand> {
+                    match resolve_btor2_constant(file, o.nid()) {
+                        Some(v) => const_for(v),
+                        None => Some(*o),
+                    }
+                };
+                Node::Op {
+                    op: Op::Ite,
+                    sort: e_sort,
+                    args: vec![args[0], rewire(&args[1])?, rewire(&args[2])?],
+                    symbol: symbol.clone(),
+                }
+            }
+            // A read `eq/neq(S, onehot const)` → `eq/neq(S, index const)`.
+            Node::Op {
+                op: op @ (Op::Eq | Op::Neq),
+                args,
+                symbol,
+                sort,
+            } if args.iter().any(|a| a.nid() == s) => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let (spos, other) = if args[0].nid() == s {
+                    (0, args[1])
+                } else {
+                    (1, args[0])
+                };
+                let idx = const_for(resolve_btor2_constant(file, other.nid())?)?;
+                let new_args = if spos == 0 {
+                    vec![Operand(s), idx]
+                } else {
+                    vec![idx, Operand(s)]
+                };
+                Node::Op {
+                    op: *op,
+                    sort: *sort,
+                    args: new_args,
+                    symbol: symbol.clone(),
+                }
+            }
+            // `redor(S)` (is any bit set) → `neq(S, index 0)` (is non-idle).
+            Node::Op {
+                op: Op::Redor,
+                args,
+                symbol,
+                sort,
+            } if args.len() == 1 && args[0].nid() == s => Node::Op {
+                op: Op::Neq,
+                sort: *sort,
+                args: vec![Operand(s), const_for(0)?],
+                symbol: symbol.clone(),
+            },
+            // Any OTHER reference to S (not a value-path node) ⇒ abstain.
+            other if node_refs_nid(other, s) => return None,
+            other => other.clone(),
+        };
+        out.push(Line {
+            nid,
+            node,
+            immediates: line.immediates.clone(),
+            source_line: line.source_line,
+        });
+    }
+    let by_nid = out.iter().enumerate().map(|(i, l)| (l.nid, i)).collect();
+    Some(Btor2File { lines: out, by_nid })
+}
+
 /// §Phase 10 §10.2 stage 1 — validate detected memory cells against
 /// the sidecar's `memories[]` declarations. Returns Ok when every
 /// detected memory has a matching sidecar entry with matching
@@ -5597,6 +5927,95 @@ pub fn translate(content: &str, options: &AdapterOptions) -> Result<AdapterOutpu
 mod tests {
     use super::*;
     use crate::adapter::AdapterOptions;
+
+    #[test]
+    fn detect_onehot_states_finds_onehot_fsm_rejects_counter() {
+        use crate::adapter::btor2::parser::parse;
+        // A 4-bit one-hot FSM (init 0001, next = go ? 0010 : hold) + a 4-bit counter
+        // (next = cnt + 1). Detection must find the FSM (one-hot value path) and REJECT
+        // the counter (an `add` on the value path is not provably one-hot).
+        let btor = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 state 2 fsm
+4 const 2 0001
+5 const 2 0010
+6 init 2 3 4
+7 input 1 go
+8 ite 2 7 5 3
+9 next 2 3 8
+10 state 2 cnt
+11 one 2
+12 add 2 10 11
+13 init 2 10 4
+14 next 2 10 12
+"#;
+        let file = parse(btor).expect("parses");
+        let oh = detect_onehot_states(&file);
+        assert_eq!(
+            oh.len(),
+            1,
+            "only the FSM is one-hot, not the counter: {oh:?}"
+        );
+        assert_eq!(oh[0].nid, 3);
+        assert_eq!(oh[0].width, 4);
+        assert_eq!(
+            oh[0].values,
+            vec![1, 2],
+            "the reachable one-hot values 0001, 0010"
+        );
+    }
+
+    #[test]
+    fn onehot_reencode_is_verdict_preserving_differential() {
+        use crate::adapter::btor2::parser::parse;
+        use crate::adapter::btor2::symbolic_bitblast::exact_symbolic_verdict;
+        // A 4-bit one-hot FSM (idle 0000 → A 0001 → B 0010) with a combinational output
+        // `done = (fsm == B)` and `busy = |fsm` (redor). The property targets the OUTPUT
+        // (preserved through the read-rewrite), not the register's raw value.
+        let btor = r#"
+1 sort bitvec 1
+2 sort bitvec 4
+3 state 2 fsm
+4 const 2 0001
+5 const 2 0010
+6 const 2 0000
+7 init 2 3 6
+8 input 1 go
+9 ite 2 8 5 4
+10 next 2 3 9
+11 eq 1 3 5
+12 output 11 done
+13 redor 1 3
+14 output 13 busy
+"#;
+        let orig = parse(btor).expect("parses");
+        let metas = detect_onehot_states(&orig);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].values, vec![0, 1, 2], "idle + A + B");
+        let reenc = onehot_reencode(&orig, &metas[0]).expect("re-encodable");
+        // fsm is now 2-bit (3 states) vs 4-bit — the compression.
+        let w = reenc.lines.iter().find_map(|l| match &l.node {
+            Node::State { sort, .. } if l.nid == 3 => parser::bv_width(&reenc, *sort),
+            _ => None,
+        });
+        assert_eq!(w, Some(2), "fsm re-encoded 4 bits → 2 (ceil log2 3)");
+        let reenc_str = crate::adapter::btor2::emit::emit_btor2(&reenc);
+        // DIFFERENTIAL ORACLE: identical verdicts on original vs re-encoded, over outputs.
+        for prop in [
+            "mu X.((done == 1) || <> X)", // EF done  (B reachable via go)
+            "mu X.((busy == 1) || <> X)", // EF busy  (fsm leaves idle)
+            "nu Y.((done == 0) && [] Y)", // AG !done (VIOLATED — go reaches B)
+        ] {
+            let f = crate::mu_calculus::parser::parse(prop).expect("formula");
+            let vo = exact_symbolic_verdict(btor, &f).expect("orig verdict");
+            let vr = exact_symbolic_verdict(&reenc_str, &f).expect("reenc verdict");
+            assert_eq!(
+                vo, vr,
+                "re-encode changed the verdict for `{prop}`: {vo:?} vs {vr:?}"
+            );
+        }
+    }
 
     // AR-S2 — the `shl_sat128`/`shr_sat128` saturating point-patches (and their
     // regression test) are retired: `Bv` shifts are exact at any width, so a

@@ -2177,6 +2177,26 @@ pub fn exact_symbolic_verdict_with_witness(
     let seed_atoms: Vec<String> = seed_regs.iter().cloned().collect();
     let keep_set = (!seed_atoms.is_empty())
         .then(|| crate::adapter::btor2::dep_graph::cone_leaf_nids(&file, &seed_atoms));
+    // F1 — one-hot → enum re-encode (before the array-havoc; both preserve NIDs, so the
+    // keep-set computed above stays valid). Compress a provably one-hot state register
+    // (`W` bits → `⌈log₂K⌉`) so its `2^W`-wide bit-blast fits the `MAX_BITBLAST_BITS` cap;
+    // a BIJECTION on the reachable states ⇒ verdict-preserving. SKIP a register a property
+    // ATOM reads BY VALUE (`c_state == start_a`) — re-encoding changes its value semantics,
+    // which would silently break the atom; leaving that one uncompressed keeps the atom
+    // sound. `onehot_reencode` additionally abstains on any unhandled use of the register.
+    let file = {
+        let syms = crate::adapter::btor2::parser::collect_symbols(&file);
+        let mut f = file;
+        for meta in crate::adapter::btor2::bit_blast::detect_onehot_states(&f) {
+            if syms.get(&meta.nid).is_some_and(|s| seed_regs.contains(s)) {
+                continue;
+            }
+            if let Some(reenc) = crate::adapter::btor2::bit_blast::onehot_reencode(&f, &meta) {
+                f = reenc;
+            }
+        }
+        f
+    };
     let file = {
         let memories = crate::adapter::btor2::bit_blast::detect_btor2_memories(&file);
         let all_out_of_cone = !memories.is_empty()
