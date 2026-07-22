@@ -2440,6 +2440,14 @@ pub fn verify_auto(
     // gated by its own `rescue_bottom_*` opt and only fires on its recognized shape.
     let rescue_notes = escalate_bottom(&mut report, &btor2, reset_pinned, opts);
 
+    // Lever (b) — exact-symbolic rescue for cube-SKIPPED properties. The predicate cube
+    // cannot seed an ATOM-LESS modal formula (no-deadlock `nu X.(<> true && [] X)`, a pure
+    // `<>`/`[]` obligation) and reports it Skipped; the full-state exact engine needs no
+    // seeding and decides it. Only fires on a cube run under reset-gating (the exact main
+    // path already ran exact; A.6 requires reset gating). Sound: exact is the differential
+    // oracle — a Skipped property is upgraded only on a DEFINITE Holds/Violated.
+    let exact_skip_notes = rescue_skipped_via_exact(&mut report, &btor2, opts);
+
     // H.J — provenance notes: surface every abstraction/scoping decision this run
     // made (config concretizations, posture, reset-gating, flop stubs, cut
     // modules, coverage).
@@ -2464,6 +2472,7 @@ pub fn verify_auto(
         report.notes.push(n);
     }
     report.notes.extend(rescue_notes);
+    report.notes.extend(exact_skip_notes);
     Ok(report)
 }
 
@@ -2599,6 +2608,92 @@ fn escalate_bottom(
         }
     }
     notes
+}
+
+/// Lever (b) — exact-symbolic rescue for cube-SKIPPED properties.
+///
+/// The predicate-cube engine skips a property it cannot seed — most commonly an
+/// ATOM-LESS modal formula (no-deadlock `nu X.(<> true && [] X)`, a pure `<>`/`[]`
+/// obligation) for which there is no state-cell / combinational atom to build a cube
+/// dimension from, so it is reported `Skipped` with "no … atoms to seed the cube". The
+/// full-state exact engine needs no seeding: it bit-blasts the design and decides the
+/// formula directly (the same engine `verify_auto` runs on the `--engine exact-symbolic`
+/// path). This pass gives every still-`Skipped` property one exact attempt and upgrades
+/// it in place on a DEFINITE verdict.
+///
+/// SOUNDNESS. Runs only under reset-gating (`opts.gate_reset`) — the exact engine's A.6
+/// precondition (with reset freed it is unsound; see [`verify_auto`]). Gated to the cube
+/// path (`!opts.exact_symbolic`); the exact main path already ran exact, so there is
+/// nothing new to rescue there. The exact engine is the differential ORACLE (the 56
+/// `symbolic_bitblast` parity tests), so a definite `Holds`/`Violated` it returns transfers
+/// to the RTL exactly as the main exact branch's does — a Skipped property gaining a
+/// definite verdict is pure precision, never a contradiction. An over-cap / intractable
+/// design returns `Err` (bounded by the node/iteration budgets + catch_unwind) and the
+/// property is left `Skipped`.
+///
+/// Pure over `(report, design_btor2)`, so it is unit-testable on a BTOR2 fixture without
+/// the SV toolchain.
+fn rescue_skipped_via_exact(
+    report: &mut AutoVerifyReport,
+    design_btor2: &str,
+    opts: &VerifyAutoOptions,
+) -> Vec<VerificationNote> {
+    use crate::adapter::btor2::symbolic_bitblast::{
+        ExactVerdict, exact_symbolic_verdict_with_witness,
+    };
+    use crate::mu_calculus::parser as mu_parser;
+
+    let mut notes = Vec::new();
+    // A.6: the exact engine is sound only under reset-gating. `opts.exact_symbolic`
+    // means the exact main path already ran — nothing to rescue on a cube run here.
+    if !opts.gate_reset || opts.exact_symbolic {
+        return notes;
+    }
+    for prop in report.properties.iter_mut() {
+        if !matches!(prop.outcome, VerifyOutcome::Skipped { .. }) {
+            continue;
+        }
+        let Ok(formula) = mu_parser::parse(&prop.formula) else {
+            continue;
+        };
+        match exact_symbolic_verdict_with_witness(design_btor2, &formula) {
+            Ok((ExactVerdict::Holds, _)) => {
+                prop.outcome = VerifyOutcome::Holds;
+                prop.counterexample = None;
+                notes.push(exact_skip_rescue_note(&prop.name, "HOLDS"));
+            }
+            Ok((ExactVerdict::Violated, witness)) => {
+                prop.outcome = VerifyOutcome::Violated { false_cells: 1 };
+                prop.counterexample = witness
+                    .map(exact_counterexample_from_lasso)
+                    .or_else(|| ef_unreachable_counterexample(&formula));
+                notes.push(exact_skip_rescue_note(&prop.name, "VIOLATED"));
+            }
+            // Err (over cap / intractable design): leave the property Skipped.
+            Err(_) => {}
+        }
+    }
+    notes
+}
+
+/// Provenance note for a cube-Skipped property the exact engine rescued (lever b).
+fn exact_skip_rescue_note(name: &str, verdict: &str) -> VerificationNote {
+    VerificationNote {
+        kind: "exact-skip-rescue".into(),
+        level: NoteLevel::Info,
+        summary: format!(
+            "`{name}`: the predicate cube could not seed the property (no atoms); the \
+             full-state exact-symbolic engine decided it {verdict}"
+        ),
+        detail: "An atom-less modal property (e.g. no-deadlock `nu X.(<> true && [] X)`) has \
+                 no state-cell / combinational atom for the cube to build a dimension from, so \
+                 the cube reports Skipped. The exact engine bit-blasts the design and decides \
+                 it directly. Sound: the exact engine is the differential oracle — under \
+                 reset-gating a definite verdict transfers to the RTL; the property is upgraded \
+                 only on a definite Holds/Violated."
+            .into(),
+        items: Vec::new(),
+    }
 }
 
 /// The engines that participated in a reachability-portfolio rescue (for a note).
@@ -2852,6 +2947,82 @@ mod tests {
         assert!(
             notes.iter().any(|n| n.kind == "portfolio-rescue"),
             "a portfolio-rescue provenance note should be recorded"
+        );
+    }
+
+    // Lever (b) — a cube-SKIPPED ATOM-LESS modal property (no-deadlock) is rescued to a
+    // definite verdict by the full-state exact engine. The 2-bit counter increments every
+    // cycle (0→1→2→3→0), so every state has a successor ⇒ `nu X.(<> true && [] X)` HOLDS.
+    // The cube has no atom to seed (pure modal) so it reports Skipped; the exact rescue
+    // upgrades it. Gated on reset-gating (`opts.gate_reset`, the exact engine's A.6 precond).
+    #[test]
+    fn rescue_skipped_via_exact_decides_atomless_no_deadlock() {
+        const COUNTER: &str = "1 sort bitvec 2\n2 sort bitvec 1\n3 zero 1\n4 one 1\n\
+                               5 state 1 cnt\n6 init 1 5 3\n7 add 1 5 4\n8 next 1 5 7\n";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "no_deadlock".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu X.(<> true && [] X)".to_string(),
+                outcome: VerifyOutcome::Skipped {
+                    reason: "no state-cell / combinational predicate atoms to seed the cube"
+                        .to_string(),
+                },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let opts = VerifyAutoOptions {
+            gate_reset: true,
+            exact_symbolic: false,
+            ..Default::default()
+        };
+        let notes = rescue_skipped_via_exact(&mut report, COUNTER, &opts);
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "the cube-Skipped atom-less no-deadlock property should be rescued to HOLDS, got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "exact-skip-rescue"),
+            "an exact-skip-rescue provenance note should be recorded"
+        );
+    }
+
+    // A.6 soundness gate — with reset-gating OFF the exact engine is unsound (it starts from
+    // the illegal power-on default and does not fire the freed reset), so the rescue must NOT
+    // touch the property: it stays Skipped, no note.
+    #[test]
+    fn rescue_skipped_via_exact_respects_reset_gate() {
+        const COUNTER: &str = "1 sort bitvec 2\n2 sort bitvec 1\n3 zero 1\n4 one 1\n\
+                               5 state 1 cnt\n6 init 1 5 3\n7 add 1 5 4\n8 next 1 5 7\n";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "no_deadlock".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu X.(<> true && [] X)".to_string(),
+                outcome: VerifyOutcome::Skipped {
+                    reason: "no atoms".to_string(),
+                },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        let opts = VerifyAutoOptions {
+            gate_reset: false,
+            ..Default::default()
+        };
+        let notes = rescue_skipped_via_exact(&mut report, COUNTER, &opts);
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Skipped { .. }),
+            "with reset-gating off (A.6) the exact rescue must not fire, got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.is_empty(),
+            "no rescue note when the A.6 gate blocks the exact engine"
         );
     }
 
