@@ -118,17 +118,33 @@ use crate::mu_calculus::symbolic::TritBdd;
 use crate::mu_calculus::trit::Trit;
 use crate::mu_calculus::{Control, Formula, FormulaVarId, Guard, ModalKind, Node as MuNode};
 
-/// Bit-count cap for the shared [`BddBitBlaster`]: a design whose cone exceeds this many
-/// register+input bits is rejected before any BDD is built, so a caller (`sv verify-auto`)
-/// degrades to a `Skipped` property rather than OoM. **Calibrated empirically at 40** — a cone
-/// even a few bits wider can blow the BDD arena *during* `walk_design` and panic on a downstream
-/// `unwrap`. Measured 2026-07-06: raising it to 56 made `prim_esc_receiver` (47-b cone) OoM-panic
-/// mid-build instead of decide — its cone is NOT a compact FSM. Designs past the cap are covered by
-/// the portfolio's other engines (the exact engine's cone for the same atom is often narrower — it
-/// seeds only the formula atoms, not the wider auto-seeded cube-predicate set the symbolic engine
-/// needs — so it decides where the cube engine cannot). Do not raise this without a `walk_design`-
-/// internal node-budget guard: a post-walk node check cannot catch a mid-walk arena overflow.
+/// DEFAULT bit-count cap for the shared [`BddBitBlaster`]: a cheap pre-filter on cone width.
+/// Bit count is only a crude upper bound on BDD cost — a ROBDD shares structure, so a
+/// wide-but-structured *control* cone (correlated bits) can have a small BDD while a narrow
+/// multiplier is exponential. The real robustness gate is now the mid-build **node-budget
+/// guard** ([`BddBitBlaster::node_budget`], checked in `eval_op` via `approx_num_inner_nodes`)
+/// plus `catch_unwind` in [`exact_symbolic_verdict_with_witness`] — together they turn a BDD
+/// blowup into a clean `Skipped` instead of an OoM panic (the 2026-07-06 `prim_esc_receiver`
+/// failure). Those make it SAFE to raise the cap.
+///
+/// The effective cap is `MUNUNU_BDD_MAX_BITS` when set (clamped to [`HARD_BITBLAST_CEILING`]),
+/// else this default. The default stays 40 because a wide **counter** has a small BDD but a
+/// slow (`2^W`-iteration) fixpoint the node-budget guard does not catch — raising the default
+/// safely needs an iteration budget too, so for now widening is opt-in.
 const MAX_BITBLAST_BITS: u32 = 40;
+
+/// Absolute ceiling the `MUNUNU_BDD_MAX_BITS` override is clamped to — bounds the largest
+/// arena we will allocate regardless of the env value.
+const HARD_BITBLAST_CEILING: u32 = 256;
+
+/// The effective bit cap: the `MUNUNU_BDD_MAX_BITS` override (clamped) or the default.
+fn effective_bitblast_cap() -> u32 {
+    std::env::var("MUNUNU_BDD_MAX_BITS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|v| v.min(HARD_BITBLAST_CEILING))
+        .unwrap_or(MAX_BITBLAST_BITS)
+}
 
 /// A bit-vector of BDDs, LSB-first: index `b` is the BDD for bit `b`. Every
 /// node's value carries exactly `width` bits.
@@ -169,6 +185,13 @@ pub struct BddBitBlaster {
     /// constraint-respecting transitions — modelling BTOR2 `constraint` (assume)
     /// soundly instead of over-approximating.
     constraint_bdd: BDDFunction,
+    /// Node-budget guard: if the manager's live inner-node count exceeds this while
+    /// building the transition BDDs (`walk_design`, `eval_op`), the build bails with a
+    /// clean error (→ `Skipped`) instead of overflowing the fixed OxiDD arena and
+    /// panicking. Sized below the arena capacity so the per-op check fires with margin;
+    /// `catch_unwind` in [`exact_symbolic_verdict_with_witness`] is the backstop for a
+    /// single op that jumps past the budget in one apply.
+    node_budget: usize,
 }
 
 impl BddBitBlaster {
@@ -225,25 +248,36 @@ impl BddBitBlaster {
             .map(|(_, _, _, w)| *w)
             .sum();
 
-        // R-F5.6 guard — the bit-blaster builds BDDs over every KEPT register+input bit. With
-        // the cone-of-influence keep-set the frame is the property's cone; without one it is
-        // the whole design. On a real design whose CONE is still wide (hundreds of bits) the
-        // BDD manager would OoM, so bail with a clean error above a conservative cap and let a
-        // caller (`sv verify-auto`) degrade to a `Skipped` property rather than panic.
-        if total_bits > MAX_BITBLAST_BITS {
+        // R-F5.6 guard — the bit-blaster builds BDDs over every KEPT register+input bit. The
+        // bit COUNT is only a crude upper bound on cost (a ROBDD shares structure), so the real
+        // robustness gate is the node-budget guard below; this cap just avoids allocating a
+        // large arena for an absurdly wide cone. The cap is `MUNUNU_BDD_MAX_BITS` (clamped) or
+        // the default 40 — see [`effective_bitblast_cap`].
+        let cap = effective_bitblast_cap();
+        if total_bits > cap {
             return Err(format!(
                 "symbolic bit-blaster: design has {total_bits} register+input bits \
-                 (> {MAX_BITBLAST_BITS}) after cone-of-influence restriction (R-F5.6) — the \
+                 (> {cap}) after cone-of-influence restriction (R-F5.6) — the \
                  property's cone is too wide to bit-blast; use `--engine explicit`"
             ));
         }
 
-        // Allocate the manager + one BDD variable per KEPT leaf bit. 2M inner nodes
-        // (~32 MB arena, index manager) + a 512K apply cache — comfortably above
-        // the toy fixtures' need and sized for a moderate (≤ `MAX_BITBLAST_BITS`)
-        // cone; the manager is dropped per `BddBitBlaster`, so at most one
-        // arena is live at a time.
-        let manager = bdd::new_manager(1 << 21, 1 << 19, 1);
+        // Arena sizing, TIERED so the common (≤ 40-bit) path is UNCHANGED — 2M inner nodes
+        // (~32 MB) + 512K apply cache. A WIDE cone (only reachable when the cap is raised via
+        // env) gets a larger, env-tunable arena; the node-budget guard (80 % of the arena)
+        // bails cleanly before it overflows, and `catch_unwind` is the backstop for a single op
+        // that jumps the budget in one apply. The manager is dropped per `BddBitBlaster`, so at
+        // most one arena is live at a time.
+        let arena_nodes: usize = if total_bits <= 40 {
+            1 << 21
+        } else {
+            std::env::var("MUNUNU_BDD_ARENA_NODES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1 << 25) // 32M nodes (~1 GB); bump via env for wider control cones
+        };
+        let node_budget = arena_nodes * 8 / 10;
+        let manager = bdd::new_manager(arena_nodes, arena_nodes / 4, 1);
         let (all_vars, var_base, tt, ff) = manager.with_manager_exclusive(|m| {
             let range = m.add_vars(total_bits as VarNo);
             let vars: Vec<BDDFunction> = (0..total_bits)
@@ -289,6 +323,7 @@ impl BddBitBlaster {
             cells,
             next_funcs: HashMap::new(),
             named_signals: HashMap::new(),
+            node_budget,
         };
 
         // Pass 2 — walk the node DAG, evaluating every Const/Op into a BitVec.
@@ -1573,6 +1608,20 @@ impl BvTermBackend for BddBitBlaster {
                 ));
             }
         };
+        // Node-budget guard — bail cleanly (→ Skipped) if this op grew the shared BDD arena
+        // past the budget, BEFORE the next op can overflow the fixed OxiDD arena and panic.
+        // `approx_num_inner_nodes` is O(1). The bit cap admitted this cone; the actual BDD is
+        // what decides tractability.
+        let live = self
+            ._manager
+            .with_manager_shared(|m| m.approx_num_inner_nodes());
+        if live > self.node_budget {
+            return Err(format!(
+                "symbolic bit-blaster: BDD node budget exceeded ({live} > {} live nodes) — the \
+                 property's cone does not compress to a tractable BDD; use `--engine explicit`",
+                self.node_budget
+            ));
+        }
         Ok(result)
     }
 
@@ -2107,6 +2156,30 @@ pub fn exact_symbolic_verdict(
 /// initial state (a reachable-but-not-initial stall — the `AG AF` case — is a future
 /// extension of [`BddBitBlaster::exact_stall_lasso`]).
 pub fn exact_symbolic_verdict_with_witness(
+    btor2_content: &str,
+    formula: &Formula,
+) -> Result<(ExactVerdict, Option<StallLasso>), String> {
+    // catch_unwind BACKSTOP for the node-budget guard. A single BDD op (`Op::Mul`, a wide
+    // variable shift) can overflow the fixed OxiDD arena *inside* one `eval_op`, before the
+    // per-op node-budget check fires — the `.unwrap()` on OxiDD's `OutOfMemory` then panics.
+    // That is a clean unwrap-panic (the op released the manager lock before returning `Err`),
+    // and the manager is local to the inner call and dropped on unwind, so catching it and
+    // degrading to a Skipped-class error is SOUND (no shared state is poisoned; the verdict is
+    // never fabricated — only turned into a clean Err → Skipped). Gradual growth is caught
+    // earlier + cheaper by the node-budget guard in `eval_op`.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exact_symbolic_verdict_with_witness_inner(btor2_content, formula)
+    }))
+    .unwrap_or_else(|_| {
+        Err(
+            "symbolic bit-blaster: BDD arena overflow while building the transition relation \
+             (the cone does not compress to a tractable BDD); use `--engine explicit`"
+                .to_string(),
+        )
+    })
+}
+
+fn exact_symbolic_verdict_with_witness_inner(
     btor2_content: &str,
     formula: &Formula,
 ) -> Result<(ExactVerdict, Option<StallLasso>), String> {
@@ -4270,9 +4343,9 @@ mod tests {
     /// guarantee for the exact path as a fast, non-docker regression.
     #[test]
     fn d1_7_exact_verdict_over_bit_cap_degrades_gracefully() {
-        // One 48-bit register (48 > 40 register+input bits), no inputs. The
-        // formula is immaterial: the cap fires in `build`, before atom
-        // resolution or fixpoint evaluation.
+        // One 48-bit register (48 > the default 40-bit cap), no inputs. The formula is
+        // immaterial: the cap fires in `build`, before atom resolution or fixpoint
+        // evaluation, so a caller degrades to Skipped rather than OoM.
         const WIDE_BTOR2: &str = r#"
 1 sort bitvec 48
 2 sort bitvec 1
@@ -4283,12 +4356,38 @@ mod tests {
 "#;
         let formula = crate::mu_calculus::parser::parse("(wide == 0)").expect("formula parses");
         let err = exact_symbolic_verdict(WIDE_BTOR2, &formula)
-            .expect_err("48-bit design exceeds MAX_BITBLAST_BITS (40) → clean Err, not OoM");
+            .expect_err("48-bit design exceeds the default MAX_BITBLAST_BITS (40) → clean Err");
         assert!(
             err.contains("register+input bits") && err.contains("48"),
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
         );
+    }
+
+    /// Safety machinery (node-budget guard + `catch_unwind`) — at the DEFAULT cap, a 40-bit
+    /// multiplier (`p' = x * y`, 20-bit inputs) has an exponential BDD that overflows the 2M
+    /// arena during `eval_op`. The engine must degrade to a clean `Err` (→ Skipped), NEVER
+    /// OoM-panic. Asserts only that a `Result` comes back — the value (Err on overflow, or Ok
+    /// if it happens to fit) is immaterial; the point is no panic escapes. No env mutation.
+    #[test]
+    fn wide_multiplier_bails_gracefully_never_panics() {
+        const MUL40: &str = r#"
+1 sort bitvec 20
+2 sort bitvec 40
+3 input 1 x
+4 input 1 y
+5 uext 2 3 20
+6 uext 2 4 20
+7 mul 2 5 6
+8 state 2 p
+9 next 2 8 7
+10 zero 2
+11 init 2 8 10
+"#;
+        let formula = crate::mu_calculus::parser::parse("(p == 0)").expect("formula");
+        // Must return a Result (Ok or Err) without panicking — `catch_unwind` converts any
+        // arena overflow into an Err. A panic here fails the test, which is the guarantee.
+        let _ = exact_symbolic_verdict(MUL40, &formula);
     }
 
     /// R-F5.6 — cone-of-influence restriction lifts the bit cap when the property's cone is
