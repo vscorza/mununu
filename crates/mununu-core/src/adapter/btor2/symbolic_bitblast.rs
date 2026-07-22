@@ -1669,6 +1669,24 @@ pub struct ExactModel {
     constraint: BDDFunction,
     tt: BDDFunction,
     ff: BDDFunction,
+    /// Fixpoint ITERATION budget — the total μ/ν fixpoint iterations across one
+    /// [`ExactModel::evaluate`]. A wide FREE COUNTER has a small BDD (so the node-budget
+    /// guard never fires) but a `2^W`-step (reachable-diameter) fixpoint; this bails it to
+    /// a clean `Err` (→ Skipped) DETERMINISTICALLY (machine-independent, unlike a wall clock).
+    /// The other blowup mode — a large BDD — is caught by the node-budget guard + catch_unwind.
+    iter_budget: usize,
+    /// Running total of fixpoint iterations. Interior-mutable because `evaluate` / `fixpoint`
+    /// take `&self`; the exact eval is single-threaded per call.
+    iters: std::cell::Cell<usize>,
+}
+
+/// The exact-engine fixpoint iteration budget: `MUNUNU_BDD_ITER_BUDGET` or a default sized to
+/// catch a wide-counter diameter (`2^W`) while admitting any control fixpoint (small diameter).
+fn fixpoint_iter_budget() -> usize {
+    std::env::var("MUNUNU_BDD_ITER_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1 << 20) // ~1M iterations; a counter's steps are cheap (small BDD) so this is fast to reach
 }
 
 impl BddBitBlaster {
@@ -1707,6 +1725,8 @@ impl BddBitBlaster {
             constraint: self.constraint_bdd.clone(),
             tt: self.tt.clone(),
             ff: self.ff.clone(),
+            iter_budget: fixpoint_iter_budget(),
+            iters: std::cell::Cell::new(0),
         }
     }
 
@@ -1941,6 +1961,18 @@ impl ExactModel {
             self.ff.clone()
         };
         loop {
+            // Iteration budget — bail deterministically before a wide-counter diameter (`2^W`)
+            // fixpoint hangs. Counted across ALL fixpoints in this `evaluate` (nested νμ share
+            // the running total), so a bounded total work regardless of nesting.
+            let n = self.iters.get() + 1;
+            self.iters.set(n);
+            if n > self.iter_budget {
+                return Err(format!(
+                    "symbolic bit-blaster: fixpoint iteration budget exceeded ({n} > {}) — the \
+                     property's reachable diameter is too large to bit-blast; use `--engine explicit`",
+                    self.iter_budget
+                ));
+            }
             bindings.insert(var, x.clone());
             let next = self.eval_node(f, body, atoms, bindings)?;
             if next == x {
