@@ -353,7 +353,12 @@ fn run_sv_flatten_btor2(
     // Yosys handles cleanly. Activated by `YosysOptions::use_sv2v`
     // (the only switch — wire `--preprocessor sv2v` on the CLI or
     // `use_sv2v: true` on the API into this field).
-    if yopts.use_sv2v {
+    //
+    // A3 — the opt-in slang RTL frontend (`MUNUNU_YOSYS_FRONTEND=slang`). `read_slang`
+    // parses SystemVerilog natively (a superset of what `read_verilog` accepts), so sv2v
+    // is redundant with it and is skipped when slang is active.
+    let slang_plugin = slang_frontend_selection();
+    if yopts.use_sv2v && slang_plugin.is_none() {
         let sv2v = locate_sv2v()?;
         let preprocessed = tmp.path().join("preprocessed.sv");
         // Include-search path. Two sources, in priority order:
@@ -401,9 +406,14 @@ fn run_sv_flatten_btor2(
         yopts.setundef_anyconst,
         &yopts.init_policy_overrides,
         &yopts.cutpoint_signals,
+        slang_plugin.is_some(),
     );
 
-    let output = Command::new(&yosys)
+    let mut yosys_cmd = Command::new(&yosys);
+    if let Some(plugin) = &slang_plugin {
+        yosys_cmd.arg("-m").arg(plugin);
+    }
+    let output = yosys_cmd
         .arg("-q")
         .arg("-p")
         .arg(&script)
@@ -1632,6 +1642,40 @@ fn locate_sv2v() -> Result<PathBuf, AdapterError> {
     })
 }
 
+/// The yosys `-m` argument that loads the yosys-slang frontend plugin (`read_slang`),
+/// or `None` if unavailable. Order: `MUNUNU_YOSYS_SLANG_PLUGIN` (a path to `slang.so`) →
+/// the pinned `mununu-sva` image plugin (loadable by bare name `slang`) → absent.
+///
+/// `read_slang` is a full SystemVerilog front-end that accepts constructs yosys's native
+/// `read_verilog` rejects (a bounded `while` loop in `always @*`, …). mununu uses it for
+/// the **RTL lift only** (`--ignore-assertions` — SVA is extracted separately by the slang
+/// `extract_sva` path, so no `bad` nodes are needed here). Named registers and ports get
+/// the SAME `instance.signal` BTOR2 names as the `read_verilog` path, so cutpoints /
+/// `--config-value` over named signals resolve unchanged.
+fn locate_slang_plugin() -> Option<String> {
+    if let Ok(p) = std::env::var("MUNUNU_YOSYS_SLANG_PLUGIN")
+        && Path::new(&p).exists()
+    {
+        return Some(p);
+    }
+    // The pinned image ships slang.so in yosys's plugin dir → loadable by bare name.
+    if Path::new("/opt/oss-cad-suite/share/yosys/plugins/slang.so").exists() {
+        return Some("slang".to_string());
+    }
+    None
+}
+
+/// The yosys-slang `-m` plugin argument when the slang RTL frontend is selected for this
+/// lift, else `None`. Opt-in via `MUNUNU_YOSYS_FRONTEND=slang` (case-insensitive) AND the
+/// plugin being present. Conservative rollout (A3): opt-in first; a
+/// fallback-on-`read_verilog`-parse-failure and a benchmark-validated default are follow-ups.
+fn slang_frontend_selection() -> Option<String> {
+    match std::env::var("MUNUNU_YOSYS_FRONTEND") {
+        Ok(v) if v.eq_ignore_ascii_case("slang") => locate_slang_plugin(),
+        _ => None,
+    }
+}
+
 /// Run sv2v over `sources`, capture stdout into `out`. sv2v's documented
 /// multi-file mode resolves cross-file packages/interfaces in one pass
 /// and emits a single combined Verilog-2005 stream on stdout.
@@ -1819,11 +1863,36 @@ fn build_script(
     setundef_anyconst: bool,
     init_policy_overrides: &InitPolicyOverrides,
     cutpoint_signals: &[String],
+    use_slang: bool,
 ) -> String {
-    let read_cmds: Vec<String> = sources
-        .iter()
-        .map(|p| format!("read_verilog -formal -sv {}", p.display()))
-        .collect();
+    // A3 — the RTL read command. `read_slang` (yosys-slang plugin) is a full SV front-end
+    // that accepts constructs `read_verilog` rejects; it reads ALL sources in ONE command
+    // and `--ignore-assertions` drops embedded SVA (extracted separately by the slang
+    // `extract_sva` path). `read_verilog` reads each source. Everything after the read is
+    // identical, so the lift is frontend-agnostic downstream.
+    let read_cmds: Vec<String> = if use_slang {
+        let files = sources
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let top_arg = top.map(|t| format!(" --top {t}")).unwrap_or_default();
+        // The staging tempdir (parent of the sources) as an include dir, so a cross-file
+        // `\`include "peer.sv"` between staged sources resolves.
+        let inc = sources
+            .first()
+            .and_then(|p| p.parent())
+            .map(|d| format!(" -I{}", d.display()))
+            .unwrap_or_default();
+        vec![format!(
+            "read_slang --ignore-assertions{top_arg}{inc} {files}"
+        )]
+    } else {
+        sources
+            .iter()
+            .map(|p| format!("read_verilog -formal -sv {}", p.display()))
+            .collect()
+    };
     let hier = match top {
         Some(t) => format!("hierarchy -top {t}"),
         None => "hierarchy -auto-top".to_string(),
@@ -2515,6 +2584,7 @@ mod tests {
             false,
             &overrides,
             &cuts,
+            false,
         );
         assert!(
             script.contains("cutpoint w:must_refresh w:precharge_done"),
@@ -2549,12 +2619,58 @@ mod tests {
             false,
             &overrides,
             &[],
+            false,
         );
         // The blackbox cut is always present; there must be no explicit `cutpoint w:` pass.
         assert!(script.contains("cutpoint -blackbox"));
         assert!(
             !script.contains("cutpoint w:"),
             "no explicit cut points expected: {script}"
+        );
+    }
+
+    // A3 — the slang RTL frontend read command: ONE `read_slang` over all sources with
+    // assertions ignored, no `read_verilog`, and the same frontend-agnostic passes after.
+    #[test]
+    fn build_script_slang_frontend_uses_read_slang() {
+        use std::path::PathBuf;
+        let sources = vec![PathBuf::from("/tmp/a.sv"), PathBuf::from("/tmp/b.sv")];
+        let btor = PathBuf::from("/tmp/out.btor");
+        let hier = PathBuf::from("/tmp/hier.json");
+        let overrides: InitPolicyOverrides = Vec::new();
+        let script = build_script(
+            &sources,
+            Some("top"),
+            &btor,
+            &hier,
+            false,
+            false,
+            &overrides,
+            &[],
+            true, // use_slang
+        );
+        assert!(
+            script.contains("read_slang --ignore-assertions"),
+            "slang read command missing: {script}"
+        );
+        assert!(
+            script.contains("--top top"),
+            "top not passed to read_slang: {script}"
+        );
+        assert!(
+            script.contains("/tmp/a.sv") && script.contains("/tmp/b.sv"),
+            "both sources must be read in one read_slang: {script}"
+        );
+        assert!(
+            !script.contains("read_verilog"),
+            "read_verilog must not appear on the slang path: {script}"
+        );
+        // Downstream is frontend-agnostic — the same lift passes run either way.
+        assert!(
+            script.contains("async2sync")
+                && script.contains("dffunmap")
+                && script.contains("write_btor"),
+            "downstream passes missing: {script}"
         );
     }
 

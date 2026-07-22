@@ -157,6 +157,19 @@ net-type declarations are left untouched (their pull / resolution semantics matt
 
 > Source of truth: [`strip_port_net_types`](../crates/mununu-core/src/adapter/yosys/mod.rs#L254) — surface: (CLI+API+UI)
 
+**Wider front-end via yosys-slang (opt-in).** yosys's native `read_verilog` rejects some legal
+SystemVerilog a full front-end accepts — e.g. a bounded `while` loop in an `always @*` block —
+and black-boxes the module (all its properties then skip). Set `MUNUNU_YOSYS_FRONTEND=slang` (when
+the yosys-slang `read_slang` plugin is present — `MUNUNU_YOSYS_SLANG_PLUGIN`, or the pinned image's
+`share/yosys/plugins/slang.so`) to lift the RTL with `read_slang` (a complete SV front-end) instead.
+It reads the RTL **only** (`--ignore-assertions` — SVA is extracted separately, so nothing is lost)
+and names named registers/ports **identically** to `read_verilog`, so cutpoints / `--config-value` /
+atoms resolve unchanged. Opt-in; a fallback-on-parse-failure default is future work. *(Example: the
+`xgate` coprocessor, whose RISC core has a rejected `while` loop, is black-boxed under `read_verilog`
+but lifts its full 125-register core under `read_slang`.)*
+
+> Source of truth: [`slang_frontend_selection`](../crates/mununu-core/src/adapter/yosys/mod.rs#L1672) — surface: (CLI+API+UI)
+
 ### 2. Properties come from the module's own assertions
 
 `sv verify-auto` checks the SVA the design *carries*; it takes no formula. An agent
