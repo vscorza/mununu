@@ -980,16 +980,16 @@ pub fn verify_recoverability_with_predicates(
 /// `good_registers` are excluded from abstraction so the property atom never desyncs.
 ///
 /// **Detection scope.** [`detect_down_counter`](crate::adapter::btor2::bit_blast::detect_down_counter)
-/// recognises a counter whose stride operates on the raw state nid (hand-authored BTOR2,
-/// clean adapters) and whose expiry gate is `eq/neq(cnt, T)` or `redor(cnt)`. Yosys often
-/// wire-indirects a synchronous counter through an async-reset mux — the decrement reads
-/// `sub(ite(reset, cnt, reset_const), 1)` rather than `sub(cnt, 1)` — so on such lifts the
-/// stride is not yet seen and this rescue abstains (falls through to the cube, never
-/// unsound). A bounded reset-mux "see-through" in the detector is the follow-on that would
-/// extend this to yosys-lifted RTL. Even then, a counter whose reload is gated by a
-/// demonic input (an `ena`/sync that an adversary can hold to stall the descent) has no
-/// ranking certificate — `AG EF good` there genuinely needs a fairness assumption mununu
-/// cannot make, and the abstain is the sound answer.
+/// recognises a counter whose stride operates on the raw state nid OR on a reset-mux alias
+/// `ite(reset, cnt, const)` (the yosys async-reset lowering — `sub(ite(reset,cnt,0),1)`,
+/// `redor(ite(reset,cnt,0))`), and ignores dead observable copies (`uext(cnt,0)` named
+/// `…cnt`). So both hand-authored BTOR2 and yosys-lifted RTL are covered. The residual
+/// limit is the **fairness wall**: a counter whose reload is gated by a demonic input
+/// (an `ena`/sync an adversary can hold to stall the descent) has no ranking certificate —
+/// `AG EF good` there genuinely needs a fairness assumption mununu cannot make, so that
+/// counter is not abstracted and the property falls to the cube (the sound answer). (i2c's
+/// SCL recurrence is exactly this: `dcnt` certifies but the `ena`-gated clock divider `cnt`
+/// does not, leaving the cone too wide → ⊥.)
 fn verify_recoverability_counter_abstracted(
     file: &crate::adapter::btor2::ast::Btor2File,
     good: &str,
