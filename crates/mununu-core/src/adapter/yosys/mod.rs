@@ -224,6 +224,103 @@ struct SvFlattenArtifacts {
 /// [`sv_discover_state_cells`] (which only reads the BTOR2's named state
 /// cells), so the sv2v include-path + Yosys-invocation logic lives in one
 /// place.
+/// Net-type keywords that yosys `read_verilog` / the slang lowering reject in a
+/// PORT header (`input tri0 baud8x`). A net type on a *port* only governs that
+/// port's EXTERNAL resolution (a shared bus with pulls / wired-logic across
+/// modules); verifying the module in isolation, an input is havoc'd and an
+/// output is driven by the module's own logic, so dropping the qualifier is
+/// SOUND — and for inputs it is *exact* (mununu havocs every input regardless of
+/// net type). Without this the whole design is rejected at parse.
+const PORT_NET_TYPE_KEYWORDS: &[&str] = &[
+    "tri0", "tri1", "triand", "trior", "trireg", "wand", "wor", "supply0", "supply1", "uwire",
+    "tri",
+];
+
+/// Drop a rejected net-type qualifier that directly follows a port direction
+/// keyword (`input`/`output`/`inout`) — an A2 lift-widening normalization.
+///
+/// SCOPE: **ports only.** INTERNAL net-type declarations are left untouched:
+/// their pull (`tri0` reads 0 undriven) and wired-resolution (`wand`/`wor`)
+/// semantics DO affect the modeled behaviour, and stripping them soundly depends
+/// on the `setundef` polarity (default `-zero` matches `tri0` but not `tri1`) —
+/// a separate, gated follow-up. Port stripping needs no such gate because a port
+/// net type is invisible to isolated single-module verification.
+///
+/// Tokenizes past `//`/`/* */` comments and `"…"` strings so a `tri0` inside a
+/// comment/string is never rewritten, and skips escaped identifiers (`\tri0`).
+/// A no-op (clone) when there is no such qualifier — safe to run on every staged
+/// source. `input`/`output`/`inout` are reserved keywords (never identifiers),
+/// so a net-type word immediately after one is unambiguously a port qualifier.
+pub(crate) fn strip_port_net_types(src: &str) -> String {
+    const DIRECTIONS: &[&str] = &["input", "output", "inout"];
+    let bytes = src.as_bytes();
+    // (start, end) byte spans of identifier/keyword words that lie in CODE
+    // (outside comments/strings, not escaped identifiers).
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else if c == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
+                i += 1;
+            }
+            // A leading backslash makes it an escaped identifier (a NAME) — skip.
+            if start == 0 || bytes[start - 1] != b'\\' {
+                words.push((start, i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    for w in words.windows(2) {
+        let d = &src[w[0].0..w[0].1];
+        let n = &src[w[1].0..w[1].1];
+        if DIRECTIONS.contains(&d) && PORT_NET_TYPE_KEYWORDS.contains(&n) {
+            removals.push((w[1].0, w[1].1));
+        }
+    }
+    if removals.is_empty() {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut last = 0;
+    for (s, e) in removals {
+        out.push_str(&src[last..s]);
+        // Swallow the whitespace after the removed keyword so `input tri0 x`
+        // collapses to `input x`, not `input  x`.
+        let mut e2 = e;
+        while e2 < bytes.len() && (bytes[e2] == b' ' || bytes[e2] == b'\t') {
+            e2 += 1;
+        }
+        last = e2;
+    }
+    out.push_str(&src[last..]);
+    out
+}
+
 fn run_sv_flatten_btor2(
     content: &str,
     yopts: &YosysOptions,
@@ -235,7 +332,10 @@ fn run_sv_flatten_btor2(
 
     let tmp = TempDir::new("mununu-yosys")?;
     let primary = tmp.path().join("work.sv");
-    write_file(&primary, content)?;
+    // A2 — strip yosys/slang-rejected net-type qualifiers on port headers
+    // (`input tri0 x`) so the design parses; sound (a port net type is invisible
+    // to isolated single-module verification). No-op on sources without them.
+    write_file(&primary, &strip_port_net_types(content))?;
 
     let mut sources = vec![primary.clone()];
     for (name, src) in &yopts.additional_sources {
@@ -243,7 +343,7 @@ fn run_sv_flatten_btor2(
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
-        write_file(&p, src)?;
+        write_file(&p, &strip_port_net_types(src))?;
         sources.push(p);
     }
 
@@ -707,7 +807,10 @@ fn translate_sv_per_module_impl(
 
     let tmp = TempDir::new("mununu-yosys-per-module")?;
     let primary = tmp.path().join("work.sv");
-    write_file(&primary, content)?;
+    // A2 — strip yosys/slang-rejected net-type qualifiers on port headers
+    // (`input tri0 x`) so the design parses; sound (a port net type is invisible
+    // to isolated single-module verification). No-op on sources without them.
+    write_file(&primary, &strip_port_net_types(content))?;
 
     let mut sources = vec![primary.clone()];
     for (name, src) in &yopts.additional_sources {
@@ -715,7 +818,7 @@ fn translate_sv_per_module_impl(
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
-        write_file(&p, src)?;
+        write_file(&p, &strip_port_net_types(src))?;
         sources.push(p);
     }
 
@@ -1870,6 +1973,76 @@ impl Drop for TempDir {
 mod tests {
     use super::*;
     use crate::controllability::BoundaryDirection;
+
+    // A2 — port net-type stripping (`input tri0 x` → `input x`).
+    #[test]
+    fn strip_port_net_types_drops_input_tri0() {
+        // ANSI port list (the rtfsimpleuart case).
+        assert_eq!(
+            strip_port_net_types("module m(\n  input cs_i,\n  input tri0 baud8x, // mode\n);"),
+            "module m(\n  input cs_i,\n  input baud8x, // mode\n);"
+        );
+        // Non-ANSI port declaration statement.
+        assert_eq!(strip_port_net_types("input tri0 baud8x;"), "input baud8x;");
+        // output / inout + the other rejected net types.
+        assert_eq!(strip_port_net_types("output tri1 y;"), "output y;");
+        assert_eq!(strip_port_net_types("inout wand bus;"), "inout bus;");
+        // A ranged port keeps the range (the net type precedes it).
+        assert_eq!(
+            strip_port_net_types("input tri0 [7:0] d;"),
+            "input [7:0] d;"
+        );
+    }
+
+    #[test]
+    fn strip_port_net_types_leaves_non_targets_untouched() {
+        // `wire`/`reg`/`logic` on a port are accepted by yosys — keep them.
+        assert_eq!(strip_port_net_types("input wire clk;"), "input wire clk;");
+        assert_eq!(
+            strip_port_net_types("output reg [3:0] q;"),
+            "output reg [3:0] q;"
+        );
+        // An INTERNAL net-type declaration (no direction before it) is out of
+        // scope — its pull/resolution semantics matter, so it is NOT stripped.
+        assert_eq!(
+            strip_port_net_types("tri0 internal_net;"),
+            "tri0 internal_net;"
+        );
+        assert_eq!(
+            strip_port_net_types("wor wired_or_net;"),
+            "wor wired_or_net;"
+        );
+        // No net types at all: exact clone.
+        assert_eq!(
+            strip_port_net_types("input clk; output y;"),
+            "input clk; output y;"
+        );
+    }
+
+    #[test]
+    fn strip_port_net_types_is_comment_and_string_safe() {
+        // `tri0` inside a line comment / block comment / string is never rewritten.
+        assert_eq!(
+            strip_port_net_types("// input tri0 x\ninput clk;"),
+            "// input tri0 x\ninput clk;"
+        );
+        assert_eq!(
+            strip_port_net_types("/* input tri0 x */ input clk;"),
+            "/* input tri0 x */ input clk;"
+        );
+        assert_eq!(
+            strip_port_net_types("$display(\"input tri0 x\"); input clk;"),
+            "$display(\"input tri0 x\"); input clk;"
+        );
+    }
+
+    #[test]
+    fn strip_port_net_types_preserves_escaped_identifier_named_tri0() {
+        // `\tri0` is an escaped IDENTIFIER (a legal port NAME yosys accepts), not
+        // the net-type keyword — it must survive.
+        let src = "input \\tri0 ;";
+        assert_eq!(strip_port_net_types(src), src);
+    }
 
     #[test]
     fn per_module_yosys_timeout_is_an_actionable_error() {
