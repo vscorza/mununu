@@ -2505,7 +2505,7 @@ fn escalate_bottom(
         LivenessVerdict, reduce_ag_ef_target, response_liveness_rescue,
     };
     use crate::adapter::reach_rescue::{RescueVerdict, reach_portfolio_rescue};
-    use crate::adapter::recoverability::verify_recoverability_scalable;
+    use crate::adapter::recoverability::{verify_recoverability, verify_recoverability_scalable};
     use crate::mu_calculus::{PropertyClass, parser as mu_parser};
     use crate::verdict::PropertyVerdict;
 
@@ -2582,7 +2582,21 @@ fn escalate_bottom(
                     // smt-hyper-must νμ path and abstains (Unknown) if it cannot decide,
                     // so a ⊥ is only ever upgraded to a DEFINITE verdict.
                     let good_str = format!("{} == {}", good.signal, good.value);
-                    if let Ok(v) = verify_recoverability_scalable(design_btor2, &good_str, &[]) {
+                    // ③a routing — try the EXACT+COI recoverability engine FIRST. On a
+                    // control signal whose cone-of-influence fits the bit cap (e.g. a
+                    // wishbone `ack`/`err` whose cone excludes the datapath), exact+COI
+                    // decides the νμ recoverability the cube + smt-hyper-must *abstains*
+                    // on — `verify_recoverability` runs exact and falls to the scalable
+                    // cube path only on an over-cap `Err`. Gated on `reset_pinned`: the
+                    // exact engine is sound only under reset-gating (A.6); with a free
+                    // reset use the cube path, whose over-approximating may-relation
+                    // soundly includes the reset edge.
+                    let recov = if reset_pinned {
+                        verify_recoverability(design_btor2, &good_str)
+                    } else {
+                        verify_recoverability_scalable(design_btor2, &good_str, &[])
+                    };
+                    if let Ok(v) = recov {
                         match v {
                             PropertyVerdict::Holds => {
                                 prop.outcome = VerifyOutcome::Holds;
@@ -2729,18 +2743,21 @@ fn rescue_note(name: &str, verdict: &str, engines: &[&str]) -> VerificationNote 
     }
 }
 
-/// A provenance note for a νμ recoverability property the cube + smt-hyper-must path
-/// rescued from `⊥`.
+/// A provenance note for a νμ recoverability property rescued from `⊥` — by the exact+COI
+/// engine (reset-gated) if its cone fits the bit cap, else the scalable cube + smt-hyper-must
+/// path.
 fn recoverability_rescue_note(name: &str, verdict: &str) -> VerificationNote {
     VerificationNote {
         kind: "recoverability-rescue".into(),
         level: NoteLevel::Info,
         summary: format!(
-            "`{name}`: the cube abstraction left ⊥; the cube + smt-hyper-must νμ path decided \
-             the recoverability property {verdict}"
+            "`{name}`: the cube abstraction left ⊥; the νμ recoverability path (exact+COI \
+             first, then cube + smt-hyper-must) decided it {verdict}"
         ),
-        detail: "The AG EF (recoverability) ⊥ was escalated to the sound predicate-cube + \
-                 smt-hyper-must path (definite νμ verdicts transfer per Bruns–Godefroid / \
+        detail: "The AG EF (recoverability) ⊥ was escalated: exact+COI decides it directly when \
+                 the property's cone fits the bit cap (a wishbone/status control signal whose \
+                 cone excludes the datapath), else the sound predicate-cube + smt-hyper-must \
+                 path. Definite νμ verdicts transfer (exact = oracle; cube per Bruns–Godefroid / \
                  Shoham–Grumberg); box-AF liveness and safety take their own reductions."
             .into(),
         items: Vec::new(),
@@ -3178,6 +3195,38 @@ mod tests {
             matches!(report.properties[0].outcome, VerifyOutcome::Holds),
             "the ⊥ νμ recoverability property must be rescued to Holds by the cube + smt-hyper-must \
              path (property-directed seeding), got {:?}",
+            report.properties[0].outcome
+        );
+        assert!(
+            notes.iter().any(|n| n.kind == "recoverability-rescue"),
+            "a recoverability-rescue provenance note should be recorded"
+        );
+    }
+
+    // ③a routing — under reset-gating, a ⊥ νμ recoverability property is routed through the
+    // EXACT+COI engine (which decides control-cone recoverability the cube abstains on), not
+    // only the scalable cube path. A 2-bit wrapping counter (0→1→2→3→0) satisfies
+    // `AG EF (cnt == 0)` — every state returns to 0 — and exact decides it Holds.
+    #[test]
+    fn escalate_bottom_recoverability_uses_exact_when_reset_pinned() {
+        const COUNTER: &str = "1 sort bitvec 2\n2 sort bitvec 1\n3 zero 1\n4 one 1\n\
+                               5 state 1 cnt\n6 init 1 5 3\n7 add 1 5 4\n8 next 1 5 7\n";
+        let mut report = AutoVerifyReport {
+            properties: vec![PropertyVerdict {
+                name: "recover_to_zero".to_string(),
+                kind: crate::adapter::slang::translate::SvaKind::Assert,
+                formula: "nu Y.((mu X.(cnt == 0 || <> X)) && [] Y)".to_string(),
+                outcome: VerifyOutcome::Unknown { unknown_cells: 1 },
+                seeded_predicates: Vec::new(),
+                counterexample: None,
+            }],
+            ..Default::default()
+        };
+        // reset_pinned = true → the ③a exact-first routing is enabled (A.6 sound).
+        let notes = escalate_bottom(&mut report, COUNTER, true, &VerifyAutoOptions::default());
+        assert!(
+            matches!(report.properties[0].outcome, VerifyOutcome::Holds),
+            "reset-pinned recoverability ⊥ must be rescued to Holds via exact+COI, got {:?}",
             report.properties[0].outcome
         );
         assert!(
