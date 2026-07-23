@@ -1342,9 +1342,11 @@ pub struct SvVerifyAutoRequest {
     /// the FSM's datapath guards drop out of the cone via cone-of-influence — the sound,
     /// netlist-level way to fit `"exact-symbolic"` on a wide control FSM. Each entry is a
     /// bare net name (e.g. `"must_refresh"`). OVER-APPROXIMATION: a definite HOLDS
-    /// transfers (safety + over-approx); a definite VIOLATED is sound only when
-    /// guard-independent (an orphaned FSM state). Surfaced as a `control-slice` note.
-    /// Default empty.
+    /// transfers for a SAFETY / universal property (safety + over-approx); for an
+    /// ALTERNATING (νμ) recoverability property (`AG EF`) a HOLDS is sound for the
+    /// abstract model only (νμ collapses under approximation) — decide those on the
+    /// un-cutpointed cone. A definite VIOLATED is sound only when guard-independent (an
+    /// orphaned FSM state). Surfaced as a `control-slice` note. Default empty.
     #[serde(default)]
     pub cutpoint: Vec<String>,
     /// Abstraction-predicate hints, mirroring the CLI `--predicate` and the in-source
