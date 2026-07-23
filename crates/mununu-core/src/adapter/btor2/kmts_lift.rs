@@ -2131,6 +2131,11 @@ pub fn predicate_cube_lift(
         // compounds every expr is None → identical to passing `&predicates`
         // (behaviour-preserving for the simple SmtAllPairs path).
         let cube_preds = cube_predicates(&predicates, &lift_opts.compound_exprs);
+        // Phase 0.a — ONE `BtorSts` (hence one `ModelFacts` memo) shared across the may /
+        // hyper-must / must edge relations below, so the theory selection
+        // (`detect_btor2_memories`) runs once per lift instead of once per edge relation.
+        use crate::adapter::sts_ir::{BtorSts, SmtEncode};
+        let sts = BtorSts::new(&file);
         // scalable-KMTS P1.4 — the may-relation via post-image (O(2^|P|·#succ)) instead of all-pairs
         // (O(2^{2|P|})). Both use `encode_design_for_lift`, so the edge set is IDENTICAL; a `None` (an
         // unresolvable register / cube-space over the bound) falls back to the all-pairs seam.
@@ -2149,8 +2154,7 @@ pub fn predicate_cube_lift(
             pairs.sort_unstable();
             pairs
         } else {
-            use crate::adapter::sts_ir::{BtorSts, SmtEncode};
-            BtorSts::new(&file).may_edges(&cube_preds, 5_000)
+            sts.may_edges(&cube_preds, 5_000)
         };
         // Emit MayOnly edges. Keep `may_edges` (borrow) — the SmtHyperMust
         // branch below reuses it as the per-source candidate target set.
@@ -2184,7 +2188,7 @@ pub fn predicate_cube_lift(
         // hyper-must distinctions remain selectable on the sampling
         // (`!SmtAllPairs`) path below.
         if !matches!(lift_opts.must_edge_inference, MustEdgeInference::Off) {
-            use crate::adapter::sts_ir::{BtorSts, SmtEncode};
+            // BtorSts / SmtEncode already in scope from the shared `sts` above (Phase 0.a).
             match lift_opts.must_edge_inference {
                 MustEdgeInference::SmtHyperMust => {
                     // B.2 (2026-06-26) — GKMTS hyper-must on the SmtAllPairs /
@@ -2199,8 +2203,7 @@ pub fn predicate_cube_lift(
                     // candidate target set is its may-successor set; the seam
                     // proves `∀ s ⊨ src. ∃ input ∃ t ∈ T. reach(t)` and emits
                     // a `MustHyperOnly(T)` edge only on a definite Must.
-                    let hyper =
-                        BtorSts::new(&file).hyper_must_edges(&cube_preds, &may_edges, 5_000);
+                    let hyper = sts.hyper_must_edges(&cube_preds, &may_edges, 5_000);
                     let emitted = hyper.len();
                     for (src, targets) in hyper {
                         let target_ids: smallvec::SmallVec<
@@ -2228,7 +2231,7 @@ pub fn predicate_cube_lift(
                 }
                 _ => {
                     // P1 #3 — canonical ∀∃ standard per-target must → Sharp.
-                    let must_edges = BtorSts::new(&file).must_edges(&cube_preds, 5_000);
+                    let must_edges = sts.must_edges(&cube_preds, 5_000);
                     let promoted = must_edges.len();
                     for (i, j) in must_edges {
                         builder.transition_ids_with_modality(

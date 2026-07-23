@@ -313,12 +313,19 @@ pub trait SmtEncode: SymbolicTransitionSystem {
 /// function, so DR0 changes no behaviour and rewires no call site.
 pub struct BtorSts<'a> {
     file: &'a Btor2File,
+    /// Lazy, memoized structural derivations of `file` (Phase 0.a). The may / must /
+    /// hyper-must edge methods share ONE instance, so the theory selection
+    /// (`detect_btor2_memories`) runs once per `BtorSts`, not once per `encode_*` call.
+    facts: crate::adapter::btor2::model_facts::ModelFacts<'a>,
 }
 
 impl<'a> BtorSts<'a> {
     /// Wrap a parsed BTOR2 file as a symbolic transition system.
     pub fn new(file: &'a Btor2File) -> Self {
-        Self { file }
+        Self {
+            file,
+            facts: crate::adapter::btor2::model_facts::ModelFacts::new(file),
+        }
     }
 
     fn vars_of(&self, want_state: bool) -> Vec<StsVar> {
@@ -426,7 +433,6 @@ impl SmtEncode for BtorSts<'_> {
         predicates: &[P],
         timeout_ms: u32,
     ) -> Vec<(usize, usize)> {
-        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMayVerdict, build_register_nid_map_with_inputs, smt_per_target_may_check_uniform,
         };
@@ -441,7 +447,7 @@ impl SmtEncode for BtorSts<'_> {
         let n_cubes = 1usize << predicates.len();
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
-            let view = match encode_design_for_lift(self.file) {
+            let view = match self.facts.encode() {
                 Ok(v) => v,
                 // Encoder can't build the view (e.g. an unsupported op):
                 // no may-edges rather than an unsound guess. Mirrors the
@@ -505,7 +511,6 @@ impl SmtEncode for BtorSts<'_> {
         candidates: &[(usize, usize)],
         timeout_ms: u32,
     ) -> Vec<(usize, usize)> {
-        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMustVerdict, build_register_nid_map_with_inputs, smt_per_target_must_check_uniform,
         };
@@ -524,7 +529,7 @@ impl SmtEncode for BtorSts<'_> {
         // Unknown / encoder failure drop it (sound under-approximation).
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
-            let view = match encode_design_for_lift(self.file) {
+            let view = match self.facts.encode() {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
@@ -554,7 +559,6 @@ impl SmtEncode for BtorSts<'_> {
         may_edges: &[(usize, usize)],
         timeout_ms: u32,
     ) -> Vec<(usize, Vec<usize>)> {
-        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             SmtMustVerdict, build_register_nid_map_with_inputs, smt_hyper_must_check_uniform,
         };
@@ -580,7 +584,7 @@ impl SmtEncode for BtorSts<'_> {
 
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
-            let view = match encode_design_for_lift(self.file) {
+            let view = match self.facts.encode() {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
@@ -624,7 +628,6 @@ impl SmtEncode for BtorSts<'_> {
         derived: &[P],
         timeout_ms: u32,
     ) -> Vec<(usize, usize, crate::clts::Tristate)> {
-        use crate::adapter::btor2::kmts_lift::encode_design_for_lift;
         use crate::adapter::btor2::smt_must_edge::{
             build_register_nid_map_with_inputs, smt_combinational_label,
         };
@@ -636,7 +639,7 @@ impl SmtEncode for BtorSts<'_> {
         let n_cubes = 1usize << cube_predicates.len();
         let cfg = z3::Config::new();
         z3::with_z3_config(&cfg, || {
-            let view = match encode_design_for_lift(self.file) {
+            let view = match self.facts.encode() {
                 Ok(v) => v,
                 // Encoder failure → every derived predicate is conservatively
                 // KleeneBot in every cube (honest "couldn't determine").
