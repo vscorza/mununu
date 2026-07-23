@@ -18,6 +18,18 @@ branching (νμ) properties can only go through the 3-valued engines.
 
 > Source of truth: [`exact_symbolic_verdict`](../../crates/mununu-core/src/adapter/btor2/symbolic_bitblast.rs#L2095) · [`cegar_refine_loop`](../../crates/mununu-core/src/adapter/btor2/cegar.rs) · [`decide_reach_portfolio_parallel`](../../crates/mununu-core/src/adapter/reach_portfolio.rs#L260) — surface: (CLI+API+UI)
 
+**Cube termination bound (`MUNUNU_CUBE_SMT_RLIMIT`).** The exact engine has deterministic
+node/iteration budgets; the cube's `smt-hyper-must` must-edge inference can otherwise grind
+indefinitely on a **wide combinational cone** (a control signal whose freed-input fanin is
+100–250 bits — e.g. i2c's 196-bit cone, a ~2-hour hang). Setting `MUNUNU_CUBE_SMT_RLIMIT` to a
+positive integer applies a Z3 `rlimit` (a **machine-independent** resource budget) to each
+must-edge query: a query that exceeds it returns `Unknown`, which the inference reads as *no
+must-edge* — a **weaker must relation, hence a more conservative (more ⊥) but always SOUND**
+abstraction. This turns the hang into a fast, deterministic ⊥ (i2c: ~2 h → 27 s). Unset =
+no bound (historical behaviour).
+
+> Source of truth: [`cube_smt_rlimit`](../../crates/mununu-core/src/adapter/btor2/smt_must_edge.rs#L85) — surface: (CLI+API+UI)
+
 ## Per-surface routing
 
 | Surface / property | Path → engine | Predicates? |

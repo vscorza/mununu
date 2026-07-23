@@ -74,6 +74,26 @@ pub enum SmtMustVerdict {
 /// state-cell BV in the encoded view (typically because the BTOR2
 /// file does not declare the register or because it was rewritten
 /// away by an earlier pass).
+/// ③b — an optional **deterministic** Z3 `rlimit` (resource-unit budget) for the cube's
+/// must-edge SMT queries, from `MUNUNU_CUBE_SMT_RLIMIT` (`None` = unset = no bound, the
+/// historical behaviour). Unlike the wall-clock `timeout`, `rlimit` is machine-independent,
+/// so the ⊥-vs-decided boundary reproduces across machines. When a query exceeds it, Z3
+/// returns `Unknown`, which the must-edge inference reads as **NotMust** — a *weaker* must
+/// relation, hence a *more conservative* (more ⊥) but always SOUND abstraction. This turns a
+/// cube that grinds on a wide combinational cone (e.g. i2c's 196-bit freed-input cone) into a
+/// fast, deterministic ⊥ instead of a hang.
+fn cube_smt_rlimit() -> Option<u32> {
+    parse_cube_smt_rlimit(std::env::var("MUNUNU_CUBE_SMT_RLIMIT").ok())
+}
+
+/// Pure parse of the `MUNUNU_CUBE_SMT_RLIMIT` value (extracted so it is unit-testable
+/// without touching the process environment): a positive integer → `Some(r)`; unset,
+/// zero, negative, or non-numeric → `None` (no bound).
+fn parse_cube_smt_rlimit(v: Option<String>) -> Option<u32> {
+    v.and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&r| r > 0)
+}
+
 fn build_predicate_constraint(bv: &z3::ast::BV, value: u64, polarity: bool) -> z3::ast::Bool {
     let width = bv.get_size();
     // R.2.5b session 2 — mask the unsigned value to the BV width.
@@ -188,6 +208,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
 
     solver.assert(&view.transition);
@@ -442,6 +465,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
     solver.assert(&view.transition);
     for c in &constraints {
@@ -584,6 +610,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
 
     // Assert src_constraints (state_curr is existentially free at
@@ -673,6 +702,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
 
     for c in &src_constraints {
@@ -787,6 +819,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
 
     for c in &src_constraints {
@@ -898,6 +933,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
     for c in &src_constraints {
         solver.assert(c);
@@ -956,6 +994,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
     for c in &src_constraints {
         solver.assert(c);
@@ -1042,6 +1083,9 @@ where
     let solver = z3::Solver::new();
     let mut params = z3::Params::new();
     params.set_u32("timeout", timeout_ms);
+    if let Some(rl) = cube_smt_rlimit() {
+        params.set_u32("rlimit", rl); // ③b deterministic bound (SOUNDNESS: Unknown → NotMust → weaker must)
+    }
     solver.set_params(&params);
 
     solver.assert(&view.transition);
@@ -1192,6 +1236,21 @@ mod tests {
     use crate::adapter::btor2::kmts_lift::PredicateSpec;
     use crate::adapter::btor2::parser::parse;
     use crate::adapter::sidecar::predicate_image::btor2_encode::{encode_design, encode_primed};
+
+    // ③b — the deterministic cube must-edge rlimit is opt-in and validates its input:
+    // a positive integer bounds the queries; unset / 0 / negative / garbage = no bound.
+    #[test]
+    fn parse_cube_smt_rlimit_only_accepts_a_positive_integer() {
+        assert_eq!(
+            parse_cube_smt_rlimit(Some("2000000".into())),
+            Some(2_000_000)
+        );
+        assert_eq!(parse_cube_smt_rlimit(Some("  4096 ".into())), Some(4096));
+        assert_eq!(parse_cube_smt_rlimit(None), None); // unset ⇒ no bound (historical)
+        assert_eq!(parse_cube_smt_rlimit(Some("0".into())), None); // 0 ⇒ disabled
+        assert_eq!(parse_cube_smt_rlimit(Some("-5".into())), None); // negative ⇒ no bound
+        assert_eq!(parse_cube_smt_rlimit(Some("lots".into())), None); // garbage ⇒ no bound
+    }
 
     /// R.2.5b session 2 — deterministic transition `reg_a := 0`
     /// (input is dropped). Predicate `p:reg_a==0`. A transition
