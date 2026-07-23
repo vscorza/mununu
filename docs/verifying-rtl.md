@@ -145,6 +145,18 @@ and returns a **structured error** if one is missing, rather than crashing. Run 
 API on a host that has them installed (the pinned `docker/Dockerfile.sva` image is the
 supported environment). See [`external-tools.md`](external-tools.md).
 
+**Net-type normalization (lift widening).** A net-type qualifier on a *port* header
+(`input tri0 baud8x`) is rejected by both yosys's reader (a parse error) and slang's
+lowering (`net type 'tri0' unsupported`) — the pull / wired-resolution of
+`tri0`/`tri1`/`wand`/`wor`/… is a strength-resolution (simulation) concept a word-level
+backend does not model. mununu strips such a qualifier on **port** declarations before
+staging the source, so the design parses: a port net type only governs that port's
+*external* resolution, so for isolated single-module verification an input is havoc'd and
+an output is driven internally — dropping it is **sound** (exact for inputs). **Internal**
+net-type declarations are left untouched (their pull / resolution semantics matter).
+
+> Source of truth: [`strip_port_net_types`](../crates/mununu-core/src/adapter/yosys/mod.rs#L254) — surface: (CLI+API+UI)
+
 ### 2. Properties come from the module's own assertions
 
 `sv verify-auto` checks the SVA the design *carries*; it takes no formula. An agent
