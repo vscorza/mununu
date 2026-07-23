@@ -696,6 +696,59 @@ fn build_counterexample_trace(
 ///
 /// - Step 3's `PredicateSource::Manual` is the only working variant.
 ///   `WeakestPrecondition` / `CraigInterpolation` short-circuit.
+///
+/// SOUNDNESS (unsatisfiable-cube-cell fix, 2026-07-23) — a predicate-cube cell with
+/// **no outgoing may-transition** holds no concrete state, so its μ-calculus verdict is
+/// vacuous and must be ⊥.
+///
+/// *Why unsatisfiable.* The concrete RTL transition relation is **total** — every
+/// register has a next-state function, so every concrete state has a successor. The
+/// may-relation is a **sound over-approximation** of it (an edge is dropped only when the
+/// SMT backend proves it impossible), so for any concrete state `s` in cell `C` with
+/// successor `s'` there is a may-edge `C → α(s')`. Contrapositive: a cell with no outgoing
+/// may-edge contains no concrete state (its predicate conjunction is unsatisfiable — e.g.
+/// a CEGAR refinement that adds `x==0` and `x==1` makes the `{x==0 ∧ x==1}` and
+/// `{x≠0 ∧ x≠1}` cells empty).
+///
+/// *Why ⊥ is the sound verdict.* An unsatisfiable cell corresponds to no concrete state,
+/// so it can neither satisfy nor falsify the property; ⊥ (`must=0, may=1`) makes no
+/// definite claim and therefore can never produce an unsound definite verdict. Before this
+/// fix the 3-valued eval read such a cell as an ordinary state: a ¬good sink made
+/// `EF good = good ∨ ⟨⟩∅ = ` definite-**False**, which then spuriously falsified the
+/// universal recoverability property `AG EF good` (νμ) — the i2c `AG EF (wb_ack_o==1)`
+/// incident, where CEGAR refined into isolated ¬good sinks and verify-auto read one as an
+/// init cube ⇒ a spurious definite VIOLATED (exact-symbolic decides HOLDS).
+///
+/// *Precision, not soundness, rests on totality.* Satisfiable cells always have an
+/// outgoing may-edge and are untouched, so every sound definite verdict is preserved. If a
+/// non-total system were ever lifted, a genuine terminal (satisfiable, no successor) would
+/// degrade to ⊥ — a precision loss, never an unsound verdict. On a normal cube (no
+/// unsatisfiable cells) the pass is a no-op.
+fn downgrade_unsatisfiable_cells(
+    clts: &crate::clts::Clts<crate::clts::DefaultStateIdx, crate::clts::DefaultLabelIdx>,
+    verdicts: TritSet,
+) -> (TritSet, std::collections::HashSet<usize>) {
+    use crate::clts::StateId;
+    let unsat: std::collections::HashSet<usize> = (0..clts.state_count())
+        .filter(|&i| {
+            StateId::<crate::clts::DefaultStateIdx>::from_index(i)
+                .is_some_and(|s| clts.outgoing(s).is_empty())
+        })
+        .collect();
+    if unsat.is_empty() {
+        return (verdicts, unsat);
+    }
+    let mut must = verdicts.must_true().clone();
+    let mut may = verdicts.may_true().clone();
+    for &i in &unsat {
+        if i < must.len() {
+            must.set(i, false); // not definitely-true
+            may.set(i, true); // but possibly-true ⇒ ⊥, never definite-False
+        }
+    }
+    (TritSet::from_parts(must, may), unsat)
+}
+
 pub fn cegar_refine_loop(
     formula: &Formula,
     btor2_content: &str,
@@ -1140,7 +1193,7 @@ pub fn cegar_refine_loop(
             prior_approximants: prior_seed,
             ..Default::default()
         };
-        let game_eval: GameEvaluation = if let Some(capture_handle) = &captured {
+        let mut game_eval: GameEvaluation = if let Some(capture_handle) = &captured {
             let sink: Arc<Mutex<HashMap<usize, StoredApproximant>>> = Arc::clone(capture_handle);
             eval_opts.on_fixpoint_convergence =
                 Some(Arc::new(move |var, view: &ApproximantView<'_>| {
@@ -1166,6 +1219,17 @@ pub fn cegar_refine_loop(
             evaluate_3v_game(formula, &lift_result.clts, eval_env)
                 .map_err(eval_err_to_adapter_err)?
         };
+
+        // SOUNDNESS (unsatisfiable-cube-cell fix, 2026-07-23) — downgrade cube cells
+        // that hold no concrete state (no outgoing may-transition) to ⊥ so they can
+        // never contribute a spurious definite verdict (the i2c `AG EF (wb_ack_o==1)`
+        // incident). See [`downgrade_unsatisfiable_cells`] for the argument. `unsat_cells`
+        // is also excluded from the convergence check below (an unreal cell must not
+        // keep the refinement loop spinning).
+        let (masked_verdicts, unsat_cells) =
+            downgrade_unsatisfiable_cells(&lift_result.clts, game_eval.verdicts.clone());
+        game_eval.verdicts = masked_verdicts;
+
         let approximants_at_end: Option<HashMap<usize, StoredApproximant>> = captured.map(|h| {
             // B.6.a invariant: by this point `eval_opts` has been
             // dropped (the `if let` arm above ended), so the
@@ -1179,9 +1243,11 @@ pub fn cegar_refine_loop(
         });
         let game_position_evaluations = estimate_position_evaluations(&lift_result.clts, formula);
 
-        // 3. Check convergence.
-        let has_kleenebot = (0..game_eval.verdicts.len())
-            .any(|s| matches!(game_eval.verdicts.verdict_at(s), Trit::Unknown));
+        // 3. Check convergence. Unsatisfiable cells (masked to ⊥ above) are not real
+        // states, so they must not keep the loop refining — exclude them.
+        let has_kleenebot = (0..game_eval.verdicts.len()).any(|s| {
+            !unsat_cells.contains(&s) && matches!(game_eval.verdicts.verdict_at(s), Trit::Unknown)
+        });
 
         // R-Y5 (2026-06-08) — identification pass: when a failure
         // subgame is present, every register named in the current
@@ -2236,6 +2302,107 @@ mod tests {
         assert!(!trace.approximant_reuse_enabled);
         // CTXDSL Phase 2 — emit_ctxdsl defaulted false ⇒ no captured cube.
         assert!(trace.final_clts.is_none());
+    }
+
+    #[test]
+    fn downgrade_unsatisfiable_cells_masks_edgeless_cells_to_bottom() {
+        use crate::clts::{Clts, DefaultLabelIdx, DefaultStateIdx, LabelControllability};
+        use bitvec::prelude::*;
+        // s0 has a self-loop (satisfiable); s1 has NO outgoing transition — an
+        // unsatisfiable cube cell in a total transition system.
+        let mut builder = Clts::<DefaultStateIdx, DefaultLabelIdx>::builder();
+        builder.state("s0").state("s1").initial("s0");
+        let lbl = builder.labels().intern(["a"]).expect("intern a");
+        builder.set_label_controllability(lbl, LabelControllability::Uncontrollable);
+        let s0 = builder.state_id_or_insert("s0").expect("s0");
+        builder.transition_ids(s0, &[lbl], s0);
+        let clts = builder.build().expect("build");
+        // s0 = definite-True, s1 = definite-False (as a ¬good sink evaluates).
+        let must = bitvec![usize, Lsb0; 1, 0];
+        let may = bitvec![usize, Lsb0; 1, 0];
+        let verdicts = crate::mu_calculus::trit::TritSet::from_parts(must, may);
+        assert_eq!(
+            verdicts.verdict_at(1),
+            Trit::False,
+            "precondition: the edgeless cell starts definite-False"
+        );
+
+        let (masked, unsat) = downgrade_unsatisfiable_cells(&clts, verdicts);
+        assert_eq!(
+            unsat,
+            std::collections::HashSet::from([1]),
+            "only the edgeless (unsatisfiable) cell is flagged"
+        );
+        assert_eq!(
+            masked.verdict_at(0),
+            Trit::True,
+            "the satisfiable cell (with an outgoing edge) is untouched"
+        );
+        assert_eq!(
+            masked.verdict_at(1),
+            Trit::Unknown,
+            "the unsatisfiable ¬good sink is masked to ⊥ — never a spurious definite-False"
+        );
+    }
+
+    // Toggle `x' = !x` with predicates {x==0, x==1}: a 1-bit `x` is always 0 or 1, so
+    // the cube cell {x≠0 ∧ x≠1} is UNSATISFIABLE and a ¬good sink (no outgoing may-edge).
+    const TOGGLE_BTOR2: &str =
+        "1 sort bitvec 1\n2 zero 1\n3 state 1 x\n4 init 1 3 2\n5 not 1 3\n6 next 1 3 5\n";
+
+    #[test]
+    fn cegar_unsatisfiable_cube_cell_does_not_falsify_recoverability() {
+        use crate::adapter::btor2::kmts_lift::{MayEdgeInference, MustEdgeInference};
+        // `AG EF (x==1)` genuinely HOLDS on the toggle (drive the toggle to reach x==1).
+        // Before the unsatisfiable-cell fix, the unsatisfiable ¬good cell's vacuous
+        // `EF (x==1) = good ∨ ⟨⟩∅ = False` spuriously falsified the universal νμ — a
+        // definite VIOLATED where exact decides HOLDS. The fix masks unsatisfiable cells
+        // to ⊥, so NO cell is definite-False (a spurious counterexample would surface as
+        // a `Trit::False` here).
+        let formula =
+            parser::parse("nu Y. ((mu X. ((x == 1) || <> X)) && [] Y)").expect("formula parses");
+        let initial = vec![
+            PredicateSpec {
+                name: "x == 0".into(),
+                register: "x".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "x == 1".into(),
+                register: "x".into(),
+                value: 1,
+            },
+        ];
+        let env = Environment::new(4); // 2^2 cubes
+        let cegar_opts = CegarOptions {
+            max_iterations: 8,
+            predicate_source: PredicateSource::WeakestPrecondition,
+            max_cube_count: 1024,
+            capture_approximants: false,
+            enable_approximant_reuse: false,
+            smart_uf_cap: false,
+            lift_strategy: LiftStrategy::Eager,
+            must_edge_inference: MustEdgeInference::SmtHyperMust,
+            may_edge_inference: MayEdgeInference::SmtAllPairs,
+            emit_ctxdsl: false,
+        };
+        let trace = cegar_refine_loop(
+            &formula,
+            TOGGLE_BTOR2,
+            initial,
+            &env,
+            &AdapterOptions::default(),
+            &cegar_opts,
+        )
+        .expect("cegar succeeds");
+        let verdicts: Vec<Trit> = (0..trace.final_verdict.len())
+            .map(|i| trace.final_verdict.verdict_at(i))
+            .collect();
+        assert!(
+            !verdicts.contains(&Trit::False),
+            "an unsatisfiable ¬good cube cell must be ⊥, not a spurious definite-False \
+             counterexample; got {verdicts:?}"
+        );
     }
 
     // H.U.2 — `reg` stuck at 0; `g = not(reg)` is a combinational-of-state signal
