@@ -1644,17 +1644,19 @@ struct SvVerifyAutoArgs {
     /// Print a JSON report instead of the human-readable summary.
     #[arg(long)]
     json: bool,
-    /// R-F5.5d (2026-07-03) — predicate-cube engine: `explicit` (default) or
-    /// `symbolic` (R-F5 BDD relation + CEGAR loop, no per-cube-pair SMT — orders
-    /// of magnitude faster at large `|P|`, the FSM-cone residual). Symbolic
-    /// supports cube-dimension predicates (equality + non-derived compounds) +
-    /// the bare `[]`/`<>` fragment; a derived predicate or guarded modality
-    /// `Skipped`s that property. D1.6 (2026-07-04) — `exact-symbolic` decides
-    /// each property EXACTLY over the reset-gated design's full bit-blasted state
-    /// (no predicate abstraction, so a **definite** 2-valued verdict, never ⊥) —
-    /// it decides `AF`-liveness where both cube engines return Unknown; bounded by
-    /// BDD size (a design too large to bit-blast ⇒ the property is `Skipped`).
-    #[arg(long, value_enum, default_value_t = EngineArg::Explicit)]
+    /// Verify engine. **Default `portfolio-sequential`** (③a, 2026-07-23): run
+    /// `exact-symbolic` → `symbolic` → `explicit` in precision order, merging and
+    /// early-exiting the moment every property is decided. Exact-first because the
+    /// exact engine decides a control property whose cone-of-influence fits the bit
+    /// cap directly (and *cleanly skips* an over-cap cone), where the bare
+    /// predicate-cube `explicit` engine can ⊥ or grind on a wide combinational cone;
+    /// the cube legs still catch what exact skips (input-antecedent, over-cap). Pin a
+    /// single engine with `--engine explicit` (predicate-cube + CEGAR), `symbolic`
+    /// (R-F5 BDD relation, no per-cube-pair SMT), or `exact-symbolic` (EXACT over the
+    /// reset-gated full bit-blast — a **definite** 2-valued verdict, never ⊥; bounded
+    /// by BDD size, over-cap ⇒ `Skipped`). NB: a pinned bare `explicit` on a wide
+    /// combinational cone can hang unless `MUNUNU_CUBE_SMT_RLIMIT` is set (③b).
+    #[arg(long, value_enum, default_value_t = EngineArg::PortfolioSequential)]
     engine: EngineArg,
     #[command(flatten)]
     ci: CiArgs,
