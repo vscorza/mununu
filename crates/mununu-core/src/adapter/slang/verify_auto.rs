@@ -187,6 +187,43 @@ fn try_ranking_recoverability(
     }
 }
 
+/// SOUNDNESS guard — corroborate a **cube** definite VIOLATED on an ALTERNATING (νμ)
+/// property against the **exact-symbolic oracle** on the same reduced model.
+///
+/// The predicate-cube's 3-valued (parity-game) evaluator can return a *spurious*
+/// definite-False on an alternating fixpoint even when the lifted KMTS is sound (the
+/// may-relation over-approximates and the hyper-must under-approximates). A safety
+/// VIOLATED is sound (may over-approximation + CEGAR concretization), but an
+/// alternating-fixpoint definite verdict collapses under plain approximation
+/// (CLAUDE.md soundness table / Bruns–Godefroid): only the exact engine (no
+/// abstraction) is authoritative for it here. So:
+/// - exact **HOLDS** ⇒ the cube VIOLATED was spurious ⇒ [`VerifyOutcome::Holds`];
+/// - exact **VIOLATED** ⇒ corroborated ⇒ keep the VIOLATED (with the cube's cell tally);
+/// - exact **over-cap / error** ⇒ cannot corroborate ⇒ degrade to ⊥
+///   ([`VerifyOutcome::Unknown`]) — honest, never a false claim.
+///
+/// This never weakens a *safety* verdict (the caller only invokes it for
+/// `alternation_depth() >= 2`) and never turns a definite HOLDS into anything else; it
+/// only prevents an uncorroborated alternating VIOLATED from escaping. The root-cause
+/// evaluator fix (the νμ may-true set over hyper-must edges) is tracked separately.
+fn corroborate_alternating_violated_with_exact(
+    btor2: &str,
+    formula: &crate::mu_calculus::Formula,
+    false_cells: usize,
+) -> VerifyOutcome {
+    use crate::adapter::btor2::symbolic_bitblast::{
+        ExactVerdict, exact_symbolic_verdict_with_witness,
+    };
+    match exact_symbolic_verdict_with_witness(btor2, formula) {
+        Ok((ExactVerdict::Holds, _)) => VerifyOutcome::Holds,
+        Ok((ExactVerdict::Violated, _)) => VerifyOutcome::Violated { false_cells },
+        // Over-cap / skip / error: no sound corroboration ⇒ honest ⊥.
+        Err(_) => VerifyOutcome::Unknown {
+            unknown_cells: false_cells.max(1),
+        },
+    }
+}
+
 /// Model-level diagnostics for an automated verification run — what the lift
 /// produced, so a "couldn't verify" outcome is traceable to a root cause
 /// (rather than only a per-property symptom like "atom over non-state signal").
@@ -2405,7 +2442,25 @@ pub fn verify_auto(
                     let false_cells = (0..v.len())
                         .filter(|&i| v.verdict_at(i) == Trit::False)
                         .count();
-                    VerifyOutcome::Violated { false_cells }
+                    // SOUNDNESS (νμ cube-VIOLATED corroboration, 2026-07-23) — the 3-valued
+                    // predicate-cube evaluator can emit a *spurious* definite VIOLATED on an
+                    // ALTERNATING (νμ) property even over a SOUND KMTS. Observed on i2c
+                    // `AG EF (wb_ack_o==1)`: the may-relation is exact
+                    // ({(¬g,¬g),(¬g,g),(g,¬g)} — so even the pure may over-approximation
+                    // HOLDS) and the hyper-must is sound, yet the parity-game eval returns
+                    // definite-False. The exact-symbolic engine (the differential oracle,
+                    // no abstraction) decides the same reduced model HOLDS. A safety
+                    // VIOLATED is sound by the may over-approximation + CEGAR refinement, but
+                    // an alternating-fixpoint definite-False collapses under approximation
+                    // (CLAUDE.md soundness table), so it must be corroborated by exact before
+                    // it is trusted: exact HOLDS ⇒ overrule to Holds; exact VIOLATED ⇒ keep;
+                    // exact over-cap ⇒ degrade to ⊥ (honest, never a false claim). The
+                    // root-cause evaluator fix is tracked separately (νμ may-true set).
+                    if formula.alternation_depth() >= 2 {
+                        corroborate_alternating_violated_with_exact(&btor2, &formula, false_cells)
+                    } else {
+                        VerifyOutcome::Violated { false_cells }
+                    }
                 } else if any_unknown {
                     let unknown_cells = (0..v.len())
                         .filter(|&i| v.verdict_at(i) == Trit::Unknown)
@@ -2421,9 +2476,13 @@ pub fn verify_auto(
         };
 
         // AR-S2 — the cube lift uses the sound `SmtAllPairs` may-relation, so a
-        // definite cube verdict is sound by over-approximation; the A.4 honest-⊥
-        // downgrade (a stopgap for the retired sampling-may under-approximation)
-        // is no longer needed.
+        // definite cube verdict on a SAFETY / non-alternating property is sound by
+        // over-approximation; the A.4 honest-⊥ downgrade (a stopgap for the retired
+        // sampling-may under-approximation) is no longer needed there. NOTE (2026-07-23):
+        // this soundness-by-over-approximation does NOT extend to a definite VIOLATED on
+        // an ALTERNATING (νμ) property — that verdict is corroborated against the exact
+        // oracle above ([`corroborate_alternating_violated_with_exact`]) precisely because
+        // the 3-valued eval can emit a spurious alternating-fixpoint False.
         report.properties.push(PropertyVerdict {
             name: t.name.clone(),
             kind: t.kind,
@@ -2790,6 +2849,39 @@ fn liveness_rescue_note(name: &str, verdict: &str, engines: &[&str]) -> Verifica
 
 #[cfg(test)]
 mod tests {
+    /// SOUNDNESS regression (νμ cube-VIOLATED corroboration) — the predicate-cube's
+    /// 3-valued parity-game evaluator returns a *spurious* definite VIOLATED on the
+    /// alternating property `AG EF (ack==1)` for the single-cycle-ack model
+    /// `ack' = drv & ~ack` (verified live: `btor2 cegar --engine explicit
+    /// --must-edge-inference smt-hyper-must` reports `T=0 F=2`), yet the exact-symbolic
+    /// oracle decides it HOLDS. The guard [`corroborate_alternating_violated_with_exact`]
+    /// must overrule the cube VIOLATED to Holds. This is the minimal self-contained
+    /// analogue of the i2c `AG EF (wb_ack_o==1)` incident. `ack` is reachable only by
+    /// driving the input `drv` high, so the good state needs an input-driven transition —
+    /// exactly the class the cube's νμ evaluator mishandles.
+    #[test]
+    fn guard_overrules_spurious_alternating_violated_via_exact() {
+        use crate::mu_calculus::parser as mu_parser;
+        // ack' = drv & ~ack : a Wishbone-style single-cycle ack driven by input `drv`.
+        let btor2 =
+            "1 sort bitvec 1\n2 input 1 drv\n3 state 1 ack\n4 not 1 3\n5 and 1 2 4\n6 next 1 3 5\n";
+        let formula = mu_parser::parse("nu Y.((mu X.(ack==1 || <> X)) && [] Y)")
+            .expect("AG EF (ack==1) parses");
+        // The guard only fires on alternating fixpoints.
+        assert!(
+            formula.alternation_depth() >= 2,
+            "AG EF is νμ (alternating); alternation_depth = {}",
+            formula.alternation_depth()
+        );
+        // Exact decides HOLDS on this small model, so a (hypothetical) cube VIOLATED with
+        // any cell tally must be overruled to Holds — never left as a spurious VIOLATED.
+        let outcome = super::corroborate_alternating_violated_with_exact(btor2, &formula, 2);
+        assert!(
+            matches!(outcome, super::VerifyOutcome::Holds),
+            "exact oracle HOLDS must overrule the spurious cube VIOLATED; got {outcome:?}"
+        );
+    }
+
     /// A.4 — a `Violated` bare `EF p` (reachability) yields the unreachable-target
     /// witness: no path (`prefix`/`cycle` empty), the target atoms naming what the
     /// design never reaches. A recoverability (`AG EF`) shape is not a bare `EF` and
