@@ -249,6 +249,16 @@ pub fn must_precondition_interpolant(
             .collect();
         let nid_to_name: HashMap<Nid, String> =
             name_to_nid.iter().map(|(n, &d)| (d, n.clone())).collect();
+        // H.E — named COMBINATIONAL outputs (`cs_n = f(state)`): their z3 value is `signal_bvs[nid]`
+        // over the canonical `state_curr` + `inputs`. A recoverability `good` over a combinational
+        // output (the corpus case — `cs_n==15`, `scl_padoen_o==1`) resolves through this, not the
+        // state-cell map.
+        let comb_name_to_nid: HashMap<String, Nid> = view
+            .signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::Combinational)
+            .filter_map(|s| s.symbol.clone().map(|sym| (sym, s.nid)))
+            .collect();
         // `cur` is BARE-named so the interpolant — over the SHARED cur vocabulary — parses to a
         // clean state predicate; the two next frames get distinct suffixes.
         let frame = |suffix: &str| -> HashMap<Nid, BV> {
@@ -276,6 +286,7 @@ pub fn must_precondition_interpolant(
         };
         let in_a = inp("__ina");
         let in_b = inp("__inb");
+        let in_cur = inp("__incur");
         let instantiate = |nx: &HashMap<Nid, BV>, ip: &HashMap<Nid, BV>| -> Bool {
             let mut subs: Vec<(&BV, &BV)> = Vec::new();
             for (nid, bv) in &view.state_curr {
@@ -297,29 +308,55 @@ pub fn must_precondition_interpolant(
         };
         let t_a = instantiate(&nx_a, &in_a);
         let t_b = instantiate(&nx_b, &in_b);
-        let build = |ps: &[PredicateExpr], f: &HashMap<Nid, BV>| -> Option<Bool> {
-            let lookup = |name: &str| -> Option<BV> {
-                name_to_nid.get(name).and_then(|nid| f.get(nid)).cloned()
+        let build =
+            |ps: &[PredicateExpr], sf: &HashMap<Nid, BV>, inf: &HashMap<Nid, BV>| -> Option<Bool> {
+                let lookup = |name: &str| -> Option<BV> {
+                    if let Some(nid) = name_to_nid.get(name) {
+                        return sf.get(nid).cloned();
+                    }
+                    // A combinational output: substitute its `signal_bvs` value (over the canonical
+                    // state_curr + inputs) INTO this frame (state_curr→sf, inputs→inf). Sound for a
+                    // STATE-ONLY combinational (the input sub is a no-op); an input-dependent one is
+                    // resolved against this frame's inputs (recoverability goods are state-only in
+                    // practice — `cs_n` is a function of the `cfg_tgt_sel` / `cs_int_n` registers).
+                    let &nid = comb_name_to_nid.get(name)?;
+                    let bv = view.signal_bvs.get(&nid)?;
+                    let mut subs: Vec<(&BV, &BV)> = Vec::new();
+                    for (n, b) in &view.state_curr {
+                        if let Some(x) = sf.get(n) {
+                            subs.push((b, x));
+                        }
+                    }
+                    for (n, b) in &view.inputs {
+                        if let Some(x) = inf.get(n) {
+                            subs.push((b, x));
+                        }
+                    }
+                    Some(bv.substitute(&subs))
+                };
+                let mut conj = Vec::new();
+                for p in ps {
+                    conj.push(p.build_constraint(&lookup)?);
+                }
+                Some(if conj.is_empty() {
+                    Bool::from_bool(true)
+                } else {
+                    Bool::and(&conj.iter().collect::<Vec<_>>())
+                })
             };
-            let mut conj = Vec::new();
-            for p in ps {
-                conj.push(p.build_constraint(&lookup)?);
+        let source_bool = match build(source, &cur, &in_cur) {
+            Some(b) => b,
+            None => {
+                return RefineOutcome::Unavailable("source over an unresolvable register".into());
             }
-            Some(if conj.is_empty() {
-                Bool::from_bool(true)
-            } else {
-                Bool::and(&conj.iter().collect::<Vec<_>>())
-            })
         };
-        let source_bool = match build(source, &cur) {
+        let good_a = match build(good, &nx_a, &in_a) {
             Some(b) => b,
-            None => return RefineOutcome::Unavailable("source over a non-state register".into()),
+            None => {
+                return RefineOutcome::Unavailable("good over an unresolvable register".into());
+            }
         };
-        let good_a = match build(good, &nx_a) {
-            Some(b) => b,
-            None => return RefineOutcome::Unavailable("good over a non-state register".into()),
-        };
-        let good_b = match build(good, &nx_b) {
+        let good_b = match build(good, &nx_b, &in_b) {
             Some(b) => b,
             None => return RefineOutcome::Unavailable("good over a non-state register".into()),
         };
@@ -1019,6 +1056,45 @@ mod tests {
             Some("(= data target)")
         );
         assert_eq!(ite_condition("(= data target)"), None);
+    }
+
+    /// Combinational-`good` resolution — the corpus recoverability targets a COMBINATIONAL output
+    /// (`cs_n==15`), not a state cell. Here `idle = !busy` is a named combinational node; the
+    /// must-precondition of `good = (idle==1)` must resolve `idle` via `signal_bvs` (⟺ `busy==0`)
+    /// and still discover `data==target` — the same invariant as the state-register case. `#[ignore]`d
+    /// (needs MathSAT; run in `mununu-sva` with `MUNUNU_MATHSAT_PATH`).
+    #[test]
+    #[ignore = "requires MathSAT (mununu-sva image); run with --ignored + MUNUNU_MATHSAT_PATH"]
+    fn must_precondition_resolves_combinational_good() {
+        use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+        const D: &str = "1 sort bitvec 1\n2 sort bitvec 3\n3 state 1 busy\n4 state 2 data\n\
+5 state 2 target\n6 one 1\n7 zero 1\n8 zero 2\n9 one 2\n10 init 1 3 6\n11 init 2 4 8\n\
+12 init 2 5 8\n13 add 2 4 9\n14 next 2 4 13\n15 add 2 5 9\n16 next 2 5 15\n17 eq 1 4 5\n\
+18 ite 1 17 7 3\n19 next 1 3 18\n20 not 1 3 idle\n";
+        let file = crate::adapter::btor2::parser::parse(D).expect("parse");
+        // ⊥ cube = {busy != 0} (state); good = {idle == 1} (COMBINATIONAL, ⟺ busy==0).
+        let source = vec![PredicateExpr::Cmp {
+            register: "busy".into(),
+            op: CmpOp::Ne,
+            value: 0,
+        }];
+        let good = vec![PredicateExpr::Cmp {
+            register: "idle".into(),
+            op: CmpOp::Eq,
+            value: 1,
+        }];
+        match must_precondition_interpolant(&file, &source, &good, 5_000) {
+            RefineOutcome::Predicate(PredicateExpr::CmpReg { lhs, op, rhs }) => {
+                assert_eq!(op, CmpOp::Eq);
+                assert!(
+                    (lhs == "data" && rhs == "target") || (lhs == "target" && rhs == "data"),
+                    "combinational-good must-pre discovered the wrong relation: {lhs} {op:?} {rhs}"
+                );
+            }
+            other => panic!(
+                "expected data==target via combinational-good (`idle`) resolution; got {other:?}"
+            ),
+        }
     }
 
     /// Validation sweep: run the interpolation invariant-discovery over every
