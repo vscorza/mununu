@@ -335,12 +335,12 @@ mod tests {
 13 init 2 6 5
 ";
 
-    /// A 64-bit register `big` that stays 0 — `AG(big == 0)` HOLDS and is
-    /// 1-inductive. The 64-bit cone EXCEEDS the exact engine's 40-bit cap, so the
-    /// exact member abstains and only the subprocess members (btormc k-induction /
+    /// An 80-bit register `big` that stays 0 — `AG(big == 0)` HOLDS and is
+    /// 1-inductive. The 80-bit cone EXCEEDS the exact engine's auto-cap ceiling (64), so
+    /// the exact member abstains and only the subprocess members (btormc k-induction /
     /// Pono IC3) can decide it — the "beyond the BDD cap" value proof.
     const WIDE_STATE: &str = "\
-1 sort bitvec 64
+1 sort bitvec 80
 2 zero 1
 3 state 1 big
 4 init 1 3 2
@@ -380,8 +380,8 @@ mod tests {
     #[test]
     #[ignore = "requires btormc + pono (mununu-sva); run with --ignored"]
     fn e2e_rescue_decides_beyond_exact_cap() {
-        // A 64-bit invariant the exact BDD engine cannot touch (over its 40-bit
-        // cap) — proving the subprocess members extend reach past the cap. The
+        // An 80-bit invariant the exact BDD engine cannot touch (over its auto-cap
+        // ceiling of 64) — proving the subprocess members extend reach past the cap. The
         // exact member must ABSTAIN; a subprocess member must carry the verdict.
         let f = parse("nu X. ((big == 0) && [] X)");
         let (verdict, outcome) =
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(verdict, RescueVerdict::Holds, "outcome: {outcome:?}");
         assert!(
             !outcome.unreachable_by.contains(&"exact"),
-            "the exact engine must abstain on the 64-bit (over-cap) design; got {outcome:?}"
+            "the exact engine must abstain on the 80-bit (over-cap) design; got {outcome:?}"
         );
         assert!(
             outcome

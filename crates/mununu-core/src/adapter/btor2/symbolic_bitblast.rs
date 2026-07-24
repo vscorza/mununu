@@ -127,23 +127,49 @@ use crate::mu_calculus::{Control, Formula, FormulaVarId, Guard, ModalKind, Node 
 /// blowup into a clean `Skipped` instead of an OoM panic (the 2026-07-06 `prim_esc_receiver`
 /// failure). Those make it SAFE to raise the cap.
 ///
-/// The effective cap is `MUNUNU_BDD_MAX_BITS` when set (clamped to [`HARD_BITBLAST_CEILING`]),
-/// else this default. The default stays 40 because a wide **counter** has a small BDD but a
-/// slow (`2^W`-iteration) fixpoint the node-budget guard does not catch — raising the default
-/// safely needs an iteration budget too, so for now widening is opt-in.
+/// The conservative default bit cap when `MUNUNU_BDD_MAX_BITS` is unset — the *floor* the
+/// auto-cap never goes below. The common control cone fits well under it, and the tiered arena
+/// (below) keeps the ≤ 40-bit path allocation-identical. A concrete cone that modestly exceeds
+/// it is admitted automatically up to [`AUTO_CAP_CEILING`]; see [`effective_bitblast_cap`].
 const MAX_BITBLAST_BITS: u32 = 40;
+
+/// Auto-cap-management ceiling (verification-execution-planner Phase 4.6). With NO explicit
+/// `MUNUNU_BDD_MAX_BITS`, a concrete cone up to this width is admitted even though it exceeds
+/// the conservative [`MAX_BITBLAST_BITS`] default, so exact decides the CONCRETE model directly
+/// (no abstraction) instead of Skipping to the cube. This is sound now that BOTH failure modes
+/// a wider cone could hit bail deterministically: the mid-build node-budget guard
+/// ([`BddBitBlaster::node_budget`]) bounds BDD *size*, and the fixpoint iteration budget
+/// ([`fixpoint_iter_budget`], #369) bounds the `2^W`-diameter *counter* fixpoint the node guard
+/// alone misses — the exact reason the default stayed at 40 until that budget shipped. 64
+/// covers word-wide control designs (e.g. the OpenTitan i2c `AG EF ack` cone) while staying
+/// inside both guards' bounded-attempt cost; a wider cone still needs an explicit env opt-in.
+const AUTO_CAP_CEILING: u32 = 64;
 
 /// Absolute ceiling the `MUNUNU_BDD_MAX_BITS` override is clamped to — bounds the largest
 /// arena we will allocate regardless of the env value.
 const HARD_BITBLAST_CEILING: u32 = 256;
 
-/// The effective bit cap: the `MUNUNU_BDD_MAX_BITS` override (clamped) or the default.
-fn effective_bitblast_cap() -> u32 {
-    std::env::var("MUNUNU_BDD_MAX_BITS")
+/// The default cap for a cone of `cone_bits` KEPT bits when no env override is present: the
+/// [`MAX_BITBLAST_BITS`] floor, auto-raised to fit the concrete cone up to [`AUTO_CAP_CEILING`]
+/// (never lowered below the floor). Pure — no env read — so the auto-raise thresholds are
+/// unit-testable without touching process-global state.
+fn default_cap_for_cone(cone_bits: u32) -> u32 {
+    MAX_BITBLAST_BITS.max(cone_bits.min(AUTO_CAP_CEILING))
+}
+
+/// The effective bit cap for a cone of `cone_bits` KEPT register+input bits. An explicit
+/// `MUNUNU_BDD_MAX_BITS` is respected exactly (clamped to [`HARD_BITBLAST_CEILING`]) — the user
+/// asked for a specific limit, so we neither raise nor lower it. With NO override, the cap is
+/// [`default_cap_for_cone`]: the conservative default auto-raised to admit a modestly-wide
+/// concrete cone.
+fn effective_bitblast_cap(cone_bits: u32) -> u32 {
+    match std::env::var("MUNUNU_BDD_MAX_BITS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .map(|v| v.min(HARD_BITBLAST_CEILING))
-        .unwrap_or(MAX_BITBLAST_BITS)
+    {
+        Some(v) => v.min(HARD_BITBLAST_CEILING),
+        None => default_cap_for_cone(cone_bits),
+    }
 }
 
 /// A bit-vector of BDDs, LSB-first: index `b` is the BDD for bit `b`. Every
@@ -251,9 +277,10 @@ impl BddBitBlaster {
         // R-F5.6 guard — the bit-blaster builds BDDs over every KEPT register+input bit. The
         // bit COUNT is only a crude upper bound on cost (a ROBDD shares structure), so the real
         // robustness gate is the node-budget guard below; this cap just avoids allocating a
-        // large arena for an absurdly wide cone. The cap is `MUNUNU_BDD_MAX_BITS` (clamped) or
-        // the default 40 — see [`effective_bitblast_cap`].
-        let cap = effective_bitblast_cap();
+        // large arena for an absurdly wide cone. The cap is `MUNUNU_BDD_MAX_BITS` (clamped) or,
+        // with no override, the default auto-raised to fit a modestly-wide concrete cone up to
+        // `AUTO_CAP_CEILING` — see [`effective_bitblast_cap`].
+        let cap = effective_bitblast_cap(total_bits);
         if total_bits > cap {
             return Err(format!(
                 "symbolic bit-blaster: design has {total_bits} register+input bits \
@@ -263,8 +290,9 @@ impl BddBitBlaster {
         }
 
         // Arena sizing, TIERED so the common (≤ 40-bit) path is UNCHANGED — 2M inner nodes
-        // (~32 MB) + 512K apply cache. A WIDE cone (only reachable when the cap is raised via
-        // env) gets a larger, env-tunable arena; the node-budget guard (80 % of the arena)
+        // (~32 MB) + 512K apply cache. A WIDE cone (reachable when the auto-cap admits a
+        // modestly-wide concrete cone, or the cap is raised further via env) gets a larger,
+        // env-tunable arena; the node-budget guard (80 % of the arena)
         // bails cleanly before it overflows, and `catch_unwind` is the backstop for a single op
         // that jumps the budget in one apply. The manager is dropped per `BddBitBlaster`, so at
         // most one arena is live at a time.
@@ -4367,19 +4395,22 @@ mod tests {
 
     /// D1.7 — the exact engine DEGRADES GRACEFULLY on a design too large to
     /// bit-blast. `BddBitBlaster::build` rejects a design whose register+input
-    /// bit count exceeds `MAX_BITBLAST_BITS` (40) with a clean `Err` — and does so
+    /// bit count exceeds the effective cap with a clean `Err` — and does so
     /// BEFORE allocating the BDD manager, so there is no OoM / hang. `build` is the
     /// first thing `exact_symbolic_verdict` calls, so the whole exact path returns
     /// `Err` (which `verify_auto`'s exact branch maps to a `Skipped` property, per
     /// `e2e_sysrst`-style graceful degradation). This locks that OoM-safety
-    /// guarantee for the exact path as a fast, non-docker regression.
+    /// guarantee for the exact path as a fast, non-docker regression. The fixture is
+    /// 80-bit — over the [`AUTO_CAP_CEILING`] (64) the no-env auto-cap will admit,
+    /// so it still degrades. (The 41–64-bit admit path is covered by
+    /// `auto_cap_admits_modestly_wide_concrete_cone`.)
     #[test]
     fn d1_7_exact_verdict_over_bit_cap_degrades_gracefully() {
-        // One 48-bit register (48 > the default 40-bit cap), no inputs. The formula is
+        // One 80-bit register (80 > AUTO_CAP_CEILING = 64), no inputs. The formula is
         // immaterial: the cap fires in `build`, before atom resolution or fixpoint
         // evaluation, so a caller degrades to Skipped rather than OoM.
         const WIDE_BTOR2: &str = r#"
-1 sort bitvec 48
+1 sort bitvec 80
 2 sort bitvec 1
 3 state 1 wide
 4 one 1
@@ -4388,11 +4419,62 @@ mod tests {
 "#;
         let formula = crate::mu_calculus::parser::parse("(wide == 0)").expect("formula parses");
         let err = exact_symbolic_verdict(WIDE_BTOR2, &formula)
-            .expect_err("48-bit design exceeds the default MAX_BITBLAST_BITS (40) → clean Err");
+            .expect_err("80-bit design exceeds the auto-cap ceiling (64) → clean Err");
         assert!(
-            err.contains("register+input bits") && err.contains("48"),
+            err.contains("register+input bits") && err.contains("80"),
             "the error must name the bit count + cap so a caller can degrade to \
              Skipped; got: {err}"
+        );
+    }
+
+    /// Auto-cap-management (verification-execution-planner Phase 4.6) — with NO explicit
+    /// `MUNUNU_BDD_MAX_BITS`, a concrete cone that modestly exceeds the conservative 40-bit
+    /// default is admitted up to [`AUTO_CAP_CEILING`] (64), so exact decides the CONCRETE model
+    /// directly instead of Skipping. Locks (a) the pure `default_cap_for_cone` thresholds and
+    /// (b) that a 48-bit concrete cone — which the old 40-bit default rejected (see `d1_7`,
+    /// which used exactly this width before the ceiling shipped) — now DECIDES. No env mutation:
+    /// the positive case relies on the default (env-unset) path; if `MUNUNU_BDD_MAX_BITS` is set
+    /// in the environment the assertion is skipped rather than falsely failing.
+    #[test]
+    fn auto_cap_admits_modestly_wide_concrete_cone() {
+        // Pure threshold math (no env, no BDD): the default floor is never lowered; a 41–64-bit
+        // cone raises the cap to fit; a > 64-bit cone is clamped to the ceiling (⇒ Err upstream).
+        assert_eq!(default_cap_for_cone(8), 40, "≤ floor ⇒ the 40-bit floor");
+        assert_eq!(default_cap_for_cone(40), 40, "exactly the floor");
+        assert_eq!(
+            default_cap_for_cone(48),
+            48,
+            "41–64 ⇒ raised to fit the cone"
+        );
+        assert_eq!(default_cap_for_cone(64), 64, "exactly the ceiling");
+        assert_eq!(
+            default_cap_for_cone(80),
+            64,
+            "> ceiling ⇒ clamped (build then Errs)"
+        );
+
+        // End-to-end: a 48-bit counter cone the old default Skipped now bit-blasts and decides.
+        // `wide` inits to 0 and increments, so `(wide == 0)` holds in the initial state — a
+        // definite verdict only reachable if the cone was admitted (not Skipped).
+        if std::env::var_os("MUNUNU_BDD_MAX_BITS").is_some() {
+            return; // an explicit cap overrides the auto-raise; don't assert against it
+        }
+        const CONE48: &str = r#"
+1 sort bitvec 48
+2 sort bitvec 1
+3 state 1 wide
+4 zero 1
+5 init 1 3 4
+6 one 1
+7 add 1 3 6
+8 next 1 3 7
+"#;
+        let formula = crate::mu_calculus::parser::parse("(wide == 0)").expect("formula parses");
+        assert_eq!(
+            exact_symbolic_verdict(CONE48, &formula),
+            Ok(ExactVerdict::Holds),
+            "a 48-bit concrete cone (> the 40-bit floor, ≤ the 64-bit ceiling) must be \
+             admitted by the auto-cap and decided, not Skipped"
         );
     }
 
@@ -4423,17 +4505,19 @@ mod tests {
     }
 
     /// R-F5.6 — cone-of-influence restriction lifts the bit cap when the property's cone is
-    /// small even though the FULL design is over 40 bits. `fsm` (2-bit) cycles 1→2→3→0→…; `wide`
-    /// (45-bit) is an out-of-cone counter `fsm` never reads. The full build hits the cap (47 >
-    /// 40), but `exact_symbolic_verdict` restricts to the cone of `fsm == 0` = {fsm} (pinning
-    /// `wide` to a constant) and DECIDES `EF (fsm == 0)` = Holds. Locks that (a) COI is wired
-    /// into the exact path, and (b) pinning the out-of-cone datapath is verdict-preserving —
-    /// the whole point of R-F5.6, as a fast non-docker regression.
+    /// small even though the FULL design is over the cap. `fsm` (2-bit) cycles 1→2→3→0→…; `wide`
+    /// (70-bit) is an out-of-cone counter `fsm` never reads. The full build hits the cap (72 >
+    /// the 64-bit auto-cap ceiling), but `exact_symbolic_verdict` restricts to the cone of
+    /// `fsm == 0` = {fsm} (pinning `wide` to a constant) and DECIDES `EF (fsm == 0)` = Holds.
+    /// `wide` is 70-bit (not 45) so the full design exceeds the auto-cap ceiling — COI, not the
+    /// auto-raise, is what makes this decidable. Locks that (a) COI is wired into the exact path,
+    /// and (b) pinning the out-of-cone datapath is verdict-preserving — the whole point of
+    /// R-F5.6, as a fast non-docker regression.
     #[test]
     fn rf5_6_coi_lifts_bit_cap_on_out_of_cone_datapath() {
         const FSM_PLUS_WIDE_CTR: &str = r#"
 1 sort bitvec 2
-2 sort bitvec 45
+2 sort bitvec 70
 3 state 1 fsm
 4 one 1
 5 add 1 3 4
@@ -4445,12 +4529,12 @@ mod tests {
 11 add 2 9 10
 12 next 2 9 11
 "#;
-        // The full design is 2 + 45 = 47 bits — over the cap.
+        // The full design is 2 + 70 = 72 bits — over the 64-bit auto-cap ceiling.
         let file = parser::parse(FSM_PLUS_WIDE_CTR).expect("parse");
         let full_err = BddBitBlaster::build(&file).err();
         assert!(
-            full_err.as_ref().is_some_and(|e| e.contains("47")),
-            "full 47-bit build must still hit the cap; got {full_err:?}",
+            full_err.as_ref().is_some_and(|e| e.contains("72")),
+            "full 72-bit build must still hit the cap; got {full_err:?}",
         );
         // The exact verdict restricts to the {fsm} cone (2 bits), pinning `wide` → decidable.
         // `fsm` inits to 1 and cycles to 0, so `EF (fsm == 0)` holds from the initial state.

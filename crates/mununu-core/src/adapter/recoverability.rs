@@ -2180,13 +2180,20 @@ mod tests {
         assert_eq!(recoverability_property_str("st == 0"), "AG EF (st == 0)");
     }
 
-    // A ≥48-bit free-running counter (over the exact ~40-bit cone cap) whose value
+    // An 80-bit free-running counter (over the 64-bit auto-cap ceiling) whose value
     // gates a small 2-state FSM (`st`: 0=idle, 1=busy). The counter feeds st's
     // next-state (idle advances to busy only when `cnt == 0`), so the counter is IN
     // st's cone-of-influence → the exact engine over-caps. busy ALWAYS returns to idle,
     // so every reachable state can reach idle ⇒ AG EF (st==0) HOLDS.
+    //
+    // Width note: this MUST exceed AUTO_CAP_CEILING (64), not just the 40-bit floor. For an
+    // `AG EF (control-target)` property the EF-reachability fixpoint converges in ~2 iterations
+    // regardless of the counter's width (a free-running counter never *blocks* reaching idle),
+    // so the fixpoint iteration budget never fires — only the bit cap does. At ≤ 64 bits the
+    // auto-cap would admit the cone and exact would DECIDE (a win), defeating the "exact
+    // abstains" premise this test needs.
     const WIDE_RECOVERABLE: &str = "\
-1 sort bitvec 48
+1 sort bitvec 80
 2 sort bitvec 2
 3 sort bitvec 1
 4 state 1 cnt
@@ -2205,12 +2212,12 @@ mod tests {
 17 next 2 9 16
 ";
 
-    // Same 48-bit counter (over the exact cap) but st's next-state is `stuck (2)`
-    // UNCONDITIONALLY — the `ite(cnt==0, 2, 2)` keeps the counter syntactically in st's
-    // cone (so the exact engine over-caps) while every state moves to the absorbing
-    // trap. From `stuck`, idle is unreachable ⇒ AG EF (st==0) VIOLATED.
+    // Same 80-bit counter (over the 64-bit auto-cap ceiling, per WIDE_RECOVERABLE's width note)
+    // but st's next-state is `stuck (2)` UNCONDITIONALLY — the `ite(cnt==0, 2, 2)` keeps the
+    // counter syntactically in st's cone (so the exact engine over-caps) while every state moves
+    // to the absorbing trap. From `stuck`, idle is unreachable ⇒ AG EF (st==0) VIOLATED.
     const WIDE_TRAP: &str = "\
-1 sort bitvec 48
+1 sort bitvec 80
 2 sort bitvec 2
 3 sort bitvec 1
 4 state 1 cnt
@@ -2282,12 +2289,12 @@ mod tests {
     }
 
     // === The proof the slice decides AT SCALE ==================================
-    // On a design whose cone exceeds the exact ~40-bit cap, the exact engine ABSTAINS
-    // (Unknown) while the cube path DECIDES — in both polarities.
+    // On a design whose cone exceeds the exact auto-cap ceiling (64), the exact engine
+    // ABSTAINS (Unknown) while the cube path DECIDES — in both polarities.
 
     #[test]
     fn wide_design_exact_abstains_but_cube_decides_holds() {
-        // The 48-bit counter feeds st's cone ⇒ the exact engine over-caps (Unknown),
+        // The 80-bit counter feeds st's cone ⇒ the exact engine over-caps (Unknown),
         // but the cube abstraction (which drops the counter) decides Holds.
         assert_eq!(
             exact_verdict(WIDE_RECOVERABLE, "st == 0"),
