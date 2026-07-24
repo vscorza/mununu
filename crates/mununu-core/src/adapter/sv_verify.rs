@@ -170,7 +170,7 @@ mod tests {
     // vendored design is the EXTRACTED control FSM (18 state bits — within the exact
     // engine's ~40-bit cap, so the exact engine decides it); the OVER-CAP cube +
     // smt-hyper-must scale path is proven separately by the wide-fixture differential
-    // tests in `crate::adapter::recoverability` (a 48-bit design where the exact engine
+    // tests in `crate::adapter::recoverability` (an 80-bit design where the exact engine
     // abstains and the cube path decides both polarities).
     #[test]
     #[ignore = "requires sv2v + Yosys + z3 (mununu-sva docker image); run with --ignored"]

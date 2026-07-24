@@ -554,10 +554,10 @@ mod tests {
     // `q` init 0, `next q = 0` (stays 0), `bad = q`. Never violated (bounded safe).
     const SAFE: &str = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 next 1 3 2\n\
                         6 bad 3\n";
-    // 64-bit counter: init 0, `next = big + 1`, `bad = (big == 5)`. Reaches 5 at
-    // depth 5. The 64-bit cone is OVER the exact engine's 40-bit cap, so only a
-    // SAT-based engine (this) decides it — the beyond-cap scale win.
-    const WIDE: &str = "1 sort bitvec 64\n2 zero 1\n3 one 1\n4 state 1 big\n5 init 1 4 2\n\
+    // 80-bit counter: init 0, `next = big + 1`, `bad = (big == 5)`. Reaches 5 at
+    // depth 5. The 80-bit cone is OVER the exact engine's auto-cap ceiling (64), so
+    // only a SAT-based engine (this) decides it — the beyond-cap scale win.
+    const WIDE: &str = "1 sort bitvec 80\n2 zero 1\n3 one 1\n4 state 1 big\n5 init 1 4 2\n\
                         6 add 1 4 3\n7 next 1 4 6\n8 constd 1 5\n9 sort bitvec 1\n\
                         10 eq 9 4 8\n11 bad 10\n";
 
@@ -574,7 +574,7 @@ mod tests {
         // Reaches bad at depth 1 / 5 — the deep CEX-only search returns the depth.
         let reach = parser::parse(REACH).expect("parse");
         assert_eq!(bmc_cex_until(&reach, 64, 5_000, far, &never), Some(1));
-        let wide = parser::parse(WIDE).expect("parse"); // depth 5, 64-bit (beyond exact cap)
+        let wide = parser::parse(WIDE).expect("parse"); // depth 5, 80-bit (beyond the auto-cap ceiling)
         assert_eq!(bmc_cex_until(&wide, 64, 5_000, far, &never), Some(5));
         // Bounded-safe design → no CEX within the depth budget → None (never a wrong verdict).
         let safe = parser::parse(SAFE).expect("parse");
@@ -646,8 +646,8 @@ mod tests {
 
     #[test]
     fn decides_beyond_the_exact_40_bit_cap() {
-        // A 64-bit reachability the exact BDD engine abstains on (over-cap); native
-        // BMC finds the depth-5 counterexample bit-precisely.
+        // An 80-bit reachability the exact BDD engine abstains on (over the 64-bit auto-cap
+        // ceiling); native BMC finds the depth-5 counterexample bit-precisely.
         assert_eq!(bmc(WIDE, 10), BmcOutcome::Violated { depth: 5 });
         // And with too small a bound it is honestly bounded, never a wrong SAFE.
         assert_eq!(bmc(WIDE, 3), BmcOutcome::NoCexWithin { k: 3 });
@@ -730,10 +730,10 @@ mod tests {
 
     #[test]
     fn k_induction_proves_safe_beyond_the_exact_40_bit_cap() {
-        // A 64-bit register that stays 0, `bad = (big != 0)`. The exact BDD engine
-        // abstains (over-cap); native k-induction proves it SAFE (1-inductive)
-        // bit-precisely — an in-house UNBOUNDED safety proof past the cap.
-        let wide_safe = "1 sort bitvec 64\n2 zero 1\n3 state 1 big\n4 init 1 3 2\n\
+        // An 80-bit register that stays 0, `bad = (big != 0)`. The exact BDD engine
+        // abstains (over the 64-bit auto-cap ceiling); native k-induction proves it SAFE
+        // (1-inductive) bit-precisely — an in-house UNBOUNDED safety proof past the cap.
+        let wide_safe = "1 sort bitvec 80\n2 zero 1\n3 state 1 big\n4 init 1 3 2\n\
                          5 next 1 3 3\n6 sort bitvec 1\n7 neq 6 3 2\n8 bad 7\n";
         assert_eq!(safety(wide_safe, 10), SafetyVerdict::Safe { k: 1 });
     }
@@ -766,8 +766,8 @@ mod tests {
         // The roadmap's `synth_pipeline(W)` signal, distilled to a scale CURVE: a
         // W-bit register that stays 0 (`AG(big == 0)`, encoded `bad = big != 0`),
         // swept over widths. The native k-induction engine proves it SAFE at EVERY
-        // width; the exact BDD engine ABSTAINS once the cone exceeds its 40-bit cap.
-        // That is the in-house scale win charted, not asserted by hand.
+        // width; the exact BDD engine ABSTAINS once the cone exceeds its cap (the
+        // auto-cap ceiling, 64). That is the in-house scale win charted, not asserted by hand.
         use crate::adapter::btor2::symbolic_bitblast::exact_bad_reachable;
         let wide_safe = |w: u32| -> String {
             format!(
@@ -784,9 +784,11 @@ mod tests {
                 "native must prove W={w} SAFE"
             );
         }
-        // The exact engine abstains once the cone is over-cap (≥64 bits here),
-        // where the native engine still decides — the scale delta.
-        for w in [64u32, 128, 256, 512] {
+        // The exact engine abstains once the cone is over-cap (> 64 bits, the auto-cap
+        // ceiling), where the native engine still decides — the scale delta. (At W=64 the
+        // auto-cap now admits the cone and exact DECIDES — covered by
+        // `symbolic_bitblast::auto_cap_admits_modestly_wide_concrete_cone`.)
+        for w in [80u32, 128, 256, 512] {
             assert!(
                 exact_bad_reachable(&wide_safe(w)).is_err(),
                 "the exact engine must abstain (over-cap) at W={w}"

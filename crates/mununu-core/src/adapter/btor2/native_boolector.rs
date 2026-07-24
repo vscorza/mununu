@@ -532,10 +532,10 @@ mod tests {
     // `q` init 0, `next q = 0`: never violated (bounded safe).
     const SAFE: &str = "1 sort bitvec 1\n2 zero 1\n3 state 1 q\n4 init 1 3 2\n5 next 1 3 2\n\
                         6 bad 3\n";
-    // 64-bit counter: init 0, `next = big + 1`, `bad = (big == 5)`. Reaches 5 at
-    // depth 5 — a cone OVER the exact engine's 40-bit cap, so a BV engine is the
-    // only one that decides it.
-    const WIDE: &str = "1 sort bitvec 64\n2 zero 1\n3 one 1\n4 state 1 big\n5 init 1 4 2\n\
+    // 80-bit counter: init 0, `next = big + 1`, `bad = (big == 5)`. Reaches 5 at
+    // depth 5 — a cone OVER the exact engine's auto-cap ceiling (64), so a BV engine
+    // is the only one that decides it.
+    const WIDE: &str = "1 sort bitvec 80\n2 zero 1\n3 one 1\n4 state 1 big\n5 init 1 4 2\n\
                         6 add 1 4 3\n7 next 1 4 6\n8 constd 1 5\n9 sort bitvec 1\n\
                         10 eq 9 4 8\n11 bad 10\n";
 
