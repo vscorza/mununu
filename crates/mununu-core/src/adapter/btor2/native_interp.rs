@@ -797,6 +797,76 @@ pub(crate) fn run_cvc5_raw(query: &str, timeout_ms: u32) -> Result<String, Strin
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
+/// Locate the MathSAT 5 binary: `MUNUNU_MATHSAT_PATH` or `mathsat` on PATH. Unlike cvc5's
+/// `locate_tool` (which invokes `--version`), MathSAT uses `-version` (single dash), so this does
+/// a light `-version` probe purely to confirm the binary is invokable; the actual interpolation
+/// query surfaces any real problem as an `Err`.
+fn locate_mathsat() -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+    let path = std::env::var("MUNUNU_MATHSAT_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("mathsat"));
+    match std::process::Command::new(&path).arg("-version").output() {
+        Ok(_) => Ok(path),
+        Err(e) => Err(format!(
+            "mathsat unavailable ({e}); set MUNUNU_MATHSAT_PATH or use the `mununu-sva` image \
+             (proof-based lazy-BV interpolation — the must-precondition query cvc5's SyGuS \
+             interpolation cannot synthesize)."
+        )),
+    }
+}
+
+/// Run MathSAT 5 on an interpolation query, returning raw stdout. Forces the LAZY BV solver
+/// (`-theory.bv.eager=false`) — the eager (bit-blast) solver cannot produce interpolation proofs
+/// (`"eager bv solver does not support proof generation"`). The query must use MathSAT's
+/// `(! φ :interpolation-group g)` + `(get-interpolant (g))` API (distinct from cvc5's
+/// `(get-interpolant I B)`). Output is `<sat-result>\n<interpolant s-expr>`.
+pub(crate) fn run_mathsat_raw(query: &str, timeout_ms: u32) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let bin = locate_mathsat()?;
+    let mut child = Command::new(&bin)
+        .arg("-theory.bv.eager=false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn mathsat: {e}"))?;
+    // The taken stdin is a temporary dropped at the end of this statement → EOF is sent.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(query.as_bytes())
+        .map_err(|e| format!("write mathsat stdin: {e}"))?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64 + 2_000);
+    let mut killed = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    killed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("wait mathsat: {e}")),
+        }
+    }
+    if killed {
+        return Err(format!("mathsat exceeded {timeout_ms}ms"));
+    }
+    let mut buf = Vec::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_end(&mut buf);
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
 /// Extract the interpolant term from cvc5's `(define-fun I () Bool <body>)` reply
 /// (cvc5 ≥ 1.x). Falls back to a bare top-level s-expression if `define-fun` is
 /// absent.

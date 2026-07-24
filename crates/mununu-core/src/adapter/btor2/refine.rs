@@ -215,6 +215,191 @@ pub fn synthesize_refinement_predicate(
     })
 }
 
+/// F.1 must-precondition interpolant (2026-07-24) — the RECOVERABILITY-correct query that the
+/// safety [`synthesize_refinement_predicate`] cannot pose. For a ⊥ cube `source` and the `good`
+/// target, interpolate the MUST-PRECONDITION of `good`: `A = source ∧ T_a ∧ good(next_a)` (current
+/// states whose transition CAN reach good) vs `B = source ∧ T_b ∧ ¬good(next_b)` (those whose
+/// transition can reach ¬good), over TWO independent next-state frames (`__a` / `__b`) so the only
+/// shared vocabulary is the CURRENT state — the interpolant `I(cur)` is then the invariant
+/// separating good-reaching from ¬good-reaching current states, i.e. the WP relation the ⊥ needs.
+///
+/// Solved by **MathSAT** proof-based lazy-BV interpolation ([`crate::adapter::btor2::native_interp::run_mathsat_raw`]);
+/// cvc5's SyGuS BV interpolation returns `fail` on this shape. MathSAT emits the WP as
+/// `(= K (ite <cond> K …))`; `<cond>` (e.g. `(= data target)`) is the discovered relational
+/// invariant, extracted below. `Unavailable` when: mathsat absent / no interpolant (a
+/// nondeterministic cur reaching BOTH good and ¬good — the `A∧B` SAT case) / a `good`/`source` atom
+/// over a non-state register / an interpolant outside the parseable grammar.
+pub fn must_precondition_interpolant(
+    file: &Btor2File,
+    source: &[PredicateExpr],
+    good: &[PredicateExpr],
+    timeout_ms: u32,
+) -> RefineOutcome {
+    let cfg = z3::Config::new();
+    z3::with_z3_config(&cfg, || {
+        let view = match encode_design(file) {
+            Ok(v) => v,
+            Err(e) => return RefineOutcome::Unavailable(format!("encode: {e:?}")),
+        };
+        let name_to_nid: HashMap<String, Nid> = view
+            .signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::State)
+            .filter_map(|s| s.symbol.clone().map(|sym| (sym, s.nid)))
+            .collect();
+        let nid_to_name: HashMap<Nid, String> =
+            name_to_nid.iter().map(|(n, &d)| (d, n.clone())).collect();
+        // `cur` is BARE-named so the interpolant — over the SHARED cur vocabulary — parses to a
+        // clean state predicate; the two next frames get distinct suffixes.
+        let frame = |suffix: &str| -> HashMap<Nid, BV> {
+            view.state_curr
+                .iter()
+                .filter_map(|(nid, bv)| {
+                    let sym = nid_to_name.get(nid)?;
+                    Some((*nid, BV::new_const(format!("{sym}{suffix}"), bv.get_size())))
+                })
+                .collect()
+        };
+        let cur = frame("");
+        let nx_a = frame("__a");
+        let nx_b = frame("__b");
+        let inp = |suffix: &str| -> HashMap<Nid, BV> {
+            view.inputs
+                .iter()
+                .map(|(nid, bv)| {
+                    (
+                        *nid,
+                        BV::new_const(format!("in{nid}{suffix}"), bv.get_size()),
+                    )
+                })
+                .collect()
+        };
+        let in_a = inp("__ina");
+        let in_b = inp("__inb");
+        let instantiate = |nx: &HashMap<Nid, BV>, ip: &HashMap<Nid, BV>| -> Bool {
+            let mut subs: Vec<(&BV, &BV)> = Vec::new();
+            for (nid, bv) in &view.state_curr {
+                if let Some(c) = cur.get(nid) {
+                    subs.push((bv, c));
+                }
+            }
+            for (nid, bv) in &view.state_next {
+                if let Some(n) = nx.get(nid) {
+                    subs.push((bv, n));
+                }
+            }
+            for (nid, bv) in &view.inputs {
+                if let Some(i) = ip.get(nid) {
+                    subs.push((bv, i));
+                }
+            }
+            view.transition.substitute(&subs)
+        };
+        let t_a = instantiate(&nx_a, &in_a);
+        let t_b = instantiate(&nx_b, &in_b);
+        let build = |ps: &[PredicateExpr], f: &HashMap<Nid, BV>| -> Option<Bool> {
+            let lookup = |name: &str| -> Option<BV> {
+                name_to_nid.get(name).and_then(|nid| f.get(nid)).cloned()
+            };
+            let mut conj = Vec::new();
+            for p in ps {
+                conj.push(p.build_constraint(&lookup)?);
+            }
+            Some(if conj.is_empty() {
+                Bool::from_bool(true)
+            } else {
+                Bool::and(&conj.iter().collect::<Vec<_>>())
+            })
+        };
+        let source_bool = match build(source, &cur) {
+            Some(b) => b,
+            None => return RefineOutcome::Unavailable("source over a non-state register".into()),
+        };
+        let good_a = match build(good, &nx_a) {
+            Some(b) => b,
+            None => return RefineOutcome::Unavailable("good over a non-state register".into()),
+        };
+        let good_b = match build(good, &nx_b) {
+            Some(b) => b,
+            None => return RefineOutcome::Unavailable("good over a non-state register".into()),
+        };
+        let a = Bool::and(&[&source_bool, &t_a, &good_a]);
+        let b = Bool::and(&[&source_bool, &t_b, &good_b.not()]);
+        let (a_decls, a_body) = match serialize_term(&a) {
+            Some(x) => x,
+            None => return RefineOutcome::Unavailable("serialize A".into()),
+        };
+        let (b_decls, b_body) = match serialize_term(&b) {
+            Some(x) => x,
+            None => return RefineOutcome::Unavailable("serialize B".into()),
+        };
+        let mut decls: BTreeSet<String> = BTreeSet::new();
+        decls.extend(a_decls);
+        decls.extend(b_decls);
+        let mut query = String::from("(set-option :produce-interpolants true)\n");
+        for d in &decls {
+            query.push_str(d);
+            query.push('\n');
+        }
+        query.push_str(&format!(
+            "(assert (! {a_body} :interpolation-group g1))\n\
+             (assert (! {b_body} :interpolation-group g2))\n\
+             (check-sat)\n(get-interpolant (g1))\n"
+        ));
+        let stdout = match crate::adapter::btor2::native_interp::run_mathsat_raw(&query, timeout_ms)
+        {
+            Ok(s) => s,
+            Err(e) => return RefineOutcome::Unavailable(e),
+        };
+        parse_mathsat_interpolant(&stdout)
+    })
+}
+
+/// Parse MathSAT's `get-interpolant` reply (`<sat-result>\n<interpolant s-expr>`) into a
+/// [`PredicateExpr`]. The must-precondition WP is emitted as `(= K (ite <cond> K <else>))` — the
+/// `ite` CONDITION is the relational invariant, and the rich #318 parser rejects `ite` directly,
+/// so it is peeled off first. Falls back to parsing the whole term (a plain comparison).
+fn parse_mathsat_interpolant(stdout: &str) -> RefineOutcome {
+    let Some(term) = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('(') && !l.starts_with("(error"))
+    else {
+        let head = stdout.lines().next().unwrap_or("").trim();
+        return RefineOutcome::Unavailable(format!("mathsat: no interpolant (status `{head}`)"));
+    };
+    let candidate = ite_condition(term).unwrap_or_else(|| term.to_string());
+    // Reuse the rich #318 parser by wrapping the candidate in cvc5's `define-fun` envelope.
+    let wrapped = format!("(define-fun I () Bool {candidate})");
+    match parse_interpolant_to_predicate_expr(&wrapped) {
+        Some(pe) => RefineOutcome::Predicate(pe),
+        None => RefineOutcome::Unavailable(format!("mathsat interpolant outside grammar: {term}")),
+    }
+}
+
+/// The first `(ite <cond> …)` condition s-expression in `term` (the WP relation), if present.
+fn ite_condition(term: &str) -> Option<String> {
+    let p = term.find("(ite ")?;
+    let after = term[p + "(ite ".len()..].trim_start();
+    if !after.starts_with('(') {
+        return after.split_whitespace().next().map(str::to_string);
+    }
+    let mut depth = 0usize;
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(after[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// P2.3b — the Craig interpolant AT CUT `cut` of the depth-`depth` BMC unrolling
 /// `Init(s0) ∧ T(s0,s1) ∧ … ∧ T(s_{depth-1}, s_depth)` with `bad` at any step
 /// `≥ cut`: `A = Init ∧ (prefix to s_cut)` vs `B = ¬(bad reachable from s_cut
@@ -800,6 +985,40 @@ mod tests {
             found_bound,
             "expected to discover the bound invariant cnt<=5; got {preds:?}"
         );
+    }
+
+    #[test]
+    fn mathsat_interpolant_parse_extracts_ite_condition_and_bare_comparison() {
+        use crate::adapter::btor2::predicate_expr::{CmpOp, PredicateExpr};
+        // The WP form MathSAT emits for the must-precondition query — the `ite` CONDITION is the
+        // relational invariant `data == target`; the sat-status line is skipped.
+        let out = "unsat\n(= (_ bv0 1) (ite (= data target) (_ bv0 1) busy))\n";
+        match parse_mathsat_interpolant(out) {
+            RefineOutcome::Predicate(PredicateExpr::CmpReg { lhs, op, rhs }) => {
+                assert_eq!(op, CmpOp::Eq);
+                assert!(
+                    (lhs == "data" && rhs == "target") || (lhs == "target" && rhs == "data"),
+                    "extracted the wrong relation: {lhs} {op:?} {rhs}"
+                );
+            }
+            other => panic!("expected CmpReg data==target from the ite condition; got {other:?}"),
+        }
+        // A bare comparison (no ite) parses directly.
+        assert!(matches!(
+            parse_mathsat_interpolant("unsat\n(bvule cnt (_ bv5 8))\n"),
+            RefineOutcome::Predicate(PredicateExpr::Cmp { op: CmpOp::Le, .. })
+        ));
+        // No interpolant (SAT / empty) → Unavailable, never a fabricated predicate.
+        assert!(matches!(
+            parse_mathsat_interpolant("sat\n"),
+            RefineOutcome::Unavailable(_)
+        ));
+        // `ite_condition` peels the condition; a term with no ite returns None.
+        assert_eq!(
+            ite_condition("(= (_ bv0 1) (ite (= data target) (_ bv0 1) busy))").as_deref(),
+            Some("(= data target)")
+        );
+        assert_eq!(ite_condition("(= data target)"), None);
     }
 
     /// Validation sweep: run the interpolation invariant-discovery over every
