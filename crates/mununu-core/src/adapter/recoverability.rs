@@ -1447,7 +1447,16 @@ pub fn verify_recoverability_scalable(
     // Cube + smt-hyper-must, matching the verify_auto CegarOptions shape.
     let cegar_opts = CegarOptions {
         max_iterations: RECOVERABILITY_MAX_ITERATIONS,
-        predicate_source: PredicateSource::WeakestPrecondition,
+        // F.1 (2026-07-24) — opt into the transition-aware Craig refinement (discovers the
+        // relational/bound invariant a datapath-dependent ⊥ needs) via `MUNUNU_CRAIG_REFINE`.
+        // Default stays WP: Craig spawns a cvc5 subprocess per classifying transition, so it is
+        // opt-in until the corpus cost/benefit is measured. The loop always falls back to WP, so
+        // enabling it can only DECIDE MORE (sound + monotone under SmtHyperMust).
+        predicate_source: if std::env::var_os("MUNUNU_CRAIG_REFINE").is_some() {
+            PredicateSource::CraigInterpolation
+        } else {
+            PredicateSource::WeakestPrecondition
+        },
         max_cube_count: 1024,
         capture_approximants: false,
         enable_approximant_reuse: false,
