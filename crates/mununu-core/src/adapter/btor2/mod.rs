@@ -30,6 +30,7 @@ pub mod dep_graph;
 pub mod emit;
 pub mod kmts_lift;
 pub mod l2s_monitor;
+pub(crate) mod model_facts;
 pub mod native_bmc;
 #[cfg(feature = "boolector")]
 pub mod native_boolector;
