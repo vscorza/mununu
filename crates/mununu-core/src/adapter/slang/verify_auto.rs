@@ -427,6 +427,28 @@ fn build_notes(
     // transitions, so a definite HOLDS is sound but a definite VIOLATED may be
     // spurious unless it is guard-independent (the orphaned-FSM-state case).
     if !cutpoint_signals.is_empty() {
+        // T3 (property-class honesty, 2026-07-23) — a cutpoint is a PLAIN over-approximation
+        // (it adds transitions). That is sound-transferring for a definite HOLDS on a SAFETY /
+        // universal property, but NOT for an ALTERNATING fixpoint (νμ recoverability `AG EF`),
+        // which collapses under a plain over- or under-approximation (CLAUDE.md soundness table;
+        // Bruns–Godefroid): a HOLDS on the cutpointed model does not automatically transfer to
+        // the concrete RTL. Only append the νμ caveat when the report actually carries an
+        // alternating property (a parse failure ⇒ conservatively omit — the base claim stays
+        // accurate for the safety case).
+        let has_alternating = report.properties.iter().any(|p| {
+            crate::mu_calculus::parser::parse(&p.formula)
+                .map(|f| f.alternation_depth() >= 2)
+                .unwrap_or(false)
+        });
+        let numu_caveat = if has_alternating {
+            " ⚠ But for an ALTERNATING recoverability property (`AG EF good`, νμ) a HOLDS under this \
+              cut is sound for the abstract (cutpointed) model ONLY — it does NOT automatically transfer \
+              to the concrete RTL, because alternating fixpoints collapse under a plain over-approximation. \
+              Decide those on the un-cutpointed cone (raise the bit cap or pin the freed inputs) rather \
+              than trusting the cut."
+        } else {
+            ""
+        };
         notes.push(VerificationNote {
             kind: "control-slice".into(),
             level: NoteLevel::ScopeCaveat,
@@ -434,15 +456,17 @@ fn build_notes(
                 "{} net(s) cut to free inputs (control-slice) — an over-approximation of the design.",
                 cutpoint_signals.len()
             ),
-            detail: "Each listed net was replaced by a free `$anyseq` input (Yosys `cutpoint`), so its \
-                     datapath fanin drops out of the cone (this is what lets `exact-symbolic` fit a wide \
-                     control FSM). Because freeing a net only ADDS transitions, a definite HOLDS transfers \
-                     to the concrete RTL (safety + over-approx = sound); a definite VIOLATED is sound only \
-                     when the counterexample is guard-independent — the canonical case being an ORPHANED \
-                     FSM state (in-degree 0), which no freed guard can make reachable, so `AG EF \
-                     <orphaned-state>` stays soundly VIOLATED. Treat any other VIOLATED under cut points \
-                     as possibly spurious and re-check without the cut."
-                .into(),
+            detail: format!(
+                "Each listed net was replaced by a free `$anyseq` input (Yosys `cutpoint`), so its \
+                 datapath fanin drops out of the cone (this is what lets `exact-symbolic` fit a wide \
+                 control FSM). Because freeing a net only ADDS transitions, for a SAFETY / universal \
+                 property a definite HOLDS transfers to the concrete RTL (safety + over-approx = \
+                 sound).{numu_caveat} A definite VIOLATED is sound only when the counterexample is \
+                 guard-independent — the canonical case being an ORPHANED FSM state (in-degree 0), \
+                 which no freed guard can make reachable, so `AG EF <orphaned-state>` stays soundly \
+                 VIOLATED. Treat any other VIOLATED under cut points as possibly spurious and re-check \
+                 without the cut."
+            ),
             items: cutpoint_signals.to_vec(),
         });
     }
@@ -2878,6 +2902,66 @@ mod tests {
             inputs: vec![vec![("esc".to_string(), 1)]],
             unreachable_target: Vec::new(),
         }
+    }
+
+    // T3 — the control-slice (cutpoint over-approximation) note must gate its
+    // "definite HOLDS transfers (safety + over-approx = sound)" claim on the property
+    // class: it holds for safety/universal properties but NOT for an alternating (νμ)
+    // recoverability property, which collapses under a plain over-approximation. The
+    // νμ caveat appears only when the report actually carries an alternating property.
+    #[test]
+    fn control_slice_note_gates_holds_transfer_claim_on_property_class() {
+        use crate::adapter::slang::translate::SvaKind;
+        let prop = |name: &str, formula: &str| PropertyVerdict {
+            name: name.into(),
+            kind: SvaKind::Assert,
+            formula: formula.into(),
+            outcome: VerifyOutcome::Holds,
+            seeded_predicates: Vec::new(),
+            counterexample: None,
+        };
+        let build = |report: &AutoVerifyReport| {
+            build_notes(
+                report,
+                MustEdgeInference::Off,
+                &[],
+                &[],
+                &["cnt".to_string()],
+                &NotePosture::Exact,
+            )
+        };
+        // νμ recoverability (`AG EF`, alternation_depth 2) under cutpoints ⇒ caveat present.
+        let alternating = AutoVerifyReport {
+            properties: vec![prop("recov", "nu Y. ((mu X. ((p == 1) || <> X)) && [] Y)")],
+            ..Default::default()
+        };
+        let cs = build(&alternating);
+        let note = cs
+            .iter()
+            .find(|n| n.kind == "control-slice")
+            .expect("control-slice note present");
+        assert!(
+            note.detail.contains("ALTERNATING recoverability property"),
+            "a νμ property under cutpoints must caveat that HOLDS is sound for the abstract model \
+             only; got: {}",
+            note.detail
+        );
+
+        // Only a safety property (alternation_depth 1) under cutpoints ⇒ no νμ caveat.
+        let safety_only = AutoVerifyReport {
+            properties: vec![prop("safe", "nu X. ((p == 1) && [] X)")],
+            ..Default::default()
+        };
+        let cs2 = build(&safety_only);
+        let note2 = cs2
+            .iter()
+            .find(|n| n.kind == "control-slice")
+            .expect("control-slice note present");
+        assert!(
+            !note2.detail.contains("ALTERNATING recoverability property"),
+            "a safety-only report must not carry the νμ caveat; got: {}",
+            note2.detail
+        );
     }
 
     // The safety-⊥ escalation reduces a reducible AG-invariant the cube left ⊥ to a
