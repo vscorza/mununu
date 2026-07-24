@@ -311,6 +311,10 @@ pub trait SmtEncode: SymbolicTransitionSystem {
 /// The BTOR2 implementation of the STS-IR seam — a thin borrow over a
 /// parsed [`Btor2File`]. Every method delegates to an already-shipped
 /// function, so DR0 changes no behaviour and rewires no call site.
+/// A GKMTS hyper-must relation: per source cube, the may-successor target set it must
+/// reach. Aliased to keep the session-cache signatures readable (clippy type-complexity).
+pub(crate) type HyperMustEdges = Vec<(usize, Vec<usize>)>;
+
 pub struct BtorSts<'a> {
     file: &'a Btor2File,
     /// Lazy, memoized structural derivations of `file` (Phase 0.a). The may / must /
@@ -326,6 +330,103 @@ impl<'a> BtorSts<'a> {
             file,
             facts: crate::adapter::btor2::model_facts::ModelFacts::new(file),
         }
+    }
+
+    /// Phase 0.c (session cache) — compute the may-relation AND the GKMTS hyper-must
+    /// relation in ONE z3 scope, sharing a SINGLE encoded view + primed node cache +
+    /// nid-map across both. Today [`SmtEncode::may_edges`] and
+    /// [`SmtEncode::hyper_must_edges`] each open their own `with_z3_config` scope and
+    /// re-encode the transition relation; this builds it once.
+    ///
+    /// SOUNDNESS (scope-lived projection, ownership/lifetime): z3 0.20 uses a
+    /// thread-local `Context` that `with_z3_config` installs for the closure and drops
+    /// on return, so a `Btor2SmtView`'s z3 handles are valid exactly while that
+    /// `Context` is alive. The view is a **non-escaping local** here — it never leaves
+    /// the closure, so its handles cannot outlive the `Context`. That nesting is what
+    /// makes the shared projection sound (z3-0.20 handles carry no lifetime parameter,
+    /// so a long-lived cache would compile yet dangle; a scope-local one cannot).
+    ///
+    /// Behaviour-identical to `may_edges` followed by `hyper_must_edges(&may)`: the same
+    /// view, primed cache, nid-map, and per-pair checks — only built once. Verified by
+    /// the differential edge suites (`sts_ir` / `kmts_lift`).
+    pub(crate) fn may_and_hyper_must_edges<P: PredicateLike + Sync>(
+        &self,
+        predicates: &[P],
+        timeout_ms: u32,
+    ) -> (Vec<(usize, usize)>, HyperMustEdges) {
+        use crate::adapter::btor2::smt_must_edge::{
+            SmtMayVerdict, SmtMustVerdict, build_register_nid_map_with_inputs,
+            smt_hyper_must_check_uniform, smt_per_target_may_check_uniform,
+        };
+        use crate::adapter::sidecar::predicate_image::btor2_encode::encode_primed;
+
+        if predicates.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let n_cubes = 1usize << predicates.len();
+        let cfg = z3::Config::new();
+        z3::with_z3_config(&cfg, || {
+            // ONE encode + ONE primed cache + ONE nid-map, shared by both relations.
+            let view = match self.facts.encode() {
+                Ok(v) => v,
+                Err(_) => return (Vec::new(), Vec::new()),
+            };
+            let primed = match encode_primed(self.file, &view) {
+                Ok(p) => p,
+                Err(_) => return (Vec::new(), Vec::new()),
+            };
+            let nid_map = build_register_nid_map_with_inputs(&view);
+
+            // may-relation (all-pairs) — identical to `may_edges`.
+            let mut may: Vec<(usize, usize)> = Vec::new();
+            for i in 0..n_cubes {
+                for j in 0..n_cubes {
+                    if matches!(
+                        smt_per_target_may_check_uniform(
+                            &view, &primed, i as u64, j as u64, predicates, &nid_map, timeout_ms,
+                        ),
+                        SmtMayVerdict::May
+                    ) {
+                        may.push((i, j));
+                    }
+                }
+            }
+
+            // hyper-must over each source's may-successor set — identical to
+            // `hyper_must_edges(&may)`.
+            let mut may_succ: Vec<Vec<usize>> = vec![Vec::new(); n_cubes];
+            for &(i, j) in &may {
+                if i < n_cubes && j < n_cubes {
+                    may_succ[i].push(j);
+                }
+            }
+            for v in &mut may_succ {
+                v.sort_unstable();
+                v.dedup();
+            }
+            let mut hyper: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (src, targets) in may_succ.iter().enumerate() {
+                if targets.is_empty() {
+                    continue;
+                }
+                let target_bits_set: Vec<u64> = targets.iter().map(|&t| t as u64).collect();
+                if matches!(
+                    smt_hyper_must_check_uniform(
+                        &view,
+                        &primed,
+                        src as u64,
+                        &target_bits_set,
+                        predicates,
+                        &nid_map,
+                        timeout_ms,
+                    ),
+                    SmtMustVerdict::Must
+                ) {
+                    hyper.push((src, targets.clone()));
+                }
+            }
+            (may, hyper)
+        })
     }
 
     fn vars_of(&self, want_state: bool) -> Vec<StsVar> {
@@ -931,6 +1032,40 @@ mod tests {
         for e in &must {
             assert!(may.contains(e), "must-edge {e:?} must also be a may-edge");
         }
+    }
+
+    #[test]
+    fn may_and_hyper_must_edges_session_equals_the_split_relations() {
+        // Phase 0.c — the combined session-cache pass (ONE z3 scope, ONE encoded view
+        // shared by may + hyper-must) must be byte-identical to `may_edges` followed by
+        // `hyper_must_edges(&may)` (each its own scope + re-encode). Exercised on a
+        // free-input design (`reg_a' = in_a`) so both relations are non-trivial.
+        const FREE_INPUT: &str = "1 sort bitvec 1\n2 input 1 in_a\n3 state 1 reg_a\n4 zero 1\n5 init 1 3 4\n6 next 1 3 2\n";
+        let file = parser::parse(FREE_INPUT).expect("parse");
+        let sts = BtorSts::new(&file);
+        let preds = vec![
+            PredicateSpec {
+                name: "reg_a == 0".into(),
+                register: "reg_a".into(),
+                value: 0,
+            },
+            PredicateSpec {
+                name: "in_a == 0".into(),
+                register: "in_a".into(),
+                value: 0,
+            },
+        ];
+        let may_split = sts.may_edges(&preds, 5_000);
+        let hyper_split = sts.hyper_must_edges(&preds, &may_split, 5_000);
+        let (may_combined, hyper_combined) = sts.may_and_hyper_must_edges(&preds, 5_000);
+        assert_eq!(
+            may_combined, may_split,
+            "session-cache may-relation must equal the standalone `may_edges`"
+        );
+        assert_eq!(
+            hyper_combined, hyper_split,
+            "session-cache hyper-must must equal the standalone `hyper_must_edges(&may)`"
+        );
     }
 
     // H.B (free-input atoms) — `reg_a' = in_a`, with a free input `in_a`.

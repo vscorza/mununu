@@ -2142,7 +2142,24 @@ pub fn predicate_cube_lift(
         // GATE (follow-up A): only for |P| >= 2. At |P| == 1 all-pairs is 2 cubes / ~4 checks (trivial),
         // and the post-image's fixed all-SAT overhead loses (measured 1.6s vs 0.13s); from |P| == 2 the
         // post-image wins (and grows to 33-256x by |P| = 3-7).
-        let may_edges: Vec<(usize, usize)> = if lift_opts.may_postimage
+        // Phase 0.c (session cache) — when the may-relation is computed via the STS-IR
+        // seam (`BtorSts`, i.e. NOT the post-image path) AND a hyper-must is requested,
+        // compute may + hyper-must in ONE z3 scope sharing a single encoded view (else
+        // each re-encodes the transition relation). Guarded to the cases where the
+        // post-image path is provably not taken (`!may_postimage || |P| < 2`), so the
+        // may-relation is byte-identical to the split path; `precomputed_hyper` carries
+        // the shared-scope hyper result to the SmtHyperMust arm below.
+        let use_session_may_hyper = matches!(
+            lift_opts.must_edge_inference,
+            MustEdgeInference::SmtHyperMust
+        ) && (!lift_opts.may_postimage || predicates.len() < 2);
+        let (may_edges, precomputed_hyper): (
+            Vec<(usize, usize)>,
+            Option<crate::adapter::sts_ir::HyperMustEdges>,
+        ) = if use_session_may_hyper {
+            let (may, hyper) = sts.may_and_hyper_must_edges(&cube_preds, 5_000);
+            (may, Some(hyper))
+        } else if lift_opts.may_postimage
             && predicates.len() >= 2
             && let Some(map) =
                 compute_all_may_edges_smt_postimage(&file, &predicates, &lift_opts.compound_exprs)
@@ -2152,9 +2169,9 @@ pub fn predicate_cube_lift(
                 .flat_map(|(src, tgts)| tgts.into_iter().map(move |t| (src, t)))
                 .collect();
             pairs.sort_unstable();
-            pairs
+            (pairs, None)
         } else {
-            sts.may_edges(&cube_preds, 5_000)
+            (sts.may_edges(&cube_preds, 5_000), None)
         };
         // Emit MayOnly edges. Keep `may_edges` (borrow) — the SmtHyperMust
         // branch below reuses it as the per-source candidate target set.
@@ -2203,7 +2220,10 @@ pub fn predicate_cube_lift(
                     // candidate target set is its may-successor set; the seam
                     // proves `∀ s ⊨ src. ∃ input ∃ t ∈ T. reach(t)` and emits
                     // a `MustHyperOnly(T)` edge only on a definite Must.
-                    let hyper = sts.hyper_must_edges(&cube_preds, &may_edges, 5_000);
+                    // Phase 0.c — reuse the hyper-must computed in the same z3 scope as
+                    // `may` when the session path was taken; else compute it standalone.
+                    let hyper = precomputed_hyper
+                        .unwrap_or_else(|| sts.hyper_must_edges(&cube_preds, &may_edges, 5_000));
                     let emitted = hyper.len();
                     for (src, targets) in hyper {
                         let target_ids: smallvec::SmallVec<
